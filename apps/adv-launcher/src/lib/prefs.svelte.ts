@@ -28,6 +28,8 @@ export interface Prefs {
   /** Whether the user has chosen automatic or manual VNDB lookup. */
   vndbAsked: boolean;
   trackPlayTime: boolean;
+  autoCheckUpdates: boolean;
+  lastUpdateCheck: number;
   touchMode: TouchMode;
   /** Phones and tablets: the touch controls beside the game are expanded. */
   touchControls: boolean;
@@ -55,6 +57,8 @@ const defaults: Prefs = {
   fetchVndb: false,
   vndbAsked: false,
   trackPlayTime: true,
+  autoCheckUpdates: true,
+  lastUpdateCheck: 0,
   touchMode: "direct",
   touchControls: true,
   autoJit: true,

@@ -1,13 +1,16 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { t, locale } from "./lib/i18n.svelte";
   import { call, onHostEvent } from "./lib/bridge";
   import JitBanner from "./components/JitBanner.svelte";
+  import UpdateNotice from "./components/UpdateNotice.svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
   import { jit } from "./lib/jit.svelte";
   import { nav } from "./lib/nav.svelte";
   import { setGameActive } from "./lib/overlay";
   import { prefs } from "./lib/prefs.svelte";
+  import { updates } from "./lib/updates.svelte";
   import Game from "./pages/Game.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
@@ -66,6 +69,15 @@
   });
 
   $effect(() => setGameActive(route.name === "game"));
+  $effect(() => {
+    if (!prefs.autoCheckUpdates || route.name !== "library") return;
+    const check = () => {
+      if (!document.hidden) untrack(() => void updates.check(true));
+    };
+    check();
+    document.addEventListener("visibilitychange", check);
+    return () => document.removeEventListener("visibilitychange", check);
+  });
   // A game started before JIT is ready runs interpreted to its end.
   $effect(() => {
     if (jit.active) jit.start();
@@ -94,6 +106,7 @@
       class:inset={device.touch && !phonePage}
     >
       {#if !phonePage}<JitBanner />{/if}
+      {#if !phonePage && route.name === "library"}<UpdateNotice />{/if}
       {#if route.name === "library" || route.name === "install"}
         {@const filter = route.name === "library" ? route.filter : "all"}
         {#if phonePage}<PhoneLibrary {filter} />{:else}<Library {filter} />{/if}

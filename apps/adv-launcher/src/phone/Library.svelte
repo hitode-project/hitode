@@ -4,6 +4,7 @@
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import UpdateNotice from "../components/UpdateNotice.svelte";
   import JitBanner from "../components/JitBanner.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
@@ -112,6 +113,7 @@
     </button>
   </header>
   <JitBanner />
+  <UpdateNotice />
   {@render categories()}
   <main class="empty">
     <div aria-hidden="true" class="stack">
@@ -144,6 +146,7 @@
     </button>
   </header>
   <JitBanner />
+  <UpdateNotice />
 
   {#if searching}
     <label class="field search">

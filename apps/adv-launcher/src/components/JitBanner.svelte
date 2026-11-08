@@ -22,12 +22,12 @@
     {:else}
       <span class="text">
         <b>{t("强烈建议启用 JIT")}</b>
-        <span>{status.error || jit.requestError ? jit.note : t("未启用时游戏以解释模式运行，速度会慢很多。")}</span>
+        <span>{status.externalOnly || status.error || jit.requestError ? jit.note : t("未启用时游戏以解释模式运行，速度会慢很多。")}</span>
       </span>
     {/if}
     <div class="actions">
       {#if !jit.signingUnsupported && !jit.busy}
-        {#if status.pairingFile && !status.liveContainer}
+        {#if jit.configured}
           <button class="act" onclick={() => jit.enable()}>{status.error ? t("重试") : t("启用")}</button>
         {:else}
           <button class="act" onclick={() => nav.go({ name: "settings" })}>{t("设置方法")}</button>

@@ -1,5 +1,5 @@
-# Builds a version tag into a draft release: the macOS DMG, the unsigned iOS
-# IPA, the signed Android APK, license texts, the Wine source and checksums.
+# Builds a version tag into a draft release: the macOS DMG, both iOS IPAs,
+# the signed Android APK, license texts, the Wine source and checksums.
 # Signing waits for a maintainer to approve the `release` environment; the
 # maintainer tests the draft's files on devices, edits its notes and publishes.
 name: Release
@@ -139,6 +139,17 @@ jobs:
           cp src-tauri/gen/apple/build/arm64/Hitode.ipa "$ipa"
           unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
           if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "the IPA is signed"; exit 1; fi
+
+      - name: Package the TrollStore IPA
+        if: matrix.platform == 'ios'
+        run: |
+          # A manual rerun can select a tag older than TrollStore support.
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ! -f tools/ios/package_trollstore.py ]]; then
+            exit 0
+          fi
+          brew install ldid
+          dist="$RUNNER_TEMP/dist"
+          python3 tools/ios/package_trollstore.py "$dist/Hitode-$VERSION-ios-unsigned.ipa" "$dist/Hitode-$VERSION-ios-trollstore.ipa"
 
       - name: Build the Android APK
         if: matrix.platform == 'android'

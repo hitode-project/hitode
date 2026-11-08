@@ -2,7 +2,7 @@
 """Build, sign and optionally install launcher packages for the chosen platforms.
 
 Usage: python3 tools/macos/package_launcher.py PLATFORM... | all
-           [--install [DEVICE]] [--side-by-side NAME] [-- COMMAND...]
+           [--install [DEVICE]] [--side-by-side NAME] [--trollstore] [-- COMMAND...]
 PLATFORM is mac, ios or android; several build one after another, all builds all.
 Input: ARM macOS with Xcode, Rust, Node and pnpm. ADV_WINE_DIST may name the
 stripped Wine installation; unset, the pinned build from tools/release/wine.json
@@ -14,6 +14,7 @@ Output: target/package/<platform>/ holds Hitode.app (ad hoc signed), Hitode.ipa
 --install puts each mobile package on the only connected device of its platform,
 or on DEVICE (adb serial or devicectl identifier) when one mobile platform is chosen. --side-by-side NAME gives the APK the application ID
 suffix NAME, so it installs beside a release-signed copy instead of replacing it.
+Use ios --trollstore to build Hitode-TrollStore.ipa with ldid instead of an Apple team.
 With -- COMMAND and one platform, it only prepares that environment and runs
 COMMAND in apps/adv-launcher. Every input is checked before compiling, because the launcher
 build would otherwise drop Wine without an error.
@@ -57,7 +58,7 @@ android = toolchain.android
 TARGETS = {'mac': 'aarch64-apple-darwin', 'ios': 'aarch64-apple-ios', 'android': 'aarch64-linux-android'}
 
 
-def preflight(platforms: list[str], env: dict) -> list[str]:
+def preflight(platforms: list[str], env: dict, trollstore: bool = False) -> list[str]:
     """Every missing input at once, each with the step that provides it."""
     if os.uname().sysname != 'Darwin' or os.uname().machine != 'arm64':
         return ['packages build on an Apple silicon Mac, where tools/macos/build.py builds FFmpeg']
@@ -73,7 +74,9 @@ def preflight(platforms: list[str], env: dict) -> list[str]:
     if 'ios' in platforms:
         if not output('xcodebuild', '-version'):
             problems.append('missing Xcode: install it, then sudo xcode-select -s /Applications/Xcode.app')
-        if not env.get('APPLE_DEVELOPMENT_TEAM'):
+        if trollstore and not shutil.which('ldid'):
+            problems.append('missing ldid: brew install ldid')
+        if not trollstore and not env.get('APPLE_DEVELOPMENT_TEAM'):
             problems.append('missing APPLE_DEVELOPMENT_TEAM: set it to your Apple signing team ID')
     if env.get('ADV_WINE_DIST'):
         problems += [f'incomplete ADV_WINE_DIST: missing {required}' for required in WINE_REQUIRED
@@ -112,7 +115,7 @@ def debug_keystore(env: dict) -> Path:
     return keystore
 
 
-def package(platform: str, env: dict, side_by_side: str | None) -> Path:
+def package(platform: str, env: dict, side_by_side: str | None, trollstore: bool) -> Path:
     out = OUTPUT / platform
     out.mkdir(parents=True, exist_ok=True)
     if platform == 'mac':
@@ -129,9 +132,16 @@ def package(platform: str, env: dict, side_by_side: str | None) -> Path:
     if platform == 'ios':
         if not (TAURI / 'icons/ios').is_dir():
             run([sys.executable, LAUNCHER / 'scripts/icons.py'], env)
-        run(['pnpm', 'tauri', 'ios', 'build', '--ci', '--export-method', 'debugging', '--target', 'aarch64'], env)
-        ipa = out / 'Hitode.ipa'
-        shutil.copy2(TAURI / 'gen/apple/build/arm64/Hitode.ipa', ipa)
+        source = TAURI / 'gen/apple/build/arm64/Hitode.ipa'
+        command = ['pnpm', 'tauri', 'ios', 'build', '--ci', '--target', 'aarch64']
+        if trollstore:
+            run([*command, '--no-sign'], env)
+            ipa = out / 'Hitode-TrollStore.ipa'
+            run([sys.executable, ROOT / 'tools/ios/package_trollstore.py', source, ipa], env)
+        else:
+            run([*command, '--export-method', 'debugging'], env)
+            ipa = out / 'Hitode.ipa'
+            shutil.copy2(source, ipa)
         return ipa
     if side_by_side:
         env = dict(env, HITODE_ANDROID_ID_SUFFIX=side_by_side)
@@ -181,10 +191,13 @@ def parse(argv: list[str]) -> tuple[argparse.Namespace, list[str], list[str] | N
                         help='install each mobile package on the connected device, or on DEVICE')
     parser.add_argument('--side-by-side', metavar='NAME',
                         help='suffix the Android application ID so the APK installs beside a release')
+    parser.add_argument('--trollstore', action='store_true', help='build the iOS IPA for TrollStore')
     args = parser.parse_args(argv[:argv.index('--')] if command is not None else argv)
     platforms = [p for p in PLATFORMS if p in args.platforms or 'all' in args.platforms]
     if args.side_by_side and ('android' not in platforms or not re.fullmatch(r'[a-z][a-z0-9]*', args.side_by_side)):
         parser.error('--side-by-side takes a lowercase name and applies to android')
+    if args.trollstore and (platforms != ['ios'] or args.install is not None or command is not None):
+        parser.error('--trollstore builds only an iOS package; install it from TrollStore')
     if command is not None and len(platforms) != 1:
         parser.error('-- COMMAND takes one platform')
     if args.install and len([p for p in platforms if p != 'mac']) != 1:
@@ -194,7 +207,7 @@ def parse(argv: list[str]) -> tuple[argparse.Namespace, list[str], list[str] | N
 
 def main(argv: list[str]) -> int:
     args, platforms, command = parse(argv)
-    problems = preflight(platforms, dict(os.environ))
+    problems = preflight(platforms, dict(os.environ), args.trollstore)
     if problems:
         print('package_launcher: fix these first:', *problems, sep='\n  ', file=sys.stderr)
         return 1
@@ -215,7 +228,7 @@ def main(argv: list[str]) -> int:
                 run(['pnpm', 'install', '--frozen-lockfile'], env)
             if command is not None:
                 return subprocess.run(command, cwd=LAUNCHER, env=env).returncode
-            artifact = package(platform, env, args.side_by_side)
+            artifact = package(platform, env, args.side_by_side, args.trollstore)
             size = (sum(f.stat().st_size for f in artifact.rglob('*')) if artifact.is_dir()
                     else artifact.stat().st_size)
             print(f'{artifact.relative_to(ROOT)} {size / 2**20:.1f} MiB')

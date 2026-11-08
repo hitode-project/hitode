@@ -11,13 +11,25 @@ Hitode {version} improves performance and compatibility. / Hitode {version} 提�
 |---|---|
 | macOS (Apple silicon, macOS 11+) | `Hitode-{version}-macos-arm64.dmg` |
 | Android (ARMv8-A 64-bit) | `Hitode-{version}-android-arm64.apk` |
-| iOS / iPadOS | `Hitode-{version}-ios-unsigned.ipa` |
+| iOS / iPadOS (development signing / 开发签名) | `Hitode-{version}-ios-unsigned.ipa` |
+| iOS / iPadOS (TrollStore) | `Hitode-{version}-ios-trollstore.ipa` |
 
 Checksums / 校验值：`SHA256SUMS.txt`. Licenses / 许可证：`Hitode-{version}-licenses.zip`. Wine source / Wine 源码：`wine-11.0.tar.xz`.
 
-**Mac:** not notarized. After the first warning, click "Open Anyway" in System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/Hitode.app`.
-**Mac：**未经公证。第一次被拦截后，在"系统设置 → 隐私与安全性"里点"仍要打开"，或在终端执行 `xattr -dr com.apple.quarantine /Applications/Hitode.app`。
+**Mac**: not notarized. After the first warning, click "Open Anyway" in System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/Hitode.app`.
 
-**iOS:** unsigned; sideload it with a development signature and enable JIT. / 未签名，需以开发签名侧载并启用 JIT。[docs/ios.zh-CN.md](https://github.com/hitode-project/hitode/blob/master/docs/ios.zh-CN.md)
+**Mac**：未经公证。第一次被拦截后，在"系统设置 → 隐私与安全性"里点"仍要打开"，或在终端执行 `xattr -dr com.apple.quarantine /Applications/Hitode.app`。
+
+**iOS / iPadOS**
+
+- **TrollStore IPA**: If you already have TrollStore 2.0.12 or later, import this IPA into TrollStore. Tap Hitode in TrollStore’s app list and select **Open with JIT**.
+- **Unsigned IPA**: Otherwise, use this IPA for sideloading with a development signature. Enable JIT before starting a game.
+
+**iOS / iPadOS 安装说明**
+
+- **TrollStore 包**：已安装 TrollStore 2.0.12 或更新版本时，选这个包。在 TrollStore 里导入 IPA，然后在应用列表中点按 Hitode，选择 **Open with JIT**。
+- **无签名包**：其余用户选这个包，用开发签名侧载，进入游戏前先启用 JIT。
+
+[iOS installation guide / iOS 安装与 JIT 指南](https://github.com/hitode-project/hitode/blob/master/docs/ios.zh-CN.md)
 
 Problems? / 遇到问题？[Open a game issue / 提交游戏问题](https://github.com/hitode-project/hitode/issues/new?template=game-issue.yml)

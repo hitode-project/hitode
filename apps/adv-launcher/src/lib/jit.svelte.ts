@@ -11,6 +11,7 @@ export interface JitStatus {
   waiting: boolean;
   task: "enable" | "ddiStatus" | "downloadDdi" | null;
   liveContainer: boolean;
+  externalOnly: boolean;
   pairingFile: boolean;
   stage: string | null;
   /** Whether the developer disk image is downloaded; null until checked. */
@@ -19,6 +20,7 @@ export interface JitStatus {
 
 const errors: Record<string, string> = {
   jitSigningUnsupported: "此安装未获得调试权限，请使用支持 JIT 的开发签名重新签名安装。",
+  jitExternalRequired: "请用当前系统支持的外部工具启用 JIT：TrollStore、SideStore 或电脑端 SideJITServer。",
   invalidPairing: "这不是配对文件，请选择 StikDebug 使用的 pairingFile.plist",
   lockdownPairing: "这是 SideStore 等使用的旧格式配对文件，请选择 StikDebug 使用的 pairingFile.plist",
 };
@@ -59,8 +61,8 @@ class Jit {
   /** A helper request is running; background status checks do not count. */
   readonly busy = $derived(!!this.status?.waiting && this.status.task !== "ddiStatus");
   readonly signingUnsupported = $derived(!!this.status && !this.status.ready && !this.status.debuggable);
-  /** The signed host permits debugging, has a pairing file and is not inside LiveContainer. */
-  readonly configured = $derived(!!this.status && this.status.debuggable && this.status.pairingFile && !this.status.liveContainer);
+  /** The host can use the embedded helper and has a pairing file. */
+  readonly configured = $derived(!!this.status && this.status.debuggable && this.status.pairingFile && !this.status.liveContainer && !this.status.externalOnly);
 
   /** What the row and the banner say about the current state. */
   readonly note = $derived.by(() => {
@@ -68,6 +70,7 @@ class Jit {
     if (!status) return "";
     if (status.ready) return t("已启用");
     if (!status.debuggable) return explainJit("jitSigningUnsupported");
+    if (status.externalOnly && !status.error) return explainJit("jitExternalRequired");
     if (this.requestError) return this.requestError;
     if (this.busy) return t(stages[status.stage ?? "starting"] ?? "正在启动 JIT 助手…");
     if (status.error) return explainJit(status.error);
@@ -89,7 +92,7 @@ class Jit {
   async refresh(): Promise<void> {
     this.status = await call<JitStatus | null>("jit_status", {}, null).catch(() => null);
     const status = this.status;
-    if (!status || status.ready || !status.debuggable || status.liveContainer) return;
+    if (!status || status.ready || !status.debuggable || status.liveContainer || status.externalOnly) return;
     if (status.waiting) return;
     // Enabling checks the image itself, so it goes first.
     if (prefs.autoJit && status.pairingFile && !this.#autoTried) {

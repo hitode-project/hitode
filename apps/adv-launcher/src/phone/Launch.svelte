@@ -37,9 +37,9 @@
         {:else if flow.view === "jit"}
           <div class="state fade">
             <div class="msg">{jit.signingUnsupported ? t("当前签名不支持 JIT") : t("强烈建议启用 JIT")}</div>
-            {#if jit.signingUnsupported}<div class="hint">{jit.note}</div>{/if}
+            {#if jit.signingUnsupported || jit.status?.externalOnly}<div class="hint">{jit.note}</div>{/if}
             <div class="hint">{t("未启用时，这次游戏会全程以解释模式运行，速度会慢很多。")}</div>
-            {#if !jit.signingUnsupported && (jit.status?.error || jit.requestError)}<div class="chip mono">{jit.note}</div>{/if}
+            {#if !jit.signingUnsupported && !jit.status?.externalOnly && (jit.status?.error || jit.requestError)}<div class="chip mono">{jit.note}</div>{/if}
           </div>
         {:else if flow.view === "failed"}
           <div class="state fade">

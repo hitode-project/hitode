@@ -64,6 +64,7 @@ pub struct JitStatus {
     task: Option<&'static str>,
     stage: Option<String>,
     live_container: bool,
+    external_only: bool,
     pairing_file: bool,
     /// Whether the developer disk image is downloaded; `None` until checked.
     ddi: Option<bool>,
@@ -109,12 +110,14 @@ fn signing_allows_debugging() -> bool {
     }
 }
 
-fn require_debug_signing() -> Result<(), String> {
-    if signing_allows_debugging() {
-        Ok(())
-    } else {
-        Err("jitSigningUnsupported".into())
+fn require_embedded_helper() -> Result<(), String> {
+    if !signing_allows_debugging() {
+        return Err("jitSigningUnsupported".into());
     }
+    if external_only() {
+        return Err("jitExternalRequired".into());
+    }
+    Ok(())
 }
 
 fn pairing_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -124,9 +127,21 @@ fn pairing_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+fn external_only() -> bool {
+    !objc2::available!(ios = 17.4)
+}
+
 #[tauri::command]
-pub fn jit_status(app: AppHandle) -> JitStatus {
-    let state = adv_shell::code_pool_state();
+pub async fn jit_status(app: AppHandle) -> JitStatus {
+    let external_only = external_only();
+    let mut state = adv_shell::code_pool_state();
+    if external_only && state.is_none() {
+        // External tools can attach after the launch-time wait has ended.
+        // Preparing may wait for the debugger to detach.
+        let _ =
+            tauri::async_runtime::spawn_blocking(adv_shell::prepare_code_pool_if_debugged).await;
+        state = adv_shell::code_pool_state();
+    }
     let request = REQUEST.lock().unwrap();
     JitStatus {
         ready: matches!(state, Some(Ok(()))),
@@ -139,6 +154,7 @@ pub fn jit_status(app: AppHandle) -> JitStatus {
         task: request.task,
         stage: request.stage.clone(),
         live_container: std::env::var_os("LC_HOME_PATH").is_some(),
+        external_only,
         pairing_file: pairing_path(&app).is_ok_and(|path| path.is_file()),
         ddi: *DDI.lock().unwrap(),
     }
@@ -149,7 +165,7 @@ pub fn request_jit(app: AppHandle) -> Result<(), String> {
     if let Some(result) = adv_shell::code_pool_state() {
         return result;
     }
-    require_debug_signing()?;
+    require_embedded_helper()?;
     // LiveContainer's "Launch with JIT" starts the player under StikDebug,
     // which prepares the pool at launch (IOS-JIT-1); it cannot host the helper.
     if std::env::var_os("LC_HOME_PATH").is_some() {
@@ -191,7 +207,7 @@ pub fn download_ddi(app: AppHandle) -> Result<(), String> {
 }
 
 fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String> {
-    require_debug_signing()?;
+    require_embedded_helper()?;
     let mut state = REQUEST.lock().unwrap();
     if state.waiting {
         return Ok(());

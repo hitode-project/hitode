@@ -15,10 +15,8 @@
         <span>{t("JIT 加速")}</span>
         <span class="note" class:ok={status.ready} role="status">{jit.signingUnsupported ? t("当前签名不支持 JIT") : jit.note}</span>
       </span>
-      {#if !status.ready && status.debuggable}
-        {#if !status.liveContainer}
-          <button class="secondary" disabled={jit.busy || !status.pairingFile} onclick={() => jit.enable()}>{t("启用 JIT")}</button>
-        {/if}
+      {#if !status.ready && status.debuggable && !status.liveContainer && !status.externalOnly}
+        <button class="secondary" disabled={jit.busy || !status.pairingFile} onclick={() => jit.enable()}>{t("启用 JIT")}</button>
       {/if}
     </div>
 
@@ -26,9 +24,9 @@
       <p class="advice">{jit.note}</p>
     {:else if !status.ready}
       <p class="advice">{t("强烈建议启用 JIT。未启用时游戏以解释模式运行，速度会慢很多。")}</p>
-      {#if status.liveContainer}
+      {#if !status.externalOnly && status.liveContainer}
         <p class="advice">{t("在 LiveContainer 的“设置”页把“JIT启用工具”选为 StikDebug，长按 Hitode → 设置，打开“带JIT启动”和“使用 LiveContainer 的包名”，确认 LocalDevVPN 已连接，再从 LiveContainer 启动 Hitode")}</p>
-      {:else}
+      {:else if !status.externalOnly}
         <ol class="steps">
           <li class:done={status.pairingFile}>
             <span class="mark" aria-hidden="true">{status.pairingFile ? "✓" : "1"}</span>
@@ -56,7 +54,7 @@
       {/if}
     {/if}
 
-    {#if status.debuggable && status.pairingFile && !status.liveContainer}
+    {#if status.debuggable && status.pairingFile && !status.liveContainer && !status.externalOnly}
       <div class="row">
         <span class="t">{t("打开启动器时自动启用 JIT")}</span>
         <SettingsSwitch touch label={t("打开启动器时自动启用 JIT")} checked={prefs.autoJit} onchange={(v) => setPref("autoJit", v)} />
