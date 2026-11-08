@@ -130,7 +130,7 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-WMV-1 Compressed samples
 
-**Rule**: WMCreateSyncReader MUST deliver compressed stream samples with timestamps and clean-point flags. Without Wine assembly, requests for decompressed output MUST return `E_NOTIMPL`. Builds without media support MUST fail reader creation.
+**Rule**: WMCreateSyncReader MUST deliver compressed samples with timestamps and clean-point flags, and reconstruct missing decoded WMA Pro timestamps by counting samples. Without Wine assembly, requests for decompressed output MUST return `E_NOTIMPL`. Builds without media support MUST fail reader creation.
 **Verification**: Test
 
 ### MEDIA-WMV-2 Input and allocation
