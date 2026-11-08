@@ -739,7 +739,7 @@ fn glyph(
     match env.ext.get_mut::<Fonts>().text.glyph(&font, request) {
         Ok(glyph) => {
             let fetch = !buffer.is_null() && capacity != 0 && format & 0x7f != 0;
-            if fetch && capacity < glyph.required_bytes {
+            if fetch && (glyph.required_bytes == 0 || capacity < glyph.required_bytes) {
                 return fail(env);
             }
             // Validate before writing either output, so protected or wrapping
@@ -767,8 +767,15 @@ fn glyph(
             } else {
                 Cow::Borrowed(&[][..])
             };
+            let mut glyph_metrics = glyph.metrics;
+            if glyph_metrics.width == 0 && glyph_metrics.height == 0 {
+                // GetGlyphOutline reports a 1×1 black box for an empty glyph
+                // even when the outline or bitmap needs zero bytes.
+                glyph_metrics.width = 1;
+                glyph_metrics.height = 1;
+            }
             if metrics
-                .write(env.cpu, pack_glyph_metrics(glyph.metrics))
+                .write(env.cpu, pack_glyph_metrics(glyph_metrics))
                 .is_err()
                 || (fetch && !bytes.is_empty() && env.cpu.write(buffer.addr(), &bytes).is_err())
             {

@@ -61,6 +61,10 @@ the same. Blending into a palette also cost a nearest-color search per pixel.
 **Rule**: ANSI widths and kerning MUST use the selected charset and device-provided default glyph. Wide outline metrics MUST preserve their own native short-buffer rules. Portable wide metrics MUST take first and last characters from the Unicode cmap, and break and default characters from OS/2 usFirstCharIndex.
 **Verification**: Test
 
+A successful `GetGlyphOutlineA/W` query for an empty glyph reports a 1×1
+black box. A size query for its outline or bitmap returns zero bytes; a fetch
+with a nonempty buffer fails without writing metrics or payload.
+
 ### WIN32-GDI-11 Character placement
 
 **Rule**: Character placement MUST validate bounded output arrays and preserve partial-result behavior. ANSI placement MUST use the guest ACP and retain explicit-charset conversion. Placement arrays MUST use the same realized fonts as measurement and drawing.
