@@ -34,6 +34,7 @@ pub(super) struct Entry {
 #[derive(Clone)]
 pub(super) struct Saved {
     pub command: u128,
+    pub attachment: u128,
     pub damage: Arc<damage::Record>,
     pub pass: Arc<passes::Effects>,
     pub destinations: Vec<Option<u128>>,

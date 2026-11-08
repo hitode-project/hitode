@@ -13,6 +13,7 @@ pub(in crate::d3d9::recording) struct Mapping {
     offset: [f64; 2],
     radius: f64,
     source: Rect,
+    repeat: [bool; 2],
 }
 impl Mapping {
     fn new(scale: [f64; 2], offset: [f64; 2], radius: f64, image: &Image) -> Option<Self> {
@@ -22,6 +23,7 @@ impl Mapping {
                 offset,
                 radius,
                 source: full(image),
+                repeat: [false; 2],
             })
     }
     /// The same pixel of a `source` extent, as depth and stencil tests read.
@@ -31,10 +33,10 @@ impl Mapping {
             offset: [0.; 2],
             radius: 0.,
             source,
+            repeat: [false; 2],
         }
     }
-    /// The source texels that destination pixels in `pixels` read. Clamped
-    /// addressing reads the edge texels beyond the source.
+    /// Bounds the source texels that destination pixels in `pixels` read.
     pub(in crate::d3d9::recording) fn unmap(self, pixels: Rect) -> Rect {
         if pixels.empty() || self.source.empty() {
             return Rect::default();
@@ -54,9 +56,14 @@ impl Mapping {
         for n in 0..2 {
             let a = lo[n] * self.scale[n] + self.offset[n];
             let b = hi[n] * self.scale[n] + self.offset[n];
-            let clamp = |v: f64| v.clamp(f64::from(first[n]), f64::from(last[n])) as u32;
-            start[n] = clamp((a.min(b) - self.radius).floor());
-            end[n] = clamp((a.max(b) + self.radius).ceil() - 1.) + 1;
+            let lo = (a.min(b) - self.radius).floor();
+            let hi = (a.max(b) + self.radius).ceil() - 1.;
+            let first = f64::from(first[n]);
+            let last = f64::from(last[n]);
+            // The two sides of a wrapped read share one bounding interval.
+            let wraps = self.repeat[n] && (lo < first || hi > last);
+            start[n] = if wraps { first } else { lo.clamp(first, last) } as u32;
+            end[n] = if wraps { last } else { hi.clamp(first, last) } as u32 + 1;
         }
         Rect {
             x: start[0],
@@ -72,18 +79,24 @@ impl Mapping {
         }
         // Clamped addressing repeats edge texels without limit, so damage on
         // a source edge reaches every coordinate beyond it.
-        let edge = |at: u32, limit: u32, value: f64, beyond: f64| {
-            if at == limit { beyond } else { value }
+        let edge = |axis: usize, at: u32, limit: u32, value: f64, beyond: f64| {
+            if !self.repeat[axis] && at == limit {
+                beyond
+            } else {
+                value
+            }
         };
         let source = self.source;
         let lo = [
             edge(
+                0,
                 damage.x,
                 source.x,
                 f64::from(damage.x) - self.radius,
                 f64::NEG_INFINITY,
             ),
             edge(
+                1,
                 damage.y,
                 source.y,
                 f64::from(damage.y) - self.radius,
@@ -92,12 +105,14 @@ impl Mapping {
         ];
         let hi = [
             edge(
+                0,
                 damage.x + damage.w,
                 source.x + source.w,
                 f64::from(damage.x + damage.w) + self.radius,
                 f64::INFINITY,
             ),
             edge(
+                1,
                 damage.y + damage.h,
                 source.y + source.h,
                 f64::from(damage.y + damage.h) + self.radius,
@@ -106,12 +121,26 @@ impl Mapping {
         ];
         let mut start = [0; 2];
         let mut end = [0; 2];
+        let min = [bounds.x, bounds.y];
+        let max = [bounds.x + bounds.w, bounds.y + bounds.h];
+        let extent = [source.w, source.h];
         for n in 0..2 {
-            let a = (lo[n] - self.offset[n]) / self.scale[n];
-            let b = (hi[n] - self.offset[n]) / self.scale[n];
-            // Outward rounding includes the sampler footprint at fractional edges.
-            start[n] = a.min(b).floor().max(0.) as u32;
-            end[n] = a.max(b).ceil().max(0.) as u32;
+            start[n] = max[n];
+            end[n] = min[n];
+            // The proven coordinate range and filter reach at most the two
+            // adjacent periods (one-texel axes are equivalent to clamping).
+            let periods = i32::from(self.repeat[n]);
+            for period in -periods..=periods {
+                let shift = f64::from(period) * f64::from(extent[n]);
+                let a = (lo[n] + shift - self.offset[n]) / self.scale[n];
+                let b = (hi[n] + shift - self.offset[n]) / self.scale[n];
+                let lo = (a.min(b).floor() as u32).max(min[n]);
+                let hi = (a.max(b).ceil() as u32).min(max[n]);
+                if lo < hi {
+                    start[n] = start[n].min(lo);
+                    end[n] = end[n].max(hi);
+                }
+            }
         }
         Rect {
             x: start[0],
@@ -119,7 +148,6 @@ impl Mapping {
             w: end[0].saturating_sub(start[0]),
             h: end[1].saturating_sub(start[1]),
         }
-        .clipped(bounds)
     }
 }
 
@@ -518,8 +546,24 @@ fn draw_reads(
                 .ok_or("texture is not bound")?
         }
         .ok_or("texture is not bound")?;
-        let mapping = mapping(&vertices, coordinates, binding.0, binding.1)
-            .ok_or("texels are not an axis-aligned affine map of pixels")?;
+        let mapping = mapping(&vertices, coordinates, binding.0, binding.1).ok_or_else(|| {
+            if super::super::trace::capturing() {
+                let coordinates: Vec<_> = vertices
+                    .iter()
+                    .map(|v| {
+                        let uv = coordinates.map(|c| {
+                            f64::from(v.varyings[c.varying][c.component]) * c.scale + c.offset
+                        });
+                        (v.position, uv)
+                    })
+                    .collect();
+                super::super::trace::detail(format!(
+                    "    sampler {:?}: {coordinates:?}",
+                    binding.1
+                ));
+            }
+            "texels are not an axis-aligned affine map of pixels"
+        })?;
         result.push(Read {
             source: key::content(env, resource, Some(0), 0),
             mapping,
@@ -689,15 +733,13 @@ fn mapping(
     image: &Image,
     sampler: Sampler,
 ) -> Option<Mapping> {
-    if sampler.first_level != 0
-        || sampler.mip.is_some()
-        || sampler.u != Address::Clamp
-        || sampler.v != Address::Clamp
-    {
+    let address = [sampler.u, sampler.v];
+    if sampler.first_level != 0 || sampler.mip.is_some() || address.contains(&Address::Border) {
         return None;
     }
     let mut scale = [0.; 2];
     let mut offset = [0.; 2];
+    let mut residual = 0.0f64;
     for axis in 0..2 {
         let low = vertices
             .iter()
@@ -720,34 +762,46 @@ fn mapping(
         } else {
             image.height()
         });
-        // Clamp keeps samples within one texel past an edge on that edge's
-        // texel, inside the outward-rounded footprint; farther ones would not be.
+        // The proof covers the source and one texel past each edge, including
+        // repeat samples from the adjacent periods.
         if !a.is_finite() || !b.is_finite() || a.min(b) * size < -1. || a.max(b) * size > size + 1.
         {
             return None;
         }
-        // Two coordinate planes prove one global axis-aligned interpolation,
-        // including indexed quads and triangle strips, without fitting a shader.
-        for v in vertices {
-            if !((v.position[axis] == low.position[axis] && value(v) == a)
-                || (v.position[axis] == high.position[axis] && value(v) == b))
-            {
-                return None;
-            }
-        }
         scale[axis] = (b - a) * size / (high.position[axis] - low.position[axis]);
         offset[axis] = a * size - low.position[axis] * scale[axis];
+        // Equal homogeneous w makes the interpolation error no larger than
+        // its largest vertex error. Allow rounding in tessellated rectangles.
+        for v in vertices {
+            let texel = value(v) * size;
+            let error = (texel - (v.position[axis] * scale[axis] + offset[axis])).abs();
+            if !(0. ..=1. / 256.).contains(&error) || !(-1. ..=size + 1.).contains(&texel) {
+                return None;
+            }
+            // In the base period, a linear mirror tap one texel across the
+            // edge reads the same edge texel as clamp.
+            if address[axis] == Address::Mirror && !(0. ..=size).contains(&texel) {
+                return None;
+            }
+            residual = residual.max(error);
+        }
     }
-    Mapping::new(
+    let mut mapping = Mapping::new(
         scale,
         offset,
-        if sampler.min == Filter::Linear || sampler.mag == Filter::Linear {
-            0.5
-        } else {
-            0.
-        },
+        residual
+            + if sampler.min == Filter::Linear || sampler.mag == Filter::Linear {
+                0.5
+            } else {
+                0.
+            },
         image,
-    )
+    )?;
+    mapping.repeat = [
+        sampler.u == Address::Repeat && image.width() > 1,
+        sampler.v == Address::Repeat && image.height() > 1,
+    ];
+    Some(mapping)
 }
 
 #[cfg(test)]
@@ -884,6 +938,7 @@ mod tests {
             scale: [1. / 32., 1. / 32.],
             offset: [-0.75, -0.75],
             radius: 0.5,
+            repeat: [false; 2],
             source: Rect {
                 x: 0,
                 y: 0,
@@ -922,5 +977,35 @@ mod tests {
                 h: 1
             }
         );
+    }
+
+    // spec: GFX-REC-4 GFX-REC-5
+    #[test]
+    fn linear_repeat_reaches_the_opposite_edge() {
+        let m = Mapping {
+            scale: [1.; 2],
+            offset: [-0.25, 0.],
+            radius: 0.5,
+            repeat: [true, false],
+            source: Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+        };
+        let bounds = Rect { w: 6, ..m.source };
+        let edge = Rect {
+            x: 7,
+            y: 2,
+            w: 1,
+            h: 1,
+        };
+        let changed = m.map(edge, bounds);
+        assert_eq!((changed.x, changed.w), (0, 1));
+        let read = m.unmap(changed);
+        assert_eq!((read.x, read.w), (0, 8));
+        let middle = m.map(Rect { x: 2, ..edge }, bounds);
+        assert_eq!((middle.x, middle.w), (1, 3));
     }
 }

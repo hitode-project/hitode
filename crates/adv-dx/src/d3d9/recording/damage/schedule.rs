@@ -19,7 +19,7 @@ pub(super) struct Node {
     pub producers: Vec<Option<usize>>,
     /// For each write, the write before it to the same content.
     pub previous: Vec<Option<usize>>,
-    pub generations: Vec<usize>,
+    pub generations: Vec<Generation>,
     pub submissions: u64,
 }
 
@@ -58,12 +58,6 @@ fn rect_cells(size: (u32, u32), rects: &[Rect]) -> Region {
     }
     r
 }
-/// Whether `outer` marks every cell of `inner`; both share a size.
-fn covers(outer: &Region, inner: &Region) -> bool {
-    let mut union = outer.clone();
-    union.union(inner);
-    union == *outer
-}
 fn clipped(parts: &[Rect], bounds: Rect) -> Vec<Rect> {
     parts
         .iter()
@@ -78,6 +72,7 @@ struct Graph<'a> {
     done: &'a HashSet<(usize, Content)>,
     /// The final chain group each write belongs to.
     group: Vec<Option<usize>>,
+    members: Vec<Vec<usize>>,
     /// The group holding each content's final chain.
     of: HashMap<Content, usize>,
     /// Each content's last write, which produces its final version.
@@ -152,9 +147,15 @@ impl<'a> Graph<'a> {
             let next = ids.len();
             of.insert(*k, *ids.entry(root).or_insert(next));
         }
-        let group = (0..nodes.len())
+        let group: Vec<_> = (0..nodes.len())
             .map(|i| chains(i).next().map(|n| of[&keys[n]]))
             .collect();
+        let mut members = vec![Vec::new(); ids.len()];
+        for (i, g) in group.iter().enumerate() {
+            if let Some(g) = g {
+                members[*g].push(i);
+            }
+        }
         let mut extent = vec![(0, 0); ids.len()];
         for node in nodes {
             for w in &node.record.writes {
@@ -204,6 +205,7 @@ impl<'a> Graph<'a> {
             nodes,
             done,
             group,
+            members,
             of,
             last,
             initial,
@@ -228,6 +230,7 @@ impl<'a> Graph<'a> {
                 })
                 .collect(),
             parts: vec![None; self.initial.len()],
+            dirty: vec![false; self.initial.len()],
             clips: vec![None; self.nodes.len()],
         };
         for i in (0..self.nodes.len()).rev() {
@@ -243,15 +246,10 @@ impl<'a> Graph<'a> {
             let e = if let Some(g) = self.group[i] {
                 for w in &node.record.writes {
                     if let Some(r) = p.need.get(&(i, w.0)) {
-                        for rect in rects(r) {
-                            p.region[g].add(rect.into());
-                        }
+                        p.dirty[g] |= p.region[g].union_clipped(r, w.3.into());
                     }
                 }
-                let frozen = p.parts[g].as_ref().is_some_and(|parts| {
-                    covers(&rect_cells(p.region[g].size(), parts), &p.region[g])
-                });
-                if !frozen {
+                if p.parts[g].is_none() || p.dirty[g] {
                     p.grow(g, i)?;
                 }
                 let e = p.cut(g, i)?;
@@ -291,6 +289,8 @@ struct Pass<'a, 'g> {
     need: HashMap<(usize, Content), Region>,
     region: Vec<Region>,
     parts: Vec<Option<Vec<Rect>>>,
+    /// New cells added since the group's scissors were coarsened.
+    dirty: Vec<bool>,
     clips: Clips,
 }
 impl Pass<'_, '_> {
@@ -305,14 +305,14 @@ impl Pass<'_, '_> {
             .map(Into::into)
             .collect();
         self.region[g] = rect_cells(size, &parts);
-        self.parts[g] = Some(parts.clone());
-        let members: Vec<usize> = (current + 1..self.graph.nodes.len())
-            .filter(|&c| self.graph.group[c] == Some(g))
-            .collect();
-        for &c in &members {
+        self.parts[g] = Some(parts);
+        self.dirty[g] = false;
+        let members = &self.graph.members[g];
+        let members = &members[members.partition_point(|&c| c <= current)..];
+        for &c in members {
             self.clips[c] = self.cut(g, c)?;
         }
-        for &c in &members {
+        for &c in members {
             let e = self.clips[c].clone();
             self.propagate(c, &e, current, Some(g))?;
             self.contract(c, &e)?;
@@ -323,9 +323,9 @@ impl Pass<'_, '_> {
     fn cut(&self, g: usize, c: usize) -> Result<Option<Vec<Rect>>, usize> {
         let record = &self.graph.nodes[c].record;
         let e = clipped(self.parts[g].as_ref().unwrap(), record.bounds);
-        // Uploads cannot be scissored; only a whole chain may run one.
+        // Uploads cannot be scissored. Every cell they write must be in the chain's plan.
         if record.upload && !e.is_empty() {
-            return if self.region[g].is_whole() {
+            return if self.region[g].covers_rect(record.bounds.into()) {
                 Ok(None)
             } else {
                 Err(g)
@@ -342,12 +342,14 @@ impl Pass<'_, '_> {
         growing: Option<usize>,
     ) -> Result<(), usize> {
         let node = &self.graph.nodes[c];
-        let executed = e.clone().unwrap_or_else(|| vec![node.record.bounds]);
+        let executed = e
+            .as_deref()
+            .unwrap_or_else(|| std::slice::from_ref(&node.record.bounds));
         for (j, &(source, mapping)) in node.record.demands.iter().enumerate() {
             let Some(p) = node.producers[j] else {
                 continue;
             };
-            for r in &executed {
+            for r in executed {
                 let r = r.clipped(node.record.bounds);
                 if !r.empty() {
                     self.ask(p, source, mapping.map(|m| m.unmap(r)), current, growing)?;
@@ -375,19 +377,18 @@ impl Pass<'_, '_> {
     /// those cells.
     fn contract(&mut self, c: usize, e: &Option<Vec<Rect>>) -> Result<(), usize> {
         let node = &self.graph.nodes[c];
-        let executed = e.clone().unwrap_or_else(|| vec![node.record.bounds]);
+        let executed = e
+            .as_deref()
+            .unwrap_or_else(|| std::slice::from_ref(&node.record.bounds));
         for w in &node.record.writes {
             let g = self.graph.of[&w.0];
             if self.graph.group[c] == Some(g) {
                 continue;
             }
-            for r in &executed {
-                self.region[g].add(r.clipped(w.2).into());
+            for r in executed {
+                self.dirty[g] |= self.region[g].add_changed(r.clipped(w.2).into());
             }
-            let covered = self.parts[g].as_ref().is_none_or(|parts| {
-                covers(&rect_cells(self.region[g].size(), parts), &self.region[g])
-            });
-            if !covered {
+            if self.parts[g].is_some() && self.dirty[g] {
                 self.grow(g, c)?;
             }
         }
@@ -417,20 +418,13 @@ impl Pass<'_, '_> {
             .need
             .entry((p, k))
             .or_insert_with(|| Region::empty(size(full)));
-        let mut asked = Region::empty(size(full));
-        match rect {
-            Some(r) => asked.add(r.into()),
-            None => asked = Region::whole(size(full)),
-        }
-        need.union(&asked);
-        if p > current {
-            let executed = match &self.clips[p] {
-                Some(parts) => rect_cells(size(full), parts),
-                None => Region::whole(size(full)),
-            };
-            if !covers(&executed, &asked) {
-                return Err(growing.or(self.graph.group[p]).unwrap());
-            }
+        let asked = rect.unwrap_or(full).into();
+        need.add(asked);
+        if p > current
+            && let Some(parts) = &self.clips[p]
+            && !rect_cells(size(full), parts).covers_rect(asked)
+        {
+            return Err(growing.or(self.graph.group[p]).unwrap());
         }
         Ok(())
     }

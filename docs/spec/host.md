@@ -146,10 +146,12 @@ Each planner pool MUST use indexed leases from one presentable pool in the backe
 
 ### HOST-VIEW-12 Debug damage overlay
 
-**Rule**: Debugger damage visualization MUST tint producer damage, upscale input changes and recomputed output in physical view coordinates, fading marks over eight presented frames. Diagnostic presentation MUST preserve normal picture layers, retained content, damage, upscale work and content statistics. Disabled visualization MUST preserve ordinary plans, pixels, leases, pacing and GPU work.
+**Rule**: Debugger damage visualization MUST mark producer damage and recomputed upscale output in physical view coordinates. Diagnostic presentation MUST preserve normal picture layers, retained content, damage, upscale work and content statistics. Disabled visualization MUST preserve ordinary plans, pixels, leases, pacing and GPU work.
 **Verification**: Test
 
-`damage on|off` applies at the next presented frame without changing guest execution. Pink marks presented-record damage, including merged publications and whole-frame invalidation, united with changed video rectangles; green marks GPU input delta; blue marks the last upscale pass's compacted output cells. Diagonal stripes distinguish overlapping marks over light and dark content. GPU histories age once per presented frame, mapping through placement, scaling and rotation; input and output marks appear only when the frame uses upscaling. No GPU damage data is read back.
+`damage on|off` applies at the next presented frame without changing guest execution. Pink marks presented-record damage, including merged publications and whole-frame invalidation, united with changed video rectangles. Blue marks the last upscale pass's compacted output cells. Marks map through placement, scaling and rotation. Outside macOS, green marks GPU input delta, stripes distinguish overlap, and histories fade over eight presented frames.
+
+On macOS, a solid pink contour and dashed blue contour mark the affected areas without filling the picture. Blue shading is confined to the edge. On each present, marks use elapsed time: hold for 150 ms, then fade for 150 ms; continued updates renew the hold. The launcher replaces the FPS badge with one HUD for the same pink and blue areas as fractions of the canvas. The readout samples at most once per 250 ms and reads back only the aggregate upscale area asynchronously; no damage mask is read back.
 
 A transparent host layer places the tints above the normal picture and video layers. Base and video layers, retained images, damage, buffer reuse, captures, redraws and content counters keep their ordinary path. Diagnostic resources are allocated on first use and discarded when disabled; outstanding host-image leases remain valid until release.
 

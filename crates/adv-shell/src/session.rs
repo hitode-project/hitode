@@ -40,6 +40,8 @@ struct Driver {
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     view: View,
     ui: RefCell<Option<frontend::Ui>>,
+    #[cfg(target_os = "macos")]
+    damage_hud: adv_display::display::DamageHud,
     done: RefCell<spsc::Consumer<Result<Finished, String>>>,
     pending: RefCell<Option<Result<Finished, String>>>,
     execution: RefCell<Option<crate::execution::Task>>,
@@ -123,8 +125,14 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let (mut worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
 
+        #[cfg(target_os = "macos")]
+        let damage_hud;
         {
             let (startup, display) = view.create_display(options.gpu_software, ui.wake())?;
+            #[cfg(target_os = "macos")]
+            {
+                damage_hud = startup.debug_settings().damage_hud.clone();
+            }
             worker.display = Some(startup);
             ui.display(display);
             #[cfg(target_os = "macos")]
@@ -196,6 +204,8 @@ impl Session {
             view,
             wake: ui.wake(),
             ui: RefCell::new(Some(ui)),
+            #[cfg(target_os = "macos")]
+            damage_hud,
             done: RefCell::new(rx),
             pending: RefCell::new(None),
             execution: RefCell::new(Some(execution)),
@@ -346,6 +356,13 @@ impl Session {
     }
     pub fn fps(&self) -> f64 {
         self.driver.ui.borrow().as_ref().map_or(0.0, |ui| ui.fps())
+    }
+    #[cfg(target_os = "macos")]
+    pub fn observe_damage(
+        &self,
+        observer: impl Fn(Option<[Option<f64>; 2]>) + Send + Sync + 'static,
+    ) {
+        self.driver.damage_hud.observe(observer);
     }
     /// Whether the game has shown its first frame.
     pub fn presented(&self) -> bool {

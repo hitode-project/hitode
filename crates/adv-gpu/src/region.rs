@@ -49,6 +49,10 @@ impl Region {
         self.bits.iter().all(|&w| w == 0)
     }
 
+    pub fn clear(&mut self) {
+        self.bits.fill(0);
+    }
+
     pub fn is_whole(&self) -> bool {
         let (columns, rows) = cells(self.size);
         let set: u64 = self.bits.iter().map(|w| u64::from(w.count_ones())).sum();
@@ -57,6 +61,16 @@ impl Region {
 
     /// Marks the cells `rect` touches, clipped to the image.
     pub fn add(&mut self, rect: Rect) {
+        self.add_cells::<false>(rect);
+    }
+
+    /// Marks `rect` and reports whether it added any cells.
+    pub fn add_changed(&mut self, rect: Rect) -> bool {
+        self.add_cells::<true>(rect)
+    }
+
+    fn add_cells<const TRACK: bool>(&mut self, rect: Rect) -> bool {
+        let mut changed = false;
         if let Some((x0, x1, y0, y1)) = self.span(rect) {
             for y in y0..y1 {
                 let row = &mut self.bits[y as usize * self.stride..][..self.stride];
@@ -64,11 +78,16 @@ impl Region {
                 while x < x1 as usize {
                     let word = x / 64;
                     let end = (x1 as usize).min(word * 64 + 64);
-                    row[word] |= mask(x % 64, end - word * 64);
+                    let bits = mask(x % 64, end - word * 64);
+                    if TRACK {
+                        changed |= row[word] & bits != bits;
+                    }
+                    row[word] |= bits;
                     x = end;
                 }
             }
         }
+        changed
     }
 
     /// Adds `other`. A region of another size changed an image this region
@@ -81,6 +100,53 @@ impl Region {
         for (a, b) in self.bits.iter_mut().zip(&other.bits) {
             *a |= b;
         }
+    }
+
+    /// Adds marked cells at the same coordinates inside `rect` and both extents.
+    pub fn union_clipped(&mut self, other: &Self, rect: Rect) -> bool {
+        let Some((x0, x1, y0, y1)) = other.span(rect) else {
+            return false;
+        };
+        let Some((_, right, _, bottom)) = self.span(rect) else {
+            return false;
+        };
+        let (x1, y1) = (x1.min(right) as usize, y1.min(bottom));
+        let mut changed = false;
+        for y in y0..y1 {
+            let start = y as usize * self.stride;
+            let source = other.row(y);
+            let mut x = x0 as usize;
+            while x < x1 {
+                let word = x / 64;
+                let end = x1.min((word + 1) * 64);
+                let bits = source[word] & mask(x % 64, end - word * 64);
+                changed |= self.bits[start + word] & bits != bits;
+                self.bits[start + word] |= bits;
+                x = end;
+            }
+        }
+        changed
+    }
+
+    /// Whether every cell touched by `rect` inside this extent is marked.
+    pub fn covers_rect(&self, rect: Rect) -> bool {
+        let Some((x0, x1, y0, y1)) = self.span(rect) else {
+            return true;
+        };
+        (y0..y1).all(|y| {
+            let row = self.row(y);
+            let mut x = x0 as usize;
+            while x < x1 as usize {
+                let word = x / 64;
+                let end = (x1 as usize).min((word + 1) * 64);
+                let bits = mask(x % 64, end - word * 64);
+                if row[word] & bits != bits {
+                    return false;
+                }
+                x = end;
+            }
+            true
+        })
     }
 
     /// Keeps only the cells `other` marks too. A region of another size
@@ -279,6 +345,19 @@ mod tests {
 
     fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn clipped_union_crosses_a_word_boundary_and_respects_both_extents() {
+        let mut source = Region::empty((528, 16));
+        source.add(rect(496, 0, 32, 16));
+        let mut target = Region::empty((640, 24));
+        let bounds = rect(504, 8, 48, 16);
+        assert!(target.union_clipped(&source, bounds));
+        assert!(!target.union_clipped(&source, bounds));
+        assert_eq!(target.rects(), [rect(504, 8, 24, 8)]);
+        assert!(target.covers_rect(rect(504, 8, 24, 8)));
+        assert!(!target.covers_rect(bounds));
     }
 
     /// Every pixel of the image is covered by `region.rects()` exactly when

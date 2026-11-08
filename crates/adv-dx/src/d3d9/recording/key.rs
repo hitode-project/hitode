@@ -228,6 +228,31 @@ pub(super) struct Prepared {
     pub bounds: adv_device::surface::Rect,
 }
 impl Prepared {
+    // A fixed-function draw without an alpha test never uses sampled color
+    // to decide coverage or the written depth and stencil values.
+    pub(super) fn ignores_sampled_color(&self, content: Content) -> bool {
+        content.2 != 0
+            && matches!(&self.operation, Operation::Draw(d)
+                if d.programmable.is_none() && d.state.alpha_test == adv_device::gpu::Compare::Always)
+    }
+
+    pub(super) fn attachment_command(&self, command: u128, contents: &Contents) -> u128 {
+        if !self
+            .writes
+            .iter()
+            .any(|(k, _)| self.ignores_sampled_color(*k))
+            || !self.reads.iter().any(|k| k.2 == 0)
+        {
+            return command;
+        }
+        let mut key = xxhash_rust::xxh3::Xxh3::new();
+        self.key.hash(&mut key);
+        for k in self.reads.iter().filter(|k| k.2 != 0) {
+            (*k, contents.get(k).copied().unwrap_or(0)).hash(&mut key);
+        }
+        key.digest128()
+    }
+
     pub(super) fn write_key(&self, content: Content, command: u128) -> u128 {
         let Operation::Clear {
             target,

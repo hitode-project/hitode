@@ -367,6 +367,7 @@ impl Debugger {
                 runtime,
                 args.first() == Some(&"reset"),
                 args.first() == Some(&"frame"),
+                args.get(1) == Some(&"2"),
             )),
             "report" => Ok(runtime.report()),
             "snap" => {
@@ -461,6 +462,7 @@ impl Debugger {
         runtime: &impl DebugTarget<Backend = Cpu>,
         reset: bool,
         frame: bool,
+        pair: bool,
     ) -> String {
         let machine = runtime.machine();
         let pid = machine.sys.pid;
@@ -472,8 +474,12 @@ impl Debugger {
             return "D3D9 counts reset".into();
         }
         if frame {
-            return adv_runtime::d3d9_frame().unwrap_or_else(|| {
-                "capturing the next whole frame; run `d3d9 frame` again".into()
+            return adv_runtime::d3d9_frame(pair).unwrap_or_else(|| {
+                if pair {
+                    "capturing the next two whole frames; run `d3d9 frame 2` again".into()
+                } else {
+                    "capturing the next whole frame; run `d3d9 frame` again".into()
+                }
             });
         }
         let base = self.d3d9_baseline.get(&pid).copied().unwrap_or_default();
@@ -1295,7 +1301,7 @@ const HELP: &str = "\
 answered at once: damage on|off, ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
 at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
-  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], d3d9 [reset|frame],
+  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], d3d9 [reset|frame [2]],
   report, snap [LABEL]
 client reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
 

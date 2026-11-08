@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 static STATE: AtomicU8 = AtomicU8::new(IDLE);
 const IDLE: u8 = 0;
 const ARMED: u8 = 1;
-const CAPTURING: u8 = 2;
+const ARMED_PAIR: u8 = 2;
+const CAPTURING: u8 = 3;
+const CAPTURING_PAIR: u8 = 4;
 static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LAST: Mutex<Option<String>> = Mutex::new(None);
 /// Why the command being prepared has no proven sample mapping.
@@ -16,15 +18,16 @@ static UNMAPPED: Mutex<Option<&'static str>> = Mutex::new(None);
 static DETAIL: Mutex<Option<String>> = Mutex::new(None);
 
 /// The last captured frame, or arms a capture of the next whole frame.
-pub fn take_or_arm() -> Option<String> {
+pub fn take_or_arm(pair: bool) -> Option<String> {
     let last = LAST.lock().unwrap().take();
     if last.is_none() {
-        let _ = STATE.compare_exchange(IDLE, ARMED, Ordering::Relaxed, Ordering::Relaxed);
+        let armed = if pair { ARMED_PAIR } else { ARMED };
+        let _ = STATE.compare_exchange(IDLE, armed, Ordering::Relaxed, Ordering::Relaxed);
     }
     last
 }
 pub(super) fn capturing() -> bool {
-    STATE.load(Ordering::Relaxed) == CAPTURING
+    STATE.load(Ordering::Relaxed) >= CAPTURING
 }
 fn push(line: String) {
     LINES.lock().unwrap().push(line);
@@ -109,7 +112,7 @@ pub(super) fn unmapped(why: &'static str) {
         *UNMAPPED.lock().unwrap() = Some(why);
     }
 }
-pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
+pub(super) fn command(index: usize, p: &key::Prepared, reused: bool, contents: &Contents) {
     if !capturing() {
         return;
     }
@@ -131,12 +134,14 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
             rect(*rectangle)
         ),
         Operation::Draw(d) => format!(
-            "draw{}",
+            "draw{} depth {:?} alpha {:?}",
             if d.programmable.is_some() {
                 " shader"
             } else {
                 " fixed"
-            }
+            },
+            d.state.depth,
+            d.state.alpha_test,
         ),
         Operation::Copy {
             rectangle, region, ..
@@ -157,14 +162,27 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
             )
         })
         .collect();
-    let mapped = |k: &Content| p.samples.iter().any(|r| r.source == *k);
+    // A proven read's mapping shows its texel phase, such as a pan's.
     let reads: Vec<_> = p
         .reads
         .iter()
-        .map(|k| format!("{}{}", name(k), if mapped(k) { " (mapped)" } else { "" }))
+        .map(|k| {
+            let mappings: Vec<_> = p
+                .samples
+                .iter()
+                .filter(|r| r.source == *k)
+                .map(|r| format!(" {:?}", r.mapping))
+                .collect();
+            format!(
+                "{}@{:032x}{}",
+                name(k),
+                contents.get(k).copied().unwrap_or(0),
+                mappings.concat()
+            )
+        })
         .collect();
     push(format!(
-        "#{index} {kind} on {} bounds {}{}: writes [{}] reads [{}]{}",
+        "#{index} {kind} on {} bounds {}{}: key {:032x} writes [{}] reads [{}]{}",
         image.map_or("-".into(), |i| format!(
             "{}x{} image {:x}",
             i.width(),
@@ -173,6 +191,7 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
         )),
         rect(p.bounds),
         if reused { " reused" } else { "" },
+        p.key,
         writes.join(", "),
         reads.join(", "),
         why.map_or(String::new(), |why| format!("; unmapped: {why}")),
@@ -180,6 +199,12 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
     if let Some(detail) = detail {
         push(detail);
     }
+}
+pub(super) fn forward(content: Content, generation: usize, event: std::fmt::Arguments<'_>) {
+    push(format!(
+        "forward {} generation {generation}: {event}",
+        name(&content)
+    ));
 }
 pub(in crate::d3d9) fn readback(env: &Env<'_>, id: Id) {
     if capturing() {
@@ -248,8 +273,17 @@ pub(super) fn work(work: &HashMap<(Content, usize, u128), damage::Work>, planned
 }
 pub(super) fn frame_end() {
     match STATE.load(Ordering::Relaxed) {
-        ARMED => {
+        state @ (ARMED | ARMED_PAIR) => {
             LINES.lock().unwrap().clear();
+            let capturing = if state == ARMED_PAIR {
+                CAPTURING_PAIR
+            } else {
+                CAPTURING
+            };
+            STATE.store(capturing, Ordering::Relaxed);
+        }
+        CAPTURING_PAIR => {
+            push("--- next frame ---".into());
             STATE.store(CAPTURING, Ordering::Relaxed);
         }
         CAPTURING => {

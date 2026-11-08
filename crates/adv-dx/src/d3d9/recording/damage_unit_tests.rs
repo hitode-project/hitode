@@ -43,8 +43,17 @@ fn feed(h: &mut History, mut next: Sequence) {
 /// One generation's change, settled as the final version.
 fn advance(h: &mut History, force: bool) -> (Region, Region) {
     let last = h.next.len() - 1;
-    let changed = h.changed(last, force, &Changes::default());
-    h.settle(force, changed)
+    let mut progress = forward::Progress::new(
+        h,
+        last,
+        force,
+        !force && h.previous.len() == 1 && h.previous[0].shape == h.next[last].shape,
+    );
+    for _ in 0..h.next[last].entries.len() {
+        progress.advance(None);
+    }
+    progress.finish();
+    h.settle(force, progress.region)
 }
 /// The cells of the test target the rectangles touch.
 fn cells(rects: &[Rect]) -> Region {
