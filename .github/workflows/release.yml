@@ -2,7 +2,7 @@
 # IPA, the signed Android APK, license texts, the Wine source and checksums.
 # Signing waits for a maintainer to approve the `release` environment; the
 # maintainer tests the draft's files on devices, edits its notes and publishes.
-name: Release
+name: Release Android recovery
 
 on:
   push:
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TAG: ${{ inputs.tag || github.ref_name }}
+  TAG: v0.2.5
   CARGO_INCREMENTAL: '0'
   CARGO_TERM_COLOR: never
   # Releases build with the same compilers every time; raise these on purpose.
@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos, ios, android]
+        platform: [android]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -66,11 +66,11 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        if: matrix.platform == 'android'
-        with:
-          distribution: temurin
-          java-version: '21'
+      - name: Use the runner JDK 21
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_21_arm64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_arm64/bin" >> "$GITHUB_PATH"
+          "$JAVA_HOME_21_arm64/bin/java" -version
       - name: Install the Android NDK
         if: matrix.platform == 'android'
         run: |
@@ -140,6 +140,17 @@ jobs:
           unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
           if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "the IPA is signed"; exit 1; fi
 
+      - name: Fetch and verify Gradle before compiling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dist="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists/gradle-9.6.1-bin/4ticwg1pgcbps2hj28r8so764"
+          mkdir -p "$dist"
+          zip="$dist/gradle-9.6.1-bin.zip"
+          gh api -H 'Accept: application/octet-stream' repos/gradle/gradle-distributions/releases/assets/458711386 > "$zip"
+          echo "9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e14  $zip" | shasum -a 256 -c
+          apps/adv-launcher/src-tauri/gen/android/gradlew --version
+
       - name: Build the Android APK
         if: matrix.platform == 'android'
         run: |
@@ -206,6 +217,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -214,6 +226,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: ${{ runner.temp }}/artifacts
+      - name: Fetch the Apple packages from the formal run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 42470028604 -R "$GITHUB_REPOSITORY" -n macos -n ios -D "$RUNNER_TEMP/artifacts"
       - name: Gather the files and their checksums
         run: |
           version="${TAG#v}"
