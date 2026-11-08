@@ -157,11 +157,19 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool) {
             )
         })
         .collect();
-    let mapped = |k: &Content| p.samples.iter().any(|r| r.source == *k);
+    // A proven read's mapping shows its texel phase, such as a pan's.
     let reads: Vec<_> = p
         .reads
         .iter()
-        .map(|k| format!("{}{}", name(k), if mapped(k) { " (mapped)" } else { "" }))
+        .map(|k| {
+            let mappings: Vec<_> = p
+                .samples
+                .iter()
+                .filter(|r| r.source == *k)
+                .map(|r| format!(" {:?}", r.mapping))
+                .collect();
+            format!("{}{}", name(k), mappings.concat())
+        })
         .collect();
     push(format!(
         "#{index} {kind} on {} bounds {}{}: writes [{}] reads [{}]{}",

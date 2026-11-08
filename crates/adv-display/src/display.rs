@@ -1,4 +1,6 @@
 //! One queue owns planning, target passes, presentation and its flight recorder.
+#[cfg(target_os = "macos")]
+pub use crate::damage::DamageHud;
 use crate::{
     Rect,
     compositor::*,
@@ -227,6 +229,8 @@ pub struct Display {
     /// before these drop.
     screen: Vec<(u64, AcquiredImage)>,
     overlay: Option<crate::damage::Damage>,
+    #[cfg(target_os = "macos")]
+    damage_hud: DamageHud,
     caps: CompositorCaps,
     settings: Settings,
     pools: PoolState,
@@ -289,6 +293,8 @@ impl Display {
             compositor: Some(compositor),
             screen: vec![],
             overlay: None,
+            #[cfg(target_os = "macos")]
+            damage_hud: DamageHud::default(),
             device,
             settings,
             pools: Default::default(),
@@ -426,6 +432,11 @@ impl Display {
     pub fn take_publication(&mut self) -> Option<Publication> {
         self.publication.take()
     }
+    #[cfg(target_os = "macos")]
+    pub fn damage_hud(&self) -> DamageHud {
+        self.damage_hud.clone()
+    }
+
     pub fn settings(&mut self, queue: &mut Queue, settings: Settings) -> Result<(), Error> {
         if self.settings == settings {
             return Ok(());
@@ -588,6 +599,8 @@ impl Display {
                     &mut diagnostic_layers,
                     &mut images,
                     &self.screen,
+                    #[cfg(target_os = "macos")]
+                    None,
                 )?;
                 &diagnostic_layers
             } else {
@@ -761,6 +774,8 @@ impl Display {
                 &mut layers,
                 &mut pending.images,
                 &self.screen,
+                #[cfg(target_os = "macos")]
+                Some(&self.damage_hud),
             )?;
             pending.record.settings.damage_overlay = self.settings.damage_overlay;
             pending.record.plan.layers = layers;

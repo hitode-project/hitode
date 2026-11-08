@@ -1,4 +1,9 @@
 //! GPU-only damage histories in an independent transparent compositor layer.
+#[cfg(target_os = "macos")]
+mod hud;
+#[cfg(target_os = "macos")]
+pub use hud::DamageHud;
+
 use crate::{
     Rect,
     compositor::{AcquiredImage, LayerId},
@@ -22,6 +27,8 @@ pub(crate) struct Damage {
     unit: u32,
     output_unit: u32,
     history: Buffer,
+    #[cfg(target_os = "macos")]
+    clock: std::time::Instant,
     age: ComputePipeline,
     mark: ComputePipeline,
     tint: RenderPipeline,
@@ -74,7 +81,14 @@ impl Damage {
         let tint = device.create_render_pipeline(
             &RenderPipelineDesc {
                 vertex: shader.entry("tint_vs", Stage::Vertex)?,
-                fragment: Some(shader.entry("tint_fs", Stage::Fragment)?),
+                fragment: Some(shader.entry(
+                    if cfg!(target_os = "macos") {
+                        "contour_fs"
+                    } else {
+                        "tint_fs"
+                    },
+                    Stage::Fragment,
+                )?),
                 bindings: bindings::DAMAGE[..2]
                     .iter()
                     .copied()
@@ -109,9 +123,12 @@ impl Damage {
             view,
             unit,
             output_unit,
+            #[cfg(target_os = "macos")]
+            clock: std::time::Instant::now(),
             history: device.create_buffer(&BufferDesc {
-                size: u64::from(canvas.0.div_ceil(unit)) * u64::from(canvas.1.div_ceil(unit)) * 16,
-                usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+                size: 16
+                    + u64::from(canvas.0.div_ceil(unit)) * u64::from(canvas.1.div_ceil(unit)) * 16,
+                usage: BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC,
                 memory: Memory::Device,
                 label: "damage history",
             })?,
@@ -129,12 +146,21 @@ impl Damage {
         record: &PresentRecord,
         upscaling: Option<&upscale::Upscaling>,
         initialize: bool,
+        #[cfg(target_os = "macos")] sample: Option<&mut hud::Sample>,
     ) -> adv_gpu::Result<adv_gpu::Encoder> {
         let has_upscale = upscaling.is_some();
         let upscaling = upscaling.filter(|_| record.plan.stages.iter().any(|s| matches!(s, crate::plan::Stage::Upscale { tiles, .. } if !tiles.rects.is_empty())));
         let mut encoder = queue.encoder("damage overlay");
+        #[cfg(target_os = "macos")]
+        let readback = sample.as_ref().and_then(|sample| sample.output.as_ref());
+        #[cfg(not(target_os = "macos"))]
+        let count_output = false;
+        #[cfg(target_os = "macos")]
+        let count_output = readback.is_some();
         if initialize {
             encoder.fill_buffer(self.history.slice(0..self.history.desc().size), 0);
+        } else if count_output {
+            encoder.fill_buffer(self.history.slice(0..4), 0);
         }
         let mut producer = record.frame.damage.clone();
         if producer.size() != self.canvas {
@@ -145,7 +171,8 @@ impl Damage {
         }
         let stride = self.canvas.0.div_ceil(8).div_ceil(32);
         let mut bits = vec![0u32; (stride * self.canvas.1.div_ceil(8)) as usize];
-        for rect in producer.rects() {
+        let rects = producer.rects();
+        for rect in &rects {
             for y in rect.y / 8..(rect.y + rect.h).div_ceil(8) {
                 for x in rect.x / 8..(rect.x + rect.w).div_ceil(8) {
                     bits[(y * stride + x / 32) as usize] |= 1 << (x % 32);
@@ -171,7 +198,9 @@ impl Damage {
             self.canvas.1.div_ceil(self.unit),
             self.unit,
             self.output_unit,
-            u32::from(upscaling.is_some()) | (u32::from(has_upscale) << 1),
+            u32::from(upscaling.is_some())
+                | (u32::from(has_upscale) << 1)
+                | (u32::from(count_output) << 2),
             rotation,
         ];
         for (out, value) in constants.bytes()[..32]
@@ -182,20 +211,17 @@ impl Damage {
         {
             out.copy_from_slice(&value.to_ne_bytes());
         }
-        for (out, value) in constants.bytes()[32..]
+        #[cfg(target_os = "macos")]
+        let mark_time = (self.clock.elapsed().as_millis() as u32).saturating_add(1);
+        #[cfg(not(target_os = "macos"))]
+        let mark_time = 0u32;
+        constants.bytes()[32..36].copy_from_slice(&mark_time.to_ne_bytes());
+        constants.bytes()[36..40].copy_from_slice(&(record.settings.scale as f32).to_ne_bytes());
+        for (out, value) in constants.bytes()[48..]
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
-            .zip([
-                self.view.0 as f32,
-                self.view.1 as f32,
-                0.,
-                0.,
-                dst.x as f32,
-                dst.y as f32,
-                dst.w as f32,
-                dst.h as f32,
-            ])
+            .zip([dst.x as f32, dst.y as f32, dst.w as f32, dst.h as f32])
         {
             out.copy_from_slice(&value.to_ne_bytes());
         }
@@ -266,6 +292,14 @@ impl Damage {
             pass.set_viewport(0., 0., self.view.0 as f32, self.view.1 as f32, 0., 1.);
             pass.draw(0..3, 0..1);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(readback) = readback {
+            encoder.copy_buffer(self.history.slice(0..4), readback, 0);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(sample) = sample {
+            sample.producer = rects.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum();
+        }
         encoder.retain(constants);
         encoder.retain(uploaded);
         Ok(encoder)
@@ -280,6 +314,7 @@ pub(crate) fn prepare(
     layers: &mut Layers,
     images: &mut Vec<AcquiredImage>,
     screen: &[(u64, AcquiredImage)],
+    #[cfg(target_os = "macos")] hud: Option<&DamageHud>,
 ) -> adv_gpu::Result<()> {
     let (device, queue) = context;
     let (record, enabled, upscaling) = frame;
@@ -312,6 +347,10 @@ pub(crate) fn prepare(
         let mut next = Damage::new(device, canvas, view, output_unit)?;
         if let Some(previous) = state.take().filter(|s| s.canvas == canvas) {
             next.history = previous.history;
+            #[cfg(target_os = "macos")]
+            {
+                next.clock = previous.clock;
+            }
         }
         *state = Some(next);
     }
@@ -337,8 +376,25 @@ pub(crate) fn prepare(
         })
         .unwrap();
     let mut image = pool.acquire_index(queue, index, true)?.unwrap();
-    let encoder = gpu.encode(queue, image.image(), record, upscaling, initialize)?;
+    #[cfg(target_os = "macos")]
+    let mut sample = hud
+        .map(|hud| hud.sample(device, upscaling.is_some()))
+        .transpose()?
+        .flatten();
+    let encoder = gpu.encode(
+        queue,
+        image.image(),
+        record,
+        upscaling,
+        initialize,
+        #[cfg(target_os = "macos")]
+        sample.as_mut(),
+    )?;
     let token = queue.submit_present(encoder, &mut [&mut image])?;
+    #[cfg(target_os = "macos")]
+    if let Some(sample) = sample {
+        sample.finish(queue, token, canvas);
+    }
     images.push(AcquiredImage {
         layer: LayerId::Host(HostLayer::Damage),
         image,
@@ -524,7 +580,15 @@ mod tests {
     ) -> Vec<u8> {
         let target = image(device, gpu.view);
         let encoder = gpu
-            .encode(queue, &target, record, upscale, initialize)
+            .encode(
+                queue,
+                &target,
+                record,
+                upscale,
+                initialize,
+                #[cfg(target_os = "macos")]
+                None,
+            )
             .unwrap();
         queue.submit(encoder).unwrap();
         read(device, queue, &target)
@@ -576,12 +640,13 @@ mod tests {
                             }
                             let inside = (0.25..0.5).contains(&u) && (0.0..0.5).contains(&v);
                             let at = ((y * view.0 + x) * 4) as usize;
-                            assert_eq!(
-                                tinted[at..at + 4] != clean[at..at + 4],
-                                inside,
-                                "{rotation:?} {placement:?} at {x},{y}"
-                            );
-                            if inside {
+                            let marked = tinted[at..at + 4] != clean[at..at + 4];
+                            if cfg!(target_os = "macos") {
+                                assert!(!marked || inside, "{rotation:?} {placement:?} at {x},{y}");
+                            } else {
+                                assert_eq!(marked, inside, "{rotation:?} {placement:?} at {x},{y}");
+                            }
+                            if marked {
                                 let alpha = f64::from(tinted[at + 3]) / 255.;
                                 assert!(alpha > 0.);
                                 assert!((0..3).any(|channel| {
@@ -597,6 +662,15 @@ mod tests {
                     }
                     assert!(inside_count > 0);
                     record.frame.damage = Region::empty(canvas);
+                    #[cfg(target_os = "macos")]
+                    {
+                        gpu.clock -= Duration::from_millis(330);
+                        assert_eq!(
+                            draw(&mut gpu, &device, &mut queue, &record, None, false),
+                            clean
+                        );
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     for age in 1..=8 {
                         let faded = draw(&mut gpu, &device, &mut queue, &record, None, false);
                         if age == 8 {
@@ -696,22 +770,24 @@ mod tests {
             for x in 0..40 {
                 let at = ((y * view.0 + x) * 4) as usize;
                 let stripe = (x + y) % 6 / 2;
-                if x < 16 && stripe == 1 {
+                if !cfg!(target_os = "macos") && x < 16 && stripe == 1 {
                     delta_tint |= pixels[at + 1] > producer[at + 1];
                 }
-                if x >= 16 && stripe == 1 {
+                if !cfg!(target_os = "macos") && x >= 16 && stripe == 1 {
                     assert_eq!(
                         pixels[at..at + 4],
                         producer[at..at + 4],
                         "delta leaked into an unchanged cell"
                     );
                 }
-                if x >= 16 && stripe == 2 {
+                if x >= 16 && (cfg!(target_os = "macos") || stripe == 2) {
                     output_tint |= pixels[at..at + 4] != producer[at..at + 4];
                 }
             }
         }
-        assert!(delta_tint, "changed input cell has no green delta tint");
+        if !cfg!(target_os = "macos") {
+            assert!(delta_tint, "changed input cell has no green delta tint");
+        }
         assert!(
             output_tint,
             "recomputed output outside delta has no blue tint"
@@ -734,6 +810,11 @@ mod tests {
                 history: Default::default(),
             },
         );
+        #[cfg(target_os = "macos")]
+        {
+            gpu.clock -= Duration::from_millis(350);
+        }
+        #[cfg(not(target_os = "macos"))]
         for _ in 0..8 {
             draw(&mut gpu, &device, &mut queue, &record, Some(&u), false);
         }
@@ -743,5 +824,76 @@ mod tests {
             faded,
             draw(&mut clean, &device, &mut queue, &record, None, true)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    // spec: HOST-VIEW-12
+    fn hud_counts_clipped_output_cells_and_clears_the_count_without_work() {
+        let (device, mut queue) = open();
+        let canvas = (97, 33);
+        let view = (194, 66);
+        let mut record = record(canvas, view, Rotation::None, Placement::Fit);
+        record.settings.upscaler = Upscaler::Anime4k;
+        record.frame.damage = Region::whole(canvas);
+        record.plan = plan(&record.frame, &record.settings, &record.caps, &record.pools);
+        let u =
+            upscale::Upscaling::with_precision(&device, upscale::models::FUSED[0], canvas, false)
+                .unwrap();
+        fill(&mut queue, u.input(), [0.1, 0.2, 0.3, 1.]);
+        let mut ring = device.ring(4 << 20).unwrap();
+        let mut encoder = queue.encoder("damage HUD fixture");
+        u.encode(
+            (&mut encoder, &mut ring),
+            None,
+            upscale::Input::Composed,
+            None,
+        )
+        .unwrap();
+        queue.submit(encoder).unwrap();
+        let target = image(&device, view);
+        let mut gpu = Damage::new(&device, canvas, view, u.damage_unit()).unwrap();
+        for whole in [true, false] {
+            if !whole {
+                record.frame.damage = Region::empty(canvas);
+                for stage in &mut record.plan.stages {
+                    if let crate::plan::Stage::Upscale { tiles, .. } = stage {
+                        tiles.rects.clear();
+                    }
+                }
+            }
+            let hud = DamageHud::default();
+            hud.observe(|_| {});
+            hud.set_enabled(true);
+            let mut sample = hud.sample(&device, true).unwrap().unwrap();
+            let encoder = gpu
+                .encode(
+                    &mut queue,
+                    &target,
+                    &record,
+                    Some(&u),
+                    whole,
+                    Some(&mut sample),
+                )
+                .unwrap();
+            let token = queue.submit(encoder).unwrap();
+            assert!(queue.wait(token, Duration::from_secs(5)).unwrap());
+            let buffer = sample.output.as_ref().unwrap();
+            // SAFETY: The submission that copied the area count has completed.
+            let bytes = unsafe { buffer.mapped().unwrap().as_ref() };
+            let expected = if whole { canvas.0 * canvas.1 } else { 0 };
+            assert_eq!(sample.producer, u64::from(expected));
+            assert_eq!(u32::from_ne_bytes(bytes[..4].try_into().unwrap()), expected);
+            if whole {
+                let pixels = read(&device, &mut queue, &target);
+                let at = |x, y| ((y * view.0 + x) * 4 + 3) as usize;
+                assert_ne!(pixels[at(0, 0)], 0, "the full-frame contour is missing");
+                assert_eq!(
+                    pixels[at(view.0 / 2, view.1 / 2)],
+                    0,
+                    "the frame interior is tinted"
+                );
+            }
+        }
     }
 }

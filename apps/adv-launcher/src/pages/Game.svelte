@@ -55,6 +55,13 @@
   let muted = $derived(prefs.muted);
   let fps = $derived(prefs.showFps);
   let measuredFps = $state(0);
+  type DamageRatios = [number | null, number | null];
+  let damageRatios = $state<DamageRatios | null>(null);
+  function ratio(value: number | null): string {
+    if (value === null) return "–";
+    const percent = value * 100;
+    return `${Number(percent.toFixed(percent < 10 ? 1 : 0))}%`;
+  }
   $effect(() => {
     if (!gameView) return;
     const value = { ...playback(gameId), scale };
@@ -192,6 +199,10 @@
       guestMenu = value;
       if (!value) menuOpen = false;
     });
+    const stopDamage = onHostEvent<[string, DamageRatios | null]>(
+      "game_damage_ratios",
+      ([id, ratios]) => { if (id === gameId) damageRatios = ratios; },
+    );
     const stopScreen = trackScreen();
     const stopBack = nav.onBack(() => {
       togglePause(true);
@@ -204,6 +215,7 @@
       stopKeyboard();
       stopDialogs();
       stopMenu();
+      stopDamage();
       stopScreen();
       stopBack();
     };
@@ -299,6 +311,12 @@
       {#if slowLoad && !stopping}
         <button class="quiet" onclick={leave} {@attach region}>{t("退出游戏")}</button>
       {/if}
+    </div>
+  {:else if damageRatios}
+    <div class="fps mono damage-hud" {@attach shown}>
+      {#if fps}<span class="fps-reading">{measuredFps.toFixed(0)} FPS</span>{/if}
+      <span class="damage-ratio producer" aria-label={`Damage: ${ratio(damageRatios[0])}`}>{ratio(damageRatios[0])}</span>
+      <span class="damage-ratio upscale" aria-label={`Upscale recomputed: ${ratio(damageRatios[1])}`}>{ratio(damageRatios[1])}</span>
     </div>
   {:else if fps && phone && screen.layout}
     {@const g = screen.layout.game}
@@ -576,6 +594,21 @@
     color: #fff;
     font-variant-numeric: tabular-nums;
   }
+  .damage-hud {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .damage-hud .fps-reading {
+    border-right: 1px solid rgba(255, 255, 255, 0.24);
+    padding-right: 8px;
+  }
+  .damage-ratio {
+    min-width: 4ch;
+    text-align: right;
+  }
+  .damage-ratio.producer { color: #f4a8bb; }
+  .damage-ratio.upscale { color: #8dc5ff; }
   /* A transparent webview cannot blur the native view below, so the menu dims it instead. */
   .scrim {
     position: absolute;

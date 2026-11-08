@@ -289,6 +289,7 @@ pub async fn start_game(
                 }
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
+                let damage_id = id.clone();
                 let finished_window = host_window.clone();
                 let started_at = Instant::now();
                 let session = Session::new_with_execution(
@@ -326,6 +327,10 @@ pub async fn start_game(
                         );
                         session.set_upscaler(filter);
                         playback.apply(&session)?;
+                        let damage_window = host_window.clone();
+                        session.observe_damage(move |ratios| {
+                            let _ = damage_window.emit("game_damage_ratios", (&damage_id, ratios));
+                        });
                         host.session = Some(session);
                         host.playback = Some(playback);
                         host.paused = false;

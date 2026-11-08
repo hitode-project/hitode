@@ -37,6 +37,8 @@ impl Mailbox {
 }
 pub(crate) struct Shared {
     settings: Mutex<Mailbox>,
+    #[cfg(target_os = "macos")]
+    pub(crate) damage_hud: display::DamageHud,
     /// Display refreshes the UI's frame clock counted.
     refreshes: AtomicU64,
     feedback: Mutex<VecDeque<Result<Feedback, String>>>,
@@ -46,6 +48,8 @@ impl Shared {
     pub(crate) fn damage(&self, enabled: bool) {
         let mut mailbox = self.settings.lock().unwrap();
         mailbox.settings.damage_overlay = enabled;
+        #[cfg(target_os = "macos")]
+        self.damage_hud.set_enabled(enabled);
         mailbox.dirty = true;
         mailbox.poke();
     }
@@ -231,6 +235,8 @@ pub(crate) fn channel(
     let display =
         Display::new(device.clone(), compositor, settings.clone()).map_err(|e| e.to_string())?;
     let shared = Arc::new(Shared {
+        #[cfg(target_os = "macos")]
+        damage_hud: display.damage_hud(),
         settings: Mutex::new(Mailbox {
             settings,
             dirty: true,
@@ -619,6 +625,8 @@ mod tests {
     use super::*;
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
+            #[cfg(target_os = "macos")]
+            damage_hud: Default::default(),
             settings: Mutex::new(Mailbox {
                 settings: plan::Settings {
                     view: (640, 480),
