@@ -83,7 +83,16 @@ jobs:
           npm install --global "$(node --print "require('./apps/adv-launcher/package.json').packageManager")"
           pnpm --dir apps/adv-launcher install --frozen-lockfile
       - name: Fetch the pinned Wine build
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          mkdir -p "$RUNNER_TEMP/wine"
+          assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/wine-dist-11.0" \
+            --jq ".assets[] | select(.name | endswith(\".tar.xz\")) | [.id, .name] | @tsv")
+          while IFS=$'\t' read -r id name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              > "$RUNNER_TEMP/wine/$name"
+          done <<< "$assets"
           python3 tools/release/fetch_wine.py "$RUNNER_TEMP/wine"
           echo "ADV_WINE_DIST=$RUNNER_TEMP/wine/wine11-sse-strip" >> "$GITHUB_ENV"
 
