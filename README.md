@@ -9,6 +9,11 @@
   English · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center">
+  <a href="https://t.me/hitode_project"><img src="https://img.shields.io/badge/Telegram-Channel-26A5E4?logo=telegram&amp;logoColor=white" alt="Telegram channel"></a>
+  <img src="https://img.shields.io/badge/QQ_Group-1131842713-12B7F5" alt="QQ group: 1131842713">
+</p>
+
 > [!IMPORTANT]
 > Hitode is experimental. Only a few engines and games have been adapted and tested so far. It is not ready for everyday play yet: expect crashes, missing features and breaking changes.
 

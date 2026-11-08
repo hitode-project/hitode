@@ -9,6 +9,11 @@
   <a href="README.md">English</a> · 简体中文
 </p>
 
+<p align="center">
+  <a href="https://t.me/hitode_project"><img src="https://img.shields.io/badge/Telegram-Channel-26A5E4?logo=telegram&amp;logoColor=white" alt="Telegram 频道"></a>
+  <img src="https://img.shields.io/badge/QQ_Group-1131842713-12B7F5" alt="QQ 群：1131842713">
+</p>
+
 > [!IMPORTANT]
 > Hitode 仍处于实验阶段，只在少数引擎和游戏上做过适配与测试。目前不适合日常游玩，可能遇到崩溃、功能缺失和不兼容的改动。
 
