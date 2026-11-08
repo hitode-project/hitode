@@ -1,7 +1,4 @@
-# Builds a version tag into a draft release: the macOS DMG, the unsigned iOS
-# IPA, the signed Android APK, license texts, the Wine source and checksums.
-# Signing waits for a maintainer to approve the `release` environment; the
-# maintainer tests the draft's files on devices, edits its notes and publishes.
+# Builds signed test packages in Actions without creating a release.
 name: Release
 
 on:
@@ -48,7 +45,7 @@ jobs:
           version="${TAG#v}"
           grep -qx "version = \"${version%%-*}\"" Cargo.toml || { echo "Cargo.toml is not ${version%%-*}"; exit 1; }
           test "$(node --print "require('./apps/adv-launcher/package.json').version")" = "${version%%-*}"
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "VERSION=${version%%-*}" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/dist"
       - name: Install toolchains
         run: |
@@ -173,6 +170,7 @@ jobs:
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           version="${TAG#v}"
+          version="${version%%-*}"
           tools="$ANDROID_HOME/build-tools/36.0.0"
           test -x "$tools/apksigner" || yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" > /dev/null
           keystore="$RUNNER_TEMP/release.p12"
@@ -190,39 +188,3 @@ jobs:
           path: ${{ runner.temp }}/dist/
           if-no-files-found: error
           retention-days: 14
-
-  draft:
-    needs: [build, sign-android]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/artifacts
-      - name: Gather the files and their checksums
-        run: |
-          version="${TAG#v}"
-          out="$RUNNER_TEMP/release"
-          mkdir -p "$out"
-          cp "$RUNNER_TEMP"/artifacts/macos/* "$RUNNER_TEMP"/artifacts/ios/* "$RUNNER_TEMP"/artifacts/android-signed/* "$out/"
-          python3 tools/privacy/scan.py --artifacts "$out/Hitode-$version-android-arm64.apk" \
-            "$out/Hitode-$version-licenses.zip"
-          (cd "$out" && sha256sum Hitode-* wine-11.0.tar.xz > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          sed "s/{version}/$version/g" tools/release/notes.txt > "$RUNNER_TEMP/notes.md"
-      - name: Create the draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="${TAG#v}"
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft \
-            --title "Hitode $version" --notes-file "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP"/release/*
-          check="$RUNNER_TEMP/check"
-          mkdir -p "$check"
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$check"
-          (cd "$check" && sha256sum -c SHA256SUMS.txt)
