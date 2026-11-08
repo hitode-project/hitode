@@ -256,7 +256,7 @@ fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
 
 // spec: A64F-FP-7
 #[test]
-fn cached_x87_runs_span_calls_stack_operations_and_sse() {
+fn cached_x87_runs_publish_at_inlined_returns() {
     use crate::jit_map::{Part, enable_memory, units_of};
     enable_memory();
     // A run through an inlined callee converting with SSE, as `_ftol2`
@@ -316,8 +316,8 @@ fn cached_x87_runs_span_calls_stack_operations_and_sse() {
                 .expect("the unit was recorded");
             assert_eq!(
                 marks.iter().filter(|m| m.part == Part::X87Entry).count(),
-                1,
-                "one cached run through the callee: {marks:?}"
+                2,
+                "the return separates the callee and caller runs: {marks:?}"
             );
         }
     }

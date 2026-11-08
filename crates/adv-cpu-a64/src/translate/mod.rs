@@ -401,7 +401,6 @@ enum Cold {
         state: State,
         refund: u32,
         branch: u64,
-        x87: Option<x87::Leave>,
     },
     /// A miss of an indirect transfer: loads `branch` into x4, then
     /// branches to the stub at `to`, which may be out of `cbnz` range.
@@ -1489,17 +1488,10 @@ impl Translator<'_> {
                 state,
                 refund,
                 branch,
-                x87,
             } => {
                 self.asm.bind(label);
                 self.state = state;
                 self.canonicalize();
-                if let Some(x87) = x87 {
-                    // Publishing uses x16, which holds the target.
-                    self.emit(mov(W, X6, X16));
-                    self.x87_leave(x87);
-                    self.emit(mov(W, X16, X6));
-                }
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
@@ -1592,10 +1584,7 @@ impl Translator<'_> {
         // offset, follow, and tables come last.
         let rank = |cold: &Cold| match cold {
             Cold::Table { .. } => 2,
-            Cold::X87(_)
-            | Cold::X87Fault { .. }
-            | Cold::Leave { x87: Some(_), .. }
-            | Cold::Lookup { x87: Some(_), .. } => 1,
+            Cold::X87(_) | Cold::X87Fault { .. } | Cold::Leave { x87: Some(_), .. } => 1,
             _ => 0,
         };
         let mut queues: [VecDeque<(u32, Cold)>; 3] = Default::default();
