@@ -561,7 +561,7 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 
 ### WINE-UI-1 Native popup presentation
 
-**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively relative to the presented window's content, without presenting frames. Their completion tokens MUST become inactive when tracking ends.
+**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively relative to the presented window's content, without presenting frames. Text dropdown lists MUST project natively without replacing the owner's frame. Completion tokens MUST become inactive when tracking ends.
 **Verification**: Test
 
 ### WINE-UI-2 Popup input

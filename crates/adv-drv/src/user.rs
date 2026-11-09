@@ -315,6 +315,7 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     }
     if flags & SWP_HIDEWINDOW != 0 {
         window.visible = false;
+        project::hidden(env.ext, hwnd);
     }
     let user32 = adv_nt::process::module_base(env.cpu, env.sys.peb, "user32.dll");
     let target = |name| user32.and_then(|base| adv_nt::process::module_export(env.cpu, base, name));

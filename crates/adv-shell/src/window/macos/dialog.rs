@@ -405,26 +405,58 @@ impl HostDialog {
         }
     }
 
-    /// Centers the dialog over its owner, which carries it as a child.
-    fn attach(&mut self, owner: &NSWindow) {
+    /// Fits the child to its owner's screen while preserving guest coordinates.
+    fn attach(&mut self, owner: &NSWindow, source: &DialogWindow) {
         let at = owner as *const NSWindow as usize;
-        if self.owner == at {
+        let reparent = self.owner != at;
+        if !reparent && self.source.client_size == source.client_size && self.window.isVisible() {
             return;
         }
-        if self.owner != 0
-            && let Some(previous) = self.window.parentWindow()
-        {
+        if reparent && let Some(previous) = self.window.parentWindow() {
             previous.removeChildWindow(&self.window);
         }
+        let guest = NSSize::new(
+            f64::from(source.client_size.0.max(1)),
+            f64::from(source.client_size.1.max(1)),
+        );
+        let visible = owner.screen().map(|screen| screen.visibleFrame());
+        let scale = visible.map_or(1.0, |screen| {
+            let available = self.window.contentRectForFrameRect(screen).size;
+            (available.width / guest.width)
+                .min(available.height / guest.height)
+                .min(1.0)
+        });
+        let size = NSSize::new(
+            (guest.width * scale).floor(),
+            (guest.height * scale).floor(),
+        );
+        let mut frame = self
+            .window
+            .frameRectForContentRect(NSRect::new(NSPoint::new(0.0, 0.0), size));
         let outer = owner.frame();
-        let own = self.window.frame();
-        self.window.setFrameOrigin(NSPoint::new(
-            (outer.origin.x + (outer.size.width - own.size.width) / 2.0).floor(),
-            (outer.origin.y + (outer.size.height - own.size.height) / 2.0).floor(),
-        ));
-        // SAFETY: both windows are retained and the child is removed on retire.
-        unsafe { owner.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
-        self.owner = at;
+        frame.origin = NSPoint::new(
+            (outer.origin.x + (outer.size.width - frame.size.width) / 2.0).floor(),
+            (outer.origin.y + (outer.size.height - frame.size.height) / 2.0).floor(),
+        );
+        if let Some(screen) = visible {
+            frame.origin.x = frame
+                .origin
+                .x
+                .min(screen.origin.x + screen.size.width - frame.size.width)
+                .max(screen.origin.x);
+            frame.origin.y = frame
+                .origin
+                .y
+                .min(screen.origin.y + screen.size.height - frame.size.height)
+                .max(screen.origin.y);
+        }
+        self.window.setFrame_display(frame, true);
+        self.content.setBoundsSize(guest);
+        if reparent {
+            // SAFETY: both windows are retained and the child is removed on retire.
+            unsafe { owner.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
+            self.owner = at;
+        }
     }
 
     fn update(
@@ -434,12 +466,6 @@ impl HostDialog {
         output: &Output,
         source: &DialogWindow,
     ) {
-        if self.source.client_size != source.client_size || self.controls.is_empty() {
-            self.window.setContentSize(NSSize::new(
-                f64::from(source.client_size.0.max(1)),
-                f64::from(source.client_size.1.max(1)),
-            ));
-        }
         self.window.setTitle(&NSString::from_str(&source.text));
         // Controls whose identity or kind changed are recreated.
         let stale: Vec<u32> = self
@@ -823,8 +849,8 @@ impl Dialogs {
                 .map(|owner| owner.window.clone());
             let dialog = self.dialogs.get_mut(&source.target.hwnd).unwrap();
             match &owner_window {
-                Some(owner) => dialog.attach(owner),
-                None => dialog.attach(main),
+                Some(owner) => dialog.attach(owner, source),
+                None => dialog.attach(main, source),
             }
             dialog.update(mtm, target, output, source);
             let mut source = source.clone();

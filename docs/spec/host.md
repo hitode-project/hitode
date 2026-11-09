@@ -327,7 +327,7 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 
 ### HOST-MENU-3 macOS placement
 
-**Rule**: Guest top-level menus MUST be inserted after the application menu and removed when the session ends. A dialog MUST be a child window of the game view's window.
+**Rule**: Guest top-level menus MUST be inserted after the application menu and removed when the session ends. A dialog MUST be a child window of the game view's window. A dialog MUST scale down proportionally when needed to fit the owner's visible screen area.
 **Applies to**: macOS
 **Verification**: Review — the main menu and child windows need a running AppKit application.
 
