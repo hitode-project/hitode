@@ -98,6 +98,17 @@ impl Playback {
         data_dir: std::path::PathBuf,
         codepage: u32,
     ) -> Result<adv_shell::Options, String> {
+        match std::fs::metadata(&exe) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err("launch_missing_file".into()),
+            Err(error) => {
+                return Err(match error.kind() {
+                    std::io::ErrorKind::NotFound => "launch_missing_file".into(),
+                    std::io::ErrorKind::PermissionDenied => "launch_folder_access".into(),
+                    _ => error.to_string(),
+                });
+            }
+        }
         let mut options = self.options(exe, data_dir, codepage)?;
         crate::drive::apply(app, &mut options)?;
         let distribution =

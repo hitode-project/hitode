@@ -131,23 +131,43 @@ export function buildReport(base: ReportBase, input: ReportInput): Report {
   return report;
 }
 
-/** GitHub accepts the template's field IDs as query parameters. */
-export function issueUrl(report: Report, json: string): string {
-  const symptoms = report.issues.map((issue) => ISSUES[issue]);
+/** Use GitHub's editable issue body: form dropdowns do not accept URL prefills. */
+export function issueDraft(report: Report, json: string): { url: string; attachReport: boolean } {
+  const symptoms = report.issues.map((issue) => ISSUES[issue]).join(", ") || "Runs normally / 能正常玩";
   const platform = { macos: "macOS", ios: "iOS / iPadOS", android: "Android" }[report.platform.os];
-  const params = new URLSearchParams({
-    template: "game-issue.yml",
-    title: report.title ? `${report.title.name}: ${symptoms.join(", ")}` : symptoms.join(", "),
-    game: report.title ? `${report.title.name} (https://vndb.org/${report.title.vndb})` : "",
-    patch: report.title?.edition ?? "",
-    platform: platform ?? report.platform.os,
-    device: `${report.platform.model} · Hitode ${report.app.version} (${report.app.build})`,
-    symptom: symptoms.join(","),
-    report: json,
-  });
+  const title = report.title ? `${report.title.name}: ${symptoms}` : symptoms;
   const page = "https://github.com/hitode-project/hitode/issues/new?";
-  const url = `${page}${params}`;
-  if (url.length <= 8000) return url;
-  params.delete("report");
-  return `${page}${params}`;
+  const issue = (details: string, attachment: string) => {
+    const fields = [
+      ["Game / 游戏", report.title ? `${report.title.name} (https://vndb.org/${report.title.vndb})` : ""],
+      ["Patch / 补丁", report.title?.edition ?? ""],
+      ["Platform / 平台", platform ?? report.platform.os],
+      ["Device and Hitode version / 设备与 Hitode 版本", `${report.platform.model} · Hitode ${report.app.version} (${report.app.build})`],
+      ["Symptom / 现象", symptoms],
+      ["What happened / 发生了什么", details],
+      ["Report / 报告", attachment],
+    ];
+    const body = fields.map(([label, value]) => `### ${label}\n\n${value}`).join("\n\n");
+    return `${page}${new URLSearchParams({ title, body })}`;
+  };
+  const note = report.note ?? "";
+  const limit = 8000;
+  const full = issue(note, `\`\`\`json\n${json}\n\`\`\``);
+  if (full.length <= limit) return { url: full, attachReport: false };
+
+  const attachment = "Attach the saved report JSON. / 请附上已保存的报告 JSON。";
+  const withAttachment = issue(note, attachment);
+  if (withAttachment.length <= limit) return { url: withAttachment, attachReport: true };
+
+  const points = Array.from(note);
+  const suffix = "…\n\nFull description in the saved report. / 完整描述见已保存的报告。";
+  const shortened = (n: number) => issue(points.slice(0, n).join("") + suffix, attachment);
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (shortened(middle).length <= limit) low = middle;
+    else high = middle - 1;
+  }
+  return { url: shortened(low), attachReport: true };
 }

@@ -179,6 +179,7 @@ pub async fn start_game(
     playback: Playback,
 ) -> Result<(), String> {
     let filter = crate::play::upscaler(&filter)?;
+    let files = window.state::<crate::game_storage::Activity>().acquire()?;
     let (exe, data_dir, codepage) = window
         .state::<Mutex<Library>>()
         .lock()
@@ -216,6 +217,7 @@ pub async fn start_game(
                 view,
                 options,
                 Box::new(move |result| {
+                    let _files = files;
                     // Dropped after the borrow: teardown must not run inside it.
                     let ended = HOST.with_borrow_mut(|host| {
                         host.playback.take();

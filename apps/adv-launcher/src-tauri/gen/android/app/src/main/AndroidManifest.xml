@@ -33,7 +33,7 @@
             </intent-filter>
         </activity>
 
-        <!-- Drive C: of the Wine prefix, in the system Files app. -->
+        <!-- Drive C: and managed game folders in the system Files app. -->
         <provider
           android:name=".DriveProvider"
           android:authorities="${applicationId}.drive"

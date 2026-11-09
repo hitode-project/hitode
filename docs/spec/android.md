@@ -88,4 +88,21 @@ iOS publishes no housing geometry. An iPhone's is read from its safe-area depth.
 
 Suspension retains the lifecycle state to restore, including foreground/background changes received while suspended. Android continues using its existing lifecycle and audio-focus callbacks and pause event path, which invalidates input generations under AND-APP-3.
 
+### AND-APP-17 Managed game files
+
+**Rule**: Managed copies MUST open through a separate Files root. The provider MUST NOT rename or delete top-level copies.
+**Applies to**: Android
+**Verification**: Review — opening folders and editing files require the system Files app.
+
+The provider MUST return the document path from the appropriate root so Files can open a managed folder directly. Selecting that root or one of its folders for import MUST use the existing managed path.
+
+### AND-APP-18 System navigation during play
+
+**Rule**: Android Back MUST dismiss the top launcher layer or open the pause menu during play. Touches starting in system gesture areas MUST NOT reach the guest. The system navigation bar MUST remain available during play.
+**Applies to**: Android
+**Verification**: Review — system Back and edge touch dispatch require an Android device.
+
+In the library, Android Back MUST dismiss only the top launcher layer, including a removal confirmation over the game management sheet.
+On launcher pages, Android Back MUST use the launcher's navigation stack. It MUST defer to the system when that stack has no destination or layer to dismiss.
+
 Withdrawn: AND-APP-5, AND-APP-6, AND-APP-7

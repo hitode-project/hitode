@@ -26,7 +26,7 @@
    * The game's menu as a sheet on mobile: the bar opens from the pause menu,
    * and a popup the game tracks opens on its own until it is answered.
    */
-  let { menu, onclose }: { menu: GuestMenu; onclose: () => void } = $props();
+  let { menu, onclose }: { menu: GuestMenu; onclose: (cancelled: boolean) => void } = $props();
 
   type Input =
     | { kind: "open"; window: number; root: number; menu: number; position: number | null }
@@ -63,13 +63,13 @@
       path = [...path, entry.position];
     } else {
       send({ kind: "choose", command: entry.command, popup: menu.popup !== null });
-      onclose();
+      onclose(false);
     }
   }
 
   function close() {
     if (menu.popup) send({ kind: "cancel", window: menu.window, root: menu.root });
-    onclose();
+    onclose(true);
   }
 
   function back() {

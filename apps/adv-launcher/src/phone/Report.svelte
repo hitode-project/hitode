@@ -200,7 +200,9 @@
       {/snippet}
       <div class="path mono">{form.savedPath}</div>
         {#if form.attachReport}<p>{t("把文件附到问题中")}</p>{/if}
+        {#if form.shareError}<p role="alert">{t("未能分享报告，请重试。")}</p>{/if}
       {#snippet actions()}
+        <button class="secondary big" disabled={form.sharing} onclick={() => form.share()}>{t("分享报告")}</button>
         <button class="primary big" data-autofocus onclick={() => nav.back()}>{t("完成")}</button>
       {/snippet}
     </PhoneReportResult>

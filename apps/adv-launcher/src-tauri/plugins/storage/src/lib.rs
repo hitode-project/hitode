@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{
     AppHandle, Manager, Runtime,
     ipc::Channel,
@@ -25,6 +25,8 @@ pub struct StorageStatus {
 pub struct Folder {
     pub uri: Option<String>,
     pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -40,6 +42,12 @@ pub struct CopiedFolder {
     pub path: PathBuf,
 }
 
+#[derive(Deserialize)]
+pub struct ExportedFolder {
+    pub label: String,
+    pub path: Option<PathBuf>,
+}
+
 pub struct Storage<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Storage<R> {
@@ -48,6 +56,15 @@ impl<R: Runtime> Storage<R> {
             .run_mobile_plugin_async(command, args)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn export_folder(&self, source: &Path, name: &str) -> Reply<Option<ExportedFolder>> {
+        self.call("exportFolder", json!({ "source": source, "name": name }))
+            .await
+    }
+
+    pub async fn share_file(&self, path: &Path) -> Reply<()> {
+        self.call("shareFile", json!({ "path": path })).await
     }
 
     pub async fn pick_folder(&self) -> Reply<Folder> {

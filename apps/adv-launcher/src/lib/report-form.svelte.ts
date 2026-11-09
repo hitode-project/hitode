@@ -1,13 +1,14 @@
 import { t } from "./i18n.svelte";
 import { invoke } from "@tauri-apps/api/core";
 import { call, inTauri } from "./bridge";
+import { device } from "./device.svelte";
 import { playback } from "./playback";
 import { prefs } from "./prefs.svelte";
 import { gameFilter } from "./upscaling.svelte";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
 import type { RunSummary } from "./host";
-import { buildReport, issueUrl, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation, type ReportTitle, type ReportTimeline, type ReportSettings } from "./report";
+import { buildReport, issueDraft, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation, type ReportTitle, type ReportTimeline, type ReportSettings } from "./report";
 import type { Game } from "./types";
 
 // The report form shared by the desktop and phone report screens: what the
@@ -149,6 +150,8 @@ export class ReportForm {
   off = $state<Record<Optional, boolean>>({ title: false, failure: false, perf: false, gaps: false, note: false });
   rawOpen = $state(false);
   savedPath = $state("");
+  sharing = $state(false);
+  shareError = $state(false);
   /** Null while loading. */
   context = $state<ReportContext | null>(null);
   /** Why the context could not be loaded (e.g. the main program is gone). */
@@ -243,13 +246,14 @@ export class ReportForm {
     this.attachReport = false;
     try {
       const json = await call<string>("report_json", { report }, JSON.stringify(report, null, 2));
-      const url = issueUrl(report, json);
-      if (!new URL(url).searchParams.has("report")) {
+      const { url, attachReport } = issueDraft(report, json);
+      if (attachReport) {
         if (!(await this.save())) return;
         this.attachReport = true;
       }
-      if (inTauri) await invoke("plugin:opener|open_url", { url });
-      else window.open(url, "_blank", "noopener");
+      if (!inTauri) window.open(url, "_blank", "noopener");
+      else if (device.platform === "android") await invoke("open_issue_in_browser", { url });
+      else await invoke("plugin:opener|open_url", { url, with: device.platform === "ios" ? "inAppBrowser" : undefined });
     } catch {
       this.view = "form";
       this.deliveryError = t("没能打开问题页，请再试一次");
@@ -261,11 +265,24 @@ export class ReportForm {
     if (!report || this.sending) return false;
     try {
       this.savedPath = await call<string>("save_report", { report }, fakeSavedPath());
+      this.shareError = false;
       this.view = "saved";
       return true;
     } catch (error) {
       console.error("save_report failed", error);
       return false;
+    }
+  }
+
+  async share(): Promise<void> {
+    this.sharing = true;
+    this.shareError = false;
+    try {
+      await call("share_report", { path: this.savedPath }, null);
+    } catch {
+      this.shareError = true;
+    } finally {
+      this.sharing = false;
     }
   }
 }

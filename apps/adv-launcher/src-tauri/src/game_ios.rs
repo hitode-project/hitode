@@ -27,7 +27,7 @@ use objc2_ui_kit::{
     UIApplicationState, UIApplicationWillResignActiveNotification, UIView,
 };
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Mutex, time::Instant};
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_storage::StorageExt;
 
 thread_local! {
@@ -88,7 +88,17 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         // with_webview supplies the retained WKWebView on the main thread.
         let webview = unsafe { &*native.inner().cast::<UIView>() };
         let router = handle.state::<OverlayState>().router.clone();
-        let container = match GameContainer::new(webview, router) {
+        let back = handle.clone();
+        let container = match GameContainer::new(webview, router, move || {
+            // Wake a hidden WebView so it can publish the new overlay.
+            HOST.with_borrow_mut(|host| {
+                if let Some(container) = &host.container {
+                    host.overlay_change = back.state::<OverlayState>().changes();
+                    container.set_overlay_visible(true);
+                }
+            });
+            let _ = back.emit("edge_back", ());
+        }) {
             Ok(container) => container,
             Err(error) => {
                 log::error!("game container: {error}");
@@ -295,6 +305,18 @@ async fn on_ui<R: Send + 'static>(
         .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub fn set_launcher_back(app: AppHandle, enabled: bool) -> Result<(), String> {
+    app.run_on_main_thread(move || {
+        HOST.with_borrow(|host| {
+            if let Some(container) = &host.container {
+                container.set_launcher_back(enabled);
+            }
+        });
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn with_session<R>(f: impl FnOnce(&mut Host, &Session) -> R) -> Result<R, String> {
     HOST.with_borrow_mut(|host| {
         let session = host.session.take().ok_or("no game is running")?;
@@ -312,6 +334,7 @@ pub async fn start_game(
     playback: Playback,
 ) -> Result<(), String> {
     let filter = crate::play::upscaler(&filter)?;
+    let files = window.state::<crate::game_storage::Activity>().acquire()?;
     let (exe, data_dir, codepage) = window
         .state::<Mutex<Library>>()
         .lock()
@@ -349,6 +372,7 @@ pub async fn start_game(
                 view,
                 options,
                 Box::new(move |result| {
+                    let _files = files;
                     // Dropped after the borrow: teardown must not run inside it.
                     let ended = HOST.with_borrow_mut(|host| {
                         host.playback.take();

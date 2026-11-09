@@ -46,8 +46,8 @@ function side(layout: GameLayout, which: "left" | "right"): Area {
     if (which === "left") [x0, outer0] = [Math.max(x0, c.x + c.width), BESIDE_CUTOUT];
     else [x1, outer1] = [Math.min(x1, c.x), BESIDE_CUTOUT];
   }
-  x0 += outer0;
-  x1 -= outer1;
+  x0 = Math.max(x0 + outer0, gestures.left);
+  x1 = Math.min(x1 - outer1, width - gestures.right);
   const corner = cornerInset(cornerRadius, which === "left" ? x0 : width - x1);
   const top = Math.max(PAD, gestures.top, corner);
   const bottom = Math.max(PAD, gestures.bottom, corner);

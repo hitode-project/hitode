@@ -1,6 +1,11 @@
+<script lang="ts" module>
+  let remembered = { searching: false, query: "", scrollTop: 0 };
+</script>
+
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import VndbLink from "../components/VndbLink.svelte";
+  import AddGameButton from "../components/AddGameButton.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -10,6 +15,7 @@
   import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { device } from "../lib/device.svelte";
   import { library } from "../lib/library.svelte";
+  import { longPress } from "../lib/long-press";
   import { nav } from "../lib/nav.svelte";
   import type { Game, LibraryFilter } from "../lib/types";
 
@@ -22,12 +28,14 @@
     { filter: "unstarted", label: t("未开始") },
   ];
 
-  let searching = $state(false);
-  let query = $state("");
+  let searching = $state(remembered.searching);
+  let query = $state(remembered.query);
   let searchInput = $state<HTMLInputElement | null>(null);
+  let grid = $state<HTMLElement>();
+  let scrollTop = remembered.scrollTop;
   /** The game whose detail page is open. */
   let openId = $state<string | null>(library.takeFocus());
-  let more = $state(false);
+  let manageId = $state<string | null>(null);
   /** "已从游戏库移除" with undo, shown for a few seconds after a removal. */
   let undoToast = $state(false);
 
@@ -39,6 +47,8 @@
 
   const items = $derived(library.filtered(filter, searching ? query : ""));
   const current = $derived<Game | undefined>(openId ? library.get(openId) : undefined);
+  const managed = $derived(manageId ? library.get(manageId) : undefined);
+
 
   function toggleSearch() {
     searching = !searching;
@@ -64,22 +74,26 @@
 
   function removed() {
     openId = null;
-    more = false;
+    manageId = null;
     undoToast = true;
   }
 
-  // A window growing to the sidebar layout selects the open game there.
+  onMount(() => { if (grid) grid.scrollTop = scrollTop; });
+
   onDestroy(() => {
+    remembered = { searching, query, scrollTop };
+    // A window growing to the sidebar layout selects the open game there.
     if (!device.phone && openId) library.focus = openId;
   });
 
   // The back gesture closes the detail page, then the search field; the
   // manage sheet registers its own handler while it is open.
+  const canDismissLibrary = $derived(!!current || searching);
   $effect(() => {
-    if (!current && !searching) return;
+    if (!canDismissLibrary) return;
     return nav.onBack(() => {
       if (current) openId = null;
-      else searching = false;
+      else toggleSearch();
       return true;
     });
   });
@@ -123,10 +137,7 @@
     </div>
     <h2>{t("添加游戏文件夹")}</h2>
     <div class="empty-actions">
-      <button class="primary" onclick={() => nav.go({ name: "scan" })}>
-        <Icon name="folder-plus" size={18} stroke={1.5} />
-        <span>{t("添加文件夹…")}</span>
-      </button>
+      <AddGameButton />
     </div>
   </main>
 {:else}
@@ -138,9 +149,7 @@
     <button class="icon-btn" aria-label={t("游玩统计")} onclick={() => nav.go({ name: "stats" })}>
       <Icon name="chart" size={20} stroke={1.5} />
     </button>
-    <button class="icon-btn" aria-label={t("添加游戏")} onclick={() => nav.go({ name: "scan" })}>
-      <Icon name="plus" size={20} stroke={1.5} />
-    </button>
+    <AddGameButton compact />
     <button class="icon-btn" aria-label={t("设置")} onclick={() => nav.go({ name: "settings" })}>
       <Icon name="sliders" size={20} stroke={1.5} />
     </button>
@@ -149,16 +158,19 @@
   <UpdateNotice />
 
   {#if searching}
-    <label class="field search">
-      <Icon name="search" size={16} stroke={1.5} />
-      <span class="sr">{t("搜索")}</span>
-      <input type="search" placeholder={t("搜索标题或品牌")} bind:this={searchInput} bind:value={query} />
-    </label>
+    <div class="search">
+      <label class="field">
+        <Icon name="search" size={16} stroke={1.5} />
+        <span class="sr">{t("搜索")}</span>
+        <input type="search" placeholder={t("搜索标题或品牌")} bind:this={searchInput} bind:value={query} />
+      </label>
+      <button class="quiet" onclick={toggleSearch}>{t("取消")}</button>
+    </div>
   {:else}
     {@render categories()}
   {/if}
 
-  <main class="grid-wrap">
+  <main class="grid-wrap" bind:this={grid} onscroll={(event) => (scrollTop = event.currentTarget.scrollTop)}>
     {#if items.length === 0}
       <div class="none">{t("没有匹配的游戏")}</div>
     {/if}
@@ -168,6 +180,7 @@
           class="card"
           class:gone={game.offline !== null}
           onclick={() => (openId = game.id)}
+          use:longPress={device.touch ? () => (manageId = game.id) : null}
           aria-label={game.offline
             ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
             : game.title}
@@ -246,7 +259,7 @@
             <span>{game.lastPlayed === null ? t("开始游戏") : t("继续游戏")}</span>
           </button>
         {/if}
-        <button class="ghost" aria-label={t("更多操作")} aria-haspopup="dialog" onclick={() => (more = true)}>
+        <button class="ghost" aria-label={t("更多操作")} aria-haspopup="dialog" onclick={() => (manageId = game.id)}>
           <Icon name="more" size={18} />
         </button>
       </div>
@@ -272,8 +285,8 @@
   </div>
 {/if}
 
-{#if current && more}
-  <PhoneManageSheet game={current} onclose={() => (more = false)} onremoved={removed} />
+{#if managed}
+  <PhoneManageSheet game={managed} returnTo={current?.id ?? null} onclose={() => (manageId = null)} onremoved={removed} />
 {/if}
 
 {#if undoToast}
@@ -339,8 +352,14 @@
     outline-offset: 2px;
   }
   .search {
+    display: flex;
+    gap: 8px;
     flex: 0 0 auto;
     margin: 12px 20px 16px;
+  }
+  .search .field {
+    flex: 1;
+    min-width: 0;
     height: 40px;
     border-radius: 12px;
   }
@@ -368,6 +387,8 @@
     color: var(--fg3);
   }
   .card {
+    -webkit-touch-callout: none;
+    user-select: none;
     all: unset;
     display: flex;
     flex-direction: column;

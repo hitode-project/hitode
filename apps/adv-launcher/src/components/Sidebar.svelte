@@ -14,7 +14,6 @@
   ];
 
   const route = $derived(nav.route);
-  const adding = $derived(route.name === "import" || route.name === "scan" || route.name === "install");
 </script>
 
 <nav class="side" aria-label={t("分类")}>
@@ -36,10 +35,7 @@
     <Icon name="chart" /><span>{t("游玩统计")}</span>
   </button>
   <div style="flex: 1"></div>
-  <button class="nav" class:on={adding} onclick={() => nav.go({ name: "scan" })}>
-    <Icon name="folder-plus" /><span>{t("添加文件夹")}</span>
-  </button>
-  <button class="nav" class:on={route.name === "settings"} onclick={() => nav.go({ name: "settings" })}>
+  <button class="nav" class:on={route.name === "settings" || route.name === "game-storage"} onclick={() => nav.go({ name: "settings" })}>
     <Icon name="sliders" /><span>{t("设置")}</span>
   </button>
 </nav>

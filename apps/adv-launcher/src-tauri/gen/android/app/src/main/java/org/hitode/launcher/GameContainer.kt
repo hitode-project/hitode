@@ -14,6 +14,8 @@ import android.view.View
 import android.view.WindowInsets
 import android.webkit.WebView
 import android.widget.FrameLayout
+import androidx.core.graphics.Insets
+import androidx.core.view.WindowInsetsCompat
 import kotlin.math.roundToInt
 
 /** Native game surface below the transparent overlay, with one target per gesture. */
@@ -22,6 +24,8 @@ class GameContainer(private val activity: MainActivity, val webView: WebView) :
     private val surfaceView = SurfaceView(activity)
     private val cursor = Cursor(activity)
     private var gameGesture = false
+    private var systemEdgeGesture = false
+    private var gestureInsets = Insets.NONE
 
     init {
         setBackgroundColor(Color.BLACK)
@@ -55,11 +59,9 @@ class GameContainer(private val activity: MainActivity, val webView: WebView) :
                 RoundedCorner.POSITION_BOTTOM_RIGHT, RoundedCorner.POSITION_BOTTOM_LEFT,
             ).maxOf { insets.getRoundedCorner(it)?.radius ?: 0 } / density
         } else 0f
-        val gestures = if (Build.VERSION.SDK_INT >= 30) {
-            insets.getInsets(WindowInsets.Type.mandatorySystemGestures())
-        } else {
-            @Suppress("DEPRECATION") insets.mandatorySystemGestureInsets
-        }
+        val types = WindowInsetsCompat.Type.systemGestures() or WindowInsetsCompat.Type.navigationBars()
+        val gestures = WindowInsetsCompat.toWindowInsetsCompat(insets, this).getInsets(types)
+        gestureInsets = gestures
         val area = activity.nativeScreen(
             width / density, height / density, cutouts, radius,
             listOf(gestures.top, gestures.right, gestures.bottom, gestures.left)
@@ -102,7 +104,21 @@ class GameContainer(private val activity: MainActivity, val webView: WebView) :
         val action = event.actionMasked
         if (action == MotionEvent.ACTION_DOWN) {
             val density = resources.displayMetrics.density
-            gameGesture = activity.nativeRouteTouch(event.getX(0) / density, event.getY(0) / density)
+            val x = event.getX(0)
+            val y = event.getY(0)
+            gameGesture = activity.nativeRouteTouch(x / density, y / density)
+            // Let a system gesture start without sending its initial motion to Wine.
+            // An overlay button in the same strip can still receive a clean tap.
+            systemEdgeGesture = gameGesture && (x < gestureInsets.left ||
+                x >= width - gestureInsets.right || y < gestureInsets.top ||
+                y >= height - gestureInsets.bottom)
+        }
+        if (systemEdgeGesture) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                systemEdgeGesture = false
+                gameGesture = false
+            }
+            return true
         }
         if (!gameGesture) return super.dispatchTouchEvent(event)
 

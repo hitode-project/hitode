@@ -4,6 +4,7 @@
   import { call, onHostEvent } from "./lib/bridge";
   import JitBanner from "./components/JitBanner.svelte";
   import UpdateNotice from "./components/UpdateNotice.svelte";
+  import FolderChoice from "./components/FolderChoice.svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import { device } from "./lib/device.svelte";
   import { jit } from "./lib/jit.svelte";
@@ -12,6 +13,7 @@
   import { prefs } from "./lib/prefs.svelte";
   import { updates } from "./lib/updates.svelte";
   import Game from "./pages/Game.svelte";
+  import GameStorage from "./pages/GameStorage.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
   import Launch from "./pages/Launch.svelte";
@@ -31,6 +33,14 @@
 
   let backupError = $state("");
   $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
+  $effect(() => onHostEvent("edge_back", () => { nav.requestBack(); }));
+  $effect(() => {
+    const platform = device.platform;
+    if (platform === "ios" || platform === "android") {
+      const enabled = nav.canGoBack && (platform === "android" || nav.route.name !== "game");
+      void call("set_launcher_back", { enabled }, null).catch(console.error);
+    }
+  });
 
   let systemDark = $state(matchMedia("(prefers-color-scheme: dark)").matches);
   $effect(() => {
@@ -90,6 +100,7 @@
 {#if backupError}<div class="backup-error" role="alert">{backupError}<button onclick={() => backupError = ""}>{t("关闭")}</button></div>{/if}
 
 {#key locale()}
+<FolderChoice />
 {#if route.name === "game"}
   <Game gameId={route.gameId} gameView={device.gameView} phone={device.touch} />
 {:else}
@@ -118,6 +129,8 @@
         {#if phonePage}<PhoneScan />{:else}<Scan />{/if}
       {:else if route.name === "settings"}
         {#if phonePage}<PhoneSettings />{:else}<Settings />{/if}
+      {:else if route.name === "game-storage" || route.name === "game-files"}
+        <GameStorage gameId={route.name === "game-files" ? route.gameId : undefined} />
       {:else if route.name === "game-settings"}
         {#if phonePage}<PhoneGameSettings gameId={route.gameId} />{:else}<GameSettings gameId={route.gameId} />{/if}
       {:else if route.name === "launch"}

@@ -156,29 +156,31 @@ class Library {
   }
 
   /** 找回: points a missing game at the folder the user picks, keeping its main program if it is there. */
-  async relocate(id: string): Promise<void> {
+  async relocate(id: string): Promise<boolean> {
     const game = this.get(id);
-    if (!game) return;
+    if (!game) return false;
     if (!inTauri) {
       game.offline = null;
-      return;
+      return true;
     }
     try {
       const folder = await libraryPickFolder();
-      if (!folder) return;
+      if (!folder) return false;
       const inspection = await libraryInspect(folder);
-      if (!inspection) return;
+      if (!inspection) return false;
       const exes = inspection.exes.map((e) => e.path);
       // The same main program by name when the new folder has it, else the suggestion.
       const same = exes.find((e) => e.toLowerCase() === game.exe.toLowerCase());
       const suggested = inspection.suggested === null ? undefined : exes[inspection.suggested];
       const exe = same ?? suggested;
-      if (!exe) return;
+      if (!exe) return false;
       const updated = await libraryUpdate(id, { folder: inspection.folder, exe });
       if (updated) this.put(updated);
       await this.refresh();
+      return updated !== null;
     } catch (error) {
       console.error("relocating the game failed", error);
+      return false;
     }
   }
 

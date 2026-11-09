@@ -76,6 +76,14 @@
         <button class="btn quiet" onclick={() => flow.withoutJit()}>{t("仍然开始")}</button>
         <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
       </div>
+    {:else if flow.recovery}
+      <div class="acts fade">
+        <button class="btn primary" disabled={flow.recovering} onclick={() => flow.recoverFolder()}>
+          {t(flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
+        </button>
+        <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
+        <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+      </div>
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
