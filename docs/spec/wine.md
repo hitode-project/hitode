@@ -248,6 +248,9 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 **Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts. An ended thread's stack MUST leave the process's allocations, so that later allocations of its range succeed.
 **Verification**: Test
 
+When importing extended x86 context registers, reserved x87 control-word bits
+are ignored. The supported fields restore without changing the current reserved bits.
+
 ### NT-PROC-3 Jobs and completions
 
 **Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.

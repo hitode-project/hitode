@@ -156,10 +156,16 @@ pub fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), 
         // was edited. Preserve the full captured tags when x87 itself is unchanged.
         candidate.x87 = state.x87.clone();
         let original = encode(state);
-        if bytes[0xcc..0xcc + 24] != original[0xcc..0xcc + 24]
+        // Import the writable control fields, as an x87 restore does.
+        // Reserved bits in an external image do not change CPU state.
+        let mask = ArchitecturalState::WRITABLE_X87_CONTROL;
+        let control = (word(bytes, 0xcc) & mask) | (state.x87.control & !mask);
+        if control != state.x87.control
+            || bytes[0xcc + 2..0xcc + 24] != original[0xcc + 2..0xcc + 24]
             || bytes[0xcc + 32..0xcc + 160] != original[0xcc + 32..0xcc + 160]
         {
             candidate.x87 = extended(bytes);
+            candidate.x87.control = control;
         }
         candidate.mxcsr = get(bytes, 0xcc + 24);
         for n in 0..8 {
@@ -284,7 +290,10 @@ mod tests {
         put(&mut bytes, 0x1c, 0x0b7f);
         decode(&bytes, &mut restored).unwrap();
         assert_eq!(restored, original);
-        bytes[0xcc..0xcc + 2].copy_from_slice(&0x0f7fu16.to_le_bytes());
+        bytes[0xcc..0xcc + 2].copy_from_slice(&(original.x87.control ^ 0x40).to_le_bytes());
+        decode(&bytes, &mut restored).unwrap();
+        assert_eq!(restored, original);
+        bytes[0xcc..0xcc + 2].copy_from_slice(&0x0f3fu16.to_le_bytes());
         bytes[0xcc + 160..0xcc + 176].fill(42);
         decode(&bytes, &mut restored).unwrap();
         assert_eq!(restored.x87.control, 0x0f7f);
