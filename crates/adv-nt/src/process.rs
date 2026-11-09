@@ -660,13 +660,27 @@ fn new_context(
     stack_size: u32,
 ) -> Result<CtxId, MemFault> {
     let context = sys.spawn(cpu, "thread", ldr_initialize_thunk, &[], stack_size)?;
+    if let Err(error) = initialize_context(cpu, sys, memory, context, tid, syscall) {
+        sys.terminate_context_stopped(context, status::ACCESS_VIOLATION);
+        return Err(error);
+    }
+    Ok(context)
+}
+
+fn initialize_context(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    memory: &mut Memory,
+    context: CtxId,
+    tid: u32,
+    syscall: u32,
+) -> Result<(), MemFault> {
     let thread = &sys.contexts[context as usize];
     let (teb, stack_base, stack_lo) = (thread.teb, thread.stack_hi, thread.stack_lo);
     // The machine's stack: a guard page under the committed pages.
     let stack = stack_lo - PAGE;
     let mut pages = vec![Some(PAGE_READWRITE); ((stack_base - stack) / PAGE) as usize];
     pages[0] = Some(PAGE_GUARD_READWRITE);
-    memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
     init_teb(cpu, teb, tid, syscall)?;
 
     let start_context = start_context(stack_base);
@@ -679,7 +693,8 @@ fn new_context(
         cpu.write_u32(frame + 4 * index as u32, value)?;
     }
     sys.set_start_stack(context, frame);
-    Ok(context)
+    memory.insert(stack, Kind::Private, PAGE_READWRITE, pages);
+    Ok(())
 }
 
 /// Forgets the stack `new_context` recorded for `context`, which has ended:
@@ -727,27 +742,38 @@ pub fn create_thread(
     entry: u32,
     argument: u32,
     stack_size: u32,
-) -> Result<CtxId, MemFault> {
+) -> Result<CtxId, status::Error> {
     let Env { cpu, sys, ext, .. } = env;
     let start = ext.get::<ThreadStart>();
     let (ldr_initialize_thunk, syscall) = (start.ldr_initialize_thunk, start.syscall);
-    let context = new_context(
-        *cpu,
-        sys,
-        ext.get_mut::<Memory>(),
-        ldr_initialize_thunk,
-        syscall,
-        tid,
-        stack_size.max(DEFAULT_STACK),
-    )?;
-    write_start_context(
-        *cpu,
-        sys,
-        ext.get::<ThreadStart>(),
-        context,
-        entry,
-        argument,
-    )?;
+    let context = sys
+        .spawn(
+            *cpu,
+            "thread",
+            ldr_initialize_thunk,
+            &[],
+            stack_size.max(DEFAULT_STACK),
+        )
+        .map_err(|_| status::NO_MEMORY)?;
+    let initialized = initialize_context(*cpu, sys, ext.get_mut::<Memory>(), context, tid, syscall)
+        .and_then(|()| {
+            write_start_context(
+                *cpu,
+                sys,
+                ext.get::<ThreadStart>(),
+                context,
+                entry,
+                argument,
+            )
+        });
+    if let Err(error) = initialized {
+        forget_stack(env, context);
+        env.sys
+            .terminate_context_stopped(context, status::ACCESS_VIOLATION);
+        return Err(status::Error::Unsupported(format!(
+            "thread initialization: {error}"
+        )));
+    }
     Ok(context)
 }
 
@@ -884,6 +910,39 @@ mod tests {
     use adv_cpu::Cpu;
     use adv_cpu::backend::Prot;
     use adv_machine::{Clock, Outcome, layout::PARK_ADDR};
+
+    // spec: NT-PROC-4
+    #[test]
+    fn wine_thread_capacity_returns_a_status_and_reuses_the_last_teb() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.sys.teb_pages = TEB_PAGES;
+        for _ in 0..111 {
+            machine.spawn("live", PARK_ADDR, &[], 0).unwrap();
+        }
+        let last = 110;
+        let teb = machine.sys.contexts[last as usize].teb;
+        assert_eq!(teb, 0x7ff0_1000);
+        machine
+            .visit_context(Some(0), |env| {
+                let handle = env.sys.vm.alloc(env.cpu, PAGE, Prot::RW).unwrap();
+                env.cpu.write_u32(handle, u32::MAX).unwrap();
+                let args = [handle, 0, 0, CURRENT_PROCESS, PARK_ADDR, 0, 0, 0, 0, 0, 0];
+                assert!(matches!(
+                    crate::thread::create(env, &args),
+                    Outcome::Return(status::NO_MEMORY)
+                ));
+                assert_eq!(env.cpu.read_u32(handle).unwrap(), u32::MAX);
+            })
+            .unwrap();
+        assert!(machine.sys.terminate_context_stopped(last, 0));
+        let replacement = machine.spawn("replacement", PARK_ADDR, &[], 0).unwrap();
+        assert_eq!(machine.sys.contexts[replacement as usize].teb, teb);
+    }
 
     // spec: NT-PROC-2
     #[test]

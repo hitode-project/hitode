@@ -21,6 +21,8 @@ pub struct Execution {
 
 impl Execution {
     pub fn new(distribution: PathBuf) -> Result<Self, String> {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        raise_open_file_limit();
         let installation = distribution.clone();
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);
         let thread = thread::Builder::new()
@@ -59,6 +61,29 @@ impl Execution {
             return Err("execution owner stopped".into());
         }
         Ok(Task::Shared(result))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+fn raise_open_file_limit() {
+    // The in-process Wine server's three pipes use six descriptors per guest
+    // thread. Leave room for the game and the host UI as well.
+    const OPEN_FILES: libc::rlim_t = 1024;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is writable for getrlimit and initialized for setrlimit.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            let soft = limit.rlim_max.min(OPEN_FILES);
+            if soft > limit.rlim_cur {
+                limit.rlim_cur = soft;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    log::warn!("open file limit: {}", std::io::Error::last_os_error());
+                }
+            }
+        }
     }
 }
 

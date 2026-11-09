@@ -37,6 +37,15 @@ impl ActiveContexts {
         &self.entries
     }
 
+    pub fn free_slot(&self, capacity: u32) -> Option<u32> {
+        self.slots
+            .iter()
+            .take(capacity as usize)
+            .position(Option::is_none)
+            .or_else(|| (self.slots.len() < capacity as usize).then_some(self.slots.len()))
+            .map(|slot| slot as u32)
+    }
+
     pub fn insert(&mut self, id: CtxId, slot: u32) {
         assert!(slot < crate::layout::MAX_CONTEXTS);
         self.slots

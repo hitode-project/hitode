@@ -372,6 +372,11 @@ impl Sys {
         context.suspend_count = old.saturating_sub(1);
         Some(old)
     }
+    /// Whether another context fits in the current TEB layout.
+    pub fn has_context_slot(&self) -> bool {
+        self.wakes.entries().len() < teb_capacity(self.teb_pages) as usize
+    }
+
     /// Create a guest context that will start at `entry(args...)`. Its return ends the thread.
     pub fn spawn(
         &mut self,
@@ -386,8 +391,7 @@ impl Sys {
             addr: 0,
             len: stack_size,
         })?;
-        let slot = (0..MAX_CONTEXTS)
-            .find(|slot| self.wakes.entries().iter().all(|entry| entry.slot != *slot));
+        let slot = self.wakes.free_slot(teb_capacity(self.teb_pages));
         let Some(slot) = slot.filter(|_| self.objects.can_insert()) else {
             return Err(MemFault {
                 addr: 0,
@@ -431,10 +435,15 @@ impl Sys {
             }
             sp -= 4;
             cpu.write_u32(sp, self.guest_return_entry)?;
+            let audio_guest = self.guest_words.allocate(cpu, &mut self.vm);
+            cpu.write_u32(
+                teb + teb::AUDIO_GUEST,
+                audio_guest.as_ref().map_or(0, |word| word.address),
+            )?;
             let (tls_directory, tls_blocks) = self.setup_static_tls(cpu, teb)?;
-            Ok((sp, tls_directory, tls_blocks))
+            Ok((sp, tls_directory, tls_blocks, audio_guest))
         })();
-        let (sp, tls_directory, tls_blocks) = match result {
+        let (sp, tls_directory, tls_blocks, audio_guest) = match result {
             Ok(sp) => sp,
             Err(error) => {
                 if mapped_teb {
@@ -445,11 +454,6 @@ impl Sys {
             }
         };
 
-        let audio_guest = self.guest_words.allocate(cpu, &mut self.vm);
-        cpu.write_u32(
-            teb + teb::AUDIO_GUEST,
-            audio_guest.as_ref().map_or(0, |word| word.address),
-        )?;
         let thread_handle = self.objects.insert(Object::Thread { ctx: id });
         self.contexts.push(Context {
             audio_call_us: None,

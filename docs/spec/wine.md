@@ -251,6 +251,13 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 When importing extended x86 context registers, reserved x87 control-word bits
 are ignored. The supported fields restore without changing the current reserved bits.
 
+### NT-PROC-4 Thread creation at capacity
+
+**Rule**: Live thread slots MUST fit inside the reserved TEB area. Exhausting those slots MUST return `STATUS_NO_MEMORY` without creating a server thread. Failed thread creation MUST release any thread resources it acquired.
+**Verification**: Test
+
+> Note: The macOS, iOS and Android launchers raise their soft descriptor limit to cover the server's thread pipes. The target is 1024, capped by the inherited hard limit.
+
 ### NT-PROC-3 Jobs and completions
 
 **Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.

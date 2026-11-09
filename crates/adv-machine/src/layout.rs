@@ -42,21 +42,27 @@ pub const HOST_MODULE_CAP: u32 = 0x100;
 pub const LDR_BASE: u32 = 0x7e20_0000;
 pub const LDR_SIZE: u32 = 0x20_0000;
 
+const TEB_REGION_START: u32 = 0x7ff0_0000;
+
 /// Regions the host owns; reserved in the VM so images never load over them.
 pub const RESERVED: &[(u32, u32)] = &[
     (0, 0x1_0000),           // null guard
     (THUNK_BASE, 0x20_0000), // thunks, park page, GDT/IDT
     (LDR_BASE, LDR_SIZE),
     (HOST_MODULE_BASE, HOST_MODULE_CAP * GRANULE),
-    (0x7ff0_0000, 0x10_0000), // TEBs, PEB, KUSER_SHARED_DATA
+    (TEB_REGION_START, 0x10_0000), // TEBs, PEB, KUSER_SHARED_DATA
 ];
 
 pub const PEB_ADDR: u32 = 0x7ffd_f000;
 /// TEB of execution storage slot `i` is at `TEB_TOP - i * PAGE`, or in
 /// blocks of more pages, [`teb_block_addr`].
-pub const TEB_TOP: u32 = 0x7ffd_e000;
-/// Concurrent execution storage limit, independent of retained thread identities.
-pub const MAX_CONTEXTS: u32 = 64;
+pub const TEB_TOP: u32 = PEB_ADDR - PAGE;
+/// Maximum concurrent slots, for one-page TEBs. Larger blocks fit fewer slots.
+pub const MAX_CONTEXTS: u32 = teb_capacity(1);
+
+pub const fn teb_capacity(pages: u32) -> u32 {
+    (PEB_ADDR - TEB_REGION_START) / (pages * PAGE)
+}
 
 pub const DEFAULT_STACK: u32 = 0x10_0000;
 

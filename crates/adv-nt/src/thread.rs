@@ -69,6 +69,9 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             0 => Vec::new(),
             attributes => Attributes::read(env, attributes)?.wire(),
         };
+        if !env.sys.has_context_slot() {
+            return Err(status::NO_MEMORY.into());
+        }
         let new = server::prepare_thread(env)?;
         let mut request = NewThreadRequest {
             process,
@@ -83,18 +86,30 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[&objattr], &mut [])?;
         status::check(reply.header.error)?;
-        write_u32(env, handle, reply.handle)?;
-
-        let context = process::create_thread(env, reply.tid, start, param, stack_reserve)
-            .map_err(|error| Error::Unsupported(format!("thread stack: {error}")))?;
-        let teb = env.sys.contexts[context as usize].teb;
-        if server::init_thread(env, new, context, reply.tid, teb, start)? {
-            process::signals::queue(env, context);
+        let mut context = None;
+        let initialized = (|| {
+            let id = process::create_thread(env, reply.tid, start, param, stack_reserve)?;
+            context = Some(id);
+            let teb = env.sys.contexts[id as usize].teb;
+            let suspended = server::init_thread(env, new, id, reply.tid, teb, start)?;
+            if attribute_list != 0 {
+                update_attribute_list(env, attribute_list, reply.tid, teb)?;
+            }
+            write_u32(env, handle, reply.handle)?;
+            if suspended {
+                process::signals::queue(env, id);
+            }
+            Ok(())
+        })();
+        if initialized.is_err() {
+            if let Some(id) = context {
+                server::end_thread(env, id);
+                env.sys
+                    .terminate_context_stopped(id, status::ACCESS_VIOLATION);
+            }
+            server::close(env, reply.handle)?;
         }
-        if attribute_list != 0 {
-            update_attribute_list(env, attribute_list, reply.tid, teb)?;
-        }
-        Ok(())
+        initialized
     })())
 }
 
