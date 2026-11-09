@@ -428,6 +428,8 @@ Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messa
 **Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. They MUST cover every format, filter and overlap the function accepts. Changed helper code or copy imports MUST leave the function unbound.
 **Verification**: Test
 
+D3DX checks an admitted CRT entry against the exact relocated bytes saved at binding. It watches those bytes and the import slots together.
+
 ### NAT-BODY-9 PNG row bodies
 
 **Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata for every pixel depth and row overlap. Every host MUST provide each filter, scalar where no device kernel exists. Row metadata offsets MUST match the pinned module's DWARF.

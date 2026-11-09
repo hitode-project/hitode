@@ -147,6 +147,7 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 ### GFX-REC-10 Detached render-target readback
 
 **Rule**: GetRenderTargetData into a plain system-memory surface MUST queue its copy in submission order and return before completion. LockRect, GetDC, surface export and another readback into that surface MUST wait for the copy first. Texture-level destinations and a busy readback lane MUST keep the blocking path.
+Blocking readbacks MUST preserve the source pixels before another guest context can write them.
 **Verification**: Test
 
 ### GFX-REC-11 Differential frame recording

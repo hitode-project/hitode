@@ -35,6 +35,61 @@ fn pending(rectangle: Rect, flags: u32) -> Lock {
     }
 }
 
+// spec: GFX-REC-10
+#[test]
+fn blocked_readback_keeps_pixels_from_before_a_later_write() {
+    for busy in [false, true] {
+        let mut f = super::super::stretch::tests::Fixture::new();
+        f.m.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
+        let src = f.render_target(4, 3, 21);
+        let source = {
+            let env = env(&mut f.m);
+            let surface = resources::resource(&env, src).unwrap().surface.unwrap();
+            (env.ext.get::<State>().provider.target)(env.ext, surface).unwrap()
+        };
+        let output = f.packet(0u32);
+        let dst = if busy {
+            f.okay(
+                "IDirect3DDevice9::CreateOffscreenPlainSurface",
+                &[f.device, 4, 3, 21, 2, output, 0],
+            );
+            f.m.cpu.read_u32(output).unwrap()
+        } else {
+            f.okay(
+                "IDirect3DDevice9::CreateTexture",
+                &[f.device, 4, 3, 1, 0, 21, 2, output, 0],
+            );
+            let texture = f.m.cpu.read_u32(output).unwrap();
+            f.okay("IDirect3DTexture9::GetSurfaceLevel", &[texture, 0, output]);
+            f.m.cpu.read_u32(output).unwrap()
+        };
+        let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+        gpu.clear(&source, Some([1., 0., 0., 1.]), None).unwrap();
+        let pause = busy.then(|| adv_device::gpu::test_support::pause_submissions(gpu).unwrap());
+        let outcome = f.call(
+            "IDirect3DDevice9::GetRenderTargetData",
+            &[f.device, src, dst],
+        );
+        assert!(matches!(outcome, Outcome::Block { .. }));
+        drop(pause);
+        // Another guest context can submit a write before the first wait is serviced.
+        let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+        gpu.clear(&source, Some([0., 1., 0., 1.]), None).unwrap();
+        gpu.flush().unwrap();
+        assert_eq!(f.finish(outcome), 0);
+        let locked = f.lock(dst, 0, 0x10);
+        assert_eq!(
+            f.m.cpu.read_u32(locked.pBits).unwrap(),
+            0xffff0000,
+            "busy={busy}"
+        );
+        f.okay("IDirect3DSurface9::UnlockRect", &[dst]);
+    }
+}
+
 // spec: GFX-COPY-1, GFX-COPY-2
 #[test]
 fn standalone_render_target_locks_read_gpu_pixels_and_upload_writes() {

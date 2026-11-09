@@ -1702,6 +1702,7 @@ mod tests {
             .insert("IDirect3DTexture9", 0);
         let gpu = Gpu::request(!cfg!(any(target_os = "macos", target_os = "android"))).unwrap();
         m.ext.insert(TestTarget(gpu.target(4, 2, false).unwrap()));
+        m.ext.get_mut::<State>().gpu = Some(gpu);
         m.ext.get_mut::<State>().provider.target =
             |ext, id| (id == 7).then(|| ext.get::<TestTarget>().0.clone());
         let wake = adv_sync::WakeEvent::new().unwrap();
