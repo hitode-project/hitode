@@ -126,7 +126,38 @@ fn enter_dispatcher(
         return Outcome::Fail("no exception dispatcher".into());
     };
 
-    let stack = (checkpoint.state.regs[4] - LAYOUT_SIZE - tail.len() as u32) & !63;
+    let sp = checkpoint.state.regs[4];
+    let Some(stack) = sp
+        .checked_sub(LAYOUT_SIZE + tail.len() as u32)
+        .map(|sp| sp & !63)
+    else {
+        return Outcome::Fail(format!(
+            "exception {:#010x}: invalid stack pointer {sp:#010x}",
+            record.code
+        ));
+    };
+    // NT-SYS-6: Like Wine's last stack page, this guard cannot grow.
+    // Do not dispatch another exception on the same exhausted stack.
+    let thread = &env.sys.contexts[env.context as usize];
+    if (thread.stack_lo - adv_machine::layout::PAGE..=thread.stack_hi).contains(&sp)
+        && stack < thread.stack_lo
+    {
+        env.ext.insert(Record {
+            code: crate::status::STACK_OVERFLOW,
+            flags: 0,
+            nested: 0,
+            address: record.address,
+            count: 0,
+            information: [0; 15],
+        });
+        env.ext.insert(checkpoint);
+        return Outcome::Fail(format!(
+            "exception stack overflow while delivering {:#010x} at {:#010x}, parameters {:x?}",
+            record.code,
+            record.address,
+            &record.information[..record.count]
+        ));
+    }
     let mut frame = vec![0u8; LAYOUT_SIZE as usize + tail.len()];
     let mut put = |offset: u32, value: u32| {
         let offset = offset as usize;
@@ -145,7 +176,10 @@ fn enter_dispatcher(
     put_context(env, &mut frame, CONTEXT as usize, &checkpoint.state);
     frame[LAYOUT_SIZE as usize..].copy_from_slice(tail);
     if let Err(error) = env.cpu.write(stack, &frame) {
-        return Outcome::Fail(format!("exception frame: {error}"));
+        return Outcome::Fail(format!(
+            "exception {:#010x} at {:#010x}: could not write frame: {error}",
+            record.code, record.address
+        ));
     }
     debug_assert_eq!(env.cpu.read_u32(stack).ok(), Some(stack + RECORD));
 

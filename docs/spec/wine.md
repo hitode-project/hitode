@@ -283,6 +283,12 @@ are ignored. The supported fields restore without changing the current reserved 
 **Rule**: Fixed system stubs MUST retain Wine 11.0 statuses and output writes. Syscall-table stubs MUST raise Wine's noncontinuable stub exception. Unsupported LDT updates MUST return `STATUS_NOT_IMPLEMENTED`.
 **Verification**: Review — the implementations are compared with Wine's Unix sources and syscall stub table.
 
+### NT-SYS-6 Exception stack exhaustion
+
+**Rule**: Exception delivery MUST stop with a terminal guest stack overflow when its frame would cross the guard at the bottom of the thread stack. The failure MUST identify the exception that required the frame.
+**Verification**: Review — the frame boundary is checked before any guest stack write.
+**Basis**: Wine 11.0 `virtual_setup_exception` aborts when the exception frame reaches the last stack page.
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries
