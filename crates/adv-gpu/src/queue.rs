@@ -151,8 +151,8 @@ impl Queue {
     pub fn wait(&mut self, token: Token, timeout: Duration) -> Result<bool> {
         self.inner.wait(token, timeout)
     }
-    /// Run `callback` on a backend thread once `token` completes. Used to wake
-    /// waiters without polling: frame release, readback delivery.
+    /// Run `callback` once `token` completes. An already retired token may
+    /// run it inline; device loss drops callbacks for unfinished work.
     pub fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
         self.inner.on_complete(token, callback)
     }

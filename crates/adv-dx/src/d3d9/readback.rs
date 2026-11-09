@@ -271,7 +271,7 @@ pub(super) fn lock_internal(
         Err(error) => return Outcome::Return(error),
     };
     set_lock(env, id, Some(selected));
-    enqueue(
+    start(
         env,
         PendingTransfer {
             context: env.context,
@@ -288,6 +288,7 @@ pub(super) fn lock_internal(
             lock_output: Some(output),
             detached: false,
         },
+        false,
     )
 }
 
@@ -547,7 +548,7 @@ fn read_target(
         Ok(event) => event,
         Err(error) => return Outcome::Return(error),
     };
-    let mut transfer = PendingTransfer {
+    let transfer = PendingTransfer {
         context: env.context,
         event,
         owner,
@@ -562,18 +563,7 @@ fn read_target(
         lock_output: None,
         detached: false,
     };
-    if detach {
-        // The copy is queued now, in submission order with the guest's draws,
-        // so returning early never lets a later frame reach these pixels.
-        if advance(env, &mut transfer) {
-            env.sys.set_event(event);
-        } else if transfer.ticket.is_some() {
-            transfer.detached = true;
-            env.ext.get_mut::<State>().transfers.push(transfer);
-            return Outcome::Return(0);
-        }
-    }
-    enqueue(env, transfer)
+    start(env, transfer, detach)
 }
 /// Wait for a detached readback into `pointer`'s resource, then retry.
 pub(super) fn settle(
@@ -628,7 +618,24 @@ fn retain_transfer(env: &mut Env<'_>, owner: Id, destination: Id) -> Result<u32,
     }
     Ok(event)
 }
-fn enqueue(env: &mut Env<'_>, transfer: PendingTransfer) -> Outcome {
+fn start(env: &mut Env<'_>, mut transfer: PendingTransfer, detach: bool) -> Outcome {
+    // Even a blocking call orders its copy before another guest thread runs.
+    if advance(env, &mut transfer) {
+        env.sys.set_event(transfer.event);
+    } else if transfer.ticket.is_none() {
+        let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
+        match gpu.snapshot_readback_source(&transfer.image) {
+            Ok(image) => transfer.image = image,
+            Err(_) => {
+                transfer.result = Some(DEVICE_LOST);
+                env.sys.set_event(transfer.event);
+            }
+        }
+    } else if detach {
+        transfer.detached = true;
+        env.ext.get_mut::<State>().transfers.push(transfer);
+        return Outcome::Return(0);
+    }
     let event = transfer.event;
     env.ext.get_mut::<State>().transfers.push(transfer);
     Outcome::block(
