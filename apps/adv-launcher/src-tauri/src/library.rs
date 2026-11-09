@@ -62,7 +62,7 @@ pub struct Library {
     version: u32,
     #[serde(default = "tracking_default")]
     track_play_time: bool,
-    games: Vec<LibraryGame>,
+    pub(crate) games: Vec<LibraryGame>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -107,7 +107,7 @@ impl Library {
         }
         Ok(lib)
     }
-    fn save(&self) -> io::Result<()> {
+    pub(crate) fn save(&self) -> io::Result<()> {
         fs::create_dir_all(self.path.parent().unwrap())?;
         let mut value = serde_json::to_value(self)?;
         for game in value["games"].as_array_mut().unwrap() {
@@ -308,7 +308,8 @@ fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
             if found.len() == 500 {
                 break;
             }
-        } else if level < depth {
+        }
+        if level < depth {
             for entry in fs::read_dir(folder)?.flatten() {
                 let visible = !entry.file_name().to_string_lossy().starts_with('.');
                 if entry.file_type().is_ok_and(|t| t.is_dir()) && visible {
@@ -362,11 +363,10 @@ fn mobile_reveal_is_unsupported() {
     );
 }
 
-/// Android opens shared-storage folders in the system Files app; a game
-/// copied into private storage has no folder another app can show.
+/// Opens shared storage in Files. Managed copies use reveal_game_files.
 #[tauri::command]
 #[cfg(target_os = "android")]
-pub fn reveal_path(app: AppHandle, path: PathBuf) -> Reply<()> {
+pub async fn reveal_path(app: AppHandle, path: PathBuf) -> Reply<()> {
     let folder = if path.is_dir() {
         path.as_path()
     } else {
@@ -375,7 +375,7 @@ pub fn reveal_path(app: AppHandle, path: PathBuf) -> Reply<()> {
     if !folder.is_dir() {
         return Err("path does not exist".into());
     }
-    crate::android::reveal_folder(&app, folder)
+    crate::android::reveal_folder(&app, folder).await
 }
 
 #[tauri::command]
@@ -800,6 +800,27 @@ mod tests {
         fs::remove_file(dir.join("game_chs.EXE")).unwrap();
         assert!(inspect(&lib.known(), &dir).unwrap().suggested.is_none());
         assert!(scan(&lib.known(), dir.clone(), 1).unwrap()[0].setup);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-2
+    #[test]
+    fn scan_finds_nested_games_below_folders_with_executables() {
+        let (dir, lib) = fixture("nested-games");
+        pe(&dir, "Setup.exe", 0x14c, 300);
+        for folder in ["game", "game/another", ".hidden"] {
+            fs::create_dir(dir.join(folder)).unwrap();
+            pe(&dir.join(folder), "play.exe", 0x14c, 100);
+        }
+        for (depth, expected) in [(1, vec!["", "game"]), (2, vec!["", "game", "game/another"])] {
+            let found = scan(&lib.known(), dir.clone(), depth).unwrap();
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|row| row.relative.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
     // spec: HOST-LIB-1, HOST-LIB-3

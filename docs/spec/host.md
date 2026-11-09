@@ -245,6 +245,8 @@ Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFr
 **Applies to**: Launcher, desktop and Android
 **Verification**: Test
 
+A scan MUST visit visible subdirectories up to the selected depth, even if an ancestor has executable candidates.
+
 ### HOST-LIB-3 Launch and play sessions
 
 **Rule**: `start_game` MUST resolve the id's executable, code page and independent `<app_data_dir>/games/<id>` directory. Completion MUST update `lastPlayed` and persist nullable `lastRun` with end time, summary and any error. The library MUST be saved before emitting `game_finished`, whose exit and error payloads MUST include `gameId`.
@@ -267,6 +269,18 @@ Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFr
 
 **Rule**: With playtime tracking enabled, completion MUST accumulate `playSeconds`, retain 30-day sessions and split `daily` at local midnights. Disabled tracking MUST preserve existing statistics without adding sessions, duration or daily totals. Tracking preferences MUST persist across launcher restarts.
 **Applies to**: Launcher, macOS
+**Verification**: Test
+
+### HOST-LIB-7 Managed game copies
+
+**Rule**: Game storage MUST enumerate complete copies below `<app_data_dir>/imports`. Deleting a copy MUST retain library entries and separate save data. Export MUST retain the source, and relinking MUST validate every affected executable before updating the library.
+**Applies to**: Launcher
+**Verification**: Test
+
+### HOST-LIB-8 Cache clearing
+
+**Rule**: Clearing the launcher cache MUST remove only the per-game graphics cache directories. It MUST NOT follow symbolic links or modify game files, saves, or library records.
+**Applies to**: Launcher
 **Verification**: Test
 
 ### HOST-RUN-1 Presentation controls

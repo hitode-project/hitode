@@ -26,6 +26,17 @@
           <div class="track" role="progressbar" aria-label={t("正在启动")} style="margin-top: 32px"><span class="fill"></span></div>
           <div style="margin-top: 36px"><button class="btn quiet" onclick={() => flow.cancel()}>{t("取消")}</button></div>
         </div>
+      {:else if flow.recovery}
+        <div class="state">
+          <div class="msg">{flow.reason}</div>
+          <div class="acts">
+            <button class="btn primary" disabled={flow.recovering} onclick={() => flow.recoverFolder()}>
+              {t(flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
+            </button>
+            <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
+            <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+          </div>
+        </div>
       {:else if flow.view === "failed"}
         <div class="state fade">
           <div class="msg">{t("游戏已停止")}</div>

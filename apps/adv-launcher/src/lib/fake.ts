@@ -4,10 +4,13 @@ import type { Game } from "./types";
 // Fake library for the browser preview (`pnpm dev`); in the app the library
 // comes from the Rust side.
 
+export const PREVIEW_IMPORTS = "~/Hitode/imports";
 const DAY = 86_400_000;
 const now = Date.now();
 
 interface Seed {
+  title?: string;
+  path?: string;
   cover: string;
   engine: string;
   /** Days since last played; null if never started. */
@@ -20,12 +23,12 @@ interface Seed {
   root?: string;
 }
 
-// Neutral sample entries: numbered titles, no brands, plain covers.
+// Neutral sample entries with plain covers.
 const seeds: Seed[] = [
-  { cover: "cv1", engine: "KiriKiri 2", last: 1, hours: 12.5, sessions: 9, favorite: true },
-  { cover: "cv2", engine: "NScripter", last: 3, hours: 31, sessions: 22, favorite: true },
-  { cover: "cv3", engine: "SoftPAL", last: 7, hours: 8, sessions: 6 },
-  { cover: "cv4", engine: "KiriKiri 2", last: 14, hours: 46, sessions: 31, favorite: true },
+  { cover: "cv1", engine: "KiriKiri 2", last: 1, hours: 12.5, sessions: 9, favorite: true, path: `${PREVIEW_IMPORTS}/star-island/main` },
+  { cover: "cv2", engine: "NScripter", last: 3, hours: 31, sessions: 22, favorite: true, path: `${PREVIEW_IMPORTS}/star-island/after-story` },
+  { cover: "cv3", engine: "SoftPAL", last: 7, hours: 8, sessions: 6, title: "Rainy Bookshop", path: `${PREVIEW_IMPORTS}/rainy-bookshop` },
+  { cover: "cv4", engine: "KiriKiri 2", last: 14, hours: 46, sessions: 31, favorite: true, title: "Tide Letters", path: "~/Games/tide-letters" },
   { cover: "cv5", engine: "CatSystem2", last: 30, hours: 3, sessions: 2 },
   { cover: "cv6", engine: "Yu-RIS", last: null, hours: 0, nsfw: true },
   { cover: "cv7", engine: "SoftPAL", last: null, hours: 0 },
@@ -64,7 +67,7 @@ function fakeGame(s: Seed, i: number): Game {
   const days = daily(i, s.last);
   // The total covers at least the last 30 days.
   const recent = days.reduce((sum, minutes) => sum + minutes, 0);
-  const title = sampleTitle(i + 1);
+  const title = s.title ?? sampleTitle(i + 1);
   return {
     id: `g${i + 1}`,
     title,
@@ -73,7 +76,7 @@ function fakeGame(s: Seed, i: number): Game {
     cover: s.cover,
     engine: s.engine,
     codepage: 932,
-    path: `${s.root ?? "~/Games"}/${title}`,
+    path: s.path ?? `${s.root ?? "~/Games"}/${title}`,
     exe: "Game.exe",
     lastPlayed: s.last === null ? null : now - s.last * DAY,
     playMinutes: Math.max(Math.round(s.hours * 60), recent),

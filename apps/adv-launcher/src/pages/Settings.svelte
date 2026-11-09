@@ -1,6 +1,8 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
+  import GameStorageSetting from "../components/GameStorageSetting.svelte";
+  import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
   import { preview } from "../lib/bridge";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
@@ -143,9 +145,12 @@
           <button class="quiet" style="margin-left: -12px" onclick={() => nav.go({ name: "scan" })}>{t("添加文件夹…")}</button>
         </div>
       </section>
+    {/if}
 
-      <section class="sec" aria-labelledby="g-store">
-        <h2 id="g-store">{t("存储")}</h2>
+    <section class="sec" aria-labelledby="g-store">
+      <h2 id="g-store">{t("存储")}</h2>
+      <GameStorageSetting />
+      {#if preview}
         <div class="store">
           <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
             <span class="total">{general.totalLabel}</span>
@@ -160,15 +165,9 @@
             <span class="key"><i class="cache"></i>{t("缓存")} {general.cacheLabel}</span>
           </div>
         </div>
-        <div class="row">
-          <span class="t">{t("缓存")}</span>
-          <span class="val">{general.cacheLabel}</span>
-          <button class="quiet" onclick={() => general.clearCache()} disabled={general.cache !== "full"}>
-            {general.clearLabel}
-          </button>
-        </div>
-      </section>
-    {/if}
+      {/if}
+      <ClearCacheSetting />
+    </section>
 
     <section class="sec" aria-labelledby="g-fb">
       <h2 id="g-fb">{t("反馈与隐私")}</h2>
@@ -288,12 +287,6 @@
     font-size: 12px;
     color: var(--fg3);
   }
-  .val {
-    font-size: 13px;
-    color: var(--fg3);
-    font-variant-numeric: tabular-nums;
-  }
-
   /* The board's quiet button: a taller pill than the shared one. */
   .quiet {
     box-sizing: border-box;

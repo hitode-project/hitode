@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -16,6 +17,7 @@ import android.view.View
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.OnBackPressedCallback
 import androidx.annotation.Keep
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -24,6 +26,9 @@ import androidx.core.view.WindowInsetsControllerCompat
 @Keep
 class MainActivity : TauriActivity() {
     private var container: GameContainer? = null
+    private val launcherBack = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() = nativeBack()
+    }
     private var gameMode = false
     private var resumed = false
     private var previousOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -55,6 +60,28 @@ class MainActivity : TauriActivity() {
         container = GameContainer(this, webView)
     }
 
+    fun setLauncherBack(enabled: Boolean) {
+        if (launcherBack.isEnabled == enabled) return
+        launcherBack.isEnabled = enabled
+        if (enabled) onBackPressedDispatcher.addCallback(this, launcherBack)
+        else launcherBack.remove()
+    }
+
+    fun openIssueInBrowser(url: String): Boolean {
+        // Resolve against generic HTTPS handlers, but deliver the original URL.
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+            selector = Intent(Intent.ACTION_VIEW, Uri.parse("https:"))
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+        }
+        return try {
+            startActivity(intent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        }
+    }
+
     // Wry calls setContentView(webView) after onWebViewCreate. Install the
     // wrapper here so it never reparents a webview already in GameContainer.
     override fun setContentView(view: View?) {
@@ -65,6 +92,7 @@ class MainActivity : TauriActivity() {
     fun setGameMode(active: Boolean) {
         if (gameMode == active) return
         gameMode = active
+        DriveProvider.gameRunning = active
         if (active) {
             previousOrientation = requestedOrientation
             previousKeepScreenOn = window.attributes.flags and
@@ -80,15 +108,18 @@ class MainActivity : TauriActivity() {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
         }
-        applyImmersiveMode()
+        applyGameBars()
     }
 
-    private fun applyImmersiveMode() {
+    private fun applyGameBars() {
         val bars = WindowCompat.getInsetsController(window, window.decorView)
         bars.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        if (gameMode) bars.hide(WindowInsetsCompat.Type.systemBars())
-        else bars.show(WindowInsetsCompat.Type.systemBars())
+        if (gameMode) {
+            // Keep Android Back, Home and Overview available during play.
+            bars.hide(WindowInsetsCompat.Type.statusBars())
+            bars.show(WindowInsetsCompat.Type.navigationBars())
+        } else bars.show(WindowInsetsCompat.Type.systemBars())
     }
 
     private fun requestAudioFocus() {
@@ -124,7 +155,7 @@ class MainActivity : TauriActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && gameMode) applyImmersiveMode()
+        if (hasFocus && gameMode) applyGameBars()
     }
 
     override fun onDestroy() {
@@ -148,6 +179,15 @@ class MainActivity : TauriActivity() {
             "com.android.externalstorage.documents",
             "primary:$relative"
         )
+        return revealDirectory(uri)
+    }
+
+    fun revealImport(relative: String): Boolean {
+        val uri = DocumentsContract.buildDocumentUri(DriveProvider.AUTHORITY, "${DriveProvider.GAMES}/$relative")
+        return revealDirectory(uri)
+    }
+
+    private fun revealDirectory(uri: android.net.Uri): Boolean {
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
@@ -192,6 +232,7 @@ class MainActivity : TauriActivity() {
     external fun nativeRouteTouch(xCss: Float, yCss: Float): Boolean
     external fun nativeTouch(pointer: Int, action: Int, x: Float, y: Float)
     external fun nativePause()
+    external fun nativeBack()
     external fun nativeResume()
     external fun nativeAudioFocus(active: Boolean)
     external fun nativeTrimMemory()

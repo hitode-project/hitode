@@ -131,6 +131,31 @@ pub fn save_report<R: Runtime>(app: AppHandle<R>, report: Report) -> Result<Path
     unreachable!()
 }
 
+#[cfg(mobile)]
+#[tauri::command]
+pub async fn share_report(app: AppHandle, path: PathBuf) -> Result<(), String> {
+    use tauri_plugin_storage::StorageExt;
+
+    let directory = app.path().download_dir().map_err(|e| e.to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if path.parent() != Some(directory.as_path())
+        || !name.starts_with("adv-report-")
+        || !name.ends_with(".json")
+    {
+        return Err("Invalid saved report path".into());
+    }
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return Err("Saved report is unavailable".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let report: Report = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    report.validate()?;
+    app.storage().share_file(&path).await
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

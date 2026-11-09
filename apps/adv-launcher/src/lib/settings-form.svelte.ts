@@ -49,7 +49,6 @@ class GeneralSettings {
   readonly totalGb = $derived(SAVES_GB + this.cacheGb);
   readonly totalLabel = $derived(gb(this.totalGb));
   readonly cacheLabel = $derived(this.cache === "cleared" ? "0 MB" : gb(CACHE_GB));
-  readonly clearLabel = $derived(this.cache === "cleared" ? t("已清除") : this.cache === "clearing" ? t("正在清除…") : t("清除"));
   /** Widths of the saves and cache segments of the usage bar, in percent. */
   readonly savesPct = $derived(Math.max(2, (SAVES_GB / this.totalGb) * 100));
   readonly cachePct = $derived((this.cacheGb / this.totalGb) * 100);

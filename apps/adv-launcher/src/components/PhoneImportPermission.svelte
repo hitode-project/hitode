@@ -155,7 +155,7 @@
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"></rect><path d="M12 7.5v7M9 11.5l3 3 3-3"></path></svg>
         </div>
         <h2 id="perm-t" class="ttl">{t("复制到本机")}</h2>
-        <p class="line">{error || `${t("复制后可离线游玩，占用")} ${copySize}`}</p>
+        <p class="line">{error || `${t("副本预计额外占用")} ${copySize}`}</p>
         <div class="acts">
           <button class="primary" onclick={() => selectFolder(true)} disabled={busy}>
             <Icon name="folder" size={17} stroke={1.5} />

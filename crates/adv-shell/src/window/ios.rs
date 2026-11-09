@@ -10,7 +10,7 @@ use crate::mobile::{Insets, Layout, Occlusion, Rect};
 use crate::overlay::{Router, Target};
 use objc2::Message;
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyObject, NSObject};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
@@ -18,7 +18,9 @@ use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_ui_kit::UIViewAutoresizing;
 use objc2_ui_kit::{
-    UIColor, UIEvent, UIPress, UIPressesEvent, UIResponder, UITouch, UITouchPhase, UIView,
+    UIColor, UIEvent, UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState,
+    UIPress, UIPressesEvent, UIRectEdge, UIResponder, UIScreenEdgePanGestureRecognizer, UITouch,
+    UITouchPhase, UIView,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Weak;
@@ -380,6 +382,9 @@ pub struct ContainerState {
     router: Arc<Mutex<Router>>,
     webview: Retained<UIView>,
     game: RefCell<Option<Retained<HostView>>>,
+    edge_swipes: [Retained<UIScreenEdgePanGestureRecognizer>; 2],
+    launcher_back: Cell<bool>,
+    on_edge_swipe: Box<dyn Fn()>,
 }
 
 define_class!(
@@ -391,7 +396,25 @@ define_class!(
     #[ivars = ContainerState]
     pub struct GameContainer;
     unsafe impl NSObjectProtocol for GameContainer {}
+    unsafe impl UIGestureRecognizerDelegate for GameContainer {
+        #[unsafe(method(gestureRecognizer:shouldReceiveTouch:))]
+        fn gesture_recognizer_should_receive_touch(
+            &self,
+            _: &UIGestureRecognizer,
+            touch: &UITouch,
+        ) -> bool {
+            // Leave the home indicator and the app-switching strip to UIKit.
+            touch.locationInView(Some(self)).y
+                < self.bounds().size.height - self.safeAreaInsets().bottom
+        }
+    }
     impl GameContainer {
+        #[unsafe(method(edgeSwipe:))]
+        fn edge_swipe(&self, gesture: &UIScreenEdgePanGestureRecognizer) {
+            if gesture.state() == UIGestureRecognizerState::Ended {
+                (self.ivars().on_edge_swipe)();
+            }
+        }
         #[unsafe(method(layoutSubviews))]
         fn layout_subviews(&self) {
             unsafe { let _: () = msg_send![super(self), layoutSubviews]; }
@@ -420,13 +443,27 @@ define_class!(
 
 impl GameContainer {
     /// Moves the host's webview into a full-size container in its place.
-    pub fn new(webview: &UIView, router: Arc<Mutex<Router>>) -> Result<Retained<Self>, String> {
+    pub fn new(
+        webview: &UIView,
+        router: Arc<Mutex<Router>>,
+        on_edge_swipe: impl Fn() + 'static,
+    ) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the container must run on the main thread")?;
         let parent = webview.superview().ok_or("the webview has no parent")?;
         let this = Self::alloc(mtm).set_ivars(ContainerState {
             router,
             webview: webview.retain(),
             game: RefCell::new(None),
+            edge_swipes: [UIRectEdge::Left, UIRectEdge::Right].map(|edge| {
+                let swipe = UIScreenEdgePanGestureRecognizer::new(mtm);
+                swipe.setEdges(edge);
+                swipe.setEnabled(false);
+                // Recognized swipes never begin a mouse gesture or a WebView tap.
+                swipe.setDelaysTouchesBegan(true);
+                swipe
+            }),
+            launcher_back: Cell::new(false),
+            on_edge_swipe: Box::new(on_edge_swipe),
         });
         let view: Retained<Self> =
             unsafe { msg_send![super(this), initWithFrame: parent.bounds()] };
@@ -440,6 +477,14 @@ impl GameContainer {
         webview.setAutoresizingMask(mask);
         webview.setOpaque(false);
         webview.setBackgroundColor(Some(&UIColor::clearColor()));
+        for swipe in &view.ivars().edge_swipes {
+            // SAFETY: GameContainer implements this selector with the recognizer argument.
+            unsafe {
+                swipe.addTarget_action(&view, sel!(edgeSwipe:));
+            }
+            swipe.setDelegate(Some(ProtocolObject::from_ref(&*view)));
+            view.addGestureRecognizer(swipe);
+        }
         Ok(view)
     }
 
@@ -450,13 +495,27 @@ impl GameContainer {
         self.ivars().webview.setHidden(game && !visible);
     }
 
+    /// Outside play, only the leading edge goes back, and only with a destination.
+    pub fn set_launcher_back(&self, enabled: bool) {
+        self.ivars().launcher_back.set(enabled);
+        self.update_edge_swipes(self.ivars().game.borrow().is_some());
+    }
+
+    fn update_edge_swipes(&self, playing: bool) {
+        let [left, right] = &self.ivars().edge_swipes;
+        left.setEnabled(playing || self.ivars().launcher_back.get());
+        right.setEnabled(playing);
+    }
+
     /// Mounts the game view below the webview, or removes the finished one.
     pub fn set_game(&self, game: Option<&GameView>) {
         if let Some(old) = self.ivars().game.borrow_mut().take() {
             old.removeFromSuperview();
         }
         self.ivars().webview.setHidden(false);
-        let Some(host) = game.and_then(|game| game.host.borrow().clone()) else {
+        let host = game.and_then(|game| game.host.borrow().clone());
+        self.update_edge_swipes(host.is_some());
+        let Some(host) = host else {
             return;
         };
         self.insertSubview_belowSubview(&host, &self.ivars().webview);

@@ -1,15 +1,18 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import VndbLink from "../components/VndbLink.svelte";
+  import AddGameButton from "../components/AddGameButton.svelte";
   import { t } from "../lib/i18n.svelte";
   import Cover from "../components/Cover.svelte";
   import EmptyLibrary from "../components/EmptyLibrary.svelte";
   import Icon from "../components/Icon.svelte";
   import ManageMenu from "../components/ManageMenu.svelte";
+  import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import Vndb from "../components/Vndb.svelte";
   import EditTitle from "../components/EditTitle.svelte";
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
+  import { longPress } from "../lib/long-press";
   import { nav } from "../lib/nav.svelte";
   import { device } from "../lib/device.svelte";
   import { canReveal, reveal } from "../lib/reveal";
@@ -40,6 +43,8 @@
   /** The "更多操作" menu or a dialog it opens. */
   let popup = $state<"none" | "menu" | "vndb" | "rename">("none");
   let moreButton = $state<HTMLButtonElement | null>(null);
+  let manageId = $state<string | null>(null);
+  const managed = $derived(manageId ? library.get(manageId) : undefined);
 
   const items = $derived.by(() => {
     const list = library.filtered(filter, query);
@@ -86,8 +91,9 @@
   }
 
   // The back gesture (Android) closes the menu or dialog, then the detail sheet.
+  const canDismissLibrary = $derived(popup !== "none" || sheet);
   $effect(() => {
-    if (popup === "none" && !sheet) return;
+    if (!canDismissLibrary) return;
     return nav.onBack(() => {
       if (popup !== "none") popup = "none";
       else sheet = false;
@@ -134,9 +140,7 @@
         {/each}
       </select>
     </label>
-    <button class="icon-btn" aria-label={t("添加游戏")} onclick={() => nav.go({ name: "import" })}>
-      <Icon name="plus" stroke={1.5} />
-    </button>
+    <AddGameButton />
   </header>
 
   <div class="body">
@@ -151,6 +155,7 @@
             class:on={current?.id === game.id}
             class:gone={game.offline !== null}
             onclick={() => pick(game)}
+            use:longPress={device.touch ? () => (manageId = game.id) : null}
             ondblclick={() => game.offline === null && nav.go({ name: "launch", gameId: game.id })}
             aria-label={game.offline
               ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
@@ -288,7 +293,12 @@
   </div>
 {/if}
 
+{#if managed}
+  <PhoneManageSheet game={managed} returnTo={selectedId} onclose={() => (manageId = null)} onremoved={() => (manageId = null)} />
+{/if}
+
 <style>
+  :global([data-touch]) .card { -webkit-touch-callout: none; user-select: none; }
   header {
     flex: 0 0 auto;
     display: flex;

@@ -114,9 +114,17 @@ Symptoms are `no_start`, `freeze`, `crash`, `stutter`, `graphics`, `sound_video`
 
 ### REPORT-SAVE-2 Issue delivery
 
-**Rule**: Opening an issue MUST prefill its fields and `report` textarea from the validated report. If the encoded URL exceeds 8000 characters, the launcher MUST omit `report` and save the JSON under REPORT-SAVE-1. The button label MUST remain the same for both cases.
+**Rule**: Opening an issue MUST prefill its title and body from the validated report, including the symptoms and any included note. If the encoded URL exceeds 8000 characters, the launcher MUST save the full JSON under REPORT-SAVE-1 and keep the draft within the limit. The button label MUST remain the same for both cases.
 **Verification**: Test
 
-The issue template is `game-issue.yml`. Short URLs include the report JSON in `report=`. For longer URLs, the player attaches the saved file.
+The launcher opens an editable issue draft through GitHub's `title` and `body` URL parameters. Short drafts include the JSON in the body. For longer drafts, the player attaches the saved file. The manual issue form is `game-issue.yml`.
+
+On Android and iOS, the launcher MUST open the issue URL in a browser rather than handing it to the GitHub app.
+
+### REPORT-SAVE-3 Mobile sharing
+
+**Rule**: The launcher MUST let the user open the system share sheet for a saved report. Only a validated report file in the download directory MUST be passed to the sheet.
+**Applies to**: Android, iOS
+**Verification**: Review — the platform share sheet requires the mobile app.
 
 Withdrawn: none

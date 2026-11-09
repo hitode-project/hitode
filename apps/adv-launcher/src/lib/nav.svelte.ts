@@ -1,4 +1,6 @@
-import { flushSync } from "svelte";
+import { flushSync, tick } from "svelte";
+import { inTauri } from "./bridge";
+import { device } from "./device.svelte";
 import type { LibraryFilter } from "./types";
 
 /** Every screen of the launcher; the game screen hosts the in-game overlay. */
@@ -9,6 +11,8 @@ export type Route =
   | { name: "scan" }
   | { name: "install" }
   | { name: "settings" }
+  | { name: "game-storage" }
+  | { name: "game-files"; gameId: string }
   | { name: "game-settings"; gameId: string }
   | { name: "report"; gameId: string }
   | { name: "launch"; gameId: string }
@@ -16,8 +20,8 @@ export type Route =
 
 const HOME: Route = { name: "library", filter: "all" };
 const FILTERS = ["all", "recent", "favorite", "unstarted"];
-const PLAIN = ["stats", "import", "scan", "settings"];
-const PER_GAME = ["game-settings", "report", "launch", "game"];
+const PLAIN = ["stats", "import", "scan", "settings", "game-storage"];
+const PER_GAME = ["game-settings", "game-files", "report", "launch", "game"];
 
 /** The screen a location hash names: `#/settings`, `#/library/recent`, `#/launch/g1`. */
 export function parseHash(hash: string): Route {
@@ -41,10 +45,8 @@ type Motion = "forward" | "back" | "fade";
  * mirrors the current screen so any screen can be opened directly while
  * developing; the back stack lives here, not in browser history.
  *
- * The system back gesture (Android back, a browser's back button) arrives as
- * `popstate`. While there is somewhere to go back to, or a screen registered
- * with `onBack`, one guard entry sits on top of the browser history so the
- * gesture is caught here instead of leaving the page.
+ * Mobile hosts send Back directly. Browser Back arrives as `popstate`; a
+ * guard entry catches it while the launcher has a route or layer to dismiss.
  *
  * Screen changes animate through the View Transitions API, styled per
  * platform in app.css. The game screen changes at once: it is transparent
@@ -52,6 +54,7 @@ type Motion = "forward" | "back" | "fade";
  */
 class Navigator {
   route = $state<Route>(typeof location === "undefined" ? HOME : parseHash(location.hash));
+  canGoBack = $state(false);
   #history: Route[] = [];
   #handlers: (() => boolean)[] = [];
   #guarded = false;
@@ -80,6 +83,16 @@ class Navigator {
   back(): void {
     this.#show(this.#history.pop() ?? HOME, "back");
     this.#sync();
+  }
+
+  /** User Back dismisses the top layer before leaving a screen. */
+  requestBack(): boolean {
+    for (let i = this.#handlers.length - 1; i >= 0; i--) {
+      if (this.#handlers[i]?.()) return true;
+    }
+    if (!this.#history.length) return false;
+    this.back();
+    return true;
   }
 
   /** Returns to the library and drops the back stack. */
@@ -122,15 +135,20 @@ class Navigator {
   }
 
   #sync(): void {
-    if (typeof history === "undefined") return;
     const wanted = this.#history.length > 0 || this.#handlers.length > 0;
+    this.canGoBack = wanted;
+    if (typeof history === "undefined" || this.#ignorePop || (inTauri && device.platform === "android")) return;
     if (wanted && !this.#guarded) {
       history.pushState({ advBackGuard: true }, "", location.href);
       this.#guarded = true;
     } else if (!wanted && this.#guarded) {
-      this.#guarded = false;
-      this.#ignorePop = true;
-      history.back();
+      // Let the next screen register its Back handler before removing the guard.
+      void tick().then(() => {
+        if (!this.#guarded || this.#history.length || this.#handlers.length) return;
+        this.#guarded = false;
+        this.#ignorePop = true;
+        history.back();
+      });
     }
   }
 
@@ -138,12 +156,12 @@ class Navigator {
     if (this.#ignorePop) {
       this.#ignorePop = false;
       this.#writeHash(routeHash(this.#target));
+      this.#sync();
       return;
     }
     // The guard entry was consumed by the gesture.
     this.#guarded = false;
-    const handler = this.#handlers.at(-1);
-    if (!handler?.() && this.#history.length > 0) this.#show(this.#history.pop() ?? HOME, "back");
+    this.requestBack();
     this.#sync();
     this.#writeHash(routeHash(this.#target));
   }

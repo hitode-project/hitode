@@ -7,7 +7,7 @@
 </script>
 
 <header>
-  <button class="back" aria-label={label} onclick={() => nav.back()}>
+  <button class="back" aria-label={label} onclick={() => { if (!nav.requestBack()) nav.back(); }}>
     <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 3.5L5 8l4.5 4.5"></path></svg>
   </button>
 </header>

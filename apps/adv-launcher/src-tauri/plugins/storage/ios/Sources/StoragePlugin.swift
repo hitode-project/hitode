@@ -37,6 +37,16 @@ struct Copied: Encodable {
   let path: String
 }
 
+struct ExportArgs: Decodable {
+  let source: String
+  let name: String
+}
+
+struct Exported: Encodable {
+  let label: String
+  let path: String
+}
+
 struct PickedFile: Encodable {
   let path: String?
 }
@@ -46,11 +56,16 @@ struct StorageError: LocalizedError {
   init(_ message: String) { errorDescription = message }
 }
 
+private struct FolderAccessError: LocalizedError {
+  var errorDescription: String? { "Folder access is unavailable. Select it again in Files." }
+}
+
 /// Files folders are read in place. Bookmarks keep external directories
 /// accessible across launches; coordinated reads download cloud files.
 class StoragePlugin: Plugin, UIDocumentPickerDelegate {
   private let lock = NSLock()
   private var picking: Invoke?
+  private var exporting: (invoke: Invoke, args: ExportArgs)?
   /// A single-file pick, told apart from folder picks by its controller.
   private var pickingFile: (picker: UIDocumentPickerViewController, invoke: Invoke)?
   private let bookmarksKey = "hitode.storage.folders"
@@ -65,6 +80,29 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
     for url in picked.values { url.stopAccessingSecurityScopedResource() }
   }
 
+  @objc public func shareFile(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      do {
+        let url = URL(fileURLWithPath: try invoke.parseArgs(PrepareArgs.self).path)
+        guard let presenter = self.manager.viewController else {
+          throw StorageError("No view controller to share the report")
+        }
+        let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = share.popoverPresentationController {
+          let view = presenter.view!
+          popover.sourceView = view
+          popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.maxY - view.safeAreaInsets.bottom,
+                                      width: 1, height: 1)
+          popover.permittedArrowDirections = []
+        }
+        presenter.present(share, animated: true)
+        invoke.resolve()
+      } catch {
+        invoke.reject(error.localizedDescription)
+      }
+    }
+  }
+
   /// iOS has no storage permission: Files grants each picked folder.
   @objc public func storageStatus(_ invoke: Invoke) {
     invoke.resolve(["granted": true])
@@ -76,7 +114,7 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
 
   @objc public func pickFolder(_ invoke: Invoke) {
     DispatchQueue.main.async {
-      guard self.picking == nil, self.pickingFile == nil else {
+      guard self.picking == nil, self.pickingFile == nil, self.exporting == nil else {
         invoke.reject("A picker is already open")
         return
       }
@@ -96,7 +134,7 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
   /// no security scope outlives the call.
   @objc public func pickFile(_ invoke: Invoke) {
     DispatchQueue.main.async {
-      guard self.picking == nil, self.pickingFile == nil else {
+      guard self.picking == nil, self.pickingFile == nil, self.exporting == nil else {
         invoke.reject("A picker is already open")
         return
       }
@@ -116,12 +154,80 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
     }
   }
 
+  @objc public func exportFolder(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      do {
+        guard self.picking == nil, self.pickingFile == nil, self.exporting == nil else {
+          throw StorageError("A picker is already open")
+        }
+        guard let presenter = self.manager.viewController else {
+          throw StorageError("No view controller to present the folder picker")
+        }
+        let args = try invoke.parseArgs(ExportArgs.self)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.delegate = self
+        self.exporting = (invoke, args)
+        presenter.present(picker, animated: true)
+      } catch {
+        invoke.reject(error.localizedDescription)
+      }
+    }
+  }
+
+  private func export(_ invoke: Invoke, _ args: ExportArgs, to parent: URL) {
+    do {
+      try remember(parent)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let source = URL(fileURLWithPath: args.source)
+      let coordinator = NSFileCoordinator()
+      var coordination: NSError?
+      var result: Result<Exported, Error>?
+      coordinator.coordinate(writingItemAt: parent, options: [], error: &coordination) { directory in
+        result = Result {
+          let manager = FileManager.default
+          let destination = directory.appendingPathComponent(args.name, isDirectory: true)
+          let stage = directory.appendingPathComponent(".hitode-export-\(UUID().uuidString)")
+          let sourcePath = source.resolvingSymlinksInPath().path + "/"
+          let directoryPath = directory.resolvingSymlinksInPath().path + "/"
+          guard !directoryPath.hasPrefix(sourcePath) else {
+            throw StorageError("Choose a location outside the source")
+          }
+          defer { try? manager.removeItem(at: stage) }
+          try manager.copyItem(at: source, to: stage)
+          try manager.moveItem(at: stage, to: destination)
+          return Exported(
+            label: destination.lastPathComponent,
+            path: destination.resolvingSymlinksInPath().path)
+        }
+      }
+      if let coordination = coordination {
+        invoke.reject(coordination.localizedDescription)
+      } else {
+        switch result {
+        case .success(let value): invoke.resolve(value)
+        case .failure(let error): invoke.reject(error.localizedDescription)
+        case nil: invoke.reject("Cannot write to the selected folder")
+        }
+      }
+    }
+  }
+
   public func documentPicker(
     _ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]
   ) {
     if let file = pickingFile, file.picker === controller {
       pickingFile = nil
       file.invoke.resolve(PickedFile(path: urls.first?.path))
+      return
+    }
+    if let export = exporting {
+      exporting = nil
+      if let url = urls.first { self.export(export.invoke, export.args, to: url) }
+      else { export.invoke.resolve(Optional<Exported>.none) }
       return
     }
     guard let invoke = picking else { return }
@@ -150,6 +256,11 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
     if let file = pickingFile, file.picker === controller {
       pickingFile = nil
       file.invoke.resolve(PickedFile(path: nil))
+      return
+    }
+    if let export = exporting {
+      exporting = nil
+      export.invoke.resolve(Optional<Exported>.none)
       return
     }
     picking?.resolve(Folder(uri: nil, path: nil))
@@ -240,7 +351,7 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
         }
       }
     }
-    throw StorageError("Folder access is unavailable. Select it again in Files.")
+    throw FolderAccessError()
   }
 
   @objc public func prepareFolder(_ invoke: Invoke) {
@@ -249,6 +360,8 @@ class StoragePlugin: Plugin, UIDocumentPickerDelegate {
         let url = try self.folderAtPath(invoke.parseArgs(PrepareArgs.self).path)
         if !StoragePlugin.contained(url) { try StoragePlugin.prepare(url) }
         invoke.resolve(Copied(path: url.resolvingSymlinksInPath().path))
+      } catch is FolderAccessError {
+        invoke.reject("launch_folder_access")
       } catch {
         invoke.reject(error.localizedDescription)
       }

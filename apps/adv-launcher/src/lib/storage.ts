@@ -1,9 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { chooseFolder } from "./folder-choice.svelte";
 import { hostInfo, inTauri } from "./bridge";
 import { hasStoragePermission as fakeStatus, requestStoragePermission as fakeRequest } from "./fake-import";
 
 /** Phones pick folders through the storage plugin: SAF on Android, Files on iOS. */
-const mobile = inTauri ? hostInfo().then((info) => info.platform === "android" || info.platform === "ios") : Promise.resolve(false);
+const platform = inTauri ? hostInfo().then((info) => info.platform) : Promise.resolve("");
+const mobile = platform.then((os) => os === "android" || os === "ios");
 
 export async function hasStoragePermission(): Promise<boolean> {
   if (await mobile) return (await invoke<{ granted: boolean }>("plugin:storage|storage_status")).granted;
@@ -22,7 +24,7 @@ export interface FolderPickOptions {
   onSize: (bytes: number) => void;
   onProgress: (progress: CopyProgress) => void;
 }
-interface Folder { uri: string | null; path: string | null }
+interface Folder { uri: string | null; path: string | null; managed?: boolean }
 
 let preparedFolder: string | null = null;
 
@@ -43,12 +45,21 @@ export async function prepareFolder(
   if (!(await mobile)) return true;
   const folder = await invoke<Folder>("plugin:storage|pick_folder");
   if (!folder.uri || signal.aborted) return false;
-  if (!copy && folder.path) {
+  if (folder.managed && folder.path) {
     preparedFolder = folder.path;
     return true;
   }
-  onSize(await invoke<number>("plugin:storage|folder_size", { uri: folder.uri }));
-  if (signal.aborted) return false;
+  if (!copy && folder.path) {
+    const mode = (await platform) === "android" ? await chooseFolder(signal, null) : "original";
+    if (!mode || signal.aborted) return false;
+    if (mode === "original") {
+      preparedFolder = folder.path;
+      return true;
+    }
+  }
+  const size = await invoke<number>("plugin:storage|folder_size", { uri: folder.uri });
+  if (!await chooseFolder(signal, size, !copy && !folder.path) || signal.aborted) return false;
+  onSize(size);
   const progress = new Channel<CopyProgress>();
   progress.onmessage = onProgress;
   const id = crypto.randomUUID();

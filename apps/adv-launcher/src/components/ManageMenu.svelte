@@ -68,6 +68,9 @@
         <span>{t("打开所在文件夹")}</span>
       </button>
     {/if}
+    <button class="mi" role="menuitem" onclick={() => go(() => { library.focus = game.id; nav.go({ name: "game-files", gameId: game.id }); })}>
+      <span class="ic"><Icon name="folder" size={16} /></span><span>{t("游戏文件…")}</span>
+    </button>
     <button class="mi" role="menuitem" aria-haspopup="dialog" onclick={onvndb}><span>VNDB</span><span>{t("搜索／关联资料…")}</span></button>
     <button class="mi" role="menuitem" aria-haspopup="dialog" onclick={onrename}>
       <svg class="ic" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M10.6 2.6l2.8 2.8-7.7 7.7-3.4.6.6-3.4z"></path></svg>

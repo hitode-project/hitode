@@ -1,7 +1,6 @@
 <script lang="ts">
+  import AddGameButton from "./AddGameButton.svelte";
   import { t } from "../lib/i18n.svelte";
-  import Icon from "./Icon.svelte";
-  import { nav } from "../lib/nav.svelte";
 </script>
 
 <main class="empty">
@@ -12,10 +11,7 @@
   </div>
   <h2>{t("添加游戏文件夹")}</h2>
   <div class="actions">
-    <button class="primary" onclick={() => nav.go({ name: "scan" })}>
-      <Icon name="folder-plus" size={15} stroke={1.5} />
-      <span>{t("添加文件夹…")}</span>
-    </button>
+    <AddGameButton />
   </div>
 </main>
 

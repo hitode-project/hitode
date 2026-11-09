@@ -14,6 +14,7 @@
   import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
   import { screen, trackScreen } from "../lib/screen.svelte";
+  import { tap } from "../lib/tap";
   import TouchControls from "../components/TouchControls.svelte";
   import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
   import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
@@ -34,7 +35,7 @@
   const game = $derived(library.get(gameId));
 
   type View = "closed" | "menu" | "confirm";
-  let view = $state<View>("closed");
+  let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
   /** The menu was opened by the back gesture; shows the edge hint briefly. */
   let backHint = $state(false);
   let textBar = $state(false);
@@ -165,15 +166,25 @@
     view = "menu";
   }
 
-  /** ⌘. and the back gesture: open the menu, or step back out of it. */
-  function togglePause(fromBack: boolean) {
+  function dismissLayer(): boolean {
     if (textBar) textBar = false;
+    else if (forceAsk) forceAsk = false;
     else if (view === "confirm") view = "menu";
     else if (view === "menu") view = "closed";
-    else {
-      openMenu();
-      backHint = fromBack;
-    }
+    else return false;
+    return true;
+  }
+
+  /** ⌘. and Back step through the launcher overlay before opening it. */
+  function togglePause(fromBack: boolean) {
+    if (dismissLayer()) return;
+    openMenu();
+    backHint = fromBack;
+  }
+
+  function openReport() {
+    runs.pauseAfterReport = gameId;
+    nav.go({ name: "report", gameId });
   }
 
   $effect(() => {
@@ -262,6 +273,9 @@
    * only forcing the game asks first.
    */
   let forceAsk = $state(false);
+  $effect(() => {
+    if (forceAsk || textBar) return nav.onBack(dismissLayer);
+  });
   function leave() {
     view = "closed";
     textBar = false;
@@ -272,15 +286,13 @@
   // The game is paused while the pause menu is open; once a quit is
   // requested the host resumes it so it can answer.
   $effect(() => {
-    if (!gameView || view === "closed" || stopping) return;
+    if (!gameView || view === "closed") return;
     return pauser.hold();
   });
 
   function onkeydown(event: KeyboardEvent) {
     if (event.key !== "Escape" || event.isComposing) return;
-    if (textBar) textBar = false;
-    else if (view === "confirm") view = "menu";
-    else if (view === "menu") view = "closed";
+    if (dismissLayer()) event.preventDefault();
   }
 
   function onTextKey(event: KeyboardEvent) {
@@ -423,7 +435,7 @@
               <span>{t("输入文字…")}</span>
               <span class="end"><Icon name="keyboard" /></span>
             </button>
-            <button class="qrow" onclick={() => nav.go({ name: "report", gameId })}>{t("报告问题…")}</button>
+            <button class="qrow" onclick={openReport}>{t("报告问题…")}</button>
             {#if canReveal() && game}
               <button class="qrow" disabled={game.offline !== null} onclick={() => game && reveal(game.path)}>{t("在访达中显示")}</button>
             {/if}
@@ -460,7 +472,7 @@
       <TouchControls layout={screen.layout} latchCtrl={playback(gameId).toggle} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
   {:else if phone}
-    <button class="grip fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}><span></span></button>
+    <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
   {:else if !titleBar}
     <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
       <Icon name="pause" />
@@ -468,7 +480,10 @@
   {/if}
 
   {#if guestMenu && (menuOpen || guestMenu.popup) && view === "closed"}
-    <GuestMenuSheet menu={guestMenu} onclose={() => (menuOpen = false)} />
+    <GuestMenuSheet menu={guestMenu} onclose={(cancelled) => {
+      if (cancelled && menuOpen && !guestMenu?.popup) openMenu();
+      menuOpen = false;
+    }} />
   {/if}
 
   {#if dialogs.length && view === "closed"}

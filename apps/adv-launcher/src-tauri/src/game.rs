@@ -269,6 +269,7 @@ pub async fn start_game(
     playback: Playback,
 ) -> Result<(), String> {
     let filter = upscaler(&filter)?;
+    let files = window.state::<crate::game_storage::Activity>().acquire()?;
     let (exe, data_dir, codepage) = window
         .state::<Mutex<Library>>()
         .lock()
@@ -296,6 +297,7 @@ pub async fn start_game(
                     view,
                     options,
                     Box::new(move |result| {
+                        let _files = files;
                         let exit = HOST.with_borrow_mut(|host| {
                             let host = host.as_mut().unwrap();
                             host.session.take();

@@ -81,6 +81,10 @@ IOSurface contents MUST attach through the Core Animation compositor after GPU c
 **Applies to**: iOS
 **Verification**: Review — UIKit hit testing runs on a device; the overlay Router has unit tests.
 
+During play, a completed inward swipe from either side edge MUST dismiss the top launcher layer or open the pause menu. Recognized swipes MUST NOT reach the game as touch input. The bottom system gesture area MUST stay outside this gesture.
+
+Outside play, a left-edge swipe MUST return one layer when a destination exists. The game management sheet MUST support swiping its grabber down to dismiss one layer.
+
 ### IOS-APP-4 Game sessions
 
 **Rule**: The launcher MUST create and drive at most one session on the main thread, pausing on inactivity, audio interruption or overlay pause under AND-APP-15. During play, the app MUST disable idle sleep, hold landscape and hide the status bar. System edge gestures MUST require a confirming swipe, with home-indicator auto-hiding disabled so touches do not reveal it.

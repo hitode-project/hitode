@@ -82,6 +82,14 @@ export const pauser = new Pauser();
  */
 class Runs {
   summaries = $state<Record<string, RunSummary | null>>({});
+  /** The pause menu to restore when returning from an in-game report. */
+  pauseAfterReport: string | null = null;
+  takePauseAfterReport(id: string): boolean {
+    if (this.pauseAfterReport !== id) return false;
+    this.pauseAfterReport = null;
+    return true;
+  }
+
   /** Launch errors not yet shown, by game id. */
   errors = $state<Record<string, string>>({});
   /** The game the host is running (start_game returned and it has not finished). */
@@ -152,6 +160,7 @@ class Runs {
     const showing = here && "gameId" in nav.route && nav.route.gameId === id;
     const stopped = this.stopping[id] === true;
     delete this.stopping[id];
+    if (this.pauseAfterReport === id) this.pauseAfterReport = null;
     if (this.running === id) this.running = null;
     pauser.reset();
     this.summaries[id] = event.summary;
@@ -179,6 +188,8 @@ export class LaunchFlow {
   view = $state<LaunchState>("prepare");
   /** Why the game stopped or cannot start. */
   reason = $state("");
+  recovery = $state<"missing" | "access" | null>(null);
+  recovering = $state(false);
   #gameId: () => string;
   #alive = true;
 
@@ -201,6 +212,7 @@ export class LaunchFlow {
     const id = this.#gameId();
     this.view = "prepare";
     this.reason = "";
+    this.recovery = null;
     if (jit.active && !jitDeclined) {
       if (!jit.status) await jit.refresh();
       if (jit.busy) {
@@ -217,6 +229,7 @@ export class LaunchFlow {
     const game = library.get(id);
     if (game?.offline) {
       this.#fail("unsupported", game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹"));
+      if (game.offline === "missing") this.recovery = "missing";
       return;
     }
     // Only builds with a native game view register start_game (macOS for now).
@@ -231,10 +244,15 @@ export class LaunchFlow {
         if (this.#alive && this.view === "prepare" && !runs.stopping[id]) nav.replace({ name: "game", gameId: id });
       },
       (error: unknown) => {
+        if (!this.#alive || this.view !== "prepare") return;
         const message = String(error);
         // Builds without the command answer "Command start_game not found".
         if (/start_game.*not found/i.test(message)) this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
-        else this.#fail("failed", message);
+        else if (message === "launch_missing_file" || message === "launch_folder_access") {
+          const missing = message === "launch_missing_file";
+          this.recovery = missing ? "missing" : "access";
+          this.#fail("failed", t(missing ? "找不到游戏文件" : "无法访问游戏文件夹"));
+        } else this.#fail("failed", message);
       },
     );
   }
@@ -257,6 +275,15 @@ export class LaunchFlow {
 
   retry(): void {
     void this.#start();
+  }
+
+  async recoverFolder(): Promise<void> {
+    this.recovering = true;
+    try {
+      if (await library.relocate(this.#gameId()) && this.#alive) this.retry();
+    } finally {
+      this.recovering = false;
+    }
   }
 
   /** Enables JIT from the recommendation, then starts the game once it is ready. */

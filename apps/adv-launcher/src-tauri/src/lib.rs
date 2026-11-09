@@ -13,6 +13,7 @@ mod drive;
 #[cfg_attr(target_os = "android", path = "game_android.rs")]
 #[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
+mod game_storage;
 #[cfg(target_os = "ios")]
 mod jit_ios;
 mod library;
@@ -82,6 +83,7 @@ pub fn run() {
     }
     let builder = tauri::Builder::default()
         .manage(overlay::OverlayState::default())
+        .manage(game_storage::Activity::default())
         .plugin(tauri_plugin_opener::init());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_storage::init());
@@ -150,6 +152,13 @@ pub fn run() {
                 library::library_update,
                 library::library_remove,
                 library::library_restore,
+                game_storage::list_game_copies,
+                game_storage::clear_game_cache,
+                game_storage::game_file_location,
+                game_storage::reveal_game_files,
+                game_storage::delete_game_copy,
+                game_storage::export_game_copy,
+                game_storage::use_game_copy,
                 drive::reveal_drive,
                 library::reveal_path
             ]);
@@ -176,11 +185,21 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        game_storage::list_game_copies,
+        game_storage::clear_game_cache,
+        game_storage::game_file_location,
+        game_storage::reveal_game_files,
+        game_storage::delete_game_copy,
+        game_storage::export_game_copy,
+        game_storage::use_game_copy,
         library::reveal_path
     ]);
     #[cfg(target_os = "android")]
     let builder = builder.invoke_handler(tauri::generate_handler![
         host_info,
+        android::open_issue_in_browser,
+        android::set_launcher_back,
+        report::share_report,
         post_text,
         start_game,
         stop_game,
@@ -215,6 +234,13 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        game_storage::list_game_copies,
+        game_storage::clear_game_cache,
+        game_storage::game_file_location,
+        game_storage::reveal_game_files,
+        game_storage::delete_game_copy,
+        game_storage::export_game_copy,
+        game_storage::use_game_copy,
         drive::reveal_drive,
         library::reveal_path
     ]);
@@ -241,6 +267,8 @@ pub fn run() {
         jit_ios::import_pairing_file,
         jit_ios::check_ddi,
         jit_ios::download_ddi,
+        game::set_launcher_back,
+        report::share_report,
         overlay::set_overlay_input,
         report::report_base,
         report::save_report,
@@ -260,6 +288,13 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        game_storage::list_game_copies,
+        game_storage::clear_game_cache,
+        game_storage::game_file_location,
+        game_storage::reveal_game_files,
+        game_storage::delete_game_copy,
+        game_storage::export_game_copy,
+        game_storage::use_game_copy,
         drive::reveal_drive,
         library::reveal_path
     ]);

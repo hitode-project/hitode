@@ -2,6 +2,8 @@
   import { onDestroy } from "svelte";
   import { t } from "../lib/i18n.svelte";
   import { call } from "../lib/bridge";
+  import { nav } from "../lib/nav.svelte";
+  import { tap } from "../lib/tap";
   import { region } from "../lib/overlay";
   import { prefs, savePrefs } from "../lib/prefs.svelte";
   import type { GameLayout } from "../lib/screen.svelte";
@@ -28,6 +30,11 @@
   const open = $derived(prefs.touchControls);
   let more = $state(false);
   let ctrl = $state(false);
+  $effect(() => {
+    if (more && open && !trackpad && arrangement.kind === "side") {
+      return nav.onBack(() => { more = false; return true; });
+    }
+  });
 
   function toggleOpen() {
     prefs.touchControls = !open;
@@ -106,21 +113,28 @@
 
   /** Pointer handlers for a key: pressed while the finger is down on it. */
   function hold(action: Action) {
+    if (action.kind !== "mouse" && action.kind !== "key" && (action.kind !== "ctrl" || latchCtrl)) {
+      return tap(() => press(action, true));
+    }
     let down = false;
+    function release() {
+      if (down) press(action, false);
+      down = false;
+    }
     return {
       onpointerdown(event: PointerEvent) {
+        const { gestures, width, height } = layout;
+        if (event.pointerType === "touch" && (
+          event.clientX < gestures.left || event.clientX >= width - gestures.right ||
+          event.clientY < gestures.top || event.clientY >= height - gestures.bottom
+        )) return;
         (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
         down = true;
         press(action, true);
       },
-      onpointerup() {
-        if (down) press(action, false);
-        down = false;
-      },
-      onpointercancel() {
-        if (down) press(action, false);
-        down = false;
-      },
+      onpointerup: release,
+      onpointercancel: release,
+      onlostpointercapture: release,
       oncontextmenu(event: Event) {
         event.preventDefault();
       },
@@ -165,7 +179,7 @@
 
 {#snippet sideButtons(labels: boolean)}
   {#each [["library", "游戏库", onlibrary], ["menu", "菜单", onmenu], ["perf", "性能", toggleHud]] as const as [name, label, action] (name)}
-    <button class={labels ? "side-btn" : "side-icon"} class:on={name === "perf" && prefs.showFps} aria-label={t(label)} onclick={action}>
+    <button class={labels ? "side-btn" : "side-icon"} class:on={name === "perf" && prefs.showFps} aria-label={t(label)} {...tap(action)}>
       {@render icon(name)}
       {#if labels}<span>{t(label)}</span>{/if}
     </button>
@@ -177,8 +191,8 @@
     <div class="column fade" class:tight={bars.left.width < 44} class:middle={tall && !trackpad} style={style(bars.left)}>
       <div class="group" class:labels={bars.wide && !trackpad} {@attach region}>
         {#if trackpad}
-          <button class="side-icon" aria-label={t("游戏库")} onclick={onlibrary}>{@render icon("library")}</button>
-          <button class="side-icon" aria-label={t("菜单")} onclick={onmenu}>{@render icon("menu")}</button>
+          <button class="side-icon" aria-label={t("游戏库")} {...tap(onlibrary)}>{@render icon("library")}</button>
+          <button class="side-icon" aria-label={t("菜单")} {...tap(onmenu)}>{@render icon("menu")}</button>
         {:else}
           {@render sideButtons(bars.wide)}
         {/if}
@@ -190,10 +204,10 @@
     </div>
     <div class="column fade" class:tight={bars.right.width < 44} class:middle={tall && !trackpad} style={style(bars.right)}>
       <div class="group" {@attach region}>
-        <button class="hide" aria-label={t("收起")} onclick={toggleOpen}>{@render icon("hide")}</button>
+        <button class="hide" aria-label={t("收起")} {...tap(toggleOpen)}>{@render icon("hide")}</button>
         {#if trackpad}
-          <button class="side-icon on" aria-label={t("触控板模式")} aria-pressed="true" onclick={toggleTrackpad}>{@render icon("pad")}</button>
-          <button class="side-icon" aria-label={t("键盘")} onclick={onkeyboard}>{@render icon("keyboard")}</button>
+          <button class="side-icon on" aria-label={t("触控板模式")} aria-pressed="true" {...tap(toggleTrackpad)}>{@render icon("pad")}</button>
+          <button class="side-icon" aria-label={t("键盘")} {...tap(onkeyboard)}>{@render icon("keyboard")}</button>
         {:else}
           <div class="keys" class:two>
             {#each keys as key (key.label)}{@render keyButton(key, keyH)}{/each}
@@ -213,7 +227,7 @@
   {:else}
     <div class="column" style={style(bars.right)}>
       <div class="spacer"></div>
-      <button class="grip" aria-label={t("展开")} onclick={toggleOpen} {@attach region}><span></span></button>
+      <button class="grip" aria-label={t("展开")} {...tap(toggleOpen)} {@attach region}><span></span></button>
       <div class="spacer"></div>
     </div>
   {/if}
@@ -222,7 +236,7 @@
     <div class="row fade" style={style(arrangement.top)}>
       <div class="group across" {@attach region}>{@render sideButtons(true)}</div>
       <div class="spacer"></div>
-      <button class="hide down" aria-label={t("收起")} onclick={toggleOpen} {@attach region}>{@render icon("hide")}</button>
+      <button class="hide down" aria-label={t("收起")} {...tap(toggleOpen)} {@attach region}>{@render icon("hide")}</button>
     </div>
     <div class="row centre fade" style={style(arrangement.bottom)}>
       <div class="group across" {@attach region}>
@@ -233,7 +247,7 @@
     </div>
   {:else}
     <div class="row centre" style={style(arrangement.bottom)}>
-      <button class="grip across" aria-label={t("展开")} onclick={toggleOpen} {@attach region}><span></span></button>
+      <button class="grip across" aria-label={t("展开")} {...tap(toggleOpen)} {@attach region}><span></span></button>
     </div>
   {/if}
 {:else}
@@ -241,11 +255,11 @@
   {#if open}
     <div class="glass across fade" style="left: {inner.x}px; top: {inner.y}px" {@attach region}>
       {#each [["library", "游戏库", onlibrary], ["menu", "菜单", onmenu], ["perf", "性能", toggleHud]] as const as [name, label, action] (name)}
-        <button class="ico" class:on={name === "perf" && prefs.showFps} aria-label={t(label)} onclick={action}>{@render icon(name)}</button>
+        <button class="ico" class:on={name === "perf" && prefs.showFps} aria-label={t(label)} {...tap(action)}>{@render icon(name)}</button>
       {/each}
     </div>
     <div class="glass panel fade" style="right: {layout.width - inner.x - inner.width}px; top: {inner.y + inner.height / 2}px" {@attach region}>
-      <div class="end"><button class="ico" aria-label={t("收起")} onclick={toggleOpen} style="height: 36px">{@render icon("hide")}</button></div>
+      <div class="end"><button class="ico" aria-label={t("收起")} {...tap(toggleOpen)} style="height: 36px">{@render icon("hide")}</button></div>
       <div class="keys two">
         {#each trackpad ? [{ label: "左键", action: { kind: "mouse", right: false } } as Key, ...full] : full as key (key.label)}
           {@render keyButton(key, 40)}
@@ -253,7 +267,7 @@
       </div>
     </div>
   {:else}
-    <button class="edge" aria-label={t("展开")} onclick={toggleOpen}
+    <button class="edge" aria-label={t("展开")} {...tap(toggleOpen)}
       style="right: {layout.width - inner.x - inner.width}px; top: {inner.y + inner.height / 2}px" {@attach region}><span></span></button>
   {/if}
 {/if}

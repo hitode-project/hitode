@@ -1,6 +1,7 @@
 package org.hitode.storage
 
 import android.app.Activity
+import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -12,6 +13,7 @@ import android.provider.DocumentsContract.Document
 import android.provider.Settings
 import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -40,8 +42,19 @@ class CopyArgs {
 }
 
 @InvokeArg
+class ExportArgs {
+    lateinit var source: String
+    lateinit var name: String
+}
+
+@InvokeArg
 class PickFileArgs {
     lateinit var dest: String
+}
+
+@InvokeArg
+class ShareFileArgs {
+    lateinit var path: String
 }
 
 @InvokeArg
@@ -68,6 +81,26 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
     private val resolver = activity.contentResolver
     @Volatile private var copying: CopyJob? = null
     private var pendingCancel: String? = null
+
+    @Command
+    fun shareFile(invoke: Invoke) {
+        activity.runOnUiThread {
+            try {
+                val file = File(invoke.parseArgs(ShareFileArgs::class.java).path)
+                val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/json"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    clipData = ClipData.newRawUri(file.name, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                activity.startActivity(Intent.createChooser(intent, null))
+                invoke.resolve()
+            } catch (error: Exception) {
+                invoke.reject(error.message ?: "Could not share report")
+            }
+        }
+    }
 
     private fun granted() = Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()
 
@@ -117,10 +150,27 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
         try {
             val uri = result.data?.data ?: throw IOException("No folder selected")
+            val id = DocumentsContract.getTreeDocumentId(uri)
+            if (uri.authority == activity.packageName + ".drive" && (id == "Games:" || id.startsWith("Games:/"))) {
+                val root = File(activity.dataDir.canonicalFile, "imports")
+                val folder = if (id == "Games:") root else {
+                    val parts = id.removePrefix("Games:/").split('/')
+                    if (parts.any { it.isEmpty() || it == "." || it == ".." } ||
+                        !parts.first().matches(Regex("[A-Za-z0-9_-]+"))) {
+                        throw IOException("Invalid Hitode folder")
+                    }
+                    File(root, parts.joinToString("/"))
+                }
+                if (folder.canonicalFile != folder || !folder.isDirectory) {
+                    throw IOException("Invalid Hitode folder")
+                }
+                invoke.resolve(JSObject().put("uri", uri.toString()).put("path", folder.path).put("managed", true))
+                return
+            }
             val flags = result.data!!.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
             resolver.takePersistableUriPermission(uri, flags)
             val path = if (uri.authority == "com.android.externalstorage.documents") {
-                primaryPath(DocumentsContract.getTreeDocumentId(uri), granted())
+                primaryPath(id, granted())
             } else null
             invoke.resolve(JSObject().put("uri", uri.toString()).put("path", path))
         } catch (error: Exception) {
@@ -336,6 +386,67 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
                 invoke.reject(error.message)
             } finally {
                 copying = null
+            }
+        }
+    }
+
+    @Command
+    fun exportFolder(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            startActivityForResult(invoke, intent, "exportResult")
+        } catch (error: Exception) {
+            invoke.reject(error.message)
+        }
+    }
+
+    private fun exportEntries(source: File, parent: Uri) {
+        for (file in source.listFiles() ?: throw IOException("Cannot read source folder")) {
+            if (Files.isSymbolicLink(file.toPath())) throw IOException("Cannot export symbolic links")
+            if (!file.isDirectory && !file.isFile) throw IOException("Cannot export a special file")
+            val target = DocumentsContract.createDocument(
+                resolver, parent, if (file.isDirectory) Document.MIME_TYPE_DIR else "application/octet-stream", file.name
+            ) ?: throw IOException("Cannot create exported entry")
+            if (file.isDirectory) exportEntries(file, target)
+            else {
+                val output = resolver.openOutputStream(target, "w") ?: throw IOException("Cannot write exported file")
+                output.use { stream -> file.inputStream().use { it.copyTo(stream) } }
+            }
+        }
+    }
+
+    @ActivityCallback
+    fun exportResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            invoke.resolve()
+            return
+        }
+        thread(name = "folder-export") {
+            var created: Uri? = null
+            try {
+                val tree = result.data?.data ?: throw IOException("No folder selected")
+                if (tree.authority == activity.packageName + ".drive") {
+                    throw IOException("Choose a destination outside Hitode")
+                }
+                val args = invoke.parseArgs(ExportArgs::class.java)
+                val id = DocumentsContract.getTreeDocumentId(tree)
+                val parent = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+                if (entries(tree, id, CancellationSignal()).any { it.name == args.name }) {
+                    throw IOException("Destination already exists")
+                }
+                val exported = DocumentsContract.createDocument(
+                    resolver, parent, Document.MIME_TYPE_DIR, args.name
+                ) ?: throw IOException("Cannot create destination folder")
+                created = exported
+                exportEntries(File(args.source), exported)
+                val path = if (exported.authority == "com.android.externalstorage.documents") {
+                    primaryPath(DocumentsContract.getDocumentId(exported), granted())
+                } else null
+                invoke.resolve(JSObject().put("label", path ?: args.name).put("path", path))
+            } catch (error: Exception) {
+                created?.let { runCatching { DocumentsContract.deleteDocument(resolver, it) } }
+                invoke.reject(error.message)
             }
         }
     }
