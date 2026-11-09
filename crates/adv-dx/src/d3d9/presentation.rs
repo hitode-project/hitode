@@ -1,4 +1,4 @@
-//! COPY presentation composes rectangles into a device-owned shared front surface.
+//! Rectangle and COPY presentation compose rectangles into a device-owned shared front surface.
 use super::*;
 use adv_device::surface::{Rect, Region};
 
@@ -118,15 +118,12 @@ pub(super) fn validate(
     dirty: GuestPtr<()>,
 ) -> Result<Option<Copy>, u32> {
     if parameters.SwapEffect != 3 {
-        return if source.is_null()
-            && destination.is_null()
-            && override_window == 0
-            && dirty.is_null()
-        {
-            Ok(None)
-        } else {
-            Err(INVALID)
-        };
+        if override_window != 0 || !dirty.is_null() {
+            return Err(INVALID);
+        }
+        if source.is_null() && destination.is_null() {
+            return Ok(None);
+        }
     }
     let source = if source.is_null() {
         None
@@ -155,7 +152,7 @@ pub(super) fn validate(
         adv_abi::warn_unavailable(
             env,
             "IDirect3DDevice9::Present",
-            "COPY presentation to another destination window is unavailable",
+            "presentation to another destination window is unavailable",
         );
         return Err(UNAVAILABLE);
     }
@@ -187,7 +184,7 @@ pub(super) fn validate(
         adv_abi::warn_unavailable(
             env,
             "IDirect3DDevice9::Present",
-            "COPY presentation with rectangle stretching is unavailable",
+            "presentation with rectangle stretching is unavailable",
         );
         return Err(UNAVAILABLE);
     }

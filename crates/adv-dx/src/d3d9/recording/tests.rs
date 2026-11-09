@@ -1657,31 +1657,44 @@ fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundar
 
 // spec: GFX-SWAP-1
 #[test]
-fn d3d9_package_b_swap_chain_raster_status_uses_display_phase() {
+fn device_and_swap_chain_raster_status_use_display_phase() {
     let mut f = fixture();
+    let device = f.device;
     let chain = package_b_chain(&mut f);
     let output = f.packet([0u32; 2]);
-    f.m.ext.get_mut::<State>().provider.vsync = |_| {
-        Some((
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(10),
-        ))
+    let mut check = |vsync, expected| {
+        f.m.ext.get_mut::<State>().provider.vsync = vsync;
+        for (name, args) in [
+            ("IDirect3DSwapChain9::GetRasterStatus", &[chain, output][..]),
+            (
+                "IDirect3DDevice9::GetRasterStatus",
+                &[device, 0, output][..],
+            ),
+        ] {
+            f.okay(name, args);
+            assert_eq!(
+                GuestPtr::<[u32; 2]>::new(output).read(&f.m.cpu).unwrap(),
+                expected
+            );
+        }
     };
-    f.okay("IDirect3DSwapChain9::GetRasterStatus", &[chain, output]);
-    assert_eq!(
-        GuestPtr::<[u32; 2]>::new(output).read(&f.m.cpu).unwrap(),
-        [0, 6]
+    check(
+        |_| {
+            Some((
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(10),
+            ))
+        },
+        [0, 6],
     );
-    f.m.ext.get_mut::<State>().provider.vsync = |_| {
-        Some((
-            std::time::Duration::from_micros(9900),
-            std::time::Duration::from_millis(10),
-        ))
-    };
-    f.okay("IDirect3DSwapChain9::GetRasterStatus", &[chain, output]);
-    assert_eq!(
-        GuestPtr::<[u32; 2]>::new(output).read(&f.m.cpu).unwrap(),
-        [1, 0]
+    check(
+        |_| {
+            Some((
+                std::time::Duration::from_micros(9900),
+                std::time::Duration::from_millis(10),
+            ))
+        },
+        [1, 0],
     );
 }
 

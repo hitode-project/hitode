@@ -26,6 +26,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
 **Verification**: Test
 
+### GFX-DDRAW-5 Vertical blank
+
+**Rule**: The virtual adapter MUST complete WaitForVerticalBlank without waiting for host scanout. Event requests MUST return DDERR_UNSUPPORTED.
+**Verification**: Review — the return depends only on the event flag.
+**Basis**: Wine 11 DirectDraw
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
@@ -107,7 +113,7 @@ Intermediate color damage MUST propagate through proven axis-aligned copies and 
 
 Each allocation carries the cells where it differs from its content's current version. Every change marks them in all allocations of that content, and executing an allocation clears its own. An allocation that never held the content, or is stale everywhere, redraws fully. A content's last proven overwrite starts its final chain, which ends the frame settled. Its writes share one scissor set covering the stale cells, cells later writes read from earlier chain versions, and cells earlier versions wrote in place. Earlier versions are transient and execute only the cells their readers need. Reads of the final version need nothing, since the allocation holds it outside the chain's scissors. Writes putting several final chains in one command share their scissors. The plan walks the writes backward once, cutting each write's scissors before asking its inputs. Changes are computed per generation and matched to the previous frame's generation by their first write. A generation appending to a known retained version changes at most where its writes drew. An external read of an intermediate final-chain version executes that storage's chain whole. A late demand on writes the pass already cut executes that chain whole and replans, at most once per chain. Scissors are at most eight disjoint rectangles covering the needed cells; more coarsen the cells, and inputs follow the coarsened scissors. Proven reads use the inverse sampling mapping; clamped edges reach every coordinate beyond them, and wrapped reads include both edges. A busy write resumes after the scissors it finished. Nonrotating targets are current after every frame. Clears, including depth and stencil, and copies respect the clip; uploads run without scissors once their written cells are covered by the chain. Early flushes that only execute (readback, waits, the command limit) keep damage history and run their writes whole. The chains those writes belong to execute whole that frame; lock, DC, Reset and Release flushes invalidate the history. A render-target readback executes only the writes the observed version depends on, and those keeping their order with them. Those are reads before their writes and earlier writes of what they write. A clear runs only the aspects needed; the other writes stay recorded, in order, for presentation. A readback skips the flush when its version repeats the previous frame's final version write for write. None of those writes may have executed yet, and the slot then already holds the version. DISCARD rotation requires an initial full overwrite so replay reconstructs stale slots exactly. Accumulating frames restore the last logical backbuffer when necessary and keep the snapshot path. Early reads restore that baseline too. Diagnostic verification executes full frames while still computing damage and reading the actual presented allocation. No presentation cadence or audio behavior changes.
 Immutable snapshot presentation MUST preserve known color damage, just as rotating presentation does. Draws whose conservative bounds do not intersect the required execution region MUST be omitted before backend submission.
-Changes to COPY presentation rectangles MUST preserve rendering history while preventing unchanged-frame elision.
+Changes to presentation rectangles MUST preserve rendering history while preventing unchanged-frame elision.
 COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse overlap with the same source mapping where the retained front and the backbuffer delta are known. New coverage and a changed mapping require copying the affected destination pixels. A new front or a changed publication source requires full published damage.
 
 ### GFX-REC-6 D3D9 unchanged calls
@@ -167,10 +173,12 @@ Blocking readbacks MUST preserve the source pixels before another guest context 
 
 `QueryInterface` supports `IUnknown` and `IDirect3DSwapChain9`. Public references
 retain the device; `GetDevice` adds a device reference. `GetPresentParameters`
-returns the normalized device parameters, including after Reset. `GetRasterStatus`
-uses the host display phase, or machine-clock refresh phase, with one modeled
+returns the normalized device parameters, including after Reset. Both `GetRasterStatus`
+methods use the host display phase, or machine-clock refresh phase, with one modeled
 blanking line after the visible rows. Nonzero Present flags are unsupported.
 Front-buffer capture retains the device method's unsupported failure contract.
+Like Wine, windowed presentation accepts equal-size source and destination
+rectangles independently of swap effect.
 
 ### GFX-QUERY-1 Nonblocking queries
 
@@ -222,7 +230,7 @@ retain their answer until reissued; later recorded work does not delay them.
 | Device and parent queries | GetDevice and GetDirect3D return AddRef'd interfaces; resource type matches the concrete object. |
 | Texture levels | GetLevelCount reports the stored mip count, or one for AUTOGENMIPMAP. Managed LOD clamps to the mip range and returns its previous value; other pools return zero. |
 | Mipmap generation | The default filter is LINEAR; POINT and LINEAR round-trip. GenerateMipSubLevels regenerates AUTOGENMIPMAP chains from level zero; other textures and single-level chains are unchanged. |
-| Device queries | One swap chain, no vertical blank, scanline zero; ValidateDevice reports one pass or the existing unsupported-stage error. |
+| Device queries | One implicit swap chain; ValidateDevice reports one pass or the existing unsupported-stage error. |
 | Stored-only state | Gamma ramps, clip status, palettes, current palette, cursor visibility and cursor position belong to the device. ShowCursor returns previous visibility. |
 | Exclusions | Software rasterizer registration returns `D3DERR_NOTAVAILABLE`; P8 textures and GFX-CAP-3 exclusions remain unsupported. |
 
@@ -272,7 +280,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-INPUT-4 Fixed texture coordinates
 
-**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading.
+**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading. Fixed vertex processing for FVF UP draws MUST omit trailing texture coordinates starting outside the uploaded stride.
 **Verification**: Test
 
 ### GFX-INPUT-5 Fixed raster limits

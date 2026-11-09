@@ -1485,12 +1485,12 @@ fn repeated_full_upload_keeps_cursor_damage_local() {
 #[test]
 fn copy_presentation_preserves_local_damage_and_rebases_changed_rectangles() {
     let mut outputs = Vec::new();
-    for verify in [false, true] {
+    for (swap_effect, verify) in [(3, false), (3, true), (1, false)] {
         let mut f = fixture();
         f.m.ext.get_mut::<State>().verify_frames = verify;
         let pointer = f.device;
         let mut parameters = device(&env(&mut f), pointer).unwrap().parameters;
-        parameters.SwapEffect = 3;
+        parameters.SwapEffect = swap_effect;
         let parameters = f.packet(parameters);
         f.okay("IDirect3DDevice9::Reset", &[pointer, parameters]);
         let full = f.packet([0u32, 0, 16, 12, 0, 1f32.to_bits()]);
@@ -1519,6 +1519,12 @@ fn copy_presentation_preserves_local_damage_and_rebases_changed_rectangles() {
             right: 12,
             bottom: 8,
         });
+        let full_rect = f.packet(RECT {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 12,
+        });
         let mut frames = Vec::new();
         for n in 0..6 {
             let before = f.m.ext.get::<State>().frames;
@@ -1530,6 +1536,7 @@ fn copy_presentation_preserves_local_damage_and_rebases_changed_rectangles() {
             let (source, destination) = match n {
                 1 | 2 | 4 => (part, shifted),
                 3 => (inner, shifted_inner),
+                _ if swap_effect == 1 => (full_rect, 0),
                 _ => (0, 0),
             };
             let copied = |f: &Fixture| {
@@ -1578,6 +1585,7 @@ fn copy_presentation_preserves_local_damage_and_rebases_changed_rectangles() {
         outputs.push(frames);
     }
     assert!(outputs[0] == outputs[1]);
+    assert!(outputs[0] == outputs[2]);
 }
 // spec: GFX-REC-3 GFX-REC-5
 #[test]

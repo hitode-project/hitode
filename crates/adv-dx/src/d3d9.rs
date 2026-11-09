@@ -1917,7 +1917,7 @@ fn raster_status(
         );
         return UNAVAILABLE;
     }
-    output.write(env.cpu, [0, 0]).map_or(INVALID, |()| 0)
+    pacing::raster_status(env, output)
 }
 #[win32(d3d9, name = "IDirect3DDevice9::ValidateDevice", level = implement)]
 fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>) -> u32 {

@@ -1276,7 +1276,18 @@ fn prepare_input_checked(
             "clip planes require the programmable draw path",
         ));
     }
-    let layout = layout(env, pointer)?;
+    let mut layout = layout(env, pointer)?;
+    if d.buffers.declaration.is_none()
+        && let input::Input::Up { stride, .. } = source
+    {
+        // UP uploads one stride of bytes per vertex. Trailing FVF texture
+        // inputs outside that record must not read the next vertex.
+        for coordinate in &mut layout.texcoords {
+            if coordinate.is_some_and(|(_, offset, _)| offset >= stride) {
+                *coordinate = None;
+            }
+        }
+    }
     let lit = !layout.transformed && f.render[&137] != 0;
     let lights = if lit { lighting::active(f)? } else { [None; 8] };
     let normal_matrix = lit.then(|| lighting::normal_matrix(f));
