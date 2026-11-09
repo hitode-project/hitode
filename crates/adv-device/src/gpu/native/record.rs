@@ -763,32 +763,6 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.check()?;
-        let format = color_format(image);
-        let copyable = match &image.storage {
-            Storage::Fixed { image, .. } => image
-                .desc()
-                .usage
-                .contains(adv_gpu::resource::Usage::COPY_SRC),
-            Storage::Swap(_) => true,
-        };
-        if !copyable
-            || !matches!(
-                format,
-                adv_gpu::Format::Bgra8Unorm | adv_gpu::Format::Rgba8Unorm
-            )
-        {
-            // Sampling expands every stored format to BGRA, as a draw sees it.
-            let scratch = self.target(image.width(), image.height(), false)?.image;
-            self.blit_validated(
-                image,
-                whole(image),
-                &scratch,
-                whole(&scratch),
-                Filter::Nearest,
-            )?;
-            return self.readback(&scratch, wake);
-        }
-        let opaque = image.alpha_mode() == gpu::AlphaMode::Opaque;
         self.recording
             .readbacks
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -796,6 +770,15 @@ impl Gpu {
             })
             .map_err(|_| Error::Busy)?;
         let reservation = Reservation(self.recording.readbacks.clone());
+        let scratch;
+        let image = if readback_copyable(image) {
+            image
+        } else {
+            scratch = self.snapshot_readback_source(image)?;
+            &scratch
+        };
+        let format = color_format(image);
+        let opaque = image.alpha_mode() == gpu::AlphaMode::Opaque;
         let buffer = self
             .device
             .create_buffer(&BufferDesc {
@@ -854,6 +837,21 @@ impl Gpu {
             completion,
             job_taken: false,
         })
+    }
+    /// Preserve the pixels at this point in the stream when CPU staging is busy.
+    pub fn snapshot_readback_source(&mut self, image: &Image) -> Result<Image, Error> {
+        let scratch = self
+            .target(image.width(), image.height(), false)?
+            .with_alpha_mode(image.alpha_mode())
+            .image;
+        let area = whole(image);
+        if readback_copyable(image) && color_format(image) == color_format(&scratch) {
+            self.copy_validated(image, area, &scratch, area)?;
+        } else {
+            // Sampling expands the stored format to BGRA, as a draw sees it.
+            self.blit_validated(image, area, &scratch, area, Filter::Nearest)?;
+        }
+        Ok(scratch)
     }
     pub fn set_readback_limit(&mut self, limit: usize) -> Result<(), Error> {
         if limit == 0 || limit > MAX_READBACKS {
@@ -928,6 +926,18 @@ impl Gpu {
     }
 }
 struct Reservation(Arc<AtomicUsize>);
+fn readback_copyable(image: &Image) -> bool {
+    matches!(
+        color_format(image),
+        adv_gpu::Format::Bgra8Unorm | adv_gpu::Format::Rgba8Unorm
+    ) && match &image.storage {
+        Storage::Fixed { image, .. } => image
+            .desc()
+            .usage
+            .contains(adv_gpu::resource::Usage::COPY_SRC),
+        Storage::Swap(_) => true,
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);

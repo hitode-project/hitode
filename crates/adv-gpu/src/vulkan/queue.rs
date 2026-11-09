@@ -20,6 +20,7 @@ pub(super) struct State {
     next: u64,
     completed: u64,
     pending: VecDeque<Submission>,
+    callbacks: Vec<(u64, Callback)>,
     pub(super) pools: Vec<encode::Commands>,
     fences: Vec<vk::Fence>,
     /// The fence the waiter thread blocks on. Fences are externally
@@ -37,9 +38,9 @@ struct Submission {
 }
 enum Message {
     Wake,
-    Callback(u64, Box<dyn FnOnce() + Send>),
     Stop,
 }
+type Callback = Box<dyn FnOnce() + Send>;
 impl Queue {
     pub(super) fn new(device: crate::Device) -> Result<Self> {
         let context = device.inner.0.clone();
@@ -63,6 +64,7 @@ impl Queue {
                 next: 1,
                 completed: 0,
                 pending: VecDeque::new(),
+                callbacks: Vec::new(),
                 pools: Vec::new(),
                 fences: Vec::new(),
                 waiting: vk::Fence::null(),
@@ -78,44 +80,32 @@ impl Queue {
             .spawn(move || {
                 // Sleeps on the GPU, never on a timer: blocked on the oldest
                 // pending submission, or on messages when none is pending.
-                let mut callbacks: Vec<(u64, Box<dyn FnOnce() + Send>)> = Vec::new();
-                let mut stop = false;
-                while !stop {
-                    let mut handle = |message| match message {
-                        Message::Wake => {}
-                        Message::Callback(token, callback) => callbacks.push((token, callback)),
-                        Message::Stop => stop = true,
-                    };
-                    if !backend.wait_oldest() {
-                        handle(receiver.recv().unwrap_or(Message::Stop));
+                let mut ready = Vec::new();
+                'waiter: loop {
+                    if !backend.dispatch_callbacks(&mut ready) {
+                        return;
                     }
                     loop {
                         match receiver.try_recv() {
-                            Ok(message) => handle(message),
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                handle(Message::Stop);
-                                break;
+                            Ok(Message::Wake) => {}
+                            Ok(Message::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                                break 'waiter;
                             }
+                            Err(mpsc::TryRecvError::Empty) => break,
                         }
                     }
-                    if let Ok(Token(completed)) = backend.poll() {
-                        callbacks.retain_mut(|(token, callback)| {
-                            if *token > completed {
-                                return true;
-                            }
-                            std::mem::replace(callback, Box::new(|| {}))();
-                            false
-                        });
+                    if !backend.wait_oldest() && !matches!(receiver.recv(), Ok(Message::Wake)) {
+                        break;
                     }
                 }
-                let _ = backend
+                if backend
                     .context
-                    .result(unsafe { backend.context.device.device_wait_idle() });
-                let _ = backend.poll();
-                for (_, callback) in callbacks {
-                    callback();
+                    .result(unsafe { backend.context.device.device_wait_idle() })
+                    .is_ok()
+                {
+                    backend.dispatch_callbacks(&mut ready);
                 }
+                backend.cancel_callbacks();
             })
             .map_err(|e| Error::Unavailable(format!("GPU waiter thread: {e}")))?;
         Ok(Self {
@@ -311,12 +301,20 @@ impl Queue {
         self.shared.poll()?;
         Ok(true)
     }
-    pub(crate) fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
-        let _ = self
-            .sender
-            .as_ref()
-            .unwrap()
-            .send(Message::Callback(token.0, callback));
+    pub(crate) fn on_complete(&mut self, token: Token, callback: Callback) {
+        let mut state = self.shared.state.lock().unwrap();
+        if self.shared.context.check().is_err() {
+            return;
+        }
+        if token.0 <= state.completed {
+            // The waiter may already be asleep on a later submission.
+            drop(state);
+            callback();
+        } else {
+            state.callbacks.push((token.0, callback));
+            drop(state);
+            let _ = self.sender.as_ref().unwrap().send(Message::Wake);
+        }
     }
     /// Makes the next submission wait on a compositor release fence.
     pub(crate) fn wait_next(&mut self, fence: super::Fence) -> Result<()> {
@@ -333,17 +331,48 @@ impl Queue {
     }
 }
 impl Shared {
-    /// Blocks until the oldest pending submission completes. False, without
-    /// blocking, when nothing is pending or the device is lost.
+    fn dispatch_callbacks(&self, ready: &mut Vec<Callback>) -> bool {
+        if matches!(self.poll(), Err(Error::DeviceLost(_))) {
+            self.cancel_callbacks();
+            return false;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            let completed = state.completed;
+            ready.extend(
+                state
+                    .callbacks
+                    .extract_if(.., |(token, _)| *token <= completed)
+                    .map(|(_, callback)| callback),
+            );
+        }
+        for callback in ready.drain(..) {
+            callback();
+        }
+        true
+    }
+    fn cancel_callbacks(&self) {
+        // Dropping a readback callback publishes failure without touching its
+        // mapping. Never run a success callback for unfinished GPU work.
+        let callbacks = std::mem::take(&mut self.state.lock().unwrap().callbacks);
+        drop(callbacks);
+    }
+    /// Wait for the oldest submission, unless a callback became ready since
+    /// the last drain. False means there is no GPU work to wait for.
     fn wait_oldest(&self) -> bool {
         let (token, fence) = {
             let mut state = self.state.lock().unwrap();
+            if self.context.lost.load(Ordering::Relaxed)
+                || state
+                    .callbacks
+                    .iter()
+                    .any(|(token, _)| *token <= state.completed)
+            {
+                return true;
+            }
             let Some(oldest) = state.pending.front() else {
                 return false;
             };
-            if self.context.lost.load(Ordering::Relaxed) {
-                return false;
-            }
             let oldest = (oldest.token, oldest.fence);
             state.waiting = oldest.1;
             oldest
