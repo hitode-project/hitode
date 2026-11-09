@@ -102,14 +102,20 @@ pub(super) fn bind_call(
         if f.rva != target - module.base || f.name.as_ref() != name {
             return None;
         }
+        checks.push((*slot, target.to_le_bytes().into()));
+        if let Some((_, original)) = sys.redirects.get(&target) {
+            // The binding already checked identity with relocations masked.
+            // Watch the relocated bytes exactly, including the relocated fields.
+            checks.push((target, original.clone()));
+            continue;
+        }
         let mut bytes = vec![0; f.size as usize];
         cpu.read(target, &mut bytes).ok()?;
         if identity::fnv1a64(&bytes) as u32 != f.hash {
             return None;
         }
-        checks.push((*slot, target.to_le_bytes().into()));
         checks.push((target, bytes.into_boxed_slice()));
-        if matches!(name.as_str(), "memcpy" | "memmove") && !sys.redirects.contains_key(&target) {
+        if matches!(name.as_str(), "memcpy" | "memmove") {
             let code = cpu.shared_bytes(target, 5)?;
             if code[0] != 0xe9 {
                 return None;
@@ -468,6 +474,94 @@ extern "C" fn adv_pixel_x87_sqrt(bits: u32, controls: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    mod wine {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/wine.rs"));
+    }
+
+    // spec: NAT-BODY-8
+    #[test]
+    fn d3dx_admits_relocated_ucrt_copies_but_rejects_a_patch() {
+        use adv_cpu::Cpu;
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+        let Some(dist) = wine::dist() else { return };
+        let root = dist.join("lib/wine/i386-windows");
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let mut map = |name: &str, base: u32| {
+            let path = root.join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut pe = adv_pe::Pe::parse(&bytes).unwrap();
+            pe.rebase(base).unwrap();
+            crate::image::map(
+                &mut machine.cpu,
+                &mut machine.sys.vm,
+                &mut crate::memory::Memory::default(),
+                &pe,
+                base,
+            )
+            .unwrap();
+            identity::note_image(
+                &mut machine.ext,
+                base,
+                pe.size_of_image,
+                Some(&path),
+                &bytes[..pe.size_of_headers as usize],
+            );
+            crate::native::bind(
+                &mut machine.cpu,
+                &mut machine.sys,
+                &mut machine.ext,
+                base,
+                &pe,
+            );
+            pe
+        };
+        let (ucrt, d3dx) = (0x1100_0000, 0x1200_0000);
+        let crt = map("ucrtbase.dll", ucrt);
+        map("d3dx9_43.dll", d3dx);
+        let images = machine.ext.get::<Images>();
+        let crt_table = images.0[&ucrt].table().unwrap();
+        let d3dx_table = images.0[&d3dx].table().unwrap();
+        let entry = d3dx
+            + d3dx_table
+                .named("d3dx_load_pixels_from_pixels")
+                .unwrap()
+                .rva;
+        for (slot, name) in &machine.ext.get::<Prepared>().0[&d3dx].copies {
+            let target = ucrt + crt_table.named(name).unwrap().rva;
+            machine.cpu.write_u32(*slot, target).unwrap();
+        }
+        let memmove = crt_table.named("memmove").unwrap();
+        assert!(machine.sys.redirects.contains_key(&(ucrt + memmove.rva)));
+        let relocation = crt
+            .relocations()
+            .unwrap()
+            .into_iter()
+            .find(|&rva| (memmove.rva..memmove.rva + memmove.size).contains(&rva))
+            .expect("pinned UCRT memmove has a relocation");
+        let field = ucrt + relocation;
+        let original = machine.cpu.read_u32(field).unwrap();
+        let admit = |machine: &mut Machine<Cpu>| {
+            bind_call(
+                &mut machine.cpu,
+                &mut machine.sys,
+                &machine.ext,
+                entry,
+                LOAD.direct,
+            )
+        };
+        assert!(admit(&mut machine).is_some(), "pristine relocated UCRT");
+        machine.cpu.write_u32(field, original ^ 1).unwrap();
+        assert!(admit(&mut machine).is_none(), "patched UCRT relocation");
+    }
+
     // spec: NAT-BODY-19
     #[test]
     fn shuffle_matches_scalar_conversion() {
