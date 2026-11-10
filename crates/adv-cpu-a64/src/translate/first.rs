@@ -34,10 +34,22 @@ pub struct Visit {
 /// Runs from `cpu.eip` until a control transfer, `stop`, `fuel`
 /// instructions, or an instruction it declines.
 pub fn run(cpu: &mut CpuState, memory: &Memory, stop: u32, fuel: u64) -> Visit {
+    run_until(cpu, memory, stop, fuel, &[])
+}
+
+pub(crate) fn run_until(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    stop: u32,
+    fuel: u64,
+    candidates: &[u32],
+) -> Visit {
     let mut fetcher = Fetcher::new(memory);
     let mut retired = 0u32;
     loop {
-        if u64::from(retired) == fuel || retired > 0 && cpu.eip == stop {
+        if u64::from(retired) == fuel
+            || retired > 0 && (cpu.eip == stop || candidates.contains(&cpu.eip))
+        {
             return Visit {
                 retired,
                 declined: false,

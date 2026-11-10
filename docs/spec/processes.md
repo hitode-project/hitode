@@ -8,12 +8,12 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 
 ### PROC-MACH-1 One execution owner
 
-**Rule**: One execution owner MUST run all guest threads, and guest code MUST NOT run in parallel. Row helpers and background compile threads are not guest execution, and each MUST keep its own bounded budget.
-**Verification**: Review — the structure of the machine enforces it.
+**Rule**: The execution owner MUST admit only proved computations with nonconflicting ranges to concurrent guest execution. Before ordinary execution, host services or unproved guest memory access, it MUST recall and collect all active computations. Row helpers and background compile threads MUST keep their own bounded budgets.
+**Verification**: Test
 
 ### PROC-MACH-2 Waits and wakeups
 
-**Rule**: Each context MUST have one owner at a time. Wait registration, signal consumption, timeouts and cancellation MUST go through the same machine state. A host with no events MUST sleep on `WakeEvent`, which keeps pending notifications so wakeups are not lost.
+**Rule**: Each context MUST have one owner at a time. Only the execution owner MAY register waits, consume signals, expire deadlines or cancel waits. A host with no events MUST sleep on `WakeEvent`, which keeps pending notifications so wakeups are not lost.
 **Verification**: Test
 
 ### PROC-MACH-10 Signal-driven waits
@@ -46,6 +46,7 @@ Recorded guest signalers MUST come from the operation that satisfied the blocked
 
 **Rule**: Urgent wakeups such as audio and input MAY run before the normal turn. They MUST NOT starve normal workers or change the completion semantics of guest locks and calls.
 CPU spin handoffs MUST return to the owner's ordinary wake and context selection.
+An external delivery or a due deadline MUST close computation admission and recall active jobs before normal dispatch.
 **Verification**: Test
 
 ### PROC-MACH-6 Audio callbacks
@@ -64,6 +65,7 @@ CPU spin handoffs MUST return to the owner's ordinary wake and context selection
 
 **Rule**: The machine MUST own the virtual clock. Ctrl time skip MAY advance to a deadline only when no context can run and the wait allows it. It MUST NOT complete external I/O early, and the audio play cursor MUST follow device consumption.
 Before the first completed frame, automatic time skip MAY advance time only when every live context is waiting for its next clock poll.
+Held or executing computations MUST prevent idle and time skip.
 **Verification**: Test
 
 ### PROC-CLOCK-2 No time skip in a family
@@ -87,6 +89,7 @@ Clock leaves MUST preserve guest polling observations and decline required waits
 
 **Rule**: A real-time polling round MAY wait only after every ready context repeated earlier yield intervals 64 times running. An interval is its host calls, completed guest instructions and yield site. A context doing new work between yields MUST run again without a host wait.
 CPU spin handoffs MUST leave the context ready and MUST NOT qualify as a polling or idle proof.
+Completed computations MUST contribute their retired instructions to the same accounting as owner execution.
 **Verification**: Test
 
 ### PROC-CLOCK-6 Timer ticks

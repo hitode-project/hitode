@@ -4,6 +4,9 @@
 //! pick: yielded; lease/collect: token. block: kind (1 timer/2 object/3 set),
 //! deadline or handle, thunk. wake: thunk, signaler context plus one (zero if
 //! absent), reason (1 timeout/2 signal/3 set/4 notification). spin_yield: resume PC.
+//! compute_offer: entry PC. compute_submit: worker assignment.
+//! compute_done: retired instructions, execution ns, flags (1 local, 2 owner required).
+//! compute_round: offered contexts, scope wall ns, accepted completions.
 //! Lease-to-collect includes queueing and completion delivery, not worker CPU time.
 //! frame: completed guest-frame serial (not a shell observation or scanout).
 use std::io::{self, Write};

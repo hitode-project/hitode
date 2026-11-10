@@ -9,8 +9,11 @@
 //! * Each guest context has its own stack, TEB (FS base), registers, and continuation
 //!   stack. Names are diagnostic labels; scheduling depends only on readiness and
 //!   the urgency of the event that woke it, never an engine-specific thread role.
+//! * Proved computation can run concurrently. The execution owner admits it from
+//!   saved contexts and drains it before entering ordinary guest code or services.
 
 pub mod clock;
+mod computation;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
@@ -1587,6 +1590,8 @@ struct Dispatch<'a> {
     parked: Option<Parked>,
     yield_on_frame: bool,
     defer_work: bool,
+    /// This turn can offer a computation if a productive peer is ready.
+    computation: bool,
 }
 
 /// Return addresses found by scanning the guest stack: values inside an image that follow
@@ -1882,6 +1887,17 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn allow_computation(&self) -> bool {
+        self.computation
+            && !DEBUGGER_ATTACHED.get()
+            && !self.sys.trace.enabled()
+            && self.sys.call_limit.is_none()
+            && self
+                .sys
+                .active_contexts()
+                .any(|c| c.id != self.sys.current && c.is_ready() && !c.yielded)
+    }
+
     fn allow_spin_yield(&self) -> bool {
         self.sys
             .active_contexts()
@@ -2060,6 +2076,7 @@ pub struct Machine<B: Backend> {
     blank: B::Context,
     /// Context whose registers are currently in the CPU.
     loaded: Option<CtxId>,
+    computation: computation::Round,
     /// None inherits the backend default; Some(None) explicitly disables the watchdog.
     /// Configured limits cover one scheduler invocation across context switches.
     execution_budget: Option<Option<Duration>>,
@@ -2184,6 +2201,7 @@ impl<B: Backend> Machine<B> {
             regs: Vec::new(),
             blank,
             loaded: None,
+            computation: computation::Round::default(),
             execution_budget: None,
             slice_backend_budget: None,
             slice_elapsed: Duration::ZERO,
@@ -2404,20 +2422,7 @@ impl<B: Backend> Machine<B> {
         if self.loaded == Some(id) {
             return Ok(());
         }
-        if let Some(prev) = self
-            .loaded
-            .filter(|&prev| !self.sys.contexts[prev as usize].is_done())
-        {
-            let mut slot = self.regs[prev as usize]
-                .take()
-                .unwrap_or_else(|| self.cpu.new_context());
-            self.cpu.save(&mut slot);
-            self.regs[prev as usize] = Some(slot);
-        } else if let Some(prev) = self.loaded
-            && let Some(slot) = self.regs.get_mut(prev as usize)
-        {
-            *slot = None;
-        }
+        self.save_loaded();
         self.regs.resize_with(self.sys.contexts.len(), || None);
         let ctx = &mut self.sys.contexts[id as usize];
         match (ctx.start.take(), &self.regs[id as usize]) {
@@ -2437,6 +2442,19 @@ impl<B: Backend> Machine<B> {
         }
         self.loaded = Some(id);
         Ok(())
+    }
+
+    fn save_loaded(&mut self) {
+        let Some(id) = self.loaded.take() else {
+            return;
+        };
+        let slot = &mut self.regs[id as usize];
+        if self.sys.contexts[id as usize].is_done() {
+            *slot = None;
+        } else {
+            let saved = slot.get_or_insert_with(|| self.cpu.new_context());
+            self.cpu.save(saved);
+        }
     }
 
     fn fail(&self, message: String) -> RunResult {
@@ -2661,6 +2679,8 @@ impl<B: Backend> Machine<B> {
             budget.enter_scheduler();
         }
         let result = self.run_scheduler_inner(slice, started, hard_budget);
+        self.computation.release(&self.sys);
+        self.restore_computation_current();
         if let Some(budget) = &mut self.sys.stats.frame_budget {
             budget.leave_scheduler();
         }
@@ -2720,7 +2740,16 @@ impl<B: Backend> Machine<B> {
                 self.sys.scheduling.external_interrupts += 1;
                 return SliceResult::Yielded;
             }
+            let deadline = self.computation.real_deadline(&self.sys);
             self.sys.wake();
+            if deadline.is_some_and(|at| at <= self.sys.clock.now_us())
+                || self.computation.delivery_changed(&self.sys)
+            {
+                self.computation.release(&self.sys);
+            } else if self.computation.collected(&self.sys) {
+                self.run_computation_round(slice, started, hard_budget);
+                continue;
+            }
             self.sys.advance_if_only_polling();
             let generation = self.sys.poll_generation();
             if generation != poll_generation {
@@ -2764,6 +2793,7 @@ impl<B: Backend> Machine<B> {
                 });
             }
             let contexts = &self.sys.contexts;
+            let computation = &self.computation;
             let selection = self.sys.wakes.pick(
                 &mut last,
                 MAX_CONTEXTS as usize,
@@ -2773,7 +2803,7 @@ impl<B: Backend> Machine<B> {
                         .scheduler_work
                         .selections
                         .set(self.sys.scheduler_work.selections.get() + 1);
-                    contexts[id as usize].is_ready()
+                    contexts[id as usize].is_ready() && !computation.holds(id)
                 },
                 latency_mode,
             );
@@ -2793,6 +2823,7 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(RunResult::Idle { next_deadline });
             };
             let id = selection.id;
+            self.computation.select(id, &self.sys);
             self.sys
                 .wakes
                 .mark_turn(id, self.sys.contexts[id as usize].yielded);
@@ -3005,6 +3036,7 @@ impl<B: Backend> Machine<B> {
             let calls_before = self.sys.host_calls;
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
+            let computation = !self.computation.take_decline(id);
             let mut d = Dispatch {
                 sys: &mut self.sys,
                 ext: &mut self.ext,
@@ -3013,6 +3045,7 @@ impl<B: Backend> Machine<B> {
                 // Explicit deferred work still returns to this scheduler to
                 // recheck deadlines/watchdog, without forcing a host handoff.
                 defer_work: latency_mode,
+                computation,
             };
             let retired_before = self.cpu.retired_instructions();
             let exit = self.cpu.run(&mut d);
@@ -3050,6 +3083,22 @@ impl<B: Backend> Machine<B> {
             self.sys.stats.total.cpu_runs += 1;
             self.note_frame();
             match exit {
+                Exit::Computation => {
+                    let ctx = &mut self.sys.contexts[id as usize];
+                    ctx.yielded = false;
+                    ctx.progress.new_work();
+                    if self.sys.schedule_trace.enabled() {
+                        self.sys.schedule_trace.event(
+                            "compute_offer",
+                            id,
+                            u64::from(self.cpu.reg(Reg::Eip)),
+                            0,
+                            0,
+                        );
+                    }
+                    self.computation.offer(id, &self.sys);
+                    self.save_loaded();
+                }
                 Exit::Reschedule => {
                     let ctx = &mut self.sys.contexts[id as usize];
                     ctx.yielded = false;
@@ -3102,6 +3151,7 @@ impl<B: Backend> Machine<B> {
                         parked: None,
                         yield_on_frame: frame_handoff,
                         defer_work: latency_mode,
+                        computation: false,
                     }
                     .exception(&mut self.cpu, exception::Exception::Fault(fault));
                     if let Err(parked) = result

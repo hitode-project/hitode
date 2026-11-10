@@ -158,6 +158,7 @@ pub enum RunOutcome {
     Budget,
     Interrupted,
     Reschedule,
+    Computation,
     ReadFault { pc: u32, address: u32 },
     WriteFault { pc: u32, address: u32 },
     FetchFault { pc: u32, address: u32 },

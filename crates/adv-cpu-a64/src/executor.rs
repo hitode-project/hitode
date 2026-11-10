@@ -27,6 +27,8 @@ const BLOCK_UNITS: u64 = 256;
 #[derive(Clone)]
 pub struct ExecutionContext {
     cpu: CpuState,
+    offered: Option<u32>,
+    resume: Option<(u32, Exit)>,
 }
 
 impl ExecutionContext {
@@ -36,6 +38,17 @@ impl ExecutionContext {
 
     pub fn cpu_mut(&mut self) -> &mut CpuState {
         &mut self.cpu
+    }
+
+    #[cfg(native)]
+    pub(crate) fn has_resume(&self) -> bool {
+        self.resume.is_some_and(|(pc, _)| pc == self.cpu.eip)
+    }
+
+    #[cfg(native)]
+    pub(crate) fn finish_computation(&mut self, exit: Exit) {
+        self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
+        self.resume = matches!(exit, Exit::Interpret | Exit::Fault).then_some((self.cpu.eip, exit));
     }
 }
 
@@ -77,6 +90,8 @@ pub struct Executor {
     diagnostics: u8,
     alarm: Option<adv_sync::pending::Deadline>,
     deadline: Option<Instant>,
+    offered: Option<u32>,
+    computation_resume: Option<(u32, Exit)>,
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
     /// `ADV_JIT_VERIFY` checks, and how often each entry has been checked.
@@ -159,6 +174,8 @@ impl Executor {
             diagnostics: 0,
             alarm: None,
             deadline: None,
+            offered: None,
+            computation_resume: None,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
             #[cfg(native)]
             verifier: translate.then(Verifier::from_env).flatten(),
@@ -244,13 +261,50 @@ impl Executor {
     pub fn save_context(&self) -> Result<ExecutionContext, String> {
         let mut cpu = self.state.clone();
         cpu.refresh_mmx();
-        Ok(ExecutionContext { cpu })
+        Ok(ExecutionContext {
+            cpu,
+            offered: self.offered,
+            resume: self.computation_resume,
+        })
     }
 
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
+        self.offered = context.offered;
+        self.computation_resume = context.resume;
         Ok(())
+    }
+
+    #[cfg(native)]
+    pub(crate) fn with_computation(
+        &mut self,
+        retired: &mut u64,
+        wake: Option<adv_sync::WakeEvent>,
+        deadline: Option<Instant>,
+        visit: &mut dyn FnMut(
+            &mut dyn adv_cpu_core::backend::Computation<Option<ExecutionContext>>,
+        ),
+    ) {
+        self.set_deadline(deadline);
+        let mask = adv_sync::pending::DEADLINE
+            | if self.host_interrupts {
+                adv_sync::pending::INTERRUPT
+            } else {
+                0
+            };
+        if let Some(native) = &mut self.native
+            && self.verifier.is_none()
+        {
+            native.with_computation(
+                &mut self.memory,
+                retired,
+                (self.interrupt.clone(), mask),
+                wake,
+                visit,
+            );
+        }
+        self.set_deadline(None);
     }
 
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
@@ -423,6 +477,10 @@ impl Executor {
         #[cfg(native)]
         if let Some(native) = &mut self.native {
             native.set_spin_yield(yield_on_spin);
+            native.set_computation_offer(
+                self.verifier.is_none() && bridge.handler.is_some(),
+                self.offered.take().filter(|&pc| pc == self.state.eip),
+            );
             native.set_body_services(
                 bridge
                     .handler
@@ -447,6 +505,10 @@ impl Executor {
             .then(|| self.instruction_trace.take())
             .flatten();
         let result = self.run_inner(stop, budget, &mut bridge, trace.as_deref_mut());
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            self.offered = self.offered.or(native.take_offer_skip());
+        }
         if let Some(trace) = &mut trace {
             trace.boundary(&result, &self.state, &self.memory);
         }
@@ -625,14 +687,25 @@ impl Executor {
             let (units, observed) = trace.as_deref_mut().map_or((units, None), |trace| {
                 trace.prepare(units, &self.state, &self.memory)
             });
+            let resume = self.computation_resume.take().filter(|(pc, exit)| {
+                *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Fault)
+            });
             let (execution, last_units) = if precise_flags || observed.is_some() {
                 let execution = self
                     .interpreter
                     .run_chunk(&mut self.state, &mut self.memory, 1);
                 (execution, execution.units)
-            } else if let Some(exit) = self.run_native(stop, bridge)? {
+            } else if let Some(exit) = match resume {
+                Some((_, exit)) => Some(exit),
+                None => self.run_native(stop, bridge)?,
+            } {
                 match exit {
                     Exit::Dispatch => continue,
+                    Exit::Computation => {
+                        self.offered = Some(self.state.eip);
+                        return Ok(RunOutcome::Computation);
+                    }
+                    Exit::Recall => unreachable!("only computation entries can be recalled"),
                     Exit::Reschedule => return Ok(RunOutcome::Reschedule),
                     Exit::Yield => {
                         if let Some(handler) = bridge.handler.as_mut() {
@@ -671,6 +744,12 @@ impl Executor {
             };
             self.stats.interpreter_entries += 1;
             self.stats.interpreter_instructions += u64::from(execution.units);
+            #[cfg(native)]
+            if execution.units != 0
+                && let Some(native) = &mut self.native
+            {
+                native.progressed();
+            }
             bridge
                 .cliffs
                 .interpreted(adv_cpu_core::InterpreterReason::Forced, execution.units);

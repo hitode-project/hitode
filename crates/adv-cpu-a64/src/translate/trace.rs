@@ -68,7 +68,7 @@ pub enum Mode {
     Inline(u32),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inst {
     /// The thunk of a recognized host call (A64-CTL-12).
     pub call: Option<u32>,

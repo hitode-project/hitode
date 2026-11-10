@@ -520,7 +520,11 @@ impl Translator<'_> {
             }
             _ => {
                 self.settle();
-                self.shadow_return();
+                if self.computation {
+                    self.computation_transfer(self.indirect(IndirectBranchKind::Return));
+                } else {
+                    self.shadow_return();
+                }
             }
         }
     }
@@ -928,19 +932,13 @@ impl Translator<'_> {
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
-        if let Some(x87) = self.x87_leaving() {
-            let label = self.asm.label();
-            self.asm.b(label);
-            self.push_cold(Cold::Leave {
-                label,
-                state: self.state,
-                simd_dirty: self.vector.dirty,
-                refund: self.trace.owed(self.index),
-                exit: Exit::Interpret,
-                eip: self.trace.insts[self.index].pc,
-                link: false,
-                x87: Some(x87),
-            });
+        if self.computation || self.x87_leaving().is_some() {
+            self.follow_exit(
+                Exit::Interpret,
+                self.trace.insts[self.index].pc,
+                self.trace.owed(self.index),
+                false,
+            );
             return;
         }
         let index = self.helpers + u32::from(index);

@@ -42,6 +42,9 @@
 //! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` outside x87 runs (A64F-FP-1, A64F-FP-7).
+//!
+//! Each admitted execution gets a private runtime. Recall, deadlines and
+//! host notifications are observed only at exhausted instruction budgets.
 
 use std::mem::offset_of;
 
@@ -61,7 +64,7 @@ pub struct Runtime {
     pub cpu: *mut CpuState,
     /// Guest window base, 4 GiB aligned: `x27`.
     pub window: u64,
-    /// Shadow return stack pointer: `x28`.
+    /// Owner shadow return stack or admitted data alias: `x28`.
     pub shadow: u64,
     /// Safepoint countdown: `x9`.
     pub countdown: u64,
@@ -123,6 +126,14 @@ pub struct Runtime {
     pub body_stack: u32,
     /// Whether proved spin backedges can hand off this execution turn.
     pub spin_yield: u32,
+    /// Read at exhausted computation budgets only.
+    pub recall: u64,
+    pub recall_mask: u32,
+    pub computation_pending: u64,
+    pub computation_pending_mask: u32,
+    pub completed: u64,
+    /// Candidate whose ordinary unit exhausted an instruction budget.
+    pub computation_hint: u32,
 }
 
 impl Runtime {
@@ -160,6 +171,12 @@ impl Runtime {
             body_value: 0,
             body_stack: 0,
             spin_yield: 0,
+            recall: 0,
+            recall_mask: 0,
+            computation_pending: 0,
+            computation_pending_mask: 0,
+            completed: 0,
+            computation_hint: 0,
         }
     }
 }
@@ -182,6 +199,8 @@ pub enum Exit {
     Yield = 4,
     /// A completed spin backedge requests a productive handoff.
     Reschedule = 5,
+    Recall = 6,
+    Computation = 7,
 }
 
 impl Exit {
@@ -193,6 +212,8 @@ impl Exit {
             3 => Some(Self::Stepped),
             4 => Some(Self::Yield),
             5 => Some(Self::Reschedule),
+            6 => Some(Self::Recall),
+            7 => Some(Self::Computation),
             _ => None,
         }
     }
@@ -281,6 +302,15 @@ pub(crate) const BODY_CLASSES: u32 =
     BODY + offset_of!(adv_cpu_core::body::BodyContext, classes) as u32;
 pub(crate) const BODY_STACK: u32 = field(offset_of!(Runtime, body_stack));
 pub(crate) const SPIN_YIELD: u32 = field(offset_of!(Runtime, spin_yield));
+pub(crate) const RECALL: u32 = field(offset_of!(Runtime, recall));
+pub(crate) const RECALL_MASK: u32 = field(offset_of!(Runtime, recall_mask));
+pub(crate) const COMPUTATION_PENDING: u32 = field(offset_of!(Runtime, computation_pending));
+pub(crate) const COMPUTATION_PENDING_MASK: u32 =
+    field(offset_of!(Runtime, computation_pending_mask));
+pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
+pub(crate) const COMPUTATION_HINT: u32 = field(offset_of!(Runtime, computation_hint));
+pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
+pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;

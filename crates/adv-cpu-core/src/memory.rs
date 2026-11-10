@@ -754,6 +754,24 @@ impl Memory {
         })
     }
 
+    /// An ordinary span of the private reservation's alias. Guest permissions
+    /// apply even when the protected host page mixes several guest pages.
+    #[cfg(unix)]
+    pub fn computation_range(&self, addr: u32, len: usize, write: bool) -> bool {
+        let Ok(range) = self.range(addr, len) else {
+            return false;
+        };
+        let info = self.host_range(&range);
+        let permission = if write { WRITE } else { READ };
+        !range.is_empty()
+            && info.committed
+            && info.protection & permission != 0
+            && info.flags & (SHARED | LINEAR | AUDIO) == 0
+            && !info.resident
+            && (!write || !self.writes_code(&range))
+            && self.window.is_some()
+    }
+
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         if perms & !7 != 0 || self.mapped[pages.clone()].iter().any(|&v| v) {
@@ -2442,7 +2460,7 @@ mod window_tests {
     /// Translated code reaches the host pages of shared storage that the
     /// window shows as ordinary memory holding the storage's bytes, until a
     /// protection the window cannot keep exact or the unmap ends the view.
-    // spec: A64-MEM-11, A64-MEM-13
+    // spec: A64-MEM-11, A64-MEM-13, A64-TR-9
     #[test]
     fn the_guest_window_shows_whole_host_pages_of_shared_storage() {
         use crate::virtual_memory::GuestAccess::{Read, Write};
@@ -2461,6 +2479,8 @@ mod window_tests {
                 "{host}"
             );
             assert_eq!(linear(&memory, tail), host == 4096, "{host}");
+            assert!(!memory.computation_range(0x20000, 4, false));
+            assert!(!memory.computation_range(0x20000, 4, true));
             let snapshot = memory.native_permissions();
             assert_eq!(
                 snapshot[page(0x20000)] & (SHARED | READ | WRITE),
@@ -2516,7 +2536,7 @@ mod window_tests {
     /// Native code takes a page directly only where its host page lets it:
     /// on 16K hosts a mixed or code-watched host page sends the accesses its
     /// window refuses through `Memory` instead of faulting on each one.
-    // spec: A64-MEM-3, A64-MEM-8
+    // spec: A64-MEM-3, A64-MEM-8, A64-TR-9
     #[test]
     fn native_permissions_follow_the_window_host_page() {
         let native = crate::virtual_memory::host_page_size().unwrap();
@@ -2535,6 +2555,12 @@ mod window_tests {
                 "{host}: watched data page"
             );
             let mixed = host == 16384;
+            assert!(memory.computation_range(0x11000, 4, false));
+            assert!(memory.computation_range(0x11000, 4, true));
+            assert!(!memory.computation_range(0x13000, 4, false));
+            assert!(memory.computation_range(0x14000, 4, false));
+            assert!(!memory.computation_range(0x14000, 4, true));
+            assert!(memory.computation_range(0x14004, 4, true));
             assert_eq!(
                 classes[1] & 7,
                 READ | WRITE | if mixed { EXEC } else { 0 },
@@ -2553,6 +2579,7 @@ mod window_tests {
             assert_eq!(classes[5] & SHARED, 0, "{host}");
             // Restoring the neighbour refreshes every guest page of its host page.
             memory.protect(0x13000, PAGE_SIZE, READ | WRITE).unwrap();
+            assert!(memory.computation_range(0x11000, 4, false));
             let classes = memory.native_permissions();
             assert_eq!(classes[1] & SHARED, 0, "{host}");
             assert_eq!(

@@ -61,7 +61,7 @@ use super::residency::Entry;
 use crate::asm::Label;
 use crate::jit_map::Part;
 
-use super::{Cold, RUNTIME, Translator, WINDOW, X5, X6, X13, X14, X16, X17, host};
+use super::{Cold, RUNTIME, Translator, X5, X6, X13, X14, X16, X17, host};
 
 const V0: VReg = VReg::new(0);
 const V1: VReg = VReg::new(1);
@@ -1004,7 +1004,7 @@ impl Translator<'_> {
                             self.emit(fmov_from_v(X, X16, V1));
                         } else {
                             self.site();
-                            self.emit(ldr_reg(X, X16, WINDOW, address, false));
+                            self.emit(ldr_reg(X, X16, self.data_view(), address, false));
                         }
                     }
                     loc => {

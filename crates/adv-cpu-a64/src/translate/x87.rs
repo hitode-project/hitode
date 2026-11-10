@@ -38,7 +38,7 @@ use crate::runtime;
 use super::access::{Addr, Dir};
 use super::decode::{Mem, memory};
 use super::flags::Operand;
-use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
 
 mod cache;
 mod pair;
@@ -145,7 +145,7 @@ impl Translator<'_> {
             self.x87_accessed();
         } else {
             self.site();
-            self.emit(ldr_reg(X, X0, WINDOW, X6, false));
+            self.emit(ldr_reg(X, X0, self.data_view(), X6, false));
         }
         // Normalize the unsigned magnitude straight into raw80. No host-double
         // conversion or rounding loses the low bits of large signed integers.
@@ -518,7 +518,7 @@ impl Translator<'_> {
             self.x87_accessed();
         } else {
             self.site();
-            self.emit(str_reg(size, X2, WINDOW, X6, false));
+            self.emit(str_reg(size, X2, self.data_view(), X6, false));
         }
     }
 

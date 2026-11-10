@@ -1016,7 +1016,7 @@ fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> O
 }
 
 /// What an instruction does to the flags, and whether it may fault.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Effects {
     pub reads: FlagSet,
     pub writes: FlagSet,

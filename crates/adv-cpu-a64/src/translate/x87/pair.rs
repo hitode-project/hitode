@@ -293,7 +293,7 @@ impl Translator<'_> {
             self.checked_base(super::X6, store, X2, fail);
             self.emit(mrs_nzcv(super::X4));
         } else {
-            self.emit(mov(X, X2, super::WINDOW));
+            self.emit(mov(X, X2, self.data_view()));
         }
         self.emit(add_imm(W, X3, super::X6, 8, false));
         self.site();

@@ -13,8 +13,8 @@ The rules are in [execution.md](../../docs/spec/execution.md) and [a64.md](../..
 ## State and execution
 
 - `CpuState` holds the GPRs, EFLAGS, EIP, FS base, segment selectors and GDTR, the raw 80-bit x87 registers with tag, TOP, control and status, MXCSR, XMM and the deferred MMX alias writes. `ExecutionContext` copies this state plus restartable executor progress. It holds no memory, devices or host continuations.
-- The fuel budget counts work units: a native basic block, an interpreted instruction or a completed REP element. It is not virtual time, and Tier 0 units and native blocks cannot be added together.
-- M:1 scheduling, waits and the clock belong to the machine layer. The CPU provides progress, exceptions, budget and park boundaries.
+- AArch64 fuel counts guest instructions and completed REP elements. It bounds execution work; the machine owns wall-clock deadlines and guest time.
+- Scheduling, waits and the clock belong to the machine layer. The CPU provides progress, exceptions, budget and park boundaries. Prepared units can execute in parallel over proved nonconflicting ranges, with private CPU snapshots and fixed exits back to the owner.
 - `HostFeatures` describes what the host CPU offers. It is separate from the guest CPUID configuration, which is a host-independent virtual profile that the API feature queries also read.
 
 ## Tier 0
@@ -29,7 +29,7 @@ The rules are in [execution.md](../../docs/spec/execution.md) and [a64.md](../..
 - TF single steps run in the interpreter. Divide errors, quotient overflow, UD2 and invalid encodings keep the fault PC; software INT commits the next PC.
 - x87 arithmetic keeps the 80-bit representation, PC and RC, exception flags and stack semantics. SSE honors MXCSR rounding, DAZ, FTZ and exceptions. Unmasked exceptions never commit the destination early, and a pending #MF forces interpretation. FXSAVE and FXRSTOR in 32-bit form touch only the first 288 bytes.
 - Basic floating point uses SoftFloat. Transcendental functions compute in binary128 and round to extended80 by the guest RC; small arguments match native x87, and large-argument trigonometry is not promised bit-exact on every CPU. FPREM and FPREM1 compute exact remainders by integer division, with C2 partial reduction and quotient bits.
-- Coverage includes common 8, 16 and 32-bit integer forms, conditional execution, stack and flags, near calls, CRT bit and string operations, user-mode LOCK read-modify-write, common MMX, SSE and SSE2, and x87. Under M:1 a read-modify-write is atomic; this is not a promise of parallel guest CPUs. Arbitrary segmentation, privileged state and far transfers are not supported.
+- Coverage includes common 8, 16 and 32-bit integer forms, conditional execution, stack and flags, near calls, CRT bit and string operations, user-mode LOCK read-modify-write, common MMX, SSE and SSE2, and x87. The owner executes atomic read-modify-write instructions after admitted computations finish. Arbitrary segmentation, privileged state and far transfers are not supported.
 
 ## AArch64 translation
 

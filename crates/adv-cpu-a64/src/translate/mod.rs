@@ -42,6 +42,8 @@
 mod access;
 mod body;
 mod channels;
+#[cfg(native)]
+pub(crate) mod computation;
 mod decode;
 pub mod first;
 mod flags;
@@ -61,8 +63,13 @@ mod x87;
 use iced_x86::ConditionCode;
 
 pub use decode::Helper;
+#[cfg(native)]
+pub(crate) use decode::Op;
 pub(crate) use flags::Overflow;
 pub use flags::{Carry, Operand, Recipe, Sense};
+#[cfg(native)]
+pub(crate) use trace::Mode;
+pub(crate) use trace::Trace;
 pub use trace::{Bound, MAX_INSTRUCTIONS, Redirect};
 
 use adv_cpu_core::IndirectBranchKind;
@@ -77,7 +84,7 @@ use crate::runtime::Exit;
 use decode::{EBP, ESP};
 use flags::FlagSet;
 use std::collections::VecDeque;
-use trace::{Edge, Next, Trace};
+use trace::{Edge, Next};
 
 /// Host features that change what the translator emits (A64-ISA-4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -395,6 +402,19 @@ enum Cold {
         leave: Label,
         resume: Label,
     },
+    /// A proved slice exhausted its credit. Refill it only under the same lease.
+    Checkpoint {
+        label: Label,
+        leave: Label,
+        target: Label,
+        refund: u32,
+        debt: u32,
+    },
+    Nominate {
+        label: Label,
+        leave: Label,
+        eip: u32,
+    },
     /// Continues at the EIP in w16 through the indirect table.
     Lookup {
         label: Label,
@@ -500,6 +520,8 @@ struct Translator<'a> {
     /// The x87 control word when translating, which runs specialize for.
     control: u16,
     pe: bool,
+    computation: bool,
+    candidate: Option<u32>,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -555,16 +577,20 @@ pub struct Jit<'a> {
 
 impl Backend for Jit<'_> {
     fn lower(&mut self, unit: &mut Unit, eip: u32) {
-        self.code.asm.reset();
-        while self.emit_unit(unit, eip) {
-            self.code.asm.rewind();
-        }
+        self.lower_form(unit, eip, false);
     }
 }
 
 impl Jit<'_> {
+    fn lower_form(&mut self, unit: &mut Unit, eip: u32, computation: bool) {
+        self.code.asm.reset();
+        while self.emit_unit(unit, eip, computation) {
+            self.code.asm.rewind();
+        }
+    }
+
     /// Emits the unit, reporting whether a wider branch requires a new layout.
-    fn emit_unit(&mut self, unit: &mut Unit, eip: u32) -> bool {
+    fn emit_unit(&mut self, unit: &mut Unit, eip: u32, computation: bool) -> bool {
         let Code {
             asm,
             labels,
@@ -617,6 +643,19 @@ impl Jit<'_> {
             x87_sites: Vec::new(),
             control: self.control,
             pe: self.pe,
+            computation,
+            candidate: {
+                #[cfg(native)]
+                {
+                    (!computation)
+                        .then(|| computation::candidate(trace))
+                        .flatten()
+                }
+                #[cfg(not(native))]
+                {
+                    None
+                }
+            },
         };
         if trace.len() == 0 {
             // Nothing to translate: other units may still link here.
@@ -630,6 +669,67 @@ impl Jit<'_> {
         }
         t.finish(self.at)
     }
+}
+
+#[cfg(native)]
+pub(crate) struct ComputationCode<'a> {
+    pub words: &'a [u32],
+    pub sites: &'a [(usize, Site)],
+    pub marks: &'a [Mark],
+}
+
+/// The outer loop extent seen in this owner trace. A later budget exit
+/// can start inside it, where decoding can only see the inner backedge.
+#[cfg(native)]
+pub(crate) fn computation_extent(trace: &Trace) -> Option<(u32, u32)> {
+    let head = computation::candidate(trace)?;
+    let end = trace.insts[..trace.primary]
+        .iter()
+        .enumerate()
+        .filter(|&(from, inst)| {
+            let backedge = |edge| {
+                matches!(edge, Edge::Internal(to) if to <= from && trace.insts[to].pc == head)
+            };
+            inst.taken.is_some_and(backedge)
+                || matches!(inst.next, Next::Edge(edge) if backedge(edge))
+        })
+        .map(|(_, inst)| inst.next_pc)
+        .max()?;
+    (head < end).then_some((head, end))
+}
+
+#[cfg(native)]
+pub(crate) fn lower_computation<'a>(
+    work: &mut Workspace,
+    code: &'a mut Code,
+    eip: u32,
+    features: Features,
+    at: usize,
+    stubs: Stubs,
+    (control, pe): (u16, bool),
+) -> Option<ComputationCode<'a>> {
+    Jit {
+        code,
+        features,
+        at,
+        stubs,
+        checked: &|_| false,
+        helpers: 0,
+        control,
+        pe,
+    }
+    .lower_form(&mut work.unit, eip, true);
+    (!code.uses_permissions
+        && code.links.is_empty()
+        && code
+            .far
+            .iter()
+            .all(|&(_, to)| to == stubs.exit || to == stubs.fault))
+    .then_some(ComputationCode {
+        words: code.asm.words(),
+        sites: &code.sites,
+        marks: &code.marks,
+    })
 }
 
 impl Translator<'_> {
@@ -728,15 +828,20 @@ impl Translator<'_> {
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
-            let refuse = self.asm.label();
+            let leave = self.asm.label();
+            let resume = self.computation.then(|| self.asm.label());
+            let refuse = self.checkpoint(leave, resume, prepaid, prepaid);
             self.emit(sub_imm(X, X9, X9, prepaid, false));
             self.asm.tbz(true, X9, 63, refuse);
+            if let Some(resume) = resume {
+                self.asm.bind(resume);
+            }
             self.push_cold(Cold::Leave {
-                label: refuse,
+                label: leave,
                 state: State::CANONICAL,
                 simd_dirty: self.vector.dirty,
                 refund: prepaid,
-                exit: Exit::Dispatch,
+                exit: self.budget_exit(),
                 eip: inst.pc,
                 link: false,
                 x87: None,
@@ -746,12 +851,14 @@ impl Translator<'_> {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
         }
-        if index == 0 {
+        if index == 0 && !self.computation {
             self.body_stack_guard();
         }
         self.asm.bind(self.labels[index]);
-        self.native_batch(index);
-        self.channel_batch(index);
+        if !self.computation {
+            self.native_batch(index);
+            self.channel_batch(index);
+        }
         if !matches!(inst.op, decode::Op::X87(_)) {
             self.x87_start_integer();
             if self.x87.active {
@@ -764,6 +871,38 @@ impl Translator<'_> {
             self.follow(edge);
         }
         self.x87_end_integer();
+    }
+
+    fn budget_exit(&self) -> Exit {
+        if self.computation {
+            Exit::Recall
+        } else {
+            Exit::Dispatch
+        }
+    }
+
+    /// The original refusal publishes a precise exit. Only the computation
+    /// form can resume from the same live host registers instead.
+    fn checkpoint(&mut self, leave: Label, target: Option<Label>, refund: u32, debt: u32) -> Label {
+        if !self.computation {
+            return if let Some(eip) = self.candidate {
+                let label = self.asm.label();
+                self.push_cold(Cold::Nominate { label, leave, eip });
+                label
+            } else {
+                leave
+            };
+        }
+        let target = target.expect("computation checkpoint continuation");
+        let label = self.asm.label();
+        self.push_cold(Cold::Checkpoint {
+            label,
+            leave,
+            target,
+            refund,
+            debt,
+        });
+        label
     }
 
     /// Where an instruction's fall-through or jump ends the trace.
@@ -813,15 +952,17 @@ impl Translator<'_> {
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
         if net > 0 {
-            let refuse = self.asm.label();
+            let leave = self.asm.label();
+            let refund = net as u32 + self.trace.unused(self.index);
+            let refuse = self.checkpoint(leave, Some(target), refund, self.trace.owed(to));
             self.emit(sub_imm(X, X9, X9, net as u32, false));
             self.asm.tbz(true, X9, 63, refuse);
             self.push_cold(Cold::Leave {
-                label: refuse,
+                label: leave,
                 state: self.state,
                 simd_dirty: self.vector.dirty,
-                refund: net as u32 + self.trace.unused(self.index),
-                exit: Exit::Dispatch,
+                refund,
+                exit: self.budget_exit(),
                 eip: self.trace.insts[to].pc,
                 link: false,
                 x87,
@@ -888,19 +1029,21 @@ impl Translator<'_> {
                     self.jump_if(test, target);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
+                    let refund = self.trace.unused(from);
+                    let taken = self.checkpoint(leave, Some(target), refund, self.trace.owed(to));
                     self.push_cold(Cold::Refuse {
                         label: refuse,
                         net,
                         test,
-                        leave,
+                        leave: taken,
                         resume,
                     });
                     self.push_cold(Cold::Leave {
                         label: leave,
                         state: self.state,
                         simd_dirty: self.vector.dirty,
-                        refund: self.trace.unused(from),
-                        exit: Exit::Dispatch,
+                        refund,
+                        exit: self.budget_exit(),
                         eip: self.trace.insts[to].pc,
                         link: false,
                         x87: self.x87_leaving(),
@@ -975,7 +1118,7 @@ impl Translator<'_> {
 
     /// Only proved spin sites test whether the owner has another ready context.
     fn spin_edge(&mut self, to: usize, test: Option<Test>) {
-        if !self.trace.insts[self.index].spin {
+        if self.computation || !self.trace.insts[self.index].spin {
             return;
         }
         let leave = self.asm.label();
@@ -1451,6 +1594,10 @@ impl Translator<'_> {
     /// the link point, the first word, which the helper may patch into a
     /// branch to the target unit.
     fn dispatch(&mut self, eip: u32, main: bool) {
+        if self.computation {
+            self.exit(Exit::Dispatch, eip);
+            return;
+        }
         let point = self.asm.offset();
         self.links.push(Link {
             offset: point,
@@ -1498,6 +1645,17 @@ impl Translator<'_> {
     fn mov_branch(&mut self, branch: u64) {
         self.mov_imm(X4, branch as u32);
         self.emit(movk(X, X4, (branch >> 32) as u16, 32));
+    }
+
+    /// Leaves after a completed transfer whose guest target is in w16.
+    fn computation_transfer(&mut self, branch: u64) {
+        self.mov_branch(branch);
+        self.emit_all(&[
+            str(X, X4, RUNTIME, crate::runtime::INDIRECT_BRANCH),
+            mov(W, X1, X16),
+            movz(W, X0, Exit::Dispatch as u16, 0),
+        ]);
+        self.far(self.stubs.exit);
     }
 
     fn cold(&mut self, cold: Cold, at: usize) {
@@ -1591,6 +1749,44 @@ impl Translator<'_> {
                 self.jump_if(test, leave);
                 self.asm.b(resume);
             }
+            Cold::Checkpoint {
+                label,
+                leave,
+                target,
+                refund,
+                debt,
+            } => {
+                self.asm.bind(label);
+                self.emit_all(&[
+                    ldr(X, X0, RUNTIME, crate::runtime::RECALL),
+                    ldr(W, X0, X0, 0),
+                    ldr(W, X1, RUNTIME, crate::runtime::RECALL_MASK),
+                    and(W, X0, X0, X1, Lsl, 0),
+                ]);
+                self.asm.cbz(W, true, X0, leave);
+                self.emit_all(&[
+                    ldr(X, X0, RUNTIME, crate::runtime::COMPUTATION_PENDING),
+                    ldr(W, X0, X0, 0),
+                    ldr(W, X1, RUNTIME, crate::runtime::COMPUTATION_PENDING_MASK),
+                    and(W, X0, X0, X1, Lsl, 0),
+                ]);
+                self.asm.cbz(W, true, X0, leave);
+                self.mov_imm(X1, crate::runtime::COMPUTATION_SLICE - refund);
+                self.emit_all(&[
+                    sub(X, X1, X1, X9, Lsl, 0),
+                    ldr(X, X0, RUNTIME, crate::runtime::COMPLETED),
+                    add(X, X0, X0, X1, Lsl, 0),
+                    str(X, X0, RUNTIME, crate::runtime::COMPLETED),
+                ]);
+                self.mov_imm(X9, crate::runtime::COMPUTATION_SLICE - debt);
+                self.asm.b(target);
+            }
+            Cold::Nominate { label, leave, eip } => {
+                self.asm.bind(label);
+                self.mov_imm(X0, eip);
+                self.emit(str(W, X0, RUNTIME, crate::runtime::COMPUTATION_HINT));
+                self.asm.b(leave);
+            }
             Cold::Lookup {
                 label,
                 state,
@@ -1612,8 +1808,12 @@ impl Translator<'_> {
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
-                self.mov_branch(branch);
-                self.far(self.stubs.lookup);
+                if self.computation {
+                    self.computation_transfer(branch);
+                } else {
+                    self.mov_branch(branch);
+                    self.far(self.stubs.lookup);
+                }
             }
             Cold::X87Backedge {
                 label,

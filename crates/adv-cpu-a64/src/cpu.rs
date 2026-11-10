@@ -518,6 +518,10 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn allow_computation(&self) -> bool {
+        self.handler.allow_computation()
+    }
+
     fn allow_spin_yield(&self) -> bool {
         self.handler.allow_spin_yield()
     }
@@ -630,6 +634,19 @@ impl Backend for Cpu {
     }
 
     type Context = Option<ExecutionContext>;
+
+    unsafe fn with_computation(
+        &mut self,
+        wake: Option<WakeEvent>,
+        deadline: Option<Instant>,
+        visit: &mut dyn FnMut(&mut dyn adv_cpu_core::backend::Computation<Self::Context>),
+    ) {
+        #[cfg(native)]
+        self.inner
+            .with_computation(&mut self.retired, wake, deadline, visit);
+        #[cfg(not(native))]
+        let _ = (wake, deadline, visit);
+    }
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {
         let Executor { state, memory, .. } = &mut self.inner;
         state.segments =
@@ -708,6 +725,7 @@ impl Backend for Cpu {
                 }
                 Ok(RunOutcome::Budget) => continue,
                 Ok(RunOutcome::Reschedule) => return Exit::Reschedule,
+                Ok(RunOutcome::Computation) => return Exit::Computation,
                 Ok(RunOutcome::Interrupted) => {
                     if let Some(budget) = self.budget
                         && start.elapsed() >= budget
