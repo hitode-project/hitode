@@ -4,7 +4,7 @@ import { onHostEvent } from "./bridge";
  * The mobile game screen as the native view reports it (AND-APP-16), in CSS
  * pixels of this page. Controls may sit in the letterbox around `game`,
  * including the safe-area margins, but never on a cutout, within
- * `cornerRadius` of a corner or on a `gestures` edge.
+ * `cornerRadius` of a corner. Android controls may overlap `gestures` edges.
  */
 export interface Area {
   x: number;

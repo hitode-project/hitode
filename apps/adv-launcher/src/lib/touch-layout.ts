@@ -3,14 +3,14 @@ import type { Area, GameLayout } from "./screen.svelte";
 /**
  * Where the touch controls go around a mobile game (AND-APP-16): the side
  * letterboxes on a phone, the top and bottom ones on a tablet, or glass
- * panels over the game when neither leaves room. Controls may use the
- * letterbox up to the screen edge but never a cutout, a rounded corner or a
- * system gesture edge. All values are CSS pixels of the page.
+ * panels over the game for groups that do not fit in the margins. Controls may use the
+ * letterbox up to the screen edge, clear of cutouts and rounded corners.
+ * Android also uses the system gesture strips. Values are CSS pixels.
  */
 export type Arrangement =
   | { kind: "side"; wide: boolean; left: Area; right: Area }
   | { kind: "band"; top: Area; bottom: Area }
-  | { kind: "float"; inner: Area };
+  | { kind: "float"; inner: Area; left: Area | null; right: Area | null };
 
 /** Space between a control group and the letterbox's edges. */
 const PAD = 6;
@@ -89,17 +89,18 @@ function inner(layout: GameLayout): Area {
   return { x: x0 + inset, y: y0 + inset, width: x1 - x0 - 2 * inset, height: y1 - y0 - 2 * inset };
 }
 
-export function arrange(layout: GameLayout): Arrangement {
+export function arrange(layout: GameLayout, android = false): Arrangement {
+  if (android) layout = { ...layout, gestures: { top: 0, right: 0, bottom: 0, left: 0 } };
   const left = side(layout, "left");
   const right = side(layout, "right");
-  const columns = Math.min(left.width, right.width);
-  if (columns >= NARROW && Math.min(left.height, right.height) >= KEY * 4) {
-    return { kind: "side", wide: columns >= WIDE, left, right };
+  const fits = (area: Area) => area.width >= NARROW && area.height >= KEY * 4;
+  if (fits(left) && fits(right)) {
+    return { kind: "side", wide: Math.min(left.width, right.width) >= WIDE, left, right };
   }
   const top = band(layout, "top");
   const bottom = band(layout, "bottom");
   if (Math.min(top.height, bottom.height) >= KEY) return { kind: "band", top, bottom };
-  return { kind: "float", inner: inner(layout) };
+  return { kind: "float", inner: inner(layout), left: fits(left) ? left : null, right: fits(right) ? right : null };
 }
 
 /**
