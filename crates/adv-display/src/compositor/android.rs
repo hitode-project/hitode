@@ -437,6 +437,7 @@ mod native {
                     Some(LayerId::Base) => c"base",
                     Some(LayerId::Video(_)) => c"video",
                     Some(LayerId::VideoBackground(_)) => c"video background",
+                    Some(LayerId::Window(_)) => c"window",
                     Some(LayerId::Host(_)) => c"host",
                 };
                 let handle = NonNull::new(unsafe {
