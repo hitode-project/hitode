@@ -534,6 +534,16 @@ pub struct Jit<'a> {
 
 impl Backend for Jit<'_> {
     fn lower(&mut self, unit: &mut Unit, eip: u32) {
+        self.code.asm.reset();
+        while self.emit_unit(unit, eip) {
+            self.code.asm.rewind();
+        }
+    }
+}
+
+impl Jit<'_> {
+    /// Emits the unit, reporting whether a wider branch requires a new layout.
+    fn emit_unit(&mut self, unit: &mut Unit, eip: u32) -> bool {
         let Code {
             asm,
             labels,
@@ -552,7 +562,6 @@ impl Backend for Jit<'_> {
             ..
         } = unit;
         *uses_permissions = false;
-        asm.reset();
         labels.clear();
         labels.extend((0..trace.len()).map(|_| asm.label()));
         sites.clear();
@@ -597,7 +606,7 @@ impl Backend for Jit<'_> {
             }
             *retired = trace.prepaid(0);
         }
-        t.finish(self.at);
+        t.finish(self.at)
     }
 }
 
@@ -772,9 +781,11 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
-        // Internal edges publish on both paths what their merge does not
-        // count dirty; a side exit's cold path publishes for itself.
-        if let Edge::Internal(to) = taken {
+        // Existing internal edges publish on both paths. Side exits and
+        // jumps into an appended path publish only on the taken path.
+        if let Edge::Internal(to) = taken
+            && (to < self.trace.primary || to <= self.index)
+        {
             self.publish(!self.entry[to].dirty);
         }
         let from = self.index;
@@ -843,6 +854,7 @@ impl Translator<'_> {
                 if self.trace.net(from, to) == 0
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
+                    && self.vector.dirty & !self.entry[to].dirty == 0
                     && self.holds(self.entry[to])
                 {
                     self.jump_if(test, self.labels[to]);
@@ -1576,12 +1588,9 @@ impl Translator<'_> {
         }
     }
 
-    fn finish(mut self, at: usize) {
-        // Cold code goes in the order it was asked for, so a tbz anywhere
-        // in the body is no farther from its target than the body or the
-        // short cold code is long. Long x87 paths and exits that publish a
-        // run, reached only by wider branches, a bridge or a fault's resume
-        // offset, follow, and tables come last.
+    fn finish(mut self, at: usize) -> bool {
+        // Short cold paths follow the body in emission order. Long x87
+        // paths and exits that publish a run follow, then the tables.
         let rank = |cold: &Cold| match cold {
             Cold::Table { .. } => 2,
             Cold::X87(_) | Cold::X87Fault { .. } | Cold::Leave { x87: Some(_), .. } => 1,
@@ -1598,6 +1607,9 @@ impl Translator<'_> {
             self.mark(pc, Part::Cold);
             self.cold(cold, at);
         }
+        if self.trace.has_loop() && self.asm.widen_bit_tests() {
+            return true;
+        }
         for &(index, label) in &self.x87_sites {
             let (at, site) = &mut self.sites[index];
             site.resume = (self.asm.position(label) - *at) as i32;
@@ -1612,5 +1624,6 @@ impl Translator<'_> {
                 b(offset)
             };
         }
+        false
     }
 }

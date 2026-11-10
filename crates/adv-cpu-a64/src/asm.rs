@@ -15,7 +15,7 @@ enum Fixup {
     Bl,
     Cond(Cond),
     Cbz(Size, bool, Reg),
-    Tbz(bool, Reg, u32),
+    Tbz(bool, Reg, u32, usize),
     Adr(Reg),
 }
 
@@ -26,7 +26,7 @@ impl Fixup {
             Self::Bl => encode::bl(offset),
             Self::Cond(cond) => encode::b_cond(cond, offset),
             Self::Cbz(size, nonzero, rt) => encode::cbz(size, nonzero, rt, offset),
-            Self::Tbz(nonzero, rt, bit) => encode::tbz(nonzero, rt, bit, offset),
+            Self::Tbz(nonzero, rt, bit, _) => encode::tbz(nonzero, rt, bit, offset),
             Self::Adr(rd) => encode::adr(rd, offset),
         }
     }
@@ -37,6 +37,8 @@ pub struct Asm {
     words: Vec<u32>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label, Fixup)>,
+    bit_tests: usize,
+    wide_bit_tests: Vec<bool>,
 }
 
 impl Asm {
@@ -89,7 +91,14 @@ impl Asm {
     }
 
     pub fn tbz(&mut self, nonzero: bool, rt: Reg, bit: u32, label: Label) {
-        self.refer(label, Fixup::Tbz(nonzero, rt, bit));
+        let index = self.bit_tests;
+        self.bit_tests += 1;
+        if self.wide_bit_tests.get(index) == Some(&true) {
+            self.emit(encode::tbz(!nonzero, rt, bit, 8));
+            self.b(label);
+        } else {
+            self.refer(label, Fixup::Tbz(nonzero, rt, bit, index));
+        }
     }
 
     pub fn adr(&mut self, rd: Reg, label: Label) {
@@ -105,6 +114,25 @@ impl Asm {
     pub fn finish(mut self) -> Vec<u32> {
         self.resolve();
         self.words
+    }
+
+    /// Finds out-of-range bit tests. Re-emit with those branches widened
+    /// so all users of code offsets see the same layout.
+    pub fn widen_bit_tests(&mut self) -> bool {
+        let mut changed = false;
+        for &(at, label, fixup) in &self.fixups {
+            if let Fixup::Tbz(_, _, _, index) = fixup {
+                let target = self.labels[label.0].expect("branch to an unbound label");
+                if !(-8192..8192).contains(&(target as isize - at as isize)) {
+                    if index >= self.wide_bit_tests.len() {
+                        self.wide_bit_tests.resize(index + 1, false);
+                    }
+                    self.wide_bit_tests[index] = true;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Patches every reference so far, keeping the buffer.
@@ -126,6 +154,13 @@ impl Asm {
 
     /// Empties the buffer and forgets every label, keeping the memory.
     pub fn reset(&mut self) {
+        self.wide_bit_tests.clear();
+        self.rewind();
+    }
+
+    /// Starts the same emission again with the chosen wide branches.
+    pub fn rewind(&mut self) {
+        self.bit_tests = 0;
         self.words.clear();
         self.labels.clear();
         self.fixups.clear();

@@ -22,7 +22,7 @@ impl Plan {
             return None;
         }
         let mut ops = Vec::new();
-        let end = (start..trace.len())
+        let end = (start..trace.primary)
             .find(|&index| trace.insts[index].taken == Some(Edge::Internal(start)))?;
         for index in start..=end {
             let inst = trace.insts[index];

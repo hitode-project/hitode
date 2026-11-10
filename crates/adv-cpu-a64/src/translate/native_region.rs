@@ -20,11 +20,11 @@ impl Unit {
         admit: &dyn Fn(u32, &[u8]) -> Vec<NativeRegion>,
         checked: &dyn Fn(u32) -> bool,
     ) {
-        for start in 0..self.trace.len() {
+        for start in 0..self.trace.primary {
             if !self.trace.merge[start] {
                 continue;
             }
-            let Some(end) = (start..self.trace.len())
+            let Some(end) = (start..self.trace.primary)
                 .find(|&n| self.trace.insts[n].taken == Some(Edge::Internal(start)))
             else {
                 continue;

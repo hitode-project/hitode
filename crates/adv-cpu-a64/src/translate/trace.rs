@@ -6,15 +6,14 @@
 //! the callee's `ret` becomes a check that the popped EIP is the expected
 //! one; otherwise it becomes a real call whose continuation is the next
 //! instruction of the trace, reached again through the shadow stack.
-//! Reaching an instruction already in the trace in the same frame closes
-//! a loop with an internal edge; conditional branches to instructions in
-//! the trace are internal edges too, and other ones side exits.
+//! A backward internal edge permits a larger trace that ends at the last
+//! loop latch. Taken paths that rejoin the trace in the same frame append
+//! to it; paths that leave it remain side exits.
 //!
-//! Budget (A64-CTL-7): a region starts at the entry and at each continuation and
-//! prepays every instruction up to the next one. An edge then settles the
-//! difference between what its target region still owes and what the
-//! source region prepaid but will not complete; only an edge that owes
-//! more checks the countdown.
+//! Budget (A64-CTL-7): the entry and call continuations prepay their regions.
+//! Edges settle the difference between the target region's debt and the
+//! source region's unused prepayment. An appended path starts a region paid
+//! by its incoming edge. Only an edge that owes more checks the countdown.
 //!
 //! Flags (A64-FLAG-3): backward liveness tracks recovery observations
 //! separately from guest reads. Merges agree on the flags recovery needs.
@@ -24,11 +23,11 @@ use adv_cpu_core::memory::Memory;
 use super::decode::{Effects, Fetcher, Helper, Op, Src};
 use super::flags::FlagSet;
 
-/// Longest trace, in guest instructions.
+/// Longest trace without a loop, in weighted guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;
-/// What a wide x87 or packed conversion counts toward `MAX_INSTRUCTIONS`:
-/// each emits hundreds of host instructions, and a unit must stay within
-/// the 32 KiB reach of `tbz` to its cold code.
+/// Longest trace with a loop.
+const LOOP_LIMIT: usize = 1024;
+/// What a wide x87 or packed conversion counts toward either limit.
 const WIDE_WEIGHT: usize = 4;
 /// Deepest inlined call.
 const MAX_DEPTH: u8 = 8;
@@ -36,7 +35,7 @@ const MAX_DEPTH: u8 = 8;
 const INLINE_ROOM: usize = 24;
 /// Slots of the (EIP, frame) index: a power of two well above the longest
 /// trace.
-const SLOTS: usize = 256;
+const SLOTS: usize = 2 * LOOP_LIMIT;
 
 /// Where control goes from an instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +111,9 @@ pub struct Trace {
     pub observe_out: Vec<FlagSet>,
     frames: Vec<Frame>,
     /// Instruction index + 1 by (EIP, frame), open addressing.
-    slots: Vec<u8>,
+    slots: Vec<u16>,
+    /// End of the original path, before any appended paths.
+    pub primary: usize,
     /// `Fetcher::failure` of the fetch that ended the trace.
     pub failure: u8,
     /// What each `Op::Helper` runs.
@@ -162,8 +163,8 @@ impl<'s> Stops<'s> {
 }
 
 fn slot(pc: u32, frame: u16) -> usize {
-    let key = pc ^ u32::from(frame) << 24;
-    (key.wrapping_mul(0x9E37_79B1) >> 24) as usize & (SLOTS - 1)
+    let key = pc ^ u32::from(frame) << 16;
+    (key.wrapping_mul(0x9E37_79B1) >> (32 - SLOTS.trailing_zeros())) as usize
 }
 
 /// Resolve forwarding entries whose register and stack effects cancel before
@@ -280,6 +281,71 @@ impl Trace {
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
+        let end = self.build_paths(memory, entry, stops, host, redirect, (LOOP_LIMIT, None));
+        if let Some(end) = end {
+            self.build_paths(
+                memory,
+                entry,
+                stops,
+                host,
+                redirect,
+                (LOOP_LIMIT, Some(end)),
+            );
+        } else if self.last_backedge(&Stops::new(stops)).is_none() {
+            self.build_paths(
+                memory,
+                entry,
+                stops,
+                host,
+                redirect,
+                (MAX_INSTRUCTIONS, None),
+            );
+        }
+        let stops = Stops::new(stops);
+        // Inlined callees and loops revisit bytes: watch each one once.
+        self.code.sort_unstable();
+        let mut merged = 0;
+        for index in 0..self.code.len() {
+            let (start, len) = self.code[index];
+            match merged {
+                0 => merged = 1,
+                _ => {
+                    let last = &mut self.code[merged - 1];
+                    let end = last.0.saturating_add(last.1);
+                    if start <= end {
+                        last.1 = last.1.max(start.saturating_add(len) - last.0);
+                    } else {
+                        self.code[merged] = (start, len);
+                        merged += 1;
+                    }
+                }
+            }
+        }
+        self.code.truncate(merged);
+        for index in 0..self.insts.len() {
+            let inst = self.insts[index];
+            if let Op::Jcc(_, target) = inst.op {
+                self.insts[index].taken = Some(match self.find(target, inst.frame) {
+                    Some(to) if !stops.contains(target) => Edge::Internal(to),
+                    _ => Edge::Exit(target),
+                });
+            }
+        }
+        self.analyze();
+    }
+
+    /// Builds the primary path and, for a loop, the paths that return to it.
+    /// Returns the stop for a rebuild when the primary path ran past its latch.
+    fn build_paths(
+        &mut self,
+        memory: &Memory,
+        entry: u32,
+        stops: &[u32],
+        host: &dyn Fn(u32, u32) -> Option<u32>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
+        bounds: (usize, Option<(u32, u16)>),
+    ) -> Option<(u32, u16)> {
+        let (limit, end) = bounds;
         self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
         self.code.clear();
@@ -296,22 +362,101 @@ impl Trace {
         self.helpers.clear();
         fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
-        let (mut pc, mut frame) = (entry, 0u16);
         let mut weight = 0;
+        let bounds = (limit, &stops, end);
+        self.path(
+            (entry, 0),
+            &mut weight,
+            (memory, &mut fetcher),
+            bounds,
+            host,
+            redirect,
+        );
+        self.primary = self.insts.len();
+        if limit == LOOP_LIMIT
+            && let Some(latch) = self.last_backedge(&stops)
+        {
+            if latch + 1 < self.primary && end.is_none() {
+                let inst = self.insts[latch];
+                self.helpers = fetcher.helpers.take().unwrap_or_default();
+                return Some((inst.next_pc, inst.frame));
+            }
+            let mut index = 0;
+            while weight < limit && index < self.insts.len() {
+                let inst = self.insts[index];
+                if let Op::Jcc(_, target) = inst.op
+                    && !stops.contains(target)
+                    && end != Some((target, inst.frame))
+                    && self.find(target, inst.frame).is_none()
+                {
+                    let start = self.insts.len();
+                    let code = self.code.len();
+                    let last_code = self.code.last().copied();
+                    let bodies = self.bodies.len();
+                    let helpers = fetcher.helpers.as_ref().unwrap().len();
+                    let frames = self.frames.len();
+                    let initial_weight = weight;
+                    fetcher.locked = None;
+                    if !self.path(
+                        (target, inst.frame),
+                        &mut weight,
+                        (memory, &mut fetcher),
+                        bounds,
+                        host,
+                        redirect,
+                    ) {
+                        // Reverse insertion order preserves the slot probe chains.
+                        while self.insts.len() > start {
+                            let id = self.insts.len() as u16;
+                            let inst = self.insts.pop().unwrap();
+                            let mut at = slot(inst.pc, inst.frame);
+                            while self.slots[at] != id {
+                                at = (at + 1) & (SLOTS - 1);
+                            }
+                            self.slots[at] = 0;
+                        }
+                        self.code.truncate(code);
+                        if let Some(last) = last_code {
+                            self.code[code - 1] = last;
+                        }
+                        self.bodies.truncate(bodies);
+                        fetcher.helpers.as_mut().unwrap().truncate(helpers);
+                        self.frames.truncate(frames);
+                        weight = initial_weight;
+                    }
+                }
+                index += 1;
+            }
+        }
+        self.helpers = fetcher.helpers.take().unwrap_or_default();
+        None
+    }
+
+    /// Walks one fall-through path, reporting a join to an earlier path.
+    fn path(
+        &mut self,
+        (mut pc, mut frame): (u32, u16),
+        weight: &mut usize,
+        (memory, fetcher): (&Memory, &mut Fetcher<'_>),
+        (limit, stops, stop): (usize, &Stops<'_>, Option<(u32, u16)>),
+        host: &dyn Fn(u32, u32) -> Option<u32>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
+    ) -> bool {
+        let start = self.insts.len();
         loop {
             let len = self.insts.len();
-            let end = if len > 0 && stops.contains(pc) {
+            let end = if len > 0 && (stops.contains(pc) || stop == Some((pc, frame))) {
                 Some(Edge::Exit(pc))
             } else if let Some(index) = self.find(pc, frame) {
                 Some(Edge::Internal(index))
-            } else if len == MAX_INSTRUCTIONS || weight >= MAX_INSTRUCTIONS {
+            } else if len == limit || *weight >= limit {
                 Some(Edge::Exit(pc))
             } else {
                 None
             };
             if let Some(edge) = end {
                 self.insts[len - 1].next = Next::Edge(edge);
-                break;
+                return matches!(edge, Edge::Internal(to) if to < start);
             }
             let intact = |entry: u32| {
                 redirect(entry).filter(|redirect| {
@@ -325,6 +470,7 @@ impl Trace {
                         })
                 })
             };
+            let helpers = fetcher.helpers.as_ref().unwrap().len();
             let fetched = match intact(pc) {
                 Some(redirect) => {
                     self.code.push((pc, redirect.original.len() as u32));
@@ -341,7 +487,7 @@ impl Trace {
                                 thunk: redirect.target,
                                 entry: true,
                             });
-                            Some((Op::Body(self.bodies.len() as u8 - 1), 0))
+                            Some((Op::Body((self.bodies.len() - 1) as u8), 0))
                         }
                         _ => Some((Op::Jmp(redirect.target), 0)),
                     }
@@ -349,11 +495,13 @@ impl Trace {
                 None => fetcher.fetch(pc),
             };
             let Some((op, size)) = fetched else {
-                self.failure = fetcher.failure;
-                if let Some(last) = self.insts.last_mut() {
-                    last.next = Next::Edge(Edge::Interpret(pc));
+                if start == 0 {
+                    self.failure = fetcher.failure;
                 }
-                break;
+                if len > start {
+                    self.insts[len - 1].next = Next::Edge(Edge::Interpret(pc));
+                }
+                return false;
             };
             let next_pc = pc.wrapping_add(size);
             // Import slots and the entries calls reach are watched like code,
@@ -386,18 +534,18 @@ impl Trace {
                 Op::Call(target)
                     if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
                 {
-                    match forwarded_body(memory, target, redirect, &stops) {
+                    match forwarded_body(memory, target, redirect, stops) {
                         Some((bound, dependencies)) => {
                             watched.extend(dependencies);
                             self.bodies.push(bound);
-                            Op::Body(self.bodies.len() as u8 - 1)
+                            Op::Body((self.bodies.len() - 1) as u8)
                         }
                         _ => op,
                     }
                 }
                 _ => op,
             };
-            weight += if matches!(op, Op::X87(_) | Op::Fild64(..))
+            let cost = if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
                     Op::Simd(super::simd::Simd {
@@ -411,6 +559,13 @@ impl Trace {
             } else {
                 1
             };
+            if limit == LOOP_LIMIT && *weight + cost > limit {
+                // Only a wide decoded instruction can exceed the remaining room.
+                fetcher.helpers.as_mut().unwrap().truncate(helpers);
+                self.insts[len - 1].next = Next::Edge(Edge::Exit(pc));
+                return false;
+            }
+            *weight += cost;
             match self.code.last_mut() {
                 // Spans grow along the fall-through path.
                 Some((start, bytes)) if start.wrapping_add(*bytes) == pc => *bytes += size,
@@ -447,8 +602,9 @@ impl Trace {
             self.code.extend(watched);
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
-                len + 4 < MAX_INSTRUCTIONS
+                len + 4 < limit
                     && !stops.contains(next_pc)
+                    && stop != Some((next_pc, frame))
                     && self.find(next_pc, frame).is_none()
             };
             let then = match op {
@@ -458,7 +614,7 @@ impl Trace {
                 Op::Call(target) => {
                     let depth = self.frames[usize::from(frame)].depth;
                     if depth < MAX_DEPTH
-                        && len + 1 + INLINE_ROOM <= MAX_INSTRUCTIONS
+                        && len + 1 + INLINE_ROOM <= limit
                         && !stops.contains(target)
                     {
                         Some((target, self.callee(frame, next_pc, depth)))
@@ -470,7 +626,7 @@ impl Trace {
                         None
                     }
                 }
-                Op::CallIndirect(_) if continuation() => {
+                Op::CallIndirect(_) if start == 0 && continuation() => {
                     inst.mode = Mode::Real;
                     Some((next_pc, frame))
                 }
@@ -498,40 +654,18 @@ impl Trace {
             self.insts.push(inst);
             match then {
                 Some((to, to_frame)) => (pc, frame) = (to, to_frame),
-                None => break,
+                None => return false,
             }
         }
-        self.helpers = fetcher.helpers.take().unwrap_or_default();
-        // Inlined callees and loops revisit bytes: watch each one once.
-        self.code.sort_unstable();
-        let mut merged = 0;
-        for index in 0..self.code.len() {
-            let (start, len) = self.code[index];
-            match merged {
-                0 => merged = 1,
-                _ => {
-                    let last = &mut self.code[merged - 1];
-                    let end = last.0.saturating_add(last.1);
-                    if start <= end {
-                        last.1 = last.1.max(start.saturating_add(len) - last.0);
-                    } else {
-                        self.code[merged] = (start, len);
-                        merged += 1;
-                    }
-                }
-            }
-        }
-        self.code.truncate(merged);
-        for index in 0..self.insts.len() {
+    }
+
+    fn last_backedge(&self, stops: &Stops<'_>) -> Option<usize> {
+        (0..self.primary).rfind(|&index| {
             let inst = self.insts[index];
-            if let Op::Jcc(_, target) = inst.op {
-                self.insts[index].taken = Some(match self.find(target, inst.frame) {
-                    Some(to) if !stops.contains(target) => Edge::Internal(to),
-                    _ => Edge::Exit(target),
-                });
-            }
-        }
-        self.analyze();
+            matches!(inst.next, Next::Edge(Edge::Internal(to)) if to <= index)
+                || matches!(inst.op, Op::Jcc(_, target) if !stops.contains(target)
+                    && self.find(target, inst.frame).is_some_and(|to| to <= index))
+        })
     }
 
     fn find(&self, pc: u32, frame: u16) -> Option<usize> {
@@ -555,7 +689,7 @@ impl Trace {
         while self.slots[at] != 0 {
             at = (at + 1) & (SLOTS - 1);
         }
-        self.slots[at] = (index + 1) as u8;
+        self.slots[at] = (index + 1) as u16;
     }
 
     /// The frame of a callee inlined from `frame`, returning to `ret`.
@@ -582,7 +716,10 @@ impl Trace {
         let mut end = len;
         for index in (0..len).rev() {
             self.region_end[index] = end;
-            if index > 0 && self.insts[index - 1].mode == Mode::Real {
+            if index > 0
+                && (self.insts[index - 1].mode == Mode::Real
+                    || (index >= self.primary && self.insts[index - 1].next != Next::Fall))
+            {
                 end = index;
             }
         }
@@ -609,6 +746,13 @@ impl Trace {
         self.observe_out.resize(len, FlagSet::NONE);
         while self.liveness(true) && backward {}
         while self.liveness(false) && backward {}
+    }
+
+    pub fn has_loop(&self) -> bool {
+        self.insts.iter().enumerate().any(|(index, inst)| {
+            matches!(inst.taken, Some(Edge::Internal(to)) if to <= index)
+                || matches!(inst.next, Next::Edge(Edge::Internal(to)) if to <= index)
+        })
     }
 
     pub fn len(&self) -> usize {

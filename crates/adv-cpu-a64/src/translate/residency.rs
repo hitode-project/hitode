@@ -95,8 +95,9 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             None => 0,
         };
     }
-    // Loop heads also hold what their bodies write, unless the cache drops.
-    for (index, inst) in trace.insts.iter().enumerate() {
+    // The primary path's loop heads also hold what their bodies write.
+    // A join from an appended path does not enclose a body in emission order.
+    for (index, inst) in trace.insts[..trace.primary].iter().enumerate() {
         let jump = match inst.next {
             Next::Edge(edge) => Some(edge),
             _ => None,
@@ -186,7 +187,9 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             dirty = footprints[index].map_or(0, |(_, writes)| dirty | writes);
             if let Some(Edge::Internal(to)) = inst.taken {
                 arrived[to] |= dirty;
-                dirty &= entry[to].dirty;
+                if to < trace.primary || to <= index {
+                    dirty &= entry[to].dirty;
+                }
             }
             if let Next::Edge(Edge::Internal(to)) = inst.next {
                 arrived[to] |= dirty;
