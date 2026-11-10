@@ -6,7 +6,7 @@
   import { tap } from "../lib/tap";
   import { region } from "../lib/overlay";
   import { prefs, savePrefs } from "../lib/prefs.svelte";
-  import type { GameLayout } from "../lib/screen.svelte";
+  import type { Area, GameLayout } from "../lib/screen.svelte";
   import { arrange, keyHeight } from "../lib/touch-layout";
 
   /**
@@ -31,7 +31,7 @@
   let more = $state(false);
   let ctrl = $state(false);
   $effect(() => {
-    if (more && open && !trackpad && arrangement.kind === "side") {
+    if (more && open && !trackpad && rightBar) {
       return nav.onBack(() => { more = false; return true; });
     }
   });
@@ -147,15 +147,15 @@
     if (ctrl) void call("game_key", { key: 0x11, down: false }, null).catch(() => {});
   });
 
-  const bars = $derived(arrangement.kind === "side" ? arrangement : null);
-  /** Two columns of keys fit a tablet's letterbox even without labels. */
-  const two = $derived(!!bars && (bars.wide || bars.right.width >= 96));
-  const keys = $derived(bars && !two ? compact : full);
-  const keyH = $derived(
-    bars ? keyHeight(Math.min(bars.left.height, bars.right.height), two ? 5 : keys.length, 50) : 44,
-  );
-  /** A tablet's tall letterbox: the groups sit where the thumbs rest, not at the top. */
-  const tall = $derived(!!bars && Math.min(bars.left.height, bars.right.height) >= 560);
+  const leftBar = $derived(arrangement.kind === "band" ? null : arrangement.left);
+  const rightBar = $derived(arrangement.kind === "band" ? null : arrangement.right);
+  const wide = $derived(arrangement.kind === "side" && arrangement.wide);
+  const two = $derived((rightBar?.width ?? 0) >= 96);
+  const keys = $derived(two ? full : compact);
+  const sideHeight = $derived(arrangement.kind === "side"
+    ? Math.min(arrangement.left.height, arrangement.right.height)
+    : (leftBar ?? rightBar)?.height ?? 0);
+  const keyH = $derived(keyHeight(sideHeight, two ? 5 : keys.length, 50));
   const style = (a: { x: number; y: number; width: number; height: number }) =>
     `left: ${a.x}px; top: ${a.y}px; width: ${a.width}px; height: ${a.height}px`;
 </script>
@@ -186,52 +186,57 @@
   {/each}
 {/snippet}
 
-{#if bars}
-  {#if open}
-    <div class="column fade" class:tight={bars.left.width < 44} class:middle={tall && !trackpad} style={style(bars.left)}>
-      <div class="group" class:labels={bars.wide && !trackpad} {@attach region}>
-        {#if trackpad}
-          <button class="side-icon" aria-label={t("游戏库")} {...tap(onlibrary)}>{@render icon("library")}</button>
-          <button class="side-icon" aria-label={t("菜单")} {...tap(onmenu)}>{@render icon("menu")}</button>
-        {:else}
-          {@render sideButtons(bars.wide)}
-        {/if}
-      </div>
+{#snippet leftColumn(bar: Area)}
+  <div class="column fade" class:tight={bar.width < 44} class:middle={sideHeight >= 560 && !trackpad} style={style(bar)}>
+    <div class="group" class:labels={wide && !trackpad} {@attach region}>
       {#if trackpad}
-        <div class="spacer"></div>
-        <button class="big" {@attach region} {...hold({ kind: "mouse", right: false })}>{t("左键")}</button>
+        <button class="side-icon" aria-label={t("游戏库")} {...tap(onlibrary)}>{@render icon("library")}</button>
+        <button class="side-icon" aria-label={t("菜单")} {...tap(onmenu)}>{@render icon("menu")}</button>
+      {:else}
+        {@render sideButtons(wide)}
       {/if}
     </div>
-    <div class="column fade" class:tight={bars.right.width < 44} class:middle={tall && !trackpad} style={style(bars.right)}>
-      <div class="group" {@attach region}>
-        <button class="hide" aria-label={t("收起")} {...tap(toggleOpen)}>{@render icon("hide")}</button>
-        {#if trackpad}
-          <button class="side-icon on" aria-label={t("触控板模式")} aria-pressed="true" {...tap(toggleTrackpad)}>{@render icon("pad")}</button>
-          <button class="side-icon" aria-label={t("键盘")} {...tap(onkeyboard)}>{@render icon("keyboard")}</button>
-        {:else}
-          <div class="keys" class:two>
-            {#each keys as key (key.label)}{@render keyButton(key, keyH)}{/each}
-          </div>
-        {/if}
-      </div>
+    {#if trackpad}
+      <div class="spacer"></div>
+      <button class="big" {@attach region} {...hold({ kind: "mouse", right: false })}>{t("左键")}</button>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet rightColumn(bar: Area)}
+  <div class="column fade" class:tight={bar.width < 44} class:middle={sideHeight >= 560 && !trackpad} style={style(bar)}>
+    <div class="group" {@attach region}>
+      <button class="hide" aria-label={t("收起")} {...tap(toggleOpen)}>{@render icon("hide")}</button>
       {#if trackpad}
-        <div class="spacer"></div>
-        <button class="big" {@attach region} {...hold({ kind: "mouse", right: true })}>{t("右键")}</button>
-      {/if}
-      {#if more && !trackpad}
-        <div class="more fade" style="right: {bars.right.width + 8}px" {@attach region}>
-          {#each extra as key (key.label)}{@render keyButton(key, 40)}{/each}
+        <button class="side-icon on" aria-label={t("触控板模式")} aria-pressed="true" {...tap(toggleTrackpad)}>{@render icon("pad")}</button>
+        <button class="side-icon" aria-label={t("键盘")} {...tap(onkeyboard)}>{@render icon("keyboard")}</button>
+      {:else}
+        <div class="keys" class:two>
+          {#each keys as key (key.label)}{@render keyButton(key, keyH)}{/each}
         </div>
       {/if}
     </div>
-  {:else}
-    <div class="column" style={style(bars.right)}>
+    {#if trackpad}
       <div class="spacer"></div>
-      <button class="grip" aria-label={t("展开")} {...tap(toggleOpen)} {@attach region}><span></span></button>
-      <div class="spacer"></div>
-    </div>
-  {/if}
-{:else if arrangement.kind === "band"}
+      <button class="big" {@attach region} {...hold({ kind: "mouse", right: true })}>{t("右键")}</button>
+    {/if}
+    {#if more && !trackpad}
+      <div class="more fade" style="right: {bar.width + 8}px" {@attach region}>
+        {#each extra as key (key.label)}{@render keyButton(key, 40)}{/each}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet sideGrip(bar: Area)}
+  <div class="column" style={style(bar)}>
+    <div class="spacer"></div>
+    <button class="grip" aria-label={t("展开")} {...tap(toggleOpen)} {@attach region}><span></span></button>
+    <div class="spacer"></div>
+  </div>
+{/snippet}
+
+{#if arrangement.kind === "band"}
   {#if open}
     <div class="row fade" style={style(arrangement.top)}>
       <div class="group across" {@attach region}>{@render sideButtons(true)}</div>
@@ -253,19 +258,32 @@
 {:else}
   {@const inner = arrangement.kind === "float" ? arrangement.inner : layout.game}
   {#if open}
-    <div class="glass across fade" style="left: {inner.x}px; top: {inner.y}px" {@attach region}>
-      {#each [["library", "游戏库", onlibrary], ["menu", "菜单", onmenu], ["perf", "性能", toggleHud]] as const as [name, label, action] (name)}
-        <button class="ico" class:on={name === "perf" && prefs.showFps} aria-label={t(label)} {...tap(action)}>{@render icon(name)}</button>
-      {/each}
-    </div>
-    <div class="glass panel fade" style="right: {layout.width - inner.x - inner.width}px; top: {inner.y + inner.height / 2}px" {@attach region}>
-      <div class="end"><button class="ico" aria-label={t("收起")} {...tap(toggleOpen)} style="height: 36px">{@render icon("hide")}</button></div>
-      <div class="keys two">
-        {#each trackpad ? [{ label: "左键", action: { kind: "mouse", right: false } } as Key, ...full] : full as key (key.label)}
-          {@render keyButton(key, 40)}
+    {#if leftBar}
+      {@render leftColumn(leftBar)}
+    {:else}
+      <div class="glass across fade" style="left: {inner.x}px; top: {inner.y}px" {@attach region}>
+        {#each [["library", "游戏库", onlibrary], ["menu", "菜单", onmenu], ["perf", "性能", toggleHud]] as const as [name, label, action] (name)}
+          <button class="ico" class:on={name === "perf" && prefs.showFps} aria-label={t(label)} {...tap(action)}>{@render icon(name)}</button>
         {/each}
+        {#if trackpad && rightBar}
+          <button class="ico" {...hold({ kind: "mouse", right: false })}>{t("左键")}</button>
+        {/if}
       </div>
-    </div>
+    {/if}
+    {#if rightBar}
+      {@render rightColumn(rightBar)}
+    {:else}
+      <div class="glass panel fade" style="right: {layout.width - inner.x - inner.width}px; top: {inner.y + inner.height / 2}px" {@attach region}>
+        <div class="end"><button class="ico" aria-label={t("收起")} {...tap(toggleOpen)} style="height: 36px">{@render icon("hide")}</button></div>
+        <div class="keys two">
+          {#each trackpad && !leftBar ? [{ label: "左键", action: { kind: "mouse", right: false } } as Key, ...full] : full as key (key.label)}
+            {@render keyButton(key, 40)}
+          {/each}
+        </div>
+      </div>
+    {/if}
+  {:else if rightBar}
+    {@render sideGrip(rightBar)}
   {:else}
     <button class="edge" aria-label={t("展开")} {...tap(toggleOpen)}
       style="right: {layout.width - inner.x - inner.width}px; top: {inner.y + inner.height / 2}px" {@attach region}><span></span></button>
@@ -415,6 +433,10 @@
     place-items: center;
     border-radius: 22px;
     color: rgba(255, 255, 255, 0.55);
+  }
+  .column .hide,
+  .column .grip {
+    max-width: 100%;
   }
   .hide.down :global(svg) {
     transform: rotate(90deg);

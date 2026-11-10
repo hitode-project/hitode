@@ -79,6 +79,8 @@ Direct mode acts where the finger lands. Trackpad mode moves a cursor drawn over
 **Applies to**: Android, iOS
 **Verification**: Test
 
+When controls do not fit above and below the frame, each side group uses its own margin if it fits. Only the groups without room float over the game.
+
 iOS publishes no housing geometry. An iPhone's is read from its safe-area depth. Under 30 points is a status bar, under 55 a notch of at most 210 points, otherwise a Dynamic Island of at most 126 points. Each takes the largest of its generation, so newer, smaller islands stay covered. The screen reports its own corner radius.
 
 ### AND-APP-15 Shared mobile lifecycle
