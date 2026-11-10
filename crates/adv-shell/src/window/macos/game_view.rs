@@ -385,6 +385,16 @@ impl Drop for Input {
         }
     }
 }
+
+impl Hub {
+    fn mouse(&self, message: u32, wparam: u32, at: (f64, f64), canvas: u32) {
+        let event = Event::mouse(&mut self.pointer.borrow_mut(), message, wparam, at, canvas);
+        if self.main_enabled.get() || matches!(event, Event::WindowInput { .. }) {
+            self.push(event);
+        }
+    }
+}
+
 impl Input {
     /// Translates input for the canvas; returns whether AppKit still gets it.
     fn handle(&mut self, view: &GameView, event: &NSEvent) -> bool {
@@ -507,9 +517,6 @@ impl Input {
         let (x, y) = self.point(view, event);
         let (cw, ch) = view.client();
         self.update_cursor(view, Some((x, y)));
-        if !self.hub.main_enabled.get() {
-            return;
-        }
         let inside = x >= 0.0 && y >= 0.0 && x < cw && y < ch;
         let viewport = view.viewport((self.width, self.height), &self.hub);
         let (gx, gy) = viewport.position(x, y, self.width, self.height);
@@ -566,14 +573,7 @@ impl Input {
             buttons
         };
         let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
-        let event = Event::mouse(
-            &mut self.hub.pointer.borrow_mut(),
-            message,
-            wparam,
-            at,
-            position,
-        );
-        self.hub.push(event);
+        self.hub.mouse(message, wparam, at, position);
     }
 
     fn cursor_visible_at(&self, view: &GameView, point: (f64, f64)) -> bool {
@@ -618,6 +618,37 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: WINE-IN-1
+    #[test]
+    fn a_modal_layer_receives_clicks_while_the_main_window_is_disabled() {
+        let hub = Hub::default();
+        hub.pointer
+            .borrow_mut()
+            .set_layers(Arc::from([crate::display::WindowLayer {
+                id: 7,
+                rectangle: [100., 50., 200., 100.],
+                size: (100, 50),
+            }]));
+
+        for (at, canvas) in [((80., 40.), 40 << 16 | 80), ((110., 60.), 60 << 16 | 110)] {
+            hub.mouse(0x201, 1, at, canvas);
+            hub.mouse(0x202, 0, at, canvas);
+        }
+
+        let events = hub.events.borrow();
+        assert_eq!(events.len(), 2);
+        for (event, (expected_message, expected_buttons)) in
+            events.iter().zip([(0x201, 1), (0x202, 0)])
+        {
+            assert!(matches!(
+                event,
+                Event::WindowInput { window: 7, message, wparam, lparam }
+                    if (*message, *wparam, *lparam) == (expected_message, expected_buttons, 5 << 16 | 5)
+            ));
+        }
+    }
+
     // spec: HOST-RUN-2
     #[test]
     fn toggle_control_ignores_physical_releases_and_uses_one_guest_key() {
