@@ -233,6 +233,14 @@ impl GameView {
         }
     }
 
+    /// Opens a web or mail address in the user's default application.
+    pub(crate) fn open_link(&self, url: String) {
+        use objc2_foundation::{NSString, NSURL};
+        if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
+            objc2_app_kit::NSWorkspace::sharedWorkspace().openURL(&url);
+        }
+    }
+
     pub(crate) fn frame_presented(&self) {
         self.request_frame();
     }

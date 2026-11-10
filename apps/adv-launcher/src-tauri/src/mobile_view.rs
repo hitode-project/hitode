@@ -100,6 +100,10 @@ pub fn listener(
         ViewEvent::Menu(bar) => {
             let _ = window.emit("game_menu", &menu(&bar));
         }
+        ViewEvent::OpenLink(url) => {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = window.opener().open_url(url, None::<&str>);
+        }
     })
 }
 

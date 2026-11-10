@@ -20,6 +20,7 @@ type SinkTarget = window::Projection;
 enum Request {
     Hide,
     Minimize,
+    OpenLink(String),
 }
 // Native statistics move each frame; boxing them would allocate per frame.
 #[allow(clippy::large_enum_variant)]
@@ -218,6 +219,11 @@ impl Worker {
     /// The guest minimized the displayed window.
     pub fn minimize(&mut self) {
         let _ = self.requests.push(Request::Minimize);
+        self.ui_wake.signal();
+    }
+    /// The guest asked to open a web or mail address.
+    pub fn open_link(&mut self, url: String) {
+        let _ = self.requests.push(Request::OpenLink(url));
         self.ui_wake.signal();
     }
 }
@@ -430,6 +436,7 @@ impl Ui {
             match request {
                 Request::Hide => window.hide(),
                 Request::Minimize => window.minimize(),
+                Request::OpenLink(url) => window.open_link(url),
             }
         }
         self.menu_changed |= self.menus.update();

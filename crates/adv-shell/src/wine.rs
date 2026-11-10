@@ -526,6 +526,11 @@ impl DebugTarget for DebugSession<'_> {
 
 /// Run the guest and answer the host until it exits, the time limit passes
 /// or a closed window's grace ends. Returns the exit code.
+const STATUS_DLL_NOT_FOUND: u32 = 0xc000_0135;
+/// The launch error naming a module the program needs that the Wine
+/// installation does not provide; the launcher words it for the player.
+const MISSING_DLL: &str = "missing_dll:";
+
 fn drive(
     options: &Options,
     mut session: Session,
@@ -813,6 +818,12 @@ fn drive(
                 }
                 Stop::Failed(error) => return Err(error),
             }
+            for url in session.take_links() {
+                match worker.as_mut() {
+                    Some(worker) => worker.open_link(url),
+                    None => eprintln!("wine: open {url}"),
+                }
+            }
             if let Some(worker) = worker.as_mut() {
                 let bar = session.menu_bar();
                 if worker.needs_menu(bar.key) {
@@ -931,6 +942,11 @@ fn drive(
     };
     if let Some(error) = outcome.screenshot_error {
         return Err(error);
+    }
+    if outcome.exit_code == Some(STATUS_DLL_NOT_FOUND)
+        && let Some(module) = session.missing_import()
+    {
+        return Err(format!("{MISSING_DLL}{module}"));
     }
     Ok((code, session, summary))
 }
