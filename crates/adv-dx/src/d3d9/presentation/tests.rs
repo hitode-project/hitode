@@ -281,12 +281,25 @@ fn copy_rectangles_and_dirty_hints_validate_permissions_and_reject_stretch_or_an
         ),
         Err(INVALID)
     );
+    // Windowed presentation of any swap effect copies rectangles; only COPY
+    // takes another window or a dirty region.
     let discard = D3DPRESENT_PARAMETERS {
         SwapEffect: 1,
         ..parameters()
     };
     assert_eq!(
         validate(&mut env, discard, full, full, 0, GuestPtr::new(0)),
+        Ok(())
+    );
+    assert_eq!(
+        validate(
+            &mut env,
+            discard,
+            full,
+            full,
+            0,
+            GuestPtr::new(region.addr())
+        ),
         Err(INVALID)
     );
     assert_eq!(
