@@ -567,8 +567,10 @@ Owners and show order do not choose the base. Toolkits own every window by one h
 
 ### WINE-IN-1 Presented window coordinates
 
-**Rule**: A host point on a plane's layer MUST reach that plane's window at the pixel shown, and a press keeps its window until release. Other host points MUST reach the base window, and scripted points the window under them, through the last presented content's origin (WINE-GFX-10). Every presenter's frames carry only that content, while the host shows caption, frame and menu bar natively.
+**Rule**: A host point on a plane's layer MUST reach that plane's window at the pixel shown, even when the base window is disabled. A press MUST keep its window until release. Other host points MUST reach the enabled base window, and scripted points the window under them, through the last presented content's origin (WINE-GFX-10).
 **Verification**: Test
+
+Every presenter's frames carry only that content, while the host shows caption, frame and menu bar natively.
 
 ### WINE-IN-2 Hardware input
 
