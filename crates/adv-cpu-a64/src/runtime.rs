@@ -121,6 +121,8 @@ pub struct Runtime {
     pub body: adv_cpu_core::body::BodyContext,
     pub body_value: u32,
     pub body_stack: u32,
+    /// Whether proved spin backedges can hand off this execution turn.
+    pub spin_yield: u32,
 }
 
 impl Runtime {
@@ -157,6 +159,7 @@ impl Runtime {
             body: adv_cpu_core::body::BodyContext::default(),
             body_value: 0,
             body_stack: 0,
+            spin_yield: 0,
         }
     }
 }
@@ -177,6 +180,8 @@ pub enum Exit {
     Stepped = 3,
     /// A completed service call requests an execution-owner yield.
     Yield = 4,
+    /// A completed spin backedge requests a productive handoff.
+    Reschedule = 5,
 }
 
 impl Exit {
@@ -187,6 +192,7 @@ impl Exit {
             2 => Some(Self::Fault),
             3 => Some(Self::Stepped),
             4 => Some(Self::Yield),
+            5 => Some(Self::Reschedule),
             _ => None,
         }
     }
@@ -274,6 +280,7 @@ pub(crate) const BODY_VALUE: u32 = field(offset_of!(Runtime, body_value));
 pub(crate) const BODY_CLASSES: u32 =
     BODY + offset_of!(adv_cpu_core::body::BodyContext, classes) as u32;
 pub(crate) const BODY_STACK: u32 = field(offset_of!(Runtime, body_stack));
+pub(crate) const SPIN_YIELD: u32 = field(offset_of!(Runtime, spin_yield));
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;

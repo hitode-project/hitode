@@ -518,6 +518,10 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn allow_spin_yield(&self) -> bool {
+        self.handler.allow_spin_yield()
+    }
+
     fn body_yield(&mut self, state: &mut CpuState, memory: &mut Memory) -> Result<bool, String> {
         state.commit_mmx();
         Ok(self.handler.on_body_yield(&mut View {
@@ -703,6 +707,7 @@ impl Backend for Cpu {
                     return Exit::Parked;
                 }
                 Ok(RunOutcome::Budget) => continue,
+                Ok(RunOutcome::Reschedule) => return Exit::Reschedule,
                 Ok(RunOutcome::Interrupted) => {
                     if let Some(budget) = self.budget
                         && start.elapsed() >= budget

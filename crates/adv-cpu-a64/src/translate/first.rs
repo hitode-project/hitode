@@ -293,7 +293,7 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
     let flags = &mut cpu.eflags;
     let mut target = None;
     match op {
-        Op::Nop => {}
+        Op::Nop | Op::Pause | Op::Fence => {}
         // The interpreter runs these: `Fetcher::helpers` is off here, and
         // narrow forms are rare in code that runs once.
         Op::PopMemory(_)

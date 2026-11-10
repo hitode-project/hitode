@@ -116,6 +116,8 @@ pub enum Exit {
     /// A host notification stopped at a resumable CPU boundary. No guest work
     /// or scheduler budget is charged for the notification itself.
     Interrupted { pc: u32 },
+    /// A completed spin backedge hands off to another ready guest context.
+    Reschedule,
     /// The guest faulted (unmapped access, invalid instruction, ...). EIP is the faulting pc.
     Fault(Fault),
 }
@@ -459,6 +461,11 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// Whether a ready peer can use the next turn on the execution owner.
+    fn allow_spin_yield(&self) -> bool {
+        false
+    }
+
     /// A service body completed and asks the owner to yield at its continuation.
     fn on_body_yield(&mut self, _cpu: &mut dyn Guest) -> TrapAction {
         TrapAction::Continue

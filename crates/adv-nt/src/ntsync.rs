@@ -69,7 +69,12 @@ struct Object {
     waiters: Cell<usize>,
 }
 type ObjectRef = Rc<Object>;
-pub(crate) type Completion = Cell<Option<Result<(u32, bool), i32>>>;
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedWait {
+    result: Result<(u32, bool), i32>,
+    pub signaler: Option<adv_machine::CtxId>,
+}
+pub(crate) type Completion = Cell<Option<CompletedWait>>;
 struct Waiter {
     objects: Vec<ObjectRef>,
     alert: Option<ObjectRef>,
@@ -296,6 +301,16 @@ unsafe extern "C" fn hitode_ntsync_ioctl(fd: i32, request: libc::c_ulong, arg: *
 /// # Safety
 /// `arg` must address the command's readable/writable UAPI structure.
 pub unsafe fn ioctl(fd: i32, request: u32, arg: *mut u32) -> Result<i32, i32> {
+    // SAFETY: the same UAPI buffer is passed through unchanged.
+    unsafe { ioctl_from(fd, request, arg, None) }
+}
+
+pub(crate) unsafe fn ioctl_from(
+    fd: i32,
+    request: u32,
+    arg: *mut u32,
+    signaler: Option<adv_machine::CtxId>,
+) -> Result<i32, i32> {
     if arg.is_null() {
         return Err(libc::EFAULT);
     }
@@ -420,7 +435,7 @@ pub unsafe fn ioctl(fd: i32, request: u32, arg: *mut u32) -> Result<i32, i32> {
             SEM_RELEASE | MUTEX_UNLOCK | MUTEX_KILL | EVENT_SET | EVENT_PULSE
         ) && object.waiters.get() != 0
         {
-            device.wake();
+            device.wake(&object, signaler);
         }
         if request == EVENT_PULSE
             && let Kind::Event { manual, .. } = next
@@ -517,7 +532,7 @@ impl Waiter {
     }
 }
 impl Device {
-    fn wake(&mut self) {
+    fn wake(&mut self, changed: &ObjectRef, signaler: Option<adv_machine::CtxId>) {
         self.waiters.retain(|waiter| {
             let now = if waiter.realtime {
                 self.unix
@@ -525,11 +540,33 @@ impl Device {
                 self.monotonic
             };
             if waiter.timeout != u64::MAX && waiter.timeout <= now {
-                waiter.result.set(Some(Err(libc::ETIMEDOUT)));
+                waiter.result.set(Some(CompletedWait {
+                    result: Err(libc::ETIMEDOUT),
+                    signaler: None,
+                }));
                 return false;
             }
             if let Some(result) = waiter.acquire() {
-                waiter.result.set(Some(Ok(result)));
+                let signaler = signaler.filter(|_| {
+                    let index = result.0 as usize;
+                    if index == waiter.objects.len() {
+                        waiter
+                            .alert
+                            .as_ref()
+                            .is_some_and(|alert| Rc::ptr_eq(alert, changed))
+                    } else if waiter.all {
+                        waiter
+                            .objects
+                            .iter()
+                            .any(|object| Rc::ptr_eq(object, changed))
+                    } else {
+                        Rc::ptr_eq(&waiter.objects[index], changed)
+                    }
+                });
+                waiter.result.set(Some(CompletedWait {
+                    result: Ok(result),
+                    signaler,
+                }));
                 false
             } else {
                 true
@@ -544,7 +581,7 @@ pub struct Pending {
 }
 impl Pending {
     pub fn result(&self) -> Option<Result<(u32, bool), i32>> {
-        self.result.get()
+        self.result.get().map(|completed| completed.result)
     }
     pub(crate) fn completion(&self) -> std::rc::Weak<Completion> {
         Rc::downgrade(&self.result)
@@ -631,7 +668,10 @@ pub unsafe fn wait_ioctl(fd: i32, request: u32, args: &WaitArgs) -> Result<Pendi
             realtime: args.flags & 1 != 0,
         };
         if let Some(acquired) = waiter.acquire() {
-            result.set(Some(Ok(acquired)));
+            result.set(Some(CompletedWait {
+                result: Ok(acquired),
+                signaler: None,
+            }));
         } else if args.timeout != u64::MAX
             && args.timeout
                 <= if args.flags & 1 != 0 {
@@ -640,7 +680,10 @@ pub unsafe fn wait_ioctl(fd: i32, request: u32, args: &WaitArgs) -> Result<Pendi
                     device.monotonic
                 }
         {
-            result.set(Some(Err(libc::ETIMEDOUT)));
+            result.set(Some(CompletedWait {
+                result: Err(libc::ETIMEDOUT),
+                signaler: None,
+            }));
         } else {
             device.waiters.push(waiter);
         }
@@ -754,6 +797,47 @@ pub(crate) fn service_alert(fd: i32, owner: u32) -> bool {
 #[cfg(test)]
 mod service_tests {
     use super::*;
+
+    // spec: PROC-MACH-10
+    #[test]
+    fn only_the_acquisition_satisfied_by_a_signal_gets_its_signaler() {
+        let device = hitode_ntsync_open();
+        let mut value = [0, 0];
+        // SAFETY: two event-creation words.
+        let event = unsafe { ioctl(device, CREATE_EVENT, value.as_mut_ptr()) }.unwrap();
+        let fds = [event];
+        let mut args = WaitArgs {
+            timeout: 100,
+            objs: fds.as_ptr() as u64,
+            count: 1,
+            owner: 7,
+            ..Default::default()
+        };
+        set_time(crate::server::Time::default());
+        // SAFETY: args retains its descriptor array through registration.
+        let expired = unsafe { wait_ioctl(device, WAIT_ANY, &args) }.unwrap();
+        args.timeout = u64::MAX;
+        // SAFETY: the array remains live.
+        let pending = unsafe { wait_ioctl(device, WAIT_ANY, &args) }.unwrap();
+        set_time(crate::server::Time {
+            monotonic: 1,
+            unix: 1,
+        });
+        // SAFETY: EVENT_SET uses the first word of value.
+        unsafe { ioctl_from(event, EVENT_SET, value.as_mut_ptr(), Some(2)) }.unwrap();
+        assert_eq!(expired.result(), Some(Err(libc::ETIMEDOUT)));
+        assert_eq!(expired.result.get().unwrap().signaler, None);
+        assert_eq!(pending.result(), Some(Ok((0, false))));
+        assert_eq!(pending.result.get().unwrap().signaler, Some(2));
+        // SAFETY: signal before another wait is registered.
+        unsafe { ioctl_from(event, EVENT_SET, value.as_mut_ptr(), Some(2)) }.unwrap();
+        // SAFETY: the array remains live.
+        let immediate = unsafe { wait_ioctl(device, WAIT_ANY, &args) }.unwrap();
+        assert_eq!(immediate.result(), Some(Ok((0, false))));
+        assert_eq!(immediate.result.get().unwrap().signaler, None);
+        hitode_ntsync_close(event);
+        hitode_ntsync_close(device);
+    }
 
     // spec: EXEC-CALL-3
     #[test]

@@ -445,9 +445,19 @@ pub fn not_implemented(_: &mut Env<'_>, _: &[u32]) -> Outcome {
     Outcome::Return(status::NOT_IMPLEMENTED)
 }
 
-/// The guest exposes one logical processor.
-pub fn processor_number(_: &mut Env<'_>, _: &[u32]) -> Outcome {
-    Outcome::Return(0)
+/// The owner runs a context on its lowest allowed virtual processor.
+pub fn processor_number(env: &mut Env<'_>, _: &[u32]) -> Outcome {
+    let mut request = GetThreadInfoRequest {
+        handle: CURRENT_THREAD,
+        ..Default::default()
+    };
+    match server::request(env, &mut request, &[], &mut []) {
+        Ok((reply, _)) if reply.header.error == 0 => {
+            Outcome::Return((reply.affinity as u32 & adv_cpu::PROCESSOR_MASK).trailing_zeros())
+        }
+        Ok((reply, _)) => Outcome::Return(reply.header.error),
+        Err(error) => status::finish(Err(error)),
+    }
 }
 
 fn remote_get_context(env: &mut Env<'_>, thread: u32, output: u32, pending: u32) -> Outcome {

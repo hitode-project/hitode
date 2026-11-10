@@ -770,7 +770,10 @@ impl Translator<'_> {
     fn follow(&mut self, edge: Edge) {
         let unused = self.trace.unused(self.index);
         match edge {
-            Edge::Internal(to) => self.jump(to, self.x87_arriving(to)),
+            Edge::Internal(to) => {
+                self.spin_edge(to, None);
+                self.jump(to, self.x87_arriving(to));
+            }
             Edge::Exit(eip) => self.follow_exit(Exit::Dispatch, eip, unused, true),
             Edge::Interpret(eip) => self.follow_exit(Exit::Interpret, eip, unused, false),
         }
@@ -831,6 +834,12 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
+        if self.trace.insts[self.index].spin
+            && let Edge::Internal(to) = taken
+        {
+            let test = self.test(cc);
+            self.spin_edge(to, Some(test));
+        }
         // Existing internal edges publish on both paths. Side exits and
         // jumps into an appended path publish only on the taken path.
         if let Edge::Internal(to) = taken
@@ -962,6 +971,33 @@ impl Translator<'_> {
             }
             Edge::Interpret(_) => unreachable!("a jcc target dispatches"),
         }
+    }
+
+    /// Only proved spin sites test whether the owner has another ready context.
+    fn spin_edge(&mut self, to: usize, test: Option<Test>) {
+        if !self.trace.insts[self.index].spin {
+            return;
+        }
+        let leave = self.asm.label();
+        let keep = self.asm.label();
+        self.emit(ldr(W, X3, RUNTIME, crate::runtime::SPIN_YIELD));
+        self.asm.cbz(W, false, X3, keep);
+        if let Some(test) = test {
+            self.jump_if(test, leave);
+        } else {
+            self.asm.b(leave);
+        }
+        self.asm.bind(keep);
+        self.push_cold(Cold::Leave {
+            label: leave,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            refund: self.trace.unused(self.index),
+            exit: Exit::Reschedule,
+            eip: self.trace.insts[to].pc,
+            link: false,
+            x87: self.x87_leaving(),
+        });
     }
 
     /// Emits what `cc` needs before its test: the decrement of a `loop`,

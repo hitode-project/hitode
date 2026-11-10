@@ -2,7 +2,8 @@
 //! TSV: host ns since enable, event, context, three event-specific numeric fields.
 //! run_start: PC; run_end: PC, owner wall ns, inline host-service ns.
 //! pick: yielded; lease/collect: token. block: kind (1 timer/2 object/3 set),
-//! deadline or handle, thunk. wake: thunk. CS: address, owner TID/recursion, event.
+//! deadline or handle, thunk. wake: thunk, signaler context plus one (zero if
+//! absent), reason (1 timeout/2 signal/3 set/4 notification). spin_yield: resume PC.
 //! Lease-to-collect includes queueing and completion delivery, not worker CPU time.
 //! frame: completed guest-frame serial (not a shell observation or scanout).
 use std::io::{self, Write};

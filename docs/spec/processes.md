@@ -19,6 +19,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-MACH-10 Signal-driven waits
 
 **Rule**: Signaling MUST release satisfiable waiters in wait order per object. A wake pass MUST evaluate only changed objects and expired wait deadlines. Before the host idles, a full scan MUST release any wait an unsignaled state change satisfied.
+Recorded guest signalers MUST come from the operation that satisfied the blocked acquisition.
 **Verification**: Test
 
 ### PROC-MACH-3 Continuations
@@ -44,6 +45,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-MACH-5 Urgent wakeups
 
 **Rule**: Urgent wakeups such as audio and input MAY run before the normal turn. They MUST NOT starve normal workers or change the completion semantics of guest locks and calls.
+CPU spin handoffs MUST return to the owner's ordinary wake and context selection.
 **Verification**: Test
 
 ### PROC-MACH-6 Audio callbacks
@@ -84,6 +86,7 @@ Clock leaves MUST preserve guest polling observations and decline required waits
 ### PROC-CLOCK-5 Productive polling
 
 **Rule**: A real-time polling round MAY wait only after every ready context repeated earlier yield intervals 64 times running. An interval is its host calls, completed guest instructions and yield site. A context doing new work between yields MUST run again without a host wait.
+CPU spin handoffs MUST leave the context ready and MUST NOT qualify as a polling or idle proof.
 **Verification**: Test
 
 ### PROC-CLOCK-6 Timer ticks

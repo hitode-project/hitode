@@ -791,6 +791,16 @@ impl Sys {
     /// Device/input delivery grants the same wait as SetEvent, then gives its
     /// newly runnable consumers a bounded, event-derived dispatch preference.
     pub fn set_event_with_priority(&mut self, h: Handle, priority: WakePriority) -> bool {
+        self.set_event_from(h, priority, None)
+    }
+
+    /// Delivers an event with the guest context known to have signaled it.
+    pub fn set_event_from(
+        &mut self,
+        h: Handle,
+        priority: WakePriority,
+        signaler: Option<CtxId>,
+    ) -> bool {
         let valid = match self.objects.get_mut(h) {
             Some(Object::Event { signaled, .. }) => {
                 *signaled = true;
@@ -799,7 +809,8 @@ impl Sys {
             _ => false,
         };
         if valid {
-            self.signal_waiters_with_priority(h, priority);
+            self.objects.mark_changed(h, priority);
+            self.wake_changed(self.clock.now_us(), signaler.map(|id| (h, id)));
         }
         valid
     }
@@ -842,16 +853,38 @@ impl Sys {
     }
     fn signal_waiters_with_priority(&mut self, h: Handle, priority: WakePriority) {
         self.objects.mark_changed(h, priority);
-        self.wake_changed(self.clock.now_us());
+        self.wake_changed(self.clock.now_us(), None);
     }
 
-    fn wake_changed(&mut self, now: u64) {
+    fn wake_changed(&mut self, now: u64, signal: Option<(Handle, CtxId)>) {
         for (id, priority) in self.objects.changed_waiters() {
             let i = id as usize;
             if matches!(self.contexts[i].state, State::Blocked { .. })
                 && let Some(reason) = self.poll_wait(i, now)
             {
-                self.release_waiter(i, reason, now);
+                let signaler = signal.and_then(|(h, signaler)| {
+                    let State::Blocked { wait, .. } = &self.contexts[i].state else {
+                        unreachable!()
+                    };
+                    let matches =
+                        |handle| self.objects.object_id(handle) == self.objects.object_id(h);
+                    let caused = match (reason, wait) {
+                        (WakeReason::Signaled, Wait::Object { handle, .. }) => matches(*handle),
+                        (WakeReason::Objects { index, .. }, Wait::Objects { handles, all, .. }) => {
+                            if *all {
+                                handles.iter().copied().any(matches)
+                            } else {
+                                matches(handles[index as usize])
+                            }
+                        }
+                        (WakeReason::Notified, Wait::Objects { notification, .. }) => {
+                            notification.is_some_and(matches)
+                        }
+                        _ => false,
+                    };
+                    caused.then_some(signaler)
+                });
+                self.release_waiter(i, reason, now, signaler);
                 self.wakes.wake_as(id, now, None, priority);
             }
         }
@@ -979,7 +1012,7 @@ impl Sys {
             self.wait_deadlines.insert((deadline, i as CtxId));
         }
         if let Some(reason) = self.poll_wait(i, self.clock.now_us()) {
-            self.release_waiter(i, reason, self.clock.now_us());
+            self.release_waiter(i, reason, self.clock.now_us(), None);
         }
     }
 
@@ -1010,7 +1043,7 @@ impl Sys {
                     log::warn!("context {i}: a wait object changed without a signal");
                 }
                 self.scheduling.missed_signal_wakes += 1;
-                self.release_waiter(i, reason, now);
+                self.release_waiter(i, reason, now, None);
                 self.wakes
                     .wake_as(i as CtxId, now, None, WakePriority::Normal);
                 rescued = true;
@@ -1023,14 +1056,14 @@ impl Sys {
     fn wake(&mut self) {
         let now = self.clock.now_us();
         self.objects.expire_timers(now);
-        self.wake_changed(now);
+        self.wake_changed(now, None);
         while let Some(&(deadline, id)) = self.wait_deadlines.first() {
             if deadline > now {
                 break;
             }
             self.wait_deadlines.pop_first();
             if let Some(reason) = self.poll_wait(id as usize, now) {
-                self.release_waiter(id as usize, reason, now);
+                self.release_waiter(id as usize, reason, now, None);
             }
         }
         #[cfg(test)]
@@ -1047,7 +1080,7 @@ impl Sys {
         }
     }
 
-    fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64) {
+    fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64, signaler: Option<CtxId>) {
         self.unregister_waiter(i);
         let State::Blocked {
             wait, then, origin, ..
@@ -1067,8 +1100,19 @@ impl Sys {
             diagnostics.wake(i as CtxId, reason, now);
         }
         self.wakes.wake(i as CtxId, now, deadline);
-        self.schedule_trace
-            .event("wake", i as u32, u64::from(origin.thunk), 0, 0);
+        let cause = match reason {
+            WakeReason::Timeout => 1,
+            WakeReason::Signaled => 2,
+            WakeReason::Objects { .. } => 3,
+            WakeReason::Notified => 4,
+        };
+        self.schedule_trace.event(
+            "wake",
+            i as u32,
+            u64::from(origin.thunk),
+            signaler.map_or(0, |id| u64::from(id) + 1),
+            cause,
+        );
         self.contexts[i].state = State::Ready {
             resume: Some(ReadyResume::Woke {
                 then,
@@ -1838,6 +1882,12 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn allow_spin_yield(&self) -> bool {
+        self.sys
+            .active_contexts()
+            .any(|c| c.id != self.sys.current && c.is_ready())
+    }
+
     fn on_body_yield(&mut self, cpu: &mut dyn Guest) -> TrapAction {
         self.parked = Some(Parked::ServiceYield {
             resume_eip: cpu.reg(Reg::Eip),
@@ -3000,6 +3050,18 @@ impl<B: Backend> Machine<B> {
             self.sys.stats.total.cpu_runs += 1;
             self.note_frame();
             match exit {
+                Exit::Reschedule => {
+                    let ctx = &mut self.sys.contexts[id as usize];
+                    ctx.yielded = false;
+                    ctx.progress.new_work();
+                    self.sys.schedule_trace.event(
+                        "spin_yield",
+                        id,
+                        u64::from(self.cpu.reg(Reg::Eip)),
+                        0,
+                        0,
+                    );
+                }
                 Exit::Interrupted { pc } => {
                     self.sys.trace.flush();
                     if let Some(hard) = hard_budget

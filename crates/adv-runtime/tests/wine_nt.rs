@@ -82,7 +82,7 @@ fn assert_checks(text: &str, ok: &str, checks: &[&str]) {
     }
 }
 
-// spec: NT-PROC-1, NT-PROC-2, NT-PROC-3
+// spec: NT-PROC-1, NT-PROC-2, NT-PROC-3, WINE-SES-4
 #[test]
 fn l_process() {
     let Some((stop, text)) = probe("l_process", "nt_l_process.exe", |session, game| {
@@ -162,7 +162,11 @@ fn l_process() {
         "queue_apc_ex",
         "continue_ex",
         "continue_ex_alert",
+        "processor_count",
+        "processor_affinity",
         "processor_number",
+        "processor_cores",
+        "processor_cores_ex",
         "process_suspend_access",
         "process_suspend_invalid",
         "process_resume",

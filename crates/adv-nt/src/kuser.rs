@@ -59,12 +59,7 @@ const PF_FASTFAIL_AVAILABLE: u32 = 23;
 
 /// Maps the page with its fixed fields; `features` is the guest CPU's
 /// CPUID leaf 1 EDX.
-pub fn map(
-    cpu: &mut dyn Guest,
-    features: u32,
-    physical_pages: u32,
-    processors: u32,
-) -> Result<(), MemFault> {
+pub fn map(cpu: &mut dyn Guest, features: u32, physical_pages: u32) -> Result<(), MemFault> {
     cpu.map(ADDRESS, PAGE, Prot::READ)?;
     let mut page = vec![0u8; PAGE as usize];
     let mut put = |offset: u32, bytes: &[u8]| {
@@ -94,8 +89,8 @@ pub fn map(
     put(NX_SUPPORT_POLICY, &[NX_SUPPORT_POLICY_OPTIN]);
     put(NUMBER_OF_PHYSICAL_PAGES, &physical_pages.to_le_bytes());
     put(SYSTEM_CALL, &1u32.to_le_bytes());
-    put(ACTIVE_PROCESSOR_COUNT, &processors.to_le_bytes());
-    put(ACTIVE_GROUP_COUNT, &1u32.to_le_bytes());
+    put(ACTIVE_PROCESSOR_COUNT, &adv_cpu::PROCESSORS.to_le_bytes());
+    put(ACTIVE_GROUP_COUNT, &[1]);
 
     let has = |bit: u32| u8::from(features & (1 << bit) != 0);
     for (feature, value) in [

@@ -392,6 +392,8 @@ impl Executor {
         handler: Option<&mut dyn ExecutionTrap>,
     ) -> Result<RunOutcome, String> {
         let diagnostics = handler.as_ref().map_or(0, |handler| handler.diagnostics());
+        let yield_on_spin = handler.as_ref().is_some_and(|h| h.allow_spin_yield());
+        self.interpreter.yield_on_spin = yield_on_spin;
         if self.diagnostics != diagnostics {
             self.diagnostics = diagnostics;
             self.memory.count_host_access(diagnostics != 0);
@@ -420,6 +422,7 @@ impl Executor {
         };
         #[cfg(native)]
         if let Some(native) = &mut self.native {
+            native.set_spin_yield(yield_on_spin);
             native.set_body_services(
                 bridge
                     .handler
@@ -630,6 +633,7 @@ impl Executor {
             } else if let Some(exit) = self.run_native(stop, bridge)? {
                 match exit {
                     Exit::Dispatch => continue,
+                    Exit::Reschedule => return Ok(RunOutcome::Reschedule),
                     Exit::Yield => {
                         if let Some(handler) = bridge.handler.as_mut() {
                             bridge.parked =
@@ -699,6 +703,7 @@ impl Executor {
             }
             match step {
                 Step::Executed => {}
+                Step::SpinBackedge => return Ok(RunOutcome::Reschedule),
                 Step::ReadTimestamp { .. } => unreachable!("completed by the execution owner"),
                 Step::ReadFault { pc, address } => {
                     let address = self.fault_address(address, adv_cpu_core::READ);

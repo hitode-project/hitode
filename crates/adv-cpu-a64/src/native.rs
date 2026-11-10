@@ -905,7 +905,7 @@ impl Native {
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
-            Exit::Stepped => {}
+            Exit::Stepped | Exit::Reschedule => {}
             Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
         let mut retired = budget - self.runtime.countdown;
@@ -948,6 +948,10 @@ impl Native {
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
         self.runtime.body.services = services;
+    }
+
+    pub(crate) fn set_spin_yield(&mut self, enabled: bool) {
+        self.runtime.spin_yield = u32::from(enabled);
     }
 
     /// The unit at `eip`, translated if needed; a nonzero `point` is

@@ -50,10 +50,19 @@ pub fn function(name: &str) -> Option<Function> {
         "mmap" => (cdecl(6), mmap),
         "mmap64" => (cdecl(7), mmap64),
         "munmap" => (cdecl(2), munmap),
+        "sysconf" => (cdecl(1), sysconf),
         "__errno_location" => (cdecl(0), errno_location),
         "strerror" => (cdecl(1), strerror),
         _ => return None,
     })
+}
+
+fn sysconf(env: &mut Env<'_>) -> Outcome {
+    // glibc i386 _SC_NPROCESSORS_CONF and _SC_NPROCESSORS_ONLN.
+    match env.arg(0) {
+        83 | 84 => Outcome::Return(adv_cpu::PROCESSORS),
+        _ => fail(env, EINVAL, u32::MAX),
+    }
 }
 
 /// The descriptors the guest opened.

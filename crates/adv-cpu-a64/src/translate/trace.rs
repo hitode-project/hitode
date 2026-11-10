@@ -81,6 +81,7 @@ pub struct Inst {
     pub next: Next,
     /// Where a taken jcc goes.
     pub taken: Option<Edge>,
+    pub spin: bool,
     frame: u16,
 }
 
@@ -331,7 +332,42 @@ impl Trace {
                 });
             }
         }
+        self.mark_spin_backedges(memory);
         self.analyze();
+    }
+
+    fn mark_spin_backedges(&mut self, memory: &Memory) {
+        for from in 0..self.insts.len() {
+            let latch = self.insts[from];
+            let Some(Edge::Internal(to)) = latch.taken.or(match latch.next {
+                Next::Edge(edge) => Some(edge),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if to >= from {
+                continue;
+            }
+            let target = self.insts[to].pc;
+            let len = latch.next_pc.wrapping_sub(target) as usize;
+            if target >= latch.pc
+                || len > adv_cpu_core::spin::MAX_BYTES
+                || !self.insts[to..=from].windows(2).all(|pair| {
+                    let [inst, next] = [pair[0], pair[1]];
+                    inst.frame == latch.frame
+                        && inst.next_pc == next.pc
+                        && inst.mode == Mode::Plain
+                        && inst.next == Next::Fall
+                        && inst.taken.is_none()
+                        && !matches!(inst.op, Op::Body(..))
+                })
+            {
+                continue;
+            }
+            self.insts[from].spin = memory
+                .read_data(target, len)
+                .is_ok_and(|bytes| adv_cpu_core::spin::backedge(&bytes, target, latch.pc));
+        }
     }
 
     /// Builds the primary path and, for a loop, the paths that return to it.
@@ -594,6 +630,7 @@ impl Trace {
                 mode: Mode::Plain,
                 next: Next::Fall,
                 taken: None,
+                spin: false,
                 frame,
             };
             if inst.call.is_some() {
@@ -820,7 +857,7 @@ impl Trace {
             {
                 out = out.or(self.edge_live(index, taken, observe));
             }
-            if inst.mode != Mode::Plain {
+            if inst.mode != Mode::Plain || inst.spin && observe {
                 out = FlagSet::ALL;
             }
             let effects = inst.effects;

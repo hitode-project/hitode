@@ -92,6 +92,8 @@ pub enum Cc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Nop,
+    Pause,
+    Fence,
     Mov(Src, Src),
     Lea(u8, Mem),
     Alu(Alu, Src, Src),
@@ -333,8 +335,9 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         ));
     }
     Some(match mnemonic {
-        M::Nop | M::Pause => Op::Nop,
-        M::Lfence | M::Sfence | M::Mfence => Op::Nop,
+        M::Nop => Op::Nop,
+        M::Pause => Op::Pause,
+        M::Lfence | M::Sfence | M::Mfence => Op::Fence,
         // Hints that never fault; ENDBR32 marks indirect branch targets for
         // CET, which the guest never enables.
         M::Endbr32 => Op::Nop,
@@ -763,7 +766,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
         0xc3 => Op::Ret(0),
         // PAUSE and `rep ret`, which older compilers emit after a branch.
         0xf3 => match b.u8()? {
-            0x90 => Op::Nop,
+            0x90 => Op::Pause,
             0xc3 => Op::Ret(0),
             _ => return None,
         },
@@ -1026,9 +1029,14 @@ impl Op {
         use FlagSet as F;
         let mem = |src: Src| matches!(src, Src::Mem(_));
         let (reads, writes, site) = match self {
-            Op::Nop | Op::Lea(..) | Op::Not(_) | Op::Cdq | Op::Jmp(_) | Op::Direction(_) => {
-                (F::NONE, F::NONE, false)
-            }
+            Op::Nop
+            | Op::Pause
+            | Op::Fence
+            | Op::Lea(..)
+            | Op::Not(_)
+            | Op::Cdq
+            | Op::Jmp(_)
+            | Op::Direction(_) => (F::NONE, F::NONE, false),
             // MMX and floating-point instructions may leave for the
             // interpreter.
             Op::Simd(simd) => (

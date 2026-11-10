@@ -5,6 +5,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
+    fn allow_spin_yield(&self) -> bool {
+        false
+    }
+
     /// The body has committed its results and its return epilogue.
     fn body_yield(&mut self, _state: &mut CpuState, _memory: &mut Memory) -> Result<bool, String> {
         Ok(false)

@@ -22,6 +22,106 @@ fn units(p: &Program, cpu: &Executor) -> usize {
         .count()
 }
 
+struct Spin;
+
+impl adv_cpu_core::trap::ExecutionTrap for Spin {
+    fn allow_spin_yield(&self) -> bool {
+        true
+    }
+
+    fn call(&mut self, _: &mut CpuState, _: &mut Memory, vector: u32) -> Result<bool, String> {
+        panic!("unexpected trap {vector}");
+    }
+}
+
+// spec: A64-CTL-7, A64-CTL-15
+#[test]
+fn spin_backedges_publish_the_exact_taken_prefix() {
+    for pause_only in [false, true] {
+        let mut p = fixture(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            if pause_only {
+                a.pause().unwrap();
+                a.jmp(top).unwrap();
+            } else {
+                a.mov(eax, dword_ptr(ebx + esi * 4 + 4)).unwrap();
+                a.cmp(eax, edx).unwrap();
+                a.jne(top).unwrap();
+            }
+        });
+        p.state.regs[6] = 2;
+        let prefix = if pause_only { 2 } else { 3 };
+        for config in pixel_loops::configs().filter(|c| !c.1) {
+            for budget in [prefix - 1, prefix, prefix + 20] {
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                let expect = if budget < prefix {
+                    RunOutcome::Budget
+                } else {
+                    RunOutcome::Reschedule
+                };
+                for cpu in [&mut native, &mut oracle] {
+                    assert_eq!(
+                        cpu.run_with_traps(p.stop, budget, &mut Spin, false)
+                            .unwrap(),
+                        expect
+                    );
+                }
+                same(&native, &oracle);
+                if budget >= prefix {
+                    assert_eq!(
+                        (native.state.eip, native.state.fuel),
+                        (CODE, budget - prefix)
+                    );
+                }
+                if budget > prefix {
+                    assert_eq!(native.stats.native_entries, 1);
+                    assert_eq!(native.stats.interpreter_entries, 0);
+                }
+            }
+            if !pause_only {
+                let offset = 12;
+                p.data[offset..offset + 4].copy_from_slice(&p.state.regs[2].to_le_bytes());
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                for cpu in [&mut native, &mut oracle] {
+                    assert_eq!(
+                        cpu.run_with_traps(p.stop, 20, &mut Spin, false).unwrap(),
+                        RunOutcome::ReachedStop
+                    );
+                }
+                same(&native, &oracle);
+                p.data[offset..offset + 4].fill(0);
+            }
+        }
+    }
+}
+
+// spec: A64-CTL-15
+#[test]
+fn counted_load_scans_do_not_request_a_handoff() {
+    let p = fixture(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(ebx + ecx * 4)).unwrap();
+        a.pause().unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(top).unwrap();
+    });
+    for config in pixel_loops::configs().filter(|c| !c.1) {
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        for cpu in [&mut native, &mut oracle] {
+            assert_eq!(
+                cpu.run_with_traps(p.stop, 20, &mut Spin, false).unwrap(),
+                RunOutcome::ReachedStop
+            );
+        }
+        same(&native, &oracle);
+    }
+}
+
 // spec: A64-TR-3
 #[test]
 fn loop_units_keep_alternating_arms_and_their_nested_paths() {

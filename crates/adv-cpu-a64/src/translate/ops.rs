@@ -43,7 +43,7 @@ impl Translator<'_> {
             return;
         }
         match inst.op {
-            Op::Nop | Op::Jmp(_) => {}
+            Op::Nop | Op::Pause | Op::Fence | Op::Jmp(_) => {}
             Op::Helper(index) => self.helper(index),
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
             Op::Timestamp => self.timestamp(),

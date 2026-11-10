@@ -30,6 +30,7 @@ mod window_tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Executed,
+    SpinBackedge,
     /// The owner completes a clock read into EDX:EAX and advances to `next`.
     /// One instruction unit is charged; all architectural state is still intact.
     ReadTimestamp {
@@ -181,6 +182,7 @@ pub struct Interpreter {
     pub frame_rep_elements: u64,
     /// Discovery and tracing observe every transfer before windows may loop.
     pub observe_transfers: bool,
+    pub yield_on_spin: bool,
 }
 
 impl Default for Interpreter {
@@ -206,6 +208,7 @@ impl Interpreter {
             frame_retired: None,
             frame_rep_elements: 0,
             observe_transfers: false,
+            yield_on_spin: false,
         }
     }
 
@@ -319,7 +322,7 @@ impl Interpreter {
                         self.frame_retired
                             .as_mut()
                             .map(|retired| (retired, &mut self.frame_rep_elements)),
-                        self.observe_transfers,
+                        (self.observe_transfers, self.yield_on_spin),
                     );
                 }
             }
@@ -343,7 +346,7 @@ impl Interpreter {
                     self.frame_retired
                         .as_mut()
                         .map(|retired| (retired, &mut self.frame_rep_elements)),
-                    self.observe_transfers,
+                    (self.observe_transfers, self.yield_on_spin),
                 );
             }
             // Preserve independent capacity limits and whole-cache saturation.
@@ -379,7 +382,7 @@ impl Interpreter {
             self.frame_retired
                 .as_mut()
                 .map(|retired| (retired, &mut self.frame_rep_elements)),
-            self.observe_transfers,
+            (self.observe_transfers, self.yield_on_spin),
         )
     }
 }
@@ -410,6 +413,20 @@ fn execute_decoded(
     }
     let instruction = match decoded {
         Decoded::Ready(i) => i,
+        Decoded::Spin(i, target) => {
+            state.rep = None;
+            registers::execute(i, state);
+            return Execution {
+                step: if debug {
+                    Step::Trap { pc, vector: 1 }
+                } else if state.eip == *target {
+                    Step::SpinBackedge
+                } else {
+                    Step::Executed
+                },
+                units: 1,
+            };
+        }
         Decoded::Stop(result) => {
             return Execution {
                 step: *result,
@@ -618,9 +635,17 @@ fn execute_decoded(
 #[derive(Clone, Copy)]
 enum Decoded {
     Ready(Predecoded),
+    /// A direct branch proved to return to the head of a spin loop.
+    Spin(Predecoded, u32),
     Extended(Instruction, crate::floating::Operation, Option<u16>),
     Simd(simd::Plan),
     Stop(Step),
+}
+
+impl Decoded {
+    fn is_transfer(self) -> bool {
+        matches!(self, Self::Spin(..)) || matches!(self, Self::Ready(i) if i.action.is_transfer())
+    }
 }
 
 fn retired_instruction(decoded: &Decoded, execution: Execution, state: &CpuState, pc: u32) -> u64 {
@@ -1061,6 +1086,7 @@ impl DecodedBlock {
                     instruction.flow_control() != iced_x86::FlowControl::Next,
                 ),
                 Decoded::Stop(_) => (pc, true),
+                Decoded::Spin(..) => unreachable!("only proved in a window"),
             };
             let len = if next > pc {
                 (next - pc) as usize
@@ -1080,7 +1106,18 @@ impl DecodedBlock {
             if let Some(offset) = block.offsets.get_mut(pc.wrapping_sub(start) as usize) {
                 *offset = block.instructions.len() as u8;
             }
-            block.instructions.push((pc, entry.decoded));
+            let mut decoded = entry.decoded;
+            if block.local_branches
+                && let Decoded::Ready(i) = decoded
+                && let Action::Branch(Operand::Immediate(target), _) = i.action
+                && (start..pc).contains(&target)
+                && block.offsets[(target - start) as usize] != u8::MAX
+                && let Some(bytes) = block.bytes.get((target - start) as usize..)
+                && crate::spin::backedge(bytes, target, pc)
+            {
+                decoded = Decoded::Spin(i, target);
+            }
+            block.instructions.push((pc, decoded));
             if terminates || next <= pc {
                 break;
             }
@@ -1097,12 +1134,12 @@ impl DecodedBlock {
         max_units: u32,
         stop: u32,
         counts: Option<(&mut u64, &mut u64)>,
-        observe_transfers: bool,
+        (observe_transfers, yield_on_spin): (bool, bool),
     ) -> (Execution, u32) {
         if observe_transfers || !self.local_branches {
-            self.execute_mode::<true>(state, memory, max_units, stop, counts)
+            self.execute_mode::<true>(state, memory, max_units, stop, counts, yield_on_spin)
         } else {
-            self.execute_mode::<false>(state, memory, max_units, stop, counts)
+            self.execute_mode::<false>(state, memory, max_units, stop, counts, yield_on_spin)
         }
     }
 
@@ -1114,17 +1151,30 @@ impl DecodedBlock {
         stop: u32,
         // Retired instructions and REP elements, counted only for diagnostics.
         counts: Option<(&mut u64, &mut u64)>,
+        yield_on_spin: bool,
     ) -> (Execution, u32) {
         // Specialize the ordinary block loop: disabled diagnostics must not
         // add a retirement branch to every interpreted instruction.
         match counts {
-            Some((retired, elements)) => {
-                self.execute::<OBSERVE>(state, memory, max_units, stop, |d, e, s, pc, count| {
+            Some((retired, elements)) => self.execute::<OBSERVE>(
+                state,
+                memory,
+                max_units,
+                stop,
+                yield_on_spin,
+                |d, e, s, pc, count| {
                     *elements += rep_elements(d, count, s);
                     *retired += retired_instruction(d, e, s, pc)
-                })
-            }
-            None => self.execute::<OBSERVE>(state, memory, max_units, stop, |_, _, _, _, _| {}),
+                },
+            ),
+            None => self.execute::<OBSERVE>(
+                state,
+                memory,
+                max_units,
+                stop,
+                yield_on_spin,
+                |_, _, _, _, _| {},
+            ),
         }
     }
 
@@ -1134,6 +1184,7 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
+        yield_on_spin: bool,
         mut retire: impl FnMut(&Decoded, Execution, &CpuState, u32, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
@@ -1175,16 +1226,21 @@ impl DecodedBlock {
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;
+            if result.step != Step::Executed {
+                if result.step != Step::SpinBackedge || yield_on_spin {
+                    break;
+                }
+                result.step = Step::Executed;
+            }
             // Stores can patch this block's next instruction. A flags change can
             // enable single stepping, and floating exceptions remain restartable.
-            if execution.step != Step::Executed
-                || memory.epoch != epoch
+            if memory.epoch != epoch
                 || state.eflags & 0x100 != 0
                 // Leave room for a full straight-line segment. Prefer a branch
                 // boundary for the owner's next interrupt/deadline poll, while
                 // retaining the hard instruction/REP allowance above.
                 || (OBSERVE || result.units >= max_units.saturating_sub(BLOCK_INSTRUCTIONS as u32))
-                    && matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
+                    && decoded.is_transfer()
             {
                 break;
             }
@@ -1197,7 +1253,7 @@ impl DecodedBlock {
             } else {
                 // Transfers may stay only at decoded instruction boundaries;
                 // REP, published native entries and owner operations still exit.
-                if !matches!(decoded, Decoded::Ready(i) if i.action.is_transfer())
+                if !decoded.is_transfer()
                     || !self.local_branches
                     || self.native_start && state.eip == self.pc
                 {
@@ -1231,6 +1287,7 @@ impl Address {
 #[derive(Clone, Copy)]
 enum Action {
     Nop,
+    Pause,
     Cpuid,
     Rdtsc,
     ReadSegment(Operand, usize),
@@ -1349,7 +1406,7 @@ fn same_width(dst: Operand, src: Operand) -> bool {
 pub(crate) fn integer_operation(i: &Instruction) -> Option<crate::integer::Operation> {
     use crate::integer::Operation;
     Some(match predecode(i)? {
-        Action::Nop => Operation::Nop,
+        Action::Nop | Action::Pause => Operation::Nop,
         Action::Mov(a, b, sign) => Operation::Mov(a, b, sign),
         Action::Lea(r, a) => Operation::Lea(r, a),
         Action::Binary(m, a, b) => Operation::Binary(m, a, b),
@@ -1402,7 +1459,8 @@ fn predecode(i: &Instruction) -> Option<Action> {
     };
     Some(match i.mnemonic() {
         // ENDBR32 marks indirect branch targets for CET, never enabled here.
-        M::Nop | M::Pause | M::Endbr32 => Action::Nop,
+        M::Nop | M::Endbr32 => Action::Nop,
+        M::Pause => Action::Pause,
         M::Cpuid => Action::Cpuid,
         M::Rdtsc => Action::Rdtsc,
         M::Xlatb => Action::Mov(Operand::Register(Reg::decode(R::AL)?), op(0)?, false),
@@ -1826,7 +1884,7 @@ impl Transaction {
         match action {
             Action::Rdtsc => unreachable!("clock reads complete at the owner boundary"),
             Action::String(_) => unreachable!("REP progress commits per element"),
-            Action::Nop => {}
+            Action::Nop | Action::Pause => {}
             Action::Cpuid => {
                 let [eax, ebx, ecx, edx] = crate::cpu_profile::cpuid(self.regs[0], self.regs[1]);
                 self.regs[0] = eax;

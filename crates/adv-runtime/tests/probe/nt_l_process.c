@@ -3,6 +3,7 @@
 #define _WIN32_WINNT 0x0602
 #include <windows.h>
 #include <winternl.h>
+#include <cpuid.h>
 #include <stdio.h>
 
 #define NT(name, signature) static NTSTATUS (WINAPI *name) signature
@@ -133,7 +134,49 @@ static void thread_checks(void)
     check("continue_ex_alert", continued == 1 && apc_result == 6);
     SYSTEM_INFO info;
     GetSystemInfo(&info);
-    check("processor_number", GetCurrentProcessorNumber() < info.dwNumberOfProcessors);
+    const BYTE *peb = (const BYTE *)NtCurrentTeb()->ProcessEnvironmentBlock;
+    const volatile BYTE *shared = (const volatile BYTE *)0x7ffe0000;
+    DWORD_PTR process_mask, system_mask;
+    unsigned eax, ebx, ecx, edx;
+    __cpuid(1, eax, ebx, ecx, edx);
+    check("processor_count", info.dwNumberOfProcessors == 8 &&
+          info.dwActiveProcessorMask == 0xff && *(const DWORD *)(peb + 0x64) == 8 &&
+          *(const DWORD *)(peb + 0xc0) == 0xff &&
+          *(const volatile DWORD *)(shared + 0x3c0) == 8 && shared[0x3c4] == 1 &&
+          ((ebx >> 16) & 0xff) == 8 && (edx & (1u << 28)) &&
+          GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) == 8);
+    check("processor_affinity", GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) &&
+          process_mask == 0xff && system_mask == 0xff);
+    DWORD_PTR old_mask = SetThreadAffinityMask(GetCurrentThread(), 0x80);
+    GROUP_AFFINITY group;
+    check("processor_number", old_mask == 0xff && GetCurrentProcessorNumber() == 7 &&
+          GetThreadGroupAffinity(GetCurrentThread(), &group) && group.Group == 0 &&
+          group.Mask == 0x80 && SetThreadAffinityMask(GetCurrentThread(), old_mask) == 0x80);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION legacy[16];
+    DWORD length = sizeof(legacy), cores = 0, mask = 0;
+    if (GetLogicalProcessorInformation(legacy, &length))
+        for (unsigned n = 0; n < length / sizeof(*legacy); ++n)
+            if (legacy[n].Relationship == RelationProcessorCore)
+            {
+                ++cores;
+                mask |= legacy[n].ProcessorMask;
+            }
+    check("processor_cores", cores == 8 && mask == 0xff);
+    BYTE extended[512];
+    length = sizeof(extended);
+    cores = mask = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, (void *)extended, &length))
+        for (DWORD n = 0; n < length;)
+        {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *core = (void *)(extended + n);
+            if (!core->Size || core->Size > length - n ||
+                core->Relationship != RelationProcessorCore || core->Processor.GroupCount != 1)
+                break;
+            ++cores;
+            mask |= core->Processor.GroupMask[0].Mask;
+            n += core->Size;
+        }
+    check("processor_cores_ex", cores == 8 && mask == 0xff);
     HANDLE limited = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, GetCurrentProcessId());
     check("process_suspend_access", (ULONG)suspend_process(limited) == 0xc0000022);
     CloseHandle(limited);

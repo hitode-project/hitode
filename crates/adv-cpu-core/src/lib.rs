@@ -55,7 +55,11 @@ pub mod virtual_memory;
 pub use architecture::{ArchitecturalState, StateError};
 pub use cliffs::{Cliffs, Count as CliffCount, InterpreterReason, X87Cliff};
 pub use code_image::AotImage;
-pub use cpu_profile::{PROCESSOR_IDENTITY, ProcessorIdentity, SegmentState};
+pub use cpu_profile::{
+    PROCESSOR_IDENTITY, PROCESSOR_MASK, PROCESSORS, ProcessorIdentity, SegmentState,
+};
+#[doc(hidden)]
+pub mod spin;
 pub use engine::{Engine, EngineCounters, EngineOptions, ProfileSample};
 pub use host_features::HostFeatures;
 pub use memory::{EXEC, Memory, PAGE_SIZE, READ, WRITE};
@@ -153,6 +157,7 @@ pub enum RunOutcome {
     ReachedStop,
     Budget,
     Interrupted,
+    Reschedule,
     ReadFault { pc: u32, address: u32 },
     WriteFault { pc: u32, address: u32 },
     FetchFault { pc: u32, address: u32 },
