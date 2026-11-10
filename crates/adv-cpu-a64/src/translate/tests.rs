@@ -90,6 +90,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,
+            false,
         );
         assert!(
             work.words().len() * 4 > 1 << 15,
@@ -140,6 +141,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
+        false,
     );
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
     let target_load = work.sites().last().unwrap().0 / 4;
@@ -165,6 +167,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
+        false,
     );
     assert_eq!(work.unit.tables.len(), 1);
     let hot = work.words().iter().position(|&w| w == br(X17)).unwrap();
@@ -328,6 +331,7 @@ impl Harness {
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,
+            false,
         );
         assert!(
             !work
@@ -807,6 +811,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 &|_| None,
                 &|_, _| Vec::new(),
                 0x037f,
+                false,
             );
             let count = work.unit.tables.first().map_or(0, |t| t.targets.len());
             assert_eq!(
@@ -886,6 +891,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
+        false,
     );
     work
 }

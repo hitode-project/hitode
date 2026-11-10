@@ -492,7 +492,9 @@ impl Translator<'_> {
 
     /// A return popping `release` argument bytes besides its address.
     fn ret(&mut self, inst: Inst, release: u16) {
-        self.flush_simd();
+        if !self.x87.active {
+            self.flush_simd();
+        }
         let esp = Operand::Guest(ESP);
         self.prepare(esp);
         self.load(Addr::Pop, X16);
@@ -512,6 +514,8 @@ impl Translator<'_> {
                     state: self.state,
                     refund: self.trace.unused(self.index),
                     branch: self.indirect(IndirectBranchKind::Return),
+                    simd_dirty: self.vector.dirty,
+                    x87: self.x87_leaving(),
                 });
             }
             _ => {
@@ -924,6 +928,21 @@ impl Translator<'_> {
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
+        if let Some(x87) = self.x87_leaving() {
+            let label = self.asm.label();
+            self.asm.b(label);
+            self.push_cold(Cold::Leave {
+                label,
+                state: self.state,
+                simd_dirty: self.vector.dirty,
+                refund: self.trace.owed(self.index),
+                exit: Exit::Interpret,
+                eip: self.trace.insts[self.index].pc,
+                link: false,
+                x87: Some(x87),
+            });
+            return;
+        }
         let index = self.helpers + u32::from(index);
         self.mov_imm(X1, index);
         self.owner_call(self.stubs.interpret);
@@ -1705,6 +1724,14 @@ impl Translator<'_> {
             self.asm.b(done);
             self.asm.bind(zero);
             let slow = self.asm.label();
+            let x87 = self.x87_leaving();
+            let refuse = if x87.is_some() {
+                let label = self.asm.label();
+                self.push_cold(Cold::Bridge { label, to: slow });
+                label
+            } else {
+                slow
+            };
             // Zero counts still require WRITE, but must not perform a store.
             // The preceding load established that both page indices are valid.
             self.emit_all(&[
@@ -1712,13 +1739,13 @@ impl Translator<'_> {
                 lsr_imm(W, X4, X5, 12),
                 ldr_narrow(Narrow::Byte, X4, X3, X4),
             ]);
-            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), refuse);
             self.emit_all(&[
                 add_imm(W, X4, X5, 3, false),
                 lsr_imm(W, X4, X4, 12),
                 ldr_narrow(Narrow::Byte, X4, X3, X4),
             ]);
-            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), refuse);
             self.push_cold(Cold::Leave {
                 label: slow,
                 state: State::CANONICAL,
@@ -1727,7 +1754,7 @@ impl Translator<'_> {
                 exit: super::Exit::Interpret,
                 eip: self.trace.insts[self.index].pc,
                 link: false,
-                x87: self.x87_leaving(),
+                x87,
             });
         }
         self.asm.bind(done);

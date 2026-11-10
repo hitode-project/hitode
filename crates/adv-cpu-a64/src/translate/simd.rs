@@ -1599,7 +1599,12 @@ impl Translator<'_> {
         }
         let leave = self.asm.label();
         self.emit(ldr(W, X13, X5, runtime::MXCSR));
-        self.asm.tbz(false, X13, 5, leave);
+        let x87 = self.x87_leaving();
+        if x87.is_some() {
+            self.x87_require_bit(X13, 5, leave);
+        } else {
+            self.asm.tbz(false, X13, 5, leave);
+        }
         self.push_cold(Cold::Leave {
             label: leave,
             state: self.state,
@@ -1608,7 +1613,7 @@ impl Translator<'_> {
             exit: crate::runtime::Exit::Dispatch,
             eip: self.trace.insts[self.index].next_pc,
             link: true,
-            x87: None,
+            x87,
         });
     }
 
@@ -2324,6 +2329,7 @@ mod tests {
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,
+            false,
         );
         println!(
             "mixed MMX loop: {} guest instructions, {} A64 instructions",

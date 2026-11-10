@@ -682,6 +682,7 @@ pub(crate) struct Native {
     pub(crate) clock: *mut std::ffi::c_void,
     /// The x87 control word of the CPU a run starts on.
     control: u16,
+    pe: bool,
 }
 
 impl Native {
@@ -784,6 +785,7 @@ impl Native {
             runtime,
             clock: std::ptr::null_mut(),
             control: 0,
+            pe: false,
         })
     }
 
@@ -808,6 +810,7 @@ impl Native {
     ) -> Result<Option<Run>, String> {
         self.bridge = bridge;
         self.control = cpu.x87.control;
+        self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
         let (entry, translated) = match self.units.get(&cpu.eip).copied() {
@@ -1269,12 +1272,13 @@ impl Native {
         let mut work = std::mem::take(&mut self.work);
         work.unit.images.clone_from(&self.images.borrow());
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
-        let control = if self.runtime.cpu.is_null() {
-            self.control
+        let (control, pe) = if self.runtime.cpu.is_null() {
+            (self.control, self.pe)
         } else {
             // SAFETY: during a run the runtime points at its live CPU, which
             // nothing writes while the owner translates.
-            unsafe { (*self.runtime.cpu).x87.control }
+            let x87 = unsafe { &(*self.runtime.cpu).x87 };
+            (x87.control, x87.status & 0x20 != 0)
         };
         translate::translate(
             &mut work,
@@ -1323,6 +1327,7 @@ impl Native {
                     .map_or_else(Vec::new, |handler| handler.native_region(pc, code))
             },
             control,
+            pe,
         );
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(work.unit.trace.failure & 3)] += 1;

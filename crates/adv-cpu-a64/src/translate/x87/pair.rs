@@ -179,7 +179,7 @@ impl Translator<'_> {
                 width,
                 integer,
                 pop,
-            } => self.pair_store(width, integer, pop, bail),
+            } => self.pair_store(width, integer, pop, bail, c1_dead && self.x87.pe),
             Fast::StoreSt { index, pop } => {
                 self.x87_copy(index, 0);
                 self.clear_c1();
@@ -225,6 +225,11 @@ impl Translator<'_> {
     /// Publish the run's x87 image around its arithmetic leaf, keeping the run open.
     fn pair_leaf(&mut self, m: iced_x86::Mnemonic, x: X87, bail: Label) {
         self.x87_publish(self.x87.model, X13);
+        if self.vector.dirty != 0 {
+            self.emit(msr_nzcv(super::X4));
+            self.flush_simd();
+            self.emit(mrs_nzcv(super::X4));
+        }
         self.x87_leaf_call(m, x, bail);
     }
 
@@ -316,14 +321,23 @@ impl Translator<'_> {
         self.x87_written(n, narrow);
     }
 
-    fn pair_store(&mut self, width: u8, integer: bool, pop: bool, bail: Label) {
+    fn pair_store(&mut self, width: u8, integer: bool, pop: bool, bail: Label, skip: bool) {
         let n = self.x87.model.reg(0);
+        if skip && (width != 8 || integer || !self.x87_narrow(n)) {
+            // Even sticky PE must be masked; for floats the fast result
+            // also needs round-to-nearest when the store can lose bits.
+            if !integer {
+                self.emit(ubfx(W, X16, X8, 10, 2));
+                self.asm.cbz(W, true, X16, bail);
+            }
+            self.x87_require_bit(X8, 5, bail);
+        }
         if width == 8 && !integer {
             // The high lane is the value rounded to nearest; a low lane
             // that is not zero makes it inexact, rounded up when its sign
             // differs.
             self.emit(fmov_from_v(X, X2, v(n)));
-            if !self.x87_narrow(n) {
+            if !skip && !self.x87_narrow(n) {
                 self.emit_all(&[
                     vumov(3, X16, v(n), 1),
                     lsl_imm(X, X17, X16, 1),
@@ -334,7 +348,7 @@ impl Translator<'_> {
                 ]);
                 self.store_rounding(width, false, bail);
                 self.store_flags(bail);
-            } else {
+            } else if !skip {
                 self.clear_c1();
             }
         } else {
@@ -361,8 +375,10 @@ impl Translator<'_> {
                     fmov_to_v(X, V0, X16),
                 ]);
             }
-            self.store_sticky(width, integer, bail);
-            self.store_flags(bail);
+            self.store_sticky(width, integer, bail, !skip);
+            if !skip {
+                self.store_flags(bail);
+            }
         }
         self.x87_store_access(width);
         if pop {
@@ -435,13 +451,18 @@ impl Translator<'_> {
         ]);
     }
 
+    pub(super) fn pair_precision(&self) -> bool {
+        precision(self.control).is_some()
+    }
+
     fn pair_guard(&mut self, to: Label) {
+        if self.x87.control_stable {
+            return;
+        }
         if !self.x87.guarded {
             self.pair_control();
         }
-        let label = self.asm.label();
-        self.asm.tbz(false, X8, 16, label);
-        self.push_cold(super::super::Cold::Bridge { label, to });
+        self.x87_require_bit(X8, 16, to);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,6 +567,17 @@ impl Translator<'_> {
         // Rounding to 24 bits may carry into the next binade.
         let span = if single { SPAN - 1 } else { SPAN };
         self.pair_range(r, zero, (LOW, span), generic);
+        let skip = c1_dead && self.x87.pe;
+        if skip {
+            if single {
+                self.pair_single(r, join, c1_dead, true);
+            }
+            self.asm.b(join);
+            self.asm.bind(zero);
+            self.exact_zero(op, a, b, generic);
+            self.asm.bind(join);
+            return;
+        }
         if c1_dead {
             self.asm.tbz(true, X13, 5, round);
         }
@@ -580,7 +612,7 @@ impl Translator<'_> {
         }
         if single {
             self.asm.bind(round);
-            self.pair_single(r, join, c1_dead);
+            self.pair_single(r, join, c1_dead, false);
         }
         self.asm.b(join);
         self.asm.bind(zero);
@@ -594,17 +626,22 @@ impl Translator<'_> {
     /// Rounds the significand of the double in `r` to 24 bits, to nearest
     /// even; a change sets PE and, unless `c1_dead`, C1 if it grew. Uses
     /// x0, x1, x3 and x17.
-    fn pair_single(&mut self, r: VReg, join: Label, c1_dead: bool) {
-        self.emit_all(&[fmov_from_v(X, X0, r), and_imm(X, X3, X0, SINGLE_TAIL)]);
-        self.asm.cbz(X, false, X3, join);
+    fn pair_single(&mut self, r: VReg, join: Label, c1_dead: bool, skip: bool) {
+        self.emit(fmov_from_v(X, X0, r));
+        if !skip {
+            self.emit(and_imm(X, X3, X0, SINGLE_TAIL));
+            self.asm.cbz(X, false, X3, join);
+        }
         self.mov_imm(X1, (1 << 28) - 1);
         self.emit_all(&[
             ubfx(X, X17, X0, 29, 1),
             add(X, X1, X0, X1, Lsl, 0),
             add(X, X1, X1, X17, Lsl, 0),
             and_imm(X, X1, X1, !SINGLE_TAIL),
-            orr_imm(W, X13, X13, u64::from(PE)),
         ]);
+        if !skip {
+            self.emit(orr_imm(W, X13, X13, u64::from(PE)));
+        }
         if !c1_dead {
             self.emit_all(&[
                 cmp(X, X1, X0, Lsl, 0),
@@ -812,6 +849,7 @@ impl Translator<'_> {
             fmov_from_v(X, X16, V0),
         ]);
         let (certain, exact) = (self.asm.label(), self.asm.label());
+        let skip = c1_dead && self.x87.pe;
         if !known {
             self.asm.cbz(X, false, X3, certain);
             // An approximate rest near half a unit could round either way.
@@ -824,30 +862,34 @@ impl Translator<'_> {
                 cmp(X, X17, X0, Lsl, 0),
             ]);
             self.asm.b_cond(Cond::Hs, generic);
+            if !skip {
+                if c1_dead {
+                    self.asm.tbz(true, X13, 5, join);
+                }
+                // Nor can a rest near zero tell whether the result is exact.
+                self.emit_all(&[
+                    sub_imm(X, X0, X7, 84, false),
+                    lsl_imm(X, X0, X0, 52),
+                    cmp(X, X17, X0, Lsl, 0),
+                ]);
+                self.asm.b_cond(Cond::Lo, generic);
+                self.inexact(high, c1_dead);
+                self.asm.b(join);
+            }
+        }
+        self.asm.bind(certain);
+        if !skip {
             if c1_dead {
                 self.asm.tbz(true, X13, 5, join);
             }
-            // Nor can a rest near zero tell whether the result is exact.
-            self.emit_all(&[
-                sub_imm(X, X0, X7, 84, false),
-                lsl_imm(X, X0, X0, 52),
-                cmp(X, X17, X0, Lsl, 0),
-            ]);
-            self.asm.b_cond(Cond::Lo, generic);
+            self.emit(lsl_imm(X, X17, X16, 1));
+            self.asm.cbz(X, false, X17, exact);
             self.inexact(high, c1_dead);
             self.asm.b(join);
-        }
-        self.asm.bind(certain);
-        if c1_dead {
-            self.asm.tbz(true, X13, 5, join);
-        }
-        self.emit(lsl_imm(X, X17, X16, 1));
-        self.asm.cbz(X, false, X17, exact);
-        self.inexact(high, c1_dead);
-        self.asm.b(join);
-        self.asm.bind(exact);
-        if !c1_dead {
-            self.clear_c1();
+            self.asm.bind(exact);
+            if !c1_dead {
+                self.clear_c1();
+            }
         }
         self.asm.b(join);
         self.asm.bind(zero);

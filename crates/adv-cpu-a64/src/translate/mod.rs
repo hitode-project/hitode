@@ -401,6 +401,23 @@ enum Cold {
         state: State,
         refund: u32,
         branch: u64,
+        simd_dirty: u16,
+        x87: Option<x87::Leave>,
+    },
+    X87Backedge {
+        label: Label,
+        state: State,
+        vector: simd::Vector,
+        from: usize,
+        to: usize,
+        arrive: x87::Arrive,
+    },
+    X87End {
+        label: Label,
+        state: State,
+        vector: simd::Vector,
+        leave: x87::Leave,
+        done: Label,
     },
     /// A miss of an indirect transfer: loads `branch` into x4, then
     /// branches to the stub at `to`, which may be out of `cbnz` range.
@@ -482,6 +499,7 @@ struct Translator<'a> {
     x87_sites: Vec<(usize, Label)>,
     /// The x87 control word when translating, which runs specialize for.
     control: u16,
+    pe: bool,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -505,6 +523,7 @@ pub fn translate(
     redirect: &dyn Fn(u32) -> Option<Redirect>,
     admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
+    pe: bool,
 ) {
     work.unit.build(memory, eip, stops, host, redirect);
     work.unit.prepare_regions(memory, admit, checked);
@@ -516,6 +535,7 @@ pub fn translate(
         checked,
         helpers,
         control,
+        pe,
     }
     .lower(&mut work.unit, eip);
 }
@@ -530,6 +550,7 @@ pub struct Jit<'a> {
     pub checked: &'a dyn Fn(u32) -> bool,
     pub helpers: u32,
     pub control: u16,
+    pub pe: bool,
 }
 
 impl Backend for Jit<'_> {
@@ -592,9 +613,10 @@ impl Jit<'_> {
             vector: simd::Vector::default(),
             entry: residency::entries(trace, self.checked),
             uses_permissions,
-            x87: x87::Cache::default(),
+            x87: x87::Cache::for_trace(trace),
             x87_sites: Vec::new(),
             control: self.control,
+            pe: self.pe,
         };
         if trace.len() == 0 {
             // Nothing to translate: other units may still link here.
@@ -730,32 +752,60 @@ impl Translator<'_> {
         self.asm.bind(self.labels[index]);
         self.native_batch(index);
         self.channel_batch(index);
-        if self.x87.active && !matches!(inst.op, decode::Op::X87(_)) {
-            self.x87_integer();
+        if !matches!(inst.op, decode::Op::X87(_)) {
+            self.x87_start_integer();
+            if self.x87.active {
+                self.x87_integer();
+            }
         }
         self.op(inst);
         if let Next::Edge(edge) = inst.next {
+            self.x87_before_edge();
             self.follow(edge);
         }
+        self.x87_end_integer();
     }
 
     /// Where an instruction's fall-through or jump ends the trace.
     fn follow(&mut self, edge: Edge) {
         let unused = self.trace.unused(self.index);
         match edge {
-            Edge::Internal(to) => {
-                if let Some(x87) = self.x87_arriving(to) {
-                    self.x87_arrive(x87, self.index, to);
-                }
-                self.jump(to)
-            }
-            Edge::Exit(eip) => self.leave(Exit::Dispatch, eip, unused, true, true),
-            Edge::Interpret(eip) => self.leave(Exit::Interpret, eip, unused, false, false),
+            Edge::Internal(to) => self.jump(to, self.x87_arriving(to)),
+            Edge::Exit(eip) => self.follow_exit(Exit::Dispatch, eip, unused, true),
+            Edge::Interpret(eip) => self.follow_exit(Exit::Interpret, eip, unused, false),
+        }
+    }
+
+    fn follow_exit(&mut self, exit: Exit, eip: u32, refund: u32, link: bool) {
+        if let Some(x87) = self.x87_leaving() {
+            let label = self.asm.label();
+            self.asm.b(label);
+            self.push_cold(Cold::Leave {
+                label,
+                state: self.state,
+                simd_dirty: self.vector.dirty,
+                refund,
+                exit,
+                eip,
+                link,
+                x87: Some(x87),
+            });
+        } else {
+            self.leave(exit, eip, refund, link, link);
         }
     }
 
     /// An unconditional internal edge from the current instruction.
-    fn jump(&mut self, to: usize) {
+    fn jump(&mut self, to: usize, arrive: Option<x87::Arrive>) {
+        let (target, x87) = match arrive {
+            Some(x87::Arrive::Reconcile(_, model, target)) => {
+                (target, Some(x87::Leave::Publish(model)))
+            }
+            _ => (self.labels[to], None),
+        };
+        if let Some(arrive) = arrive {
+            self.x87_arrive(arrive, self.index, to);
+        }
         self.coerce(self.entry[to]);
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
@@ -771,12 +821,12 @@ impl Translator<'_> {
                 exit: Exit::Dispatch,
                 eip: self.trace.insts[to].pc,
                 link: false,
-                x87: None,
+                x87,
             });
         } else if net < 0 {
             self.emit(add_imm(X, X9, X9, (-net) as u32, false));
         }
-        self.asm.b(self.labels[to]);
+        self.asm.b(target);
     }
 
     /// A jcc at the current instruction whose taken edge is `taken`.
@@ -793,7 +843,20 @@ impl Translator<'_> {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
                 self.convert(self.trace.live_in[to]);
+                let x87 = self.x87_arriving(to);
                 let mut target = self.labels[to];
+                if let Some(arrive) = x87 {
+                    let label = self.asm.label();
+                    self.push_cold(Cold::X87Backedge {
+                        label,
+                        state: self.state,
+                        vector: self.vector,
+                        from,
+                        to,
+                        arrive,
+                    });
+                    target = label;
+                }
                 if !self.holds(self.entry[to]) {
                     // Only paths that dropped the cache get here.
                     let load = self.asm.label();
@@ -831,7 +894,7 @@ impl Translator<'_> {
                         exit: Exit::Dispatch,
                         eip: self.trace.insts[to].pc,
                         link: false,
-                        x87: None,
+                        x87: self.x87_leaving(),
                     });
                 } else if net == 0 {
                     self.jump_if(test, target);
@@ -844,7 +907,7 @@ impl Translator<'_> {
                         vector: self.vector,
                         from,
                         to,
-                        x87: None,
+                        x87,
                     });
                 }
             }
@@ -1467,10 +1530,7 @@ impl Translator<'_> {
                 self.state = state;
                 self.vector = vector;
                 self.index = from;
-                if let Some(x87) = x87 {
-                    self.x87_arrive(x87, from, to);
-                }
-                self.jump(to);
+                self.jump(to, x87);
             }
             Cold::Load {
                 label,
@@ -1500,15 +1560,57 @@ impl Translator<'_> {
                 state,
                 refund,
                 branch,
+                simd_dirty,
+                x87,
             } => {
                 self.asm.bind(label);
                 self.state = state;
                 self.canonicalize();
+                if let Some(x87) = x87 {
+                    self.emit(mov(W, X6, X16));
+                    self.x87_leave(x87);
+                    self.emit(mov(W, X16, X6));
+                    self.vector.dirty = simd_dirty;
+                    self.flush_simd();
+                }
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
                 self.mov_branch(branch);
                 self.far(self.stubs.lookup);
+            }
+            Cold::X87Backedge {
+                label,
+                state,
+                vector,
+                from,
+                to,
+                arrive,
+            } => {
+                self.asm.bind(label);
+                self.state = state;
+                self.vector = vector;
+                self.index = from;
+                self.x87_arrive(arrive, from, to);
+                let target = match arrive {
+                    x87::Arrive::Reconcile(_, _, target) => target,
+                    x87::Arrive::Publish(_) => self.labels[to],
+                };
+                self.asm.b(target);
+            }
+            Cold::X87End {
+                label,
+                state,
+                vector,
+                leave,
+                done,
+            } => {
+                self.asm.bind(label);
+                self.state = state;
+                self.vector = vector;
+                self.x87_leave(leave);
+                self.flush_simd();
+                self.asm.b(done);
             }
             Cold::Miss { label, to, branch } => {
                 self.asm.bind(label);
@@ -1593,7 +1695,11 @@ impl Translator<'_> {
         // paths and exits that publish a run follow, then the tables.
         let rank = |cold: &Cold| match cold {
             Cold::Table { .. } => 2,
-            Cold::X87(_) | Cold::X87Fault { .. } | Cold::Leave { x87: Some(_), .. } => 1,
+            Cold::X87(_)
+            | Cold::X87Fault { .. }
+            | Cold::X87End { .. }
+            | Cold::Leave { x87: Some(_), .. }
+            | Cold::Lookup { x87: Some(_), .. } => 1,
             _ => 0,
         };
         let mut queues: [VecDeque<(u32, Cold)>; 3] = Default::default();

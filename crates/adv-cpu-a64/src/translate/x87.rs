@@ -464,7 +464,7 @@ impl Translator<'_> {
         }
         if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
-            self.store_sticky(width, integer, slow);
+            self.store_sticky(width, integer, slow, true);
         } else {
             // Round the significand to 53 bits, nearest even, in integers.
             let zero = self.asm.label();
@@ -557,7 +557,7 @@ impl Translator<'_> {
     /// The bits of an integer or binary32 store in x2 from the value's
     /// sticky double in d0 (w3 whether it lost bits), w3 whether they are
     /// inexact and w7 whether rounding grew the magnitude.
-    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label) {
+    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label, track: bool) {
         if integer {
             // Below 2^63, and below 2^51 when bits were lost.
             let whole = self.asm.label();
@@ -578,7 +578,9 @@ impl Translator<'_> {
                 self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
                 self.asm.b_cond(Cond::Ne, slow);
             }
-            self.grew(V1, V0);
+            if track {
+                self.grew(V1, V0);
+            }
         } else {
             // A normal input and output: no underflow or overflow.
             let zero = self.asm.label();
@@ -591,9 +593,11 @@ impl Translator<'_> {
             self.asm.b_cond(Cond::Hi, slow);
             self.asm.bind(zero);
             self.emit_all(&[unary(Unary::Narrow, V1, V0), fmov_from_v(W, X2, V1)]);
-            self.emit(unary(Unary::Widen, V1, V1));
-            self.grew(V1, V0);
-            self.store_rounding(width, false, slow);
+            if track {
+                self.emit(unary(Unary::Widen, V1, V1));
+                self.grew(V1, V0);
+                self.store_rounding(width, false, slow);
+            }
             self.emit_all(&[ubfx(W, X16, X2, 23, 8), cmp_imm(W, X16, 0xff, false)]);
             self.asm.b_cond(Cond::Eq, slow);
         }

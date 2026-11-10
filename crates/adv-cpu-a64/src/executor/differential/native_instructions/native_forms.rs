@@ -64,6 +64,7 @@ fn no_operation_calls(p: &Program) {
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
+        false,
     );
     let exceptional = iced_x86::Decoder::new(32, &p.code, 0).iter().any(|i| {
         matches!(
