@@ -1035,11 +1035,16 @@ fn upright_glyph_boxes_stay_inside_the_font_cell() {
 struct FixtureDirectory(PathBuf);
 impl FixtureDirectory {
     fn new() -> Self {
+        // Parallel tests can read the same clock value; the counter keeps
+        // their directories apart.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("adv-fonts-{}-{stamp}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("adv-fonts-{}-{stamp}-{next}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         let directory = Self(path);
         std::fs::write(directory.0.join("single.ttf"), SINGLE).unwrap();
