@@ -83,6 +83,7 @@ pub struct SurfaceProvider {
     pub presentation_serial: fn(&Ext) -> Option<u64>,
     pub window: fn(&Ext, &Objects, u32) -> Option<(u32, u32)>,
     pub visible: fn(&Ext, &Objects, u32) -> Option<bool>,
+    pub window_presented: fn(&Ext, u32),
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
     pub display: fn(&Ext) -> (u32, u32, u32),
@@ -1471,6 +1472,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             .clear_region(target, *rectangle, *color, *depth, *stencil)
             .map(|()| Completion::Command),
         Operation::Present {
+            owner,
             surface,
             deadline,
             copy,
@@ -1479,15 +1481,8 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {
-                let (rotate, damage) = match operation {
-                    Operation::Present { owner, .. } => {
-                        match com(env).get_identity(&env.sys.objects, *owner) {
-                            Some(Payload::Device(d)) => {
-                                (d.frame.rotate, recording::changed(&d.frame))
-                            }
-                            _ => (false, None),
-                        }
-                    }
+                let (rotate, damage) = match com(env).get_identity(&env.sys.objects, *owner) {
+                    Some(Payload::Device(d)) => (d.frame.rotate, recording::changed(&d.frame)),
                     _ => (false, None),
                 };
                 if rotate {

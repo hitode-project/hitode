@@ -1058,6 +1058,14 @@ pub(super) fn present_operation(
         },
     )
 }
+
+fn window_presented(env: &Env<'_>, owner: Id) {
+    if let Some(Payload::Device(device)) = com(env).get_identity(&env.sys.objects, owner) {
+        let provider = env.ext.get::<State>().provider;
+        (provider.window_presented)(env.ext, device.parameters.hDeviceWindow);
+    }
+}
+
 pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
     let Operation::Present {
         owner,
@@ -1091,6 +1099,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
     if repeat && !verify {
         let provider = env.ext.get::<State>().provider;
         let serial = (provider.repeat)(env.ext, *surface)?;
+        window_presented(env, *owner);
         env.ext.get_mut::<State>().frames.eliminated_frames += 1;
         finish(
             env,
@@ -1199,6 +1208,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
     }
     if frame(env, *owner).presented.is_none() {
         let completion = execute_gpu(env, operation)?;
+        window_presented(env, *owner);
         let Completion::Presented(serial, _) = completion else {
             unreachable!()
         };

@@ -110,6 +110,14 @@ int main(void)
         IDirect3DSurface9_Release(back);
         presented = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
     }
+    /* A rejected Present still queries the other window's dimensions. */
+    HWND other_window = CreateWindowExW(0, L"static", L"other", WS_POPUP, 0, 0, WIDTH, HEIGHT,
+                                        NULL, NULL, NULL, NULL);
+    RECT invalid = {0, 0, 0, 0};
+    if (!other_window ||
+        IDirect3DDevice9_Present(device, &invalid, NULL, other_window, NULL) != D3DERR_INVALIDCALL)
+        return 7;
+
     /* Wine flushes the repainted window surface while messages are read. */
     InvalidateRect(window, NULL, TRUE);
     UpdateWindow(window);
@@ -123,6 +131,7 @@ int main(void)
     IDirect3DSurface9_Release(surface);
     IDirect3DDevice9_Release(device);
     IDirect3D9_Release(d3d);
+    DestroyWindow(other_window);
     DestroyWindow(window);
 
     printf("drawn=%#x released=%#lx pitch=%d inked=%d background=%d other=%d "

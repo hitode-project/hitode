@@ -21,17 +21,40 @@ pub struct Provider {
     pub dc: MemoryDc,
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
+    pub submitted: fn(&Ext, u32, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
     /// The DirectDraw object is gone: its windows present their own surfaces.
-    pub released: fn(&Ext),
+    pub released: fn(&Ext, u32),
 }
 pub struct State {
     draw: DirectDraw,
     provider: Provider,
+    binding: Option<(u32, u32)>,
+    presented: Option<(u32, u32)>,
 }
 impl State {
     pub fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {
         self.draw.configure_clipper(clipper, origin);
+    }
+
+    fn submitted(ext: &mut Ext, surface: u32) {
+        let state = ext.get_mut::<Self>();
+        state.presented = state.binding.map(|(device, _)| (device, surface));
+        let hwnd = state
+            .draw
+            .surface_clippers
+            .get(&surface)
+            .and_then(|clipper| state.draw.clipper_windows.get(clipper))
+            .copied()
+            .filter(|&hwnd| hwnd != 0)
+            .or(state.binding.map(|(_, hwnd)| hwnd))
+            .unwrap_or(0);
+        (state.provider.submitted)(ext, hwnd, surface);
+    }
+
+    fn device(&self, objects: &Objects, pointer: u32) -> Option<u32> {
+        let object = self.draw.com?.get::<ComState>(objects, pointer)?;
+        matches!(object.kind, Kind::Device).then_some(object.modern)
     }
 }
 
@@ -110,6 +133,8 @@ pub fn install<B: Backend>(
     machine.ext.insert(State {
         draw: DirectDraw::new(entries.clone()),
         provider,
+        binding: None,
+        presented: None,
     });
     Ok(entries)
 }
@@ -179,7 +204,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let geometry = binding.and_then(|(window, clipper)| {
         (provider.window)(env.ext, &env.sys.objects, window).map(|geometry| (geometry, clipper))
     });
-    let (result, presented, changed) = {
+    let (result, presented, changed, submitted) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
         if let Some((geometry, clipper)) = geometry {
@@ -196,12 +221,21 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
         let result = state
             .draw
             .call(id, words, store, &mut env.sys.objects, &mut memory);
+        if id == api::COOPERATIVE && matches!(result, Ok(0)) {
+            state.binding = state
+                .device(&env.sys.objects, words[0])
+                .map(|device| (device, words[1]));
+        }
         (
             result,
             store.stats.presentations,
             store.stats.presentations != before,
+            state.draw.submitted.take(),
         )
     };
+    if let Some(surface) = submitted {
+        State::submitted(env.ext, surface);
+    }
     publish_counters(env);
     if changed
         && result.is_ok()
@@ -313,9 +347,22 @@ fn addref(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
 }
 #[win32(ddraw, name = "IDirectDraw7::Release", level = implement)]
 fn release(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    let state = env.ext.get::<State>();
+    let device = state.device(&env.sys.objects, this.addr());
     let outcome = call(env, api::RELEASE, &[this.addr()]);
-    if matches!(outcome, Outcome::Return(0)) {
-        (env.ext.get::<State>().provider.released)(env.ext);
+    if let Some(device) = device
+        && matches!(outcome, Outcome::Return(0))
+    {
+        let state = env.ext.get_mut::<State>();
+        if state.binding.is_some_and(|(id, _)| id == device) {
+            state.binding = None;
+        }
+        if let Some((id, surface)) = state.presented
+            && id == device
+        {
+            state.presented = None;
+            (state.provider.released)(env.ext, surface);
+        }
     }
     outcome
 }
@@ -698,6 +745,7 @@ fn release_dc(env: &mut Env<'_>, object: u32, dc: u32) -> Outcome {
                             return Outcome::Fail(format!("DirectDraw: {error}"));
                         }
                         let serial = store.stats.presentations;
+                        State::submitted(env.ext, sid);
                         if let Some(outcome) = (provider.completed)(env, serial) {
                             return outcome;
                         }

@@ -332,7 +332,8 @@ pub(super) fn compose(env: &mut Env<'_>, drawn: Option<(u32, [i32; 4])>) -> Resu
     // A presenter may draw into a child window: its top-level window holds the base.
     let current =
         super::input::frame_window(env.ext).map(|(hwnd, _)| super::input::top_level(env.ext, hwnd));
-    let front = super::input::front_window(env.ext);
+    let source = env.ext.get::<SurfaceStore>().base_source();
+    let front = super::input::front_window(env.ext, source);
     env.ext.get_or_default::<Surfaces>();
     let ext = &*env.ext;
     let base = ext

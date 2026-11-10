@@ -62,7 +62,7 @@ fn store() -> Store {
     Store::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
 }
 
-// spec: HOST-VIEW-10
+// spec: HOST-VIEW-10, WINE-GFX-10, DEV-FRAME-11
 #[cfg(feature = "gpu")]
 #[test]
 fn returning_from_software_to_native_publishes_whole_damage_once() {
@@ -92,11 +92,18 @@ fn returning_from_software_to_native_publishes_whole_damage_once() {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
     };
-    store.present_native(native, None, &mut gpu).unwrap();
-    let original = next();
+    let (producer, _consumer) = adv_device::surface::frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
     store
         .present(software, &memory, store[software].rect())
         .unwrap();
+    store.present_native(native, None, &mut gpu).unwrap();
+    let original = next();
+    assert!(!store.flush(&memory, FlushReason::Wait).unwrap());
+    store
+        .present(software, &memory, store[software].rect())
+        .unwrap();
+    assert!(store.flush(&memory, FlushReason::Wait).unwrap());
     assert!(next().pixels.bgra != original.pixels.bgra);
     let unchanged = Region::empty((5, 4));
     store
@@ -109,6 +116,40 @@ fn returning_from_software_to_native_publishes_whole_damage_once() {
         .present_native(native, Some(unchanged), &mut gpu)
         .unwrap();
     assert!(next().damage.is_empty());
+    store
+        .present(software, &memory, store[software].rect())
+        .unwrap();
+    store.repeat_native_frame(native).unwrap();
+    assert!(!store.flush(&memory, FlushReason::Wait).unwrap());
+
+    // A layer update cannot use a replacement target before its first present.
+    let replacement = gpu.target(5, 4, false).unwrap();
+    gpu.clear(&replacement, Some([0., 0., 0., 1.]), None)
+        .unwrap();
+    store.replace_native(native, replacement).unwrap();
+    let plane = adv_device::surface::Plane {
+        id: 9,
+        pixels: store[software].pixels,
+        pitch: store[software].pitch,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    let before = store.stats.presentations;
+    store.set_planes(vec![plane], &[], (5, 4), &memory).unwrap();
+    store.present_planes(0, &memory).unwrap();
+    assert_eq!(store.stats.presentations, before);
+    assert_eq!(store.output_serial(), None);
+
+    store.present_native(native, None, &mut gpu).unwrap();
+    assert_eq!(next().windows.len(), 1);
+    assert_eq!(store.output_serial(), Some(store.stats.presentations));
+    let before = store.stats.presentations;
+    assert!(store.delete(native));
+    store.set_planes(Vec::new(), &[], (5, 4), &memory).unwrap();
+    store.present_planes(0, &memory).unwrap();
+    assert_eq!(store.stats.presentations, before);
 }
 
 fn video_layer() -> VideoLayer {
