@@ -185,10 +185,13 @@ pub struct MenuBar {
     pub popup: Option<PopupPresentation>,
 }
 
-/// Screen placement is projected to the guest client's coordinate space. UI
-/// reads the completion token only; no guest objects or native HWNDs are shared.
+/// Screen placement is projected to the coordinate space of what shows it:
+/// the guest window `window` when that shows as its own layer, else the
+/// presented client. UI reads the completion token only; no guest objects or
+/// native HWNDs are shared.
 #[derive(Clone, Debug)]
 pub struct PopupPresentation {
+    pub window: u32,
     pub x: i32,
     pub y: i32,
     pub flags: u32,
@@ -198,7 +201,8 @@ pub struct PopupPresentation {
 
 impl PartialEq for PopupPresentation {
     fn eq(&self, other: &Self) -> bool {
-        self.x == other.x
+        self.window == other.window
+            && self.x == other.x
             && self.y == other.y
             && self.flags == other.flags
             && self.exclude == other.exclude

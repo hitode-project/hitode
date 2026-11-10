@@ -16,6 +16,7 @@ pub struct CapturedFrame {
     pub buffer: Option<u64>,
     /// The video layers the frame carried, by id.
     pub video: Vec<u64>,
+    pub windows: std::sync::Arc<[super::WindowLayer]>,
 }
 
 pub struct CapturePresenter {
@@ -40,6 +41,7 @@ impl Presenter for CapturePresenter {
     }
     fn present(&mut self, queue: &mut Queue, frame: Frame) {
         let video = frame.video.iter().map(|v| v.id).collect();
+        let windows = frame.windows.clone();
         let (pixels, damage, buffer) = match frame.base {
             Base::Gpu { image, damage, .. } => {
                 let image = match &image {
@@ -146,6 +148,7 @@ impl Presenter for CapturePresenter {
                 damage,
                 buffer,
                 video,
+                windows,
             })
             .unwrap();
     }

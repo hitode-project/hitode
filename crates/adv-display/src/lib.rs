@@ -13,6 +13,7 @@ pub mod display;
 pub mod plan;
 pub mod recorder;
 pub mod stages;
+pub mod windows;
 
 /// A rectangle in physical pixels or texels, with its origin at the top left.
 /// Display owns this serializable geometry; GPU rectangles remain GPU data.

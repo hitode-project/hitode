@@ -83,7 +83,7 @@ impl Slots {
         whole: bool,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
-        planes: &[Plane],
+        windows: Arc<[crate::frame::WindowLayer]>,
     ) -> Result<u64, String> {
         for entry in &mut self.entries {
             entry.debt.union(&damage);
@@ -104,9 +104,13 @@ impl Slots {
         let mut copied = 0;
         let debt = rects(&entry.debt);
         for &r in &debt {
+            let start = s.format.byte_offset(r.x);
+            let len = s.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
-                let row = (y * s.pitch) as usize..((y + 1) * s.pitch) as usize;
-                copied += planes::compose_row(s, planes, m, y, r, &mut output[row])?;
+                let row = m.read(s.row(0, y) + start, len)?;
+                let at = (y * s.pitch + start) as usize;
+                output[at..at + len].copy_from_slice(&row);
+                copied += len as u64;
             }
         }
         entry.buffer.flush(debt.iter().map(|r| {
@@ -134,6 +138,7 @@ impl Slots {
                 damage,
             },
             video,
+            windows,
             serial,
         });
         Ok(copied)
@@ -253,7 +258,7 @@ mod tests {
                     frame == 3,
                     frame as u64,
                     Arc::from([]),
-                    &[],
+                    Arc::from([]),
                 )
                 .unwrap();
             let (slot, _, _, damage) = take(&consumer);
@@ -310,7 +315,7 @@ mod tests {
                     serial == 0,
                     serial,
                     Arc::from([]),
-                    &[],
+                    Arc::from([]),
                 )
                 .unwrap();
             let (slot, _, palette, _) = take(&consumer);
@@ -333,7 +338,7 @@ mod tests {
                     false,
                     3,
                     Arc::from([]),
-                    &[],
+                    Arc::from([]),
                 )
                 .unwrap(),
             0
@@ -369,7 +374,7 @@ mod tests {
                     false,
                     serial,
                     Arc::from([]),
-                    &[],
+                    Arc::from([]),
                 )
                 .unwrap();
             held.push(take(&consumer).0);
@@ -386,7 +391,7 @@ mod tests {
                     false,
                     3,
                     Arc::from([]),
-                    &[],
+                    Arc::from([]),
                 )
                 .unwrap();
             events.send(1).unwrap();

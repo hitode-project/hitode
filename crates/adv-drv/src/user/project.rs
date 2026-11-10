@@ -362,7 +362,22 @@ pub fn menu_bar(ext: &Ext) -> MenuBar {
         .and_then(|state| state.popup.as_ref())
         && let Some(popup) = info(ext, *hwnd)
     {
-        let (x, y) = input::presented_origin(ext).unwrap_or((0, 0));
+        // A popup shows where its owner does, or, unowned like a combo list,
+        // its thread's active window: over that window's layer when it is a
+        // plane (WINE-GFX-10), else over the presented client.
+        let anchor = match popup.owner {
+            0 => ext.try_get::<Projection>().map_or(0, |state| {
+                let mut parts = state.parts.values();
+                parts
+                    .find(|part| part.windows.iter().any(|info| info.hwnd == *hwnd))
+                    .map_or(0, |part| part.active)
+            }),
+            owner => owner,
+        };
+        let (window, (x, y)) = match super::surface::plane(ext, anchor) {
+            Some([left, top, ..]) => (anchor, (left, top)),
+            None => (0, input::presented_origin(ext).unwrap_or((0, 0))),
+        };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         Arc::as_ptr(active).hash(&mut hasher);
         let root = if popup.combo_popup() { *hwnd } else { popup.id };
@@ -406,6 +421,7 @@ pub fn menu_bar(ext: &Ext) -> MenuBar {
                 popup.menu.clone()
             },
             popup: Some(PopupPresentation {
+                window,
                 x: popup.rect.left - x,
                 y: popup.rect.top - y,
                 flags: 0,
@@ -1310,7 +1326,7 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
         .map(|command| command.menu);
     projection.parts.insert(context, part);
     // A window read as a dialog now shows natively, not as a plane.
-    if let Err(error) = super::surface::sync_planes(env, None) {
+    if let Err(error) = super::surface::compose(env, None) {
         return Outcome::Fail(error);
     }
     if let Some(menu) = next
@@ -1453,6 +1469,11 @@ mod tests {
             Part {
                 windows: vec![Info {
                     hwnd: 1,
+                    rect: Rect {
+                        left: 130,
+                        top: 90,
+                        ..Rect::default()
+                    },
                     class: "ComboLBox".into(),
                     style: WS_VISIBLE | WS_CHILD,
                     items: vec!["First".into(), "Second".into()],
@@ -1460,6 +1481,7 @@ mod tests {
                     selection: 1,
                     ..Info::default()
                 }],
+                active: 7,
                 ..Part::default()
             },
         );
@@ -1469,6 +1491,12 @@ mod tests {
         assert_eq!(bar.items.len(), 2);
         assert_eq!(bar.items[1].flags, 8);
         assert_eq!(bar.items[1].command.position, 1);
+        let popup = bar.popup.unwrap();
+        assert_eq!((popup.window, popup.x, popup.y), (0, 130, 90));
+        // An unowned list shows over its thread's active window's layer.
+        super::super::surface::show_plane(&mut ext, 7, [100, 50, 300, 150]);
+        let popup = menu_bar(&ext).popup.unwrap();
+        assert_eq!((popup.window, popup.x, popup.y), (7, 30, 40));
         hidden(&mut ext, 1);
         assert!(!active.load(Ordering::Acquire));
         assert!(!projected(&ext, 1));

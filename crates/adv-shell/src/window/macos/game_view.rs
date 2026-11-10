@@ -341,6 +341,10 @@ impl GameView {
             self.hub().placement.set(placement);
         }
     }
+    /// The guest window layers presented over the frame.
+    pub(crate) fn place_windows(&self, layers: Arc<[crate::display::WindowLayer]>) {
+        self.hub().pointer.borrow_mut().set_layers(layers);
+    }
 
     pub(crate) fn hub(&self) -> Rc<Hub> {
         self.ivars().borrow().hub.clone()
@@ -509,7 +513,10 @@ impl Input {
         let inside = x >= 0.0 && y >= 0.0 && x < cw && y < ch;
         let viewport = view.viewport((self.width, self.height), &self.hub);
         let (gx, gy) = viewport.position(x, y, self.width, self.height);
-        let on_canvas = gx >= 0 && gy >= 0 && gx < self.width as i32 && gy < self.height as i32;
+        let backing = view.window().map_or(1.0, |w| w.backingScaleFactor());
+        let at = (x * backing, y * backing);
+        let on_canvas = (gx >= 0 && gy >= 0 && gx < self.width as i32 && gy < self.height as i32)
+            || self.hub.pointer.borrow().over(at);
         let pressed = NSEvent::pressedMouseButtons();
         let flags = event.modifierFlags();
         let mut buttons = u32::from(pressed & 1 != 0)
@@ -559,11 +566,14 @@ impl Input {
             buttons
         };
         let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
-        self.hub.push(Event::Input {
+        let event = Event::mouse(
+            &mut self.hub.pointer.borrow_mut(),
             message,
             wparam,
-            lparam: position,
-        });
+            at,
+            position,
+        );
+        self.hub.push(event);
     }
 
     fn cursor_visible_at(&self, view: &GameView, point: (f64, f64)) -> bool {

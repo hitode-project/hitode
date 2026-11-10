@@ -109,6 +109,7 @@ fn info(serial: u64, base: BaseKind, damage: Region) -> FrameInfo {
         damage,
         video: Default::default(),
         cursor_regions: Default::default(),
+        windows: Default::default(),
     }
 }
 fn private(d: &Device, q: &mut Queue) -> Image {
@@ -158,6 +159,7 @@ fn frame(serial: u64, image: &Image, damage: Region) -> Frame {
         info: info(serial, BaseKind::Gpu { presentable: false }, damage),
         base: Base::Private(image.clone()),
         video: vec![],
+        windows: vec![],
         published_at: std::time::Instant::now(),
         on_read: None,
     }
@@ -187,6 +189,7 @@ fn presentable_swap_is_shown_by_reference_without_a_stage() {
                 info: info(1, BaseKind::Gpu { presentable: true }, all()),
                 base: Base::Presentable { image, ready },
                 video: vec![],
+                windows: vec![],
                 published_at: std::time::Instant::now(),
                 on_read: None,
             },
@@ -405,6 +408,7 @@ fn software_ingest_and_video_layers_share_one_plan() {
                     palette: None,
                 },
                 video: vec![video],
+                windows: vec![],
                 published_at: std::time::Instant::now(),
                 on_read: None,
             },
@@ -466,6 +470,7 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
                 palette: None,
             },
             video: vec![],
+            windows: vec![],
             published_at: std::time::Instant::now(),
             on_read: None,
         },
@@ -574,6 +579,7 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
                     ),
                     base: Base::Presentable { image, ready },
                     video: vec![],
+                    windows: vec![],
                     published_at: std::time::Instant::now(),
                     on_read: None,
                 },
@@ -1054,6 +1060,7 @@ fn exact_software_upscaling_uses_producer_cells() {
                 palette: None,
             },
             video: vec![],
+            windows: vec![],
             published_at: std::time::Instant::now(),
             on_read: None,
         }
@@ -1334,6 +1341,7 @@ fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
                 palette: None,
             },
             video: vec![],
+            windows: vec![],
             published_at: std::time::Instant::now(),
             on_read: Some(Box::new(move |_| reads.lock().unwrap().push(serial))),
         }
@@ -1760,4 +1768,73 @@ fn damage_toggle_keeps_separate_video_and_rebuilt_captures_clean() {
             assert!(presentation.layers.host.contains(&HostLayer::Damage));
         }
     }
+}
+
+// spec: WINE-GFX-10
+#[test]
+fn window_layers_upload_once_capture_over_the_frame_and_leave() {
+    let (d, mut q, mut display, history) = setup();
+    let image = private(&d, &mut q);
+    let red = [0u8, 0, 255, 0].repeat(8);
+    let windowed = |serial, version| {
+        let mut f = frame(serial, &image, if serial == 1 { all() } else { none() });
+        f.info.windows.push(WindowGeometry {
+            id: 3,
+            at: (10, 20),
+            size: (4, 2),
+            changed: false,
+        });
+        f.windows.push(crate::windows::Window {
+            id: 3,
+            size: (4, 2),
+            pixels: red.clone().into(),
+            version,
+        });
+        f
+    };
+    let shown = |display: &mut Display, q: &mut Queue, f| {
+        let token = display.present(q, f).unwrap();
+        assert!(q.wait(token, std::time::Duration::from_secs(20)).unwrap());
+        display.service(q).unwrap();
+        history.lock().unwrap().last().cloned().unwrap()
+    };
+    let first = shown(&mut display, &mut q, windowed(1, 7));
+    let [(3, layer)] = &first.layers.windows[..] else {
+        panic!("one window layer")
+    };
+    assert_eq!(
+        layer.dst,
+        Rect {
+            x: 10,
+            y: 20,
+            w: 4,
+            h: 2
+        }
+    );
+    assert!(first.acquires.iter().any(|(l, _)| *l == LayerId::Window(3)));
+    // The same pixels again keep the attached image.
+    let second = shown(&mut display, &mut q, windowed(2, 7));
+    assert!(
+        !second
+            .acquires
+            .iter()
+            .any(|(l, _)| *l == LayerId::Window(3))
+    );
+    assert!(second.layers.windows[0].1.damage.is_empty());
+    let publication = display.take_publication().unwrap();
+    assert_eq!(publication.windows, vec![(3, layer.dst, (4, 2))]);
+    // A capture shows the window where the guest has it, opaque.
+    let (send, done) = std::sync::mpsc::channel();
+    display.capture(&mut q, Box::new(move |r| send.send(r).unwrap()));
+    let captured = done
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap()
+        .unwrap();
+    let at = |x: usize, y: usize| &captured.bgra[(y * 64 + x) * 4..][..4];
+    assert_eq!(at(10, 20), &[0, 0, 255, 255]);
+    assert_eq!(at(13, 21), &[0, 0, 255, 255]);
+    assert_eq!(at(14, 21), &[191, 128, 64, 255]);
+    // Closed, its layer goes.
+    let third = shown(&mut display, &mut q, frame(3, &image, none()));
+    assert!(third.layers.windows.is_empty());
 }

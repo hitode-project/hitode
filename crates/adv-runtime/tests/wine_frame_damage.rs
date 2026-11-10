@@ -44,7 +44,14 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
         |env| {
             let stage = env.arg(0);
             if stage == 4 {
-                adv_drv::user::input::post(env.ext, 0x200, 0, 17 << 16 | 13).unwrap();
+                adv_drv::user::input::post(
+                    env.ext,
+                    adv_drv::user::input::Pointer::Screen,
+                    0x200,
+                    0,
+                    17 << 16 | 13,
+                )
+                .unwrap();
                 adv_nt::server::run(env);
             }
             let (checkpoints, store) = env.ext.get2_installed_mut::<Checkpoints, SurfaceStore>();

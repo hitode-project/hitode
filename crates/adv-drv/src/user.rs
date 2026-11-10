@@ -27,12 +27,13 @@ pub const MODULE: &str = "wineadv.drv";
 /// `WINE_GDI_DRIVER_VERSION` of the vendored Wine.
 const VERSION: u32 = 108;
 /// Offsets in `struct user_driver_funcs` (i386), which is 604 bytes.
-const FUNCS: [(u32, &str); 7] = [
+const FUNCS: [(u32, &str); 8] = [
     (468, "UpdateDisplayDevices"),
     (476, "CreateWindow"),
     (484, "DestroyWindow"),
     (496, "ProcessEvents"),
     (512, "SetDesktopWindow"),
+    (536, "SetWindowStyle"),
     (572, "CreateWindowSurface"),
     (580, "WindowPosChanged"),
 ];
@@ -44,9 +45,7 @@ const VISIBLE_RECT: u32 = 32;
 const SWP_NOZORDER: u32 = 0x4;
 const SWP_NOACTIVATE: u32 = 0x10;
 const HWND_BOTTOM: u32 = 1;
-const GW_OWNER: u32 = 4;
 const GWL_STYLE: u32 = -16i32 as u32;
-const GWL_EXSTYLE: u32 = -20i32 as u32;
 const SWP_SHOWWINDOW: u32 = 0x40;
 const SWP_HIDEWINDOW: u32 = 0x80;
 const DESKTOP_CLASS_ATOM: u32 = 32769;
@@ -66,10 +65,8 @@ pub struct Window {
     /// Client origin on screen for top-level windows.
     pub origin: (i32, i32),
     parent: u32,
-    /// A top-level window's owner and styles.
-    owner: u32,
+    /// A top-level window's style.
     style: u32,
-    ex_style: u32,
     /// The guest context that owns the window.
     context: adv_machine::CtxId,
 }
@@ -152,6 +149,32 @@ pub(super) fn register(registry: &mut Registry) {
         Conv::Cdecl { argc: 6 },
         position_changed,
     );
+    registry.add(
+        MODULE,
+        "SetWindowStyle",
+        Conv::Cdecl { argc: 3 },
+        style_changed,
+    );
+}
+
+/// SetWindowStyle(hwnd, offset, STYLESTRUCT *): enabling or disabling a
+/// window can hand over the base (WINE-GFX-10).
+fn style_changed(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, offset, style) = (env.arg(0), env.arg(1), env.arg(2));
+    if offset != GWL_STYLE {
+        return Outcome::Return(0);
+    }
+    let Ok(new) = env.cpu.read_u32(style + 4) else {
+        return Outcome::Fail("user driver: unreadable STYLESTRUCT".into());
+    };
+    let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) else {
+        return Outcome::Return(0);
+    };
+    window.style = new;
+    match surface::compose(env, None) {
+        Ok(()) => Outcome::Return(0),
+        Err(error) => Outcome::Fail(error),
+    }
 }
 
 /// Write the function table and build the driver's image.
@@ -358,10 +381,9 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     }
     let user32 = adv_nt::process::module_base(env.cpu, env.sys.peb, "user32.dll");
     let target = |name| user32.and_then(|base| adv_nt::process::module_export(env.cpu, base, name));
-    let (Some(origin), Some(parent), Some(relative), Some(long)) = (
+    let (Some(origin), Some(parent), Some(long)) = (
         target("ClientToScreen"),
         target("GetAncestor"),
-        target("GetWindow"),
         target("GetWindowLongW"),
     ) else {
         return Outcome::Fail("user driver: missing window geometry exports".into());
@@ -398,21 +420,14 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
             env.ext
                 .get_or_default::<Order>()
                 .place(hwnd, insert_after, flags);
-            Outcome::call(relative, [hwnd, GW_OWNER], move |_, owner| {
-                Outcome::call(long, [hwnd, GWL_STYLE], move |_, style| {
-                    Outcome::call(long, [hwnd, GWL_EXSTYLE], move |env, ex_style| {
-                        if let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) {
-                            window.owner = owner.value();
-                            window.style = style.value();
-                            window.ex_style = ex_style.value();
-                        }
-                        let hidden = flags & SWP_HIDEWINDOW != 0;
-                        if let Err(error) = surface::arranged(env, hwnd, hidden) {
-                            return Outcome::Fail(error);
-                        }
-                        shown(env)
-                    })
-                })
+            Outcome::call(long, [hwnd, GWL_STYLE], move |env, style| {
+                if let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) {
+                    window.style = style.value();
+                }
+                if let Err(error) = surface::compose(env, None) {
+                    return Outcome::Fail(error);
+                }
+                shown(env)
             })
         })
     })

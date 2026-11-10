@@ -591,7 +591,20 @@ fn drive(
                             });
                             continue;
                         }
-                        session.input(message, wparam, lparam)?;
+                        session.input_at(adv_runtime::Pointer::Frame, message, wparam, lparam)?;
+                    }
+                    window::Event::WindowInput {
+                        window,
+                        message,
+                        wparam,
+                        lparam,
+                    } => {
+                        session.input_at(
+                            adv_runtime::Pointer::Window(window),
+                            message,
+                            wparam,
+                            lparam,
+                        )?;
                     }
 
                     window::Event::Text(text, reply) => {

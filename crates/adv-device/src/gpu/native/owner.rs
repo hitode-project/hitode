@@ -457,6 +457,7 @@ impl State {
                 damage,
                 serial,
                 video,
+                windows,
             } => {
                 let (raw, _, _) = self.image(&image)?;
                 let mut swap = match &image.storage {
@@ -485,6 +486,7 @@ impl State {
                             ready,
                         },
                         video,
+                        windows,
                         published_at: Instant::now(),
                     },
                 );
@@ -493,6 +495,7 @@ impl State {
             Command::Present {
                 base,
                 video,
+                windows,
                 serial,
             } => {
                 if self.encoder.is_some() {
@@ -504,6 +507,7 @@ impl State {
                         serial,
                         base,
                         video,
+                        windows,
                         published_at: Instant::now(),
                     },
                 );
@@ -868,6 +872,7 @@ mod tests {
             damage,
             serial,
             video: Arc::from([]),
+            windows: Arc::from([]),
         }
     }
 
@@ -1224,6 +1229,7 @@ struct Color {rgba:vec4<f32>}
                         damage: crate::frame::Region::whole((4, 4)),
                     },
                     video: video.clone(),
+                    windows: Arc::from([]),
                     serial,
                 });
             }

@@ -1,7 +1,7 @@
 #[path = "common/surface_frames.rs"]
 mod frames;
 use adv_device::surface::{
-    BlitOptions, BlitRect, FlushReason, PixelFormat, Plane, Rect, Sampling, Sprite, SpriteAlpha,
+    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Sprite, SpriteAlpha,
     SpriteMode, SurfaceMemory, VideoCursorRegion, VideoFrame, VideoLayer,
 };
 use frames::{Snapshot, Store, frame_mailbox};
@@ -2050,6 +2050,7 @@ fn unchanged_base_with_a_retained_video_layer_does_not_republish() {
 }
 
 // spec: WINE-GFX-10
+#[cfg(not(feature = "gpu"))]
 #[test]
 fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
     let mut m = Memory::new(false);
@@ -2067,7 +2068,8 @@ fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
                 .unwrap();
         }
     }
-    let plane = Plane {
+    let plane = adv_device::surface::Plane {
+        id: 1,
         pixels: window,
         pitch: 16,
         x: -2,
@@ -2086,7 +2088,8 @@ fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
     s.present(id, &m, s[id].rect()).unwrap();
     assert_eq!(shown(&mut s, &m), base.concat());
 
-    s.set_planes(7, vec![plane], &[], &m).unwrap();
+    s.set_planes(vec![plane], &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
     let mut covered = base.clone();
     for y in 5..8usize {
         for x in 0..2usize {
@@ -2104,14 +2107,17 @@ fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
         w: 1,
         h: 1,
     };
-    s.set_planes(7, vec![plane], &[inside], &m).unwrap();
+    s.set_planes(vec![plane], &[inside], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
     covered[6 * 16 + 1] = vec![0x11, 0x22, 0x33, 0xff];
     assert_eq!(shown(&mut s, &m), covered.concat());
 
-    s.set_planes(7, Vec::new(), &[], &m).unwrap();
+    s.set_planes(Vec::new(), &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
     assert_eq!(shown(&mut s, &m), base.concat());
     // An unchanged plane list publishes nothing.
-    s.set_planes(7, Vec::new(), &[], &m).unwrap();
+    s.set_planes(Vec::new(), &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
     s.flush(&m, FlushReason::Immediate).unwrap();
     assert!(!consumer.update());
 }

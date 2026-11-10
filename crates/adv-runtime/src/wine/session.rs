@@ -1246,14 +1246,26 @@ impl Session {
         }
     }
 
-    /// Post host input in coordinates of the last presented frame and wake
-    /// the guest through Wine's queue fd, including when every thread waits.
-    /// A press, or the host window's restore, brings back a window the
-    /// guest minimized, as its taskbar button would.
+    /// Post input in coordinates of the last presented frame on the guest's
+    /// screen, as [`Self::input_at`] does.
     pub fn input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
+        self.input_at(crate::Pointer::Screen, message, wparam, lparam)
+    }
+
+    /// Post host input, its mouse points relative to `pointer`, and wake the
+    /// guest through Wine's queue fd, including when every thread waits. A
+    /// press, or the host window's restore, brings back a window the guest
+    /// minimized, as its taskbar button would.
+    pub fn input_at(
+        &mut self,
+        pointer: crate::Pointer,
+        message: u32,
+        wparam: u32,
+        lparam: u32,
+    ) -> Result<(), String> {
         let restoring = matches!((message, wparam), (5, 0) | (0x201 | 0x204, _));
         if !(restoring && project::restore(&mut self.machine.ext)) {
-            adv_drv::user::input::post(&mut self.machine.ext, message, wparam, lparam)?;
+            adv_drv::user::input::post(&mut self.machine.ext, pointer, message, wparam, lparam)?;
         }
         self.poke()
     }

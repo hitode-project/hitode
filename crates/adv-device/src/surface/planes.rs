@@ -1,12 +1,16 @@
-//! Window planes: top-level windows shown over the software base (WINE-GFX-10).
-//! A publication copies each damaged base row and then the plane rows over it,
-//! bottom first, so a plane costs no pass of its own and the base beneath it
-//! stays untouched in guest memory.
-use super::{PixelFormat, Rect, Surface, SurfaceMemory, encode_pixel};
+//! Window planes: top-level windows shown over the base (WINE-GFX-10). The
+//! host shows each as a layer of its own (`frame::WindowLayer`). Without a
+//! host compositor, a publication copies each damaged base row and then the
+//! plane rows over it, bottom first, leaving the base untouched in guest memory.
+use super::Rect;
+#[cfg(not(feature = "gpu"))]
+use super::{PixelFormat, Surface, SurfaceMemory, encode_pixel};
 
 /// A window's guest `Bgra32` rows at a signed position in base pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plane {
+    /// The guest window.
+    pub id: u32,
     pub pixels: u32,
     pub pitch: u32,
     pub x: i32,
@@ -29,6 +33,7 @@ impl Plane {
     }
 }
 
+#[cfg(not(feature = "gpu"))]
 /// Copy row `y` of `r` from the base `s` into `row`, which holds the whole
 /// output row, then the planes over it, bottom first. Returns bytes copied.
 pub(crate) fn compose_row(

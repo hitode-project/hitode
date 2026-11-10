@@ -273,6 +273,7 @@ mod macos {
             video: video
                 .map(|dst| smallvec![(7, layer(Source::Video(7), whole, dst, false))])
                 .unwrap_or_default(),
+            windows: smallvec![],
             host: smallvec![],
             background: [0.0, 0.0, 0.0],
         }

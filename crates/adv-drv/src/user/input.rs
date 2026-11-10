@@ -22,11 +22,14 @@ const QS_ALLINPUT: u32 = 0x1cff;
 const SEND_HARDWARE_INPUT: u32 = 26;
 
 /// The window and screen origin of the frame being presented, then the
-/// last completed presentation. Geometry callbacks take shared extensions.
+/// last completed presentation, and the top-level window whose content a
+/// front (Direct3D 9, DirectDraw) presents. Geometry callbacks take shared
+/// extensions.
 #[derive(Default)]
 pub(super) struct Presentation {
     candidate: Cell<Option<(u32, (i32, i32))>>,
     last: Cell<Option<(u32, (i32, i32))>>,
+    front: Cell<Option<u32>>,
 }
 
 /// Associate the next presentation with this window and its screen origin.
@@ -34,6 +37,35 @@ pub fn prepare(ext: &Ext, hwnd: u32, origin: (i32, i32)) {
     ext.get::<Presentation>()
         .candidate
         .set(Some((hwnd, origin)));
+}
+
+/// Associate the next presentation with a front that presents into `hwnd`:
+/// until the front is released, the frames of `hwnd`'s top-level window
+/// are the front's, not its window surface's (WINE-GFX-10).
+pub fn prepare_front(ext: &Ext, hwnd: u32, origin: (i32, i32)) {
+    prepare(ext, hwnd, origin);
+    ext.get::<Presentation>()
+        .front
+        .set(Some(top_level(ext, hwnd)));
+}
+
+/// A front was released: window surfaces present their windows again.
+pub fn front_released(ext: &Ext) {
+    ext.get::<Presentation>().front.set(None);
+}
+
+/// The top-level window whose content a front presents.
+pub(super) fn front_window(ext: &Ext) -> Option<u32> {
+    let hwnd = ext.get::<Presentation>().front.get()?;
+    window(ext, hwnd).map(|_| hwnd)
+}
+
+/// `hwnd`'s top-level ancestor.
+pub(super) fn top_level(ext: &Ext, mut hwnd: u32) -> u32 {
+    while let Some(parent) = window(ext, hwnd).map(|w| w.parent).filter(|&p| p != 0) {
+        hwnd = parent;
+    }
+    hwnd
 }
 
 /// A frame has been presented using the recorded window geometry.
@@ -159,11 +191,11 @@ pub fn presented_window(ext: &Ext) -> Option<u32> {
 }
 
 /// The window of the frame being presented, or else of the last presented
-/// frame, if it still exists: the window whose frames are the base.
-pub(super) fn base_window(ext: &Ext) -> Option<u32> {
+/// frame, if it still exists, and the frame's screen origin.
+pub(super) fn frame_window(ext: &Ext) -> Option<(u32, (i32, i32))> {
     let presentation = ext.get::<Presentation>();
-    let (hwnd, _) = presentation.candidate.get().or(presentation.last.get())?;
-    window(ext, hwnd).map(|_| hwnd)
+    let (hwnd, origin) = presentation.candidate.get().or(presentation.last.get())?;
+    window(ext, hwnd).map(|_| (hwnd, origin))
 }
 
 /// The screen origin used by the last presented client frame.
@@ -210,7 +242,7 @@ pub fn release(ext: &mut Ext) -> usize {
                 key => (0x101, key),
             };
             let lparam = if message == 0x101 { 0xc000_0001 } else { 0 };
-            post(ext, message, wparam, lparam).is_ok()
+            post(ext, Pointer::Frame, message, wparam, lparam).is_ok()
         })
         .count()
 }
@@ -259,9 +291,28 @@ pub(super) fn click(env: &mut Env<'_>, hwnd: u32, x: i32, y: i32) -> Result<(), 
     Ok(())
 }
 
+/// What a mouse message's point is relative to, and so which window gets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pointer {
+    /// The last presented frame, as a point on the guest's screen: the
+    /// window there gets it, a window plane included.
+    Screen,
+    /// The last presented frame as the host shows it: its window gets it.
+    Frame,
+    /// The top-level window `hwnd`, which the host shows as a layer of its
+    /// own (WINE-GFX-10).
+    Window(u32),
+}
+
 /// Queue a host Win32 mouse or key message. Mouse points are relative to
-/// the last presented frame, and become screen coordinates here.
-pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
+/// what `pointer` names, and become screen coordinates here.
+pub fn post(
+    ext: &mut Ext,
+    pointer: Pointer,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+) -> Result<(), String> {
     let Some((hwnd, (left, top))) = ext.get::<Presentation>().last.get() else {
         return Ok(());
     };
@@ -280,13 +331,14 @@ pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(),
     let Some(window) = window(ext, hwnd) else {
         return Ok(());
     };
-    let (mask, words) = match message {
+    let (mask, words, hwnd) = match message {
         0x100 | 0x101 | 0x104 | 0x105 => {
             let scan = (lparam >> 16) & 0xff;
             let flags = ((lparam >> 24) & 1) | if message & 1 != 0 { 2 } else { 0 };
             (
                 QS_KEY,
                 [1, (wparam & 0xffff) | scan << 16, flags, 0, 0, 0, 0],
+                hwnd,
             )
         }
         0x200..=0x20a => {
@@ -301,6 +353,17 @@ pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(),
                 0x20a => (0x0800, (wparam as i32 >> 16) as u32),
                 _ => unreachable!(),
             };
+            // wineserver gives a mouse message to the window it names while
+            // that is visible.
+            let (hwnd, (left, top)) = match pointer {
+                Pointer::Window(plane) => {
+                    let Some(shown) = super::surface::plane(ext, plane) else {
+                        return Ok(());
+                    };
+                    (plane, (shown[0], shown[1]))
+                }
+                _ => (hwnd, (left, top)),
+            };
             let x = left + i32::from(lparam as u16 as i16);
             let y = top + i32::from((lparam >> 16) as u16 as i16);
             let mask = if message == 0x200 {
@@ -308,7 +371,15 @@ pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(),
             } else {
                 QS_MOUSEBUTTON
             };
-            (mask, [0, x as u32, y as u32, data, flag | 0x8001, 0, 0])
+            let hwnd = match pointer {
+                Pointer::Screen => super::surface::plane_at(ext, x, y).unwrap_or(hwnd),
+                _ => hwnd,
+            };
+            (
+                mask,
+                [0, x as u32, y as u32, data, flag | 0x8001, 0, 0],
+                hwnd,
+            )
         }
         _ => return Ok(()),
     };

@@ -558,16 +558,16 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 
 ### WINE-GFX-10 Window planes
 
-**Rule**: Only the base window's flush MUST replace the base frame, which keeps that window's size. Other shown top-level windows in front of it MUST show as planes over the base, in z-order. A plane that appears, moves, changes or goes away MUST show the base beneath again without a guest draw.
+**Rule**: The largest shown top-level window MUST be the base, whose frames come from its front while one presents it, else from its surface. Other shown windows in front of it MUST show over it in z-order, each its own layer at a whole scale near native windows'. A plane that appears, moves, changes or goes away MUST show the base beneath again without a guest draw.
 **Verification**: Test
 
-The base window is the window of the frame being presented, or else of the last presented frame. A window replaces it while none is shown. So does an unowned non-tool window with larger content, as a game window beside its splash. Hiding the base window makes the largest shown main window the base, or else the front window. Natively projected and minimized windows are not planes. A plane is a window's whole surface at its screen position relative to the base window's content. Publishing a software base copies plane rows over the base rows it copies; plane damage is never refined against base memory. A native base shows no planes. A plane outside the base window's content is moved into it with `SetWindowPos`, as a window manager keeps windows on screen.
+Owners and show order do not choose the base. Toolkits own every window by one hidden application window, and a startup window may show first. The current base wins a tie. A window becomes the base once it has been drawn; hiding or minimizing the base hands it to the next largest window at once. A modal window disables the windows it stands over, as `DialogBox` and toolkit modal forms do. While a shown window is disabled, only a disabled window can be the base. A settings form larger than its main window thus stays a plane. A front is a Direct3D 9 device or a DirectDraw object; while it lives, its window's surface flushes do not replace its frames, as a windowed Direct3D present covers the window's content. Natively projected and minimized windows are neither base nor planes. A plane is a window's whole surface at its screen position relative to the base window's content. Frames carry the planes beside the base, never inside it. The host centers each on the game point it covers, at the whole scale nearest its own, with nearest sampling. Resizing the host moves a plane without scaling it. Captures draw the planes at their guest positions. A frame carrying only changed planes presents again while the guest presents nothing. A plane outside the base window's content is moved into it with `SetWindowPos`, as a window manager keeps windows on screen.
 
 ## Input
 
 ### WINE-IN-1 Presented window coordinates
 
-**Rule**: Host mouse points MUST map to screen coordinates through the origin of the last presented window's content, also over planes (WINE-GFX-10). Every presenter's frames carry only that content; the host shows caption, frame and menu bar natively.
+**Rule**: A host point on a plane's layer MUST reach that plane's window at the pixel shown, and a press keeps its window until release. Other host points MUST reach the base window, and scripted points the window under them, through the last presented content's origin (WINE-GFX-10). Every presenter's frames carry only that content, while the host shows caption, frame and menu bar natively.
 **Verification**: Test
 
 ### WINE-IN-2 Hardware input
@@ -584,7 +584,7 @@ The base window is the window of the frame being presented, or else of the last 
 
 ### WINE-UI-1 Native popup presentation
 
-**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively relative to the presented window's content, without presenting frames. Text dropdown lists MUST project natively without replacing the owner's frame. Completion tokens MUST become inactive when tracking ends.
+**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively over their owner's plane layer (WINE-GFX-10) or the presented content, without presenting frames. Text dropdown lists MUST project natively without replacing the owner's frame. Completion tokens MUST become inactive when tracking ends.
 **Verification**: Test
 
 ### WINE-UI-2 Popup input

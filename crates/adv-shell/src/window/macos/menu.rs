@@ -341,9 +341,24 @@ impl Projection {
     fn track_popup(&mut self, bar: &MenuBar, popup: &PopupPresentation) -> Result<(), String> {
         let (width, height) = self.hub.canvas.get();
         let client = self.view.client();
-        let viewport = self.view.viewport((width, height), &self.hub);
-        let x = viewport.x + f64::from(popup.x) * viewport.width / f64::from(width.max(1));
-        let y = viewport.y + f64::from(popup.y) * viewport.height / f64::from(height.max(1));
+        let shown = self
+            .hub
+            .pointer
+            .borrow()
+            .shown_at(popup.window, (popup.x, popup.y));
+        let (x, y) = match shown {
+            Some((x, y)) => {
+                let scale = self.view.native_scale();
+                (x / scale, y / scale)
+            }
+            None => {
+                let viewport = self.view.viewport((width, height), &self.hub);
+                (
+                    viewport.x + f64::from(popup.x) * viewport.width / f64::from(width.max(1)),
+                    viewport.y + f64::from(popup.y) * viewport.height / f64::from(height.max(1)),
+                )
+            }
+        };
         let native = self
             .hub
             .menus

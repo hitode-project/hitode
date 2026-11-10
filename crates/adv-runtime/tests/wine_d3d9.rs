@@ -31,7 +31,7 @@ fn count(bgra: &[u8], stride: usize, width: usize, height: usize, color: [u8; 3]
         .count()
 }
 
-// spec: WINE-GFX-6
+// spec: WINE-GFX-6, WINE-GFX-10
 #[test]
 fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
     let mut registry = Registry::default();
@@ -90,7 +90,8 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
     );
     let (size, frames, inked, background) = presented.unwrap();
     assert!(frames >= 1, "no frame was presented");
-    // The device presents its 64 × 32 back buffer to the probe window.
+    // The device presents its 64 × 32 back buffer to the probe window, and
+    // the window's later GDI repaint does not replace it (WINE-GFX-10).
     assert_eq!(size, (64, 32));
     assert_eq!((inked, background), (43, 2005));
 }

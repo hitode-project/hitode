@@ -22,6 +22,8 @@ pub struct Provider {
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
+    /// The DirectDraw object is gone: its windows present their own surfaces.
+    pub released: fn(&Ext),
 }
 pub struct State {
     draw: DirectDraw,
@@ -311,7 +313,11 @@ fn addref(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
 }
 #[win32(ddraw, name = "IDirectDraw7::Release", level = implement)]
 fn release(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
-    call(env, api::RELEASE, &[this.addr()])
+    let outcome = call(env, api::RELEASE, &[this.addr()]);
+    if matches!(outcome, Outcome::Return(0)) {
+        (env.ext.get::<State>().provider.released)(env.ext);
+    }
+    outcome
 }
 #[win32(ddraw, name = "IDirectDraw7::CreateSurface", level = implement)]
 fn create_surface(

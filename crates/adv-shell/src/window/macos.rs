@@ -114,6 +114,7 @@ impl Viewport {
 #[derive(Default)]
 pub(crate) struct Hub {
     placement: Cell<Option<crate::display::Placement>>,
+    pointer: RefCell<super::Pointer>,
     pub(crate) scaling: Cell<crate::Scaling>,
     main: Cell<usize>,
     wake: RefCell<Option<WakeEvent>>,

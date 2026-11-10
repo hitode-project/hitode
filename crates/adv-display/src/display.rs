@@ -7,6 +7,7 @@ use crate::{
     plan::*,
     recorder::{self, PlanKind, PresentRecord, StageStats, Statistics, Totals},
     stages::{ingest, output, upscale, video},
+    windows::{self, Window},
 };
 use adv_gpu::{
     Device, Format, Image, ImageView, PresentImage, PresentPool, Queue, RenderPipeline, Ring,
@@ -92,6 +93,8 @@ pub struct Frame {
     pub info: FrameInfo,
     pub base: Base,
     pub video: Vec<Video>,
+    /// The pixels of `info.windows`, in its order.
+    pub windows: Vec<Window>,
     pub published_at: Instant,
     /// Called with the token after which every stage that read the base has
     /// completed; dropped uncalled when nothing read it, as when a newer frame
@@ -141,6 +144,8 @@ pub struct Publication {
     pub placement: Rect,
     pub nearest: bool,
     pub cursor_regions: Vec<(Rect, bool)>,
+    /// Each window layer's place in the view and its size in window pixels.
+    pub windows: Vec<(u32, Rect, (u32, u32))>,
 }
 struct Pending {
     record: PresentRecord,
@@ -248,6 +253,7 @@ pub struct Display {
     single: bool,
     /// Each video's current decoder image while it is not attached.
     leases: HashMap<u64, PresentImage>,
+    windows: windows::Windows,
     ring: Ring,
     spans: Vec<Span>,
     recorder: recorder::Recorder,
@@ -306,6 +312,7 @@ impl Display {
             building: None,
             single: false,
             leases: HashMap::new(),
+            windows: Default::default(),
             ring,
             spans: vec![],
             recorder: recorder::Recorder::present_history(),
@@ -487,6 +494,7 @@ impl Display {
                 rotation: buffer_rotation(record),
             },
             video: video.iter().map(Video::retained).collect(),
+            windows: self.windows.current.clone(),
             published_at: self.origin + record.published_at,
             on_read: None,
         })
@@ -499,6 +507,7 @@ impl Display {
             damage: Region::empty(canvas),
             video: Default::default(),
             cursor_regions: Default::default(),
+            windows: Default::default(),
         };
         matches!(
             plan(&info, &self.settings, &self.caps, &self.pools).swap_role,
@@ -527,6 +536,9 @@ impl Display {
                 }
                 (LayerId::Video(id), Some((_, layers))) => {
                     layers.video.iter().any(|(v, _)| *v == id)
+                }
+                (LayerId::Window(id), Some((_, layers))) => {
+                    layers.windows.iter().any(|(w, _)| *w == id)
                 }
                 _ => false,
             })
@@ -663,6 +675,9 @@ impl Display {
         for acquired in pending.images {
             if let LayerId::Video(id) = acquired.layer {
                 self.leases.insert(id, acquired.image);
+            } else if let LayerId::Window(id) = acquired.layer {
+                self.windows.discarded(id);
+                self.release(acquired.image, None);
             } else if source == Some(acquired.image.image().id()) {
                 reading = Some(acquired.image);
             } else {
@@ -854,6 +869,13 @@ impl Display {
                         canvas: r.frame.canvas,
                         placement: r.plan.layers.base.dst,
                         nearest: r.plan.layers.base.nearest,
+                        windows: r
+                            .plan
+                            .layers
+                            .windows
+                            .iter()
+                            .map(|(id, layer)| (*id, layer.dst, (layer.crop.w, layer.crop.h)))
+                            .collect(),
                         cursor_regions: self
                             .video
                             .iter()
@@ -1246,6 +1268,7 @@ impl Display {
         // A frame that failed mid-way left its unsubmitted spans; drop them.
         self.spans.clear();
         let started = Instant::now();
+        self.windows.changes(&mut frame.info, &frame.windows);
         let (settings, planned) = self.plan(&frame.info, reading);
         let mut targets = self.targets(queue, &planned)?;
         let retired = self.update_leases(&mut frame.video);
@@ -1521,6 +1544,12 @@ impl Display {
                 });
             }
         }
+        self.windows.upload(
+            (&self.device, queue),
+            &frame.info,
+            frame.windows,
+            &mut images,
+        )?;
         Ok(Pending {
             record: PresentRecord {
                 token: token.0,
@@ -1557,7 +1586,7 @@ impl Display {
         let result = self.capture_commands(queue);
         match result {
             Err(error) => reply(Err(error)),
-            Ok((token, buffer, serial, canvas)) => queue.on_complete(
+            Ok((token, buffer, serial, canvas, shown)) => queue.on_complete(
                 token,
                 Box::new(move || {
                     let mut bgra = unsafe { buffer.mapped().unwrap().as_ref() }.to_vec();
@@ -1567,6 +1596,7 @@ impl Display {
                         }
                         pixel[3] = 255;
                     }
+                    windows::overlay(&mut bgra, canvas, &shown);
                     reply(Ok(Captured {
                         serial,
                         width: canvas.0,
@@ -1577,10 +1607,21 @@ impl Display {
             ),
         }
     }
+    /// The capture's commands and readback, and the windows over it.
+    #[allow(clippy::type_complexity)]
     fn capture_commands(
         &mut self,
         queue: &mut Queue,
-    ) -> Result<(Token, adv_gpu::Buffer, u64, (u32, u32)), Error> {
+    ) -> Result<
+        (
+            Token,
+            adv_gpu::Buffer,
+            u64,
+            (u32, u32),
+            Vec<((i32, i32), Window)>,
+        ),
+        Error,
+    > {
         self.spans.clear();
         let record = self
             .recorder
@@ -1588,6 +1629,11 @@ impl Display {
             .ok_or_else(|| adv_gpu::Error::Invalid("no presented frame".into()))?;
         let serial = record.frame.serial;
         let canvas = record.frame.canvas;
+        let shown_windows = self
+            .windows
+            .placed(&record.frame)
+            .map(|(at, window)| (at, window.clone()))
+            .collect();
         let separate = record
             .plan
             .layers
@@ -1690,7 +1736,13 @@ impl Display {
             },
             size,
         );
-        Ok((queue.submit(encoder)?, buffer, serial, canvas))
+        Ok((
+            queue.submit(encoder)?,
+            buffer,
+            serial,
+            canvas,
+            shown_windows,
+        ))
     }
 }
 

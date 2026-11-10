@@ -1,9 +1,9 @@
 //! Window surfaces. As Wine's Mac driver wraps its own pixels, the driver
 //! gives win32u a surface over guest pixels it owns, so GDI draws a window
 //! straight into what the host presents. win32u rounds a surface up to whole
-//! tiles. A flush of the base window presents a store view of its client
-//! area, without copying; other shown top-level windows show as planes over
-//! it (WINE-GFX-10).
+//! tiles. The base window's frames are a store view of its client area,
+//! presented without copying; other shown top-level windows show as planes
+//! over it (WINE-GFX-10).
 use std::collections::HashMap;
 
 use adv_abi::{Conv, Env, Outcome, Registry};
@@ -21,7 +21,7 @@ pub(super) const FUNCS: [&str; 3] = ["SurfaceSetClip", "SurfaceFlush", "SurfaceD
 const SURFACE_SIZE: u32 = 108;
 const DCX_WINDOW: u32 = 1;
 const WS_MINIMIZE: u32 = 0x2000_0000;
-const WS_EX_TOOLWINDOW: u32 = 0x80;
+const WS_DISABLED: u32 = 0x0800_0000;
 const SWP_NOSIZE: u32 = 0x1;
 const SWP_NOZORDER: u32 = 0x4;
 const SWP_NOACTIVATE: u32 = 0x10;
@@ -39,6 +39,8 @@ struct Surface {
     height: u32,
     /// The store surface over the window's part, with its size and first pixel.
     view: Option<(u32, u32, u32, u32)>,
+    /// Whether win32u has flushed it: only drawn windows show.
+    drawn: bool,
 }
 
 /// The driver's window surfaces, by address.
@@ -230,6 +232,7 @@ fn surface(
             width,
             height,
             view: None,
+            drawn: false,
         };
         env.ext
             .get_or_default::<Surfaces>()
@@ -244,34 +247,19 @@ fn surface(
 }
 
 /// flush(surface, rect, dirty, color_info, color_bits, shape_changed, shape_info, shape_bits).
-///
-/// The base window's frames are the base; any other shown top-level window
-/// is a plane over it (WINE-GFX-10).
 fn flush(env: &mut Env<'_>) -> Outcome {
     let (address, dirty) = (env.arg(0), env.arg(2));
-    let Some(hwnd) = env
-        .ext
-        .get_or_default::<Surfaces>()
-        .0
-        .get(&address)
-        .map(|surface| surface.hwnd)
-    else {
+    let Some(surface) = env.ext.get_or_default::<Surfaces>().0.get_mut(&address) else {
         return Outcome::Return(0);
     };
+    surface.drawn = true;
+    let hwnd = surface.hwnd;
     if !window(env.ext, hwnd).is_some_and(|window| window.visible) {
         return Outcome::Return(1);
     }
     let dirty = check!(rect(env, dirty));
     let before = env.ext.get::<SurfaceStore>().stats.presentations;
-    // The host shows a projected dialog natively, and a window's caption,
-    // frame and menu bar as its own: frames carry the client area.
-    if super::project::projected(env.ext, hwnd) {
-        check!(sync_planes(env, None));
-    } else if presents_base(env.ext, hwnd) {
-        check!(present_base(env, address, dirty));
-    } else {
-        check!(sync_planes(env, Some((hwnd, dirty))));
-    }
+    check!(compose(env, Some((address, dirty))));
     let presented = env.ext.get::<SurfaceStore>().stats.presentations;
     if presented != before {
         env.sys.poll_work();
@@ -283,193 +271,113 @@ fn flush(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-/// The window whose frames are the base, while it is shown.
-fn base_window(ext: &Ext) -> Option<u32> {
-    super::input::base_window(ext)
-        .filter(|&hwnd| window(ext, hwnd).is_some_and(|window| window.visible))
-}
-
 fn area(rect: [i32; 4]) -> i64 {
     i64::from(rect[2] - rect[0]).max(0) * i64::from(rect[3] - rect[1]).max(0)
 }
 
-/// Whether a main window: unowned and not a tool window.
-fn main_window(window: &super::Window) -> bool {
-    window.owner == 0 && window.ex_style & WS_EX_TOOLWINDOW == 0
+/// Whether a window can show: a shown, unminimized top-level window that the
+/// host does not show natively.
+fn shows(ext: &Ext, hwnd: u32) -> bool {
+    window(ext, hwnd).is_some_and(|w| w.visible && w.parent == 0 && w.style & WS_MINIMIZE == 0)
+        && !super::project::projected(ext, hwnd)
 }
 
-/// Whether `hwnd`'s frames become the base: it is the base window, no base
-/// window is shown, or it is a main window larger than the base window, as a
-/// game window is beside its splash.
-fn presents_base(ext: &Ext, hwnd: u32) -> bool {
-    let Some(base) = base_window(ext) else {
-        return true;
-    };
-    let (Some(candidate), Some(base_window)) = (window(ext, hwnd), window(ext, base)) else {
-        return true;
-    };
-    base == hwnd || main_window(&candidate) && area(candidate.client) > area(base_window.client)
+/// The windows shown as planes, bottom first, with their screen rectangles
+/// (WINE-IN-1).
+#[derive(Default)]
+struct Shown(Vec<(u32, [i32; 4])>);
+
+#[cfg(test)]
+pub(super) fn show_plane(ext: &mut Ext, hwnd: u32, rect: [i32; 4]) {
+    ext.get_or_default::<Shown>().0.push((hwnd, rect));
 }
 
-/// The client area's place in its surface: offset and size.
-fn client_part(surface: &Surface, window: &super::Window) -> Option<(u32, u32, u32, u32)> {
-    let full = (surface.width, surface.height);
-    let [left, top, right, bottom] = window.client;
-    let x = (left - window.extent[0]).clamp(0, full.0 as i32) as u32;
-    let y = (top - window.extent[1]).clamp(0, full.1 as i32) as u32;
-    let width = ((right - left).max(0) as u32).min(full.0 - x);
-    let height = ((bottom - top).max(0) as u32).min(full.1 - y);
-    (width != 0 && height != 0).then_some((x, y, width, height))
+/// The plane at screen point (`x`, `y`), if any.
+pub(super) fn plane_at(ext: &Ext, x: i32, y: i32) -> Option<u32> {
+    ext.try_get::<Shown>()?
+        .0
+        .iter()
+        .rev()
+        .find(|(_, [l, t, r, b])| (*l..*r).contains(&x) && (*t..*b).contains(&y))
+        .map(|&(hwnd, _)| hwnd)
 }
 
-/// Present the client area of the surface at `address` as the base, with
-/// `dirty` changed in surface coordinates.
-fn present_base(env: &mut Env<'_>, address: u32, dirty: [i32; 4]) -> Result<(), String> {
-    let surface = &env.ext.get::<Surfaces>().0[&address];
-    let (hwnd, pixels, full, view) = (
-        surface.hwnd,
-        surface.pixels,
-        (surface.width, surface.height),
-        surface.view,
-    );
-    let window = window(env.ext, hwnd).ok_or("presented window is unknown")?;
-    let Some((x, y, width, height)) = client_part(surface, &window) else {
+/// The screen rectangle of plane `hwnd`, if it shows.
+pub(super) fn plane(ext: &Ext, hwnd: u32) -> Option<[i32; 4]> {
+    let shown = ext.try_get::<Shown>()?;
+    shown
+        .0
+        .iter()
+        .find(|(h, _)| *h == hwnd)
+        .map(|&(_, rect)| rect)
+}
+
+/// The address of `hwnd`'s surface, if it has been drawn.
+fn drawn_surface(ext: &Ext, hwnd: u32) -> Option<u32> {
+    ext.get::<Surfaces>()
+        .0
+        .iter()
+        .find(|(_, surface)| surface.hwnd == hwnd && surface.drawn)
+        .map(|(&address, _)| address)
+}
+
+/// Place every window by one rule (WINE-GFX-10). The base is the largest
+/// window that shows and has been drawn, or the current base, which wins a
+/// tie; owners and show order say nothing, as toolkits own every window by
+/// one hidden application window. A modal window disables the windows it
+/// stands over, so while one of them shows, only a disabled window is the
+/// base. Every other drawn window that shows in front of the base is a plane. `drawn` is the surface a flush changed and
+/// its changed part.
+pub(super) fn compose(env: &mut Env<'_>, drawn: Option<(u32, [i32; 4])>) -> Result<(), String> {
+    // A presenter may draw into a child window: its top-level window holds the base.
+    let current =
+        super::input::frame_window(env.ext).map(|(hwnd, _)| super::input::top_level(env.ext, hwnd));
+    let front = super::input::front_window(env.ext);
+    env.ext.get_or_default::<Surfaces>();
+    let ext = &*env.ext;
+    let base = ext
+        .get::<Surfaces>()
+        .0
+        .values()
+        .filter(|surface| surface.drawn)
+        .map(|surface| surface.hwnd)
+        .chain(current)
+        .filter(|&hwnd| shows(ext, hwnd))
+        .max_by_key(|&hwnd| {
+            let window = window(ext, hwnd).unwrap();
+            let disabled = window.style & WS_DISABLED != 0;
+            (disabled, area(window.client), Some(hwnd) == current)
+        });
+    let Some(base) = base else {
+        env.ext.get_or_default::<Shown>().0.clear();
         return Ok(());
     };
-    let start = pixels + y * full.0 * 4 + x * 4;
-    let [left, top, right, bottom] = dirty;
-    let (left, top) = ((left - x as i32).max(0), (top - y as i32).max(0));
-    let (right, bottom) = (
-        (right - x as i32).min(width as i32),
-        (bottom - y as i32).min(height as i32),
-    );
-    let damage = Rect {
-        x: left as u32,
-        y: top as u32,
-        w: (right - left).max(0) as u32,
-        h: (bottom - top).max(0) as u32,
+    // A new base presents whole; the current one presents what its flush changed.
+    // A front's window shows the front's frames, never its window surface.
+    let address = drawn_surface(env.ext, base).filter(|_| Some(base) != front);
+    let dirty = match drawn {
+        _ if Some(base) != current => Some([0, 0, i32::MAX, i32::MAX]),
+        Some((at, dirty)) if Some(at) == address => Some(dirty),
+        _ => None,
     };
+    let view = match (address, dirty) {
+        (Some(address), Some(dirty)) => attach(env, address, dirty)?,
+        _ => None,
+    };
+    let moves = place_planes(env, base, drawn)?;
     let provider = *env.ext.get::<Provider>();
-    let anchored = super::input::base_window(env.ext) == Some(hwnd);
-    super::input::prepare(env.ext, hwnd, (window.client[0], window.client[1]));
-    let changed = {
-        let store = env.ext.get_mut::<SurfaceStore>();
-        let mut memory = (provider.memory)(env.cpu);
-        let sid = match view {
-            Some((sid, w, h, at)) if (w, h, at) == (width, height, start) => sid,
-            _ => {
-                if let Some((old, _, _, _)) = view {
-                    store.delete(old);
-                }
-                let part = adv_device::surface::Surface {
-                    pixels: start,
-                    width,
-                    height,
-                    pitch: full.0 * 4,
-                    bottom_up: false,
-                    locked: None,
-                    version: 0,
-                    format: PixelFormat::Bgra32,
-                    palette: None,
-                };
-                let sid = store.import_guest(part, &mut memory)?;
-                env.ext
-                    .get_mut::<Surfaces>()
-                    .0
-                    .get_mut(&address)
-                    .unwrap()
-                    .view = Some((sid, width, height, start));
-                sid
-            }
-        };
-        let store = env.ext.get_mut::<SurfaceStore>();
-        if (store.width, store.height) != (width, height) {
-            store.configure_window(width, height, &mut memory)?;
-        }
+    let memory = (provider.memory)(env.cpu);
+    let store = env.ext.get_mut::<SurfaceStore>();
+    if let Some((sid, damage)) = view {
         let before = store.stats.presentations;
         store.present_from(env.context, sid, &memory, damage)?;
-        store.stats.presentations != before
-    };
-    if changed || anchored {
-        super::input::presented(env.ext);
-    }
-    if !anchored {
-        // Planes are placed relative to the base window.
-        sync_planes(env, None)?;
-    }
-    Ok(())
-}
-
-/// Show every shown top-level window in front of the base window as a plane
-/// over the base, with `content` drawn in surface coordinates of one of them.
-/// A plane outside the base is moved into it, as a window manager keeps
-/// windows on screen; the host shows nothing outside the base.
-pub(super) fn sync_planes(
-    env: &mut Env<'_>,
-    content: Option<(u32, [i32; 4])>,
-) -> Result<(), String> {
-    let mut planes = Vec::new();
-    let mut damage = Vec::new();
-    let mut moves = Vec::new();
-    if let Some(base) = base_window(env.ext)
-        && let Some(base_window) = window(env.ext, base)
-    {
-        let [base_left, base_top, base_right, base_bottom] = base_window.client;
-        let order = env
-            .ext
-            .try_get::<super::Order>()
-            .map_or(&[][..], |order| &order.0[..]);
-        let front = order
-            .iter()
-            .position(|&hwnd| hwnd == base)
-            .map_or(order, |at| &order[..at]);
-        for &hwnd in front.iter().rev() {
-            let Some(shown) = window(env.ext, hwnd)
-                .filter(|w| w.visible && w.parent == 0 && w.style & WS_MINIMIZE == 0)
-            else {
-                continue;
-            };
-            let Some(surface) = env
-                .ext
-                .get::<Surfaces>()
-                .0
-                .values()
-                .find(|surface| surface.hwnd == hwnd)
-            else {
-                continue;
-            };
-            if super::project::projected(env.ext, hwnd) {
-                continue;
-            }
-            let [left, top, right, bottom] = shown.extent;
-            let (width, height) = (right - left, bottom - top);
-            let x = left.clamp(base_left, (base_right - width).max(base_left));
-            let y = top.clamp(base_top, (base_bottom - height).max(base_top));
-            if (x, y) != (left, top) {
-                moves.push((hwnd, x, y));
-            }
-            let plane = Plane {
-                pixels: surface.pixels,
-                pitch: surface.width * 4,
-                x: left - base_left,
-                y: top - base_top,
-                width: (width.max(0) as u32).min(surface.width),
-                height: (height.max(0) as u32).min(surface.height),
-            };
-            if let Some((_, [l, t, r, b])) = content.filter(|&(drawn, _)| drawn == hwnd) {
-                let side = |at: i32, from: i32| (from + at).max(0) as u32;
-                let (l, t) = (side(l, plane.x), side(t, plane.y));
-                let (r, b) = (side(r, plane.x), side(b, plane.y));
-                damage.push(Rect {
-                    x: l,
-                    y: t,
-                    w: r.saturating_sub(l),
-                    h: b.saturating_sub(t),
-                });
-            }
-            planes.push(plane);
+        if store.stats.presentations != before || Some(base) == current {
+            super::input::presented(env.ext);
         }
     }
+    env.ext
+        .get_mut::<SurfaceStore>()
+        .present_planes(env.context, &memory)?;
     for (hwnd, x, y) in moves {
         super::input::schedule(
             env.ext,
@@ -486,47 +394,156 @@ pub(super) fn sync_planes(
             }),
         );
     }
+    Ok(())
+}
+
+/// The client area's place in its surface: offset and size.
+fn client_part(surface: &Surface, window: &super::Window) -> Option<(u32, u32, u32, u32)> {
+    let full = (surface.width, surface.height);
+    let [left, top, right, bottom] = window.client;
+    let x = (left - window.extent[0]).clamp(0, full.0 as i32) as u32;
+    let y = (top - window.extent[1]).clamp(0, full.1 as i32) as u32;
+    let width = ((right - left).max(0) as u32).min(full.0 - x);
+    let height = ((bottom - top).max(0) as u32).min(full.1 - y);
+    (width != 0 && height != 0).then_some((x, y, width, height))
+}
+
+/// Make the client area of the surface at `address` the base: a store view,
+/// with the frame sized to it, and `dirty`, in surface coordinates, as its
+/// damage in view coordinates.
+fn attach(env: &mut Env<'_>, address: u32, dirty: [i32; 4]) -> Result<Option<(u32, Rect)>, String> {
+    let surface = &env.ext.get::<Surfaces>().0[&address];
+    let (hwnd, pixels, full, view) = (
+        surface.hwnd,
+        surface.pixels,
+        (surface.width, surface.height),
+        surface.view,
+    );
+    let window = window(env.ext, hwnd).ok_or("presented window is unknown")?;
+    let Some((x, y, width, height)) = client_part(surface, &window) else {
+        return Ok(None);
+    };
+    let start = pixels + y * full.0 * 4 + x * 4;
+    let [left, top, right, bottom] = dirty;
+    let (left, top) = ((left - x as i32).max(0), (top - y as i32).max(0));
+    let (right, bottom) = (
+        (right - x as i32).min(width as i32),
+        (bottom - y as i32).min(height as i32),
+    );
+    let damage = Rect {
+        x: left as u32,
+        y: top as u32,
+        w: (right - left).max(0) as u32,
+        h: (bottom - top).max(0) as u32,
+    };
+    super::input::prepare(env.ext, hwnd, (window.client[0], window.client[1]));
+    let provider = *env.ext.get::<Provider>();
+    let mut memory = (provider.memory)(env.cpu);
+    let store = env.ext.get_mut::<SurfaceStore>();
+    let sid = match view {
+        Some((sid, w, h, at)) if (w, h, at) == (width, height, start) => sid,
+        _ => {
+            if let Some((old, _, _, _)) = view {
+                store.delete(old);
+            }
+            let part = adv_device::surface::Surface {
+                pixels: start,
+                width,
+                height,
+                pitch: full.0 * 4,
+                bottom_up: false,
+                locked: None,
+                version: 0,
+                format: PixelFormat::Bgra32,
+                palette: None,
+            };
+            let sid = store.import_guest(part, &mut memory)?;
+            env.ext
+                .get_mut::<Surfaces>()
+                .0
+                .get_mut(&address)
+                .unwrap()
+                .view = Some((sid, width, height, start));
+            sid
+        }
+    };
+    let store = env.ext.get_mut::<SurfaceStore>();
+    if (store.width, store.height) != (width, height) {
+        store.configure_window(width, height, &mut memory)?;
+    }
+    Ok(Some((sid, damage)))
+}
+
+/// Record the planes over `base` and what `drawn` changed in them. Returns
+/// the planes outside the frame, with the positions that move
+/// them into it, as a window manager keeps windows on screen; the host shows
+/// nothing outside the base.
+fn place_planes(
+    env: &mut Env<'_>,
+    base: u32,
+    drawn: Option<(u32, [i32; 4])>,
+) -> Result<Vec<(u32, i32, i32)>, String> {
+    let base_window = window(env.ext, base).ok_or("base window is unknown")?;
+    let [base_left, base_top, base_right, base_bottom] = base_window.client;
+    let canvas = (
+        (base_right - base_left).max(0) as u32,
+        (base_bottom - base_top).max(0) as u32,
+    );
+    let order = env
+        .ext
+        .try_get::<super::Order>()
+        .map_or(&[][..], |order| &order.0[..]);
+    let front = order
+        .iter()
+        .position(|&hwnd| hwnd == base)
+        .map_or(order, |at| &order[..at]);
+    let (mut planes, mut damage, mut moves, mut shown) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for &hwnd in front.iter().rev() {
+        if !shows(env.ext, hwnd) {
+            continue;
+        }
+        let Some(address) = drawn_surface(env.ext, hwnd) else {
+            continue;
+        };
+        let surface = &env.ext.get::<Surfaces>().0[&address];
+        let [left, top, right, bottom] = window(env.ext, hwnd).unwrap().extent;
+        let (width, height) = (right - left, bottom - top);
+        let x = left.clamp(base_left, (base_right - width).max(base_left));
+        let y = top.clamp(base_top, (base_bottom - height).max(base_top));
+        if (x, y) != (left, top) {
+            moves.push((hwnd, x, y));
+        }
+        let plane = Plane {
+            id: hwnd,
+            pixels: surface.pixels,
+            pitch: surface.width * 4,
+            x: left - base_left,
+            y: top - base_top,
+            width: (width.max(0) as u32).min(surface.width),
+            height: (height.max(0) as u32).min(surface.height),
+        };
+        if let Some((_, [l, t, r, b])) = drawn.filter(|&(at, _)| at == address) {
+            let side = |at: i32, from: i32| (from + at).max(0) as u32;
+            let (l, t) = (side(l, plane.x), side(t, plane.y));
+            let (r, b) = (side(r, plane.x), side(b, plane.y));
+            damage.push(Rect {
+                x: l,
+                y: t,
+                w: r.saturating_sub(l),
+                h: b.saturating_sub(t),
+            });
+        }
+        shown.push((hwnd, [left, top, right, bottom]));
+        planes.push(plane);
+    }
+    *env.ext.get_or_default::<Shown>() = Shown(shown);
     let provider = *env.ext.get::<Provider>();
     let memory = (provider.memory)(env.cpu);
     env.ext
         .get_mut::<SurfaceStore>()
-        .set_planes(env.context, planes, &damage, &memory)
-}
-
-/// A top-level window moved, was shown or was hidden. Hiding the base
-/// window makes the largest shown main window the base, or else the front
-/// window; then the planes follow.
-pub(super) fn arranged(env: &mut Env<'_>, hwnd: u32, hidden: bool) -> Result<(), String> {
-    if hidden && super::input::base_window(env.ext) == Some(hwnd) {
-        let order = env
-            .ext
-            .try_get::<super::Order>()
-            .map_or(Vec::new(), |order| order.0.clone());
-        let candidates: Vec<(u32, super::Window)> = order
-            .into_iter()
-            .filter(|&other| other != hwnd && !super::project::projected(env.ext, other))
-            .filter_map(|other| Some((other, window(env.ext, other)?)))
-            .filter(|(_, other)| other.visible && other.parent == 0)
-            .collect();
-        let next = candidates
-            .iter()
-            .filter(|(_, other)| main_window(other))
-            .max_by_key(|(_, other)| area(other.client))
-            .or(candidates.first())
-            .map(|&(other, _)| other);
-        let address = next.and_then(|next| {
-            env.ext
-                .get::<Surfaces>()
-                .0
-                .iter()
-                .find(|(_, surface)| surface.hwnd == next)
-                .map(|(&address, _)| address)
-        });
-        if let Some(address) = address {
-            return present_base(env, address, [0, 0, i32::MAX, i32::MAX]);
-        }
-    }
-    sync_planes(env, None)
+        .set_planes(planes, &damage, canvas, &memory)?;
+    Ok(moves)
 }
 
 fn destroy(env: &mut Env<'_>) -> Outcome {

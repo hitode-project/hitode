@@ -545,6 +545,7 @@ fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
                         damage,
                         video: Default::default(),
                         cursor_regions: Default::default(),
+                        windows: Default::default(),
                     };
                     for (state, images) in &mut pools {
                         let selected = step % images.len();

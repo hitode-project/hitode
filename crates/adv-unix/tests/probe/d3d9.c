@@ -1,8 +1,9 @@
 /* The Direct3D 9 probe: GDI draws a TrueType string into an offscreen plain
  * surface through the surface's DC, and the surface is read back through
  * LockRect. GDI then draws the same into the back buffer's DC, which is
- * presented. It exits with 0 only when the text inked the surface, the rest
- * kept the fill and the back buffer drew and presented.
+ * presented, and the window repaints with GDI afterwards, which must not
+ * replace the presented frame. It exits with 0 only when the text inked the
+ * surface, the rest kept the fill and the back buffer drew and presented.
  * Build: i686-w64-mingw32-gcc -O1 -o d3d9.exe d3d9.c -ld3d9 -lgdi32 -luser32 */
 #define COBJMACROS
 #include <windows.h>
@@ -108,6 +109,15 @@ int main(void)
         backdrawn = draw(back, &backreleased);
         IDirect3DSurface9_Release(back);
         presented = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+    }
+    /* Wine flushes the repainted window surface while messages are read. */
+    InvalidateRect(window, NULL, TRUE);
+    UpdateWindow(window);
+    for (int i = 0; i < 5; ++i)
+    {
+        MSG message;
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
+        Sleep(20);
     }
 
     IDirect3DSurface9_Release(surface);
