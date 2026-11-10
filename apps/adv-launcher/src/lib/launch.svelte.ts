@@ -178,6 +178,15 @@ class Runs {
 
 export const runs = new Runs();
 
+/** Words a host launch error that names its cause for the player. */
+function launchError(message: string): string {
+  const missing = /^missing_dll:(.+)$/.exec(message);
+  if (missing) return t(MISSING_DLL, missing[1]);
+  return message;
+}
+
+const MISSING_DLL = "缺少 {0}：这是 Hitode 不提供的 Windows 组件。如果这个程序是启动器或正版验证程序，请改为启动游戏本体。";
+
 /**
  * The launch flow shared by the desktop and phone launch screens: start the
  * game through the host, then the game screen or the failure. The host does
@@ -201,7 +210,7 @@ export class LaunchFlow {
       const id = this.#gameId();
       if (runs.errors[id] === undefined) return;
       const error = untrack(() => runs.takeError(id));
-      if (error !== null) this.#fail("failed", error);
+      if (error !== null) this.#fail("failed", launchError(error));
     });
     $effect(() => () => {
       this.#alive = false;
@@ -252,7 +261,7 @@ export class LaunchFlow {
           const missing = message === "launch_missing_file";
           this.recovery = missing ? "missing" : "access";
           this.#fail("failed", t(missing ? "找不到游戏文件" : "无法访问游戏文件夹"));
-        } else this.#fail("failed", message);
+        } else this.#fail("failed", launchError(message));
       },
     );
   }

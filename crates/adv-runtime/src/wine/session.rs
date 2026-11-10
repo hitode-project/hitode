@@ -91,6 +91,7 @@ pub struct Session {
     pub machine: Machine<Cpu>,
     pub failed_process: Option<u32>,
     pub stub_gaps: Rc<RefCell<adv_nt::exception::StubGaps>>,
+    links: Rc<RefCell<adv_nt::unix::Links>>,
     pub milestones: std::sync::Arc<adv_device::Milestones>,
     // Retires clients after the active machine releases its connection.
     _lease: host::Lease,
@@ -117,6 +118,7 @@ impl Drop for Session {
 }
 
 struct Settings {
+    exe: PathBuf,
     dist: PathBuf,
     prefix: PathBuf,
     drive: PathBuf,
@@ -737,6 +739,8 @@ impl Session {
         machine.ext.insert(mounts);
         let stub_gaps = Rc::new(RefCell::new(adv_nt::exception::StubGaps::default()));
         machine.ext.insert(stub_gaps.clone());
+        let links = Rc::new(RefCell::new(adv_nt::unix::Links::default()));
+        machine.ext.insert(links.clone());
         let milestones = std::sync::Arc::new(adv_device::Milestones::default());
         audio.set_milestones(milestones.clone());
         machine.ext.insert(milestones.clone());
@@ -786,6 +790,7 @@ impl Session {
             machine,
             failed_process: None,
             stub_gaps,
+            links,
             milestones,
             _lease: lease,
             wake,
@@ -800,6 +805,7 @@ impl Session {
             finished: None,
             idle: BTreeMap::new(),
             settings: Settings {
+                exe: exe.clone(),
                 dist: config.dist.to_owned(),
                 prefix: prefix.clone(),
                 drive: drive.clone(),
@@ -1210,6 +1216,7 @@ impl Session {
                 .insert(self.machine.ext.get::<process::Children>().fork());
             machine.ext.insert(shared.clone());
             machine.ext.insert(self.stub_gaps.clone());
+            machine.ext.insert(self.links.clone());
             self.shared
                 .driver
                 .borrow_mut()
@@ -1343,6 +1350,21 @@ impl Session {
         project::minimized(&self.machine.ext)
     }
 
+    /// The first module in the program's static import closure that neither
+    /// its directory nor system32 holds: why its process would end with
+    /// `STATUS_DLL_NOT_FOUND`.
+    pub fn missing_import(&self) -> Option<String> {
+        missing_import(
+            &self.settings.exe,
+            &self.settings.drive.join("windows/system32"),
+        )
+    }
+
+    /// Web and mail addresses the guest asked to open since the last call.
+    pub fn take_links(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.links.borrow_mut().0)
+    }
+
     /// Frames presented so far.
     pub fn presented_frames(&self) -> u64 {
         self.machine.ext.get::<SurfaceStore>().stats.presentations
@@ -1465,6 +1487,96 @@ mod link_tests {
             lookup(&devices, &name("data1.arc")),
             Ok(Lookup::Found(_))
         ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Walks `exe`'s imports through the modules beside it, as the loader
+/// resolves them; system modules are the installation's and stay unwalked.
+fn missing_import(exe: &Path, system: &Path) -> Option<String> {
+    let local = exe.parent()?;
+    let find = |directory: &Path, name: &str| {
+        std::fs::read_dir(directory)
+            .ok()?
+            .flatten()
+            .find(|entry| entry.file_name().eq_ignore_ascii_case(name))
+            .map(|entry| entry.path())
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![exe.to_owned()];
+    while let Some(path) = pending.pop() {
+        let image = std::fs::read(&path).ok()?;
+        for module in adv_pe::Pe::parse(&image).ok()?.imports().ok()? {
+            let name = module.dll.to_ascii_lowercase();
+            if name.starts_with("api-ms-")
+                || name.starts_with("ext-ms-")
+                || !seen.insert(name.clone())
+            {
+                continue;
+            }
+            if let Some(path) = find(local, &name) {
+                pending.push(path);
+            } else if find(system, &name).is_none() {
+                return Some(module.dll);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod import_tests {
+    use adv_pe::{Import, ImportModule, ImportName, write::DllWriter};
+
+    fn image(name: &str, imports: &[&str]) -> Vec<u8> {
+        let mut writer = DllWriter::new(name, 0x40_0000);
+        let modules: Vec<ImportModule> = imports
+            .iter()
+            .map(|dll| ImportModule {
+                dll: dll.to_string(),
+                imports: vec![Import {
+                    name: ImportName::Ordinal(1),
+                    iat_rva: 0,
+                }],
+            })
+            .collect();
+        writer.imports(&modules).unwrap();
+        writer.finish().unwrap()
+    }
+
+    // spec: HOST-LIB-9
+    #[test]
+    fn the_missing_module_is_named_through_modules_beside_the_program() {
+        let root = std::env::temp_dir().join(format!("adv-missing-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (game, system) = (root.join("game"), root.join("system32"));
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(system.join("kernel32.dll"), b"").unwrap();
+        let exe = game.join("game.exe");
+        std::fs::write(
+            &exe,
+            image(
+                "game.exe",
+                &[
+                    "KERNEL32.dll",
+                    "Engine.dll",
+                    "api-ms-win-core-synch-l1-2-0.dll",
+                ],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            game.join("engine.DLL"),
+            image("engine.dll", &["kernel32.dll", "MFC42.DLL"]),
+        )
+        .unwrap();
+        assert_eq!(
+            super::missing_import(&exe, &system).as_deref(),
+            Some("MFC42.DLL")
+        );
+        std::fs::write(system.join("mfc42.dll"), b"").unwrap();
+        assert_eq!(super::missing_import(&exe, &system), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

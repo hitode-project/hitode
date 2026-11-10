@@ -36,6 +36,8 @@ pub enum ViewEvent {
     /// The guest's menu bar or tracked popup changed; the overlay lists it
     /// and answers through `Session::menu_event`.
     Menu(adv_runtime::MenuBar),
+    /// The guest asked to open a web or mail address.
+    OpenLink(String),
 }
 
 /// Trackpad cursor travel per finger travel.
@@ -617,6 +619,9 @@ impl GameView {
     }
     /// A mobile view cannot be minimized; the next touch restores the guest.
     pub(crate) fn minimize(&self) {}
+    pub(crate) fn open_link(&self, url: String) {
+        self.notify(ViewEvent::OpenLink(url));
+    }
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
     pub(crate) fn frame_presented(&self) {
         self.frame_clock.set(true);

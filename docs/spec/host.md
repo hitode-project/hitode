@@ -253,6 +253,12 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Applies to**: Launcher, macOS
 **Verification**: Test
 
+### HOST-LIB-9 Missing modules
+
+**Rule**: A program that ends with `STATUS_DLL_NOT_FOUND` MUST fail its launch with the first module in its static import closure that is missing. The closure MUST follow modules beside the program, and the launcher MUST word the error for the player.
+**Applies to**: Launcher, macOS
+**Verification**: Test
+
 ### HOST-LIB-4 Stop game
 
 **Rule**: `stop_game` MUST request normal session closure, and force closure only when the game screen's explicit 强制结束 passes `force`. With no running session it MUST return `no game is running`. Completion MUST use the existing finish callback and `game_finished` event without quitting the launcher.
@@ -330,6 +336,11 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Rule**: Guest top-level menus MUST be inserted after the application menu and removed when the session ends. A dialog MUST be a child window of the game view's window. A dialog MUST scale down proportionally when needed to fit the owner's visible screen area.
 **Applies to**: macOS
 **Verification**: Review — the main menu and child windows need a running AppKit application.
+
+### HOST-MENU-4 Guest links
+
+**Rule**: A guest asking Wine's browser or mailer launcher to open an `http`, `https` or `mailto` address MUST open it in the host's default application. The host MUST NOT run a host program for the guest; other launch requests MUST fail as a missing program does.
+**Verification**: Test
 
 ## macOS lifecycle
 

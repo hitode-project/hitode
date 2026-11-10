@@ -150,6 +150,7 @@ export const messages: Record<string, [string, string]> = {
   "所在磁盘未连接": ["The containing disk is disconnected", "保存先ディスクが接続されていません"],
   "找不到文件夹": ["Folder not found", "フォルダーが見つかりません"],
   "找不到游戏文件": ["Game file not found", "ゲームファイルが見つかりません"],
+  "缺少 {0}：这是 Hitode 不提供的 Windows 组件。如果这个程序是启动器或正版验证程序，请改为启动游戏本体。": ["Missing {0}: Hitode does not provide this Windows component. If this program is a launcher or license check, start the game itself instead.", "{0} がありません。Hitode が提供していない Windows コンポーネントです。このプログラムがランチャーや認証プログラムの場合は、ゲーム本体を起動してください。"],
   "无法访问游戏文件夹": ["Can't access the game folder", "ゲームフォルダーにアクセスできません"],
   "无法启动": ["Cannot start", "起動できない"],
   "中途出错": ["Failed during play", "プレイ中にエラー"],

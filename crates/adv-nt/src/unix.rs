@@ -9,6 +9,7 @@ use crate::server::Link;
 
 const WINE_DBG_WRITE: u32 = 2;
 const WINE_SERVER_CALL: u32 = 3;
+const WINE_SPAWNVP: u32 = 6;
 
 /// `struct __server_request_info` (i386): the fixed part, then the data
 /// count, the reply data pointer and up to five request data vectors.
@@ -23,6 +24,7 @@ pub fn call(env: &mut Env<'_>, code: u32, args: u32) -> Outcome {
     match code {
         WINE_DBG_WRITE => debug_write(env, args),
         WINE_SERVER_CALL => server_call(env, args),
+        WINE_SPAWNVP => spawnvp(env, args),
         7 => crate::system::query_time(env, &[args]),
         _ => Outcome::Fail(format!("unix call {code} is not implemented")),
     }
@@ -45,6 +47,56 @@ fn debug_write(env: &mut Env<'_>, params: u32) -> Outcome {
         }
         Err(error) => Outcome::Fail(format!("debug output: {error}")),
     }
+}
+
+/// Web and mail addresses the session's processes asked the host to open,
+/// shared by its processes.
+#[derive(Default)]
+pub struct Links(pub Vec<String>);
+
+/// `__wine_unix_spawnvp(argv, wait)`. Wine's browser and mailer launchers
+/// pass the address last, after a host program to try; the host opens the
+/// address itself and runs no program. Anything else fails, as a missing
+/// program does.
+fn spawnvp(env: &mut Env<'_>, params: u32) -> Outcome {
+    let Ok(argv) = arguments(env, params) else {
+        return Outcome::Return(1);
+    };
+    let Some(links) = env.ext.try_get::<std::rc::Rc<std::cell::RefCell<Links>>>() else {
+        return Outcome::Return(1);
+    };
+    match argv.last().filter(|url| link(url)) {
+        Some(url) => {
+            links.borrow_mut().0.push(url.clone());
+            Outcome::Return(0)
+        }
+        None => Outcome::Return(1),
+    }
+}
+
+/// `struct wine_spawnvp_params { char **argv; int wait; }`.
+fn arguments(env: &mut Env<'_>, params: u32) -> Result<Vec<String>, adv_cpu::backend::MemFault> {
+    let mut argv = env.cpu.read_u32(params)?;
+    let mut list = Vec::new();
+    // winebrowser passes a candidate's words and the address.
+    while list.len() < 16 {
+        let pointer = env.cpu.read_u32(argv)?;
+        if pointer == 0 {
+            break;
+        }
+        let word = env.cpu.read_cstr(pointer, 4096)?;
+        list.push(String::from_utf8_lossy(&word).into_owned());
+        argv += 4;
+    }
+    Ok(list)
+}
+
+/// A web or mail address, which a browser or mailer can open.
+fn link(url: &str) -> bool {
+    let scheme = url.split_once(':').map_or("", |(scheme, _)| scheme);
+    ["http", "https", "mailto"]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
 }
 
 /// Passes a request ntdll.dll prepared to the server.
@@ -98,4 +150,18 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
             .map_err(fault)?;
     }
     Ok(u32::from_le_bytes(fixed[..4].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    // spec: HOST-MENU-4
+    #[test]
+    fn only_web_and_mail_addresses_open() {
+        assert!(super::link("https://example.com/"));
+        assert!(super::link("HTTP://example.com/"));
+        assert!(super::link("mailto:someone@example.com"));
+        assert!(!super::link("file:///etc/passwd"));
+        assert!(!super::link("/usr/bin/open"));
+        assert!(!super::link("xdg-open"));
+    }
 }
