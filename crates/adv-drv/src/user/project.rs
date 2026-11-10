@@ -47,6 +47,10 @@ const LB_GETCURSEL: u32 = 0x188;
 const LB_GETTEXT: u32 = 0x189;
 const LB_GETTEXTLEN: u32 = 0x18a;
 const LB_GETCOUNT: u32 = 0x18b;
+const LB_GETITEMRECT: u32 = 0x198;
+const LB_SETCARETINDEX: u32 = 0x19e;
+const WM_LBUTTONDOWN: u32 = 0x201;
+const WM_LBUTTONUP: u32 = 0x202;
 const CB_GETCOUNT: u32 = 0x146;
 const CB_GETCURSEL: u32 = 0x147;
 const CB_GETLBTEXT: u32 = 0x148;
@@ -122,8 +126,17 @@ impl Info {
     fn is(&self, class: &str) -> bool {
         self.class.eq_ignore_ascii_case(class)
     }
+    fn combo_list(&self) -> bool {
+        self.top_level() && self.is("ComboLBox") && self.style & 0x30 == 0
+    }
+    fn combo_popup(&self) -> bool {
+        self.combo_list()
+            && self.visible()
+            && self.count != 0
+            && self.items.len() == self.count as usize
+    }
     fn list(&self) -> Option<(u32, u32, u32)> {
-        if self.is("ListBox") {
+        if self.is("ListBox") || (self.combo_list() && self.visible()) {
             Some((LB_GETCOUNT, LB_GETTEXTLEN, LB_GETTEXT))
         } else if self.is("ComboBox") {
             Some((CB_GETCOUNT, CB_GETLBTEXTLEN, CB_GETLBTEXT))
@@ -301,7 +314,8 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
 /// exactly as [`dialogs`] would, without building the dialog set.
 pub fn projected(ext: &Ext, hwnd: u32) -> bool {
     let children = |parent| windows(ext).filter(|info| info.parent == parent).collect();
-    info(ext, hwnd).is_some_and(|info| info.is("#32768") || is_dialog(info, &children))
+    info(ext, hwnd)
+        .is_some_and(|info| info.is("#32768") || info.combo_popup() || is_dialog(info, &children))
 }
 
 fn target(dialog: u32, info: &Info) -> DialogTarget {
@@ -348,18 +362,66 @@ pub fn menu_bar(ext: &Ext) -> MenuBar {
         .and_then(|state| state.popup.as_ref())
         && let Some(popup) = info(ext, *hwnd)
     {
-        let (x, y) = input::presented_origin(ext).unwrap_or((0, 0));
+        // A popup shows where its owner does, or, unowned like a combo list,
+        // its thread's active window: over that window's layer when it is a
+        // plane (WINE-GFX-10), else over the presented client.
+        let anchor = match popup.owner {
+            0 => ext.try_get::<Projection>().map_or(0, |state| {
+                let mut parts = state.parts.values();
+                parts
+                    .find(|part| part.windows.iter().any(|info| info.hwnd == *hwnd))
+                    .map_or(0, |part| part.active)
+            }),
+            owner => owner,
+        };
+        let (window, (x, y)) = match super::surface::plane(ext, anchor) {
+            Some([left, top, ..]) => (anchor, (left, top)),
+            None => (0, input::presented_origin(ext).unwrap_or((0, 0))),
+        };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         Arc::as_ptr(active).hash(&mut hasher);
+        let root = if popup.combo_popup() { *hwnd } else { popup.id };
         return MenuBar {
             key: MenuKey {
                 window: *hwnd,
-                menu: popup.id,
+                menu: root,
                 revision: hasher.finish(),
                 enabled: true,
             },
-            items: popup.menu.clone(),
+            items: if popup.combo_popup() {
+                popup
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| MenuItem {
+                        // Menu adapters decode ampersands and reserve tabs for accelerators.
+                        text: text
+                            .replace('&', "&&")
+                            .replace('\t', " ")
+                            .encode_utf16()
+                            .collect(),
+                        flags: if popup.selection == index as i32 {
+                            8
+                        } else {
+                            0
+                        },
+                        supported: true,
+                        command: MenuCommand {
+                            window: *hwnd,
+                            root,
+                            menu: root,
+                            position: index as u32,
+                            id: index as u32,
+                        },
+                        submenu: 0,
+                        children: Vec::new(),
+                    })
+                    .collect()
+            } else {
+                popup.menu.clone()
+            },
             popup: Some(PopupPresentation {
+                window,
                 x: popup.rect.left - x,
                 y: popup.rect.top - y,
                 flags: 0,
@@ -686,6 +748,36 @@ pub fn menu_event(ext: &mut Ext, event: MenuEvent) -> bool {
         })
     }
     if bar.popup.is_some() {
+        if info(ext, window).is_some_and(Info::combo_popup) {
+            return match event {
+                MenuEvent::Initialize { .. } => true,
+                MenuEvent::Cancel { .. } if projection(ext).choice.is_some() => true,
+                MenuEvent::Cancel { .. } => deliver(
+                    ext,
+                    window,
+                    vec![
+                        // A click outside the list lets Wine cancel its own dropdown.
+                        Message::Send(window, WM_LBUTTONDOWN, 1, 0x8000_8000),
+                    ],
+                ),
+                MenuEvent::Command(command)
+                    if bar.items.iter().any(|item| item.command == command) =>
+                {
+                    let queued = input::schedule(
+                        ext,
+                        window,
+                        Box::new(move |env, done| {
+                            choose_combo_item(env, window, command.position, done)
+                        }),
+                    );
+                    if queued {
+                        projection(ext).choice = Some(VecDeque::new());
+                    }
+                    queued
+                }
+                MenuEvent::Command(_) => false,
+            };
+        }
         return match event {
             // Native hosts follow a choice with cancellation for rejected choices.
             // Accepted choices still need Wine's loop to consume their clicks.
@@ -970,7 +1062,7 @@ fn state(env: &mut Env<'_>, context: CtxId, part: Part, buffer: u32, done: Done)
             list.push(("SendMessageW", vec![hwnd, BM_GETCHECK, 0, 0]));
         }
         if let Some((count, _, _)) = info.list() {
-            let selection = if info.is("ListBox") {
+            let selection = if count == LB_GETCOUNT {
                 LB_GETCURSEL
             } else {
                 CB_GETCURSEL
@@ -1211,6 +1303,11 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
     let projection = projection(env.ext);
     projection.reading.remove(&context);
     projection.read.insert(context, Instant::now());
+    let popup = part
+        .windows
+        .iter()
+        .find(|info| info.combo_popup())
+        .map(|info| info.hwnd);
     let shown: Vec<_> = part
         .windows
         .iter()
@@ -1218,7 +1315,7 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
         .map(|info| (info.hwnd, info.id))
         .collect();
     if projection.popup.is_none()
-        && let Some(&(hwnd, _)) = shown.first()
+        && let Some(hwnd) = shown.first().map(|&(hwnd, _)| hwnd).or(popup)
     {
         projection.popup = Some((hwnd, Arc::new(AtomicBool::new(true))));
     }
@@ -1228,12 +1325,23 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
         .and_then(|path| path.front())
         .map(|command| command.menu);
     projection.parts.insert(context, part);
+    // A window read as a dialog now shows natively, not as a plane.
+    if let Err(error) = super::surface::compose(env, None) {
+        return Outcome::Fail(error);
+    }
     if let Some(menu) = next
         && shown.iter().any(|&(_, id)| id == menu)
     {
         return click_next(env, menu, done);
     }
     done(env)
+}
+
+/// A combo list is hidden and reused, unlike a menu window.
+pub(super) fn hidden(ext: &mut Ext, hwnd: u32) {
+    if info(ext, hwnd).is_some_and(Info::combo_list) {
+        forget(ext, hwnd);
+    }
 }
 
 /// Forget a destroyed window.
@@ -1258,12 +1366,13 @@ pub(super) fn forget(ext: &mut Ext, hwnd: u32) {
 /// popup or dialog the host projects never presents a frame.
 pub(super) fn shown(env: &mut Env<'_>, hwnd: u32) -> Outcome {
     const GWL_STYLE: u32 = -16i32 as u32;
-    const WS_CHILD: u32 = 0x4000_0000;
     calls(
         env,
         vec![("GetWindowLongW", vec![hwnd, GWL_STYLE])],
         move |env, results| {
-            if results[0] & WS_CHILD == 0 {
+            if results[0] & WS_CHILD == 0
+                || super::window(env.ext, hwnd).is_some_and(|w| w.parent == 0)
+            {
                 if let Some(milestones) =
                     env.ext.try_get::<std::sync::Arc<adv_device::Milestones>>()
                 {
@@ -1273,6 +1382,37 @@ pub(super) fn shown(env: &mut Env<'_>, hwnd: u32) -> Outcome {
             } else {
                 Outcome::Return(0)
             }
+        },
+    )
+}
+
+fn choose_combo_item(env: &mut Env<'_>, hwnd: u32, index: u32, done: Done) -> Outcome {
+    let buffer = match env.sys.vm.alloc(env.cpu, 16, Prot::RW) {
+        Ok(buffer) => buffer,
+        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+    };
+    calls(
+        env,
+        vec![
+            ("SendMessageW", vec![hwnd, LB_SETCARETINDEX, index, 0]),
+            ("SendMessageW", vec![hwnd, LB_GETITEMRECT, index, buffer]),
+        ],
+        move |env, results| {
+            let [left, top, right, bottom] = words::<4>(env, buffer);
+            let _ = env.sys.vm.free(env.cpu, buffer);
+            if results[1] == u32::MAX {
+                return done(env);
+            }
+            let at = u32::from(((left + right) / 2) as u16)
+                | (u32::from(((top + bottom) / 2) as u16) << 16);
+            send(
+                env,
+                VecDeque::from([
+                    Message::Send(hwnd, WM_LBUTTONDOWN, 1, at),
+                    Message::Send(hwnd, WM_LBUTTONUP, 0, at),
+                ]),
+                done,
+            )
         },
     )
 }
@@ -1315,6 +1455,53 @@ fn click_next(env: &mut Env<'_>, menu: u32, done: Done) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: WINE-UI-1
+    #[test]
+    fn shown_combo_projects_items_and_retires_when_hidden() {
+        let mut ext = Ext::default();
+        ext.insert(input::Presentation::default());
+        let state = projection(&mut ext);
+        let active = Arc::new(AtomicBool::new(true));
+        state.popup = Some((1, active.clone()));
+        state.parts.insert(
+            1,
+            Part {
+                windows: vec![Info {
+                    hwnd: 1,
+                    rect: Rect {
+                        left: 130,
+                        top: 90,
+                        ..Rect::default()
+                    },
+                    class: "ComboLBox".into(),
+                    style: WS_VISIBLE | WS_CHILD,
+                    items: vec!["First".into(), "Second".into()],
+                    count: 2,
+                    selection: 1,
+                    ..Info::default()
+                }],
+                active: 7,
+                ..Part::default()
+            },
+        );
+
+        assert!(projected(&ext, 1));
+        let bar = menu_bar(&ext);
+        assert_eq!(bar.items.len(), 2);
+        assert_eq!(bar.items[1].flags, 8);
+        assert_eq!(bar.items[1].command.position, 1);
+        let popup = bar.popup.unwrap();
+        assert_eq!((popup.window, popup.x, popup.y), (0, 130, 90));
+        // An unowned list shows over its thread's active window's layer.
+        super::super::surface::show_plane(&mut ext, 7, [100, 50, 300, 150]);
+        let popup = menu_bar(&ext).popup.unwrap();
+        assert_eq!((popup.window, popup.x, popup.y), (7, 30, 40));
+        hidden(&mut ext, 1);
+        assert!(!active.load(Ordering::Acquire));
+        assert!(!projected(&ext, 1));
+        assert!(menu_bar(&ext).popup.is_none());
+    }
 
     #[test]
     // spec: WINE-UI-7

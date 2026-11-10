@@ -2048,3 +2048,76 @@ fn unchanged_base_with_a_retained_video_layer_does_not_republish() {
         );
     }
 }
+
+// spec: WINE-GFX-10
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
+    let mut m = Memory::new(false);
+    let mut s = Store::new(16, 8, 16, 32768, Snapshot::default()).unwrap();
+    let id = s.create(16, 8, false, PixelFormat::Bgra32, &mut m).unwrap();
+    pattern(&s, id, &mut m);
+    let (producer, mut consumer) = frame_mailbox();
+    s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    // A 4x3 window whose rows hold their column and row, two pixels of
+    // which lie left of the base.
+    let window = 40000;
+    for y in 0..3u32 {
+        for x in 0..4u32 {
+            m.write(window + y * 16 + x * 4, &[0xf0 | x as u8, y as u8, 0, 0xff])
+                .unwrap();
+        }
+    }
+    let plane = adv_device::surface::Plane {
+        id: 1,
+        pixels: window,
+        pitch: 16,
+        x: -2,
+        y: 5,
+        width: 4,
+        height: 3,
+    };
+    let base = logical_pixels(&s, id, &m);
+    let mut shown = |s: &mut Store, m: &Memory| {
+        s.flush(m, FlushReason::Immediate).unwrap();
+        assert!(consumer.update());
+        let mut out = Snapshot::default();
+        consumer.current().snapshot(&mut out).unwrap();
+        out.bgra
+    };
+    s.present(id, &m, s[id].rect()).unwrap();
+    assert_eq!(shown(&mut s, &m), base.concat());
+
+    s.set_planes(vec![plane], &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    let mut covered = base.clone();
+    for y in 5..8usize {
+        for x in 0..2usize {
+            covered[y * 16 + x] = vec![0xf2 + x as u8, y as u8 - 5, 0, 0xff];
+        }
+    }
+    assert_eq!(shown(&mut s, &m), covered.concat());
+
+    // Drawing inside the window republishes it; the base is not redrawn.
+    m.write(window + 16 + 3 * 4, &[0x11, 0x22, 0x33, 0xff])
+        .unwrap();
+    let inside = Rect {
+        x: 1,
+        y: 6,
+        w: 1,
+        h: 1,
+    };
+    s.set_planes(vec![plane], &[inside], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    covered[6 * 16 + 1] = vec![0x11, 0x22, 0x33, 0xff];
+    assert_eq!(shown(&mut s, &m), covered.concat());
+
+    s.set_planes(Vec::new(), &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    assert_eq!(shown(&mut s, &m), base.concat());
+    // An unchanged plane list publishes nothing.
+    s.set_planes(Vec::new(), &[], (16, 8), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    s.flush(&m, FlushReason::Immediate).unwrap();
+    assert!(!consumer.update());
+}

@@ -18,6 +18,7 @@ pub use adv_cpu::jit_map::{
 pub use adv_cpu::{CompileStrategy, Cpu, Engine, EngineOptions, HostFeatures};
 #[cfg(target_os = "ios")]
 pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
+pub use adv_drv::user::input::Pointer;
 pub use adv_nt::native::{
     BodyCount as NativeBodyCount, Boundary as NativeBoundary,
     debugger_attached as native_debugger_attached,
@@ -34,6 +35,7 @@ pub use adv_device::ui::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
     MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, WindowView,
 };
+#[cfg(feature = "gpu")]
 pub use adv_dx::d3d9::{
     FrameCounters as D3d9Counters, frame_counters as d3d9_counters, frame_trace as d3d9_frame,
 };

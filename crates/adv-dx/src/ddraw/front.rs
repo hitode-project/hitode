@@ -22,6 +22,8 @@ pub struct Provider {
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
+    /// The DirectDraw object is gone: its windows present their own surfaces.
+    pub released: fn(&Ext),
 }
 pub struct State {
     draw: DirectDraw,
@@ -37,6 +39,7 @@ pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
     registry.register(get_device_identifier_ABI);
     registry.register(get_fourcc_codes_ABI);
+    registry.register(wait_for_vertical_blank_ABI);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
@@ -310,7 +313,11 @@ fn addref(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
 }
 #[win32(ddraw, name = "IDirectDraw7::Release", level = implement)]
 fn release(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
-    call(env, api::RELEASE, &[this.addr()])
+    let outcome = call(env, api::RELEASE, &[this.addr()]);
+    if matches!(outcome, Outcome::Return(0)) {
+        (env.ext.get::<State>().provider.released)(env.ext);
+    }
+    outcome
 }
 #[win32(ddraw, name = "IDirectDraw7::CreateSurface", level = implement)]
 fn create_surface(
@@ -329,6 +336,21 @@ fn create_surface(
 #[win32(ddraw, name = "IDirectDraw7::SetCooperativeLevel", level = implement)]
 fn cooperative(env: &mut Env<'_>, this: GuestPtr<()>, arg1: Handle, arg2: u32) -> Outcome {
     call(env, api::COOPERATIVE, &[this.addr(), arg1.0, arg2])
+}
+#[win32(ddraw, name = "IDirectDraw7::WaitForVerticalBlank", level = state)]
+fn wait_for_vertical_blank(
+    _env: &mut Env<'_>,
+    _this: GuestPtr<()>,
+    flags: u32,
+    _event: Handle,
+) -> Outcome {
+    // Like Wine, the virtual adapter has no scanout to wait for.
+    const DDWAITVB_BLOCKBEGINEVENT: u32 = 0x2;
+    Outcome::Return(if flags & DDWAITVB_BLOCKBEGINEVENT != 0 {
+        UNSUPPORTED
+    } else {
+        0
+    })
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::Lock", level = implement)]
 fn lock(

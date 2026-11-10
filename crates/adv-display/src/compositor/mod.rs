@@ -36,6 +36,7 @@ pub enum LayerId {
     Base,
     Video(u64),
     VideoBackground(u64),
+    Window(u32),
     Host(crate::plan::HostLayer),
 }
 
@@ -136,6 +137,7 @@ impl Compositor for HeadlessCompositor {
         let replaced = self.showing.extract_if(.., |(_, layer)| {
             images.iter().any(|i| i.layer == *layer)
                 || matches!(layer, LayerId::Video(id) if !layers.video.iter().any(|(v, _)| v == id))
+                || matches!(layer, LayerId::Window(id) if !layers.windows.iter().any(|(w, _)| w == id))
                 || matches!(layer, LayerId::Host(crate::plan::HostLayer::Damage) if !layers.host.contains(&crate::plan::HostLayer::Damage))
         });
         self.released

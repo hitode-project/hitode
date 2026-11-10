@@ -54,6 +54,7 @@ pub struct GameView {
     canvas: Cell<(u32, u32)>,
 
     placement: Cell<Option<crate::display::Placement>>,
+    pointer: RefCell<crate::window::Pointer>,
     pub(crate) scaling: Cell<crate::Scaling>,
     events: RefCell<Vec<Event>>,
     wake: RefCell<Option<WakeEvent>>,
@@ -106,6 +107,7 @@ impl GameView {
             canvas: Cell::new((width.max(1), height.max(1))),
 
             placement: Cell::new(None),
+            pointer: Default::default(),
             scaling: Cell::new(crate::Scaling::Fit),
             events: RefCell::new(Vec::new()),
             wake: RefCell::new(None),
@@ -159,6 +161,10 @@ impl GameView {
         if let Some(host) = self.host.borrow().as_ref() {
             host.placed();
         }
+    }
+    /// The guest window layers presented over the frame.
+    pub(crate) fn place_windows(&self, layers: Arc<[crate::display::WindowLayer]>) {
+        self.pointer.borrow_mut().set_layers(layers);
     }
     /// The presented frame's rectangle in view pixels.
     pub(crate) fn frame_rectangle(&self) -> [f64; 4] {
@@ -315,12 +321,8 @@ impl GameView {
             (true, true) => 0x204,
             (true, false) => 0x205,
         };
-        for (message, wparam, lparam) in [(0x200, held, at), (message, buttons, at)] {
-            self.push(Event::Input {
-                message,
-                wparam,
-                lparam,
-            });
+        for (message, wparam) in [(0x200, held), (message, buttons)] {
+            self.mouse(message, wparam, at);
         }
     }
     /// Presses or releases a virtual key for the overlay's keys: Enter, Esc,
@@ -381,12 +383,23 @@ impl GameView {
             crate::mobile::mouse(gesture, self.cursor_position(), self.buttons.get());
         self.buttons.set(buttons);
         if let Some((message, wparam, lparam)) = message {
-            self.push(Event::Input {
-                message,
-                wparam,
-                lparam,
-            });
+            self.mouse(message, wparam, lparam);
         }
+    }
+    /// Mouse `message` at canvas point `lparam`, or on the guest window
+    /// layer shown there.
+    fn mouse(&self, message: u32, wparam: u32, lparam: u32) {
+        let (x, y) = ((lparam & 0xffff) as f32, (lparam >> 16) as f32);
+        let (x, y) =
+            crate::mobile::touch::client_point_in(self.frame_rectangle(), self.canvas.get(), x, y);
+        let event = Event::mouse(
+            &mut self.pointer.borrow_mut(),
+            message,
+            wparam,
+            (f64::from(x), f64::from(y)),
+            lparam,
+        );
+        self.push(event);
     }
     /// The mouse position as a packed client lParam.
     fn cursor_position(&self) -> u32 {
@@ -478,7 +491,11 @@ impl GameView {
         self.events.borrow_mut().retain(|event| {
             !matches!(
                 event,
-                Event::Input { .. } | Event::Menu(_) | Event::Dialog(_) | Event::Text(..)
+                Event::Input { .. }
+                    | Event::WindowInput { .. }
+                    | Event::Menu(_)
+                    | Event::Dialog(_)
+                    | Event::Text(..)
             )
         });
         self.clear_control_latch();
@@ -538,9 +555,19 @@ impl GameView {
             )
         }
     }
+    /// View pixels per point: what native windows are drawn at.
     #[cfg(target_os = "ios")]
     pub(crate) fn native_scale(&self) -> f64 {
         self.host.borrow().as_ref().unwrap().contentScaleFactor()
+    }
+    /// View pixels per density-independent pixel: what native windows are
+    /// drawn at.
+    #[cfg(target_os = "android")]
+    pub(crate) fn native_scale(&self) -> f64 {
+        self.screen
+            .borrow()
+            .as_ref()
+            .map_or(1., |(_, scale)| *scale)
     }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
         Ok(if self.has_surface() && !self.paused.get() {

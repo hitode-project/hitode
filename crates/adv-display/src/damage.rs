@@ -542,6 +542,7 @@ mod tests {
             damage: Region::empty(canvas),
             video: Default::default(),
             cursor_regions: Default::default(),
+            windows: Default::default(),
         };
         let caps = CompositorCaps {
             fractional_crops: true,

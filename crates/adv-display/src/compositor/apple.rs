@@ -187,9 +187,10 @@ impl Compositor for LayerCompositor {
                 None => self.showing.push(shown),
             }
         }
-        // A video that left the frame retires with its layer.
+        // A video or window that left the frame retires with its layer.
         let gone = self.showing.extract_if(.., |(_, layer, _)| {
             matches!(layer, LayerId::Video(v) if !layers.video.iter().any(|(id, _)| id == v))
+                || matches!(layer, LayerId::Window(w) if !layers.windows.iter().any(|(id, _)| id == w))
                 || matches!(layer, LayerId::Host(HostLayer::Damage) if !layers.host.contains(&HostLayer::Damage))
         });
         self.retired
@@ -228,13 +229,17 @@ impl Compositor for LayerCompositor {
         for (i, (id, layer)) in layers.video.iter().enumerate() {
             place(LayerId::Video(*id), layer, (i * 2 + 2) as f64);
         }
+        let windows = layers.video.len() * 2 + 3;
+        for (i, (id, layer)) in layers.windows.iter().enumerate() {
+            place(LayerId::Window(*id), layer, (windows + i) as f64);
+        }
         if layers.host.contains(&HostLayer::Damage)
             && let Some(size) = size(LayerId::Host(HostLayer::Damage))
         {
             place(
                 LayerId::Host(HostLayer::Damage),
                 &crate::damage::layer(size),
-                (layers.video.len() * 2 + 3) as f64,
+                (windows + layers.windows.len()) as f64,
             );
         }
         for (id, dst, color) in &layers.solids {
@@ -346,6 +351,7 @@ impl Tree {
                         id,
                         LayerId::Video(_)
                             | LayerId::VideoBackground(_)
+                            | LayerId::Window(_)
                             | LayerId::Host(HostLayer::Damage)
                     )
                 {
@@ -423,7 +429,8 @@ impl Tree {
                 layer.setZPosition(match id {
                     LayerId::Base => 0.0,
                     LayerId::Video(_) | LayerId::VideoBackground(_) => 1.0,
-                    LayerId::Host(_) => 2.0,
+                    LayerId::Window(_) => 2.0,
+                    LayerId::Host(_) => 3.0,
                 });
                 self.root.addSublayer(&layer);
                 self.layers.push((id, layer));

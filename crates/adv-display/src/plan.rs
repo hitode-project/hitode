@@ -37,6 +37,18 @@ pub struct VideoGeometry {
     pub background: Option<(Rect, [u8; 4])>,
 }
 
+/// A guest window over the frame, shown at the host's scale like a native
+/// window (WINE-GFX-10).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub id: u32,
+    /// Top-left corner in canvas coordinates, possibly outside the canvas.
+    pub at: (i32, i32),
+    pub size: (u32, u32),
+    /// True when its pixels changed since the shown image.
+    pub changed: bool,
+}
+
 /// One published frame, as the planner sees it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrameInfo {
@@ -48,6 +60,9 @@ pub struct FrameInfo {
     pub damage: Region,
     pub video: SmallVec<[VideoGeometry; 2]>,
     pub cursor_regions: SmallVec<[Rect; 2]>,
+    /// Bottom first.
+    #[serde(default)]
+    pub windows: SmallVec<[WindowGeometry; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -188,6 +203,7 @@ pub enum Source {
     Base,
     Pool(PoolId),
     Video(u64),
+    Window(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -243,6 +259,9 @@ pub struct Layers {
     pub solids: SmallVec<[(u64, Rect, [f32; 4]); 2]>,
     pub base: Layer,
     pub video: SmallVec<[(u64, Layer); 2]>,
+    /// Guest windows over the video, bottom first.
+    #[serde(default)]
+    pub windows: SmallVec<[(u32, Layer); 2]>,
     pub host: SmallVec<[HostLayer; 2]>,
     pub background: [f32; 3],
 }
@@ -529,6 +548,60 @@ fn tiles(
         rects: cover.rects().into_iter().map(Into::into).collect(),
     }
 }
+/// Window layers: each at one integer scale near the host's, the largest
+/// the view holds, so its pixels stay whole and crisp; its center over the
+/// point of the game it covers; inside the view.
+fn windows(
+    frame: &FrameInfo,
+    settings: &Settings,
+    panel: (u32, u32),
+    viewport: Rect,
+) -> SmallVec<[(u32, Layer); 2]> {
+    let fits = frame
+        .windows
+        .iter()
+        .map(|w| (panel.0 / w.size.0.max(1)).min(panel.1 / w.size.1.max(1)))
+        .min()
+        .unwrap_or(1);
+    let scale = (settings.scale.round() as u32).min(fits).max(1);
+    let center = |at: i32, size: u32, canvas: u32, origin: u32, length: u32| {
+        f64::from(origin)
+            + (f64::from(at) + f64::from(size) / 2.) * f64::from(length) / f64::from(canvas)
+    };
+    let place = |center: f64, size: u32, panel: u32| {
+        ((center - f64::from(size) / 2.).round().max(0.) as u32).min(panel.saturating_sub(size))
+    };
+    frame
+        .windows
+        .iter()
+        .map(|w| {
+            let (width, height) = (w.size.0 * scale, w.size.1 * scale);
+            let x = center(w.at.0, w.size.0, frame.canvas.0, viewport.x, viewport.w);
+            let y = center(w.at.1, w.size.1, frame.canvas.1, viewport.y, viewport.h);
+            let dst = Rect {
+                x: place(x, width, panel.0),
+                y: place(y, height, panel.1),
+                w: width,
+                h: height,
+            };
+            let layer = Layer {
+                source_uv: None,
+                source: Source::Window(w.id),
+                crop: whole(w.size),
+                dst: rotate(dst, panel, settings.rotation),
+                rotation: settings.rotation,
+                nearest: true,
+                damage: if w.changed {
+                    Region::whole(w.size)
+                } else {
+                    Region::empty(w.size)
+                },
+            };
+            (w.id, layer)
+        })
+        .collect()
+}
+
 /// Decide how to show a frame. `canvas` dimensions must be nonzero. Destinations
 /// are in panel pixels; crops and layer damage are in source-image coordinates.
 /// The caller acquires the named targets before executing any stage.
@@ -612,6 +685,7 @@ pub fn plan(
                 damage: damage.clone(),
             },
             video: SmallVec::new(),
+            windows: windows(frame, settings, panel, viewport),
             host: SmallVec::new(),
             background: settings.background,
         },

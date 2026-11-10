@@ -26,6 +26,7 @@ fn frame() -> FrameInfo {
         damage: all(),
         video: Default::default(),
         cursor_regions: Default::default(),
+        windows: Default::default(),
     }
 }
 fn settings() -> Settings {
@@ -388,6 +389,62 @@ fn video_layers_or_canvas_composition() {
     );
     assert_eq!(p.stages.len(), 1); // Decode merges into canvas composition.
     assert!(matches!(p.stages[0], Stage::Video { .. }));
+}
+
+// spec: WINE-GFX-10
+#[test]
+fn window_layers_keep_the_host_scale_over_any_viewport() {
+    let window = |id, at, size, changed| WindowGeometry {
+        id,
+        at,
+        size,
+        changed,
+    };
+    let mut f = frame();
+    // A dialog centered on the 320 × 240 canvas, a small one at its corner.
+    f.windows.push(window(5, (110, 90), (100, 60), true));
+    f.windows.push(window(6, (-4, 0), (20, 10), false));
+    let mut s = settings();
+    s.scale = 2.;
+    for (view, viewport) in [
+        ((640, 480), rect(0, 0, 640, 480)),
+        ((1000, 480), rect(180, 0, 640, 480)),
+    ] {
+        s.view = view;
+        let p = run(&f, &s, &caps(), &PoolState::default());
+        assert_eq!(p.layers.base.dst, viewport);
+        let [(5, dialog), (6, corner)] = &p.layers.windows[..] else {
+            panic!("two window layers")
+        };
+        // Twice its pixels, centered where the game shows its center.
+        assert_eq!(dialog.dst, rect(viewport.x + 220, 180, 200, 120));
+        assert_eq!(
+            (dialog.crop, dialog.source),
+            (rect(0, 0, 100, 60), Source::Window(5))
+        );
+        assert!(dialog.nearest && dialog.damage.is_whole());
+        // Kept inside the view, its damage empty while unchanged.
+        assert_eq!(corner.dst, rect(viewport.x.saturating_sub(8), 0, 40, 20));
+        assert!(corner.damage.is_empty());
+    }
+    // Fractional host scales round to whole window pixels; a view too small
+    // for that scale takes the largest that fits.
+    s.view = (640, 480);
+    s.scale = 2.6;
+    let p = run(&f, &s, &caps(), &PoolState::default());
+    assert_eq!(
+        (p.layers.windows[0].1.dst.w, p.layers.windows[0].1.dst.h),
+        (300, 180)
+    );
+    s.view = (250, 160);
+    let p = run(&f, &s, &caps(), &PoolState::default());
+    assert_eq!(
+        (p.layers.windows[0].1.dst.w, p.layers.windows[0].1.dst.h),
+        (200, 120)
+    );
+    // Windows never change the base plan.
+    let plain = run(&frame(), &s, &caps(), &PoolState::default());
+    assert_eq!((p.stages, p.layers.base), (plain.stages, plain.layers.base));
 }
 
 // spec: HOST-VIEW-7, HOST-VIEW-9

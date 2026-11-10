@@ -535,6 +535,9 @@ mod native {
                     for (id, _) in &layers.video {
                         self.surface(Some(LayerId::Video(*id)))?;
                     }
+                    for (id, _) in &layers.windows {
+                        self.surface(Some(LayerId::Window(*id)))?;
+                    }
                     for id in &layers.host {
                         self.surface(Some(LayerId::Host(*id)))?;
                     }
@@ -554,6 +557,9 @@ mod native {
             } else {
                 None
             };
+            // Windows go over the videos, host layers over the windows.
+            let windows = 3 + 2 * layers.video.len() as i32;
+            let host = windows + layers.windows.len() as i32;
             for surface in &mut self.surfaces {
                 let handle = surface.handle.as_ptr();
                 let (layer, visible, z) = match surface.id {
@@ -606,6 +612,14 @@ mod native {
                                 .map_or(0, |i| 2 + 2 * i as i32),
                         )
                     }
+                    Some(LayerId::Window(id)) => {
+                        let position = layers.windows.iter().position(|(w, _)| *w == id);
+                        (
+                            position.map(|i| &layers.windows[i].1),
+                            position.is_some(),
+                            position.map_or(0, |i| windows + i as i32),
+                        )
+                    }
                     Some(LayerId::Host(HostLayer::Damage)) => {
                         // ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT.
                         unsafe {
@@ -614,14 +628,10 @@ mod native {
                         (
                             damage_layer.as_ref(),
                             damage_layer.is_some(),
-                            3 + 2 * layers.video.len() as i32 + HostLayer::Damage as i32,
+                            host + HostLayer::Damage as i32,
                         )
                     }
-                    Some(LayerId::Host(id)) => (
-                        None,
-                        layers.host.contains(&id),
-                        2 + layers.video.len() as i32 + id as i32,
-                    ),
+                    Some(LayerId::Host(id)) => (None, layers.host.contains(&id), host + id as i32),
                 };
                 unsafe {
                     if visible != surface.visible {
@@ -634,6 +644,7 @@ mod native {
                             Some(
                                 LayerId::Video(_)
                                     | LayerId::VideoBackground(_)
+                                    | LayerId::Window(_)
                                     | LayerId::Host(HostLayer::Damage)
                             )
                         ) {
@@ -713,6 +724,9 @@ mod native {
                 let layer = match acquired.layer {
                     LayerId::Base => &layers.base,
                     LayerId::Video(id) => &layers.video.iter().find(|(v, _)| *v == id).unwrap().1,
+                    LayerId::Window(id) => {
+                        &layers.windows.iter().find(|(w, _)| *w == id).unwrap().1
+                    }
                     LayerId::VideoBackground(_) => unreachable!("solid layer has no image"),
                     LayerId::Host(HostLayer::Damage) => damage_layer.as_ref().unwrap(),
                     LayerId::Host(_) => panic!("host content is not implemented"),
@@ -754,6 +768,7 @@ mod native {
                         Some(
                             LayerId::Video(_)
                                 | LayerId::VideoBackground(_)
+                                | LayerId::Window(_)
                                 | LayerId::Host(HostLayer::Damage)
                         )
                     );

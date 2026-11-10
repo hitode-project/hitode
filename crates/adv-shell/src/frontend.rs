@@ -316,6 +316,7 @@ impl Ui {
         let event = match event {
             Delivery::Input(
                 event @ (window::Event::Input { .. }
+                | window::Event::WindowInput { .. }
                 | window::Event::Menu(_)
                 | window::Event::Dialog(_)
                 | window::Event::Text(..)),
@@ -370,6 +371,12 @@ impl Ui {
                         update_keys(&self.keys, *message, *wparam, *lparam);
                     }
                 }
+                window::Event::WindowInput {
+                    message,
+                    wparam,
+                    lparam,
+                    ..
+                } => update_keys(&self.keys, *message, *wparam, *lparam),
                 window::Event::FocusLost | window::Event::Close => self.keys.release_all(),
                 window::Event::Repaint => {
                     repaint = true;
@@ -442,10 +449,7 @@ impl Ui {
 
         if self.native.is_some() {
             let dimensions = window.native_client_size()?;
-            #[cfg(target_vendor = "apple")]
             let scale = window.native_scale();
-            #[cfg(target_os = "android")]
-            let scale = 1.;
             while let Some(feedback) = self.native.as_mut().unwrap().poll()? {
                 let completed = match feedback {
                     crate::display::Feedback::Statistics(stats) => {
@@ -462,6 +466,7 @@ impl Ui {
                 self.metric(Delivery::Native(completed.stats));
                 window.native_canvas(completed.canvas)?;
                 window.place(Some(completed.placement));
+                window.place_windows(completed.windows);
                 window.set_video_cursor_regions(completed.cursor_regions);
                 let now = Instant::now();
                 while self

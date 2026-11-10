@@ -122,10 +122,12 @@ pub(crate) enum Command {
         damage: crate::frame::Region,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
+        windows: Arc<[crate::frame::WindowLayer]>,
     },
     Present {
         base: crate::frame::Base,
         video: Arc<[crate::frame::VideoPlane]>,
+        windows: Arc<[crate::frame::WindowLayer]>,
         serial: u64,
     },
 }

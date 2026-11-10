@@ -83,6 +83,7 @@ impl Slots {
         whole: bool,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
+        windows: Arc<[crate::frame::WindowLayer]>,
     ) -> Result<u64, String> {
         for entry in &mut self.entries {
             entry.debt.union(&damage);
@@ -137,6 +138,7 @@ impl Slots {
                 damage,
             },
             video,
+            windows,
             serial,
         });
         Ok(copied)
@@ -256,6 +258,7 @@ mod tests {
                     frame == 3,
                     frame as u64,
                     Arc::from([]),
+                    Arc::from([]),
                 )
                 .unwrap();
             let (slot, _, _, damage) = take(&consumer);
@@ -312,6 +315,7 @@ mod tests {
                     serial == 0,
                     serial,
                     Arc::from([]),
+                    Arc::from([]),
                 )
                 .unwrap();
             let (slot, _, palette, _) = take(&consumer);
@@ -333,7 +337,8 @@ mod tests {
                     Region::empty((s.width, s.height)),
                     false,
                     3,
-                    Arc::from([])
+                    Arc::from([]),
+                    Arc::from([]),
                 )
                 .unwrap(),
             0
@@ -369,6 +374,7 @@ mod tests {
                     false,
                     serial,
                     Arc::from([]),
+                    Arc::from([]),
                 )
                 .unwrap();
             held.push(take(&consumer).0);
@@ -384,6 +390,7 @@ mod tests {
                     Region::whole((s.width, s.height)),
                     false,
                     3,
+                    Arc::from([]),
                     Arc::from([]),
                 )
                 .unwrap();

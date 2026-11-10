@@ -27,12 +27,13 @@ pub const MODULE: &str = "wineadv.drv";
 /// `WINE_GDI_DRIVER_VERSION` of the vendored Wine.
 const VERSION: u32 = 108;
 /// Offsets in `struct user_driver_funcs` (i386), which is 604 bytes.
-const FUNCS: [(u32, &str); 7] = [
+const FUNCS: [(u32, &str); 8] = [
     (468, "UpdateDisplayDevices"),
     (476, "CreateWindow"),
     (484, "DestroyWindow"),
     (496, "ProcessEvents"),
     (512, "SetDesktopWindow"),
+    (536, "SetWindowStyle"),
     (572, "CreateWindowSurface"),
     (580, "WindowPosChanged"),
 ];
@@ -41,7 +42,10 @@ const SURFACE_FUNCS: u32 = 1024;
 /// Rectangles in `struct window_rects`: window, client, visible.
 const CLIENT_RECT: u32 = 16;
 const VISIBLE_RECT: u32 = 32;
+const SWP_NOZORDER: u32 = 0x4;
 const SWP_NOACTIVATE: u32 = 0x10;
+const HWND_BOTTOM: u32 = 1;
+const GWL_STYLE: u32 = -16i32 as u32;
 const SWP_SHOWWINDOW: u32 = 0x40;
 const SWP_HIDEWINDOW: u32 = 0x80;
 const DESKTOP_CLASS_ATOM: u32 = 32769;
@@ -61,6 +65,8 @@ pub struct Window {
     /// Client origin on screen for top-level windows.
     pub origin: (i32, i32),
     parent: u32,
+    /// A top-level window's style.
+    style: u32,
     /// The guest context that owns the window.
     context: adv_machine::CtxId,
 }
@@ -68,6 +74,32 @@ pub struct Window {
 /// The windows win32u reported, by handle.
 #[derive(Default)]
 struct Windows(HashMap<u32, Window>);
+
+/// Top-level windows in z-order, front first, as `WindowPosChanged` placed them.
+#[derive(Default)]
+struct Order(Vec<u32>);
+
+impl Order {
+    /// Place `hwnd` after `insert_after`, as SetWindowPos does. A window
+    /// first seen goes to the front, where Wine links a new window.
+    fn place(&mut self, hwnd: u32, insert_after: u32, flags: u32) {
+        let known = self.0.contains(&hwnd);
+        if known && flags & SWP_NOZORDER != 0 {
+            return;
+        }
+        self.0.retain(|&window| window != hwnd);
+        let at = match insert_after {
+            _ if !known && flags & SWP_NOZORDER != 0 => 0,
+            HWND_BOTTOM => self.0.len(),
+            after => self
+                .0
+                .iter()
+                .position(|&window| window == after)
+                .map_or(0, |at| at + 1),
+        };
+        self.0.insert(at, hwnd);
+    }
+}
 
 /// The guest copy of the driver's function table.
 struct Funcs(u32);
@@ -98,6 +130,10 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add(MODULE, "DestroyWindow", Conv::Cdecl { argc: 1 }, |env| {
         let hwnd = env.arg(0);
         env.ext.get_or_default::<Windows>().0.remove(&hwnd);
+        env.ext
+            .get_or_default::<Order>()
+            .0
+            .retain(|&window| window != hwnd);
         project::forget(env.ext, hwnd);
         Outcome::Return(0)
     });
@@ -113,6 +149,32 @@ pub(super) fn register(registry: &mut Registry) {
         Conv::Cdecl { argc: 6 },
         position_changed,
     );
+    registry.add(
+        MODULE,
+        "SetWindowStyle",
+        Conv::Cdecl { argc: 3 },
+        style_changed,
+    );
+}
+
+/// SetWindowStyle(hwnd, offset, STYLESTRUCT *): enabling or disabling a
+/// window can hand over the base (WINE-GFX-10).
+fn style_changed(env: &mut Env<'_>) -> Outcome {
+    let (hwnd, offset, style) = (env.arg(0), env.arg(1), env.arg(2));
+    if offset != GWL_STYLE {
+        return Outcome::Return(0);
+    }
+    let Ok(new) = env.cpu.read_u32(style + 4) else {
+        return Outcome::Fail("user driver: unreadable STYLESTRUCT".into());
+    };
+    let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) else {
+        return Outcome::Return(0);
+    };
+    window.style = new;
+    match surface::compose(env, None) {
+        Ok(()) => Outcome::Return(0),
+        Err(error) => Outcome::Fail(error),
+    }
 }
 
 /// Write the function table and build the driver's image.
@@ -291,7 +353,7 @@ fn read_rect(env: &Env<'_>, at: u32) -> Result<[i32; 4], String> {
 
 /// WindowPosChanged(hwnd, insert_after, owner_hint, swp_flags, rects, surface).
 fn position_changed(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, flags, rects) = (env.arg(0), env.arg(3), env.arg(4));
+    let (hwnd, insert_after, flags, rects) = (env.arg(0), env.arg(1), env.arg(3), env.arg(4));
     if is_desktop(env, hwnd) {
         return Outcome::Return(0);
     }
@@ -315,10 +377,15 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     }
     if flags & SWP_HIDEWINDOW != 0 {
         window.visible = false;
+        project::hidden(env.ext, hwnd);
     }
     let user32 = adv_nt::process::module_base(env.cpu, env.sys.peb, "user32.dll");
     let target = |name| user32.and_then(|base| adv_nt::process::module_export(env.cpu, base, name));
-    let (Some(origin), Some(parent)) = (target("ClientToScreen"), target("GetAncestor")) else {
+    let (Some(origin), Some(parent), Some(long)) = (
+        target("ClientToScreen"),
+        target("GetAncestor"),
+        target("GetWindowLongW"),
+    ) else {
         return Outcome::Fail("user driver: missing window geometry exports".into());
     };
     let scratch = match crate::slot(env) {
@@ -340,11 +407,28 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
             let window = env.ext.get_mut::<Windows>().0.get_mut(&hwnd).unwrap();
             window.origin = point;
             window.parent = parent;
-            if flags & SWP_SHOWWINDOW != 0 {
-                project::shown(env, hwnd)
-            } else {
-                Outcome::Return(0)
+            let shown = move |env: &mut Env<'_>| {
+                if flags & SWP_SHOWWINDOW != 0 {
+                    project::shown(env, hwnd)
+                } else {
+                    Outcome::Return(0)
+                }
+            };
+            if parent != 0 {
+                return shown(env);
             }
+            env.ext
+                .get_or_default::<Order>()
+                .place(hwnd, insert_after, flags);
+            Outcome::call(long, [hwnd, GWL_STYLE], move |env, style| {
+                if let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) {
+                    window.style = style.value();
+                }
+                if let Err(error) = surface::compose(env, None) {
+                    return Outcome::Fail(error);
+                }
+                shown(env)
+            })
         })
     })
 }

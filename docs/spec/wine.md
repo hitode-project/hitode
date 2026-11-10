@@ -248,6 +248,16 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 **Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts. An ended thread's stack MUST leave the process's allocations, so that later allocations of its range succeed.
 **Verification**: Test
 
+When importing extended x86 context registers, reserved x87 control-word bits
+are ignored. The supported fields restore without changing the current reserved bits.
+
+### NT-PROC-4 Thread creation at capacity
+
+**Rule**: Live thread slots MUST fit inside the reserved TEB area. Exhausting those slots MUST return `STATUS_NO_MEMORY` without creating a server thread. Failed thread creation MUST release any thread resources it acquired.
+**Verification**: Test
+
+> Note: The macOS, iOS and Android launchers raise their soft descriptor limit to cover the server's thread pipes. The target is 1024, capped by the inherited hard limit.
+
 ### NT-PROC-3 Jobs and completions
 
 **Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.
@@ -279,6 +289,12 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 **Rule**: Fixed system stubs MUST retain Wine 11.0 statuses and output writes. Syscall-table stubs MUST raise Wine's noncontinuable stub exception. Unsupported LDT updates MUST return `STATUS_NOT_IMPLEMENTED`.
 **Verification**: Review — the implementations are compared with Wine's Unix sources and syscall stub table.
+
+### NT-SYS-6 Exception stack exhaustion
+
+**Rule**: Exception delivery MUST stop with a terminal guest stack overflow when its frame would cross the guard at the bottom of the thread stack. The failure MUST identify the exception that required the frame.
+**Verification**: Review — the frame boundary is checked before any guest stack write.
+**Basis**: Wine 11.0 `virtual_setup_exception` aborts when the exception frame reaches the last stack page.
 
 ## Unix libraries
 
@@ -511,7 +527,7 @@ D3DX checks an admitted CRT entry against the exact relocated bytes saved at bin
 
 ### WINE-GFX-4 Window surfaces
 
-**Rule**: The driver MUST give each window except the desktop a window surface over pixels it owns, wrapped by `NtGdiDdDDICreateDCFromMemory`. A flush of a visible window MUST present the window's part of those pixels without copying them.
+**Rule**: The driver MUST give each window except the desktop a window surface over pixels it owns, wrapped by `NtGdiDdDDICreateDCFromMemory`. A flush of the base window MUST present its content in those pixels without copying them; other windows follow WINE-GFX-10.
 **Verification**: Test
 
 ### WINE-GFX-5 In-process desktop
@@ -540,11 +556,18 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 **Rule**: The driver MUST report one 2560x1440 monitor, so win32u never clamps a framed 1920x1080 game window. The mode list MUST include it. Its work area MUST leave out a 40-pixel taskbar at the bottom.
 **Verification**: Test
 
+### WINE-GFX-10 Window planes
+
+**Rule**: The largest shown top-level window MUST be the base, whose frames come from its front while one presents it, else from its surface. Other shown windows in front of it MUST show over it in z-order, each its own layer at a whole scale near native windows'. A plane that appears, moves, changes or goes away MUST show the base beneath again without a guest draw.
+**Verification**: Test
+
+Owners and show order do not choose the base. Toolkits own every window by one hidden application window, and a startup window may show first. The current base wins a tie. A window becomes the base once it has been drawn; hiding or minimizing the base hands it to the next largest window at once. A modal window disables the windows it stands over, as `DialogBox` and toolkit modal forms do. While a shown window is disabled, only a disabled window can be the base. A settings form larger than its main window thus stays a plane. A front is a Direct3D 9 device or a DirectDraw object; while it lives, its window's surface flushes do not replace its frames, as a windowed Direct3D present covers the window's content. Natively projected and minimized windows are neither base nor planes. A plane is a window's whole surface at its screen position relative to the base window's content. Frames carry the planes beside the base, never inside it. The host centers each on the game point it covers, at the whole scale nearest its own, with nearest sampling. Resizing the host moves a plane without scaling it. Captures draw the planes at their guest positions. A frame carrying only changed planes presents again while the guest presents nothing. A plane outside the base window's content is moved into it with `SetWindowPos`, as a window manager keeps windows on screen.
+
 ## Input
 
 ### WINE-IN-1 Presented window coordinates
 
-**Rule**: Host mouse points MUST map to screen coordinates through the origin of the last presented window's content. Every presenter's frames carry only that content; the host shows caption, frame and menu bar natively.
+**Rule**: A host point on a plane's layer MUST reach that plane's window at the pixel shown, and a press keeps its window until release. Other host points MUST reach the base window, and scripted points the window under them, through the last presented content's origin (WINE-GFX-10). Every presenter's frames carry only that content, while the host shows caption, frame and menu bar natively.
 **Verification**: Test
 
 ### WINE-IN-2 Hardware input
@@ -561,7 +584,7 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 
 ### WINE-UI-1 Native popup presentation
 
-**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively relative to the presented window's content, without presenting frames. Their completion tokens MUST become inactive when tracking ends.
+**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively over their owner's plane layer (WINE-GFX-10) or the presented content, without presenting frames. Text dropdown lists MUST project natively without replacing the owner's frame. Completion tokens MUST become inactive when tracking ends.
 **Verification**: Test
 
 ### WINE-UI-2 Popup input

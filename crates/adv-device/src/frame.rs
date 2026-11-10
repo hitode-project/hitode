@@ -17,7 +17,26 @@ pub struct Frame {
     pub base: Base,
     /// Decoded pictures and their canvas geometry.
     pub video: Arc<[VideoPlane]>,
+    /// Guest windows over everything else, bottom first (WINE-GFX-10).
+    pub windows: Arc<[WindowLayer]>,
     pub published_at: Instant,
+}
+
+/// A guest window shown over the frame as a layer of its own, as a native
+/// window shows over the game: the host draws it at its own scale, never
+/// through the base's scaling (WINE-GFX-10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowLayer {
+    /// The guest window; host input on the layer goes to it.
+    pub id: u32,
+    /// Top-left corner in canvas pixels, possibly outside the canvas.
+    pub at: (i32, i32),
+    pub width: u32,
+    pub height: u32,
+    /// Top-down `Bgra32` rows of `width * 4` bytes.
+    pub pixels: Arc<[u8]>,
+    /// Changes whenever `pixels` do.
+    pub version: u64,
 }
 
 pub use crate::surface::PixelFormat;

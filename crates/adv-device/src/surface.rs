@@ -11,6 +11,8 @@ use convert::{BLACK_PALETTE, decode_pixel};
 mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
+mod planes;
+pub use planes::Plane;
 #[cfg(feature = "gpu")]
 pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};
@@ -190,6 +192,7 @@ impl PendingFrame {
         serial: u64,
         history: &DamageHistory,
         damage: &Region,
+        planes: &[Plane],
     ) -> Result<u64, String> {
         let full = surface.rect();
         let pitch = surface.pitch;
@@ -219,22 +222,18 @@ impl PendingFrame {
         let output = Arc::get_mut(&mut self.pixels).unwrap();
         output.resize((pitch * surface.height) as usize, 0);
         let mut copied = 0;
+        let row = |y: u32| y as usize * pitch as usize..(y as usize + 1) * pitch as usize;
         for r in rects(&regions) {
-            let start = surface.format.byte_offset(r.x) as usize;
-            let n = surface.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
-                let src = memory.read(surface.row(0, y) + start as u32, n)?;
-                let dst = y as usize * pitch as usize + start;
-                output[dst..dst + n].copy_from_slice(src.as_ref());
-                copied += n as u64;
+                copied += planes::compose_row(surface, planes, memory, y, r, &mut output[row(y)])?;
             }
         }
         if verify_software() {
+            let mut expected = vec![0; pitch as usize];
             for y in 0..surface.height {
                 let n = surface.format.row_bytes(surface.width) as usize;
-                let src = memory.read(surface.row(0, y), n)?;
-                let at = y as usize * pitch as usize;
-                if output[at..at + n] != *src {
+                planes::compose_row(surface, planes, memory, y, full, &mut expected)?;
+                if output[row(y)][..n] != expected[..n] {
                     return Err("incremental software slot differs from full storage".into());
                 }
             }
@@ -1252,6 +1251,16 @@ type NativeVideo = (
     (u32, u32),
     Arc<[crate::frame::VideoPlane]>,
 );
+/// The planes' pixels as last read, positioned in the base window.
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct Windows {
+    layers: Arc<[crate::frame::WindowLayer]>,
+    /// No frame carried `layers` yet.
+    unshown: bool,
+    /// The last version a read gave.
+    version: u64,
+}
 pub struct Surfaces<P: Presenter> {
     pub presenter: P,
     pub milestones: Option<Arc<crate::Milestones>>,
@@ -1267,6 +1276,8 @@ pub struct Surfaces<P: Presenter> {
     /// The native surface last presented, when it is the current base.
     #[cfg(feature = "gpu")]
     native_source: Option<u32>,
+    #[cfg(feature = "gpu")]
+    windows: Windows,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
     pub width: u32,
@@ -1289,6 +1300,14 @@ pub struct Surfaces<P: Presenter> {
     pending_frame: Option<PendingFrame>,
     retained_frame: Option<PendingFrame>,
     video_layers: Arc<[(u64, VideoLayer)]>,
+    /// Windows shown over the base, bottom first, and the base window's size
+    /// they are placed in.
+    planes: Vec<Plane>,
+    plane_canvas: (u32, u32),
+    /// Base pixels that planes changed, exposed or covered since the last
+    /// publication. Plane pixels are not base memory, so this damage is never
+    /// refined against it.
+    plane_damage: Vec<Rect>,
     captured_serial: u64,
     conversion: Snapshot,
     blit_row: Vec<u8>,
@@ -1347,6 +1366,8 @@ impl<P: Presenter> Surfaces<P> {
             native_video: (Arc::from([]), (0, 0), Arc::from([])),
             #[cfg(feature = "gpu")]
             native_source: None,
+            #[cfg(feature = "gpu")]
+            windows: Windows::default(),
             stats: GraphicsStats::default(),
             width,
             height,
@@ -1365,6 +1386,9 @@ impl<P: Presenter> Surfaces<P> {
             pending_frame: None,
             retained_frame: None,
             video_layers: Arc::from([]),
+            planes: Vec::new(),
+            plane_canvas: (0, 0),
+            plane_damage: Vec::new(),
             captured_serial: 0,
             conversion: Snapshot::default(),
             blit_row: Vec::new(),
@@ -1609,6 +1633,171 @@ impl<P: Presenter> Surfaces<P> {
         Ok(serial)
     }
 
+    /// Record `planes` over the base, bottom first, with `damage` drawn
+    /// inside them, in pixels of a base window of `extent` (WINE-GFX-10).
+    /// [`Self::present_planes`] shows what changed.
+    pub fn set_planes(
+        &mut self,
+        planes: Vec<Plane>,
+        damage: &[Rect],
+        extent: (u32, u32),
+        m: &dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        self.record_windows(&planes, damage, m)?;
+        #[cfg(not(feature = "gpu"))]
+        {
+            // Without a host compositor, publications compose the planes.
+            let _ = m;
+            let full = Rect {
+                x: 0,
+                y: 0,
+                w: extent.0,
+                h: extent.1,
+            };
+            let moved = |from: &[Plane], to: &[Plane]| {
+                from.iter()
+                    .enumerate()
+                    .filter(|&(i, plane)| to.get(i) != Some(plane))
+                    .map(|(_, plane)| plane.visible(extent))
+                    .collect::<Vec<_>>()
+            };
+            let mut changed = moved(&self.planes, &planes);
+            changed.extend(moved(&planes, &self.planes));
+            changed.extend(damage.iter().map(|r| r.clipped(full)));
+            changed.retain(|r| !r.empty());
+            self.plane_damage.extend(changed);
+        }
+        self.planes = planes;
+        self.plane_canvas = extent;
+        Ok(())
+    }
+
+    /// Read the pixels of planes that are new, moved or inside `damage`;
+    /// the others keep their layers.
+    #[cfg(feature = "gpu")]
+    fn record_windows(
+        &mut self,
+        planes: &[Plane],
+        damage: &[Rect],
+        m: &dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        let drawn = |p: &Plane| {
+            damage.iter().any(|r| {
+                let (x, y) = (i64::from(r.x), i64::from(r.y));
+                x < i64::from(p.x) + i64::from(p.width)
+                    && i64::from(p.x) < x + i64::from(r.w)
+                    && y < i64::from(p.y) + i64::from(p.height)
+                    && i64::from(p.y) < y + i64::from(r.h)
+            })
+        };
+        let shown = &self.windows.layers;
+        let mut windows = Vec::with_capacity(planes.len());
+        for plane in planes {
+            let kept = shown
+                .iter()
+                .find(|w| w.id == plane.id)
+                .filter(|_| self.planes.contains(plane) && !drawn(plane));
+            windows.push(match kept {
+                Some(window) => window.clone(),
+                None => {
+                    let row = plane.width as usize * 4;
+                    let mut pixels = Vec::with_capacity(row * plane.height as usize);
+                    for y in 0..plane.height {
+                        pixels.extend_from_slice(&m.read(plane.pixels + y * plane.pitch, row)?);
+                    }
+                    self.stats.copied_bytes += pixels.len() as u64;
+                    self.windows.version += 1;
+                    crate::frame::WindowLayer {
+                        id: plane.id,
+                        at: (plane.x, plane.y),
+                        width: plane.width,
+                        height: plane.height,
+                        pixels: pixels.into(),
+                        version: self.windows.version,
+                    }
+                }
+            });
+        }
+        let key = |w: &crate::frame::WindowLayer| (w.id, w.at, w.version);
+        if !windows
+            .iter()
+            .map(key)
+            .eq(self.windows.layers.iter().map(key))
+        {
+            self.windows.layers = windows.into();
+            self.windows.unshown = true;
+        }
+        Ok(())
+    }
+
+    /// The windows positioned in a base of `canvas` pixels, as frames carry
+    /// them: a back buffer of another size than its window moves them too.
+    #[cfg(feature = "gpu")]
+    fn window_layers(&mut self, canvas: (u32, u32)) -> Arc<[crate::frame::WindowLayer]> {
+        self.windows.unshown = false;
+        let windows = &self.windows.layers;
+        let extent = self.plane_canvas;
+        if canvas == extent || windows.is_empty() {
+            return windows.clone();
+        }
+        let scale = |at: i32, to: u32, from: u32| {
+            (i64::from(at) * i64::from(to) / i64::from(from.max(1))) as i32
+        };
+        windows
+            .iter()
+            .map(|w| crate::frame::WindowLayer {
+                at: (
+                    scale(w.at.0, canvas.0, extent.0),
+                    scale(w.at.1, canvas.1, extent.1),
+                ),
+                ..w.clone()
+            })
+            .collect()
+    }
+
+    /// Present recorded plane changes that no publication carried yet, over
+    /// the base that shows (WINE-GFX-10).
+    pub fn present_planes(&mut self, context: u32, m: &dyn SurfaceMemory) -> Result<(), String> {
+        #[cfg(feature = "gpu")]
+        {
+            let _ = context;
+            // A pending software flush carries them.
+            if !self.windows.unshown || self.software_pending.is_some() {
+                return Ok(());
+            }
+            let serial = self
+                .stats
+                .presentations
+                .checked_add(1)
+                .ok_or("presentation serial exhausted")?;
+            if self.republish(m, serial, false)? {
+                self.stats.presentations = serial;
+                // A software base publishes again.
+                self.stats.published_frames += u64::from(self.native_source.is_none());
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let base = self
+                .software_pending
+                .as_ref()
+                .map(|pending| pending.source)
+                .or(self.software_source)
+                .filter(|id| self.surfaces.contains_key(id));
+            match base {
+                Some(base) if !self.plane_damage.is_empty() => {
+                    self.present_from(context, base, m, Rect::default())
+                }
+                _ => {
+                    self.plane_damage.clear();
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Pin pixels and overlay metadata together for an explicit capture.
     pub fn latest_frame(&self) -> Option<&PendingFrame> {
         self.frame_mailbox
@@ -1844,7 +2033,7 @@ impl<P: Presenter> Surfaces<P> {
         }
         let full = self.surfaces[&id].rect();
         let damage = damage.clipped(full);
-        if damage.empty() {
+        if damage.empty() && self.plane_damage.is_empty() {
             self.stats.empty_damage += 1;
         } else if self.frame_mailbox.is_some() {
             if self
@@ -1861,7 +2050,9 @@ impl<P: Presenter> Surfaces<P> {
                 damage: Region::empty((full.w, full.h)),
             });
             pending.writer = context;
-            pending.damage.add(damage.into());
+            if !damage.empty() {
+                pending.damage.add(damage.into());
+            }
         } else {
             return self.publish_software(id, m, region((full.w, full.h), damage));
         }
@@ -1930,12 +2121,15 @@ impl<P: Presenter> Surfaces<P> {
             self.damage_history.clear();
         }
         let frame_pixels = u64::from(s.width) * u64::from(s.height);
-        let damage = match latest {
+        let mut damage = match latest {
             Some(previous) if !reset => {
                 refine_damage(s, m, &previous.pixels, previous.pitch, &damage)?
             }
             _ => damage,
         };
+        for r in self.plane_damage.drain(..) {
+            damage.add(r.into());
+        }
         if damage.is_empty() {
             self.stats.empty_damage += 1;
             return Ok(());
@@ -1959,6 +2153,7 @@ impl<P: Presenter> Surfaces<P> {
                     self.stats.presentations,
                     &self.damage_history,
                     &damage,
+                    &self.planes,
                 )?;
                 frame.video = self.video_layers.clone();
                 self.retained_frame = Some(frame.clone());
@@ -1989,6 +2184,7 @@ impl<P: Presenter> Surfaces<P> {
                 self.stats.presentations,
                 &self.damage_history,
                 &damage,
+                &self.planes,
             )?;
             frame.video = self.video_layers.clone();
             self.retained_frame = Some(frame.clone());
@@ -2036,12 +2232,14 @@ impl<P: Presenter> Surfaces<P> {
                 &damage,
             )?
         };
-        if damage.is_empty() {
+        if damage.is_empty() && !self.windows.unshown {
             self.stats.empty_damage += 1;
             return Ok(());
         }
         let serial = self.stats.presentations + 1;
-        let video = self.native_video((s.width, s.height));
+        let extent = (s.width, s.height);
+        let video = self.native_video(extent);
+        let windows = self.window_layers(extent);
         let s = &self.surfaces[&id];
         let damaged = area(&damage);
         self.stats.copied_bytes += self.gpu.publish_software(
@@ -2052,6 +2250,7 @@ impl<P: Presenter> Surfaces<P> {
             whole,
             serial,
             video,
+            windows,
         )?;
         self.software_video = Some(self.video_layers.clone());
         self.software_source = Some(id);
@@ -2162,11 +2361,13 @@ impl<P: Presenter> Surfaces<P> {
             .filter(|_| self.native_source == Some(id))
             .unwrap_or_else(|| Region::whole(extent));
         let video = self.native_video(extent);
+        let windows = self.window_layers(extent);
         gpu.present(
             &self.native_surfaces[&id].target.image,
             damage,
             serial,
             video,
+            windows,
         )
         .map_err(|error| error.to_string())?;
         self.software_source = None;
@@ -2186,16 +2387,11 @@ impl<P: Presenter> Surfaces<P> {
         planes.clone()
     }
 
-    /// Show changed video layers over the unchanged native base. A layer that
+    /// Show changed video layers over the unchanged base. A layer that
     /// moved, appeared or went away redraws the base beneath it.
     #[cfg(feature = "gpu")]
     fn present_video(&mut self, m: &dyn SurfaceMemory, serial: u64) -> Result<(), String> {
-        let extent = if let Some(id) = self.native_source {
-            let image = &self.native_surfaces[&id].target.image;
-            (image.width(), image.height())
-        } else if let Some(id) = self.software_source {
-            (self.surfaces[&id].width, self.surfaces[&id].height)
-        } else {
+        let Some(extent) = self.base_extent() else {
             return Ok(());
         };
         let before = self.native_video.2.clone();
@@ -2205,27 +2401,51 @@ impl<P: Presenter> Surfaces<P> {
                 .iter()
                 .zip(video.iter())
                 .any(|(a, b)| a.id != b.id || a.geometry != b.geometry);
+        self.republish(m, serial, whole).map(drop)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn base_extent(&self) -> Option<(u32, u32)> {
         if let Some(id) = self.native_source {
-            let damage = if whole {
-                Region::whole(extent)
-            } else {
-                Region::empty(extent)
-            };
+            let image = &self.native_surfaces[&id].target.image;
+            Some((image.width(), image.height()))
+        } else {
+            let s = &self.surfaces[&self.software_source?];
+            Some((s.width, s.height))
+        }
+    }
+
+    /// Present the base that shows again with the current layers over it,
+    /// all of it changed when `whole`. Returns whether a base shows.
+    #[cfg(feature = "gpu")]
+    fn republish(
+        &mut self,
+        m: &dyn SurfaceMemory,
+        serial: u64,
+        whole: bool,
+    ) -> Result<bool, String> {
+        let Some(extent) = self.base_extent() else {
+            return Ok(false);
+        };
+        let damage = if whole {
+            Region::whole(extent)
+        } else {
+            Region::empty(extent)
+        };
+        let video = self.native_video(extent);
+        let windows = self.window_layers(extent);
+        if let Some(id) = self.native_source {
             self.gpu
                 .present(
                     &self.native_surfaces[&id].target.image,
                     damage,
                     serial,
                     video,
+                    windows,
                 )
                 .map_err(|error| error.to_string())?;
         } else if let Some(id) = self.software_source {
             let s = &self.surfaces[&id];
-            let damage = if whole {
-                Region::whole((s.width, s.height))
-            } else {
-                Region::empty((s.width, s.height))
-            };
             self.stats.copied_bytes += self.gpu.publish_software(
                 self.software_slots.get_mut(&id).unwrap(),
                 s,
@@ -2234,10 +2454,11 @@ impl<P: Presenter> Surfaces<P> {
                 whole,
                 serial,
                 video,
+                windows,
             )?;
             self.software_video = Some(self.video_layers.clone());
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Request an explicit diagnostic transfer of a native surface.

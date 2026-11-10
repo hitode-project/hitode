@@ -181,6 +181,7 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
             memory,
             window: |_, _, _| None,
             completed: |_, _| None,
+            released: |_| {},
         },
     )
     .unwrap();

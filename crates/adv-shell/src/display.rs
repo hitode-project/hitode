@@ -21,6 +21,14 @@ pub(crate) struct Placement {
     pub rectangle: [f32; 4],
     pub nearest: bool,
 }
+/// Where the view shows a guest window, in view pixels, and its size in
+/// window pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WindowLayer {
+    pub id: u32,
+    pub rectangle: [f32; 4],
+    pub size: (u32, u32),
+}
 struct Mailbox {
     settings: plan::Settings,
     dirty: bool,
@@ -68,6 +76,7 @@ pub(crate) struct Presented {
     pub serial: u64,
     pub canvas: (u32, u32),
     pub placement: Placement,
+    pub windows: Arc<[WindowLayer]>,
     pub cursor_regions: Arc<[adv_runtime::VideoCursorRegion]>,
     pub elapsed: Duration,
     pub at: Instant,
@@ -371,7 +380,27 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
         damage: changed,
         video: Default::default(),
         cursor_regions: Default::default(),
+        windows: frame
+            .windows
+            .iter()
+            .map(|w| plan::WindowGeometry {
+                id: w.id,
+                at: w.at,
+                size: (w.width, w.height),
+                changed: false,
+            })
+            .collect(),
     };
+    let windows = frame
+        .windows
+        .iter()
+        .map(|w| adv_display::windows::Window {
+            id: w.id,
+            size: (w.width, w.height),
+            pixels: w.pixels.clone(),
+            version: w.version,
+        })
+        .collect();
     let video = frame
         .video
         .iter()
@@ -410,6 +439,7 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
             info,
             base,
             video,
+            windows,
             published_at: frame.published_at,
             on_read: None,
         },
@@ -466,6 +496,15 @@ impl Presenter {
                     ],
                     nearest: p.nearest,
                 },
+                windows: p
+                    .windows
+                    .iter()
+                    .map(|&(id, r, size)| WindowLayer {
+                        id,
+                        rectangle: [r.x as f32, r.y as f32, r.w as f32, r.h as f32],
+                        size,
+                    })
+                    .collect(),
                 cursor_regions: p
                     .cursor_regions
                     .into_iter()
@@ -711,6 +750,7 @@ mod tests {
                     rectangle: [10., 20., 640., 480.],
                     nearest: true,
                 },
+                windows: Arc::from([]),
                 cursor_regions: Arc::from([adv_runtime::VideoCursorRegion {
                     rectangle: adv_device::surface::Rect {
                         x: 2,
@@ -763,6 +803,7 @@ mod tests {
                     damage: frame::Region::whole((2, 2)),
                 },
                 video: Arc::from([]),
+                windows: Arc::from([]),
                 published_at: Instant::now(),
             });
             assert_eq!(mapped.info.canvas, (2, 2));
@@ -807,6 +848,7 @@ mod tests {
                     ready: adv_gpu::Token(7),
                 },
                 video: Arc::from([]),
+                windows: Arc::from([]),
                 published_at: Instant::now(),
             });
             assert_eq!(mapped.info.base, plan::BaseKind::Gpu { presentable });
@@ -865,6 +907,7 @@ mod tests {
                     damage: frame::Region::empty((8, 8)),
                 },
                 video: Arc::clone(&video),
+                windows: Arc::from([]),
                 published_at: Instant::now(),
             });
             assert_eq!(mapped.info.video[0].changed, changed);

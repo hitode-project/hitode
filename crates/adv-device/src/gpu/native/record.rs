@@ -734,6 +734,7 @@ impl Gpu {
         damage: Region,
         serial: u64,
         video: std::sync::Arc<[crate::frame::VideoPlane]>,
+        windows: std::sync::Arc<[crate::frame::WindowLayer]>,
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
@@ -742,6 +743,7 @@ impl Gpu {
             damage,
             serial,
             video,
+            windows,
         });
         self.check()
     }

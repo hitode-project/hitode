@@ -67,13 +67,31 @@ impl SurfaceCapture {
         while self.published < surfaces.stats.published_frames {
             let frame = source.get(source.reserve());
             let pixels = &frame.pixels;
+            // The guest's own screen: its windows over the frame.
+            let mut bgra = pixels.bgra.clone();
+            for window in frame.windows.iter() {
+                for row in 0..window.height as i32 {
+                    let y = window.at.1 + row;
+                    if !(0..pixels.height as i32).contains(&y) {
+                        continue;
+                    }
+                    for column in 0..window.width as i32 {
+                        let x = window.at.0 + column;
+                        if (0..pixels.width as i32).contains(&x) {
+                            let from = (row * window.width as i32 + column) as usize * 4;
+                            let to = (y * pixels.width as i32 + x) as usize * 4;
+                            bgra[to..to + 4].copy_from_slice(&window.pixels[from..from + 4]);
+                        }
+                    }
+                }
+            }
             crate::surface::Presenter::present(
                 &mut surfaces.presenter,
                 crate::surface::FrameView {
                     width: pixels.width,
                     height: pixels.height,
                     pitch: pixels.width * 4,
-                    bgra: &pixels.bgra,
+                    bgra: &bgra,
                     serial: pixels.frames,
                 },
             )
@@ -117,7 +135,13 @@ pub fn present(
     serial: u64,
 ) -> Result<Frame, Error> {
     let damage = damage.unwrap_or_else(|| Region::whole((image.width(), image.height())));
-    gpu.present(image, damage.clone(), serial, std::sync::Arc::from([]))?;
+    gpu.present(
+        image,
+        damage.clone(),
+        serial,
+        std::sync::Arc::from([]),
+        std::sync::Arc::from([]),
+    )?;
     let source = gpu.execution.capture.borrow().as_ref().unwrap().clone();
     let index = source.reserve();
     Ok(Frame {
@@ -174,6 +198,75 @@ mod tests {
         destroy(&child);
         assert!(matches!(gpu.check(), Err(Error::Device(_))));
         assert!(matches!(child.check(), Err(Error::Device(_))));
+    }
+
+    // spec: WINE-GFX-10
+    #[test]
+    fn window_planes_show_over_a_native_base_and_leave_it_again() {
+        struct Flat(Vec<u8>);
+        impl crate::surface::SurfaceMemory for Flat {
+            fn read(&self, at: u32, len: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+                let at = at as usize;
+                Ok(std::borrow::Cow::Borrowed(&self.0[at..at + len]))
+            }
+            fn write(&mut self, _: u32, _: &[u8]) -> Result<(), String> {
+                unreachable!()
+            }
+            fn writable(&self, _: u32, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn copy(&mut self, _: u32, _: u32, _: usize) -> Result<(), String> {
+                unreachable!()
+            }
+        }
+        const BLUE: [u8; 4] = [255, 0, 0, 255];
+        const RED: [u8; 4] = [0, 0, 255, 255];
+        let mut gpu = request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+        let mut store =
+            crate::surface::SurfaceStore::new(8, 4, 16, 65520, Default::default()).unwrap();
+        let target = gpu.target(8, 4, false).unwrap();
+        let whole = crate::surface::Rect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 4,
+        };
+        gpu.upload(&target.image, whole, 32, &BLUE.repeat(32))
+            .unwrap();
+        let base = store.insert_native(target).unwrap();
+        // A 2 × 2 window at (7, 1), its right column past the base's right
+        // edge, shows as a layer of its own over the unchanged base.
+        let memory = Flat(RED.repeat(4));
+        let plane = crate::surface::Plane {
+            id: 9,
+            pixels: 0,
+            pitch: 8,
+            x: 7,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        store.set_planes(vec![plane], &[], (8, 4), &memory).unwrap();
+        store.present_native(base, None, &mut gpu).unwrap();
+        let frames = gpu.execution.capture.borrow().clone().unwrap();
+        let shown = frames.get(0);
+        assert_eq!(shown.pixels.bgra, BLUE.repeat(32));
+        let [window] = &shown.windows[..] else {
+            panic!("one window layer")
+        };
+        assert_eq!(
+            (window.id, window.at, window.width, window.height),
+            (9, (7, 1), 2, 2)
+        );
+        assert_eq!(&window.pixels[..], &RED.repeat(4)[..]);
+        drop(shown);
+        // Closing it while the guest presents nothing shows the base alone,
+        // without redrawing it.
+        store.set_planes(Vec::new(), &[], (8, 4), &memory).unwrap();
+        store.present_planes(0, &memory).unwrap();
+        let shown = frames.get(1);
+        assert!(shown.windows.is_empty() && shown.damage.is_empty());
+        assert_eq!(shown.pixels.bgra, BLUE.repeat(32));
     }
 
     #[cfg(feature = "media")]

@@ -488,31 +488,50 @@ pub fn current_tid(env: &mut Env<'_>) -> Result<u32, crate::status::Error> {
     Ok(link(env)?.thread(context).map_err(broken)?.tid)
 }
 
-/// A thread's request pipe, made before the server knows the thread.
+/// A thread's pipes, made before the server knows the thread.
 pub struct NewThread {
-    request: PipeFd,
+    channel: Channel,
     /// The server's end, which `new_thread` names.
-    server_request: PipeFd,
+    server_request: RawFd,
+    reply_write: PipeFd,
+    wait_write: PipeFd,
 }
 
 impl NewThread {
     /// The descriptor `new_thread` takes as `request_fd`.
     pub fn request_fd(&self) -> i32 {
-        self.server_request.as_raw_fd()
+        self.server_request
     }
 }
 
-/// Makes a request pipe for a new thread and sends the server its end, as
-/// Wine's `NtCreateThreadEx` does before `new_thread`.
+fn thread_io_error(error: io::Error) -> crate::status::Error {
+    match error.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE) => crate::status::TOO_MANY_OPENED_FILES.into(),
+        Some(libc::ENOMEM) => crate::status::NO_MEMORY.into(),
+        _ => broken(error.into()),
+    }
+}
+
+/// Allocates all thread pipes before registering a thread with the server.
 pub fn prepare_thread(env: &mut Env<'_>) -> Result<NewThread, crate::status::Error> {
     let tid = current_tid(env)?;
     let link = link(env)?;
-    let (server_request, request) = pipe().map_err(|error| broken(error.into()))?;
-    set_nonblocking(&request).map_err(|error| broken(error.into()))?;
-    send_fd(&link.socket, tid, server_request.as_raw_fd()).map_err(|error| broken(error.into()))?;
+    let (server_request, request) = pipe().map_err(thread_io_error)?;
+    let (reply, reply_write) = pipe().map_err(thread_io_error)?;
+    let (wait, wait_write) = pipe().map_err(thread_io_error)?;
+    for fd in [&request, &reply, &wait] {
+        set_nonblocking(fd).map_err(|error| broken(error.into()))?;
+    }
+    let server_request = send_thread_pipe(&link.socket, tid, server_request)?;
     Ok(NewThread {
-        request,
+        channel: Channel {
+            request,
+            reply,
+            wait,
+        },
         server_request,
+        reply_write,
+        wait_write,
     })
 }
 
@@ -527,32 +546,23 @@ pub fn init_thread(
     teb: u32,
     entry: u32,
 ) -> Result<bool, crate::status::Error> {
-    let fail = |error: io::Error| broken(error.into());
-    let NewThread { request, .. } = new;
-    let (reply, reply_write) = pipe().map_err(fail)?;
-    let (wait, wait_write) = pipe().map_err(fail)?;
-    set_nonblocking(&reply).map_err(fail)?;
-    set_nonblocking(&wait).map_err(fail)?;
+    let NewThread {
+        channel,
+        reply_write,
+        wait_write,
+        ..
+    } = new;
     let Env { ext, sys, cpu, .. } = env;
     let link = ext
         .try_get_mut::<Link>()
         .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))?;
-    send_fd(&link.socket, tid, reply_write.as_raw_fd()).map_err(fail)?;
-    send_fd(&link.socket, tid, wait_write.as_raw_fd()).map_err(fail)?;
-    link.add_thread(
-        context,
-        tid,
-        Channel {
-            request,
-            reply,
-            wait,
-        },
-        sys,
-    );
+    let reply_fd = send_thread_pipe(&link.socket, tid, reply_write)?;
+    let wait_fd = send_thread_pipe(&link.socket, tid, wait_write)?;
+    link.add_thread(context, tid, channel, sys);
     let mut init = InitThreadRequest {
         unix_tid: context as i32 + 1,
-        reply_fd: reply_write.as_raw_fd(),
-        wait_fd: wait_write.as_raw_fd(),
+        reply_fd,
+        wait_fd,
         teb: u64::from(teb),
         entry: u64::from(entry),
         ..Default::default()
@@ -562,6 +572,18 @@ pub fn init_thread(
         .map_err(broken)?;
     crate::status::check(answer.header.error)?;
     Ok(answer.suspend != 0)
+}
+
+/// SCM_RIGHTS owns the sent reference. Close our end before the in-process
+/// server receives it, so receiving can reuse its descriptor slot.
+fn send_thread_pipe(
+    socket: &UnixStream,
+    tid: u32,
+    pipe: PipeFd,
+) -> Result<RawFd, crate::status::Error> {
+    let fd = pipe.as_raw_fd();
+    send_fd(socket, tid, fd).map_err(thread_io_error)?;
+    Ok(fd)
 }
 
 /// Forgets the thread of `context`, which is ending: the server sees its

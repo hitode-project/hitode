@@ -497,6 +497,7 @@ mod state_tests {
         assert!(env.ext.get::<Surfaces>().targets.is_empty());
     }
 
+    // spec: GFX-INPUT-4
     #[test]
     fn permuted_declaration_decodes_like_its_fvf_and_reset_unbinds_it() {
         use super::super::super::declaration;
@@ -562,7 +563,7 @@ mod state_tests {
         };
         assert_eq!(call(&mut env, begin_scene_ABI, &[pointer]), 0);
         let mut decoded = Vec::new();
-        for permuted in [false, true] {
+        for (permuted, fvf) in [(false, 0x144), (false, 0x844), (true, 0)] {
             let words: Vec<u8> = corners
                 .iter()
                 .flat_map(|&(x, y)| vertex(x, y, permuted))
@@ -573,7 +574,7 @@ mod state_tests {
             if permuted {
                 assert_eq!(declaration::set(&mut env, this, GuestPtr::new(decl)), 0);
             } else {
-                assert_eq!(call(&mut env, set_fvf_ABI, &[pointer, 0x144]), 0);
+                assert_eq!(call(&mut env, set_fvf_ABI, &[pointer, fvf]), 0);
             }
             let draw = prepare(&mut env, pointer, 4, 1, GuestPtr::new(vertices), 28, None).unwrap();
             decoded.push(draw.vertices);
@@ -582,6 +583,7 @@ mod state_tests {
             v.iter().map(|v| (v.position, v.color, v.uv)).collect()
         };
         assert_eq!(fields(&decoded[0]), fields(&decoded[1]));
+        assert_eq!(fields(&decoded[0]), fields(&decoded[2]));
         assert_eq!(decoded[0][0].uv, [0.25, 0.75]);
         assert_eq!(call(&mut env, end_scene_ABI, &[pointer]), 0);
         // Reset restores the default (no declaration) and drops the binding.
