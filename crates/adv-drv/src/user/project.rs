@@ -1309,6 +1309,10 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
         .and_then(|path| path.front())
         .map(|command| command.menu);
     projection.parts.insert(context, part);
+    // A window read as a dialog now shows natively, not as a plane.
+    if let Err(error) = super::surface::sync_planes(env, None) {
+        return Outcome::Fail(error);
+    }
     if let Some(menu) = next
         && shown.iter().any(|&(_, id)| id == menu)
     {

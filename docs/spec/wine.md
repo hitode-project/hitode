@@ -527,7 +527,7 @@ D3DX checks an admitted CRT entry against the exact relocated bytes saved at bin
 
 ### WINE-GFX-4 Window surfaces
 
-**Rule**: The driver MUST give each window except the desktop a window surface over pixels it owns, wrapped by `NtGdiDdDDICreateDCFromMemory`. A flush of a visible window MUST present the window's part of those pixels without copying them.
+**Rule**: The driver MUST give each window except the desktop a window surface over pixels it owns, wrapped by `NtGdiDdDDICreateDCFromMemory`. A flush of the base window MUST present its content in those pixels without copying them; other windows follow WINE-GFX-10.
 **Verification**: Test
 
 ### WINE-GFX-5 In-process desktop
@@ -556,11 +556,18 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 **Rule**: The driver MUST report one 2560x1440 monitor, so win32u never clamps a framed 1920x1080 game window. The mode list MUST include it. Its work area MUST leave out a 40-pixel taskbar at the bottom.
 **Verification**: Test
 
+### WINE-GFX-10 Window planes
+
+**Rule**: Only the base window's flush MUST replace the base frame, which keeps that window's size. Other shown top-level windows in front of it MUST show as planes over the base, in z-order. A plane that appears, moves, changes or goes away MUST show the base beneath again without a guest draw.
+**Verification**: Test
+
+The base window is the window of the frame being presented, or else of the last presented frame. A window replaces it while none is shown. So does an unowned non-tool window with larger content, as a game window beside its splash. Hiding the base window makes the largest shown main window the base, or else the front window. Natively projected and minimized windows are not planes. A plane is a window's whole surface at its screen position relative to the base window's content. Publishing a software base copies plane rows over the base rows it copies; plane damage is never refined against base memory. A native base shows no planes. A plane outside the base window's content is moved into it with `SetWindowPos`, as a window manager keeps windows on screen.
+
 ## Input
 
 ### WINE-IN-1 Presented window coordinates
 
-**Rule**: Host mouse points MUST map to screen coordinates through the origin of the last presented window's content. Every presenter's frames carry only that content; the host shows caption, frame and menu bar natively.
+**Rule**: Host mouse points MUST map to screen coordinates through the origin of the last presented window's content, also over planes (WINE-GFX-10). Every presenter's frames carry only that content; the host shows caption, frame and menu bar natively.
 **Verification**: Test
 
 ### WINE-IN-2 Hardware input

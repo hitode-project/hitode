@@ -193,6 +193,7 @@ impl Gpu {
         whole: bool,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
+        planes: &[crate::surface::Plane],
     ) -> Result<u64, String> {
         self.check().map_err(|e| e.to_string())?;
         slots.publish(
@@ -203,6 +204,7 @@ impl Gpu {
             whole,
             serial,
             video,
+            planes,
         )
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {

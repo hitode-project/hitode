@@ -11,6 +11,8 @@ use convert::{BLACK_PALETTE, decode_pixel};
 mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
+mod planes;
+pub use planes::Plane;
 #[cfg(feature = "gpu")]
 pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};
@@ -190,6 +192,7 @@ impl PendingFrame {
         serial: u64,
         history: &DamageHistory,
         damage: &Region,
+        planes: &[Plane],
     ) -> Result<u64, String> {
         let full = surface.rect();
         let pitch = surface.pitch;
@@ -219,22 +222,18 @@ impl PendingFrame {
         let output = Arc::get_mut(&mut self.pixels).unwrap();
         output.resize((pitch * surface.height) as usize, 0);
         let mut copied = 0;
+        let row = |y: u32| y as usize * pitch as usize..(y as usize + 1) * pitch as usize;
         for r in rects(&regions) {
-            let start = surface.format.byte_offset(r.x) as usize;
-            let n = surface.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
-                let src = memory.read(surface.row(0, y) + start as u32, n)?;
-                let dst = y as usize * pitch as usize + start;
-                output[dst..dst + n].copy_from_slice(src.as_ref());
-                copied += n as u64;
+                copied += planes::compose_row(surface, planes, memory, y, r, &mut output[row(y)])?;
             }
         }
         if verify_software() {
+            let mut expected = vec![0; pitch as usize];
             for y in 0..surface.height {
                 let n = surface.format.row_bytes(surface.width) as usize;
-                let src = memory.read(surface.row(0, y), n)?;
-                let at = y as usize * pitch as usize;
-                if output[at..at + n] != *src {
+                planes::compose_row(surface, planes, memory, y, full, &mut expected)?;
+                if output[row(y)][..n] != expected[..n] {
                     return Err("incremental software slot differs from full storage".into());
                 }
             }
@@ -1289,6 +1288,12 @@ pub struct Surfaces<P: Presenter> {
     pending_frame: Option<PendingFrame>,
     retained_frame: Option<PendingFrame>,
     video_layers: Arc<[(u64, VideoLayer)]>,
+    /// Windows shown over the software base, bottom first.
+    planes: Vec<Plane>,
+    /// Base pixels that planes changed, exposed or covered since the last
+    /// publication. Plane pixels are not base memory, so this damage is never
+    /// refined against it.
+    plane_damage: Vec<Rect>,
     captured_serial: u64,
     conversion: Snapshot,
     blit_row: Vec<u8>,
@@ -1365,6 +1370,8 @@ impl<P: Presenter> Surfaces<P> {
             pending_frame: None,
             retained_frame: None,
             video_layers: Arc::from([]),
+            planes: Vec::new(),
+            plane_damage: Vec::new(),
             captured_serial: 0,
             conversion: Snapshot::default(),
             blit_row: Vec::new(),
@@ -1609,6 +1616,47 @@ impl<P: Presenter> Surfaces<P> {
         Ok(serial)
     }
 
+    /// Show `planes` over the software base, bottom first, with `damage`
+    /// drawn inside them, in base pixels (WINE-GFX-10). A plane that moved,
+    /// appeared or went away shows the base again without a guest draw. A
+    /// native base shows no planes.
+    pub fn set_planes(
+        &mut self,
+        context: u32,
+        planes: Vec<Plane>,
+        damage: &[Rect],
+        m: &dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        let Some(base) = self
+            .software_pending
+            .as_ref()
+            .map(|pending| pending.source)
+            .or(self.software_source)
+            .filter(|id| self.surfaces.contains_key(id))
+        else {
+            self.planes = planes;
+            return Ok(());
+        };
+        let full = self.surfaces[&base].rect();
+        let extent = (full.w, full.h);
+        let moved = |from: &[Plane], to: &[Plane]| {
+            from.iter()
+                .enumerate()
+                .filter(|&(i, plane)| to.get(i) != Some(plane))
+                .map(|(_, plane)| plane.visible(extent))
+                .collect::<Vec<_>>()
+        };
+        let mut changed = moved(&self.planes, &planes);
+        changed.extend(moved(&planes, &self.planes));
+        changed.extend(damage.iter().map(|r| r.clipped(full)));
+        changed.retain(|r| !r.empty());
+        self.planes = planes;
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.plane_damage.extend(changed);
+        self.present_from(context, base, m, Rect::default())
+    }
     /// Pin pixels and overlay metadata together for an explicit capture.
     pub fn latest_frame(&self) -> Option<&PendingFrame> {
         self.frame_mailbox
@@ -1844,7 +1892,7 @@ impl<P: Presenter> Surfaces<P> {
         }
         let full = self.surfaces[&id].rect();
         let damage = damage.clipped(full);
-        if damage.empty() {
+        if damage.empty() && self.plane_damage.is_empty() {
             self.stats.empty_damage += 1;
         } else if self.frame_mailbox.is_some() {
             if self
@@ -1861,7 +1909,9 @@ impl<P: Presenter> Surfaces<P> {
                 damage: Region::empty((full.w, full.h)),
             });
             pending.writer = context;
-            pending.damage.add(damage.into());
+            if !damage.empty() {
+                pending.damage.add(damage.into());
+            }
         } else {
             return self.publish_software(id, m, region((full.w, full.h), damage));
         }
@@ -1930,12 +1980,15 @@ impl<P: Presenter> Surfaces<P> {
             self.damage_history.clear();
         }
         let frame_pixels = u64::from(s.width) * u64::from(s.height);
-        let damage = match latest {
+        let mut damage = match latest {
             Some(previous) if !reset => {
                 refine_damage(s, m, &previous.pixels, previous.pitch, &damage)?
             }
             _ => damage,
         };
+        for r in self.plane_damage.drain(..) {
+            damage.add(r.into());
+        }
         if damage.is_empty() {
             self.stats.empty_damage += 1;
             return Ok(());
@@ -1959,6 +2012,7 @@ impl<P: Presenter> Surfaces<P> {
                     self.stats.presentations,
                     &self.damage_history,
                     &damage,
+                    &self.planes,
                 )?;
                 frame.video = self.video_layers.clone();
                 self.retained_frame = Some(frame.clone());
@@ -1989,6 +2043,7 @@ impl<P: Presenter> Surfaces<P> {
                 self.stats.presentations,
                 &self.damage_history,
                 &damage,
+                &self.planes,
             )?;
             frame.video = self.video_layers.clone();
             self.retained_frame = Some(frame.clone());
@@ -2025,7 +2080,7 @@ impl<P: Presenter> Surfaces<P> {
                 .software_video
                 .as_ref()
                 .is_none_or(|video| !Arc::ptr_eq(video, &self.video_layers));
-        let damage = if whole {
+        let mut damage = if whole {
             Region::whole((s.width, s.height))
         } else {
             refine_damage(
@@ -2036,6 +2091,9 @@ impl<P: Presenter> Surfaces<P> {
                 &damage,
             )?
         };
+        for r in self.plane_damage.drain(..) {
+            damage.add(r.into());
+        }
         if damage.is_empty() {
             self.stats.empty_damage += 1;
             return Ok(());
@@ -2052,6 +2110,7 @@ impl<P: Presenter> Surfaces<P> {
             whole,
             serial,
             video,
+            &self.planes,
         )?;
         self.software_video = Some(self.video_layers.clone());
         self.software_source = Some(id);
@@ -2234,6 +2293,7 @@ impl<P: Presenter> Surfaces<P> {
                 whole,
                 serial,
                 video,
+                &self.planes,
             )?;
             self.software_video = Some(self.video_layers.clone());
         }

@@ -158,6 +158,14 @@ pub fn presented_window(ext: &Ext) -> Option<u32> {
     window(ext, hwnd).map(|_| hwnd)
 }
 
+/// The window of the frame being presented, or else of the last presented
+/// frame, if it still exists: the window whose frames are the base.
+pub(super) fn base_window(ext: &Ext) -> Option<u32> {
+    let presentation = ext.get::<Presentation>();
+    let (hwnd, _) = presentation.candidate.get().or(presentation.last.get())?;
+    window(ext, hwnd).map(|_| hwnd)
+}
+
 /// The screen origin used by the last presented client frame.
 pub(super) fn presented_origin(ext: &Ext) -> Option<(i32, i32)> {
     ext.get::<Presentation>()
