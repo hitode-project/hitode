@@ -70,7 +70,10 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(reads < 4096, "clock-only loop spun {reads} times");
+    // A streak of back-to-back reads proves the spin; a host stall between two
+    // reads, such as a run slice ending, may restart the proof once.
+    let streak = adv_machine::clock::POLL_STREAK;
+    assert!(reads < 3 * streak, "clock-only loop spun {reads} times");
     assert!(session.machine.sys.scheduling.active_time_skip_us >= 50_000);
     until(&mut session, &mut output, &mut text, "deadline=");
     let ready = text
