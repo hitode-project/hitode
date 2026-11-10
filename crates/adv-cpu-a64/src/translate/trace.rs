@@ -598,7 +598,9 @@ impl Trace {
             if limit == LOOP_LIMIT && *weight + cost > limit {
                 // Only a wide decoded instruction can exceed the remaining room.
                 fetcher.helpers.as_mut().unwrap().truncate(helpers);
-                self.insts[len - 1].next = Next::Edge(Edge::Exit(pc));
+                if len > start {
+                    self.insts[len - 1].next = Next::Edge(Edge::Exit(pc));
+                }
                 return false;
             }
             *weight += cost;

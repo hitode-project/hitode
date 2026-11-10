@@ -341,3 +341,38 @@ fn loop_units_end_before_a_long_straight_line_tail() {
         }
     }
 }
+
+// spec: A64-TR-3
+#[test]
+fn rejected_wide_side_path_preserves_the_loop_exit() {
+    let mut stop = 0;
+    let mut p = fixture(|a| {
+        let (mut top, mut wide) = (a.create_label(), a.create_label());
+        a.set_label(&mut top).unwrap();
+        a.test(edx, edx).unwrap();
+        a.jz(wide).unwrap();
+        // Leave one instruction of room in the weighted loop unit.
+        for _ in 0..1019 {
+            a.nop().unwrap();
+        }
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        stop = a.instructions().len();
+        a.nop().unwrap();
+
+        a.set_label(&mut wide).unwrap();
+        a.fld1().unwrap();
+        a.fstp(qword_ptr(ebx)).unwrap();
+        a.jmp(top).unwrap();
+    });
+    p.stop = pc(&p, stop);
+    p.state.regs[1] = 1;
+    p.state.regs[2] = 1;
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        compare(&mut native, &mut oracle, &p, 1500),
+        RunOutcome::ReachedStop
+    );
+}
