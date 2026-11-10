@@ -4,8 +4,8 @@ import type { Area, GameLayout } from "./screen.svelte";
  * Where the touch controls go around a mobile game (AND-APP-16): the side
  * letterboxes on a phone, the top and bottom ones on a tablet, or glass
  * panels over the game for groups that do not fit in the margins. Controls may use the
- * letterbox up to the screen edge but never a cutout, a rounded corner or a
- * system gesture edge. All values are CSS pixels of the page.
+ * letterbox up to the screen edge, clear of cutouts and rounded corners.
+ * Android also uses the system gesture strips. Values are CSS pixels.
  */
 export type Arrangement =
   | { kind: "side"; wide: boolean; left: Area; right: Area }
@@ -89,7 +89,8 @@ function inner(layout: GameLayout): Area {
   return { x: x0 + inset, y: y0 + inset, width: x1 - x0 - 2 * inset, height: y1 - y0 - 2 * inset };
 }
 
-export function arrange(layout: GameLayout): Arrangement {
+export function arrange(layout: GameLayout, android = false): Arrangement {
+  if (android) layout = { ...layout, gestures: { top: 0, right: 0, bottom: 0, left: 0 } };
   const left = side(layout, "left");
   const right = side(layout, "right");
   const fits = (area: Area) => area.width >= NARROW && area.height >= KEY * 4;

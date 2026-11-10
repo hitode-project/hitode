@@ -75,11 +75,11 @@ Direct mode acts where the finger lands. Trackpad mode moves a cursor drawn over
 
 ### AND-APP-16 Game screen layout
 
-**Rule**: The game view MUST occupy the largest centred area no camera cutout reaches. It MUST report the presented frame, the cutouts, the corner radius and the system gesture edges to the overlay whenever they change. Overlay controls MAY use the letterbox and safe-area margins but MUST NOT overlap a cutout, a rounded corner or a gesture edge.
+**Rule**: The game view MUST occupy the largest centred area no camera cutout reaches. It MUST report the presented frame, the cutouts, the corner radius and the system gesture edges to the overlay whenever they change. Overlay controls MUST avoid cutouts and rounded corners.
 **Applies to**: Android, iOS
 **Verification**: Test
 
-When controls do not fit above and below the frame, each side group uses its own margin if it fits. Only the groups without room float over the game.
+Android controls can overlap system gesture edges; iOS controls stay outside them. When controls do not fit above and below the frame, each side group uses its own margin if it fits. Only the groups without room float over the game.
 
 iOS publishes no housing geometry. An iPhone's is read from its safe-area depth. Under 30 points is a status bar, under 55 a notch of at most 210 points, otherwise a Dynamic Island of at most 126 points. Each takes the largest of its generation, so newer, smaller islands stay covered. The screen reports its own corner radius.
 
@@ -100,9 +100,11 @@ The provider MUST return the document path from the appropriate root so Files ca
 
 ### AND-APP-18 System navigation during play
 
-**Rule**: Android Back MUST dismiss the top launcher layer or open the pause menu during play. Touches starting in system gesture areas MUST NOT reach the guest. The system navigation bar MUST remain available during play.
+**Rule**: Android Back MUST dismiss the top launcher layer or open the pause menu during play. Direct touches starting in system gesture areas MUST NOT reach the guest. The system navigation bar MUST remain available during play.
 **Applies to**: Android
 **Verification**: Review — system Back and edge touch dispatch require an Android device.
+
+Overlay controls in system gesture areas activate only on a completed tap.
 
 In the library, Android Back MUST dismiss only the top launcher layer, including a removal confirmation over the game management sheet.
 On launcher pages, Android Back MUST use the launcher's navigation stack. It MUST defer to the system when that stack has no destination or layer to dismiss.

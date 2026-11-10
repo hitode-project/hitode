@@ -4,7 +4,7 @@ import { tap } from "./tap.ts";
 import { arrange } from "./touch-layout.ts";
 import type { GameLayout } from "./screen.svelte.ts";
 
-test("side controls stay outside both system Back strips", () => {
+test("iOS controls stay outside system gesture strips", () => {
   const layout: GameLayout = {
     width: 900, height: 400, game: { x: 130, y: 0, width: 640, height: 400 },
     cutouts: [], cornerRadius: 0, gestures: { left: 30, right: 42, top: 0, bottom: 24 },
@@ -15,6 +15,17 @@ test("side controls stay outside both system Back strips", () => {
   assert.equal(placement.left.x, 30);
   assert.equal(placement.right.x + placement.right.width, 858);
   assert.equal(placement.left.y + placement.left.height, 376);
+});
+
+test("Android controls keep both black bars despite system gesture strips", () => {
+  const layout: GameLayout = {
+    width: 740, height: 480, game: { x: 50, y: 0, width: 640, height: 480 },
+    cutouts: [], cornerRadius: 0, gestures: { left: 24, right: 30, top: 0, bottom: 24 },
+  };
+  const placement = arrange(layout, true);
+  assert.equal(placement.kind, "side");
+  assert.deepEqual(placement.left, { x: 6, y: 6, width: 40, height: 468 });
+  assert.deepEqual(placement.right, { x: 694, y: 6, width: 40, height: 468 });
 });
 
 test("each side keeps its controls when its black bar still fits", () => {

@@ -2,6 +2,7 @@
   import { onDestroy } from "svelte";
   import { t } from "../lib/i18n.svelte";
   import { call } from "../lib/bridge";
+  import { device } from "../lib/device.svelte";
   import { nav } from "../lib/nav.svelte";
   import { tap } from "../lib/tap";
   import { region } from "../lib/overlay";
@@ -25,7 +26,8 @@
   }
   let { layout, latchCtrl, onlibrary, onmenu, onkeyboard }: Props = $props();
 
-  const arrangement = $derived(arrange(layout));
+  const android = $derived(device.platform === "android");
+  const arrangement = $derived(arrange(layout, android));
   const trackpad = $derived(prefs.touchMode === "trackpad");
   const open = $derived(prefs.touchControls);
   let more = $state(false);
@@ -117,6 +119,13 @@
       return tap(() => press(action, true));
     }
     let down = false;
+    let edge = false;
+    // Wait for a tap to finish in an Android gesture strip. A system swipe
+    // must not send a guest press before Android takes over the touch.
+    const edgeTap = tap(() => {
+      press(action, true);
+      setTimeout(() => press(action, false), 100);
+    });
     function release() {
       if (down) press(action, false);
       down = false;
@@ -124,16 +133,32 @@
     return {
       onpointerdown(event: PointerEvent) {
         const { gestures, width, height } = layout;
-        if (event.pointerType === "touch" && (
+        edge = event.pointerType === "touch" && (
           event.clientX < gestures.left || event.clientX >= width - gestures.right ||
           event.clientY < gestures.top || event.clientY >= height - gestures.bottom
-        )) return;
+        );
+        if (edge) {
+          if (android) edgeTap.onpointerdown(event);
+          return;
+        }
         (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
         down = true;
         press(action, true);
       },
-      onpointerup: release,
-      onpointercancel: release,
+      onpointermove(event: PointerEvent) {
+        if (edge && android) edgeTap.onpointermove(event);
+      },
+      onpointerup(event: PointerEvent) {
+        if (edge && android) edgeTap.onpointerup(event);
+        release();
+      },
+      onpointercancel(event: PointerEvent) {
+        if (edge && android) edgeTap.onpointercancel(event);
+        release();
+      },
+      onclick(event: MouseEvent) {
+        if (edge && android) edgeTap.onclick(event);
+      },
       onlostpointercapture: release,
       oncontextmenu(event: Event) {
         event.preventDefault();
