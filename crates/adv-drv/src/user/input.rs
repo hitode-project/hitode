@@ -29,7 +29,7 @@ const SEND_HARDWARE_INPUT: u32 = 26;
 pub(super) struct Presentation {
     candidate: Cell<Option<(u32, (i32, i32))>>,
     last: Cell<Option<(u32, (i32, i32))>>,
-    front: Cell<Option<u32>>,
+    front: Cell<Option<(u32, u32)>>,
 }
 
 /// Associate the next presentation with this window and its screen origin.
@@ -39,25 +39,30 @@ pub fn prepare(ext: &Ext, hwnd: u32, origin: (i32, i32)) {
         .set(Some((hwnd, origin)));
 }
 
-/// Associate the next presentation with a front that presents into `hwnd`:
-/// until the front is released, the frames of `hwnd`'s top-level window
-/// are the front's, not its window surface's (WINE-GFX-10).
-pub fn prepare_front(ext: &Ext, hwnd: u32, origin: (i32, i32)) {
-    prepare(ext, hwnd, origin);
+/// Associate a submitted front frame with its window (WINE-GFX-10).
+pub fn front_frame(ext: &Ext, hwnd: u32, source: u32) {
+    let Some(window) = window(ext, hwnd) else {
+        front_released(ext, source);
+        return;
+    };
+    prepare(ext, hwnd, window.origin);
     ext.get::<Presentation>()
         .front
-        .set(Some(top_level(ext, hwnd)));
+        .set(Some((top_level(ext, hwnd), source)));
 }
 
-/// A front was released: window surfaces present their windows again.
-pub fn front_released(ext: &Ext) {
-    ext.get::<Presentation>().front.set(None);
+/// Release the association for this source, without affecting another front.
+pub fn front_released(ext: &Ext, source: u32) {
+    let front = &ext.get::<Presentation>().front;
+    if front.get().is_some_and(|(_, id)| id == source) {
+        front.set(None);
+    }
 }
 
-/// The top-level window whose content a front presents.
-pub(super) fn front_window(ext: &Ext) -> Option<u32> {
-    let hwnd = ext.get::<Presentation>().front.get()?;
-    window(ext, hwnd).map(|_| hwnd)
+/// The top-level window whose front supplies the submitted base.
+pub(super) fn front_window(ext: &Ext, source: Option<u32>) -> Option<u32> {
+    let (hwnd, id) = ext.get::<Presentation>().front.get()?;
+    (source == Some(id)).then_some(hwnd)
 }
 
 /// `hwnd`'s top-level ancestor.

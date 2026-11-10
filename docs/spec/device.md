@@ -53,7 +53,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-11 Deleted frame sources
 
-**Rule**: Deleting the source of a pending software frame MUST discard that frame.
+**Rule**: Deleting the source of a pending software frame MUST discard that frame. Layer updates MUST NOT republish a deleted source or a replacement target that has never presented.
 **Verification**: Test
 
 ### DEV-FRAME-10 Content-diff publication damage

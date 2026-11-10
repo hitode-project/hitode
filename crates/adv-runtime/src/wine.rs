@@ -94,6 +94,7 @@ pub fn install<B: Backend>(
             memory: guest_memory,
             window: geometry,
             completed: frame_completed,
+            submitted: adv_drv::user::input::front_frame,
             released: adv_drv::user::input::front_released,
         },
     )?;
@@ -153,7 +154,6 @@ fn geometry(
 ) -> Option<adv_dx::ddraw::WindowGeometry> {
     let [left, top, right, bottom] = adv_drv::user::window(ext, hwnd)?.client;
     let (width, height) = (right.checked_sub(left)?, bottom.checked_sub(top)?);
-    adv_drv::user::input::prepare_front(ext, hwnd, (left, top));
     (width > 0 && height > 0).then_some(adv_dx::ddraw::WindowGeometry {
         width: width as u32,
         height: height as u32,
@@ -219,7 +219,7 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         dc: memory_dc::<D3D9>(),
         // Windowed devices only; full-screen modes come with display modes.
         mode_changed: |_, _, _| Outcome::Return(0),
-        device_released: |env, _| adv_drv::user::input::front_released(env.ext),
+        device_released: |_, _| {},
         display: |_| {
             let (width, height) = adv_drv::user::DESKTOP;
             (width, height, 60)
@@ -229,9 +229,11 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         window: |ext, objects, hwnd| {
             geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
         },
-        visible: |ext, objects, hwnd| {
-            let _ = geometry(ext, objects, hwnd);
-            adv_drv::user::window(ext, hwnd).map(|window| window.visible)
+        visible: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).map(|window| window.visible),
+        window_presented: |ext, hwnd| {
+            if let Some(id) = ext.get::<Surfaces<Snapshot>>().base_source() {
+                adv_drv::user::input::front_frame(ext, hwnd, id);
+            }
         },
         completed: frame_completed,
         fast_forward: |_| false,

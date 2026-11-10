@@ -1501,6 +1501,18 @@ impl<P: Presenter> Surfaces<P> {
         self.primary
     }
 
+    /// Source of the newest submitted base, including a queued software frame.
+    pub fn base_source(&self) -> Option<u32> {
+        if let Some(pending) = &self.software_pending {
+            return Some(pending.source);
+        }
+        #[cfg(feature = "gpu")]
+        if self.native_source.is_some() {
+            return self.native_source;
+        }
+        self.software_source
+    }
+
     /// Delete surface `id` and free its pixels.
     pub fn delete(&mut self, id: u32) -> bool {
         let Some(s) = self.surfaces.remove(&id) else {
@@ -1508,6 +1520,9 @@ impl<P: Presenter> Surfaces<P> {
         };
         #[cfg(feature = "gpu")]
         self.software_slots.remove(&id);
+        if self.software_source == Some(id) {
+            self.software_source = None;
+        }
         // A pending frame cannot outlive the pixels it would publish.
         if self
             .software_pending
@@ -1518,6 +1533,9 @@ impl<P: Presenter> Surfaces<P> {
         }
         #[cfg(feature = "gpu")]
         if self.native_surfaces.remove(&id).is_some() {
+            if self.native_source == Some(id) {
+                self.native_source = None;
+            }
             return true;
         }
         // Imported guest storage is retired by its frontend owner, not returned
@@ -2334,6 +2352,9 @@ impl<P: Presenter> Surfaces<P> {
         surface.pitch = surface.width * 4;
         surface.version = surface.version.wrapping_add(1);
 
+        if self.native_source == Some(id) {
+            self.native_source = None;
+        }
         Ok(std::mem::replace(&mut native.target, target))
     }
 
@@ -2370,6 +2391,8 @@ impl<P: Presenter> Surfaces<P> {
             windows,
         )
         .map_err(|error| error.to_string())?;
+        // A later native Present supersedes software work still waiting to publish.
+        self.software_pending = None;
         self.software_source = None;
         self.native_source = Some(id);
         self.stats.presentations = serial;
@@ -2477,11 +2500,11 @@ impl<P: Presenter> Surfaces<P> {
             .map_err(|error| error.to_string())
     }
 
-    /// A deferred store without the shared output can finish private frames.
-    /// Those frames are not a baseline for eliminating a foreground Present.
+    /// A frame is a baseline for eliminating Present only on shared output
+    /// and after it has carried the latest window layers.
     #[cfg(feature = "gpu")]
     pub fn output_serial(&self) -> Option<u64> {
-        (!self.deferred_presentation || self.frame_mailbox.is_some())
+        (!self.windows.unshown && (!self.deferred_presentation || self.frame_mailbox.is_some()))
             .then_some(self.stats.presentations)
     }
 
@@ -2497,6 +2520,7 @@ impl<P: Presenter> Surfaces<P> {
             self.stats.presentations.checked_add(1).ok_or_else(|| {
                 crate::gpu::Error::Invalid("presentation serial exhausted".into())
             })?;
+        self.software_pending = None;
         self.stats.presentations = serial;
         Ok(serial)
     }
