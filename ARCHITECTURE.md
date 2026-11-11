@@ -199,7 +199,7 @@ The supported product hosts are macOS on Apple silicon, iOS/iPadOS and Android o
 
 One execution owner runs all guest threads; there is no parallel guest execution. Waits, signals, timeouts and cancellation go through the same machine state. API handlers that need a guest callback save a continuation instead of blocking the host.
 
-The machine owns the virtual clock. Holding Ctrl to skip may advance time to the next deadline only when no context can run, and never completes external I/O early. Several guest processes can run inside one host process, each with its own address space, machine and handles. The rules are in [docs/spec/processes.md](docs/spec/processes.md).
+The machine owns the virtual clock. Holding Ctrl to skip may advance time to the next deadline only when no context can run, and never completes external I/O early. Before the first frame, time may also skip automatically when every live context is waiting for its next clock poll. Several guest processes can run inside one host process, each with its own address space, machine and handles. The rules are in [docs/spec/processes.md](docs/spec/processes.md).
 
 ## Personality and compatibility
 

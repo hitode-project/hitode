@@ -175,9 +175,8 @@ impl WaitDiagnostics {
             self.classes[thunk as usize]
         };
         let mut deadline = match wait {
-            Wait::Until(at) => Some(*at),
-            Wait::Object { deadline, .. } | Wait::Objects { deadline, .. } => *deadline,
             Wait::Yield => Some(now),
+            _ => wait.deadline(),
         };
         if class == 5 {
             let due = |h| match objects.get(h) {

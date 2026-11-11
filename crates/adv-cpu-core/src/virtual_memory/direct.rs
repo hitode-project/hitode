@@ -144,9 +144,17 @@ impl NativeProtection {
 pub(super) struct DirectPages {
     guest: Vec<GuestPageProtection>,
     host: Vec<NativeProtection>,
-    /// Host pages whose decommitted bytes may not read as zero. Fresh
-    /// backing and released pages do, so a commit clears only these.
-    stale: Vec<bool>,
+    backing: Vec<BackingState>,
+}
+
+/// What a commit must do before using the decommitted bytes of a host page.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackingState {
+    Zero,
+    Stale,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    Reclaimable,
 }
 
 #[cfg(any(unix, test))]
@@ -170,7 +178,7 @@ impl UnixPages {
         self.direct = Some(DirectPages {
             guest: vec![GuestPageProtection::NONE; self.committed.len()],
             host: vec![NativeProtection::None; self.mapped_len / self.host_page_size],
-            stale: vec![false; self.mapped_len / self.host_page_size],
+            backing: vec![BackingState::Zero; self.mapped_len / self.host_page_size],
         });
     }
 
@@ -290,23 +298,38 @@ pub(super) struct SharedAlias {
 
 #[cfg(unix)]
 impl SharedAlias {
-    /// Releases completely empty host pages; whether they now read as zero.
-    fn discard(&self, span: &Range<usize>) -> bool {
+    /// Discards backing only when every guest page in the span is empty.
+    fn discard(&self, span: &Range<usize>) -> BackingState {
         // On Linux/Android MADV_REMOVE releases the shared backing too, so
         // the alias cannot keep decommitted memfd pages resident, and they
-        // read as zero again. Elsewhere shared pages keep their bytes.
+        // read as zero again. On Darwin mark the shared backing reclaimable;
+        // MADV_DONTNEED leaves it charged even after the guest releases it.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let (advice, zeroes) = (libc::MADV_REMOVE, true);
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let (advice, zeroes) = (libc::MADV_DONTNEED, false);
-        let done = unsafe {
+        let (advice, discarded) = (libc::MADV_REMOVE, BackingState::Zero);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (advice, discarded) = (libc::MADV_FREE_REUSABLE, BackingState::Reclaimable);
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        let (advice, discarded) = (libc::MADV_DONTNEED, BackingState::Stale);
+        if self.advise(span, advice) {
+            discarded
+        } else {
+            BackingState::Stale
+        }
+    }
+
+    fn advise(&self, span: &Range<usize>, advice: libc::c_int) -> bool {
+        (unsafe {
             libc::madvise(
                 self.pointer.as_ptr().add(span.start).cast(),
                 span.len(),
                 advice,
             )
-        } == 0;
-        done && zeroes
+        }) == 0
     }
 
     /// Maps the window view at `place` and the alias at `alias_place` when
@@ -941,6 +964,29 @@ impl Reservation {
             .try_borrow_mut()
             .map_err(|_| "direct mapping is pinned by an execution lease")?;
         let plan = pages.plan_direct(offset, end, mutation)?;
+        let host = pages.host_page_size;
+        let backing = &mut pages.direct.as_mut().unwrap().backing;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if clear && matches!(mutation, Mutation::Commit(_)) {
+            // Take backing out of the reclaimable state before any subpage
+            // goes live. Overlays use another owner and leave this backing idle.
+            for span in &plan.host_spans {
+                let states = &mut backing[span.start / host..span.end / host];
+                if states.contains(&BackingState::Reclaimable) {
+                    if !alias.advise(span, libc::MADV_FREE_REUSE) {
+                        return Err(format!(
+                            "reuse direct guest memory: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    for state in states {
+                        if *state == BackingState::Reclaimable {
+                            *state = BackingState::Stale;
+                        }
+                    }
+                }
+            }
+        }
         for (index, change) in plan.protection_changes.iter().enumerate() {
             if !alias.protect(self.ptr, change, change.after) {
                 let error = std::io::Error::last_os_error();
@@ -958,15 +1004,13 @@ impl Reservation {
                 return Err(format!("protect direct guest memory: {error}"));
             }
         }
-        let host = pages.host_page_size;
-        let stale = &mut pages.direct.as_mut().unwrap().stale;
         if clear && matches!(mutation, Mutation::Commit(_)) {
             // Recommit clears stale bytes through the stable alias, even when
             // the guest window is NONE for a mixed or guest-protected page.
             let first = offset / host;
             for (page, _) in (first..)
-                .zip(&stale[first..end.div_ceil(host)])
-                .filter(|p| *p.1)
+                .zip(&backing[first..end.div_ceil(host)])
+                .filter(|p| *p.1 != BackingState::Zero)
             {
                 let span = offset.max(page * host)..end.min((page + 1) * host);
                 unsafe {
@@ -984,8 +1028,7 @@ impl Reservation {
                 };
             }
             for span in &plan.host_spans {
-                let zeroed = alias.discard(span);
-                stale[span.start / host..span.end / host].fill(!zeroed);
+                backing[span.start / host..span.end / host].fill(alias.discard(span));
             }
         }
         pages.apply_direct(&plan, mutation);
@@ -1017,18 +1060,21 @@ mod tests {
     fn commit_clears_only_bytes_release_left_behind() {
         let host = super::super::os::page_size().unwrap();
         let r = reservation(host, 2 * host);
-        let stale = |r: &Reservation| r.pages.borrow().direct.as_ref().unwrap().stale.clone();
+        let backing = || r.pages.borrow().direct.as_ref().unwrap().backing.clone();
         // Fresh backing reads as zero without clearing.
-        assert_eq!(stale(&r), [false, false]);
+        assert_eq!(backing(), [BackingState::Zero; 2]);
         r.commit_direct(0, 2 * host, GuestPageProtection::READ_WRITE)
             .unwrap();
         fill(&r, 0, 2 * host, 0x5a);
         r.decommit(host, host).unwrap();
-        // Only Linux and Android release shared pages to zero.
-        let released = cfg!(any(target_os = "linux", target_os = "android"));
-        assert_eq!(stale(&r), [false, !released]);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(backing(), [BackingState::Zero; 2]);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert_eq!(backing(), [BackingState::Zero, BackingState::Reclaimable]);
         r.commit_direct(host, host, GuestPageProtection::READ_WRITE)
             .unwrap();
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert_eq!(backing(), [BackingState::Zero, BackingState::Stale]);
         expect(&r, 0, host, 0x5a);
         expect(&r, host, host, 0);
     }

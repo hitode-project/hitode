@@ -913,7 +913,7 @@ impl Sys {
         };
         match wait {
             Wait::Yield => Some(WakeReason::Timeout),
-            Wait::Until(t) => (now >= *t).then_some(WakeReason::Timeout),
+            Wait::Until(t) | Wait::ClockPoll(t) => (now >= *t).then_some(WakeReason::Timeout),
             Wait::Object { handle, deadline } => {
                 let (handle, deadline) = (*handle, *deadline);
                 if sched::poll_object(&mut self.objects, &self.contexts, handle, i as CtxId, true) {
@@ -1056,11 +1056,7 @@ impl Sys {
             unreachable!("only blocked contexts have a pending wait")
         };
         let deadline = if matches!(reason, WakeReason::Timeout) {
-            match wait {
-                Wait::Until(t) => Some(t),
-                Wait::Object { deadline, .. } | Wait::Objects { deadline, .. } => deadline,
-                Wait::Yield => None,
-            }
+            wait.deadline()
         } else {
             None
         };
@@ -2158,9 +2154,8 @@ impl<B: Backend> Machine<B> {
         self.sys.spawn(&mut self.cpu, name, entry, args, stack_size)
     }
 
-    /// Install a non-blocking, live skip policy (normally atomic key state). It is
-    /// told whether the machine is still starting up: no frame completed yet, so
-    /// nothing a skipped wait would hurry has been shown.
+    /// Install a live skip policy. The argument allows automatic skipping
+    /// when all live contexts are parked in clock polls before the first frame.
     pub fn set_time_skip_source(
         &mut self,
         source: Option<std::sync::Arc<dyn Fn(bool) -> bool + Send + Sync>>,
@@ -2172,8 +2167,17 @@ impl<B: Backend> Machine<B> {
         let Some(source) = &self.time_skip_source else {
             return false;
         };
-        let startup = self.sys.completed_frames == 0;
-        if !source(startup) || self.sys.active_contexts().any(|context| context.is_ready()) {
+        let startup_poll = self.sys.completed_frames == 0
+            && self.sys.active_contexts().all(|context| {
+                matches!(
+                    context.state,
+                    State::Blocked {
+                        wait: Wait::ClockPoll(_),
+                        ..
+                    }
+                )
+            });
+        if !source(startup_poll) || self.sys.active_contexts().any(|context| context.is_ready()) {
             return false;
         }
         let Some(deadline) = self.sys.next_deadline() else {
@@ -2188,17 +2192,11 @@ impl<B: Backend> Machine<B> {
             else {
                 return false;
             };
-            match wait {
-                Wait::Until(at) => *at == deadline,
-                Wait::Object { deadline: at, .. } | Wait::Objects { deadline: at, .. } => {
-                    *at == Some(deadline)
-                }
-                Wait::Yield => false,
-            }
+            wait.deadline() == Some(deadline)
         });
         // Re-read live intent at the commit point; an up event never has to drain
         // a guest message queue before stopping time skipping.
-        if !eligible || !source(startup) {
+        if !eligible || !source(startup_poll) {
             return false;
         }
         let advanced = self.sys.clock.skip_to(deadline);
@@ -2502,7 +2500,7 @@ impl<B: Backend> Machine<B> {
                     );
                 }
                 let (kind, resource) = match &wait {
-                    Wait::Until(at) => (1, *at),
+                    Wait::Until(at) | Wait::ClockPoll(at) => (1, *at),
                     Wait::Object { handle, .. } => (2, u64::from(*handle)),
                     Wait::Objects { .. } => (3, 0),
                     Wait::Yield => unreachable!(),
@@ -2695,7 +2693,7 @@ impl<B: Backend> Machine<B> {
                         && !self
                             .time_skip_source
                             .as_ref()
-                            .is_some_and(|source| source(self.sys.completed_frames == 0))))
+                            .is_some_and(|source| source(false))))
                 && self
                     .sys
                     .wakes

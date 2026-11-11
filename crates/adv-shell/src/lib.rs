@@ -121,14 +121,12 @@ impl Options {
         if self.time_skip {
             let skip_keys = keys.clone();
             let pending_input = wake.interrupt_flag();
-            machine.set_time_skip_source(Some(std::sync::Arc::new(move |startup| {
+            machine.set_time_skip_source(Some(std::sync::Arc::new(move |startup_poll| {
                 // Pending input/audio notifications must be drained before jumping.
-                // Until the first frame nothing is on screen to pace, so timed waits
-                // only delay first entry; afterwards skipping follows the Ctrl keys.
                 pending_input.load(std::sync::atomic::Ordering::Acquire)
                     & adv_sync::pending::INTERRUPT
                     == 0
-                    && (startup
+                    && (startup_poll
                         || [0x11, 0xa2, 0xa3]
                             .iter()
                             .any(|key| skip_keys.get(*key) & 0x80 != 0))
@@ -257,7 +255,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
-  --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
+  --no-time-skip           disable startup clock-poll and Ctrl time skipping\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\

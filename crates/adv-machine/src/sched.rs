@@ -146,6 +146,8 @@ pub enum Wait {
     Yield,
     /// Sleep until the given time.
     Until(u64),
+    /// Wait for the next tick after a streak of consecutive clock reads.
+    ClockPoll(u64),
     /// Wait for an object to become signaled, with an optional deadline.
     Object {
         handle: Handle,
@@ -173,7 +175,7 @@ pub(crate) fn next_tick(us: u64) -> u64 {
 impl Wait {
     pub(crate) fn deadline(&self) -> Option<u64> {
         match self {
-            Self::Until(at) => Some(*at),
+            Self::Until(at) | Self::ClockPoll(at) => Some(*at),
             Self::Object { deadline, .. } | Self::Objects { deadline, .. } => *deadline,
             Self::Yield => None,
         }

@@ -468,14 +468,14 @@ fn time_skip_respects_external_waits_and_process_families() {
 
 // spec: WINE-THR-3, WINE-THR-4, WINE-TIME-1
 #[test]
-fn thread_control_with_startup_time_skip() {
+fn thread_control_with_time_skip() {
     let Some((stop, text)) = probe(
-        "thread_control_with_startup_time_skip",
+        "thread_control_with_time_skip",
         "control.exe",
         |session, _| {
             session
                 .machine
-                .set_time_skip_source(Some(std::sync::Arc::new(|startup| startup)));
+                .set_time_skip_source(Some(std::sync::Arc::new(|_| true)));
         },
     ) else {
         return;

@@ -467,7 +467,7 @@ pub fn poll_clock(
         return finish(env, now);
     }
     let next_ms = (now / 1000 + 1) * 1000;
-    Outcome::block_timed(Wait::Until(next_ms), move |env, _| {
+    Outcome::block_timed(Wait::ClockPoll(next_ms), move |env, _| {
         let now = env.sys.clock.guest_now_us();
         let clock = &env.sys.clock;
         let mut poll = clock.state.poll.get();

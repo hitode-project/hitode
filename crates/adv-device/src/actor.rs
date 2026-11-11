@@ -72,6 +72,7 @@ pub(crate) struct SourceState {
 pub struct RingState {
     sequence: AtomicU64,
     position: AtomicU64,
+    write_position: AtomicU32,
     minimum_position: AtomicU64,
     pts: AtomicU64,
     frequency: AtomicU32,
@@ -83,7 +84,11 @@ pub struct RingState {
 }
 impl RingState {
     pub fn cursor(&self, now: u64, generation: u64) -> Option<u32> {
-        let (epoch, bytes, align, base, minimum, playing, looping, pts, frequency) = loop {
+        self.cursors(now, generation).map(|(play, _)| play)
+    }
+
+    pub fn cursors(&self, now: u64, generation: u64) -> Option<(u32, u32)> {
+        let (epoch, bytes, align, base, write, minimum, playing, looping, pts, frequency) = loop {
             let sequence = self.sequence.load(Ordering::Acquire);
             if sequence & 1 != 0 {
                 std::hint::spin_loop();
@@ -94,6 +99,7 @@ impl RingState {
                 self.bytes.load(Ordering::Relaxed),
                 self.align.load(Ordering::Relaxed),
                 self.position.load(Ordering::Relaxed),
+                self.write_position.load(Ordering::Relaxed),
                 self.minimum_position.load(Ordering::Relaxed),
                 self.playing.load(Ordering::Relaxed),
                 self.looping.load(Ordering::Relaxed),
@@ -109,7 +115,7 @@ impl RingState {
             return None;
         }
         if bytes == 0 {
-            return Some(0);
+            return Some((0, 0));
         }
         let align = align.max(1);
         let mut position = i128::from(base);
@@ -117,21 +123,18 @@ impl RingState {
             let delta = i128::from(now) - i128::from(pts);
             position += delta * i128::from(frequency) * i128::from(align) / 1_000_000;
         }
-        if looping {
-            Some(
-                position
-                    .max(i128::from(minimum))
-                    .rem_euclid(i128::from(bytes)) as u32
-                    / align
-                    * align,
-            )
+        let play = if looping {
+            position
+                .max(i128::from(minimum))
+                .rem_euclid(i128::from(bytes)) as u32
+                / align
+                * align
+        } else if position >= i128::from(bytes) {
+            0
         } else {
-            Some(if position >= i128::from(bytes) {
-                0
-            } else {
-                position.max(0) as u32 / align * align
-            })
-        }
+            position.max(0) as u32 / align * align
+        };
+        Some((play, if playing { write } else { play }))
     }
 }
 
@@ -448,6 +451,9 @@ impl AudioControl {
     }
     pub fn playback_clock(&self) -> Arc<PlaybackClock> {
         self.stream.shared.clock.clone()
+    }
+    pub fn device_connected(&self) -> bool {
+        self.stream.shared.connected.load(Ordering::Acquire)
     }
     pub fn sync_clock(&self, guest_us: u64) {
         {
@@ -1054,6 +1060,9 @@ impl Engine {
                         state
                             .position
                             .store(voice.total_position(), Ordering::Relaxed);
+                        state
+                            .write_position
+                            .store(voice.write_position(), Ordering::Relaxed);
                         state
                             .minimum_position
                             .store(voice.minimum_position(), Ordering::Relaxed);

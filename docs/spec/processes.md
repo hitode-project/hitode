@@ -61,6 +61,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-1 Time skip
 
 **Rule**: The machine MUST own the virtual clock. Ctrl time skip MAY advance to a deadline only when no context can run and the wait allows it. It MUST NOT complete external I/O early, and the audio play cursor MUST follow device consumption.
+Before the first completed frame, automatic time skip MAY advance time only when every live context is waiting for its next clock poll.
 **Verification**: Test
 
 ### PROC-CLOCK-2 No time skip in a family

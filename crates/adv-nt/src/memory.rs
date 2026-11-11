@@ -4,7 +4,8 @@
 //! does: reserved pages are not mapped in the guest, committed pages are
 //! mapped with their protection. Address space comes from the machine's
 //! reservations, which also hold what the machine allocates itself; such a
-//! range reads as a reserved private region.
+//! range reads as a reserved private region. Unconstrained private allocations
+//! prefer the dynamic arena but can use any free user address.
 
 use std::collections::BTreeMap;
 
@@ -516,17 +517,12 @@ fn allocate_in(
     } else if reserve {
         let (start, length) = if address == 0 {
             let length = align_up(size, PAGE);
+            let top_down = kind & MEM_TOP_DOWN != 0;
             let start = if low == 0 && high == 0 && alignment == GRANULE {
-                find_free(&env.sys.vm, length, kind & MEM_TOP_DOWN != 0)
+                find_free(&env.sys.vm, length, top_down)
+                    .or_else(|| find_free_range(&env.sys.vm, length, top_down, 0, 0, GRANULE))
             } else {
-                find_free_range(
-                    &env.sys.vm,
-                    length,
-                    kind & MEM_TOP_DOWN != 0,
-                    low,
-                    high,
-                    alignment,
-                )
+                find_free_range(&env.sys.vm, length, top_down, low, high, alignment)
             }
             .ok_or(status::NO_MEMORY)?;
             (start, length)
@@ -1622,6 +1618,49 @@ mod volume_tests {
         fn unmap(&mut self, at: u32, len: u32) -> Result<(), adv_cpu::backend::MemFault> {
             self.cpu.unmap(at, len)
         }
+    }
+
+    // spec: NT-SYS-2
+    #[test]
+    fn unconstrained_reservation_can_use_free_space_outside_the_dynamic_arena() {
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, false).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let args = GRANULE;
+        let size = 8 * 1024 * 1024;
+        assert!(machine.sys.vm.reserve_at(args, PAGE));
+        machine.cpu.map(args, PAGE, Prot::RW).unwrap();
+        assert!(machine.sys.vm.reserve_at(DYN_START, DYN_END - DYN_START));
+        machine.cpu.write_u32(args + 4, size).unwrap();
+        let mut env = Env {
+            context: 0,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        allocate_in(
+            &mut env,
+            &[
+                CURRENT_PROCESS,
+                args,
+                0,
+                args + 4,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            ],
+            0,
+            0,
+            GRANULE,
+        )
+        .unwrap();
+        let base = env.cpu.read_u32(args).unwrap();
+        assert!((GRANULE..DYN_START).contains(&base));
+        assert_eq!(env.sys.vm.region(base), Some(size));
     }
 
     // spec: A64-MEM-4

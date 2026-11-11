@@ -230,16 +230,16 @@ impl Buffer {
                 0
             }
     }
-    fn cursor(&self, now: u64) -> u32 {
+    fn cursors(&self, now: u64, device_connected: bool) -> (u32, u32) {
         if self.playback_clock.uses_device_time()
-            && let Some(position) = self
+            && let Some((play, write)) = self
                 .voice
                 .as_ref()
-                .and_then(|voice| voice.cursor(now, self.generation))
+                .and_then(|voice| voice.cursors(now, self.generation))
         {
-            return position;
+            return (play, if device_connected { write } else { play });
         }
-        if self.len == 0 {
+        let play = if self.len == 0 {
             0
         } else if self.looping {
             (self.progress(now) % u64::from(self.len)) as u32
@@ -250,7 +250,12 @@ impl Buffer {
             } else {
                 progress as u32
             }
-        }
+        };
+        // A live callback has not published a position for this generation yet.
+        (play, if device_connected { self.base } else { play })
+    }
+    fn cursor(&self, now: u64) -> u32 {
+        self.cursors(now, false).0
     }
     fn stop(&mut self, now: u64) {
         self.base = self
@@ -1412,16 +1417,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             0
         }
         "GetCurrentPosition" => {
-            let pos = buf.cursor(now);
+            let (play, write) = buf.cursors(now, s.audio.device_connected());
             if b != 0 {
-                e.cpu.write_u32(b, pos).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(b, play).map_err(|e| e.to_string())?;
             }
             if c != 0 {
-                let write = if buf.len == 0 {
-                    0
-                } else {
-                    (pos + buf.frequency / 25 * buf.format.align()) % buf.len
-                };
                 e.cpu.write_u32(c, write).map_err(|e| e.to_string())?;
             }
             0
@@ -1649,7 +1649,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             let offset = if flags & 1 != 0 {
-                (buf.cursor(now) + buf.frequency / 25 * buf.format.align()) % buf.len
+                buf.cursors(now, s.audio.device_connected()).1
             } else {
                 b
             };
@@ -2508,6 +2508,104 @@ mod tests {
         invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[b, 399]);
         assert_eq!(position(&mut m, b), 396);
     }
+
+    #[test]
+    // spec: DEV-AUDIO-1
+    fn live_write_cursor_releases_each_half_only_after_the_mixer_reads_it() {
+        let audio = AudioControl::new(true);
+        let mut m = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            64,
+        );
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .storage_addr();
+        m.cpu.write(storage, &[192; 64]).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]),
+            0
+        );
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        let write = |m: &mut Machine<JitCpu>| {
+            assert_eq!(
+                invoke(
+                    m,
+                    "IDirectSoundBuffer8::GetCurrentPosition",
+                    &[b, 0, DATA + 128]
+                ),
+                0
+            );
+            m.cpu.read_u32(DATA + 128).unwrap()
+        };
+
+        let mut first = [0.0; 48];
+        reader.read(&mut first, 1_000_000);
+        assert_eq!(first, [0.5; 48]);
+        assert_eq!(write(&mut m), 24);
+        let mut first_tail = [0.0; 16];
+        reader.read(&mut first_tail, 1_000_000);
+        assert_eq!(first_tail, [0.5; 16]);
+        assert_eq!(write(&mut m), 32);
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Lock",
+                &[b, 0, 1, DATA + 128, DATA + 132, 0, 0, 1]
+            ),
+            0
+        );
+        let pointer = m.cpu.read_u32(DATA + 128).unwrap();
+        assert_eq!(pointer, storage + 32);
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Unlock",
+                &[b, pointer, 0, 0, 0]
+            ),
+            0
+        );
+
+        // Refill the released half while the callback is still using the other half.
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Lock",
+                &[b, 0, 32, DATA + 128, DATA + 132, 0, 0, 0]
+            ),
+            0
+        );
+        let pointer = m.cpu.read_u32(DATA + 128).unwrap();
+        m.cpu.write(pointer, &[64; 32]).unwrap();
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Unlock",
+                &[b, pointer, 32, 0, 0]
+            ),
+            0
+        );
+        let mut second = [0.0; 64];
+        reader.read(&mut second, 1_000_000);
+        assert_eq!(second, [0.5; 64]);
+        assert_eq!(write(&mut m), 0);
+        let mut wrapped = [0.0; 16];
+        reader.read(&mut wrapped, 1_000_000);
+        assert_eq!(wrapped, [-0.5; 16]);
+    }
+
     #[test]
     fn unsigned_mono_and_signed_stereo_pcm_are_read_from_shared_guest_memory() {
         for format in [

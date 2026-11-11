@@ -277,6 +277,7 @@ are ignored. The supported fields restore without changing the current reserved 
 ### NT-SYS-2 Memory services
 
 **Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
+An unconstrained private allocation MUST be able to use free user addresses outside the dynamic arena.
 **Verification**: Test
 
 ### NT-SYS-3 Guest system state
