@@ -134,6 +134,10 @@ Search expressions MUST recognize the NT DOS wildcard tokens `<`, `>` and `"` al
 Directory query `BOOLEAN` arguments MUST use only the low byte of their stack slot.
 **Verification**: Test
 
+Wine retries an initial exact file lookup with the legacy directory record if
+the guest returns success without data for the extended record. Both calls
+use the current guest import so inline hooks remain effective.
+
 ### WINE-SYS-7 Instruction coherence
 
 **Rule**: For the current process, `NtFlushInstructionCache` MUST return success after prior guest writes become visible to instruction execution.
@@ -196,7 +200,7 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 ### NT-FILE-1 File descriptor operations
 
-**Rule**: File flushing, deletion, mailslot creation, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
+**Rule**: File flushing, deletion, mailslot creation and queries, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
 **Verification**: Test
 
 ### NT-FILE-2 File waits and cancellation

@@ -621,6 +621,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     bind_builtin_bodies(env, base, &pe);
     let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
+    crate::directory::bind_find_query(env, base, &pe);
     crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
     if let Some(binding) = env.ext.try_get::<ImageBinding>().copied() {
         (binding.mapped)(env, base, &pe, path.as_deref());

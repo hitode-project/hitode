@@ -4,10 +4,11 @@
  * presented, and the window repaints with GDI afterwards, which must not
  * replace the presented frame. It exits with 0 only when the text inked the
  * surface, the rest kept the fill and the back buffer drew and presented.
- * Build: i686-w64-mingw32-gcc -O1 -o d3d9.exe d3d9.c -ld3d9 -lgdi32 -luser32 */
+ * Build: i686-w64-mingw32-gcc -O1 -o d3d9.exe d3d9.c -ld3d9 -lgdi32 -luser32 -lwinmm */
 #define COBJMACROS
 #include <windows.h>
 #include <d3d9.h>
+#include <mmsystem.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -39,6 +40,26 @@ static int draw(IDirect3DSurface9 *surface, HRESULT *released)
     DeleteObject(font);
     DeleteObject(blue);
     return SUCCEEDED(got) ? drawn : got;
+}
+
+/* GFX-PACE-1: a timer alone is not a frame wait. Once the timer is used
+ * in a message wait, Present must return in time to service the queue. */
+static int frame_wait(IDirect3DDevice9 *device)
+{
+    HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!event || !timeSetEvent(5, 1, (LPTIMECALLBACK)event, 0, TIME_CALLBACK_EVENT_SET) ||
+        FAILED(IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL)) ||
+        WaitForSingleObject(event, 0) != WAIT_OBJECT_0)
+        return 8;
+    if (!timeSetEvent(5, 1, (LPTIMECALLBACK)event, 0, TIME_CALLBACK_EVENT_SET) ||
+        MsgWaitForMultipleObjects(1, &event, FALSE, 1000, QS_MOUSEBUTTON) != WAIT_OBJECT_0 ||
+        !timeSetEvent(5, 1, (LPTIMECALLBACK)event, 0, TIME_CALLBACK_EVENT_SET) ||
+        FAILED(IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL)) ||
+        WaitForSingleObject(event, 0) != WAIT_TIMEOUT ||
+        WaitForSingleObject(event, 1000) != WAIT_OBJECT_0)
+        return 9;
+    CloseHandle(event);
+    return 0;
 }
 
 int main(void)
@@ -117,6 +138,12 @@ int main(void)
     if (!other_window ||
         IDirect3DDevice9_Present(device, &invalid, NULL, other_window, NULL) != D3DERR_INVALIDCALL)
         return 7;
+
+    if (GetFileAttributesA("check-frame-wait") != INVALID_FILE_ATTRIBUTES)
+    {
+        int result = frame_wait(device);
+        if (result) return result;
+    }
 
     /* Wine flushes the repainted window surface while messages are read. */
     InvalidateRect(window, NULL, TRUE);

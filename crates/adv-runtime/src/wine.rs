@@ -237,6 +237,7 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         },
         completed: frame_completed,
         fast_forward: |_| false,
+        guest_frame_wait: winmm::frame_timer::take,
         insert: |ext, target| ext.get_mut::<Surfaces<Snapshot>>().insert_native(target),
         target: |ext, id| ext.get::<Surfaces<Snapshot>>().native_target(id).cloned(),
         remove: |ext, _, id| {

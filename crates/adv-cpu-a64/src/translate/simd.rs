@@ -27,8 +27,10 @@
 //!
 //! Packed float-to-integer conversions handle every MXCSR rounding mode,
 //! DAZ, sticky exceptions and integer indefinite before publishing their result.
-//! Other SSE arithmetic and conversions run in NEON while MXCSR is the default:
-//! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
+//! Other SSE arithmetic and conversions normally require default MXCSR:
+//! masked exceptions, round to nearest, no DAZ or FTZ. Binary32 adds,
+//! multiplies and packed integer-to-single conversions also accept directed
+//! rounding, with FPCR restored before continuing. The A64
 //! result is the x86 one whenever the operation raises nothing but
 //! inexact: a quiet NaN operand propagates as the first source, as on x86.
 //! Translated code never touches FPSR on the fast path, since its accesses
@@ -206,6 +208,12 @@ impl Simd {
         )
     }
 
+    /// Single-instruction NEON operations that can use MXCSR rounding.
+    fn directed_rounding(&self) -> bool {
+        matches!(self.kind, Kind::Float(Float::Fadd | Float::Fmul, _))
+            || self.kind == Kind::FromInt(false) && !self.mmx()
+    }
+
     /// Whether a `floating` instruction reads binary64 operands.
     fn double(&self) -> bool {
         matches!(
@@ -244,6 +252,7 @@ impl Simd {
     pub fn guarding(&self, before: Guards) -> Guards {
         let mut after = before;
         if self.kind == Kind::LoadControl {
+            after.fp_masked = false;
             after.fp_default = false;
             after.fp_pe = false;
         }
@@ -251,7 +260,8 @@ impl Simd {
             after.ready = self.kind != Kind::Emms;
         }
         if self.floating() {
-            after.fp_default = true;
+            after.fp_masked = true;
+            after.fp_default |= !self.directed_rounding();
             after.fp_pe |= self.inexact();
         }
         after
@@ -311,6 +321,7 @@ pub struct Slow {
     tiny: Option<Label>,
     resume: Label,
     bail: Label,
+    rounded: Option<Label>,
 }
 
 const NO_MEM: Mem = Mem {
@@ -681,7 +692,9 @@ pub struct Vector {
 pub struct Guards {
     /// No x87 exception is pending, and TOP and the tags are 0.
     pub ready: bool,
-    /// MXCSR's control bits have passed the native SSE guard.
+    /// MXCSR masks all exceptions and does not enable DAZ or FTZ.
+    pub fp_masked: bool,
+    /// MXCSR has default control bits, including nearest rounding.
     pub fp_default: bool,
     /// MXCSR PE is set on every path continuing inside this unit.
     pub fp_pe: bool,
@@ -690,6 +703,7 @@ pub struct Guards {
 impl Guards {
     pub const ALL: Self = Self {
         ready: true,
+        fp_masked: true,
         fp_default: true,
         fp_pe: true,
     };
@@ -698,6 +712,7 @@ impl Guards {
     pub fn meet(self, other: Self) -> Self {
         Self {
             ready: self.ready && other.ready,
+            fp_masked: self.fp_masked && other.fp_masked,
             fp_default: self.fp_default && other.fp_default,
             fp_pe: self.fp_pe && other.fp_pe,
         }
@@ -937,6 +952,7 @@ impl Translator<'_> {
                 self.asm.cbz(W, true, X17, bail);
                 self.cpu();
                 self.emit(str(W, X13, X5, runtime::MXCSR));
+                self.vector.guards.fp_masked = false;
                 self.vector.guards.fp_default = false;
                 self.vector.guards.fp_pe = false;
                 return;
@@ -1437,8 +1453,8 @@ impl Translator<'_> {
         }
     }
 
-    /// Arithmetic, conversions and binary32/64 compares under the default
-    /// MXCSR. The fast path never touches FPSR: it runs once PE is set, or
+    /// Arithmetic, conversions and binary32/64 compares. The fast path
+    /// never touches FPSR: it runs once PE is set, or
     /// for operations that cannot be inexact, with no denormal operand, and
     /// sends values that could raise anything else to the slow path, which
     /// redoes the operation between a cleared and a read FPSR and leaves
@@ -1451,17 +1467,28 @@ impl Translator<'_> {
         let inexact = simd.inexact();
         let first_pe = inexact && !self.vector.guards.fp_pe;
         let guards = self.vector.guards;
+        let directed = !guards.fp_default && simd.directed_rounding();
+        let rounded = directed.then(|| self.asm.label());
         self.as_part(Part::SimdGuard, |t| {
             if inexact && !guards.fp_pe || !guards.fp_default {
                 t.emit(ldr(W, X13, X5, runtime::MXCSR));
             }
-            // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
+            // Masked exceptions, no DAZ or FTZ; other forms require nearest.
             if !guards.fp_default {
-                t.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
-                t.asm.cbz(W, true, X17, bail);
+                if !guards.fp_masked {
+                    t.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
+                    if directed {
+                        t.emit(and_imm(W, X17, X17, u64::from(!0x6000u32)));
+                    }
+                    t.asm.cbz(W, true, X17, bail);
+                } else if !directed {
+                    t.emit(and_imm(W, X17, X13, 0x6000));
+                    t.asm.cbz(W, true, X17, bail);
+                }
             }
         });
-        self.vector.guards.fp_default = true;
+        self.vector.guards.fp_masked = true;
+        self.vector.guards.fp_default = !directed;
         let s = match simd.src {
             Loc::Mem => {
                 self.simd_access(vmem(simd.width), V1, address, false);
@@ -1487,7 +1514,13 @@ impl Translator<'_> {
             self.vector.guards.fp_pe = true;
         }
         self.denormals(simd, operands, Some(slow));
-        let tiny = self.floating_fast(simd, operands, slow);
+        if let Some(rounded) = rounded {
+            self.as_part(Part::SimdGuard, |t| {
+                t.emit(and_imm(W, X17, X13, 0x6000));
+                t.asm.cbz(W, true, X17, rounded);
+            });
+        }
+        let tiny = self.floating_fast(simd, operands, slow, false);
         self.asm.bind(resume);
         self.push_cold(Cold::Floating(Slow {
             simd,
@@ -1496,6 +1529,7 @@ impl Translator<'_> {
             tiny,
             resume,
             bail,
+            rounded,
         }));
         if matches!(simd.kind, Kind::ScalarToInt(..)) {
             let Loc::Gpr(index) = simd.dst else {
@@ -1581,7 +1615,13 @@ impl Translator<'_> {
     /// The fast path of `floating` into v0 (and v2), with the checks around
     /// it; the label of the cold check of a zero or subnormal result that
     /// zero operands may make exact.
-    fn floating_fast(&mut self, simd: Simd, operands: Operands, slow: Label) -> Option<Label> {
+    fn floating_fast(
+        &mut self,
+        simd: Simd,
+        operands: Operands,
+        slow: Label,
+        rounded: bool,
+    ) -> Option<Label> {
         let (v3, v4, v5, v6) = (VReg::new(3), VReg::new(4), VReg::new(5), VReg::new(6));
         let double = simd.double();
         let scalar = simd.scalar();
@@ -1642,14 +1682,30 @@ impl Translator<'_> {
             }
             return None;
         }
-        self.floating_op(simd, operands);
+        if rounded {
+            self.rounded_op(simd, operands);
+        } else {
+            self.floating_op(simd, operands);
+        }
         match simd.kind {
             Kind::Float(op, _) | Kind::Double(op, _) if scalar => {
                 let sum = matches!(op, Float::Fadd | Float::Fsub);
                 let tiny = self.result_bits(double, V0, !sum);
+                if rounded {
+                    // Overflow can saturate to max finite. A product
+                    // rounded up to min normal can also raise underflow.
+                    self.emit(add_imm(W, X16, X17, 1, false));
+                    self.asm.tbz(true, X16, 8, slow);
+                    if !sum {
+                        self.emit(eor_imm(W, X16, X17, 2));
+                        self.asm.cbz(W, false, X16, slow);
+                    }
+                }
                 if sum {
                     // A tiny sum is exact: only infinities and NaNs.
-                    self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
+                    if !rounded {
+                        self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
+                    }
                     return None;
                 }
                 let label = self.asm.label();
@@ -1664,19 +1720,31 @@ impl Translator<'_> {
                 } else {
                     self.emit(movz(W, X16, 0x7f80, 16));
                 }
-                self.emit_all(&[
-                    vdup(arr, v4, X16),
-                    vlogic(Logic::And, true, v5, V0, v4),
-                    vsame(Same::Cmeq, arr, v6, v5, v4),
-                ]);
+                self.emit_all(&[vdup(arr, v4, X16), vlogic(Logic::And, true, v5, V0, v4)]);
+                if rounded {
+                    self.emit_all(&[
+                        movz(W, X16, 0x7f00, 16),
+                        vdup(arr, v4, X16),
+                        vlogic(Logic::And, true, v6, v5, v4),
+                        vsame(Same::Cmeq, arr, v6, v6, v4),
+                    ]);
+                } else {
+                    self.emit(vsame(Same::Cmeq, arr, v6, v5, v4));
+                }
                 if !matches!(op, Float::Fadd | Float::Fsub) {
                     // A product with a zero factor, or a zero dividend, is
                     // an exact zero.
-                    self.emit_all(&[
-                        vzero(true, V2),
-                        vsame(Same::Cmeq, arr, v5, v5, V2),
-                        vcompare(Float::Fcmeq, false, double, v3, a.unwrap(), V2),
-                    ]);
+                    self.emit(vzero(true, V2));
+                    if rounded {
+                        self.emit_all(&[
+                            movz(W, X16, 0x0100, 16),
+                            vdup(arr, v4, X16),
+                            vsame(Same::Uqsub, arr, v5, v4, v5),
+                        ]);
+                    } else {
+                        self.emit(vsame(Same::Cmeq, arr, v5, v5, V2));
+                    }
+                    self.emit(vcompare(Float::Fcmeq, false, double, v3, a.unwrap(), V2));
                     if op == Float::Fmul {
                         self.emit_all(&[
                             vcompare(Float::Fcmeq, false, double, v4, s, V2),
@@ -1907,7 +1975,36 @@ impl Translator<'_> {
         }
     }
 
-    /// The slow path of a `floating` instruction, and its tiny-result check.
+    /// Run a single operation under MXCSR rounding, restoring host FPCR.
+    fn rounded_op(&mut self, simd: Simd, operands: Operands) {
+        // x86 and ARM reverse the encodings for round up and round down.
+        self.emit_all(&[
+            and_imm(W, X17, X13, 0x6000),
+            rbit(W, X17, X17),
+            lsl_imm(W, X17, X17, 5),
+            mrs_fpcr(X14),
+            msr_fpcr(X17),
+        ]);
+        self.floating_op(simd, operands);
+        self.emit(msr_fpcr(X14));
+    }
+
+    fn floating_tiny(&mut self, simd: Simd, operands: Operands, slow: Label, resume: Label) {
+        let double = simd.double();
+        self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
+        let zeros = match simd.kind {
+            Kind::Float(Float::Fmul, _) | Kind::Double(Float::Fmul, _) => operands.inputs,
+            Kind::Narrow(..) => [Some(operands.s), None],
+            _ => [operands.inputs[0], None],
+        };
+        for zero in zeros.into_iter().flatten() {
+            let size = if double { X } else { W };
+            self.emit_all(&[fmov_from_v(size, X16, zero), lsl_imm(size, X16, X16, 1)]);
+            self.asm.cbz(size, false, X16, resume);
+        }
+    }
+
+    /// The out-of-line paths of a `floating` instruction.
     pub(super) fn floating_cold(&mut self, cold: Slow) {
         let Slow {
             simd,
@@ -1916,28 +2013,33 @@ impl Translator<'_> {
             tiny,
             resume,
             bail,
+            rounded,
         } = cold;
+        if let Some(rounded) = rounded {
+            self.asm.bind(rounded);
+            self.remark(Part::Body);
+            let tiny = self.floating_fast(simd, operands, slow, true);
+            self.asm.b(resume);
+            if let Some(tiny) = tiny {
+                self.asm.bind(tiny);
+                self.floating_tiny(simd, operands, slow, resume);
+                self.asm.b(slow);
+            }
+        }
         if let Some(tiny) = tiny {
             self.asm.bind(tiny);
-            let double = simd.double();
-            self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
-            let zeros = match simd.kind {
-                Kind::Float(Float::Fmul, _) | Kind::Double(Float::Fmul, _) => operands.inputs,
-                Kind::Narrow(..) => [Some(operands.s), None],
-                _ => [operands.inputs[0], None],
-            };
-            for zero in zeros.into_iter().flatten() {
-                let size = if double { X } else { W };
-                self.emit_all(&[fmov_from_v(size, X16, zero), lsl_imm(size, X16, X16, 1)]);
-                self.asm.cbz(size, false, X16, resume);
-            }
+            self.floating_tiny(simd, operands, slow, resume);
         }
         self.asm.bind(slow);
         self.remark(crate::jit_map::Part::FpStatus);
         self.emit(ldr(W, X13, X5, runtime::MXCSR));
         self.denormals(simd, operands, None);
         self.emit(msr_fpsr(Reg::ZR));
-        self.floating_op(simd, operands);
+        if rounded.is_some() {
+            self.rounded_op(simd, operands);
+        } else {
+            self.floating_op(simd, operands);
+        }
         // Anything but inexact leaves; inexact sets PE.
         self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
         self.asm.cbz(X, true, X14, bail);
