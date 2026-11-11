@@ -6,6 +6,11 @@ Each port's urgent/background queues hold 1–64 items; `start()` creates one `a
 Components sharing an execution owner can use `into_local()` for a local `Rc<RefCell<Sender>>`.
 There is no cross-thread MPSC lock.
 
+`WakeEvent` retains notifications in a nonblocking pipe. Apple hosts register
+that pipe once with a reusable kqueue; Linux/Android use ppoll. Both wait paths
+accept submillisecond timeouts without rounding them up to a millisecond, and
+input or completion notifications can interrupt the wait.
+
 `try_submit(Priority, Task)` never waits. A full or closed queue returns the original Task and its resources.
 After rejection, `sender_with_capacity_wake` wakes the owner when the first slot becomes available, allowing retries without polling.
 The blocked marker is published before checking capacity; the service shutdown gate also counts producers publishing tasks.

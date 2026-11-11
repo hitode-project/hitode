@@ -316,8 +316,8 @@ fn cached_x87_runs_publish_at_inlined_returns() {
                 .expect("the unit was recorded");
             assert_eq!(
                 marks.iter().filter(|m| m.part == Part::X87Entry).count(),
-                2,
-                "the return separates the callee and caller runs: {marks:?}"
+                1,
+                "the callee and caller share the run: {marks:?}"
             );
         }
     }
@@ -370,4 +370,979 @@ fn parity_exits_from_long_runs_reach_their_publication() {
         let end = marks.last().unwrap().offset;
         assert!(end > 1 << 15, "unit of {end} bytes is within tbz reach");
     }
+}
+
+fn pixel_loop(advance: bool, middle: bool) -> (Program, u32) {
+    let (mut stop, mut latch) = (0, 0);
+    let mut p = fixture(|a| {
+        let (mut top, mut convert, mut floor, mut arm, mut join) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut top).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(ebx + 8)).unwrap();
+        a.fadd(qword_ptr(ebx + 16)).unwrap();
+        a.fchs().unwrap();
+        a.call(convert).unwrap();
+        a.cdq().unwrap();
+        a.idiv(ebp).unwrap();
+        a.xor(edx, edx).unwrap();
+        a.div(dword_ptr(ebx + 60)).unwrap();
+        a.shl(eax, cl).unwrap();
+        a.inc(dword_ptr(ebx + 64)).unwrap();
+        a.call(floor).unwrap();
+        if middle {
+            a.cmp(dword_ptr(esi + 8), 0).unwrap();
+            a.test(ecx, 1).unwrap();
+            a.jz(arm).unwrap();
+            a.fchs().unwrap();
+            a.fchs().unwrap();
+            a.set_label(&mut join).unwrap();
+        }
+        a.fnstcw(word_ptr(ebx + 40)).unwrap();
+        a.fldcw(word_ptr(ebx + 42)).unwrap();
+        a.fistp(qword_ptr(ebx + 48)).unwrap();
+        a.fldcw(word_ptr(ebx + 40)).unwrap();
+        a.mov(edi, ecx).unwrap();
+        a.and(edi, 127).unwrap();
+        a.mov(dword_ptr(ebx + edi * 4 + 0x800), eax).unwrap();
+        if advance {
+            a.add(esi, 8).unwrap();
+        }
+        a.dec(ecx).unwrap();
+        latch = a.instructions().len();
+        a.jne(top).unwrap();
+        stop = a.instructions().len();
+        a.nop().unwrap();
+
+        a.set_label(&mut convert).unwrap();
+        a.fstp(qword_ptr(ebx + 24)).unwrap();
+        a.cvttsd2si(eax, qword_ptr(ebx + 24)).unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut floor).unwrap();
+        a.movsd_2(xmm0, qword_ptr(ebx + 24)).unwrap();
+        a.addsd(xmm0, xmm1).unwrap();
+        a.cvttsd2si(edi, xmm0).unwrap();
+        a.cvtsi2sd(xmm0, edi).unwrap();
+        a.movsd_2(qword_ptr(ebx + 32), xmm0).unwrap();
+        a.fld(qword_ptr(ebx + 32)).unwrap();
+        a.ret().unwrap();
+
+        if middle {
+            a.set_label(&mut arm).unwrap();
+            a.fabs().unwrap();
+            a.jmp(join).unwrap();
+        }
+    });
+    let ip = |index| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(index)
+            .unwrap()
+            .ip32()
+    };
+    let latch = ip(latch);
+    p.stop = ip(stop);
+    p.state.regs[1] = 100;
+    p.state.regs[5] = 3;
+    p.state.regs[6] = DATA + 0x1000;
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.x87.regs[7] = X87Register::from_parts(0xf123_4567_89ab_cdef, 0x3ffe);
+    p.state.x87.ip = 0x1234;
+    p.state.x87.opcode = 0x555;
+    p.state.xmm[1][..8].copy_from_slice(&0.25f64.to_le_bytes());
+    p.state.mxcsr |= 0x20;
+    for (at, value) in [(8, 0.5f64), (16, 3.0 * 2f64.powi(-54))] {
+        p.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    p.data[42..44].copy_from_slice(&0x0e7fu16.to_le_bytes());
+    p.data[60..64].copy_from_slice(&3u32.to_le_bytes());
+    for (index, bytes) in p.data[0x1000..]
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        bytes.copy_from_slice(&(63.0 + index as f64 * 0.25).to_le_bytes());
+    }
+    (p, latch)
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-MEM-7 A64-CTL-7 A64-VER-1
+#[test]
+fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let (p, _) = pixel_loop(true, false);
+    for config in pixel_loops::configs() {
+        for budget in [19, 37, 1000, 5000] {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            let outcome = native.run(p.stop, budget).unwrap();
+            assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+            same(&native, &oracle);
+        }
+    }
+    for (fault, checks) in [
+        (None, Checks::Adaptive),
+        (None, Checks::Slow),
+        (Some(false), Checks::Adaptive),
+        (Some(true), Checks::Slow),
+    ] {
+        let (mut p, latch) = pixel_loop(true, fault == Some(true));
+        if let Some(middle) = fault {
+            p.state.regs[6] = DATA + DATA_LEN as u32 - 8 * (36 + u32::from(middle));
+        }
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        let outcome = native.run(p.stop, 5000).unwrap();
+        assert_eq!(
+            outcome,
+            oracle.run(p.stop, 5000).unwrap(),
+            "{fault:?} {checks:?}"
+        );
+        same(&native, &oracle);
+        let engine = native.native.as_ref().unwrap();
+        assert_eq!(engine.diagnostics.helpers, 0);
+        if fault.is_none() {
+            assert_eq!(outcome, RunOutcome::ReachedStop);
+        } else {
+            assert_eq!(native.state.regs[1], 64);
+            if checks == Checks::Slow {
+                assert_eq!(engine.diagnostics.refused, 1);
+            } else {
+                assert_eq!(engine.diagnostics.faults, 1);
+            }
+        }
+        if checks == Checks::Slow {
+            assert!(engine.diagnostics.accesses > 0);
+        }
+        let base = engine.unit_address(CODE).unwrap();
+        let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+        let inline = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+        assert_eq!(
+            inline.iter().filter(|m| m.part == Part::X87Entry).count(),
+            1
+        );
+        assert!(!inline.iter().any(|m| m.part == Part::X87Publish));
+        assert!(inline.iter().any(|m| m.eip == latch));
+    }
+
+    // The first SSE conversion is exact with MXCSR.PE clear, so its
+    // cold continuation has to publish the stale slot left by FSTP.
+    let (mut p, _) = pixel_loop(true, false);
+    p.state.mxcsr &= !0x20;
+    p.data[0x1000..0x1008].copy_from_slice(&64.0f64.to_le_bytes());
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        native.run(p.stop, 5000).unwrap(),
+        oracle.run(p.stop, 5000).unwrap()
+    );
+    same(&native, &oracle);
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64-CTL-8
+#[test]
+fn balanced_x87_loop_publishes_at_the_deadline_slice_backedge() {
+    use std::time::{Duration, Instant};
+
+    let (mut p, _) = pixel_loop(false, false);
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    assert_eq!(native.run(p.stop, 5000).unwrap(), RunOutcome::ReachedStop);
+    p.state.regs[1] = 100_000;
+    native.state = p.state.clone();
+    native.memory_mut().write(DATA, &p.data).unwrap();
+    native.state.refresh_mmx();
+    native.state.settle_flags();
+
+    // Run one owner slice: its budget check stops at a taken backedge,
+    // after which the owner observes the elapsed deadline.
+    let engine = native.native.as_mut().unwrap();
+    engine.deadline = Some(crate::native::deadline(
+        Instant::now() + Duration::from_nanos(1),
+    ));
+    let run = engine
+        .run(
+            &mut native.state,
+            &mut native.memory,
+            p.stop,
+            1 << 16,
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.exit, crate::runtime::Exit::Dispatch);
+    assert!(engine.past());
+    assert_eq!(native.state.eip, CODE);
+    assert!(run.retired > 60_000);
+    native.state.fuel = 0;
+    native.state.refresh_mmx();
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        oracle.run(p.stop, u64::from(run.retired)).unwrap(),
+        RunOutcome::Budget
+    );
+    same(&native, &oracle);
+}
+
+// spec: A64F-FP-7
+#[test]
+fn unbalanced_x87_loop_ends_the_run_at_its_head() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let mut p = fixture(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.fld1().unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    p.state.regs[1] = 3;
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        native.run(p.stop, 100).unwrap(),
+        oracle.run(p.stop, 100).unwrap()
+    );
+    same(&native, &oracle);
+    let base = native.native.as_ref().unwrap().unit_address(CODE).unwrap();
+    let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+    assert!(
+        marks
+            .iter()
+            .take_while(|m| m.part != Part::Cold)
+            .any(|m| m.part == Part::X87Publish)
+    );
+}
+
+// spec: A64F-FP-3 A64F-FP-7
+#[test]
+fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    for translate_with_pe in [false, true] {
+        let (mut p, _) = pixel_loop(true, false);
+        let mut native = executor(&p, config, false);
+        if translate_with_pe {
+            assert_eq!(native.run(p.stop, 5000).unwrap(), RunOutcome::ReachedStop);
+            native.memory_mut().write(DATA, &p.data).unwrap();
+        }
+        p.state.x87.status &= !0x20;
+        native.state = p.state.clone();
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(
+            native.run(p.stop, 5000).unwrap(),
+            oracle.run(p.stop, 5000).unwrap()
+        );
+        same(&native, &oracle);
+        assert_ne!(native.state.x87.status & 0x20, 0);
+        assert_eq!(
+            native.native.as_ref().unwrap().diagnostics.helpers != 0,
+            translate_with_pe,
+            "only the guard on a PE specialization needs an interpreter helper",
+        );
+    }
+
+    let mut p = fixture(|a| {
+        let mut top = a.create_label();
+        a.fld(qword_ptr(ebx + 8)).unwrap();
+        a.fistp(qword_ptr(ebx + 16)).unwrap();
+        a.fld1().unwrap();
+        a.set_label(&mut top).unwrap();
+        a.fadd(qword_ptr(ebx)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.fnstsw(ax).unwrap();
+    });
+    p.state.regs[1] = 100;
+    p.state.x87.status |= 0x20;
+    p.data[..8].copy_from_slice(&(3.0 * 2f64.powi(-54)).to_le_bytes());
+    p.data[8..16].copy_from_slice(&3.5f64.to_le_bytes());
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        native.run(p.stop, 500).unwrap(),
+        oracle.run(p.stop, 500).unwrap()
+    );
+    same(&native, &oracle);
+    assert_eq!(native.state.regs[0] & 0x220, 0x220);
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-TR-5
+#[test]
+fn x87_run_break_sse_back_jumps_agree_with_merge_guards() {
+    let mut p = fixture(|a| {
+        let (mut outer, mut wrapper, mut body, mut merge, mut special, mut scaling, mut done) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fnstcw(word_ptr(ebx + 144)).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fld1().unwrap();
+        a.call(wrapper).unwrap();
+        // Keep the enclosing loop from becoming one complete resident run.
+        a.frndint().unwrap();
+        a.fstp(qword_ptr(ebx + 128)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.dec(edi).unwrap();
+        a.jnz(outer).unwrap();
+        a.jmp(done).unwrap();
+
+        a.set_label(&mut wrapper).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 16).unwrap();
+        a.and(esp, -16).unwrap();
+        a.fxch(st0, st1).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.fstp(qword_ptr(esp + 8)).unwrap();
+        a.call(body).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut body).unwrap();
+        a.movlpd(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.andpd(xmm0, xmmword_ptr(ebx + 64)).unwrap();
+        a.orpd(xmm0, xmmword_ptr(ebx + 80)).unwrap();
+        a.psrlq(xmm0, 52).unwrap();
+        a.pextrw(eax, xmm0, 0).unwrap();
+        a.and(eax, 3).unwrap();
+        a.movlpd(xmm7, qword_ptr(esp + 12)).unwrap();
+        a.mulsd(xmm7, qword_ptr(ebx + eax * 4 + 96)).unwrap();
+        a.movapd(xmm6, xmmword_ptr(ebx + 112)).unwrap();
+        a.movlpd(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.sub(esp, 16).unwrap();
+        a.cmp(eax, 1).unwrap();
+        a.jae(special).unwrap();
+        a.mov(ecx, 0).unwrap();
+        a.mov(edx, 1).unwrap();
+        a.set_label(&mut merge).unwrap();
+        a.movd(xmm1, edx).unwrap();
+        a.psubq(xmm0, xmm1).unwrap();
+        a.addsd(xmm0, xmm7).unwrap();
+        a.mulsd(xmm0, xmm6).unwrap();
+        a.movlpd(qword_ptr(esp + 20), xmm0).unwrap();
+        a.fld(qword_ptr(esp + 20)).unwrap();
+        a.add(esp, 16).unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut special).unwrap();
+        a.cmp(eax, 2).unwrap();
+        a.jae(scaling).unwrap();
+        a.mov(edx, 2).unwrap();
+        a.addsd(xmm0, xmm6).unwrap();
+        a.inc(dword_ptr(ebx + 136)).unwrap();
+        a.jmp(merge).unwrap();
+        a.set_label(&mut scaling).unwrap();
+        a.mov(edx, 3).unwrap();
+        a.mulsd(xmm0, xmm6).unwrap();
+        a.inc(dword_ptr(ebx + 140)).unwrap();
+        a.jmp(merge).unwrap();
+        a.set_label(&mut done).unwrap();
+    });
+    for (index, value) in [2.0f64, 4.0, 8.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+        p.data[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    p.data[64..80].fill(0xff);
+    p.data[96..112].copy_from_slice(&1.0f64.to_le_bytes().repeat(2));
+    p.data[112..128].copy_from_slice(&0.5f64.to_le_bytes().repeat(2));
+    p.state.regs[7] = 6;
+    p.state.x87.set_control(0x027f);
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(oracle.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        same(&native, &oracle);
+        assert_eq!(
+            native.memory().read(DATA + 136, 4).unwrap(),
+            &2u32.to_le_bytes()
+        );
+        assert_eq!(
+            native.memory().read(DATA + 140, 4).unwrap(),
+            &2u32.to_le_bytes()
+        );
+        assert!(native.stats.native_entries > 0);
+    }
+}
+
+/// An authored loop nest with stack arguments, control checks and two arrivals
+/// at the inner body. The head discards the preceding iteration's temporaries.
+fn run_break_nest() -> (Program, u32) {
+    let (mut stop, mut latch) = (0, 0);
+    let mut p = fixture(|a| {
+        let (
+            mut outer,
+            mut head,
+            mut middle,
+            mut pixels,
+            mut floor,
+            mut ftol,
+            mut fallback,
+            mut done,
+        ) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fld(st0).unwrap();
+        a.mov(ecx, 8).unwrap();
+        a.jmp(middle).unwrap();
+        a.set_label(&mut head).unwrap();
+        a.mov(edi, dword_ptr(ebx + 64)).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(st2).unwrap();
+        a.set_label(&mut middle).unwrap();
+        for _ in 0..2 {
+            a.fld(st0).unwrap();
+            a.sub(esp, 8).unwrap();
+            a.fstp(qword_ptr(esp)).unwrap();
+            a.call(floor).unwrap();
+            a.add(esp, 8).unwrap();
+        }
+        a.fld(st0).unwrap();
+        a.call(ftol).unwrap();
+        // Reserve enough scratch for the chop sequence, including its ESP move.
+        a.sub(esp, 80).unwrap();
+        a.fnstcw(word_ptr(esp + 0x2c)).unwrap();
+        a.add(esp, 8).unwrap();
+        a.movzx(eax, word_ptr(esp + 0x24)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(dword_ptr(esp + 0x30), eax).unwrap();
+        a.fldcw(word_ptr(esp + 0x30)).unwrap();
+        a.fld(st0).unwrap();
+        a.fistp(qword_ptr(esp + 0x38)).unwrap();
+        a.fldcw(word_ptr(esp + 0x24)).unwrap();
+        a.add(esp, 72).unwrap();
+        a.mov(edi, 3).unwrap();
+        a.set_label(&mut pixels).unwrap();
+        a.add(eax, dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(edi).unwrap();
+        a.jnz(pixels).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(qword_ptr(ebx + 24)).unwrap();
+        a.fstp(qword_ptr(ebx + 32)).unwrap();
+        a.dec(edx).unwrap();
+        latch = a.instructions().len();
+        a.jnz(outer).unwrap();
+        stop = a.instructions().len();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+
+        a.set_label(&mut floor).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.stmxcsr(dword_ptr(esp + 4)).unwrap();
+        a.mov(eax, dword_ptr(esp + 4)).unwrap();
+        a.and(eax, 0x6000).unwrap();
+        a.cmp(eax, 0).unwrap();
+        a.jne(fallback).unwrap();
+        a.fnstcw(word_ptr(esp)).unwrap();
+        a.mov(ax, word_ptr(esp)).unwrap();
+        a.and(ax, 0x7f).unwrap();
+        a.cmp(ax, 0x7f).unwrap();
+        a.lea(esp, ptr(esp + 8)).unwrap();
+        a.jne(fallback).unwrap();
+        a.movq(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.cvttsd2si(eax, xmm0).unwrap();
+        a.cvtsi2sd(xmm1, eax).unwrap();
+        a.movq(qword_ptr(esp + 4), xmm1).unwrap();
+        a.fld(qword_ptr(esp + 4)).unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut ftol).unwrap();
+        a.cmp(dword_ptr(ebx + 68), 0).unwrap();
+        a.jne(fallback).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.and(esp, -8).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.cvttsd2si(eax, qword_ptr(esp)).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+
+        // This fallback leaves the helper and stops outside the nest trace.
+        a.set_label(&mut fallback).unwrap();
+        a.frndint().unwrap();
+        a.jmp(done).unwrap();
+    });
+    let ip = |n| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(n)
+            .unwrap()
+            .ip32()
+    };
+    let latch = ip(latch);
+    p.stop = ip(stop);
+    p.state.regs[2] = 3;
+    p.state.regs[6] = DATA + 0x1000;
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.mxcsr |= 0x20;
+    p.data[..8].copy_from_slice(&12.75f64.to_le_bytes());
+    (p, latch)
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-MEM-7
+#[test]
+fn x87_run_break_nest_keeps_the_steady_path_resident() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let (p, _) = run_break_nest();
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        native.run(p.stop, 10000).unwrap(),
+        oracle.run(p.stop, 10000).unwrap()
+    );
+    same(&native, &oracle);
+    let engine = native.native.as_ref().unwrap();
+    let base = engine.unit_address(CODE).unwrap();
+    let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+    let inline = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+    assert_eq!(native.stats.compilations, 1);
+    assert_eq!(engine.diagnostics.helpers, 0);
+    assert_eq!(
+        inline.iter().filter(|m| m.part == Part::X87Entry).count(),
+        1
+    );
+    assert!(!inline.iter().any(|m| m.part == Part::X87Publish));
+    // c3cf26e7, this fixture and configuration: one unit, 78,864 bytes total.
+    assert!(native.stats.native_code_bytes < 78_864);
+    eprintln!(
+        "nest and session code bytes: 78864 -> {}",
+        native.stats.native_code_bytes
+    );
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-MEM-7 A64-CTL-7
+#[test]
+fn x87_run_break_nest_preserves_middle_iteration_exits() {
+    for (fault, checks) in [
+        (false, Checks::Slow),
+        (true, Checks::Slow),
+        (true, Checks::Adaptive),
+    ] {
+        let (mut p, _) = run_break_nest();
+        if fault {
+            // Nine successful pixel loads, then a refusal/fault in iteration four.
+            p.state.regs[6] = DATA + DATA_LEN as u32 - 36;
+        }
+        for flagm in [false, true] {
+            let config = (Features { flagm }, false, checks);
+            for budget in [31, 117, 10000] {
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                let outcome = native.run(p.stop, budget).unwrap();
+                assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+                same(&native, &oracle);
+                if budget == 10000 {
+                    let diagnostics = &native.native.as_ref().unwrap().diagnostics;
+                    assert_eq!(diagnostics.helpers, 0);
+                    if checks == Checks::Slow {
+                        assert!(diagnostics.accesses > 0);
+                        assert_eq!(diagnostics.refused, u64::from(fault));
+                    } else {
+                        assert_eq!(diagnostics.faults, 1);
+                    }
+                    if fault {
+                        assert_eq!(native.state.regs[1], 5);
+                    } else {
+                        assert_eq!(outcome, RunOutcome::ReachedStop);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64-CTL-8
+#[test]
+fn x87_run_break_nest_publishes_at_the_deadline_backedge() {
+    use std::time::{Duration, Instant};
+    let (mut p, _) = run_break_nest();
+    // Reusing the same pixel span avoids leaving data during the long slice.
+    let add = iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+        .into_iter()
+        .find(|i| {
+            i.mnemonic() == iced_x86::Mnemonic::Add && i.op0_register() == iced_x86::Register::ESI
+        })
+        .unwrap();
+    let mut replacement = CodeAssembler::new(32).unwrap();
+    replacement.add(esi, 0).unwrap();
+    let bytes = replacement.assemble(add.ip()).unwrap();
+    assert_eq!(bytes.len(), add.len());
+    p.code[(add.ip32() - CODE) as usize..(add.next_ip32() - CODE) as usize].copy_from_slice(&bytes);
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+    p.state.regs[2] = 100_000;
+    native.state = p.state.clone();
+    native.memory_mut().write(DATA, &p.data).unwrap();
+    native.state.refresh_mmx();
+    native.state.settle_flags();
+    let engine = native.native.as_mut().unwrap();
+    engine.deadline = Some(crate::native::deadline(
+        Instant::now() + Duration::from_nanos(1),
+    ));
+    let run = engine
+        .run(
+            &mut native.state,
+            &mut native.memory,
+            p.stop,
+            1 << 16,
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.exit, crate::runtime::Exit::Dispatch);
+    assert!(engine.past());
+    assert!(run.retired > 60_000);
+    native.state.fuel = 0;
+    native.state.refresh_mmx();
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        oracle.run(p.stop, u64::from(run.retired)).unwrap(),
+        RunOutcome::Budget
+    );
+    same(&native, &oracle);
+}
+
+// spec: A64F-FP-7 A64-REG-5
+#[test]
+fn x87_run_break_nest_publishes_only_when_the_fallback_is_taken() {
+    let (mut p, _) = run_break_nest();
+    // The control check takes the fallback once, executes FRNDINT, then leaves.
+    p.state.x87.set_control(0x023f);
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(oracle.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        same(&native, &oracle);
+    }
+}
+
+// spec: A64F-FP-7 A64-REG-5
+#[test]
+fn x87_run_break_return_and_control_exit_keep_the_integer_tail() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let mut p = fixture(|a| {
+            let (mut helper, mut done) = (a.create_label(), a.create_label());
+            a.fld1().unwrap();
+            a.sub(esp, 8).unwrap();
+            a.fstp(qword_ptr(esp)).unwrap();
+            a.call(helper).unwrap();
+            a.add(esp, 8).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut helper).unwrap();
+            a.movq(xmm0, qword_ptr(esp + 4)).unwrap();
+            a.movq(qword_ptr(esp + 4), xmm0).unwrap();
+            a.fld(qword_ptr(esp + 4)).unwrap();
+            a.fnstcw(word_ptr(esp - 4)).unwrap();
+            a.mov(ax, word_ptr(esp - 4)).unwrap();
+            a.cmp(ax, 0x27f).unwrap();
+            a.jne(done).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut done).unwrap();
+        });
+        p.state.x87.set_control(0x027f);
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(
+            native.run(p.stop, 100).unwrap(),
+            oracle.run(p.stop, 100).unwrap()
+        );
+        same(&native, &oracle);
+        let base = native.native.as_ref().unwrap().unit_address(CODE).unwrap();
+        let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+        let inline = marks.iter().take_while(|m| m.part != Part::Cold);
+        assert_eq!(
+            inline.clone().filter(|m| m.part == Part::X87Entry).count(),
+            1
+        );
+        assert!(
+            !inline.clone().any(|m| m.part == Part::X87Publish),
+            "{marks:?}"
+        );
+    }
+}
+
+// spec: A64F-FP-7 A64F-FP-3 A64-REG-5
+#[test]
+fn x87_outside_helper_arrivals_enter_the_merge_cold() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let (mut stop_index, mut rare_index) = (0, 0);
+    let mut p = fixture(|a| {
+        let (mut outer, mut top, mut helper, mut rare, mut done, mut middle) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        // The inner head is appended after the returning fallback in trace order.
+        a.jmp(middle).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.fld1().unwrap();
+        a.fstp(st0).unwrap();
+        a.set_label(&mut middle).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fcom_2(st0, st6).unwrap();
+        a.call(helper).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fstp(qword_ptr(ebx + 16)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.mov(ecx, 4).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(outer).unwrap();
+        a.jmp(done).unwrap();
+        a.set_label(&mut helper).unwrap();
+        a.cmp(ecx, dword_ptr(ebx + 32)).unwrap();
+        a.je(rare).unwrap();
+        a.fchs().unwrap();
+        a.ret().unwrap();
+        rare_index = a.instructions().len();
+        a.set_label(&mut rare).unwrap();
+        a.fild(qword_ptr(ebx + 8)).unwrap();
+        a.fstp(st0).unwrap();
+        a.fchs().unwrap();
+        a.ret().unwrap();
+        stop_index = a.instructions().len();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+    });
+    let ip = |index| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(index)
+            .unwrap()
+            .ip32()
+    };
+    let rare = ip(rare_index);
+    p.stop = ip(stop_index);
+    p.state.regs[1] = 4;
+    p.state.regs[2] = 2;
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.x87.regs[5] = X87Register::from_parts(0xc000_0000_0000_0000, 0x3fff);
+    p.state.x87.tag &= !(3 << 10);
+    p.data[..8].copy_from_slice(&1.25f64.to_le_bytes());
+    p.data[8..16].copy_from_slice(&123i64.to_le_bytes());
+    for taken in [false, true] {
+        p.data[32..36].copy_from_slice(&u32::from(taken).to_le_bytes());
+        for config in pixel_loops::configs() {
+            for budget in [17, 500] {
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                assert_eq!(
+                    native.run(p.stop, budget).unwrap(),
+                    oracle.run(p.stop, budget).unwrap()
+                );
+                same(&native, &oracle);
+                if budget == 500 && !config.1 {
+                    assert_eq!(native.stats.compilations, 1);
+                    let engine = native.native.as_ref().unwrap();
+                    assert_eq!(engine.diagnostics.helpers, 0);
+                    let base = engine.unit_address(CODE).unwrap();
+                    let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+                    let hot: Vec<_> = marks
+                        [..marks.iter().position(|m| m.part == Part::Cold).unwrap()]
+                        .iter()
+                        .filter(|m| m.eip < rare)
+                        .collect();
+                    assert_eq!(hot.iter().filter(|m| m.part == Part::X87Entry).count(), 1);
+                    assert!(!hot.iter().any(|m| m.part == Part::X87Publish));
+                }
+            }
+        }
+    }
+    // An entry value read across the merge keeps its canonical tag,
+    // including images restored with a tag that disagrees with its payload.
+    for (payload, exponent, tag) in [(0, 0, 0), (0xc000_0000_0000_0000, 0x3fff, 1)] {
+        p.state.x87.regs[5] = X87Register::from_parts(payload, exponent);
+        p.state.x87.tag = (p.state.x87.tag & !(3 << 10)) | tag << 10;
+        for config in pixel_loops::configs() {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            assert_eq!(
+                native.run(p.stop, 500).unwrap(),
+                oracle.run(p.stop, 500).unwrap()
+            );
+            same(&native, &oracle);
+        }
+    }
+}
+
+fn integer_loop_run() -> (Program, u32) {
+    let (mut head_index, mut stop_index) = (0, 0);
+    let mut p = fixture(|a| {
+        let (mut outer, mut body, mut check, mut done) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fld1().unwrap();
+        a.mov(edi, ecx).unwrap();
+        a.test(edi, edi).unwrap();
+        a.jz(done).unwrap();
+        a.jmp(check).unwrap();
+        a.set_label(&mut body).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(edi).unwrap();
+        head_index = a.instructions().len();
+        a.set_label(&mut check).unwrap();
+        a.test(edi, edi).unwrap();
+        a.jnz(body).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fstp(qword_ptr(ebx + 16)).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(outer).unwrap();
+        stop_index = a.instructions().len();
+        a.nop().unwrap();
+    });
+    let ip = |index| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(index)
+            .unwrap()
+            .ip32()
+    };
+    let head = ip(head_index);
+    p.stop = ip(stop_index);
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.regs[2] = 2;
+    p.state.regs[6] = DATA + 64;
+    (p, head)
+}
+
+// spec: A64F-FP-7 A64-MEM-7 A64-CTL-7 A64-REG-5
+#[test]
+fn x87_inner_integer_loop_keeps_the_model_at_every_arrival() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    for count in [0, 1, 19] {
+        for fault in [false, true] {
+            let (mut p, _) = integer_loop_run();
+            p.state.regs[1] = count;
+            if fault {
+                p.state.regs[6] = DATA + DATA_LEN as u32 - 4;
+            }
+            for config in pixel_loops::configs() {
+                for budget in [12, 1000] {
+                    let mut native = executor(&p, config, false);
+                    let mut oracle = executor(&p, config, true);
+                    assert_eq!(
+                        native.run(p.stop, budget).unwrap(),
+                        oracle.run(p.stop, budget).unwrap()
+                    );
+                    same(&native, &oracle);
+                    if budget == 1000 {
+                        assert_eq!(
+                            native.state.fault_addr,
+                            if fault && count > 0 {
+                                DATA + DATA_LEN as u32
+                            } else {
+                                0
+                            }
+                        );
+                    }
+                    if budget == 1000 && !config.1 {
+                        let base = native.native.as_ref().unwrap().unit_address(CODE).unwrap();
+                        let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+                        let hot =
+                            &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+                        assert_eq!(hot.iter().filter(|m| m.part == Part::X87Entry).count(), 1);
+                        assert!(!hot.iter().any(|m| m.part == Part::X87Publish));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64-CTL-8
+#[test]
+fn x87_inner_integer_loop_publishes_at_its_deadline_backedge() {
+    use std::time::{Duration, Instant};
+    let (mut p, head) = integer_loop_run();
+    p.state.regs[1] = 1;
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    assert_eq!(native.run(p.stop, 1000).unwrap(), RunOutcome::ReachedStop);
+    p.state.regs[1] = 100_000;
+    // Repeated reads stay mapped for the entire owner slice.
+    p.state.regs[6] = DATA;
+    native.state = p.state.clone();
+    native.memory_mut().write(DATA, &p.data).unwrap();
+    native.state.refresh_mmx();
+    native.state.settle_flags();
+    let engine = native.native.as_mut().unwrap();
+    engine.deadline = Some(crate::native::deadline(
+        Instant::now() + Duration::from_nanos(1),
+    ));
+    let run = engine
+        .run(
+            &mut native.state,
+            &mut native.memory,
+            p.stop,
+            256,
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.exit, crate::runtime::Exit::Dispatch);
+    assert!(engine.past());
+    assert_eq!(native.state.eip, head);
+    native.state.fuel = 0;
+    native.state.refresh_mmx();
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        oracle.run(p.stop, u64::from(run.retired)).unwrap(),
+        RunOutcome::Budget
+    );
+    same(&native, &oracle);
 }

@@ -8,7 +8,7 @@
 //! ([`TrapAction::Park`]). Parking unwinds out of `run`, so only the top-level scheduler
 //! ever re-enters guest code. There is no host→guest recursion.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use crate::{ArchitecturalState, StateError};
 use thiserror::Error;
@@ -116,6 +116,10 @@ pub enum Exit {
     /// A host notification stopped at a resumable CPU boundary. No guest work
     /// or scheduler budget is charged for the notification itself.
     Interrupted { pc: u32 },
+    /// A completed spin backedge hands off to another ready guest context.
+    Reschedule,
+    /// The owner reached the entry of a prepared computation.
+    Computation,
     /// The guest faulted (unmapped access, invalid instruction, ...). EIP is the faulting pc.
     Fault(Fault),
 }
@@ -192,6 +196,11 @@ pub trait Guest {
     /// Establish an exclusive guest-memory boundary for composite atomics or
     /// mapping-sensitive host operations. Synchronous backends need no action.
     fn quiesce_memory(&mut self) {}
+    /// Whether guest code loaded a shared clock field since the last call
+    /// (PROC-CLOCK-7). Backends that do not track it report none.
+    fn take_clock_read(&mut self) -> bool {
+        false
+    }
     /// Pin the actual backing storage, without a per-page reference count.
     /// Backends without an owned, physically pinnable window reject the request.
     fn lock_pages(&mut self, _addr: u32, _len: u32) -> Result<(), PageLockError> {
@@ -459,6 +468,17 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// Whether reaching a prepared computation should return to the scheduler.
+    /// Instruction debugging and host-call tracing keep execution on the owner.
+    fn allow_computation(&self) -> bool {
+        false
+    }
+
+    /// Whether a ready peer can use the next turn on the execution owner.
+    fn allow_spin_yield(&self) -> bool {
+        false
+    }
+
     /// A service body completed and asks the owner to yield at its continuation.
     fn on_body_yield(&mut self, _cpu: &mut dyn Guest) -> TrapAction {
         TrapAction::Continue
@@ -542,6 +562,24 @@ impl SegmentSetup {
     pub const IDT_LIMIT: u16 = 256 * 8 - 1;
 }
 
+pub struct Completion<C> {
+    pub id: u32,
+    pub context: C,
+    pub retired: u64,
+    pub elapsed: Duration,
+    /// An early exit that needs the ordinary owner path.
+    pub requires_owner: bool,
+}
+
+/// The execution owner's restricted access while admitted computations run.
+pub trait Computation<C> {
+    fn submit(&mut self, id: u32, context: &C) -> bool;
+    fn run_local(&mut self, id: u32, context: &C) -> Option<Completion<C>>;
+    fn poll(&mut self) -> Option<Completion<C>>;
+    fn wait(&mut self, timeout: Option<Duration>) -> Option<Completion<C>>;
+    fn recall(&mut self);
+}
+
 pub trait Backend: Guest {
     /// Snapshot only at an explicitly enabled host frame boundary.
     fn frame_counters(&self) -> Option<crate::frame_counters::FrameCounters> {
@@ -556,6 +594,22 @@ pub trait Backend: Guest {
         Err("backend does not support independent guest processes".into())
     }
     type Context;
+
+    /// Run admitted snapshots without making ordinary guest access available.
+    /// The deadline is observed at admitted instruction checkpoints.
+    ///
+    /// # Safety
+    /// The callback must not access another CPU sharing this backend's compact
+    /// guest window, including dropping it. Each admitted context must remain
+    /// exclusively assigned until the scheduler accepts its completion. Collect
+    /// all completions before returning from the callback.
+    unsafe fn with_computation(
+        &mut self,
+        _wake: Option<adv_sync::WakeEvent>,
+        _deadline: Option<Instant>,
+        _visit: &mut dyn FnMut(&mut dyn Computation<Self::Context>),
+    ) {
+    }
 
     /// Install the guest-owned GDT/IDT and load flat CS/DS/ES/SS before running.
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault>;

@@ -746,6 +746,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 **Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
 UI projection refreshes MUST wake execution only when they queue new guest work.
+A front end input wake MUST return control to the front end at the next session loop boundary.
 **Verification**: Test
 
 ### WINE-SES-3 Provisioned prefix
@@ -758,6 +759,7 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 ### WINE-SES-4 Fixed identity
 
 **Rule**: What a guest learns about its user and machine MUST NOT come from the host: the user MUST be `Player` and the computer `HITODE`. The firmware tables MUST name the virtual machine and the emulated processor, with no serial numbers or UUID. Name resolution through `getaddrinfo` MUST fail.
+Processor counts and affinity MUST describe eight guest cores in one group, independently of the execution owner's host CPU.
 **Verification**: Test
 
 ### WINE-SES-5 Regional text

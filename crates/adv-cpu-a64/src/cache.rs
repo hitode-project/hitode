@@ -24,6 +24,12 @@ use std::sync::OnceLock;
 /// Direct branches reach ±128 MiB.
 pub const MAX_LEN: usize = 128 << 20;
 
+/// A fresh resident worker enters the shared code in execute mode.
+#[cfg(native)]
+pub(crate) fn execution_thread() {
+    backend::writable(false);
+}
+
 pub struct CodeCache {
     /// Where the translator writes.
     write: NonNull<u8>,

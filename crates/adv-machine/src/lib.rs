@@ -9,8 +9,11 @@
 //! * Each guest context has its own stack, TEB (FS base), registers, and continuation
 //!   stack. Names are diagnostic labels; scheduling depends only on readiness and
 //!   the urgency of the event that woke it, never an engine-specific thread role.
+//! * Proved computation can run concurrently. The execution owner admits it from
+//!   saved contexts and drains it before entering ordinary guest code or services.
 
 pub mod clock;
+mod computation;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
@@ -25,6 +28,7 @@ pub mod objects;
 pub mod outcome;
 pub mod patch;
 mod poll_progress;
+pub use poll_progress::Observation;
 pub mod process;
 pub mod sched;
 pub mod schedule_trace;
@@ -98,7 +102,7 @@ pub struct Sys {
     pub body_services: Option<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
-    poll_observed: bool,
+    poll_observed: Option<Observation>,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -791,6 +795,16 @@ impl Sys {
     /// Device/input delivery grants the same wait as SetEvent, then gives its
     /// newly runnable consumers a bounded, event-derived dispatch preference.
     pub fn set_event_with_priority(&mut self, h: Handle, priority: WakePriority) -> bool {
+        self.set_event_from(h, priority, None)
+    }
+
+    /// Delivers an event with the guest context known to have signaled it.
+    pub fn set_event_from(
+        &mut self,
+        h: Handle,
+        priority: WakePriority,
+        signaler: Option<CtxId>,
+    ) -> bool {
         let valid = match self.objects.get_mut(h) {
             Some(Object::Event { signaled, .. }) => {
                 *signaled = true;
@@ -799,7 +813,8 @@ impl Sys {
             _ => false,
         };
         if valid {
-            self.signal_waiters_with_priority(h, priority);
+            self.objects.mark_changed(h, priority);
+            self.wake_changed(self.clock.now_us(), signaler.map(|id| (h, id)));
         }
         valid
     }
@@ -842,16 +857,38 @@ impl Sys {
     }
     fn signal_waiters_with_priority(&mut self, h: Handle, priority: WakePriority) {
         self.objects.mark_changed(h, priority);
-        self.wake_changed(self.clock.now_us());
+        self.wake_changed(self.clock.now_us(), None);
     }
 
-    fn wake_changed(&mut self, now: u64) {
+    fn wake_changed(&mut self, now: u64, signal: Option<(Handle, CtxId)>) {
         for (id, priority) in self.objects.changed_waiters() {
             let i = id as usize;
             if matches!(self.contexts[i].state, State::Blocked { .. })
                 && let Some(reason) = self.poll_wait(i, now)
             {
-                self.release_waiter(i, reason, now);
+                let signaler = signal.and_then(|(h, signaler)| {
+                    let State::Blocked { wait, .. } = &self.contexts[i].state else {
+                        unreachable!()
+                    };
+                    let matches =
+                        |handle| self.objects.object_id(handle) == self.objects.object_id(h);
+                    let caused = match (reason, wait) {
+                        (WakeReason::Signaled, Wait::Object { handle, .. }) => matches(*handle),
+                        (WakeReason::Objects { index, .. }, Wait::Objects { handles, all, .. }) => {
+                            if *all {
+                                handles.iter().copied().any(matches)
+                            } else {
+                                matches(handles[index as usize])
+                            }
+                        }
+                        (WakeReason::Notified, Wait::Objects { notification, .. }) => {
+                            notification.is_some_and(matches)
+                        }
+                        _ => false,
+                    };
+                    caused.then_some(signaler)
+                });
+                self.release_waiter(i, reason, now, signaler);
                 self.wakes.wake_as(id, now, None, priority);
             }
         }
@@ -979,7 +1016,7 @@ impl Sys {
             self.wait_deadlines.insert((deadline, i as CtxId));
         }
         if let Some(reason) = self.poll_wait(i, self.clock.now_us()) {
-            self.release_waiter(i, reason, self.clock.now_us());
+            self.release_waiter(i, reason, self.clock.now_us(), None);
         }
     }
 
@@ -1010,7 +1047,7 @@ impl Sys {
                     log::warn!("context {i}: a wait object changed without a signal");
                 }
                 self.scheduling.missed_signal_wakes += 1;
-                self.release_waiter(i, reason, now);
+                self.release_waiter(i, reason, now, None);
                 self.wakes
                     .wake_as(i as CtxId, now, None, WakePriority::Normal);
                 rescued = true;
@@ -1023,14 +1060,14 @@ impl Sys {
     fn wake(&mut self) {
         let now = self.clock.now_us();
         self.objects.expire_timers(now);
-        self.wake_changed(now);
+        self.wake_changed(now, None);
         while let Some(&(deadline, id)) = self.wait_deadlines.first() {
             if deadline > now {
                 break;
             }
             self.wait_deadlines.pop_first();
             if let Some(reason) = self.poll_wait(id as usize, now) {
-                self.release_waiter(id as usize, reason, now);
+                self.release_waiter(id as usize, reason, now, None);
             }
         }
         #[cfg(test)]
@@ -1047,7 +1084,7 @@ impl Sys {
         }
     }
 
-    fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64) {
+    fn release_waiter(&mut self, i: usize, reason: WakeReason, now: u64, signaler: Option<CtxId>) {
         self.unregister_waiter(i);
         let State::Blocked {
             wait, then, origin, ..
@@ -1067,8 +1104,19 @@ impl Sys {
             diagnostics.wake(i as CtxId, reason, now);
         }
         self.wakes.wake(i as CtxId, now, deadline);
-        self.schedule_trace
-            .event("wake", i as u32, u64::from(origin.thunk), 0, 0);
+        let cause = match reason {
+            WakeReason::Timeout => 1,
+            WakeReason::Signaled => 2,
+            WakeReason::Objects { .. } => 3,
+            WakeReason::Notified => 4,
+        };
+        self.schedule_trace.event(
+            "wake",
+            i as u32,
+            u64::from(origin.thunk),
+            signaler.map_or(0, |id| u64::from(id) + 1),
+            cause,
+        );
         self.contexts[i].state = State::Ready {
             resume: Some(ReadyResume::Woke {
                 then,
@@ -1109,13 +1157,13 @@ impl Sys {
     }
 
     /// Classify this host call as a clock read, empty message peek or yield.
-    pub fn poll_observation(&mut self) {
-        self.poll_observed = true;
+    pub fn poll_observation(&mut self, observation: Observation) {
+        self.poll_observed = Some(observation);
     }
 
     /// Begin the implementation of a message peek, including its nested host calls.
     pub fn begin_poll_peek(&mut self) {
-        self.poll_observation();
+        self.poll_observation(Observation::Event);
         self.contexts[self.current as usize].poll_peek_depth += 1;
     }
 
@@ -1146,6 +1194,13 @@ impl Sys {
                 .active_contexts()
                 .filter(|c| c.is_ready())
                 .all(|c| c.progress.quiet())
+    }
+
+    /// No ready polling context observed anything time alone changes.
+    fn polling_timeless(&self) -> bool {
+        self.active_contexts()
+            .filter(|c| c.is_ready())
+            .all(|c| c.progress.timeless())
     }
 
     /// Every ready context repeats earlier yield intervals (PROC-CLOCK-5).
@@ -1543,6 +1598,8 @@ struct Dispatch<'a> {
     parked: Option<Parked>,
     yield_on_frame: bool,
     defer_work: bool,
+    /// This turn can offer a computation if a productive peer is ready.
+    computation: bool,
 }
 
 /// Return addresses found by scanning the guest stack: values inside an image that follow
@@ -1747,7 +1804,7 @@ impl Dispatch<'_> {
             )));
         }
         let t0 = self.sys.stats.start();
-        self.sys.poll_observed = false;
+        self.sys.poll_observed = None;
         let out = (f.handler)(&mut Env {
             context: self.sys.current,
             cpu: &mut *cpu,
@@ -1757,9 +1814,9 @@ impl Dispatch<'_> {
         });
         let observed = std::mem::take(&mut self.sys.poll_observed);
         let context = &mut self.sys.contexts[self.sys.current as usize];
-        let observation = observed || context.poll_peek_depth != 0;
+        let observation = observed.or((context.poll_peek_depth != 0).then_some(Observation::Event));
         context.progress.call(index, observation);
-        if !observation {
+        if observation.is_none() {
             self.sys.clock.work();
         }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
@@ -1838,6 +1895,23 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn allow_computation(&self) -> bool {
+        self.computation
+            && !DEBUGGER_ATTACHED.get()
+            && !self.sys.trace.enabled()
+            && self.sys.call_limit.is_none()
+            && self
+                .sys
+                .active_contexts()
+                .any(|c| c.id != self.sys.current && c.is_ready() && !c.yielded)
+    }
+
+    fn allow_spin_yield(&self) -> bool {
+        self.sys
+            .active_contexts()
+            .any(|c| c.id != self.sys.current && c.is_ready())
+    }
+
     fn on_body_yield(&mut self, cpu: &mut dyn Guest) -> TrapAction {
         self.parked = Some(Parked::ServiceYield {
             resume_eip: cpu.reg(Reg::Eip),
@@ -1910,6 +1984,9 @@ impl TrapHandler for Dispatch<'_> {
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {
+        self.sys.contexts[self.sys.current as usize]
+            .progress
+            .read_clock();
         Some(self.sys.clock.guest_now_us())
     }
 
@@ -2010,6 +2087,7 @@ pub struct Machine<B: Backend> {
     blank: B::Context,
     /// Context whose registers are currently in the CPU.
     loaded: Option<CtxId>,
+    computation: computation::Round,
     /// None inherits the backend default; Some(None) explicitly disables the watchdog.
     /// Configured limits cover one scheduler invocation across context switches.
     execution_budget: Option<Option<Duration>>,
@@ -2075,7 +2153,7 @@ impl<B: Backend> Machine<B> {
             clock,
             body_services: None,
             poll_wake: None,
-            poll_observed: false,
+            poll_observed: None,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -2134,6 +2212,7 @@ impl<B: Backend> Machine<B> {
             regs: Vec::new(),
             blank,
             loaded: None,
+            computation: computation::Round::default(),
             execution_budget: None,
             slice_backend_budget: None,
             slice_elapsed: Duration::ZERO,
@@ -2354,20 +2433,7 @@ impl<B: Backend> Machine<B> {
         if self.loaded == Some(id) {
             return Ok(());
         }
-        if let Some(prev) = self
-            .loaded
-            .filter(|&prev| !self.sys.contexts[prev as usize].is_done())
-        {
-            let mut slot = self.regs[prev as usize]
-                .take()
-                .unwrap_or_else(|| self.cpu.new_context());
-            self.cpu.save(&mut slot);
-            self.regs[prev as usize] = Some(slot);
-        } else if let Some(prev) = self.loaded
-            && let Some(slot) = self.regs.get_mut(prev as usize)
-        {
-            *slot = None;
-        }
+        self.save_loaded();
         self.regs.resize_with(self.sys.contexts.len(), || None);
         let ctx = &mut self.sys.contexts[id as usize];
         match (ctx.start.take(), &self.regs[id as usize]) {
@@ -2387,6 +2453,19 @@ impl<B: Backend> Machine<B> {
         }
         self.loaded = Some(id);
         Ok(())
+    }
+
+    fn save_loaded(&mut self) {
+        let Some(id) = self.loaded.take() else {
+            return;
+        };
+        let slot = &mut self.regs[id as usize];
+        if self.sys.contexts[id as usize].is_done() {
+            *slot = None;
+        } else {
+            let saved = slot.get_or_insert_with(|| self.cpu.new_context());
+            self.cpu.save(saved);
+        }
     }
 
     fn fail(&self, message: String) -> RunResult {
@@ -2611,6 +2690,8 @@ impl<B: Backend> Machine<B> {
             budget.enter_scheduler();
         }
         let result = self.run_scheduler_inner(slice, started, hard_budget);
+        self.computation.release(&self.sys);
+        self.restore_computation_current();
         if let Some(budget) = &mut self.sys.stats.frame_budget {
             budget.leave_scheduler();
         }
@@ -2670,7 +2751,16 @@ impl<B: Backend> Machine<B> {
                 self.sys.scheduling.external_interrupts += 1;
                 return SliceResult::Yielded;
             }
+            let deadline = self.computation.real_deadline(&self.sys);
             self.sys.wake();
+            if deadline.is_some_and(|at| at <= self.sys.clock.now_us())
+                || self.computation.delivery_changed(&self.sys)
+            {
+                self.computation.release(&self.sys);
+            } else if self.computation.collected(&self.sys) {
+                self.run_computation_round(slice, started, hard_budget);
+                continue;
+            }
             self.sys.advance_if_only_polling();
             let generation = self.sys.poll_generation();
             if generation != poll_generation {
@@ -2683,7 +2773,7 @@ impl<B: Backend> Machine<B> {
                 }
             }
             // Real time: polling contexts would spin the host. Hand control back so the host
-            // can wait (at most 1 ms) like the OS would schedule them.
+            // can wait until what they observed can change (PROC-CLOCK-6).
             // Requested skipping retains the full proof: bounded iteration work
             // can repeat quiet APIs while still advancing the game.
             if !self.sys.clock.is_virtual()
@@ -2704,16 +2794,29 @@ impl<B: Backend> Machine<B> {
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
-                // End on the tick that timed waits expire on, so both share a wake.
-                let soon = sched::next_tick(self.sys.clock.now_us() + 1);
-                let soon = self.sys.frame_spin_round(soon).unwrap_or(soon);
-                let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
-                self.sys.clock.begin_wait(Some(t));
-                return SliceResult::Complete(RunResult::Idle {
-                    next_deadline: Some(t),
+                // Timeless polls see nothing new before a delivery, which
+                // wakes the host, or a deadline. Others end on the tick that
+                // timed waits expire on, so both share a wake.
+                let soon = (!self.sys.polling_timeless()).then(|| {
+                    let soon = sched::next_tick(self.sys.clock.now_us() + 1);
+                    self.sys.frame_spin_round(soon).unwrap_or(soon)
                 });
+                let t = match (self.sys.next_deadline(), soon) {
+                    (Some(d), Some(s)) => Some(d.min(s)),
+                    (d, s) => d.or(s),
+                };
+                if self.sys.schedule_trace.enabled() {
+                    let ahead = t.map_or(u64::MAX, |t| t.saturating_sub(self.sys.clock.now_us()));
+                    let settled = u64::from(self.sys.polling_settled());
+                    self.sys
+                        .schedule_trace
+                        .event("poll_idle", 0, ahead, settled, 0);
+                }
+                self.sys.clock.begin_wait(t);
+                return SliceResult::Complete(RunResult::Idle { next_deadline: t });
             }
             let contexts = &self.sys.contexts;
+            let computation = &self.computation;
             let selection = self.sys.wakes.pick(
                 &mut last,
                 MAX_CONTEXTS as usize,
@@ -2723,7 +2826,7 @@ impl<B: Backend> Machine<B> {
                         .scheduler_work
                         .selections
                         .set(self.sys.scheduler_work.selections.get() + 1);
-                    contexts[id as usize].is_ready()
+                    contexts[id as usize].is_ready() && !computation.holds(id)
                 },
                 latency_mode,
             );
@@ -2743,6 +2846,7 @@ impl<B: Backend> Machine<B> {
                 return SliceResult::Complete(RunResult::Idle { next_deadline });
             };
             let id = selection.id;
+            self.computation.select(id, &self.sys);
             self.sys
                 .wakes
                 .mark_turn(id, self.sys.contexts[id as usize].yielded);
@@ -2955,6 +3059,7 @@ impl<B: Backend> Machine<B> {
             let calls_before = self.sys.host_calls;
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
+            let computation = !self.computation.take_decline(id);
             let mut d = Dispatch {
                 sys: &mut self.sys,
                 ext: &mut self.ext,
@@ -2963,6 +3068,7 @@ impl<B: Backend> Machine<B> {
                 // Explicit deferred work still returns to this scheduler to
                 // recheck deadlines/watchdog, without forcing a host handoff.
                 defer_work: latency_mode,
+                computation,
             };
             let retired_before = self.cpu.retired_instructions();
             let exit = self.cpu.run(&mut d);
@@ -2973,6 +3079,12 @@ impl<B: Backend> Machine<B> {
                 c.spin.ran(run_elapsed);
                 if c.services.new_work.replace(false) {
                     c.progress.new_work();
+                }
+                if self.cpu.take_clock_read() | c.services.clock_read.replace(false) {
+                    c.progress.read_clock();
+                }
+                if c.services.peeked.replace(false) {
+                    c.progress.saw_event();
                 }
                 c.progress.ran(retired);
             }
@@ -3000,6 +3112,34 @@ impl<B: Backend> Machine<B> {
             self.sys.stats.total.cpu_runs += 1;
             self.note_frame();
             match exit {
+                Exit::Computation => {
+                    let ctx = &mut self.sys.contexts[id as usize];
+                    ctx.yielded = false;
+                    ctx.progress.new_work();
+                    if self.sys.schedule_trace.enabled() {
+                        self.sys.schedule_trace.event(
+                            "compute_offer",
+                            id,
+                            u64::from(self.cpu.reg(Reg::Eip)),
+                            0,
+                            0,
+                        );
+                    }
+                    self.computation.offer(id, &self.sys);
+                    self.save_loaded();
+                }
+                Exit::Reschedule => {
+                    let ctx = &mut self.sys.contexts[id as usize];
+                    ctx.yielded = false;
+                    ctx.progress.new_work();
+                    self.sys.schedule_trace.event(
+                        "spin_yield",
+                        id,
+                        u64::from(self.cpu.reg(Reg::Eip)),
+                        0,
+                        0,
+                    );
+                }
                 Exit::Interrupted { pc } => {
                     self.sys.trace.flush();
                     if let Some(hard) = hard_budget
@@ -3040,6 +3180,7 @@ impl<B: Backend> Machine<B> {
                         parked: None,
                         yield_on_frame: frame_handoff,
                         defer_work: latency_mode,
+                        computation: false,
                     }
                     .exception(&mut self.cpu, exception::Exception::Fault(fault));
                     if let Err(parked) = result

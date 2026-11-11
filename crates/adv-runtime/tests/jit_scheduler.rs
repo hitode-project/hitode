@@ -1,7 +1,7 @@
 use adv_abi::Registry;
 use adv_cpu::JitCpu;
 use adv_cpu::backend::asm::Asm;
-use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::layout::PARK_ADDR;
 use adv_machine::{Clock, Conv, Env, Machine, Object, Outcome, RunResult, Wait};
 
@@ -40,6 +40,41 @@ fn signal(env: &mut Env<'_>) -> Outcome {
 }
 fn exit(env: &mut Env<'_>) -> Outcome {
     Outcome::ExitProcess(env.arg(0))
+}
+
+// spec: PROC-MACH-5, PROC-CLOCK-5
+#[test]
+fn spin_backedges_let_a_ready_peer_write_without_idling_the_host() {
+    for jit in [false, true] {
+        let mut registry = Registry::default();
+        registry.add("test", "exit", Conv::Stdcall { argc: 1 }, exit);
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, jit).unwrap(),
+            registry,
+            Clock::real(),
+        )
+        .unwrap();
+        m.set_execution_budget(Some(std::time::Duration::from_secs(2)));
+        m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+        m.cpu.map(DATA, 4096, Prot::RW).unwrap();
+        let exit = m.resolve_import("test", "exit").unwrap();
+        let mut main = Asm::new(CODE);
+        // cmp dword [DATA], 0; je CODE
+        main.bytes.extend_from_slice(&[0x83, 0x3d]);
+        main.bytes.extend_from_slice(&DATA.to_le_bytes());
+        main.bytes.extend_from_slice(&[0x00, 0x74, 0xf7]);
+        main.push_imm(42).call(exit);
+        let mut worker = Asm::new(WORKER);
+        worker.mov_mem_imm(DATA, 1).ret();
+        m.cpu.write(CODE, &main.bytes).unwrap();
+        m.cpu.write(WORKER, &worker.bytes).unwrap();
+        m.spawn("poller", CODE, &[], 0x1_0000).unwrap();
+        m.spawn("peer", WORKER, &[], 0x1_0000).unwrap();
+        let result = m.run();
+        assert!(matches!(result, RunResult::Exited(42)), "{result:?}");
+        assert_eq!(m.sys.scheduling.polling_rounds, 0);
+        assert!(m.cpu.retired_instructions() < 100);
+    }
 }
 
 #[test]

@@ -870,8 +870,10 @@ impl Session {
         }
         let frame = self.presented_frames();
         loop {
+            // A new delivery after clearing the interrupt either shows up
+            // here or interrupts the machine or the retained wait below.
             self.wake.take_interrupt();
-            if Instant::now() >= until {
+            if self.wake.frontend_pending() || Instant::now() >= until {
                 return Stop::Paused;
             }
             if let Err(error) = self.spawn_children().and_then(|_| self.deliver()) {
@@ -1012,6 +1014,13 @@ impl Session {
                 Err(error) => return Stop::Failed(error.to_string()),
             };
             let waited = started.elapsed();
+            self.machine.sys.schedule_trace.event(
+                "host_wait",
+                0,
+                wait.as_nanos() as u64,
+                waited.as_nanos() as u64,
+                u64::from(signaled),
+            );
             self.metrics.idle_waits += 1;
             self.metrics.wait_time += waited;
             let sys = &mut self.machine.sys;
@@ -1270,6 +1279,13 @@ impl Session {
         wparam: u32,
         lparam: u32,
     ) -> Result<(), String> {
+        self.machine.sys.schedule_trace.event(
+            "input",
+            0,
+            message.into(),
+            wparam.into(),
+            lparam.into(),
+        );
         let restoring = matches!((message, wparam), (5, 0) | (0x201 | 0x204, _));
         if !(restoring && project::restore(&mut self.machine.ext)) {
             adv_drv::user::input::post(&mut self.machine.ext, pointer, message, wparam, lparam)?;

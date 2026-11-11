@@ -32,6 +32,11 @@
 //! `watch_code`, which write-protects them in the window, so any store to
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
+//!
+//! Proved computation uses a second entry emitted from the same trace.
+//! Its outer transfers return complete state through fixed exits, and its
+//! faults use a private capture and an immutable unit table. The owner
+//! keeps the code and mapping stable while its computation session is open.
 
 use iced_x86::Code;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -48,13 +53,23 @@ use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
+mod worker;
+
 const CACHE_LEN: usize = 64 << 20;
 
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
-const SLICE: u64 = 1 << 16;
+const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
+/// Budget exits at one EIP that promote it: a few slices of owner time.
+pub(crate) const PROMOTION: u8 = 4;
+/// How far below a promoted EIP, in bytes, an enclosing entry may start.
+const PROMOTION_REACH: u32 = 4096;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
+
+fn alias_base(memory: &Memory) -> u64 {
+    (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64
+}
 
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
@@ -97,10 +112,7 @@ struct Faults {
     /// order, and their sites in emission order.
     sites: Vec<(usize, Site)>,
     stub: usize,
-    /// The site that faulted, written in signal context.
-    pc: Cell<usize>,
-    /// v8-v23 captured before the fault stub restores host SIMD.
-    simd: Cell<[[u8; 16]; 16]>,
+    capture: FaultCapture,
     /// The shadow stack's guard pages.
     guard: (usize, usize),
     /// Where an overflow resumes, and the runtime field it reads the
@@ -109,16 +121,70 @@ struct Faults {
     resume: *mut u64,
 }
 
+#[derive(Default)]
+struct FaultCapture {
+    /// The site that faulted, written in signal context.
+    pc: Cell<usize>,
+    /// v8-v23 captured before the fault stub restores host SIMD.
+    simd: Cell<[[u8; 16]; 16]>,
+}
+
+fn site_at(sites: &[(usize, Site)], pc: usize) -> Option<Site> {
+    let index = sites.binary_search_by_key(&pc, |&(at, _)| at).ok()?;
+    Some(sites[index].1)
+}
+
 impl Faults {
     fn site(&self, pc: usize) -> Option<Site> {
-        let index = self.sites.binary_search_by_key(&pc, |&(at, _)| at).ok()?;
-        Some(self.sites[index].1)
+        site_at(&self.sites, pc)
     }
+}
+
+#[derive(Clone, Copy)]
+enum Active {
+    None,
+    Owner(*const Faults),
+    Worker(*const worker::Faults<'static>),
 }
 
 thread_local! {
     /// The `Faults` of the code this thread is running, or null.
-    static ACTIVE: Cell<*const Faults> = const { Cell::new(std::ptr::null()) };
+    static ACTIVE: Cell<Active> = const { Cell::new(Active::None) };
+}
+
+impl FaultCapture {
+    fn record(
+        &self,
+        site: Site,
+        pc: usize,
+        stub: usize,
+        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
+    ) -> usize {
+        self.simd.set(std::array::from_fn(|n| snapshot.simd[8 + n]));
+        self.pc.set(pc);
+        if site.resume != 0 {
+            // The unit publishes its cached x87 state, then faults.
+            pc.wrapping_add_signed(site.resume as isize)
+        } else {
+            stub
+        }
+    }
+
+    fn recover(&self, cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
+        recover(cpu, site, temps);
+        for (n, bytes) in self.simd.get().into_iter().enumerate() {
+            if site.simd_dirty & (1 << n) == 0 {
+                continue;
+            }
+            if n < 8 {
+                let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                cpu.mmx[n] = value;
+                cpu.x87.regs[n] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
+            } else {
+                cpu.xmm[n - 8] = bytes;
+            }
+        }
+    }
 }
 
 /// Runs in signal context: no allocation, no locks.
@@ -129,10 +195,21 @@ unsafe fn on_fault(
 ) -> usize {
     ACTIVE
         .try_with(|slot| {
-            let faults = slot.get();
-            if faults.is_null() {
-                return 0;
-            }
+            let faults = match slot.get() {
+                Active::None => return 0,
+                Active::Worker(faults) => {
+                    // SAFETY: the worker keeps its private capture and unit
+                    // side table alive while its entry is active on this thread.
+                    let faults = unsafe { &*faults };
+                    if !(faults.code.entry..faults.code.end).contains(&pc) {
+                        return 0;
+                    }
+                    return site_at(&faults.code.sites, pc).map_or(0, |site| {
+                        faults.capture.record(site, pc, faults.stub, snapshot)
+                    });
+                }
+                Active::Owner(faults) => faults,
+            };
             // SAFETY: `run` keeps the pointee alive and unmodified, apart
             // from the `pc` and `simd` cells, until it clears the slot.
             let faults = unsafe { &*faults };
@@ -149,15 +226,7 @@ unsafe fn on_fault(
             let Some(site) = faults.site(pc) else {
                 return 0;
             };
-            faults
-                .simd
-                .set(std::array::from_fn(|n| snapshot.simd[8 + n]));
-            faults.pc.set(pc);
-            if site.resume != 0 {
-                // The unit publishes its cached x87 state, then faults.
-                return pc.wrapping_add_signed(site.resume as isize);
-            }
-            faults.stub
+            faults.capture.record(site, pc, faults.stub, snapshot)
         })
         .unwrap_or(0)
 }
@@ -270,6 +339,12 @@ struct Entry {
     retired: u32,
 }
 
+struct Probed {
+    eip: u32,
+    trace: translate::Trace,
+    proof: translate::computation::Proof,
+}
+
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
 #[derive(Clone, Copy, Debug, Default)]
@@ -283,6 +358,8 @@ pub(crate) struct Diagnostics {
     pub dispatches: u64,
     pub dropped_units: u64,
     pub clears: u64,
+    /// Entries promoted to loop traces.
+    pub promotions: u64,
     /// Empty units translated, by `Fetcher::failure`.
     pub empty_units: [u64; 4],
     /// Checked accesses `access` performed and refused.
@@ -326,17 +403,9 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     if branch != 0 {
         // SAFETY: the runtime's CPU is live while units run.
         let cpu = unsafe { &mut *(*runtime).cpu };
-        cpu.last_indirect_branch = IndirectBranch {
-            source: branch as u32,
-            target: eip,
-            kind: match branch >> 32 {
-                1 => IndirectBranchKind::Call,
-                2 => IndirectBranchKind::Jump,
-                _ => IndirectBranchKind::Return,
-            },
-        };
+        record_branch(cpu, branch, eip);
     }
-    if native.stops.contains(&eip) || owner.error.is_some() {
+    if native.is_stop(eip) || owner.error.is_some() {
         return 0;
     }
     // A first visit runs in the owner; the point links on the next one.
@@ -359,6 +428,20 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     native.cache.sync();
     native.faults.end.set(native.cache.next());
     unit
+}
+
+fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
+    if branch != 0 {
+        cpu.last_indirect_branch = IndirectBranch {
+            source: branch as u32,
+            target,
+            kind: match branch >> 32 {
+                1 => IndirectBranchKind::Call,
+                2 => IndirectBranchKind::Jump,
+                _ => IndirectBranchKind::Return,
+            },
+        };
+    }
 }
 
 /// Called by the `access` stub for a checked access of `kind` the window
@@ -414,7 +497,7 @@ unsafe extern "C" fn access(
         Some(value) => u64::from(value),
         None => {
             native.diagnostics.refused += 1;
-            native.faults.pc.set(site);
+            native.faults.capture.pc.set(site);
             let resume = native.faults.site(site).map_or(0, |site| site.resume);
             // SAFETY: the runtime is live and translated code is in this helper.
             unsafe {
@@ -675,6 +758,23 @@ pub(crate) struct Native {
     shadow: ShadowStack,
     /// Stop addresses seen so far; units end before all of them.
     stops: Vec<u32>,
+    /// Candidate stops cut incoming units, but not the candidate's own backedges.
+    candidates: Vec<u32>,
+    rejected_candidates: FxHashSet<u32>,
+    computation_extents: Vec<(u32, u32)>,
+    nominated: Option<(u32, u32)>,
+    /// Budget exits an entry needs before it is promoted; zero translates
+    /// every entry with loop traces.
+    pub(crate) promotion: u8,
+    /// Budget exits by EIP, and the entries promoted to loop traces.
+    samples: FxHashMap<u32, u8>,
+    promoted: FxHashSet<u32>,
+    probed: Option<Probed>,
+    computation_enabled: bool,
+    skip_offer: Option<u32>,
+    computation: FxHashMap<u32, worker::Prepared>,
+    computation_code: translate::Code,
+    admission: worker::Admission,
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
@@ -682,6 +782,7 @@ pub(crate) struct Native {
     pub(crate) clock: *mut std::ffi::c_void,
     /// The x87 control word of the CPU a run starts on.
     control: u16,
+    pe: bool,
 }
 
 impl Native {
@@ -731,8 +832,7 @@ impl Native {
                 end: Cell::new(cache.next()),
                 sites: Vec::new(),
                 stub: base + stubs.fault,
-                pc: Cell::new(0),
-                simd: Cell::new([[0; 16]; 16]),
+                capture: FaultCapture::default(),
                 guard: shadow.guard(),
                 reset: base + stubs.shadow_reset,
                 resume: &raw mut runtime.resume,
@@ -780,10 +880,24 @@ impl Native {
             table,
             shadow,
             stops: Vec::new(),
+            candidates: Vec::new(),
+            rejected_candidates: FxHashSet::default(),
+            computation_extents: Vec::new(),
+            nominated: None,
+            promotion: PROMOTION,
+            samples: FxHashMap::default(),
+            promoted: FxHashSet::default(),
+            probed: None,
+            computation_enabled: false,
+            skip_offer: None,
+            computation: FxHashMap::default(),
+            computation_code: translate::Code::default(),
+            admission: worker::Admission::default(),
             features: features(),
             runtime,
             clock: std::ptr::null_mut(),
             control: 0,
+            pe: false,
         })
     }
 
@@ -791,6 +905,65 @@ impl Native {
         self.retired_forms = enabled.then_some([0; 5]);
         if enabled {
             crate::jit_map::enable_memory();
+        }
+    }
+
+    pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        self.computation_enabled = enabled;
+        self.skip_offer = skip;
+    }
+
+    pub(crate) fn progressed(&mut self) {
+        self.skip_offer = None;
+    }
+
+    pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
+        self.skip_offer.take()
+    }
+
+    fn offer_computation(&self) -> bool {
+        self.computation_enabled
+            && (self.bridge.is_null()
+                // SAFETY: this query occurs only within the owning run.
+                || unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_ref().is_some_and(|handler| handler.allow_computation()))
+    }
+
+    fn is_stop(&self, eip: u32) -> bool {
+        self.stops.contains(&eip) || self.candidates.contains(&eip)
+    }
+
+    pub(crate) fn with_computation(
+        &mut self,
+        memory: &mut Memory,
+        retired: &mut u64,
+        pending: (Arc<std::sync::atomic::AtomicU32>, u32),
+        wake: Option<adv_sync::WakeEvent>,
+        visit: &mut dyn FnMut(
+            &mut dyn adv_cpu_core::backend::Computation<Option<crate::ExecutionContext>>,
+        ),
+    ) {
+        if self.computation.is_empty() || memory.attach().is_err() {
+            return;
+        }
+        self.invalidate(memory);
+        self.cache.sync();
+        let entry = worker::Entry {
+            enter: self.enter,
+            window: self.runtime.window,
+            alias: alias_base(memory),
+            fault: self.stubs.fault,
+        };
+        if let Some(mut session) = worker::Session::new(
+            entry,
+            &self.computation,
+            memory,
+            &mut self.admission,
+            retired,
+            &mut self.retired_forms,
+            worker::Notifications { pending, wake },
+        ) {
+            visit(&mut session);
         }
     }
 
@@ -808,12 +981,42 @@ impl Native {
     ) -> Result<Option<Run>, String> {
         self.bridge = bridge;
         self.control = cpu.x87.control;
+        self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
+        if self.nominated.is_some()
+            && self.offer_computation()
+            && let Some((candidate, end)) = self.nominated.take()
+        {
+            if let Some(probed) = self.prove_candidate(memory, candidate, end) {
+                self.candidates
+                    .retain(|&inside| !(candidate < inside && inside < end));
+                if self.candidates.len() == 8 {
+                    self.candidates.remove(0);
+                }
+                self.candidates.push(candidate);
+                // Incoming direct links and already-inlined fall-through paths
+                // may bypass the new boundary. Rebuild them between entries.
+                self.clear();
+                self.probed = Some(probed);
+            } else {
+                self.rejected_candidates.insert(candidate);
+            }
+        }
         let (entry, translated) = match self.units.get(&cpu.eip).copied() {
             Some(entry) => (entry, 0),
-            None if self.first_visit(cpu.eip) => {
-                let visit = translate::first::run(cpu, memory, stop, fuel.min(SLICE));
+            None if !self.candidates.contains(&cpu.eip) && self.first_visit(cpu.eip) => {
+                let visit = if self.candidates.is_empty() {
+                    translate::first::run(cpu, memory, stop, fuel.min(SLICE))
+                } else {
+                    translate::first::run_until(
+                        cpu,
+                        memory,
+                        stop,
+                        fuel.min(SLICE),
+                        &self.candidates,
+                    )
+                };
                 if let Some(forms) = &mut self.retired_forms {
                     forms[3] += u64::from(visit.retired);
                 }
@@ -824,6 +1027,9 @@ impl Native {
                 } else {
                     Exit::Dispatch
                 };
+                if visit.retired != 0 {
+                    self.progressed();
+                }
                 return Ok(Some(Run {
                     exit,
                     retired: visit.retired,
@@ -836,6 +1042,17 @@ impl Native {
                 (entry, self.cache.used().saturating_sub(before))
             }
         };
+        if self.skip_offer != Some(cpu.eip)
+            && let Some(prepared) = self.computation.get(&cpu.eip)
+            && self.offer_computation()
+            && prepared.worth_offering()
+        {
+            return Ok(Some(Run {
+                exit: Exit::Computation,
+                retired: 0,
+                translated,
+            }));
+        }
         if u64::from(entry.retired) > fuel {
             self.diagnostics.over_fuel += 1;
             return Ok(None);
@@ -881,12 +1098,12 @@ impl Native {
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
-            (*runtime).fault_simd = (*faults).simd.as_ptr() as u64;
+            (*runtime).fault_simd = (*faults).capture.simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
-            let previous = ACTIVE.replace(faults);
+            let previous = ACTIVE.replace(Active::Owner(faults));
             enter(runtime, entry.unit);
             ACTIVE.set(previous);
         }
@@ -896,32 +1113,24 @@ impl Native {
             return Err(error);
         }
         let translated = owner.translated;
-        let exit = Exit::from_raw(self.runtime.exit)
+        let mut exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
+        if exit == Exit::Budget {
+            self.sample(memory, cpu.eip);
+            exit = Exit::Dispatch;
+        }
         match exit {
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
-            Exit::Stepped => {}
+            Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {
-            let pc = self.faults.pc.get();
+            let pc = self.faults.capture.pc.get();
             let site = self.faults.site(pc).expect("faulting site");
-            recover(cpu, site, self.runtime.temps);
-            for (n, bytes) in self.faults.simd.get().into_iter().enumerate() {
-                if site.simd_dirty & (1 << n) == 0 {
-                    continue;
-                }
-                if n < 8 {
-                    let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                    cpu.mmx[n] = value;
-                    cpu.x87.regs[n] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
-                } else {
-                    cpu.xmm[n - 8] = bytes;
-                }
-            }
+            self.faults.capture.recover(cpu, site, self.runtime.temps);
             retired -= u64::from(site.refund);
             if !site.checked {
                 self.unchecked_faults += 1;
@@ -935,6 +1144,9 @@ impl Native {
             // apart would cost emitted code in every REP loop.
             forms[0] += retired - self.helper_units;
         }
+        if retired != 0 {
+            self.progressed();
+        }
         let retired = retired as u32;
         Ok(Some(Run {
             exit,
@@ -945,6 +1157,10 @@ impl Native {
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
         self.runtime.body.services = services;
+    }
+
+    pub(crate) fn set_spin_yield(&mut self, enabled: bool) {
+        self.runtime.spin_yield = u32::from(enabled);
     }
 
     /// The unit at `eip`, translated if needed; a nonzero `point` is
@@ -980,7 +1196,7 @@ impl Native {
 
     fn resolve_tables(&mut self, memory: &Memory, eip: u32, unit: usize) {
         if !self.rows.contains_key(&eip)
-            || self.stops.contains(&eip)
+            || self.is_stop(eip)
             || !translate::tables::image(&self.images.borrow(), eip, 1)
         {
             return;
@@ -1016,12 +1232,16 @@ impl Native {
         let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
+                self.promoted.remove(&eip);
                 let unit = self.drop_unit(eip);
                 self.diagnostics.dropped_units += u64::from(unit);
                 dropped |= unit;
             }
         }
         if dropped {
+            self.rejected_candidates.clear();
+            self.computation_extents.clear();
+            self.samples.clear();
             self.forget_dynamic();
         }
     }
@@ -1044,6 +1264,7 @@ impl Native {
             self.cache.patch(point, word);
             next = after;
         }
+        self.computation.remove(&eip);
         self.units.remove(&eip).is_some()
     }
 
@@ -1134,8 +1355,7 @@ impl Native {
         {
             self.classifications += 1;
         }
-        self.runtime.alias =
-            (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64;
+        self.runtime.alias = alias_base(memory);
         self.runtime.alias_classes =
             (memory.perms.as_ptr() as usize).wrapping_sub((memory.base >> 12) as usize) as u64;
         memory.fast.body_table((memory.base >> 12) as usize);
@@ -1188,6 +1408,7 @@ impl Native {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
         self.units.clear();
+        self.computation.clear();
         self.rows.clear();
         self.table_sources.clear();
         self.uses_permissions = false;
@@ -1245,7 +1466,7 @@ impl Native {
         while let Some(&(point, target, main)) = self.points.get(index) {
             index += 1;
             // The owner must see stops.
-            if self.stops.contains(&target) {
+            if self.is_stop(target) {
                 continue;
             }
             let unit = match self.units.get(&target) {
@@ -1268,19 +1489,34 @@ impl Native {
         let at = self.cache.next();
         let mut work = std::mem::take(&mut self.work);
         work.unit.images.clone_from(&self.images.borrow());
+        let candidate_stops = (!self.candidates.is_empty()).then(|| {
+            self.stops
+                .iter()
+                .copied()
+                .chain(
+                    self.candidates
+                        .iter()
+                        .copied()
+                        .filter(|&candidate| candidate != eip),
+                )
+                .collect::<Vec<_>>()
+        });
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
-        let control = if self.runtime.cpu.is_null() {
-            self.control
+        let (control, pe) = if self.runtime.cpu.is_null() {
+            (self.control, self.pe)
         } else {
             // SAFETY: during a run the runtime points at its live CPU, which
             // nothing writes while the owner translates.
-            unsafe { (*self.runtime.cpu).x87.control }
+            let x87 = unsafe { &(*self.runtime.cpu).x87 };
+            (x87.control, x87.status & 0x20 != 0)
         };
+        work.cold =
+            self.promotion != 0 && !self.promoted.contains(&eip) && !self.candidates.contains(&eip);
         translate::translate(
             &mut work,
             memory,
             eip,
-            &self.stops,
+            candidate_stops.as_deref().unwrap_or(&self.stops),
             &|pc| all || checked.contains(&pc),
             self.helpers.len() as u32,
             self.features,
@@ -1323,6 +1559,7 @@ impl Native {
                     .map_or_else(Vec::new, |handler| handler.native_region(pc, code))
             },
             control,
+            pe,
         );
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(work.unit.trace.failure & 3)] += 1;
@@ -1336,6 +1573,12 @@ impl Native {
         );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
+            // A cold path reaches only inner loop heads; nominate from loop traces.
+            if !work.cold
+                && let Some(extent) = translate::computation_extent(&work.unit.trace)
+            {
+                self.record_extent(extent);
+            }
             if !work.unit.tables.is_empty() {
                 self.table_sources.insert(eip);
             }
@@ -1358,23 +1601,40 @@ impl Native {
                     self.resolve_tables(memory, target, entry.unit);
                 }
             }
-            self.helpers.extend(work.helpers());
-            self.helper_counts.resize(self.helpers.len(), 0);
             let points = work
                 .links()
                 .iter()
                 .map(|link| (at + link.offset, link.eip, link.main));
             self.points.extend(points);
-            // The spans are sorted, so a page repeats only next to itself.
+            // Spans are sorted by start. Watch every page, even when
+            // a merged span crosses more than one page boundary.
             let mut last = None;
-            for &(start, len) in work.code() {
-                for page in [start & !0xfff, (start + len - 1) & !0xfff] {
-                    if last != Some(page) {
+            for &(start, len) in work.code().iter().filter(|&&(_, len)| len != 0) {
+                let end = (u64::from(start) + u64::from(len) - 1).min(u64::from(u32::MAX));
+                for page in (start & !0xfff..=end as u32 & !0xfff).step_by(4096) {
+                    if last.is_none_or(|last| last < page) {
                         last = Some(page);
                         self.pages.entry(page).or_default().push(eip);
                     }
                 }
             }
+            if self.candidates.contains(&eip) {
+                let probed = self.probed.take_if(|probe| probe.eip == eip);
+                let proof = probed
+                    .filter(|probe| probe.trace.insts == work.unit.trace.insts)
+                    .map(|probe| probe.proof)
+                    .or_else(|| computation_proof(&work.unit.trace));
+                if let Some(proof) = proof
+                    && let Some(code) =
+                        self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
+                {
+                    let iterates = work.unit.trace.returns_at_head();
+                    self.computation
+                        .insert(eip, worker::Prepared::new(code, iterates, proof));
+                }
+            }
+            self.helpers.extend(work.helpers());
+            self.helper_counts.resize(self.helpers.len(), 0);
         }
         self.uses_permissions |= entry.is_some() && work.code.uses_permissions;
         // Code discovery can protect a host page shared with ordinary data.
@@ -1384,6 +1644,157 @@ impl Native {
         }
         self.work = work;
         entry
+    }
+
+    fn emit_computation(
+        &mut self,
+        unit: &mut translate::Unit,
+        eip: u32,
+        (control, pe): (u16, bool),
+        proof: &translate::computation::Proof,
+    ) -> Option<worker::Code> {
+        let retired = unit.trace.prepaid(0);
+        let code = translate::lower_computation(
+            unit,
+            &mut self.computation_code,
+            eip,
+            self.features,
+            self.cache.next(),
+            self.stubs,
+            (control, pe, Some(proof)),
+        )?;
+        let entry = self.cache.append(code.words)?;
+        let mut sites: Vec<_> = code
+            .sites
+            .iter()
+            .map(|&(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        let len = code.words.len() * 4;
+        crate::jit_map::record(entry, len, eip, retired, code.marks);
+        Some(worker::Code {
+            entry,
+            end: entry + len,
+            sites: sites.into(),
+        })
+    }
+
+    /// A budget exit samples where owner time goes. It nominates the
+    /// computation enclosing EIP. Once EIP has `promotion` samples, it and
+    /// the nearby entry with the widest computation extent around it take
+    /// loop traces.
+    fn sample(&mut self, memory: &Memory, eip: u32) {
+        if self.computation_enabled
+            && self.offer_computation()
+            && let Some((candidate, end)) = self.enclosing_computation(eip)
+            && !self.is_stop(candidate)
+        {
+            self.nominated = Some((candidate, end));
+        }
+        if self.promotion == 0 || self.promoted.contains(&eip) {
+            return;
+        }
+        let count = self.samples.entry(eip).or_default();
+        *count += 1;
+        if *count < self.promotion {
+            return;
+        }
+        self.samples.remove(&eip);
+        let nearby: Vec<u32> = self
+            .units
+            .keys()
+            .copied()
+            .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
+            .collect();
+        // Entries retranslate only when control next enters them, so every
+        // enclosing loop's extent is recorded now. Nomination then tries the
+        // outermost first and falls back inward as proofs are rejected.
+        let mut outer: Option<(u32, u32)> = None;
+        for entry in nearby {
+            let trace = self.loop_trace(memory, entry, &self.stops);
+            let Some((head, end)) = translate::computation_extent(&trace)
+                .filter(|&(head, end)| head <= eip && eip < end)
+            else {
+                continue;
+            };
+            self.record_extent((head, end));
+            let size = end - head;
+            if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
+                outer = Some((entry, size));
+            }
+        }
+        for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
+            if self.promoted.insert(entry) {
+                self.diagnostics.promotions += 1;
+                self.drop_unit(entry);
+            }
+        }
+        self.forget_dynamic();
+    }
+
+    fn record_extent(&mut self, extent: (u32, u32)) {
+        if !self.computation_extents.contains(&extent) {
+            if self.computation_extents.len() == 64 {
+                self.computation_extents.remove(0);
+            }
+            self.computation_extents.push(extent);
+        }
+    }
+
+    fn enclosing_computation(&self, eip: u32) -> Option<(u32, u32)> {
+        self.computation_extents
+            .iter()
+            .copied()
+            .filter(|&(head, end)| {
+                head <= eip && eip < end && !self.rejected_candidates.contains(&head)
+            })
+            .max_by_key(|&(head, end)| end - head)
+    }
+
+    fn prove_candidate(&self, memory: &Memory, eip: u32, end: u32) -> Option<Probed> {
+        // The installed owner trace watches the code. Reuse this proof
+        // only if that trace has identical decoded effects and edges.
+        let mut stops = self.stops.clone();
+        stops.extend(
+            self.candidates
+                .iter()
+                .copied()
+                .filter(|&inside| !(eip < inside && inside < end)),
+        );
+        let trace = self.loop_trace(memory, eip, &stops);
+        let proof = computation_proof(&trace)?;
+        Some(Probed { eip, trace, proof })
+    }
+
+    /// The trace a hot entry at `eip` takes.
+    fn loop_trace(&self, memory: &Memory, eip: u32, stops: &[u32]) -> translate::Trace {
+        let mut trace = translate::Trace::default();
+        let handler = if self.bridge.is_null() {
+            None
+        } else {
+            // SAFETY: preparation stays within this owner's bridge call.
+            unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                .handler
+                .as_ref()
+        };
+        trace.build(
+            memory,
+            eip,
+            stops,
+            &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
+            &|pc| {
+                let handler = handler?;
+                let (target, original) = handler.redirect(pc)?;
+                Some(translate::Redirect {
+                    target,
+                    original: original.to_vec(),
+                    checks: handler.redirect_checks(pc).to_vec(),
+                    body: handler.direct_body(pc),
+                })
+            },
+            true,
+        );
+        trace
     }
 
     /// Appends a unit for `eip` whose `sites` are at byte offsets.
@@ -1409,6 +1820,33 @@ impl Native {
         self.placed.push((unit, eip));
         Some(entry)
     }
+}
+
+fn computation_proof(trace: &translate::Trace) -> Option<translate::computation::Proof> {
+    use translate::Mode;
+    use translate::Op;
+
+    // The proved form has no owner-dependent call, shadow entry, indirect
+    // table, permissions helper or other runtime service.
+    if trace.insts.iter().any(|inst| {
+        inst.mode == Mode::Real
+            || inst.locked.is_some()
+            || inst.spin
+            || inst.op.reads_clock()
+            || matches!(
+                inst.op,
+                Op::Body(_)
+                    | Op::Syscall
+                    | Op::Timestamp
+                    | Op::Fence
+                    | Op::Strings(_)
+                    | Op::CallIndirect(_)
+                    | Op::JmpIndirect(_)
+            )
+    }) {
+        return None;
+    }
+    translate::computation::Proof::build(trace)
 }
 
 /// Rebuilds the x86 flags at a fault site, where the exit stub assumed

@@ -572,6 +572,7 @@ fn drive(
     };
     let result = (|| -> Result<(), String> {
         'run: loop {
+            wake.clear_frontend();
             if worker.as_ref().is_some_and(frontend::Worker::stopped) {
                 return Err("UI stopped while the guest was running".into());
             }
@@ -717,7 +718,6 @@ fn drive(
                         }
                     }
                 }
-                controller.after_guest_step(!metrics.gate.frozen());
             }
             if let Some(delay) = auto_delay {
                 auto.answer(delay, &mut session, Instant::now());
@@ -787,6 +787,9 @@ fn drive(
             } else {
                 session.run(deadline)
             };
+            if let Some(controller) = control.as_mut() {
+                controller.after_guest_step(!wake.frontend_pending());
+            }
             let serial = session.presented_frames();
             if let Some(debugger) = debugger.as_mut() {
                 debugger.after_step(

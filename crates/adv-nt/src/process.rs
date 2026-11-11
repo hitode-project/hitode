@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use adv_cpu::backend::{ArchitecturalState, Backend, Guest, GuestExt, MemFault};
+use adv_cpu::{PROCESSOR_MASK, PROCESSORS};
 use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
 use adv_machine::{CtxId, Env, Machine, Sys};
 use adv_pe::{ExportTarget, Pe, PeError};
@@ -47,8 +48,6 @@ const TEB_PAGES: u32 = 2;
 /// reads at `PEB + PAGE`.
 const BLOCK_SIZE: u32 = 2 * PAGE;
 
-/// Guest threads share one host thread.
-pub const PROCESSORS: u32 = 1;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 
 /// PEB fields (i386) the platform sets, as Wine's `init_peb` and
@@ -71,6 +70,7 @@ mod peb {
     pub const IMAGE_SUBSYSTEM: u32 = 0xb4;
     pub const IMAGE_SUBSYSTEM_MAJOR: u32 = 0xb8;
     pub const IMAGE_SUBSYSTEM_MINOR: u32 = 0xbc;
+    pub const ACTIVE_PROCESS_AFFINITY_MASK: u32 = 0xc0;
 }
 
 /// PEB_LDR_DATA and LDR_DATA_TABLE_ENTRY fields (i386) that ntdll's loader keeps.
@@ -403,6 +403,7 @@ pub fn start_connected<B: Backend>(
     )?;
     for (offset, value) in [
         (peb::NUMBER_OF_PROCESSORS, PROCESSORS),
+        (peb::ACTIVE_PROCESS_AFFINITY_MASK, PROCESSOR_MASK),
         (peb::HEAP_SEGMENT_RESERVE, 0x10_0000),
         (peb::HEAP_SEGMENT_COMMIT, 0x1_0000),
         (peb::HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD, 0x1_0000),
@@ -446,12 +447,7 @@ pub fn start_connected<B: Backend>(
     let teb = machine.sys.contexts[main as usize].teb;
     machine.ext.insert(memory);
     let features = machine.cpu.cpuid_features();
-    kuser::map(
-        &mut machine.cpu,
-        features,
-        system::physical_pages(),
-        PROCESSORS,
-    )?;
+    kuser::map(&mut machine.cpu, features, system::physical_pages())?;
     debug_assert_eq!(machine.cpu.read_u32(teb + teb::PEB)?, peb);
 
     machine.ext.insert(nls::Locale(startup.locale));

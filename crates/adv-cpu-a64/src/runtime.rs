@@ -42,6 +42,9 @@
 //! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` outside x87 runs (A64F-FP-1, A64F-FP-7).
+//!
+//! Each admitted execution gets a private runtime. Recall, deadlines and
+//! host notifications are observed only at exhausted instruction budgets.
 
 use std::mem::offset_of;
 
@@ -61,7 +64,7 @@ pub struct Runtime {
     pub cpu: *mut CpuState,
     /// Guest window base, 4 GiB aligned: `x27`.
     pub window: u64,
-    /// Shadow return stack pointer: `x28`.
+    /// Owner shadow return stack or admitted data alias: `x28`.
     pub shadow: u64,
     /// Safepoint countdown: `x9`.
     pub countdown: u64,
@@ -121,6 +124,18 @@ pub struct Runtime {
     pub body: adv_cpu_core::body::BodyContext,
     pub body_value: u32,
     pub body_stack: u32,
+    /// Whether proved spin backedges can hand off this execution turn.
+    pub spin_yield: u32,
+    /// Read at exhausted computation budgets only.
+    pub recall: u64,
+    pub recall_mask: u32,
+    pub computation_pending: u64,
+    pub computation_pending_mask: u32,
+    pub completed: u64,
+    /// Nonzero: the proved form leaves at its next return to its head.
+    pub head_exit: u32,
+    /// Checkpoints that kept running past a recall to reach the head.
+    pub deferred: u32,
 }
 
 impl Runtime {
@@ -157,6 +172,14 @@ impl Runtime {
             body: adv_cpu_core::body::BodyContext::default(),
             body_value: 0,
             body_stack: 0,
+            spin_yield: 0,
+            recall: 0,
+            recall_mask: 0,
+            computation_pending: 0,
+            computation_pending_mask: 0,
+            completed: 0,
+            head_exit: 0,
+            deferred: 0,
         }
     }
 }
@@ -177,6 +200,13 @@ pub enum Exit {
     Stepped = 3,
     /// A completed service call requests an execution-owner yield.
     Yield = 4,
+    /// A completed spin backedge requests a productive handoff.
+    Reschedule = 5,
+    Recall = 6,
+    Computation = 7,
+    /// An ordinary unit exhausted its instruction budget at EIP. The owner
+    /// samples EIP, then dispatches.
+    Budget = 8,
 }
 
 impl Exit {
@@ -187,6 +217,10 @@ impl Exit {
             2 => Some(Self::Fault),
             3 => Some(Self::Stepped),
             4 => Some(Self::Yield),
+            5 => Some(Self::Reschedule),
+            6 => Some(Self::Recall),
+            7 => Some(Self::Computation),
+            8 => Some(Self::Budget),
             _ => None,
         }
     }
@@ -274,6 +308,20 @@ pub(crate) const BODY_VALUE: u32 = field(offset_of!(Runtime, body_value));
 pub(crate) const BODY_CLASSES: u32 =
     BODY + offset_of!(adv_cpu_core::body::BodyContext, classes) as u32;
 pub(crate) const BODY_STACK: u32 = field(offset_of!(Runtime, body_stack));
+pub(crate) const SPIN_YIELD: u32 = field(offset_of!(Runtime, spin_yield));
+pub(crate) const RECALL: u32 = field(offset_of!(Runtime, recall));
+pub(crate) const RECALL_MASK: u32 = field(offset_of!(Runtime, recall_mask));
+pub(crate) const COMPUTATION_PENDING: u32 = field(offset_of!(Runtime, computation_pending));
+pub(crate) const COMPUTATION_PENDING_MASK: u32 =
+    field(offset_of!(Runtime, computation_pending_mask));
+pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
+pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
+pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
+/// Inner checkpoints a recall waits through before it leaves where it is:
+/// a few outer iterations of a hot computation.
+pub(crate) const RECALL_GRACE: u32 = 64;
+pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
+pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;
@@ -281,6 +329,7 @@ const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
+pub(crate) const CLOCK_READ: u32 = field(offset_of!(CpuState, clock_read));
 pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
 pub(crate) const XMM: u32 = field(offset_of!(CpuState, xmm));
 pub(crate) const MMX: u32 = field(offset_of!(CpuState, mmx));

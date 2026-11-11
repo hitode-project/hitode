@@ -1050,6 +1050,30 @@ impl Translator<'_> {
     }
 
     fn divide(&mut self, src: Src, signed: bool, helper: u8) {
+        #[cfg(native)]
+        if signed && let Some(division) = self.proof.and_then(|proof| proof.division(self.index)) {
+            let value = self.source(src);
+            let (eax, edx) = (host(EAX), host(EDX));
+            self.clobber(Operand::Guest(EAX));
+            self.clobber(Operand::Guest(EDX));
+            match division {
+                super::computation::Division::SignExtended => self.emit_all(&[
+                    sdiv(W, X17, eax, value),
+                    msub(W, edx, X17, value, eax),
+                    mov(W, eax, X17),
+                ]),
+                super::computation::Division::Normalized => self.emit_all(&[
+                    // EAX is r+d, 1 <= EAX < 2*d, and 0 < d <= 2^30.
+                    // The sign mask selects the adjustment without NZCV.
+                    sub(W, X16, eax, value, Lsl, 0),
+                    asr_imm(W, X17, X16, 31),
+                    and(W, X14, value, X17, Lsl, 0),
+                    add(W, edx, X16, X14, Lsl, 0),
+                    add_imm(W, eax, X17, 1, false),
+                ]),
+            }
+            return;
+        }
         self.flush_simd();
         self.canonicalize();
         let value = self.source(src);

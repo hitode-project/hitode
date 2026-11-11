@@ -10,6 +10,10 @@ TEXT = """Call graph:
     + ! 3 ???  (in <unknown binary>)  [0x1010]
     + ! 1 _RNvadv_cpu_a64native9interpret  (in adv-launcher) + 4  [0x5000]
     + 4 poll  (in libsystem_kernel.dylib) + 8  [0x18b]
+    3 Thread_3: guest computation
+    + 3 ???  (in <unknown binary>)  [0x2000]
+    2 Thread_4: guest computation
+    + 2 ???  (in <unknown binary>)  [0x2004]
 
 Total number in stack (recursive counted multiple times):
 """
@@ -21,6 +25,10 @@ class ThreadLeavesTests(unittest.TestCase):
         self.assertEqual(leaves, [("???", 0x1000, 1), ("???", 0x1010, 3),
                                   ("_RNvadv_cpu_a64native9interpret", 0x5000, 1), ("poll", 0x18b, 4)])
         self.assertEqual(thread_leaves(TEXT, "main"), [("mach_msg2_trap", 0x18a, 10)])
+
+    def test_every_thread_with_the_name_counts(self):
+        self.assertEqual(thread_leaves(TEXT, "guest computation"),
+                         [("???", 0x2000, 3), ("???", 0x2004, 2)])
 
 
 if __name__ == "__main__":

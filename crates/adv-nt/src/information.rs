@@ -1,11 +1,11 @@
 //! Process and thread information, after Wine's `NtQueryInformationProcess`
 //! and `NtQueryInformationThread`.
 
+use adv_cpu::PROCESSOR_MASK;
 use adv_machine::{Env, Outcome};
 
 use crate::memory::CURRENT_PROCESS;
 use crate::object::{write_bytes, write_u32};
-use crate::process::PROCESSORS;
 use crate::protocol::{GetNextThreadRequest, GetProcessInfoRequest, GetThreadInfoRequest};
 use crate::section::{IMAGE_INFORMATION_SIZE, PE_IMAGE_INFO_SIZE, image_information};
 use crate::server;
@@ -138,7 +138,7 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 for (index, value) in [
                     reply.exit_code as u32,
                     reply.peb as u32,
-                    reply.affinity as u32 & ((1 << PROCESSORS) - 1),
+                    reply.affinity as u32 & PROCESSOR_MASK,
                     u32::from(reply.base_priority),
                     reply.pid,
                     reply.ppid,
@@ -210,7 +210,7 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 };
                 let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
                 status::check(reply.header.error)?;
-                (reply.affinity as u32 & ((1 << PROCESSORS) - 1))
+                (reply.affinity as u32 & PROCESSOR_MASK)
                     .to_le_bytes()
                     .to_vec()
             }
@@ -415,8 +415,7 @@ pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
             status::check(reply.header.error)?;
             let mut bytes = [0; 12];
-            bytes[..4]
-                .copy_from_slice(&(reply.affinity as u32 & ((1 << PROCESSORS) - 1)).to_le_bytes());
+            bytes[..4].copy_from_slice(&(reply.affinity as u32 & PROCESSOR_MASK).to_le_bytes());
             let count = size.min(12);
             if info != 0 {
                 write_bytes(env, info, &bytes[..count as usize])?;
@@ -567,7 +566,7 @@ pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
         if class == THREAD_AFFINITY_MASK {
-            let affinity = reply.affinity as u32 & ((1 << PROCESSORS) - 1);
+            let affinity = reply.affinity as u32 & PROCESSOR_MASK;
             let count = size.min(4);
             if info != 0 {
                 write_bytes(env, info, &affinity.to_le_bytes()[..count as usize])?;
@@ -595,7 +594,7 @@ pub fn query_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             reply.teb as u32,
             reply.pid,
             reply.tid,
-            reply.affinity as u32 & ((1 << PROCESSORS) - 1),
+            reply.affinity as u32 & PROCESSOR_MASK,
             reply.priority as u32,
             reply.base_priority as u32,
         ];
@@ -747,7 +746,7 @@ pub fn set_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                         request.mask = 2;
                     }
                     4 => {
-                        request.affinity = u64::from(value & ((1 << PROCESSORS) - 1));
+                        request.affinity = u64::from(value & PROCESSOR_MASK);
                         request.mask = 4;
                         if request.affinity == 0 {
                             return Err(status::INVALID_PARAMETER.into());
@@ -818,7 +817,7 @@ pub fn set_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 }
                 let value = crate::object::read_u32(env, info)?;
                 if value == 0
-                    || value & !((1 << PROCESSORS) - 1) != 0
+                    || value & !PROCESSOR_MASK != 0
                     || crate::object::read_u32(env, info + 4)? != 0
                     || crate::object::read_u32(env, info + 8)? != 0
                 {
@@ -900,8 +899,9 @@ pub fn query_process64(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     let mut data = [0; 48];
                     data[..4].copy_from_slice(&reply.exit_code.to_le_bytes());
                     data[8..16].copy_from_slice(&u64::from(reply.peb as u32).to_le_bytes());
-                    data[16..24]
-                        .copy_from_slice(&(reply.affinity & ((1 << PROCESSORS) - 1)).to_le_bytes());
+                    data[16..24].copy_from_slice(
+                        &(reply.affinity & u64::from(PROCESSOR_MASK)).to_le_bytes(),
+                    );
                     data[24..28].copy_from_slice(&u32::from(reply.base_priority).to_le_bytes());
                     data[32..40].copy_from_slice(&u64::from(reply.pid).to_le_bytes());
                     data[40..48].copy_from_slice(&u64::from(reply.ppid).to_le_bytes());

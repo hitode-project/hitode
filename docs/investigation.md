@@ -160,7 +160,7 @@ Headless runs check mechanisms. Judge a change by what its code path does and by
 2. **Compare function shares with native.** A function near zero natively but high under Hitode usually means the guest took another path, such as a different device capability. Shares close to native but a much slower whole means a general cost in generated code.
 3. **For scattered hot spots, look for shared costs** such as memory checks, register spills, region entry and exit, REP and helper round trips. Do not patch functions one by one.
 4. **`--profile` disables region linking** and creates entries that normally do not exist. Use it only to count entries.
-5. **Sampling reads the wall-clock RIP of one thread.** All guest threads run on one host thread, while a native game spreads work such as audio decoding over several. Sampling suspends the thread, so read results as shares.
+5. **A single-thread sample covers only that thread.** Admitted computations also run on workers; include their samples and whole-process CPU when comparing parallel execution. Sampling suspends threads, so read results as shares.
 
 ```
 # native baseline: CPU per thread, EIP of the busiest thread by module and function
@@ -174,10 +174,10 @@ python tools/performance/attribute_pc.py <run>
 python tools/performance/native_hotspots.py <run> <guest_start>   # machine code and samples of a hot region
 python tools/performance/native_hotspots.py <run> --summary       # generated code cost by part and category
 python tools/performance/stack_report.py <run> [--focus <name>]   # host call stacks
-# macOS, also the launcher: one-second slices with guest regions (a64 writes jit-<pid>.tsv only)
+# macOS, also the launcher: one-second slices with guest regions and, with --instructions, guest instructions
 ADV_JIT_MAP_DIR=<run> <launcher or adv-run> ...
 python3 tools/performance/macos_sample.py record <run> --pid <pid> --seconds 30
-python3 tools/performance/macos_sample.py report <run> [--from <ms> --to <ms>]
+python3 tools/performance/macos_sample.py report <run> [--thread <name>] [--from <ms> --to <ms>] [--instructions]
 python tools/performance/compare_loop_profiles.py <base> <cand>
 # before running: what a module will ask of the CPU
 python tools/survey/module_profile.py <module> [--json <out>]
@@ -186,8 +186,7 @@ python tools/survey/module_profile.py <module> [--json <out>]
 - `native_sample.py --while-key ctrl` samples only while the key is held, to measure skipping. Count work that a native game spreads over threads against the single Hitode thread.
 - `native_hotspots.py --summary` gives host instructions per guest instruction, split by check, body, pure and slow, and the share of stack accesses. Untagged code counts toward the next tag, so the check share is a lower bound.
 - JIT code has no unwind information, so host stacks stop at native regions. They answer who calls a host function, not which guest code ran.
-- `ADV_JIT_DUMP_DIR` with `ADV_JIT_DUMP_REGIONS=<hex,...>` dumps the VCode of chosen regions.
-- `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames. `--host-profile <csv>` gives API service time.
+- `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames. Its checkpoint reports include bounded wait-source, wake lateness and ready-to-dispatch distributions, also in windowed runs. Its `input_responses` follow each click, key or wheel press to the frames after it and split the execution thread into guest runs, polling-round waits and all-blocked waits, so a felt stall in a windowed run gets its cause. `--host-profile <csv>` gives API service time.
 - `ADV_LOOP_COVERAGE=1` with `--report` writes `*.loops.tsv` for `loop_coverage.py`. It ranks by instruction weight, not time.
 - `ADV_INTERP_PROFILE=<file>` profiles the interpreter.
 - On macOS, `play_session.py` writes cumulative process CPU time and memory to each checkpoint's `*.process.json`. Subtract CPU time and `wall_seconds` between checkpoints for whole-process core usage; 1.0 means one fully occupied core.

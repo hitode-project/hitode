@@ -38,11 +38,11 @@ use crate::runtime;
 use super::access::{Addr, Dir};
 use super::decode::{Mem, memory};
 use super::flags::Operand;
-use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
 
 mod cache;
 mod pair;
-pub(super) use cache::{Arrive, Cache, Cold, Leave, Model};
+pub(super) use cache::{Arrive, Cache, Cold, Leave, Model, Scratch};
 
 const X7: Reg = Reg::new(7);
 const X8: Reg = Reg::new(8);
@@ -145,7 +145,7 @@ impl Translator<'_> {
             self.x87_accessed();
         } else {
             self.site();
-            self.emit(ldr_reg(X, X0, WINDOW, X6, false));
+            self.emit(ldr_reg(X, X0, self.data_view(), X6, false));
         }
         // Normalize the unsigned magnitude straight into raw80. No host-double
         // conversion or rounding loses the low bits of large signed integers.
@@ -318,8 +318,10 @@ impl Translator<'_> {
                 self.access(Addr::Window(X6), 2, Dir::Load, X0);
                 self.x87_accessed();
                 // Unmasking a pending exception takes the interpreter.
-                self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
-                self.asm.cbz(W, true, X16, slow);
+                if !self.x87_saved_control() {
+                    self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
+                    self.asm.cbz(W, true, X16, slow);
+                }
                 self.emit_all(&[
                     strh(X0, X5, runtime::X87_CONTROL),
                     movz(W, X16, 0x8080, 0),
@@ -464,7 +466,7 @@ impl Translator<'_> {
         }
         if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
-            self.store_sticky(width, integer, slow);
+            self.store_sticky(width, integer, slow, true);
         } else {
             // Round the significand to 53 bits, nearest even, in integers.
             let zero = self.asm.label();
@@ -518,7 +520,7 @@ impl Translator<'_> {
             self.x87_accessed();
         } else {
             self.site();
-            self.emit(str_reg(size, X2, WINDOW, X6, false));
+            self.emit(str_reg(size, X2, self.data_view(), X6, false));
         }
     }
 
@@ -557,7 +559,7 @@ impl Translator<'_> {
     /// The bits of an integer or binary32 store in x2 from the value's
     /// sticky double in d0 (w3 whether it lost bits), w3 whether they are
     /// inexact and w7 whether rounding grew the magnitude.
-    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label) {
+    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label, track: bool) {
         if integer {
             // Below 2^63, and below 2^51 when bits were lost.
             let whole = self.asm.label();
@@ -578,7 +580,9 @@ impl Translator<'_> {
                 self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
                 self.asm.b_cond(Cond::Ne, slow);
             }
-            self.grew(V1, V0);
+            if track {
+                self.grew(V1, V0);
+            }
         } else {
             // A normal input and output: no underflow or overflow.
             let zero = self.asm.label();
@@ -591,9 +595,11 @@ impl Translator<'_> {
             self.asm.b_cond(Cond::Hi, slow);
             self.asm.bind(zero);
             self.emit_all(&[unary(Unary::Narrow, V1, V0), fmov_from_v(W, X2, V1)]);
-            self.emit(unary(Unary::Widen, V1, V1));
-            self.grew(V1, V0);
-            self.store_rounding(width, false, slow);
+            if track {
+                self.emit(unary(Unary::Widen, V1, V1));
+                self.grew(V1, V0);
+                self.store_rounding(width, false, slow);
+            }
             self.emit_all(&[ubfx(W, X16, X2, 23, 8), cmp_imm(W, X16, 0xff, false)]);
             self.asm.b_cond(Cond::Eq, slow);
         }

@@ -43,7 +43,7 @@ impl Translator<'_> {
             return;
         }
         match inst.op {
-            Op::Nop | Op::Jmp(_) => {}
+            Op::Nop | Op::Pause | Op::Fence | Op::Jmp(_) => {}
             Op::Helper(index) => self.helper(index),
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
             Op::Timestamp => self.timestamp(),
@@ -492,7 +492,9 @@ impl Translator<'_> {
 
     /// A return popping `release` argument bytes besides its address.
     fn ret(&mut self, inst: Inst, release: u16) {
-        self.flush_simd();
+        if !self.x87.active {
+            self.flush_simd();
+        }
         let esp = Operand::Guest(ESP);
         self.prepare(esp);
         self.load(Addr::Pop, X16);
@@ -512,11 +514,17 @@ impl Translator<'_> {
                     state: self.state,
                     refund: self.trace.unused(self.index),
                     branch: self.indirect(IndirectBranchKind::Return),
+                    simd_dirty: self.vector.dirty,
+                    x87: self.x87_leaving(),
                 });
             }
             _ => {
                 self.settle();
-                self.shadow_return();
+                if self.computation {
+                    self.computation_transfer(self.indirect(IndirectBranchKind::Return));
+                } else {
+                    self.shadow_return();
+                }
             }
         }
     }
@@ -839,6 +847,11 @@ impl Translator<'_> {
                 self.load(addr, result(dst));
                 self.forget(guest);
                 self.commit(dst);
+                if Op::Mov(Src::Reg(dst), source).reads_clock() {
+                    // Any nonzero value marks the read; RUNTIME is never zero.
+                    self.emit(ldr(X, X17, RUNTIME, runtime::CPU_STATE));
+                    self.emit(str(X, RUNTIME, X17, runtime::CLOCK_READ));
+                }
             }
             Src::Reg(source) => {
                 self.clobber(guest);
@@ -924,6 +937,15 @@ impl Translator<'_> {
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
+        if self.computation || self.x87_leaving().is_some() {
+            self.follow_exit(
+                Exit::Interpret,
+                self.trace.insts[self.index].pc,
+                self.trace.owed(self.index),
+                false,
+            );
+            return;
+        }
         let index = self.helpers + u32::from(index);
         self.mov_imm(X1, index);
         self.owner_call(self.stubs.interpret);
@@ -1705,6 +1727,14 @@ impl Translator<'_> {
             self.asm.b(done);
             self.asm.bind(zero);
             let slow = self.asm.label();
+            let x87 = self.x87_leaving();
+            let refuse = if x87.is_some() {
+                let label = self.asm.label();
+                self.push_cold(Cold::Bridge { label, to: slow });
+                label
+            } else {
+                slow
+            };
             // Zero counts still require WRITE, but must not perform a store.
             // The preceding load established that both page indices are valid.
             self.emit_all(&[
@@ -1712,13 +1742,13 @@ impl Translator<'_> {
                 lsr_imm(W, X4, X5, 12),
                 ldr_narrow(Narrow::Byte, X4, X3, X4),
             ]);
-            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), refuse);
             self.emit_all(&[
                 add_imm(W, X4, X5, 3, false),
                 lsr_imm(W, X4, X4, 12),
                 ldr_narrow(Narrow::Byte, X4, X3, X4),
             ]);
-            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), refuse);
             self.push_cold(Cold::Leave {
                 label: slow,
                 state: State::CANONICAL,
@@ -1727,7 +1757,7 @@ impl Translator<'_> {
                 exit: super::Exit::Interpret,
                 eip: self.trace.insts[self.index].pc,
                 link: false,
-                x87: self.x87_leaving(),
+                x87,
             });
         }
         self.asm.bind(done);

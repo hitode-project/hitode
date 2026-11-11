@@ -590,7 +590,7 @@ impl Control {
                             }
                             Err(command) => {
                                 pending = command;
-                                reader_wake.signal();
+                                reader_wake.signal_frontend();
                                 // Only this producer parks for backpressure.
                                 // The guest worker never waits for the reader;
                                 // unpark retains a token across this race.
@@ -599,7 +599,7 @@ impl Control {
                         }
                     }
                     if interrupt {
-                        reader_wake.signal();
+                        reader_wake.signal_frontend();
                     } else {
                         reader_wake.notify();
                     }

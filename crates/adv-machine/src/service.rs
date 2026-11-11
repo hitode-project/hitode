@@ -5,6 +5,10 @@ use std::cell::Cell;
 pub struct Thread {
     empty_peeks: Cell<u32>,
     pub(crate) new_work: Cell<bool>,
+    /// A direct body read the clock (PROC-CLOCK-7).
+    pub(crate) clock_read: Cell<bool>,
+    /// A direct body found the message queue empty (PROC-CLOCK-5).
+    pub(crate) peeked: Cell<bool>,
 }
 
 /// Windows 11 empty A/W peeks, including PM_NOYIELD, hand off about once per
@@ -13,6 +17,7 @@ pub struct Thread {
 /// `services.thread_state` must name the current context's live shared Thread.
 pub unsafe fn empty_peek(services: adv_cpu::body::Services) -> bool {
     let thread = unsafe { &*services.thread_state.cast::<Thread>() };
+    thread.peeked.set(true);
     let count = thread.empty_peeks.get() + 1;
     thread.empty_peeks.set(if count == 100 { 0 } else { count });
     count == 100
@@ -43,12 +48,18 @@ fn time<M: adv_cpu::body::Mem>(
     let now =
         unsafe { crate::Clock::body_poll(services.clock, services.epoch_us, services.context) }
             .ok_or(adv_cpu::body::Stop::Guest)?;
+    if !services.thread_state.is_null() {
+        // SAFETY: the owner retains the current context's Thread while it runs.
+        unsafe { &*services.thread_state.cast::<Thread>() }
+            .clock_read
+            .set(true);
+    }
     Ok(adv_cpu::body::Ret::from((now / 1000) as u32))
 }
 
 /// The full timeGetTime handler shares the body and schedules required waits.
 pub fn time_get_time(env: &mut crate::Env<'_>) -> crate::Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(crate::Observation::Clock);
     let services = env.sys.services(env.ext);
     let mut scratch = adv_cpu::body::Scratch::default();
     let result = (TIME_GET_TIME.full)(

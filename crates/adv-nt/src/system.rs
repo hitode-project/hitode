@@ -1,12 +1,11 @@
 //! System information, after Wine's `unix/system.c`.
 
-use adv_cpu::PROCESSOR_IDENTITY;
+use adv_cpu::{PROCESSOR_IDENTITY, PROCESSOR_MASK, PROCESSORS};
 use adv_machine::layout::{GRANULE, PAGE};
 use adv_machine::{Env, Outcome};
 
 use crate::memory::USER_END;
 use crate::object::{write_bytes, write_u32};
-use crate::process::PROCESSORS;
 use crate::status::{self, Error};
 use crate::timezone;
 
@@ -258,7 +257,7 @@ fn basic_information() -> [u8; 0x2c] {
         GRANULE,
         0x1_0000,
         USER_END - 1,
-        (1 << PROCESSORS) - 1,
+        PROCESSOR_MASK,
         PROCESSORS,
     ];
     let mut bytes = [0u8; 0x2c];
@@ -325,7 +324,7 @@ fn host_system() -> (Vec<u8>, Vec<u8>) {
 /// NtQueryPerformanceCounter(*counter, *frequency): 100 ns ticks of the
 /// monotonic clock, as the server's.
 pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(adv_machine::Observation::Clock);
     let &[counter, frequency] = args else {
         unreachable!()
     };
@@ -366,7 +365,7 @@ pub(crate) fn performance_counter(env: &Env<'_>) -> u64 {
 
 /// NtQuerySystemTime(*time)
 pub fn query_time(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(adv_machine::Observation::Clock);
     let time = env.sys.clock.system_time();
     status::finish(write_bytes(env, args[0], &time.to_le_bytes()).map_err(Error::from))
 }
@@ -968,31 +967,38 @@ fn logical_processors(extended: bool, relation: u32) -> Vec<u8> {
         if relation != u32::MAX && relation != kind {
             continue;
         }
-        if !extended {
-            if kind == 4 {
-                continue;
-            }
-            let mut entry = vec![0; 24];
-            entry[..4].copy_from_slice(&((1u32 << PROCESSORS) - 1).to_le_bytes());
-            entry[4..8].copy_from_slice(&kind.to_le_bytes());
-            bytes.extend(entry);
+        if !extended && kind == 4 {
             continue;
         }
-        let length = if kind == 4 { 76 } else { 44 };
-        let mut entry = vec![0; length];
-        entry[..4].copy_from_slice(&kind.to_le_bytes());
-        entry[4..8].copy_from_slice(&(length as u32).to_le_bytes());
-        if kind == 4 {
-            entry[8..10].copy_from_slice(&1u16.to_le_bytes());
-            entry[10..12].copy_from_slice(&1u16.to_le_bytes());
-            entry[32] = 32;
-            entry[33] = PROCESSORS as u8;
-            entry[72..76].copy_from_slice(&((1u32 << PROCESSORS) - 1).to_le_bytes());
-        } else {
-            entry[30..32].copy_from_slice(&1u16.to_le_bytes());
-            entry[32..36].copy_from_slice(&((1u32 << PROCESSORS) - 1).to_le_bytes());
+        for core in 0..if kind == 0 { PROCESSORS } else { 1 } {
+            let mask = if kind == 0 { 1 << core } else { PROCESSOR_MASK };
+            let length = if !extended {
+                24
+            } else if kind == 4 {
+                76
+            } else {
+                44
+            };
+            let mut entry = [0u8; 76];
+            if !extended {
+                entry[..4].copy_from_slice(&mask.to_le_bytes());
+                entry[4..8].copy_from_slice(&kind.to_le_bytes());
+            } else {
+                entry[..4].copy_from_slice(&kind.to_le_bytes());
+                entry[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+                if kind == 4 {
+                    entry[8..10].copy_from_slice(&1u16.to_le_bytes());
+                    entry[10..12].copy_from_slice(&1u16.to_le_bytes());
+                    entry[32] = PROCESSORS as u8;
+                    entry[33] = PROCESSORS as u8;
+                    entry[72..76].copy_from_slice(&mask.to_le_bytes());
+                } else {
+                    entry[30..32].copy_from_slice(&1u16.to_le_bytes());
+                    entry[32..36].copy_from_slice(&mask.to_le_bytes());
+                }
+            }
+            bytes.extend_from_slice(&entry[..length]);
         }
-        bytes.extend(entry);
     }
     if relation == u32::MAX || relation == 2 {
         #[cfg(target_vendor = "apple")]
@@ -1022,9 +1028,10 @@ fn logical_processors(extended: bool, relation: u32) -> Vec<u8> {
             if extended {
                 entry[..4].copy_from_slice(&2u32.to_le_bytes());
                 entry[4..8].copy_from_slice(&52u32.to_le_bytes());
-                entry[40..44].copy_from_slice(&((1u32 << PROCESSORS) - 1).to_le_bytes());
+                entry[38..40].copy_from_slice(&1u16.to_le_bytes());
+                entry[40..44].copy_from_slice(&PROCESSOR_MASK.to_le_bytes());
             } else {
-                entry[..4].copy_from_slice(&((1u32 << PROCESSORS) - 1).to_le_bytes());
+                entry[..4].copy_from_slice(&PROCESSOR_MASK.to_le_bytes());
                 entry[4..8].copy_from_slice(&2u32.to_le_bytes());
             }
             entry[8] = level;
@@ -1123,12 +1130,11 @@ fn processor_performance(count: u32) -> Vec<u8> {
         if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
             // SAFETY: sysconf has no preconditions.
             let frequency = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-            for (entry, line) in bytes
-                .as_chunks_mut::<48>()
-                .0
-                .iter_mut()
-                .zip(stat.lines().skip(1))
-            {
+            for (entry, line) in bytes.as_chunks_mut::<48>().0.iter_mut().zip(
+                stat.lines()
+                    .skip(1)
+                    .take_while(|line| line.starts_with("cpu")),
+            ) {
                 let values: Vec<u64> = line
                     .split_whitespace()
                     .skip(1)

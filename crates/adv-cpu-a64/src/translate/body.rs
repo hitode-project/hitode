@@ -650,6 +650,7 @@ mod tests {
                 },
                 &|_, _| Vec::new(),
                 0x037f,
+                false,
             );
             let mut pc = work.code.asm.position(work.code.labels[0]) / 4;
             let end = work.code.asm.position(work.code.labels[args.len() + 1]) / 4;

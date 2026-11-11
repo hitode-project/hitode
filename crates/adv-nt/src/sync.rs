@@ -136,7 +136,7 @@ pub fn release_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtYieldExecution(): another thread runs if one is ready.
 pub fn yield_execution(env: &mut Env<'_>, _: &[u32]) -> Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(adv_machine::Observation::Yield);
     Outcome::block_then_return(Wait::Yield, status::SUCCESS)
 }
 
@@ -154,8 +154,14 @@ fn event_op(env: &mut Env<'_>, args: &[u32], op: i32) -> Outcome {
     let &[handle, previous] = args else {
         unreachable!()
     };
+    let signaler = trace_signaler(env);
     status::finish((|| {
-        let state = signal(env, handle, op)?;
+        let state = signal_as(
+            env,
+            handle,
+            op,
+            (adv_machine::WakePriority::Normal, signaler),
+        )?;
         if previous != 0 {
             write_u32(env, previous, state)?;
         }
@@ -166,20 +172,25 @@ fn event_op(env: &mut Env<'_>, args: &[u32], op: i32) -> Outcome {
 /// Set, reset or pulse an event, in process when it has an in-process sync,
 /// and return its previous state. The server rejects event operations on those.
 pub(crate) fn signal(env: &mut Env<'_>, handle: u32, op: i32) -> Result<u32, status::Error> {
-    signal_as(env, handle, op, adv_machine::WakePriority::Normal)
+    signal_as(env, handle, op, (adv_machine::WakePriority::Normal, None))
 }
+
+fn trace_signaler(env: &Env<'_>) -> Option<adv_machine::CtxId> {
+    env.sys.schedule_trace.enabled().then_some(env.context)
+}
+
 fn signal_as(
     env: &mut Env<'_>,
     handle: u32,
     op: i32,
-    priority: adv_machine::WakePriority,
+    delivery: (adv_machine::WakePriority, Option<adv_machine::CtxId>),
 ) -> Result<u32, status::Error> {
     let command = match op {
         SET_EVENT => ntsync::EVENT_SET,
         RESET_EVENT => ntsync::EVENT_RESET,
         _ => ntsync::EVENT_PULSE,
     };
-    if let Some(value) = inproc_operation_as(env, handle, 2, 2, command, [0; 2], priority)? {
+    if let Some(value) = inproc_operation_as(env, handle, 2, 2, command, [0; 2], delivery)? {
         return Ok(value[0]);
     }
     let mut request = EventOpRequest {
@@ -331,7 +342,7 @@ pub fn delay(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let wait = if deadline > env.sys.clock.now_us() {
         Wait::Until(deadline)
     } else {
-        env.sys.poll_observation();
+        env.sys.poll_observation(adv_machine::Observation::Yield);
         Wait::Yield
     };
     Outcome::block_then_return(wait, status::SUCCESS)
@@ -1012,7 +1023,9 @@ fn alert_event(env: &mut Env<'_>, tid: u32) -> Result<adv_machine::sched::Handle
 pub fn alert_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     match alert_event(env, args[0]) {
         Ok(event) => {
-            env.sys.set_event(event);
+            let signaler = trace_signaler(env);
+            env.sys
+                .set_event_from(event, adv_machine::WakePriority::Normal, signaler);
             Outcome::Return(status::SUCCESS)
         }
         Err(status) => Outcome::Return(status),
@@ -1353,7 +1366,9 @@ pub fn alert_multiple(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             events.push(alert_event(env, read_u32(env, args[0] + index * 4)?)?);
         }
         for event in events {
-            env.sys.set_event(event);
+            let signaler = trace_signaler(env);
+            env.sys
+                .set_event_from(event, adv_machine::WakePriority::Normal, signaler);
         }
         Ok(())
     })())
@@ -2082,7 +2097,16 @@ fn inproc_operation(
     value: [u32; 2],
 ) -> Result<Option<[u32; 2]>, status::Error> {
     let priority = adv_machine::WakePriority::Normal;
-    inproc_operation_as(env, handle, kind, access, command, value, priority)
+    let signaler = trace_signaler(env);
+    inproc_operation_as(
+        env,
+        handle,
+        kind,
+        access,
+        command,
+        value,
+        (priority, signaler),
+    )
 }
 fn inproc_operation_as(
     env: &mut Env<'_>,
@@ -2091,14 +2115,15 @@ fn inproc_operation_as(
     access: u32,
     command: u32,
     mut value: [u32; 2],
-    priority: adv_machine::WakePriority,
+    (priority, signaler): (adv_machine::WakePriority, Option<adv_machine::CtxId>),
 ) -> Result<Option<[u32; 2]>, status::Error> {
     let sync = match inproc_get(env, handle, kind, access) {
         Err(status::Error::Status(status::NOT_IMPLEMENTED)) => return Ok(None),
         result => result?,
     };
     // SAFETY: value holds the two fields used by every object ioctl.
-    match unsafe { ntsync::ioctl(sync.fd.as_raw_fd(), command, value.as_mut_ptr()) } {
+    match unsafe { ntsync::ioctl_from(sync.fd.as_raw_fd(), command, value.as_mut_ptr(), signaler) }
+    {
         Ok(_) => {}
         Err(libc::EOWNERDEAD) if command == ntsync::MUTEX_READ => value[0] = u32::MAX,
         Err(error) => return Err(inproc_status(error, command).into()),
@@ -2124,8 +2149,8 @@ fn deliver_inproc_as(env: &mut Env<'_>, priority: adv_machine::WakePriority) -> 
         let Some(result) = result.upgrade() else {
             return false;
         };
-        if result.get().is_some() {
-            delivered |= env.sys.set_event_with_priority(*wake, priority);
+        if let Some(completed) = result.get() {
+            delivered |= env.sys.set_event_from(*wake, priority, completed.signaler);
         }
         true
     });
@@ -2135,7 +2160,13 @@ fn deliver_inproc_as(env: &mut Env<'_>, priority: adv_machine::WakePriority) -> 
 /// Set an audio notification event; the waiters it satisfies run first, as
 /// the built-in stack's audio wakes do.
 pub fn set_audio_event(env: &mut Env<'_>, handle: u32) -> Result<(), status::Error> {
-    signal_as(env, handle, SET_EVENT, adv_machine::WakePriority::Audio).map(drop)
+    signal_as(
+        env,
+        handle,
+        SET_EVENT,
+        (adv_machine::WakePriority::Audio, None),
+    )
+    .map(drop)
 }
 struct InprocWait {
     pending: ntsync::Pending,
@@ -2204,8 +2235,11 @@ fn prepare_inproc_wait(
                 _ => unreachable!(),
             };
             // SAFETY: value supplies the command's UAPI fields.
-            unsafe { ntsync::ioctl(signal.fd.as_raw_fd(), command, value.as_mut_ptr()) }
-                .map_err(|e| status::Error::from(inproc_status(e, command)))?;
+            let signaler = trace_signaler(env);
+            unsafe {
+                ntsync::ioctl_from(signal.fd.as_raw_fd(), command, value.as_mut_ptr(), signaler)
+            }
+            .map_err(|e| status::Error::from(inproc_status(e, command)))?;
             deliver_inproc(env);
         }
         let alert = if alertable as u8 != 0 {

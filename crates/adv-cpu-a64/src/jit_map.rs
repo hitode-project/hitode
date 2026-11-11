@@ -1,12 +1,11 @@
 //! Opt-in native address maps for samplers. They record placed units, not
 //! execution counts, and never change translation.
 //!
-//! `ADV_JIT_MAP_DIR` writes the x64 backend's `jit-{pid}.tsv` rows for an
-//! external sampler. [`enable_memory`] keeps the same rows in process for an
-//! in-process sampler, with the guest instruction and [`Part`] of every
-//! stretch of a unit and the names of the shared stubs. A cleared cache
-//! reuses addresses, so attribution takes the newest unit placed before the
-//! sample.
+//! `ADV_JIT_MAP_DIR` writes `jit-{pid}.tsv` rows for an external sampler,
+//! and `insn-{pid}.tsv` rows with the guest instruction and [`Part`] of
+//! every stretch of a unit. [`enable_memory`] keeps the same in process for
+//! an in-process sampler, with the names of the shared stubs. A cleared cache reuses addresses,
+//! so attribution takes the newest unit placed before the sample.
 // The translator needs these types on every host; native execution records units.
 #![cfg_attr(not(native), allow(dead_code))]
 
@@ -203,12 +202,15 @@ pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[
             }),
         }
     }
-    static MAP: OnceLock<Option<Mutex<File>>> = OnceLock::new();
-    let Some(file) = MAP.get_or_init(|| {
+    static MAP: OnceLock<Option<Mutex<(File, File)>>> = OnceLock::new();
+    let Some(files) = MAP.get_or_init(|| {
         let directory = std::path::PathBuf::from(std::env::var_os("ADV_JIT_MAP_DIR")?);
-        let path = directory.join(format!("jit-{}.tsv", std::process::id()));
-        match std::fs::create_dir_all(&directory).and_then(|_| File::create(path)) {
-            Ok(file) => Some(Mutex::new(file)),
+        let create =
+            |name: &str| File::create(directory.join(format!("{name}-{}.tsv", std::process::id())));
+        match std::fs::create_dir_all(&directory)
+            .and_then(|_| Ok((create("jit")?, create("insn")?)))
+        {
+            Ok(files) => Some(Mutex::new(files)),
             Err(error) => {
                 eprintln!("warning: JIT address map disabled: {error}");
                 None
@@ -217,11 +219,29 @@ pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[
     }) else {
         return;
     };
-    // Decimal TSV as in x64: Unix ns, native base, bytes, guest start, mode,
+    // Decimal TSV: Unix ns, native base, bytes, guest start, mode,
     // guest span (unknown here, 0), retired guest instructions.
-    let row = format!("{}\t{base}\t{size}\t{eip}\ta64\t0\t{retired}\n", now_ns());
-    let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
-    let _ = file.write_all(row.as_bytes());
+    let ns = now_ns();
+    let row = format!("{ns}\t{base}\t{size}\t{eip}\ta64\t0\t{retired}\n");
+    let stretches = stretches(ns, base, size, marks);
+    let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _ = files.0.write_all(row.as_bytes());
+    let _ = files.1.write_all(stretches.as_bytes());
+}
+
+/// `insn-{pid}.tsv` rows of a unit, keyed by its `jit-{pid}.tsv` row: Unix
+/// ns, native base, start and end offsets of each stretch, guest
+/// instruction, part and class (a64 has none).
+fn stretches(ns: u128, base: usize, size: usize, marks: &[Mark]) -> String {
+    let mut marks = marks.to_vec();
+    marks.sort_by_key(|mark| mark.offset);
+    let mut rows = String::new();
+    for (n, mark) in marks.iter().enumerate() {
+        let end = marks.get(n + 1).map_or(size, |next| next.offset as usize);
+        let (start, eip, part) = (mark.offset, mark.eip, mark.part);
+        rows += &format!("{ns}\t{base}\t{start}\t{end}\t{eip}\t{part:?}\ta64\n");
+    }
+    rows
 }
 
 /// The base and marks of every unit recorded for `eip`.
@@ -288,5 +308,18 @@ mod tests {
         assert_eq!(stub(0x9010), Some("enter"));
         assert_eq!(stub(0x9050), Some("exit"));
         assert_eq!(stub(0x9100), None);
+    }
+
+    #[test]
+    fn stretches_run_from_each_mark_to_the_next_or_the_unit_end() {
+        let mark = |offset, eip, part| Mark { offset, eip, part };
+        let marks = [
+            mark(0x20, 0x401004, Part::Cold),
+            mark(0, 0x401000, Part::X87Entry),
+        ];
+        assert_eq!(
+            stretches(7, 0x1000, 0x40, &marks),
+            "7\t4096\t0\t32\t4198400\tX87Entry\ta64\n7\t4096\t32\t64\t4198404\tCold\ta64\n"
+        );
     }
 }

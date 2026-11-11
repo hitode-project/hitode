@@ -13,7 +13,7 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 
 use super::decode::{ESP, Mem};
-use super::{Cold, RUNTIME, Translator, WINDOW, X3, X4, X5, biased, host};
+use super::{Cold, RUNTIME, SHADOW, Translator, WINDOW, X3, X4, X5, biased, host};
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
@@ -22,10 +22,13 @@ pub(super) const PAGE_SHIFT: u32 = 12;
 /// An address operand ready for a load or store.
 #[derive(Clone, Copy)]
 pub(super) enum Addr {
-    /// A W register holding the guest address: `[x27, w, uxtw]`.
+    /// A W register holding the guest address relative to the data view.
     Window(Reg),
     /// A biased stack register plus an offset the guards cover.
     Biased(Reg, i32),
+    /// A proved loop invariant in an unused high SIMD lane.
+    #[cfg(native)]
+    FrameCache(u8),
     /// The slot below ESP, which a store pushes to.
     Push,
     /// The slot at ESP, which a load pops from.
@@ -59,8 +62,8 @@ impl Dir {
             }
     }
 
-    /// `[x27, address, uxtw]` for a `width`-byte access of `rt`.
-    fn window(self, width: u8, rt: Reg, address: Reg) -> u32 {
+    /// A `width`-byte access of `rt` through the selected data view.
+    fn window(self, width: u8, rt: Reg, base: Reg, address: Reg) -> u32 {
         let narrow = |half| match (half, self) {
             (false, Self::Signed) => Narrow::SignedByte,
             (false, _) => Narrow::Byte,
@@ -68,22 +71,55 @@ impl Dir {
             (true, _) => Narrow::Half,
         };
         match (width, self) {
-            (1 | 2, Self::Store) => str_narrow(narrow(width == 2), rt, WINDOW, address),
-            (1 | 2, _) => ldr_narrow(narrow(width == 2), rt, WINDOW, address),
-            (4, Self::Store) => str_reg(W, rt, WINDOW, address, false),
-            (4, _) => ldr_reg(W, rt, WINDOW, address, false),
+            (1 | 2, Self::Store) => str_narrow(narrow(width == 2), rt, base, address),
+            (1 | 2, _) => ldr_narrow(narrow(width == 2), rt, base, address),
+            (4, Self::Store) => str_reg(W, rt, base, address, false),
+            (4, _) => ldr_reg(W, rt, base, address, false),
             _ => unreachable!("no {width}-byte integer access"),
         }
     }
 }
 
 impl Translator<'_> {
+    #[cfg(native)]
+    pub(super) fn load_frame_cache(&mut self, offsets: &[i32]) {
+        for (slot, &offset) in offsets.iter().enumerate() {
+            let address = self.effective(Mem {
+                base: Some(ESP),
+                index: None,
+                scale: 1,
+                address_bits: 32,
+                disp: offset as u32,
+                fs: false,
+            });
+            // Admission already granted the original four bytes through
+            // this alias. Hoisting does not add a guest fault or effect.
+            self.emit(ldr_reg(W, super::X16, self.data_view(), address, false));
+            let (reg, lane) = frame_lane(slot as u8);
+            self.emit(vins_general(2, reg, lane, super::X16));
+        }
+    }
+
+    /// The worker's unused shadow register holds its admitted private alias.
+    pub(super) fn data_view(&self) -> Reg {
+        if self.computation { SHADOW } else { WINDOW }
+    }
+
     /// An address for a 32-bit access to `mem`; a checked one is always in
     /// a register.
     pub(super) fn address(&mut self, mem: Mem) -> Addr {
+        #[cfg(native)]
+        if let Some(slot) = self
+            .proof
+            .and_then(|proof| proof.frame_cache())
+            .and_then(|cache| cache.read(self.index))
+        {
+            return Addr::FrameCache(slot);
+        }
         if let (Some(base), None) = (mem.base, mem.index)
             && biased(base)
             && !self.checking
+            && !self.computation
             && mem.address_bits == 32
             && !mem.fs
         {
@@ -110,12 +146,17 @@ impl Translator<'_> {
     pub(super) fn access(&mut self, addr: Addr, width: u8, dir: Dir, rt: Reg) {
         let store = dir == Dir::Store;
         match addr {
+            #[cfg(native)]
+            Addr::FrameCache(slot) => {
+                let (reg, lane) = frame_lane(slot);
+                self.emit(vumov(2, rt, reg, lane));
+            }
             Addr::Push => {
                 assert!(store && width == 4, "a push stores 4 bytes");
-                if self.checking {
+                if self.checking || self.computation {
                     // ESP wraps like the guest's, and stays biased.
                     self.emit(sub_imm(W, X5, host(ESP), 4, false));
-                    self.checked(X5, rt, dir.kind(4), dir.window(4, rt, X5));
+                    self.access(Addr::Window(X5), width, dir, rt);
                     self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
                 } else {
                     self.site();
@@ -124,8 +165,8 @@ impl Translator<'_> {
             }
             Addr::Pop => {
                 assert!(!store && width == 4, "a pop loads 4 bytes");
-                if self.checking {
-                    self.checked(host(ESP), rt, dir.kind(4), dir.window(4, rt, host(ESP)));
+                if self.checking || self.computation {
+                    self.access(Addr::Window(host(ESP)), width, dir, rt);
                     self.emit(add_imm(X, host(ESP), host(ESP), 4, false));
                 } else {
                     self.site();
@@ -133,11 +174,26 @@ impl Translator<'_> {
                 }
             }
             Addr::Window(address) | Addr::Biased(address, 0) if self.checking => {
-                self.checked(address, rt, dir.kind(width), dir.window(width, rt, address));
+                self.checked(
+                    address,
+                    rt,
+                    dir.kind(width),
+                    dir.window(width, rt, WINDOW, address),
+                );
             }
             Addr::Window(address) => {
                 self.site();
-                self.emit(dir.window(width, rt, address));
+                self.emit(dir.window(width, rt, self.data_view(), address));
+            }
+            Addr::Biased(base, disp) if self.computation => {
+                let address = if disp == 0 {
+                    base
+                } else {
+                    self.mov_imm(X3, disp as u32);
+                    self.emit(add(W, X3, base, X3, Lsl, 0));
+                    X3
+                };
+                self.access(Addr::Window(address), width, dir, rt);
             }
             Addr::Biased(base, disp) => {
                 assert!(!self.checking && width == 4, "a biased access is unchecked");
@@ -174,9 +230,9 @@ impl Translator<'_> {
     /// A vector access using the same sites and permission checks as integers.
     pub(super) fn vector_access(&mut self, size: VMem, value: VReg, address: Reg, store: bool) {
         let direct = if store {
-            vstr_reg(size, value, WINDOW, address)
+            vstr_reg(size, value, self.data_view(), address)
         } else {
-            vldr_reg(size, value, WINDOW, address)
+            vldr_reg(size, value, self.data_view(), address)
         };
         if self.checking {
             let slow = self.asm.label();
@@ -272,4 +328,11 @@ impl Translator<'_> {
             self.asm.tbz(true, X4, bit(permission), excluded);
         }
     }
+}
+
+#[cfg(native)]
+fn frame_lane(slot: u8) -> (VReg, u32) {
+    // Detached units exclude MMX instructions. Preserve each low D lane,
+    // which the host ABI saves and restores even in this form.
+    (VReg::new(8 + slot / 2), 2 + u32::from(slot % 2))
 }

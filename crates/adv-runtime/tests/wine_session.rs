@@ -148,7 +148,12 @@ fn sequential_sessions_child() {
         let stop = loop {
             assert!(Instant::now() < until, "session {turn} timed out");
             match session.run(Instant::now() + Duration::from_millis(20)) {
-                Stop::Paused if turn == 1 && directory.join("ready").exists() => {
+                // The probe creates the file before writing it; wait for both words.
+                Stop::Paused
+                    if turn == 1
+                        && std::fs::metadata(directory.join("ready"))
+                            .is_ok_and(|m| m.len() == 8) =>
+                {
                     break Stop::Paused;
                 }
                 Stop::Paused => {}

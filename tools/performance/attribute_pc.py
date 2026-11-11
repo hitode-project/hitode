@@ -54,6 +54,7 @@ class JitMap:
         for rows in self.bodies.values():
             rows.sort()
         self.bases = sorted(self.bodies)
+        self.longest = max((row[1] for rows in self.bodies.values() for row in rows), default=0)
         self.ranges = defaultdict(list)
         for path in sorted(directory.glob("insn-*.tsv")):
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -64,30 +65,36 @@ class JitMap:
         self.tagged = bool(self.ranges)
 
     def lookup(self, rip, unix_ns):
+        # A cleared cache places again from its bottom, so an older body may
+        # start inside a newer one: the newest body covering rip owns it.
+        owner = None
         index = bisect.bisect_right(self.bases, rip) - 1
-        for base in self.bases[max(0, index - 3):index + 1][::-1]:
-            # The newest compilation at this base before the sample owns it.
-            live = [row for row in self.bodies[base] if row[0] <= unix_ns]
-            if not live or rip >= base + live[-1][1]:
-                continue
-            ns, _, guest, mode = live[-1]
-            offset = rip - base
-            ranges = self.ranges.get((ns, base), [])
-            at = bisect.bisect_right(ranges, (offset, float("inf"))) - 1
-            found = {"region": guest, "mode": mode}
-            if at >= 0 and ranges[at][0] <= offset < ranges[at][1]:
-                _, _, pc, part, kind = ranges[at]
-                return {**found, "pc": pc, "part": part, "class": kind}
-            if not ranges or at + 1 == len(ranges):
-                return {**found, "pc": 0, "part": "untagged", "class": "untagged"}
-            if at < 0:
-                return {**found, "pc": 0, "part": "prologue", "class": "overhead"}
-            # Cranelift's egraph re-creates rewritten pure values without source
-            # locations and places them before their first use: charge the next
-            # tagged instruction, as a separate part.
-            _, _, pc, _, kind = ranges[at + 1]
-            return {**found, "pc": pc, "part": "pure", "class": kind}
-        return None
+        while index >= 0 and self.bases[index] > rip - self.longest:
+            base = self.bases[index]
+            index -= 1
+            rows = self.bodies[base]
+            at = bisect.bisect_right(rows, (unix_ns, float("inf"))) - 1
+            if at >= 0 and rip < base + rows[at][1] and (owner is None or rows[at][0] > owner[1][0]):
+                owner = (base, rows[at])
+        if owner is None:
+            return None
+        base, (ns, _, guest, mode) = owner
+        offset = rip - base
+        ranges = self.ranges.get((ns, base), [])
+        at = bisect.bisect_right(ranges, (offset, float("inf"))) - 1
+        found = {"region": guest, "mode": mode}
+        if at >= 0 and ranges[at][0] <= offset < ranges[at][1]:
+            _, _, pc, part, kind = ranges[at]
+            return {**found, "pc": pc, "part": part, "class": kind}
+        if not ranges or at + 1 == len(ranges):
+            return {**found, "pc": 0, "part": "untagged", "class": "untagged"}
+        if at < 0:
+            return {**found, "pc": 0, "part": "prologue", "class": "overhead"}
+        # Cranelift's egraph re-creates rewritten pure values without source
+        # locations and places them before their first use: charge the next
+        # tagged instruction, as a separate part.
+        _, _, pc, _, kind = ranges[at + 1]
+        return {**found, "pc": pc, "part": "pure", "class": kind}
 
 
 def component(frames):

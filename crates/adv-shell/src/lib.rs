@@ -146,9 +146,11 @@ impl Options {
             frame_timing: self.frame_budget || debug::requested(self.debug),
             profiling: self.profile,
         })?;
-        if self.frame_budget {
+        if self.frame_budget || self.schedule_profile.is_some() {
             machine.sys.stats.wait_diagnostics =
                 Some(adv_machine::wait_diagnostics::WaitDiagnostics::default());
+        }
+        if self.frame_budget {
             machine.sys.stats.frame_budget = Some(adv_machine::frame_budget::FrameBudget::new(
                 machine.sys.stats.total,
                 machine.cpu.frame_counters(),

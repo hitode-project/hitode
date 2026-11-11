@@ -28,7 +28,7 @@ fn until(session: &mut Session, output: &mut File, text: &mut String, expected: 
     }
 }
 
-// spec: PROC-CLOCK-7, PROC-CLOCK-3, PROC-CLOCK-5, PROC-CLOCK-6
+// spec: PROC-CLOCK-7, PROC-CLOCK-3, PROC-CLOCK-5, PROC-CLOCK-6, WINE-SES-2
 #[test]
 fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
     let Some(wine::Wine { dist, probes }) = wine::wine() else {
@@ -99,6 +99,22 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
         assert!(matches!(stop, Stop::Paused), "{stop:?}");
         assert!(Instant::now() < deadline, "quiet polling did not idle");
     }
+    // The front end owns the input queue. A session already idle when
+    // that queue is signaled returns before another guest slice or wait.
+    let run_time = session.control_metrics().run_time;
+    let waits = session.control_metrics().idle_waits;
+    let schedules = session.machine.sys.stats.total.sched;
+    wake.signal_frontend();
+    assert!(matches!(
+        session.run(Instant::now() + Duration::from_secs(1)),
+        Stop::Paused
+    ));
+    assert_eq!(session.control_metrics().run_time, run_time);
+    assert_eq!(session.control_metrics().idle_waits, waits);
+    assert_eq!(session.machine.sys.stats.total.sched, schedules);
+    assert!(wake.frontend_pending());
+    wake.clear_frontend();
+
     let before = session.machine.cpu.read_u32(fields[4]).unwrap();
     wake.take_interrupt();
     // Bounded so a polling loop that never idles fails instead of hanging.

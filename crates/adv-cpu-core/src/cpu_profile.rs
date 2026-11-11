@@ -36,6 +36,10 @@ pub const PROCESSOR_IDENTITY: ProcessorIdentity = ProcessorIdentity {
     name: "ADV virtual x86 processor",
 };
 
+/// Logical processors in the guest's single processor group.
+pub const PROCESSORS: u32 = 8;
+pub const PROCESSOR_MASK: u32 = (1 << PROCESSORS) - 1;
+
 /// Guest-visible flat segment selectors and descriptor-table identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentState {
@@ -142,12 +146,20 @@ pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
         ],
         // Family 6; user-mode x87, CMOV, MMX, FXSAVE, SSE and SSE2.
         // TSC uses the owner's reference clock, never the host CPU counter.
-        // No AVX/XSAVE/HT or RDTSCP claim.
+        // HTT describes the package's logical processor count, not SMT.
+        // No AVX/XSAVE or RDTSCP claim.
         1 => [
             PROCESSOR_IDENTITY.signature,
+            PROCESSORS << 16,
             0,
-            0,
-            (1 << 0) | (1 << 4) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26),
+            (1 << 0)
+                | (1 << 4)
+                | (1 << 15)
+                | (1 << 23)
+                | (1 << 24)
+                | (1 << 25)
+                | (1 << 26)
+                | (1 << 28),
         ],
         0x8000_0000 => [0x8000_0000, 0, 0, 0],
         _ => [0; 4],

@@ -38,6 +38,7 @@ pub(super) fn eligible(action: Action) -> bool {
     matches!(
         action,
         Action::Nop
+            | Action::Pause
             | Action::Mov(Register(_), Register(_) | Immediate(_), _)
             | Action::Lea(..)
             | Action::Binary(_, Register(_), Register(_) | Immediate(_))
@@ -53,7 +54,7 @@ pub(super) fn execute(instruction: &Predecoded, state: &mut CpuState) -> bool {
     use Operand::{Immediate, Register};
     let mut next = instruction.next;
     match instruction.action {
-        Action::Nop => {}
+        Action::Nop | Action::Pause => {}
         Action::Mov(Register(dst), src @ (Register(_) | Immediate(_)), extend) => {
             let value = read(src, &state.regs);
             let value = if extend {
@@ -194,6 +195,7 @@ mod tests {
                 next: i.next_ip32(),
                 exclusive: false,
                 register_only: eligible(predecode(&i).unwrap()),
+                clock: false,
                 checked_scalar: false,
             };
             assert!(instruction.register_only, "{:?}", i.code());

@@ -80,6 +80,7 @@ fn run(machine: &mut Machine<JitCpu>) {
         parked: None,
         yield_on_frame: false,
         defer_work: false,
+        computation: false,
     };
     assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
     assert!(dispatch.parked.is_none());
@@ -487,6 +488,7 @@ fn a_raised_fault_is_the_entrys_first_instruction_faulting() {
         parked: None,
         yield_on_frame: false,
         defer_work: false,
+        computation: false,
     };
     assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
     // Without a guest exception handler the fault stops the machine, with
@@ -576,6 +578,7 @@ fn ordinary_host_call_without_diagnostics_reads_no_stack_or_clock() {
         parked: None,
         yield_on_frame: false,
         defer_work: false,
+        computation: false,
     };
     assert!(dispatch.host_call(&mut cpu, index).is_ok());
     assert_eq!(thunk::LOOKUPS.get() - lookups, 1);
@@ -589,6 +592,7 @@ fn ordinary_host_call_without_diagnostics_reads_no_stack_or_clock() {
         parked: None,
         yield_on_frame: false,
         defer_work: false,
+        computation: false,
     };
     assert!(dispatch.host_call(&mut cpu, index).is_ok());
     assert_eq!(cpu.reads.get(), 1);
@@ -638,6 +642,7 @@ fn a_completed_body_yields_at_its_continuation_without_repeating_work() {
                 parked: None,
                 yield_on_frame: false,
                 defer_work: false,
+                computation: false,
             };
             assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
             let Some(reason) = dispatch.parked.take() else {
@@ -654,6 +659,7 @@ fn a_completed_body_yields_at_its_continuation_without_repeating_work() {
                 parked: None,
                 yield_on_frame: false,
                 defer_work: false,
+                computation: false,
             };
             assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
             assert!(dispatch.parked.is_none());

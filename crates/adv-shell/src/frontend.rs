@@ -341,7 +341,7 @@ impl Ui {
             .borrow_mut()
             .push(event)
             .map_err(|_| "UI input channel capacity exceeded")?;
-        self.execution_wake.signal();
+        self.execution_wake.signal_frontend();
         Ok(())
     }
     /// Telemetry never wakes execution and can occupy at most 128 queue slots.
@@ -396,7 +396,7 @@ impl Ui {
                 #[cfg(host_view)]
                 window::Event::ForceClose => {
                     self.stopped.store(true, Ordering::Release);
-                    self.execution_wake.signal();
+                    self.execution_wake.signal_frontend();
                     continue;
                 }
                 window::Event::Menu(_) | window::Event::Dialog(_) => {}
@@ -529,7 +529,7 @@ impl Ui {
                 .borrow_mut()
                 .push(Delivery::Input(window::Event::Menu(event)))
                 .map_err(|_| "UI menu input channel capacity exceeded".to_owned())?;
-            execution_wake.signal();
+            execution_wake.signal_frontend();
             Ok(())
         }));
         let events = self.events.clone();
@@ -539,7 +539,7 @@ impl Ui {
                 .borrow_mut()
                 .push(Delivery::Input(window::Event::Dialog(event)))
                 .map_err(|_| "UI dialog input channel capacity exceeded".to_owned())?;
-            execution_wake.signal();
+            execution_wake.signal_frontend();
             Ok(())
         }));
     }
@@ -575,7 +575,7 @@ impl Drop for Ui {
     fn drop(&mut self) {
         self.keys.release_all();
         self.stopped.store(true, Ordering::Release);
-        self.execution_wake.signal();
+        self.execution_wake.signal_frontend();
     }
 }
 pub fn update_keys(keys: &KeyState, message: u32, key: u32, lparam: u32) {
@@ -738,6 +738,7 @@ mod tests {
             ..Default::default()
         }));
         assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(!wake.frontend_pending());
         assert_eq!(
             wake.interrupt_flag().load(Ordering::Acquire) & adv_sync::pending::INTERRUPT,
             0
@@ -762,6 +763,8 @@ mod tests {
         .unwrap();
         assert_eq!(keys.get(17) & 0x80, 0x80);
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(wake.frontend_pending());
+        wake.clear_frontend();
         assert!(matches!(
             worker.pump(&mut performance).as_slice(),
             [window::Event::Input {
@@ -774,6 +777,16 @@ mod tests {
             .unwrap();
         assert_eq!(keys.get(17) & 0x80, 0);
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(wake.frontend_pending());
+        #[cfg(host_view)]
+        {
+            wake.clear_frontend();
+            ui.pump_events(vec![window::Event::ForceClose], Instant::now())
+                .unwrap();
+            assert!(worker.stopped());
+            assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+            assert!(wake.frontend_pending());
+        }
     }
 
     // spec: HOST-SES-3

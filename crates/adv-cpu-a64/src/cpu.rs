@@ -174,6 +174,9 @@ impl Guest for View<'_> {
     fn wants_code_images(&self) -> bool {
         cfg!(native)
     }
+    fn take_clock_read(&mut self) -> bool {
+        std::mem::take(&mut self.state.clock_read) != 0
+    }
     fn register_code_image(&mut self, image: adv_cpu_core::AotImage) {
         self.images.borrow_mut().push((image.base, image.size));
     }
@@ -406,6 +409,9 @@ impl Guest for Cpu {
     fn wants_code_images(&self) -> bool {
         cfg!(native) && self.native
     }
+    fn take_clock_read(&mut self) -> bool {
+        std::mem::take(&mut self.inner.state.clock_read) != 0
+    }
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -518,6 +524,14 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn allow_computation(&self) -> bool {
+        self.handler.allow_computation()
+    }
+
+    fn allow_spin_yield(&self) -> bool {
+        self.handler.allow_spin_yield()
+    }
+
     fn body_yield(&mut self, state: &mut CpuState, memory: &mut Memory) -> Result<bool, String> {
         state.commit_mmx();
         Ok(self.handler.on_body_yield(&mut View {
@@ -626,6 +640,19 @@ impl Backend for Cpu {
     }
 
     type Context = Option<ExecutionContext>;
+
+    unsafe fn with_computation(
+        &mut self,
+        wake: Option<WakeEvent>,
+        deadline: Option<Instant>,
+        visit: &mut dyn FnMut(&mut dyn adv_cpu_core::backend::Computation<Self::Context>),
+    ) {
+        #[cfg(native)]
+        self.inner
+            .with_computation(&mut self.retired, wake, deadline, visit);
+        #[cfg(not(native))]
+        let _ = (wake, deadline, visit);
+    }
     fn setup_segments(&mut self, seg: SegmentSetup) -> Result<(), MemFault> {
         let Executor { state, memory, .. } = &mut self.inner;
         state.segments =
@@ -703,6 +730,8 @@ impl Backend for Cpu {
                     return Exit::Parked;
                 }
                 Ok(RunOutcome::Budget) => continue,
+                Ok(RunOutcome::Reschedule) => return Exit::Reschedule,
+                Ok(RunOutcome::Computation) => return Exit::Computation,
                 Ok(RunOutcome::Interrupted) => {
                     if let Some(budget) = self.budget
                         && start.elapsed() >= budget

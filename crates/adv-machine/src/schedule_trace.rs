@@ -2,9 +2,16 @@
 //! TSV: host ns since enable, event, context, three event-specific numeric fields.
 //! run_start: PC; run_end: PC, owner wall ns, inline host-service ns.
 //! pick: yielded; lease/collect: token. block: kind (1 timer/2 object/3 set),
-//! deadline or handle, thunk. wake: thunk. CS: address, owner TID/recursion, event.
+//! deadline or handle, thunk. wake: thunk, signaler context plus one (zero if
+//! absent), reason (1 timeout/2 signal/3 set/4 notification). spin_yield: resume PC.
+//! compute_offer: entry PC. compute_submit: worker assignment.
+//! compute_done: retired instructions, execution ns, flags (1 local, 2 owner required).
+//! compute_round: offered contexts, scope wall ns, admitted contexts.
 //! Lease-to-collect includes queueing and completion delivery, not worker CPU time.
 //! frame: completed guest-frame serial (not a shell observation or scanout).
+//! poll_idle: guest µs to the round's deadline (u64::MAX for none), 1 if every ready context
+//! settled (PROC-CLOCK-5) else 0 (quiet round). host_wait (stamped at its end):
+//! requested ns, waited ns, 1 if signaled. input: message, wparam, lparam.
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -23,7 +30,7 @@ impl ScheduleTrace {
         Ok(Self {
             sink: Some(sink),
             start: Some(Instant::now()),
-            remaining: 1_000_000,
+            remaining: 30_000_000,
             ..Self::default()
         })
     }
