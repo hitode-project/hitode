@@ -192,21 +192,50 @@ fn an_earlier_external_timeout_cannot_be_overtaken_by_a_later_sleep() {
     assert_eq!(machine.sys.scheduling.active_time_skips, 0);
 }
 
+// spec: PROC-CLOCK-1, PROC-CLOCK-3
 #[test]
-fn the_policy_sees_startup_until_the_first_completed_frame() {
-    for framed in [false, true] {
+fn automatic_skip_requires_only_clock_polls_before_the_first_frame() {
+    for (framed, clock_poll, worker) in [
+        (false, true, false),
+        (true, true, false),
+        (false, false, false),
+        (false, true, true),
+    ] {
         let (mut machine, _) = fixture(true, false, false, false, true);
-        machine.set_time_skip_source(Some(Arc::new(|startup| startup)));
+        machine.set_time_skip_source(Some(Arc::new(|startup_poll| startup_poll)));
+        if clock_poll {
+            machine.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+                "skip",
+                "clock",
+                Conv::Stdcall { argc: 0 },
+                |env| adv_machine::clock::poll_clock(env, |_, _| Outcome::Return(0)),
+            );
+            let clock = machine.resolve_import("skip", "clock").unwrap();
+            let done = machine.resolve_import("skip", "done").unwrap();
+            let mut code = Asm::new(CODE);
+            code.mov_ecx_imm(adv_machine::clock::POLL_STREAK);
+            let repeat = code.here();
+            code.call(clock).dec_ecx().jnz(repeat).call(done);
+            machine.cpu.write(CODE, &code.bytes).unwrap();
+        }
+        if worker {
+            let at = CODE + 0x100;
+            let mut code = Asm::new(at);
+            code.call(machine.resolve_import("skip", "wait").unwrap())
+                .ret();
+            machine.cpu.write(at, &code.bytes).unwrap();
+            machine.spawn("sleeping worker", at, &[], 0x10000).unwrap();
+        }
         if framed {
             machine.sys.complete_frame();
         }
         let result = machine.run();
-        if framed {
-            assert!(matches!(result, RunResult::Idle { .. }));
-            assert_eq!(machine.sys.scheduling.active_time_skips, 0);
-        } else {
+        if clock_poll && !framed && !worker {
             assert!(matches!(result, RunResult::Exited(0)));
             assert_eq!(machine.sys.scheduling.active_time_skips, 1);
+        } else {
+            assert!(matches!(result, RunResult::Idle { .. }));
+            assert_eq!(machine.sys.scheduling.active_time_skips, 0);
         }
     }
 }
