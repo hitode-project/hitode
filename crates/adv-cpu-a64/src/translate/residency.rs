@@ -69,6 +69,53 @@ fn footprint(trace: &Trace, index: usize, _checked: &dyn Fn(u32) -> bool) -> Opt
     }
 }
 
+/// Whether clearing SIMD state after `index` can still supply every merge's
+/// guards. An x87 integer tail adds this boundary to the instruction graph.
+pub(super) fn can_drop_after(
+    trace: &Trace,
+    entries: &[Entry],
+    checked: &dyn Fn(u32) -> bool,
+    index: usize,
+) -> bool {
+    if trace.insts[index].next != Next::Fall {
+        return true;
+    }
+    let mut guards = Guards::default();
+    for index in index + 1..trace.len() {
+        if trace.head(index) || trace.merge[index] {
+            return entries[index].guards.meet(guards) == entries[index].guards;
+        }
+        if footprint(trace, index, checked).is_none() {
+            // Residency already accounts for this instruction clearing it.
+            return true;
+        }
+        let inst = trace.insts[index];
+        if let Op::Simd(simd) = inst.op {
+            guards = simd.guarding(guards);
+        }
+        for edge in [
+            inst.taken,
+            match inst.next {
+                Next::Edge(edge) => Some(edge),
+                _ => None,
+            },
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Edge::Internal(to) = edge
+                && entries[to].guards.meet(guards) != entries[to].guards
+            {
+                return false;
+            }
+        }
+        if inst.next != Next::Fall {
+            break;
+        }
+    }
+    true
+}
+
 /// The entry of each instruction; only merges' are used.
 pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry> {
     let len = trace.len();

@@ -15,6 +15,8 @@
 //! A fault or refused access publishes the state before the instruction.
 //! Exits and interpreter helpers publish the state at their boundary, and
 //! checked accesses preserve the run and record the dirty SIMD mask.
+//! Integer tails end only where clearing SIMD state still supplies the guards
+//! of subsequent merges; other arrivals can lie outside the x87 run.
 
 use adv_cpu_core::floating::fast::{Fast, Source};
 
@@ -855,6 +857,12 @@ impl Translator<'_> {
                             .crossings
                             .iter()
                             .any(|&at| at >= start && at <= index)
+                        && super::super::residency::can_drop_after(
+                            self.trace,
+                            &self.entry,
+                            self.checked,
+                            index,
+                        )
                     {
                         end = Some(index);
                     }
@@ -1106,6 +1114,14 @@ impl Translator<'_> {
                 return None;
             }
             if !changed {
+                if !super::super::residency::can_drop_after(
+                    self.trace,
+                    &self.entry,
+                    self.checked,
+                    end,
+                ) {
+                    return None;
+                }
                 return Some((end, need, merges));
             }
         }

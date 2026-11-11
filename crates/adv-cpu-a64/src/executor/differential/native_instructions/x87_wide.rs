@@ -678,6 +678,111 @@ fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
     assert_eq!(native.state.regs[0] & 0x220, 0x220);
 }
 
+// spec: A64F-FP-7 A64-REG-5 A64-TR-5
+#[test]
+fn x87_run_break_sse_back_jumps_agree_with_merge_guards() {
+    let mut p = fixture(|a| {
+        let (mut outer, mut wrapper, mut body, mut merge, mut special, mut scaling, mut done) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fnstcw(word_ptr(ebx + 144)).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fld1().unwrap();
+        a.call(wrapper).unwrap();
+        // Keep the enclosing loop from becoming one complete resident run.
+        a.frndint().unwrap();
+        a.fstp(qword_ptr(ebx + 128)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.dec(edi).unwrap();
+        a.jnz(outer).unwrap();
+        a.jmp(done).unwrap();
+
+        a.set_label(&mut wrapper).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 16).unwrap();
+        a.and(esp, -16).unwrap();
+        a.fxch(st0, st1).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.fstp(qword_ptr(esp + 8)).unwrap();
+        a.call(body).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut body).unwrap();
+        a.movlpd(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.andpd(xmm0, xmmword_ptr(ebx + 64)).unwrap();
+        a.orpd(xmm0, xmmword_ptr(ebx + 80)).unwrap();
+        a.psrlq(xmm0, 52).unwrap();
+        a.pextrw(eax, xmm0, 0).unwrap();
+        a.and(eax, 3).unwrap();
+        a.movlpd(xmm7, qword_ptr(esp + 12)).unwrap();
+        a.mulsd(xmm7, qword_ptr(ebx + eax * 4 + 96)).unwrap();
+        a.movapd(xmm6, xmmword_ptr(ebx + 112)).unwrap();
+        a.movlpd(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.sub(esp, 16).unwrap();
+        a.cmp(eax, 1).unwrap();
+        a.jae(special).unwrap();
+        a.mov(ecx, 0).unwrap();
+        a.mov(edx, 1).unwrap();
+        a.set_label(&mut merge).unwrap();
+        a.movd(xmm1, edx).unwrap();
+        a.psubq(xmm0, xmm1).unwrap();
+        a.addsd(xmm0, xmm7).unwrap();
+        a.mulsd(xmm0, xmm6).unwrap();
+        a.movlpd(qword_ptr(esp + 20), xmm0).unwrap();
+        a.fld(qword_ptr(esp + 20)).unwrap();
+        a.add(esp, 16).unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut special).unwrap();
+        a.cmp(eax, 2).unwrap();
+        a.jae(scaling).unwrap();
+        a.mov(edx, 2).unwrap();
+        a.addsd(xmm0, xmm6).unwrap();
+        a.inc(dword_ptr(ebx + 136)).unwrap();
+        a.jmp(merge).unwrap();
+        a.set_label(&mut scaling).unwrap();
+        a.mov(edx, 3).unwrap();
+        a.mulsd(xmm0, xmm6).unwrap();
+        a.inc(dword_ptr(ebx + 140)).unwrap();
+        a.jmp(merge).unwrap();
+        a.set_label(&mut done).unwrap();
+    });
+    for (index, value) in [2.0f64, 4.0, 8.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+        p.data[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    p.data[64..80].fill(0xff);
+    p.data[96..112].copy_from_slice(&1.0f64.to_le_bytes().repeat(2));
+    p.data[112..128].copy_from_slice(&0.5f64.to_le_bytes().repeat(2));
+    p.state.regs[7] = 6;
+    p.state.x87.set_control(0x027f);
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(oracle.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        same(&native, &oracle);
+        assert_eq!(
+            native.memory().read(DATA + 136, 4).unwrap(),
+            &2u32.to_le_bytes()
+        );
+        assert_eq!(
+            native.memory().read(DATA + 140, 4).unwrap(),
+            &2u32.to_le_bytes()
+        );
+        assert!(native.stats.native_entries > 0);
+    }
+}
+
 /// An authored loop nest with stack arguments, control checks and two arrivals
 /// at the inner body. The head discards the preceding iteration's temporaries.
 fn run_break_nest() -> (Program, u32) {
