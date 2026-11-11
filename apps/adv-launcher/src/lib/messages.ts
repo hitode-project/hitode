@@ -463,4 +463,13 @@ export const messages: Record<string, [string, string]> = {
   "正在搜索…": ["Searching…", "検索中…"],
   "没有找到作品": ["No matches", "作品が見つかりません"],
   "未关联": ["Not linked", "未関連付け"],
+  "自定义": ["Custom", "カスタム"],
+  "排列": ["Arrange", "並び"],
+  "每行": ["Per row", "1行あたり"],
+  "每行 {0} 个": ["{0} per row", "1行に{0}個"],
+  "封面大小": ["Cover size", "カバーのサイズ"],
+  "已移到第 {0} 位": ["Moved to position {0}", "{0}番目に移動しました"],
+  "按住封面拖动即可自定义顺序": ["Hold a cover and drag it to set your own order", "カバーを長押ししてドラッグすると、自由に並べ替えられます"],
+  "游戏文字的编码；乱码时换一种试试": ["Text encoding of the game; try the other one if text is garbled", "ゲームの文字コード。文字化けする場合は切り替えてください"],
+  "双指缩放封面": ["Pinch to resize covers", "ピンチでカバーのサイズを変更"],
 };
