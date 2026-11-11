@@ -56,7 +56,6 @@ Authored fixtures and generators for one area:
 |---|---|---|
 | Uneven animation intervals, slow Ctrl skip, long first start | `play_session.py --wine <dist> --binary <runner> --exe <exe> --schedule <schedule> --output <run> --frame-budget` | Summarizes presentation runs, load boundaries and Ctrl commits per second. `--frame-budget` reads the clock twice per host call, so leave it off when timing startup. |
 | Slow, stuttering or slow skipping in a game | The attribution workflow below | |
-| Two builds A/B | `compare_runtime.py` on a fixed frame prefix, gated on frame hashes | Compatibility regressions use `sample_matrix.py` and `matrix_gate.py`. |
 | Heap allocation cost | `heap_service` example in `adv-os` | `large` and `metadata` select other workloads. |
 | Slow D3D9 system memory texture upload | `benchmark_update_texture` in `adv-dx`, run with `--ignored` | Semantic tests sit beside it. |
 | Wait precision | `wait_precision` example in `adv-sync` | `--no-time-skip` checks the Ctrl policy. |
@@ -141,10 +140,10 @@ Coordinates are guest canvas coordinates, so they change with the guest resoluti
 
 - `at` is seconds since process start. `checkpoint` saves the picture and report, and `reset_metrics` starts a new measurement window.
 - Reusable scenarios without paths go into `tools/performance/scenarios/`. Do not write a private driver script.
-- To compare headed performance, use `play_session.py --mode hidden --audio --mute-audio` without capture or trace. This keeps the interactive compile budget and the real audio device path. Headless runs have a different background compile budget.
+- To reproduce headed conditions without a window, use `play_session.py --mode hidden --audio --mute-audio` without capture or trace. This keeps the interactive compile budget and the real audio device path. Headless runs have a different background compile budget.
 - To sample at the same time, wait until the schedule passes `reset-metrics`, then start a sampler on the same PID.
 
-Headless runs check mechanisms and gains quickly. Fix the binary, configuration, code page, seed and input, and prefer short A/B runs. A headless result states its conditions and does not stand for headed frame rate, input latency or power use; the user judges those on the target platform.
+Headless runs check mechanisms. Judge a change by what its code path does and by counts that do not depend on machine load, not by timing two builds against each other. A headless result states its conditions and does not stand for headed frame rate, input latency or power use; the user judges those on the target platform.
 
 ## Performance work
 
