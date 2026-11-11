@@ -16,7 +16,10 @@
 //! Exits and interpreter helpers publish the state at their boundary, and
 //! checked accesses preserve the run and record the dirty SIMD mask.
 //! Integer tails end only where clearing SIMD state still supplies the guards
-//! of subsequent merges; other arrivals can lie outside the x87 run.
+//! of subsequent merges. Outside arrivals pass cold entry checks and fetch
+//! the merge model; resident arrivals retain their reconciliation code.
+//! Integer-only loops carry the same model around their backedges. Native
+//! paths can resume a run beyond intervening fallback segments in trace order.
 
 use adv_cpu_core::floating::fast::{Fast, Source};
 
@@ -363,7 +366,7 @@ fn canonical(known: [Known; 8], delta: u8) -> Model {
 }
 
 /// The cold paths of one cached instruction.
-pub(in super::super) struct Cold {
+pub(in super::super) struct InstructionCold {
     index: usize,
     helper: u8,
     /// The state before the instruction, and whether w14 holds its status.
@@ -381,6 +384,25 @@ pub(in super::super) struct Cold {
     generic: Option<Generic>,
     dirty: u16,
     dispatch: bool,
+}
+
+/// Cold continuations of an instruction or a canonical merge arrival.
+pub(in super::super) enum Cold {
+    Instruction(InstructionCold),
+    Tags {
+        label: Label,
+        done: Label,
+        fail: Label,
+        value: u8,
+    },
+    Entry {
+        index: usize,
+        model: Model,
+        need: Need,
+        label: Label,
+        hot: Label,
+        run: std::ops::RangeInclusive<usize>,
+    },
 }
 
 /// Internal edges from an instruction, independent of its fall-through.
@@ -642,6 +664,16 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
     (crossings, controls)
 }
 
+/// A cyclic run can have several emission segments, separated by paths
+/// that leave it. Its models and hot labels survive those intervening paths.
+#[derive(Clone)]
+struct Run {
+    models: Vec<(usize, Model)>,
+    entries: Vec<(usize, Label)>,
+    continuations: Vec<(usize, Option<Label>)>,
+    need: Need,
+}
+
 /// The run being emitted.
 #[derive(Default)]
 pub(in super::super) struct Cache {
@@ -662,13 +694,18 @@ pub(in super::super) struct Cache {
     done: Option<Label>,
     /// Whether integer instructions of the run are being emitted.
     suspended: bool,
-    /// The merges inside the run and their states.
+    /// Cyclic instruction models, or a straight run's merge models.
     merges: Vec<(usize, Model)>,
     /// Whether the current instruction's entry is bound already.
     bound: bool,
     /// Backward edges in emission order, as (head, latch).
     loops: Vec<(usize, usize)>,
-    incoming: Vec<usize>,
+    /// Separate hot labels where canonical arrivals need a cold entry.
+    entries: Vec<(usize, Label)>,
+    /// Cyclic runs with later emission segments.
+    runs: Vec<Run>,
+    /// The canonical label to restore after binding a merge's hot label.
+    binding: Option<(usize, Label)>,
     /// Where an internal arrival enters a run that starts at a loop head.
     loop_entry: Option<Label>,
     /// An x87 helper leaves rather than trying to rebuild loop or SIMD state.
@@ -682,11 +719,9 @@ pub(in super::super) struct Cache {
 
 impl Cache {
     pub(in super::super) fn for_trace(trace: &Trace) -> Self {
-        let mut incoming = vec![0; trace.len()];
         let mut loops = Vec::new();
         for from in 0..trace.len() {
             for to in edges(trace, from) {
-                incoming[to] += 1;
                 if to <= from {
                     loops.push((to, from));
                 }
@@ -697,7 +732,6 @@ impl Cache {
             crossings,
             controls,
             loops,
-            incoming,
             ..Self::default()
         }
     }
@@ -745,6 +779,9 @@ impl Translator<'_> {
 
     /// The state of the run at its merge `index`, if it is one.
     fn merge_model(&self, index: usize) -> Option<Model> {
+        if !self.trace.merge[index] {
+            return None;
+        }
         self.x87.merges.iter().find(|m| m.0 == index).map(|m| m.1)
     }
 
@@ -778,6 +815,14 @@ impl Translator<'_> {
         let mut after_leaf = false;
         let mut pe_at = None;
         'run: for index in start..self.trace.len() {
+            if self
+                .x87
+                .runs
+                .iter()
+                .any(|r| r.models.iter().any(|m| m.0 == index))
+            {
+                break;
+            }
             if index != start && self.trace.head(index) {
                 break;
             }
@@ -792,7 +837,7 @@ impl Translator<'_> {
                     },
                     None => {
                         let arrivals: Vec<_> = pending.iter().filter(|p| p.0 == index).collect();
-                        if arrivals.is_empty() || arrivals.len() != self.x87.incoming[index] {
+                        if gap && arrivals.is_empty() {
                             break;
                         }
                         if gap {
@@ -918,6 +963,8 @@ impl Translator<'_> {
         }
     }
 
+    /// Follow native edges, retaining a model at each member. Unsupported
+    /// paths leave the run; native backedges can reach later emission segments.
     #[allow(clippy::type_complexity)]
     fn plan_arrivals(
         &self,
@@ -930,7 +977,12 @@ impl Translator<'_> {
         let mut need = Need::default();
         let mut seen_x87 = false;
         while let Some(index) = work.pop_front() {
-            if index != start && self.trace.head(index) {
+            if self
+                .x87
+                .runs
+                .iter()
+                .any(|r| r.models.iter().any(|m| m.0 == index))
+            {
                 return None;
             }
             let (mut slots, mut delta) = states[index]?;
@@ -946,8 +998,15 @@ impl Translator<'_> {
             }
             let fall = (self.trace.insts[index].next == Next::Fall).then_some(index + 1);
             for to in edges(self.trace, index).chain(fall) {
-                if to < start || to > end {
-                    return None;
+                if to < start
+                    || to > end
+                    || to != start && self.trace.head(to)
+                    || !(self
+                        .cacheable(to)
+                        .is_some_and(|x| !matches!(x.fast, Fast::Leaf(_)))
+                        || self.joins(to))
+                {
+                    continue;
                 }
                 let mut incoming = (slots, delta);
                 if let Some((previous, top)) = states[to] {
@@ -972,29 +1031,38 @@ impl Translator<'_> {
                 }
             }
         }
-        if !seen_x87 || need.value & need.empty != 0 || states[start..].iter().any(Option::is_none)
+        if !seen_x87
+            || need.value & need.empty != 0
+            || !self.x87.loops.iter().any(|&(to, from)| {
+                from <= end && to >= start && states[to].is_some() && states[from].is_some()
+            })
         {
             return None;
         }
-        // A model only belongs to the run when every incoming edge belongs.
-        for from in 0..self.trace.len() {
-            if from < start || from > end {
-                if edges(self.trace, from).any(|to| to > start && to <= end) {
-                    return None;
-                }
+        let end = (start..=end).rfind(|&index| states[index].is_some())?;
+        for index in start..=end {
+            if states[index].is_some()
+                && (index == end || states[index + 1].is_none())
+                && !super::super::residency::can_drop_after(
+                    self.trace,
+                    &self.entry,
+                    self.checked,
+                    index,
+                )
+            {
+                return None;
             }
         }
         let merges = (start..=end)
-            .filter(|&index| self.trace.merge[index])
-            .map(|index| {
-                let (slots, delta) = states[index].unwrap();
-                (
+            .filter_map(|index| {
+                let (slots, delta) = states[index]?;
+                Some((
                     index,
                     Model {
                         shared: true,
                         ..loop_model(slots, delta)
                     },
-                )
+                ))
             })
             .collect();
         Some((end, need, merges))
@@ -1027,12 +1095,19 @@ impl Translator<'_> {
             let mut model = Some(([Known::Unknown; 8], 0));
             let mut seen_x87 = false;
             for index in start..=end {
+                if self
+                    .x87
+                    .runs
+                    .iter()
+                    .any(|r| r.models.iter().any(|m| m.0 == index))
+                {
+                    return None;
+                }
                 if index != start && self.trace.head(index) {
                     return None;
                 }
                 let head = heads.binary_search_by_key(&index, |h| h.0).ok();
                 if self.trace.merge[index] || head.is_some() {
-                    let mut arrivals = 0;
                     let mut meet = |incoming: ([Known; 8], u8)| -> Option<()> {
                         let Some((ref mut slots, delta)) = model else {
                             model = Some(incoming);
@@ -1057,22 +1132,12 @@ impl Translator<'_> {
                     for &(to, incoming) in &pending {
                         if to == index {
                             meet(incoming)?;
-                            arrivals += 1;
                         }
                     }
                     if let Some(h) = head {
                         if let Some(seed) = heads[h].1 {
                             meet(seed)?;
                         }
-                        arrivals += self
-                            .x87
-                            .loops
-                            .iter()
-                            .filter(|&&(to, from)| to == index && from <= end)
-                            .count();
-                    }
-                    if index != start && arrivals != self.x87.incoming[index] {
-                        return None;
                     }
                     let (slots, delta) = model?;
                     if let Some(h) = head {
@@ -1081,6 +1146,9 @@ impl Translator<'_> {
                     merges.push((index, loop_model(slots, delta)));
                 }
                 let (mut slots, mut delta) = model?;
+                if !self.trace.merge[index] && head.is_none() {
+                    merges.push((index, loop_model(slots, delta)));
+                }
                 if let Some(x) = self.cacheable(index) {
                     if matches!(x.fast, Fast::Leaf(_)) {
                         return None;
@@ -1230,7 +1298,7 @@ impl Translator<'_> {
         {
             self.x87_checks(model, need, help);
         }
-        self.push_cold(UnitCold::X87(Cold {
+        self.push_cold(UnitCold::X87(Cold::Instruction(InstructionCold {
             index,
             helper: x.helper,
             before: self.x87.before,
@@ -1243,7 +1311,7 @@ impl Translator<'_> {
             generic,
             dirty: self.vector.dirty,
             dispatch: self.x87.model.cyclic || (self.x87.dispatch && index < self.x87.end),
-        }));
+        })));
         if index == self.x87.end && !self.x87.model.cyclic {
             self.x87_close();
         }
@@ -1303,6 +1371,12 @@ impl Translator<'_> {
     /// merge's own code, which runs suspended in the merge's state.
     pub(in super::super) fn x87_merge(&mut self, index: usize) {
         let to = self.merge_model(index).expect("a planned merge");
+        // Resident edges target the hot label. Other edges keep the original
+        // label, which is bound by the cold entry after body emission.
+        if let Some(&(_, hot)) = self.x87.entries.iter().find(|e| e.0 == index) {
+            let canonical = std::mem::replace(&mut self.labels[index], hot);
+            self.x87.binding = Some((index, canonical));
+        }
         if self.trace.insts[index - 1].next != Next::Fall {
             // Only jumps arrive, each reconciled already.
             self.x87.model = to;
@@ -1337,7 +1411,11 @@ impl Translator<'_> {
                 if to == self.x87.start {
                     self.x87.loop_entry.expect("an internal loop entry")
                 } else {
-                    self.labels[to]
+                    self.x87
+                        .entries
+                        .iter()
+                        .find(|e| e.0 == to)
+                        .map_or(self.labels[to], |e| e.1)
                 },
             ),
             None => Arrive::Publish(from),
@@ -1584,7 +1662,14 @@ impl Translator<'_> {
     }
 
     pub(in super::super) fn x87_start_integer(&mut self) {
-        if !self.x87.active && self.x87.loops.iter().any(|&(to, _)| to == self.index) {
+        if !self.x87.active
+            && (self.x87.loops.iter().any(|&(to, _)| to == self.index)
+                || self
+                    .x87
+                    .runs
+                    .iter()
+                    .any(|r| r.continuations.iter().any(|c| c.0 == self.index)))
+        {
             self.x87_open();
         }
     }
@@ -1592,6 +1677,46 @@ impl Translator<'_> {
     /// The prologue of a run from the current instruction.
     fn x87_open(&mut self) -> bool {
         let start = self.index;
+        if let Some(run) = self
+            .x87
+            .runs
+            .iter()
+            .find(|r| r.continuations.iter().any(|c| c.0 == start))
+            .cloned()
+        {
+            let position = run.models.iter().position(|m| m.0 == start).unwrap();
+            let end = run.models[position..]
+                .iter()
+                .enumerate()
+                .take_while(|&(offset, m)| m.0 == start + offset)
+                .last()
+                .unwrap()
+                .1
+                .0;
+            self.x87_segment(start, end);
+            self.x87.model = run.models[position].1;
+            self.x87.suspended = true;
+            self.x87.pe = run.need.pe;
+            self.x87.control_stable =
+                self.stable_control(run.models[0].0, run.models.last().unwrap().0);
+            self.x87.dispatch = true;
+            self.x87.entries = run.entries;
+            self.x87.merges = run.models;
+            let hot = self
+                .x87
+                .entries
+                .iter()
+                .find(|e| e.0 == start)
+                .map_or(self.labels[start], |e| e.1);
+            if let Some(label) = run.continuations.iter().find(|c| c.0 == start).unwrap().1 {
+                self.asm.b(label);
+            }
+            if hot != self.labels[start] {
+                self.asm.bind(hot);
+            }
+            self.x87.loop_entry = Some(hot);
+            return true;
+        }
         let loop_plan = self
             .x87
             .loops
@@ -1610,50 +1735,92 @@ impl Translator<'_> {
         self.flush_simd();
         self.canonicalize();
         self.cpu();
-        let count = end - start + 1;
-        self.x87.hot = (0..count).map(|_| self.asm.label()).collect();
-        self.x87.help = (0..count).map(|_| self.asm.label()).collect();
-        self.x87.done = Some(self.asm.label());
-        self.x87.start = start;
-        self.x87.end = end;
+        let sparse = cyclic && merges.windows(2).any(|m| m[1].0 > m[0].0 + 1);
+        let segment_end = if sparse {
+            merges
+                .iter()
+                .enumerate()
+                .take_while(|&(offset, m)| m.0 == start + offset)
+                .last()
+                .unwrap()
+                .1
+                .0
+        } else {
+            end
+        };
+        self.x87_segment(start, segment_end);
         self.x87.model = Model {
             shared: merges.iter().any(|m| m.1.shared),
             cyclic,
             ..Model::default()
         };
-        self.x87.active = true;
         self.x87.suspended = false;
         self.x87.merges = merges;
-        self.x87.bound = false;
-        self.x87.loop_entry = None;
         self.x87.pe = need.pe;
-        self.x87.control_stable = cyclic
-            && self.pair_precision()
-            && self.trace.insts[start..=end].iter().any(|inst| {
-                matches!(
-                    inst.op,
-                    Op::X87(X87 {
-                        fast: Fast::Arith { .. },
-                        ..
-                    })
-                )
-            })
-            && !self.trace.insts[start..=end].iter().any(|inst| {
-                matches!(
-                    inst.op,
-                    Op::X87(X87 {
-                        fast: Fast::LoadControl,
-                        ..
-                    })
-                )
-            });
+        self.x87.control_stable = cyclic && self.stable_control(start, end);
+        self.x87.entries.clear();
+        let mut continuations = Vec::new();
+        for (index, model) in self.x87.merges.clone() {
+            if index == start || !self.trace.merge[index] {
+                continue;
+            }
+            let segment = sparse && !self.x87.merges.iter().any(|m| m.0 + 1 == index);
+            let outside = (segment && self.trace.insts[index - 1].next == Next::Fall)
+                || (0..self.trace.len()).any(|from| {
+                    (if sparse {
+                        !self.x87.merges.iter().any(|m| m.0 == from)
+                    } else {
+                        from < start || from > end
+                    }) && edges(self.trace, from).any(|to| to == index)
+                });
+            if !outside && !segment {
+                continue;
+            }
+            let hot = self.asm.label();
+            self.x87.entries.push((index, hot));
+            let label = if segment && outside {
+                self.asm.label()
+            } else {
+                self.labels[index]
+            };
+            if segment {
+                continuations.push((index, outside.then_some(label)));
+            }
+            if !outside {
+                continue;
+            }
+            let mut needed = need;
+            for (r, slot) in model.slots.iter().enumerate() {
+                match slot {
+                    Slot::Clean(_) | Slot::Dirty(_) => {
+                        needed.value |= 1 << r;
+                        needed.empty &= !(1 << r);
+                    }
+                    Slot::Freed(_) => {
+                        needed.empty |= 1 << r;
+                        needed.value &= !(1 << r);
+                    }
+                    Slot::Entry => {}
+                }
+            }
+            self.push_cold(UnitCold::X87(Cold::Entry {
+                index,
+                model,
+                need: needed,
+                label,
+                hot,
+                run: start..=end,
+            }));
+        }
         self.x87.dispatch = cyclic
             || self.trace.insts[start..=end]
                 .iter()
                 .any(|inst| matches!(inst.op, Op::Simd(simd) if simd.footprint().1 != 0));
         self.emit(mrs_nzcv(X4));
         let help = self.x87.help[0];
+        self.x87.end = end;
         self.x87_checks(self.x87.model, need, help);
+        self.x87.end = segment_end;
         if self.x87.control_stable {
             self.x87_require_bit(X8, 16, help);
         }
@@ -1675,6 +1842,9 @@ impl Translator<'_> {
                 let entry = self.asm.label();
                 self.asm.bind(entry);
                 self.x87.loop_entry = Some(entry);
+                if sparse {
+                    self.x87.entries.push((start, entry));
+                }
             }
             if self.cacheable(start).is_none() {
                 self.push_cold(UnitCold::Leave {
@@ -1689,8 +1859,59 @@ impl Translator<'_> {
                 });
             }
         }
+        if sparse {
+            self.x87.runs.push(Run {
+                models: self.x87.merges.clone(),
+                entries: self.x87.entries.clone(),
+                continuations,
+                need,
+            });
+        }
         self.remark(Part::Body);
         true
+    }
+
+    fn x87_segment(&mut self, start: usize, end: usize) {
+        let count = end - start + 1;
+        self.x87.hot = (0..count).map(|_| self.asm.label()).collect();
+        self.x87.help = (0..count).map(|_| self.asm.label()).collect();
+        self.x87.done = Some(self.asm.label());
+        self.x87.start = start;
+        self.x87.end = end;
+        self.x87.active = true;
+        self.x87.bound = false;
+        self.x87.loop_entry = None;
+    }
+
+    fn stable_control(&self, start: usize, end: usize) -> bool {
+        let models = self
+            .x87
+            .runs
+            .iter()
+            .map(|run| run.models.as_slice())
+            .chain(std::iter::once(self.x87.merges.as_slice()))
+            .find(|models| {
+                models.first().is_some_and(|m| m.0 == start)
+                    && models.last().is_some_and(|m| m.0 == end)
+            });
+        let mut arithmetic = false;
+        for index in start..=end {
+            if models.is_some_and(|models| models.binary_search_by_key(&index, |m| m.0).is_err()) {
+                continue;
+            }
+            match self.trace.insts[index].op {
+                Op::X87(X87 {
+                    fast: Fast::Arith { .. },
+                    ..
+                }) => arithmetic = true,
+                Op::X87(X87 {
+                    fast: Fast::LoadControl,
+                    ..
+                }) => return false,
+                _ => {}
+            }
+        }
+        self.pair_precision() && arithmetic
     }
 
     pub(in super::super) fn x87_require_bit(&mut self, reg: Reg, bit: u32, to: Label) {
@@ -1728,9 +1949,18 @@ impl Translator<'_> {
                 .fold(0u32, |all, r| all | bits << (2 * r))
         };
         if need.value != 0 {
-            self.mov_imm(X17, spread(need.value, 2));
+            let tags = self.asm.label();
+            let done = self.asm.label();
+            self.mov_imm(X17, spread(need.value, 3));
             self.emit(and(W, X17, X17, X16, Lsl, 0));
-            self.asm.cbz(W, true, X17, fail);
+            self.asm.cbz(W, true, X17, tags);
+            self.asm.bind(done);
+            self.push_cold(UnitCold::X87(Cold::Tags {
+                label: tags,
+                done,
+                fail,
+                value: need.value,
+            }));
         }
         if need.empty != 0 {
             self.mov_imm(X17, spread(need.empty, 3));
@@ -1777,7 +2007,20 @@ impl Translator<'_> {
     fn x87_fetch(&mut self, r: usize, n: u8, narrow: bool, fail: Label) {
         self.x87_slot(r);
         self.emit_all(&[ldr(X, X0, X17, 0), ldrh(X1, X17, 8)]);
-        self.pair_from_extended(X0, X1, n, narrow, fail);
+        let (zero, done) = self.pair_from_extended(X0, X1, n, narrow, fail);
+        self.asm.bind(zero);
+        // A resident zero can become dirty at a merge. Keep a canonical
+        // normal tag with a zero payload on the interpreter path instead.
+        self.emit_all(&[
+            add_imm(W, X16, X15, r as u32, false),
+            and_imm(W, X16, X16, 7),
+            lsl_imm(W, X16, X16, 1),
+            ldrh(X17, X5, runtime::X87_TAG),
+            shiftv(W, Shift::Lsr, X17, X17, X16),
+        ]);
+        self.x87_require_bit(X17, 0, fail);
+        self.pair_zero(X1, n, fail);
+        self.asm.bind(done);
     }
 
     /// Branches to `fail` unless physical register `r` holds what host
@@ -1960,6 +2203,9 @@ impl Translator<'_> {
     }
 
     pub(in super::super) fn x87_end_integer(&mut self) {
+        if let Some((index, label)) = self.x87.binding.take() {
+            self.labels[index] = label;
+        }
         if !self.x87.active || self.x87.end != self.index {
             return;
         }
@@ -2042,6 +2288,90 @@ impl Translator<'_> {
     }
 
     pub(in super::super) fn x87_cold(&mut self, cold: Cold) {
+        let cold = match cold {
+            Cold::Instruction(cold) => cold,
+            Cold::Tags {
+                label,
+                done,
+                fail,
+                value,
+            } => {
+                self.asm.bind(label);
+                // Merges can make a read entry value dirty. A zero tag then
+                // requires a zero payload, so publication preserves its tag.
+                let mask = (0..8)
+                    .filter(|r| value & (1 << r) != 0)
+                    .fold(0, |mask, r| mask | 2 << (2 * r));
+                self.mov_imm(X17, mask);
+                self.emit(and(W, X17, X17, X16, Lsl, 0));
+                self.asm.cbz(W, true, X17, fail);
+                self.emit(mov(W, X2, X16));
+                for r in (0..8).filter(|r| value & (1 << r) != 0) {
+                    let normal = self.asm.label();
+                    self.asm.tbz(false, X2, 2 * r as u32, normal);
+                    self.x87_slot(r);
+                    self.emit(ldr(X, X0, X17, 0));
+                    self.asm.cbz(X, true, X0, fail);
+                    self.emit_all(&[ldrh(X0, X17, 8), and_imm(W, X0, X0, 0x7fff)]);
+                    self.asm.cbz(W, true, X0, fail);
+                    self.asm.bind(normal);
+                }
+                self.emit(mov(W, X16, X2));
+                self.asm.b(done);
+                return;
+            }
+            Cold::Entry {
+                index,
+                model,
+                need,
+                label,
+                hot,
+                run,
+            } => {
+                self.asm.bind(label);
+                self.index = index;
+                self.state = State::CANONICAL;
+                self.vector = super::super::simd::Vector::at(self.entry[index]);
+                self.mark(self.trace.insts[index].pc, Part::X87Entry);
+                self.emit_all(&[mrs_nzcv(X4), ldr(X, X5, RUNTIME, runtime::CPU_STATE)]);
+                let fail = self.asm.label();
+                self.push_cold(UnitCold::Leave {
+                    label: fail,
+                    state: State::CANONICAL,
+                    simd_dirty: self.vector.dirty,
+                    refund: self.trace.owed(index),
+                    exit: Exit::Dispatch,
+                    eip: self.trace.insts[index].pc,
+                    link: false,
+                    x87: Some(Leave::Restore(None)),
+                });
+                let end = std::mem::replace(&mut self.x87.end, *run.end());
+                self.x87_checks(model, need, fail);
+                self.x87.end = end;
+                if model.cyclic && self.stable_control(*run.start(), *run.end()) {
+                    self.x87_require_bit(X8, 16, fail);
+                }
+                for (r, slot) in model.slots.iter().enumerate() {
+                    if let Slot::Dirty(n) | Slot::Freed(Some(n)) = *slot {
+                        self.x87_fetch(r, n, false, fail);
+                    }
+                }
+                if model.cyclic {
+                    self.emit_all(&[
+                        ldr(W, X16, X5, runtime::X87_IP),
+                        vins_general(2, RUN, 2, X16),
+                        ldrh(X16, X5, runtime::X87_OPCODE),
+                        vins_general(2, RUN, 3, X16),
+                        bfi(W, X13, X15, 11, 3),
+                        vins_general(2, RUN, 0, X13),
+                        vins_general(2, RUN, 1, X8),
+                    ]);
+                }
+                self.emit(msr_nzcv(X4));
+                self.asm.b(hot);
+                return;
+            }
+        };
         if let Some(generic) = cold.generic {
             self.remark(Part::X87Wide);
             self.pair_generic(generic, cold.bail);

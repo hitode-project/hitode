@@ -131,7 +131,10 @@ impl Translator<'_> {
             Fast::Load80 => {
                 let to = self.x87_alloc();
                 self.pair_m80(false, bail);
-                self.pair_from_extended(X0, X1, to, false, bail);
+                let (zero, done) = self.pair_from_extended(X0, X1, to, false, bail);
+                self.asm.bind(zero);
+                self.pair_zero(X1, to, bail);
+                self.asm.bind(done);
                 self.x87.model.push();
                 self.x87_set(0, to, false);
                 self.clear_c1();
@@ -911,7 +914,10 @@ impl Translator<'_> {
         }
         self.pair_to_extended(g.dest, X0, X1);
         self.wide_ops(g.op, g.reverse, bail);
-        self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
+        let (zero, done) = self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
+        self.asm.bind(zero);
+        self.pair_zero(X1, g.to, bail);
+        self.asm.bind(done);
         self.emit(ldrh(X8, X5, runtime::X87_CONTROL));
         self.pair_control();
         self.asm.b(g.join);
@@ -974,6 +980,8 @@ impl Translator<'_> {
     /// Host register `n` = the extended value in `sig` and `sexp`,
     /// branching to `fail` unless a run may hold it, or when `narrow` and
     /// its low lane would not be zero; uses x16, x17, d0 and d1.
+    /// Converts a nonzero value, leaving the zero and completion labels
+    /// for the caller to bind around `pair_zero` and any zero-tag checks.
     pub(super) fn pair_from_extended(
         &mut self,
         sig: Reg,
@@ -981,7 +989,7 @@ impl Translator<'_> {
         n: u8,
         narrow: bool,
         fail: Label,
-    ) {
+    ) -> (Label, Label) {
         let (zero, done) = (self.asm.label(), self.asm.label());
         self.emit(and_imm(W, X17, sexp, 0x7fff));
         self.asm.cbz(X, false, sig, zero);
@@ -1021,13 +1029,16 @@ impl Translator<'_> {
             vins(3, v(n), 1, V1, 0),
         ]);
         self.asm.b(done);
-        self.asm.bind(zero);
+        (zero, done)
+    }
+
+    pub(super) fn pair_zero(&mut self, sexp: Reg, n: u8, fail: Label) {
+        self.emit(and_imm(W, X17, sexp, 0x7fff));
         self.asm.cbz(W, true, X17, fail);
         self.emit_all(&[
             lsr_imm(W, X16, sexp, 15),
             lsl_imm(X, X16, X16, 63),
             fmov_to_v(X, v(n), X16),
         ]);
-        self.asm.bind(done);
     }
 }

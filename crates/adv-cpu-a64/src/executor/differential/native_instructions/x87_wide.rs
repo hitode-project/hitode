@@ -1101,3 +1101,248 @@ fn x87_run_break_return_and_control_exit_keep_the_integer_tail() {
         );
     }
 }
+
+// spec: A64F-FP-7 A64F-FP-3 A64-REG-5
+#[test]
+fn x87_outside_helper_arrivals_enter_the_merge_cold() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let (mut stop_index, mut rare_index) = (0, 0);
+    let mut p = fixture(|a| {
+        let (mut outer, mut top, mut helper, mut rare, mut done, mut middle) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        // The inner head is appended after the returning fallback in trace order.
+        a.jmp(middle).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.fld1().unwrap();
+        a.fstp(st0).unwrap();
+        a.set_label(&mut middle).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fcom_2(st0, st6).unwrap();
+        a.call(helper).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fstp(qword_ptr(ebx + 16)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.mov(ecx, 4).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(outer).unwrap();
+        a.jmp(done).unwrap();
+        a.set_label(&mut helper).unwrap();
+        a.cmp(ecx, dword_ptr(ebx + 32)).unwrap();
+        a.je(rare).unwrap();
+        a.fchs().unwrap();
+        a.ret().unwrap();
+        rare_index = a.instructions().len();
+        a.set_label(&mut rare).unwrap();
+        a.fild(qword_ptr(ebx + 8)).unwrap();
+        a.fstp(st0).unwrap();
+        a.fchs().unwrap();
+        a.ret().unwrap();
+        stop_index = a.instructions().len();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+    });
+    let ip = |index| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(index)
+            .unwrap()
+            .ip32()
+    };
+    let rare = ip(rare_index);
+    p.stop = ip(stop_index);
+    p.state.regs[1] = 4;
+    p.state.regs[2] = 2;
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.x87.regs[5] = X87Register::from_parts(0xc000_0000_0000_0000, 0x3fff);
+    p.state.x87.tag &= !(3 << 10);
+    p.data[..8].copy_from_slice(&1.25f64.to_le_bytes());
+    p.data[8..16].copy_from_slice(&123i64.to_le_bytes());
+    for taken in [false, true] {
+        p.data[32..36].copy_from_slice(&u32::from(taken).to_le_bytes());
+        for config in pixel_loops::configs() {
+            for budget in [17, 500] {
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                assert_eq!(
+                    native.run(p.stop, budget).unwrap(),
+                    oracle.run(p.stop, budget).unwrap()
+                );
+                same(&native, &oracle);
+                if budget == 500 && !config.1 {
+                    assert_eq!(native.stats.compilations, 1);
+                    let engine = native.native.as_ref().unwrap();
+                    assert_eq!(engine.diagnostics.helpers, 0);
+                    let base = engine.unit_address(CODE).unwrap();
+                    let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+                    let hot: Vec<_> = marks
+                        [..marks.iter().position(|m| m.part == Part::Cold).unwrap()]
+                        .iter()
+                        .filter(|m| m.eip < rare)
+                        .collect();
+                    assert_eq!(hot.iter().filter(|m| m.part == Part::X87Entry).count(), 1);
+                    assert!(!hot.iter().any(|m| m.part == Part::X87Publish));
+                }
+            }
+        }
+    }
+    // An entry value read across the merge keeps its canonical tag,
+    // including images restored with a tag that disagrees with its payload.
+    for (payload, exponent, tag) in [(0, 0, 0), (0xc000_0000_0000_0000, 0x3fff, 1)] {
+        p.state.x87.regs[5] = X87Register::from_parts(payload, exponent);
+        p.state.x87.tag = (p.state.x87.tag & !(3 << 10)) | tag << 10;
+        for config in pixel_loops::configs() {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            assert_eq!(
+                native.run(p.stop, 500).unwrap(),
+                oracle.run(p.stop, 500).unwrap()
+            );
+            same(&native, &oracle);
+        }
+    }
+}
+
+fn integer_loop_run() -> (Program, u32) {
+    let (mut head_index, mut stop_index) = (0, 0);
+    let mut p = fixture(|a| {
+        let (mut outer, mut body, mut check, mut done) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fld1().unwrap();
+        a.mov(edi, ecx).unwrap();
+        a.test(edi, edi).unwrap();
+        a.jz(done).unwrap();
+        a.jmp(check).unwrap();
+        a.set_label(&mut body).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(edi).unwrap();
+        head_index = a.instructions().len();
+        a.set_label(&mut check).unwrap();
+        a.test(edi, edi).unwrap();
+        a.jnz(body).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fstp(qword_ptr(ebx + 16)).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(outer).unwrap();
+        stop_index = a.instructions().len();
+        a.nop().unwrap();
+    });
+    let ip = |index| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(index)
+            .unwrap()
+            .ip32()
+    };
+    let head = ip(head_index);
+    p.stop = ip(stop_index);
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.regs[2] = 2;
+    p.state.regs[6] = DATA + 64;
+    (p, head)
+}
+
+// spec: A64F-FP-7 A64-MEM-7 A64-CTL-7 A64-REG-5
+#[test]
+fn x87_inner_integer_loop_keeps_the_model_at_every_arrival() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    for count in [0, 1, 19] {
+        for fault in [false, true] {
+            let (mut p, _) = integer_loop_run();
+            p.state.regs[1] = count;
+            if fault {
+                p.state.regs[6] = DATA + DATA_LEN as u32 - 4;
+            }
+            for config in pixel_loops::configs() {
+                for budget in [12, 1000] {
+                    let mut native = executor(&p, config, false);
+                    let mut oracle = executor(&p, config, true);
+                    assert_eq!(
+                        native.run(p.stop, budget).unwrap(),
+                        oracle.run(p.stop, budget).unwrap()
+                    );
+                    same(&native, &oracle);
+                    if budget == 1000 {
+                        assert_eq!(
+                            native.state.fault_addr,
+                            if fault && count > 0 {
+                                DATA + DATA_LEN as u32
+                            } else {
+                                0
+                            }
+                        );
+                    }
+                    if budget == 1000 && !config.1 {
+                        let base = native.native.as_ref().unwrap().unit_address(CODE).unwrap();
+                        let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+                        let hot =
+                            &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+                        assert_eq!(hot.iter().filter(|m| m.part == Part::X87Entry).count(), 1);
+                        assert!(!hot.iter().any(|m| m.part == Part::X87Publish));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64-CTL-8
+#[test]
+fn x87_inner_integer_loop_publishes_at_its_deadline_backedge() {
+    use std::time::{Duration, Instant};
+    let (mut p, head) = integer_loop_run();
+    p.state.regs[1] = 1;
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    assert_eq!(native.run(p.stop, 1000).unwrap(), RunOutcome::ReachedStop);
+    p.state.regs[1] = 100_000;
+    // Repeated reads stay mapped for the entire owner slice.
+    p.state.regs[6] = DATA;
+    native.state = p.state.clone();
+    native.memory_mut().write(DATA, &p.data).unwrap();
+    native.state.refresh_mmx();
+    native.state.settle_flags();
+    let engine = native.native.as_mut().unwrap();
+    engine.deadline = Some(crate::native::deadline(
+        Instant::now() + Duration::from_nanos(1),
+    ));
+    let run = engine
+        .run(
+            &mut native.state,
+            &mut native.memory,
+            p.stop,
+            256,
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.exit, crate::runtime::Exit::Dispatch);
+    assert!(engine.past());
+    assert_eq!(native.state.eip, head);
+    native.state.fuel = 0;
+    native.state.refresh_mmx();
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        oracle.run(p.stop, u64::from(run.retired)).unwrap(),
+        RunOutcome::Budget
+    );
+    same(&native, &oracle);
+}
