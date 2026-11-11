@@ -12,10 +12,16 @@
   import UpdateNotice from "../components/UpdateNotice.svelte";
   import JitBanner from "../components/JitBanner.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
+  import PhoneArrangeSheet from "../components/PhoneArrangeSheet.svelte";
+  import { sortGames } from "../lib/arrange";
+  import { CardSize } from "../lib/card-size.svelte";
+  import { cardDrag } from "../lib/card-drag";
+  import { gridZoom } from "../lib/grid-zoom";
+  import { prefs } from "../lib/prefs.svelte";
+  import { trendBars } from "../lib/stats";
   import { bylineLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { device } from "../lib/device.svelte";
   import { library } from "../lib/library.svelte";
-  import { longPress } from "../lib/long-press";
   import { nav } from "../lib/nav.svelte";
   import type { Game, LibraryFilter } from "../lib/types";
 
@@ -45,7 +51,21 @@
     return () => clearTimeout(timer);
   });
 
-  const items = $derived(library.filtered(filter, searching ? query : ""));
+  /** The order shown while a card is dragged. */
+  let preview = $state<string[] | null>(null);
+  const items = $derived(
+    preview
+      ? preview.flatMap((id) => library.get(id) ?? [])
+      : sortGames(library.filtered(filter, searching ? query : ""), prefs.librarySort),
+  );
+  let arranging = $state(false);
+  /** Read out after a card moved. */
+  let moved = $state("");
+
+  const size = new CardSize("cardPhone", 12, 56, 200);
+  $effect(() => {
+    size.scroller = grid;
+  });
   const current = $derived<Game | undefined>(openId ? library.get(openId) : undefined);
   const managed = $derived(manageId ? library.get(manageId) : undefined);
 
@@ -60,12 +80,6 @@
     return game.offline === "disk" ? t("未连接") : t("找不到");
   }
 
-  function trend(game: Game) {
-    return game.daily.map((minutes) => ({
-      h: minutes ? Math.max(4, Math.round((minutes / 180) * 38)) : 2,
-      on: minutes > 0,
-    }));
-  }
 
   function remove(game: Game) {
     void library.remove(game.id);
@@ -111,6 +125,12 @@
         {c.label}{filter === c.filter ? ` ${items.length}` : ""}
       </button>
     {/each}
+    {#if library.games.length > 0}
+      <button class="chip arrange" aria-haspopup="dialog" onclick={() => (arranging = true)}>
+        <span>{t("排列")}</span>
+        <Icon name="chevron-down" size={14} stroke={1.6} />
+      </button>
+    {/if}
   </div>
 {/snippet}
 
@@ -170,17 +190,33 @@
     {@render categories()}
   {/if}
 
-  <main class="grid-wrap" bind:this={grid} onscroll={(event) => (scrollTop = event.currentTarget.scrollTop)}>
+  <main class="grid-wrap" bind:this={grid} onscroll={(event) => (scrollTop = event.currentTarget.scrollTop)}
+    use:gridZoom={{ enabled: prefs.pinchZoom, onpinch: (scale, at) => size.pinch(scale, at), onend: () => size.pinchEnd() }}>
     {#if items.length === 0}
       <div class="none">{t("没有匹配的游戏")}</div>
     {/if}
-    <div class="grid">
+    <span class="sr" aria-live="polite">{moved}</span>
+    <div
+      class="grid"
+      style:grid-template-columns={size.template}
+      bind:this={size.grid}
+      bind:clientWidth={size.width}
+      use:cardDrag={{
+        movable: !(searching && query.trim()),
+        onhold: device.touch ? (id) => (manageId = id) : null,
+        onpreview: (ids) => (preview = ids),
+        onmove: (ids, id) => {
+          library.move(ids, id);
+          moved = t("已移到第 {0} 位", ids.indexOf(id) + 1);
+        },
+      }}
+    >
       {#each items as game (game.id)}
         <button
           class="card"
+          data-id={game.id}
           class:gone={game.offline !== null}
           onclick={() => (openId = game.id)}
-          use:longPress={device.touch ? () => (manageId = game.id) : null}
           aria-label={game.offline
             ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
             : game.title}
@@ -275,7 +311,7 @@
         <div style="margin-top: 22px">
           <div class="trend-head"><span>{t("近 30 天")}</span><span>{game.sessions30} {t("次")}</span></div>
           <div class="trend" role="img" aria-label={t("近 30 天每日游玩时长")}>
-            {#each trend(game) as day, i (i)}
+            {#each trendBars(game.daily, 38) as day, i (i)}
               <span class="tb" class:on={day.on} style="height: {day.h}px"></span>
             {/each}
           </div>
@@ -287,6 +323,10 @@
 
 {#if managed}
   <PhoneManageSheet game={managed} returnTo={current?.id ?? null} onclose={() => (manageId = null)} onremoved={removed} />
+{/if}
+
+{#if arranging}
+  <PhoneArrangeSheet choices={size.choices} columns={size.columns} oncolumns={(n) => size.set(n)} onclose={() => (arranging = false)} />
 {/if}
 
 {#if undoToast}
@@ -347,6 +387,13 @@
     color: var(--bg);
     font-weight: 500;
   }
+  .chip.arrange {
+    gap: 4px;
+    margin-left: auto;
+    padding-right: 10px;
+    background: none;
+    color: var(--fg2);
+  }
   .chip:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -369,14 +416,12 @@
   .grid-wrap {
     flex: 1 1 0;
     min-height: 0;
-    overflow-y: auto;
+    overflow: hidden auto;
     padding: 0 20px calc(var(--safe-bottom) + 24px);
   }
   .grid {
+    position: relative;
     display: grid;
-    /* Three columns on a phone, more in a wider window (split screen, a
-       small tablet, a large phone in landscape). */
-    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
     column-gap: 12px;
     row-gap: 18px;
   }
@@ -387,18 +432,51 @@
     color: var(--fg3);
   }
   .card {
+    all: unset;
     -webkit-touch-callout: none;
     user-select: none;
-    all: unset;
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 6px;
     min-width: 0;
     cursor: pointer;
+    transition: scale 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+  }
+  /* Arranging (card-drag.ts): the held card rises above the others. */
+  .card:global(.lifted),
+  .card:global(.dragging),
+  .card:global(.settling) {
+    z-index: 3;
+  }
+  .grid .card:global(.lifted),
+  .grid .card:global(.dragging) {
+    scale: 1.06;
+    opacity: 1;
+  }
+  .card:global(.lifted) :global(.cv),
+  .card:global(.dragging) :global(.cv) {
+    box-shadow: 0 0 0 1px var(--line), 0 14px 30px rgba(0, 0, 0, 0.3);
   }
   .card:focus-visible :global(.cv) {
     outline: 2px solid var(--accent);
     outline-offset: 3px;
+  }
+  /*
+   * A pinch (pinch-layout.ts) scales the cards whole: the titles and the labels
+   * on the covers fade while it lasts and come back at their size once it rests.
+   * The blur of a hidden cover is on the art and stays.
+   */
+  .card > :not(:first-child),
+  .veil,
+  .badge {
+    transition: opacity 0.18s ease;
+  }
+  .grid:global(.pinching) .card > :not(:first-child),
+  .grid:global(.pinching) .veil,
+  .grid:global(.pinching) .badge {
+    opacity: 0;
+    transition-duration: 0.08s;
   }
   .ttl {
     font-size: 12px;

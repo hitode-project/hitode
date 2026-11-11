@@ -122,6 +122,10 @@
         <SettingsSwitch touch={device.touch} label={t("遮挡成人内容封面")} checked={prefs.blurAdult} onchange={(v) => set("blurAdult", v)} />
       </div>
       <div class="row">
+        <span class="t">{t("双指缩放封面")}</span>
+        <SettingsSwitch touch={device.touch} label={t("双指缩放封面")} checked={prefs.pinchZoom} onchange={(v) => set("pinchZoom", v)} />
+      </div>
+      <div class="row">
         <span class="t">{t("记录游玩时间")}</span>
         <SettingsSwitch touch={device.touch} label={t("记录游玩时间")} checked={prefs.trackPlayTime} onchange={(v) => set("trackPlayTime", v)} />
       </div>

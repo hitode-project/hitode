@@ -239,3 +239,9 @@ export function fakeOlderDays(game: Game, now: number): number[] {
   if (left > 0 && at(lastAgo) >= 0) out[at(lastAgo)] = (out[at(lastAgo)] ?? 0) + left;
   return out;
 }
+
+/** Bars of a per-day trend `height` px tall; the longest day, and at least three hours, fills it. */
+export function trendBars(daily: number[], height: number): { h: number; on: boolean }[] {
+  const top = Math.max(180, ...daily);
+  return daily.map((minutes) => ({ h: minutes ? Math.max(4, Math.round((minutes / top) * height)) : 2, on: minutes > 0 }));
+}

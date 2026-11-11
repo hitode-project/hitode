@@ -82,6 +82,13 @@ export function libraryUpdate(id: string, patch: GamePatch): Promise<LibraryGame
 export function libraryRemove(id: string): Promise<LibraryGame | null> {
   return call("library_remove", { id }, null);
 }
+export function libraryReorder(ids: string[]): Promise<void> {
+  return call("library_reorder", { ids }, undefined);
+}
+/** A light haptic tick for a step under the finger. */
+export function hapticTick(): void {
+  void call("haptic_tick", {}, undefined);
+}
 export function libraryRestore(game: LibraryGame, index: number): Promise<void> {
   return call("library_restore", { game, index }, undefined);
 }

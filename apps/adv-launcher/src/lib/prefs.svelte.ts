@@ -1,4 +1,6 @@
 /** Persisted launcher-wide preferences. */
+import type { LibrarySort } from "./arrange";
+
 export type Theme = "system" | "light" | "dark";
 export type Accent = "blue" | "green" | "graphite";
 export type Language = "auto" | "zh" | "ja" | "en";
@@ -39,6 +41,12 @@ export interface Prefs {
   liveContainerImportHintSeen: boolean;
   /** iOS: permanently dismiss library and game-launch JIT warnings. */
   hideJitWarnings: boolean;
+  librarySort: LibrarySort;
+  /** Pinching the library grid changes the covers per row. */
+  pinchZoom: boolean;
+  /** Smallest cover width in px of the library grid, in the sidebar and phone layouts. */
+  cardWide: number;
+  cardPhone: number;
 }
 
 const KEY = "adv-launcher.prefs";
@@ -64,6 +72,10 @@ const defaults: Prefs = {
   autoJit: true,
   liveContainerImportHintSeen: false,
   hideJitWarnings: false,
+  librarySort: "recent",
+  pinchZoom: true,
+  cardWide: 132,
+  cardPhone: 96,
 };
 
 function load(): Prefs {

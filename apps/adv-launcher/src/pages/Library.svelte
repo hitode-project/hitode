@@ -10,12 +10,19 @@
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import Vndb from "../components/Vndb.svelte";
   import EditTitle from "../components/EditTitle.svelte";
+  import GridSize from "../components/GridSize.svelte";
+  import { sortGames, type LibrarySort } from "../lib/arrange";
+  import { CardSize } from "../lib/card-size.svelte";
+  import { cardDrag } from "../lib/card-drag";
+  import { gridZoom } from "../lib/grid-zoom";
+  import { prefs, savePrefs } from "../lib/prefs.svelte";
+  import { trendBars } from "../lib/stats";
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
-  import { longPress } from "../lib/long-press";
   import { nav } from "../lib/nav.svelte";
   import { device } from "../lib/device.svelte";
   import { canReveal, reveal } from "../lib/reveal";
+  import type { Codepage } from "../lib/host";
   import type { Game, LibraryFilter } from "../lib/types";
 
   let { filter }: { filter: LibraryFilter } = $props();
@@ -27,16 +34,15 @@
     unstarted: t("未开始"),
   };
 
-  type Sort = "recent" | "title" | "brand" | "year";
-  const sorts: { value: Sort; label: string }[] = [
+  const sorts: { value: LibrarySort; label: string }[] = [
     { value: "recent", label: t("最近游玩") },
+    { value: "custom", label: t("自定义") },
     { value: "title", label: t("标题") },
     { value: "brand", label: t("品牌") },
     { value: "year", label: t("发行年份") },
   ];
 
   let query = $state("");
-  let sort = $state<Sort>("recent");
   let selectedId = $state<string | null>(library.takeFocus());
   /** The detail panel is a sheet over the grid on narrow windows. */
   let sheet = $state(false);
@@ -46,14 +52,22 @@
   let manageId = $state<string | null>(null);
   const managed = $derived(manageId ? library.get(manageId) : undefined);
 
-  const items = $derived.by(() => {
-    const list = library.filtered(filter, query);
-    const collator = new Intl.Collator("ja");
-    if (sort === "title") list.sort((a, b) => collator.compare(a.title, b.title));
-    if (sort === "brand") list.sort((a, b) => collator.compare(a.brand, b.brand) || collator.compare(a.title, b.title));
-    if (sort === "year") list.sort((a, b) => b.year - a.year);
-    return list;
-  });
+  /** The order shown while a card is dragged. */
+  let preview = $state<string[] | null>(null);
+  const items = $derived(
+    preview
+      ? preview.flatMap((id) => library.get(id) ?? [])
+      : sortGames(library.filtered(filter, query), prefs.librarySort),
+  );
+  /** Read out after a card moved. */
+  let moved = $state("");
+
+  const size = new CardSize("cardWide", 24, 96, 260);
+
+  function setSort(sort: LibrarySort) {
+    prefs.librarySort = sort;
+    savePrefs();
+  }
   const current = $derived<Game | undefined>(items.find((g) => g.id === selectedId) ?? items[0]);
 
   function pick(game: Game) {
@@ -83,12 +97,6 @@
     return game.offline === "disk" ? t("未连接") : t("找不到");
   }
 
-  function trend(game: Game) {
-    return game.daily.map((minutes) => ({
-      h: minutes ? Math.max(4, Math.round((minutes / 180) * 34)) : 2,
-      on: minutes > 0,
-    }));
-  }
 
   // The back gesture (Android) closes the menu or dialog, then the detail sheet.
   const canDismissLibrary = $derived(popup !== "none" || sheet);
@@ -114,6 +122,12 @@
   function onkeydown(event: KeyboardEvent) {
     // The menu and its dialogs handle their own Escape.
     if (event.key === "Escape" && popup === "none" && sheet) sheet = false;
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && popup === "none") {
+      const step = event.key === "-" ? 1 : event.key === "=" || event.key === "+" ? -1 : 0;
+      if (!step) return;
+      event.preventDefault();
+      size.set(size.columns + step);
+    }
   }
 </script>
 
@@ -131,10 +145,13 @@
       <span class="sr">{t("搜索")}</span>
       <input type="search" placeholder={t("搜索标题或品牌")} bind:value={query} />
     </label>
+    {#if size.choices.length > 1}
+      <GridSize choices={size.choices} columns={size.columns} onpick={(n) => size.set(n)} />
+    {/if}
     <label class="pill sort">
-      <span>{sorts.find((s) => s.value === sort)?.label}</span>
+      <span>{sorts.find((s) => s.value === prefs.librarySort)?.label}</span>
       <Icon name="chevron-down" size={14} stroke={1.5} />
-      <select bind:value={sort} aria-label={t("排序")}>
+      <select value={prefs.librarySort} onchange={(e) => setSort(e.currentTarget.value as LibrarySort)} aria-label={t("排序")}>
         {#each sorts as s (s.value)}
           <option value={s.value}>{s.label}</option>
         {/each}
@@ -144,18 +161,36 @@
   </header>
 
   <div class="body">
-    <main class="scroll grid-wrap">
+    <main class="scroll grid-wrap" bind:this={size.scroller}
+      use:gridZoom={{ enabled: prefs.pinchZoom, onpinch: (scale, at) => size.pinch(scale, at), onend: () => size.pinchEnd() }}>
       {#if items.length === 0}
         <div class="none">{t("没有匹配的游戏")}</div>
       {/if}
-      <div class="grid">
+      <span class="sr" aria-live="polite">{moved}</span>
+      <div
+        class="grid"
+        style:grid-template-columns={size.template}
+        bind:this={size.grid}
+        bind:clientWidth={size.width}
+        use:cardDrag={{
+          movable: !query.trim(),
+          selected: current?.id ?? null,
+          onhold: device.touch ? (id) => (manageId = id) : null,
+          onpreview: (ids) => (preview = ids),
+          onmove: (ids, id) => {
+            library.move(ids, id);
+            selectedId = id;
+            moved = t("已移到第 {0} 位", ids.indexOf(id) + 1);
+          },
+        }}
+      >
         {#each items as game (game.id)}
           <button
             class="card"
+            data-id={game.id}
             class:on={current?.id === game.id}
             class:gone={game.offline !== null}
             onclick={() => pick(game)}
-            use:longPress={device.touch ? () => (manageId = game.id) : null}
             ondblclick={() => game.offline === null && nav.go({ name: "launch", gameId: game.id })}
             aria-label={game.offline
               ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
@@ -264,7 +299,21 @@
             <dt>{t("累计时长")}</dt><dd>{playTimeLabel(game.playMinutes)}</dd>
             {#if game.engine}<dt>{t("引擎")}</dt><dd>{game.engine}</dd>{/if}
             <dt>VNDB</dt><dd><VndbLink {game} /></dd>
-            <dt>{t("编码")}</dt><dd>{codepageLabel(game.codepage)}</dd>
+            <dt>{t("编码")}</dt>
+            <dd>
+              <label class="cp" title={t("游戏文字的编码；乱码时换一种试试")}>
+                <span>{codepageLabel(game.codepage)}</span>
+                <Icon name="chevron-down" size={12} stroke={1.6} />
+                <select
+                  aria-label={t("编码")}
+                  value={String(game.codepage)}
+                  onchange={(e) => void library.setRun(game.id, { codepage: Number(e.currentTarget.value) as Codepage })}
+                >
+                  <option value="932">{t("日文")}</option>
+                  <option value="936">{t("简体中文")}</option>
+                </select>
+              </label>
+            </dd>
           </dl>
           {#if canReveal()}
             <button class="quiet locate" title={game.path} disabled={game.offline !== null} onclick={() => reveal(game.path)}>
@@ -276,7 +325,7 @@
             <div style="margin-top: 24px">
               <div class="trend-head"><span>{t("近 30 天")}</span><span>{game.sessions30} {t("次")}</span></div>
               <div class="trend" role="img" aria-label={t("近 30 天每日游玩时长")}>
-                {#each trend(game) as day, i (i)}
+                {#each trendBars(game.daily, 34) as day, i (i)}
                   <span class="tb" class:on={day.on} style="height: {day.h}px"></span>
                 {/each}
               </div>
@@ -338,15 +387,15 @@
   .grid-wrap {
     flex: 1 1 0;
     min-width: 0;
-    overflow: auto;
+    overflow: hidden auto;
     /* Keep the scrollbar's room even when nothing scrolls, so the grid does
        not change scale between a long list and a short one. */
     scrollbar-gutter: stable;
     padding: 10px 32px 48px;
   }
   .grid {
+    position: relative;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
     column-gap: 24px;
     row-gap: 28px;
   }
@@ -358,13 +407,49 @@
   }
   .card {
     all: unset;
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 9px;
     cursor: pointer;
     min-width: 0;
+    transition: scale 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
   }
-  .card:hover :global(.cv) {
+  /* Arranging (card-drag.ts): the held card rises above the others. */
+  .card:global(.lifted),
+  .card:global(.dragging),
+  .card:global(.settling) {
+    z-index: 3;
+  }
+  .grid .card:global(.lifted),
+  .grid .card:global(.dragging) {
+    scale: 1.04;
+    opacity: 1;
+  }
+  .card:global(.lifted) :global(.cv),
+  .card:global(.dragging) :global(.cv) {
+    box-shadow: 0 0 0 1px var(--line), 0 18px 36px rgba(0, 0, 0, 0.26);
+  }
+  .grid:global(.arranging) .card {
+    cursor: grabbing;
+  }
+  /*
+   * A pinch (pinch-layout.ts) scales the cards whole: the titles and the labels
+   * on the covers fade while it lasts and come back at their size once it rests.
+   * The blur of a hidden cover is on the art and stays.
+   */
+  .card > :not(:first-child),
+  .veil,
+  .badge {
+    transition: opacity 0.18s ease;
+  }
+  .grid:global(.pinching) .card > :not(:first-child),
+  .grid:global(.pinching) .veil,
+  .grid:global(.pinching) .badge {
+    opacity: 0;
+    transition-duration: 0.08s;
+  }
+  .grid:not(:global(.arranging)) .card:hover :global(.cv) {
     transform: translateY(-2px);
     box-shadow: 0 0 0 1px var(--line), 0 8px 20px rgba(0, 0, 0, 0.12);
   }
@@ -376,6 +461,8 @@
     outline-offset: 4px;
   }
   .names {
+    /* Two lines whether or not a brand shows, so rows are even while arranging. */
+    min-height: 36px;
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -579,6 +666,32 @@
     color: var(--fg);
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+  .cp {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: -3px -6px -3px 0;
+    padding: 3px 6px 3px 8px;
+    border-radius: 6px;
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .cp :global(svg) {
+    color: var(--fg3);
+  }
+  .cp:hover {
+    background: var(--hover);
+  }
+  .cp:has(select:focus-visible) {
+    outline: 2px solid var(--accent);
+  }
+  .cp select {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
   }
   .trend-head {
     display: flex;

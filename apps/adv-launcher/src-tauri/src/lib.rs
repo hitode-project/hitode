@@ -14,6 +14,8 @@ mod drive;
 #[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
 mod game_storage;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+mod haptics;
 #[cfg(target_os = "ios")]
 mod jit_ios;
 mod library;
@@ -152,6 +154,8 @@ pub fn run() {
                 library::library_update,
                 library::library_remove,
                 library::library_restore,
+                library::library_reorder,
+                haptics::haptic_tick,
                 game_storage::list_game_copies,
                 game_storage::clear_game_cache,
                 game_storage::game_file_location,
@@ -185,6 +189,7 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        library::library_reorder,
         game_storage::list_game_copies,
         game_storage::clear_game_cache,
         game_storage::game_file_location,
@@ -234,6 +239,8 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        haptics::haptic_tick,
+        library::library_reorder,
         game_storage::list_game_copies,
         game_storage::clear_game_cache,
         game_storage::game_file_location,
@@ -287,7 +294,9 @@ pub fn run() {
         library::library_add,
         library::library_update,
         library::library_remove,
+        haptics::haptic_tick,
         library::library_restore,
+        library::library_reorder,
         game_storage::list_game_copies,
         game_storage::clear_game_cache,
         game_storage::game_file_location,

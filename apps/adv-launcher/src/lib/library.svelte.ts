@@ -5,12 +5,15 @@ import {
   libraryList,
   libraryPickFolder,
   libraryRemove,
+  libraryReorder,
   libraryRestore,
   libraryUpdate,
   type Codepage,
   type GamePatch,
   type LibraryGame,
 } from "./host";
+import { placeAmong, sortGames } from "./arrange";
+import { prefs, savePrefs } from "./prefs.svelte";
 import { minutesByDay } from "./stats";
 import type { Game, LibraryFilter } from "./types";
 
@@ -94,16 +97,39 @@ class Library {
     return this.games.find((g) => g.id === id);
   }
 
+  /** The games of a category matching the search, in library order. */
   filtered(filter: LibraryFilter, query: string): Game[] {
     const q = query.trim().toLowerCase();
-    const list = this.games.filter((g) => {
+    return this.games.filter((g) => {
       if (filter === "recent" && g.lastPlayed === null) return false;
       if (filter === "favorite" && !g.favorite) return false;
       if (filter === "unstarted" && g.lastPlayed !== null) return false;
       return !q || g.title.toLowerCase().includes(q) || g.brand.toLowerCase().includes(q) || [g.vndb?.title, g.vndb?.alttitle, ...(g.vndb?.aliases ?? [])].some((name) => name?.toLowerCase().includes(q));
     });
-    // Most recently played first, then never-started games in library order.
-    return list.sort((a, b) => (b.lastPlayed ?? -1) - (a.lastPlayed ?? -1));
+  }
+
+  /**
+   * Keeps the order `visible` shows after `id` was moved in it, as the custom
+   * order: the current sort becomes the custom order first, so nothing else
+   * on screen moves, and games outside `visible` keep their places.
+   */
+  move(visible: string[], id: string): void {
+    const order = placeAmong(sortGames(this.games, prefs.librarySort).map((g) => g.id), visible, id);
+    prefs.librarySort = "custom";
+    savePrefs();
+    void this.#reorder(order);
+  }
+
+  async #reorder(ids: string[]): Promise<void> {
+    const byId = new Map(this.games.map((g) => [g.id, g]));
+    this.games = ids.map((id) => byId.get(id)!);
+    if (!inTauri) return;
+    try {
+      await libraryReorder(ids);
+    } catch (error) {
+      console.error("library_reorder failed", error);
+      await this.refresh();
+    }
   }
 
   count(filter: LibraryFilter): number {

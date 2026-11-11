@@ -219,6 +219,22 @@ impl Library {
         self.games.insert(index.min(self.games.len()), game);
         self.save()
     }
+    /// Puts the games in the order of `ids`, which must name each game once.
+    fn reorder(&mut self, ids: &[String]) -> io::Result<()> {
+        let rank: BTreeMap<&str, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        if rank.len() != ids.len()
+            || ids.len() != self.games.len()
+            || self.games.iter().any(|g| !rank.contains_key(g.id.as_str()))
+        {
+            return Err(io::Error::other("order must name every game once"));
+        }
+        self.games.sort_by_key(|g| rank[g.id.as_str()]);
+        self.save()
+    }
     /// Folder, executable and id snapshots, so discovery can run unlocked.
     fn known(&self) -> Known {
         self.games
@@ -588,6 +604,10 @@ pub fn library_remove(state: Store<'_>, id: String) -> Reply<LibraryGame> {
     reply(state.lock().unwrap().remove(&id))
 }
 #[tauri::command]
+pub fn library_reorder(state: Store<'_>, ids: Vec<String>) -> Reply<()> {
+    reply(state.lock().unwrap().reorder(&ids))
+}
+#[tauri::command]
 pub fn library_restore(state: Store<'_>, game: LibraryGame, index: usize) -> Reply<()> {
     reply(state.lock().unwrap().restore(game, index))
 }
@@ -765,6 +785,31 @@ mod tests {
         assert_eq!(offline(&dir.join("missing")), Some("missing"));
         let volume = Path::new("/Volumes").join(dir.file_name().unwrap());
         assert_eq!(offline(&volume.join("game")), Some("disk"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-10
+    #[test]
+    fn reorder_persists_a_full_permutation_only() {
+        let (dir, mut lib) = fixture("reorder");
+        let ids: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                fs::create_dir_all(dir.join(name)).unwrap();
+                lib.add(&dir.join(name), "game.exe", 932, name).unwrap().id
+            })
+            .collect();
+        let order = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+        lib.reorder(&order).unwrap();
+        let ids_of = |lib: &Library| lib.games.iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids_of(&Library::load(dir.join("app")).unwrap()), order);
+        for bad in [
+            vec![ids[0].clone(), ids[1].clone()],
+            vec![ids[0].clone(), ids[0].clone(), ids[1].clone()],
+            vec![ids[0].clone(), ids[1].clone(), "other".into()],
+        ] {
+            assert!(lib.reorder(&bad).is_err());
+        }
+        assert_eq!(ids_of(&lib), order);
         fs::remove_dir_all(dir).unwrap();
     }
     // spec: HOST-LIB-2
