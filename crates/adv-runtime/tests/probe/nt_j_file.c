@@ -136,7 +136,11 @@ static void run(void)
     RtlFreeUnicodeString(&name);
 
     slot = CreateMailslotW(L"\\\\.\\mailslot\\j-file", 64, MAILSLOT_WAIT_FOREVER, NULL);
-    check("mailslot", slot != INVALID_HANDLE_VALUE && CloseHandle(slot));
+    DWORD max_message, next_message, messages, timeout;
+    check("mailslot", slot != INVALID_HANDLE_VALUE &&
+          GetMailslotInfo(slot, &max_message, &next_message, &messages, &timeout) &&
+          max_message == 64 && next_message == MAILSLOT_NO_MESSAGE &&
+          messages == 0 && timeout == MAILSLOT_WAIT_FOREVER && CloseHandle(slot));
 
     CreateDirectoryW(L"j-notify", NULL);
     directory = CreateFileW(L"j-notify", FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,

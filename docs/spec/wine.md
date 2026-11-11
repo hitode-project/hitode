@@ -196,7 +196,7 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 ### NT-FILE-1 File descriptor operations
 
-**Rule**: File flushing, deletion, mailslot creation, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
+**Rule**: File flushing, deletion, mailslot creation and queries, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
 **Verification**: Test
 
 ### NT-FILE-2 File waits and cancellation
