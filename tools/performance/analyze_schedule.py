@@ -125,6 +125,65 @@ def frame_gaps(rows, runs, waits, segments, lo, hi):
     return result, summary
 
 
+# WM_KEYDOWN, WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL: inputs a player waits on.
+PRESSES = {0x100, 0x201, 0x204, 0x20a}
+
+
+def host_waits(rows):
+    """Execution-thread host waits as (begin, end, polling round, signaled)."""
+    waits, polled = [], False
+    for row in rows:
+        if row["event"] == "poll_idle":
+            polled = True
+        elif row["event"] == "host_wait":
+            waits.append((row["time_ns"] - row["b"], row["time_ns"], polled, bool(row["c"])))
+            polled = False
+    return waits
+
+
+def thread_budget(runs, waits, rounds, begin, end):
+    """Execution-thread wall split inside [begin, end): inline guest runs, polling-round
+    waits, all-blocked waits and computation scopes (which overlap inline runs)."""
+    budget = Counter()
+    for start, stop, *_ in runs:
+        budget["run_ms"] += overlap(start, stop, begin, end) / 1e6
+    for start, stop, polled, _ in waits:
+        budget["poll_wait_ms" if polled else "blocked_wait_ms"] += overlap(start, stop, begin, end) / 1e6
+    for start, stop in rounds:
+        budget["compute_scope_ms"] += overlap(start, stop, begin, end) / 1e6
+    budget["other_ms"] = max(0.0, (end - begin) / 1e6 - budget["run_ms"]
+                             - budget["poll_wait_ms"] - budget["blocked_wait_ms"])
+    return {name: round(ms, 3) for name, ms in budget.items()}
+
+
+def input_responses(rows, runs, lo, hi, window_ms=1500):
+    """For each press, the frames and execution-thread budget until the next press
+    or `window_ms`. The longest gap there is the stall a player would feel."""
+    waits = host_waits(rows)
+    rounds = [(r["time_ns"] - r["b"], r["time_ns"]) for r in rows if r["event"] == "compute_round"]
+    frames = [r["time_ns"] for r in rows if r["event"] == "frame"]
+    presses = [r for r in rows if r["event"] == "input" and r["a"] in PRESSES and lo <= r["time_ns"] < hi]
+    result = []
+    for index, press in enumerate(presses):
+        begin = press["time_ns"]
+        end = min(begin + window_ms * 1_000_000, hi,
+                  presses[index + 1]["time_ns"] if index + 1 < len(presses) else hi)
+        inside = [t for t in frames if begin <= t < end]
+        edges = [begin, *inside]
+        gaps = [(b - a, a, b) for a, b in zip(edges, edges[1:])]
+        worst = max(gaps, default=(end - begin, begin, end))
+        result.append({
+            "at_ms": round((begin - lo) / 1e6, 1), "message": hex(press["a"]), "wparam": press["b"],
+            "window_ms": round((end - begin) / 1e6, 1), "frames": len(inside),
+            "first_frame_ms": round((inside[0] - begin) / 1e6, 1) if inside else None,
+            "longest_gap_ms": round(worst[0] / 1e6, 1),
+            "longest_gap_at_ms": round((worst[1] - begin) / 1e6, 1),
+            "window_budget": thread_budget(runs, waits, rounds, begin, end),
+            "longest_gap_budget": thread_budget(runs, waits, rounds, worst[1], worst[2]),
+        })
+    return result
+
+
 def trace_model(rows):
     """Measurement window, inline runs, completed lock waits and per-context states."""
     if not rows:
@@ -237,6 +296,8 @@ def analyze(rows):
                 entry["owner_state_ms"][state_name] += duration / 1e6
 
     longest, gap_summary = frame_gaps(rows, runs, records, segments, lo, hi)
+    waits = host_waits(rows)
+    polling = [w for w in waits if w[2]]
     summary = {
         "interval_kind": "host wall; leased includes queueing and completion delivery",
         "boundary_note": "host/end-PC time is prorated for runs crossing the measurement boundary",
@@ -258,6 +319,13 @@ def analyze(rows):
         "cause_note": "dominant producer state; idle (sleep/poll) includes text pacing and static images",
         "frame_gap_causes": gap_summary,
         "longest_frame_gaps": longest,
+        "host_wait_note": "execution-thread host waits; poll = after a polling round (PROC-CLOCK-5/7)",
+        "host_waits": {
+            "count": len(waits), "polling_count": len(polling),
+            "polling_signaled": sum(1 for w in polling if w[3]),
+            "budget": thread_budget(runs, waits, [], lo, hi),
+        },
+        "input_responses": input_responses(rows, runs, lo, hi),
     }
     return summary, selected
 

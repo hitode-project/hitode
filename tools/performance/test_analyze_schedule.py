@@ -24,6 +24,21 @@ class ScheduleAnalysisTests(unittest.TestCase):
         self.assertEqual(summary["states_ms"][1]["ready"], 4)
         self.assertEqual(summary["inline_runs"]["ctx1_host_ms"], 0.5)
 
+    def test_press_response_splits_polling_waits_from_blocked_waits(self):
+        summary, _ = analyze([
+            row(0, "mark"), row(10, "input", 0, 0x201),
+            row(10, "run_start", 1), row(12, "run_end", 1, 0, 2_000_000),
+            row(12, "poll_idle", 0, 1000, 1), row(13, "host_wait", 0, 1_000_000, 1_000_000),
+            row(13, "run_start", 1), row(14, "run_end", 1, 0, 1_000_000),
+            row(17, "host_wait", 0, 4_000_000, 3_000_000, 1), row(18, "frame", 1, 1),
+            row(20, "observe"),
+        ])
+        press = summary["input_responses"][0]
+        self.assertEqual((press["frames"], press["first_frame_ms"], press["longest_gap_ms"]), (1, 8, 8))
+        budget = press["longest_gap_budget"]
+        self.assertEqual((budget["run_ms"], budget["poll_wait_ms"], budget["blocked_wait_ms"]), (3, 1, 3))
+        self.assertEqual(summary["host_waits"]["polling_count"], 1)
+
     def test_stolen_lock_starts_new_attempt_without_reusing_old_owner(self):
         summary, waits = analyze([
             row(0, "mark"), row(0, "cs_take", 1, 16, 1),

@@ -9,6 +9,9 @@
 //! compute_round: offered contexts, scope wall ns, admitted contexts.
 //! Lease-to-collect includes queueing and completion delivery, not worker CPU time.
 //! frame: completed guest-frame serial (not a shell observation or scanout).
+//! poll_idle: guest µs to the round's deadline (u64::MAX for none), 1 if every ready context
+//! settled (PROC-CLOCK-5) else 0 (quiet round). host_wait (stamped at its end):
+//! requested ns, waited ns, 1 if signaled. input: message, wparam, lparam.
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -27,7 +30,7 @@ impl ScheduleTrace {
         Ok(Self {
             sink: Some(sink),
             start: Some(Instant::now()),
-            remaining: 1_000_000,
+            remaining: 30_000_000,
             ..Self::default()
         })
     }
