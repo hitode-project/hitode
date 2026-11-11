@@ -75,6 +75,11 @@ impl PollProgress {
         self.clock = true;
     }
 
+    /// A direct body read the message queue without a host call.
+    pub(crate) fn saw_event(&mut self) {
+        self.sensed = true;
+    }
+
     /// Guest instructions completed by one run of the context.
     pub(crate) fn ran(&mut self, retired: u64) {
         self.retired = self.retired.wrapping_add(retired);
@@ -163,6 +168,17 @@ mod tests {
         interval(&mut progress, &[(4, None)], 10);
         interval(&mut progress, &[(3, None), (2, None), (1, None)], 10);
         assert!(!progress.settled(), "order is part of the interval");
+    }
+
+    #[test]
+    fn direct_body_peeks_are_observations_not_computation() {
+        // A hundred empty peeks completed in guest code, then the handoff.
+        let mut progress = PollProgress::default();
+        for _ in 0..=STREAK {
+            progress.saw_event();
+            interval(&mut progress, &[], 3_000);
+        }
+        assert!(progress.settled() && progress.timeless());
     }
 
     #[test]

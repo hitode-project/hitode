@@ -92,6 +92,7 @@ Clock leaves MUST preserve guest polling observations and decline required waits
 An interval that read no clock, saw no event and made no host call besides its yield changes only through guest memory. Once it retires more instructions than a memory spin's lap, it is computing and MUST NOT count as a repeat.
 CPU spin handoffs MUST leave the context ready and MUST NOT qualify as a polling or idle proof.
 Completed computations MUST contribute their retired instructions to the same accounting as owner execution.
+Direct bodies that read the clock or find the message queue empty MUST record those observations like host calls.
 **Verification**: Test
 
 ### PROC-CLOCK-6 Timer ticks

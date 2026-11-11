@@ -7,6 +7,8 @@ pub struct Thread {
     pub(crate) new_work: Cell<bool>,
     /// A direct body read the clock (PROC-CLOCK-7).
     pub(crate) clock_read: Cell<bool>,
+    /// A direct body found the message queue empty (PROC-CLOCK-5).
+    pub(crate) peeked: Cell<bool>,
 }
 
 /// Windows 11 empty A/W peeks, including PM_NOYIELD, hand off about once per
@@ -15,6 +17,7 @@ pub struct Thread {
 /// `services.thread_state` must name the current context's live shared Thread.
 pub unsafe fn empty_peek(services: adv_cpu::body::Services) -> bool {
     let thread = unsafe { &*services.thread_state.cast::<Thread>() };
+    thread.peeked.set(true);
     let count = thread.empty_peeks.get() + 1;
     thread.empty_peeks.set(if count == 100 { 0 } else { count });
     count == 100

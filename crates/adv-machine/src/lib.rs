@@ -3083,6 +3083,9 @@ impl<B: Backend> Machine<B> {
                 if self.cpu.take_clock_read() | c.services.clock_read.replace(false) {
                     c.progress.read_clock();
                 }
+                if c.services.peeked.replace(false) {
+                    c.progress.saw_event();
+                }
                 c.progress.ran(retired);
             }
             if self.sys.schedule_trace.enabled() {
