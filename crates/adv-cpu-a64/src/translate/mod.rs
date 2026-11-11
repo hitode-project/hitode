@@ -182,6 +182,7 @@ pub struct Workspace {
 #[derive(Default)]
 pub struct Code {
     asm: Asm,
+    x87: x87::Scratch,
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
     /// Out-of-line paths with the guest instruction they serve.
@@ -517,6 +518,7 @@ struct Translator<'a> {
     uses_permissions: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
+    x87_scratch: &'a mut x87::Scratch,
     /// Sites inside such runs and the stubs that publish before faulting.
     x87_sites: Vec<(usize, Label)>,
     /// The x87 control word when translating, which runs specialize for.
@@ -592,6 +594,7 @@ impl Backend for Jit<'_> {
 impl Jit<'_> {
     fn lower_form(&mut self, unit: &mut Unit, eip: u32, computation: bool) {
         self.code.asm.reset();
+        self.code.x87.reset(unit.trace.len());
         while self.emit_unit(unit, eip, computation) {
             self.code.asm.rewind();
         }
@@ -601,6 +604,7 @@ impl Jit<'_> {
     fn emit_unit(&mut self, unit: &mut Unit, eip: u32, computation: bool) -> bool {
         let Code {
             asm,
+            x87: x87_scratch,
             labels,
             sites,
             cold,
@@ -648,6 +652,7 @@ impl Jit<'_> {
             entry: residency::entries(trace, self.checked),
             uses_permissions,
             x87: x87::Cache::for_trace(trace),
+            x87_scratch,
             x87_sites: Vec::new(),
             control: self.control,
             pe: self.pe,
@@ -667,6 +672,7 @@ impl Jit<'_> {
                 }
             },
         };
+        t.x87_prepare();
         if trace.len() == 0 {
             // Nothing to translate: other units may still link here.
             t.exit(Exit::Interpret, eip);

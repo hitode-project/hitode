@@ -20,6 +20,11 @@
 //! the merge model; resident arrivals retain their reconciliation code.
 //! Integer-only loops carry the same model around their backedges. Native
 //! paths can resume a run beyond intervening fallback segments in trace order.
+//!
+//! Planning reuses the back end's scratch and indexes arrivals and ownership.
+//! Component reachability and prefix facts reject impossible loop attempts.
+//! Memo keys retain the start, effective bound and ownership epoch; starts
+//! with different entry constraints still receive their own fixed points.
 
 use adv_cpu_core::floating::fast::{Fast, Source};
 
@@ -664,6 +669,103 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
     (crossings, controls)
 }
 
+type Stack = ([Known; 8], u8);
+type Plan = (usize, Need, Vec<(usize, Model)>);
+type Plans = std::collections::HashMap<(usize, usize), (usize, Option<Plan>)>;
+
+/// Forward arrivals retain insertion order, with a chain per target.
+#[derive(Default)]
+struct Pending {
+    at: Vec<Option<(usize, usize)>>,
+    edges: Vec<(Stack, Option<usize>)>,
+    targets: Vec<usize>,
+    last: usize,
+}
+
+impl Pending {
+    fn reset(&mut self, len: usize) {
+        self.at.clear();
+        self.at.resize(len, None);
+        self.edges.clear();
+        self.edges.reserve(2 * len);
+        self.targets.clear();
+        self.targets.reserve(len);
+        self.last = 0;
+    }
+
+    fn clear(&mut self) {
+        self.edges.clear();
+        for target in self.targets.drain(..) {
+            self.at[target] = None;
+        }
+        self.last = 0;
+    }
+
+    fn push(&mut self, to: usize, state: Stack) {
+        let index = self.edges.len();
+        self.edges.push((state, None));
+        if let Some((first, last)) = self.at[to] {
+            self.edges[last].1 = Some(index);
+            self.at[to] = Some((first, index));
+        } else {
+            self.targets.push(to);
+            self.at[to] = Some((index, index));
+        }
+        self.last = self.last.max(to);
+    }
+}
+
+/// Work buffers and results for one translation, including layout retries.
+/// Loop keys retain start and bound: both affect reachable backedges and stack
+/// requirements. Loop entry is always Unknown at delta zero; control, PE,
+/// access policy and residency are fixed for the translation. Only ownership
+/// changes. Successes require the same ownership epoch; failures also hold
+/// after more instructions become owned. Helper suffixes use their actual
+/// entry model and stored merges and do not share the loop memo tables.
+#[derive(Default)]
+pub(in super::super) struct Scratch {
+    states: Vec<Option<([Known; 8], u8)>>,
+    touched: Vec<usize>,
+    work: std::collections::VecDeque<usize>,
+    models: Vec<(usize, Model)>,
+    member: Vec<usize>,
+    heads: Vec<(usize, Option<Stack>)>,
+    head_at: Vec<Option<usize>>,
+    pending: Pending,
+    seen: Vec<bool>,
+    order: Vec<usize>,
+    stack: Vec<(usize, usize)>,
+    component: Vec<usize>,
+    members: Vec<usize>,
+    component_ends: Vec<usize>,
+    component_max: Vec<usize>,
+    component_head: Vec<Option<usize>>,
+    arrivals: Plans,
+    ordered: Plans,
+}
+
+impl Scratch {
+    pub(in super::super) fn reset(&mut self, len: usize) {
+        self.states.clear();
+        self.states.resize(len, None);
+        self.touched.clear();
+        self.touched.reserve(len);
+        self.work.clear();
+        self.work.reserve(len);
+        self.models.clear();
+        self.models.reserve(len);
+        self.member.clear();
+        self.member.resize(len, 0);
+        self.heads.clear();
+        self.heads.reserve(len);
+        self.head_at.clear();
+        self.head_at.resize(len, None);
+        self.pending.reset(len);
+        self.arrivals.clear();
+        self.ordered.clear();
+    }
+}
+
 /// A cyclic run can have several emission segments, separated by paths
 /// that leave it. Its models and hot labels survive those intervening paths.
 #[derive(Clone)]
@@ -700,10 +802,26 @@ pub(in super::super) struct Cache {
     bound: bool,
     /// Backward edges in emission order, as (head, latch).
     loops: Vec<(usize, usize)>,
+    loop_head: Vec<bool>,
     /// Separate hot labels where canonical arrivals need a cold entry.
     entries: Vec<(usize, Label)>,
     /// Cyclic runs with later emission segments.
     runs: Vec<Run>,
+    /// The sparse run that owns each instruction, if any.
+    owners: Vec<Option<usize>>,
+    /// Largest forward-edge source or memory crossing through each end.
+    arrival_from: Vec<Option<usize>>,
+    /// Native suffix endpoint after each possible loop latch.
+    extended: Vec<usize>,
+    /// Prefix counts of instructions an ordered loop cannot contain.
+    barriers: Vec<usize>,
+    incoming: Vec<Vec<usize>>,
+    native: Vec<bool>,
+    successors: Vec<[Option<usize>; 2]>,
+    /// Reachability ceiling before applying a start's lower bound.
+    furthest: Vec<usize>,
+    /// Largest unowned backedge target reachable within that ceiling.
+    cycle_head: Vec<Option<usize>>,
     /// The canonical label to restore after binding a merge's hot label.
     binding: Option<(usize, Label)>,
     /// Where an internal arrival enters a run that starts at a loop head.
@@ -720,10 +838,14 @@ pub(in super::super) struct Cache {
 impl Cache {
     pub(in super::super) fn for_trace(trace: &Trace) -> Self {
         let mut loops = Vec::new();
+        let mut loop_head = vec![false; trace.len()];
+        let mut incoming = vec![Vec::new(); trace.len()];
         for from in 0..trace.len() {
             for to in edges(trace, from) {
+                incoming[to].push(from);
                 if to <= from {
                     loops.push((to, from));
+                    loop_head[to] = true;
                 }
             }
         }
@@ -732,12 +854,189 @@ impl Cache {
             crossings,
             controls,
             loops,
+            loop_head,
+            incoming,
+            owners: vec![None; trace.len()],
             ..Self::default()
         }
     }
 }
 
 impl Translator<'_> {
+    pub(in super::super) fn x87_prepare(&mut self) {
+        let len = self.trace.len();
+        self.x87_scratch.member.fill(0);
+        self.x87.cycle_head.resize(len, None);
+        if self.x87.loops.is_empty()
+            || !(0..len).any(|index| {
+                self.cacheable(index)
+                    .is_some_and(|x| !matches!(x.fast, Fast::Leaf(_)))
+            })
+        {
+            return;
+        }
+        self.x87.arrival_from.resize(len, None);
+        let mut last = None;
+        let mut crossing = 0;
+        for index in 0..len {
+            if self.x87.crossings.get(crossing) == Some(&index) {
+                last = Some(index);
+                crossing += 1;
+            }
+            for &from in &self.x87.incoming[index] {
+                if from < index {
+                    last = Some(last.map_or(from, |previous| previous.max(from)));
+                }
+            }
+            self.x87.arrival_from[index] = last;
+        }
+        self.x87.extended.resize(len, 0);
+        for index in (0..len).rev() {
+            self.x87.extended[index] = if index + 1 < len
+                && !self.trace.head(index + 1)
+                && (self.cacheable(index + 1).is_some() || self.joins(index + 1))
+            {
+                self.x87.extended[index + 1]
+            } else {
+                index
+            };
+        }
+        self.x87.native = (0..len)
+            .map(|index| {
+                self.cacheable(index)
+                    .is_some_and(|x| !matches!(x.fast, Fast::Leaf(_)))
+                    || self.joins(index)
+            })
+            .collect();
+        self.x87_reachability();
+    }
+
+    /// Compute native reachability on the component DAG. Heads have no
+    /// incoming edges: returning to the starting head cannot enlarge reach.
+    /// Owned nodes are terminal failures, so bounds cannot hide a refusal.
+    fn x87_reachability(&mut self) {
+        let len = self.trace.len();
+        self.x87.barriers.clear();
+        self.x87.barriers.push(0);
+        self.x87.successors.clear();
+        for index in 0..len {
+            let barrier = usize::from(self.trace.head(index))
+                + usize::from(!self.x87.native[index] || self.x87.owners[index].is_some());
+            self.x87.barriers.push(self.x87.barriers[index] + barrier);
+            let mut successors = [None; 2];
+            if self.x87.native[index] && self.x87.owners[index].is_none() {
+                let fall = (self.trace.insts[index].next == Next::Fall).then_some(index + 1);
+                for (slot, to) in successors
+                    .iter_mut()
+                    .zip(edges(self.trace, index).chain(fall))
+                {
+                    if to < len && self.x87.native[to] && !self.trace.head(to) {
+                        *slot = Some(to);
+                    }
+                }
+            }
+            self.x87.successors.push(successors);
+        }
+        let scratch = &mut *self.x87_scratch;
+        scratch.seen.clear();
+        scratch.seen.resize(len, false);
+        scratch.order.clear();
+        scratch.stack.clear();
+        for root in 0..len {
+            if scratch.seen[root] {
+                continue;
+            }
+            scratch.seen[root] = true;
+            scratch.stack.push((root, 0));
+            while let Some((index, edge)) = scratch.stack.last_mut() {
+                if *edge == 2 {
+                    scratch.order.push(*index);
+                    scratch.stack.pop();
+                } else {
+                    let to = self.x87.successors[*index][*edge];
+                    *edge += 1;
+                    if let Some(to) = to
+                        && !scratch.seen[to]
+                    {
+                        scratch.seen[to] = true;
+                        scratch.stack.push((to, 0));
+                    }
+                }
+            }
+        }
+        scratch.component.clear();
+        scratch.component.resize(len, usize::MAX);
+        scratch.members.clear();
+        scratch.component_ends.clear();
+        scratch.component_max.clear();
+        scratch.component_head.clear();
+        scratch.work.clear();
+        for &root in scratch.order.iter().rev() {
+            if scratch.component[root] != usize::MAX {
+                continue;
+            }
+            let component = scratch.component_ends.len();
+            scratch.component[root] = component;
+            scratch.work.push_back(root);
+            let mut furthest = root;
+            let mut head = None;
+            while let Some(index) = scratch.work.pop_front() {
+                scratch.members.push(index);
+                furthest = furthest.max(index);
+                if self.x87.native[index] && self.x87.owners[index].is_none() {
+                    for to in backedge(self.trace, index) {
+                        if self.x87.native[to] && self.x87.owners[to].is_none() {
+                            head = Some(head.map_or(to, |previous: usize| previous.max(to)));
+                        }
+                    }
+                }
+                if self.trace.head(index) || !self.x87.native[index] {
+                    continue;
+                }
+                let fall = (index > 0 && self.trace.insts[index - 1].next == Next::Fall)
+                    .then_some(index.wrapping_sub(1));
+                for from in self.x87.incoming[index].iter().copied().chain(fall) {
+                    if self.x87.native[from]
+                        && self.x87.owners[from].is_none()
+                        && scratch.component[from] == usize::MAX
+                    {
+                        scratch.component[from] = component;
+                        scratch.work.push_back(from);
+                    }
+                }
+            }
+            scratch.component_ends.push(scratch.members.len());
+            scratch.component_max.push(furthest);
+            scratch.component_head.push(head);
+        }
+        for component in (0..scratch.component_ends.len()).rev() {
+            let begin = if component == 0 {
+                0
+            } else {
+                scratch.component_ends[component - 1]
+            };
+            for &index in &scratch.members[begin..scratch.component_ends[component]] {
+                for to in self.x87.successors[index].into_iter().flatten() {
+                    let target = scratch.component[to];
+                    scratch.component_max[component] =
+                        scratch.component_max[component].max(scratch.component_max[target]);
+                    if let Some(head) = scratch.component_head[target] {
+                        scratch.component_head[component] = Some(
+                            scratch.component_head[component]
+                                .map_or(head, |previous| previous.max(head)),
+                        );
+                    }
+                }
+            }
+        }
+        self.x87.furthest.clear();
+        self.x87.cycle_head.clear();
+        for component in scratch.component.iter().copied() {
+            self.x87.furthest.push(scratch.component_max[component]);
+            self.x87.cycle_head.push(scratch.component_head[component]);
+        }
+    }
+
     pub(super) fn x87_saved_control(&self) -> bool {
         self.x87.active && self.x87.controls.contains(&self.index)
     }
@@ -788,13 +1087,25 @@ impl Translator<'_> {
     /// The last instruction of a run from `start` in state `from`, what
     /// it needs, and the states of its merges, which are `stored` once the
     /// run is open; `None` when not even the first fits.
-    #[allow(clippy::type_complexity)]
     fn plan(
+        &mut self,
+        start: usize,
+        from: Model,
+        stored: Option<&[(usize, Model)]>,
+    ) -> Option<Plan> {
+        let mut scratch = std::mem::take(self.x87_scratch);
+        let result = self.plan_with(start, from, stored, &mut scratch);
+        *self.x87_scratch = scratch;
+        result
+    }
+
+    fn plan_with(
         &self,
         start: usize,
         from: Model,
         stored: Option<&[(usize, Model)]>,
-    ) -> Option<(usize, Need, Vec<(usize, Model)>)> {
+        scratch: &mut Scratch,
+    ) -> Option<Plan> {
         let mut known = known(from);
         let mut need = Need::default();
         for (at, slot) in from.slots.iter().enumerate() {
@@ -807,20 +1118,17 @@ impl Translator<'_> {
         let mut delta = from.delta;
         // A helper can resume into the integer-only tail of an open run.
         let mut end = stored.map(|_| start);
-        let mut merges = Vec::new();
-        // Forward edges from the run: target, slots and TOP.
-        let mut pending: Vec<(usize, [Known; 8], u8)> = Vec::new();
+        let merges = &mut scratch.models;
+        merges.clear();
+        let pending = &mut scratch.pending;
+        pending.clear();
+        let mut stored_at = 0;
         // Whether the instruction before jumps instead of falling through.
         let mut gap = false;
         let mut after_leaf = false;
         let mut pe_at = None;
         'run: for index in start..self.trace.len() {
-            if self
-                .x87
-                .runs
-                .iter()
-                .any(|r| r.models.iter().any(|m| m.0 == index))
-            {
+            if self.x87.owners[index].is_some() {
                 break;
             }
             if index != start && self.trace.head(index) {
@@ -831,21 +1139,28 @@ impl Translator<'_> {
             }
             if index != start && self.trace.merge[index] {
                 let met = match stored {
-                    Some(stored) => match stored.iter().find(|m| m.0 == index) {
-                        Some(&(_, model)) => model,
-                        None => break,
-                    },
+                    Some(stored) => {
+                        while stored_at < stored.len() && stored[stored_at].0 < index {
+                            stored_at += 1;
+                        }
+                        match stored.get(stored_at) {
+                            Some(&(at, model)) if at == index => model,
+                            _ => break,
+                        }
+                    }
                     None => {
-                        let arrivals: Vec<_> = pending.iter().filter(|p| p.0 == index).collect();
-                        if gap && arrivals.is_empty() {
+                        let first = pending.at[index].map(|at| at.0);
+                        if gap && first.is_none() {
                             break;
                         }
                         if gap {
-                            (_, known, delta) = *arrivals[0];
+                            (known, delta) = pending.edges[first.unwrap()].0;
                         }
                         let mut met = known;
-                        for &&(_, slots, arrival) in &arrivals {
-                            if arrival != delta {
+                        let mut arrival = first;
+                        while let Some(at) = arrival {
+                            let ((slots, top), next) = pending.edges[at];
+                            if top != delta {
                                 break 'run;
                             }
                             for r in 0..8 {
@@ -854,6 +1169,7 @@ impl Translator<'_> {
                                 };
                                 met[r] = k;
                             }
+                            arrival = next;
                         }
                         let model = canonical(met, delta);
                         merges.push((index, model));
@@ -863,10 +1179,12 @@ impl Translator<'_> {
                 // An arrival that has not read a value the merge holds
                 // fetches it.
                 for (r, slot) in met.slots.iter().enumerate() {
-                    let unread = (!gap && known[r] == Known::Unknown)
-                        || pending
-                            .iter()
-                            .any(|p| p.0 == index && p.1[r] == Known::Unknown);
+                    let mut unread = !gap && known[r] == Known::Unknown;
+                    let mut arrival = pending.at[index].map(|at| at.0);
+                    while let Some(at) = arrival {
+                        unread |= pending.edges[at].0.0[r] == Known::Unknown;
+                        arrival = pending.edges[at].1;
+                    }
                     if matches!(slot, Slot::Dirty(_)) && unread {
                         need.value |= 1 << r;
                     }
@@ -878,7 +1196,7 @@ impl Translator<'_> {
             match self.cacheable(index) {
                 Some(x) => {
                     if matches!(x.fast, Fast::Leaf(_)) {
-                        if pending.iter().any(|p| p.0 > index) {
+                        if pending.last > index {
                             break;
                         }
                         known = [Known::Unknown; 8];
@@ -915,12 +1233,12 @@ impl Translator<'_> {
                         break;
                     }
                     if let Some(Edge::Internal(to)) = self.trace.insts[index].taken {
-                        pending.push((to, known, delta));
+                        pending.push(to, (known, delta));
                     }
                     if let Next::Edge(Edge::Internal(to)) = self.trace.insts[index].next
                         && to > index
                     {
-                        pending.push((to, known, delta));
+                        pending.push(to, (known, delta));
                         gap = true;
                         continue;
                     }
@@ -934,27 +1252,14 @@ impl Translator<'_> {
         let end = end?;
         need.pe = pe_at.is_some_and(|index| index < end);
         merges.retain(|m| m.0 <= end);
-        Some((end, need, merges))
+        Some((end, need, merges.clone()))
     }
 
     /// Memory exchanges and loops with forward arrivals use a model at every
     /// arrival point. Other loops retain their ordered plan and emitted code.
-    #[allow(clippy::type_complexity)]
-    fn plan_loop(&self, start: usize, end: usize) -> Option<(usize, Need, Vec<(usize, Model)>)> {
-        if self
-            .x87
-            .crossings
-            .iter()
-            .any(|&at| at >= start && at <= end)
-            || (start..=end).any(|from| edges(self.trace, from).any(|to| to > from && to <= end))
-        {
-            let extended = (end + 1..self.trace.len())
-                .take_while(|&index| {
-                    !self.trace.head(index)
-                        && (self.cacheable(index).is_some() || self.joins(index))
-                })
-                .last()
-                .unwrap_or(end);
+    fn plan_loop(&mut self, start: usize, end: usize) -> Option<Plan> {
+        if self.x87.arrival_from[end].is_some_and(|from| from >= start) {
+            let extended = self.x87.extended[end];
             self.plan_arrivals(start, extended)
                 .or_else(|| self.plan_arrivals(start, end))
                 .or_else(|| self.plan_ordered_loop(start, end))
@@ -965,24 +1270,39 @@ impl Translator<'_> {
 
     /// Follow native edges, retaining a model at each member. Unsupported
     /// paths leave the run; native backedges can reach later emission segments.
-    #[allow(clippy::type_complexity)]
-    fn plan_arrivals(
-        &self,
-        start: usize,
-        end: usize,
-    ) -> Option<(usize, Need, Vec<(usize, Model)>)> {
-        let mut states = vec![None; end + 1];
+    fn plan_arrivals(&mut self, start: usize, end: usize) -> Option<Plan> {
+        // Bounds beyond native reach see exactly the same graph. Keep one
+        // extra index to preserve the strict PE-candidate comparison.
+        let end = end.min(self.x87.furthest[start] + 1);
+        let epoch = self.x87.runs.len();
+        if let Some((previous, plan)) = self.x87_scratch.arrivals.get(&(start, end))
+            && (plan.is_none() && *previous <= epoch || *previous == epoch)
+        {
+            return plan.clone();
+        }
+        let mut scratch = std::mem::take(self.x87_scratch);
+        let result = self.plan_arrivals_with(start, end, &mut scratch);
+        scratch
+            .arrivals
+            .insert((start, end), (epoch, result.clone()));
+        *self.x87_scratch = scratch;
+        result
+    }
+
+    fn plan_arrivals_with(&self, start: usize, end: usize, scratch: &mut Scratch) -> Option<Plan> {
+        for index in scratch.touched.drain(..) {
+            scratch.states[index] = None;
+        }
+        let states = &mut scratch.states;
         states[start] = Some(([Known::Unknown; 8], 0));
-        let mut work = std::collections::VecDeque::from([start]);
+        scratch.touched.push(start);
+        let work = &mut scratch.work;
+        work.clear();
+        work.push_back(start);
         let mut need = Need::default();
         let mut seen_x87 = false;
         while let Some(index) = work.pop_front() {
-            if self
-                .x87
-                .runs
-                .iter()
-                .any(|r| r.models.iter().any(|m| m.0 == index))
-            {
+            if self.x87.owners[index].is_some() {
                 return None;
             }
             let (mut slots, mut delta) = states[index]?;
@@ -1026,6 +1346,9 @@ impl Translator<'_> {
                     }
                 }
                 if states[to] != Some(incoming) {
+                    if states[to].is_none() {
+                        scratch.touched.push(to);
+                    }
                     states[to] = Some(incoming);
                     work.push_back(to);
                 }
@@ -1053,60 +1376,84 @@ impl Translator<'_> {
                 return None;
             }
         }
-        let merges = (start..=end)
-            .filter_map(|index| {
-                let (slots, delta) = states[index]?;
-                Some((
-                    index,
-                    Model {
-                        shared: true,
-                        ..loop_model(slots, delta)
-                    },
-                ))
-            })
-            .collect();
-        Some((end, need, merges))
+        scratch.models.clear();
+        scratch.models.extend((start..=end).filter_map(|index| {
+            let (slots, delta) = states[index]?;
+            Some((
+                index,
+                Model {
+                    shared: true,
+                    ..loop_model(slots, delta)
+                },
+            ))
+        }));
+        Some((end, need, scratch.models.clone()))
     }
 
     /// Proves every arrival at each loop head has the same TOP and tag
     /// model. Starting with forward arrivals, widen the slots to retain
     /// until the backedges no longer add a value to the entry model.
-    #[allow(clippy::type_complexity)]
-    fn plan_ordered_loop(
+    fn plan_ordered_loop(&mut self, start: usize, end: usize) -> Option<Plan> {
+        if self.x87.barriers[end + 1] - self.x87.barriers[start]
+            > usize::from(self.trace.head(start))
+        {
+            return None;
+        }
+        let epoch = self.x87.runs.len();
+        if let Some((previous, plan)) = self.x87_scratch.ordered.get(&(start, end))
+            && (plan.is_none() && *previous <= epoch || *previous == epoch)
+        {
+            return plan.clone();
+        }
+        let mut scratch = std::mem::take(self.x87_scratch);
+        let result = self.plan_ordered_loop_with(start, end, &mut scratch);
+        scratch
+            .ordered
+            .insert((start, end), (epoch, result.clone()));
+        *self.x87_scratch = scratch;
+        result
+    }
+
+    fn plan_ordered_loop_with(
         &self,
         start: usize,
         end: usize,
-    ) -> Option<(usize, Need, Vec<(usize, Model)>)> {
-        let mut heads: Vec<_> = self
-            .x87
-            .loops
-            .iter()
-            .filter(|&&(to, from)| to >= start && from <= end)
-            .map(|&(to, _)| (to, None))
-            .collect();
-        heads.sort_unstable_by_key(|h| h.0);
-        heads.dedup_by_key(|h| h.0);
+        scratch: &mut Scratch,
+    ) -> Option<Plan> {
+        let heads = &mut scratch.heads;
+        for &(index, _) in heads.iter() {
+            scratch.head_at[index] = None;
+        }
+        heads.clear();
+        for &(to, from) in &self.x87.loops {
+            if to >= start && from <= end {
+                scratch.head_at[to] = Some(usize::MAX);
+            }
+        }
+        for index in start..=end {
+            if scratch.head_at[index].is_some() {
+                scratch.head_at[index] = Some(heads.len());
+                heads.push((index, None));
+            }
+        }
         let mut changed = true;
         while changed {
             changed = false;
             let mut need = Need::default();
-            let mut merges = Vec::new();
-            let mut pending = Vec::new();
+            let merges = &mut scratch.models;
+            merges.clear();
+            let pending = &mut scratch.pending;
+            pending.clear();
             let mut model = Some(([Known::Unknown; 8], 0));
             let mut seen_x87 = false;
             for index in start..=end {
-                if self
-                    .x87
-                    .runs
-                    .iter()
-                    .any(|r| r.models.iter().any(|m| m.0 == index))
-                {
+                if self.x87.owners[index].is_some() {
                     return None;
                 }
                 if index != start && self.trace.head(index) {
                     return None;
                 }
-                let head = heads.binary_search_by_key(&index, |h| h.0).ok();
+                let head = scratch.head_at[index];
                 if self.trace.merge[index] || head.is_some() {
                     let mut meet = |incoming: ([Known; 8], u8)| -> Option<()> {
                         let Some((ref mut slots, delta)) = model else {
@@ -1129,10 +1476,11 @@ impl Translator<'_> {
                         }
                         Some(())
                     };
-                    for &(to, incoming) in &pending {
-                        if to == index {
-                            meet(incoming)?;
-                        }
+                    let mut arrival = pending.at[index].map(|at| at.0);
+                    while let Some(at) = arrival {
+                        let (incoming, next) = pending.edges[at];
+                        meet(incoming)?;
+                        arrival = next;
                     }
                     if let Some(h) = head {
                         if let Some(seed) = heads[h].1 {
@@ -1162,9 +1510,9 @@ impl Translator<'_> {
                 let state = (slots, delta);
                 for to in edges(self.trace, index) {
                     if to > index && to <= end {
-                        pending.push((to, state));
+                        pending.push(to, state);
                     } else if to >= start && to <= index {
-                        let h = heads.binary_search_by_key(&to, |h| h.0).ok()?;
+                        let h = scratch.head_at[to]?;
                         let (seed, top) = heads[h].1.as_mut()?;
                         if *top != delta {
                             return None;
@@ -1190,7 +1538,7 @@ impl Translator<'_> {
                 ) {
                     return None;
                 }
-                return Some((end, need, merges));
+                return Some((end, need, merges.clone()));
             }
         }
         unreachable!()
@@ -1287,9 +1635,11 @@ impl Translator<'_> {
         let done = self.x87.done.expect("an open run");
         let next = (!self.x87.dispatch && index < self.x87.end).then(|| {
             // A merge next reconciles from this state first.
+            let merges = std::mem::take(&mut self.x87.merges);
             let (_, mut need, _) = self
-                .plan(index + 1, model, Some(&self.x87.merges))
+                .plan(index + 1, model, Some(&merges))
                 .expect("a planned run");
+            self.x87.merges = merges;
             need.pe = self.x87.pe;
             (self.x87.hot[offset + 1], self.x87.help[offset + 1], need)
         });
@@ -1663,12 +2013,7 @@ impl Translator<'_> {
 
     pub(in super::super) fn x87_start_integer(&mut self) {
         if !self.x87.active
-            && (self.x87.loops.iter().any(|&(to, _)| to == self.index)
-                || self
-                    .x87
-                    .runs
-                    .iter()
-                    .any(|r| r.continuations.iter().any(|c| c.0 == self.index)))
+            && (self.x87.loop_head[self.index] || self.x87.owners[self.index].is_some())
         {
             self.x87_open();
         }
@@ -1677,13 +2022,8 @@ impl Translator<'_> {
     /// The prologue of a run from the current instruction.
     fn x87_open(&mut self) -> bool {
         let start = self.index;
-        if let Some(run) = self
-            .x87
-            .runs
-            .iter()
-            .find(|r| r.continuations.iter().any(|c| c.0 == start))
-            .cloned()
-        {
+        if let Some(owner) = self.x87.owners[start] {
+            let run = self.x87.runs[owner].clone();
             let position = run.models.iter().position(|m| m.0 == start).unwrap();
             let end = run.models[position..]
                 .iter()
@@ -1717,13 +2057,21 @@ impl Translator<'_> {
             self.x87.loop_entry = Some(hot);
             return true;
         }
-        let loop_plan = self
-            .x87
-            .loops
-            .iter()
-            .rev()
-            .filter(|&&(to, _)| to >= start)
-            .find_map(|&(_, end)| self.plan_loop(start, end));
+        let mut loop_plan = None;
+        let candidates = if self.x87.cycle_head[start].is_some_and(|head| head >= start) {
+            self.x87.loops.len()
+        } else {
+            0
+        };
+        for index in (0..candidates).rev() {
+            let (to, end) = self.x87.loops[index];
+            if to >= start {
+                loop_plan = self.plan_loop(start, end);
+                if loop_plan.is_some() {
+                    break;
+                }
+            }
+        }
         let cyclic = loop_plan.is_some();
         let Some((end, need, merges)) = loop_plan.or_else(|| {
             self.cacheable(start)?;
@@ -1759,19 +2107,24 @@ impl Translator<'_> {
         self.x87.pe = need.pe;
         self.x87.control_stable = cyclic && self.stable_control(start, end);
         self.x87.entries.clear();
+        if sparse {
+            for &(index, _) in &self.x87.merges {
+                self.x87_scratch.member[index] = start + 1;
+            }
+        }
         let mut continuations = Vec::new();
         for (index, model) in self.x87.merges.clone() {
             if index == start || !self.trace.merge[index] {
                 continue;
             }
-            let segment = sparse && !self.x87.merges.iter().any(|m| m.0 + 1 == index);
+            let segment = sparse && self.x87_scratch.member[index - 1] != start + 1;
             let outside = (segment && self.trace.insts[index - 1].next == Next::Fall)
-                || (0..self.trace.len()).any(|from| {
-                    (if sparse {
-                        !self.x87.merges.iter().any(|m| m.0 == from)
+                || self.x87.incoming[index].iter().any(|&from| {
+                    if sparse {
+                        self.x87_scratch.member[from] != start + 1
                     } else {
                         from < start || from > end
-                    }) && edges(self.trace, from).any(|to| to == index)
+                    }
                 });
             if !outside && !segment {
                 continue;
@@ -1860,12 +2213,17 @@ impl Translator<'_> {
             }
         }
         if sparse {
+            let owner = self.x87.runs.len();
+            for &(index, _) in &self.x87.merges {
+                self.x87.owners[index] = Some(owner);
+            }
             self.x87.runs.push(Run {
                 models: self.x87.merges.clone(),
                 entries: self.x87.entries.clone(),
                 continuations,
                 need,
             });
+            self.x87_reachability();
         }
         self.remark(Part::Body);
         true

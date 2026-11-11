@@ -42,7 +42,7 @@ use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16,
 
 mod cache;
 mod pair;
-pub(super) use cache::{Arrive, Cache, Cold, Leave, Model};
+pub(super) use cache::{Arrive, Cache, Cold, Leave, Model, Scratch};
 
 const X7: Reg = Reg::new(7);
 const X8: Reg = Reg::new(8);
