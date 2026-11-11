@@ -42,7 +42,7 @@ Bring your own games and keep them anywhere outside the repository. Tools find t
 - Headless checks are yours to run. The felt experience in a window, such as stutter, audio and input response, is confirmed by a person.
 - Report compatibility by stage, separately for each engine and entry path: S1 starts and logs its first gap, S2 the title screen responds, S3 sound and basic play work, S4 a chapter finishes. A smoke run that draws frames proves only S1.
 - Widen an API's implementation only on evidence of a real call or an observable difference. A static import, a DLL name or an optional probe is not evidence.
-- Back a speed claim with a short A/B on a fixed binary, configuration, code page and input, and state those conditions. Headless throughput is not the felt experience.
+- Back a speed claim with its mechanism and with counts that do not depend on machine load, such as retired instructions, host calls, work per frame or generated code bytes. Timing two builds against each other is not evidence. Headless throughput is not the felt experience.
 - Say in the pull request how you verified the change and what still needs a person.
 
 ## Switches

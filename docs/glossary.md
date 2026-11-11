@@ -41,6 +41,6 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | strict | strict | API strict stops at an unimplemented diagnostic stub. `ADV_JIT_VERIFY=strict` is a separate CPU check policy. Always write the full name. |
 | smoke | 冒烟 | A short start of one game per engine. It passes when frames are produced and no new structural gap appears; it does not show that the title is playable. |
 | full run | 全量 | The whole workspace test suite or the full sample matrix. It runs when batching changes or updating the compatibility baseline, not for each change. |
-| headed / headless | 有头／无头 | A headed run shows a window and is judged by the user. A headless run has no window; agents use short headless A/B runs to check mechanisms, and headless throughput says nothing about the headed experience. |
+| headed / headless | 有头／无头 | A headed run shows a window and is judged by the user. A headless run has no window; agents use headless runs to check mechanisms through counts, and headless throughput says nothing about the headed experience. |
 | cold start / warm start | 冷启动／热启动 | A cold start has no warm profile and no code cache. A warm start reuses one of them and states which. Neither implies clearing the operating system file cache. |
 | feature / comparison / diagnostic switch | 功能／对照／诊断开关 | A feature switch changes what the program can do. A comparison switch selects an old or new implementation to verify a migration. A diagnostic switch only observes or checks. |
