@@ -20,6 +20,7 @@ type VarId = usize;
 // Admission performs bounded work on the owner, including parameter reads.
 const PROOF_STEPS: usize = 128 * 1024;
 const PARAMETER_WORDS: usize = 32;
+const GATHERED_WORDS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Expr {
@@ -64,6 +65,10 @@ enum Var {
     /// A value in 0..=max that no address depends on beyond its range: a
     /// zero extension, a right shift, a mask, or their sum or union.
     Bounded(u32),
+    /// The dword at an address that varies within the segment: an entry of
+    /// a table the computation reads, such as row or column pointers.
+    /// Admission reads the entries it can reach and bounds it by them.
+    Gathered(Form),
     Either([(Form, Vec<Limit>); 2]),
 }
 
@@ -113,6 +118,9 @@ pub(crate) struct Evaluation {
     parameters: Vec<Range>,
     outputs: Vec<Range>,
     frame: Vec<Range>,
+    gathered: Vec<Option<(i64, i64)>>,
+    tables: Vec<Range>,
+    entries: usize,
 }
 
 pub(crate) struct Proof {
@@ -631,7 +639,13 @@ impl Builder<'_> {
         {
             return value.clone();
         }
-        Some(self.word(addr.invariant()?))
+        Some(match addr.invariant() {
+            Some(addr) => self.word(addr),
+            None => {
+                let var = self.variable(Var::Gathered(addr));
+                self.term(var)
+            }
+        })
     }
 
     fn write(&mut self, state: &mut State, addr: Form, bytes: u8, value: Value, record: bool) {
@@ -1065,6 +1079,27 @@ impl Builder<'_> {
         }
     }
 
+    /// The frame word that ends each iteration equal to an entry register,
+    /// as when a loop keeps a pointer in both: admission checks that the
+    /// register starts equal to it too.
+    fn mirrored_word(
+        &mut self,
+        a: &Form,
+        back: &Form,
+        first: &State,
+        slots: &BTreeMap<i32, Value>,
+    ) -> Value {
+        let offset = first
+            .slots
+            .iter()
+            .find_map(|(&offset, value)| (value.as_ref() == Some(back)).then_some(offset))?;
+        let word = match slots.get(&offset) {
+            Some(value) => value.clone()?,
+            None => self.frame_word(offset),
+        };
+        self.cached_word(a, &word)
+    }
+
     /// The entry register that one arm holds where the other holds a
     /// constant: admission checks they are equal, as for a cached word.
     fn entry_or_constant(&self, a: &Value, b: &Value) -> Option<u8> {
@@ -1202,27 +1237,36 @@ impl Builder<'_> {
     fn trip(&mut self, lp: usize, test: Test, var: VarId) -> Option<ExprId> {
         let lp = &self.graph.loops[lp];
         let coefficient = |a: &Form, c| a.terms.as_slice() == [(var, c)];
+        let signed = matches!(lp.condition, Cond::l | Cond::ge | Cond::le | Cond::g);
         let count = match (test, lp.condition, lp.taken) {
             (Test::Zero(a), Cond::ne, true) | (Test::Zero(a), Cond::e, false)
                 if coefficient(&a, *self.interned.get(&Expr::Constant(u32::MAX))?) =>
             {
                 self.add(a.base, self.one)
             }
-            (Test::Compare(a, b), Cond::l | Cond::b, true)
-            | (Test::Compare(a, b), Cond::ge | Cond::ae, false)
-                if coefficient(&a, self.one) && a.base == self.one =>
+            (Test::Compare(a, b), Cond::l | Cond::b | Cond::le, true)
+            | (Test::Compare(a, b), Cond::ge | Cond::ae | Cond::g, false)
+                if coefficient(&a, self.one) && (signed || a.base == self.one) =>
             {
-                b.invariant()?
+                // The counter runs from its start to the bound, or one past
+                // an inclusive bound that admission keeps below i32::MAX.
+                let mut end = b.invariant()?;
+                if matches!(lp.condition, Cond::le | Cond::g) {
+                    end = self.add(end, self.one);
+                    let bias = self.constant(1 << 31);
+                    let biased = self.add(end, bias);
+                    self.check(Check::Positive(biased, u32::MAX));
+                }
+                let start = self.neg(a.base);
+                let past = self.add(end, start);
+                self.add(past, self.one)
             }
             _ => return None,
         };
         // A do-while loop entered with zero cannot be treated as empty.
-        // Only a signed compare limits the count to a signed dword.
-        let max = if matches!(lp.condition, Cond::l | Cond::ge) {
-            i32::MAX as u32
-        } else {
-            u32::MAX
-        };
+        // Only a signed compare limits the count to a signed dword, which
+        // also keeps a count from a nonzero start exact.
+        let max = if signed { i32::MAX as u32 } else { u32::MAX };
         self.check(Check::Positive(count, max));
         Some(count)
     }
@@ -1301,8 +1345,11 @@ impl Builder<'_> {
                         Check::Equal(reg, word) if reg == a.base => Some(self.form(word)),
                         _ => None,
                     });
-                    if let Some(word) =
-                        known.or_else(|| self.reloaded_word(a, first.regs[r].as_ref()?))
+                    if let Some(word) = known
+                        .or_else(|| self.reloaded_word(a, first.regs[r].as_ref()?))
+                        .or_else(|| {
+                            self.mirrored_word(a, first.regs[r].as_ref()?, &first, &initial.slots)
+                        })
                         && &word != a
                     {
                         *value = Some(word);
@@ -1530,6 +1577,33 @@ impl Builder<'_> {
     }
 }
 
+/// The retained index of `v`, retaining first the variables a gathered
+/// address depends on.
+fn renumber(
+    old: &[Var],
+    v: VarId,
+    ids: &mut FxHashMap<VarId, VarId>,
+    vars: &mut Vec<Var>,
+) -> VarId {
+    if let Some(&id) = ids.get(&v) {
+        return id;
+    }
+    let mut var = old[v].clone();
+    if let Var::Gathered(addr) = &mut var {
+        for (inner, _) in &mut addr.terms {
+            *inner = renumber(old, *inner, ids, vars);
+        }
+    }
+    let id = vars.len();
+    ids.insert(v, id);
+    vars.push(var);
+    id
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 impl Proof {
     pub(crate) fn build(trace: &Trace) -> Option<Self> {
         let graph = Graph::build(trace)?;
@@ -1623,11 +1697,7 @@ impl Proof {
                 .limits
                 .retain(|l| effect.addr.terms.iter().any(|&(var, _)| var == l.var));
             for (v, _) in &mut effect.addr.terms {
-                *v = *ids.entry(*v).or_insert_with(|| {
-                    let id = vars.len();
-                    vars.push(b.vars[*v].clone());
-                    id
-                });
+                *v = renumber(&b.vars, *v, &mut ids, &mut vars);
             }
             for l in &mut effect.limits {
                 l.var = ids[&l.var];
@@ -1703,6 +1773,10 @@ impl Proof {
         scratch.parameters.clear();
         scratch.outputs.clear();
         scratch.frame.clear();
+        scratch.gathered.clear();
+        scratch.gathered.resize(self.vars.len(), None);
+        scratch.tables.clear();
+        scratch.entries = 0;
         for &check in &self.checks {
             match check {
                 Check::Positive(expr, max) => {
@@ -1725,44 +1799,11 @@ impl Proof {
             }
         }
         for effect in &self.effects {
-            let base = i64::from(self.value(effect.addr.base, cpu, scratch, &mut read)?);
-            let (mut lo, mut hi) = (base, base);
-            let mut empty = false;
-            for &(var, coefficient) in &effect.addr.terms {
-                let k = self.value(coefficient, cpu, scratch, &mut read)? as i32;
-                let (a, b) = match self.vars[var] {
-                    Var::Counter(Some(count)) => (
-                        0,
-                        i64::from(self.value(count, cpu, scratch, &mut read)?) - 1,
-                    ),
-                    Var::Remainder {
-                        divisor,
-                        normalized,
-                    } => {
-                        let n = i64::from(self.value(divisor, cpu, scratch, &mut read)?);
-                        let trim = effect
-                            .limits
-                            .iter()
-                            .filter(|l| l.var == var)
-                            .map(|l| l.trim)
-                            .max()
-                            .unwrap_or(0);
-                        (if normalized { 0 } else { 1 - n }, n - 1 - i64::from(trim))
-                    }
-                    Var::Bounded(max) => (0, i64::from(max)),
-                    _ => return None,
-                };
-                if b < a {
-                    empty = true;
-                    break;
-                }
-                let (a, b) = (a.checked_mul(i64::from(k))?, b.checked_mul(i64::from(k))?);
-                lo = lo.checked_add(a.min(b))?;
-                hi = hi.checked_add(a.max(b))?;
-            }
-            if empty {
+            let Some((lo, hi)) =
+                self.interval(&effect.addr, &effect.limits, cpu, scratch, &mut read)?
+            else {
                 continue;
-            }
+            };
             let start = u32::try_from(lo).ok()?;
             let end = u64::try_from(hi.checked_add(i64::from(effect.bytes))?).ok()?;
             if end > 1 << 32 {
@@ -1787,7 +1828,17 @@ impl Proof {
                 .frame
                 .iter()
                 .chain(&scratch.parameters)
+                .chain(&scratch.tables)
                 .any(|&range| range.intersects(output))
+            {
+                return None;
+            }
+        }
+        for &table in &scratch.tables {
+            if scratch
+                .frame
+                .iter()
+                .any(|&f| f.write && f.intersects(table))
             {
                 return None;
             }
@@ -1820,6 +1871,101 @@ impl Proof {
         }
         scratch.ranges.truncate(len);
         Some(&scratch.ranges)
+    }
+
+    /// The least and greatest guest address `form` takes over the segment,
+    /// or `Some(None)` when a limit leaves it no value.
+    fn interval(
+        &self,
+        form: &Form,
+        limits: &[Limit],
+        cpu: &CpuState,
+        scratch: &mut Evaluation,
+        read: &mut impl FnMut(u32) -> Option<u32>,
+    ) -> Option<Option<(i64, i64)>> {
+        let base = i64::from(self.value(form.base, cpu, scratch, read)?);
+        let (mut lo, mut hi) = (base, base);
+        for &(var, coefficient) in &form.terms {
+            let k = self.value(coefficient, cpu, scratch, read)? as i32;
+            let (a, b) = match self.vars[var] {
+                Var::Counter(Some(count)) => {
+                    (0, i64::from(self.value(count, cpu, scratch, read)?) - 1)
+                }
+                Var::Remainder {
+                    divisor,
+                    normalized,
+                } => {
+                    let n = i64::from(self.value(divisor, cpu, scratch, read)?);
+                    let trim = limits
+                        .iter()
+                        .filter(|l| l.var == var)
+                        .map(|l| l.trim)
+                        .max()
+                        .unwrap_or(0);
+                    (if normalized { 0 } else { 1 - n }, n - 1 - i64::from(trim))
+                }
+                Var::Bounded(max) => (0, i64::from(max)),
+                Var::Gathered(_) => self.gathered(var, cpu, scratch, read)?,
+                _ => return None,
+            };
+            if b < a {
+                return Some(None);
+            }
+            let (a, b) = (a.checked_mul(i64::from(k))?, b.checked_mul(i64::from(k))?);
+            lo = lo.checked_add(a.min(b))?;
+            hi = hi.checked_add(a.max(b))?;
+        }
+        // Guest addresses wrap: a span within one 2^32 period is the same
+        // span shifted. Callers reject one that crosses a period boundary.
+        let shift = lo.div_euclid(1 << 32) << 32;
+        Some(Some((lo - shift, hi - shift)))
+    }
+
+    /// Reads every table entry a gathered dword can come from, at the
+    /// common stride of its address terms, and returns their least and
+    /// greatest value. The table joins the ranges no write may touch.
+    fn gathered(
+        &self,
+        var: VarId,
+        cpu: &CpuState,
+        scratch: &mut Evaluation,
+        read: &mut impl FnMut(u32) -> Option<u32>,
+    ) -> Option<(i64, i64)> {
+        if let Some(bounds) = scratch.gathered[var] {
+            return Some(bounds);
+        }
+        let Var::Gathered(addr) = &self.vars[var] else {
+            return None;
+        };
+        let (lo, hi) = self.interval(addr, &[], cpu, scratch, read)??;
+        let mut stride = 0u64;
+        for &(_, coefficient) in &addr.terms {
+            let k = u64::from((self.value(coefficient, cpu, scratch, read)? as i32).unsigned_abs());
+            stride = gcd(stride, k);
+        }
+        let stride = stride.max(1);
+        let entries = u64::try_from(hi - lo).ok()? / stride + 1;
+        scratch.entries += usize::try_from(entries).ok()?;
+        if scratch.entries > GATHERED_WORDS {
+            return None;
+        }
+        let end = u64::try_from(hi).ok()? + 4;
+        if end > 1 << 32 {
+            return None;
+        }
+        let (mut min, mut max) = (u32::MAX, 0);
+        for n in 0..entries {
+            let word = read(u32::try_from(lo).ok()? + (n * stride) as u32)?;
+            (min, max) = (min.min(word), max.max(word));
+        }
+        scratch.tables.push(Range {
+            start: lo as u32,
+            end,
+            write: false,
+        });
+        let bounds = (i64::from(min), i64::from(max));
+        scratch.gathered[var] = Some(bounds);
+        Some(bounds)
     }
 
     fn value(

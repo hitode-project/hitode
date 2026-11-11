@@ -1408,3 +1408,146 @@ fn admitted_frame_values_are_reloaded_at_each_outer_iteration() {
         }
     }
 }
+
+// spec: A64-TR-9
+#[test]
+#[cfg(native)]
+fn table_row_loops_admit_gathered_entries_mirrored_pointers_and_inclusive_bounds() {
+    // Rows run from a nonzero first row to an inclusive last row. Each
+    // reads its source through a row table, biased by a negative offset
+    // that wraps the address sum, and its columns through a column table.
+    // It updates its output row in place through a pointer that the loop
+    // also keeps in a frame slot.
+    let code = bytes(|a| {
+        let mut outer = a.create_label();
+        let mut inner = a.create_label();
+        let mut skip = a.create_label();
+        a.set_label(&mut outer).unwrap();
+        a.mov(ebp, dword_ptr(esp)).unwrap();
+        a.mov(edx, dword_ptr(esp + 20)).unwrap();
+        a.mov(edx, dword_ptr(edx + ebp * 4)).unwrap();
+        a.add(edx, dword_ptr(esp + 32)).unwrap();
+        a.xor(ebp, ebp).unwrap();
+        a.mov(ecx, dword_ptr(esp + 28)).unwrap();
+        a.test(ecx, ecx).unwrap();
+        a.jle(skip).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.mov(ebx, dword_ptr(esp + 24)).unwrap();
+        a.mov(ebx, dword_ptr(ebx + ebp * 4)).unwrap();
+        a.movzx(eax, byte_ptr(ebx + edx)).unwrap();
+        a.mov(esi, dword_ptr(edi)).unwrap();
+        a.add(eax, esi).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, dword_ptr(esp + 16)).unwrap();
+        a.inc(ebp).unwrap();
+        a.cmp(ebp, ecx).unwrap();
+        a.jl(inner).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.mov(edx, dword_ptr(esp)).unwrap();
+        a.mov(edi, dword_ptr(esp + 8)).unwrap();
+        a.add(edi, dword_ptr(esp + 12)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, dword_ptr(esp + 4)).unwrap();
+        a.mov(dword_ptr(esp), edx).unwrap();
+        a.mov(dword_ptr(esp + 8), edi).unwrap();
+        a.jle(outer).unwrap();
+    });
+    let work = j1_unit(&code);
+    let proof = computation::Proof::build(&work.unit.trace).expect("table row proof");
+    const FRAME: u32 = 0x100;
+    const ROWS: u32 = 0x180;
+    const COLUMNS: u32 = 0x1c0;
+    const OUTPUT: u32 = 0x200;
+    const SOURCE: u32 = 0x300;
+    let setup = |first: u32, last: u32, mirror: u32, rows: u32| {
+        let mut data = vec![0u8; 0x400];
+        let mut put = |at: u32, value: u32| {
+            data[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes())
+        };
+        let output = DATA + OUTPUT + first * 0x20;
+        for (slot, value) in [
+            first,
+            last,
+            output,
+            0x20,
+            4,
+            DATA + rows,
+            DATA + COLUMNS,
+            3,
+            0x10u32.wrapping_neg(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(FRAME + slot as u32 * 4, value);
+        }
+        for row in 0..8 {
+            put(rows + row * 4, DATA + SOURCE + row * 0x10 + 0x10);
+        }
+        for (n, offset) in [2, 5, 1].into_iter().enumerate() {
+            put(COLUMNS + n as u32 * 4, offset);
+        }
+        for at in SOURCE..0x400 {
+            data[at as usize] = at as u8;
+        }
+        for at in OUTPUT..SOURCE {
+            data[at as usize] = (at * 7) as u8;
+        }
+        let mut state = initial();
+        state.regs[4] = DATA + FRAME;
+        state.regs[7] = output + mirror;
+        (state, data)
+    };
+    let admits = |(state, data): &(CpuState, Vec<u8>)| {
+        let mem = memory(&code, data);
+        proof
+            .evaluate(state, &mut computation::Evaluation::default(), |addr| {
+                Some(u32::from_le_bytes(
+                    mem.read_data(addr, 4).ok()?.as_ref().try_into().ok()?,
+                ))
+            })
+            .is_some()
+    };
+    // The pointer must start equal to its slot; an inclusive bound may not
+    // be i32::MAX; a first row past the last still runs once in the guest.
+    assert!(!admits(&setup(2, 4, 4, ROWS)));
+    assert!(!admits(&setup(2, i32::MAX as u32, 0, ROWS)));
+    assert!(!admits(&setup(5, 4, 0, ROWS)));
+    // Rows may not write the table that locates them.
+    assert!(!admits(&setup(2, 4, 0, OUTPUT + 0x40)));
+    let mut h = Harness::new();
+    let (state, data) = setup(2, 4, 0, ROWS);
+    let mut interpreter = Interpreter::new();
+    let mut want = state.clone();
+    let mut mem = memory(&code, &data);
+    let mut prefixes = vec![(want.clone(), data.clone())];
+    while want.eip != CODE + code.len() as u32 {
+        assert_eq!(
+            interpreter.step(&mut want, &mut mem),
+            adv_cpu_core::interpreter::Step::Executed
+        );
+        prefixes.push((
+            want.clone(),
+            mem.read_data(DATA, data.len()).unwrap().to_vec(),
+        ));
+    }
+    let retired = prefixes.len() as u64 - 1;
+    for fuel in 0..=retired {
+        let (got, exit, left) = h.run_form(&code, &data, &state, false, Some(fuel));
+        let completed = fuel - left;
+        let (want, bytes) = &prefixes[completed as usize];
+        assert_eq!(got, *want, "fuel={fuel}");
+        assert_eq!(
+            h.emu.read(WINDOW_BASE + u64::from(DATA), data.len()),
+            *bytes
+        );
+        assert_eq!(
+            exit,
+            if completed == retired {
+                Exit::Dispatch
+            } else {
+                Exit::Recall
+            }
+        );
+    }
+}
