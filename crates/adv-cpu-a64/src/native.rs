@@ -1616,39 +1616,15 @@ impl Native {
                     .filter(|probe| probe.trace.insts == work.unit.trace.insts)
                     .map(|probe| probe.proof)
                     .or_else(|| computation_proof(&work.unit.trace));
-                if let Some(proof) = proof {
-                    let at = self.cache.next();
-                    if let Some(code) = translate::lower_computation(
-                        &mut work,
-                        &mut self.computation_code,
-                        eip,
-                        self.features,
-                        at,
-                        self.stubs,
-                        (control, pe),
-                    ) && let Some(entry) = self.cache.append(code.words)
-                    {
-                        let mut sites: Vec<_> = code
-                            .sites
-                            .iter()
-                            .map(|&(offset, site)| (entry + offset, site))
-                            .collect();
-                        sites.sort_unstable_by_key(|&(pc, _)| pc);
-                        let len = code.words.len() * 4;
-                        crate::jit_map::record(entry, len, eip, work.retired(), code.marks);
-                        self.computation.insert(
-                            eip,
-                            worker::Prepared {
-                                code: worker::Code {
-                                    entry,
-                                    end: entry + len,
-                                    sites: sites.into(),
-                                },
-                                proof,
-                                skip: Cell::new(0),
-                            },
-                        );
-                    }
+                if let Some(proof) = proof
+                    && let Some(code) =
+                        self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
+                {
+                    let iteration = work.unit.iteration().and_then(|mut unit| {
+                        self.emit_computation(&mut unit, eip, (control, pe), &proof)
+                    });
+                    self.computation
+                        .insert(eip, worker::Prepared::new(code, iteration, proof));
                 }
             }
             self.helpers.extend(work.helpers());
@@ -1662,6 +1638,39 @@ impl Native {
         }
         self.work = work;
         entry
+    }
+
+    fn emit_computation(
+        &mut self,
+        unit: &mut translate::Unit,
+        eip: u32,
+        (control, pe): (u16, bool),
+        proof: &translate::computation::Proof,
+    ) -> Option<worker::Code> {
+        let retired = unit.trace.prepaid(0);
+        let code = translate::lower_computation(
+            unit,
+            &mut self.computation_code,
+            eip,
+            self.features,
+            self.cache.next(),
+            self.stubs,
+            (control, pe, Some(proof)),
+        )?;
+        let entry = self.cache.append(code.words)?;
+        let mut sites: Vec<_> = code
+            .sites
+            .iter()
+            .map(|&(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        let len = code.words.len() * 4;
+        crate::jit_map::record(entry, len, eip, retired, code.marks);
+        Some(worker::Code {
+            entry,
+            end: entry + len,
+            sites: sites.into(),
+        })
     }
 
     fn enclosing_computation(&self, hint: u32) -> (u32, u32) {

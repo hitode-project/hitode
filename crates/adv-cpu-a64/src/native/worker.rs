@@ -17,11 +17,44 @@ use crate::translate::computation::{Evaluation, Proof, Range};
 
 pub(super) struct Prepared {
     pub code: Code,
+    iteration: Option<Code>,
     pub proof: Proof,
-    pub skip: std::cell::Cell<u32>,
+    skip: std::cell::Cell<u32>,
+    mode: std::cell::Cell<Mode>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Whole(u8),
+    Trial,
+    Iteration,
+    WholeOnly,
 }
 
 impl Prepared {
+    pub fn new(code: Code, iteration: Option<Code>, proof: Proof) -> Self {
+        let mode = if iteration.is_some() {
+            Mode::Whole(0)
+        } else {
+            Mode::WholeOnly
+        };
+        Self {
+            code,
+            iteration,
+            proof,
+            skip: std::cell::Cell::new(0),
+            mode: std::cell::Cell::new(mode),
+        }
+    }
+
+    fn selected(&self) -> (&Code, bool) {
+        if matches!(self.mode.get(), Mode::Trial | Mode::Iteration) {
+            (self.iteration.as_ref().expect("iteration form"), true)
+        } else {
+            (&self.code, false)
+        }
+    }
+
     pub fn worth_offering(&self) -> bool {
         let skip = self.skip.get();
         if skip == 0 {
@@ -32,14 +65,39 @@ impl Prepared {
         }
     }
 
-    fn observe(&self, done: &Done) {
-        if done.requires_owner {
+    fn observe(&self, entry: u32, iteration: bool, done: &Done) {
+        let completion = &done.completion;
+        if iteration {
+            if self.mode.get() == Mode::Trial
+                && !completion.requires_owner
+                && completion.context.as_ref().unwrap().cpu().eip == entry
+            {
+                self.mode
+                    .set(if completion.elapsed >= Duration::from_micros(50) {
+                        Mode::Iteration
+                    } else {
+                        Mode::WholeOnly
+                    });
+            }
             return;
         }
-        // Measured admission and queue cost was about 2.5 us per job.
-        // Give short sites another trial after about one ordinary slice.
-        let skip = if done.elapsed < Duration::from_micros(50) {
-            (u64::from(COMPUTATION_SLICE) / done.retired.max(1)).max(1) as u32
+        if let Mode::Whole(recalls) = self.mode.get()
+            && done.deadline_recall
+        {
+            self.mode.set(if recalls >= 1 {
+                self.skip.set(0);
+                Mode::Trial
+            } else {
+                Mode::Whole(recalls + 1)
+            });
+        }
+        if completion.requires_owner || matches!(self.mode.get(), Mode::Trial | Mode::Iteration) {
+            return;
+        }
+        // Short jobs do not amortize admission and queueing. Give them
+        // another trial after about one ordinary slice.
+        let skip = if completion.elapsed < Duration::from_micros(50) {
+            (u64::from(COMPUTATION_SLICE) / completion.retired.max(1)).max(1) as u32
         } else {
             0
         };
@@ -78,7 +136,10 @@ struct Task {
     wake: Option<WakeEvent>,
 }
 
-type Done = Completion<Option<ExecutionContext>>;
+struct Done {
+    completion: Completion<Option<ExecutionContext>>,
+    deadline_recall: bool,
+}
 
 const RECALL: u32 = 1;
 const OWNER_NEEDED: u32 = 2;
@@ -152,12 +213,19 @@ fn run(
     record_branch(cpu, runtime.branch, cpu.eip);
     cpu.refresh_mmx();
     context.finish_computation(exit);
-    Completion {
-        id,
-        context: Some(context),
-        retired,
-        elapsed,
-        requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
+    Done {
+        deadline_recall: exit == Exit::Recall
+            && signals.pending.0.load(Ordering::Acquire)
+                & signals.pending.1
+                & adv_sync::pending::DEADLINE
+                != 0,
+        completion: Completion {
+            id,
+            context: Some(context),
+            retired,
+            elapsed,
+            requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
+        },
     }
 }
 
@@ -192,6 +260,14 @@ impl Pool {
             if std::thread::Builder::new()
                 .name("guest computation".into())
                 .spawn(move || {
+                    // These jobs produce the same interactive frame as the owner.
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        libc::pthread_set_qos_class_self_np(
+                            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                            0,
+                        );
+                    }
                     crate::cache::execution_thread();
                     let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
                     loop {
@@ -206,7 +282,7 @@ impl Pool {
                             &task.signals,
                             false,
                         );
-                        if result.requires_owner {
+                        if result.completion.requires_owner {
                             task.signals
                                 .recall
                                 .fetch_or(OWNER_NEEDED, Ordering::Release);
@@ -311,6 +387,7 @@ fn grant(memory: &Memory, cache: &mut Vec<Range>, range: &Range) -> bool {
 struct ActiveTask {
     id: u32,
     entry: u32,
+    iteration: bool,
     ranges: Vec<Range>,
 }
 
@@ -372,7 +449,7 @@ impl<'a> Session<'a> {
         })
     }
 
-    fn prepare(&mut self, id: u32, context: &ExecutionContext) -> Option<(&Code, &[Range])> {
+    fn prepare(&mut self, id: u32, context: &ExecutionContext) -> Option<(&Code, &[Range], bool)> {
         let cpu = context.cpu();
         if self.signals.requested() || self.active.iter().any(|job| job.id == id) {
             return None;
@@ -384,28 +461,34 @@ impl<'a> Session<'a> {
         let ranges = self
             .admission
             .ranges(&prepared.proof, cpu, self.memory, &self.active)?;
-        Some((&prepared.code, ranges))
+        let (code, iteration) = prepared.selected();
+        Some((code, ranges, iteration))
     }
 
-    fn account(&mut self, entry: u32, done: Done) -> Completion<Option<ExecutionContext>> {
-        self.prepared[&entry].observe(&done);
-        let retired = done.retired;
+    fn account(
+        &mut self,
+        entry: u32,
+        iteration: bool,
+        done: Done,
+    ) -> Completion<Option<ExecutionContext>> {
+        self.prepared[&entry].observe(entry, iteration, &done);
+        let retired = done.completion.retired;
         *self.retired += retired;
         if let Some(forms) = self.forms {
             forms[0] += retired;
         }
-        done
+        done.completion
     }
 
     fn accept(&mut self, done: Done) -> Completion<Option<ExecutionContext>> {
         let index = self
             .active
             .iter()
-            .position(|job| job.id == done.id)
+            .position(|job| job.id == done.completion.id)
             .expect("active computation");
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
-        self.account(job.entry, done)
+        self.account(job.entry, job.iteration, done)
     }
 }
 
@@ -420,7 +503,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
         }
         let mut grant = self.admission.spare.pop().unwrap_or_default();
         grant.clear();
-        let Some((code, ranges)) = self.prepare(id, context) else {
+        let Some((code, ranges, iteration)) = self.prepare(id, context) else {
             self.admission.spare.push(grant);
             return false;
         };
@@ -438,6 +521,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             self.active.push(ActiveTask {
                 id,
                 entry: guest_entry,
+                iteration,
                 ranges: grant,
             });
             true
@@ -454,7 +538,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
     ) -> Option<Completion<Option<ExecutionContext>>> {
         let context = context.as_ref()?;
         let guest_entry = context.cpu().eip;
-        let (code, _) = self.prepare(id, context)?;
+        let (code, _, iteration) = self.prepare(id, context)?;
         let code = code.clone();
         let done = run(
             &mut self.runtime,
@@ -465,7 +549,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             &self.signals,
             true,
         );
-        Some(self.account(guest_entry, done))
+        Some(self.account(guest_entry, iteration, done))
     }
 
     fn poll(&mut self) -> Option<Completion<Option<ExecutionContext>>> {
@@ -661,7 +745,8 @@ mod tests {
                 ),
             },
             true,
-        );
+        )
+        .completion;
         assert!(local.requires_owner);
         assert_eq!(local.retired, u64::from(COMPUTATION_SLICE / 5 * 5));
         let left = local.context.as_ref().unwrap().cpu().regs[1];
@@ -749,7 +834,8 @@ mod tests {
                 pending: (Arc::new(AtomicU32::new(0)), 0),
             },
             false,
-        );
+        )
+        .completion;
         assert!(recalled.requires_owner);
         cpu = recalled.context.unwrap().cpu().clone();
         assert_eq!(cpu.eip, inner);
@@ -915,13 +1001,13 @@ mod tests {
         let at = native.cache.next();
         let mut scratch = translate::Code::default();
         let emitted = translate::lower_computation(
-            &mut work,
+            &mut work.unit,
             &mut scratch,
             CODE,
             native.features,
             at,
             native.stubs,
-            (0x37f, false),
+            (0x37f, false, None),
         )
         .unwrap();
         assert_eq!(native.cache.append(emitted.words), Some(at));
@@ -970,8 +1056,14 @@ mod tests {
             &code,
             &signals,
             true,
-        );
-        for result in [local, recv.recv_timeout(Duration::from_secs(5)).unwrap()] {
+        )
+        .completion;
+        for result in [
+            local,
+            recv.recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .completion,
+        ] {
             assert!(result.requires_owner);
             assert_eq!(result.retired, 2);
             let context = result.context.unwrap();
@@ -996,6 +1088,175 @@ mod tests {
             executor.memory().read(OUTPUT, 8).unwrap(),
             [42, 0, 0, 0, 42, 0, 0, 0]
         );
+    }
+
+    // spec: A64-CTL-7 A64-CTL-8 A64-TR-9 A64F-FP-7
+    #[test]
+    fn outer_iteration_returns_canonical_state_and_can_be_readmitted() {
+        const INNER: u32 = 20_000;
+        const ROWS: u32 = 3;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut outer = a.create_label();
+        let mut inner = a.create_label();
+        a.set_label(&mut outer).unwrap();
+        a.mov(ecx, INNER).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fst(dword_ptr(edi)).unwrap();
+        a.paddd(xmm0, xmm1).unwrap();
+        a.movd(dword_ptr(edi + 4), xmm0).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(inner).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(outer).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = (INNER * ROWS * 8) as usize;
+        executor
+            .memory_mut()
+            .map(OUTPUT, 0x80000, READ | WRITE)
+            .unwrap();
+        let mut start = state(&mut executor, CODE, OUTPUT, 0).unwrap();
+        let cpu = start.cpu_mut();
+        cpu.regs[3] = ROWS;
+        cpu.x87.control = 0x037f;
+        cpu.x87.tag = 0xfff0;
+        cpu.x87.regs[0] = adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff);
+        cpu.x87.regs[1] = cpu.x87.regs[0];
+        cpu.xmm[1] = [3; 16];
+        cpu.eflags = 0x8d7;
+        native.candidates.push(CODE);
+        native.set_computation_offer(true, None);
+        assert_eq!(
+            native
+                .run(
+                    &mut start.cpu().clone(),
+                    executor.memory_mut(),
+                    stop,
+                    1 << 16,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap()
+                .exit,
+            Exit::Computation,
+        );
+        native.cache.sync();
+
+        // A separate ordinary translator stops at the same original head.
+        let mut owner = Native::new(native.runtime.window as usize).unwrap();
+        owner.first_visits = false;
+        owner.observe_stop(stop);
+        let mut serial = start.clone();
+        let mut first = None;
+        let mut total = 0;
+        loop {
+            let result = owner
+                .run(
+                    serial.cpu_mut(),
+                    executor.memory_mut(),
+                    CODE,
+                    1 << 16,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.exit, Exit::Dispatch);
+            total += u64::from(result.retired);
+            if serial.cpu().eip == CODE {
+                serial.cpu_mut().refresh_mmx();
+                first.get_or_insert_with(|| (serial.clone(), total));
+            } else if serial.cpu().eip == stop {
+                break;
+            }
+        }
+        serial.cpu_mut().refresh_mmx();
+        let (expected_first, first_retired) = first.unwrap();
+        assert_eq!(first_retired, u64::from(INNER) * 7 + 3);
+        assert_eq!(total, first_retired * u64::from(ROWS));
+        let expected = executor.memory().read(OUTPUT, len).unwrap().to_vec();
+        executor.memory_mut().fill(OUTPUT, &[0], len).unwrap();
+
+        // Only actual deadline recalls activate the alternate fixed form.
+        let entry = Entry {
+            enter: native.enter,
+            window: native.runtime.window,
+            alias: super::super::alias_base(executor.memory()),
+            fault: native.stubs.fault,
+        };
+        let prepared = &native.computation[&CODE];
+        let pending = Signals {
+            recall: Arc::new(AtomicU32::new(0)),
+            pending: (
+                Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)),
+                adv_sync::pending::DEADLINE,
+            ),
+        };
+        for _ in 0..2 {
+            let done = run(
+                &mut Runtime::new(std::ptr::null_mut(), 0),
+                1,
+                start.clone(),
+                entry,
+                &prepared.code,
+                &pending,
+                false,
+            );
+            assert!(done.deadline_recall);
+            prepared.observe(CODE, false, &done);
+        }
+        assert!(prepared.mode.get() == Mode::Trial);
+        executor.memory_mut().fill(OUTPUT, &[0], len).unwrap();
+
+        let mut context = Some(start);
+        let mut retired = 0;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |scope| {
+                let done = scope.run_local(1, &context).expect("outer iteration");
+                assert!(!done.requires_owner);
+                assert_eq!(done.retired, first_retired);
+                assert_eq!(done.context.as_ref().unwrap().cpu(), expected_first.cpu());
+                context = done.context;
+                while context.as_ref().unwrap().cpu().eip != stop {
+                    let done = scope.run_local(1, &context).expect("fresh root admission");
+                    assert!(!done.requires_owner);
+                    context = done.context;
+                }
+            },
+        );
+        assert_eq!(retired, total);
+        assert_eq!(context.as_ref().unwrap().cpu(), serial.cpu());
+        assert_eq!(executor.memory().read(OUTPUT, len).unwrap(), expected);
+
+        // A short row disables only that form, even if old whole-job
+        // completions arrive after the trial has been selected.
+        let prepared = &native.computation[&CODE];
+        prepared.mode.set(Mode::Trial);
+        let mut sample = Done {
+            completion: Completion {
+                id: 1,
+                context: Some(expected_first),
+                retired: first_retired,
+                elapsed: Duration::from_micros(10),
+                requires_owner: false,
+            },
+            deadline_recall: false,
+        };
+        prepared.observe(CODE, false, &sample);
+        assert!(prepared.mode.get() == Mode::Trial);
+        prepared.observe(CODE, true, &sample);
+        assert!(prepared.mode.get() == Mode::WholeOnly);
+        assert!(prepared.worth_offering());
+        prepared.mode.set(Mode::Trial);
+        sample.completion.elapsed = Duration::from_micros(100);
+        prepared.observe(CODE, true, &sample);
+        assert!(prepared.mode.get() == Mode::Iteration);
     }
 
     // spec: A64-CTL-7 A64-CTL-8 A64-TR-9 A64F-FP-7
@@ -1101,7 +1362,8 @@ mod tests {
                 &code,
                 &signals,
                 true,
-            );
+            )
+            .completion;
             assert_eq!(done.requires_owner, pending != 0);
             if pending != 0 {
                 assert_eq!(done.retired, u64::from(COMPUTATION_SLICE / 7 * 7));

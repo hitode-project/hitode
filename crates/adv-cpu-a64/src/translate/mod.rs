@@ -131,6 +131,14 @@ pub struct Unit {
 }
 
 impl Unit {
+    #[cfg(native)]
+    pub(crate) fn iteration(&self) -> Option<Self> {
+        Some(Self {
+            trace: self.trace.iteration()?,
+            ..Self::default()
+        })
+    }
+
     /// Traces the unit at `eip`, ending before any of `stops`. Each byte
     /// the unit depends on is registered with `watch_code`, so a store to
     /// it reaches the owner. `host` and `redirect` are as for
@@ -521,6 +529,8 @@ struct Translator<'a> {
     control: u16,
     pe: bool,
     computation: bool,
+    #[cfg(native)]
+    proof: Option<&'a computation::Proof>,
     candidate: Option<u32>,
 }
 
@@ -558,6 +568,8 @@ pub fn translate(
         helpers,
         control,
         pe,
+        #[cfg(native)]
+        proof: None,
     }
     .lower(&mut work.unit, eip);
 }
@@ -573,6 +585,8 @@ pub struct Jit<'a> {
     pub helpers: u32,
     pub control: u16,
     pub pe: bool,
+    #[cfg(native)]
+    proof: Option<&'a computation::Proof>,
 }
 
 impl Backend for Jit<'_> {
@@ -644,6 +658,8 @@ impl Jit<'_> {
             control: self.control,
             pe: self.pe,
             computation,
+            #[cfg(native)]
+            proof: self.proof,
             candidate: {
                 #[cfg(native)]
                 {
@@ -700,13 +716,13 @@ pub(crate) fn computation_extent(trace: &Trace) -> Option<(u32, u32)> {
 
 #[cfg(native)]
 pub(crate) fn lower_computation<'a>(
-    work: &mut Workspace,
+    unit: &mut Unit,
     code: &'a mut Code,
     eip: u32,
     features: Features,
     at: usize,
     stubs: Stubs,
-    (control, pe): (u16, bool),
+    (control, pe, proof): (u16, bool, Option<&computation::Proof>),
 ) -> Option<ComputationCode<'a>> {
     Jit {
         code,
@@ -717,8 +733,9 @@ pub(crate) fn lower_computation<'a>(
         helpers: 0,
         control,
         pe,
+        proof,
     }
-    .lower_form(&mut work.unit, eip, true);
+    .lower_form(unit, eip, true);
     (!code.uses_permissions
         && code.links.is_empty()
         && code
@@ -853,6 +870,12 @@ impl Translator<'_> {
         }
         if index == 0 && !self.computation {
             self.body_stack_guard();
+        }
+        #[cfg(native)]
+        if let Some(cache) = self.proof.and_then(computation::Proof::frame_cache)
+            && cache.head == index
+        {
+            self.load_frame_cache(&cache.offsets);
         }
         self.asm.bind(self.labels[index]);
         if !self.computation {
@@ -1949,7 +1972,7 @@ impl Translator<'_> {
             self.mark(pc, Part::Cold);
             self.cold(cold, at);
         }
-        if self.trace.has_loop() && self.asm.widen_bit_tests() {
+        if (self.computation || self.trace.has_loop()) && self.asm.widen_bit_tests() {
             return true;
         }
         for &(index, label) in &self.x87_sites {

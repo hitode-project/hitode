@@ -114,6 +114,29 @@ pub(crate) struct Proof {
     vars: Vec<Var>,
     checks: Vec<Check>,
     effects: Vec<Effect>,
+    divisions: Vec<Option<Division>>,
+    frame_cache: Option<FrameCache>,
+}
+
+pub(crate) struct FrameCache {
+    pub head: usize,
+    /// Byte displacements from ESP on entry to the loop.
+    pub offsets: Vec<i32>,
+    reads: Vec<Option<u8>>,
+}
+
+impl FrameCache {
+    pub(crate) fn read(&self, index: usize) -> Option<u8> {
+        self.reads[index]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Division {
+    /// The dividend is sign extended from EAX and the divisor is positive.
+    SignExtended,
+    /// EAX is a signed remainder plus its positive divisor (at most 2^30).
+    Normalized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,8 +358,11 @@ struct Builder<'a> {
     exprs: Vec<Expr>,
     interned: FxHashMap<Expr, ExprId>,
     vars: Vec<Var>,
-    effects: Vec<Effect>,
+    effects: Vec<(usize, Effect)>,
     checks: Vec<Check>,
+    divisions: Vec<(usize, Option<Division>)>,
+    frame_heads: Vec<(usize, Option<i32>)>,
+    at: usize,
     zero: ExprId,
     one: ExprId,
     remaining: usize,
@@ -557,16 +583,19 @@ impl Builder<'_> {
     fn read(&mut self, state: &mut State, addr: Form, bytes: u8, record: bool) -> Value {
         let frame = self.frame_offset(&addr);
         if record {
-            self.effects.push(Effect {
-                addr: addr.clone(),
-                limits: state.limits.clone(),
-                access: if frame.is_some() {
-                    Access::FrameRead
-                } else {
-                    Access::Read
+            self.effects.push((
+                self.at,
+                Effect {
+                    addr: addr.clone(),
+                    limits: state.limits.clone(),
+                    access: if frame.is_some() {
+                        Access::FrameRead
+                    } else {
+                        Access::Read
+                    },
+                    bytes: u32::from(bytes),
                 },
-                bytes: u32::from(bytes),
-            });
+            ));
         }
         if bytes != 4 {
             return None;
@@ -592,16 +621,19 @@ impl Builder<'_> {
             }
         }
         if record {
-            self.effects.push(Effect {
-                addr,
-                limits: state.limits.clone(),
-                access: if frame.is_some() {
-                    Access::FrameWrite
-                } else {
-                    Access::Write
+            self.effects.push((
+                self.at,
+                Effect {
+                    addr,
+                    limits: state.limits.clone(),
+                    access: if frame.is_some() {
+                        Access::FrameWrite
+                    } else {
+                        Access::Write
+                    },
+                    bytes: u32::from(bytes),
                 },
-                bytes: u32::from(bytes),
-            });
+            ));
         }
     }
 
@@ -695,6 +727,13 @@ impl Builder<'_> {
 
     fn operation(&mut self, at: usize, state: &mut State, record: bool) -> Option<()> {
         self.remaining = self.remaining.checked_sub(1)?;
+        self.at = at;
+        if record && self.graph.heads[at].is_some() {
+            let offset = state.regs[usize::from(ESP)]
+                .as_ref()
+                .and_then(|sp| self.frame_offset(sp));
+            self.frame_heads.push((at, offset));
+        }
         let inst = self.trace.insts[at];
         if inst.locked.is_some() || inst.call.is_some() || inst.spin {
             return None;
@@ -806,6 +845,7 @@ impl Builder<'_> {
             }
             Op::Integer(Integer::Divide(src, true, _)) => {
                 let divisor = self.src(state, src, record)?.and_then(|x| x.invariant());
+                let mut fact = None;
                 let value = if let Some(divisor) = divisor.filter(|_| state.cdq) {
                     let normalized = state.regs[0].as_ref().is_some_and(|a| {
                         a.base == divisor
@@ -816,6 +856,11 @@ impl Builder<'_> {
                         divisor,
                         if normalized { 1 << 30 } else { i32::MAX as u32 },
                     ));
+                    fact = Some(if normalized {
+                        Division::Normalized
+                    } else {
+                        Division::SignExtended
+                    });
                     let var = self.variable(Var::Remainder {
                         divisor,
                         normalized,
@@ -824,6 +869,9 @@ impl Builder<'_> {
                 } else {
                     None
                 };
+                if record {
+                    self.divisions.push((at, fact));
+                }
                 state.put(0, None);
                 state.put(2, value);
                 state.test = None;
@@ -1222,6 +1270,8 @@ impl Builder<'_> {
         // candidates before using the resulting memory effects.
         let checks = self.checks.len();
         let effects = self.effects.len();
+        let divisions = self.divisions.len();
+        let frame_heads = self.frame_heads.len();
         let mut after = loop {
             let (back, after) = self.walk(head, before.clone(), Some(lp), record)??;
             let mut changed = false;
@@ -1255,6 +1305,8 @@ impl Builder<'_> {
             }
             self.checks.truncate(checks);
             self.effects.truncate(effects);
+            self.divisions.truncate(divisions);
+            self.frame_heads.truncate(frame_heads);
         };
         let count = self.trip(lp, after.test.take()?, var)?;
         self.vars[var] = Var::Counter(Some(count));
@@ -1272,6 +1324,104 @@ impl Builder<'_> {
 }
 
 impl Builder<'_> {
+    fn frame_cache(&self) -> Option<FrameCache> {
+        let n = self.trace.len();
+        let mut reads = vec![None; n];
+        let mut writes = Vec::new();
+        for (at, effect) in &self.effects {
+            let at = *at;
+            let offset = self.frame_offset(&effect.addr);
+            if effect.access == Access::FrameWrite {
+                writes.push((at, offset?, effect.bytes));
+            }
+            if matches!(
+                self.trace.insts[at].op,
+                Op::Mov(Src::Reg(_), Src::Mem(_)) | Op::Imul(_, Src::Mem(_), _)
+            ) {
+                let offset = (effect.access == Access::FrameRead && effect.bytes == 4)
+                    .then_some(offset)
+                    .flatten();
+                reads[at] = Some(match reads[at] {
+                    None => offset,
+                    Some(previous) if previous == offset => offset,
+                    _ => None,
+                });
+            }
+        }
+        let mut best = None;
+        let mut best_count = 1;
+        for lp in &self.graph.loops {
+            let head = lp.head;
+            if self
+                .graph
+                .loops
+                .iter()
+                .any(|other| other.head != head && lp.inside[other.head])
+            {
+                continue;
+            }
+            // The initialization sits on fall-through before the loop's
+            // body label. Every other arrival must already be in the loop.
+            if head != 0 && (lp.inside[head - 1] || self.trace.insts[head - 1].next != Next::Fall)
+                || self.graph.edges.iter().enumerate().any(|(from, edges)| {
+                    !lp.inside[from]
+                        && (edges[1] == Some(head) || edges[0] == Some(head) && from + 1 != head)
+                })
+            {
+                continue;
+            }
+            let mut stack = self
+                .frame_heads
+                .iter()
+                .filter_map(|&(at, offset)| (at == head).then_some(offset));
+            let Some(Some(sp)) = stack.next() else {
+                continue;
+            };
+            if stack.any(|offset| offset != Some(sp)) {
+                continue;
+            }
+            let mut offsets = Vec::new();
+            let mut slots = vec![None; n];
+            let mut count = 0;
+            for (at, offset) in reads.iter().enumerate() {
+                let Some(Some(offset)) = *offset else {
+                    continue;
+                };
+                // Entry admission excludes non-frame writes from these
+                // reads. Here, exclude frame writes at exact byte widths.
+                if !lp.inside[at]
+                    || writes.iter().any(|&(from, write, bytes)| {
+                        lp.inside[from]
+                            && ((offset.wrapping_sub(write) as u32) < bytes
+                                || (write.wrapping_sub(offset) as u32) < 4)
+                    })
+                {
+                    continue;
+                }
+                let disp = offset.wrapping_sub(sp);
+                let slot = if let Some(slot) = offsets.iter().position(|&d| d == disp) {
+                    slot
+                } else if offsets.len() < 8 {
+                    offsets.push(disp);
+                    offsets.len() - 1
+                } else {
+                    continue;
+                };
+                slots[at] = Some(slot as u8);
+                count += 1;
+            }
+            if count > best_count {
+                best_count = count;
+                best = Some(FrameCache {
+                    head,
+                    offsets,
+                    reads: slots,
+                });
+            }
+        }
+        best
+    }
+
     fn expand(&mut self, mut effect: Effect, out: &mut Vec<Effect>) -> Option<()> {
         self.remaining = self.remaining.checked_sub(1)?;
         let choice = effect
@@ -1320,6 +1470,9 @@ impl Proof {
             vars: Vec::new(),
             effects: Vec::new(),
             checks: Vec::new(),
+            divisions: Vec::new(),
+            frame_heads: Vec::new(),
+            at: 0,
             zero: 0,
             one: 0,
             remaining: PROOF_STEPS,
@@ -1344,8 +1497,9 @@ impl Proof {
             None,
             true,
         )?;
+        let frame_cache = b.frame_cache();
         let mut effects = Vec::new();
-        for effect in std::mem::take(&mut b.effects) {
+        for (_, effect) in std::mem::take(&mut b.effects) {
             b.expand(effect, &mut effects)?;
         }
         if !effects.iter().any(|e| e.access == Access::Write) {
@@ -1433,12 +1587,33 @@ impl Proof {
             }
             checks.push(check);
         }
+        // A visit without a fact rules out specialization. Where the two
+        // forms meet, the normalized dividend also satisfies SignExtended.
+        let mut divisions = vec![None; trace.len()];
+        for (at, fact) in b.divisions {
+            divisions[at] = Some(match (divisions[at], fact) {
+                (None, fact) => fact,
+                (Some(Some(a)), Some(b)) if a == b => Some(a),
+                (Some(Some(_)), Some(_)) => Some(Division::SignExtended),
+                _ => None,
+            });
+        }
         Some(Self {
             exprs: b.exprs,
             vars,
             checks,
             effects,
+            divisions: divisions.into_iter().map(Option::flatten).collect(),
+            frame_cache,
         })
+    }
+
+    pub(crate) fn frame_cache(&self) -> Option<&FrameCache> {
+        self.frame_cache.as_ref()
+    }
+
+    pub(crate) fn division(&self, index: usize) -> Option<Division> {
+        self.divisions[index]
     }
 
     /// Evaluate at the matching unit entry. The reader grants and reads one
@@ -1770,6 +1945,8 @@ mod tests {
             a.int3().unwrap();
         });
         let proof = Proof::build(&t).expect("bounded gather proof");
+        let divisions: Vec<_> = (0..t.len()).filter_map(|i| proof.division(i)).collect();
+        assert_eq!(divisions, [Division::SignExtended, Division::Normalized]);
         let mut cpu = CpuState::default();
         cpu.regs[4..8].copy_from_slice(&[FRAME, PARAMS, INPUT, OUTPUT]);
         let mut scratch = Evaluation::default();
@@ -1792,6 +1969,60 @@ mod tests {
             }
             assert!(!read(INPUT.wrapping_add_signed(n as i32 * stride)));
             assert!(ranges.contains(&range(OUTPUT, 17, true)));
+        }
+        for divisor in [0, (1 << 30) + 1] {
+            assert!(
+                proof
+                    .evaluate(&cpu, &mut scratch, |addr| match addr {
+                        FRAME => Some(9),
+                        PARAMS => Some(divisor),
+                        x if x == PARAMS + 4 => Some(3),
+                        _ => None,
+                    })
+                    .is_none()
+            );
+        }
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn division_facts_require_every_path_and_the_final_loop_recurrence() {
+        for (conditional_cdq, changing_divisor, expected) in [
+            (false, false, Some(Division::SignExtended)),
+            (true, false, None),
+            (false, true, None),
+        ] {
+            let t = trace(|a| {
+                let mut again = a.create_label();
+                let mut divide = a.create_label();
+                // The first transfer preserves ECX. Once EBX advances, that
+                // candidate recurrence fails and the division loses its fact.
+                a.mov(ebx, ecx).unwrap();
+                a.set_label(&mut again).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                if conditional_cdq {
+                    a.test(ebp, ebp).unwrap();
+                    a.jz(divide).unwrap();
+                }
+                a.cdq().unwrap();
+                a.set_label(&mut divide).unwrap();
+                a.idiv(ecx).unwrap();
+                a.mov(byte_ptr(edi), al).unwrap();
+                if changing_divisor {
+                    a.mov(ecx, ebx).unwrap();
+                    a.inc(ebx).unwrap();
+                }
+                a.sub(dword_ptr(esp), 1).unwrap();
+                a.jne(again).unwrap();
+                a.int3().unwrap();
+            });
+            let proof = Proof::build(&t).expect("division independent of output bounds");
+            let at = t
+                .insts
+                .iter()
+                .position(|i| matches!(i.op, Op::Integer(Integer::Divide(..))))
+                .unwrap();
+            assert_eq!(proof.division(at), expected);
         }
     }
 

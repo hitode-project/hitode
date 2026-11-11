@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -8,6 +8,8 @@ mod os {
     pub struct Handle {
         read: i32,
         write: i32,
+        #[cfg(target_vendor = "apple")]
+        queue: i32,
     }
     impl Handle {
         pub fn new() -> std::io::Result<Self> {
@@ -18,7 +20,37 @@ mod os {
             let handle = Self {
                 read: fds[0],
                 write: fds[1],
+                #[cfg(target_vendor = "apple")]
+                queue: unsafe { libc::kqueue() },
             };
+            #[cfg(target_vendor = "apple")]
+            {
+                if handle.queue < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let event = libc::kevent {
+                    ident: handle.read as libc::uintptr_t,
+                    filter: libc::EVFILT_READ,
+                    flags: libc::EV_ADD,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                if unsafe { libc::fcntl(handle.queue, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                    || unsafe {
+                        libc::kevent(
+                            handle.queue,
+                            &event,
+                            1,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    } < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             for fd in fds {
                 if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
                     || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
@@ -40,12 +72,13 @@ mod os {
             let started = std::time::Instant::now();
             loop {
                 let remaining = timeout.map(|d| d.saturating_sub(started.elapsed()));
+                #[cfg(not(target_vendor = "apple"))]
                 let mut fd = libc::pollfd {
                     fd: self.read,
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                // Linux/Android take a nanosecond deadline: poll's millisecond
+                // Apple and Linux/Android take a nanosecond deadline: poll's
                 // timeout rounds every short frame wait up by up to 1 ms. Keep
                 // the pipe in the wait set: input/audio/compiler wakes must
                 // interrupt even an indefinite deadline. EINTR retries use the
@@ -66,7 +99,29 @@ mod os {
                         )
                     }
                 };
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                #[cfg(target_vendor = "apple")]
+                let result = {
+                    let timespec = remaining.map(|d| libc::timespec {
+                        tv_sec: d.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+                        tv_nsec: d.subsec_nanos().into(),
+                    });
+                    let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+                    unsafe {
+                        libc::kevent(
+                            self.queue,
+                            std::ptr::null(),
+                            0,
+                            event.as_mut_ptr(),
+                            1,
+                            timespec.as_ref().map_or(std::ptr::null(), |t| t),
+                        )
+                    }
+                };
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_vendor = "apple"
+                )))]
                 let result = {
                     let ms = remaining.map_or(-1, |d| {
                         d.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
@@ -96,6 +151,8 @@ mod os {
             unsafe {
                 libc::close(self.read);
                 libc::close(self.write);
+                #[cfg(target_vendor = "apple")]
+                libc::close(self.queue);
             }
         }
     }
@@ -107,25 +164,46 @@ mod os {
 pub struct WakeEvent {
     handle: Arc<os::Handle>,
     interrupt: Arc<AtomicU32>,
-    generation: Arc<AtomicU64>,
+    deliveries: Arc<Deliveries>,
 }
+
+#[derive(Default)]
+struct Deliveries {
+    generation: AtomicU64,
+    frontend: AtomicBool,
+}
+
 impl WakeEvent {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             handle: Arc::new(os::Handle::new()?),
             interrupt: Arc::new(AtomicU32::new(0)),
-            generation: Arc::new(AtomicU64::new(0)),
+            deliveries: Arc::new(Deliveries::default()),
         })
     }
     pub fn signal(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.deliveries.generation.fetch_add(1, Ordering::AcqRel);
         self.interrupt
             .fetch_or(crate::pending::INTERRUPT, Ordering::Release);
         self.notify();
     }
     /// Execution deliveries since creation, including repeated signals before a drain.
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.deliveries.generation.load(Ordering::Acquire)
+    }
+    /// Request a return to the owner of a front end input queue.
+    /// Publish the queue entry before signaling.
+    pub fn signal_frontend(&self) {
+        self.deliveries.frontend.store(true, Ordering::Release);
+        self.signal();
+    }
+    /// A CPU interrupt can be consumed before the front end takes its input.
+    pub fn frontend_pending(&self) -> bool {
+        self.deliveries.frontend.load(Ordering::Acquire)
+    }
+    /// Called by the front end before it drains its queues.
+    pub fn clear_frontend(&self) {
+        self.deliveries.frontend.swap(false, Ordering::AcqRel);
     }
     /// Retain an OS wake without requesting a CPU safepoint exit. Read-only
     /// diagnostics use this so they cannot overtake an input's guest time slice.
@@ -133,8 +211,8 @@ impl WakeEvent {
     pub fn notify(&self) {
         self.handle.signal();
     }
-    /// Submillisecond deadlines on Linux/Android (ppoll); other Unix hosts
-    /// round up to poll's milliseconds.
+    /// Submillisecond deadlines on Apple (kevent) and Linux/Android (ppoll).
+    /// Other Unix hosts round up to poll's milliseconds.
     /// No spinning, timer-resolution changes or guest-clock advancement.
     pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
         self.handle.wait(timeout)
@@ -211,6 +289,28 @@ mod tests {
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
         assert!(wake.take_interrupt());
         assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
+    }
+
+    #[test]
+    fn front_end_delivery_survives_the_session_consuming_its_interrupt() {
+        let wake = WakeEvent::new().unwrap();
+        wake.signal();
+        assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(wake.take_interrupt());
+        assert!(!wake.frontend_pending());
+        wake.notify();
+        assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(!wake.take_interrupt());
+        assert!(!wake.frontend_pending());
+        let generation = wake.generation();
+        wake.signal_frontend();
+        assert_eq!(wake.generation(), generation + 1);
+        assert!(wake.wait(Some(Duration::ZERO)).unwrap());
+        assert!(wake.take_interrupt());
+        assert!(wake.frontend_pending());
+        wake.clear_frontend();
+        assert!(!wake.frontend_pending());
+        assert!(!wake.take_interrupt());
     }
 
     #[test]

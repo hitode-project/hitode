@@ -870,8 +870,10 @@ impl Session {
         }
         let frame = self.presented_frames();
         loop {
+            // A new delivery after clearing the interrupt either shows up
+            // here or interrupts the machine or the retained wait below.
             self.wake.take_interrupt();
-            if Instant::now() >= until {
+            if self.wake.frontend_pending() || Instant::now() >= until {
                 return Stop::Paused;
             }
             if let Err(error) = self.spawn_children().and_then(|_| self.deliver()) {

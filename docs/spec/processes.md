@@ -9,6 +9,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-MACH-1 One execution owner
 
 **Rule**: The execution owner MUST admit only proved computations with nonconflicting ranges to concurrent guest execution. Before ordinary execution, host services or unproved guest memory access, it MUST recall and collect all active computations. Row helpers and background compile threads MUST keep their own bounded budgets.
+Completed contexts MAY receive fresh admission within the same scope while other computations remain active.
 **Verification**: Test
 
 ### PROC-MACH-2 Waits and wakeups

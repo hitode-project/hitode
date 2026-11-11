@@ -4,7 +4,7 @@
 //! Schedule trace: compute_offer reports the prepared EIP and compute_submit
 //! starts a worker assignment. compute_done reports retired instructions,
 //! execution ns, and flags (local=1, owner=2).
-//! compute_round reports the number offered, scope wall ns, and completions.
+//! compute_round reports offered contexts, scope wall ns, and admitted contexts.
 
 use std::time::{Duration, Instant};
 
@@ -190,10 +190,12 @@ fn run_batch<C>(
     let mut pending = [true; TEAM];
     let pending = &mut pending[..offered.len()];
     let mut active = 0;
+    let mut admitted = 0;
     let mut owner_needed = false;
     loop {
         while let Some(done) = jobs.poll() {
             active -= 1;
+            pending[offered.iter().position(|&id| id == done.id).unwrap()] = !done.requires_owner;
             owner_needed |= complete(sys, regs, done, false);
         }
         if owner_needed
@@ -211,6 +213,7 @@ fn run_batch<C>(
             if jobs.submit(id, regs[id as usize].as_ref().expect("held snapshot")) {
                 sys.schedule_trace.event("compute_submit", id, 0, 0, 0);
                 *ready = false;
+                admitted |= 1 << index;
                 active += 1;
             }
         }
@@ -218,14 +221,21 @@ fn run_batch<C>(
             // There is no overlapping work to justify this scope.
             break;
         }
-        if let Some((ready, done)) = pending.iter_mut().zip(offered).find_map(|(ready, &id)| {
-            if !*ready {
-                return None;
-            }
-            let context = regs[id as usize].as_ref().expect("held snapshot");
-            jobs.run_local(id, context).map(|done| (ready, done))
-        }) {
-            *ready = false;
+        if let Some((index, done)) =
+            pending
+                .iter()
+                .zip(offered)
+                .enumerate()
+                .find_map(|(index, (ready, &id))| {
+                    if !*ready {
+                        return None;
+                    }
+                    let context = regs[id as usize].as_ref().expect("held snapshot");
+                    jobs.run_local(id, context).map(|done| (index, done))
+                })
+        {
+            pending[index] = !done.requires_owner;
+            admitted |= 1 << index;
             owner_needed = complete(sys, regs, done, true);
             continue;
         }
@@ -238,6 +248,7 @@ fn run_batch<C>(
             }
         } else if let Some(done) = jobs.wait(remaining) {
             active -= 1;
+            pending[offered.iter().position(|&id| id == done.id).unwrap()] = !done.requires_owner;
             owner_needed = complete(sys, regs, done, false);
         }
     }
@@ -249,9 +260,7 @@ fn run_batch<C>(
         active -= 1;
         complete(sys, regs, done, false);
     }
-    pending.iter().enumerate().fold(0, |mask, (index, &ready)| {
-        mask | (u32::from(!ready) << index)
-    })
+    admitted
 }
 
 fn complete<C>(sys: &mut Sys, regs: &mut [Option<C>], done: Completion<C>, local: bool) -> bool {
@@ -458,6 +467,90 @@ mod tests {
         assert_eq!(regs, [Some(1), Some(2), Some(3), Some(3)]);
         assert_eq!(machine.sys.clock.now_us(), time);
         assert_eq!(machine.sys.stats.total.cpu_runs, 1);
+    }
+
+    // spec: PROC-MACH-1 PROC-MACH-2 PROC-MACH-5 PROC-CLOCK-5
+    #[test]
+    fn completed_slices_receive_fresh_admission_until_delivery() {
+        struct Slices {
+            queued: Option<(CtxId, u32)>,
+            remote: Vec<u32>,
+            local: Vec<u32>,
+            polled: usize,
+            wake: WakeEvent,
+            recalled: bool,
+        }
+
+        impl Computation<u32> for Slices {
+            fn submit(&mut self, id: u32, context: &u32) -> bool {
+                assert!(!self.recalled);
+                assert!(self.queued.is_none());
+                self.remote.push(*context);
+                self.queued = Some((id, *context));
+                true
+            }
+
+            fn run_local(&mut self, id: u32, context: &u32) -> Option<Completion<u32>> {
+                assert!(!self.recalled);
+                assert!(self.queued.is_some());
+                self.local.push(*context);
+                if *context == 2 {
+                    self.wake.signal();
+                }
+                Some(done(id, *context, false))
+            }
+
+            fn poll(&mut self) -> Option<Completion<u32>> {
+                if self.polled == self.local.len() || self.local.len() == 3 {
+                    return None;
+                }
+                self.polled = self.local.len();
+                self.queued
+                    .take()
+                    .map(|(id, context)| done(id, context, false))
+            }
+
+            fn wait(&mut self, _: Option<Duration>) -> Option<Completion<u32>> {
+                assert!(self.recalled);
+                self.queued
+                    .take()
+                    .map(|(id, context)| done(id, context, true))
+            }
+
+            fn recall(&mut self) {
+                self.recalled = true;
+            }
+        }
+
+        let mut machine = machine(false);
+        for _ in 0..2 {
+            machine.spawn("test", CODE, &[], 0x1_0000).unwrap();
+        }
+        let wake = WakeEvent::new().unwrap();
+        let mut jobs = Slices {
+            queued: None,
+            remote: Vec::new(),
+            local: Vec::new(),
+            polled: 0,
+            wake: wake.clone(),
+            recalled: false,
+        };
+        let mut regs = [Some(0), Some(0)];
+        let admitted = run_batch(
+            &mut jobs,
+            &mut machine.sys,
+            &mut regs,
+            &[0, 1],
+            Some(&wake),
+            Some(wake.generation()),
+            None,
+        );
+        assert_eq!(jobs.remote, [0, 1, 2]);
+        assert_eq!(jobs.local, [0, 1, 2]);
+        assert_eq!(regs, [Some(3), Some(3)]);
+        assert_eq!(admitted, 3);
+        assert!(jobs.recalled && jobs.queued.is_none());
+        assert_eq!(machine.sys.stats.total.cpu_runs, 3);
     }
 
     #[derive(Clone, Default)]

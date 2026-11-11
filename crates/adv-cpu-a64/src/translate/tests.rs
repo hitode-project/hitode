@@ -302,11 +302,33 @@ impl Harness {
         initial: &CpuState,
         flagm: bool,
     ) -> (CpuState, Exit, u64) {
+        self.run_form(code, data, initial, flagm, None)
+    }
+
+    fn run_form(
+        &mut self,
+        code: &[u8],
+        data: &[u8],
+        initial: &CpuState,
+        flagm: bool,
+        admitted: Option<u64>,
+    ) -> (CpuState, Exit, u64) {
         let mut memory = memory(code, data);
         let at = self.prefix.len() * 4;
         let end = CODE + code.len() as u32;
         let mut work = Workspace::default();
         let addr = |offset| HOST_CODE as usize + offset;
+        let stubs = Stubs {
+            call: addr(self.forbidden),
+            exit: addr(self.stubs.exit),
+            dispatch: addr(self.dispatch),
+            lookup: addr(self.forbidden),
+            lookup_slow: addr(self.forbidden),
+            ret_miss: addr(self.forbidden),
+            access: addr(self.forbidden),
+            interpret: addr(self.forbidden),
+            fault: addr(self.forbidden),
+        };
         translate(
             &mut work,
             &mut memory,
@@ -316,17 +338,7 @@ impl Harness {
             0,
             Features { flagm },
             addr(at),
-            Stubs {
-                call: addr(self.forbidden),
-                exit: addr(self.stubs.exit),
-                dispatch: addr(self.dispatch),
-                lookup: addr(self.forbidden),
-                lookup_slow: addr(self.forbidden),
-                ret_miss: addr(self.forbidden),
-                access: addr(self.forbidden),
-                interpret: addr(self.forbidden),
-                fault: addr(self.forbidden),
-            },
+            stubs,
             &|_, _| None,
             &|_| None,
             &|_, _| Vec::new(),
@@ -343,17 +355,58 @@ impl Harness {
             "form has no native plan"
         );
         let mut host_code = self.prefix.clone();
-        host_code.extend_from_slice(work.words());
+        #[cfg(native)]
+        let mut computation_code = Code::default();
+        if admitted.is_some() {
+            #[cfg(native)]
+            {
+                let proof = computation::Proof::build(&work.unit.trace).expect("range proof");
+                assert!(
+                    proof
+                        .evaluate(initial, &mut computation::Evaluation::default(), |addr| {
+                            Some(u32::from_le_bytes(
+                                memory.read_data(addr, 4).ok()?.as_ref().try_into().ok()?,
+                            ))
+                        })
+                        .is_some(),
+                    "entry satisfies proof"
+                );
+                let lowered = lower_computation(
+                    &mut work.unit,
+                    &mut computation_code,
+                    CODE,
+                    Features { flagm },
+                    addr(at),
+                    stubs,
+                    (0x037f, false, Some(&proof)),
+                )
+                .expect("detached form");
+                host_code.extend_from_slice(lowered.words);
+            }
+            #[cfg(not(native))]
+            panic!("admitted form requires native translation");
+        } else {
+            host_code.extend_from_slice(work.words());
+        }
         let mut context = vec![0; size_of::<runtime::Runtime>()];
         let mut put = |offset: usize, value: u64| {
             context[offset..offset + 8].copy_from_slice(&value.to_le_bytes())
         };
         put(offset_of!(runtime::Runtime, cpu), CPU);
         put(offset_of!(runtime::Runtime, window), WINDOW_BASE);
-        put(offset_of!(runtime::Runtime, countdown), 100);
+        put(
+            offset_of!(runtime::Runtime, countdown),
+            admitted.unwrap_or(100),
+        );
+        if admitted.is_some() {
+            put(offset_of!(runtime::Runtime, shadow), WINDOW_BASE);
+            put(offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00);
+            put(offset_of!(runtime::Runtime, recall_mask), 1);
+        }
         let permissions = CONTEXT + 0x3000;
         put(offset_of!(runtime::Runtime, alias_classes), permissions);
         self.emu.write(permissions, &vec![3; 0x100]);
+        self.emu.write(CONTEXT + 0x3f00, &1u32.to_le_bytes());
         self.emu.write(CONTEXT, &context);
         let mut state = vec![0; size_of::<CpuState>()];
         for (n, value) in initial.regs.iter().enumerate() {
@@ -896,6 +949,257 @@ fn j1_unit(code: &[u8]) -> Workspace {
     work
 }
 
+#[cfg(native)]
+fn proved_division_code(memory_divisor: bool, simd: bool) -> Vec<u8> {
+    bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        if simd {
+            a.paddd(xmm0, xmm1).unwrap();
+        }
+        for offset in [0, 16] {
+            a.mov(eax, esi).unwrap();
+            a.cdq().unwrap();
+            if memory_divisor {
+                a.idiv(dword_ptr(ebp)).unwrap();
+            } else {
+                a.idiv(ecx).unwrap();
+            }
+            a.mov(dword_ptr(edi + offset), eax).unwrap();
+            a.mov(dword_ptr(edi + offset + 4), edx).unwrap();
+            a.mov(eax, edx).unwrap();
+            if memory_divisor {
+                a.add(eax, dword_ptr(ebp)).unwrap();
+            } else {
+                a.add(eax, ecx).unwrap();
+            }
+            a.cdq().unwrap();
+            if memory_divisor {
+                a.idiv(dword_ptr(ebp)).unwrap();
+            } else {
+                a.idiv(ecx).unwrap();
+            }
+            a.mov(dword_ptr(edi + offset + 8), eax).unwrap();
+            a.mov(dword_ptr(edi + offset + 12), edx).unwrap();
+        }
+        if simd {
+            a.movdqu(xmmword_ptr(edi + 32), xmm0).unwrap();
+        }
+        a.add(edi, if simd { 48 } else { 32 }).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(top).unwrap();
+    })
+}
+
+// spec: A64-TR-4 A64-TR-9 A64-VER-1
+#[test]
+#[cfg(native)]
+fn proved_divisions_keep_both_results_flags_memory_and_budget_prefixes() {
+    let mut h = Harness::new();
+    for memory_divisor in [false, true] {
+        let code = proved_division_code(memory_divisor, true);
+        for numerator in [i32::MIN, -1_073_741_825, -1, 0, 1, i32::MAX] {
+            for divisor in [1u32, 2, 1 << 30] {
+                let mut data = vec![0; 0x500];
+                data[..4].copy_from_slice(&divisor.to_le_bytes());
+                let mut state = initial();
+                state.regs[1] = divisor;
+                state.regs[3] = 2;
+                state.regs[5] = DATA;
+                state.regs[6] = numerator as u32;
+                state.regs[7] = DATA + 0x400;
+                state.xmm[0] = [0x21; 16];
+                state.xmm[1] = [0x67; 16];
+                let mut reference_memory = memory(&code, &data);
+                let mut want = state.clone();
+                let mut interpreter = Interpreter::new();
+                let mut retired = 0;
+                while want.eip != CODE + code.len() as u32 {
+                    assert_eq!(
+                        interpreter.step(&mut want, &mut reference_memory),
+                        adv_cpu_core::interpreter::Step::Executed
+                    );
+                    retired += 1;
+                }
+                let want_data = reference_memory.read_data(DATA, data.len()).unwrap();
+                for flagm in [false, true] {
+                    let (got, exit, left) = h.run_form(&code, &data, &state, flagm, Some(100));
+                    assert_eq!((exit, 100 - left), (Exit::Dispatch, retired));
+                    assert_eq!(got, want, "n={numerator} d={divisor} mem={memory_divisor}");
+                    assert_eq!(
+                        h.emu.read(WINDOW_BASE + u64::from(DATA), data.len()),
+                        want_data.as_ref()
+                    );
+                    if numerator == i32::MIN && divisor == 1 << 30
+                        || numerator == -1 && divisor == 2
+                    {
+                        for fuel in 0..retired {
+                            let (got, exit, left) =
+                                h.run_form(&code, &data, &state, flagm, Some(fuel));
+                            assert_eq!(exit, Exit::Recall);
+                            let mut want = state.clone();
+                            let mut reference_memory = memory(&code, &data);
+                            for _ in 0..fuel - left {
+                                assert_eq!(
+                                    interpreter.step(&mut want, &mut reference_memory),
+                                    adv_cpu_core::interpreter::Step::Executed
+                                );
+                            }
+                            assert_eq!(got, want, "fuel={fuel}, left={left}, mem={memory_divisor}");
+                            assert_eq!(
+                                h.emu.read(WINDOW_BASE + u64::from(DATA), data.len()),
+                                reference_memory
+                                    .read_data(DATA, data.len())
+                                    .unwrap()
+                                    .as_ref()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-TR-4 A64-TR-9
+#[test]
+#[cfg(native)]
+fn proved_divisions_leave_unadmitted_values_to_the_ordinary_form() {
+    let mut h = Harness::new();
+    for memory_divisor in [false, true] {
+        let code = proved_division_code(memory_divisor, false);
+        let work = j1_unit(&code);
+        let proof = computation::Proof::build(&work.unit.trace).unwrap();
+        for divisor in [0u32, u32::MAX, (1 << 30) + 1] {
+            let mut data = vec![0; 0x500];
+            data[..4].copy_from_slice(&divisor.to_le_bytes());
+            let mut state = initial();
+            state.regs[1] = divisor;
+            state.regs[3] = 2;
+            state.regs[5] = DATA;
+            state.regs[6] = 10;
+            state.regs[7] = DATA + 0x400;
+            let mem = memory(&code, &data);
+            assert!(
+                proof
+                    .evaluate(&state, &mut computation::Evaluation::default(), |addr| {
+                        Some(u32::from_le_bytes(
+                            mem.read_data(addr, 4).ok()?.as_ref().try_into().ok()?,
+                        ))
+                    })
+                    .is_none()
+            );
+            if divisor != 0 {
+                let want = reference(&code, &data, &state);
+                for flagm in [false, true] {
+                    let (got, exit, _) = h.run(&code, &data, &state, flagm);
+                    assert_eq!(exit, Exit::Dispatch);
+                    assert_eq!(got, want);
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-TR-4 A64-TR-9 A64-REG-3 A64-MEM-10
+#[test]
+#[cfg(native)]
+fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites() {
+    for (memory_divisor, simd) in [(false, false), (true, true)] {
+        let guest = proved_division_code(memory_divisor, simd);
+        let mut work = j1_unit(&guest);
+        let proof = computation::Proof::build(&work.unit.trace).unwrap();
+        let at = HOST_CODE as usize;
+        let stubs = Stubs {
+            call: at,
+            exit: at,
+            dispatch: at,
+            lookup: at,
+            lookup_slow: at,
+            ret_miss: at,
+            access: at,
+            interpret: at,
+            fault: at,
+        };
+        let mut totals = Vec::new();
+        for facts in [None, Some(&proof)] {
+            let mut code = Code::default();
+            lower_computation(
+                &mut work.unit,
+                &mut code,
+                CODE,
+                Features { flagm: false },
+                at,
+                stubs,
+                (0x037f, false, facts),
+            )
+            .unwrap();
+            let mut fixed = 0;
+            let mut hot = 0;
+            for (index, inst) in work.unit.trace.insts.iter().enumerate() {
+                if !matches!(inst.op, Op::Cdq | Op::Integer(integer::Integer::Divide(..))) {
+                    continue;
+                }
+                let begin = code.asm.position(code.labels[index]) / 4;
+                let end = code.asm.position(code.labels[index + 1]) / 4;
+                let words = &code.asm.words()[begin..end];
+                if matches!(inst.op, Op::Cdq) {
+                    assert!(words.contains(&sbfx(W, host(2), host(0), 31, 1)));
+                    fixed += 1;
+                    hot += words.len();
+                } else if facts.is_none() {
+                    let divide = words
+                        .iter()
+                        .position(|&w| w == sdiv(X, X17, X16, X14))
+                        .unwrap();
+                    assert_eq!(
+                        words[divide - 5] & 0xff00_0000,
+                        cbz(W, false, X0, 0) & 0xff00_0000
+                    );
+                    assert_eq!(words[divide + 6] & 0xfc00_0000, b(0));
+                    fixed += 12;
+                    hot += divide - 5 + 12;
+                } else {
+                    let fixed_words = match proof.division(index).unwrap() {
+                        computation::Division::SignExtended => 3,
+                        computation::Division::Normalized => 5,
+                    };
+                    fixed += fixed_words;
+                    hot += words.len();
+                }
+            }
+            if facts.is_some() && memory_divisor && simd {
+                for inst in work
+                    .unit
+                    .trace
+                    .insts
+                    .iter()
+                    .filter(|inst| matches!(inst.op, Op::Integer(integer::Integer::Divide(..))))
+                {
+                    let site = code
+                        .sites
+                        .iter()
+                        .find(|(_, site)| site.eip == inst.pc)
+                        .unwrap()
+                        .1;
+                    assert_ne!(
+                        site.simd_dirty & (1 << 8),
+                        0,
+                        "live XMM0 at the divisor load"
+                    );
+                }
+            }
+            totals.push((fixed, hot));
+        }
+        assert_eq!((totals[0].0, totals[1].0), (52, 20));
+        assert!(totals[0].1 - totals[1].1 >= 32);
+        eprintln!(
+            "four DIV + CDQ: fixed 52 -> 20 words; with wrappers {} -> {} (memory={memory_divisor}, simd={simd})",
+            totals[0].1, totals[1].1
+        );
+    }
+}
+
 // spec: A64-FLAG-3, A64-FLAG-5, A64-CTL-7
 #[test]
 fn j1_hot_paths_omit_dead_logic_tests_and_loop_materialization() {
@@ -1012,5 +1316,89 @@ fn j1_sse_reuses_mxcsr_and_pe_checks_until_a_control_write() {
             .filter(|&&word| word == ldr(W, X13, X5, runtime::MXCSR))
             .count();
         assert_eq!(loads, if control_write { 4 } else { 2 });
+    }
+}
+
+// spec: A64-TR-9 A64-CTL-8
+#[test]
+#[cfg(native)]
+fn admitted_frame_values_are_reloaded_at_each_outer_iteration() {
+    let mut h = Harness::new();
+    for overlapping_store in [false, true] {
+        let code = bytes(|a| {
+            let mut outer = a.create_label();
+            let mut inner = a.create_label();
+            let mut alternate = a.create_label();
+            let mut output = a.create_label();
+            a.set_label(&mut outer).unwrap();
+            a.mov(dword_ptr(esp + 4), ebx).unwrap();
+            a.mov(dword_ptr(esp + 8), 7).unwrap();
+            a.mov(dword_ptr(esp + 12), 11).unwrap();
+            a.mov(ecx, 4).unwrap();
+            a.set_label(&mut inner).unwrap();
+            a.mov(eax, dword_ptr(esp + 4)).unwrap();
+            a.test(ebx, 1).unwrap();
+            a.jz(alternate).unwrap();
+            a.imul_2(eax, dword_ptr(esp + 8)).unwrap();
+            a.jmp(output).unwrap();
+            a.set_label(&mut alternate).unwrap();
+            a.imul_2(eax, dword_ptr(esp + 12)).unwrap();
+            if overlapping_store {
+                a.mov(byte_ptr(esp + 5), al).unwrap();
+            }
+            a.set_label(&mut output).unwrap();
+            a.mov(edx, dword_ptr(esp + 4)).unwrap();
+            a.add(eax, edx).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(inner).unwrap();
+            a.dec(ebx).unwrap();
+            a.jne(outer).unwrap();
+        });
+        let work = j1_unit(&code);
+        let proof = computation::Proof::build(&work.unit.trace).expect("nested proof");
+        let cache = proof.frame_cache().expect("inner loop residence");
+        assert!(cache.offsets.contains(&8) && cache.offsets.contains(&12));
+        assert_eq!(cache.offsets.contains(&4), !overlapping_store);
+
+        let mut state = initial();
+        state.regs[3] = 3;
+        state.regs[4] = DATA + 0x100;
+        state.regs[7] = DATA + 0x200;
+        let data = vec![0; 0x300];
+        let mut interpreter = Interpreter::new();
+        let mut want = state.clone();
+        let mut mem = memory(&code, &data);
+        let mut prefixes = vec![(want.clone(), data.clone())];
+        while want.eip != CODE + code.len() as u32 {
+            assert_eq!(
+                interpreter.step(&mut want, &mut mem),
+                adv_cpu_core::interpreter::Step::Executed
+            );
+            prefixes.push((
+                want.clone(),
+                mem.read_data(DATA, data.len()).unwrap().to_vec(),
+            ));
+        }
+        let retired = prefixes.len() as u64 - 1;
+        for fuel in 0..=retired {
+            let (got, exit, left) = h.run_form(&code, &data, &state, false, Some(fuel));
+            let completed = fuel - left;
+            let (want, bytes) = &prefixes[completed as usize];
+            assert_eq!(got, *want, "overlap={overlapping_store} fuel={fuel}");
+            assert_eq!(
+                h.emu.read(WINDOW_BASE + u64::from(DATA), data.len()),
+                *bytes
+            );
+            assert_eq!(
+                exit,
+                if completed == retired {
+                    Exit::Dispatch
+                } else {
+                    Exit::Recall
+                }
+            );
+        }
     }
 }

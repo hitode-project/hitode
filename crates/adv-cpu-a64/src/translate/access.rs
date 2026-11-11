@@ -26,6 +26,9 @@ pub(super) enum Addr {
     Window(Reg),
     /// A biased stack register plus an offset the guards cover.
     Biased(Reg, i32),
+    /// A proved loop invariant in an unused high SIMD lane.
+    #[cfg(native)]
+    FrameCache(u8),
     /// The slot below ESP, which a store pushes to.
     Push,
     /// The slot at ESP, which a load pops from.
@@ -78,6 +81,25 @@ impl Dir {
 }
 
 impl Translator<'_> {
+    #[cfg(native)]
+    pub(super) fn load_frame_cache(&mut self, offsets: &[i32]) {
+        for (slot, &offset) in offsets.iter().enumerate() {
+            let address = self.effective(Mem {
+                base: Some(ESP),
+                index: None,
+                scale: 1,
+                address_bits: 32,
+                disp: offset as u32,
+                fs: false,
+            });
+            // Admission already granted the original four bytes through
+            // this alias. Hoisting does not add a guest fault or effect.
+            self.emit(ldr_reg(W, super::X16, self.data_view(), address, false));
+            let (reg, lane) = frame_lane(slot as u8);
+            self.emit(vins_general(2, reg, lane, super::X16));
+        }
+    }
+
     /// The worker's unused shadow register holds its admitted private alias.
     pub(super) fn data_view(&self) -> Reg {
         if self.computation { SHADOW } else { WINDOW }
@@ -86,6 +108,14 @@ impl Translator<'_> {
     /// An address for a 32-bit access to `mem`; a checked one is always in
     /// a register.
     pub(super) fn address(&mut self, mem: Mem) -> Addr {
+        #[cfg(native)]
+        if let Some(slot) = self
+            .proof
+            .and_then(|proof| proof.frame_cache())
+            .and_then(|cache| cache.read(self.index))
+        {
+            return Addr::FrameCache(slot);
+        }
         if let (Some(base), None) = (mem.base, mem.index)
             && biased(base)
             && !self.checking
@@ -116,6 +146,11 @@ impl Translator<'_> {
     pub(super) fn access(&mut self, addr: Addr, width: u8, dir: Dir, rt: Reg) {
         let store = dir == Dir::Store;
         match addr {
+            #[cfg(native)]
+            Addr::FrameCache(slot) => {
+                let (reg, lane) = frame_lane(slot);
+                self.emit(vumov(2, rt, reg, lane));
+            }
             Addr::Push => {
                 assert!(store && width == 4, "a push stores 4 bytes");
                 if self.checking || self.computation {
@@ -293,4 +328,11 @@ impl Translator<'_> {
             self.asm.tbz(true, X4, bit(permission), excluded);
         }
     }
+}
+
+#[cfg(native)]
+fn frame_lane(slot: u8) -> (VReg, u32) {
+    // Detached units exclude MMX instructions. Preserve each low D lane,
+    // which the host ABI saves and restores even in this form.
+    (VReg::new(8 + slot / 2), 2 + u32::from(slot % 2))
 }

@@ -787,6 +787,35 @@ impl Trace {
         while self.liveness(false) && backward {}
     }
 
+    /// One outer iteration of a proved trace, with the original instruction
+    /// indices so the full trace's proof also describes this prefix.
+    #[cfg(native)]
+    pub(crate) fn iteration(&self) -> Option<Self> {
+        let root = self.insts.first()?.pc;
+        let mut cut = false;
+        let mut trace = Self {
+            insts: self.insts.clone(),
+            primary: self.primary,
+            ..Self::default()
+        };
+        for inst in &mut trace.insts {
+            if inst.next == Next::Edge(Edge::Internal(0)) {
+                inst.next = Next::Edge(Edge::Exit(root));
+                cut = true;
+            }
+            if inst.taken == Some(Edge::Internal(0)) {
+                inst.taken = Some(Edge::Exit(root));
+                cut = true;
+            }
+        }
+        if cut {
+            trace.analyze();
+            Some(trace)
+        } else {
+            None
+        }
+    }
+
     pub fn has_loop(&self) -> bool {
         self.insts.iter().enumerate().any(|(index, inst)| {
             matches!(inst.taken, Some(Edge::Internal(to)) if to <= index)
