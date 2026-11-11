@@ -68,7 +68,10 @@ int main(void)
     UpdateWindow(window);
     flush();
     checkpoint(4);
-    flush();
+    /* The pointer checkpoint 4 queued arrives whenever the queue next runs,
+     * which a busy machine can put off past one flush: wait for it, bounded. */
+    for (DWORD start = GetTickCount(); mouse_point == 0xffffffff && GetTickCount() - start < 10000;)
+        flush();
     printf("mouse=%d,%d\n", (short)mouse_point, (short)(mouse_point >> 16));
     DestroyWindow(window);
     return mouse_point != (17u << 16 | 13u);
