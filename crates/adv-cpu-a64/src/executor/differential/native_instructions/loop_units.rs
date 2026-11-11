@@ -376,3 +376,35 @@ fn rejected_wide_side_path_preserves_the_loop_exit() {
         RunOutcome::ReachedStop
     );
 }
+
+// spec: A64-TR-3
+#[test]
+fn budget_exits_promote_a_hot_loop_and_its_enclosing_entry() {
+    // The outer backedge lies beyond a cold trace from the outer head, so
+    // only budget exits in the inner loop can promote both heads.
+    let mut p = fixture(|a| {
+        let mut outer = a.create_label();
+        let mut inner = a.create_label();
+        a.set_label(&mut outer).unwrap();
+        a.mov(ecx, 20_000).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.add(eax, edx).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(inner).unwrap();
+        for _ in 0..100 {
+            a.add(ebx, 1).unwrap();
+        }
+        a.dec(esi).unwrap();
+        a.jne(outer).unwrap();
+    });
+    p.state.regs[6] = 8;
+    for (fuel, promotions) in [(1 << 15, 0), (u64::from(u32::MAX), 2)] {
+        let config = (Features { flagm: false }, false, Checks::Adaptive);
+        let mut native = executor(&p, config, false);
+        native.native.as_mut().unwrap().promotion = crate::native::PROMOTION;
+        let mut oracle = executor(&p, config, true);
+        compare(&mut native, &mut oracle, &p, fuel);
+        let engine = native.native.as_ref().unwrap();
+        assert_eq!(engine.diagnostics.promotions, promotions, "fuel {fuel}");
+    }
+}

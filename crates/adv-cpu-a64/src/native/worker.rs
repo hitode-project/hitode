@@ -605,7 +605,9 @@ mod tests {
         memory.map(CODE, 0x4000, READ | WRITE).unwrap();
         memory.write(CODE, &words).unwrap();
         memory.protect(CODE, 0x4000, READ | EXEC).unwrap();
-        let native = Native::new(memory.window_base().unwrap()).unwrap();
+        let mut native = Native::new(memory.window_base().unwrap()).unwrap();
+        // These tests nominate from the first budget exit; promotion has its own test.
+        native.promotion = 0;
         (executor, native)
     }
 
@@ -1001,8 +1003,14 @@ mod tests {
             .map(OUTPUT, 0x4000, READ | WRITE)
             .unwrap();
         let mut work = Workspace::default();
-        work.unit
-            .build(executor.memory_mut(), CODE, &[], &|_, _| None, &|_| None);
+        work.unit.build(
+            executor.memory_mut(),
+            CODE,
+            &[],
+            &|_, _| None,
+            &|_| None,
+            true,
+        );
         let at = native.cache.next();
         let mut scratch = translate::Code::default();
         let emitted = translate::lower_computation(

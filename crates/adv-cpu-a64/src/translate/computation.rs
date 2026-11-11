@@ -2054,7 +2054,7 @@ mod tests {
         memory.write(CODE, &code).unwrap();
         memory.protect(CODE, 4096, 5).unwrap();
         let mut trace = Trace::default();
-        trace.build(&memory, CODE, &[], &|_, _| None, &|_| None);
+        trace.build(&memory, CODE, &[], &|_, _| None, &|_| None, true);
         trace
     }
 

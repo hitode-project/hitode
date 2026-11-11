@@ -136,8 +136,6 @@ pub struct Runtime {
     pub head_exit: u32,
     /// Checkpoints that kept running past a recall to reach the head.
     pub deferred: u32,
-    /// Candidate whose ordinary unit exhausted an instruction budget.
-    pub computation_hint: u32,
 }
 
 impl Runtime {
@@ -182,7 +180,6 @@ impl Runtime {
             completed: 0,
             head_exit: 0,
             deferred: 0,
-            computation_hint: 0,
         }
     }
 }
@@ -207,6 +204,9 @@ pub enum Exit {
     Reschedule = 5,
     Recall = 6,
     Computation = 7,
+    /// An ordinary unit exhausted its instruction budget at EIP. The owner
+    /// samples EIP, then dispatches.
+    Budget = 8,
 }
 
 impl Exit {
@@ -220,6 +220,7 @@ impl Exit {
             5 => Some(Self::Reschedule),
             6 => Some(Self::Recall),
             7 => Some(Self::Computation),
+            8 => Some(Self::Budget),
             _ => None,
         }
     }
@@ -319,7 +320,6 @@ pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
 pub(crate) const RECALL_GRACE: u32 = 64;
-pub(crate) const COMPUTATION_HINT: u32 = field(offset_of!(Runtime, computation_hint));
 pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
 pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));

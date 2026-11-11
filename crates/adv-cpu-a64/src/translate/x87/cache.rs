@@ -1482,10 +1482,10 @@ impl Translator<'_> {
                         meet(incoming)?;
                         arrival = next;
                     }
-                    if let Some(h) = head {
-                        if let Some(seed) = heads[h].1 {
-                            meet(seed)?;
-                        }
+                    if let Some(h) = head
+                        && let Some(seed) = heads[h].1
+                    {
+                        meet(seed)?;
                     }
                     let (slots, delta) = model?;
                     if let Some(h) = head {

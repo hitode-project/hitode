@@ -700,7 +700,7 @@ impl Executor {
                 None => self.run_native(stop, bridge)?,
             } {
                 match exit {
-                    Exit::Dispatch => continue,
+                    Exit::Dispatch | Exit::Budget => continue,
                     Exit::Computation => {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);

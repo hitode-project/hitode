@@ -35,6 +35,7 @@ fn executor(program: &Program, config: Config, interpreted: bool) -> Executor {
     let native = executor.native.as_mut().unwrap();
     native.features = config.0;
     native.first_visits = config.1;
+    native.promotion = 0;
     native.checks = config.2;
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();

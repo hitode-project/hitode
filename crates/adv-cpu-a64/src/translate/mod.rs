@@ -133,7 +133,7 @@ pub struct Unit {
 impl Unit {
     /// Traces the unit at `eip`, ending before any of `stops`. Each byte
     /// the unit depends on is registered with `watch_code`, so a store to
-    /// it reaches the owner. `host` and `redirect` are as for
+    /// it reaches the owner. `host`, `redirect` and `loops` are as for
     /// [`Trace::build`].
     pub fn build(
         &mut self,
@@ -142,9 +142,10 @@ impl Unit {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
+        loops: bool,
     ) {
         self.regions.clear();
-        self.trace.build(memory, eip, stops, host, redirect);
+        self.trace.build(memory, eip, stops, host, redirect, loops);
         tables::prepare(self, memory);
         for &(start, len) in &self.trace.code {
             memory.watch_code(start, len as usize);
@@ -176,6 +177,8 @@ pub trait Backend {
 pub struct Workspace {
     pub(crate) unit: Unit,
     pub(crate) code: Code,
+    /// Translate the next entry as cold: one path, no loop trace.
+    pub(crate) cold: bool,
 }
 
 /// The JIT back end's output, in buffers the next unit reuses.
@@ -413,11 +416,6 @@ enum Cold {
         /// Whether a recall waits for the form to return at its head.
         defer: bool,
     },
-    Nominate {
-        label: Label,
-        leave: Label,
-        eip: u32,
-    },
     /// Continues at the EIP in w16 through the indirect table.
     Lookup {
         label: Label,
@@ -527,7 +525,6 @@ struct Translator<'a> {
     computation: bool,
     #[cfg(native)]
     proof: Option<&'a computation::Proof>,
-    candidate: Option<u32>,
 }
 
 /// Translates the unit at `eip` into `work`, to be placed at host address
@@ -553,7 +550,8 @@ pub fn translate(
     control: u16,
     pe: bool,
 ) {
-    work.unit.build(memory, eip, stops, host, redirect);
+    work.unit
+        .build(memory, eip, stops, host, redirect, !work.cold);
     work.unit.prepare_regions(memory, admit, checked);
     Jit {
         code: &mut work.code,
@@ -659,18 +657,6 @@ impl Jit<'_> {
             computation,
             #[cfg(native)]
             proof: self.proof,
-            candidate: {
-                #[cfg(native)]
-                {
-                    (!computation)
-                        .then(|| computation::candidate(trace))
-                        .flatten()
-                }
-                #[cfg(not(native))]
-                {
-                    None
-                }
-            },
         };
         t.x87_prepare();
         if trace.len() == 0 {
@@ -900,7 +886,7 @@ impl Translator<'_> {
         if self.computation {
             Exit::Recall
         } else {
-            Exit::Dispatch
+            Exit::Budget
         }
     }
 
@@ -908,13 +894,7 @@ impl Translator<'_> {
     /// form can resume from the same live host registers instead.
     fn checkpoint(&mut self, leave: Label, target: Option<Label>, refund: u32, debt: u32) -> Label {
         if !self.computation {
-            return if let Some(eip) = self.candidate {
-                let label = self.asm.label();
-                self.push_cold(Cold::Nominate { label, leave, eip });
-                label
-            } else {
-                leave
-            };
+            return leave;
         }
         let target = target.expect("computation checkpoint continuation");
         let label = self.asm.label();
@@ -1871,12 +1851,6 @@ impl Translator<'_> {
                 ]);
                 self.mov_imm(X9, crate::runtime::COMPUTATION_SLICE - debt);
                 self.asm.b(target);
-            }
-            Cold::Nominate { label, leave, eip } => {
-                self.asm.bind(label);
-                self.mov_imm(X0, eip);
-                self.emit(str(W, X0, RUNTIME, crate::runtime::COMPUTATION_HINT));
-                self.asm.b(leave);
             }
             Cold::Lookup {
                 label,

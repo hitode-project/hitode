@@ -302,6 +302,7 @@ mod tests {
             &[0x10000 + bytes.len() as u32],
             &|_, _| None,
             &|_| None,
+            true,
         );
         let head = 2 + usize::from(matches!(variant, 3 | 6));
         assert!(trace.merge[head]);

@@ -6,9 +6,10 @@
 //! the callee's `ret` becomes a check that the popped EIP is the expected
 //! one; otherwise it becomes a real call whose continuation is the next
 //! instruction of the trace, reached again through the shadow stack.
-//! A backward internal edge permits a larger trace that ends at the last
-//! loop latch. Taken paths that rejoin the trace in the same frame append
-//! to it; paths that leave it remain side exits.
+//! A cold entry takes one path. At a hot entry, a backward internal edge
+//! permits a larger trace that ends at the last loop latch. Taken paths
+//! that rejoin the trace in the same frame append to it; paths that leave
+//! it remain side exits.
 //!
 //! Budget (A64-CTL-7): the entry and call continuations prepay their regions.
 //! Edges settle the difference between the target region's debt and the
@@ -25,7 +26,7 @@ use super::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;
-/// Longest trace with a loop.
+/// Longest trace with a loop, at a hot entry.
 const LOOP_LIMIT: usize = 1024;
 /// What a wide x87 or packed conversion counts toward either limit.
 const WIDE_WEIGHT: usize = 4;
@@ -274,6 +275,8 @@ impl Trace {
     /// entry. `redirect` gives, for a function entry whose calls go
     /// elsewhere, the target and the bytes the function must still begin
     /// with; the trace then jumps there instead of decoding the function.
+    /// Only `loops` permits the larger loop trace; a cold entry takes one
+    /// path of at most `MAX_INSTRUCTIONS`.
     pub fn build(
         &mut self,
         memory: &Memory,
@@ -281,26 +284,31 @@ impl Trace {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
+        loops: bool,
     ) {
-        let end = self.build_paths(memory, entry, stops, host, redirect, (LOOP_LIMIT, None));
-        if let Some(end) = end {
-            self.build_paths(
-                memory,
-                entry,
-                stops,
-                host,
-                redirect,
-                (LOOP_LIMIT, Some(end)),
-            );
-        } else if self.last_backedge(&Stops::new(stops)).is_none() {
-            self.build_paths(
-                memory,
-                entry,
-                stops,
-                host,
-                redirect,
-                (MAX_INSTRUCTIONS, None),
-            );
+        let limit = if loops { LOOP_LIMIT } else { MAX_INSTRUCTIONS };
+        match self.build_paths(memory, entry, stops, host, redirect, (limit, None)) {
+            Some(end) => {
+                self.build_paths(
+                    memory,
+                    entry,
+                    stops,
+                    host,
+                    redirect,
+                    (LOOP_LIMIT, Some(end)),
+                );
+            }
+            None if loops && self.last_backedge(&Stops::new(stops)).is_none() => {
+                self.build_paths(
+                    memory,
+                    entry,
+                    stops,
+                    host,
+                    redirect,
+                    (MAX_INSTRUCTIONS, None),
+                );
+            }
+            None => {}
         }
         let stops = Stops::new(stops);
         // Inlined callees and loops revisit bytes: watch each one once.

@@ -389,28 +389,42 @@ impl Harness {
             host_code.extend_from_slice(work.words());
         }
         let mut context = vec![0; size_of::<runtime::Runtime>()];
-        let mut put = |offset: usize, value: u64| {
-            context[offset..offset + 8].copy_from_slice(&value.to_le_bytes())
+        let mut put = |offset: usize, value: &[u8]| {
+            context[offset..offset + value.len()].copy_from_slice(value)
         };
-        put(offset_of!(runtime::Runtime, cpu), CPU);
-        put(offset_of!(runtime::Runtime, window), WINDOW_BASE);
+        put(offset_of!(runtime::Runtime, cpu), &CPU.to_le_bytes());
+        put(
+            offset_of!(runtime::Runtime, window),
+            &WINDOW_BASE.to_le_bytes(),
+        );
         put(
             offset_of!(runtime::Runtime, countdown),
-            admitted.unwrap_or(100),
+            &admitted.unwrap_or(100).to_le_bytes(),
         );
         if admitted.is_some() {
-            put(offset_of!(runtime::Runtime, shadow), WINDOW_BASE);
-            put(offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00);
-            put(offset_of!(runtime::Runtime, recall_mask), 1);
-            // The recall has spent its grace (with a zero hint after it):
-            // leave at the first checkpoint.
+            put(
+                offset_of!(runtime::Runtime, shadow),
+                &WINDOW_BASE.to_le_bytes(),
+            );
+            put(
+                offset_of!(runtime::Runtime, recall),
+                &(CONTEXT + 0x3f00).to_le_bytes(),
+            );
+            put(
+                offset_of!(runtime::Runtime, recall_mask),
+                &1u32.to_le_bytes(),
+            );
+            // The recall has spent its grace: leave at the first checkpoint.
             put(
                 offset_of!(runtime::Runtime, deferred),
-                u64::from(runtime::RECALL_GRACE),
+                &runtime::RECALL_GRACE.to_le_bytes(),
             );
         }
         let permissions = CONTEXT + 0x3000;
-        put(offset_of!(runtime::Runtime, alias_classes), permissions);
+        put(
+            offset_of!(runtime::Runtime, alias_classes),
+            &permissions.to_le_bytes(),
+        );
         self.emu.write(permissions, &vec![3; 0x100]);
         self.emu.write(CONTEXT + 0x3f00, &1u32.to_le_bytes());
         self.emu.write(CONTEXT, &context);

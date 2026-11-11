@@ -60,6 +60,10 @@ const CACHE_LEN: usize = 64 << 20;
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
 const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
+/// Budget exits at one EIP that promote it: a few slices of owner time.
+pub(crate) const PROMOTION: u8 = 4;
+/// How far below a promoted EIP, in bytes, an enclosing entry may start.
+const PROMOTION_REACH: u32 = 4096;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 
@@ -354,6 +358,8 @@ pub(crate) struct Diagnostics {
     pub dispatches: u64,
     pub dropped_units: u64,
     pub clears: u64,
+    /// Entries promoted to loop traces.
+    pub promotions: u64,
     /// Empty units translated, by `Fetcher::failure`.
     pub empty_units: [u64; 4],
     /// Checked accesses `access` performed and refused.
@@ -757,6 +763,12 @@ pub(crate) struct Native {
     rejected_candidates: FxHashSet<u32>,
     computation_extents: Vec<(u32, u32)>,
     nominated: Option<(u32, u32)>,
+    /// Budget exits an entry needs before it is promoted; zero translates
+    /// every entry with loop traces.
+    pub(crate) promotion: u8,
+    /// Budget exits by EIP, and the entries promoted to loop traces.
+    samples: FxHashMap<u32, u8>,
+    promoted: FxHashSet<u32>,
     probed: Option<Probed>,
     computation_enabled: bool,
     skip_offer: Option<u32>,
@@ -872,6 +884,9 @@ impl Native {
             rejected_candidates: FxHashSet::default(),
             computation_extents: Vec::new(),
             nominated: None,
+            promotion: PROMOTION,
+            samples: FxHashMap::default(),
+            promoted: FxHashSet::default(),
             probed: None,
             computation_enabled: false,
             skip_offer: None,
@@ -1081,9 +1096,6 @@ impl Native {
         unsafe {
             (*runtime).countdown = budget;
             (*runtime).cpu = cpu;
-            if self.computation_enabled {
-                (*runtime).computation_hint = 0;
-            }
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
             (*runtime).fault_simd = (*faults).capture.simd.as_ptr() as u64;
@@ -1101,13 +1113,17 @@ impl Native {
             return Err(error);
         }
         let translated = owner.translated;
-        let exit = Exit::from_raw(self.runtime.exit)
+        let mut exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
+        if exit == Exit::Budget {
+            self.sample(memory, cpu.eip);
+            exit = Exit::Dispatch;
+        }
         match exit {
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
-            Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall => {}
+            Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
         let mut retired = budget - self.runtime.countdown;
@@ -1130,16 +1146,6 @@ impl Native {
         }
         if retired != 0 {
             self.progressed();
-        }
-        if self.computation_enabled
-            && retired != 0
-            && self.runtime.computation_hint != 0
-            && self.offer_computation()
-        {
-            let (candidate, end) = self.enclosing_computation(self.runtime.computation_hint);
-            if !self.is_stop(candidate) && !self.rejected_candidates.contains(&candidate) {
-                self.nominated = Some((candidate, end));
-            }
         }
         let retired = retired as u32;
         Ok(Some(Run {
@@ -1226,6 +1232,7 @@ impl Native {
         let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
             for eip in self.pages.remove(&page).unwrap_or_default() {
+                self.promoted.remove(&eip);
                 let unit = self.drop_unit(eip);
                 self.diagnostics.dropped_units += u64::from(unit);
                 dropped |= unit;
@@ -1234,6 +1241,7 @@ impl Native {
         if dropped {
             self.rejected_candidates.clear();
             self.computation_extents.clear();
+            self.samples.clear();
             self.forget_dynamic();
         }
     }
@@ -1502,6 +1510,8 @@ impl Native {
             let x87 = unsafe { &(*self.runtime.cpu).x87 };
             (x87.control, x87.status & 0x20 != 0)
         };
+        work.cold =
+            self.promotion != 0 && !self.promoted.contains(&eip) && !self.candidates.contains(&eip);
         translate::translate(
             &mut work,
             memory,
@@ -1563,13 +1573,11 @@ impl Native {
         );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
-            if let Some(extent) = translate::computation_extent(&work.unit.trace)
-                && !self.computation_extents.contains(&extent)
+            // A cold path reaches only inner loop heads; nominate from loop traces.
+            if !work.cold
+                && let Some(extent) = translate::computation_extent(&work.unit.trace)
             {
-                if self.computation_extents.len() == 64 {
-                    self.computation_extents.remove(0);
-                }
-                self.computation_extents.push(extent);
+                self.record_extent(extent);
             }
             if !work.unit.tables.is_empty() {
                 self.table_sources.insert(eip);
@@ -1671,21 +1679,81 @@ impl Native {
         })
     }
 
-    fn enclosing_computation(&self, hint: u32) -> (u32, u32) {
+    /// A budget exit samples where owner time goes. It nominates the
+    /// computation enclosing EIP. Once EIP has `promotion` samples, it and
+    /// the nearby entry with the widest computation extent around it take
+    /// loop traces.
+    fn sample(&mut self, memory: &Memory, eip: u32) {
+        if self.computation_enabled
+            && self.offer_computation()
+            && let Some((candidate, end)) = self.enclosing_computation(eip)
+            && !self.is_stop(candidate)
+        {
+            self.nominated = Some((candidate, end));
+        }
+        if self.promotion == 0 || self.promoted.contains(&eip) {
+            return;
+        }
+        let count = self.samples.entry(eip).or_default();
+        *count += 1;
+        if *count < self.promotion {
+            return;
+        }
+        self.samples.remove(&eip);
+        let nearby: Vec<u32> = self
+            .units
+            .keys()
+            .copied()
+            .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
+            .collect();
+        // Entries retranslate only when control next enters them, so every
+        // enclosing loop's extent is recorded now. Nomination then tries the
+        // outermost first and falls back inward as proofs are rejected.
+        let mut outer: Option<(u32, u32)> = None;
+        for entry in nearby {
+            let trace = self.loop_trace(memory, entry, &self.stops);
+            let Some((head, end)) = translate::computation_extent(&trace)
+                .filter(|&(head, end)| head <= eip && eip < end)
+            else {
+                continue;
+            };
+            self.record_extent((head, end));
+            let size = end - head;
+            if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
+                outer = Some((entry, size));
+            }
+        }
+        for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
+            if self.promoted.insert(entry) {
+                self.diagnostics.promotions += 1;
+                self.drop_unit(entry);
+            }
+        }
+        self.forget_dynamic();
+    }
+
+    fn record_extent(&mut self, extent: (u32, u32)) {
+        if !self.computation_extents.contains(&extent) {
+            if self.computation_extents.len() == 64 {
+                self.computation_extents.remove(0);
+            }
+            self.computation_extents.push(extent);
+        }
+    }
+
+    fn enclosing_computation(&self, eip: u32) -> Option<(u32, u32)> {
         self.computation_extents
             .iter()
             .copied()
             .filter(|&(head, end)| {
-                head <= hint && hint < end && !self.rejected_candidates.contains(&head)
+                head <= eip && eip < end && !self.rejected_candidates.contains(&head)
             })
             .max_by_key(|&(head, end)| end - head)
-            .unwrap_or((hint, hint))
     }
 
     fn prove_candidate(&self, memory: &Memory, eip: u32, end: u32) -> Option<Probed> {
         // The installed owner trace watches the code. Reuse this proof
         // only if that trace has identical decoded effects and edges.
-        let mut trace = translate::Trace::default();
         let mut stops = self.stops.clone();
         stops.extend(
             self.candidates
@@ -1693,6 +1761,14 @@ impl Native {
                 .copied()
                 .filter(|&inside| !(eip < inside && inside < end)),
         );
+        let trace = self.loop_trace(memory, eip, &stops);
+        let proof = computation_proof(&trace)?;
+        Some(Probed { eip, trace, proof })
+    }
+
+    /// The trace a hot entry at `eip` takes.
+    fn loop_trace(&self, memory: &Memory, eip: u32, stops: &[u32]) -> translate::Trace {
+        let mut trace = translate::Trace::default();
         let handler = if self.bridge.is_null() {
             None
         } else {
@@ -1704,7 +1780,7 @@ impl Native {
         trace.build(
             memory,
             eip,
-            &stops,
+            stops,
             &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
             &|pc| {
                 let handler = handler?;
@@ -1716,9 +1792,9 @@ impl Native {
                     body: handler.direct_body(pc),
                 })
             },
+            true,
         );
-        let proof = computation_proof(&trace)?;
-        Some(Probed { eip, trace, proof })
+        trace
     }
 
     /// Appends a unit for `eip` whose `sites` are at byte offsets.

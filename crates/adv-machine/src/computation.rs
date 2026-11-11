@@ -575,8 +575,9 @@ mod tests {
         }
         const INPUT: u32 = 0x0050_0000;
         const OUTPUT: u32 = 0x0060_0000;
-        const SPACE: u32 = 0x4_0000;
-        const COUNT: u32 = 40_000;
+        const SPACE: u32 = 0x10_0000;
+        // Enough budget slices to promote the loop before nominating it.
+        const COUNT: u32 = 160_000;
         let mut m = machine(true);
         let trace = Trace::default();
         m.sys.schedule_trace = ScheduleTrace::to_writer(Box::new(trace.clone())).unwrap();
