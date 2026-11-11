@@ -12,6 +12,8 @@ use adv_machine::{Env, Machine, Object, Outcome, Wait};
 use adv_pe::{ImportModule, ImportName};
 
 mod exports;
+#[cfg(feature = "gpu")]
+pub(super) mod frame_timer;
 mod sound;
 mod stream;
 mod wave;
@@ -111,6 +113,10 @@ pub(super) fn register(registry: &mut Registry) {
                     && let Err(error) = stream::pump(env)
                 {
                     return Outcome::Fail(error);
+                }
+                #[cfg(feature = "gpu")]
+                if matches!(name, "timeSetEvent" | "timeKillEvent") {
+                    return frame_timer::call(env, name, args);
                 }
                 forward(env, name, args)
             },

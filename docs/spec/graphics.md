@@ -163,8 +163,13 @@ Blocking readbacks MUST preserve the source pixels before another guest context 
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
-**Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
+**Rule**: Host-paced Present boundaries MUST fall on host vsyncs without repaying missed frames, and guest-timed Presents MUST skip the refresh wait. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
+
+A Present is guest-timed when its thread armed a one-shot WinMM event since
+the previous Present and its latest message wait in that interval waited for
+either that event or mouse button messages. The compositor still presents on its
+own refresh cycle.
 
 ### GFX-SWAP-1 Implicit swap chain
 

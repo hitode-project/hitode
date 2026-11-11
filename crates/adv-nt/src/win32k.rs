@@ -62,6 +62,17 @@ pub struct Dispatcher(pub u32);
 /// Returning `None` leaves dispatch to the registered guest function.
 pub struct CallFilter(pub fn(&mut Env<'_>, u32, u32, &[u32]) -> Option<Outcome>);
 
+/// The single event a thread last waited for alongside mouse messages.
+/// An interested front can take the observation at its next frame.
+#[derive(Default)]
+pub struct MessageWaitEvents(HashMap<CtxId, u32>);
+
+impl MessageWaitEvents {
+    pub fn take(&mut self, context: CtxId) -> Option<u32> {
+        self.0.remove(&context)
+    }
+}
+
 /// KeAddSystemServiceTable(functions, counters, limit, arguments, index)
 pub fn add_table(
     env: &mut Env<'_>,
@@ -86,6 +97,9 @@ pub fn add_table(
 
 /// NtUserPeekMessage in Wine 11's win32syscalls.h; its nested yield is part of the peek.
 const PEEK_MESSAGE: u32 = 0x14ca;
+const MSG_WAIT: u32 = 0x14bb;
+const QS_MOUSEBUTTON: u32 = 4;
+const MWMO_WAITALL: u32 = 1;
 
 /// System call `number` of a table other than the NT table, entered like
 /// [`crate::dispatch`]'s system calls: argument `i` is `env.arg(i + 1)`.
@@ -115,6 +129,19 @@ pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
     let peek = number == PEEK_MESSAGE;
     if peek {
         env.sys.begin_poll_peek();
+    }
+    if number == MSG_WAIT
+        && let Some(events) = env.ext.try_get_mut::<MessageWaitEvents>()
+    {
+        if let &[1, handles, _, mask, flags] = args.as_slice()
+            && mask & QS_MOUSEBUTTON != 0
+            && flags & MWMO_WAITALL == 0
+            && let Ok(event) = env.cpu.read_u32(handles)
+        {
+            events.0.insert(env.context, event);
+        } else {
+            events.take(env.context);
+        }
     }
     Outcome::call_aligned(env, function, args, move |env, returned| {
         if peek {

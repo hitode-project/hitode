@@ -31,7 +31,7 @@ fn count(bgra: &[u8], stride: usize, width: usize, height: usize, color: [u8; 3]
         .count()
 }
 
-// spec: WINE-GFX-6, WINE-GFX-10
+// spec: WINE-GFX-6, WINE-GFX-10, GFX-PACE-1
 #[test]
 fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
     let mut registry = Registry::default();
@@ -43,6 +43,7 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
         adv_runtime::wine::GRAPHICS_DRIVER,
         Platform(registry),
         |machine, prefix| {
+            std::fs::write(prefix.join("drive_c/check-frame-wait"), []).unwrap();
             let gpu = adv_device::gpu::test_support::request(false).unwrap();
             machine.ext.insert(gpu.waker());
             adv_unix::install(machine);

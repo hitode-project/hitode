@@ -33,6 +33,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         repeat: |_, _| unreachable!(),
         presentation_serial: |_| Some(0),
         vsync: |_| None,
+        guest_frame_wait: |_| false,
         window: |_, _, _| Some((16, 12)),
         visible: |_, _, _| Some(false),
         window_presented: |_, _| {},
