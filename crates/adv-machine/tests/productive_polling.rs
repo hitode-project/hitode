@@ -95,18 +95,18 @@ fn quiet_machine() -> Machine<adv_cpu::Cpu> {
         if pending != 0 {
             return Outcome::ExitProcess(pending);
         }
-        env.sys.poll_observation();
+        env.sys.poll_observation(adv_machine::Observation::Event);
         Outcome::Return(0)
     });
     registry.add("test", "timeGetTime", Conv::Stdcall { argc: 0 }, |env| {
         if env.ext.get::<Quiet>().polls == env.ext.get::<Quiet>().signal_at {
             env.sys.poll_wake.as_ref().unwrap().signal();
         }
-        env.sys.poll_observation();
+        env.sys.poll_observation(adv_machine::Observation::Clock);
         Outcome::Return((env.sys.clock.now_us() / 1000) as u32)
     });
     registry.add("test", "yield", Conv::Stdcall { argc: 0 }, |env| {
-        env.sys.poll_observation();
+        env.sys.poll_observation(adv_machine::Observation::Yield);
         Outcome::block_then_return(Wait::Yield, 0)
     });
     let mut machine = Machine::new(
@@ -239,4 +239,85 @@ fn ctrl_skip_retains_the_full_proof_for_bounded_iteration_work() {
     assert!(matches!(machine.run(), RunResult::Idle { .. }));
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), STEPS as u32);
     assert!(machine.ext.get::<Quiet>().polls >= 64);
+}
+
+/// `quiet_machine` running `body` as its poller instead.
+fn quiet_machine_running(
+    body: impl FnOnce(&mut Machine<adv_cpu::Cpu>, &mut Asm),
+) -> Machine<adv_cpu::Cpu> {
+    let mut machine = quiet_machine();
+    machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
+    machine.cpu.map(0x7ffe_0000, 4096, Prot::RW).unwrap();
+    let mut code = Asm::new(CODE);
+    body(&mut machine, &mut code);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine
+}
+
+/// MOV ECX,n; L: DEC ECX; JNZ L: 2n guest instructions observing nothing.
+fn compute(code: &mut Asm, n: u32) {
+    code.bytes.push(0xb9);
+    code.bytes.extend_from_slice(&n.to_le_bytes());
+    code.bytes.extend_from_slice(&[0x49, 0x75, 0xfd]);
+}
+
+// spec: PROC-CLOCK-6, PROC-CLOCK-7
+#[test]
+fn peeks_without_a_clock_wait_for_a_delivery() {
+    let mut machine = quiet_machine_running(|machine, code| {
+        for name in ["PeekMessage", "yield"] {
+            code.call(machine.resolve_import("test", name).unwrap());
+        }
+        code.jmp(CODE);
+    });
+    assert!(matches!(
+        machine.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert!(machine.ext.get::<Quiet>().polls < 10);
+}
+
+// spec: PROC-CLOCK-5, PROC-CLOCK-7
+#[test]
+fn a_computing_slice_between_yields_never_idles() {
+    // A stepped interpreter: the same slice of work, then Sleep(0), 100 times.
+    const SLICES: i8 = 100;
+    let mut machine = quiet_machine_running(|machine, code| {
+        let yield_ = machine.resolve_import("test", "yield").unwrap();
+        compute(code, 2000);
+        code.bytes.extend_from_slice(&[0xff, 0x05]); // inc dword [DATA]
+        code.bytes.extend_from_slice(&DATA.to_le_bytes());
+        code.call(yield_);
+        code.cmp_mem_imm8(DATA, SLICES).jnz(CODE);
+        let idle = CODE + code.bytes.len() as u32;
+        code.call(machine.resolve_import("test", "PeekMessage").unwrap());
+        code.call(yield_).jmp(idle);
+    });
+    assert!(matches!(machine.run(), RunResult::Idle { .. }));
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), SLICES as u32);
+}
+
+// spec: PROC-CLOCK-6, PROC-CLOCK-7
+#[test]
+fn a_heavy_shared_clock_poll_idles_until_the_next_tick() {
+    // GetTickCount reads the shared clock page; the slice around it is heavy.
+    let mut machine = quiet_machine_running(|machine, code| {
+        compute(code, 2000);
+        code.bytes
+            .extend_from_slice(&[0xa1, 0x20, 0x03, 0xfe, 0x7f]);
+        code.bytes.extend_from_slice(&[0xff, 0x05]); // inc dword [DATA]
+        code.bytes.extend_from_slice(&DATA.to_le_bytes());
+        code.call(machine.resolve_import("test", "yield").unwrap());
+        code.jmp(CODE);
+    });
+    let RunResult::Idle {
+        next_deadline: Some(deadline),
+    } = machine.run()
+    else {
+        panic!("the clock poll did not idle on a tick");
+    };
+    assert_eq!(deadline % 1000, 0);
+    assert!(machine.cpu.read_u32(DATA).unwrap() < 10);
 }

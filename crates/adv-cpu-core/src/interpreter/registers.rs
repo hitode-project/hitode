@@ -195,6 +195,7 @@ mod tests {
                 next: i.next_ip32(),
                 exclusive: false,
                 register_only: eligible(predecode(&i).unwrap()),
+                clock: false,
                 checked_scalar: false,
             };
             assert!(instruction.register_only, "{:?}", i.code());

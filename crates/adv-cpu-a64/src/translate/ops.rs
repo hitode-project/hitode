@@ -847,6 +847,11 @@ impl Translator<'_> {
                 self.load(addr, result(dst));
                 self.forget(guest);
                 self.commit(dst);
+                if Op::Mov(Src::Reg(dst), source).reads_clock() {
+                    // Any nonzero value marks the read; RUNTIME is never zero.
+                    self.emit(ldr(X, X17, RUNTIME, runtime::CPU_STATE));
+                    self.emit(str(X, RUNTIME, X17, runtime::CLOCK_READ));
+                }
             }
             Src::Reg(source) => {
                 self.clobber(guest);

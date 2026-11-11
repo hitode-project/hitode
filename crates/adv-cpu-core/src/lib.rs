@@ -104,6 +104,16 @@ pub struct CpuState {
     /// Arithmetic flags native code left lazy: operands a and b, result and
     /// recipe kind. Kind 0 means `eflags` is exact. Rust settles before use.
     pub lazy_flags: [u32; 4],
+    /// Nonzero once guest code loaded a shared clock field ([`shared_clock`])
+    /// since the owner last took it with `Guest::take_clock_read`.
+    pub clock_read: u64,
+}
+
+/// Windows' shared clock fields in KUSER_SHARED_DATA: the tick counts,
+/// interrupt time and system time. A load from a constant address in them is
+/// a clock read, as RDTSC is, and the owner learns of it (PROC-CLOCK-7).
+pub fn shared_clock(address: u32) -> bool {
+    matches!(address.wrapping_sub(0x7ffe_0000), 0..0x20 | 0x320..0x330)
 }
 
 impl Default for CpuState {
@@ -124,6 +134,7 @@ impl Default for CpuState {
             rep: None,
             last_indirect_branch: IndirectBranch::default(),
             lazy_flags: [0; 4],
+            clock_read: 0,
         }
     }
 }

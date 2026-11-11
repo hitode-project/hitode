@@ -5,12 +5,36 @@
 //! must run on at once, even when only its instruction count tells it apart.
 //! Explicit observations also admit an earlier quiet round (PROC-CLOCK-7),
 //! provided the machine sees no intervening delivery or productive host call.
+//!
+//! Between observations a guest is deterministic. An interval that read no
+//! clock and saw no event changes only through its own computation or another
+//! context's memory. One longer than a memory spin's lap, the yield call and a
+//! test, is computing, such as a script interpreter yielding after a fixed
+//! number of steps, and is never a repeat. What an interval observed also
+//! bounds its round: a quiet interval that read no clock sees nothing new
+//! before the next delivery or deadline (PROC-CLOCK-6). An unclassified host
+//! call may read anything, so it keeps the clock's ticks.
 
 /// Recent yield intervals a repeat may match; covers loops with several yields.
 const HISTORY: usize = 4;
 /// Repeats before a loop counts as polling. Iteration-paced work breaks its
 /// repeats within a few dozen yields; a loop waiting for time or input does not.
 const STREAK: u32 = 64;
+/// Guest instructions above which an interval that observed nothing computes.
+/// A memory spin's lap, Sleep(0) through its system call and a flag test,
+/// takes tens; a stepped interpreter's slice takes thousands or more.
+const SPIN_LAP: u64 = 1024;
+
+/// What a host call that is not work tells the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Observation {
+    /// It gave up the processor; it read nothing.
+    Yield,
+    /// It read the message queue or an object's state.
+    Event,
+    /// It read a clock.
+    Clock,
+}
 
 /// The yield intervals of a context.
 #[derive(Clone, Copy, Debug, Default)]
@@ -25,13 +49,30 @@ pub struct PollProgress {
     repeats: u32,
     /// This interval contains unclassified or productive work.
     work: bool,
+    /// This interval read a clock or saw an event.
+    sensed: bool,
+    /// This interval read a clock.
+    clock: bool,
     quiet: bool,
+    /// The last closed interval read a clock.
+    read_clock: bool,
 }
 
 impl PollProgress {
-    pub(crate) fn call(&mut self, thunk: u32, observation: bool) {
-        self.work |= !observation;
+    pub(crate) fn call(&mut self, thunk: u32, observation: Option<Observation>) {
+        self.work |= observation.is_none();
+        self.sensed |= matches!(observation, Some(Observation::Event | Observation::Clock));
+        if observation == Some(Observation::Clock) {
+            self.read_clock();
+        }
         self.mix(u64::from(thunk) ^ 0x100);
+    }
+
+    /// Guest code read a clock without a host call: RDTSC, a direct body or a
+    /// shared clock field.
+    pub(crate) fn read_clock(&mut self) {
+        self.sensed = true;
+        self.clock = true;
     }
 
     /// Guest instructions completed by one run of the context.
@@ -45,12 +86,15 @@ impl PollProgress {
         self.mix(retired);
         self.mix(u64::from(site));
         let interval = std::mem::take(&mut self.current);
-        self.quiet = !std::mem::take(&mut self.work) && self.history.contains(&interval);
-        self.repeats = if self.history.contains(&interval) {
+        let computing = !std::mem::take(&mut self.sensed) && retired > SPIN_LAP;
+        let repeat = !computing && self.history.contains(&interval);
+        self.quiet = !std::mem::take(&mut self.work) && repeat;
+        self.repeats = if repeat {
             self.repeats.saturating_add(1)
         } else {
             0
         };
+        self.read_clock = std::mem::take(&mut self.clock);
         self.history[self.next] = interval;
         self.next = (self.next + 1) % HISTORY;
     }
@@ -62,6 +106,18 @@ impl PollProgress {
 
     pub(crate) fn quiet(&self) -> bool {
         self.quiet
+    }
+
+    /// Its last interval read a clock, so the next tick may change it.
+    #[cfg(test)]
+    fn reads_clock(&self) -> bool {
+        self.read_clock
+    }
+
+    /// Its last interval was quiet and read no clock: only a delivery or a
+    /// deadline can change what it observes.
+    pub(crate) fn timeless(&self) -> bool {
+        self.quiet && !self.read_clock
     }
 
     pub(crate) fn new_work(&mut self) {
@@ -78,11 +134,15 @@ impl PollProgress {
 mod tests {
     use super::*;
 
-    fn interval(progress: &mut PollProgress, calls: &[u32], retired: u64) {
-        for &call in calls {
-            progress.call(call, false);
+    const YIELD: u32 = 9;
+
+    /// One interval: `calls`, `retired` instructions, then a Sleep(0).
+    fn interval(progress: &mut PollProgress, calls: &[(u32, Option<Observation>)], retired: u64) {
+        for &(call, observation) in calls {
+            progress.call(call, observation);
         }
         progress.ran(retired);
+        progress.call(YIELD, Some(Observation::Yield));
         progress.yielded(0x40);
     }
 
@@ -90,14 +150,18 @@ mod tests {
     fn two_yield_loops_settle_and_new_work_unsettles_at_once() {
         let mut progress = PollProgress::default();
         for _ in 0..STREAK {
-            interval(&mut progress, &[1, 2, 3], 10);
-            interval(&mut progress, &[4], 10);
+            interval(&mut progress, &[(1, None), (2, None), (3, None)], 10);
+            interval(&mut progress, &[(4, None)], 10);
         }
         assert!(progress.settled());
-        interval(&mut progress, &[1, 5, 2, 3], 10);
+        interval(
+            &mut progress,
+            &[(1, None), (5, None), (2, None), (3, None)],
+            10,
+        );
         assert!(!progress.settled());
-        interval(&mut progress, &[4], 10);
-        interval(&mut progress, &[3, 2, 1], 10);
+        interval(&mut progress, &[(4, None)], 10);
+        interval(&mut progress, &[(3, None), (2, None), (1, None)], 10);
         assert!(!progress.settled(), "order is part of the interval");
     }
 
@@ -105,10 +169,56 @@ mod tests {
     fn one_more_instruction_is_new_work() {
         let mut progress = PollProgress::default();
         for _ in 0..=STREAK {
-            interval(&mut progress, &[1], 10);
+            interval(&mut progress, &[(1, None)], 10);
         }
         assert!(progress.settled());
-        interval(&mut progress, &[1], 11);
+        interval(&mut progress, &[(1, None)], 11);
         assert!(!progress.settled());
+    }
+
+    #[test]
+    fn a_computing_interval_never_repeats() {
+        // A stepped interpreter: the same slice, then Sleep(0), observing nothing.
+        let mut progress = PollProgress::default();
+        for _ in 0..=STREAK {
+            interval(&mut progress, &[], 30_000);
+            assert!(!progress.quiet() && !progress.settled());
+        }
+    }
+
+    #[test]
+    fn a_heavy_clock_poll_repeats_and_reads_the_clock() {
+        // GetTickCount between heavy slices, read from the shared clock page.
+        let mut progress = PollProgress::default();
+        for _ in 0..=STREAK {
+            progress.read_clock();
+            interval(&mut progress, &[], 30_000);
+        }
+        assert!(progress.quiet() && progress.settled() && progress.reads_clock());
+        assert!(!progress.timeless());
+        // timeGetTime as a host call counts the same.
+        interval(&mut progress, &[(2, Some(Observation::Clock))], 30_000);
+        interval(&mut progress, &[(2, Some(Observation::Clock))], 30_000);
+        assert!(progress.quiet() && progress.reads_clock());
+    }
+
+    #[test]
+    fn event_polls_and_memory_spins_repeat_without_the_clock() {
+        let mut progress = PollProgress::default();
+        for _ in 0..2 {
+            interval(&mut progress, &[(3, Some(Observation::Event))], 30_000);
+        }
+        assert!(progress.timeless());
+        let mut spin = PollProgress::default();
+        for _ in 0..2 {
+            interval(&mut spin, &[], 40);
+        }
+        assert!(spin.timeless());
+        // An unclassified call may read something that changes with time.
+        let mut unknown = PollProgress::default();
+        for _ in 0..=STREAK {
+            interval(&mut unknown, &[(4, None)], 40);
+        }
+        assert!(unknown.settled() && !unknown.timeless());
     }
 }

@@ -463,7 +463,12 @@ fn pixel_loop(advance: bool, middle: bool) -> (Program, u32) {
     }
     p.data[42..44].copy_from_slice(&0x0e7fu16.to_le_bytes());
     p.data[60..64].copy_from_slice(&3u32.to_le_bytes());
-    for (index, bytes) in p.data[0x1000..].chunks_exact_mut(8).enumerate() {
+    for (index, bytes) in p.data[0x1000..]
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         bytes.copy_from_slice(&(63.0 + index as f64 * 0.25).to_le_bytes());
     }
     (p, latch)

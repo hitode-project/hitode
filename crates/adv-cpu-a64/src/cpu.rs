@@ -174,6 +174,9 @@ impl Guest for View<'_> {
     fn wants_code_images(&self) -> bool {
         cfg!(native)
     }
+    fn take_clock_read(&mut self) -> bool {
+        std::mem::take(&mut self.state.clock_read) != 0
+    }
     fn register_code_image(&mut self, image: adv_cpu_core::AotImage) {
         self.images.borrow_mut().push((image.base, image.size));
     }
@@ -405,6 +408,9 @@ macro_rules! forward {
 impl Guest for Cpu {
     fn wants_code_images(&self) -> bool {
         cfg!(native) && self.native
+    }
+    fn take_clock_read(&mut self) -> bool {
+        std::mem::take(&mut self.inner.state.clock_read) != 0
     }
     #[cfg(any(
         target_os = "linux",

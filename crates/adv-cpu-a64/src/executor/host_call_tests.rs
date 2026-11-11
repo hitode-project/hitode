@@ -1226,3 +1226,26 @@ fn inline_body_length_discovery_stops_at_a_merge() {
         );
     }
 }
+
+// spec: PROC-CLOCK-7
+#[test]
+fn shared_clock_loads_mark_the_state_in_every_tier() {
+    for (first, native) in [(false, true), (true, true), (false, false)] {
+        let (mut cpu, _) = fixture((false, first, Checks::Adaptive));
+        if !native {
+            cpu.native = None;
+        }
+        cpu.map(0x7ffe_0000, 0x1000, READ).unwrap();
+        // MOV EAX,[7FFE0320] (TickCount); NOP. MOV EAX,[7FFE0260] (build); NOP.
+        cpu.write(CODE, &[0xa1, 0x20, 0x03, 0xfe, 0x7f, 0x90])
+            .unwrap();
+        cpu.write(CODE + 0x100, &[0xa1, 0x60, 0x02, 0xfe, 0x7f, 0x90])
+            .unwrap();
+        for (at, clock) in [(CODE, true), (CODE + 0x100, false)] {
+            cpu.state.eip = at;
+            cpu.state.clock_read = 0;
+            assert_eq!(cpu.run(at + 5, 100).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(cpu.state.clock_read != 0, clock, "{first} {native} {at:#x}");
+        }
+    }
+}

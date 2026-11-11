@@ -110,6 +110,7 @@ fn checked_scalar_forms_match_transactions_and_decline_without_effects() {
                             next: i.next_ip32(),
                             exclusive: false,
                             register_only: false,
+                            clock: false,
                             checked_scalar: true,
                         };
                         let reference = Predecoded {

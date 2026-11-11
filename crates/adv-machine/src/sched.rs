@@ -611,7 +611,7 @@ mod active_tests {
             clock: Clock::virtual_time(),
             body_services: None,
             poll_wake: None,
-            poll_observed: false,
+            poll_observed: None,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks: ThunkTable::new(Box::new(Empty)),

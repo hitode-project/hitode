@@ -512,6 +512,9 @@ fn execute_decoded(
         );
     }
     state.rep = None;
+    if instruction.clock {
+        state.clock_read = 1;
+    }
     if let Action::Rdtsc = instruction.action {
         return Execution {
             step: Step::ReadTimestamp {
@@ -692,6 +695,8 @@ struct Predecoded {
     exclusive: bool,
     register_only: bool,
     checked_scalar: bool,
+    /// Loads a shared clock field from its constant address.
+    clock: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -846,11 +851,19 @@ fn fetch(memory: &mut Memory, pc: u32) -> Cached {
 /// How the interpreter runs a valid `instruction` encoded as `bytes`.
 fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
     if let Some(action) = predecode(instruction) {
+        let clock = matches!(
+            action,
+            Action::Mov(Operand::Register(_), Operand::Memory(a, _), _)
+                if a.base.is_none() && a.index.is_none() && !a.fs && !a.word
+                    && crate::shared_clock(a.displacement)
+        );
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
             register_only: registers::eligible(action),
-            checked_scalar: !instruction.has_lock_prefix() && scalar::eligible(action),
+            clock,
+            // A clock load takes `execute_decoded`, which marks it.
+            checked_scalar: !instruction.has_lock_prefix() && !clock && scalar::eligible(action),
             exclusive: instruction.has_lock_prefix()
                 || instruction.mnemonic() == M::Cpuid
                 || instruction.mnemonic() == M::Xchg

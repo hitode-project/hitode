@@ -196,6 +196,11 @@ pub trait Guest {
     /// Establish an exclusive guest-memory boundary for composite atomics or
     /// mapping-sensitive host operations. Synchronous backends need no action.
     fn quiesce_memory(&mut self) {}
+    /// Whether guest code loaded a shared clock field since the last call
+    /// (PROC-CLOCK-7). Backends that do not track it report none.
+    fn take_clock_read(&mut self) -> bool {
+        false
+    }
     /// Pin the actual backing storage, without a per-page reference count.
     /// Backends without an owned, physically pinnable window reject the request.
     fn lock_pages(&mut self, _addr: u32, _len: u32) -> Result<(), PageLockError> {

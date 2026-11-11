@@ -457,7 +457,7 @@ pub fn poll_clock(
     env: &mut Env<'_>,
     finish: impl FnOnce(&mut Env<'_>, u64) -> Outcome + 'static,
 ) -> Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(crate::Observation::Clock);
     let now = env.sys.clock.guest_now_us();
     let clock = &env.sys.clock;
     let mut poll = clock.state.poll.get();

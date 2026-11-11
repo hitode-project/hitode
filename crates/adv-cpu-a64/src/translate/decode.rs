@@ -1025,6 +1025,20 @@ pub struct Effects {
 }
 
 impl Op {
+    /// A load from a shared clock field's constant address (PROC-CLOCK-7).
+    pub fn reads_clock(self) -> bool {
+        match self {
+            Op::Mov(Src::Reg(_), Src::Mem(mem)) => {
+                mem.base.is_none()
+                    && mem.index.is_none()
+                    && !mem.fs
+                    && mem.address_bits == 32
+                    && adv_cpu_core::shared_clock(mem.disp)
+            }
+            _ => false,
+        }
+    }
+
     pub fn effects(self) -> Effects {
         use FlagSet as F;
         let mem = |src: Src| matches!(src, Src::Mem(_));

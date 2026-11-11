@@ -28,6 +28,7 @@ pub mod objects;
 pub mod outcome;
 pub mod patch;
 mod poll_progress;
+pub use poll_progress::Observation;
 pub mod process;
 pub mod sched;
 pub mod schedule_trace;
@@ -101,7 +102,7 @@ pub struct Sys {
     pub body_services: Option<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
-    poll_observed: bool,
+    poll_observed: Option<Observation>,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -1156,13 +1157,13 @@ impl Sys {
     }
 
     /// Classify this host call as a clock read, empty message peek or yield.
-    pub fn poll_observation(&mut self) {
-        self.poll_observed = true;
+    pub fn poll_observation(&mut self, observation: Observation) {
+        self.poll_observed = Some(observation);
     }
 
     /// Begin the implementation of a message peek, including its nested host calls.
     pub fn begin_poll_peek(&mut self) {
-        self.poll_observation();
+        self.poll_observation(Observation::Event);
         self.contexts[self.current as usize].poll_peek_depth += 1;
     }
 
@@ -1193,6 +1194,13 @@ impl Sys {
                 .active_contexts()
                 .filter(|c| c.is_ready())
                 .all(|c| c.progress.quiet())
+    }
+
+    /// No ready polling context observed anything time alone changes.
+    fn polling_timeless(&self) -> bool {
+        self.active_contexts()
+            .filter(|c| c.is_ready())
+            .all(|c| c.progress.timeless())
     }
 
     /// Every ready context repeats earlier yield intervals (PROC-CLOCK-5).
@@ -1796,7 +1804,7 @@ impl Dispatch<'_> {
             )));
         }
         let t0 = self.sys.stats.start();
-        self.sys.poll_observed = false;
+        self.sys.poll_observed = None;
         let out = (f.handler)(&mut Env {
             context: self.sys.current,
             cpu: &mut *cpu,
@@ -1806,9 +1814,9 @@ impl Dispatch<'_> {
         });
         let observed = std::mem::take(&mut self.sys.poll_observed);
         let context = &mut self.sys.contexts[self.sys.current as usize];
-        let observation = observed || context.poll_peek_depth != 0;
+        let observation = observed.or((context.poll_peek_depth != 0).then_some(Observation::Event));
         context.progress.call(index, observation);
-        if !observation {
+        if observation.is_none() {
             self.sys.clock.work();
         }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
@@ -1976,6 +1984,9 @@ impl TrapHandler for Dispatch<'_> {
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {
+        self.sys.contexts[self.sys.current as usize]
+            .progress
+            .read_clock();
         Some(self.sys.clock.guest_now_us())
     }
 
@@ -2142,7 +2153,7 @@ impl<B: Backend> Machine<B> {
             clock,
             body_services: None,
             poll_wake: None,
-            poll_observed: false,
+            poll_observed: None,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -2762,7 +2773,7 @@ impl<B: Backend> Machine<B> {
                 }
             }
             // Real time: polling contexts would spin the host. Hand control back so the host
-            // can wait (at most 1 ms) like the OS would schedule them.
+            // can wait until what they observed can change (PROC-CLOCK-6).
             // Requested skipping retains the full proof: bounded iteration work
             // can repeat quiet APIs while still advancing the game.
             if !self.sys.clock.is_virtual()
@@ -2783,14 +2794,26 @@ impl<B: Backend> Machine<B> {
             {
                 self.sys.scheduling.polling_rounds += 1;
                 self.sys.rr_last = last;
-                // End on the tick that timed waits expire on, so both share a wake.
-                let soon = sched::next_tick(self.sys.clock.now_us() + 1);
-                let soon = self.sys.frame_spin_round(soon).unwrap_or(soon);
-                let t = self.sys.next_deadline().map_or(soon, |d| d.min(soon));
-                self.sys.clock.begin_wait(Some(t));
-                return SliceResult::Complete(RunResult::Idle {
-                    next_deadline: Some(t),
+                // Timeless polls see nothing new before a delivery, which
+                // wakes the host, or a deadline. Others end on the tick that
+                // timed waits expire on, so both share a wake.
+                let soon = (!self.sys.polling_timeless()).then(|| {
+                    let soon = sched::next_tick(self.sys.clock.now_us() + 1);
+                    self.sys.frame_spin_round(soon).unwrap_or(soon)
                 });
+                let t = match (self.sys.next_deadline(), soon) {
+                    (Some(d), Some(s)) => Some(d.min(s)),
+                    (d, s) => d.or(s),
+                };
+                if self.sys.schedule_trace.enabled() {
+                    let ahead = t.map_or(u64::MAX, |t| t.saturating_sub(self.sys.clock.now_us()));
+                    let settled = u64::from(self.sys.polling_settled());
+                    self.sys
+                        .schedule_trace
+                        .event("poll_idle", 0, ahead, settled, 0);
+                }
+                self.sys.clock.begin_wait(t);
+                return SliceResult::Complete(RunResult::Idle { next_deadline: t });
             }
             let contexts = &self.sys.contexts;
             let computation = &self.computation;
@@ -3056,6 +3079,9 @@ impl<B: Backend> Machine<B> {
                 c.spin.ran(run_elapsed);
                 if c.services.new_work.replace(false) {
                     c.progress.new_work();
+                }
+                if self.cpu.take_clock_read() | c.services.clock_read.replace(false) {
+                    c.progress.read_clock();
                 }
                 c.progress.ran(retired);
             }

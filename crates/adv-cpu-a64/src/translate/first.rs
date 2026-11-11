@@ -332,6 +332,9 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         Op::Mov(dst, src) => {
             let value = read(src, &regs, memory)?;
             Place::of(dst, &regs, memory)?.commit(value, cpu);
+            if op.reads_clock() {
+                cpu.clock_read = 1;
+            }
         }
         Op::Lea(dst, mem) => cpu.regs[usize::from(dst)] = address(mem, &regs)?,
         Op::Alu(alu, dst, src) => {

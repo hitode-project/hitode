@@ -89,13 +89,16 @@ Clock leaves MUST preserve guest polling observations and decline required waits
 ### PROC-CLOCK-5 Productive polling
 
 **Rule**: A real-time polling round MAY wait only after every ready context repeated earlier yield intervals 64 times running. An interval is its host calls, completed guest instructions and yield site. A context doing new work between yields MUST run again without a host wait.
+An interval that read no clock, saw no event and made no host call besides its yield changes only through guest memory. Once it retires more instructions than a memory spin's lap, it is computing and MUST NOT count as a repeat.
 CPU spin handoffs MUST leave the context ready and MUST NOT qualify as a polling or idle proof.
 Completed computations MUST contribute their retired instructions to the same accounting as owner execution.
 **Verification**: Test
 
 ### PROC-CLOCK-6 Timer ticks
 
-**Rule**: In real time, timed waits and waitable timers MUST expire on the first whole guest millisecond at or after their deadline. Display-paced waits MUST keep exact deadlines. Polling rounds MUST end on the next whole millisecond.
+**Rule**: In real time, timed waits and waitable timers MUST expire on the first whole guest millisecond at or after their deadline. Display-paced waits MUST keep exact deadlines. Polling rounds MUST end on the next whole millisecond unless they are timeless.
+A round is timeless when every ready context's last interval was quiet and read no clock. It MUST wait only for a delivery or the next deadline.
+Clock reads are clock system calls and services, RDTSC, and loads from the constant addresses of the shared clock fields.
 **Verification**: Test
 
 ### PROC-CLOCK-7 Quiet observation rounds

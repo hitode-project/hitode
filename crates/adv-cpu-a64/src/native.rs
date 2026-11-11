@@ -1758,6 +1758,7 @@ fn computation_proof(trace: &translate::Trace) -> Option<translate::computation:
         inst.mode == Mode::Real
             || inst.locked.is_some()
             || inst.spin
+            || inst.op.reads_clock()
             || matches!(
                 inst.op,
                 Op::Body(_)

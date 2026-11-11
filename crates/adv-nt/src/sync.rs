@@ -136,7 +136,7 @@ pub fn release_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtYieldExecution(): another thread runs if one is ready.
 pub fn yield_execution(env: &mut Env<'_>, _: &[u32]) -> Outcome {
-    env.sys.poll_observation();
+    env.sys.poll_observation(adv_machine::Observation::Yield);
     Outcome::block_then_return(Wait::Yield, status::SUCCESS)
 }
 
@@ -342,7 +342,7 @@ pub fn delay(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let wait = if deadline > env.sys.clock.now_us() {
         Wait::Until(deadline)
     } else {
-        env.sys.poll_observation();
+        env.sys.poll_observation(adv_machine::Observation::Yield);
         Wait::Yield
     };
     Outcome::block_then_return(wait, status::SUCCESS)
