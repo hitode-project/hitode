@@ -57,7 +57,13 @@ struct Limit {
 #[derive(Clone, Debug)]
 enum Var {
     Counter(Option<ExprId>),
-    Remainder { divisor: ExprId, normalized: bool },
+    Remainder {
+        divisor: ExprId,
+        normalized: bool,
+    },
+    /// A value in 0..=max that no address depends on beyond its range: a
+    /// zero extension, a right shift, a mask, or their sum or union.
+    Bounded(u32),
     Either([(Form, Vec<Limit>); 2]),
 }
 
@@ -477,6 +483,26 @@ impl Builder<'_> {
         id
     }
 
+    fn bounded(&mut self, max: u32) -> Form {
+        let var = self.variable(Var::Bounded(max));
+        self.term(var)
+    }
+
+    /// The largest value of a constant plus nonnegative multiples of
+    /// bounded variables, if it fits a dword.
+    fn bound(&self, form: &Form) -> Option<u32> {
+        let Expr::Constant(mut max) = self.exprs[form.base] else {
+            return None;
+        };
+        for &(var, k) in &form.terms {
+            let (Var::Bounded(m), Expr::Constant(k)) = (&self.vars[var], self.exprs[k]) else {
+                return None;
+            };
+            max = max.checked_add(m.checked_mul(i32::try_from(k).ok()? as u32)?)?;
+        }
+        Some(max)
+    }
+
     fn term(&self, var: VarId) -> Form {
         Form {
             base: self.zero,
@@ -709,6 +735,21 @@ impl Builder<'_> {
             Alu::Add => self.plus(a, b),
             Alu::Sub => self.minus(a, b),
             Alu::Xor if a == b => self.form(self.zero),
+            // a & b <= min(a, b) and a | b <= a + b for unsigned values.
+            Alu::And
+                if self.bound(&a).or(self.bound(&b)).is_some()
+                    && a.invariant().zip(b.invariant()).is_none() =>
+            {
+                let max = match (self.bound(&a), self.bound(&b)) {
+                    (Some(x), Some(y)) => x.min(y),
+                    (x, y) => x.or(y)?,
+                };
+                self.bounded(max)
+            }
+            Alu::Or if a.invariant().zip(b.invariant()).is_none() => {
+                let max = self.bound(&a)?.checked_add(self.bound(&b)?)?;
+                self.bounded(max)
+            }
             _ => {
                 let (Expr::Constant(a), Expr::Constant(b)) =
                     (self.exprs[a.invariant()?], self.exprs[b.invariant()?])
@@ -835,6 +876,10 @@ impl Builder<'_> {
                         let k = self.constant(1u32 << n);
                         Some(self.scale(a, k))
                     }
+                    (ShiftKind::Shr, a, Some(n)) if n != 0 => {
+                        let max = a.and_then(|a| self.bound(&a)).unwrap_or(u32::MAX);
+                        Some(self.bounded(max >> n))
+                    }
                     _ => None,
                 };
                 self.put(state, dst, value, record)?;
@@ -880,12 +925,18 @@ impl Builder<'_> {
                 self.src(state, src, record)?;
                 state.put(dst, None);
             }
-            Op::Extend(dst, source, _) => {
-                if let Narrow8or16::Mem(mem, word) = source {
-                    let addr = self.address(state, mem)?;
-                    self.read(state, addr, if word { 2 } else { 1 }, record);
-                }
-                state.put(dst, None);
+            Op::Extend(dst, source, signed) => {
+                let word = match source {
+                    Narrow8or16::Mem(mem, word) => {
+                        let addr = self.address(state, mem)?;
+                        self.read(state, addr, if word { 2 } else { 1 }, record);
+                        word
+                    }
+                    Narrow8or16::Byte(_) => false,
+                    Narrow8or16::Word(_) => true,
+                };
+                let value = (!signed).then(|| self.bounded(if word { 0xffff } else { 0xff }));
+                state.put(dst, value);
             }
             Op::Narrow(op, width, dst, src) => {
                 if op.is_some() {
@@ -1002,9 +1053,25 @@ impl Builder<'_> {
                 self.check(Check::Equal(ai, bi));
                 Some(b.clone())
             }
-            (Expr::Word(_), Expr::Register(_)) => {
+            (Expr::Word(_) | Expr::Constant(_), Expr::Register(_)) => {
                 self.check(Check::Equal(bi, ai));
                 Some(a.clone())
+            }
+            (Expr::Register(_), Expr::Constant(_)) => {
+                self.check(Check::Equal(ai, bi));
+                Some(b.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The entry register that one arm holds where the other holds a
+    /// constant: admission checks they are equal, as for a cached word.
+    fn entry_or_constant(&self, a: &Value, b: &Value) -> Option<u8> {
+        let (a, b) = (a.as_ref()?.invariant()?, b.as_ref()?.invariant()?);
+        match (self.exprs[a], self.exprs[b]) {
+            (Expr::Register(r), Expr::Constant(_)) | (Expr::Constant(_), Expr::Register(r)) => {
+                Some(r)
             }
             _ => None,
         }
@@ -1031,8 +1098,12 @@ impl Builder<'_> {
             *into = Some(incoming);
             return;
         };
-        let used = state.entry_reads | incoming.entry_reads;
+        let mut used = state.entry_reads | incoming.entry_reads;
         for reg in 0..8 {
+            if let Some(r) = self.entry_or_constant(&state.regs[reg], &incoming.regs[reg]) {
+                used |= 1 << r;
+                state.entry_reads |= 1 << r;
+            }
             state.regs[reg] = self.join_value(
                 state.regs[reg].take(),
                 &state.limits,
@@ -1678,6 +1749,7 @@ impl Proof {
                             .unwrap_or(0);
                         (if normalized { 0 } else { 1 - n }, n - 1 - i64::from(trim))
                     }
+                    Var::Bounded(max) => (0, i64::from(max)),
                     _ => return None,
                 };
                 if b < a {
@@ -1906,6 +1978,153 @@ mod tests {
         assert!(
             proof.evaluate(&cpu, &mut scratch, |_| None).is_none(),
             "denied parameter access"
+        );
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn bounds_table_lookups_indexed_by_loaded_bytes() {
+        const TABLE: u32 = 0x60000;
+        let blend = |signed: bool| {
+            trace(|a| {
+                let mut pixel = a.create_label();
+                a.set_label(&mut pixel).unwrap();
+                if signed {
+                    a.movsx(eax, byte_ptr(esi + 3)).unwrap();
+                } else {
+                    a.movzx(eax, byte_ptr(esi + 3)).unwrap();
+                }
+                a.movzx(ebx, byte_ptr(ebp)).unwrap();
+                a.shl(eax, 8).unwrap();
+                a.or(eax, ebx).unwrap();
+                a.mov(al, byte_ptr(eax + edi)).unwrap();
+                a.movzx(edx, al).unwrap();
+                a.shl(edx, 8).unwrap();
+                a.add(edx, edi).unwrap();
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.shr(eax, 24).unwrap();
+                a.movzx(eax, byte_ptr(eax + edx)).unwrap();
+                a.and(ebx, 0x3f).unwrap();
+                a.mov(byte_ptr(ecx), al).unwrap();
+                a.mov(byte_ptr(ebx + ecx + 1), al).unwrap();
+                a.add(esi, 4).unwrap();
+                a.add(ecx, 2).unwrap();
+                a.sub(dword_ptr(esp + 8), 1).unwrap();
+                a.jne(pixel).unwrap();
+                a.int3().unwrap();
+            })
+        };
+        let proof = Proof::build(&blend(false)).expect("byte-indexed table proof");
+        let mut cpu = CpuState::default();
+        cpu.regs[1] = OUTPUT;
+        cpu.regs[4..8].copy_from_slice(&[FRAME, PARAMS, INPUT, TABLE]);
+        let mut scratch = Evaluation::default();
+        let read = |addr| (addr == FRAME + 8).then_some(3);
+        let ranges = proof.evaluate(&cpu, &mut scratch, read).unwrap();
+        // Index (alpha << 8 | level) and (entry << 8) + top byte reach the
+        // whole 64 KiB table and nothing past it; the masked offset adds
+        // 0x3f to the last output byte.
+        assert!(ranges.contains(&range(TABLE, 0x1_0000, false)));
+        assert!(ranges.contains(&range(INPUT, 12, false)));
+        assert!(ranges.contains(&range(OUTPUT, 4 + 1 + 0x3f + 1, true)));
+        cpu.regs[7] = u32::MAX - 0x8000;
+        assert!(
+            proof.evaluate(&cpu, &mut scratch, read).is_none(),
+            "table crosses guest zero"
+        );
+        assert!(
+            Proof::build(&blend(true))
+                .is_none_or(|proof| proof.evaluate(&cpu, &mut scratch, read).is_none()),
+            "a sign-extended index is unbounded"
+        );
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn bounds_rows_of_a_table_blend_with_an_opaque_skip() {
+        const GLOBAL: u32 = 0x31000;
+        let t = trace(|a| {
+            let (mut row, mut pixel, mut blend, mut next, mut kept, mut empty) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.set_label(&mut row).unwrap();
+            a.mov(ecx, ebp).unwrap();
+            a.mov(esi, edx).unwrap();
+            a.test(eax, eax).unwrap();
+            a.jle(empty).unwrap();
+            a.mov(dword_ptr(esp + 0x30), eax).unwrap();
+            a.set_label(&mut pixel).unwrap();
+            a.movzx(eax, byte_ptr(esi + 3)).unwrap();
+            a.mov(ebx, dword_ptr(esp + 0x34)).unwrap();
+            a.movzx(ebx, byte_ptr(ebx)).unwrap();
+            a.shl(eax, 8).unwrap();
+            a.or(eax, ebx).unwrap();
+            a.mov(al, byte_ptr(eax + edi)).unwrap();
+            a.cmp(al, 0xff).unwrap();
+            a.jne(blend).unwrap();
+            a.mov(ax, word_ptr(esi)).unwrap();
+            a.mov(word_ptr(ecx), ax).unwrap();
+            a.jmp(next).unwrap();
+            a.set_label(&mut blend).unwrap();
+            a.test(al, al).unwrap();
+            a.jbe(kept).unwrap();
+            a.movzx(edx, al).unwrap();
+            a.shl(edx, 8).unwrap();
+            a.add(edx, edi).unwrap();
+            a.mov(edi, edx).unwrap();
+            a.movzx(edx, byte_ptr(esi)).unwrap();
+            a.movzx(edx, byte_ptr(edx + edi)).unwrap();
+            a.mov(byte_ptr(ecx), dl).unwrap();
+            a.mov(edx, dword_ptr(esp + 0x10)).unwrap();
+            a.set_label(&mut next).unwrap();
+            a.mov(edi, dword_ptr(GLOBAL)).unwrap();
+            a.set_label(&mut kept).unwrap();
+            a.mov(ebx, 1).unwrap();
+            a.add(ecx, 3).unwrap();
+            a.add(esi, 4).unwrap();
+            a.sub(dword_ptr(esp + 0x30), ebx).unwrap();
+            a.jne(pixel).unwrap();
+            a.mov(eax, dword_ptr(esp + 0x2c)).unwrap();
+            a.set_label(&mut empty).unwrap();
+            a.add(edx, dword_ptr(esp + 0x1c)).unwrap();
+            a.add(ebp, dword_ptr(esp + 0x20)).unwrap();
+            a.sub(dword_ptr(esp + 0x14), ebx).unwrap();
+            a.mov(dword_ptr(esp + 0x10), edx).unwrap();
+            a.jne(row).unwrap();
+            a.int3().unwrap();
+        });
+        assert_eq!(candidate(&t), Some(CODE));
+        let proof = Proof::build(&t).expect("row blend proof");
+        const TABLE: u32 = 0x60000;
+        // eax pixels, edx source row, ebx the latch step, ebp target row.
+        let mut cpu = CpuState {
+            regs: [4, 0, INPUT, 1, FRAME, OUTPUT, 0, TABLE],
+            ..CpuState::default()
+        };
+        let mut scratch = Evaluation::default();
+        let read = |addr| match addr {
+            GLOBAL => Some(TABLE),
+            x if x == FRAME + 0x34 => Some(PARAMS),
+            x if x == FRAME + 0x2c => Some(4),
+            x if x == FRAME + 0x1c || x == FRAME + 0x20 => Some(0x100),
+            x if x == FRAME + 0x14 => Some(3),
+            // The source row, saved for the blend arm.
+            x if x == FRAME + 0x10 => Some(INPUT),
+            _ => None,
+        };
+        let ranges = proof.evaluate(&cpu, &mut scratch, read).unwrap();
+        assert!(ranges.contains(&range(TABLE, 0x1_0000, false)));
+        assert!(ranges.contains(&range(INPUT, 0x200 + 12 + 4, false)));
+        assert!(ranges.contains(&range(OUTPUT, 0x200 + 9 + 2, true)));
+        cpu.regs[3] = 2;
+        assert!(
+            proof.evaluate(&cpu, &mut scratch, read).is_none(),
+            "the skipped row's latch step is the constant only when admitted"
         );
     }
 
