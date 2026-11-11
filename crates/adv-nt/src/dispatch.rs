@@ -353,6 +353,7 @@ impl Resolver for Platform {
         let (conv, handler): (_, fn(&mut Env<'_>) -> Outcome) = match name {
             // The system call stub pops its own arguments.
             SYSCALL => (Conv::Cdecl { argc: 0 }, syscall),
+            directory::FIND_QUERY => (Conv::Stdcall { argc: 11 }, directory::find_query),
             // (handle: u64, code: u32, params: *mut c_void)
             UNIX_CALL => (Conv::Stdcall { argc: 4 }, unix_call),
             _ => return None,

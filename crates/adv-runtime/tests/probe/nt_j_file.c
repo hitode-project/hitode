@@ -85,6 +85,59 @@ static void enumerate(void)
     RemoveDirectoryW(L"j-enum");
 }
 
+static const WCHAR virtual_name[] = L"virtual-entry.dat";
+static unsigned extended_queries, legacy_queries;
+
+static NTSTATUS WINAPI virtual_directory(HANDLE dir, HANDLE event, void *apc, void *context,
+                                        IO_STATUS_BLOCK *io, void *buffer, ULONG length, ULONG class,
+                                        ULONG single, UNICODE_STRING *mask, ULONG restart)
+{
+    if (!mask || mask->Length != sizeof(virtual_name) - sizeof(WCHAR)) return (NTSTATUS)0xc000000f;
+    for (unsigned i = 0; i < mask->Length / sizeof(WCHAR); i++)
+        if (mask->Buffer[i] != virtual_name[i]) return (NTSTATUS)0xc000000f;
+    io->Status = 0;
+    io->Information = 0;
+    if (class == 63) {
+        extended_queries++;
+        return 0;
+    }
+    if (class != 3 || length < 94 + mask->Length) return (NTSTATUS)0xc0000003;
+    legacy_queries++;
+    BYTE *entry = buffer;
+    for (unsigned i = 0; i < 94; i++) entry[i] = 0;
+    *(ULONG *)(entry + 40) = 123;
+    *(ULONG *)(entry + 56) = FILE_ATTRIBUTE_ARCHIVE;
+    *(ULONG *)(entry + 60) = mask->Length;
+    for (unsigned i = 0; i < mask->Length / sizeof(WCHAR); i++)
+        ((WCHAR *)(entry + 94))[i] = virtual_name[i];
+    io->Information = 94 + mask->Length;
+    return 0;
+}
+
+static void enumerate_hook(void)
+{
+    BYTE *entry = (BYTE *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile");
+    BYTE original[5];
+    DWORD protection, ignored;
+    WIN32_FIND_DATAW found;
+    if (!entry || !VirtualProtect(entry, 5, PAGE_EXECUTE_READWRITE, &protection)) {
+        check("directory_hook_legacy_record", FALSE);
+        return;
+    }
+    for (unsigned i = 0; i < 5; i++) original[i] = entry[i];
+    entry[0] = 0xe9;
+    *(DWORD *)(entry + 1) = (DWORD)(ULONG_PTR)virtual_directory - (DWORD)(ULONG_PTR)(entry + 5);
+    FlushInstructionCache(GetCurrentProcess(), entry, 5);
+    HANDLE search = FindFirstFileW(virtual_name, &found);
+    for (unsigned i = 0; i < 5; i++) entry[i] = original[i];
+    FlushInstructionCache(GetCurrentProcess(), entry, 5);
+    VirtualProtect(entry, 5, protection, &ignored);
+    if (search != INVALID_HANDLE_VALUE) FindClose(search);
+    check("directory_hook_legacy_record", search != INVALID_HANDLE_VALUE &&
+          extended_queries == 1 && legacy_queries == 1 && !lstrcmpW(found.cFileName, virtual_name) &&
+          found.nFileSizeLow == 123 && found.dwFileAttributes == FILE_ATTRIBUTE_ARCHIVE);
+}
+
 static void run(void)
 {
     HANDLE h, other, worker, directory, slot, pipe_write;
@@ -208,6 +261,7 @@ static void run(void)
 void mainCRTStartup(void)
 {
     enumerate();
+    enumerate_hook();
     run();
     ExitProcess(failed);
 }
