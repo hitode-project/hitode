@@ -115,6 +115,7 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-1 Shared playback
 
 **Rule**: DirectSound and waveOut MUST share mixing and playback time. Stable PCM views, generations, and retirement acknowledgments MUST prevent reads from retired or reused storage.
+With live output, the DirectSound write cursor MUST follow the source bytes committed by the mixer, including when locking from that cursor.
 **Verification**: Test
 
 ### DEV-AUDIO-2 Control delivery

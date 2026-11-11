@@ -139,6 +139,11 @@ impl RingVoice {
     pub fn total_position(&self) -> u64 {
         (self.phase >> 32) * u64::from(self.align())
     }
+    /// Source bytes the mixer has passed and will not reread on a retune.
+    pub(crate) fn write_position(&self) -> u32 {
+        let frame = self.read_frame.min(self.phase >> 32);
+        (frame % self.frames()) as u32 * self.align()
+    }
     pub fn minimum_position(&self) -> u64 {
         self.minimum_position
     }
