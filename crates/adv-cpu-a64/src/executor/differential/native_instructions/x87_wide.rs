@@ -677,3 +677,322 @@ fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
     same(&native, &oracle);
     assert_eq!(native.state.regs[0] & 0x220, 0x220);
 }
+
+/// An authored loop nest with stack arguments, control checks and two arrivals
+/// at the inner body. The head discards the preceding iteration's temporaries.
+fn run_break_nest() -> (Program, u32) {
+    let (mut stop, mut latch) = (0, 0);
+    let mut p = fixture(|a| {
+        let (
+            mut outer,
+            mut head,
+            mut middle,
+            mut pixels,
+            mut floor,
+            mut ftol,
+            mut fallback,
+            mut done,
+        ) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut outer).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fld(st0).unwrap();
+        a.mov(ecx, 8).unwrap();
+        a.jmp(middle).unwrap();
+        a.set_label(&mut head).unwrap();
+        a.mov(edi, dword_ptr(ebx + 64)).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(st2).unwrap();
+        a.set_label(&mut middle).unwrap();
+        for _ in 0..2 {
+            a.fld(st0).unwrap();
+            a.sub(esp, 8).unwrap();
+            a.fstp(qword_ptr(esp)).unwrap();
+            a.call(floor).unwrap();
+            a.add(esp, 8).unwrap();
+        }
+        a.fld(st0).unwrap();
+        a.call(ftol).unwrap();
+        // Reserve enough scratch for the chop sequence, including its ESP move.
+        a.sub(esp, 80).unwrap();
+        a.fnstcw(word_ptr(esp + 0x2c)).unwrap();
+        a.add(esp, 8).unwrap();
+        a.movzx(eax, word_ptr(esp + 0x24)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(dword_ptr(esp + 0x30), eax).unwrap();
+        a.fldcw(word_ptr(esp + 0x30)).unwrap();
+        a.fld(st0).unwrap();
+        a.fistp(qword_ptr(esp + 0x38)).unwrap();
+        a.fldcw(word_ptr(esp + 0x24)).unwrap();
+        a.add(esp, 72).unwrap();
+        a.mov(edi, 3).unwrap();
+        a.set_label(&mut pixels).unwrap();
+        a.add(eax, dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(edi).unwrap();
+        a.jnz(pixels).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(st2).unwrap();
+        a.fstp(qword_ptr(ebx + 24)).unwrap();
+        a.fstp(qword_ptr(ebx + 32)).unwrap();
+        a.dec(edx).unwrap();
+        latch = a.instructions().len();
+        a.jnz(outer).unwrap();
+        stop = a.instructions().len();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+
+        a.set_label(&mut floor).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.stmxcsr(dword_ptr(esp + 4)).unwrap();
+        a.mov(eax, dword_ptr(esp + 4)).unwrap();
+        a.and(eax, 0x6000).unwrap();
+        a.cmp(eax, 0).unwrap();
+        a.jne(fallback).unwrap();
+        a.fnstcw(word_ptr(esp)).unwrap();
+        a.mov(ax, word_ptr(esp)).unwrap();
+        a.and(ax, 0x7f).unwrap();
+        a.cmp(ax, 0x7f).unwrap();
+        a.lea(esp, ptr(esp + 8)).unwrap();
+        a.jne(fallback).unwrap();
+        a.movq(xmm0, qword_ptr(esp + 4)).unwrap();
+        a.cvttsd2si(eax, xmm0).unwrap();
+        a.cvtsi2sd(xmm1, eax).unwrap();
+        a.movq(qword_ptr(esp + 4), xmm1).unwrap();
+        a.fld(qword_ptr(esp + 4)).unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut ftol).unwrap();
+        a.cmp(dword_ptr(ebx + 68), 0).unwrap();
+        a.jne(fallback).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.and(esp, -8).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.cvttsd2si(eax, qword_ptr(esp)).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+
+        // This fallback leaves the helper and stops outside the nest trace.
+        a.set_label(&mut fallback).unwrap();
+        a.frndint().unwrap();
+        a.jmp(done).unwrap();
+    });
+    let ip = |n| {
+        iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+            .into_iter()
+            .nth(n)
+            .unwrap()
+            .ip32()
+    };
+    let latch = ip(latch);
+    p.stop = ip(stop);
+    p.state.regs[2] = 3;
+    p.state.regs[6] = DATA + 0x1000;
+    p.state.x87.set_control(0x027f);
+    p.state.x87.status |= 0x20;
+    p.state.mxcsr |= 0x20;
+    p.data[..8].copy_from_slice(&12.75f64.to_le_bytes());
+    (p, latch)
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-MEM-7
+#[test]
+fn x87_run_break_nest_keeps_the_steady_path_resident() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    let (p, _) = run_break_nest();
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        native.run(p.stop, 10000).unwrap(),
+        oracle.run(p.stop, 10000).unwrap()
+    );
+    same(&native, &oracle);
+    let engine = native.native.as_ref().unwrap();
+    let base = engine.unit_address(CODE).unwrap();
+    let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+    let inline = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+    assert_eq!(native.stats.compilations, 1);
+    assert_eq!(engine.diagnostics.helpers, 0);
+    assert_eq!(
+        inline.iter().filter(|m| m.part == Part::X87Entry).count(),
+        1
+    );
+    assert!(!inline.iter().any(|m| m.part == Part::X87Publish));
+    // c3cf26e7, this fixture and configuration: one unit, 78,864 bytes total.
+    assert!(native.stats.native_code_bytes < 78_864);
+    eprintln!(
+        "nest and session code bytes: 78864 -> {}",
+        native.stats.native_code_bytes
+    );
+}
+
+// spec: A64F-FP-7 A64-REG-5 A64-MEM-7 A64-CTL-7
+#[test]
+fn x87_run_break_nest_preserves_middle_iteration_exits() {
+    for (fault, checks) in [
+        (false, Checks::Slow),
+        (true, Checks::Slow),
+        (true, Checks::Adaptive),
+    ] {
+        let (mut p, _) = run_break_nest();
+        if fault {
+            // Nine successful pixel loads, then a refusal/fault in iteration four.
+            p.state.regs[6] = DATA + DATA_LEN as u32 - 36;
+        }
+        for flagm in [false, true] {
+            let config = (Features { flagm }, false, checks);
+            for budget in [31, 117, 10000] {
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                let outcome = native.run(p.stop, budget).unwrap();
+                assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+                same(&native, &oracle);
+                if budget == 10000 {
+                    let diagnostics = &native.native.as_ref().unwrap().diagnostics;
+                    assert_eq!(diagnostics.helpers, 0);
+                    if checks == Checks::Slow {
+                        assert!(diagnostics.accesses > 0);
+                        assert_eq!(diagnostics.refused, u64::from(fault));
+                    } else {
+                        assert_eq!(diagnostics.faults, 1);
+                    }
+                    if fault {
+                        assert_eq!(native.state.regs[1], 5);
+                    } else {
+                        assert_eq!(outcome, RunOutcome::ReachedStop);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64-CTL-8
+#[test]
+fn x87_run_break_nest_publishes_at_the_deadline_backedge() {
+    use std::time::{Duration, Instant};
+    let (mut p, _) = run_break_nest();
+    // Reusing the same pixel span avoids leaving data during the long slice.
+    let add = iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+        .into_iter()
+        .find(|i| {
+            i.mnemonic() == iced_x86::Mnemonic::Add && i.op0_register() == iced_x86::Register::ESI
+        })
+        .unwrap();
+    let mut replacement = CodeAssembler::new(32).unwrap();
+    replacement.add(esi, 0).unwrap();
+    let bytes = replacement.assemble(add.ip()).unwrap();
+    assert_eq!(bytes.len(), add.len());
+    p.code[(add.ip32() - CODE) as usize..(add.next_ip32() - CODE) as usize].copy_from_slice(&bytes);
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let mut native = executor(&p, config, false);
+    assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+    p.state.regs[2] = 100_000;
+    native.state = p.state.clone();
+    native.memory_mut().write(DATA, &p.data).unwrap();
+    native.state.refresh_mmx();
+    native.state.settle_flags();
+    let engine = native.native.as_mut().unwrap();
+    engine.deadline = Some(crate::native::deadline(
+        Instant::now() + Duration::from_nanos(1),
+    ));
+    let run = engine
+        .run(
+            &mut native.state,
+            &mut native.memory,
+            p.stop,
+            1 << 16,
+            std::ptr::null_mut(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.exit, crate::runtime::Exit::Dispatch);
+    assert!(engine.past());
+    assert!(run.retired > 60_000);
+    native.state.fuel = 0;
+    native.state.refresh_mmx();
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(
+        oracle.run(p.stop, u64::from(run.retired)).unwrap(),
+        RunOutcome::Budget
+    );
+    same(&native, &oracle);
+}
+
+// spec: A64F-FP-7 A64-REG-5
+#[test]
+fn x87_run_break_nest_publishes_only_when_the_fallback_is_taken() {
+    let (mut p, _) = run_break_nest();
+    // The control check takes the fallback once, executes FRNDINT, then leaves.
+    p.state.x87.set_control(0x023f);
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(oracle.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
+        same(&native, &oracle);
+    }
+}
+
+// spec: A64F-FP-7 A64-REG-5
+#[test]
+fn x87_run_break_return_and_control_exit_keep_the_integer_tail() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    for checks in [Checks::Adaptive, Checks::Slow] {
+        let mut p = fixture(|a| {
+            let (mut helper, mut done) = (a.create_label(), a.create_label());
+            a.fld1().unwrap();
+            a.sub(esp, 8).unwrap();
+            a.fstp(qword_ptr(esp)).unwrap();
+            a.call(helper).unwrap();
+            a.add(esp, 8).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut helper).unwrap();
+            a.movq(xmm0, qword_ptr(esp + 4)).unwrap();
+            a.movq(qword_ptr(esp + 4), xmm0).unwrap();
+            a.fld(qword_ptr(esp + 4)).unwrap();
+            a.fnstcw(word_ptr(esp - 4)).unwrap();
+            a.mov(ax, word_ptr(esp - 4)).unwrap();
+            a.cmp(ax, 0x27f).unwrap();
+            a.jne(done).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut done).unwrap();
+        });
+        p.state.x87.set_control(0x027f);
+        let config = (Features { flagm: false }, false, checks);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(
+            native.run(p.stop, 100).unwrap(),
+            oracle.run(p.stop, 100).unwrap()
+        );
+        same(&native, &oracle);
+        let base = native.native.as_ref().unwrap().unit_address(CODE).unwrap();
+        let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
+        let inline = marks.iter().take_while(|m| m.part != Part::Cold);
+        assert_eq!(
+            inline.clone().filter(|m| m.part == Part::X87Entry).count(),
+            1
+        );
+        assert!(
+            !inline.clone().any(|m| m.part == Part::X87Publish),
+            "{marks:?}"
+        );
+    }
+}

@@ -25,8 +25,8 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime;
 
-use super::super::decode::Op;
-use super::super::simd::Kind;
+use super::super::decode::{Alu, Mem, Narrow8or16, Op, Part as OperandPart, Src};
+use super::super::simd::{Kind, Loc};
 use super::super::trace::{Edge, Mode, Next, Trace};
 use super::super::{
     Cold as UnitCold, RUNTIME, State, Translator, X0, X1, X2, X3, X13, X14, X15, X16, X17,
@@ -66,6 +66,8 @@ pub(in super::super) struct Model {
     ip: Option<u32>,
     opcode: Option<u16>,
     cyclic: bool,
+    /// Publication bodies shared by the additional arrival plans.
+    shared: bool,
     /// The host registers whose values are narrow.
     pub(super) narrow: u8,
 }
@@ -78,6 +80,7 @@ impl Default for Model {
             ip: None,
             opcode: None,
             cyclic: false,
+            shared: false,
             narrow: 0,
         }
     }
@@ -423,6 +426,220 @@ fn loop_model(slots: [Known; 8], delta: u8) -> Model {
     model
 }
 
+/// Stack addresses relative to a still-known register value. Alignment starts
+/// a new origin; the frame pointer retains the old one until LEAVE.
+#[derive(Default)]
+struct MemoryRun {
+    addresses: [Option<(usize, u32)>; 8],
+    words: [Option<u16>; 8],
+    saved: Vec<((usize, u32), u16)>,
+    control: Option<u16>,
+    transfers: Vec<((usize, u32), usize)>,
+}
+
+impl MemoryRun {
+    fn address(&self, mem: Mem) -> Option<(usize, u32)> {
+        if mem.fs || mem.address_bits != 32 || mem.index.is_some() {
+            return None;
+        }
+        let (origin, offset) = self.addresses[usize::from(mem.base?)]?;
+        Some((origin, offset.wrapping_add(mem.disp)))
+    }
+
+    fn store(&mut self, mem: Mem, width: u32, word: Option<u16>, transfer: Option<usize>) {
+        let address = self.address(mem);
+        let disjoint = |other: (usize, u32)| {
+            address.is_some_and(|(origin, offset)| {
+                origin == other.0
+                    && other.1.wrapping_sub(offset) >= width
+                    && offset.wrapping_sub(other.1) >= 8
+            })
+        };
+        self.saved.retain(|&(at, _)| disjoint(at));
+        self.transfers.retain(|&(at, _)| disjoint(at));
+        if let Some(at) = address {
+            if let Some(word) = word {
+                self.saved.push((at, word));
+            }
+            if let Some(index) = transfer {
+                self.transfers.push((at, index));
+            }
+        }
+    }
+
+    fn word(&self, mem: Mem) -> Option<u16> {
+        let at = self.address(mem)?;
+        self.saved.iter().find(|w| w.0 == at).map(|w| w.1)
+    }
+}
+
+/// Identify memory exchanges and saved-control restores along native paths.
+/// Stores remain real accesses; these facts only extend run planning and
+/// remove the unmask check when every possible loaded mask is unchanged.
+fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
+    let (mut crossings, mut controls) = (Vec::new(), Vec::new());
+    let mut facts = MemoryRun::default();
+    for (index, inst) in trace.insts.iter().enumerate() {
+        if trace.head(index)
+            || trace.merge[index]
+            || index > 0 && trace.insts[index - 1].next != Next::Fall
+        {
+            facts = MemoryRun::default();
+            facts.addresses[4] = Some((index, 0));
+        }
+        let transfer = |facts: &MemoryRun, mem| {
+            let address = facts.address(mem)?;
+            facts.transfers.iter().find(|t| t.0 == address).map(|t| t.1)
+        };
+        match inst.op {
+            Op::X87(x) => match x.fast {
+                Fast::StoreControl => {
+                    // A fresh save establishes the identity of the current word.
+                    if facts.control.is_none() {
+                        facts.saved.clear();
+                        facts.words = [None; 8];
+                    }
+                    let control = *facts.control.get_or_insert(0);
+                    if let Some(mem) = x.mem {
+                        facts.store(mem, 2, Some(control), None);
+                    }
+                    crossings.push(index);
+                }
+                Fast::LoadControl => {
+                    let word = x.mem.and_then(|m| facts.word(m));
+                    if word.is_some() && facts.control.is_some() {
+                        controls.push(index);
+                    }
+                    facts.control = word;
+                }
+                Fast::Load(Source::F64) => {
+                    if let Some(from) = x.mem.and_then(|mem| transfer(&facts, mem)) {
+                        crossings.extend([from, index]);
+                    }
+                }
+                Fast::Store { width, integer, .. } => {
+                    if let Some(mem) = x.mem {
+                        facts.store(
+                            mem,
+                            u32::from(width),
+                            None,
+                            (width == 8 && !integer).then_some(index),
+                        );
+                    }
+                }
+                Fast::Store80 | Fast::StoreStatus => {
+                    if x.mem.is_none() {
+                        facts.words[0] = None;
+                        facts.addresses[0] = None;
+                    }
+                    facts.saved.clear();
+                    facts.transfers.clear();
+                }
+                _ => {}
+            },
+            Op::Simd(simd) if !simd.mmx() => {
+                if simd.src == Loc::Mem
+                    && simd.width == 8
+                    && let Some(from) = transfer(&facts, simd.mem)
+                    && matches!(trace.insts[from].op, Op::X87(_))
+                {
+                    crossings.extend([from, index]);
+                }
+                if simd.kind == Kind::MaskMove {
+                    facts.saved.clear();
+                    facts.transfers.clear();
+                }
+                if simd.dst == Loc::Mem {
+                    facts.store(
+                        simd.mem,
+                        u32::from(simd.width),
+                        None,
+                        (simd.width == 8).then_some(index),
+                    );
+                }
+                if let Loc::Gpr(r) = simd.dst {
+                    facts.words[usize::from(r)] = None;
+                    facts.addresses[usize::from(r)] = None;
+                }
+            }
+            Op::Mov(Src::Reg(to), Src::Reg(from)) => {
+                facts.addresses[usize::from(to)] = facts.addresses[usize::from(from)];
+                facts.words[usize::from(to)] = facts.words[usize::from(from)];
+            }
+            Op::Mov(Src::Reg(r), _) => {
+                facts.addresses[usize::from(r)] = None;
+                facts.words[usize::from(r)] = None;
+            }
+            Op::Mov(Src::Mem(mem), Src::Reg(r)) => {
+                facts.store(mem, 4, facts.words[usize::from(r)], None);
+            }
+            Op::Extend(r, Narrow8or16::Mem(mem, true), false) => {
+                facts.words[usize::from(r)] = facts.word(mem);
+                facts.addresses[usize::from(r)] = None;
+            }
+            Op::Alu(Alu::Or, Src::Reg(r), Src::Imm(0xc00)) => {
+                facts.words[usize::from(r)] = facts.words[usize::from(r)].map(|w| w | 0xc00);
+                facts.addresses[usize::from(r)] = None;
+            }
+            Op::Alu(op @ (Alu::Add | Alu::Sub), Src::Reg(r), Src::Imm(n)) => {
+                let offset = if op == Alu::Add { n } else { n.wrapping_neg() };
+                facts.addresses[usize::from(r)] = facts.addresses[usize::from(r)]
+                    .map(|(origin, at)| (origin, at.wrapping_add(offset)));
+                facts.words[usize::from(r)] = None;
+            }
+            Op::Lea(r, mem) => {
+                facts.addresses[usize::from(r)] = facts.address(mem);
+                facts.words[usize::from(r)] = None;
+            }
+            Op::Alu(Alu::And, Src::Reg(4), Src::Imm(_)) => {
+                facts.addresses[4] = Some((index, 0));
+                facts.words[4] = None;
+            }
+            Op::Push(_) | Op::Call(_) => {
+                facts.words[4] = None;
+                facts.addresses[4] = facts.addresses[4].map(|(o, n)| (o, n.wrapping_sub(4)));
+                facts.saved.clear();
+                facts.transfers.clear();
+            }
+            Op::Ret(pop) => {
+                facts.words[4] = None;
+                facts.addresses[4] =
+                    facts.addresses[4].map(|(o, n)| (o, n.wrapping_add(4 + u32::from(pop))));
+            }
+            Op::Leave => {
+                facts.words[4] = None;
+                facts.addresses[4] = facts.addresses[5].map(|(o, n)| (o, n.wrapping_add(4)));
+                facts.addresses[5] = None;
+                facts.words[5] = None;
+            }
+            Op::Nop | Op::Jcc(..) | Op::Jmp(_) | Op::Alu(Alu::Cmp | Alu::Test, ..) => {}
+            Op::Narrow(Some(Alu::Cmp | Alu::Test), ..) => {}
+            Op::Alu(_, Src::Reg(r), _) | Op::Step(_, r) | Op::Neg(r) | Op::Not(r) => {
+                facts.words[usize::from(r)] = None;
+                facts.addresses[usize::from(r)] = None;
+            }
+            Op::Narrow(op, 2, OperandPart::Reg(r), _) => {
+                facts.words[usize::from(r)] = None;
+                facts.addresses[usize::from(r)] = None;
+                if op.is_some() {
+                    facts.transfers.clear();
+                }
+            }
+            _ => {
+                // An unmodelled writer cannot contribute to a saved-word proof.
+                facts.words = [None; 8];
+                facts.control = None;
+                facts.addresses = [None; 8];
+                facts.saved.clear();
+                facts.transfers.clear();
+            }
+        }
+    }
+    crossings.sort_unstable();
+    crossings.dedup();
+    (crossings, controls)
+}
+
 /// The run being emitted.
 #[derive(Default)]
 pub(in super::super) struct Cache {
@@ -456,6 +673,9 @@ pub(in super::super) struct Cache {
     dispatch: bool,
     pub(super) pe: bool,
     pub(super) control_stable: bool,
+    publishers: Vec<(Model, Reg, Label)>,
+    crossings: Vec<usize>,
+    controls: Vec<usize>,
 }
 
 impl Cache {
@@ -470,7 +690,10 @@ impl Cache {
                 }
             }
         }
+        let (crossings, controls) = memory_runs(trace);
         Self {
+            crossings,
+            controls,
             loops,
             incoming,
             ..Self::default()
@@ -479,6 +702,10 @@ impl Cache {
 }
 
 impl Translator<'_> {
+    pub(super) fn x87_saved_control(&self) -> bool {
+        self.x87.active && self.x87.controls.contains(&self.index)
+    }
+
     /// The cacheable x87 instruction at `index`, if it is one.
     fn cacheable(&self, index: usize) -> Option<X87> {
         let inst = self.trace.insts[index];
@@ -500,7 +727,7 @@ impl Translator<'_> {
                 !simd.mmx()
                     && !((self.checked)(inst.pc)
                         && simd.memory()
-                        && matches!(simd.kind, Kind::InsertWord | Kind::StoreControl))
+                        && matches!(simd.kind, Kind::InsertWord))
             }
             Op::Body(_)
             | Op::CallIndirect(_)
@@ -539,7 +766,8 @@ impl Translator<'_> {
             }
         }
         let mut delta = from.delta;
-        let mut end = None;
+        // A helper can resume into the integer-only tail of an open run.
+        let mut end = stored.map(|_| start);
         let mut merges = Vec::new();
         // Forward edges from the run: target, slots and TOP.
         let mut pending: Vec<(usize, [Known; 8], u8)> = Vec::new();
@@ -621,6 +849,15 @@ impl Translator<'_> {
                     end = Some(index);
                 }
                 None if self.joins(index) => {
+                    if end.is_some()
+                        && self
+                            .x87
+                            .crossings
+                            .iter()
+                            .any(|&at| at >= start && at <= index)
+                    {
+                        end = Some(index);
+                    }
                     if backedge(self.trace, index).next().is_some() {
                         break;
                     }
@@ -647,11 +884,123 @@ impl Translator<'_> {
         Some((end, need, merges))
     }
 
+    /// Memory exchanges and loops with forward arrivals use a model at every
+    /// arrival point. Other loops retain their ordered plan and emitted code.
+    #[allow(clippy::type_complexity)]
+    fn plan_loop(&self, start: usize, end: usize) -> Option<(usize, Need, Vec<(usize, Model)>)> {
+        if self
+            .x87
+            .crossings
+            .iter()
+            .any(|&at| at >= start && at <= end)
+            || (start..=end).any(|from| edges(self.trace, from).any(|to| to > from && to <= end))
+        {
+            let extended = (end + 1..self.trace.len())
+                .take_while(|&index| {
+                    !self.trace.head(index)
+                        && (self.cacheable(index).is_some() || self.joins(index))
+                })
+                .last()
+                .unwrap_or(end);
+            self.plan_arrivals(start, extended)
+                .or_else(|| self.plan_arrivals(start, end))
+                .or_else(|| self.plan_ordered_loop(start, end))
+        } else {
+            self.plan_ordered_loop(start, end)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn plan_arrivals(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, Need, Vec<(usize, Model)>)> {
+        let mut states = vec![None; end + 1];
+        states[start] = Some(([Known::Unknown; 8], 0));
+        let mut work = std::collections::VecDeque::from([start]);
+        let mut need = Need::default();
+        let mut seen_x87 = false;
+        while let Some(index) = work.pop_front() {
+            if index != start && self.trace.head(index) {
+                return None;
+            }
+            let (mut slots, mut delta) = states[index]?;
+            if let Some(x) = self.cacheable(index) {
+                if matches!(x.fast, Fast::Leaf(_)) {
+                    return None;
+                }
+                step(&mut slots, &mut delta, &mut need, x.fast)?;
+                seen_x87 = true;
+                need.pe |= index < end && self.pe_candidate(index, x.fast, slots, delta);
+            } else if !self.joins(index) {
+                return None;
+            }
+            let fall = (self.trace.insts[index].next == Next::Fall).then_some(index + 1);
+            for to in edges(self.trace, index).chain(fall) {
+                if to < start || to > end {
+                    return None;
+                }
+                let mut incoming = (slots, delta);
+                if let Some((previous, top)) = states[to] {
+                    if top != delta {
+                        return None;
+                    }
+                    for r in 0..8 {
+                        let next = loop_meet(previous[r], slots[r])?;
+                        if previous[r] == Known::Unknown || slots[r] == Known::Unknown {
+                            match next {
+                                Known::Value => need.value |= 1 << r,
+                                Known::Empty | Known::Stale => need.empty |= 1 << r,
+                                Known::Unknown => {}
+                            }
+                        }
+                        incoming.0[r] = next;
+                    }
+                }
+                if states[to] != Some(incoming) {
+                    states[to] = Some(incoming);
+                    work.push_back(to);
+                }
+            }
+        }
+        if !seen_x87 || need.value & need.empty != 0 || states[start..].iter().any(Option::is_none)
+        {
+            return None;
+        }
+        // A model only belongs to the run when every incoming edge belongs.
+        for from in 0..self.trace.len() {
+            if from < start || from > end {
+                if edges(self.trace, from).any(|to| to > start && to <= end) {
+                    return None;
+                }
+            }
+        }
+        let merges = (start..=end)
+            .filter(|&index| self.trace.merge[index])
+            .map(|index| {
+                let (slots, delta) = states[index].unwrap();
+                (
+                    index,
+                    Model {
+                        shared: true,
+                        ..loop_model(slots, delta)
+                    },
+                )
+            })
+            .collect();
+        Some((end, need, merges))
+    }
+
     /// Proves every arrival at each loop head has the same TOP and tag
     /// model. Starting with forward arrivals, widen the slots to retain
     /// until the backedges no longer add a value to the entry model.
     #[allow(clippy::type_complexity)]
-    fn plan_loop(&self, start: usize, end: usize) -> Option<(usize, Need, Vec<(usize, Model)>)> {
+    fn plan_ordered_loop(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<(usize, Need, Vec<(usize, Model)>)> {
         let mut heads: Vec<_> = self
             .x87
             .loops
@@ -1252,6 +1601,7 @@ impl Translator<'_> {
         self.x87.start = start;
         self.x87.end = end;
         self.x87.model = Model {
+            shared: merges.iter().any(|m| m.1.shared),
             cyclic,
             ..Model::default()
         };
@@ -1468,8 +1818,53 @@ impl Translator<'_> {
     }
 
     /// Stores `model` with status word `status` into `CpuState`; uses x0
-    /// to x2, x16, x17, d0 and d1.
+    /// to x2, x16, x17, d0 and d1, and x3 for shared cold bodies.
     pub(super) fn x87_publish(&mut self, model: Model, status: Reg) {
+        if model.shared {
+            let state = Model {
+                ip: None,
+                opcode: None,
+                cyclic: false,
+                ..model
+            };
+            let entry = self
+                .x87
+                .publishers
+                .iter()
+                .find(|&&(m, s, _)| m == state && s == status)
+                .map(|&(_, _, label)| label);
+            let entry = entry.unwrap_or_else(|| {
+                let (entry, skip) = (self.asm.label(), self.asm.label());
+                self.x87.publishers.push((state, status, entry));
+                self.asm.b(skip);
+                self.asm.bind(entry);
+                self.x87_publish_state(state, status);
+                self.emit(br(X3));
+                self.asm.bind(skip);
+                entry
+            });
+            let done = self.asm.label();
+            self.asm.adr(X3, done);
+            self.asm.b(entry);
+            self.asm.bind(done);
+        } else {
+            self.x87_publish_state(model, status);
+        }
+        if let Some(ip) = model.ip {
+            self.mov_imm(X16, ip);
+            self.emit(str(W, X16, X5, runtime::X87_IP));
+        } else if model.cyclic {
+            self.emit_all(&[vumov(2, X16, RUN, 2), str(W, X16, X5, runtime::X87_IP)]);
+        }
+        if let Some(opcode) = model.opcode {
+            self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
+        } else if model.cyclic {
+            self.emit_all(&[vumov(2, X16, RUN, 3), strh(X16, X5, runtime::X87_OPCODE)]);
+        }
+    }
+
+    /// The stack, tags and status part, using x3 only as its cold return address.
+    fn x87_publish_state(&mut self, model: Model, status: Reg) {
         for (r, slot) in model.slots.iter().enumerate() {
             if let Slot::Dirty(n) | Slot::Freed(Some(n)) = *slot {
                 self.x87_store_slot(r, n);
@@ -1517,17 +1912,6 @@ impl Translator<'_> {
             bfi(W, status, X16, 11, 3),
             strh(status, X5, runtime::X87_STATUS),
         ]);
-        if let Some(ip) = model.ip {
-            self.mov_imm(X16, ip);
-            self.emit(str(W, X16, X5, runtime::X87_IP));
-        } else if model.cyclic {
-            self.emit_all(&[vumov(2, X16, RUN, 2), str(W, X16, X5, runtime::X87_IP)]);
-        }
-        if let Some(opcode) = model.opcode {
-            self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
-        } else if model.cyclic {
-            self.emit_all(&[vumov(2, X16, RUN, 3), strh(X16, X5, runtime::X87_OPCODE)]);
-        }
     }
 
     /// Stores host register `n` to physical register `r` and its MMX

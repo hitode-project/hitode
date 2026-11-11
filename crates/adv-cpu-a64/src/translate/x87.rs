@@ -318,8 +318,10 @@ impl Translator<'_> {
                 self.access(Addr::Window(X6), 2, Dir::Load, X0);
                 self.x87_accessed();
                 // Unmasking a pending exception takes the interpreter.
-                self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
-                self.asm.cbz(W, true, X16, slow);
+                if !self.x87_saved_control() {
+                    self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
+                    self.asm.cbz(W, true, X16, slow);
+                }
                 self.emit_all(&[
                     strh(X0, X5, runtime::X87_CONTROL),
                     movz(W, X16, 0x8080, 0),
