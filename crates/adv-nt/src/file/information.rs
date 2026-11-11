@@ -25,6 +25,7 @@ const FILE_ALL_INFORMATION: u32 = 18;
 const FILE_END_OF_FILE_INFORMATION: u32 = 20;
 const FILE_PIPE_INFORMATION: u32 = 23;
 const FILE_PIPE_LOCAL_INFORMATION: u32 = 24;
+const FILE_MAILSLOT_QUERY_INFORMATION: u32 = 26;
 const FILE_NETWORK_OPEN_INFORMATION: u32 = 34;
 const FILE_ATTRIBUTE_TAG_INFORMATION: u32 = 35;
 const FILE_ID_INFORMATION: u32 = 59;
@@ -109,6 +110,7 @@ fn query_in(
         FILE_STAT_INFORMATION => 72,
         FILE_PIPE_INFORMATION => 8,
         FILE_PIPE_LOCAL_INFORMATION => 40,
+        FILE_MAILSLOT_QUERY_INFORMATION => 24,
         FILE_NETWORK_OPEN_INFORMATION => 56,
         FILE_ATTRIBUTE_TAG_INFORMATION => 8,
         FILE_ID_INFORMATION => 24,
@@ -146,8 +148,11 @@ fn query_in(
         drop(fd);
         return query_server(env, handle, buffer, length, class);
     }
-    if class == FILE_ALIGNMENT_INFORMATION {
-        // Wine checks the size and fd, then returns STATUS_NOT_IMPLEMENTED.
+    if matches!(
+        class,
+        FILE_ALIGNMENT_INFORMATION | FILE_MAILSLOT_QUERY_INFORMATION
+    ) {
+        // Neither class has a result for a Unix fd.
         return Err(status::NOT_IMPLEMENTED.into());
     }
     if class == FILE_NAME_INFORMATION {

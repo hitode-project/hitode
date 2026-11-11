@@ -216,8 +216,10 @@ mod tests {
         let (mut top, mut done) = (a.create_label(), a.create_label());
         a.movq(mm1, qword_ptr(esi)).unwrap();
         a.pxor(xmm2, xmm2).unwrap();
-        if variant == 3 {
-            a.mulps(xmm4, xmm5).unwrap();
+        match variant {
+            3 => a.mulps(xmm4, xmm5).unwrap(),
+            6 => a.subps(xmm4, xmm5).unwrap(),
+            _ => {}
         }
         a.set_label(&mut top).unwrap();
         match variant {
@@ -251,7 +253,7 @@ mod tests {
             &|_, _| None,
             &|_| None,
         );
-        let head = 2 + usize::from(variant == 3);
+        let head = 2 + usize::from(matches!(variant, 3 | 6));
         assert!(trace.merge[head]);
         entries(&trace, &|_| false)[head]
     }
@@ -299,7 +301,14 @@ mod tests {
         assert_eq!(head_entry(0).guards, ready);
         // A helper inside the loop is followed by guards again.
         assert_eq!(head_entry(2).guards, ready);
-        assert_eq!(head_entry(3).guards, Guards::ALL);
+        assert_eq!(
+            head_entry(3).guards,
+            Guards {
+                fp_default: false,
+                ..Guards::ALL
+            }
+        );
+        assert_eq!(head_entry(6).guards, Guards::ALL);
         // EMMS on the backedge path loses the x87 guard.
         assert!(!head_entry(4).guards.ready);
     }

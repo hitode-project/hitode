@@ -501,6 +501,96 @@ fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
 
 // spec: A64F-FP-5
 #[test]
+fn sse_directed_arithmetic_and_conversion_stay_native() {
+    let mut program = fixture(|a| {
+        a.addps(xmm0, xmm1).unwrap();
+        a.mulps(xmm2, xmm3).unwrap();
+        a.cvtdq2ps(xmm4, xmmword_ptr(DATA as i32)).unwrap();
+        a.addss(xmm5, xmm1).unwrap();
+        a.mulss(xmm6, xmm3).unwrap();
+        a.ldmxcsr(dword_ptr(DATA as i32 + 16)).unwrap();
+        a.addps(xmm7, xmm1).unwrap();
+    });
+    let floats = |values: [f32; 4]| std::array::from_fn(|i| values[i / 4].to_le_bytes()[i % 4]);
+    let step = f32::EPSILON / 2.0;
+    program.state.xmm[0] = floats([1.0, -1.0, 0.0, -0.0]);
+    program.state.xmm[1] = floats([step, -step, -0.0, 0.0]);
+    program.state.xmm[2] = floats([1.0 + f32::EPSILON, -1.0 - f32::EPSILON, 0.0, -0.0]);
+    program.state.xmm[3] = floats([1.0 + f32::EPSILON, 1.0 + f32::EPSILON, -1.0, -1.0]);
+    program.state.xmm[5] = program.state.xmm[0];
+    program.state.xmm[6] = program.state.xmm[2];
+    program.state.xmm[7] = program.state.xmm[0];
+    let (lanes, _) = program.data[..16].as_chunks_mut::<4>();
+    for (lane, value) in lanes
+        .iter_mut()
+        .zip([16_777_217i32, -16_777_217, i32::MAX, i32::MIN])
+    {
+        lane.copy_from_slice(&value.to_le_bytes());
+    }
+    program.data[16..20].copy_from_slice(&0x1fa0u32.to_le_bytes());
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    for rc in 0..4 {
+        for sticky in [0, 0x20] {
+            program.state.mxcsr = 0x1f80 | (rc << 13) | sticky;
+            let mut native = executor(&program, config, false);
+            let mut oracle = executor(&program, config, true);
+            assert_eq!(
+                native.run(program.stop, 100).unwrap(),
+                RunOutcome::ReachedStop
+            );
+            assert_eq!(
+                oracle.run(program.stop, 100).unwrap(),
+                RunOutcome::ReachedStop
+            );
+            same(&native, &oracle);
+            assert_eq!(
+                native.stats.interpreter_entries, 0,
+                "RC={rc}, sticky={sticky}"
+            );
+        }
+    }
+}
+
+// spec: A64F-FP-5
+#[test]
+fn sse_directed_arithmetic_leaves_other_exceptions_and_controls_to_the_owner() {
+    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    for packed in [false, true] {
+        let mut program = fixture(|a| {
+            a.addps(xmm2, xmm2).unwrap();
+            a.ldmxcsr(dword_ptr(DATA as i32)).unwrap();
+            if packed {
+                a.mulps(xmm0, xmm1).unwrap();
+            } else {
+                a.mulss(xmm0, xmm1).unwrap();
+            }
+        });
+        program.state.mxcsr = 0x3fa0;
+        for (a, b, mxcsr) in [
+            (f32::MAX, 2.0, 0x3fa0), // Round-down overflow returns finite max.
+            (-f32::MAX, 2.0, 0x5fa0),
+            (f32::MIN_POSITIVE, 0.33333334, 0x3fa0),
+            (f32::from_bits(1), 2.0, 0x3fe0),                 // DAZ.
+            (f32::MIN_POSITIVE, 0.5, 0xbfa0),                 // FTZ.
+            (1.0 + f32::EPSILON, 1.0 + f32::EPSILON, 0x2f80), // PE unmasked.
+        ] {
+            program.state.xmm[0][..4].copy_from_slice(&a.to_bits().to_le_bytes());
+            program.state.xmm[1][..4].copy_from_slice(&b.to_bits().to_le_bytes());
+            program.data[..4].copy_from_slice(&(mxcsr as u32).to_le_bytes());
+            let mut native = executor(&program, config, false);
+            let mut oracle = executor(&program, config, true);
+            assert_eq!(
+                native.run(program.stop, 100).unwrap(),
+                oracle.run(program.stop, 100).unwrap()
+            );
+            same(&native, &oracle);
+            assert_eq!(native.stats.interpreter_entries, 1, "MXCSR={mxcsr:x}");
+        }
+    }
+}
+
+// spec: A64F-FP-5
+#[test]
 fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {
     for scalar in [false, true] {
         for double in [false, true] {

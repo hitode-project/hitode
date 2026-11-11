@@ -92,6 +92,8 @@ pub struct SurfaceProvider {
     /// Time since the host display's latest vsync and its period; None keeps
     /// refresh boundaries on the machine clock.
     pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,
+    /// Consume the guest's own pacing for this frame, if any.
+    pub guest_frame_wait: fn(&mut Env<'_>) -> bool,
     /// Apply guest display/window state only after device creation/reset succeeds.
     pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
     pub device_released: fn(&mut Env<'_>, u32),
@@ -1829,19 +1831,24 @@ fn present(
         return Outcome::Return(INVALID);
     }
     let surface = d.surface;
+    let previous = d.boundary;
     let provider = env.ext.get::<State>().provider;
-    let occluded = (provider.visible)(env.ext, &env.sys.objects, d.parameters.hDeviceWindow)
-        .is_some_and(|visible| !visible);
-    let deadline = match pacing::deadline(
-        env.sys.clock.now_us(),
-        d.parameters.PresentationInterval,
-        (provider.display)(env.ext).2,
-        occluded,
-        (provider.vsync)(env.ext),
-        d.boundary,
-    ) {
-        Ok(deadline) => deadline,
-        Err(()) => return Outcome::Return(UNAVAILABLE),
+    let deadline = if (provider.guest_frame_wait)(env) {
+        None
+    } else {
+        let occluded = (provider.visible)(env.ext, &env.sys.objects, parameters.hDeviceWindow)
+            .is_some_and(|visible| !visible);
+        match pacing::deadline(
+            env.sys.clock.now_us(),
+            parameters.PresentationInterval,
+            (provider.display)(env.ext).2,
+            occluded,
+            (provider.vsync)(env.ext),
+            previous,
+        ) {
+            Ok(deadline) => deadline,
+            Err(()) => return Outcome::Return(UNAVAILABLE),
+        }
     };
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())

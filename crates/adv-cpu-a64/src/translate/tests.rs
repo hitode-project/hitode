@@ -984,12 +984,13 @@ fn j1_x87_run_admits_sahf_and_guards_once_until_control_changes() {
 fn j1_sse_reuses_mxcsr_and_pe_checks_until_a_control_write() {
     for control_write in [false, true] {
         let code = bytes(|a| {
-            a.addss(xmm0, xmm1).unwrap();
+            a.subss(xmm0, xmm1).unwrap();
             if control_write {
                 a.ldmxcsr(dword_ptr(ebx)).unwrap();
+                a.subss(xmm0, xmm1).unwrap();
             }
             a.mulss(xmm0, xmm1).unwrap();
-            a.subss(xmm0, xmm1).unwrap();
+            a.addss(xmm0, xmm1).unwrap();
         });
         let work = j1_unit(&code);
         let hot_end = work

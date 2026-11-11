@@ -10,7 +10,10 @@ use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
+use adv_pe::{ImportName, Pe};
+use iced_x86::{Code, Decoder, DecoderOptions};
 
 use crate::file::basic_information;
 use crate::object::{read_unicode_string, write_bytes, write_u32};
@@ -23,6 +26,134 @@ const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
 const FD_TYPE_DIR: i32 = 2;
 const BUFFER_OVERFLOW: Status = 0x8000_0005;
 const NO_MORE_FILES: Status = 0x8000_0006;
+const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION: u32 = 63;
+
+pub(crate) const FIND_QUERY: &str = "find_first_directory_query";
+
+struct FindQuerySlot(u32);
+
+/// Route Wine's initial Win32 file search through the current guest import.
+/// Some inline hooks handle the older directory record but return empty
+/// success for the extended record Wine requests.
+pub(crate) fn bind_find_query(env: &mut Env<'_>, base: u32, pe: &Pe) {
+    let Some(table) = env
+        .ext
+        .get_or_default::<crate::identity::Images>()
+        .0
+        .get(&base)
+        .filter(|module| module.name == "kernelbase.dll")
+        .and_then(crate::identity::Module::table)
+    else {
+        return;
+    };
+    let Some(function) = table.named("FindFirstFileExW") else {
+        return;
+    };
+    let (Ok(relocations), Ok(code), Ok(imports)) = (
+        pe.relocations(),
+        pe.slice(function.rva, function.size),
+        pe.imports(),
+    ) else {
+        return;
+    };
+    let entry = base + function.rva;
+    if !crate::identity::intact(env.cpu, entry, function, |address| {
+        relocations.contains(&address.wrapping_sub(base))
+    }) {
+        return;
+    }
+    let Some(slot) = imports
+        .into_iter()
+        .filter(|module| module.dll.eq_ignore_ascii_case("ntdll.dll"))
+        .flat_map(|module| module.imports)
+        .find_map(|import| match import.name {
+            ImportName::Name { name, .. } if name == "NtQueryDirectoryFile" => {
+                Some(base + import.iat_rva)
+            }
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let Some(call) = Decoder::with_ip(32, code, u64::from(entry), DecoderOptions::NONE)
+        .into_iter()
+        .find(|ins| {
+            ins.code() == Code::Call_rm32 && ins.len() == 6 && ins.memory_displacement32() == slot
+        })
+    else {
+        return;
+    };
+    let Ok(thunk) = env
+        .sys
+        .thunks
+        .publish(env.cpu, crate::dispatch::MODULE, FIND_QUERY)
+    else {
+        return;
+    };
+    let at = call.ip32();
+    let mut bytes = [0xe8, 0, 0, 0, 0, 0x90];
+    bytes[1..5].copy_from_slice(&thunk.wrapping_sub(at + 5).to_le_bytes());
+    if env.cpu.write(at, &bytes).is_ok() {
+        env.ext.insert(FindQuerySlot(slot));
+    }
+}
+
+pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
+    let slot = env.ext.get::<FindQuerySlot>().0;
+    let Ok(target) = env.cpu.read_u32(slot) else {
+        return Outcome::Return(status::ACCESS_VIOLATION);
+    };
+    let mut args: [u32; 11] = std::array::from_fn(|i| env.arg(i as u32));
+    let (io, buffer, length, class, mask, restart) =
+        (args[4], args[5], args[6], args[7], args[9], args[10]);
+    Outcome::call(target, args, move |env, result| {
+        if result.value() != status::SUCCESS
+            || class != FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION
+            || restart as u8 == 0
+            || env.cpu.read_u32(io + 4).ok() != Some(0)
+            || !read_unicode_string(env, mask).is_ok_and(|name| {
+                !name.is_empty()
+                    && !name
+                        .iter()
+                        .any(|&unit| [42, 63, 60, 62, 34].contains(&unit))
+            })
+        {
+            return Outcome::Return(result.value());
+        }
+        args[7] = FILE_BOTH_DIRECTORY_INFORMATION;
+        Outcome::call(target, args, move |env, legacy| {
+            if legacy.value() == status::SUCCESS
+                && let Some(bytes) = legacy_find_record(env, io, buffer, length)
+                && env.cpu.write(buffer, &bytes).is_ok()
+            {
+                return status::finish(
+                    write_u32(env, io + 4, bytes.len() as u32).map_err(Error::Status),
+                );
+            }
+            // Leave the result of the original empty query intact.
+            status::finish(
+                write_u32(env, io, status::SUCCESS)
+                    .and_then(|()| write_u32(env, io + 4, 0))
+                    .map_err(Error::Status),
+            )
+        })
+    })
+}
+
+fn legacy_find_record(env: &Env<'_>, io: u32, buffer: u32, length: u32) -> Option<Vec<u8>> {
+    let size = env.cpu.read_u32(io + 4).ok()?;
+    if size < 94 || size > length.checked_sub(20)? {
+        return None;
+    }
+    let mut entry = vec![0; size as usize];
+    env.cpu.read(buffer, &mut entry).ok()?;
+    let name_len = u32::from_le_bytes(entry[60..64].try_into().unwrap());
+    if entry[..4] != [0; 4] || name_len > size - 94 || name_len > 518 || entry[68] > 24 {
+        return None;
+    }
+    entry.splice(68..68, [0; 20]);
+    Some(entry)
+}
 
 /// The listing of each directory handle that has been queried.
 #[derive(Default)]
@@ -73,7 +204,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             FILE_DIRECTORY_INFORMATION => 64,
             FILE_FULL_DIRECTORY_INFORMATION => 68,
             FILE_BOTH_DIRECTORY_INFORMATION => 94,
-            63 => 114,
+            FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION => 114,
             10 | 12 | 37 | 38 | 50 | 60 => {
                 return Err(Error::Unsupported(format!(
                     "directory information class {class}"
