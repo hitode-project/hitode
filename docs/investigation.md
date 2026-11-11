@@ -186,7 +186,6 @@ python tools/survey/module_profile.py <module> [--json <out>]
 - `native_sample.py --while-key ctrl` samples only while the key is held, to measure skipping. Count work that a native game spreads over threads against the single Hitode thread.
 - `native_hotspots.py --summary` gives host instructions per guest instruction, split by check, body, pure and slow, and the share of stack accesses. Untagged code counts toward the next tag, so the check share is a lower bound.
 - JIT code has no unwind information, so host stacks stop at native regions. They answer who calls a host function, not which guest code ran.
-- `ADV_JIT_DUMP_DIR` with `ADV_JIT_DUMP_REGIONS=<hex,...>` dumps the VCode of chosen regions.
 - `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames. Its checkpoint reports include bounded wait-source, wake lateness and ready-to-dispatch distributions, also in windowed runs. Its `input_responses` follow each click, key or wheel press to the frames after it and split the execution thread into guest runs, polling-round waits and all-blocked waits, so a felt stall in a windowed run gets its cause. `--host-profile <csv>` gives API service time.
 - `ADV_LOOP_COVERAGE=1` with `--report` writes `*.loops.tsv` for `loop_coverage.py`. It ranks by instruction weight, not time.
 - `ADV_INTERP_PROFILE=<file>` profiles the interpreter.

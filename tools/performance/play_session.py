@@ -146,7 +146,7 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
     # Diagnostics can substantially change decoder throughput and scheduling.
     environment = dict(os.environ)
     removed = []
-    for name in ("ADV_AUDIO_TRACE", "ADV_AUDIO_DUMP_DIR", "ADV_PRINTF_DIAG_PATH", "ADV_PRINTF_DIAG_WORDS", "ADV_AUDIO_DUMP_CHUNKS", "ADV_AUDIO_CAPTURE", "ADV_AUDIO_CAPTURE_CALLBACK", "ADV_AUDIO_MUTE_DEVICE", "ADV_MMIO_TRACE", "ADV_JIT_DUMP_DIR"):
+    for name in ("ADV_AUDIO_TRACE", "ADV_AUDIO_DUMP_DIR", "ADV_PRINTF_DIAG_PATH", "ADV_PRINTF_DIAG_WORDS", "ADV_AUDIO_DUMP_CHUNKS", "ADV_AUDIO_CAPTURE", "ADV_AUDIO_CAPTURE_CALLBACK", "ADV_AUDIO_MUTE_DEVICE", "ADV_MMIO_TRACE"):
         if environment.pop(name, None) is not None:
             removed.append(name)
     environment.pop("ADV_PERF_MAP_DIR", None)

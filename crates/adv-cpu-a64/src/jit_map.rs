@@ -1,12 +1,11 @@
 //! Opt-in native address maps for samplers. They record placed units, not
 //! execution counts, and never change translation.
 //!
-//! `ADV_JIT_MAP_DIR` writes the x64 backend's `jit-{pid}.tsv` rows for an
-//! external sampler. [`enable_memory`] keeps the same rows in process for an
-//! in-process sampler, with the guest instruction and [`Part`] of every
-//! stretch of a unit and the names of the shared stubs. A cleared cache
-//! reuses addresses, so attribution takes the newest unit placed before the
-//! sample.
+//! `ADV_JIT_MAP_DIR` writes `jit-{pid}.tsv` rows for an external sampler.
+//! [`enable_memory`] keeps the same rows in process for an in-process
+//! sampler, with the guest instruction and [`Part`] of every stretch of a
+//! unit and the names of the shared stubs. A cleared cache reuses addresses,
+//! so attribution takes the newest unit placed before the sample.
 // The translator needs these types on every host; native execution records units.
 #![cfg_attr(not(native), allow(dead_code))]
 
@@ -217,7 +216,7 @@ pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[
     }) else {
         return;
     };
-    // Decimal TSV as in x64: Unix ns, native base, bytes, guest start, mode,
+    // Decimal TSV: Unix ns, native base, bytes, guest start, mode,
     // guest span (unknown here, 0), retired guest instructions.
     let row = format!("{}\t{base}\t{size}\t{eip}\ta64\t0\t{retired}\n", now_ns());
     let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
