@@ -174,10 +174,10 @@ python tools/performance/attribute_pc.py <run>
 python tools/performance/native_hotspots.py <run> <guest_start>   # machine code and samples of a hot region
 python tools/performance/native_hotspots.py <run> --summary       # generated code cost by part and category
 python tools/performance/stack_report.py <run> [--focus <name>]   # host call stacks
-# macOS, also the launcher: one-second slices with guest regions (a64 writes jit-<pid>.tsv only)
+# macOS, also the launcher: one-second slices with guest regions and, with --instructions, guest instructions
 ADV_JIT_MAP_DIR=<run> <launcher or adv-run> ...
 python3 tools/performance/macos_sample.py record <run> --pid <pid> --seconds 30
-python3 tools/performance/macos_sample.py report <run> [--from <ms> --to <ms>]
+python3 tools/performance/macos_sample.py report <run> [--thread <name>] [--from <ms> --to <ms>] [--instructions]
 python tools/performance/compare_loop_profiles.py <base> <cand>
 # before running: what a module will ask of the CPU
 python tools/survey/module_profile.py <module> [--json <out>]

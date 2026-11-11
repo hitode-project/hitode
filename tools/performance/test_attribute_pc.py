@@ -33,6 +33,17 @@ class JitMapTests(unittest.TestCase):
         self.assertIsNone(jit.lookup(4096 + 40, 600))  # Beyond the live 32-byte body.
         self.assertIsNone(jit.lookup(4096, 50))  # Before any compilation.
 
+    def test_newest_body_owns_an_address_an_older_body_also_covers(self):
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            # A small body at 4160, then a cleared cache places a large one at 4096.
+            (directory / "jit-1.tsv").write_text(
+                "100\t4160\t32\t65536\ta64\t0\t3\n"
+                "500\t4096\t4096\t69632\ta64\t0\t9\n", encoding="utf-8")
+            jit = JitMap(directory)
+        self.assertEqual(jit.lookup(4170, 200)["region"], 65536)
+        self.assertEqual(jit.lookup(4170, 600)["region"], 69632)
+
 
 class ComponentTests(unittest.TestCase):
     def test_innermost_project_frame_names_the_component(self):
