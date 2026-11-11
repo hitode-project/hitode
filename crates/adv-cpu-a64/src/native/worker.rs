@@ -17,7 +17,6 @@ use crate::translate::computation::{Evaluation, Proof, Range};
 
 pub(super) struct Prepared {
     pub code: Code,
-    iteration: Option<Code>,
     pub proof: Proof,
     skip: std::cell::Cell<u32>,
     mode: std::cell::Cell<Mode>,
@@ -32,27 +31,27 @@ enum Mode {
 }
 
 impl Prepared {
-    pub fn new(code: Code, iteration: Option<Code>, proof: Proof) -> Self {
-        let mode = if iteration.is_some() {
+    /// `iterates` when the code can stop after one outer iteration.
+    pub fn new(code: Code, iterates: bool, proof: Proof) -> Self {
+        let mode = if iterates {
             Mode::Whole(0)
         } else {
             Mode::WholeOnly
         };
         Self {
             code,
-            iteration,
             proof,
             skip: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
         }
     }
 
+    /// The code and whether a job stops after one outer iteration.
     fn selected(&self) -> (&Code, bool) {
-        if matches!(self.mode.get(), Mode::Trial | Mode::Iteration) {
-            (self.iteration.as_ref().expect("iteration form"), true)
-        } else {
-            (&self.code, false)
-        }
+        (
+            &self.code,
+            matches!(self.mode.get(), Mode::Trial | Mode::Iteration),
+        )
     }
 
     pub fn worth_offering(&self) -> bool {
@@ -131,6 +130,7 @@ struct Task {
     context: ExecutionContext,
     entry: Entry,
     code: Code,
+    once: bool,
     signals: Signals,
     done: SyncSender<Done>,
     wake: Option<WakeEvent>,
@@ -167,7 +167,7 @@ fn run(
     id: u32,
     mut context: ExecutionContext,
     entry: Entry,
-    code: &Code,
+    (code, once): (&Code, bool),
     signals: &Signals,
     local: bool,
 ) -> Done {
@@ -188,6 +188,8 @@ fn run(
     runtime.computation_pending = signals.pending.0.as_ptr() as u64;
     runtime.computation_pending_mask = signals.pending.1;
     runtime.completed = 0;
+    runtime.head_exit = u32::from(once);
+    runtime.deferred = 0;
     runtime.branch = 0;
     runtime.fault_simd = faults.capture.simd.as_ptr() as u64;
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
@@ -214,7 +216,7 @@ fn run(
     cpu.refresh_mmx();
     context.finish_computation(exit);
     Done {
-        deadline_recall: exit == Exit::Recall
+        deadline_recall: (exit == Exit::Recall || runtime.deferred != 0)
             && signals.pending.0.load(Ordering::Acquire)
                 & signals.pending.1
                 & adv_sync::pending::DEADLINE
@@ -278,7 +280,7 @@ impl Pool {
                             task.id,
                             task.context,
                             task.entry,
-                            &task.code,
+                            (&task.code, task.once),
                             &task.signals,
                             false,
                         );
@@ -513,6 +515,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             id,
             context: context.clone(),
             code,
+            once: iteration,
             entry: self.entry,
             signals: self.signals.clone(),
             done: self.send.clone(),
@@ -545,7 +548,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             id,
             context.clone(),
             self.entry,
-            &code,
+            (&code, iteration),
             &self.signals,
             true,
         );
@@ -724,8 +727,9 @@ mod tests {
         );
         assert_eq!(memory.read(local_end, 4).unwrap(), [0; 4]);
 
-        // The same local entry returns at the first exhausted budget when
-        // the owner deadline is pending, with the exact completed prefix.
+        // With the owner deadline pending, the same local entry finishes the
+        // iteration after the first exhausted budget and returns at its head
+        // (A64-CTL-8), with the exact completed prefix.
         let local = run(
             &mut Runtime::new(std::ptr::null_mut(), 0),
             3,
@@ -736,7 +740,7 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
-            &native.computation.get(&head).unwrap().code,
+            (&native.computation.get(&head).unwrap().code, false),
             &Signals {
                 recall: Arc::new(AtomicU32::new(0)),
                 pending: (
@@ -747,8 +751,8 @@ mod tests {
             true,
         )
         .completion;
-        assert!(local.requires_owner);
-        assert_eq!(local.retired, u64::from(COMPUTATION_SLICE / 5 * 5));
+        assert!(!local.requires_owner);
+        assert_eq!(local.retired, u64::from(COMPUTATION_SLICE / 5 * 5 + 5));
         let left = local.context.as_ref().unwrap().cpu().regs[1];
         assert_eq!(u64::from(COUNT - left) * 5, local.retired);
 
@@ -764,9 +768,11 @@ mod tests {
         let mut a = CodeAssembler::new(32).unwrap();
         let mut outer = a.create_label();
         let mut inner = a.create_label();
+        // A row longer than RECALL_GRACE budgets.
+        const ROW: u32 = (crate::runtime::RECALL_GRACE + 4) * COMPUTATION_SLICE / 4;
         a.nop().unwrap();
         a.set_label(&mut outer).unwrap();
-        a.mov(ecx, COUNT).unwrap();
+        a.mov(ecx, ROW).unwrap();
         a.set_label(&mut inner).unwrap();
         a.mov(dword_ptr(edi), eax).unwrap();
         a.add(edi, 4).unwrap();
@@ -778,9 +784,7 @@ mod tests {
         let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
         let (mut executor, mut native) = fixture(&mut a);
         let memory = executor.memory_mut();
-        memory
-            .map(OUTPUT, SPACE as usize * 2, READ | WRITE)
-            .unwrap();
+        memory.map(OUTPUT, ROW as usize * 8, READ | WRITE).unwrap();
         let outer = CODE + 1;
         let inner = outer + 5;
         let mut cpu = adv_cpu_core::CpuState {
@@ -811,8 +815,9 @@ mod tests {
         assert_eq!(offer.exit, Exit::Computation);
         assert!(!native.candidates.contains(&inner));
 
-        // A real checkpoint recall publishes an interior PC. Resume the
-        // prefix on the owner and offer only at the original proved head.
+        // A recall waits RECALL_GRACE budgets for the head, then publishes an
+        // interior PC. Resume the prefix on the owner and offer only at the
+        // original proved head.
         let mut context = executor.save_context().unwrap();
         cpu.regs[3] = 2;
         cpu.regs[7] = OUTPUT;
@@ -828,7 +833,7 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
-            &native.computation[&outer].code,
+            (&native.computation[&outer].code, false),
             &Signals {
                 recall: Arc::new(AtomicU32::new(RECALL)),
                 pending: (Arc::new(AtomicU32::new(0)), 0),
@@ -1044,6 +1049,7 @@ mod tests {
             context: first,
             entry,
             code: code.clone(),
+            once: false,
             signals: signals.clone(),
             done: send,
             wake: None,
@@ -1053,7 +1059,7 @@ mod tests {
             2,
             second,
             entry,
-            &code,
+            (&code, false),
             &signals,
             true,
         )
@@ -1200,7 +1206,7 @@ mod tests {
                 1,
                 start.clone(),
                 entry,
-                &prepared.code,
+                (&prepared.code, false),
                 &pending,
                 false,
             );
@@ -1208,6 +1214,25 @@ mod tests {
             prepared.observe(CODE, false, &done);
         }
         assert!(prepared.mode.get() == Mode::Trial);
+
+        // A recalled iteration still finishes at its head (A64-CTL-8).
+        let recalled = Signals {
+            recall: Arc::new(AtomicU32::new(RECALL)),
+            pending: (Arc::new(AtomicU32::new(0)), 0),
+        };
+        let done = run(
+            &mut Runtime::new(std::ptr::null_mut(), 0),
+            1,
+            start.clone(),
+            entry,
+            (&prepared.code, true),
+            &recalled,
+            false,
+        )
+        .completion;
+        assert!(!done.requires_owner);
+        assert_eq!(done.retired, first_retired);
+        assert_eq!(done.context.unwrap().cpu(), expected_first.cpu());
         executor.memory_mut().fill(OUTPUT, &[0], len).unwrap();
 
         let mut context = Some(start);
@@ -1359,14 +1384,15 @@ mod tests {
                 3,
                 start.clone(),
                 entry,
-                &code,
+                (&code, false),
                 &signals,
                 true,
             )
             .completion;
-            assert_eq!(done.requires_owner, pending != 0);
+            // A pending deadline finishes the iteration and returns at the head.
+            assert!(!done.requires_owner);
             if pending != 0 {
-                assert_eq!(done.retired, u64::from(COMPUTATION_SLICE / 7 * 7));
+                assert_eq!(done.retired, u64::from(COMPUTATION_SLICE / 7 * 7 + 7));
             }
             let mut context = done.context.unwrap();
             let suffix = run_owner(&mut context, &mut native, &mut executor);

@@ -131,14 +131,6 @@ pub struct Unit {
 }
 
 impl Unit {
-    #[cfg(native)]
-    pub(crate) fn iteration(&self) -> Option<Self> {
-        Some(Self {
-            trace: self.trace.iteration()?,
-            ..Self::default()
-        })
-    }
-
     /// Traces the unit at `eip`, ending before any of `stops`. Each byte
     /// the unit depends on is registered with `watch_code`, so a store to
     /// it reaches the owner. `host` and `redirect` are as for
@@ -417,6 +409,8 @@ enum Cold {
         target: Label,
         refund: u32,
         debt: u32,
+        /// Whether a recall waits for the form to return at its head.
+        defer: bool,
     },
     Nominate {
         label: Label,
@@ -924,8 +918,34 @@ impl Translator<'_> {
             target,
             refund,
             debt,
+            defer: self.trace.returns_at_head(),
         });
         label
+    }
+
+    /// For an edge back to the head of a form that can stop there, loads
+    /// the head-exit word into w0 and returns the label of its exit.
+    fn head_exit(&mut self, to: usize) -> Option<Label> {
+        if !self.computation || to != 0 || !self.trace.returns_at_head() {
+            return None;
+        }
+        self.emit(ldr(W, X0, RUNTIME, crate::runtime::HEAD_EXIT));
+        Some(self.asm.label())
+    }
+
+    /// Returns at the head with canonical state, as an ordinary exit, so the
+    /// owner can admit the context again (A64-CTL-8).
+    fn leave_at_head(&mut self, label: Label, refund: u32, x87: Option<x87::Leave>) {
+        self.push_cold(Cold::Leave {
+            label,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            refund,
+            exit: Exit::Dispatch,
+            eip: self.trace.insts[0].pc,
+            link: false,
+            x87,
+        });
     }
 
     /// Where an instruction's fall-through or jump ends the trace.
@@ -974,6 +994,11 @@ impl Translator<'_> {
         self.coerce(self.entry[to]);
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
+        if let Some(done) = self.head_exit(to) {
+            self.asm.cbz(W, true, X0, done);
+            let refund = self.trace.unused(self.index);
+            self.leave_at_head(done, refund, x87);
+        }
         if net > 0 {
             let leave = self.asm.label();
             let refund = net as u32 + self.trace.unused(self.index);
@@ -1042,6 +1067,21 @@ impl Translator<'_> {
                     target = load;
                 }
                 let test = self.test(cc);
+                if let Some(done) = self.head_exit(to) {
+                    let (check, back) = (self.asm.label(), self.asm.label());
+                    self.asm.cbz(W, true, X0, check);
+                    self.asm.bind(back);
+                    let refund = self.trace.unused(from);
+                    let x87 = self.x87_leaving();
+                    self.leave_at_head(done, refund, x87);
+                    self.push_cold(Cold::Refuse {
+                        label: check,
+                        net: 0,
+                        test,
+                        leave: done,
+                        resume: back,
+                    });
+                }
                 let net = self.trace.net(from, to);
                 if net > 0 {
                     let net = net as u32;
@@ -1778,7 +1818,13 @@ impl Translator<'_> {
                 target,
                 refund,
                 debt,
+                defer,
             } => {
+                // A form that can return at its head finishes the iteration,
+                // so the owner can admit the context again at once. Past
+                // RECALL_GRACE checkpoints it leaves where it is.
+                let recalled = if defer { self.asm.label() } else { leave };
+                let refill = self.asm.label();
                 self.asm.bind(label);
                 self.emit_all(&[
                     ldr(X, X0, RUNTIME, crate::runtime::RECALL),
@@ -1786,14 +1832,30 @@ impl Translator<'_> {
                     ldr(W, X1, RUNTIME, crate::runtime::RECALL_MASK),
                     and(W, X0, X0, X1, Lsl, 0),
                 ]);
-                self.asm.cbz(W, true, X0, leave);
+                self.asm.cbz(W, true, X0, recalled);
                 self.emit_all(&[
                     ldr(X, X0, RUNTIME, crate::runtime::COMPUTATION_PENDING),
                     ldr(W, X0, X0, 0),
                     ldr(W, X1, RUNTIME, crate::runtime::COMPUTATION_PENDING_MASK),
                     and(W, X0, X0, X1, Lsl, 0),
                 ]);
-                self.asm.cbz(W, true, X0, leave);
+                self.asm.cbz(W, true, X0, recalled);
+                if defer {
+                    self.asm.b(refill);
+                    self.asm.bind(recalled);
+                    self.emit_all(&[
+                        movz(W, X0, 1, 0),
+                        str(W, X0, RUNTIME, crate::runtime::HEAD_EXIT),
+                        ldr(W, X0, RUNTIME, crate::runtime::DEFERRED),
+                        add_imm(W, X0, X0, 1, false),
+                        str(W, X0, RUNTIME, crate::runtime::DEFERRED),
+                    ]);
+                    // NZCV may hold guest flags: test the count's bit instead.
+                    const GRACE: u32 = crate::runtime::RECALL_GRACE;
+                    const { assert!(GRACE.is_power_of_two()) };
+                    self.asm.tbz(true, X0, GRACE.trailing_zeros(), leave);
+                }
+                self.asm.bind(refill);
                 self.mov_imm(X1, crate::runtime::COMPUTATION_SLICE - refund);
                 self.emit_all(&[
                     sub(X, X1, X1, X9, Lsl, 0),

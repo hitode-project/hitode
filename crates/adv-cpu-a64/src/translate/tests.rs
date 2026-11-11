@@ -402,6 +402,12 @@ impl Harness {
             put(offset_of!(runtime::Runtime, shadow), WINDOW_BASE);
             put(offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00);
             put(offset_of!(runtime::Runtime, recall_mask), 1);
+            // The recall has spent its grace (with a zero hint after it):
+            // leave at the first checkpoint.
+            put(
+                offset_of!(runtime::Runtime, deferred),
+                u64::from(runtime::RECALL_GRACE),
+            );
         }
         let permissions = CONTEXT + 0x3000;
         put(offset_of!(runtime::Runtime, alias_classes), permissions);

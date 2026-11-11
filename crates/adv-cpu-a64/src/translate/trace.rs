@@ -787,33 +787,26 @@ impl Trace {
         while self.liveness(false) && backward {}
     }
 
-    /// One outer iteration of a proved trace, with the original instruction
-    /// indices so the full trace's proof also describes this prefix.
-    #[cfg(native)]
-    pub(crate) fn iteration(&self) -> Option<Self> {
-        let root = self.insts.first()?.pc;
-        let mut cut = false;
-        let mut trace = Self {
-            insts: self.insts.clone(),
-            primary: self.primary,
-            ..Self::default()
-        };
-        for inst in &mut trace.insts {
-            if inst.next == Next::Edge(Edge::Internal(0)) {
-                inst.next = Next::Edge(Edge::Exit(root));
-                cut = true;
-            }
-            if inst.taken == Some(Edge::Internal(0)) {
-                inst.taken = Some(Edge::Exit(root));
-                cut = true;
-            }
-        }
-        if cut {
-            trace.analyze();
-            Some(trace)
-        } else {
-            None
-        }
+    /// Whether the trace can stop after one outer iteration: edges reenter
+    /// its first instruction, and every one of them checks the countdown, so
+    /// all flags are observable where it would leave.
+    pub(crate) fn returns_at_head(&self) -> bool {
+        let mut edges = self.insts.iter().enumerate().flat_map(|(from, inst)| {
+            let next = match inst.next {
+                Next::Edge(edge) => Some(edge),
+                _ => None,
+            };
+            [next, inst.taken]
+                .into_iter()
+                .flatten()
+                .filter(|&edge| edge == Edge::Internal(0))
+                .map(move |_| from)
+        });
+        let mut any = false;
+        edges.all(|from| {
+            any = true;
+            self.net(from, 0) > 0
+        }) && any
     }
 
     pub fn has_loop(&self) -> bool {

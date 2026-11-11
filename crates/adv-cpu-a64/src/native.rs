@@ -1620,11 +1620,9 @@ impl Native {
                     && let Some(code) =
                         self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
                 {
-                    let iteration = work.unit.iteration().and_then(|mut unit| {
-                        self.emit_computation(&mut unit, eip, (control, pe), &proof)
-                    });
+                    let iterates = work.unit.trace.returns_at_head();
                     self.computation
-                        .insert(eip, worker::Prepared::new(code, iteration, proof));
+                        .insert(eip, worker::Prepared::new(code, iterates, proof));
                 }
             }
             self.helpers.extend(work.helpers());

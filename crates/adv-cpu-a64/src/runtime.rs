@@ -132,6 +132,10 @@ pub struct Runtime {
     pub computation_pending: u64,
     pub computation_pending_mask: u32,
     pub completed: u64,
+    /// Nonzero: the proved form leaves at its next return to its head.
+    pub head_exit: u32,
+    /// Checkpoints that kept running past a recall to reach the head.
+    pub deferred: u32,
     /// Candidate whose ordinary unit exhausted an instruction budget.
     pub computation_hint: u32,
 }
@@ -176,6 +180,8 @@ impl Runtime {
             computation_pending: 0,
             computation_pending_mask: 0,
             completed: 0,
+            head_exit: 0,
+            deferred: 0,
             computation_hint: 0,
         }
     }
@@ -308,6 +314,11 @@ pub(crate) const COMPUTATION_PENDING: u32 = field(offset_of!(Runtime, computatio
 pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
+pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
+pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
+/// Inner checkpoints a recall waits through before it leaves where it is:
+/// a few outer iterations of a hot computation.
+pub(crate) const RECALL_GRACE: u32 = 64;
 pub(crate) const COMPUTATION_HINT: u32 = field(offset_of!(Runtime, computation_hint));
 pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
 pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
