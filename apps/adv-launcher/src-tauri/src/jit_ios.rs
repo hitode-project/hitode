@@ -166,11 +166,6 @@ pub fn request_jit(app: AppHandle) -> Result<(), String> {
         return result;
     }
     require_embedded_helper()?;
-    // LiveContainer's "Launch with JIT" starts the player under StikDebug,
-    // which prepares the pool at launch (IOS-JIT-1); it cannot host the helper.
-    if std::env::var_os("LC_HOME_PATH").is_some() {
-        return Err("Launch with JIT in LiveContainer".into());
-    }
     let pairing =
         std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?;
     run_helper(app, Task::Enable, pairing)
@@ -223,7 +218,7 @@ fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String
     let result = app
         .run_on_main_thread(move || {
             if let Err(error) = start_helper(&handle, task, pairing) {
-                finish(&handle, Err(error));
+                finish(&handle, Err(extension_unavailable(error)));
             }
         })
         .map_err(|e| e.to_string());
@@ -268,6 +263,17 @@ fn check_pairing(bytes: &[u8]) -> Result<(), String> {
     } else {
         Err("invalidPairing".into())
     }
+}
+
+/// LiveContainer runs the helper extension only in builds that host guest
+/// extensions, with the app's helper process support on (IOS-JIT-2); there
+/// the settings row explains that instead of the raw failure.
+fn extension_unavailable(error: String) -> String {
+    if std::env::var_os("LC_HOME_PATH").is_none() {
+        return error;
+    }
+    log::warn!("JIT extension in LiveContainer: {error}");
+    "jitLiveContainerHelper".into()
 }
 
 fn finish(app: &AppHandle, result: Result<(), String>) {
@@ -406,7 +412,11 @@ fn listen(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return Err(format!("JIT extension did not connect: {e}")),
+            Err(e) => {
+                return Err(extension_unavailable(format!(
+                    "JIT extension did not connect: {e}"
+                )));
+            }
         }
     };
     // Darwin sockets inherit O_NONBLOCK from the listener they were accepted on.

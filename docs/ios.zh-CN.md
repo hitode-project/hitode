@@ -124,6 +124,8 @@ LocalDevVPN 只在手机内部建一条本地通道，不会把你的流量发�
 
 <img src="images/ios/settings-jit-livecontainer.png" alt="LiveContainer 中的 Hitode 设置页：JIT 加速显示已启用" width="320">
 
+使用 LiveContainer nightly 版时，也可以不装 StikDebug，让 Hitode 自己开启 JIT：在 LiveContainer 里长按 Hitode → 设置，打开"启用应用辅助进程"，关掉"带JIT启动"，再按方式二的步骤在 Hitode 设置页导入配对文件。这样只占用 LiveContainer + SideStore 这 1 个 app 名额。
+
 **方式二**：
 
 1. 确认 LocalDevVPN 已经连接。
