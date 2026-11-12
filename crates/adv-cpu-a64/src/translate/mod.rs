@@ -50,6 +50,9 @@ mod flags;
 mod integer;
 mod native_region;
 mod ops;
+// The optimizing tier lands before its back end and integration use it.
+#[allow(dead_code)]
+mod opt;
 pub(crate) mod parts;
 mod residency;
 mod simd;
