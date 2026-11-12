@@ -84,6 +84,7 @@ enum Access {
 
 #[derive(Clone, Debug)]
 struct Effect {
+    indices: Vec<usize>,
     addr: Form,
     limits: Vec<Limit>,
     access: Access,
@@ -667,6 +668,7 @@ impl Builder<'_> {
             self.effects.push((
                 self.at,
                 Effect {
+                    indices: vec![self.at],
                     addr: addr.clone(),
                     limits: state.limits.clone(),
                     access: if frame.is_some() {
@@ -712,6 +714,7 @@ impl Builder<'_> {
             self.effects.push((
                 self.at,
                 Effect {
+                    indices: vec![self.at],
                     addr,
                     limits: state.limits.clone(),
                     access: if frame.is_some() {
@@ -1622,13 +1625,17 @@ impl Builder<'_> {
             .iter()
             .position(|&(v, _)| matches!(self.vars[v], Var::Either(_)));
         let Some(i) = choice else {
-            if !out.iter().any(|e| {
+            if let Some(old) = out.iter_mut().find(|e| {
                 e.addr == effect.addr
                     && e.access == effect.access
                     && e.bytes == effect.bytes
                     && e.limits == effect.limits
                     && e.tail == effect.tail
             }) {
+                old.indices.extend(effect.indices);
+                old.indices.sort_unstable();
+                old.indices.dedup();
+            } else {
                 out.push(effect);
             }
             return Some(());
@@ -1755,6 +1762,7 @@ impl Proof {
             }
             for (start, end) in spans.into_iter().take(len) {
                 effects.push(Effect {
+                    indices: Vec::new(),
                     addr: b.frame_address(start),
                     limits: Vec::new(),
                     access,
@@ -1994,6 +2002,90 @@ impl Proof {
                 .any(|&(v, _)| Some(v) == counter || self.varies(v, counter)),
             _ => false,
         }
+    }
+
+    /// Whether this instruction's non-frame read is invariant in the unit.
+    /// Admission separates such a span from every write span.
+    pub(crate) fn invariant_read(&self, index: usize) -> bool {
+        let effects: Vec<_> = self
+            .effects
+            .iter()
+            .filter(|e| e.access == Access::Read && e.indices.contains(&index))
+            .collect();
+        !effects.is_empty() && effects.iter().all(|e| e.addr.terms.is_empty())
+    }
+
+    /// Disjoint bytes of two effects in the same iteration. Different
+    /// nonzero strides are separated by admission; equal strides require
+    /// a constant displacement from the same symbolic base.
+    pub(crate) fn disjoint_effects(&self, store: usize, load: usize) -> bool {
+        let writes: Vec<_> = self
+            .effects
+            .iter()
+            .filter(|e| e.access == Access::Write && e.indices.contains(&store))
+            .collect();
+        let reads: Vec<_> = self
+            .effects
+            .iter()
+            .filter(|e| e.access == Access::Read && e.indices.contains(&load))
+            .collect();
+        if writes.is_empty() || reads.is_empty() {
+            return false;
+        }
+        fn base(
+            exprs: &[Expr],
+            id: ExprId,
+            scale: u32,
+            terms: &mut BTreeMap<ExprId, u32>,
+            constant: &mut u32,
+        ) {
+            match exprs[id] {
+                Expr::Constant(n) => *constant = constant.wrapping_add(n.wrapping_mul(scale)),
+                Expr::Add(a, b) => {
+                    base(exprs, a, scale, terms, constant);
+                    base(exprs, b, scale, terms, constant);
+                }
+                Expr::Neg(a) => base(exprs, a, scale.wrapping_neg(), terms, constant),
+                _ => {
+                    let entry = terms.entry(id).or_default();
+                    *entry = entry.wrapping_add(scale);
+                }
+            }
+        }
+        writes.iter().all(|a| {
+            reads.iter().all(|b| {
+                if b.addr.terms.is_empty() {
+                    return true;
+                }
+                if let Some(counter) = self.outer.and_then(|o| o.counter) {
+                    let stride = |e: &Effect| {
+                        e.addr.terms.iter().find(|(v, _)| *v == counter).map_or(
+                            Some(0),
+                            |&(_, k)| match self.exprs[k] {
+                                Expr::Constant(n) => Some(n),
+                                _ => None,
+                            },
+                        )
+                    };
+                    if stride(a).zip(stride(b)).is_some_and(|(a, b)| a != b) {
+                        return true;
+                    }
+                }
+                if a.addr.terms != b.addr.terms {
+                    return false;
+                }
+                let (mut at, mut bt) = (BTreeMap::new(), BTreeMap::new());
+                let (mut ac, mut bc) = (0u32, 0u32);
+                base(&self.exprs, a.addr.base, 1, &mut at, &mut ac);
+                base(&self.exprs, b.addr.base, 1, &mut bt, &mut bc);
+                at.retain(|_, k| *k != 0);
+                bt.retain(|_, k| *k != 0);
+                let delta = bc.wrapping_sub(ac);
+                at == bt
+                    && u64::from(delta) >= u64::from(a.bytes)
+                    && u64::from(delta) + u64::from(b.bytes) <= 1 << 32
+            })
+        })
     }
 
     pub(crate) fn frame_cache(&self) -> Option<&FrameCache> {

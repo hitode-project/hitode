@@ -58,6 +58,7 @@
 //! depend only on its trace index; a record holds that refund.
 
 pub(crate) mod eval;
+pub(crate) mod front;
 pub(crate) mod ir;
 pub(crate) mod recovery;
 pub(crate) mod verify;
