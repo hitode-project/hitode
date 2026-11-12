@@ -447,9 +447,11 @@ impl Translator<'_> {
         } else {
             self.emit(sub_imm(W, X16, X8, control, false));
         }
+        // Cyclic runs restore the cached bit with the word; only the low
+        // half (the architectural word) decides a fresh comparison.
         self.emit_all(&[
-            clz(W, X16, X16),
-            lsr_imm(W, X16, X16, 5),
+            tst_imm(W, X16, 0xffff),
+            cset(W, X16, Cond::Eq),
             bfi(W, X8, X16, 16, 1),
         ]);
     }
