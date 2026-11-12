@@ -1032,66 +1032,91 @@ fn upright_glyph_boxes_stay_inside_the_font_cell() {
 
 // spec: DEV-FONT-9
 #[test]
-fn automatic_cjk_substitutes_use_the_requested_cell() {
+fn substituted_cjk_baseline_comes_from_the_selected_face() {
+    let mut bytes = include_bytes!("fixtures/font-resource-japanese.ttf").to_vec();
+    // OS/2 at 400: add Windows padding around the fixture's 800/200 em box.
+    bytes[474..476].copy_from_slice(&1060u16.to_be_bytes());
+    bytes[476..478].copy_from_slice(&340u16.to_be_bytes());
     let mut text = Text::with_font_directories(&[]);
-    text.add_file_resource(LEGACY, true).unwrap();
-    let target = "ADV Resource Fixture Medium";
-    let cases = [("宋体", 3), ("細明體", 0), ("ＭＳ ゴシック", 0)];
-    text.set_font_replacements(&FontReplacements {
-        files: Vec::new(),
-        families: cases
-            .iter()
-            .map(|&(name, _)| (vec![name.into()], vec![target.into()]))
-            .collect(),
-    });
-    let mut direct = font(target);
-    direct.height = -24;
-    let glyph = glyph(Character::Unicode('B' as u32), GlyphFormat::Gray8);
-    let expected = text.glyph(&direct, glyph).unwrap();
-    for (family, leading) in cases {
-        let mut request = font(family);
-        for height in [-24, 24] {
+    text.add_file_resource(&bytes, true).unwrap();
+    let mut direct = font("ADV Japanese Fixture");
+    direct.encoding = Encoding::Japanese;
+    direct.height = -16;
+    direct.quality = Quality::Monochrome;
+    let metrics = text.metrics(&direct).unwrap();
+    assert_eq!(
+        (metrics.height, metrics.ascent, metrics.descent),
+        (22, 17, 5)
+    );
+    let paint = |text: &mut Text, request: &FontRequest, height: u32| {
+        let pitch = 32 * 4;
+        let mut pixels = vec![0; (pitch * height) as usize];
+        text.paint(
+            request,
+            Paint {
+                input: TextInput::Unicode(&[0x3042]),
+                origin: Point { x: 0, y: 0 },
+                horizontal: Horizontal::Left,
+                vertical: Vertical::Top,
+                foreground: [255; 3],
+                background: [0; 3],
+                opaque_background: false,
+                clip: None,
+                fill: None,
+            },
+            Pixels {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 32,
+                    h: height,
+                },
+                pitch,
+                format: PixelFormat::Bgra32,
+                bytes: &mut pixels,
+            },
+        )
+        .unwrap();
+        pixels
+    };
+    let direct_pixels = paint(&mut text, &direct, 32);
+    let crop = 32 * 16 * 4;
+    assert!(direct_pixels[crop..].iter().any(|&b| b != 0));
+    for face in ["Missing Japanese Face", "ＭＳ ゴシック"] {
+        let mut request = FontRequest {
+            face: face.into(),
+            ..direct.clone()
+        };
+        let resolved = text.resolved_character(&request, 0x3042).unwrap();
+        assert_eq!(resolved.family, direct.face);
+        for height in [-16, 16] {
             request.height = height;
             let m = text.metrics(&request).unwrap();
-            assert_eq!(
-                (m.height, m.ascent, m.descent, m.external_leading),
-                (24, 21, 3, leading)
-            );
-            let drawn = text.glyph(&request, glyph).unwrap();
-            assert_eq!(
-                drawn.metrics,
-                GlyphMetrics {
-                    origin_y: expected.metrics.origin_y + 1,
-                    ..expected.metrics
-                }
-            );
-            assert_eq!(drawn.data, expected.data);
+            assert_eq!((m.height, m.ascent, m.descent), (16, 13, 3));
+            let whole = paint(&mut text, &request, 32);
+            assert!(whole[..crop].iter().any(|&b| b != 0));
+            assert!(whole[crop..].iter().all(|&b| b == 0));
+            assert_eq!(paint(&mut text, &request, 16), whole[..crop]);
         }
         let enumerated = text
-            .enumerate(Some(family), FontEnumeration::Families)
+            .enumerate(Some(face), FontEnumeration::Families)
             .unwrap();
         assert_eq!(
             (enumerated[0].metrics.height, enumerated[0].metrics.ascent),
-            (16, 14)
+            (16, 13)
         );
     }
 
-    for (family, cell) in [("Meiryo", (36, 25, 11)), ("Meiryo UI", (30, 25, 5))] {
-        let mut request = font(family);
-        request.height = -24;
-        let m = text.metrics(&request).unwrap();
-        assert_eq!((m.height, m.ascent, m.descent), cell);
-    }
-
     text.set_overrides(Overrides {
-        families: [("宋体".into(), target.into())].into(),
+        families: [("Missing Japanese Face".into(), direct.face.clone())].into(),
         antialiased: None,
     });
-    let mut request = font("宋体");
-    request.height = -24;
-    let m = text.metrics(&request).unwrap();
-    assert_eq!((m.height, m.ascent), (29, 24));
-    assert_eq!(m, text.metrics(&direct).unwrap());
+    let request = FontRequest {
+        face: "Missing Japanese Face".into(),
+        ..direct
+    };
+    assert_eq!(text.metrics(&request).unwrap(), metrics);
+    assert_eq!(paint(&mut text, &request, 32), direct_pixels);
 }
 
 // spec: WIN32-GDI-18
