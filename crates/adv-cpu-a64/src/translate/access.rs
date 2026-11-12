@@ -307,6 +307,16 @@ impl Translator<'_> {
     /// Verify the alias class after the window class granted the guest permission.
     pub(super) fn checked_alias(&mut self, address: Reg, store: bool, slow: Label) {
         self.check_class(address, runtime::ALIAS_CLASSES, store, slow, slow);
+        if store {
+            // Watching a writable data page sets the store barrier in the
+            // derived classes, without changing its raw guest permissions.
+            self.emit_all(&[
+                ldr(X, X3, RUNTIME, runtime::BODY_CLASSES),
+                lsr_imm(W, X4, address, PAGE_SHIFT),
+                ldr_narrow(Narrow::Byte, X4, X3, X4),
+            ]);
+            self.asm.tbz(true, X4, EXEC.trailing_zeros(), slow);
+        }
     }
 
     /// Test guest permission and excluded classes with the same scratch and NZCV contract.

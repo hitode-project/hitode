@@ -33,6 +33,34 @@ fn check(p: &Program, config: Config, permission: Option<u8>, native_only: bool)
     }
 }
 
+// spec: A64-CALL-1, A64-CTL-10, A64-MEM-7
+#[test]
+fn checked_store_rebinds_a_writable_call_slot() {
+    let (first, second) = (CODE + 0x1000, CODE + 0x1010);
+    let mut p = fixture(|a| {
+        a.mov(dword_ptr(DATA as i32), second as i32).unwrap();
+        a.call(dword_ptr(DATA as i32)).unwrap();
+    });
+    p.code.resize(0x1020, 0x90);
+    p.data[..4].copy_from_slice(&first.to_le_bytes());
+    for (address, result) in [(first, 1), (second, 2)] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(eax, result).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(u64::from(address)).unwrap();
+        let start = (address - CODE) as usize;
+        p.code[start..start + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    let config = (Features::default(), false, Checks::All);
+    let mut native = executor(&p, config, false);
+    let mut oracle = executor(&p, config, true);
+    assert_eq!(native.run(p.stop, 32).unwrap(), RunOutcome::ReachedStop);
+    assert_eq!(oracle.run(p.stop, 32).unwrap(), RunOutcome::ReachedStop);
+    same(&native, &oracle);
+    assert!(native.memory().stores_code(DATA, 4));
+}
+
 fn no_operation_calls(p: &Program) {
     use crate::translate::{Stubs, Workspace, translate};
     let mut memory = Memory::new(BASE, LEN).unwrap();
