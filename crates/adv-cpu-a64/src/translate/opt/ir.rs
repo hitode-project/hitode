@@ -126,11 +126,17 @@ pub(crate) enum Op {
         divisor: Value,
         proved: bool,
     },
+    /// EFLAGS after `kind` on `width`-byte operands, as the interpreter
+    /// computes them. Flags the operation keeps, and the carry that ADC, SBB,
+    /// INC and DEC read, come from `prior`. `Logic` takes its result as `a`;
+    /// shifts take the unmasked count as `b`, and a zero count keeps `prior`.
+    /// `UnorderedCompare` compares F64 operands.
     Flags {
         kind: FlagKind,
+        width: u8,
         a: Value,
         b: Value,
-        carry: Option<Value>,
+        prior: Option<Value>,
     },
     /// 1 when the condition holds for `flags`, else 0.
     Test {
@@ -204,7 +210,7 @@ impl Op {
             | Op::Store {
                 addr: a, value: b, ..
             } => [Some(a), Some(b), None],
-            Op::Flags { a, b, carry, .. } => [Some(a), Some(b), carry],
+            Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b } => [Some(cond), Some(a), Some(b)],
         };
         list.into_iter().flatten()

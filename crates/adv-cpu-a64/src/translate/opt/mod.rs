@@ -56,6 +56,7 @@
 //! **Retirement (A64-OPT-6).** Loop heads prepay their segment; a record holds
 //! the instructions prepaid but not retired at its region start.
 
+pub(crate) mod eval;
 pub(crate) mod ir;
 pub(crate) mod recovery;
 pub(crate) mod verify;
