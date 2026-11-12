@@ -327,9 +327,10 @@ pub(crate) struct Func {
     pub records: Vec<IrRecord>,
     /// The sources of block 0's parameters, in order.
     pub entry: Vec<Source>,
-    /// Charged edges to block 0 also check the head-exit word, as a form
-    /// that returns at its head does.
-    pub head_exit: bool,
+    /// The head at trace index 0 when the form returns at its head: charged
+    /// edges to it also check the head-exit word. Block 0 may be an entry
+    /// prologue that jumps there.
+    pub head_exit: Option<Block>,
 }
 
 impl Func {
