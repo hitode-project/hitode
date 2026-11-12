@@ -3,7 +3,7 @@ import { gameFilter } from "./upscaling.svelte";
 import { call } from "./bridge";
 import { pickStorageFolder, takePreparedFolder, type FolderPickOptions } from "./storage";
 
-export type Codepage = 932 | 936;
+export type Codepage = 932 | 936 | 950;
 export interface PlaySession { ended: number; seconds: number }
 export interface LastRun { ended: number; summary: RunSummary | null; error: string | null }
 export interface Novel {

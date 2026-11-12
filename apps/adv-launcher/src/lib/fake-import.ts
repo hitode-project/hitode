@@ -1,4 +1,4 @@
-import type { FolderInspection, ScanFound } from "./host";
+import type { Codepage, FolderInspection, ScanFound } from "./host";
 import { library } from "./library.svelte";
 import type { Game } from "./types";
 
@@ -7,11 +7,11 @@ import type { Game } from "./types";
 // The installer flow uses simulated actions.
 
 /** Guest text encoding offered when adding a game. */
-export type Enc = "ja" | "zh";
+export type Enc = "ja" | "zh" | "zh-TW";
 
-const CODEPAGE: Record<Enc, number> = { ja: 932, zh: 936 };
+export const CODEPAGES: Record<Enc, Codepage> = { ja: 932, zh: 936, "zh-TW": 950 };
 
-/** The two encoding choices with a preview of the title as each would render it. */
+/** An encoding choice with a title preview. */
 export interface EncChoice {
   k: Enc;
   label: string;
@@ -19,14 +19,12 @@ export interface EncChoice {
   preview: string;
 }
 
-/**
- * `mojibake` is the Shift-JIS title read as GBK, which is what the wrong
- * choice shows; without it (nothing to decode it from) both show the title.
- */
+/** Simulated installs can supply a GBK preview of the Shift-JIS title. */
 export function encChoices(title: string, mojibake = title): EncChoice[] {
   return [
     { k: "ja", label: "日文", lang: "ja", preview: title },
     { k: "zh", label: "简体中文", lang: "zh-CN", preview: mojibake },
+    { k: "zh-TW", label: "繁体中文", lang: "zh-TW", preview: title },
   ];
 }
 
@@ -190,7 +188,7 @@ export function addToLibrary(title: string, enc: Enc, path: string, meta?: Meta)
     year: meta?.year ?? 0,
     cover: meta?.cover ?? "cv1",
     engine: "",
-    codepage: CODEPAGE[enc],
+    codepage: CODEPAGES[enc],
     path,
     exe: "Game.exe",
     lastPlayed: null,
