@@ -10,6 +10,7 @@
   import { prefs } from "../lib/prefs.svelte";
   import { library } from "../lib/library.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
+  import type { Codepage } from "../lib/host";
   import type { Game } from "../lib/types";
 
   let { game }: { game: Game } = $props();
@@ -64,18 +65,16 @@
       <div class="row" style="min-height: 68px">
         <span class="t" style="display: flex; flex-direction: column; gap: 3px">
           <span>{t("编码")}</span>
-          <span class="enc ellipsis" lang={game.codepage === 932 ? "ja" : "zh-CN"}>{form.encPreview}</span>
+          <span class="enc ellipsis" lang={game.codepage === 950 ? "zh-TW" : game.codepage === 936 ? "zh-CN" : "ja"}>{form.encPreview}</span>
         </span>
-        <SettingsSeg
-          variant="phone-sheet"
-          label={t("编码")}
-          value={game.codepage === 936 ? "936" : "932"}
-          onpick={(v) => form.setCodepage(v === "936" ? 936 : 932)}
-          options={[
-            { value: "932", label: t("日文") },
-            { value: "936", label: t("简体中文") },
-          ]}
-        />
+        <span class="selw">
+          <select aria-label={t("编码")} value={String(game.codepage)} onchange={(e) => form.setCodepage(Number(e.currentTarget.value) as Codepage)}>
+            <option value="932">{t("日文")}</option>
+            <option value="936">{t("简体中文")}</option>
+            <option value="950">{t("繁体中文")}</option>
+          </select>
+          {@render chevron()}
+        </span>
       </div>
       {#if device.gameView || device.simulated}
         <div class="row">

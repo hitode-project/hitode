@@ -9,6 +9,7 @@
   import { canReveal, reveal, revealC } from "../lib/reveal";
   import { nav } from "../lib/nav.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
+  import type { Codepage } from "../lib/host";
   import type { Game } from "../lib/types";
 
   let { game }: { game: Game } = $props();
@@ -66,16 +67,17 @@
         <div class="row" style="min-height: 64px">
           <span class="t" style="display: flex; flex-direction: column; gap: 3px">
             <span>{t("编码")}</span>
-            <span class="enc ellipsis" lang={game.codepage === 932 ? "ja" : "zh-CN"}>{form.encPreview}</span>
+            <span class="enc ellipsis" lang={game.codepage === 950 ? "zh-TW" : game.codepage === 936 ? "zh-CN" : "ja"}>{form.encPreview}</span>
           </span>
           <SettingsSeg
             variant="sheet"
             label={t("编码")}
-            value={game.codepage === 936 ? "936" : "932"}
-            onpick={(v) => form.setCodepage(v === "936" ? 936 : 932)}
+            value={String(game.codepage)}
+            onpick={(v) => form.setCodepage(Number(v) as Codepage)}
             options={[
               { value: "932", label: t("日文") },
               { value: "936", label: t("简体中文") },
+              { value: "950", label: t("繁体中文") },
             ]}
           />
         </div>

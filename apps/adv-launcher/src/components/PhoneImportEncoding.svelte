@@ -26,7 +26,7 @@
         style="flex-direction: column; align-items: flex-start; justify-content: center; gap: 4px; min-height: {compact ? 76 : 84}px; padding: 12px 14px; background: {value === e.k ? 'var(--sel)' : 'var(--field)'}"
       >
         <span class="pv" class:compact lang={e.lang}>{e.preview}</span>
-        <span class="cap">{e.label}</span>
+        <span class="cap">{t(e.label)}</span>
       </PhoneImportOption>
     {/each}
   </div>
@@ -47,7 +47,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
   }
   .pv {

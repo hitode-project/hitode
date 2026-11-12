@@ -311,6 +311,7 @@
                 >
                   <option value="932">{t("日文")}</option>
                   <option value="936">{t("简体中文")}</option>
+                  <option value="950">{t("繁体中文")}</option>
                 </select>
               </label>
             </dd>

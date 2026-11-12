@@ -32,6 +32,7 @@ With upscaling off, native GPU presentation uses sharp-bilinear sampling: intege
 
 `adv-launcher.prefs` stores interface language (`auto`, Chinese, Japanese or English), playtime tracking (on), background pause (on), Ctrl behavior (hold), FPS display (off), volume (70%) and mute (off).
 Per-game settings in `adv-launcher.game-settings` override proportional scaling with integer or stretch modes and Ctrl hold with toggle mode.
+The launcher offers Japanese (932), Simplified Chinese (936) and Traditional Chinese (950 / Big5) for game text when importing games and in per-game settings.
 Font replacements, smoothing and up to four ISO images on D: through G: apply on the next launch; font and disc defaults follow the game and mount nothing.
 The per-game Chinese font menu overrides common simplified and traditional Chinese families, including SimSun, SimHei, Microsoft YaHei and MingLiU.
 It accepts installed families and imported font files; Auto restores the runtime's default matching.

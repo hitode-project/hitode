@@ -2,6 +2,7 @@ import { t } from "./i18n.svelte";
 import { call, inTauri } from "./bridge";
 import {
   addToLibrary,
+  CODEPAGES,
   defaultInstallTarget,
   encChoices,
   fakeInspection,
@@ -11,7 +12,7 @@ import {
   takeInstallSource,
   type Enc,
 } from "./fake-import";
-import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
+import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 import { storageSize, type FolderPickOptions } from "./storage";
@@ -21,8 +22,7 @@ import { storageSize, type FolderPickOptions } from "./storage";
 // Folder picking, inspection, scanning and adding go to the host (library_*
 // commands); in a plain browser (`pnpm dev`) they use fake results instead.
 
-const CODEPAGES: Record<Enc, Codepage> = { ja: 932, zh: 936 };
-export const encOfCodepage = (codepage: number): Enc => (codepage === 936 ? "zh" : "ja");
+export const encOfCodepage = (codepage: number): Enc => (codepage === 950 ? "zh-TW" : codepage === 936 ? "zh" : "ja");
 
 /** Where the flow is: the folder picker is open, the host is reading, or a result. */
 export type Phase = "picking" | "reading" | "ready" | "error";
@@ -55,6 +55,7 @@ export function depthLabel(n: number): string {
 export const SCAN_ENC_OPTIONS: { value: Enc; label: string }[] = [
   { value: "ja", get label() { return t("日文"); } },
   { value: "zh", get label() { return t("简中"); } },
+  { value: "zh-TW", get label() { return t("繁中"); } },
 ];
 
 /** A scan result as the pages list it. */

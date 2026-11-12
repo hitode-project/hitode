@@ -26,7 +26,7 @@
         style="flex-direction: column; align-items: flex-start; justify-content: center; gap: {compact ? 4 : 6}px; min-height: {compact ? 80 : 96}px; padding: {compact ? '14px 18px' : '16px 18px'}; background: {value === e.k ? 'var(--sel)' : 'var(--field)'}; box-shadow: {value === e.k ? 'inset 0 0 0 2px var(--accent)' : 'none'}"
       >
         <span class="pv" class:compact lang={e.lang}>{e.preview}</span>
-        <span class="cap">{e.label}</span>
+        <span class="cap">{t(e.label)}</span>
       </ImportOption>
     {/each}
   </div>
@@ -47,7 +47,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
   }
   .pv {
