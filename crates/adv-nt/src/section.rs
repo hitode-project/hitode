@@ -612,10 +612,18 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     } else {
         memory::find_free(&env.sys.vm, size, false).ok_or(status::NO_MEMORY)?
     };
-    // The section is relocated to its shared dynamic base. The loader applies
-    // any remaining relocation when it loads an image from a displaced view.
-    if preferred != pe.image_base {
-        pe.rebase(preferred)
+    // A further view of an image at its shared base keeps that base in its
+    // headers and fixups. An image displaced by other memory is relocated
+    // where it lands now, since its code is bound below and the loader must
+    // not patch it again.
+    let further_view = env
+        .ext
+        .try_get::<crate::identity::Images>()
+        .and_then(|images| images.0.get(&preferred))
+        .is_some_and(|module| path.is_some() && module.path == path);
+    let target = if further_view { preferred } else { base };
+    if target != pe.image_base {
+        pe.rebase(target)
             .map_err(|_| status::INVALID_IMAGE_FORMAT)?;
     }
     let memory = env.ext.get_or_default::<Memory>();

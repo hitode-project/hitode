@@ -113,8 +113,8 @@ Descriptors that remain ready MUST remain observable on later steps.
 ### WINE-SYS-3 Section views
 
 **Rule**: A read-only or read-write view of a data section MUST share the file's pages with every other mapping, the server's included. A view MUST start at the requested offset, which MUST be a multiple of 64 KiB.
-When the server assigns a DLL a dynamic base, its image views MUST retain that base in their headers and fixups.
-The loader MUST apply any remaining relocation when loading a displaced image.
+A further view of an image at its server-assigned dynamic base MUST retain that base in its headers and fixups.
+An image that other memory displaces from that base MUST be relocated to its view's address before its code is bound.
 **Verification**: Test
 
 ### WINE-SYS-4 One process per machine
