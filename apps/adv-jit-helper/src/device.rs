@@ -22,13 +22,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 // Keep all files in a DDI set at the same upstream revision, including the mirror.
 const DDI_REVISION: &str = "6eae353ae694bda1c421d4a3eee5459ae59c99a1";
 
+/// Enables JIT for `pid` and returns the RemotePairing port that answered.
 pub async fn enable(
     pid: u32,
     pairing: &[u8],
-    remote_pairing_port: u16,
+    ports: &[u16],
     cache: &Path,
     progress: &impl Fn(&str),
-) -> Result<()> {
+) -> Result<u16> {
     progress("connecting");
     let pairing = RpPairingFile::from_bytes(pairing)?;
     // StikJIT's order, which iOS 27 accepts: the version comes from this
@@ -36,7 +37,8 @@ pub async fn enable(
     // debugger gets a fresh one.
     let (major, minor) = local_version();
     let cryptex = uses_cryptex(major, minor);
-    let mut tunnel = Tunnel::open(&pairing, remote_pairing_port).await?;
+    let (port, remote) = find_service(&pairing, ports, progress).await?;
+    let mut tunnel = Tunnel::open(remote).await?;
     progress("checkingDdi");
     if !ddi_mounted(&mut tunnel, cryptex).await? {
         let directory = download_ddi(cache, cryptex, progress).await?;
@@ -45,13 +47,117 @@ pub async fn enable(
     }
     tunnel.adapter.close().await?;
     progress("connecting");
-    let mut tunnel = Tunnel::open(&pairing, remote_pairing_port).await?;
+    let remote = pair(&pairing, port).await.map_err(Miss::into_error)?;
+    let mut tunnel = Tunnel::open(remote).await?;
     // StikJIT holds the instruments hub open while it debugs.
     let _hub = RemoteServerClient::connect_rsd(&mut tunnel.adapter, &mut tunnel.rsd).await?;
     let mut debugger = gdb::Debugger::connect_rsd(&mut tunnel.adapter, &mut tunnel.rsd).await?;
     gdb::attach(&mut debugger, pid, major >= 26, progress).await?;
     tunnel.adapter.close().await?;
-    Ok(())
+    Ok(port)
+}
+
+type Remote = RemotePairingClient<RpPairingSocket<TcpStream>>;
+
+/// This device as LocalDevVPN routes it, the only route here.
+const DEVICE: &str = "10.7.0.1";
+
+/// Connecting and answering a handshake are local and take milliseconds.
+const PROBE: Duration = Duration::from_secs(3);
+
+/// Why a port gave no session.
+enum Miss {
+    /// No RemotePairing service answered there.
+    Absent(String),
+    /// RemotePairing answered and refused this pairing file.
+    Rejected(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Miss {
+    fn into_error(self) -> Box<dyn std::error::Error + Send + Sync> {
+        match self {
+            Miss::Absent(why) => why.into(),
+            Miss::Rejected(error) => error,
+        }
+    }
+}
+
+/// Finds this device's RemotePairing service (IOS-JIT-2): the launcher's
+/// candidates first, then, as Henge does, every open port in the dynamic
+/// range. lockdownd always listens, so it tells whether LocalDevVPN routes
+/// at all; without a route the search fails at once.
+async fn find_service(
+    pairing: &RpPairingFile,
+    candidates: &[u16],
+    progress: &impl Fn(&str),
+) -> Result<(u16, Remote)> {
+    let mut misses = Vec::new();
+    for &port in candidates {
+        match pair(pairing, port).await {
+            Ok(remote) => return Ok((port, remote)),
+            Err(Miss::Rejected(error)) => return Err(error),
+            Err(Miss::Absent(why)) => misses.push(why),
+        }
+    }
+    if let Err(why) = connect(crate::LOCKDOWN_PORT).await {
+        return Err(format!("LocalDevVPN unreachable: {why}; {}", misses.join("; ")).into());
+    }
+    progress("scanning");
+    // Below the 256 descriptors iOS grants an extension by default.
+    for batch in crate::scan_ports(candidates).chunks(128) {
+        for port in open_ports(batch).await {
+            match pair(pairing, port).await {
+                Ok(remote) => return Ok((port, remote)),
+                Err(Miss::Rejected(error)) => return Err(error),
+                Err(Miss::Absent(why)) => misses.push(why),
+            }
+        }
+    }
+    Err(format!("no RemotePairing service found ({})", misses.join("; ")).into())
+}
+
+async fn connect(port: u16) -> std::result::Result<TcpStream, String> {
+    match tokio::time::timeout(PROBE, TcpStream::connect((DEVICE, port))).await {
+        Ok(Ok(socket)) => Ok(socket),
+        Ok(Err(error)) => Err(format!("port {port}: {error}")),
+        Err(_) => Err(format!("port {port}: timed out")),
+    }
+}
+
+/// Connects to `port` and verifies the pairing there.
+async fn pair(pairing: &RpPairingFile, port: u16) -> std::result::Result<Remote, Miss> {
+    let socket = connect(port).await.map_err(Miss::Absent)?;
+    let mut remote = RemotePairingClient::new(RpPairingSocket::new(socket), "Hitode");
+    match tokio::time::timeout(PROBE, remote.attempt_pair_verify()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(Miss::Absent(format!("port {port}: {error}"))),
+        Err(_) => return Err(Miss::Absent(format!("port {port}: no answer"))),
+    }
+    let mut pairing = pairing.clone();
+    remote
+        .validate_pairing(&mut pairing)
+        .await
+        .map_err(|e| Miss::Rejected(format!("RemotePairing port {port}: {e}").into()))?;
+    Ok(remote)
+}
+
+/// The ports of `batch` that accept a connection. Closed ports answer at
+/// once through LocalDevVPN, so a batch takes milliseconds.
+async fn open_ports(batch: &[u16]) -> Vec<u16> {
+    let mut probes = tokio::task::JoinSet::new();
+    for &port in batch {
+        probes.spawn(async move {
+            let connect = TcpStream::connect((DEVICE, port));
+            matches!(
+                tokio::time::timeout(Duration::from_millis(250), connect).await,
+                Ok(Ok(_))
+            )
+            .then_some(port)
+        });
+    }
+    let mut open: Vec<u16> = probes.join_all().await.into_iter().flatten().collect();
+    open.sort_unstable();
+    open
 }
 
 /// A RemotePairing tunnel to this device and its service directory.
@@ -61,18 +167,7 @@ struct Tunnel {
 }
 
 impl Tunnel {
-    async fn open(pairing: &RpPairingFile, port: u16) -> Result<Self> {
-        let socket = connect_vpn(port).await?;
-        let mut pairing = pairing.clone();
-        let pair = async {
-            let mut remote = RemotePairingClient::new(RpPairingSocket::new(socket), "Hitode");
-            remote.attempt_pair_verify().await?;
-            remote.validate_pairing(&mut pairing).await?;
-            Result::Ok(remote)
-        };
-        let mut remote = pair
-            .await
-            .map_err(|e| format!("RemotePairing port {port}: {e}"))?;
+    async fn open(mut remote: Remote) -> Result<Self> {
         let listener = remote.create_tcp_listener().await?;
         let tunnel =
             connect_tls_psk_tunnel_native(connect_vpn(listener).await?, remote.encryption_key())
@@ -145,12 +240,7 @@ async fn mount_ddi(tunnel: &mut Tunnel, cryptex: bool, directory: &Path) -> Resu
 
 /// Connects to this device through LocalDevVPN, which is the only route here.
 async fn connect_vpn(port: u16) -> Result<TcpStream> {
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(("10.7.0.1", port)),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((DEVICE, port))).await {
         Ok(Ok(socket)) => Ok(socket),
         Ok(Err(error)) => Err(format!("LocalDevVPN unreachable: {error} (port {port})").into()),
         Err(_) => {

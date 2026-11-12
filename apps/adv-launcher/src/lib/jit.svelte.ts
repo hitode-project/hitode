@@ -28,6 +28,7 @@ const errors: Record<string, string> = {
 const stages: Record<string, string> = {
   starting: "正在启动 JIT 助手…",
   connecting: "正在连接设备，请保持 LocalDevVPN 开启…",
+  scanning: "正在查找设备的配对端口…",
   checkingDdi: "正在检查开发者镜像…",
   downloading: "正在下载开发者镜像…",
   mounting: "正在挂载开发者镜像…",
@@ -38,6 +39,8 @@ const stages: Record<string, string> = {
 /** A host error, or a code the helper answers, in the user's words. */
 export function explainJit(error: string): string {
   if (error.startsWith("LocalDevVPN unreachable")) return t("连不上 LocalDevVPN，请确认它已开启并显示已连接");
+  if (error.startsWith("no RemotePairing service found")) return t("设备上找不到配对服务，请确认已开启开发者模式，重新连接 LocalDevVPN 后再试");
+  if (error.includes("Pair verify failed")) return t("这台设备不接受当前的配对文件，请用 iloader 重新生成 pairingFile.plist 并重新导入");
   return errors[error] ? t(errors[error]) : error;
 }
 
