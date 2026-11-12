@@ -1245,9 +1245,6 @@ impl DirectDraw {
                 if a[5] & !0x31 != 0 {
                     return Ok(UNSUPPORTED);
                 }
-                if self.surface_clippers.contains_key(&dst) {
-                    return Ok(BLT_FAST_CANT_CLIP);
-                }
                 let key = if a[5] & 1 != 0 {
                     let Some(&key) = self.color_keys.get(&(src, 8)) else {
                         return Ok(INVALID);
@@ -1269,6 +1266,10 @@ impl DirectDraw {
                     || dr.y.checked_add(dr.h).is_none_or(|b| b > d.height)
                 {
                     return Ok(INVALID);
+                }
+                // Windows validates flags, keys and rectangles first.
+                if self.surface_clippers.contains_key(&dst) {
+                    return Ok(BLT_FAST_CANT_CLIP);
                 }
                 if d.locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
