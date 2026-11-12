@@ -115,7 +115,7 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-1 Shared playback
 
 **Rule**: DirectSound and waveOut MUST share mixing and playback time. Stable PCM views, generations, and retirement acknowledgments MUST prevent reads from retired or reused storage.
-With live output, the DirectSound write cursor MUST follow the source bytes committed by the mixer, including when locking from that cursor.
+With live output, the DirectSound write cursor MUST follow the source bytes committed by the mixer, including when locking from that cursor. Without live output, a playing buffer's write cursor MUST lead its play cursor by 30 ms of frames, and a stopped buffer's MUST equal it.
 **Verification**: Test
 
 ### DEV-AUDIO-2 Control delivery
@@ -159,6 +159,11 @@ Changed library code MUST NOT execute against stale native or guest decoder stat
 Unmatched libraries MUST execute their guest implementations.
 **Verification**: Test
 
+### DEV-AUDIO-6 DirectSound 3D
+
+**Rule**: Primary buffers MUST expose the 3D listener and secondary buffers created with 3D control a 3D buffer interface. Defaults, parameter ranges, orientation normalization, creation rules and deferred settings MUST match Windows. Sources MUST pan by bearing, fade with distance and cones, and shift pitch with relative velocity.
+**Verification**: Test
+
 ### DEV-AUDIO-5 Owned PCM timing
 
 **Rule**: Owned PCM clock conversion MUST use guest and device readings from the same synchronization point. Decode duration MUST NOT shift a continuous audio stream's presentation timestamps. Queue-depth metrics MUST measure total queued duration per stream.
@@ -173,8 +178,8 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-FONT-2 Font resource budgets
 
-**Rule**: Guest font resources MUST remain within 64 MiB. System and controlled font files MUST individually remain within 128 MiB, with 128 MiB aggregate budgets for their respective stores.
-**Verification**: Review — resource tests cover guest admission failure but do not test both system and controlled-font 128 MiB boundaries.
+**Rule**: Guest font resources MUST remain within 64 MiB. System and controlled font files MUST individually remain within 128 MiB, with 128 MiB aggregate budgets for their respective stores. A system font file over its limit MUST be left out of discovery, so fallback never selects it.
+**Verification**: Test
 
 ### DEV-FONT-3 Legacy family names
 

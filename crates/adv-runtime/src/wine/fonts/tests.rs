@@ -245,6 +245,21 @@ fn ansi_text_decodes_through_the_code_page_windows_uses() {
         ansi_text(env, request, b"\xbb").unwrap()
     });
     assert_eq!(units, [0xff7b]);
+    // A Big5 font decodes through code page 950.
+    let units = with_charset(&mut machine, dc, 136, |env, request| {
+        ansi_text(env, request, b"\xac\x4f").unwrap()
+    });
+    assert_eq!(units, [0x662f]);
+}
+
+// spec: WINE-SES-5
+#[test]
+fn traditional_chinese_sessions_use_big5_as_the_ansi_code_page() {
+    let (mut machine, _, _) = fixture();
+    let locale = crate::wine::session::locale(950);
+    assert_eq!(locale, 0x404);
+    install(&mut machine, Text::with_font_directories(&[]), locale);
+    assert_eq!(machine.ext.get::<Fonts>().codec.acp, 950);
 }
 
 // spec: WIN32-GDI-10

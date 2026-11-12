@@ -1131,6 +1131,34 @@ pub struct BlitOptions {
     pub sampling: Sampling,
     /// Inclusive source color key: raw source pixels in range are not copied.
     pub key: Option<(u32, u32)>,
+    /// Destination pixels outside this rectangle are left untouched; the
+    /// source still maps onto the whole destination rectangle.
+    pub clip: Option<Rect>,
+}
+
+/// The written part of `dr` as (left, top, right, bottom): inside `d` and
+/// the optional clip. Empty when right <= left or bottom <= top.
+fn written(dr: BlitRect, d: &Surface, clip: Option<Rect>) -> Result<(i64, i64, i64, i64), String> {
+    let mut bounds = (0, 0, i64::from(d.width), i64::from(d.height));
+    if let Some(c) = clip {
+        bounds = (
+            bounds.0.max(i64::from(c.x)),
+            bounds.1.max(i64::from(c.y)),
+            bounds.2.min(i64::from(c.x) + i64::from(c.w)),
+            bounds.3.min(i64::from(c.y) + i64::from(c.h)),
+        );
+    }
+    let overflow = || "destination overflow".to_string();
+    Ok((
+        dr.x.max(bounds.0),
+        dr.y.max(bounds.1),
+        dr.x.checked_add(i64::from(dr.w))
+            .ok_or_else(overflow)?
+            .min(bounds.2),
+        dr.y.checked_add(i64::from(dr.h))
+            .ok_or_else(overflow)?
+            .min(bounds.3),
+    ))
 }
 
 impl Surface {
@@ -1499,6 +1527,12 @@ impl<P: Presenter> Surfaces<P> {
     /// The primary surface, if one exists yet.
     pub fn primary_id(&self) -> Option<u32> {
         self.primary
+    }
+
+    /// Stops treating the primary surface as the display; it stays an
+    /// ordinary surface and the next primary is created anew.
+    pub fn detach_primary(&mut self) -> Option<u32> {
+        self.primary.take()
     }
 
     /// Source of the newest submitted base, including a queued software frame.
@@ -2885,16 +2919,7 @@ impl<P: Presenter> Surfaces<P> {
         {
             return Err("source rectangle outside surface".into());
         }
-        let right =
-            dr.x.checked_add(i64::from(dr.w))
-                .ok_or("destination overflow")?
-                .min(i64::from(d.width));
-        let bottom =
-            dr.y.checked_add(i64::from(dr.h))
-                .ok_or("destination overflow")?
-                .min(i64::from(d.height));
-        let left = dr.x.max(0);
-        let top = dr.y.max(0);
+        let (left, top, right, bottom) = written(dr, &d, options.clip)?;
         if sr.w == 0 || sr.h == 0 || dr.w == 0 || dr.h == 0 || right <= left || bottom <= top {
             return Ok(Rect::default());
         }

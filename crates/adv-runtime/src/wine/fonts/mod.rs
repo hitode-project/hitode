@@ -50,12 +50,14 @@ pub(super) fn install<B: adv_cpu::backend::Backend>(
     let acp = match locale {
         0x411 => 932,
         0x804 => 936,
+        0x404 => 950,
         _ => 1252,
     };
     let mut text = text;
     text.set_ansi_encoding(match acp {
         932 => Encoding::Japanese,
         936 => Encoding::SimplifiedChinese,
+        950 => Encoding::TraditionalChinese,
         _ => Encoding::Latin,
     });
     let mut apis = Registry::default();
@@ -178,6 +180,7 @@ fn ansi_codepage(env: &Env<'_>, request: &FontRequest) -> Option<u32> {
         | Encoding::Reserved(_) => env.ext.get::<Fonts>().codec.acp,
         Encoding::Japanese => 932,
         Encoding::SimplifiedChinese => 936,
+        Encoding::TraditionalChinese => 950,
         _ => return None,
     })
 }

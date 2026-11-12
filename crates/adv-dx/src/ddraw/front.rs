@@ -253,8 +253,12 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::CREATE_CLIPPER, create_clipper_ABI),
     (api::CLIPPER_SET_HWND, clipper_set_hwnd_ABI),
     (api::CLIPPER_GET_HWND, clipper_get_hwnd_ABI),
+    (api::GET_CLIPPER, get_clipper_ABI),
+    (api::GET_BLT_STATUS, get_blt_status_ABI),
+    (api::GET_FLIP_STATUS, get_flip_status_ABI),
     (api::SET_CLIPPER, set_clipper_ABI),
     (api::CLIPPER_INITIALIZE, clipper_initialize_ABI),
+    (api::CLIPPER_SET_CLIP_LIST, clipper_set_clip_list_ABI),
     (api::DD_CREATE, dd_create_ABI),
     (api::INITIALIZE, initialize_ABI),
     (api::QUERY, query_ABI),
@@ -302,9 +306,34 @@ fn create_clipper(
 fn clipper_set_hwnd(env: &mut Env<'_>, this: GuestPtr<()>, arg1: u32, arg2: Handle) -> Outcome {
     call(env, api::CLIPPER_SET_HWND, &[this.addr(), arg1, arg2.0])
 }
+#[win32(ddraw, name = "IDirectDrawClipper::SetClipList", level = implement)]
+fn clipper_set_clip_list(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    arg1: GuestPtr<()>,
+    arg2: u32,
+) -> Outcome {
+    call(
+        env,
+        api::CLIPPER_SET_CLIP_LIST,
+        &[this.addr(), arg1.addr(), arg2],
+    )
+}
 #[win32(ddraw, name = "IDirectDrawClipper::GetHWnd", level = implement)]
 fn clipper_get_hwnd(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {
     call(env, api::CLIPPER_GET_HWND, &[this.addr(), arg1.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetBltStatus", level = implement)]
+fn get_blt_status(env: &mut Env<'_>, this: GuestPtr<()>, arg1: u32) -> Outcome {
+    call(env, api::GET_BLT_STATUS, &[this.addr(), arg1])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetFlipStatus", level = implement)]
+fn get_flip_status(env: &mut Env<'_>, this: GuestPtr<()>, arg1: u32) -> Outcome {
+    call(env, api::GET_FLIP_STATUS, &[this.addr(), arg1])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetClipper", level = implement)]
+fn get_clipper(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {
+    call(env, api::GET_CLIPPER, &[this.addr(), arg1.addr()])
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::SetClipper", level = implement)]
 fn set_clipper(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {

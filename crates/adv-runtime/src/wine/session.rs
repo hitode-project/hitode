@@ -466,11 +466,12 @@ fn new_machine(
 const ENVIRONMENT: &[(&str, &str)] = &[("SystemDrive", "C:"), ("SystemRoot", r"C:\windows")];
 
 /// The locale whose ANSI code page is `codepage`: ja-JP for 932, zh-CN for
-/// 936, en-US otherwise.
+/// 936, zh-TW for 950, en-US otherwise.
 pub fn locale(codepage: u32) -> u32 {
     match codepage {
         932 => 0x411,
         936 => 0x804,
+        950 => 0x404,
         _ => 0x409,
     }
 }

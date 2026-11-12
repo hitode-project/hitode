@@ -262,7 +262,8 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
   --no-region-linking     return to the dispatcher between native regions\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
-  --codepage auto|932|936 guest ANSI encoding: Japanese or GBK (default: auto)\n\
+  --codepage auto|932|936|950\n\
+                          guest ANSI encoding: Japanese, GBK or Big5 (default: auto)\n\
   --headless              run without a host window\n\
   --codec-kernels guest|verify|native  codec library acceleration (default: native; Vorbis permits FP rounding differences)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
@@ -392,7 +393,8 @@ impl Options {
                         "auto" => None,
                         "932" => Some(932),
                         "936" => Some(936),
-                        _ => return Err("--codepage must be auto, 932 or 936".into()),
+                        "950" => Some(950),
+                        _ => return Err("--codepage must be auto, 932, 936 or 950".into()),
                     };
                 }
                 "--row-workers" => {

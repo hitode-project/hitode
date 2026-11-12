@@ -203,6 +203,15 @@ pub(super) fn start_w(
     };
     start(env, dc, face, callback, param, mode, true)
 }
+/// The language whose localized family names enumeration lists for `locale`.
+fn language(locale: u32) -> &'static str {
+    match locale {
+        0x804 => "zh-Hans",
+        0x404 => "zh-Hant",
+        _ => "ja-JP",
+    }
+}
+
 /// A face name fits LF_FACESIZE both in UTF-16 and in the guest's ANSI code page.
 fn listed(codec: &adv_os::nls::Codec, face: &str) -> bool {
     face.encode_utf16().count() < 32 && codec.encode(face).len() < 32
@@ -233,10 +242,7 @@ pub(super) fn start(
         set_last_error(env, 87);
         return Outcome::Return(0);
     }
-    let language = match env.ext.get::<Fonts>().locale {
-        0x804 => "zh-Hans",
-        _ => "ja-JP",
-    };
+    let language = language(env.ext.get::<Fonts>().locale);
     let text = &mut env.ext.get_mut::<Fonts>().text;
     text.set_language(language);
     let api = match (mode, wide) {
@@ -531,11 +537,7 @@ pub(super) fn driver(env: &mut Env<'_>, _dc: u32, a: &[u32]) -> Outcome {
             .collect::<Vec<_>>(),
     );
     let mode = FontEnumeration::FamiliesEx(decode_encoding(raw[23]));
-    let language = if env.ext.get::<Fonts>().locale == 0x804 {
-        "zh-Hans"
-    } else {
-        "ja-JP"
-    };
+    let language = language(env.ext.get::<Fonts>().locale);
     let text = &mut env.ext.get_mut::<Fonts>().text;
     text.set_language(language);
     let Ok(fonts) = text.enumerate((!face.is_empty()).then_some(face.as_str()), mode) else {

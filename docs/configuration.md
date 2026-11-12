@@ -129,7 +129,7 @@ device loss; builds without it omit the executor hooks.
 | `--wine-prefix` | Host path override | One prefix shared by every game, beside the data folder |
 | `--backend` | Diagnostic | `jit` (Tier 0 with the a64 translator); `interpreter` optional |
 | `--no-time-skip` | Diagnostic | Absent: startup clock polling and Ctrl time skip allowed when their conditions hold |
-| `--codepage` | Feature | `auto`: 936 for marked or mostly GB2312 executables, otherwise 932; `932` and `936` override |
+| `--codepage` | Feature | `auto`: 936 for marked or mostly GB2312 executables, otherwise 932; `932`, `936` and `950` (Big5) override |
 | `--headless` | Fixture | Off: a host window is shown |
 | `--codec-kernels` | Diagnostic | `native`; `guest` or `verify` compare Vorbis kernels and admitted Theora decoders |
 | `--audio` | Feature | Off; headless runs simulate the device. To become default or be removed with the normal-play audio baseline |

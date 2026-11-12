@@ -183,10 +183,7 @@ impl<P: Presenter> Surfaces<P> {
         options: BlitOptions,
         memory: &mut dyn SurfaceMemory,
     ) -> Result<Rect, String> {
-        let left = dr.x.max(0);
-        let top = dr.y.max(0);
-        let right = (dr.x + i64::from(dr.w)).min(i64::from(destination.width));
-        let bottom = (dr.y + i64::from(dr.h)).min(i64::from(destination.height));
+        let (left, top, right, bottom) = super::written(dr, destination, options.clip)?;
         let width = (right - left) as u32;
         let ox = (left - dr.x) as u32;
         let oy = (top - dr.y) as u32;
