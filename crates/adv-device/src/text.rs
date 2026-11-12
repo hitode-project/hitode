@@ -648,6 +648,20 @@ impl Text {
     pub fn replacement_fonts(&self) -> Result<FontReplacements, TextError> {
         self.backend.replacement_fonts()
     }
+    /// Prefer the catalog's substitutes when the requested family is missing.
+    pub fn set_font_replacements(&mut self, replacements: &FontReplacements) {
+        self.invalidate_fonts();
+        self.backend.replacements = replacements
+            .families
+            .iter()
+            .filter_map(|(aliases, targets)| targets.first().map(|target| (aliases, target)))
+            .flat_map(|(aliases, target)| {
+                aliases
+                    .iter()
+                    .map(|alias| (alias.to_lowercase(), target.clone()))
+            })
+            .collect();
+    }
     pub fn set_overrides(&mut self, overrides: Overrides) {
         self.invalidate_fonts();
         self.overrides = overrides;

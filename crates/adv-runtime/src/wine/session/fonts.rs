@@ -139,18 +139,8 @@ impl Fonts {
             text.add_file_resource(bytes, true)
                 .map_err(|e| e.to_string())?;
         }
-        let mut overrides = self.overrides.clone();
-        for (aliases, targets) in &self.catalog.families {
-            if let Some(target) = targets.first() {
-                for alias in aliases {
-                    overrides
-                        .families
-                        .entry(alias.clone())
-                        .or_insert_with(|| target.clone());
-                }
-            }
-        }
-        text.set_overrides(overrides);
+        text.set_font_replacements(&self.catalog);
+        text.set_overrides(self.overrides.clone());
         super::super::fonts::install(machine, text, self.locale);
         if !self.overrides.families.is_empty() {
             machine.ext.insert(Names(

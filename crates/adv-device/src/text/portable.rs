@@ -45,6 +45,7 @@ pub(super) struct Backend {
     database: OnceLock<Result<Discovery, String>>,
     directories: Option<Vec<PathBuf>>,
     profile_path: Option<PathBuf>,
+    pub(super) replacements: BTreeMap<String, String>,
     /// Fonts the Windows installation ships (Tahoma, Marlett, Symbol...).
     /// They fill only families the host lacks; a profile ignores them.
     windows: Option<PathBuf>,
@@ -351,16 +352,24 @@ impl Backend {
             )))?;
             let face = load_face(&db, &self.store, primary, Some(profile))?;
             return Font::new(
+                self,
                 request,
-                self.ansi.unwrap_or(Encoding::Latin),
                 db,
-                Arc::clone(&self.store),
                 candidates,
                 face,
                 Some(profile.clone()),
+                None,
             );
         }
-        let names = families(request);
+        let name = request.face.trim_start_matches('@').to_lowercase();
+        let replacement = self
+            .replacements
+            .get(&name)
+            .filter(|_| request.default.is_none());
+        let mut names = families(request);
+        if let Some(replacement) = replacement {
+            names.insert(1, replacement.clone());
+        }
         let mut candidates: Vec<_> = db.faces().collect();
         let weight = normalized_weight(request);
         candidates.sort_by_cached_key(|face| {
@@ -380,14 +389,26 @@ impl Backend {
             TextError::Font("no OpenType fonts found; install fonts or set ADV_FONT_DIR".into())
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
+        let substitute = request.default.is_none() && !family_matches(&db, &face.info, &name);
+        let cell = substitute.then(|| replacement_cell(&name)).flatten();
+        let mapped = replacement
+            .filter(|_| substitute)
+            .map(|target| FontRequest {
+                face: if request.face.starts_with('@') {
+                    format!("@{target}")
+                } else {
+                    target.clone()
+                },
+                ..request.clone()
+            });
         Font::new(
-            request,
-            self.ansi.unwrap_or(Encoding::Latin),
+            self,
+            mapped.as_ref().unwrap_or(request),
             db,
-            Arc::clone(&self.store),
             candidates,
             face,
             None,
+            cell,
         )
     }
     pub(super) fn resource_font(
@@ -419,13 +440,13 @@ impl Backend {
             discovery.profile.as_deref(),
         )?;
         Font::new(
+            self,
             request,
-            self.ansi.unwrap_or(Encoding::Latin),
             discovery.database.clone(),
-            self.store.clone(),
             vec![face_id],
             face,
             discovery.profile.clone(),
+            None,
         )
     }
     pub(super) fn enumerate(
@@ -436,7 +457,8 @@ impl Backend {
         if face.is_some_and(|name| name.contains('\0') || name.encode_utf16().count() > 32767) {
             return Err(TextError::Font("invalid enumeration face name".into()));
         }
-        let db = &self.discovery()?.database;
+        let discovery = self.discovery()?;
+        let db = &discovery.database;
         if db.faces().next().is_none() {
             return Err(TextError::Font("no OpenType fonts found".into()));
         }
@@ -549,10 +571,13 @@ impl Backend {
                             })
                             .unwrap_or_default()
                     });
-                    let (em, xscale, metrics) = font_metrics(&font, &request)?;
-                    let _ = (em, xscale);
+                    let cell = forced
+                        .as_ref()
+                        .filter(|_| discovery.profile.is_none())
+                        .and_then(|name| replacement_cell(name));
+                    let (_, _, metrics) = font_metrics(&font, &request, cell)?;
                     let unscaled = font.metrics(Size::unscaled(), LocationRef::default());
-                    let (asc, desc) = cell_units(&font);
+                    let (asc, desc) = cell_units(&font, f32::from(unscaled.units_per_em), cell);
                     let charmap = font.charmap();
                     let first = charmap
                         .mappings()
@@ -917,6 +942,10 @@ fn families(request: &FontRequest) -> Vec<String> {
             | "黑体"
             | "黑體"
             | "微软雅黑"
+            | "dengxian"
+            | "等线"
+            | "microsoft jhenghei"
+            | "microsoft jhenghei ui"
             | "微軟正黑體"
             | "dotum"
             | "gulim"
@@ -944,6 +973,8 @@ fn families(request: &FontRequest) -> Vec<String> {
                     | "宋體"
                     | "mingliu"
                     | "pmingliu"
+                    | "mingliu-extb"
+                    | "pmingliu-extb"
                     | "細明體"
                     | "新細明體"
                     | "batang"
@@ -962,9 +993,15 @@ fn families(request: &FontRequest) -> Vec<String> {
                 | "nsimsun"
                 | "simsun-extb"
                 | "simhei"
+                | "fangsong"
+                | "kaiti"
+                | "dengxian"
                 | "宋体"
                 | "新宋体"
                 | "黑体"
+                | "仿宋"
+                | "楷体"
+                | "等线"
                 | "微软雅黑"
         ) =>
         {
@@ -972,7 +1009,15 @@ fn families(request: &FontRequest) -> Vec<String> {
         }
         _ if matches!(
             name.as_str(),
-            "mingliu" | "pmingliu" | "細明體" | "新細明體" | "微軟正黑體"
+            "mingliu"
+                | "pmingliu"
+                | "mingliu-extb"
+                | "pmingliu-extb"
+                | "細明體"
+                | "新細明體"
+                | "microsoft jhenghei"
+                | "microsoft jhenghei ui"
+                | "微軟正黑體"
         ) =>
         {
             Some("TC")
@@ -1122,7 +1167,71 @@ fn location(font: &FontRef<'_>, request: &FontRequest) -> Location {
         ("slnt", if request.italic { -12.0 } else { 0.0 }),
     ])
 }
-fn cell_units(font: &FontRef<'_>) -> (f32, f32) {
+#[derive(Clone, Copy)]
+struct ReplacementCell {
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+    ideographic_ascent: Option<f32>,
+}
+
+impl ReplacementCell {
+    fn glyph_offset(self, font: &FontRef<'_>, em: f32) -> Option<f32> {
+        let target = self.ideographic_ascent?;
+        let os2 = font.os2().ok()?;
+        let upem = f32::from(font.head().ok()?.units_per_em());
+        let ascent = f32::from(os2.s_typo_ascender());
+        let descent = f32::from(os2.s_typo_descender());
+        // The CJK typographic bounds enclose one ideographic em. Translate
+        // the outline in whole pixels so the hinter's grid fit is preserved.
+        (ascent - descent == upem).then(|| ((target - ascent / upem) * em).round())
+    }
+}
+
+fn replacement_cell(name: &str) -> Option<ReplacementCell> {
+    let name = name.to_lowercase();
+    let family = WINDOWS_FAMILIES
+        .iter()
+        .find(|family| family.names().any(|alias| alias.to_lowercase() == name))
+        .map_or(name.as_str(), |family| family.0);
+    // Use the requested Windows family's cell, in ems. For example, PingFang
+    // leaves extra room on both sides of its ideographs; using that room in a
+    // SimSun cell pushes the text down and increases the line height.
+    let (ascent, descent, leading, ideographic_ascent) = match family {
+        "SimSun" | "NSimSun" | "SimHei" | "fangsong" | "仿宋" | "kaiti" | "楷体" => (
+            220.0 / 256.0,
+            36.0 / 256.0,
+            36.0 / 256.0,
+            Some(220.0 / 256.0),
+        ),
+        "MS Gothic" | "MS PGothic" | "MS UI Gothic" | "MS Mincho" | "MS PMincho" | "MingLiU"
+        | "PMingLiU" => (220.0 / 256.0, 36.0 / 256.0, 0.0, Some(220.0 / 256.0)),
+        "Meiryo" => (2171.0 / 2048.0, 901.0 / 2048.0, 0.0, Some(1798.0 / 2048.0)),
+        "Meiryo UI" => (2171.0 / 2048.0, 430.0 / 2048.0, 0.0, Some(1798.0 / 2048.0)),
+        "mingliu-extb" | "pmingliu-extb" => (
+            820.0 / 1024.0,
+            204.0 / 1024.0,
+            204.0 / 1024.0,
+            Some(820.0 / 1024.0),
+        ),
+        "microsoft jhenghei" | "microsoft jhenghei ui" | "微軟正黑體" => {
+            (1.0, 0.25, 0.0, Some(1823.0 / 2048.0))
+        }
+        "dengxian" | "等线" => (1659.0 / 2048.0, 475.0 / 2048.0, 0.0, None),
+        _ => return None,
+    };
+    Some(ReplacementCell {
+        ascent,
+        descent,
+        leading,
+        ideographic_ascent,
+    })
+}
+
+fn cell_units(font: &FontRef<'_>, upem: f32, replacement: Option<ReplacementCell>) -> (f32, f32) {
+    if let Some(cell) = replacement {
+        return (cell.ascent * upem, cell.descent * upem);
+    }
     if let Ok(os2) = font.os2() {
         let (asc, desc) = (os2.us_win_ascent() as f32, os2.us_win_descent() as f32);
         if asc + desc > 0.0 {
@@ -1135,21 +1244,23 @@ fn cell_units(font: &FontRef<'_>) -> (f32, f32) {
 fn font_metrics(
     font: &FontRef<'_>,
     request: &FontRequest,
+    replacement: Option<ReplacementCell>,
 ) -> Result<(f32, f32, TextMetrics), TextError> {
     let loc = location(font, request);
     let units = font.metrics(Size::unscaled(), &loc);
-    let (asc, desc) = cell_units(font);
-    if units.units_per_em == 0 || asc + desc <= 0.0 {
+    let upem = f32::from(units.units_per_em);
+    let (asc, desc) = cell_units(font, upem, replacement);
+    if upem == 0.0 || asc + desc <= 0.0 {
         return Err(TextError::Font("font has invalid em/cell metrics".into()));
     }
     let em = if request.height < 0 {
         -request.height as f32
     } else if request.height > 0 {
-        request.height as f32 * f32::from(units.units_per_em) / (asc + desc)
+        request.height as f32 * upem / (asc + desc)
     } else {
         16.0
     };
-    let scale = em / f32::from(units.units_per_em);
+    let scale = em / upem;
     let m = font.metrics(Size::new(em), &loc);
     let average = if fixed(request) {
         em * 0.5
@@ -1161,19 +1272,42 @@ fn font_metrics(
     } else {
         1.0
     };
+    let orientation = request.glyph_angle.rem_euclid(1800);
+    let rotated_truetype = orientation != 0 && replacement.is_none() && font.glyf().is_ok();
     let ascent = (asc * scale).round() as i32;
-    // Windows rounds the ascent and descent of an em-sized font separately.
-    let height = if request.height > 0 {
-        request.height
+    let descent = (desc * scale).round() as i32;
+    let (ascent, descent) = if rotated_truetype {
+        // GDI pads rotated TrueType cells by one pixel at either edge.
+        // Oblique angles use the outline box instead of the Windows cell.
+        if orientation == 900 {
+            (ascent + 1, descent + 1)
+        } else {
+            let head = font.head().map_err(font_error)?;
+            (
+                (f32::from(head.y_max()) * scale).round() as i32 + 1,
+                (-f32::from(head.y_min()) * scale).round() as i32 + 1,
+            )
+        }
+    } else if request.height > 0 && replacement.is_none() {
+        (ascent, request.height - ascent)
     } else {
-        ascent + (desc * scale).round() as i32
+        (ascent, descent)
     };
+    let height = ascent + descent;
+    let internal_leading = height - em.round() as i32;
     let metrics = TextMetrics {
         height,
         ascent,
-        descent: height - ascent,
-        internal_leading: (height - em.round() as i32).max(0),
-        external_leading: m.leading.max(0.0).round() as i32,
+        descent,
+        internal_leading: if rotated_truetype {
+            internal_leading
+        } else {
+            internal_leading.max(0)
+        },
+        external_leading: replacement
+            .map_or(m.leading, |cell| cell.leading * em)
+            .max(0.0)
+            .round() as i32,
         average_width: (average * xscale).round().max(1.0) as i32,
         maximum_width: (m.max_width.unwrap_or(em).max(em) * xscale).ceil() as i32,
         weight: if request.weight == 0 {
@@ -1246,21 +1380,30 @@ pub(super) struct Font {
     hints: Mutex<BTreeMap<(ID, bool), HintingInstance>>,
     em: f32,
     xscale: f32,
+    glyph_offset: f32,
     metrics: TextMetrics,
 }
 impl Font {
     fn new(
+        backend: &Backend,
         request: &FontRequest,
-        ansi: Encoding,
         database: Arc<Database>,
-        store: Arc<Mutex<FaceStore>>,
         candidates: Vec<ID>,
         primary: Arc<Face>,
         profile: Option<Arc<profile::Loaded>>,
+        cell: Option<ReplacementCell>,
     ) -> Result<Self, TextError> {
         let font = primary.font()?;
-        let (em, xscale, mut metrics) = font_metrics(&font, request)?;
-        metrics.encoding = realized(request.encoding, ansi, &font);
+        let (em, xscale, mut metrics) = font_metrics(&font, request, cell)?;
+        let glyph_offset = cell
+            .filter(|_| !request.face.starts_with('@'))
+            .and_then(|cell| cell.glyph_offset(&font, em))
+            .unwrap_or(0.0);
+        metrics.encoding = realized(
+            request.encoding,
+            backend.ansi.unwrap_or(Encoding::Latin),
+            &font,
+        );
         if synthetic_bold(request, &font, primary.info.weight.0) {
             metrics.average_width += 1;
             metrics.maximum_width += 1;
@@ -1276,7 +1419,7 @@ impl Font {
         Ok(Self {
             request: request.clone(),
             database,
-            store,
+            store: Arc::clone(&backend.store),
             candidates,
             primary,
             profile,
@@ -1284,6 +1427,7 @@ impl Font {
             hints: Mutex::default(),
             em,
             xscale,
+            glyph_offset,
             metrics,
         })
     }
@@ -1779,6 +1923,11 @@ impl Font {
             transform: Transform::IDENTITY,
             xscale: self.xscale,
             italic,
+            y_offset: if face.info.id == self.primary.info.id {
+                self.glyph_offset
+            } else {
+                0.0
+            },
         };
         if request.hinted {
             let mono = request.format == GlyphFormat::Monochrome
@@ -2061,13 +2210,14 @@ struct Pen {
     transform: Transform,
     xscale: f32,
     italic: bool,
+    y_offset: f32,
 }
 impl Pen {
     fn point(&self, x: f32, y: f32) -> Vector {
         let (x, y) = transform_point(
             self.transform,
             (x + if self.italic { y * 0.21256 } else { 0.0 }) * self.xscale,
-            y,
+            y + self.y_offset,
         );
         Vector::new(x, y)
     }

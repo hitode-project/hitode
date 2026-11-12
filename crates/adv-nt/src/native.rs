@@ -648,6 +648,7 @@ pub(crate) fn bind_relocated(
         .chain(fonts::BODIES)
         .any(|body| body.name.starts_with(module.name.as_str()));
     let own = own_calls::covers(&module.name);
+    let text = ext.try_get::<FontFrontend>().is_some();
     if !bodies && !own {
         return;
     }
@@ -662,12 +663,14 @@ pub(crate) fn bind_relocated(
     if own {
         own_calls::bind(cpu, sys, ext, base, &module.name, &table, relocated);
     }
+    if text && module.name == "dwrite.dll" {
+        fonts::fix_dwrite_rasterization(cpu, sys, base, &table, relocated);
+    }
     if !bodies {
         return;
     }
     // Text bodies need the runtime's frontend; machines assembled without
     // text services keep Wine's code.
-    let text = ext.try_get::<FontFrontend>().is_some();
     let bodies = BODIES.iter().chain(dib::BODIES);
     for body in bodies.chain(fonts::BODIES.iter().filter(|_| text)) {
         #[cfg(any(target_vendor = "apple", target_os = "android"))]

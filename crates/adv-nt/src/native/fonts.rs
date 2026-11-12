@@ -1,5 +1,67 @@
 //! Font ownership is supplied by the runtime assembly over the device Text.
-use adv_machine::{Conv, Env, Outcome};
+use adv_cpu::backend::{Guest, GuestExt, Reg};
+use adv_machine::{Conv, Env, Outcome, Sys};
+
+const DWRITE_ORIGINS: &str = "dwrite.dll!round_analysis_origins";
+
+pub(super) fn fix_dwrite_rasterization(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    base: u32,
+    table: &crate::identity::Table,
+    relocated: impl Fn(u32) -> bool,
+) {
+    // The pinned PE frontend inlines its bitmap lookup into CreateAlphaTexture.
+    // Store the rendering mode (SI) in the key instead of zero (AX).
+    if let Some(function) = table.named("glyphrunanalysis_CreateAlphaTexture")
+        && function.hash == 0x2073_a27e
+        && crate::identity::intact(cpu, base + function.rva, function, &relocated)
+        && let Err(error) = cpu.write(base + function.rva + 0x45a, &[0xb5])
+    {
+        log::warn!("dwrite.dll: could not key glyph bitmaps by rendering mode: {error:?}");
+    }
+
+    if let Some(function) = table.named("create_glyphrunanalysis")
+        && function.hash == 0x4581_a329
+        && crate::identity::intact(cpu, base + function.rva, function, &relocated)
+    {
+        // Replace the final output store, after all origin transforms.
+        let at = base + function.rva + 0x1f0;
+        let result = sys.thunks.publish(cpu, super::MODULE, DWRITE_ORIGINS);
+        match result {
+            Ok(thunk) => {
+                let mut call = [0xe8, 0, 0, 0, 0];
+                call[1..].copy_from_slice(&thunk.wrapping_sub(at + 5).to_le_bytes());
+                if let Err(error) = cpu.write(at, &call) {
+                    log::warn!("dwrite.dll: could not round glyph origins: {error:?}");
+                }
+            }
+            Err(error) => log::warn!("dwrite.dll: could not bind glyph origin rounding: {error:?}"),
+        }
+    }
+}
+
+fn round_analysis_origins(env: &mut Env<'_>) -> Outcome {
+    let analysis = env.cpu.reg(Reg::Ebx);
+    let frame = env.cpu.reg(Reg::Ebp);
+    let mut write = || {
+        // dwrite_glyphrunanalysis.run.glyphCount and origins.
+        let count = env.cpu.read_u32(analysis + 0x18)?;
+        let origins = env.cpu.read_u32(analysis + 0x4c)?;
+        for i in 0..count {
+            let y = origins + i * 8 + 4;
+            let value = f32::from_bits(env.cpu.read_u32(y)?);
+            let rounded = (f64::from(value) + 0.5).floor() as f32;
+            env.cpu.write_u32(y, rounded.to_bits())?;
+        }
+        let output = env.cpu.read_u32(frame - 0x18)?;
+        env.cpu.write_u32(output, analysis)
+    };
+    match write() {
+        Ok(()) => Outcome::Return(0),
+        Err(error) => Outcome::Fail(format!("dwrite glyph origins: {error:?}")),
+    }
+}
 
 /// The session's font frontend, including guest continuations for enumeration.
 pub struct FontFrontend(pub fn(&mut Env<'_>, &'static str) -> Outcome);
@@ -14,7 +76,13 @@ fn run(env: &mut Env<'_>) -> Outcome {
 }
 macro_rules! bodies {
     ($($module:literal, $conv:ident, $argc:literal, $name:literal;)*) => {
-        pub(super) const BODIES: &[super::Body] = &[$(super::Body {
+        pub(super) const BODIES: &[super::Body] = &[super::Body {
+            name: std::borrow::Cow::Borrowed(DWRITE_ORIGINS),
+            conv: Conv::Cdecl { argc: 0 },
+            body: None,
+            handler: round_analysis_origins,
+            direct: None,
+        }, $(super::Body {
             name: std::borrow::Cow::Borrowed(concat!($module,"!",$name)),
             conv: Conv::$conv { argc: $argc }, body: None, handler: run, direct: None,
         }),*];

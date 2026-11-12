@@ -35,6 +35,29 @@ int main(void){
  UINT size=(bounds.right-bounds.left)*(bounds.bottom-bounds.top);if(!size)return 9;BYTE *bitmap=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,size);
  if(FAILED(IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,DWRITE_TEXTURE_ALIASED_1x1,&bounds,bitmap,size)))return 10;
  UINT ink=0;for(UINT i=0;i<size;i++)ink+=bitmap[i]!=0;if(!ink)return 11;
+ IDWriteGlyphRunAnalysis *aa=0;
+ if(FAILED(IDWriteFactory_CreateGlyphRunAnalysis(factory,&run,1.0f,0,DWRITE_RENDERING_MODE_NATURAL,DWRITE_MEASURING_MODE_NATURAL,0,0,&aa)))return 13;
+ RECT gray;if(FAILED(IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(aa,DWRITE_TEXTURE_CLEARTYPE_3x1,&gray)))return 14;
+ UINT pitch=3*(gray.right-gray.left),rows=gray.bottom-gray.top;
+ BYTE coverage[4096];
+ if(!pitch||!rows||pitch*rows>sizeof(coverage)||
+    FAILED(IDWriteGlyphRunAnalysis_CreateAlphaTexture(aa,DWRITE_TEXTURE_CLEARTYPE_3x1,&gray,coverage,pitch*rows)))return 15;
+ UINT first=rows,last=0;BOOL intermediate=FALSE;
+ for(UINT y=0;y<rows;y++)for(UINT x=0;x<pitch;x++){
+  BYTE sample=coverage[y*pitch+x];
+  if(sample){if(y<first)first=y;if(y>last)last=y;if(sample!=255)intermediate=TRUE;}
+ }
+ if(!intermediate||last-first+1<(bounds.bottom-bounds.top)-2)return 16;
+ IDWriteGlyphRunAnalysis_Release(aa);
+ const FLOAT origins[]={0.5f,-1.5f};
+ const INT shifts[]={1,-1};
+ for(UINT i=0;i<2;i++){
+  RECT shifted;
+  if(FAILED(IDWriteFactory_CreateGlyphRunAnalysis(factory,&run,1.0f,0,DWRITE_RENDERING_MODE_NATURAL,DWRITE_MEASURING_MODE_NATURAL,0,origins[i],&aa)))return 17;
+  if(FAILED(IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(aa,DWRITE_TEXTURE_CLEARTYPE_3x1,&shifted))||
+     shifted.top!=gray.top+shifts[i]||shifted.bottom!=gray.bottom+shifts[i])return 18;
+  IDWriteGlyphRunAnalysis_Release(aa);
+ }
  FILE *out=fopen("font-dwrite.bin","wb");if(!out)return 12;fwrite(&figures,4,1,out);fwrite(&points,4,1,out);fwrite(&bounds,sizeof(bounds),1,out);fwrite(&size,4,1,out);fwrite(bitmap,1,size,out);fclose(out);
  HeapFree(GetProcessHeap(),0,bitmap);IDWriteGlyphRunAnalysis_Release(analysis);IDWriteFontFace_Release(face);IDWriteFontFile_Release(file);IDWriteFactory_Release(factory);return 0;
 }

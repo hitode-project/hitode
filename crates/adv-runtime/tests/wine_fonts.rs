@@ -445,7 +445,7 @@ fn font_stack_records_use_native_glyphs_and_composition() {
     assert_eq!(at, bytes.len());
 }
 
-// spec: WINE-UNIX-6, WIN32-GDI-14, WIN32-GDI-15
+// spec: WINE-UNIX-6, WIN32-GDI-14, WIN32-GDI-15, WIN32-GDI-17, WIN32-GDI-18
 #[test]
 fn restored_font_probe_records() {
     for name in [
@@ -489,7 +489,7 @@ fn font_loading_and_drawing_timings() {
     );
 }
 
-// spec: WINE-UNIX-6, DEV-FONT-1
+// spec: WINE-UNIX-6, WINE-UNIX-7, DEV-FONT-1
 #[test]
 fn directwrite_uses_the_host_cff_glyphs_without_freetype() {
     let Some((bytes, _, _, stats)) = probe("font-dwrite", false) else {

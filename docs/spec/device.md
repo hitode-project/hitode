@@ -211,6 +211,12 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: An upright glyph's box and bitmap MUST be clipped to its font's cell: the box never reaches above the ascent or below the descent.
 **Verification**: Test
 
+### DEV-FONT-9 Cell metrics of CJK replacements
+
+**Rule**: Automatic substitutes for CJK families with a Windows reference cell MUST use that cell for sizing, metrics, and drawing. A substitute with an ideographic em box MUST align that box to the reference in horizontal drawing. Exact matches and explicit host choices MUST use the selected face's cell.
+**Verification**: Test
+**Basis**: Windows 11 GDI metrics for the same requested family and size
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration
