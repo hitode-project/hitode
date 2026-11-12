@@ -99,22 +99,32 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
             crate::device::download_ddi(&cache, cryptex, &|stage| send(stage, None))
                 .await
                 .map(drop)
-                .map_err(|error| error.to_string())
+                .map_err(|error| crate::describe(&*error))
         }),
         Mode::Enable => runtime.block_on(async {
-            tokio::time::timeout(
+            // The banner shows only the error, so it names the stage that failed.
+            let last = std::cell::RefCell::new("connecting".to_owned());
+            let result = tokio::time::timeout(
                 Duration::from_secs(240),
                 crate::device::enable(
                     request.pid,
                     &request.pairing,
                     request.remote_pairing_port,
                     &cache,
-                    &|stage| send(stage, None),
+                    &|stage| {
+                        stage.clone_into(&mut last.borrow_mut());
+                        send(stage, None);
+                    },
                 ),
             )
-            .await
-            .map_err(|_| "JIT helper timed out".to_string())?
-            .map_err(|error| error.to_string())
+            .await;
+            let stage = last.borrow();
+            match result {
+                Err(_) => Err(format!("JIT helper timed out ({stage})")),
+                Ok(result) => {
+                    result.map_err(|error| format!("{} ({stage})", crate::describe(&*error)))
+                }
+            }
         }),
     };
     send("finished", result.err());
