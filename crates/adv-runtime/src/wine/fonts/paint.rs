@@ -2,15 +2,22 @@
 use super::*;
 use std::sync::Arc;
 
+// A half unit in GDI's 28.4 position grid. Add it before dropping the
+// fractional pixels to account for the preceding fixed-point rounding.
+const FIXED_HALF: f64 = 1.0 / 32.0;
+
 pub(super) fn register(_registry: &mut Registry) {}
 #[derive(Clone, Copy)]
 struct Matrix([f64; 6]);
 impl Matrix {
     fn point(self, x: f64, y: f64) -> [i32; 2] {
+        self.rounded_point(x, y, 0.5)
+    }
+    fn rounded_point(self, x: f64, y: f64, bias: f64) -> [i32; 2] {
         let m = self.0;
         [
-            (x * m[0] + y * m[2] + m[4] + 0.5).floor() as i32,
-            (x * m[1] + y * m[3] + m[5] + 0.5).floor() as i32,
+            (x * m[0] + y * m[2] + m[4] + bias).floor() as i32,
+            (x * m[1] + y * m[3] + m[5] + bias).floor() as i32,
         ]
     }
     fn glyph(self) -> Transform {
@@ -100,7 +107,8 @@ pub(super) fn render(
         Ok((p, _)) => p,
         Err(_) => return Outcome::Return(0),
     };
-    let angle = f64::from(request.baseline_angle) / 1800.0 * std::f64::consts::PI;
+    let escapement = request.baseline_angle.rem_euclid(3600);
+    let angle = f64::from(escapement) / 1800.0 * std::f64::consts::PI;
     let (sin, cos) = angle.sin_cos();
     let mut advance = Vec::with_capacity(units.len() + 1);
     advance.push([0.0, 0.0]);
@@ -118,8 +126,8 @@ pub(super) fn render(
         previous = positions[i];
         let p = advance[i];
         advance.push([
-            p[0] + f64::from(x) * cos + f64::from(y) * sin,
-            p[1] - f64::from(x) * sin + f64::from(y) * cos,
+            p[0] + f64::from(x) * cos - f64::from(y) * sin,
+            p[1] - f64::from(x) * sin - f64::from(y) * cos,
         ]);
     }
     let total = *advance.last().unwrap();
@@ -140,13 +148,13 @@ pub(super) fn render(
         env.cpu
             .write_u32(
                 attr + layout::attr::cur_pos,
-                (f64::from(origin[0]) + p[0]).round() as i32 as u32,
+                (f64::from(origin[0]) + p[0] + FIXED_HALF).floor() as i32 as u32,
             )
             .unwrap();
         env.cpu
             .write_u32(
                 attr + layout::attr::cur_pos + 4,
-                (f64::from(origin[1]) + p[1]).round() as i32 as u32,
+                (f64::from(origin[1]) + p[1] + FIXED_HALF).floor() as i32 as u32,
             )
             .unwrap();
     }
@@ -164,7 +172,13 @@ pub(super) fn render(
         f64::from(origin[0]) - total[0] * h + v * sin,
         f64::from(origin[1]) - total[1] * h + v * cos,
     ];
-    origin = matrix.point(base[0], base[1]);
+    let bias = if escapement == 0 {
+        0.5
+    } else {
+        0.5 + FIXED_HALF
+    };
+    let glyph_origin = |x, y| matrix.rounded_point(x, y, bias);
+    origin = glyph_origin(base[0], base[1]);
     let foreground = color(
         env,
         dc,
@@ -279,7 +293,7 @@ pub(super) fn render(
             Ok(g) => g,
             Err(_) => return Outcome::Return(0),
         };
-        let p = matrix.point(base[0] + advance[i][0], base[1] + advance[i][1]);
+        let p = glyph_origin(base[0] + advance[i][0], base[1] + advance[i][1]);
         run.glyphs.push((glyph, p));
     }
     let Some((dev, function)) = physdev(env, dc) else {
@@ -299,8 +313,8 @@ pub(super) fn render(
     let mut bytes: Vec<_> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
     let dp = scratch + count * 2;
     for i in 0..units.len() {
-        let p = matrix.point(base[0] + advance[i][0], base[1] + advance[i][1]);
-        let q = matrix.point(base[0] + advance[i + 1][0], base[1] + advance[i + 1][1]);
+        let p = glyph_origin(base[0] + advance[i][0], base[1] + advance[i][1]);
+        let q = glyph_origin(base[0] + advance[i + 1][0], base[1] + advance[i + 1][1]);
         bytes.extend((q[0] - p[0]).to_le_bytes());
         bytes.extend((q[1] - p[1]).to_le_bytes());
     }

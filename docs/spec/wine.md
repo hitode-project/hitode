@@ -346,6 +346,13 @@ The host owns text services under WINE-UNIX-6.
 
 Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tables from the PEB, as Wine's does.
 
+### WINE-UNIX-7 DirectWrite glyph bitmaps
+
+**Rule**: DirectWrite MUST keep glyph bitmaps of different rendering modes separate. DirectWrite MUST round glyph bitmap origins vertically to the nearest pixel, with half pixels rounded toward positive infinity.
+**Verification**: Test
+
+Identity checks admit the pinned DirectWrite PE module's bitmap cache key and raster origin corrections at load time.
+
 ## Threads
 
 ### WINE-THR-1 One scheduling authority

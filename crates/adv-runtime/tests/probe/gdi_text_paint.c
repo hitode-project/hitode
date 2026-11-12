@@ -1,6 +1,7 @@
 /* Build: i686-w64-mingw32-gcc -O2 -Wall gdi_text_paint.c -o gdi_text_paint.exe -lgdi32 */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <string.h>
 /* A bounded, silent fixture: only private memory DCs and owned DIB sections. */
 static HANDLE output;
 static void emit(const void *data,DWORD size) {DWORD n;if(!WriteFile(output,data,size,&n,NULL)||n!=size)ExitProcess(90);}
@@ -43,6 +44,38 @@ int main(void) {
         }
         if(!n)ExitProcess(4);if(!GdiFlush())ExitProcess(5);
         emit(header,sizeof(header));emit(bits,header[9]);records++;
+        if(format==2 && up && style==1 && align==0){
+            const WCHAR pair[]={0x3042,0x3042};
+            const INT dx[]={20,3,0,0};
+            BYTE placed[96*56*4];
+            ZeroMemory(bits,sizeof(placed));
+            if(!ExtTextOutW(dc,12,20,ETO_PDY,NULL,pair,2,dx)||!GdiFlush())ExitProcess(11);
+            memcpy(placed,bits,sizeof(placed));
+            ZeroMemory(bits,sizeof(placed));
+            if(!TextOutW(dc,12,20,pair,1)||!TextOutW(dc,32,17,pair+1,1)||
+               !GdiFlush()||memcmp(placed,bits,sizeof(placed)))ExitProcess(12);
+
+            HFONT tilted=CreateFontW(-24,0,-250,-250,400,0,0,0,SHIFTJIS_CHARSET,
+                                     OUT_DEFAULT_PRECIS,0,NONANTIALIASED_QUALITY,0,L"MS Gothic");
+            if(!tilted)ExitProcess(13);
+            SelectObject(dc,tilted);
+            SetTextAlign(dc,TA_BASELINE);
+            const INT spaced[]={39,0};
+            ZeroMemory(bits,sizeof(placed));
+            if(!ExtTextOutW(dc,12,26,0,NULL,pair,2,spaced)||!GdiFlush())ExitProcess(14);
+            memcpy(placed,bits,sizeof(placed));
+            ZeroMemory(bits,sizeof(placed));
+            if(!TextOutW(dc,12,26,pair,1)||!TextOutW(dc,47,43,pair+1,1)||
+               !GdiFlush()||memcmp(placed,bits,sizeof(placed)))ExitProcess(15);
+
+            SetTextAlign(dc,TA_BASELINE|TA_UPDATECP);
+            const WCHAR triple[]={0x3042,0x3042,0x3042};
+            const INT advances[]={39,43,45};
+            POINT pen;
+            if(!MoveToEx(dc,12,26,NULL)||!ExtTextOutW(dc,0,0,0,NULL,triple,3,advances)||
+               !GetCurrentPositionEx(dc,&pen)||pen.x!=127||pen.y!=79)ExitProcess(16);
+            SelectObject(dc,font);DeleteObject(tilted);
+        }
         if(pal){SelectPalette(dc,oldpal,FALSE);if(!DeleteObject(pal))ExitProcess(10);}
         SelectObject(dc,oldfont);SelectObject(dc,oldbitmap);if(style!=2&&!DeleteObject(font))ExitProcess(6);if(!DeleteObject(bitmap)||!DeleteDC(dc))ExitProcess(7);
     }

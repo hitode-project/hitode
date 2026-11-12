@@ -1030,6 +1030,90 @@ fn upright_glyph_boxes_stay_inside_the_font_cell() {
     }
 }
 
+// spec: DEV-FONT-9
+#[test]
+fn automatic_cjk_substitutes_use_the_requested_cell() {
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(LEGACY, true).unwrap();
+    let target = "ADV Resource Fixture Medium";
+    let cases = [("宋体", 3), ("細明體", 0), ("ＭＳ ゴシック", 0)];
+    text.set_font_replacements(&FontReplacements {
+        files: Vec::new(),
+        families: cases
+            .iter()
+            .map(|&(name, _)| (vec![name.into()], vec![target.into()]))
+            .collect(),
+    });
+    let mut direct = font(target);
+    direct.height = -24;
+    let glyph = glyph(Character::Unicode('B' as u32), GlyphFormat::Gray8);
+    let expected = text.glyph(&direct, glyph).unwrap();
+    for (family, leading) in cases {
+        let mut request = font(family);
+        for height in [-24, 24] {
+            request.height = height;
+            let m = text.metrics(&request).unwrap();
+            assert_eq!(
+                (m.height, m.ascent, m.descent, m.external_leading),
+                (24, 21, 3, leading)
+            );
+            let drawn = text.glyph(&request, glyph).unwrap();
+            assert_eq!(
+                drawn.metrics,
+                GlyphMetrics {
+                    origin_y: expected.metrics.origin_y + 1,
+                    ..expected.metrics
+                }
+            );
+            assert_eq!(drawn.data, expected.data);
+        }
+        let enumerated = text
+            .enumerate(Some(family), FontEnumeration::Families)
+            .unwrap();
+        assert_eq!(
+            (enumerated[0].metrics.height, enumerated[0].metrics.ascent),
+            (16, 14)
+        );
+    }
+
+    for (family, cell) in [("Meiryo", (36, 25, 11)), ("Meiryo UI", (30, 25, 5))] {
+        let mut request = font(family);
+        request.height = -24;
+        let m = text.metrics(&request).unwrap();
+        assert_eq!((m.height, m.ascent, m.descent), cell);
+    }
+
+    text.set_overrides(Overrides {
+        families: [("宋体".into(), target.into())].into(),
+        antialiased: None,
+    });
+    let mut request = font("宋体");
+    request.height = -24;
+    let m = text.metrics(&request).unwrap();
+    assert_eq!((m.height, m.ascent), (29, 24));
+    assert_eq!(m, text.metrics(&direct).unwrap());
+}
+
+// spec: WIN32-GDI-18
+#[test]
+fn rotated_truetype_cells_follow_glyph_orientation() {
+    let (mut text, mut request) = loaded();
+    request.height = -24;
+    for (orientation, expected) in [
+        (0, (24, 19, 5, 0)),
+        (250, (19, 18, 1, -5)),
+        (900, (26, 20, 6, 2)),
+        (1800, (24, 19, 5, 0)),
+    ] {
+        request.glyph_angle = orientation;
+        let m = text.metrics(&request).unwrap();
+        assert_eq!(
+            (m.height, m.ascent, m.descent, m.internal_leading),
+            expected
+        );
+    }
+}
+
 /// Tests may execute on another host than the compiler (notably Android).
 /// Materialize the authored input on that host and retire only our own files.
 struct FixtureDirectory(PathBuf);

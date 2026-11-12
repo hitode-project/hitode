@@ -80,4 +80,14 @@ with a nonempty buffer fails without writing metrics or payload.
 **Rule**: AddFontMemResourceEx MUST register a copy as a process-private, non-enumerable resource, report its face count, and return a distinct handle. RemoveFontMemResourceEx MUST release only that registration. Process cleanup MUST release remaining memory fonts.
 **Verification**: Test
 
+### WIN32-GDI-17 Vertical glyph advances
+
+**Rule**: Text output with `ETO_PDY` MUST interpret a positive vertical advance as upward in the font's coordinates.
+**Verification**: Test
+
+### WIN32-GDI-18 Rotated text positions
+
+**Rule**: Exact TrueType faces at angles other than multiples of 90 degrees MUST use the scaled outline bounds. Rotated text MUST round glyph origins from GDI's 28.4 grid and discard fractional pixels when updating the current position.
+**Verification**: Test
+
 Withdrawn: WIN32-IMAGE-5
