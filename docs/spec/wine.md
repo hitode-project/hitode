@@ -113,6 +113,8 @@ Descriptors that remain ready MUST remain observable on later steps.
 ### WINE-SYS-3 Section views
 
 **Rule**: A read-only or read-write view of a data section MUST share the file's pages with every other mapping, the server's included. A view MUST start at the requested offset, which MUST be a multiple of 64 KiB.
+A further view of an image at its server-assigned dynamic base MUST retain that base in its headers and fixups.
+An image that other memory displaces from that base MUST be relocated to its view's address before its code is bound.
 **Verification**: Test
 
 ### WINE-SYS-4 One process per machine
@@ -217,6 +219,11 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 **Rule**: `NtQueryEaFile`, `NtSetEaFile`, and `NtSetVolumeInformationFile` MUST preserve Wine 11's stub checks, statuses, and side effects.
 **Verification**: Review — the probe omits Wine's stubs.
+
+### NT-FILE-5 Replaced files
+
+**Rule**: A name that resolves to a replaced file's host identity MUST open its replacement, whatever path reaches it. Names reported to the guest MUST remain the original's.
+**Verification**: Test
 
 ## NT security
 

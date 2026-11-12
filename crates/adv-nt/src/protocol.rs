@@ -1046,6 +1046,32 @@ impl Request for GetMappingInfoRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct GetImageMapAddressRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetImageMapAddressRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetImageMapAddressRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetImageMapAddressReply {
+    pub header: ReplyHeader,
+    pub addr: u64,
+}
+const _: () = assert!(size_of::<GetImageMapAddressReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetImageMapAddressReply, addr) == 8);
+
+impl Request for GetImageMapAddressRequest {
+    const NUMBER: i32 = 66;
+    type Reply = GetImageMapAddressReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MapImageViewRequest {
     pub header: RequestHeader,
     pub mapping: u32,

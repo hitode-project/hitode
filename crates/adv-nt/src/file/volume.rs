@@ -110,6 +110,13 @@ struct Namespace {
     root: Option<PathBuf>,
     volumes: BTreeMap<char, Mounted>,
     identities: RefCell<HashMap<(u64, u64), Rc<Identity>>>,
+    replaced: Vec<Replaced>,
+}
+/// A host file the guest sees in place of another (NT-FILE-5).
+struct Replaced {
+    identity: (u64, u64),
+    original: PathBuf,
+    file: PathBuf,
 }
 impl Drop for Namespace {
     fn drop(&mut self) {
@@ -126,6 +133,7 @@ impl Mounts {
             root,
             volumes: BTreeMap::new(),
             identities: RefCell::new(HashMap::new()),
+            replaced: Vec::new(),
         }))
     }
     /// Publish this namespace once, shared by wineboot, the game and its children.
@@ -154,6 +162,40 @@ impl Mounts {
         );
         ns.volumes.insert(letter, Mounted { root, source });
         Ok(())
+    }
+    /// Opens that resolve to `original` reach `file` instead (NT-FILE-5).
+    /// Called before the namespace is shared with any process.
+    pub fn replace(&mut self, original: &Path, file: PathBuf) -> io::Result<()> {
+        let ns = Rc::get_mut(&mut self.0).expect("mounts precede process startup");
+        let metadata = std::fs::metadata(original)?;
+        ns.replaced.push(Replaced {
+            identity: (metadata.dev(), metadata.ino()),
+            original: original.to_owned(),
+            file,
+        });
+        Ok(())
+    }
+    /// The file that stands in for `host`, matched by identity so that every
+    /// spelling of its name resolves alike.
+    pub(crate) fn replacement(&self, host: &Path) -> Option<PathBuf> {
+        if self.0.replaced.is_empty() {
+            return None;
+        }
+        let metadata = std::fs::metadata(host).ok()?;
+        let identity = (metadata.dev(), metadata.ino());
+        self.0
+            .replaced
+            .iter()
+            .find(|replaced| replaced.identity == identity)
+            .map(|replaced| replaced.file.clone())
+    }
+    /// The original a replacement stands in for, to name it to the guest.
+    pub(crate) fn original<'a>(&'a self, host: &'a Path) -> &'a Path {
+        self.0
+            .replaced
+            .iter()
+            .find(|replaced| replaced.file == host)
+            .map_or(host, |replaced| &replaced.original)
     }
     pub fn device_name(&self, letter: char) -> Option<String> {
         self.0
@@ -440,4 +482,37 @@ pub fn read_all(mounts: &Mounts, fd: std::os::fd::RawFd) -> std::io::Result<Vec<
         std::os::unix::fs::FileExt::read_exact_at(&*file, &mut bytes, 0)?;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: NT-FILE-5
+    #[test]
+    fn a_replaced_file_answers_every_spelling_and_keeps_its_name() {
+        let root = std::env::temp_dir().join(format!("adv-nt-replaced-{}", std::process::id()));
+        let game = root.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        let original = game.join("Config.ini");
+        std::fs::write(&original, "original").unwrap();
+        std::fs::write(game.join("other.ini"), "other").unwrap();
+        let file = root.join("replaced.ini");
+        std::fs::write(&file, "replaced").unwrap();
+        // A drive link reaches the same file under another host path.
+        let drive = root.join("d:");
+        std::os::unix::fs::symlink(&game, &drive).unwrap();
+        let mut mounts = Mounts::default();
+        mounts.replace(&original, file.clone()).unwrap();
+
+        assert_eq!(
+            mounts.replacement(&drive.join("Config.ini")),
+            Some(file.clone())
+        );
+        assert_eq!(mounts.replacement(&original), Some(file.clone()));
+        assert_eq!(mounts.replacement(&drive.join("other.ini")), None);
+        assert_eq!(mounts.original(&file), original);
+        assert_eq!(mounts.original(&drive), drive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -5,6 +5,7 @@ pub mod codepage;
 mod debug_views;
 mod font;
 mod graphics;
+pub mod reallive;
 /// The Wine userland: sessions, the host fronts and their drivers.
 #[cfg(unix)]
 pub mod wine;

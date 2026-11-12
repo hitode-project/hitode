@@ -46,6 +46,7 @@ REQUESTS = [
     "close_handle",
     "create_mapping",
     "get_mapping_info",
+    "get_image_map_address",
     "map_image_view",
     "map_view",
     "is_same_mapping",

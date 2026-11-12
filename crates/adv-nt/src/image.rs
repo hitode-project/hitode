@@ -17,7 +17,7 @@ pub enum Error {
     Memory(#[from] MemFault),
 }
 
-/// Maps `pe`, already relocated for `base`, at `base`.
+/// Maps the prepared image bytes of `pe` at `base`.
 pub fn map(
     cpu: &mut dyn Guest,
     vm: &mut Vm,

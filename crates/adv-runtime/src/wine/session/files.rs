@@ -115,11 +115,14 @@ pub(super) fn prepare(
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
-    let root = if options.cdroms.is_empty() {
+    let game = std::path::absolute(config.exe.parent().ok_or("the program has no directory")?)
+        .map_err(|e| e.to_string())?;
+    let configuration = crate::reallive::configuration(&game);
+    let root = if options.cdroms.is_empty() && configuration.is_none() {
         None
     } else {
         let root =
-            std::path::absolute(prefix.join(format!(".hitode-media-{}", std::process::id())))
+            std::path::absolute(prefix.join(format!(".hitode-files-{}", std::process::id())))
                 .map_err(|e| e.to_string())?;
         std::fs::create_dir(&root).map_err(|e| e.to_string())?;
         Some(root.canonicalize().map_err(|e| e.to_string())?)
@@ -128,7 +131,7 @@ pub(super) fn prepare(
     for (letter, _) in vfs.optical_drives() {
         let path = root
             .as_ref()
-            .expect("mounted media directory")
+            .expect("session files directory")
             .join(letter.to_string());
         mounts
             .attach(
@@ -141,6 +144,17 @@ pub(super) fn prepare(
             )
             .map_err(|e| e.to_string())?;
     }
+    if let Some((original, text)) = configuration {
+        let directory = root
+            .as_ref()
+            .expect("session files directory")
+            .join("replaced");
+        let file = directory.join(original.file_name().expect("a file name"));
+        std::fs::create_dir(&directory)
+            .and_then(|()| std::fs::write(&file, text))
+            .and_then(|()| mounts.replace(&original, file))
+            .map_err(|e| format!("{}: {e}", original.display()))?;
+    }
     let devices = prefix.join("dosdevices");
     let managed = prefix.join(".hitode-drives");
     if let Ok(letters) = std::fs::read_to_string(&managed) {
@@ -152,8 +166,6 @@ pub(super) fn prepare(
             }
         }
     }
-    let game = std::path::absolute(config.exe.parent().ok_or("the program has no directory")?)
-        .map_err(|e| e.to_string())?;
     link(
         &game,
         &devices.join(format!("{}:", game_drive.to_ascii_lowercase())),

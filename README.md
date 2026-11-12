@@ -172,6 +172,7 @@ Third-party parts keep their own licenses:
 - `vendor/wine`: the server of Wine 11.0 and the headers it includes, the `l_intl.nls` table the server loads at startup, and the `ntsyscalls.h` system call table, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
 - `crates/adv-unix/freetype`: the FreeType ftgrays rasterizer, used under the FreeType License (FTL); see its `LICENSE.TXT`.
 - `vendor/fluidr3mono`: the FluidR3 Mono GM SoundFont, MIT; see its `LICENSE`.
+- `vendor/opencc`: OpenCC character dictionaries, Apache-2.0; see its `NOTICE`.
 - `vendor/upscaling`: upscaling shader sources, under GPL-3.0 and each original's license (MIT for Anime4K); see its `NOTICE`.
 
 The Wine modules in release packages are an i386 build of Wine 11.0, LGPL-2.1-or-later; the build scripts are in `tools/wine/`.

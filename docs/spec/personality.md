@@ -93,6 +93,12 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. Markers are a name token `chs`, `cn`, `gb` or `zhcn`, a kana-free name with a GBK-only character, or GB2312 data text outnumbering Shift_JIS threefold. An explicit code page MUST replace the detected one before guest code runs.
 **Verification**: Test
 
+### PERS-PROFILE-10 GBK plugin default names
+
+**Rule**: When `Gameexe.ini` loads the `rlgbk` plugin, its `#NAME.*` values MUST reach the guest as GBK, with Japanese forms simplified by `vendor/opencc`. A value the Shift_JIS parser would read past its closing quote MUST end with a NUL byte. Values either code page cannot hold, and the file on disk, MUST stay unchanged.
+**Verification**: Test
+**Basis**: NT-FILE-5
+
 ## ABI ownership
 
 ### PERS-ABI-1 Single signature source
