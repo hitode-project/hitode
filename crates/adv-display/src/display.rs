@@ -151,6 +151,8 @@ struct Pending {
     record: PresentRecord,
     images: Vec<AcquiredImage>,
     video: Vec<Video>,
+    /// A resample of the last output, not a new damage baseline.
+    retained: bool,
     /// The last submission that reads the frame's base, or `Token(0)`.
     read: Token,
 }
@@ -738,8 +740,6 @@ impl Display {
         } else {
             None
         };
-        // A redraw resamples the shown image; the next frame replaces it whole.
-        let redraw = source.is_some();
         let reading = self.held.take().and_then(|held| {
             frame.info.damage.union(&held.record.plan.damage);
             self.discard(held, source)
@@ -768,7 +768,6 @@ impl Display {
         } else {
             self.held = Some(pending);
         }
-        self.invalid |= redraw;
         Ok(token)
     }
     fn attach(&mut self, queue: &mut Queue, mut pending: Pending) -> Result<(), Error> {
@@ -836,7 +835,7 @@ impl Display {
         self.video = pending.video;
         self.unlatched = Some(serial);
         self.attached_refresh = self.refresh.unwrap_or(0);
-        self.invalid = false;
+        self.invalid = pending.retained;
         self.recorder
             .record(recorder::Event::Present(Box::new(pending.record)));
         Ok(())
@@ -1268,6 +1267,7 @@ impl Display {
         // A frame that failed mid-way left its unsubmitted spans; drop them.
         self.spans.clear();
         let started = Instant::now();
+        let retained = matches!(frame.base, Base::Retained { .. });
         self.windows.changes(&mut frame.info, &frame.windows);
         let (settings, planned) = self.plan(&frame.info, reading);
         let mut targets = self.targets(queue, &planned)?;
@@ -1566,6 +1566,7 @@ impl Display {
             },
             images,
             video: frame.video,
+            retained,
             read: if reads_base { token } else { Token(0) },
         })
     }
