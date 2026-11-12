@@ -137,6 +137,13 @@ pub struct Runtime {
     pub head_exit: u32,
     /// Checkpoints that kept running past a recall to reach the head.
     pub deferred: u32,
+    /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
+    pub opt_params: u64,
+    /// Per-thread optimized spills and parallel-copy scratch, in 16-byte cells.
+    pub opt_spills: u64,
+    pub opt_fpcr: u64,
+    pub opt_record: u32,
+    pub opt_dump: RegisterDump,
 }
 
 impl Runtime {
@@ -181,8 +188,21 @@ impl Runtime {
             completed: 0,
             head_exit: 0,
             deferred: 0,
+            opt_params: 0,
+            opt_spills: 0,
+            opt_fpcr: 0,
+            opt_record: 0,
+            opt_dump: RegisterDump::default(),
         }
     }
+}
+
+/// Host state shared by optimized exits and signal-context capture.
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+pub struct RegisterDump {
+    pub x: [u64; 31],
+    pub v: [u128; 32],
 }
 
 /// Why translated code returned to the owner.
@@ -208,6 +228,8 @@ pub enum Exit {
     /// An ordinary unit exhausted its instruction budget at EIP. The owner
     /// samples EIP, then dispatches.
     Budget = 8,
+    /// An optimized record and register dump await materialization.
+    Optimized = 9,
 }
 
 impl Exit {
@@ -222,6 +244,7 @@ impl Exit {
             6 => Some(Self::Recall),
             7 => Some(Self::Computation),
             8 => Some(Self::Budget),
+            9 => Some(Self::Optimized),
             _ => None,
         }
     }
@@ -231,6 +254,7 @@ impl Exit {
 pub struct Stubs {
     pub code: Vec<u32>,
     pub enter: usize,
+    pub opt_exit: usize,
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
     pub fault: usize,
@@ -399,10 +423,13 @@ pub fn stubs() -> Stubs {
     emit_interpret(&mut asm, INTERPRET);
     let call = asm.offset();
     emit_interpret(&mut asm, CALL);
+    let opt_exit = asm.offset();
+    emit_opt_exit(&mut asm);
     Stubs {
         call,
         code: asm.finish(),
         enter,
+        opt_exit,
         exit,
         fault,
         dispatch,
@@ -679,6 +706,35 @@ fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[
         str(X, r(9), RUNTIME, COUNTDOWN),
         str(X, r(28), RUNTIME, SHADOW),
+        ldr(X, r(16), RUNTIME, HOST_SP),
+        mov_sp(SP, r(16)),
+    ]);
+    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
+        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
+    }
+    for (i, (a, b)) in SAVED.into_iter().enumerate() {
+        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
+    }
+    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
+}
+
+// spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
+fn emit_opt_exit(asm: &mut Asm) {
+    let dump = offset_of!(Runtime, opt_dump) as u32;
+    // Capture before borrowing any allocatable register. x16/x17 are emission scratch.
+    for n in 0..31 {
+        asm.emit(str(X, r(n), RUNTIME, dump + 8 * u32::from(n)));
+    }
+    let vectors = dump + offset_of!(RegisterDump, v) as u32;
+    for n in 0..32 {
+        asm.emit(str_v(VSize::Q, v(n), RUNTIME, vectors + 16 * u32::from(n)));
+    }
+    asm.emit_all(&[
+        ldr(X, r(16), RUNTIME, offset_of!(Runtime, opt_fpcr) as u32),
+        msr_fpcr(r(16)),
+        movz(W, r(16), Exit::Optimized as u16, 0),
+        str(W, r(16), RUNTIME, EXIT),
+        str(X, r(9), RUNTIME, COUNTDOWN),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
     ]);

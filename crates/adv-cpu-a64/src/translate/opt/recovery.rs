@@ -95,3 +95,113 @@ impl<L: Copy> Record<L> {
 
 /// A record over IR values, as the front end builds it.
 pub(crate) type IrRecord = Record<Value>;
+
+/// A stable location in an optimized form. Spill cells are 16 bytes each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Host {
+    Register(u8),
+    Vector(u8),
+    Spill(u32),
+    Constant(u128),
+}
+
+/// The captured registers and the same thread's spill cells. Neither the
+/// materializer nor its records depend on the source of the capture.
+pub(crate) struct Dump<'a> {
+    pub registers: &'a crate::runtime::RegisterDump,
+    pub spills: &'a [u128],
+}
+
+impl Dump<'_> {
+    fn get(&self, host: Host) -> u128 {
+        match host {
+            Host::Register(n) => u128::from(self.registers.x[n as usize]),
+            Host::Vector(n) => self.registers.v[n as usize],
+            Host::Spill(n) => self.spills[n as usize],
+            Host::Constant(bits) => bits,
+        }
+    }
+
+    fn locate(&self, location: Location<Host>) -> u128 {
+        match location {
+            Location::Constant(bits) => u128::from(bits),
+            Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => self.get(host),
+            Location::Recipe(Recipe::C1 { op, a, b }) => super::eval::locate(
+                &Location::Recipe(Recipe::C1 {
+                    op,
+                    a: Value(0),
+                    b: Value(1),
+                }),
+                &[self.get(a), self.get(b)],
+            ),
+        }
+    }
+}
+
+/// Restores the record's observable state and frame bytes. The returned
+/// refund is added to the captured countdown to obtain the retired count.
+// spec: A64-OPT-6
+pub(crate) fn materialize(
+    record: &Record<Host>,
+    dump: &Dump<'_>,
+    cpu: &mut adv_cpu_core::CpuState,
+    mut frame: impl FnMut(i32, &[u8]),
+) -> u32 {
+    for (reg, location) in cpu.regs.iter_mut().zip(record.regs) {
+        if let Some(location) = location {
+            *reg = dump.locate(location) as u32;
+        }
+    }
+    if let Some(location) = record.eflags {
+        cpu.eflags = dump.locate(location) as u32;
+    }
+    cpu.eip = record.eip;
+    for (i, location) in record.x87.stack.iter().enumerate() {
+        if record.x87.valid >> i & 1 != 0
+            && let Some(location) = location
+        {
+            let value = binary80(dump.locate(*location) as u64);
+            cpu.x87.regs[i] = value;
+            cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
+        }
+    }
+    cpu.x87.control = record.x87.control;
+    cpu.x87.status = record.x87.status & !((7 << 11) | (1 << 9)) | u16::from(record.x87.top) << 11;
+    if let Some(location) = record.x87.c1 {
+        cpu.x87.status |= (dump.locate(location) as u16 & 1) << 9;
+    }
+    if let Some(location) = record.x87.ip {
+        cpu.x87.ip = dump.locate(location) as u32;
+    }
+    if let Some(location) = record.x87.opcode {
+        cpu.x87.opcode = dump.locate(location) as u16;
+    }
+    for (reg, location) in cpu.xmm.iter_mut().zip(record.xmm) {
+        if let Some(location) = location {
+            *reg = dump.locate(location).to_le_bytes();
+        }
+    }
+    for &(offset, width, location) in &record.frame {
+        frame(
+            offset,
+            &dump.locate(location).to_le_bytes()[..usize::from(width)],
+        );
+    }
+    record.refund
+}
+
+fn binary80(bits: u64) -> adv_cpu_core::state::X87Register {
+    let sign = ((bits >> 48) as u16) & 0x8000;
+    let exponent = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1 << 52) - 1);
+    let (significand, exponent) = match exponent {
+        0 if fraction == 0 => (0, 0),
+        0 => {
+            let shift = fraction.leading_zeros();
+            (fraction << shift, (16383 - 1074 + 63 - shift) as u16)
+        }
+        0x7ff => ((1 << 63) | fraction << 11, 0x7fff),
+        _ => ((1 << 63) | fraction << 11, (exponent + 16383 - 1023) as u16),
+    };
+    adv_cpu_core::state::X87Register::from_parts(significand, sign | exponent)
+}

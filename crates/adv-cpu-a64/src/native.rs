@@ -1128,6 +1128,7 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
+            Exit::Optimized => unreachable!("optimized forms run only on computation workers"),
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
@@ -1954,6 +1955,7 @@ mod tests {
             checked: false,
             simd_dirty: 0,
             resume: 0,
+            opt_record: None,
         };
         let words = [
             load,
@@ -2182,6 +2184,7 @@ mod tests {
                 checked: false,
                 simd_dirty: 0,
                 resume: 0,
+                opt_record: None,
             },
             [0; 2],
         );

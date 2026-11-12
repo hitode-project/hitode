@@ -119,6 +119,8 @@ pub struct Site {
     /// cached in host registers must be published first; 0 for the fault
     /// stub itself.
     pub resume: i32,
+    /// Optimized region record, when this access belongs to an optimized form.
+    pub opt_record: Option<u32>,
 }
 
 /// A unit as the front end leaves it, for a back end to lower (A64-TR-7):
@@ -1289,6 +1291,7 @@ impl Translator<'_> {
                 checked: self.checking,
                 simd_dirty: self.vector.dirty,
                 resume: 0,
+                opt_record: None,
             },
         ));
         self.x87_site();

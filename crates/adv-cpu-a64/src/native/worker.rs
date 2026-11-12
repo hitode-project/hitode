@@ -223,6 +223,9 @@ fn run(
     runtime.cpu = std::ptr::null_mut();
     let exit = Exit::from_raw(runtime.exit).expect("computation exit");
     let mut retired = runtime.completed + u64::from(COMPUTATION_SLICE) - runtime.countdown;
+    if exit == Exit::Optimized {
+        unreachable!("optimized worker entry is not installed");
+    }
     if exit == Exit::Fault {
         let site = super::site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
         faults.capture.recover(cpu, site, runtime.temps);

@@ -57,6 +57,7 @@
 //! edge nets do, so the instructions charged and not retired at a point
 //! depend only on its trace index; a record holds that refund.
 
+pub(crate) mod back;
 pub(crate) mod eval;
 pub(crate) mod front;
 pub(crate) mod ir;

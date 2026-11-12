@@ -706,6 +706,9 @@ impl Executor {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);
                     }
+                    Exit::Optimized => {
+                        unreachable!("optimized forms run only on computation workers")
+                    }
                     Exit::Recall => unreachable!("only computation entries can be recalled"),
                     Exit::Reschedule => return Ok(RunOutcome::Reschedule),
                     Exit::Yield => {

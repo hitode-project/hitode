@@ -1733,3 +1733,1078 @@ fn table_row_loops_admit_gathered_entries_mirrored_pointers_and_inclusive_bounds
         );
     }
 }
+
+mod opt_back {
+    use super::super::opt::{back, eval, ir::*, recovery::*};
+    use super::super::opt::{ir::Op, recovery::Recipe};
+    use super::*;
+    use crate::encode::bl;
+
+    const AREA: u64 = 0x4000_0000;
+    const PARAMETER: u64 = AREA;
+    const SPILL: u64 = AREA + 0x8000;
+    const SAVED_FPCR: u64 = 1 << 25;
+
+    struct Captured {
+        cpu: CpuState,
+        frame: Vec<(i32, Vec<u8>)>,
+        record: RecordId,
+        countdown: u64,
+        completed: u64,
+        registers: runtime::RegisterDump,
+        spills: Vec<u128>,
+        lowered: back::Lowered,
+    }
+
+    impl Harness {
+        fn run_opt(
+            &mut self,
+            func: &Func,
+            params: &[u128],
+            budget: u64,
+            recall: u32,
+            head_exit: u32,
+        ) -> Captured {
+            let mut code = self.prefix.clone();
+            let wrapper = code.len() * 4;
+            code.extend_from_slice(&[
+                stp(X, Index::Pre, Reg::LR, Reg::ZR, Reg::new(31), -16),
+                movz(X, X16, (SAVED_FPCR >> 16) as u16, 16),
+                msr_fpcr(X16),
+                bl(self.stubs.enter as i32 - (wrapper + 12) as i32),
+                mrs_fpcr(X16),
+                ldp(X, Index::Post, Reg::LR, Reg::ZR, Reg::new(31), 16),
+                ret(Reg::LR),
+            ]);
+            let at = code.len() * 4;
+            let lowered = back::lower(func, at, &self.stubs);
+            code.extend_from_slice(&lowered.words);
+            let mut context = vec![0; size_of::<runtime::Runtime>()];
+            let mut put = |offset: usize, value: &[u8]| {
+                context[offset..offset + value.len()].copy_from_slice(value)
+            };
+            for (offset, value) in [
+                (offset_of!(runtime::Runtime, cpu), CPU),
+                (offset_of!(runtime::Runtime, window), WINDOW_BASE),
+                (offset_of!(runtime::Runtime, shadow), WINDOW_BASE),
+                (offset_of!(runtime::Runtime, countdown), budget),
+                (offset_of!(runtime::Runtime, opt_params), PARAMETER),
+                (offset_of!(runtime::Runtime, opt_spills), SPILL),
+                (offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00),
+                (
+                    offset_of!(runtime::Runtime, computation_pending),
+                    CONTEXT + 0x3f04,
+                ),
+            ] {
+                put(offset, &value.to_le_bytes());
+            }
+            put(
+                offset_of!(runtime::Runtime, recall_mask),
+                &1u32.to_le_bytes(),
+            );
+            put(
+                offset_of!(runtime::Runtime, computation_pending_mask),
+                &2u32.to_le_bytes(),
+            );
+            put(
+                offset_of!(runtime::Runtime, head_exit),
+                &head_exit.to_le_bytes(),
+            );
+            self.emu.write(CONTEXT, &context);
+            self.emu.write(CONTEXT + 0x3f00, &recall.to_le_bytes());
+            self.emu
+                .write(CONTEXT + 0x3f04, &(recall & 2).to_le_bytes());
+            self.emu.write(
+                PARAMETER,
+                &params
+                    .iter()
+                    .flat_map(|p| p.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            self.emu.write(SPILL, &vec![0; lowered.spill_cells * 16]);
+            let state = vec![0; size_of::<CpuState>()];
+            self.emu.write(CPU, &state);
+            self.emu.set_sp(HOST_STACK);
+            self.emu.set_x(X0, CONTEXT);
+            self.emu.set_x(X1, HOST_CODE + at as u64);
+            self.emu.set_x(Reg::new(18), 0x1818);
+            for n in 19..30 {
+                self.emu.set_x(Reg::new(n), 0xcafe_0000 + u64::from(n));
+            }
+            for n in 8..16 {
+                self.emu.set_q(n, 0xbeef_0000 + u128::from(n));
+            }
+            let result = self.emu.call_at(&code, wrapper);
+            if result.is_err() {
+                // Model signal-context capture and resume through opt_exit. This
+                // test has a single faulting site; native signal wiring is separate.
+                assert_eq!(lowered.sites.len(), 1);
+                let id = lowered.sites[0].1.opt_record.unwrap();
+                self.emu.write(
+                    CONTEXT + offset_of!(runtime::Runtime, opt_record) as u64,
+                    &id.to_le_bytes(),
+                );
+                let mut tail = code.clone();
+                let fault = tail.len() * 4;
+                tail.push(b(self.stubs.opt_exit as i32 - fault as i32));
+                self.emu
+                    .call_at(&tail, fault)
+                    .expect("fault recovery returns");
+            }
+            assert_eq!(self.emu.x(X16), SAVED_FPCR, "FPCR restored");
+            assert_eq!(self.emu.x(Reg::new(18)), 0x1818);
+            for n in 19..30 {
+                assert_eq!(
+                    self.emu.x(Reg::new(n)),
+                    0xcafe_0000 + u64::from(n),
+                    "host x{n}"
+                );
+            }
+            for n in 8..16 {
+                assert_eq!(
+                    self.emu.q(n) as u64,
+                    0xbeef_0000 + u64::from(n),
+                    "host d{n}"
+                );
+            }
+            assert_eq!(self.emu.sp(), HOST_STACK);
+            assert_eq!(
+                self.emu.read(CPU, state.len()),
+                state,
+                "no canonical write-back"
+            );
+            let context = self.emu.read(CONTEXT, context.len());
+            let word =
+                |offset: usize| u32::from_le_bytes(context[offset..][..4].try_into().unwrap());
+            let wide =
+                |offset: usize| u64::from_le_bytes(context[offset..][..8].try_into().unwrap());
+            assert_eq!(
+                word(offset_of!(runtime::Runtime, exit)),
+                Exit::Optimized as u32
+            );
+            let base = offset_of!(runtime::Runtime, opt_dump);
+            let registers = runtime::RegisterDump {
+                x: std::array::from_fn(|i| wide(base + i * 8)),
+                v: std::array::from_fn(|i| {
+                    let offset = base + offset_of!(runtime::RegisterDump, v) + i * 16;
+                    u128::from_le_bytes(context[offset..][..16].try_into().unwrap())
+                }),
+            };
+            let spills = self
+                .emu
+                .read(SPILL, lowered.spill_cells * 16)
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|b| u128::from_le_bytes(*b))
+                .collect::<Vec<_>>();
+            let record = RecordId(word(offset_of!(runtime::Runtime, opt_record)));
+            let mut cpu = initial();
+            let mut frame = Vec::new();
+            let refund = materialize(
+                &lowered.records[record.0 as usize],
+                &Dump {
+                    registers: &registers,
+                    spills: &spills,
+                },
+                &mut cpu,
+                |offset, bytes| frame.push((offset, bytes.to_vec())),
+            );
+            Captured {
+                cpu,
+                frame,
+                record,
+                countdown: wide(offset_of!(runtime::Runtime, countdown))
+                    .wrapping_add(u64::from(refund)),
+                completed: wide(offset_of!(runtime::Runtime, completed)),
+                registers,
+                spills,
+                lowered,
+            }
+        }
+    }
+
+    fn harness() -> Harness {
+        let mut h = Harness::new();
+        h.emu.map(AREA, 0x20000);
+        h
+    }
+
+    fn record(eip: u32) -> IrRecord {
+        IrRecord {
+            eip,
+            refund: 0,
+            regs: [Some(Location::Constant(0)); 8],
+            eflags: Some(Location::Constant(0x202)),
+            x87: X87 {
+                top: 0,
+                valid: 0,
+                control: 0x027f,
+                stack: [None; 8],
+                status: 0x20,
+                c1: Some(Location::Constant(0)),
+                ip: Some(Location::Constant(0x1234)),
+                opcode: Some(Location::Constant(0x321)),
+            },
+            xmm: [Some(Location::Constant(0)); 8],
+            frame: Vec::new(),
+        }
+    }
+
+    fn start(types: &[Type]) -> (Func, Block, Vec<Value>, RecordId) {
+        let mut f = Func::default();
+        let entry = f.record(record(0x1000));
+        let b = f.block(Some(Head { record: entry }));
+        let values = types.iter().map(|&ty| f.param(b, ty)).collect();
+        f.entry = types
+            .iter()
+            .map(|ty| match ty {
+                Type::I32 => Source::Reg(0),
+                Type::I64 => Source::Frame {
+                    offset: 0,
+                    width: 8,
+                },
+                Type::F64 => Source::X87(0),
+                Type::V128 => Source::Xmm(0),
+                Type::Flags => Source::Eflags,
+            })
+            .collect();
+        (f, b, values, entry)
+    }
+
+    fn finish(f: &mut Func, b: Block, value: Value) -> RecordId {
+        let mut r = record(0x2000);
+        match f.ty(value) {
+            Type::I32 | Type::I64 => {
+                r.regs[0] = Some(Location::At(value));
+                r.frame.push((-8, 8, Location::At(value)));
+            }
+            Type::Flags => r.eflags = Some(Location::Recipe(Recipe::Eflags(value))),
+            Type::F64 => {
+                r.x87.valid = 1;
+                r.x87.stack[0] = Some(Location::At(value));
+            }
+            Type::V128 => r.xmm[0] = Some(Location::At(value)),
+        }
+        let exit = f.record(r);
+        f.end(b, End::Exit(exit));
+        exit
+    }
+
+    fn compare(f: &Func, params: &[u128], h: &mut Harness) -> Captured {
+        let mut memory = memory(&[], &[]);
+        let run = eval::run(f, params, &mut memory, 10000);
+        let got = h.run_opt(f, params, 10000, 0, 0);
+        let want = match run.outcome {
+            eval::Outcome::Exit(r) | eval::Outcome::Fail(r) => r,
+            _ => panic!("reference terminates"),
+        };
+        assert_eq!(got.record, want);
+        compare_record(f, &run.values, &got);
+        assert_eq!(
+            10000u64
+                .wrapping_sub(got.countdown)
+                .wrapping_add(got.completed),
+            (run.charged - i64::from(f.records[want.0 as usize].refund)) as u64
+        );
+        got
+    }
+
+    fn compare_record(f: &Func, values: &[u128], got: &Captured) {
+        let r = &f.records[got.record.0 as usize];
+        let locate = |l: Location<Value>| eval::locate(&l, values);
+        for (i, l) in r.regs.iter().enumerate() {
+            if let Some(l) = l {
+                assert_eq!(got.cpu.regs[i], locate(*l) as u32, "reg {i}");
+            }
+        }
+        if let Some(l) = r.eflags {
+            assert_eq!(got.cpu.eflags, locate(l) as u32, "eflags");
+        }
+        assert_eq!(got.cpu.eip, r.eip);
+        assert_eq!(got.cpu.x87.top(), r.x87.top as usize);
+        assert_eq!(got.cpu.x87.control, r.x87.control);
+        for i in 0..8 {
+            if r.x87.valid >> i & 1 != 0 {
+                if r.x87.stack[i].is_some() {
+                    assert_eq!(got.cpu.x87.tag >> (2 * i) & 3, got.cpu.x87.regs[i].tag());
+                }
+            } else {
+                assert_eq!(
+                    got.cpu.x87.tag >> (2 * i) & 3,
+                    initial().x87.tag >> (2 * i) & 3
+                );
+            }
+        }
+        assert_eq!(
+            got.cpu.x87.status & !((7 << 11) | (1 << 9)),
+            r.x87.status & !((7 << 11) | (1 << 9))
+        );
+        if let Some(l) = r.x87.ip {
+            assert_eq!(got.cpu.x87.ip, locate(l) as u32);
+        }
+        if let Some(l) = r.x87.opcode {
+            assert_eq!(got.cpu.x87.opcode, locate(l) as u16);
+        }
+        if let Some(l) = r.x87.c1 {
+            assert_eq!(u128::from(got.cpu.x87.status >> 9 & 1), locate(l));
+        }
+        for (i, l) in r.x87.stack.iter().enumerate() {
+            if let Some(l) = l {
+                let bits = locate(*l) as u64;
+                let reg = got.cpu.x87.regs[i];
+                // Independent exact-double representation check, including zeros,
+                // infinities and denormals.
+                let exponent = bits >> 52 & 0x7ff;
+                let fraction = bits & ((1 << 52) - 1);
+                assert_eq!(reg.sign_exponent() >> 15, (bits >> 63) as u16);
+                if exponent == 0 && fraction == 0 {
+                    assert_eq!(reg.significand(), 0);
+                    assert_eq!(reg.sign_exponent() & 0x7fff, 0);
+                } else if exponent == 0x7ff {
+                    assert_eq!(reg.sign_exponent() & 0x7fff, 0x7fff);
+                    assert_eq!(reg.significand(), 1 << 63 | fraction << 11);
+                } else {
+                    let exponent = i32::from(reg.sign_exponent() & 0x7fff) - 16383;
+                    let mantissa = reg.significand() as f64 / 2f64.powi(63);
+                    let actual = if exponent < -1022 {
+                        (mantissa * 2f64.powi(exponent + 1022)) * f64::MIN_POSITIVE
+                    } else {
+                        mantissa * 2f64.powi(exponent)
+                    };
+                    assert_eq!(actual, f64::from_bits(bits).abs());
+                }
+            }
+        }
+        for (i, l) in r.xmm.iter().enumerate() {
+            if let Some(l) = l {
+                assert_eq!(got.cpu.xmm[i], locate(*l).to_le_bytes());
+            }
+        }
+        assert_eq!(
+            got.frame,
+            r.frame
+                .iter()
+                .map(|&(o, w, l)| (o, locate(l).to_le_bytes()[..w as usize].to_vec()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_integer_operations_and_conversions_match_reference() {
+        let mut h = harness();
+        for ty in [Type::I32, Type::I64] {
+            for op in [
+                IntOp::Add,
+                IntOp::Sub,
+                IntOp::And,
+                IntOp::Or,
+                IntOp::Xor,
+                IntOp::Shl,
+                IntOp::Shr,
+                IntOp::Sar,
+                IntOp::Mul,
+                IntOp::MulHighSigned,
+                IntOp::MulHighUnsigned,
+            ] {
+                let (mut f, b, p, _) = start(&[ty, ty]);
+                let v = f.push(b, Op::Int(op, p[0], p[1])).unwrap();
+                finish(&mut f, b, v);
+                for (a, b) in [
+                    (0, 0),
+                    (0xffff_ffff, 37),
+                    (0x8000_0000, 31),
+                    (0x8000_0000_0000_0000, 63),
+                    (u64::MAX, u64::MAX),
+                ] {
+                    let mask = if ty == Type::I32 {
+                        u32::MAX as u128
+                    } else {
+                        u64::MAX as u128
+                    };
+                    compare(&f, &[u128::from(a) & mask, u128::from(b) & mask], &mut h);
+                }
+            }
+            for op in [
+                IntUnary::Not,
+                IntUnary::Neg,
+                IntUnary::ZeroExtend8,
+                IntUnary::ZeroExtend16,
+                IntUnary::SignExtend8,
+                IntUnary::SignExtend16,
+                IntUnary::Low32,
+                IntUnary::High32,
+                IntUnary::Widen,
+            ] {
+                let (mut f, b, p, _) = start(&[ty]);
+                let v = f.push(b, Op::IntUnary(op, p[0])).unwrap();
+                finish(&mut f, b, v);
+                compare(
+                    &f,
+                    &[if ty == Type::I32 {
+                        0xdead_ba98
+                    } else {
+                        0x1234_5678_dead_ba98
+                    }],
+                    &mut h,
+                );
+            }
+        }
+        for signed in [false, true] {
+            for remainder in [false, true] {
+                for proved in [false, true] {
+                    let (mut f, b, p, _) = start(&[Type::I64, Type::I32]);
+                    let v = f
+                        .push(
+                            b,
+                            Op::Div {
+                                signed,
+                                remainder,
+                                dividend: p[0],
+                                divisor: p[1],
+                                proved,
+                            },
+                        )
+                        .unwrap();
+                    finish(&mut f, b, v);
+                    for (n, d) in [(17u64, 3u32), ((-17i64) as u64, 3), (u64::MAX, 0xffff_ffff)] {
+                        if proved && (!signed && n / u64::from(d) > u64::from(u32::MAX)) {
+                            continue;
+                        }
+                        compare(&f, &[u128::from(n), u128::from(d)], &mut h);
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: A64-OPT-4, A64-OPT-6
+    #[test]
+    fn opt_back_floating_vector_bits_and_select_match_reference() {
+        let mut h = harness();
+        for op in [FpOp::Add, FpOp::Sub, FpOp::Mul, FpOp::Div] {
+            let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
+            let v = f.push(b, Op::Fp(op, p[0], p[1])).unwrap();
+            f.push(b, Op::Validate);
+            finish(&mut f, b, v);
+            for (a, b) in [
+                (1.5f64, -2.0f64),
+                (0.0, -0.0),
+                (f64::INFINITY, 1.0),
+                (f64::from_bits(0x7ff8_0000_0000_0123), 1.0),
+            ] {
+                compare(
+                    &f,
+                    &[u128::from(a.to_bits()), u128::from(b.to_bits())],
+                    &mut h,
+                );
+            }
+        }
+        for op in [
+            FpUnary::Neg,
+            FpUnary::Abs,
+            FpUnary::RoundZero,
+            FpUnary::RoundDown,
+        ] {
+            let (mut f, b, p, _) = start(&[Type::F64]);
+            let v = f.push(b, Op::FpUnary(op, p[0])).unwrap();
+            f.push(b, Op::Validate);
+            finish(&mut f, b, v);
+            compare(&f, &[u128::from((-2.7f64).to_bits())], &mut h);
+        }
+        for ty in [Type::I32, Type::I64] {
+            let (mut f, b, p, _) = start(&[ty]);
+            let v = f.push(b, Op::FromInt(p[0])).unwrap();
+            finish(&mut f, b, v);
+            for n in [
+                0,
+                17,
+                0xffff_ffff,
+                1 << 53,
+                (1 << 53) + 1,
+                i64::MAX as u128,
+                i64::MIN as u64 as u128,
+            ] {
+                compare(
+                    &f,
+                    &[if ty == Type::I32 {
+                        n & u128::from(u32::MAX)
+                    } else {
+                        n
+                    }],
+                    &mut h,
+                );
+            }
+        }
+        for wide in [false, true] {
+            let (mut f, b, p, _) = start(&[Type::F64]);
+            let v = f.push(b, Op::ToInt { value: p[0], wide }).unwrap();
+            f.push(b, Op::Validate);
+            finish(&mut f, b, v);
+            for x in [12.7, -8.9, f64::INFINITY, f64::NAN, 1e100] {
+                compare(&f, &[u128::from(x.to_bits())], &mut h);
+            }
+        }
+        for op in [
+            VecOp::And,
+            VecOp::AndNot,
+            VecOp::Or,
+            VecOp::Xor,
+            VecOp::SubI32,
+            VecOp::ShlI64,
+            VecOp::ShrI64,
+            VecOp::LessF64,
+        ] {
+            let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+            let v = f.push(b, Op::Vec(op, p[0], p[1])).unwrap();
+            f.push(b, Op::Validate);
+            finish(&mut f, b, v);
+            for count in [0, 1, 31, 63, 64, 256, u64::MAX] {
+                compare(
+                    &f,
+                    &[0x3ff0_0000_0000_0000_ffff_0000_1234_5678, u128::from(count)],
+                    &mut h,
+                );
+            }
+        }
+        for from in [Type::I32, Type::I64, Type::F64, Type::V128] {
+            for to in [Type::I32, Type::I64, Type::F64, Type::V128] {
+                let (mut f, b, p, _) = start(&[from]);
+                let v = f.push(b, Op::Bits { to, value: p[0] }).unwrap();
+                finish(&mut f, b, v);
+                let bits = match from {
+                    Type::I32 => 123,
+                    Type::V128 => 0x4020_0000_0000_0000_4030_0000_0000_0000,
+                    _ => 0x4030_0000_0000_0000,
+                };
+                compare(&f, &[bits], &mut h);
+            }
+            let (mut f, b, p, _) = start(&[Type::I32, from, from]);
+            let v = f
+                .push(
+                    b,
+                    Op::Select {
+                        cond: p[0],
+                        a: p[1],
+                        b: p[2],
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            for cond in [0, 1] {
+                compare(&f, &[cond, 123, 456], &mut h);
+            }
+        }
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_flags_and_conditions_match_reference() {
+        use iced_x86::ConditionCode as CC;
+        let mut h = harness();
+        for width in [1, 2, 4] {
+            for kind in [
+                FlagKind::Add,
+                FlagKind::AddCarry,
+                FlagKind::Sub,
+                FlagKind::SubBorrow,
+                FlagKind::Logic,
+                FlagKind::Increment,
+                FlagKind::Decrement,
+                FlagKind::Negate,
+                FlagKind::Shl,
+                FlagKind::Shr,
+                FlagKind::Sar,
+                FlagKind::MulSigned,
+            ] {
+                let (mut f, b, p, _) = start(&[Type::I32, Type::I32, Type::Flags]);
+                let v = f
+                    .push(
+                        b,
+                        Op::Flags {
+                            kind,
+                            width,
+                            a: p[0],
+                            b: p[1],
+                            prior: Some(p[2]),
+                        },
+                    )
+                    .unwrap();
+                finish(&mut f, b, v);
+                for (x, y) in [
+                    (0, 0),
+                    (0x7f, 1),
+                    (0xff, 1),
+                    (0x7fff_ffff, 1),
+                    (0x8000_0000, 1),
+                    (0x1234_abcd, 7),
+                    (0xffff_ffff, 8),
+                    (0xa5a5_4321, 16),
+                    (0x8000_0001, 31),
+                    (0xffff_ffff, 32),
+                    (0x1234_5678, 33),
+                ] {
+                    for prior in [0x202, 0xed7] {
+                        compare(&f, &[x, y, prior], &mut h);
+                    }
+                }
+            }
+        }
+        for cc in [
+            CC::o,
+            CC::no,
+            CC::b,
+            CC::ae,
+            CC::e,
+            CC::ne,
+            CC::be,
+            CC::a,
+            CC::s,
+            CC::ns,
+            CC::p,
+            CC::np,
+            CC::l,
+            CC::ge,
+            CC::le,
+            CC::g,
+        ] {
+            let (mut f, b, p, _) = start(&[Type::Flags]);
+            let v = f
+                .push(
+                    b,
+                    Op::Test {
+                        flags: p[0],
+                        cond: cc,
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            for flags in 0..64 {
+                let bits = [0, 2, 4, 6, 7, 11]
+                    .iter()
+                    .enumerate()
+                    .fold(0x202, |v, (i, b)| v | (flags >> i & 1) << b);
+                compare(&f, &[bits], &mut h);
+            }
+        }
+        let (mut f, b, p, _) = start(&[Type::F64, Type::F64, Type::Flags]);
+        let v = f
+            .push(
+                b,
+                Op::Flags {
+                    kind: FlagKind::UnorderedCompare,
+                    width: 8,
+                    a: p[0],
+                    b: p[1],
+                    prior: Some(p[2]),
+                },
+            )
+            .unwrap();
+        f.push(b, Op::Validate);
+        finish(&mut f, b, v);
+        for (x, y) in [
+            (1.0f64, 2.0f64),
+            (2.0, 1.0),
+            (0.0, -0.0),
+            (f64::NAN, 1.0),
+            (f64::from_bits(0x7ff0_0000_0000_0001), 0.0),
+        ] {
+            compare(
+                &f,
+                &[u128::from(x.to_bits()), u128::from(y.to_bits()), 0xed7],
+                &mut h,
+            );
+        }
+    }
+
+    // spec: A64-OPT-4, A64-OPT-6
+    #[test]
+    fn opt_back_failures_recover_the_region_and_restore_fpcr() {
+        let mut h = harness();
+        let (mut f, b, p, entry) = start(&[Type::F64, Type::F64]);
+        f.records[entry.0 as usize].x87.valid = 3;
+        f.records[entry.0 as usize].x87.stack[0] = Some(Location::At(p[0]));
+        f.records[entry.0 as usize].x87.stack[1] = Some(Location::At(p[1]));
+        let v = f.push(b, Op::Fp(FpOp::Mul, p[0], p[1])).unwrap();
+        f.push(b, Op::Validate);
+        finish(&mut f, b, v);
+        for (x, y) in [
+            (1e300f64, 1e300f64),
+            (1e-200, 1e-200),
+            (f64::from_bits(1), 1.0),
+            (f64::MIN_POSITIVE, 0.5),
+        ] {
+            assert_eq!(
+                compare(
+                    &f,
+                    &[u128::from(x.to_bits()), u128::from(y.to_bits())],
+                    &mut h
+                )
+                .record,
+                entry
+            );
+        }
+        for denormal in [false, true] {
+            let (mut f, b, p, entry) = start(&[Type::I64]);
+            f.records[entry.0 as usize]
+                .frame
+                .push((4, 8, Location::At(p[0])));
+            let v = f
+                .push(
+                    b,
+                    Op::X87Load {
+                        bits: p[0],
+                        denormal,
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            for x in [
+                f64::NAN,
+                f64::from_bits(0x7ff0_0000_0000_0001),
+                f64::from_bits(1),
+                -0.0,
+                f64::INFINITY,
+                3.5,
+            ] {
+                compare(&f, &[u128::from(x.to_bits())], &mut h);
+            }
+        }
+        for signed in [false, true] {
+            let (mut f, b, p, entry) = start(&[Type::I64, Type::I32]);
+            f.records[entry.0 as usize].regs[0] = Some(Location::At(p[1]));
+            let v = f
+                .push(
+                    b,
+                    Op::Div {
+                        signed,
+                        remainder: false,
+                        dividend: p[0],
+                        divisor: p[1],
+                        proved: false,
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            for (n, d) in [(123, 0), (u64::MAX, 1), (i64::MIN as u64, u32::MAX)] {
+                compare(&f, &[u128::from(n), u128::from(d)], &mut h);
+            }
+        }
+    }
+
+    // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7, A64-MEM-10
+    #[test]
+    fn opt_back_memory_and_fault_records_use_the_private_alias() {
+        let mut h = harness();
+        for width in [1, 2, 4, 8, 16] {
+            let ty = if width == 16 {
+                Type::V128
+            } else if width == 8 {
+                Type::I64
+            } else {
+                Type::I32
+            };
+            let (mut f, b, p, _) = start(&[Type::I32, ty]);
+            let after = f.record(record(0x1010));
+            f.push(
+                b,
+                Op::Store {
+                    width,
+                    addr: p[0],
+                    value: p[1],
+                    after,
+                },
+            );
+            let loaded = f
+                .push(
+                    b,
+                    Op::Load {
+                        ty,
+                        width,
+                        addr: p[0],
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, loaded);
+            let input = 0x1234_5678_9abc_def0_ffff_eeee_dddd_cccc;
+            compare(&f, &[u128::from(DATA), input], &mut h);
+            assert_eq!(
+                h.emu.read(WINDOW_BASE + u64::from(DATA), width as usize),
+                input.to_le_bytes()[..width as usize]
+            );
+        }
+        for store in [false, true] {
+            let (mut f, b, p, entry) = start(&[Type::I32, Type::I64]);
+            f.records[entry.0 as usize].regs[7] = Some(Location::At(p[0]));
+            f.records[entry.0 as usize]
+                .frame
+                .push((-8, 8, Location::At(p[1])));
+            let value = if store {
+                let after = f.record(record(0x1010));
+                f.push(
+                    b,
+                    Op::Store {
+                        width: 8,
+                        addr: p[0],
+                        value: p[1],
+                        after,
+                    },
+                );
+                p[1]
+            } else {
+                f.push(
+                    b,
+                    Op::Load {
+                        ty: Type::I64,
+                        width: 8,
+                        addr: p[0],
+                    },
+                )
+                .unwrap()
+            };
+            finish(&mut f, b, value);
+            let got = compare(&f, &[0x80000, 0xdead_beef], &mut h);
+            assert_eq!(got.record, entry);
+            assert_eq!(got.lowered.sites[0].1.opt_record, Some(entry.0));
+        }
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_loop_parameters_countdown_and_head_exit() {
+        let (mut f, head, p, entry) = start(&[Type::I32, Type::I32]);
+        f.records[entry.0 as usize].regs[0] = Some(Location::At(p[0]));
+        f.records[entry.0 as usize].regs[1] = Some(Location::At(p[1]));
+        f.records[entry.0 as usize].refund = 3;
+        let one = f.push(head, Op::Constant(Type::I32, 1)).unwrap();
+        let next = f.push(head, Op::Int(IntOp::Sub, p[0], one)).unwrap();
+        let total = f.push(head, Op::Int(IntOp::Add, p[1], p[0])).unwrap();
+        let body = f.block(None);
+        let done = f.block(None);
+        f.end(
+            head,
+            End::Branch {
+                cond: next,
+                taken: Target {
+                    block: body,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+                fall: Target {
+                    block: done,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+            },
+        );
+        f.end(
+            body,
+            End::Jump(Target {
+                block: head,
+                args: vec![next, total],
+                charge: 3,
+            }),
+        );
+        finish(&mut f, done, total);
+        let mut h = harness();
+        let full = compare(&f, &[5, 0], &mut h);
+        assert_eq!(full.cpu.regs[0], 15);
+        assert_eq!(full.countdown, 10000 - 15);
+        for recall in [1, 2] {
+            let cut = h.run_opt(&f, &[5, 0], 7, recall, 0);
+            assert_eq!(cut.record, entry);
+            assert_eq!(cut.cpu.regs[0..2], [3, 9]);
+            assert_eq!(7u64.wrapping_sub(cut.countdown), 6);
+        }
+        f.head_exit = Some(head);
+        let head_stop = h.run_opt(&f, &[5, 0], 100, 0, 2);
+        assert_eq!(head_stop.record, entry);
+        assert_eq!(head_stop.cpu.regs[0..2], [3, 9]);
+        assert_eq!(head_stop.countdown, 94);
+        f.head_exit = None;
+        let refill = h.run_opt(&f, &[5, 0], 1, 0, 0);
+        assert_eq!(refill.cpu.regs[0], 15);
+        assert_ne!(refill.completed, 0);
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_spills_cold_values_and_c1_recipes() {
+        let mut h = harness();
+        let (mut f, b, p, entry) = start(&[Type::I64; 36]);
+        for (i, &value) in p.iter().take(8).enumerate() {
+            f.records[entry.0 as usize].regs[i] = Some(Location::At(value));
+        }
+        let mut result = p[0];
+        for &v in &p[1..] {
+            result = f.push(b, Op::Int(IntOp::Add, result, v)).unwrap();
+        }
+        finish(&mut f, b, result);
+        let params: Vec<_> = (1..=36).collect();
+        let got = compare(&f, &params, &mut h);
+        assert_eq!(got.cpu.regs[0], 666);
+        assert!(got.lowered.spill_cells > 36);
+        assert!(got.spills.iter().any(|&v| v > 0));
+        // Check a failure while all entry values must remain recoverable.
+        let (mut f, b, p, entry) = start(&[Type::I64; 36]);
+        f.records[entry.0 as usize].frame = p
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (i as i32 * 8, 8, Location::At(p)))
+            .collect();
+        let zero = f.push(b, Op::Constant(Type::I32, 0)).unwrap();
+        let v = f
+            .push(
+                b,
+                Op::Div {
+                    signed: false,
+                    remainder: false,
+                    dividend: p[0],
+                    divisor: zero,
+                    proved: false,
+                },
+            )
+            .unwrap();
+        finish(&mut f, b, v);
+        compare(&f, &params, &mut h);
+        let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
+        let v = f.push(b, Op::Fp(FpOp::Div, p[0], p[1])).unwrap();
+        f.push(b, Op::Validate);
+        let exit = finish(&mut f, b, v);
+        f.records[exit.0 as usize].x87.c1 = Some(Location::Recipe(Recipe::C1 {
+            op: FpOp::Div,
+            a: p[0],
+            b: p[1],
+        }));
+        f.records[exit.0 as usize].x87.top = 3;
+        let got = compare(
+            &f,
+            &[u128::from(1f64.to_bits()), u128::from(10f64.to_bits())],
+            &mut h,
+        );
+        assert_eq!(got.cpu.x87.status >> 9 & 1, 1);
+        assert_eq!(got.registers.x[28], WINDOW_BASE);
+        assert_eq!(got.registers.x[29], CONTEXT);
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_edges_refund_and_copy_parameters_at_a_nonentry_head() {
+        let (mut f, entry, p, _) = start(&[Type::I32, Type::I32, Type::I32]);
+        let mut r = record(0x1100);
+        r.refund = 3;
+        let head_record = f.record(r);
+        let head = f.block(Some(Head {
+            record: head_record,
+        }));
+        let n = f.param(head, Type::I32);
+        let x = f.param(head, Type::I32);
+        let y = f.param(head, Type::I32);
+        f.records[head_record.0 as usize].regs[0] = Some(Location::At(n));
+        f.records[head_record.0 as usize].regs[1] = Some(Location::At(x));
+        f.records[head_record.0 as usize].regs[2] = Some(Location::At(y));
+        f.records[head_record.0 as usize].x87.ip = Some(Location::At(x));
+        f.records[head_record.0 as usize].x87.opcode = Some(Location::At(y));
+        f.end(
+            entry,
+            End::Jump(Target {
+                block: head,
+                args: p.clone(),
+                charge: 3,
+            }),
+        );
+        let one = f.push(head, Op::Constant(Type::I32, 1)).unwrap();
+        let next = f.push(head, Op::Int(IntOp::Sub, n, one)).unwrap();
+        let flags = f
+            .push(
+                head,
+                Op::Flags {
+                    kind: FlagKind::Sub,
+                    width: 4,
+                    a: n,
+                    b: one,
+                    prior: None,
+                },
+            )
+            .unwrap();
+        let cond = f
+            .push(
+                head,
+                Op::Test {
+                    flags,
+                    cond: iced_x86::ConditionCode::a,
+                },
+            )
+            .unwrap();
+        let done = f.block(None);
+        f.end(
+            head,
+            End::Branch {
+                cond,
+                taken: Target {
+                    block: head,
+                    args: vec![next, y, x],
+                    charge: 3,
+                },
+                fall: Target {
+                    block: done,
+                    args: Vec::new(),
+                    charge: -2,
+                },
+            },
+        );
+        let result = f.push(done, Op::Int(IntOp::Add, x, y)).unwrap();
+        finish(&mut f, done, result);
+        let mut h = harness();
+        compare(&f, &[3, 0x1234, 0x5678], &mut h);
+        f.head_exit = Some(head);
+        let cut = h.run_opt(&f, &[3, 0x1234, 0x5678], 100, 0, 2);
+        assert_eq!(cut.record, head_record);
+        assert_eq!(cut.cpu.regs[0..3], [2, 0x5678, 0x1234]);
+        assert_eq!(cut.cpu.x87.ip, 0x5678);
+        assert_eq!(cut.cpu.x87.opcode, 0x1234);
+        assert_eq!(100 - cut.countdown, 3);
+        let deferred = h.run_opt(&f, &[3, 0x1234, 0x5678], 1, 1, 0);
+        assert_eq!(deferred.record, head_record);
+        assert_eq!(deferred.cpu.regs[0..3], [2, 0x5678, 0x1234]);
+    }
+
+    // spec: A64-OPT-4, A64-OPT-6
+    #[test]
+    fn opt_back_failure_after_store_recovers_the_new_region() {
+        let (mut f, b, p, _) = start(&[Type::I32, Type::I64, Type::F64, Type::F64]);
+        let mut r = record(0x1010);
+        r.regs[1] = Some(Location::At(p[1]));
+        r.frame.push((8, 8, Location::At(p[1])));
+        let after = f.record(r);
+        f.push(
+            b,
+            Op::Store {
+                width: 8,
+                addr: p[0],
+                value: p[1],
+                after,
+            },
+        );
+        let v = f.push(b, Op::Fp(FpOp::Mul, p[2], p[3])).unwrap();
+        f.push(b, Op::Validate);
+        finish(&mut f, b, v);
+        let mut h = harness();
+        let got = compare(
+            &f,
+            &[
+                u128::from(DATA),
+                0x1234_abcd,
+                u128::from(1e300f64.to_bits()),
+                u128::from(1e300f64.to_bits()),
+            ],
+            &mut h,
+        );
+        assert_eq!(got.record, after);
+        assert_eq!(
+            h.emu.read(WINDOW_BASE + u64::from(DATA), 8),
+            0x1234_abcdu64.to_le_bytes()
+        );
+    }
+}
