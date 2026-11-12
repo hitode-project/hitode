@@ -484,6 +484,13 @@ pub trait TrapHandler {
         TrapAction::Continue
     }
 
+    /// The share of a frame's splittable loop work that running it in blocks
+    /// on other threads should save (A64-TR-9), 1 when a loop's blocks are
+    /// worth any idle thread, or 0 when the frame meets its deadline.
+    fn split_share(&self) -> f32 {
+        0.0
+    }
+
     /// Shared service storage retained by the execution owner for this run.
     fn body_services(&self) -> crate::body::Services {
         crate::body::Services::default()
@@ -567,6 +574,8 @@ pub struct Completion<C> {
     pub context: C,
     pub retired: u64,
     pub elapsed: Duration,
+    /// Time other threads spent on its blocks, beyond `elapsed`.
+    pub helpers: Duration,
     /// An early exit that needs the ordinary owner path.
     pub requires_owner: bool,
 }

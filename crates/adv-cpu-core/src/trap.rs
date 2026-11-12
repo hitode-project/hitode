@@ -18,6 +18,13 @@ pub trait ExecutionTrap {
         Ok(false)
     }
 
+    /// The share of a frame's splittable loop work that running it in blocks
+    /// on other threads should save (A64-TR-9), 1 when a loop's blocks are
+    /// worth any idle thread, or 0 when the frame meets its deadline.
+    fn split_share(&self) -> f32 {
+        0.0
+    }
+
     /// Shared service storage retained by the execution owner for this run.
     fn body_services(&self) -> crate::body::Services {
         crate::body::Services::default()

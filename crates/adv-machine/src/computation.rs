@@ -125,7 +125,7 @@ impl<B: Backend> Machine<B> {
         self.computation
             .offered
             .retain(|&id| self.sys.context(id).is_ready());
-        if self.computation.offered.len() >= 2 {
+        if !self.computation.offered.is_empty() {
             let timer = (!self.sys.clock.is_virtual())
                 .then(|| self.sys.next_deadline())
                 .flatten()
@@ -187,6 +187,17 @@ fn run_batch<C>(
     delivery: Option<u64>,
     deadline: Option<Instant>,
 ) -> u32 {
+    if let [id] = *offered {
+        // A single context may split its loop (A64-TR-9).
+        let context = regs[id as usize].as_ref().expect("held snapshot");
+        return match jobs.run_local(id, context) {
+            Some(done) => {
+                complete(sys, regs, done, true);
+                1
+            }
+            None => 0,
+        };
+    }
     let mut pending = [true; TEAM];
     let pending = &mut pending[..offered.len()];
     let mut active = 0;
@@ -274,6 +285,7 @@ fn complete<C>(sys: &mut Sys, regs: &mut [Option<C>], done: Completion<C>, local
     sys.wakes.mark_turn(id, false);
     let ns = done.elapsed.as_nanos() as u64;
     if local {
+        sys.load.computed(done.elapsed, done.helpers);
         sys.scheduling
             .context_run(id as usize, done.elapsed, 0, true);
         sys.stats.total.cpu_runs += 1;
@@ -427,6 +439,7 @@ mod tests {
             context: context + 1,
             retired: 1,
             elapsed: Duration::from_micros(1),
+            helpers: Duration::ZERO,
             requires_owner,
         }
     }
