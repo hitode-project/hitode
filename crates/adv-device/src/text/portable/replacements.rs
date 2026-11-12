@@ -51,6 +51,10 @@ fn claims_cjk(codepages: u32) -> bool {
         .any(|&(encoding, _)| codepages & codepage(encoding) != 0)
 }
 
+pub(super) fn covers_cjk(font: &FontRef<'_>, codepages: u32) -> bool {
+    claims_cjk(mapped_codepages(codepages, Some(font)))
+}
+
 /// The claimed code pages whose sample character the face maps.
 fn mapped_codepages(mut codepages: u32, font: Option<&FontRef<'_>>) -> u32 {
     for (encoding, sample) in SAMPLES {

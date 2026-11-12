@@ -213,9 +213,8 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-FONT-9 Cell metrics of CJK replacements
 
-**Rule**: Automatic substitutes for CJK families with a Windows reference cell MUST use that cell for sizing, metrics, and drawing. A substitute with an ideographic em box MUST align that box to the reference in horizontal drawing. Exact matches and explicit host choices MUST use the selected face's cell.
+**Rule**: Font cells and glyph baselines MUST use the selected face's own metrics. Automatic CJK substitutes MUST use their one-em typographic box when it is enclosed by a larger Windows cell. Exact matches and explicit host choices MUST use the selected face's Windows cell.
 **Verification**: Test
-**Basis**: Windows 11 GDI metrics for the same requested family and size
 
 ## Optical media
 

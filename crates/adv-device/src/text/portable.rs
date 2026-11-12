@@ -390,7 +390,11 @@ impl Backend {
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
         let substitute = request.default.is_none() && !family_matches(&db, &face.info, &name);
-        let cell = substitute.then(|| replacement_cell(&name)).flatten();
+        let cell = if substitute && !name.is_empty() {
+            ideographic_ascent(&face.font()?)
+        } else {
+            None
+        };
         let mapped = replacement
             .filter(|_| substitute)
             .map(|target| FontRequest {
@@ -574,7 +578,7 @@ impl Backend {
                     let cell = forced
                         .as_ref()
                         .filter(|_| discovery.profile.is_none())
-                        .and_then(|name| replacement_cell(name));
+                        .and_then(|_| ideographic_ascent(&font));
                     let (_, _, metrics) = font_metrics(&font, &request, cell)?;
                     let unscaled = font.metrics(Size::unscaled(), LocationRef::default());
                     let (asc, desc) = cell_units(&font, f32::from(unscaled.units_per_em), cell);
@@ -1167,70 +1171,31 @@ fn location(font: &FontRef<'_>, request: &FontRequest) -> Location {
         ("slnt", if request.italic { -12.0 } else { 0.0 }),
     ])
 }
-#[derive(Clone, Copy)]
-struct ReplacementCell {
-    ascent: f32,
-    descent: f32,
-    leading: f32,
-    ideographic_ascent: Option<f32>,
-}
-
-impl ReplacementCell {
-    fn glyph_offset(self, font: &FontRef<'_>, em: f32) -> Option<f32> {
-        let target = self.ideographic_ascent?;
-        let os2 = font.os2().ok()?;
-        let upem = f32::from(font.head().ok()?.units_per_em());
-        let ascent = f32::from(os2.s_typo_ascender());
-        let descent = f32::from(os2.s_typo_descender());
-        // The CJK typographic bounds enclose one ideographic em. Translate
-        // the outline in whole pixels so the hinter's grid fit is preserved.
-        (ascent - descent == upem).then(|| ((target - ascent / upem) * em).round())
+fn ideographic_ascent(font: &FontRef<'_>) -> Option<f32> {
+    let os2 = font.os2().ok()?;
+    let upem = f32::from(font.head().ok()?.units_per_em());
+    let ascent = f32::from(os2.s_typo_ascender());
+    let descent = -f32::from(os2.s_typo_descender());
+    let win_ascent = f32::from(os2.us_win_ascent());
+    let win_descent = f32::from(os2.us_win_descent());
+    // The Windows bounds can pad both sides of a CJK face's one-em
+    // typographic box. Do not borrow that padding for a missing family.
+    if ascent + descent != upem
+        || ascent <= 0.0
+        || descent < 0.0
+        || win_ascent < ascent
+        || win_descent < descent
+        || win_ascent + win_descent == upem
+        || !replacements::covers_cjk(font, os2.ul_code_page_range_1().unwrap_or(0))
+    {
+        return None;
     }
+    Some(ascent)
 }
 
-fn replacement_cell(name: &str) -> Option<ReplacementCell> {
-    let name = name.to_lowercase();
-    let family = WINDOWS_FAMILIES
-        .iter()
-        .find(|family| family.names().any(|alias| alias.to_lowercase() == name))
-        .map_or(name.as_str(), |family| family.0);
-    // Use the requested Windows family's cell, in ems. For example, PingFang
-    // leaves extra room on both sides of its ideographs; using that room in a
-    // SimSun cell pushes the text down and increases the line height.
-    let (ascent, descent, leading, ideographic_ascent) = match family {
-        "SimSun" | "NSimSun" | "SimHei" | "fangsong" | "仿宋" | "kaiti" | "楷体" => (
-            220.0 / 256.0,
-            36.0 / 256.0,
-            36.0 / 256.0,
-            Some(220.0 / 256.0),
-        ),
-        "MS Gothic" | "MS PGothic" | "MS UI Gothic" | "MS Mincho" | "MS PMincho" | "MingLiU"
-        | "PMingLiU" => (220.0 / 256.0, 36.0 / 256.0, 0.0, Some(220.0 / 256.0)),
-        "Meiryo" => (2171.0 / 2048.0, 901.0 / 2048.0, 0.0, Some(1798.0 / 2048.0)),
-        "Meiryo UI" => (2171.0 / 2048.0, 430.0 / 2048.0, 0.0, Some(1798.0 / 2048.0)),
-        "mingliu-extb" | "pmingliu-extb" => (
-            820.0 / 1024.0,
-            204.0 / 1024.0,
-            204.0 / 1024.0,
-            Some(820.0 / 1024.0),
-        ),
-        "microsoft jhenghei" | "microsoft jhenghei ui" | "微軟正黑體" => {
-            (1.0, 0.25, 0.0, Some(1823.0 / 2048.0))
-        }
-        "dengxian" | "等线" => (1659.0 / 2048.0, 475.0 / 2048.0, 0.0, None),
-        _ => return None,
-    };
-    Some(ReplacementCell {
-        ascent,
-        descent,
-        leading,
-        ideographic_ascent,
-    })
-}
-
-fn cell_units(font: &FontRef<'_>, upem: f32, replacement: Option<ReplacementCell>) -> (f32, f32) {
-    if let Some(cell) = replacement {
-        return (cell.ascent * upem, cell.descent * upem);
+fn cell_units(font: &FontRef<'_>, upem: f32, ideographic_ascent: Option<f32>) -> (f32, f32) {
+    if let Some(ascent) = ideographic_ascent {
+        return (ascent, upem - ascent);
     }
     if let Ok(os2) = font.os2() {
         let (asc, desc) = (os2.us_win_ascent() as f32, os2.us_win_descent() as f32);
@@ -1244,12 +1209,12 @@ fn cell_units(font: &FontRef<'_>, upem: f32, replacement: Option<ReplacementCell
 fn font_metrics(
     font: &FontRef<'_>,
     request: &FontRequest,
-    replacement: Option<ReplacementCell>,
+    ideographic_ascent: Option<f32>,
 ) -> Result<(f32, f32, TextMetrics), TextError> {
     let loc = location(font, request);
     let units = font.metrics(Size::unscaled(), &loc);
     let upem = f32::from(units.units_per_em);
-    let (asc, desc) = cell_units(font, upem, replacement);
+    let (asc, desc) = cell_units(font, upem, ideographic_ascent);
     if upem == 0.0 || asc + desc <= 0.0 {
         return Err(TextError::Font("font has invalid em/cell metrics".into()));
     }
@@ -1273,7 +1238,7 @@ fn font_metrics(
         1.0
     };
     let orientation = request.glyph_angle.rem_euclid(1800);
-    let rotated_truetype = orientation != 0 && replacement.is_none() && font.glyf().is_ok();
+    let rotated_truetype = orientation != 0 && font.glyf().is_ok();
     let ascent = (asc * scale).round() as i32;
     let descent = (desc * scale).round() as i32;
     let (ascent, descent) = if rotated_truetype {
@@ -1288,8 +1253,10 @@ fn font_metrics(
                 (-f32::from(head.y_min()) * scale).round() as i32 + 1,
             )
         }
-    } else if request.height > 0 && replacement.is_none() {
+    } else if request.height > 0 {
         (ascent, request.height - ascent)
+    } else if ideographic_ascent.is_some() {
+        (ascent, em.round() as i32 - ascent)
     } else {
         (ascent, descent)
     };
@@ -1304,10 +1271,7 @@ fn font_metrics(
         } else {
             internal_leading.max(0)
         },
-        external_leading: replacement
-            .map_or(m.leading, |cell| cell.leading * em)
-            .max(0.0)
-            .round() as i32,
+        external_leading: m.leading.max(0.0).round() as i32,
         average_width: (average * xscale).round().max(1.0) as i32,
         maximum_width: (m.max_width.unwrap_or(em).max(em) * xscale).ceil() as i32,
         weight: if request.weight == 0 {
@@ -1380,7 +1344,6 @@ pub(super) struct Font {
     hints: Mutex<BTreeMap<(ID, bool), HintingInstance>>,
     em: f32,
     xscale: f32,
-    glyph_offset: f32,
     metrics: TextMetrics,
 }
 impl Font {
@@ -1391,14 +1354,10 @@ impl Font {
         candidates: Vec<ID>,
         primary: Arc<Face>,
         profile: Option<Arc<profile::Loaded>>,
-        cell: Option<ReplacementCell>,
+        cell: Option<f32>,
     ) -> Result<Self, TextError> {
         let font = primary.font()?;
         let (em, xscale, mut metrics) = font_metrics(&font, request, cell)?;
-        let glyph_offset = cell
-            .filter(|_| !request.face.starts_with('@'))
-            .and_then(|cell| cell.glyph_offset(&font, em))
-            .unwrap_or(0.0);
         metrics.encoding = realized(
             request.encoding,
             backend.ansi.unwrap_or(Encoding::Latin),
@@ -1427,7 +1386,6 @@ impl Font {
             hints: Mutex::default(),
             em,
             xscale,
-            glyph_offset,
             metrics,
         })
     }
@@ -1923,11 +1881,6 @@ impl Font {
             transform: Transform::IDENTITY,
             xscale: self.xscale,
             italic,
-            y_offset: if face.info.id == self.primary.info.id {
-                self.glyph_offset
-            } else {
-                0.0
-            },
         };
         if request.hinted {
             let mono = request.format == GlyphFormat::Monochrome
@@ -2210,14 +2163,13 @@ struct Pen {
     transform: Transform,
     xscale: f32,
     italic: bool,
-    y_offset: f32,
 }
 impl Pen {
     fn point(&self, x: f32, y: f32) -> Vector {
         let (x, y) = transform_point(
             self.transform,
             (x + if self.italic { y * 0.21256 } else { 0.0 }) * self.xscale,
-            y + self.y_offset,
+            y,
         );
         Vector::new(x, y)
     }
