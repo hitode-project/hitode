@@ -991,13 +991,10 @@ impl Native {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
                 self.candidates
                     .retain(|&inside| !(candidate < inside && inside < end));
-                if self.candidates.len() == 8 {
-                    self.candidates.remove(0);
-                }
                 self.candidates.push(candidate);
-                // Incoming direct links and already-inlined fall-through paths
-                // may bypass the new boundary. Rebuild them between entries.
-                self.clear();
+                // Units inlining the new boundary or a candidate it encloses,
+                // or linking to them, come from these pages.
+                self.cut(candidate, end);
                 self.probed = Some(probed);
             } else {
                 self.rejected_candidates.insert(candidate);
@@ -1388,7 +1385,7 @@ impl Native {
         self.runtime.shadow = self.shadow.top();
     }
 
-    /// Units must not run past any stop; a new one clears them all.
+    /// Units must not run past any stop; a new one cuts those that could.
     fn observe_stop(&mut self, stop: u32) {
         if self.stops.contains(&stop) {
             return;
@@ -1400,7 +1397,23 @@ impl Native {
                 std::sync::atomic::Ordering::Release,
             );
         }
-        self.clear();
+        self.cut(stop, stop.saturating_add(1));
+    }
+
+    /// Drops the units decoded from the pages of `start..end`, which hold
+    /// every unit whose trace runs through a new boundary there, and the
+    /// unit starting at it, whose dropping restores the links to it.
+    fn cut(&mut self, start: u32, end: u32) {
+        let end = u64::from(end).max(u64::from(start) + 1);
+        let mut dropped = false;
+        for page in (u64::from(start & !0xfff)..end).step_by(4096) {
+            for eip in self.pages.remove(&(page as u32)).unwrap_or_default() {
+                dropped |= self.drop_unit(eip);
+            }
+        }
+        if dropped {
+            self.forget_dynamic();
+        }
     }
 
     /// Clears the cache as a whole (A64-CTL-1).
@@ -2049,6 +2062,46 @@ mod tests {
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 1));
         assert_eq!(cpu.regs[0], 0x1234_5678);
         assert_eq!(cpu.eip, 0x1003);
+    }
+
+    // spec: A64-CTL-9
+    #[test]
+    fn a_new_stop_cuts_only_the_units_from_its_page() {
+        use adv_cpu_core::memory::{EXEC, READ};
+
+        let (mut memory, mut native) = native();
+        memory.map(0x1000, 0x2000, READ | WRITE).unwrap();
+        // 0x1000: mov eax, 1; jmp 0x2000
+        memory
+            .write(0x1000, &[0xb8, 1, 0, 0, 0, 0xe9, 0xf6, 0x0f, 0, 0])
+            .unwrap();
+        // 0x1800: mov ebx, 5; int3
+        memory.write(0x1800, &[0xbb, 5, 0, 0, 0, 0xcc]).unwrap();
+        // 0x2000: add eax, 2; inc eax; int3
+        memory
+            .write(0x2000, &[0x83, 0xc0, 0x02, 0x40, 0xcc])
+            .unwrap();
+        memory.protect(0x1000, 0x2000, READ | EXEC).unwrap();
+        native.first_visits = false;
+        let to = |native: &mut Native, memory: &mut Memory, eip, stop| {
+            let mut cpu = cpu(eip, 0x8000, 0);
+            while cpu.eip != stop {
+                native
+                    .run(&mut cpu, memory, stop, 100, std::ptr::null_mut())
+                    .unwrap();
+            }
+            cpu
+        };
+        to(&mut native, &mut memory, 0x1800, 0x1805);
+        assert_eq!(to(&mut native, &mut memory, 0x1000, 0x2004).regs[0], 4);
+        let (clears, kept) = (native.diagnostics.clears, native.unit_address(0x1800));
+        assert!(kept.is_some());
+
+        // The unit through 0x2003 must end there now; the other page keeps its unit.
+        let cpu = to(&mut native, &mut memory, 0x1000, 0x2003);
+        assert_eq!(cpu.regs[0], 3);
+        assert_eq!(native.unit_address(0x1800), kept);
+        assert_eq!(native.diagnostics.clears, clears);
     }
 
     // spec: A64-MEM-1, A64-MEM-5, A64-MEM-9
