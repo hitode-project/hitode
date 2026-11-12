@@ -8,7 +8,7 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 ### GFX-DDRAW-1 Lock and clipper state
 
-**Rule**: WRITEONLY Lock and Unlock MUST retain shared busy-state and write-version semantics. Primary Blt MUST refresh a window clipper's geometry after window movement without requiring reattachment.
+**Rule**: WRITEONLY Lock and Unlock MUST retain shared busy-state and write-version semantics. Primary Blt MUST refresh a window clipper's geometry after window movement without requiring reattachment. GetClipper MUST return the attached clipper with a new reference, or DDERR_NOCLIPPERATTACHED without writing the output.
 **Verification**: Test
 
 ### GFX-DDRAW-2 Device identity
@@ -31,6 +31,18 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Rule**: The virtual adapter MUST complete WaitForVerticalBlank without waiting for host scanout. Event requests MUST return DDERR_UNSUPPORTED.
 **Verification**: Review — the return depends only on the event flag.
 **Basis**: Wine 11 DirectDraw
+
+### GFX-DDRAW-6 Exclusive mode and primaries
+
+**Rule**: A primary surface MUST outlive the DirectDraw object that created it. Exclusive fullscreen mode of another object MUST detach that primary, whose IsLost then returns DDERR_SURFACELOST. The new object MUST then set display modes and create its own primary.
+**Verification**: Test
+**Basis**: Measured on Windows 11
+
+### GFX-DDRAW-7 Clip lists
+
+**Rule**: A clip list MUST limit Blt and color fills to its rectangles, mapping the source onto the whole destination rectangle. That destination MAY extend past the surface. BltFast to a surface with a clipper MUST return DDERR_BLTFASTCANTCLIP, and window clippers MUST refuse clip lists.
+**Verification**: Test
+**Basis**: Measured on Windows 11
 
 ## Native programmable execution
 

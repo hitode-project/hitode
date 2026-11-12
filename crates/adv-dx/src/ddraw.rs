@@ -2,7 +2,7 @@
 //! IDirectDrawClipper objects. Objects and vtables live in guest memory from the surface
 //! arena, so a guest can read or patch them; every vtable slot points at a registry thunk.
 //! Pixels belong to the shared surface store; assembly lends a memory DC over them.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
 use adv_device::surface::{
@@ -48,6 +48,10 @@ pub mod api {
     pub const INITIALIZE: u32 = 231;
     pub const SET_COLOR_KEY: u32 = 232;
     pub const GET_COLOR_KEY: u32 = 233;
+    pub const GET_CLIPPER: u32 = 234;
+    pub const CLIPPER_SET_CLIP_LIST: u32 = 235;
+    pub const GET_BLT_STATUS: u32 = 236;
+    pub const GET_FLIP_STATUS: u32 = 237;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -170,6 +174,11 @@ const IID_CLIPPER: [u8; 16] = [
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
+const SURFACE_LOST: u32 = 0x887601c2;
+const NO_CLIPPER_ATTACHED: u32 = 0x88760238;
+const INVALID_CLIP_LIST: u32 = 0x8876006e;
+const CLIPPER_IS_USING_HWND: u32 = 0x88760237;
+const BLT_FAST_CANT_CLIP: u32 = 0x8876023e;
 const NO_COLOR_KEY: u32 = 0x887600d7;
 /// DDCKEY_DESTBLT, DDCKEY_DESTOVERLAY, DDCKEY_SRCBLT and DDCKEY_SRCOVERLAY.
 const KEY_KINDS: [u32; 4] = [2, 4, 8, 0x10];
@@ -191,12 +200,19 @@ pub struct DirectDraw {
     /// (surface, DDCKEY kind) -> inclusive raw pixel range.
     color_keys: BTreeMap<(u32, u32), (u32, u32)>,
     clipper_origins: BTreeMap<u32, (i32, i32)>,
+    /// Explicit clip lists by clipper; Blt writes only inside these rectangles.
+    clip_lists: BTreeMap<u32, Vec<Rect>>,
     /// Call id -> guest entry; 400 + slot and 500 + slot are the device and surface
     /// vtables' diagnostic entries.
     entries: BTreeMap<u32, u32>,
     attached: BTreeMap<u32, u32>,
     /// Each parent attachment retains one reference in the common COM table.
     attached_refs: BTreeMap<u32, u32>,
+    /// The live DirectDraw object (its modern interface) that created the
+    /// primary surface; none once that object is gone.
+    primary_owner: Option<u32>,
+    /// Surfaces lost to another DirectDraw object's exclusive mode.
+    lost: BTreeSet<u32>,
 }
 
 impl DirectDraw {
@@ -215,9 +231,12 @@ impl DirectDraw {
             surface_clippers: BTreeMap::new(),
             color_keys: BTreeMap::new(),
             clipper_origins: BTreeMap::new(),
+            clip_lists: BTreeMap::new(),
             entries,
             attached: BTreeMap::new(),
             attached_refs: BTreeMap::new(),
+            primary_owner: None,
+            lost: BTreeSet::new(),
         }
     }
 
@@ -300,13 +319,16 @@ impl DirectDraw {
                 (7, api::BLT_FAST),
                 (11, api::FLIP),
                 (12, api::GET_ATTACHED),
+                (13, api::GET_BLT_STATUS),
                 (17, api::SURFACE_DC),
+                (18, api::GET_FLIP_STATUS),
                 (21, api::GET_PIXEL_FORMAT),
                 (22, api::GET_DESC),
                 (24, api::IS_LOST),
                 (25, api::LOCK),
                 (26, api::SURFACE_RELEASE_DC),
                 (27, api::RESTORE),
+                (15, api::GET_CLIPPER),
                 (16, api::GET_COLOR_KEY),
                 (28, api::SET_CLIPPER),
                 (29, api::SET_COLOR_KEY),
@@ -387,6 +409,7 @@ impl DirectDraw {
                     (2, api::RELEASE),
                     (4, api::CLIPPER_GET_HWND),
                     (5, api::CLIPPER_INITIALIZE),
+                    (7, api::CLIPPER_SET_CLIP_LIST),
                     (8, api::CLIPPER_SET_HWND),
                 ] {
                     if slot >= 3 || !self.entries.contains_key(&600) {
@@ -515,6 +538,13 @@ impl DirectDraw {
         }
         Ok(0)
     }
+    /// The clip list of the clipper attached to surface `sid`, if it has one.
+    fn clip_list(&self, sid: u32) -> Option<Vec<Rect>> {
+        self.surface_clippers
+            .get(&sid)
+            .and_then(|clipper| self.clip_lists.get(clipper))
+            .cloned()
+    }
     fn surface_id(&self, objects: &Objects, object: u32) -> Option<u32> {
         match self.com?.get::<ComState>(objects, object)?.kind {
             Kind::Surface(id) => Some(id),
@@ -539,8 +569,15 @@ impl DirectDraw {
                 surfaces.release(pointer, 16);
                 self.clipper_windows.remove(&pointer);
                 self.clipper_origins.remove(&pointer);
+                self.clip_lists.remove(&pointer);
+            }
+            if matches!(destroyed.value.kind, Kind::Device)
+                && self.primary_owner == Some(destroyed.value.modern)
+            {
+                self.primary_owner = None;
             }
             if let Kind::Surface(sid) = destroyed.value.kind {
+                self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
                 self.attached.remove(&sid);
                 if let Some(back) = self.attached_refs.remove(&sid) {
@@ -590,6 +627,55 @@ fn desc<P: Presenter>(surfaces: &Surfaces<P>, id: u32, pixels: u32) -> [u8; 124]
         d[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
     }
     d
+}
+
+/// A destination rectangle that may extend past the surface, shifted by a
+/// window clipper's `origin`; the whole surface when `p` is null.
+fn unbounded<P: Presenter>(
+    surfaces: &Surfaces<P>,
+    id: u32,
+    p: u32,
+    (ox, oy): (i32, i32),
+    m: &dyn SurfaceMemory,
+) -> Result<Option<BlitRect>, String> {
+    if p == 0 {
+        let r = surfaces[id].rect();
+        return Ok(Some(BlitRect {
+            x: 0,
+            y: 0,
+            w: r.w,
+            h: r.h,
+        }));
+    }
+    let (left, top, right, bottom) = (
+        i64::from(m.u32(p)? as i32) - i64::from(ox),
+        i64::from(m.u32(p + 4)? as i32) - i64::from(oy),
+        i64::from(m.u32(p + 8)? as i32) - i64::from(ox),
+        i64::from(m.u32(p + 12)? as i32) - i64::from(oy),
+    );
+    Ok((right > left && bottom > top).then(|| BlitRect {
+        x: left,
+        y: top,
+        w: (right - left) as u32,
+        h: (bottom - top) as u32,
+    }))
+}
+
+/// The part of `dr` inside `clip`.
+fn written(dr: BlitRect, clip: Rect) -> Rect {
+    let left = dr.x.max(i64::from(clip.x));
+    let top = dr.y.max(i64::from(clip.y));
+    let right = (dr.x + i64::from(dr.w)).min(i64::from(clip.x + clip.w));
+    let bottom = (dr.y + i64::from(dr.h)).min(i64::from(clip.y + clip.h));
+    if right <= left || bottom <= top {
+        return Rect::default();
+    }
+    Rect {
+        x: left as u32,
+        y: top as u32,
+        w: (right - left) as u32,
+        h: (bottom - top) as u32,
+    }
 }
 
 fn rect<P: Presenter>(
@@ -706,7 +792,25 @@ impl DirectDraw {
                     com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
                     0
                 } else if a[2] == 8 || a[2] & 0x11 == 0x11 {
-                    com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
+                    let device = com.get_mut::<ComState>(objects, a[0]).unwrap();
+                    device.focus_window = a[1];
+                    let device = device.modern;
+                    // Exclusive mode loses the surfaces of every other
+                    // DirectDraw object, so a primary another object made, or
+                    // one left behind by a released object, stops being the
+                    // display.
+                    if a[2] & 0x11 == 0x11
+                        && self.primary_owner != Some(device)
+                        && let Some(sid) = surfaces.detach_primary()
+                    {
+                        if self.surface_objects.contains_key(&sid)
+                            || self.attached.values().any(|&other| other == sid)
+                        {
+                            self.lost.insert(sid);
+                        } else {
+                            surfaces.delete(sid);
+                        }
+                    }
                     0
                 } else {
                     UNSUPPORTED
@@ -739,7 +843,50 @@ impl DirectDraw {
                 self.clipper_windows.insert(a[0], a[2]);
                 if a[2] == 0 {
                     self.clipper_origins.remove(&a[0]);
+                } else {
+                    self.clip_lists.remove(&a[0]);
                 }
+                0
+            }
+            api::CLIPPER_SET_CLIP_LIST => {
+                if !matches!(kind, Kind::Clipper) || a[2] != 0 {
+                    return Ok(INVALID);
+                }
+                if self
+                    .clipper_windows
+                    .get(&a[0])
+                    .is_some_and(|&hwnd| hwnd != 0)
+                {
+                    return Ok(CLIPPER_IS_USING_HWND);
+                }
+                if a[1] == 0 {
+                    self.clip_lists.remove(&a[0]);
+                    return Ok(0);
+                }
+                // RGNDATAHEADER: dwSize 32, iType RDH_RECTANGLES, nCount,
+                // nRgnSize, rcBound; the rectangles follow it.
+                if m.u32(a[1])? != 32 || m.u32(a[1] + 4)? != 1 {
+                    return Ok(INVALID_CLIP_LIST);
+                }
+                let count = m.u32(a[1] + 8)?;
+                let bytes = m.read(a[1] + 32, count as usize * 16)?;
+                let rects = bytes
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .filter_map(|r| {
+                        let v =
+                            |i: usize| i32::from_le_bytes(r[i..i + 4].try_into().unwrap()).max(0);
+                        let (left, top, right, bottom) = (v(0), v(4), v(8), v(12));
+                        (right > left && bottom > top).then(|| Rect {
+                            x: left as u32,
+                            y: top as u32,
+                            w: (right - left) as u32,
+                            h: (bottom - top) as u32,
+                        })
+                    })
+                    .collect();
+                self.clip_lists.insert(a[0], rects);
                 0
             }
             api::CLIPPER_GET_HWND => {
@@ -779,6 +926,29 @@ impl DirectDraw {
                 };
                 m.put_u32(a[2], low)?;
                 m.put_u32(a[2] + 4, high)?;
+                0
+            }
+            // Blits and flips complete synchronously, so DDGBS/DDGFS_CANBLT
+            // (CANFLIP) and ISBLTDONE (ISFLIPDONE) always succeed.
+            api::GET_BLT_STATUS | api::GET_FLIP_STATUS => {
+                if matches!(kind, Kind::Surface(_)) && matches!(a[1], 1 | 2) {
+                    0
+                } else {
+                    INVALID
+                }
+            }
+            api::GET_CLIPPER => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] == 0 {
+                    return Ok(INVALID);
+                }
+                let Some(&clipper) = self.surface_clippers.get(&sid) else {
+                    return Ok(NO_CLIPPER_ATTACHED);
+                };
+                com.add_ref::<ComState>(objects, clipper);
+                m.put_u32(a[1], clipper)?;
                 0
             }
             api::SET_CLIPPER => {
@@ -890,6 +1060,7 @@ impl DirectDraw {
                 }
                 let sid = if caps & 0x200 != 0 {
                     let primary = surfaces.primary(m)?;
+                    self.primary_owner = com.get::<ComState>(objects, a[0]).map(|d| d.modern);
                     if caps & 0x18 == 0x18 && flags & 0x20 != 0 && m.u32(a[1] + 20)? > 0 {
                         if self.attached.contains_key(&primary) {
                             return Ok(BUSY);
@@ -1013,13 +1184,13 @@ impl DirectDraw {
                 m.write(a[1], &desc[..len as usize])?;
                 0
             }
-            api::IS_LOST | api::RESTORE => {
-                if matches!(kind, Kind::Surface(_)) {
-                    0
-                } else {
-                    INVALID
+            api::IS_LOST | api::RESTORE => match kind {
+                Kind::Surface(sid) if id == api::IS_LOST && self.lost.contains(&sid) => {
+                    SURFACE_LOST
                 }
-            }
+                Kind::Surface(_) => 0,
+                _ => INVALID,
+            },
             api::GET_PIXEL_FORMAT => {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
@@ -1074,6 +1245,9 @@ impl DirectDraw {
                 if a[5] & !0x31 != 0 {
                     return Ok(UNSUPPORTED);
                 }
+                if self.surface_clippers.contains_key(&dst) {
+                    return Ok(BLT_FAST_CANT_CLIP);
+                }
                 let key = if a[5] & 1 != 0 {
                     let Some(&key) = self.color_keys.get(&(src, 8)) else {
                         return Ok(INVALID);
@@ -1120,18 +1294,35 @@ impl DirectDraw {
                     let Some(dst) = self.surface_id(objects, a[0]) else {
                         return Ok(INVALID);
                     };
-                    if a[5] == 0 || a[4] & !(0x400 | 0x01000000) != 0 {
+                    // DDBLT_COLORFILL with ASYNC, WAIT or DONOTWAIT.
+                    if a[5] == 0 || a[4] & !(0x400 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
                         return Ok(UNSUPPORTED);
                     }
-                    let Ok(dr) = rect(surfaces, dst, a[1], m) else {
-                        return Ok(INVALID);
+                    let clips = self.clip_list(dst);
+                    let dr = if let Some(clips) = &clips {
+                        let Some(dr) = unbounded(surfaces, dst, a[1], (0, 0), m)? else {
+                            return Ok(INVALID);
+                        };
+                        clips.iter().map(|&clip| written(dr, clip)).collect()
+                    } else {
+                        let Ok(dr) = rect(surfaces, dst, a[1], m) else {
+                            return Ok(INVALID);
+                        };
+                        vec![dr]
                     };
                     let s = &surfaces[dst];
                     if s.locked.is_some() {
                         return Ok(BUSY);
                     }
-                    surfaces.fill_raw(dst, dr, m.u32(a[5] + 80)?, m)?;
-                    let damage = dr;
+                    let (color, bounds) = (m.u32(a[5] + 80)?, s.rect());
+                    let mut damage = Rect::default();
+                    for dr in dr {
+                        let dr = dr.clipped(bounds);
+                        if !dr.empty() {
+                            surfaces.fill_raw(dst, dr, color, m)?;
+                            damage = damage.union(dr);
+                        }
+                    }
                     if surfaces.primary_id() == Some(dst) {
                         self.present(surfaces, dst, m, damage)?;
                     }
@@ -1178,6 +1369,7 @@ impl DirectDraw {
                 let Ok(sr) = rect(surfaces, src, a[3], m) else {
                     return Ok(INVALID);
                 };
+                let clips = self.clip_list(dst);
                 let origin = if surfaces.primary_id() == Some(dst) {
                     self.surface_clippers
                         .get(&dst)
@@ -1186,22 +1378,11 @@ impl DirectDraw {
                 } else {
                     None
                 };
-                let dr = if let Some((ox, oy)) = origin.filter(|_| a[1] != 0) {
-                    let (left, top, right, bottom) = (
-                        i64::from(m.u32(a[1])? as i32) - i64::from(ox),
-                        i64::from(m.u32(a[1] + 4)? as i32) - i64::from(oy),
-                        i64::from(m.u32(a[1] + 8)? as i32) - i64::from(ox),
-                        i64::from(m.u32(a[1] + 12)? as i32) - i64::from(oy),
-                    );
-                    if right <= left || bottom <= top {
+                let dr = if let Some(origin) = origin.or(clips.as_ref().map(|_| (0, 0))) {
+                    let Some(dr) = unbounded(surfaces, dst, a[1], origin, m)? else {
                         return Ok(INVALID);
-                    }
-                    BlitRect {
-                        x: left,
-                        y: top,
-                        w: (right - left) as u32,
-                        h: (bottom - top) as u32,
-                    }
+                    };
+                    dr
                 } else {
                     let Ok(dr) = rect(surfaces, dst, a[1], m) else {
                         return Ok(INVALID);
@@ -1220,11 +1401,16 @@ impl DirectDraw {
                 {
                     return Ok(0);
                 }
-                let options = BlitOptions {
-                    key,
-                    ..BlitOptions::default()
-                };
-                let damage = surfaces.blit(src, sr, dst, dr, options, m)?;
+                let mut damage = Rect::default();
+                for clip in clips.map_or(vec![None], |clips| clips.into_iter().map(Some).collect())
+                {
+                    let options = BlitOptions {
+                        key,
+                        clip,
+                        ..BlitOptions::default()
+                    };
+                    damage = damage.union(surfaces.blit(src, sr, dst, dr, options, m)?);
+                }
                 if surfaces.primary_id() == Some(dst) {
                     self.present(surfaces, dst, m, damage)?;
                 }

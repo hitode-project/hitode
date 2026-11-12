@@ -117,9 +117,26 @@ fn system_fonts() -> Arc<Database> {
                     db.load_fonts_dir(directory);
                 }
             }
+            remove_oversized(&mut db, MAX_SYSTEM_FONT_BYTES as u64);
             Arc::new(db)
         })
         .clone()
+}
+
+/// Fallback walks every face for a missing character, so a face whose file
+/// is over the data limit, which never loads, is not listed at all.
+fn remove_oversized(db: &mut Database, limit: u64) {
+    let oversized: Vec<_> = db
+        .faces()
+        .filter(|face| {
+            matches!(&face.source, Source::File(path)
+                if std::fs::metadata(path).is_ok_and(|file| file.len() > limit))
+        })
+        .map(|face| face.id)
+        .collect();
+    for id in oversized {
+        db.remove_face(id);
+    }
 }
 
 pub(super) fn system_font_families() -> Vec<String> {
@@ -2337,6 +2354,34 @@ fn blend(pixels: &mut Pixels<'_>, x: i64, y: i64, color: [u8; 3], coverage: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: DEV-FONT-2
+    #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
+    fn system_fonts_over_the_limit_are_not_listed() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut db = Database::new();
+        db.load_font_file(fixtures.join("font-resource.ttf"))
+            .unwrap();
+        db.load_font_file(fixtures.join("font-resource.ttc"))
+            .unwrap();
+        let single = std::fs::metadata(fixtures.join("font-resource.ttf"))
+            .unwrap()
+            .len();
+        let collection = std::fs::metadata(fixtures.join("font-resource.ttc"))
+            .unwrap()
+            .len();
+        assert_ne!(single, collection);
+        let limit = single.min(collection);
+        let kept = if single == limit {
+            "font-resource.ttf"
+        } else {
+            "font-resource.ttc"
+        };
+        remove_oversized(&mut db, limit);
+        assert!(db.faces().next().is_some());
+        assert!(db.faces().all(|face| matches!(&face.source,
+            Source::File(path) if path.ends_with(kept))));
+    }
     #[test]
     // spec: DEV-FONT-5
     fn private_and_unnamed_families_are_not_listed() {

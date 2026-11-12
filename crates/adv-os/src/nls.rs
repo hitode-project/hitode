@@ -1,8 +1,9 @@
 //! Code pages: ANSI <-> UTF-16 conversions for the guest's configured code page.
 
-use encoding_rs::{Encoding, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
+use encoding_rs::{BIG5, Encoding, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
 
 mod case_table;
+mod cp950;
 mod evidence;
 pub use evidence::{TextScore, text_score};
 
@@ -21,7 +22,7 @@ pub struct Codec {
 pub fn lead_byte_ranges(cp: u32) -> &'static [(u8, u8)] {
     match cp {
         932 => &[(0x81, 0x9f), (0xe0, 0xfc)],
-        936 => &[(0x81, 0xfe)],
+        936 | 950 => &[(0x81, 0xfe)],
         _ => &[],
     }
 }
@@ -32,6 +33,7 @@ fn table(cp: u32) -> Option<&'static Encoding> {
         // WHATWG Shift_JIS is Windows-31J (NEC/IBM extensions included), as is GBK/cp936.
         932 => Some(SHIFT_JIS),
         936 => Some(GBK),
+        950 => Some(BIG5),
         CP_UTF8 => Some(UTF_8),
         1252 => Some(WINDOWS_1252),
         _ => None,
@@ -45,7 +47,7 @@ pub fn is_modeled(cp: u32) -> bool {
 }
 
 pub fn is_valid_codepage(cp: u32) -> bool {
-    matches!(cp, 932 | 936 | 1252 | 437 | CP_UTF8 | 20127)
+    matches!(cp, 932 | 936 | 950 | 1252 | 437 | CP_UTF8 | 20127)
 }
 
 impl Codec {
@@ -98,12 +100,24 @@ impl Codec {
                     (932, 0xa0) => 0xf8f0,
                     (932, 0xfd..=0xff) => 0xf8f1 + u16::from(byte - 0xfd),
                     (936, 0xff) => 0xf8f5,
+                    (950, 0x80) => 0x80,
+                    (950, 0xff) => 0xf8f8,
                     _ => single(encoding, &[byte]).unwrap_or(default),
                 });
                 i += 1;
                 continue;
             }
-            let decoded = bytes.get(i..i + 2).and_then(|pair| single(encoding, pair));
+            if cp == 950 && bytes.get(i + 1) == Some(&0) {
+                // A lead byte before NUL is the default character; NUL stays.
+                units.push(default);
+                replaced = true;
+                i += 1;
+                continue;
+            }
+            let decoded = bytes.get(i..i + 2).and_then(|pair| match cp {
+                950 => cp950::decode(pair[0], pair[1]),
+                _ => single(encoding, pair),
+            });
             replaced |= decoded.is_none();
             units.push(decoded.unwrap_or(default));
             i += 2;
@@ -114,6 +128,16 @@ impl Codec {
     /// UTF-16 to code page `cp`; unmappable characters become `?`. Returns whether any did.
     pub fn from_utf16(&self, cp: u32, units: &[u16]) -> (Vec<u8>, bool) {
         let s = String::from_utf16_lossy(units);
+        if self.resolve(cp) == 950 {
+            let (mut out, mut lossy) = (Vec::with_capacity(s.len()), false);
+            for ch in s.chars() {
+                if !cp950::encode(ch, &mut out) {
+                    out.push(b'?');
+                    lossy = true;
+                }
+            }
+            return (out, lossy);
+        }
         let (b, _, lossy) = self.encoding(cp).encode(&s);
         if !lossy {
             return (b.into_owned(), false);
@@ -172,7 +196,7 @@ impl Codec {
 fn dbcs_default(cp: u32) -> Option<u16> {
     match cp {
         932 => Some(0x30fb),
-        936 => Some(u16::from(b'?')),
+        936 | 950 => Some(u16::from(b'?')),
         _ => None,
     }
 }
@@ -293,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn big5_encodes_as_the_inverse_of_windows_decoding() {
+        // Native WideCharToMultiByte(950, 0, ...) results.
+        let big5 = Codec::new(950);
+        let units = [0x3000, 0x662f, 0xe000, 0xf848, 0x2593, 0x80, 0xf8f8, 0x41];
+        let bytes = b"\xa1\x40\xac\x4f\xfa\x40\xc8\xfe\xf9\xfe\x80\xffA";
+        assert_eq!(big5.from_utf16(CP_ACP, &units), (bytes.to_vec(), false));
+        // No mapping on Windows: past the private-use area, HKSCS and the
+        // cells Windows leaves undefined.
+        for unit in [0xf849, 0xffed, 0x2400, 0x041b] {
+            assert_eq!(big5.from_utf16(950, &[unit]), (b"?".to_vec(), true));
+        }
+    }
+
+    #[test]
     fn invalid_dbcs_sequences_follow_multi_byte_to_wide_char() {
         // Native MultiByteToWideChar(cp, 0, ...) results.
         let sjis = Codec::new(932);
@@ -323,6 +361,23 @@ mod tests {
             (b"\xaa\xa1", &[0xe000]),
         ] {
             assert_eq!(gbk.to_utf16(CP_ACP, bytes), units, "936 {bytes:x?}");
+        }
+        let big5 = Codec::new(950);
+        for (bytes, units) in [
+            (&b"\xa1\x40\xac\x4f"[..], &[0x3000, 0x662f][..]),
+            (
+                b"\x81\x40\x8d\xfe\x8e\x40\xa0\xfe",
+                &[0xeeb8, 0xf6b0, 0xe311, 0xeeb7],
+            ),
+            (
+                b"\xc6\x7e\xc6\xa1\xc8\xfe\xfa\x40\xfe\xfe",
+                &[0x7c72, 0xf6b1, 0xf848, 0xe000, 0xe310],
+            ),
+            (b"\xa3\xc0\xf9\xfe", &[0x3f, 0x2593]),
+            (b"\x80\xff", &[0x80, 0xf8f8]),
+            (b"\xa1\x00A\xa1\x30\xa1", &[0x3f, 0, 0x41, 0x3f, 0x3f]),
+        ] {
+            assert_eq!(big5.to_utf16(CP_ACP, bytes), units, "950 {bytes:x?}");
         }
         assert_eq!(gbk.to_utf16_checked(CP_ACP, b"\x82"), (vec![0x3f], true));
         assert_eq!(gbk.to_utf16_checked(CP_ACP, b"?"), (vec![0x3f], false));

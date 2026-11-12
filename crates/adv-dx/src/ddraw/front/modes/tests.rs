@@ -54,7 +54,17 @@ fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachmen
         0
     );
     let primary = m.cpu.read_u32(DATA).unwrap();
+    m.cpu.write_u32(DATA + 8, 0x1234).unwrap();
+    assert_eq!(
+        call(&mut m, api::GET_CLIPPER, &[primary, DATA + 8]),
+        0x88760238
+    );
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0x1234);
+    assert_eq!(call(&mut m, api::GET_CLIPPER, &[primary, 0]), 0x80070057);
     assert_eq!(call(&mut m, api::SET_CLIPPER, &[primary, clipper]), 0);
+    assert_eq!(call(&mut m, api::GET_CLIPPER, &[primary, DATA + 8]), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), clipper);
+    assert_eq!(call(&mut m, api::RELEASE, &[clipper]), 2);
     desc[4..8].copy_from_slice(&7u32.to_le_bytes());
     desc[8..12].copy_from_slice(&2u32.to_le_bytes());
     desc[12..16].copy_from_slice(&4u32.to_le_bytes());
@@ -487,4 +497,206 @@ fn activated_device_initialization_identity_and_release_share_the_function_owner
         front::call(&mut env(&mut m), api::INITIALIZE, &[this, 0]),
         Outcome::Return(INVALID)
     ));
+}
+
+#[test]
+// spec: GFX-DDRAW-6
+fn exclusive_mode_of_a_new_device_loses_a_primary_left_by_a_released_one() {
+    let (mut m, first) = setup(false, false, Registry::default());
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x200u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[first, 0, 8]), 0);
+    assert_eq!(call(&mut m, api::DISPLAY_MODE, &[first, 8, 8, 32, 0, 0]), 0);
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[first, DATA + 64, DATA, 0]),
+        0
+    );
+    let leaked = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::RELEASE, &[first]), 0);
+    assert_eq!(call(&mut m, api::IS_LOST, &[leaked]), 0);
+
+    m.cpu.write(DATA + 256, &IID_DDRAW7).unwrap();
+    assert_eq!(call(&mut m, api::DD_CREATE, &[0, DATA, DATA + 256, 0]), 0);
+    let second = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[second, 7, 0x11]), 0);
+    assert_eq!(call(&mut m, api::IS_LOST, &[leaked]), 0x887601c2);
+    assert_eq!(
+        call(&mut m, api::DISPLAY_MODE, &[second, 16, 8, 32, 0, 0]),
+        0
+    );
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[second, DATA + 64, DATA, 0]),
+        0
+    );
+    let primary = m.cpu.read_u32(DATA).unwrap();
+    assert_ne!(primary, leaked);
+    assert_eq!(call(&mut m, api::IS_LOST, &[primary]), 0);
+    // The owner entering exclusive mode again keeps its own primary.
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[second, 7, 0x11]), 0);
+    assert_eq!(call(&mut m, api::IS_LOST, &[primary]), 0);
+    assert_eq!(call(&mut m, api::RELEASE, &[leaked]), 0);
+}
+
+#[test]
+// spec: GFX-DDRAW-7
+fn clip_lists_limit_blits_and_fills_like_windows() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    let surface = |m: &mut Machine<JitCpu>, size: u32| {
+        let mut desc = [0u8; 124];
+        desc[..4].copy_from_slice(&124u32.to_le_bytes());
+        desc[4..8].copy_from_slice(&7u32.to_le_bytes());
+        desc[8..12].copy_from_slice(&size.to_le_bytes());
+        desc[12..16].copy_from_slice(&size.to_le_bytes());
+        desc[104..108].copy_from_slice(&0x40u32.to_le_bytes());
+        m.cpu.write(DATA + 0x400, &desc).unwrap();
+        assert_eq!(
+            call(m, api::CREATE_SURFACE, &[device, DATA + 0x400, DATA, 0]),
+            0
+        );
+        m.cpu.read_u32(DATA).unwrap()
+    };
+    let fill = |m: &mut Machine<JitCpu>, target: u32, rect: u32, color: u32| {
+        let mut fx = [0u8; 100];
+        fx[..4].copy_from_slice(&100u32.to_le_bytes());
+        fx[80..84].copy_from_slice(&color.to_le_bytes());
+        m.cpu.write(DATA + 0x500, &fx).unwrap();
+        call(m, api::BLT, &[target, rect, 0, 0, 0x400, DATA + 0x500])
+    };
+    let rows = |m: &mut Machine<JitCpu>, target: u32| -> Vec<String> {
+        m.cpu.write_u32(DATA + 0x400, 124).unwrap();
+        assert_eq!(call(m, api::LOCK, &[target, 0, DATA + 0x400, 1, 0]), 0);
+        let (pitch, pixels) = (
+            m.cpu.read_u32(DATA + 0x400 + 16).unwrap(),
+            m.cpu.read_u32(DATA + 0x400 + 36).unwrap(),
+        );
+        let rows = (0..8)
+            .map(|y| {
+                (0..8)
+                    .map(
+                        |x| match m.cpu.read_u32(pixels + y * pitch + x * 4).unwrap() & 0xffffff {
+                            0 => '.',
+                            0xff => 'B',
+                            0xff0000 => 'R',
+                            _ => '?',
+                        },
+                    )
+                    .collect()
+            })
+            .collect();
+        assert_eq!(call(m, api::UNLOCK, &[target, 0]), 0);
+        rows
+    };
+    let rect = |m: &mut Machine<JitCpu>, at: u32, r: [i32; 4]| {
+        for (i, v) in r.into_iter().enumerate() {
+            m.cpu.write_u32(at + i as u32 * 4, v as u32).unwrap();
+        }
+    };
+    let (dst, src, half) = (surface(&mut m, 8), surface(&mut m, 8), surface(&mut m, 4));
+    assert_eq!(fill(&mut m, src, 0, 0xff), 0);
+    assert_eq!(fill(&mut m, half, 0, 0xff0000), 0);
+    assert_eq!(call(&mut m, api::CREATE_CLIPPER, &[device, 0, DATA, 0]), 0);
+    let clipper = m.cpu.read_u32(DATA).unwrap();
+
+    // RGNDATA with two rectangles.
+    let region = DATA + 0x600;
+    for (i, v) in [32u32, 1, 2, 32, 0, 0, 0, 0].into_iter().enumerate() {
+        m.cpu.write_u32(region + i as u32 * 4, v).unwrap();
+    }
+    rect(&mut m, region + 32, [0, 0, 3, 8]);
+    rect(&mut m, region + 48, [5, 2, 8, 4]);
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, region, 1]),
+        0x80070057
+    );
+    m.cpu.write_u32(region + 4, 2).unwrap();
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, region, 0]),
+        0x8876006e
+    );
+    m.cpu.write_u32(region + 4, 1).unwrap();
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, region, 0]),
+        0
+    );
+    assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, clipper]), 0);
+
+    let two = [
+        "BBB.....", "BBB.....", "BBB..BBB", "BBB..BBB", "BBB.....", "BBB.....", "BBB.....",
+        "BBB.....",
+    ];
+    assert_eq!(fill(&mut m, dst, 0, 0xff), 0);
+    assert_eq!(rows(&mut m, dst), two);
+    for (source, color) in [(src, 'B'), (half, 'R')] {
+        let mut clear = [0u8; 100];
+        clear[..4].copy_from_slice(&100u32.to_le_bytes());
+        m.cpu.write(DATA + 0x500, &clear).unwrap();
+        assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, 0]), 0);
+        assert_eq!(fill(&mut m, dst, 0, 0), 0);
+        assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, clipper]), 0);
+        assert_eq!(call(&mut m, api::BLT, &[dst, 0, source, 0, 0, 0]), 0);
+        let expected: Vec<String> = two
+            .iter()
+            .map(|row| row.replace('B', &color.to_string()))
+            .collect();
+        assert_eq!(rows(&mut m, dst), expected);
+    }
+    assert_eq!(
+        call(&mut m, api::BLT_FAST, &[dst, 0, 0, src, 0, 0]),
+        0x8876023e
+    );
+    for (flags, hr) in [(0, 0x80070057), (1, 0), (2, 0), (3, 0x80070057)] {
+        assert_eq!(call(&mut m, api::GET_BLT_STATUS, &[dst, flags]), hr);
+        assert_eq!(call(&mut m, api::GET_FLIP_STATUS, &[dst, flags]), hr);
+    }
+
+    // With a full-surface list a destination may extend past the surface.
+    m.cpu.write_u32(region + 8, 1).unwrap();
+    rect(&mut m, region + 32, [0, 0, 8, 8]);
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, region, 0]),
+        0
+    );
+    assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, 0]), 0);
+    assert_eq!(fill(&mut m, dst, 0, 0), 0);
+    rect(&mut m, DATA + 0x700, [4, 4, 12, 12]);
+    assert_eq!(
+        call(&mut m, api::BLT, &[dst, DATA + 0x700, src, 0, 0, 0]),
+        0x80070057
+    );
+    assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, clipper]), 0);
+    assert_eq!(
+        call(&mut m, api::BLT, &[dst, DATA + 0x700, src, 0, 0, 0]),
+        0
+    );
+    assert_eq!(
+        rows(&mut m, dst),
+        [
+            "........", "........", "........", "........", "....BBBB", "....BBBB", "....BBBB",
+            "....BBBB"
+        ]
+    );
+
+    // A window clipper cannot take a clip list.
+    assert_eq!(call(&mut m, api::CLIPPER_SET_HWND, &[clipper, 0, 7]), 0);
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, region, 0]),
+        0x88760237
+    );
+    assert_eq!(
+        call(&mut m, api::CLIPPER_SET_CLIP_LIST, &[clipper, 0, 0]),
+        0x88760237
+    );
 }

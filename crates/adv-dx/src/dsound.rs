@@ -10,6 +10,8 @@ use std::io::Write;
 use std::sync::Arc;
 
 mod enumeration;
+mod spatial;
+use spatial::{Deferred, Listener, Source, Vector};
 
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
@@ -20,7 +22,10 @@ const NO_DRIVER: u32 = 0x88780078;
 const CONTROL_UNAVAILABLE: u32 = 0x8878001e;
 const OBJECT_NOT_FOUND: u32 = 0x88781161;
 const CLASS_NOT_REGISTERED: u32 = 0x80040154;
+const CTRL_3D: u32 = 0x10;
+const CTRL_PAN: u32 = 0x40;
 const CTRL_FX: u32 = 0x200;
+const MUTE_3D_AT_MAX_DISTANCE: u32 = 0x20000;
 const LOC_DEFER: u32 = 0x40000;
 const MAX_FX_DESCRIPTORS: u32 = 64;
 const DEVICE: &[(&str, u8)] = &[
@@ -69,6 +74,57 @@ const NOTIFY: &[(&str, u8)] = &[
     ("Release", 1),
     ("SetNotificationPositions", 3),
 ];
+const LISTENER: &[(&str, u8)] = &[
+    ("QueryInterface", 3),
+    ("AddRef", 1),
+    ("Release", 1),
+    ("GetAllParameters", 2),
+    ("GetDistanceFactor", 2),
+    ("GetDopplerFactor", 2),
+    ("GetOrientation", 3),
+    ("GetPosition", 2),
+    ("GetRolloffFactor", 2),
+    ("GetVelocity", 2),
+    ("SetAllParameters", 3),
+    ("SetDistanceFactor", 3),
+    ("SetDopplerFactor", 3),
+    ("SetOrientation", 8),
+    ("SetPosition", 5),
+    ("SetRolloffFactor", 3),
+    ("SetVelocity", 5),
+    ("CommitDeferredSettings", 1),
+];
+const BUFFER_3D: &[(&str, u8)] = &[
+    ("QueryInterface", 3),
+    ("AddRef", 1),
+    ("Release", 1),
+    ("GetAllParameters", 2),
+    ("GetConeAngles", 3),
+    ("GetConeOrientation", 2),
+    ("GetConeOutsideVolume", 2),
+    ("GetMaxDistance", 2),
+    ("GetMinDistance", 2),
+    ("GetMode", 2),
+    ("GetPosition", 2),
+    ("GetVelocity", 2),
+    ("SetAllParameters", 3),
+    ("SetConeAngles", 4),
+    ("SetConeOrientation", 5),
+    ("SetConeOutsideVolume", 3),
+    ("SetMaxDistance", 3),
+    ("SetMinDistance", 3),
+    ("SetMode", 3),
+    ("SetPosition", 5),
+    ("SetVelocity", 5),
+];
+/// The interfaces whose method tables the front allocates, by table index.
+const INTERFACES: [(&str, &[(&str, u8)]); 5] = [
+    ("IDirectSound8", DEVICE),
+    ("IDirectSoundBuffer8", BUFFER),
+    ("IDirectSoundNotify", NOTIFY),
+    ("IDirectSound3DListener", LISTENER),
+    ("IDirectSound3DBuffer", BUFFER_3D),
+];
 const IID_DEVICE: [u8; 16] = [
     0x83, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -91,6 +147,12 @@ const IID_BUFFER8: [u8; 16] = [
 ];
 const IID_NOTIFY: [u8; 16] = [
     0x83, 0x07, 0x21, 0xb0, 0xcd, 0x89, 0xd0, 0x11, 0xaf, 8, 0, 0xa0, 0xc9, 0x25, 0xcd, 0x16,
+];
+const IID_LISTENER: [u8; 16] = [
+    0x84, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
+];
+const IID_BUFFER_3D: [u8; 16] = [
+    0x86, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -143,14 +205,20 @@ impl Format {
 }
 #[derive(Clone, Copy)]
 enum Kind {
-    Device { initialized: bool, version8: bool },
+    Device {
+        initialized: bool,
+        version8: bool,
+    },
     Buffer,
     Notify(u32),
+    /// The listener of a primary buffer, or the 3D control of a secondary one.
+    Spatial(u32),
 }
 struct Object {
     kind: Kind,
     pointer: u32,
     notify: u32,
+    spatial: u32,
     buffer: Option<Buffer>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,9 +257,11 @@ struct Buffer {
     len: u32,
     flags: u32,
     format: Format,
+    /// The playback rate, which a 3D source's Doppler shift may change.
     frequency: u32,
     volume: i32,
     pan: i32,
+    spatial: Option<Deferred<Source>>,
     playing: bool,
     looping: bool,
     base: u32,
@@ -237,7 +307,14 @@ impl Buffer {
                 .as_ref()
                 .and_then(|voice| voice.cursors(now, self.generation))
         {
-            return (play, if device_connected { write } else { play });
+            return (
+                play,
+                if device_connected {
+                    write
+                } else {
+                    self.lead(play)
+                },
+            );
         }
         let play = if self.len == 0 {
             0
@@ -252,7 +329,24 @@ impl Buffer {
             }
         };
         // A live callback has not published a position for this generation yet.
-        (play, if device_connected { self.base } else { play })
+        (
+            play,
+            if device_connected {
+                self.base
+            } else {
+                self.lead(play)
+            },
+        )
+    }
+    /// Without a live mixer frontier, a playing buffer's write cursor leads
+    /// its play cursor by 30 ms of frames, as Windows reports; a stopped
+    /// buffer's equals it.
+    fn lead(&self, play: u32) -> u32 {
+        if !self.playing || self.len == 0 {
+            return play;
+        }
+        let lead = u64::from(self.frequency * 3 / 100) * u64::from(self.format.align());
+        ((u64::from(play) + lead) % u64::from(self.len)) as u32
     }
     fn cursor(&self, now: u64) -> u32 {
         self.cursors(now, false).0
@@ -284,7 +378,8 @@ pub struct AudioSourceStatus {
 
 pub struct Sound {
     pub enabled: bool,
-    tables: [u32; 3],
+    tables: [u32; 5],
+    listener: Deferred<Listener>,
     com: Com,
     /// Non-owning iteration index; payload and all references live in Objects.
     buffer_ids: BTreeMap<u64, ComIdentity<Object>>,
@@ -367,11 +462,7 @@ pub fn register(reg: &mut Registry) {
     for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
         reg.add("dsound.dll", name, Conv::Stdcall { argc: 3 }, call);
     }
-    for (prefix, methods) in [
-        ("IDirectSound8", DEVICE),
-        ("IDirectSoundBuffer8", BUFFER),
-        ("IDirectSoundNotify", NOTIFY),
-    ] {
+    for (prefix, methods) in INTERFACES {
         for &(name, argc) in methods {
             reg.add(
                 "dsound.dll",
@@ -483,15 +574,8 @@ fn install_audio<B: Backend>(
     } else {
         None
     };
-    let mut tables = [0; 3];
-    for (i, (prefix, methods)) in [
-        ("IDirectSound8", DEVICE),
-        ("IDirectSoundBuffer8", BUFFER),
-        ("IDirectSoundNotify", NOTIFY),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let mut tables = [0; 5];
+    for (i, (prefix, methods)) in INTERFACES.into_iter().enumerate() {
         let table = m
             .sys
             .vm
@@ -512,6 +596,7 @@ fn install_audio<B: Backend>(
     m.ext.insert(Sound {
         enabled: false,
         tables,
+        listener: Deferred::new(Listener::default()),
         com,
         buffer_ids: BTreeMap::new(),
         audio,
@@ -578,6 +663,7 @@ fn create_com_device(
             version8,
         },
         false,
+        None,
     ) {
         Ok(Some(ptr)) => ptr,
         Ok(None) => return Outcome::Return(OUT_OF_MEMORY),
@@ -647,34 +733,69 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     }
     0
 }
-fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>, String> {
-    let i = match kind {
-        Kind::Device { .. } => 0,
-        Kind::Buffer => 1,
-        Kind::Notify(_) => unreachable!("notification is an alias of the buffer"),
-    };
-    let table = e.ext.get::<Sound>().tables[i];
+/// An interface pointer whose method table is `INTERFACES[table]`.
+fn interface(e: &mut Env<'_>, table: usize) -> Result<Option<u32>, String> {
     let Some(ptr) = alloc(e, 8) else {
         return Ok(None);
     };
-    if let Err(error) = e.cpu.write_u32(ptr, table) {
+    if let Err(error) = e.cpu.write_u32(ptr, e.ext.get::<Sound>().tables[table]) {
         free(e, ptr);
         return Err(error.to_string());
     }
-    let notify = if with_notify {
-        let Some(notify) = alloc(e, 8) else {
-            free(e, ptr);
-            return Ok(None);
-        };
-        if let Err(error) = e.cpu.write_u32(notify, e.ext.get::<Sound>().tables[2]) {
-            free(e, notify);
-            free(e, ptr);
-            return Err(error.to_string());
-        }
-        notify
+    Ok(Some(ptr))
+}
+/// The 3D interface a buffer created with `flags` exposes, by table index:
+/// every primary buffer the listener, a secondary buffer with `CTRL_3D` its
+/// 3D control.
+fn spatial_interface(flags: u32) -> Option<(usize, [u8; 16])> {
+    if flags & 1 != 0 {
+        Some((3, IID_LISTENER))
+    } else if flags & CTRL_3D != 0 {
+        Some((4, IID_BUFFER_3D))
     } else {
-        0
+        None
+    }
+}
+fn object(
+    e: &mut Env<'_>,
+    kind: Kind,
+    with_notify: bool,
+    spatial: Option<(usize, [u8; 16])>,
+) -> Result<Option<u32>, String> {
+    let i = match kind {
+        Kind::Device { .. } => 0,
+        Kind::Buffer => 1,
+        Kind::Notify(_) | Kind::Spatial(_) => unreachable!("aliases belong to the buffer"),
     };
+    let Some(ptr) = interface(e, i)? else {
+        return Ok(None);
+    };
+    let mut aliases = Vec::new();
+    for (table, iid) in [with_notify.then_some((2, IID_NOTIFY)), spatial]
+        .into_iter()
+        .flatten()
+    {
+        match interface(e, table) {
+            Ok(Some(alias)) => aliases.push((alias, iid)),
+            failed => {
+                for &(alias, _) in &aliases {
+                    free(e, alias);
+                }
+                free(e, ptr);
+                return failed.map(|_| None);
+            }
+        }
+    }
+    let alias_of = |iid: [u8; 16]| {
+        aliases
+            .iter()
+            .find(|&&(_, known)| known == iid)
+            .map_or(0, |&(alias, _)| alias)
+    };
+    let (notify, spatial) = (
+        alias_of(IID_NOTIFY),
+        spatial.map_or(0, |(_, iid)| alias_of(iid)),
+    );
     let com = e.ext.get::<Sound>().com;
     let (iid, iid8) = if matches!(kind, Kind::Device { .. }) {
         (IID_DEVICE, IID_DEVICE8)
@@ -689,11 +810,12 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
             kind,
             pointer: ptr,
             notify,
+            spatial,
             buffer: None,
         },
     ) else {
-        if notify != 0 {
-            free(e, notify);
+        for &(alias, _) in &aliases {
+            free(e, alias);
         }
         free(e, ptr);
         return Ok(None);
@@ -705,16 +827,24 @@ fn object(e: &mut Env<'_>, kind: Kind, with_notify: bool) -> Result<Option<u32>,
             ..
         }
     );
-    if (supports8 && !com.register_interface(&mut e.sys.objects, id, iid8, ptr))
-        || (notify != 0 && !com.register_interface(&mut e.sys.objects, id, IID_NOTIFY, notify))
-    {
-        // The notify alias is registered last. A failed registration leaves its
-        // allocation outside the table and the unpublished owner holds one ref.
-        if notify != 0 {
-            free(e, notify);
+    if supports8 && !com.register_interface(&mut e.sys.objects, id, iid8, ptr) {
+        for &(alias, _) in &aliases {
+            free(e, alias);
         }
         release(e, ptr);
         return Ok(None);
+    }
+    for (at, &(alias, iid)) in aliases.iter().enumerate() {
+        if !com.register_interface(&mut e.sys.objects, id, iid, alias) {
+            // Registered aliases are released with the owner. A failed
+            // registration leaves the remaining allocations outside the table
+            // and the unpublished owner holds one ref.
+            for &(rest, _) in &aliases[at..] {
+                free(e, rest);
+            }
+            release(e, ptr);
+            return Ok(None);
+        }
     }
     com.enable_guest(e, id);
     Ok(Some(ptr))
@@ -888,6 +1018,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 version8: name == "DirectSoundCreate8",
             },
             false,
+            None,
         )?
         else {
             return Ok(OUT_OF_MEMORY);
@@ -901,6 +1032,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     };
     let kind = if a == obj.notify {
         Kind::Notify(obj.pointer)
+    } else if a == obj.spatial {
+        Kind::Spatial(obj.pointer)
     } else {
         obj.kind
     };
@@ -962,12 +1095,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 if !fx {
                     e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
                 }
-                // Software PCM supports an empty FX chain, without 3D,
+                // Software PCM supports 3D and an empty FX chain, without
                 // hardware voices or effect-DSP constructors.
                 let unsupported = flags
                     & !(0x1
                         | 0x2
                         | 0x8
+                        | CTRL_3D
                         | 0x20
                         | 0x40
                         | 0x80
@@ -976,17 +1110,21 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         | 0x4000
                         | 0x8000
                         | 0x10000
+                        | MUTE_3D_AT_MAX_DISTANCE
                         | LOC_DEFER
                         | 0x80000);
                 if flags & LOC_DEFER != 0 && flags & 0xc != 0 {
                     return Ok(INVALID); // Deferred and fixed allocation are mutually exclusive.
+                }
+                if flags & (CTRL_3D | MUTE_3D_AT_MAX_DISTANCE) == MUTE_3D_AT_MAX_DISTANCE {
+                    return Ok(INVALID);
                 }
                 if unsupported != 0 {
                     adv_abi::warn_unavailable(
                         e,
                         &format!("dsound.dll!{full}"),
                         &format!(
-                            "software PCM buffer flags are unsupported: flags=0x{flags:08x}, unsupported_mask=0x{unsupported:08x}; 3D and hardware voices are unavailable (HRESULT=0x80004001)"
+                            "software PCM buffer flags are unsupported: flags=0x{flags:08x}, unsupported_mask=0x{unsupported:08x}; hardware voices are unavailable (HRESULT=0x80004001)"
                         ),
                     );
                     return Ok(UNSUPPORTED);
@@ -1008,6 +1146,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         Err(_) => return Ok(0x88780064),
                     }
                 };
+                // DirectSound 8 takes 3D sources in mono and without pan
+                // control; earlier versions take either.
+                if version8
+                    && !primary
+                    && flags & CTRL_3D != 0
+                    && (format.channels != 1 || flags & CTRL_PAN != 0)
+                {
+                    return Ok(INVALID);
+                }
                 if (!primary
                     && (len == 0 || len > 32 * 1024 * 1024 || !len.is_multiple_of(format.align())))
                     || (primary && len != 0)
@@ -1042,7 +1189,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
                     return Ok(OUT_OF_MEMORY);
                 };
-                let Some(ptr) = object(e, Kind::Buffer, flags & 0x100 != 0)? else {
+                let Some(ptr) = object(
+                    e,
+                    Kind::Buffer,
+                    flags & 0x100 != 0,
+                    spatial_interface(flags),
+                )?
+                else {
                     return Ok(OUT_OF_MEMORY);
                 };
                 let (base, region) = if primary {
@@ -1142,6 +1295,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     frequency: format.rate,
                     volume: 0,
                     pan: 0,
+                    spatial: (!primary && flags & CTRL_3D != 0)
+                        .then(|| Deferred::new(Source::new(format.rate))),
                     playing: false,
                     looping: false,
                     base: 0,
@@ -1154,6 +1309,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     trace_generation: 0,
                     trace_chunks: None,
                 });
+                let buffer = com
+                    .get_identity(&e.sys.objects, id)
+                    .and_then(|object| object.buffer.as_ref())
+                    .unwrap();
+                if buffer.spatial.is_some() {
+                    s.audio
+                        .set_stereo_gain(audio_id, mix(&s.listener.applied, buffer).0);
+                }
                 s.buffer_ids.insert(audio_id, id);
                 e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
                 Ok(0)
@@ -1177,6 +1340,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     orig_vol,
                     orig_pan,
                     orig_freq,
+                    orig_spatial,
                 ) = match com
                     .get_identity(&e.sys.objects, orig_id)
                     .and_then(|o| o.buffer.as_ref())
@@ -1189,6 +1353,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         buf.volume,
                         buf.pan,
                         buf.frequency,
+                        buf.spatial.map(|source| Deferred::new(source.applied)),
                     ),
                     None => return Ok(INVALID),
                 };
@@ -1203,7 +1368,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
                     return Ok(OUT_OF_MEMORY);
                 };
-                let Some(ptr) = object(e, Kind::Buffer, orig_flags & 0x100 != 0)? else {
+                let Some(ptr) = object(
+                    e,
+                    Kind::Buffer,
+                    orig_flags & 0x100 != 0,
+                    spatial_interface(orig_flags),
+                )?
+                else {
                     return Ok(OUT_OF_MEMORY);
                 };
                 let s = e.ext.get_mut::<Sound>();
@@ -1245,6 +1416,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     frequency: orig_freq,
                     volume: orig_vol,
                     pan: orig_pan,
+                    spatial: orig_spatial,
                     playing: false,
                     looping: false,
                     base: 0,
@@ -1257,7 +1429,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     trace_generation: 0,
                     trace_chunks: None,
                 };
-                s.audio.set_stereo_gain(audio_id, dup_buffer.stereo_gain());
+                s.audio
+                    .set_stereo_gain(audio_id, mix(&s.listener.applied, &dup_buffer).0);
                 if orig_freq != orig_format.rate {
                     s.audio.set_frequency(audio_id, orig_freq)?;
                 }
@@ -1337,6 +1510,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             );
         }
         return Ok(0);
+    }
+    if let Kind::Spatial(parent) = kind {
+        return spatial_call(e, name, parent, now);
     }
     if matches!(name, "SetFX" | "GetObjectInPath") {
         return empty_fx(e, a, name);
@@ -1444,7 +1620,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             let value = match name {
                 "GetVolume" => buf.volume as u32,
                 "GetPan" => buf.pan as u32,
-                "GetFrequency" => buf.frequency,
+                "GetFrequency" => buf
+                    .spatial
+                    .map_or(buf.frequency, |source| source.applied.frequency),
                 _ => {
                     u32::from(
                         buf.playing
@@ -1462,7 +1640,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             buf.volume = b as i32;
-            s.audio.set_stereo_gain(buf.audio_id, buf.stereo_gain());
+            spatialize(&s.audio, &s.listener.applied, buf, now);
             0
         }
         "SetPan" => {
@@ -1470,7 +1648,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             buf.pan = b as i32;
-            s.audio.set_stereo_gain(buf.audio_id, buf.stereo_gain());
+            spatialize(&s.audio, &s.listener.applied, buf, now);
             0
         }
         "SetFrequency" => {
@@ -1478,20 +1656,18 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if !(100..=200000).contains(&freq) {
                 return Ok(INVALID);
             }
-            let base = buf.cursor(now);
-            let generation = buf.generation.wrapping_add(1);
-            if s.audio
-                .set_frequency_generation(buf.audio_id, freq, generation)
-                .is_err()
+            // A 3D source keeps the requested rate and plays it Doppler-shifted.
+            let rate = match buf.spatial.as_mut() {
+                Some(source) => {
+                    source.set(spatial::IMMEDIATE, |source| source.frequency = freq);
+                    mix(&s.listener.applied, buf).1
+                }
+                None => freq,
+            };
+            if (buf.spatial.is_none() || rate != buf.frequency) && !retune(&s.audio, buf, rate, now)
             {
                 return Ok(INVALID_CALL);
             }
-            buf.base = base;
-            buf.anchor = now;
-            buf.frequency = freq;
-            buf.queued_frames = 0;
-            buf.notice_bytes = u64::from(buf.base);
-            buf.generation = generation;
             0
         }
         "SetFormat" => {
@@ -1743,6 +1919,298 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
     let ready = std::mem::take(&mut s.ready_notices);
     notify(e, ready)?;
     Ok(value)
+}
+/// A deferred change to a buffer's 3D parameters.
+type SourceUpdate = Box<dyn Fn(&mut Source)>;
+
+/// `IDirectSound3DListener` on a primary buffer and `IDirectSound3DBuffer`
+/// on a secondary one; `parent` is the buffer's own interface.
+fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u32, String> {
+    let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
+    let float = |i: usize| f32::from_bits(args[i]);
+    let vector = |i: usize| Vector::from_words([args[i], args[i + 1], args[i + 2]]);
+    let com = e.ext.get::<Sound>().com;
+    let Some(id) = com.identity::<Object>(&e.sys.objects, parent) else {
+        return Ok(INVALID);
+    };
+    let primary = com
+        .get_identity(&e.sys.objects, id)
+        .and_then(|object| object.buffer.as_ref())
+        .is_some_and(|buffer| buffer.flags & 1 != 0);
+    // Getters write one value to the first argument's pointer.
+    let out = args[1];
+    if name.starts_with("Get") && (out == 0 || (name == "GetConeAngles" && args[2] == 0)) {
+        return Ok(INVALID);
+    }
+    // Setters end with the apply flag.
+    let apply = match name {
+        "SetOrientation" => Some(args[7]),
+        "SetPosition" | "SetVelocity" | "SetConeOrientation" => Some(args[4]),
+        "SetConeAngles" => Some(args[3]),
+        _ if name.starts_with("Set") => Some(args[2]),
+        _ => None,
+    };
+    if apply.is_some_and(|apply| apply > spatial::DEFERRED) {
+        return Ok(INVALID);
+    }
+    let apply = apply.unwrap_or(spatial::IMMEDIATE);
+    let write_float = |cpu: &mut dyn Guest, value: f32| {
+        cpu.write_u32(out, value.to_bits())
+            .map_err(|error| error.to_string())
+    };
+    let valid_size = |cpu: &dyn Guest, at: u32| {
+        at != 0
+            && cpu
+                .read_u32(at)
+                .is_ok_and(|size| size == spatial::PARAMETERS)
+    };
+
+    if primary {
+        let listener = e.ext.get::<Sound>().listener.applied;
+        let changed = |e: &mut Env<'_>, change: &dyn Fn(&mut Listener)| {
+            e.ext.get_mut::<Sound>().listener.set(apply, change)
+        };
+        let applied = match name {
+            "GetAllParameters" => {
+                if !valid_size(e.cpu, out) {
+                    return Ok(INVALID);
+                }
+                listener.write(e.cpu, out)?;
+                false
+            }
+            "GetDistanceFactor" => write_float(e.cpu, listener.distance_factor).map(|()| false)?,
+            "GetDopplerFactor" => write_float(e.cpu, listener.doppler_factor).map(|()| false)?,
+            "GetRolloffFactor" => write_float(e.cpu, listener.rolloff_factor).map(|()| false)?,
+            "GetOrientation" => {
+                if args[2] == 0 {
+                    return Ok(INVALID);
+                }
+                listener.front.write(e.cpu, out)?;
+                listener.top.write(e.cpu, args[2])?;
+                false
+            }
+            "GetPosition" => listener.position.write(e.cpu, out).map(|()| false)?,
+            "GetVelocity" => listener.velocity.write(e.cpu, out).map(|()| false)?,
+            "SetAllParameters" => {
+                if !valid_size(e.cpu, out) {
+                    return Ok(INVALID);
+                }
+                let Some(new) = Listener::read(e.cpu, out)?.checked() else {
+                    return Ok(INVALID);
+                };
+                changed(e, &|listener| *listener = new)
+            }
+            "SetDistanceFactor" => {
+                let factor = float(1);
+                if factor.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                    return Ok(INVALID);
+                }
+                changed(e, &|listener| listener.distance_factor = factor)
+            }
+            "SetDopplerFactor" | "SetRolloffFactor" => {
+                let factor = float(1);
+                if !(0.0..=10.0).contains(&factor) {
+                    return Ok(INVALID);
+                }
+                if name == "SetDopplerFactor" {
+                    changed(e, &|listener| listener.doppler_factor = factor)
+                } else {
+                    changed(e, &|listener| listener.rolloff_factor = factor)
+                }
+            }
+            "SetOrientation" => {
+                let Some((front, top)) = spatial::orientation(vector(1), vector(4)) else {
+                    return Ok(INVALID);
+                };
+                changed(e, &|listener| (listener.front, listener.top) = (front, top))
+            }
+            "SetPosition" => {
+                let position = vector(1);
+                changed(e, &|listener| listener.position = position)
+            }
+            "SetVelocity" => {
+                let velocity = vector(1);
+                changed(e, &|listener| listener.velocity = velocity)
+            }
+            "CommitDeferredSettings" => {
+                let s = e.ext.get_mut::<Sound>();
+                s.listener.commit();
+                for id in s.buffer_ids.values().copied().collect::<Vec<_>>() {
+                    if let Some(source) = com
+                        .get_identity_mut(&mut e.sys.objects, id)
+                        .and_then(|object| object.buffer.as_mut())
+                        .and_then(|buffer| buffer.spatial.as_mut())
+                    {
+                        source.commit();
+                    }
+                }
+                true
+            }
+            _ => {
+                return Err(format!(
+                    "unimplemented audio method IDirectSound3DListener::{name}"
+                ));
+            }
+        };
+        if applied {
+            let s = e.ext.get_mut::<Sound>();
+            for id in s.buffer_ids.values().copied().collect::<Vec<_>>() {
+                if let Some(buffer) = com
+                    .get_identity_mut(&mut e.sys.objects, id)
+                    .and_then(|object| object.buffer.as_mut())
+                    .filter(|buffer| buffer.spatial.is_some())
+                {
+                    spatialize(&s.audio, &s.listener.applied, buffer, now);
+                }
+            }
+        }
+        return Ok(0);
+    }
+
+    let source = com
+        .get_identity(&e.sys.objects, id)
+        .and_then(|object| object.buffer.as_ref())
+        .and_then(|buffer| buffer.spatial)
+        .ok_or("3D control of a buffer without 3D processing")?;
+    let current = source.applied;
+    let mut update: Option<SourceUpdate> = None;
+    match name {
+        "GetAllParameters" => {
+            if !valid_size(e.cpu, out) {
+                return Ok(INVALID);
+            }
+            current.write(e.cpu, out)?;
+        }
+        "GetConeAngles" => {
+            e.cpu
+                .write_u32(out, current.inside_cone)
+                .map_err(|e| e.to_string())?;
+            e.cpu
+                .write_u32(args[2], current.outside_cone)
+                .map_err(|e| e.to_string())?;
+        }
+        "GetConeOrientation" => current.cone.write(e.cpu, out)?,
+        "GetConeOutsideVolume" => e
+            .cpu
+            .write_u32(out, current.cone_outside_volume as u32)
+            .map_err(|e| e.to_string())?,
+        "GetMaxDistance" => write_float(e.cpu, current.max_distance)?,
+        "GetMinDistance" => write_float(e.cpu, current.min_distance)?,
+        "GetMode" => e
+            .cpu
+            .write_u32(out, current.mode)
+            .map_err(|e| e.to_string())?,
+        "GetPosition" => current.position.write(e.cpu, out)?,
+        "GetVelocity" => current.velocity.write(e.cpu, out)?,
+        "SetAllParameters" => {
+            if !valid_size(e.cpu, out) {
+                return Ok(INVALID);
+            }
+            let new = Source::read(e.cpu, out, current.frequency)?;
+            update = Some(Box::new(move |source| {
+                *source = Source {
+                    frequency: source.frequency,
+                    ..new
+                }
+            }));
+        }
+        "SetConeAngles" => {
+            let (inside, outside) = (args[1], args[2]);
+            update = Some(Box::new(move |source| {
+                (source.inside_cone, source.outside_cone) = (inside, outside)
+            }));
+        }
+        "SetConeOrientation" => {
+            let cone = vector(1);
+            update = Some(Box::new(move |source| source.cone = cone));
+        }
+        "SetConeOutsideVolume" => {
+            let volume = args[1] as i32;
+            update = Some(Box::new(move |source| source.cone_outside_volume = volume));
+        }
+        "SetMaxDistance" => {
+            let distance = float(1);
+            update = Some(Box::new(move |source| source.max_distance = distance));
+        }
+        "SetMinDistance" => {
+            let distance = float(1);
+            update = Some(Box::new(move |source| source.min_distance = distance));
+        }
+        "SetMode" => {
+            let mode = args[1];
+            update = Some(Box::new(move |source| source.mode = mode));
+        }
+        "SetPosition" => {
+            let position = vector(1);
+            update = Some(Box::new(move |source| source.position = position));
+        }
+        "SetVelocity" => {
+            let velocity = vector(1);
+            update = Some(Box::new(move |source| source.velocity = velocity));
+        }
+        _ => {
+            return Err(format!(
+                "unimplemented audio method IDirectSound3DBuffer::{name}"
+            ));
+        }
+    }
+    let Some(update) = update else {
+        return Ok(0);
+    };
+    // Each setter checks the parameters as they would be after it.
+    let mut checked = current;
+    update(&mut checked);
+    if !checked.valid() {
+        return Ok(INVALID);
+    }
+    let s = e.ext.get_mut::<Sound>();
+    let buffer = com
+        .get_identity_mut(&mut e.sys.objects, id)
+        .and_then(|object| object.buffer.as_mut())
+        .unwrap();
+    if buffer.spatial.as_mut().unwrap().set(apply, update) {
+        spatialize(&s.audio, &s.listener.applied, buffer, now);
+    }
+    Ok(0)
+}
+/// The stereo gains and playback rate of `buf`: its 3D output, or its
+/// volume and pan when it has no 3D processing.
+fn mix(listener: &Listener, buf: &Buffer) -> ([f32; 2], u32) {
+    let Some(source) = buf.spatial.as_ref() else {
+        return (buf.stereo_gain(), buf.frequency);
+    };
+    let mute = buf.flags & MUTE_3D_AT_MAX_DISTANCE != 0;
+    match spatial::output(listener, &source.applied, buf.volume, mute) {
+        Some(output) => (output.gains, output.rate),
+        None => (buf.stereo_gain(), source.applied.frequency),
+    }
+}
+/// Sends `buf`'s gains and rate to the mixer. A rate change the mixer
+/// refuses under backpressure keeps the previous rate.
+fn spatialize(audio: &AudioControl, listener: &Listener, buf: &mut Buffer, now: u64) {
+    let (gains, rate) = mix(listener, buf);
+    audio.set_stereo_gain(buf.audio_id, gains);
+    if rate != buf.frequency {
+        retune(audio, buf, rate, now);
+    }
+}
+/// Restarts `buf`'s playback clock at `rate` from its current position.
+fn retune(audio: &AudioControl, buf: &mut Buffer, rate: u32, now: u64) -> bool {
+    let base = buf.cursor(now);
+    let generation = buf.generation.wrapping_add(1);
+    if audio
+        .set_frequency_generation(buf.audio_id, rate, generation)
+        .is_err()
+    {
+        return false;
+    }
+    buf.base = base;
+    buf.anchor = now;
+    buf.frequency = rate;
+    buf.queued_frames = 0;
+    buf.notice_bytes = u64::from(buf.base);
+    buf.generation = generation;
+    true
 }
 fn call(e: &mut Env<'_>) -> Outcome {
     match result(e) {
@@ -2175,6 +2643,167 @@ mod tests {
         );
         m.cpu.read_u32(DATA + 128).unwrap()
     }
+    // spec: DEV-AUDIO-6
+    #[test]
+    fn three_d_controls_follow_windows_and_drive_the_mix() {
+        let mut m = machine();
+        let device = device(&mut m);
+        assert_eq!(invoke(&mut m, "DirectSoundCreate8", &[0, DATA + 128, 0]), 0);
+        let device8 = m.cpu.read_u32(DATA + 128).unwrap();
+        let create = |m: &mut Machine<JitCpu>, device: u32, flags: u32, channels: u16| {
+            let format = Format {
+                rate: 22050,
+                channels,
+                bits: 16,
+            };
+            m.cpu.write(DATA + 64, &format.bytes()).unwrap();
+            let (bytes, at) = if flags & 1 != 0 {
+                (0, 0)
+            } else {
+                (22050 * 2 * u32::from(channels), DATA + 64)
+            };
+            for (i, value) in [20, flags, bytes, 0, at].into_iter().enumerate() {
+                m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+            }
+            let hr = invoke(
+                m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[device, DATA, DATA + 128, 0],
+            );
+            (hr, m.cpu.read_u32(DATA + 128).unwrap())
+        };
+        let f = |value: f32| value.to_bits();
+        let read_vector = |m: &Machine<JitCpu>| {
+            Vector::from_words(std::array::from_fn(|i| {
+                m.cpu.read_u32(DATA + 160 + i as u32 * 4).unwrap()
+            }))
+        };
+
+        // The calls a game makes when it enables 3D sound, with Windows'
+        // results: a zero orientation is rejected and the default stays.
+        let (hr, primary) = create(&mut m, device, 0x91, 0);
+        assert_eq!(hr, 0);
+        let listener = query(&mut m, primary, &IID_LISTENER);
+        let call = |m: &mut Machine<JitCpu>, name: &str, args: &[u32]| {
+            invoke(m, &format!("IDirectSound3DListener::{name}"), args)
+        };
+        assert_eq!(call(&mut m, "SetPosition", &[listener, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&mut m, "SetVelocity", &[listener, 0, 0, 0, 0]), 0);
+        let zero = [listener, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(call(&mut m, "SetOrientation", &zero), INVALID);
+        assert_eq!(
+            call(&mut m, "SetPosition", &[listener, f(9.0), 0, 0, 2]),
+            INVALID
+        );
+        assert_eq!(
+            call(&mut m, "SetRolloffFactor", &[listener, f(10.5), 0]),
+            INVALID
+        );
+        let skewed = [listener, 0, 0, f(3.0), 0, f(1.0), f(1.0), 0];
+        assert_eq!(call(&mut m, "SetOrientation", &skewed), 0);
+        assert_eq!(
+            call(
+                &mut m,
+                "GetOrientation",
+                &[listener, DATA + 160, DATA + 176]
+            ),
+            0
+        );
+        assert_eq!(read_vector(&m), Vector::from_words([0, 0, f(1.0)]));
+        // Deferred settings stay invisible until the listener commits them.
+        assert_eq!(
+            call(
+                &mut m,
+                "SetPosition",
+                &[listener, f(1.0), f(2.0), f(3.0), 1]
+            ),
+            0
+        );
+        assert_eq!(call(&mut m, "GetPosition", &[listener, DATA + 160]), 0);
+        assert_eq!(read_vector(&m), Vector::default());
+        assert_eq!(call(&mut m, "CommitDeferredSettings", &[listener]), 0);
+        assert_eq!(call(&mut m, "GetPosition", &[listener, DATA + 160]), 0);
+        assert_eq!(
+            read_vector(&m),
+            Vector::from_words([f(1.0), f(2.0), f(3.0)])
+        );
+        assert_eq!(call(&mut m, "SetPosition", &[listener, 0, 0, 0, 0]), 0);
+
+        // Creation rules: DirectSound 8 takes mono 3D sources without pan.
+        assert_eq!(create(&mut m, device, 0x20000, 1).0, INVALID);
+        assert_eq!(create(&mut m, device, 0x10, 2).0, 0);
+        assert_eq!(create(&mut m, device, 0x50, 1).0, 0);
+        assert_eq!(create(&mut m, device8, 0x10, 2).0, INVALID);
+        assert_eq!(create(&mut m, device8, 0x50, 1).0, INVALID);
+        assert_eq!(create(&mut m, device8, 0x20010, 1).0, 0);
+
+        let (hr, source) = create(&mut m, device, 0x100b0, 1);
+        assert_eq!(hr, 0);
+        let control = query(&mut m, source, &IID_BUFFER_3D);
+        let call = |m: &mut Machine<JitCpu>, name: &str, args: &[u32]| {
+            invoke(m, &format!("IDirectSound3DBuffer::{name}"), args)
+        };
+        m.cpu.write_u32(DATA + 192, spatial::PARAMETERS).unwrap();
+        assert_eq!(call(&mut m, "GetAllParameters", &[control, DATA + 192]), 0);
+        let defaults = Source::read(&m.cpu, DATA + 192, 22050).unwrap();
+        assert_eq!(defaults, Source::new(22050));
+        assert_eq!(defaults.cone, Vector::from_words([0, 0, f(1.0)]));
+        assert_eq!(
+            call(&mut m, "SetConeAngles", &[control, 270, 90, 0]),
+            INVALID
+        );
+        assert_eq!(call(&mut m, "SetMode", &[control, 3, 0]), INVALID);
+        assert_eq!(
+            call(&mut m, "SetConeOrientation", &[control, 0, 0, 0, 0]),
+            INVALID
+        );
+        assert_eq!(call(&mut m, "SetMaxDistance", &[control, f(0.5), 0]), 0);
+        assert_eq!(call(&mut m, "SetMaxDistance", &[control, f(1e9), 0]), 0);
+
+        // An approaching source plays faster while reporting its own rate.
+        assert_eq!(call(&mut m, "SetPosition", &[control, 0, 0, f(10.0), 0]), 0);
+        assert_eq!(
+            call(&mut m, "SetVelocity", &[control, 0, 0, f(-36.0), 0]),
+            0
+        );
+        let playing = |m: &Machine<JitCpu>, buffer: u32| {
+            let sound = m.ext.get::<Sound>();
+            let buffer = sound.buffer(&m.sys.objects, buffer).unwrap();
+            (buffer.frequency, mix(&sound.listener.applied, buffer).0)
+        };
+        assert_eq!(playing(&m, source).0, (22050.0f32 * 360.0 / 324.0) as u32);
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::GetFrequency",
+                &[source, DATA + 128]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 22050);
+        // A source to the right plays from the right speaker only.
+        assert_eq!(call(&mut m, "SetVelocity", &[control, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&mut m, "SetPosition", &[control, f(1.0), 0, 0, 0]), 0);
+        let right = |(rate, [left, right]): (u32, [f32; 2])| {
+            rate == 22050 && left < 1e-3 && (right - 1.0).abs() < 1e-6
+        };
+        assert!(right(playing(&m, source)));
+
+        // A duplicate carries the 3D parameters.
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSound8::DuplicateSoundBuffer",
+                &[device, source, DATA + 128]
+            ),
+            0
+        );
+        let duplicate = m.cpu.read_u32(DATA + 128).unwrap();
+        let copy = query(&mut m, duplicate, &IID_BUFFER_3D);
+        assert_eq!(call(&mut m, "GetPosition", &[copy, DATA + 160]), 0);
+        assert_eq!(read_vector(&m), Vector::from_words([f(1.0), 0, 0]));
+        assert!(right(playing(&m, duplicate)));
+    }
     fn query(m: &mut Machine<JitCpu>, object: u32, iid: &[u8; 16]) -> u32 {
         m.cpu.write(DATA + 256, iid).unwrap();
         assert_eq!(
@@ -2197,6 +2826,17 @@ mod tests {
             0
         );
         m.cpu.read_u32(DATA + 128).unwrap()
+    }
+    fn write_cursor(m: &mut Machine<JitCpu>, buffer: u32) -> u32 {
+        assert_eq!(
+            invoke(
+                m,
+                "IDirectSoundBuffer8::GetCurrentPosition",
+                &[buffer, 0, DATA + 132]
+            ),
+            0
+        );
+        m.cpu.read_u32(DATA + 132).unwrap()
     }
     fn advance(m: &mut Machine<JitCpu>, us: u64) {
         m.sys.clock.advance_to(m.sys.clock.now_us() + us);
@@ -2476,6 +3116,7 @@ mod tests {
         );
     }
     #[test]
+    // spec: DEV-AUDIO-1
     fn cursor_frequency_stop_restart_are_guest_clock_driven() {
         let mut m = machine();
         let b = buffer(
@@ -2493,15 +3134,19 @@ mod tests {
         );
         advance(&mut m, 25_000);
         assert_eq!(position(&mut m, b), 100);
+        // Without live output the write cursor leads by 30 ms, as on Windows.
+        assert_eq!(write_cursor(&mut m, b), 220);
         assert_eq!(
             invoke(&mut m, "IDirectSoundBuffer8::SetFrequency", &[b, 2000]),
             0
         );
         advance(&mut m, 25_000);
         assert_eq!(position(&mut m, b), 300);
+        assert_eq!(write_cursor(&mut m, b), 140);
         invoke(&mut m, "IDirectSoundBuffer8::Stop", &[b]);
         advance(&mut m, 500_000);
         assert_eq!(position(&mut m, b), 300);
+        assert_eq!(write_cursor(&mut m, b), 300);
         invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]);
         advance(&mut m, 25_000);
         assert_eq!(position(&mut m, b), 100);
@@ -3465,7 +4110,8 @@ mod tests {
         let header = heap_next(&mut m);
         // Invalid structure size is distinct from an unsupported capability.
         m.cpu.write_u32(DATA, 19).unwrap();
-        m.cpu.write_u32(DATA + 4, 0x10).unwrap();
+        // A 3D hardware voice, which Windows also refuses with E_NOTIMPL.
+        m.cpu.write_u32(DATA + 4, 0x14).unwrap();
         assert_eq!(
             invoke(
                 &mut m,
@@ -3497,8 +4143,8 @@ mod tests {
         assert_eq!(diagnostics.warnings.len(), 1);
         let ((api, reason), count) = diagnostics.warnings.first_key_value().unwrap();
         assert_eq!(api, "dsound.dll!IDirectSound8::CreateSoundBuffer");
-        assert!(reason.contains("flags=0x00000010"));
-        assert!(reason.contains("unsupported_mask=0x00000010"));
+        assert!(reason.contains("flags=0x00000014"));
+        assert!(reason.contains("unsupported_mask=0x00000004"));
         assert!(reason.contains("HRESULT=0x80004001"));
         assert_eq!(*count, 128);
         assert_eq!(m.sys.objects.object_count(), objects);

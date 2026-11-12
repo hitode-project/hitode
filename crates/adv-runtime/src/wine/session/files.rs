@@ -98,6 +98,7 @@ pub(super) fn prepare(
     cfg.codepage = match config.locale {
         0x411 => 932,
         0x804 => 936,
+        0x404 => 950,
         _ => 1252,
     };
     let mut vfs = adv_os::Vfs::new(&cfg);

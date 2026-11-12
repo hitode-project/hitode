@@ -771,7 +771,7 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 ### WINE-SES-5 Regional text
 
-**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936. Text MUST use portable matching and regional replacements without overriding installed families. Font discovery MUST be shared across sessions and scan each directory once per process.
+**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936, zh-TW for 950. Text MUST use portable matching and regional replacements without overriding installed families. Font discovery MUST be shared across sessions and scan each directory once per process.
 **Verification**: Test
 
 ### WINE-SES-6 Installed system subdirectories
