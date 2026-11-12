@@ -67,6 +67,7 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Verification**: Test
 
 The planner MUST choose fit, integer or stretch placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
+Resizing a visible view MUST redraw retained content without waiting for a guest frame. The display MUST use the next guest frame to replace the whole resampled output.
 
 ### HOST-VIEW-3 One composition path
 

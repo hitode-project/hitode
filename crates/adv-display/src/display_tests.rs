@@ -934,6 +934,31 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     display.service(&mut q).unwrap();
     let record = display.recorder().latest().unwrap();
     assert_eq!(record.frame.damage, all());
+    assert_eq!(record.frame.serial, 2);
+    assert_eq!(record.plan.layers.base.dst.w, 128);
+    assert_eq!(record.plan.layers.base.dst.h, 96);
+
+    // A resize that latches on a later refresh still leaves only a
+    // resampled copy on screen. The next real frame must replace it whole.
+    display.refreshed(4);
+    latch(&events, 3);
+    let damage = cells(&[Rect {
+        x: 0,
+        y: 0,
+        w: 8,
+        h: 8,
+    }]);
+    display
+        .present(&mut q, frame(3, &image, damage.clone()))
+        .unwrap();
+    assert_eq!(display.recorder().latest().unwrap().frame.damage, all());
+
+    display.refreshed(5);
+    latch(&events, 4);
+    display
+        .present(&mut q, frame(4, &image, damage.clone()))
+        .unwrap();
+    assert_eq!(display.recorder().latest().unwrap().frame.damage, damage);
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
 
