@@ -51,14 +51,16 @@ encoding_rs = "0.8"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-[profile.dev.package.unicorn-engine-sys]
-opt-level = 3
-debug = false
+# Line tables keep panic backtraces; full DWARF made each target directory
+# several times larger.
+[profile.dev]
+debug = "line-tables-only"
 
-# Third-party crates are built once and cached. Unoptimized, the resampler's FFT
-# makes the DAC tests take minutes. Workspace crates keep the plain debug profile.
+# Third-party crates are built once and cached, without debug info. Unoptimized,
+# the resampler's FFT makes the DAC tests take minutes.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 [profile.release]
 debug = "line-tables-only"
