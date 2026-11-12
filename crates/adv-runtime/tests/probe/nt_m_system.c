@@ -26,6 +26,26 @@ typedef BOOL (WINAPI *unmap2_fn)(HANDLE, void *, ULONG);
 typedef BOOL (WINAPI *prefetch_fn)(HANDLE, ULONG_PTR, void *, ULONG);
 typedef void *(WINAPI *alloc2_fn)(HANDLE, void *, SIZE_T, ULONG, ULONG, void *, ULONG);
 
+static int displaced_image_base(void)
+{
+    HMODULE module = LoadLibraryW(L"version.dll");
+    WCHAR path[MAX_PATH];
+    if (!module || !GetModuleFileNameW(module, path, MAX_PATH)) return 0;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    HANDLE mapping = CreateFileMappingW(file, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    CloseHandle(file);
+    if (!mapping) return 0;
+    BYTE *view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (!view) return 0;
+    IMAGE_NT_HEADERS *header = (void *)(view + ((IMAGE_DOS_HEADER *)view)->e_lfanew);
+    int ok = view != (BYTE *)module && header->OptionalHeader.ImageBase == (DWORD_PTR)module;
+    UnmapViewOfFile(view);
+    FreeLibrary(module);
+    return ok;
+}
+
 int main(void)
 {
     HMODULE nt = GetModuleHandleA("ntdll.dll"), kb = GetModuleHandleA("kernelbase.dll");
@@ -42,6 +62,7 @@ int main(void)
     MEMORY_BASIC_INFORMATION mbi;
     void *placeholder;
 
+    check("displaced-image-base", displaced_image_base());
     mapping = mapping2(INVALID_HANDLE_VALUE, NULL, SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, 65536, NULL, NULL, 0);
     check("create-section-ex", mapping != NULL);
     view = map3(mapping, GetCurrentProcess(), NULL, 0, 65536, 0, PAGE_READWRITE, NULL, 0);

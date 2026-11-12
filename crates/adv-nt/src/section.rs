@@ -5,14 +5,14 @@
 use adv_machine::layout::PAGE;
 use adv_machine::vm::align_up;
 use adv_machine::{Env, Outcome};
-use adv_pe::Pe;
+use adv_pe::{Pe, file_flags};
 
 use crate::image;
 use crate::memory::{self, Memory};
 use crate::object::{Attributes, read_u32, write_bytes, write_u32};
 use crate::protocol::{
-    CreateMappingRequest, GetMappingInfoRequest, IsSameMappingRequest, MapImageViewRequest,
-    MapViewRequest, OpenMappingRequest, UnmapViewRequest,
+    CreateMappingRequest, GetImageMapAddressRequest, GetMappingInfoRequest, IsSameMappingRequest,
+    MapImageViewRequest, MapViewRequest, OpenMappingRequest, UnmapViewRequest,
 };
 use crate::server;
 use crate::status::{self, Error, Status};
@@ -41,6 +41,7 @@ const ALLOCATION_GRANULARITY: u32 = 0x1_0000;
 const MACHINE_I386: u16 = 0x014c;
 const MACHINE_AMD64: u16 = 0x8664;
 const MACHINE_ARM64: u16 = 0xaa64;
+const IMAGE_DYNAMICALLY_RELOCATED: u8 = 0x04;
 
 /// The parts of `struct pe_image_info` the platform reads.
 pub struct ImageInfo {
@@ -53,6 +54,7 @@ pub struct ImageInfo {
     pub image_charact: u16,
     pub dll_charact: u16,
     pub machine: u16,
+    image_flags: u8,
 }
 
 /// `struct pe_image_info`.
@@ -73,6 +75,7 @@ impl ImageInfo {
             image_charact: u16_at(60),
             dll_charact: u16_at(62),
             machine: u16_at(64),
+            image_flags: bytes[67],
         }
     }
 }
@@ -110,7 +113,7 @@ pub fn image_information(pe_info: &[u8]) -> [u8; IMAGE_INFORMATION_SIZE] {
     // alike in both; then the code flag and the image flags.
     out[0x14..0x22].copy_from_slice(&pe_info[52..66]);
     out[0x22] = pe_info[66] & 1;
-    out[0x23] = pe_info[67];
+    out[0x23] = info.image_flags;
     out
 }
 
@@ -571,7 +574,20 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
             "mapping a view of a data section".into(),
         ));
     }
-    let info = ImageInfo::parse(&data);
+    let mut info = ImageInfo::parse(&data);
+    if info.map_addr == 0
+        && info.image_charact & file_flags::DLL != 0
+        && info.image_flags & IMAGE_DYNAMICALLY_RELOCATED != 0
+    {
+        let mut request = GetImageMapAddressRequest {
+            handle: mapping,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        if reply.header.error == 0 {
+            info.map_addr = reply.addr as u32;
+        }
+    }
 
     let fd = server::handle_fd(env, mapping)?;
     let file = crate::file::volume::read_all(&crate::file::volume::mounts(env), fd.fd)
@@ -596,8 +612,11 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     } else {
         memory::find_free(&env.sys.vm, size, false).ok_or(status::NO_MEMORY)?
     };
-    if base != pe.image_base {
-        pe.rebase(base).map_err(|_| status::INVALID_IMAGE_FORMAT)?;
+    // The section is relocated to its shared dynamic base. The loader applies
+    // any remaining relocation when it loads an image from a displaced view.
+    if preferred != pe.image_base {
+        pe.rebase(preferred)
+            .map_err(|_| status::INVALID_IMAGE_FORMAT)?;
     }
     let memory = env.ext.get_or_default::<Memory>();
     image::map(env.cpu, &mut env.sys.vm, memory, &pe, base)
