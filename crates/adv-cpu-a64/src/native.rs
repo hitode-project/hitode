@@ -1695,11 +1695,10 @@ impl Native {
             .map(|&(offset, site)| (entry + offset, site))
             .collect();
         sites.sort_unstable_by_key(|&(pc, _)| pc);
-        let len = code.words.len() * 4;
-        crate::jit_map::record(entry, len, eip, retired, code.marks);
+        crate::jit_map::record(entry, code.words, eip, retired, code.marks);
         Some(worker::Code {
             entry,
-            end: entry + len,
+            end: entry + code.words.len() * 4,
             sites: sites.into(),
         })
     }
@@ -1840,7 +1839,7 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
-        crate::jit_map::record(unit, words.len() * 4, eip, retired, marks);
+        crate::jit_map::record(unit, words, eip, retired, marks);
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
