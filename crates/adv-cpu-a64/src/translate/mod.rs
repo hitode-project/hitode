@@ -406,6 +406,12 @@ enum Cold {
         leave: Label,
         resume: Label,
     },
+    /// A nonzero head-exit count: leave once it counts down to zero.
+    Count {
+        label: Label,
+        leave: Label,
+        resume: Label,
+    },
     /// A proved slice exhausted its credit. Refill it only under the same lease.
     Checkpoint {
         label: Label,
@@ -981,7 +987,14 @@ impl Translator<'_> {
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
         if let Some(done) = self.head_exit(to) {
-            self.asm.cbz(W, true, X0, done);
+            let (count, resume) = (self.asm.label(), self.asm.label());
+            self.asm.cbz(W, true, X0, count);
+            self.asm.bind(resume);
+            self.push_cold(Cold::Count {
+                label: count,
+                leave: done,
+                resume,
+            });
             let refund = self.trace.unused(self.index);
             self.leave_at_head(done, refund, x87);
         }
@@ -1054,7 +1067,8 @@ impl Translator<'_> {
                 }
                 let test = self.test(cc);
                 if let Some(done) = self.head_exit(to) {
-                    let (check, back) = (self.asm.label(), self.asm.label());
+                    let (check, count, back) =
+                        (self.asm.label(), self.asm.label(), self.asm.label());
                     self.asm.cbz(W, true, X0, check);
                     self.asm.bind(back);
                     let refund = self.trace.unused(from);
@@ -1064,6 +1078,11 @@ impl Translator<'_> {
                         label: check,
                         net: 0,
                         test,
+                        leave: count,
+                        resume: back,
+                    });
+                    self.push_cold(Cold::Count {
+                        label: count,
                         leave: done,
                         resume: back,
                     });
@@ -1796,6 +1815,21 @@ impl Translator<'_> {
                 self.asm.bind(label);
                 self.emit(add_imm(X, X9, X9, net, false));
                 self.jump_if(test, leave);
+                self.asm.b(resume);
+            }
+            Cold::Count {
+                label,
+                leave,
+                resume,
+            } => {
+                // NZCV may hold guest flags: count without setting them.
+                self.asm.bind(label);
+                self.emit_all(&[
+                    ldr(W, X0, RUNTIME, crate::runtime::HEAD_EXIT),
+                    sub_imm(W, X0, X0, 1, false),
+                    str(W, X0, RUNTIME, crate::runtime::HEAD_EXIT),
+                ]);
+                self.asm.cbz(W, false, X0, leave);
                 self.asm.b(resume);
             }
             Cold::Checkpoint {

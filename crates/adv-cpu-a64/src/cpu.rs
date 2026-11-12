@@ -545,6 +545,10 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.body_services()
     }
 
+    fn split_share(&self) -> f32 {
+        self.handler.split_share()
+    }
+
     fn diagnostics(&self) -> u8 {
         self.handler.diagnostics()
     }

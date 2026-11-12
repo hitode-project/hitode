@@ -132,7 +132,8 @@ pub struct Runtime {
     pub computation_pending: u64,
     pub computation_pending_mask: u32,
     pub completed: u64,
-    /// Nonzero: the proved form leaves at its next return to its head.
+    /// Nonzero: the proved form leaves when this many returns to its head
+    /// have counted it down to zero.
     pub head_exit: u32,
     /// Checkpoints that kept running past a recall to reach the head.
     pub deferred: u32,

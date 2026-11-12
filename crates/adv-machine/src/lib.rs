@@ -17,6 +17,7 @@ mod computation;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
+mod frame_load;
 pub mod frame_spin;
 mod guest_words;
 #[cfg(test)]
@@ -187,6 +188,8 @@ pub struct Sys {
     pub scheduling: scheduling::SchedulingStats,
     /// The host display's frame clock for frame spins (PROC-CLOCK-4).
     pub frame_pacer: Option<std::sync::Arc<dyn frame_spin::FramePacer>>,
+    /// Owner work per frame, which selects loop splitting (PROC-MACH-1).
+    load: frame_load::FrameLoad,
     pub schedule_trace: schedule_trace::ScheduleTrace,
     wakes: sched::ActiveContexts,
     wait_deadlines: std::collections::BTreeSet<(u64, CtxId)>,
@@ -902,12 +905,13 @@ impl Sys {
         if let Some(budget) = &mut self.stats.frame_budget {
             budget.mark_frame(u64::from(self.completed_frames));
         }
+        let work = self.load.frame(std::time::Instant::now());
         self.schedule_trace.event(
             "frame",
             self.current,
             u64::from(self.completed_frames),
-            0,
-            0,
+            work,
+            (self.load.share() * 1000.0) as u64,
         );
     }
 
@@ -1906,6 +1910,26 @@ impl TrapHandler for Dispatch<'_> {
                 .any(|c| c.id != self.sys.current && c.is_ready() && !c.yielded)
     }
 
+    fn split_share(&self) -> f32 {
+        if !self.computation
+            || DEBUGGER_ATTACHED.get()
+            || self.sys.trace.enabled()
+            || self.sys.call_limit.is_some()
+        {
+            0.0
+        } else if self
+            .sys
+            .frame_pacer
+            .as_ref()
+            .is_some_and(|p| p.input_held())
+        {
+            // Skipping has no frame deadline: any helper worth waking serves.
+            1.0
+        } else {
+            self.sys.load.share()
+        }
+    }
+
     fn allow_spin_yield(&self) -> bool {
         self.sys
             .active_contexts()
@@ -2165,6 +2189,7 @@ impl<B: Backend> Machine<B> {
             frame: 0,
             completed_frames: 0,
             frame_pacer: None,
+            load: frame_load::FrameLoad::default(),
             pid: 0x1000,
             peb: PEB_ADDR,
             teb_pages: 1,
@@ -3087,6 +3112,9 @@ impl<B: Backend> Machine<B> {
                     c.progress.saw_event();
                 }
                 c.progress.ran(retired);
+                if !c.progress.settled() {
+                    self.sys.load.ran(run_elapsed);
+                }
             }
             if self.sys.schedule_trace.enabled() {
                 self.sys.schedule_trace.event(

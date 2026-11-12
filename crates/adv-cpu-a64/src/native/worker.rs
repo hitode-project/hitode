@@ -13,13 +13,26 @@ use rustc_hash::FxHashMap;
 use super::{ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Runtime, Site, record_branch};
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
-use crate::translate::computation::{Evaluation, Proof, Range};
+use crate::translate::computation::{Evaluation, Plan, Proof, Range};
+
+/// A helper's wake latency until helpers have shown theirs: it starts
+/// claiming this long after the owner.
+const WAKE_NS: f64 = 50_000.0;
+/// Blocks per thread, so the last block to finish leaves the others idle
+/// for about a quarter of a thread's part. A block is at most one slice.
+const BLOCKS_PER_THREAD: f64 = 4.0;
+/// The owner's fixed work in a split besides its blocks: admission and merge.
+const ROUND_NS: f64 = 10_000.0;
+/// MXCSR exception flags, sticky across a loop's blocks.
+const MXCSR_FLAGS: u32 = 0x3f;
 
 pub(super) struct Prepared {
     pub code: Code,
     pub proof: Proof,
     skip: std::cell::Cell<u32>,
     mode: std::cell::Cell<Mode>,
+    /// Instructions and time per outer iteration, once a job showed them.
+    per_iteration: std::cell::Cell<Option<(u64, f64)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +56,7 @@ impl Prepared {
             proof,
             skip: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
+            per_iteration: std::cell::Cell::new(None),
         }
     }
 
@@ -143,6 +157,8 @@ struct Done {
 
 const RECALL: u32 = 1;
 const OWNER_NEEDED: u32 = 2;
+/// The owner's own job also stops for its ordinary work.
+const LOCAL: u32 = RECALL | OWNER_NEEDED;
 
 pub(super) struct Notifications {
     pub pending: (Arc<AtomicU32>, u32),
@@ -167,9 +183,9 @@ fn run(
     id: u32,
     mut context: ExecutionContext,
     entry: Entry,
-    (code, once): (&Code, bool),
+    (code, head_exit): (&Code, u32),
     signals: &Signals,
-    local: bool,
+    recall_mask: u32,
 ) -> Done {
     let cpu = context.cpu_mut();
     cpu.settle_flags();
@@ -184,11 +200,11 @@ fn run(
     runtime.shadow = entry.alias;
     runtime.countdown = u64::from(COMPUTATION_SLICE);
     runtime.recall = signals.recall.as_ptr() as u64;
-    runtime.recall_mask = if local { RECALL | OWNER_NEEDED } else { RECALL };
+    runtime.recall_mask = recall_mask;
     runtime.computation_pending = signals.pending.0.as_ptr() as u64;
     runtime.computation_pending_mask = signals.pending.1;
     runtime.completed = 0;
-    runtime.head_exit = u32::from(once);
+    runtime.head_exit = head_exit;
     runtime.deferred = 0;
     runtime.branch = 0;
     runtime.fault_simd = faults.capture.simd.as_ptr() as u64;
@@ -226,13 +242,185 @@ fn run(
             context: Some(context),
             retired,
             elapsed,
+            helpers: Duration::ZERO,
             requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
         },
     }
 }
 
+/// How split loops ran, for reports.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SplitCounts {
+    pub splits: u64,
+    pub blocks: u64,
+    pub wakes: u64,
+    /// Helpers that found no block left to claim.
+    pub idle_wakes: u64,
+    /// Total time from submitting blocks to each helper's first claim.
+    pub claim_ns: u64,
+}
+
+enum Job {
+    Whole(Box<Task>),
+    Blocks(Arc<Blocks>, SyncSender<Drained>),
+}
+
+/// An admitted head loop split into blocks of consecutive iterations
+/// (A64-TR-9). Threads claim blocks in order, so completed blocks are a
+/// prefix. Only the last block runs past the loop. A loop that writes its
+/// frame runs each thread's blocks on a private copy below ESP.
+struct Blocks {
+    next: AtomicU32,
+    stop: std::sync::atomic::AtomicBool,
+    /// Thread indices: the owner is 0.
+    threads: AtomicU32,
+    count: u32,
+    size: u32,
+    plan: Plan,
+    start: ExecutionContext,
+    entry: Entry,
+    code: Code,
+    signals: Signals,
+    submitted: Instant,
+}
+
+#[derive(Default)]
+struct Drained {
+    retired: u64,
+    elapsed: Duration,
+    sticky: u32,
+    blocks: u32,
+    /// From submission to its first claim.
+    claimed_after: Duration,
+    /// The last block's completion and its thread.
+    last: Option<(Completion<Option<ExecutionContext>>, u32)>,
+}
+
+const ESP: usize = 4;
+
+/// The distance between private frames: the span in cache lines.
+fn frame_stride((lo, hi): (i32, i32)) -> u32 {
+    ((hi - lo) as u32).next_multiple_of(64)
+}
+
+impl Blocks {
+    /// The context at the head before outer iteration `first`.
+    fn at(&self, first: u32) -> ExecutionContext {
+        let mut context = self.start.clone();
+        let cpu = context.cpu_mut();
+        for (reg, affine) in cpu.regs.iter_mut().zip(self.plan.regs) {
+            if let Some((start, step)) = affine {
+                *reg = start.wrapping_add(step.wrapping_mul(first));
+            }
+        }
+        context
+    }
+
+    fn host(&self, addr: u32) -> *mut u8 {
+        self.entry.alias.wrapping_add(u64::from(addr)) as *mut u8
+    }
+
+    /// Stores the affine frame dwords before iteration `first` in the frame
+    /// at `esp`.
+    fn slots(&self, esp: u32, first: u32) {
+        for &(offset, start, step) in self.plan.slots.iter().flatten() {
+            let value = start.wrapping_add(step.wrapping_mul(first));
+            let addr = esp.wrapping_add(offset as u32);
+            // SAFETY: admission granted the frame span for writing.
+            unsafe { self.host(addr).cast::<u32>().write_unaligned(value) };
+        }
+    }
+
+    /// Copies the frame span from the frame at `from` to the frame at `to`.
+    fn copy(&self, (lo, hi): (i32, i32), from: u32, to: u32) {
+        let at = |esp: u32| self.host(esp.wrapping_add(lo as u32));
+        // SAFETY: admission granted both spans, which are a stride apart.
+        unsafe { std::ptr::copy_nonoverlapping(at(from), at(to), (hi - lo) as usize) };
+    }
+
+    /// The context before iteration `first` on thread `thread`'s frame.
+    fn enter(&self, first: u32, thread: u32) -> ExecutionContext {
+        let mut context = self.at(first);
+        if let Some(frame) = self.plan.frame {
+            let esp = self.start.cpu().regs[ESP];
+            let private = esp.wrapping_sub((thread + 1) * frame_stride(frame));
+            self.copy(frame, esp, private);
+            self.slots(private, first);
+            context.cpu_mut().regs[ESP] = private;
+        }
+        context
+    }
+
+    /// Moves the last block's frame and ESP back to the real frame, or
+    /// stores the affine frame dwords of a prefix ending before `first`.
+    fn settle(&self, cpu: &mut adv_cpu_core::CpuState, last: Option<u32>, first: u32) {
+        let Some(frame) = self.plan.frame else {
+            return;
+        };
+        let esp = self.start.cpu().regs[ESP];
+        match last {
+            Some(thread) => {
+                let delta = (thread + 1) * frame_stride(frame);
+                self.copy(frame, esp.wrapping_sub(delta), esp);
+                cpu.regs[ESP] = cpu.regs[ESP].wrapping_add(delta);
+            }
+            None => self.slots(esp, first),
+        }
+    }
+
+    fn drain(&self, runtime: &mut Runtime) -> Drained {
+        let started = Instant::now();
+        let thread = self.threads.fetch_add(1, Ordering::Relaxed);
+        let mut out = Drained::default();
+        // A block ignores recalls; a request only ends further claims.
+        let quiet = Signals {
+            recall: self.signals.recall.clone(),
+            pending: (self.signals.pending.0.clone(), 0),
+        };
+        while !self.stop.load(Ordering::Acquire) {
+            if self.signals.requested() {
+                self.stop.store(true, Ordering::Release);
+                break;
+            }
+            let index = self.next.fetch_add(1, Ordering::AcqRel);
+            if index >= self.count {
+                break;
+            }
+            if out.blocks == 0 {
+                out.claimed_after = started - self.submitted;
+            }
+            out.blocks += 1;
+            let last = index + 1 == self.count;
+            let iterations = if last { 0 } else { self.size };
+            let context = self.enter(index * self.size, thread);
+            let done = run(
+                runtime,
+                0,
+                context,
+                self.entry,
+                (&self.code, iterations),
+                &quiet,
+                0,
+            )
+            .completion;
+            let cpu = done.context.as_ref().expect("block context").cpu();
+            assert!(
+                last || (!done.requires_owner && cpu.eip == self.start.cpu().eip),
+                "a proved block left its iterations"
+            );
+            out.retired += done.retired;
+            out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
+            if last {
+                out.last = Some((done, thread));
+            }
+        }
+        out.elapsed = started.elapsed();
+        out
+    }
+}
+
 struct Pool {
-    send: SyncSender<Task>,
+    send: SyncSender<Job>,
     active: Arc<AtomicUsize>,
     limit: usize,
 }
@@ -252,7 +440,7 @@ impl Pool {
         if limit == 0 {
             return None;
         }
-        let (send, recv) = sync_channel::<Task>(limit);
+        let (send, recv) = sync_channel::<Job>(limit);
         let recv = Arc::new(Mutex::new(recv));
         let active = Arc::new(AtomicUsize::new(0));
         let mut started = 0;
@@ -273,16 +461,25 @@ impl Pool {
                     crate::cache::execution_thread();
                     let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
                     loop {
-                        let task = recv.lock().unwrap().recv();
-                        let Ok(task) = task else { break };
+                        let job = recv.lock().unwrap().recv();
+                        let task = match job {
+                            Ok(Job::Whole(task)) => *task,
+                            Ok(Job::Blocks(blocks, done)) => {
+                                let drained = blocks.drain(&mut runtime);
+                                active.fetch_sub(1, Ordering::Release);
+                                let _ = done.send(drained);
+                                continue;
+                            }
+                            Err(_) => break,
+                        };
                         let result = run(
                             &mut runtime,
                             task.id,
                             task.context,
                             task.entry,
-                            (&task.code, task.once),
+                            (&task.code, u32::from(task.once)),
                             &task.signals,
-                            false,
+                            RECALL,
                         );
                         if result.completion.requires_owner {
                             task.signals
@@ -308,7 +505,11 @@ impl Pool {
         })
     }
 
-    fn submit(&self, task: Task) -> bool {
+    fn idle(&self) -> usize {
+        self.limit - self.active.load(Ordering::Acquire)
+    }
+
+    fn submit(&self, task: Job) -> bool {
         if self
             .active
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
@@ -347,24 +548,64 @@ impl Admission {
             self.generation = generation;
             self.grants.clear();
         }
+        let grants = &mut self.grants;
         let ranges = proof.evaluate(cpu, &mut self.eval, |addr| {
-            let range = Range {
-                start: addr,
-                end: u64::from(addr) + 4,
-                write: false,
-            };
-            if conflicts(&range, active) || !grant(memory, &mut self.grants, &range) {
-                return None;
-            }
-            let mut bytes = [0; 4];
-            memory.read_into(addr, &mut bytes).ok()?;
-            Some(u32::from_le_bytes(bytes))
+            parameter(memory, grants, active, addr)
         })?;
         ranges
             .iter()
             .all(|range| !conflicts(range, active) && grant(memory, &mut self.grants, range))
             .then_some(ranges)
     }
+}
+
+impl Admission {
+    /// After `ranges`, the blocks of its head loop, if it splits.
+    fn plan(
+        &mut self,
+        proof: &Proof,
+        cpu: &adv_cpu_core::CpuState,
+        memory: &Memory,
+        active: &[ActiveTask],
+    ) -> Option<Plan> {
+        let grants = &mut self.grants;
+        proof.plan(cpu, &mut self.eval, |addr| {
+            parameter(memory, grants, active, addr)
+        })
+    }
+}
+
+impl Admission {
+    /// Whether the evaluated computation may also write `region`, which it
+    /// does not otherwise touch.
+    fn private(&mut self, memory: &Memory, active: &[ActiveTask], region: &Range) -> bool {
+        let overlaps = |other: &Range| {
+            u64::from(region.start) < other.end && u64::from(other.start) < region.end
+        };
+        !self.eval.admitted().iter().any(overlaps)
+            && !conflicts(region, active)
+            && grant(memory, &mut self.grants, region)
+    }
+}
+
+/// One ordinary four-byte parameter cell, after checking active write leases.
+fn parameter(
+    memory: &Memory,
+    grants: &mut Vec<Range>,
+    active: &[ActiveTask],
+    addr: u32,
+) -> Option<u32> {
+    let range = Range {
+        start: addr,
+        end: u64::from(addr) + 4,
+        write: false,
+    };
+    if conflicts(&range, active) || !grant(memory, grants, &range) {
+        return None;
+    }
+    let mut bytes = [0; 4];
+    memory.read_into(addr, &mut bytes).ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 fn grant(memory: &Memory, cache: &mut Vec<Range>, range: &Range) -> bool {
@@ -417,6 +658,8 @@ pub(super) struct Session<'a> {
     send: SyncSender<Done>,
     recv: Receiver<Done>,
     runtime: Runtime,
+    share: f32,
+    counts: &'a mut SplitCounts,
 }
 
 impl<'a> Session<'a> {
@@ -425,9 +668,9 @@ impl<'a> Session<'a> {
         prepared: &'a FxHashMap<u32, Prepared>,
         memory: &'a Memory,
         admission: &'a mut Admission,
-        retired: &'a mut u64,
-        forms: &'a mut Option<[u64; 5]>,
+        (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
         notifications: Notifications,
+        (share, counts): (f32, &'a mut SplitCounts),
     ) -> Option<Self> {
         let pool = Pool::get()?;
         let (send, recv) = sync_channel(pool.limit);
@@ -448,6 +691,8 @@ impl<'a> Session<'a> {
                 pending: notifications.pending,
             },
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
+            share,
+            counts,
         })
     }
 
@@ -465,6 +710,120 @@ impl<'a> Session<'a> {
             .ranges(&prepared.proof, cpu, self.memory, &self.active)?;
         let (code, iteration) = prepared.selected();
         Some((code, ranges, iteration))
+    }
+
+    /// Runs the admitted head loop as blocks of about one budget slice, on
+    /// the owner and the fewest idle workers that save the session's share
+    /// of its serial time.
+    fn split(
+        &mut self,
+        id: u32,
+        context: &ExecutionContext,
+        code: &Code,
+        plan: Plan,
+        (retired, ns): (u64, f64),
+    ) -> Option<Completion<Option<ExecutionContext>>> {
+        let slice = (u64::from(COMPUTATION_SLICE) / retired).clamp(1, u64::from(u32::MAX)) as u32;
+        let serial = f64::from(plan.iterations) * ns;
+        let most = self.pool.idle().min(plan.iterations as usize - 1);
+        let counts = &*self.counts;
+        let wake = match counts.wakes - counts.idle_wakes {
+            0 => WAKE_NS,
+            claimed => counts.claim_ns as f64 / claimed as f64,
+        };
+        let helpers = helpers(serial, (wake, f64::from(slice) * ns), self.share, most);
+        if helpers == 0 {
+            return None;
+        }
+        let threads = (helpers + 1) as f64 * BLOCKS_PER_THREAD;
+        let size = slice.min((f64::from(plan.iterations) / threads).ceil() as u32);
+        let count = plan.iterations.div_ceil(size);
+        // Private frames lie below ESP, one stride per thread.
+        if let Some(frame) = plan.frame {
+            let below = (helpers as u32 + 1) * frame_stride(frame);
+            let start = context.cpu().regs[ESP]
+                .wrapping_sub(below)
+                .wrapping_add(frame.0 as u32);
+            let region = Range {
+                start,
+                end: u64::from(start) + u64::from(below),
+                write: true,
+            };
+            if !self.admission.private(self.memory, &self.active, &region) {
+                return None;
+            }
+        }
+        let started = Instant::now();
+        let mut start = context.clone();
+        start.cpu_mut().settle_flags();
+        let blocks = Arc::new(Blocks {
+            next: AtomicU32::new(0),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            threads: AtomicU32::new(0),
+            count,
+            size,
+            plan,
+            start,
+            entry: self.entry,
+            code: code.clone(),
+            signals: self.signals.clone(),
+            submitted: started,
+        });
+        let (send, recv) = sync_channel(helpers);
+        let submitted = (0..helpers)
+            .take_while(|_| self.pool.submit(Job::Blocks(blocks.clone(), send.clone())))
+            .count();
+        let mut total = blocks.drain(&mut self.runtime);
+        let mut helped = Duration::ZERO;
+        self.counts.splits += 1;
+        self.counts.wakes += submitted as u64;
+        for _ in 0..submitted {
+            let drained = recv.recv().expect("block helper");
+            if drained.blocks == 0 {
+                self.counts.idle_wakes += 1;
+            } else {
+                self.counts.claim_ns += drained.claimed_after.as_nanos() as u64;
+            }
+            total.blocks += drained.blocks;
+            total.retired += drained.retired;
+            total.sticky |= drained.sticky;
+            total.last = total.last.or(drained.last);
+            helped += drained.elapsed;
+        }
+        // A recall stops claims: the completed prefix returns at the head.
+        let claimed = blocks.next.load(Ordering::Acquire).min(count);
+        let iterations = if claimed == count {
+            plan.iterations
+        } else {
+            claimed * size
+        };
+        let (mut completion, last) = match total.last.take() {
+            Some((done, thread)) => (done, Some(thread)),
+            None => (
+                Completion {
+                    id,
+                    context: Some(blocks.at(iterations)),
+                    retired: 0,
+                    elapsed: Duration::ZERO,
+                    helpers: Duration::ZERO,
+                    requires_owner: false,
+                },
+                None,
+            ),
+        };
+        blocks.settle(
+            completion.context.as_mut().unwrap().cpu_mut(),
+            last,
+            iterations,
+        );
+        self.counts.blocks += u64::from(total.blocks);
+        completion.id = id;
+        completion.retired = total.retired;
+        completion.elapsed = started.elapsed();
+        completion.helpers = helped;
+        completion.context.as_mut().unwrap().cpu_mut().mxcsr |= total.sticky;
+        learn(&self.prepared[&context.cpu().eip], &completion, iterations);
+        Some(completion)
     }
 
     fn account(
@@ -494,6 +853,35 @@ impl<'a> Session<'a> {
     }
 }
 
+/// The fewest helpers whose blocks cut `serial` ns by `share`, or all that
+/// are worth waking, given the `wake` latency and the most a `slice` block
+/// takes. One is worth waking only if its part of the loop exceeds four
+/// wake latencies.
+fn helpers(serial: f64, (wake, slice): (f64, f64), share: f32, most: usize) -> usize {
+    let worth = ((serial - wake) / (4.0 * wake) - 1.0).max(0.0) as usize;
+    let most = most.min(worth);
+    let target = serial * f64::from(1.0 - share);
+    (1..=most)
+        .find(|&h| {
+            let part = (serial - wake) / (h + 1) as f64;
+            wake + part + (part / BLOCKS_PER_THREAD).min(slice) + ROUND_NS <= target
+        })
+        .unwrap_or(most)
+}
+
+/// Records the instructions and time per outer iteration of a job that ran
+/// `iterations` of them.
+fn learn(prepared: &Prepared, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+    if iterations == 0 || done.requires_owner {
+        return;
+    }
+    let n = u64::from(iterations);
+    let ns = (done.elapsed + done.helpers).as_nanos() as f64;
+    prepared
+        .per_iteration
+        .set(Some(((done.retired / n).max(1), ns / n as f64)));
+}
+
 impl Computation<Option<ExecutionContext>> for Session<'_> {
     fn submit(&mut self, id: u32, context: &Option<ExecutionContext>) -> bool {
         let Some(context) = context.as_ref() else {
@@ -511,7 +899,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
         };
         grant.extend_from_slice(ranges);
         let code = code.clone();
-        if self.pool.submit(Task {
+        if self.pool.submit(Job::Whole(Box::new(Task {
             id,
             context: context.clone(),
             code,
@@ -520,7 +908,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             signals: self.signals.clone(),
             done: self.send.clone(),
             wake: self.wake.clone(),
-        }) {
+        }))) {
             self.active.push(ActiveTask {
                 id,
                 entry: guest_entry,
@@ -543,15 +931,46 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
         let guest_entry = context.cpu().eip;
         let (code, _, iteration) = self.prepare(id, context)?;
         let code = code.clone();
+        let prepared = &self.prepared[&guest_entry];
+        let plan = prepared
+            .proof
+            .splits()
+            .then(|| {
+                self.admission
+                    .plan(&prepared.proof, context.cpu(), self.memory, &self.active)
+            })
+            .flatten();
+        if let Some(plan) = plan
+            && self.share > 0.0
+            && let Some(per_iteration) = prepared.per_iteration.get()
+            && let Some(completion) = self.split(id, context, &code, plan, per_iteration)
+        {
+            let done = Done {
+                completion,
+                deadline_recall: false,
+            };
+            return Some(self.account(guest_entry, false, done));
+        }
         let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
-            (&code, iteration),
+            (&code, u32::from(iteration)),
             &self.signals,
-            true,
+            LOCAL,
         );
+        if let Some(plan) = plan
+            && !done.completion.requires_owner
+        {
+            let eip = done.completion.context.as_ref().unwrap().cpu().eip;
+            let iterations = match (eip == guest_entry, iteration) {
+                (false, _) => plan.iterations,
+                (true, true) => 1,
+                (true, false) => 0,
+            };
+            learn(prepared, &done.completion, iterations);
+        }
         Some(self.account(guest_entry, iteration, done))
     }
 
@@ -742,7 +1161,7 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
-            (&native.computation.get(&head).unwrap().code, false),
+            (&native.computation.get(&head).unwrap().code, 0),
             &Signals {
                 recall: Arc::new(AtomicU32::new(0)),
                 pending: (
@@ -750,7 +1169,7 @@ mod tests {
                     adv_sync::pending::DEADLINE,
                 ),
             },
-            true,
+            LOCAL,
         )
         .completion;
         assert!(!local.requires_owner);
@@ -762,6 +1181,260 @@ mod tests {
         memory.write(head, &[0xcc]).unwrap();
         native.invalidate(memory);
         assert!(!native.computation.contains_key(&head));
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn helpers_save_the_share_past_their_wake() {
+        // A 400 us loop that must lose 10%: one helper once wakes are known
+        // to take 12 us, none while a wake is assumed to take 50 us.
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.1, 7), 1);
+        assert_eq!(helpers(400_000.0, (50_000.0, 1e9), 0.1, 7), 0);
+        // Half of it needs two; a held key takes every helper worth one.
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.5, 7), 2);
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 1.0, 7), 7);
+    }
+
+    const SRC: u32 = 0x100_0000;
+    const DST: u32 = 0x200_0000;
+    const N: u32 = 1 << 20;
+
+    /// Offers the head loop at CODE, runs it from `start` once whole and
+    /// once split, and checks that both leave the same state and memory
+    /// `check`. `reset` restores memory before each run.
+    fn whole_then_split(
+        executor: &mut Executor,
+        native: &mut Native,
+        start: &Option<ExecutionContext>,
+        stop: u32,
+        reset: impl Fn(&mut Memory),
+        check: &[(u32, usize)],
+    ) -> (u64, ExecutionContext) {
+        native.candidates.push(CODE);
+        native.set_computation_offer(true, None);
+        let mut cpu = start.as_ref().unwrap().cpu().clone();
+        let offer = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.exit, Exit::Computation);
+        assert!(native.computation[&CODE].proof.splits());
+        native.split_share = 1.0;
+        let mut results = Vec::new();
+        let mut memories = Vec::new();
+        // The first job shows the iteration's cost; the second splits.
+        for _ in 0..2 {
+            reset(executor.memory_mut());
+            let mut retired = 0;
+            native.with_computation(
+                executor.memory_mut(),
+                &mut retired,
+                (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+                None,
+                &mut |scope| results.push(scope.run_local(1, start).expect("admitted loop")),
+            );
+            assert_eq!(retired, results.last().unwrap().retired);
+            let memory = executor.memory();
+            memories.push(
+                check
+                    .iter()
+                    .map(|&(at, len)| memory.read(at, len).unwrap().to_vec())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(memories[0] == memories[1], "split memory differs");
+        let split = native.diagnostics.split;
+        assert_eq!(split.splits, 1);
+        assert!(split.wakes >= 1 && split.blocks > 2);
+        let [whole, blocks] = results.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!(whole.helpers, Duration::ZERO);
+        assert!(!blocks.requires_owner);
+        assert_eq!(blocks.retired, whole.retired);
+        let (whole, blocks) = (
+            whole.context.as_ref().unwrap(),
+            blocks.context.as_ref().unwrap(),
+        );
+        assert_eq!(blocks.cpu().eip, stop);
+        assert_eq!(blocks.cpu(), whole.cpu());
+        (results[0].retired, whole.clone())
+    }
+
+    /// Blocks of the offered loop, stopped after claiming `claimed` of 8.
+    fn stopped_blocks(
+        executor: &Executor,
+        native: &Native,
+        start: &Option<ExecutionContext>,
+        claimed: u32,
+    ) -> Blocks {
+        let (proof, cpu) = (
+            &native.computation[&CODE].proof,
+            start.as_ref().unwrap().cpu(),
+        );
+        let mut scratch = Evaluation::default();
+        let read = |addr| {
+            let bytes = executor.memory().read(addr, 4).ok()?;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        };
+        proof.evaluate(cpu, &mut scratch, read).unwrap();
+        let plan = proof.plan(cpu, &mut scratch, read);
+        Blocks {
+            next: AtomicU32::new(claimed),
+            stop: std::sync::atomic::AtomicBool::new(true),
+            threads: AtomicU32::new(0),
+            count: 8,
+            size: N / 8,
+            plan: plan.expect("blocks"),
+            start: start.clone().unwrap(),
+            entry: Entry {
+                enter: native.enter,
+                window: native.runtime.window,
+                alias: super::super::alias_base(executor.memory()),
+                fault: native.stubs.fault,
+            },
+            code: native.computation[&CODE].code.clone(),
+            signals: Signals {
+                recall: Arc::new(AtomicU32::new(0)),
+                pending: (Arc::new(AtomicU32::new(0)), 0),
+            },
+            submitted: Instant::now(),
+        }
+    }
+
+    // spec: A64-CTL-7 A64-CTL-8 A64-TR-9
+    #[test]
+    fn a_single_context_runs_its_head_loop_as_exact_blocks() {
+        if Pool::get().is_none_or(|pool| pool.limit < 2) {
+            return;
+        }
+        // head: dst[i] = (src[i] + dst[i]) >> 1, in place.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, dword_ptr(edi)).unwrap();
+        a.shr(eax, 1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 4;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        let src: Vec<u8> = (0..N).flat_map(|i| (i * 7).to_le_bytes()).collect();
+        let dst: Vec<u8> = (0..N).flat_map(|i| (i ^ 0x5555).to_le_bytes()).collect();
+        memory.write(SRC, &src).unwrap();
+        let expected: Vec<u8> = (0..N)
+            .flat_map(|i| ((i * 7 + (i ^ 0x5555)) >> 1).to_le_bytes())
+            .collect();
+        executor.state.eip = CODE;
+        executor.state.regs[1] = N;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        let start = Some(executor.save_context().unwrap());
+        let reset = |memory: &mut Memory| memory.write(DST, &dst).unwrap();
+        let (retired, _) = whole_then_split(
+            &mut executor,
+            &mut native,
+            &start,
+            stop,
+            reset,
+            &[(DST, len)],
+        );
+        assert_eq!(retired, u64::from(N) * 8);
+        assert_eq!(executor.memory().read(DST, len).unwrap(), expected);
+
+        // A recalled split returns the completed prefix at the head.
+        let prefix = stopped_blocks(&executor, &native, &start, 3).at(3 * N / 8);
+        let cpu = prefix.cpu();
+        assert_eq!((cpu.eip, cpu.regs[1]), (CODE, N - 3 * N / 8));
+        assert_eq!(
+            (cpu.regs[6], cpu.regs[7]),
+            (SRC + 3 * N / 2, DST + 3 * N / 2)
+        );
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn blocks_run_frame_writing_iterations_on_private_frames() {
+        fn word(executor: &Executor, addr: u32) -> u32 {
+            u32::from_le_bytes(executor.memory().read(addr, 4).unwrap().try_into().unwrap())
+        }
+        if Pool::get().is_none_or(|pool| pool.limit < 2) {
+            return;
+        }
+        const STACK: u32 = 0x300_0000;
+        const ESP_START: u32 = STACK + 0x8000;
+        // head: the source pointer lives in an affine frame dword, the sum
+        // in a private one, and a push and pop move ESP inside the body.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(ebx, dword_ptr(esp + 12)).unwrap();
+        a.mov(eax, dword_ptr(ebx)).unwrap();
+        a.add(dword_ptr(esp + 12), 4).unwrap();
+        a.mov(dword_ptr(esp + 8), eax).unwrap();
+        a.mov(edx, dword_ptr(esp + 8)).unwrap();
+        a.add(edx, dword_ptr(edi)).unwrap();
+        a.shr(edx, 1).unwrap();
+        a.push(edx).unwrap();
+        a.pop(eax).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 4;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        memory.map(STACK, 0x1_0000, READ | WRITE).unwrap();
+        let src: Vec<u8> = (0..N).flat_map(|i| (i * 7).to_le_bytes()).collect();
+        let dst: Vec<u8> = (0..N).flat_map(|i| (i ^ 0x5555).to_le_bytes()).collect();
+        memory.write(SRC, &src).unwrap();
+        executor.state.eip = CODE;
+        executor.state.regs[1] = N;
+        executor.state.regs[4] = ESP_START;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        let start = Some(executor.save_context().unwrap());
+        let reset = |memory: &mut Memory| {
+            memory.write(DST, &dst).unwrap();
+            memory.write(STACK, &[0; 0x1_0000]).unwrap();
+            memory.write(ESP_START + 12, &SRC.to_le_bytes()).unwrap();
+        };
+        // The real frame span is [ESP - 4, ESP + 16).
+        let check = [(DST, len), (ESP_START - 4, 20)];
+        let (_, whole) = whole_then_split(&mut executor, &mut native, &start, stop, reset, &check);
+        assert_eq!(whole.cpu().regs[4], ESP_START);
+        let last = ((N - 1) * 7 + ((N - 1) ^ 0x5555)) >> 1;
+        assert_eq!(word(&executor, DST + 4 * (N - 1)), last);
+        assert_eq!(word(&executor, ESP_START + 12), SRC + 4 * N);
+        assert_eq!(word(&executor, ESP_START - 4), last);
+
+        // A recalled split stores the prefix's affine dwords in the frame.
+        reset(executor.memory_mut());
+        let blocks = stopped_blocks(&executor, &native, &start, 3);
+        assert!(blocks.plan.frame.is_some());
+        let mut prefix = blocks.at(3 * N / 8);
+        blocks.settle(prefix.cpu_mut(), None, 3 * N / 8);
+        assert_eq!(prefix.cpu().regs[4], ESP_START);
+        assert_eq!(word(&executor, ESP_START + 12), SRC + 3 * N / 2);
     }
 
     // spec: A64-CTL-9 A64-TR-9
@@ -835,12 +1508,12 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
-            (&native.computation[&outer].code, false),
+            (&native.computation[&outer].code, 0),
             &Signals {
                 recall: Arc::new(AtomicU32::new(RECALL)),
                 pending: (Arc::new(AtomicU32::new(0)), 0),
             },
-            false,
+            RECALL,
         )
         .completion;
         assert!(recalled.requires_owner);
@@ -1052,7 +1725,7 @@ mod tests {
         let pool = Pool::get().expect("resident pool");
         // Inject an inaccessible read to exercise recovery. This does not
         // change any mapping during either run; the output bytes are disjoint.
-        assert!(pool.submit(Task {
+        assert!(pool.submit(Job::Whole(Box::new(Task {
             id: 1,
             context: first,
             entry,
@@ -1061,15 +1734,15 @@ mod tests {
             signals: signals.clone(),
             done: send,
             wake: None,
-        }));
+        }))));
         let local = run(
             &mut Runtime::new(std::ptr::null_mut(), 0),
             2,
             second,
             entry,
-            (&code, false),
+            (&code, 0),
             &signals,
-            true,
+            LOCAL,
         )
         .completion;
         for result in [
@@ -1214,9 +1887,9 @@ mod tests {
                 1,
                 start.clone(),
                 entry,
-                (&prepared.code, false),
+                (&prepared.code, 0),
                 &pending,
-                false,
+                RECALL,
             );
             assert!(done.deadline_recall);
             prepared.observe(CODE, false, &done);
@@ -1233,9 +1906,9 @@ mod tests {
             1,
             start.clone(),
             entry,
-            (&prepared.code, true),
+            (&prepared.code, 1),
             &recalled,
-            false,
+            RECALL,
         )
         .completion;
         assert!(!done.requires_owner);
@@ -1277,6 +1950,7 @@ mod tests {
                 context: Some(expected_first),
                 retired: first_retired,
                 elapsed: Duration::from_micros(10),
+                helpers: Duration::ZERO,
                 requires_owner: false,
             },
             deadline_recall: false,
@@ -1392,9 +2066,9 @@ mod tests {
                 3,
                 start.clone(),
                 entry,
-                (&code, false),
+                (&code, 0),
                 &signals,
-                true,
+                LOCAL,
             )
             .completion;
             // A pending deadline finishes the iteration and returns at the head.

@@ -12,6 +12,13 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 Completed contexts MAY receive fresh admission within the same scope while other computations remain active.
 **Verification**: Test
 
+A single context may offer a loop whose blocks split (A64-TR-9). Owner work per
+frame selects how much splitting saves. It excludes settled polling and counts
+split loops at their serial cost, so splitting does not change it. Splitting SHOULD save
+the work beyond 60% of the frame period, which frames that left the owner idle set.
+A held key or button removes the deadline. A helper is worth waking only for four
+wake latencies of work, and a split wakes the fewest helpers that save its share.
+
 ### PROC-MACH-2 Waits and wakeups
 
 **Rule**: Each context MUST have one owner at a time. Only the execution owner MAY register waits, consume signals, expire deadlines or cancel waits. A host with no events MUST sleep on `WakeEvent`, which keeps pending notifications so wakeups are not lost.

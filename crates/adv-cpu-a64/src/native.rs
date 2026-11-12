@@ -370,6 +370,9 @@ pub(crate) struct Diagnostics {
     /// Instructions `interpret` ran, and the runs it left.
     pub helpers: u64,
     pub helper_exits: u64,
+    /// Proofs whose head loop splits, and how its blocks ran.
+    pub split_proofs: u64,
+    pub split: worker::SplitCounts,
 }
 
 pub(crate) struct Run {
@@ -771,6 +774,8 @@ pub(crate) struct Native {
     promoted: FxHashSet<u32>,
     probed: Option<Probed>,
     computation_enabled: bool,
+    /// The handler's split share for this run (A64-TR-9).
+    pub(crate) split_share: f32,
     skip_offer: Option<u32>,
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
@@ -889,6 +894,7 @@ impl Native {
             promoted: FxHashSet::default(),
             probed: None,
             computation_enabled: false,
+            split_share: 0.0,
             skip_offer: None,
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
@@ -929,6 +935,11 @@ impl Native {
                     .handler.as_ref().is_some_and(|handler| handler.allow_computation()))
     }
 
+    /// A single context may offer a loop whose blocks split.
+    fn offer_split(&self) -> bool {
+        self.computation_enabled && self.split_share > 0.0
+    }
+
     fn is_stop(&self, eip: u32) -> bool {
         self.stops.contains(&eip) || self.candidates.contains(&eip)
     }
@@ -959,9 +970,9 @@ impl Native {
             &self.computation,
             memory,
             &mut self.admission,
-            retired,
-            &mut self.retired_forms,
+            (retired, &mut self.retired_forms),
             worker::Notifications { pending, wake },
+            (self.split_share, &mut self.diagnostics.split),
         ) {
             visit(&mut session);
         }
@@ -985,7 +996,7 @@ impl Native {
         self.invalidate(memory);
         self.observe_stop(stop);
         if self.nominated.is_some()
-            && self.offer_computation()
+            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
@@ -1041,7 +1052,7 @@ impl Native {
         };
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && self.offer_computation()
+            && (prepared.proof.splits() && self.offer_split() || self.offer_computation())
             && prepared.worth_offering()
         {
             return Ok(Some(Run {
@@ -1636,12 +1647,13 @@ impl Native {
                 let proof = probed
                     .filter(|probe| probe.trace.insts == work.unit.trace.insts)
                     .map(|probe| probe.proof)
-                    .or_else(|| computation_proof(&work.unit.trace));
+                    .or_else(|| computation_proof(memory, &work.unit.trace));
                 if let Some(proof) = proof
                     && let Some(code) =
                         self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
                 {
                     let iterates = work.unit.trace.returns_at_head();
+                    self.diagnostics.split_proofs += u64::from(proof.splits());
                     self.computation
                         .insert(eip, worker::Prepared::new(code, iterates, proof));
                 }
@@ -1698,7 +1710,7 @@ impl Native {
     /// loop traces.
     fn sample(&mut self, memory: &Memory, eip: u32) {
         if self.computation_enabled
-            && self.offer_computation()
+            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.enclosing_computation(eip)
             && !self.is_stop(candidate)
         {
@@ -1775,7 +1787,7 @@ impl Native {
                 .filter(|&inside| !(eip < inside && inside < end)),
         );
         let trace = self.loop_trace(memory, eip, &stops);
-        let proof = computation_proof(&trace)?;
+        let proof = computation_proof(memory, &trace)?;
         Some(Probed { eip, trace, proof })
     }
 
@@ -1835,7 +1847,10 @@ impl Native {
     }
 }
 
-fn computation_proof(trace: &translate::Trace) -> Option<translate::computation::Proof> {
+fn computation_proof(
+    memory: &Memory,
+    trace: &translate::Trace,
+) -> Option<translate::computation::Proof> {
     use translate::Mode;
     use translate::Op;
 
@@ -1859,7 +1874,15 @@ fn computation_proof(trace: &translate::Trace) -> Option<translate::computation:
     }) {
         return None;
     }
-    translate::computation::Proof::build(trace)
+    let mut proof = translate::computation::Proof::build(trace)?;
+    proof.prove_split(trace, |pc, len| {
+        let mut bytes = [0; 15];
+        let bytes = bytes.get_mut(..usize::try_from(len).ok()?)?;
+        memory.read_into(pc, bytes).ok()?;
+        let ins = iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode();
+        (!ins.is_invalid() && ins.len() == bytes.len()).then_some(ins)
+    });
+    Some(proof)
 }
 
 /// Rebuilds the x86 flags at a fault site, where the exit stub assumed
