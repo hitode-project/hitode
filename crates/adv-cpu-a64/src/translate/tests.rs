@@ -2,7 +2,7 @@
 use super::*;
 use crate::emulator::{CODE as HOST_CODE, Emulator};
 use crate::runtime;
-use adv_cpu_core::{CpuState, Memory, interpreter::Interpreter};
+use adv_cpu_core::{CpuState, Memory, X87State, interpreter::Interpreter};
 use iced_x86::code_asm::*;
 use std::mem::{offset_of, size_of};
 
@@ -342,7 +342,7 @@ impl Harness {
             &|_, _| None,
             &|_| None,
             &|_, _| Vec::new(),
-            0x037f,
+            initial.x87.control,
             false,
         );
         assert!(
@@ -378,7 +378,7 @@ impl Harness {
                     Features { flagm },
                     addr(at),
                     stubs,
-                    (0x037f, false, Some(&proof)),
+                    (initial.x87.control, false, Some(&proof)),
                 )
                 .expect("detached form");
                 host_code.extend_from_slice(lowered.words);
@@ -387,6 +387,16 @@ impl Harness {
             panic!("admitted form requires native translation");
         } else {
             host_code.extend_from_slice(work.words());
+            // Wide bodies trap, so a matching result proves the double path.
+            let marks = work.marks();
+            for (n, mark) in marks.iter().enumerate() {
+                if mark.part == Part::X87Wide {
+                    let end = marks
+                        .get(n + 1)
+                        .map_or(work.words().len(), |m| m.offset as usize / 4);
+                    host_code[at / 4 + mark.offset as usize / 4..at / 4 + end].fill(brk(0x87));
+                }
+            }
         }
         let mut context = vec![0; size_of::<runtime::Runtime>()];
         let mut put = |offset: usize, value: &[u8]| {
@@ -443,6 +453,29 @@ impl Harness {
         }
         let at_xmm = offset_of!(CpuState, xmm);
         state[at_xmm..at_xmm + 128].copy_from_slice(initial.xmm.as_flattened());
+        let at_mmx = offset_of!(CpuState, mmx);
+        for (n, value) in initial.mmx.iter().enumerate() {
+            state[at_mmx + n * 8..at_mmx + n * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let at_x87 = offset_of!(CpuState, x87);
+        let x87 = &initial.x87;
+        for (n, r) in x87.regs.iter().enumerate() {
+            state[at_x87 + n * 10..at_x87 + n * 10 + 10].copy_from_slice(&r.0);
+        }
+        for (at, value) in [
+            (offset_of!(X87State, control), x87.control),
+            (offset_of!(X87State, status), x87.status),
+            (offset_of!(X87State, tag), x87.tag),
+            (offset_of!(X87State, opcode), x87.opcode),
+        ] {
+            state[at_x87 + at..at_x87 + at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at, value) in [
+            (offset_of!(X87State, ip), x87.ip),
+            (offset_of!(X87State, dp), x87.dp),
+        ] {
+            state[at_x87 + at..at_x87 + at + 4].copy_from_slice(&value.to_le_bytes());
+        }
         self.emu.write(CPU, &state);
         self.emu.write(WINDOW_BASE + u64::from(DATA), data);
         self.emu.set_sp(HOST_STACK);
@@ -470,6 +503,25 @@ impl Harness {
             .xmm
             .as_flattened_mut()
             .copy_from_slice(&state[at_xmm..at_xmm + 128]);
+        actual.mmx = std::array::from_fn(|n| {
+            u64::from_le_bytes(
+                state[at_mmx + n * 8..at_mmx + n * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        });
+        let read16 =
+            |at: usize| u16::from_le_bytes(state[at_x87 + at..at_x87 + at + 2].try_into().unwrap());
+        let x87 = &mut actual.x87;
+        for (n, r) in x87.regs.iter_mut().enumerate() {
+            r.0.copy_from_slice(&state[at_x87 + n * 10..at_x87 + n * 10 + 10]);
+        }
+        x87.control = read16(offset_of!(X87State, control));
+        x87.status = read16(offset_of!(X87State, status));
+        x87.tag = read16(offset_of!(X87State, tag));
+        x87.opcode = read16(offset_of!(X87State, opcode));
+        x87.ip = read32(at_x87 + offset_of!(X87State, ip));
+        x87.dp = read32(at_x87 + offset_of!(X87State, dp));
         let context = self.emu.read(CONTEXT, size_of::<runtime::Runtime>());
         let at = offset_of!(runtime::Runtime, exit);
         let exit =
@@ -1307,6 +1359,122 @@ fn j1_x87_run_admits_sahf_and_guards_once_until_control_changes() {
             1
         );
     }
+}
+
+/// Runs `code` with ESP inside the data window and sticky PE, comparing x87,
+/// MMX, integer and SSE state with the interpreter; wide bodies trap.
+fn double_loop(h: &mut Harness, code: &[u8], data: &[u8], control: u16) {
+    let mut state = initial();
+    state.regs[1] = 2;
+    state.regs[4] = DATA + 0xff00;
+    state.x87.set_control(control);
+    // Sticky PE as in a running program: inexact conversions stay native.
+    state.x87.status |= 0x20;
+    state.mxcsr |= 0x20;
+    let expected = reference(code, data, &state);
+    let (got, exit, _) = h.run(code, data, &state, false);
+    assert_eq!(exit, Exit::Dispatch);
+    assert_eq!(got.eip, expected.eip);
+    assert_eq!(got.x87, expected.x87);
+    assert_eq!(got.mmx, expected.mmx);
+    assert_eq!(got.regs, expected.regs);
+    assert_eq!(got.eflags, expected.eflags);
+    assert_eq!(got.xmm, expected.xmm);
+}
+
+// spec: A64F-FP-3, A64F-FP-7
+#[test]
+fn double_arithmetic_stays_native_after_control_restores_in_loops() {
+    // The cached guard decision travels with the control word; a later
+    // comparison must not count it as a control bit.
+    let code = bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fmul(qword_ptr(ebx + 8)).unwrap();
+        a.fnstcw(word_ptr(ebx + 16)).unwrap();
+        a.movzx(eax, word_ptr(ebx + 16)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(dword_ptr(ebx + 20), eax).unwrap();
+        a.fldcw(word_ptr(ebx + 20)).unwrap();
+        a.fistp(qword_ptr(ebx + 24)).unwrap();
+        a.fldcw(word_ptr(ebx + 16)).unwrap();
+        a.fld(qword_ptr(ebx)).unwrap();
+        a.fmul(qword_ptr(ebx + 8)).unwrap();
+        a.fstp(qword_ptr(ebx + 32)).unwrap();
+        a.movsd_2(xmm1, qword_ptr(ebx + 32)).unwrap();
+        a.mov(edx, dword_ptr(ebx + 24)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let mut data = vec![0; 40];
+    data[..8].copy_from_slice(&1.25f64.to_le_bytes());
+    data[8..16].copy_from_slice(&(-0.5f64).to_le_bytes());
+    let mut h = Harness::new();
+    for control in [0x007f, 0x027f] {
+        double_loop(&mut h, &code, &data, control);
+    }
+}
+
+// spec: A64F-FP-7
+#[test]
+fn double_fraction_loops_stay_in_one_run_across_calls_sse_and_truncation() {
+    let code = bytes(|a| {
+        let (mut top, mut floor, mut convert) =
+            (a.create_label(), a.create_label(), a.create_label());
+        a.jmp(top).unwrap();
+        a.set_label(&mut floor).unwrap();
+        a.stmxcsr(dword_ptr(ebx + 40)).unwrap();
+        a.fnstcw(word_ptr(ebx + 44)).unwrap();
+        a.movsd_2(xmm0, qword_ptr(ebx)).unwrap();
+        a.cvttsd2si(eax, xmm0).unwrap();
+        a.cvtsi2sd(xmm0, eax).unwrap();
+        a.movq(qword_ptr(ebx + 48), xmm0).unwrap();
+        a.fld(qword_ptr(ebx + 48)).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut convert).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.and(esp, -8).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.cvttsd2si(eax, qword_ptr(esp)).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut top).unwrap();
+        a.call(floor).unwrap();
+        a.fsubr(qword_ptr(ebx)).unwrap();
+        a.fmul(qword_ptr(ebx + 8)).unwrap();
+        a.fld(qword_ptr(ebx + 16)).unwrap();
+        a.fmulp(st1, st0).unwrap();
+        a.fld1().unwrap();
+        a.fsubrp(st1, st0).unwrap();
+        a.fld(st0).unwrap();
+        a.call(convert).unwrap();
+        a.fnstcw(word_ptr(ebx + 24)).unwrap();
+        a.movzx(eax, word_ptr(ebx + 24)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(dword_ptr(ebx + 28), eax).unwrap();
+        a.fldcw(word_ptr(ebx + 28)).unwrap();
+        a.fistp(qword_ptr(ebx + 32)).unwrap();
+        a.fldcw(word_ptr(ebx + 24)).unwrap();
+        a.mov(edx, dword_ptr(ebx + 32)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let mut h = Harness::new();
+    for x in [0.0f64, -0.0, 2.0, 2.75] {
+        let mut data = vec![0; 56];
+        for (at, value) in [(0, x), (8, 0.5), (16, 1.25)] {
+            data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        double_loop(&mut h, &code, &data, 0x027f);
+    }
+    let work = j1_unit(&code);
+    let marks = work.marks();
+    let hot = marks.iter().take_while(|m| m.part != Part::Cold);
+    assert_eq!(hot.clone().filter(|m| m.part == Part::X87Entry).count(), 1);
+    assert!(!hot.clone().any(|m| m.part == Part::X87Publish));
 }
 
 // spec: A64F-FP-5, A64-REG-5
