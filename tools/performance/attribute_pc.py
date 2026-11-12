@@ -82,7 +82,7 @@ class JitMap:
         offset = rip - base
         ranges = self.ranges.get((ns, base), [])
         at = bisect.bisect_right(ranges, (offset, float("inf"))) - 1
-        found = {"region": guest, "mode": mode}
+        found = {"region": guest, "mode": mode, "base": base, "ns": ns}
         if at >= 0 and ranges[at][0] <= offset < ranges[at][1]:
             _, _, pc, part, kind = ranges[at]
             return {**found, "pc": pc, "part": part, "class": kind}
