@@ -497,7 +497,7 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
 
 /// C1 after a nearest-rounded `a op b` without other exceptions: whether
 /// the magnitude was rounded up.
-fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
+pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
     let (r, error) = match op {
         FpOp::Add | FpOp::Sub => {
             let b = if op == FpOp::Sub { -b } else { b };
