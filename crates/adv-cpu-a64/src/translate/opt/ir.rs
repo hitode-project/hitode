@@ -244,6 +244,11 @@ impl Op {
 pub(crate) struct Target {
     pub block: Block,
     pub args: Vec<Value>,
+    /// Instructions the edge charges to the countdown, as the trace's edge
+    /// net: a positive charge checks the countdown and may leave at the
+    /// target, which is then a head with a complete record; a negative one
+    /// refunds.
+    pub charge: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,11 +275,11 @@ impl End {
     }
 }
 
-/// A loop head: an effect point where the countdown and the head-exit word
-/// are checked, and a region start.
+/// A region start that arrivals reach with no unvalidated result: block 0,
+/// loop heads, targets of charged edges, and merges of arrivals from
+/// different regions. Code at a head comes only from its arrivals' charges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
-    pub prepaid: u32,
     pub record: RecordId,
 }
 
@@ -299,6 +304,7 @@ pub(crate) enum Source {
     /// A valid x87 physical register as binary64, F64.
     X87(u8),
     /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
+    /// Narrower accesses extract from these.
     Frame { offset: i32, width: u8 },
 }
 
@@ -321,6 +327,9 @@ pub(crate) struct Func {
     pub records: Vec<IrRecord>,
     /// The sources of block 0's parameters, in order.
     pub entry: Vec<Source>,
+    /// Charged edges to block 0 also check the head-exit word, as a form
+    /// that returns at its head does.
+    pub head_exit: bool,
 }
 
 impl Func {

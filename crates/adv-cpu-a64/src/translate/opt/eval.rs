@@ -36,6 +36,10 @@ pub(crate) struct Run {
     pub outcome: Outcome,
     /// Every value's bits, zero-extended; values never defined are 0.
     pub values: Vec<u128>,
+    /// Instructions charged to the countdown: block 0's refund at entry,
+    /// then each taken edge's charge. Less the outcome record's refund, the
+    /// instructions retired.
+    pub charged: i64,
 }
 
 /// Runs `func` from block 0 with `params`, for at most `limit` instructions.
@@ -46,6 +50,8 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
     let mut args = params.to_vec();
     let mut region = None;
     let mut steps = 0usize;
+    let first = func.blocks[0].head.expect("block 0 is a head").record;
+    let mut charged = i64::from(func.records[first.0 as usize].refund);
     let outcome = 'run: loop {
         let data = &func.blocks[block.0 as usize];
         for (&p, &v) in data.params.iter().zip(&args) {
@@ -54,14 +60,10 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
         if let Some(head) = data.head {
             region = Some(head.record);
         }
-        let fail = region.expect("block 0 is a head");
         for (result, op) in &data.insts {
             steps += 1;
             if steps > limit {
                 break 'run Outcome::Limit;
-            }
-            if let Op::Store { after, .. } = *op {
-                region = Some(after);
             }
             match step(func, op, &values, &mut fpsr, memory) {
                 Some(bits) => {
@@ -69,7 +71,10 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
                         values[r.0 as usize] = bits;
                     }
                 }
-                None => break 'run Outcome::Fail(fail),
+                None => break 'run Outcome::Fail(region.expect("block 0 is a head")),
+            }
+            if let Op::Store { after, .. } = *op {
+                region = Some(after);
             }
         }
         let get = |v: Value| values[v.0 as usize];
@@ -86,9 +91,14 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
             End::Unset => unreachable!("verified"),
         };
         args = target.args.iter().map(|&v| get(v)).collect();
+        charged += i64::from(target.charge);
         block = target.block;
     };
-    Run { outcome, values }
+    Run {
+        outcome,
+        values,
+        charged,
+    }
 }
 
 /// One instruction's result bits, or `None` when it fails.
@@ -521,12 +531,13 @@ mod tests {
             eflags: None,
             x87: X87 {
                 top: 0,
-                tags: 0xffff,
+                valid: 0,
+                control: 0x27f,
                 stack: [None; 8],
                 status: 0,
                 c1: None,
-                ip: 0,
-                opcode: 0,
+                ip: None,
+                opcode: None,
             },
             xmm: [None; 8],
             frame: Vec::new(),
@@ -539,10 +550,7 @@ mod tests {
         let entry = f.record(record());
         let after = f.record(record());
         let exit = f.record(record());
-        let b = f.block(Some(Head {
-            prepaid: 1,
-            record: entry,
-        }));
+        let b = f.block(Some(Head { record: entry }));
         let x = f.param(b, Type::F64);
         let y = f.param(b, Type::F64);
         let addr = f.param(b, Type::I32);
@@ -599,15 +607,36 @@ mod tests {
         assert_eq!(run.outcome, Outcome::Fail(entry));
     }
 
+    // spec: A64-OPT-6
+    #[test]
+    fn a_failure_after_a_store_returns_to_the_store_boundary() {
+        let (mut f, _, exit) = store_product();
+        let b = Block(0);
+        let after = f.record(record());
+        let Op::Store { after: first, .. } = f.blocks[0].insts[2].1 else {
+            unreachable!("built with a store")
+        };
+        let unmapped = f.push(b, Op::Constant(Type::I32, 0x30000)).unwrap();
+        f.push(
+            b,
+            Op::Store {
+                width: 4,
+                addr: unmapped,
+                value: unmapped,
+                after,
+            },
+        );
+        f.end(b, End::Exit(exit));
+        let run = run(&f, &[bits(1.0), bits(1.0), 0x10000], &mut memory(), 100);
+        assert_eq!(run.outcome, Outcome::Fail(first));
+    }
+
     #[test]
     fn x87_loads_refuse_nan_and_optionally_denormals() {
         let mut f = Func::default();
         let entry = f.record(record());
         let exit = f.record(record());
-        let b = f.block(Some(Head {
-            prepaid: 1,
-            record: entry,
-        }));
+        let b = f.block(Some(Head { record: entry }));
         let raw = f.param(b, Type::I64);
         f.push(
             b,
@@ -632,17 +661,19 @@ mod tests {
     #[test]
     fn a_counted_loop_carries_block_parameters() {
         let mut f = Func::default();
-        let entry = f.record(record());
         let mut full = record();
         full.regs = [Some(Location::Constant(0)); 8];
         full.eflags = Some(Location::Constant(0));
         full.x87.c1 = Some(Location::Constant(0));
+        full.x87.ip = Some(Location::Constant(0));
+        full.x87.opcode = Some(Location::Constant(0));
         full.xmm = [Some(Location::Constant(0)); 8];
+        let entry = f.record(IrRecord {
+            refund: 3,
+            ..full.clone()
+        });
         let exit = f.record(full);
-        let head = f.block(Some(Head {
-            prepaid: 2,
-            record: entry,
-        }));
+        let head = f.block(Some(Head { record: entry }));
         let n = f.param(head, Type::I32);
         let sum = f.param(head, Type::I32);
         f.entry = vec![Source::Reg(1), Source::Reg(0)];
@@ -679,10 +710,12 @@ mod tests {
                 taken: Target {
                     block: body,
                     args: Vec::new(),
+                    charge: 0,
                 },
                 fall: Target {
                     block: done,
                     args: Vec::new(),
+                    charge: 0,
                 },
             },
         );
@@ -691,12 +724,14 @@ mod tests {
             End::Jump(Target {
                 block: head,
                 args: vec![next, total],
+                charge: 2,
             }),
         );
         f.end(done, End::Exit(exit));
         let run = run(&f, &[5, 0], &mut memory(), 1000);
         assert_eq!(run.outcome, Outcome::Exit(exit));
         assert_eq!(run.values[total.0 as usize], 15);
+        assert_eq!(run.charged, 3 + 4 * 2);
         assert_eq!(super::super::verify::verify(&f), Ok(()));
     }
 

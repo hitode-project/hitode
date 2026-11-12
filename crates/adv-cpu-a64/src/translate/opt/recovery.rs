@@ -24,25 +24,32 @@ pub(crate) enum Recipe<L> {
     Eflags(L),
 }
 
-/// The x87 state at a region start. TOP, tags, IP and opcode are proven
-/// constants; the control word is the form's.
+/// The x87 state at a region start. TOP, occupancy, the control word and
+/// the status bits are proven constants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X87<L> {
     pub top: u8,
-    pub tags: u16,
+    /// Bit `i` set when physical register `i` is valid. The materializer
+    /// derives each valid register's tag from its value; empty registers
+    /// keep their contents and tags from the job's entry state.
+    pub valid: u8,
+    pub control: u16,
     /// Physical registers 0–7: valid slots hold binary64 values.
     pub stack: [Option<Location<L>>; 8],
     /// Condition and exception bits other than C1 and TOP.
     pub status: u16,
     pub c1: Option<Location<L>>,
-    pub ip: u32,
-    pub opcode: u16,
+    /// Last instruction pointer and opcode, as I32 values when arrivals
+    /// at a head disagree.
+    pub ip: Option<Location<L>>,
+    pub opcode: Option<Location<L>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record<L> {
     pub eip: u32,
-    /// Instructions prepaid at the last loop head and not retired at `eip`.
+    /// Instructions charged to the countdown and not retired at `eip`: the
+    /// trace's `owed` at a head, its `unused` after an instruction.
     pub refund: u32,
     pub regs: [Option<Location<L>>; 8],
     pub eflags: Option<Location<L>>,
@@ -56,7 +63,11 @@ pub(crate) struct Record<L> {
 impl<L: Copy> Record<L> {
     /// Every location the record reads.
     pub(crate) fn uses(&self) -> impl Iterator<Item = L> + '_ {
-        let x87 = self.x87.stack.iter().chain([&self.x87.c1]);
+        let x87 = self
+            .x87
+            .stack
+            .iter()
+            .chain([&self.x87.c1, &self.x87.ip, &self.x87.opcode]);
         let held = self.regs.iter().chain([&self.eflags]).chain(x87);
         held.chain(&self.xmm)
             .flatten()
@@ -75,8 +86,10 @@ impl<L: Copy> Record<L> {
         self.regs.iter().all(Option::is_some)
             && self.eflags.is_some()
             && self.x87.c1.is_some()
+            && self.x87.ip.is_some()
+            && self.x87.opcode.is_some()
             && self.xmm.iter().all(Option::is_some)
-            && (0..8).all(|i| self.x87.tags >> (2 * i) & 3 == 3 || self.x87.stack[i].is_some())
+            && (0..8).all(|i| self.x87.valid >> i & 1 == 0 || self.x87.stack[i].is_some())
     }
 }
 

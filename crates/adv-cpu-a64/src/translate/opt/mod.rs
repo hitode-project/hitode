@@ -53,8 +53,9 @@
 //! and a path the reference shares, and stores keep their order, so the
 //! guest boundary after a store is again a region start.
 //!
-//! **Retirement (A64-OPT-6).** Loop heads prepay their segment; a record holds
-//! the instructions prepaid but not retired at its region start.
+//! **Retirement (A64-OPT-6).** Edges charge the countdown as the trace's
+//! edge nets do, so the instructions charged and not retired at a point
+//! depend only on its trace index; a record holds that refund.
 
 pub(crate) mod eval;
 pub(crate) mod ir;

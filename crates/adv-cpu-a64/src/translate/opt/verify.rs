@@ -6,7 +6,8 @@ use super::ir::{Block, End, Func, Op, RecordId, Type, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
-    /// Block 0 is not a loop head, or a block has no end.
+    /// Block 0 is not a head, a charged edge reaches a block that is not,
+    /// or a block has no end.
     Shape(Block),
     /// A use the definition does not dominate.
     Undominated(Value),
@@ -102,6 +103,14 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
             let types = |list: &[Value]| list.iter().map(|&v| func.ty(v)).collect::<Vec<_>>();
             if types(params) != types(&target.args) {
                 return Err(Error::Type(Block(b as u32)));
+            }
+            if target.charge > 0 {
+                let Some(head) = blocks[target.block.0 as usize].head else {
+                    return Err(Error::Shape(target.block));
+                };
+                if !func.records[head.record.0 as usize].complete() {
+                    return Err(Error::Record(head.record));
+                }
             }
         }
     }
@@ -272,12 +281,13 @@ mod tests {
             eflags: Some(Location::Constant(0)),
             x87: X87 {
                 top: 0,
-                tags: 0xffff,
+                valid: 0,
+                control: 0x27f,
                 stack: [None; 8],
                 status: 0x20,
                 c1: Some(Location::Constant(0)),
-                ip: 0,
-                opcode: 0,
+                ip: Some(Location::Constant(0)),
+                opcode: Some(Location::Constant(0)),
             },
             xmm: [Some(Location::Constant(0)); 8],
             frame: Vec::new(),
@@ -293,16 +303,14 @@ mod tests {
         let x = f.param(head, Type::F64);
         f.entry = vec![Source::Reg(0), Source::X87(0)];
         let entry = f.record(record([Some(eax); 8]));
-        f.blocks[0].head = Some(Head {
-            prepaid: 4,
-            record: entry,
-        });
+        f.blocks[0].head = Some(Head { record: entry });
         let body = f.block(None);
         f.end(
             head,
             End::Jump(Target {
                 block: body,
                 args: Vec::new(),
+                charge: 0,
             }),
         );
         (f, body, eax, x)
@@ -355,6 +363,7 @@ mod tests {
         let to = |block| Target {
             block,
             args: Vec::new(),
+            charge: 0,
         };
         f.end(
             body,
@@ -391,10 +400,34 @@ mod tests {
         let back = Target {
             block: Block(0),
             args: vec![eax, sum],
+            charge: 2,
         };
         f.end(body, End::Jump(back.clone()));
         assert_eq!(verify(&f), Err(Error::Pending(body)));
         f.blocks[body.0 as usize].insts.push((None, Op::Validate));
+        assert_eq!(verify(&f), Ok(()));
+    }
+
+    // spec: A64-OPT-6
+    #[test]
+    fn a_charged_edge_reaches_a_head_with_a_complete_record() {
+        let (mut f, body, eax, _) = skeleton();
+        let tail = f.block(None);
+        let exit = f.record(record([Some(eax); 8]));
+        f.end(tail, End::Exit(exit));
+        let to_tail = Target {
+            block: tail,
+            args: Vec::new(),
+            charge: 1,
+        };
+        f.end(body, End::Jump(to_tail));
+        assert_eq!(verify(&f), Err(Error::Shape(tail)));
+        let mut partial = record([Some(eax); 8]);
+        partial.regs[5] = None;
+        let start = f.record(partial);
+        f.blocks[tail.0 as usize].head = Some(Head { record: start });
+        assert_eq!(verify(&f), Err(Error::Record(start)));
+        f.records[start.0 as usize] = record([Some(eax); 8]);
         assert_eq!(verify(&f), Ok(()));
     }
 
@@ -435,6 +468,7 @@ mod tests {
         let to = |block| Target {
             block,
             args: Vec::new(),
+            charge: 0,
         };
         f.end(
             body,
