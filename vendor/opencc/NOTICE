@@ -1,0 +1,7 @@
+OpenCC (Open Chinese Convert) character dictionaries, unmodified.
+Source: https://github.com/BYVoid/OpenCC/tree/fae2a0a911c30764e669a7d8b0591cd8e852934a/data/dictionary
+Files: JPShinjitaiCharacters.txt, TSCharacters.txt
+License: Apache-2.0; see LICENSE.
+
+tools/reallive/generate_simplified.py derives
+crates/adv-runtime/src/reallive/simplified.rs from these files.

@@ -750,7 +750,9 @@ fn object_id(env: &mut Env<'_>, handle: u32, out: u32) -> Result<(), Error> {
 
 /// Reverse host redirects before naming paths through the drive links.
 pub(crate) fn nt_name(env: &Env<'_>, host: &std::path::Path) -> String {
-    volume::mounts(env)
+    let mounts = volume::mounts(env);
+    let host = mounts.original(host);
+    mounts
         .nt_name(host)
         .unwrap_or_else(|| path::nt_name(&env.ext.get::<Files>().dosdevices, host))
 }
@@ -766,6 +768,10 @@ pub(crate) fn lookup_name(env: &mut Env<'_>, name: &[u16]) -> Result<Lookup, Err
             .unwrap_or_else(|| path::lookup(devices, &name));
         match result {
             Ok(Lookup::Device) | Err(status::OBJECT_PATH_NOT_FOUND) => {}
+            Ok(Lookup::Found(host)) => {
+                let replacement = volume::mounts(env).replacement(&host);
+                return Ok(Lookup::Found(replacement.unwrap_or(host)));
+            }
             result => return Ok(result?),
         }
         let text = String::from_utf16(&name).map_err(|_| status::OBJECT_NAME_INVALID)?;

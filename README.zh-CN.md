@@ -172,6 +172,7 @@ Hitode 以 [GNU 通用公共许可证第 3 版或任何更新版本](COPYING)发
 - `vendor/wine`：Wine 11.0 的服务端及其包含的头文件、服务端启动时加载的 `l_intl.nls`，以及 `ntsyscalls.h` 系统调用表，LGPL-2.1-or-later，未修改，见其 `NOTICE`。
 - `crates/adv-unix/freetype`：FreeType 的 ftgrays 光栅器，按 FreeType License（FTL）使用，见其 `LICENSE.TXT`。
 - `vendor/fluidr3mono`：FluidR3 Mono GM 音色库，MIT，见其 `LICENSE`。
+- `vendor/opencc`：OpenCC 字符字典，Apache-2.0，见其 `NOTICE`。
 - `vendor/upscaling`：超分着色器源码，GPL-3.0 与各原作的许可证（Anime4K 为 MIT），见其 `NOTICE`。
 
 发行包内的 Wine 模块是 Wine 11.0 的 i386 构建，LGPL-2.1-or-later，构建脚本在 `tools/wine/`。

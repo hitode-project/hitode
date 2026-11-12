@@ -121,7 +121,7 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
                         .unwrap()
                         .file_name()
                         .to_string_lossy()
-                        .starts_with(".hitode-media-"))
+                        .starts_with(".hitode-files-"))
             );
         }
         std::fs::remove_dir_all(root).unwrap();

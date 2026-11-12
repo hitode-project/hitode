@@ -220,6 +220,11 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 **Rule**: `NtQueryEaFile`, `NtSetEaFile`, and `NtSetVolumeInformationFile` MUST preserve Wine 11's stub checks, statuses, and side effects.
 **Verification**: Review — the probe omits Wine's stubs.
 
+### NT-FILE-5 Replaced files
+
+**Rule**: A name that resolves to a replaced file's host identity MUST open its replacement, whatever path reaches it. Names reported to the guest MUST remain the original's.
+**Verification**: Test
+
 ## NT security
 
 ### NT-SEC-1 Tokens and privileges
