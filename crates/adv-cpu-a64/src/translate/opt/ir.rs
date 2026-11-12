@@ -286,11 +286,41 @@ pub(crate) struct BlockData {
     pub head: Option<Head>,
 }
 
+/// Where a parameter of block 0 comes from when the job enters. Admission
+/// stores each one in the entry parameter area the form loads from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// A general register, I32.
+    Reg(u8),
+    /// EFLAGS, as a `Flags` value.
+    Eflags,
+    /// An XMM register, V128.
+    Xmm(u8),
+    /// A valid x87 physical register as binary64, F64.
+    X87(u8),
+    /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
+    Frame { offset: i32, width: u8 },
+}
+
+impl Source {
+    pub(crate) fn ty(self) -> Type {
+        match self {
+            Source::Reg(_) | Source::Frame { width: 4, .. } => Type::I32,
+            Source::Frame { .. } => Type::I64,
+            Source::Eflags => Type::Flags,
+            Source::Xmm(_) => Type::V128,
+            Source::X87(_) => Type::F64,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Func {
     pub blocks: Vec<BlockData>,
     pub types: Vec<Type>,
     pub records: Vec<IrRecord>,
+    /// The sources of block 0's parameters, in order.
+    pub entry: Vec<Source>,
 }
 
 impl Func {

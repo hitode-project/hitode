@@ -33,6 +33,10 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
     if let Some(b) = blocks.iter().position(|b| b.end == End::Unset) {
         return Err(Error::Shape(Block(b as u32)));
     }
+    let sources = func.entry.iter().map(|s| s.ty());
+    if !sources.eq(blocks[0].params.iter().map(|&p| func.ty(p))) {
+        return Err(Error::Type(Block(0)));
+    }
     let dom = dominators(func);
     let mut defs = vec![None; func.types.len()];
     for (b, block) in blocks.iter().enumerate() {
@@ -256,7 +260,7 @@ fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ir::{FpOp, Head, Op, Target};
+    use super::super::ir::{FpOp, Head, Op, Source, Target};
     use super::super::recovery::{IrRecord, Location, X87};
     use super::*;
 
@@ -287,6 +291,7 @@ mod tests {
         let head = f.block(None);
         let eax = f.param(head, Type::I32);
         let x = f.param(head, Type::F64);
+        f.entry = vec![Source::Reg(0), Source::X87(0)];
         let entry = f.record(record([Some(eax); 8]));
         f.blocks[0].head = Some(Head {
             prepaid: 4,

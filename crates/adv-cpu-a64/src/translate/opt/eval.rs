@@ -509,7 +509,7 @@ fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ir::{Head, Target};
+    use super::super::ir::{Head, Source, Target};
     use super::super::recovery::{IrRecord, X87};
     use super::*;
 
@@ -546,6 +546,7 @@ mod tests {
         let x = f.param(b, Type::F64);
         let y = f.param(b, Type::F64);
         let addr = f.param(b, Type::I32);
+        f.entry = vec![Source::X87(0), Source::X87(1), Source::Reg(7)];
         let p = f.push(b, Op::Fp(FpOp::Mul, x, y)).unwrap();
         f.push(b, Op::Validate);
         f.push(
@@ -644,6 +645,7 @@ mod tests {
         }));
         let n = f.param(head, Type::I32);
         let sum = f.param(head, Type::I32);
+        f.entry = vec![Source::Reg(1), Source::Reg(0)];
         let body = f.block(None);
         let done = f.block(None);
         let one = f.push(head, Op::Constant(Type::I32, 1)).unwrap();
