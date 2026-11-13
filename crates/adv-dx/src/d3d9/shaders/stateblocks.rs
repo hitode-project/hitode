@@ -284,14 +284,12 @@ pub(in crate::d3d9) fn unchanged(env: &mut Env<'_>, pointer: u32, _capture: bool
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
         return false;
     };
-    if d.recording.is_some() || !b.current(d) {
-        return false;
-    }
+    let unchanged = d.recording.is_none() && b.current(d);
     #[cfg(feature = "d3d9-counters")]
-    if !_capture {
+    if unchanged && !_capture {
         count_apply(env, 0);
     }
-    true
+    unchanged
 }
 pub(in crate::d3d9) enum FixedKey {
     Fvf,

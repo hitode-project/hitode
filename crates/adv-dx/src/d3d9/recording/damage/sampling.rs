@@ -674,9 +674,8 @@ fn vertices(
             };
             output.texcoords[0] = [v.uv[0], v.uv[1], 0., 1.];
             if let Some((count, values)) = &draw.texcoords {
-                for c in 0..*count {
-                    output.texcoords[c] = *values.get(n * count + c)?;
-                }
+                let start = n * count;
+                output.texcoords[..*count].copy_from_slice(values.get(start..start + count)?);
             }
             output
         };

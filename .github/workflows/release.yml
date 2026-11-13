@@ -128,28 +128,34 @@ jobs:
           (cd "$RUNNER_TEMP" && zip -qrX "dist/$name.zip" "$name")
           cp "$RUNNER_TEMP/wine/wine-11.0.tar.xz" "$RUNNER_TEMP/dist/"
 
-      - name: Build the unsigned iOS app
+      - name: Build the iOS app
         if: matrix.platform == 'ios'
         run: |
           python3 apps/adv-launcher/scripts/icons.py
           python3 tools/macos/build.py --ios
           cd apps/adv-launcher
           PATH="$GITHUB_WORKSPACE/target/ios-ffmpeg/bin:$PATH" pnpm tauri ios build --ci --no-sign
-          ipa="$RUNNER_TEMP/dist/Hitode-$VERSION-ios-unsigned.ipa"
+          ipa="$RUNNER_TEMP/Hitode-unsigned.ipa"
           cp src-tauri/gen/apple/build/arm64/Hitode.ipa "$ipa"
           unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
-          if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "the IPA is signed"; exit 1; fi
+          if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "tauri signed the IPA"; exit 1; fi
 
-      - name: Package the TrollStore IPA
+      - name: Sign the iOS IPAs with their entitlements
         if: matrix.platform == 'ios'
         run: |
-          # A manual rerun can select a tag older than TrollStore support.
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ! -f tools/ios/package_trollstore.py ]]; then
-            exit 0
-          fi
           brew install ldid
           dist="$RUNNER_TEMP/dist"
-          python3 tools/ios/package_trollstore.py "$dist/Hitode-$VERSION-ios-unsigned.ipa" "$dist/Hitode-$VERSION-ios-trollstore.ipa"
+          unsigned="$RUNNER_TEMP/Hitode-unsigned.ipa"
+          # A manual rerun can select a tag that published the unsigned IPA.
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ! -f tools/ios/sign_ipa.py ]]; then
+            cp "$unsigned" "$dist/Hitode-$VERSION-ios-unsigned.ipa"
+            if [[ -f tools/ios/package_trollstore.py ]]; then
+              python3 tools/ios/package_trollstore.py "$unsigned" "$dist/Hitode-$VERSION-ios-trollstore.ipa"
+            fi
+            exit 0
+          fi
+          python3 tools/ios/sign_ipa.py "$unsigned" "$dist/Hitode-$VERSION-ios.ipa"
+          python3 tools/ios/sign_ipa.py --trollstore "$unsigned" "$dist/Hitode-$VERSION-ios-trollstore.ipa"
 
       - name: Build the Android APK
         if: matrix.platform == 'android'

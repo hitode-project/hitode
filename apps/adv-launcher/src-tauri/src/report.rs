@@ -62,6 +62,12 @@ pub async fn report_base<R: Runtime>(
                 }
             }
         };
+        let platform = Platform::current(graphics, settings);
+        #[cfg(target_os = "ios")]
+        let platform = Platform {
+            increased_memory_limit: Some(crate::jit_ios::increased_memory_limit()),
+            ..platform
+        };
         Ok(ReportBase {
             dedupe_key: adv_report::dedupe_key(&installation_secret(&data)?, &game.exe_sha256),
             app: App {
@@ -69,7 +75,7 @@ pub async fn report_base<R: Runtime>(
                 build: env!("ADV_BUILD").into(),
                 channel: "preview".into(),
             },
-            platform: Platform::current(graphics, settings),
+            platform,
             game,
         })
     })

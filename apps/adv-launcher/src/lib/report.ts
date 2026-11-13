@@ -46,6 +46,8 @@ export interface ReportPlatform {
   os: string;
   os_major: string;
   model: string;
+  /** iOS: whether the signature raises the memory limit. */
+  increased_memory_limit?: boolean;
   graphics: ReportGraphics;
   settings: ReportSettings;
 }

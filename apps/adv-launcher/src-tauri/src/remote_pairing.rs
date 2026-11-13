@@ -9,7 +9,6 @@ use std::{
 /// The port iOS used before it randomized it.
 pub const FALLBACK: u16 = 49152;
 const SERVICE: &CStr = c"_remotepairing._tcp";
-const FLAGS_MORE_COMING: u32 = 0x1;
 const FLAGS_ADD: u32 = 0x2;
 /// Resolving a found instance answers from the cache or one query.
 const RESOLVE: Duration = Duration::from_secs(1);
@@ -70,23 +69,15 @@ struct Instance {
     domain: CString,
 }
 
-/// The instances seen so far, and whether the last reply ended a batch.
-#[derive(Default)]
-struct Found {
-    instances: Vec<Instance>,
-    settled: bool,
-}
-
-/// The advertised port and where it came from, or the fallback when
-/// nothing answers within `timeout` (no service, or Local Network denied).
-pub fn port(timeout: Duration) -> (u16, &'static str) {
+/// The port this device advertises, if its loopback instance appears within
+/// `timeout`. Other interfaces carry other devices' services. The helper
+/// still finds the port when Bonjour misses it.
+pub fn port(timeout: Duration) -> Option<u16> {
     browse(Instant::now() + timeout)
         .and_then(|instance| resolve(&instance, Instant::now() + RESOLVE))
-        .map_or((FALLBACK, "default"), |port| (port, "Bonjour"))
 }
 
-/// The loopback instance of the first complete batch of replies, or else
-/// its first instance. iOS 18 advertises only on Wi-Fi and USB interfaces.
+/// This device's own instance, the one on the loopback interface.
 fn browse(deadline: Instant) -> Option<Instance> {
     extern "C" fn add(
         _: ServiceRef,
@@ -101,22 +92,20 @@ fn browse(deadline: Instant) -> Option<Instance> {
         if error != 0 {
             return;
         }
-        // SAFETY: the context is `browse`'s state; the strings live for this call.
-        let found = unsafe { &mut *context.cast::<Found>() };
-        found.settled = flags & FLAGS_MORE_COMING == 0;
-        if flags & FLAGS_ADD != 0 {
-            // SAFETY: as above.
-            found.instances.push(unsafe {
-                Instance {
-                    interface,
-                    name: CStr::from_ptr(name).to_owned(),
-                    kind: CStr::from_ptr(kind).to_owned(),
-                    domain: CStr::from_ptr(domain).to_owned(),
-                }
+        if flags & FLAGS_ADD == 0 || !loopback(interface) {
+            return;
+        }
+        // SAFETY: the context is `browse`'s slot; the strings live for this call.
+        unsafe {
+            *context.cast::<Option<Instance>>() = Some(Instance {
+                interface,
+                name: CStr::from_ptr(name).to_owned(),
+                kind: CStr::from_ptr(kind).to_owned(),
+                domain: CStr::from_ptr(domain).to_owned(),
             });
         }
     }
-    let mut found = Found::default();
+    let mut found: Option<Instance> = None;
     let context = &raw mut found;
     let mut sd = std::ptr::null_mut();
     // SAFETY: `found` outlives the reference, which `serve` deallocates.
@@ -134,15 +123,8 @@ fn browse(deadline: Instant) -> Option<Instance> {
     if error != 0 {
         return None;
     }
-    serve(sd, deadline, context, |found| {
-        found.settled && !found.instances.is_empty()
-    });
-    let mut instances = found.instances;
-    let at = instances
-        .iter()
-        .position(|i| loopback(i.interface))
-        .unwrap_or(0);
-    (at < instances.len()).then(|| instances.swap_remove(at))
+    serve(sd, deadline, context, Option::is_some);
+    found
 }
 
 fn resolve(instance: &Instance, deadline: Instant) -> Option<u16> {

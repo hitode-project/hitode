@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
-  import { jit } from "../lib/jit.svelte";
+  import { explainJit, jit } from "../lib/jit.svelte";
   import { nav } from "../lib/nav.svelte";
   import { prefs, savePrefs } from "../lib/prefs.svelte";
 
@@ -10,10 +10,22 @@
     prefs.hideJitWarnings = true;
     savePrefs();
   }
+
+  function dismissMemory(): void {
+    prefs.hideMemoryWarning = true;
+    savePrefs();
+  }
 </script>
 
-<!-- iOS library: show JIT readiness and signing restrictions. -->
-{#if jit.active && status && !status.ready && !prefs.hideJitWarnings}
+<!-- iOS library: show a missing memory extension, then JIT readiness and signing restrictions. -->
+{#if jit.active && jit.memoryMissing && !prefs.hideMemoryWarning}
+  <div class="banner" role="status">
+    <span class="text"><b>{t("未开启内存扩展")}</b><span>{explainJit("memoryLimitMissing")}</span></span>
+    <div class="actions">
+      <button class="dismiss" onclick={dismissMemory}>{t("不再提醒")}</button>
+    </div>
+  </div>
+{:else if jit.active && status && !status.ready && !prefs.hideJitWarnings}
   <div class="banner" role="status">
     {#if jit.signingUnsupported}
       <span class="text"><b>{t("当前签名不支持 JIT")}</b><span>{jit.note}</span></span>

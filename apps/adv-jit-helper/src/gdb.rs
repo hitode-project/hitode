@@ -15,10 +15,12 @@ pub async fn attach(
 ) -> Result<()> {
     debugger.send_ack().await?;
     debugger.send_ack().await?;
-    expect_ok(debugger, "QStartNoAckMode").await?;
+    // StikJIT's handshake: debugserver takes `;thread:` suffixes without
+    // QThreadSuffixSupported, and neither reply decides anything.
+    command(debugger, "QStartNoAckMode").await?;
     debugger.set_ack_mode(false);
-    expect_ok(debugger, "QSetDetachOnError:1").await?;
-    expect_ok(debugger, "QThreadSuffixSupported").await?;
+    // Keeps the player running if this helper dies while it is stopped.
+    command(debugger, "QSetDetachOnError:1").await?;
     progress("attaching");
     let stop = command(debugger, &format!("vAttach;{pid:x}")).await?;
     let result: Result<()> = async {
@@ -253,8 +255,7 @@ mod session_tests {
     fn handshake() -> Vec<(&'static str, &'static str)> {
         vec![
             ("QStartNoAckMode", "OK"),
-            ("QSetDetachOnError:1", "OK"),
-            ("QThreadSuffixSupported", "OK"),
+            ("QSetDetachOnError:1", ""),
             ("vAttach;2a", "T05thread:1;"),
         ]
     }

@@ -34,8 +34,12 @@ define_class!(
         }
         #[unsafe(method(setFrameSize:))]
         fn resize(&self, size: NSSize) {
+            let changed = NSView::frame(self).size != size;
             unsafe { let _: () = msg_send![super(self), setFrameSize: size]; }
             self.hub().push(Event::Repaint);
+            if changed && self.inLiveResize() {
+                self.request_frame();
+            }
         }
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn backing_changed(&self) { self.hub().push(Event::Repaint); }

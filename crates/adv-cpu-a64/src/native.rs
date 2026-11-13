@@ -370,6 +370,9 @@ pub(crate) struct Diagnostics {
     /// Instructions `interpret` ran, and the runs it left.
     pub helpers: u64,
     pub helper_exits: u64,
+    /// Proofs whose head loop splits, and how its blocks ran.
+    pub split_proofs: u64,
+    pub split: worker::SplitCounts,
 }
 
 pub(crate) struct Run {
@@ -771,6 +774,8 @@ pub(crate) struct Native {
     promoted: FxHashSet<u32>,
     probed: Option<Probed>,
     computation_enabled: bool,
+    /// The handler's split share for this run (A64-TR-9).
+    pub(crate) split_share: f32,
     skip_offer: Option<u32>,
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
@@ -889,6 +894,7 @@ impl Native {
             promoted: FxHashSet::default(),
             probed: None,
             computation_enabled: false,
+            split_share: 0.0,
             skip_offer: None,
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
@@ -929,6 +935,11 @@ impl Native {
                     .handler.as_ref().is_some_and(|handler| handler.allow_computation()))
     }
 
+    /// A single context may offer a loop whose blocks split.
+    fn offer_split(&self) -> bool {
+        self.computation_enabled && self.split_share > 0.0
+    }
+
     fn is_stop(&self, eip: u32) -> bool {
         self.stops.contains(&eip) || self.candidates.contains(&eip)
     }
@@ -959,9 +970,9 @@ impl Native {
             &self.computation,
             memory,
             &mut self.admission,
-            retired,
-            &mut self.retired_forms,
+            (retired, &mut self.retired_forms),
             worker::Notifications { pending, wake },
+            (self.split_share, &mut self.diagnostics.split),
         ) {
             visit(&mut session);
         }
@@ -985,19 +996,16 @@ impl Native {
         self.invalidate(memory);
         self.observe_stop(stop);
         if self.nominated.is_some()
-            && self.offer_computation()
+            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
                 self.candidates
                     .retain(|&inside| !(candidate < inside && inside < end));
-                if self.candidates.len() == 8 {
-                    self.candidates.remove(0);
-                }
                 self.candidates.push(candidate);
-                // Incoming direct links and already-inlined fall-through paths
-                // may bypass the new boundary. Rebuild them between entries.
-                self.clear();
+                // Units inlining the new boundary or a candidate it encloses,
+                // or linking to them, come from these pages.
+                self.cut(candidate, end);
                 self.probed = Some(probed);
             } else {
                 self.rejected_candidates.insert(candidate);
@@ -1044,7 +1052,7 @@ impl Native {
         };
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && self.offer_computation()
+            && (prepared.proof.splits() && self.offer_split() || self.offer_computation())
             && prepared.worth_offering()
         {
             return Ok(Some(Run {
@@ -1388,7 +1396,7 @@ impl Native {
         self.runtime.shadow = self.shadow.top();
     }
 
-    /// Units must not run past any stop; a new one clears them all.
+    /// Units must not run past any stop; a new one cuts those that could.
     fn observe_stop(&mut self, stop: u32) {
         if self.stops.contains(&stop) {
             return;
@@ -1400,7 +1408,23 @@ impl Native {
                 std::sync::atomic::Ordering::Release,
             );
         }
-        self.clear();
+        self.cut(stop, stop.saturating_add(1));
+    }
+
+    /// Drops the units decoded from the pages of `start..end`, which hold
+    /// every unit whose trace runs through a new boundary there, and the
+    /// unit starting at it, whose dropping restores the links to it.
+    fn cut(&mut self, start: u32, end: u32) {
+        let end = u64::from(end).max(u64::from(start) + 1);
+        let mut dropped = false;
+        for page in (u64::from(start & !0xfff)..end).step_by(4096) {
+            for eip in self.pages.remove(&(page as u32)).unwrap_or_default() {
+                dropped |= self.drop_unit(eip);
+            }
+        }
+        if dropped {
+            self.forget_dynamic();
+        }
     }
 
     /// Clears the cache as a whole (A64-CTL-1).
@@ -1623,12 +1647,13 @@ impl Native {
                 let proof = probed
                     .filter(|probe| probe.trace.insts == work.unit.trace.insts)
                     .map(|probe| probe.proof)
-                    .or_else(|| computation_proof(&work.unit.trace));
+                    .or_else(|| computation_proof(memory, &work.unit.trace));
                 if let Some(proof) = proof
                     && let Some(code) =
                         self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
                 {
                     let iterates = work.unit.trace.returns_at_head();
+                    self.diagnostics.split_proofs += u64::from(proof.splits());
                     self.computation
                         .insert(eip, worker::Prepared::new(code, iterates, proof));
                 }
@@ -1670,11 +1695,10 @@ impl Native {
             .map(|&(offset, site)| (entry + offset, site))
             .collect();
         sites.sort_unstable_by_key(|&(pc, _)| pc);
-        let len = code.words.len() * 4;
-        crate::jit_map::record(entry, len, eip, retired, code.marks);
+        crate::jit_map::record(entry, code.words, eip, retired, code.marks);
         Some(worker::Code {
             entry,
-            end: entry + len,
+            end: entry + code.words.len() * 4,
             sites: sites.into(),
         })
     }
@@ -1685,7 +1709,7 @@ impl Native {
     /// loop traces.
     fn sample(&mut self, memory: &Memory, eip: u32) {
         if self.computation_enabled
-            && self.offer_computation()
+            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.enclosing_computation(eip)
             && !self.is_stop(candidate)
         {
@@ -1762,7 +1786,7 @@ impl Native {
                 .filter(|&inside| !(eip < inside && inside < end)),
         );
         let trace = self.loop_trace(memory, eip, &stops);
-        let proof = computation_proof(&trace)?;
+        let proof = computation_proof(memory, &trace)?;
         Some(Probed { eip, trace, proof })
     }
 
@@ -1815,14 +1839,17 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
-        crate::jit_map::record(unit, words.len() * 4, eip, retired, marks);
+        crate::jit_map::record(unit, words, eip, retired, marks);
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
     }
 }
 
-fn computation_proof(trace: &translate::Trace) -> Option<translate::computation::Proof> {
+fn computation_proof(
+    memory: &Memory,
+    trace: &translate::Trace,
+) -> Option<translate::computation::Proof> {
     use translate::Mode;
     use translate::Op;
 
@@ -1846,7 +1873,15 @@ fn computation_proof(trace: &translate::Trace) -> Option<translate::computation:
     }) {
         return None;
     }
-    translate::computation::Proof::build(trace)
+    let mut proof = translate::computation::Proof::build(trace)?;
+    proof.prove_split(trace, |pc, len| {
+        let mut bytes = [0; 15];
+        let bytes = bytes.get_mut(..usize::try_from(len).ok()?)?;
+        memory.read_into(pc, bytes).ok()?;
+        let ins = iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode();
+        (!ins.is_invalid() && ins.len() == bytes.len()).then_some(ins)
+    });
+    Some(proof)
 }
 
 /// Rebuilds the x86 flags at a fault site, where the exit stub assumed
@@ -2049,6 +2084,46 @@ mod tests {
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 1));
         assert_eq!(cpu.regs[0], 0x1234_5678);
         assert_eq!(cpu.eip, 0x1003);
+    }
+
+    // spec: A64-CTL-9
+    #[test]
+    fn a_new_stop_cuts_only_the_units_from_its_page() {
+        use adv_cpu_core::memory::{EXEC, READ};
+
+        let (mut memory, mut native) = native();
+        memory.map(0x1000, 0x2000, READ | WRITE).unwrap();
+        // 0x1000: mov eax, 1; jmp 0x2000
+        memory
+            .write(0x1000, &[0xb8, 1, 0, 0, 0, 0xe9, 0xf6, 0x0f, 0, 0])
+            .unwrap();
+        // 0x1800: mov ebx, 5; int3
+        memory.write(0x1800, &[0xbb, 5, 0, 0, 0, 0xcc]).unwrap();
+        // 0x2000: add eax, 2; inc eax; int3
+        memory
+            .write(0x2000, &[0x83, 0xc0, 0x02, 0x40, 0xcc])
+            .unwrap();
+        memory.protect(0x1000, 0x2000, READ | EXEC).unwrap();
+        native.first_visits = false;
+        let to = |native: &mut Native, memory: &mut Memory, eip, stop| {
+            let mut cpu = cpu(eip, 0x8000, 0);
+            while cpu.eip != stop {
+                native
+                    .run(&mut cpu, memory, stop, 100, std::ptr::null_mut())
+                    .unwrap();
+            }
+            cpu
+        };
+        to(&mut native, &mut memory, 0x1800, 0x1805);
+        assert_eq!(to(&mut native, &mut memory, 0x1000, 0x2004).regs[0], 4);
+        let (clears, kept) = (native.diagnostics.clears, native.unit_address(0x1800));
+        assert!(kept.is_some());
+
+        // The unit through 0x2003 must end there now; the other page keeps its unit.
+        let cpu = to(&mut native, &mut memory, 0x1000, 0x2003);
+        assert_eq!(cpu.regs[0], 3);
+        assert_eq!(native.unit_address(0x1800), kept);
+        assert_eq!(native.diagnostics.clears, clears);
     }
 
     // spec: A64-MEM-1, A64-MEM-5, A64-MEM-9

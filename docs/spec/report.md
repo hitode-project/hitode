@@ -91,7 +91,7 @@ Window means a top-level window shown; audio means rendered non-silent audio; vi
 **Rule**: Platform MUST include OS major version and hardware model identifier. Graphics MUST contain API, adapter name, vendor, device, driver and selected binding tier from the GPU device. Settings MUST record launcher choices that select host execution paths, without file paths or font names.
 **Verification**: Test
 
-Apple model identifiers use `hw.model` on macOS and `hw.machine` on iOS; Android uses `ro.product.model`. OS versions use `kern.osproductversion` on Apple and `ro.build.version.release` on Android. Metal uses its adapter model as device identity, never its registry ID; Vulkan uses vendor and device IDs. Tiers are `metal`, `bindless`, `push_descriptors` or `descriptor_sets`.
+Apple model identifiers use `hw.model` on macOS and `hw.machine` on iOS; Android uses `ro.product.model`. iOS reports also record whether the signature carries the memory extension (IOS-MEM-4). OS versions use `kern.osproductversion` on Apple and `ro.build.version.release` on Android. Metal uses its adapter model as device identity, never its registry ID; Vulkan uses vendor and device IDs. Tiers are `metal`, `bindless`, `push_descriptors` or `descriptor_sets`.
 
 The summary builds its typed settings once from the end-of-run display mailbox, game view and options. It holds upscaler, scaling, fast-forward mode, custom-font file and override counts, font smoothing and disc count. Headless runs omit display and game-view settings. The report uses this snapshot and adds the frontend’s current touch mode. Reports without a run use current launcher settings.
 

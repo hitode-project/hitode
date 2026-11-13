@@ -4,7 +4,7 @@ import { androidStorage } from "./android-access.svelte";
 import { inTauri, onHostEvent } from "./bridge";
 import { device } from "./device.svelte";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
-import { jit } from "./jit.svelte";
+import { explainJit, jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 import { prefs } from "./prefs.svelte";
@@ -184,6 +184,9 @@ export const runs = new Runs();
 function launchError(message: string): string {
   const missing = /^missing_dll:(.+)$/.exec(message);
   if (missing) return t(MISSING_DLL, missing[1]);
+  if (message.includes("no 4 GiB-aligned guest window")) {
+    return explainJit(jit.status?.increasedMemoryLimit ? "noGuestWindowExtended" : "noGuestWindow");
+  }
   return message;
 }
 

@@ -2,8 +2,9 @@
 //! execution counts, and never change translation.
 //!
 //! `ADV_JIT_MAP_DIR` writes `jit-{pid}.tsv` rows for an external sampler,
-//! and `insn-{pid}.tsv` rows with the guest instruction and [`Part`] of
-//! every stretch of a unit. [`enable_memory`] keeps the same in process for
+//! `insn-{pid}.tsv` rows with the guest instruction and [`Part`] of every
+//! stretch of a unit, and `code-{pid}.bin`, the units' code as placed (before
+//! links are patched), concatenated in `jit-{pid}.tsv` row order. [`enable_memory`] keeps the same in process for
 //! an in-process sampler, with the names of the shared stubs. A cleared cache reuses addresses,
 //! so attribution takes the newest unit placed before the sample.
 // The translator needs these types on every host; native execution records units.
@@ -179,9 +180,10 @@ fn now_ns() -> u128 {
         .as_nanos()
 }
 
-/// Records a unit of `size` bytes at `base` translated from `eip`, whose
-/// stretches start at `marks`.
-pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[Mark]) {
+/// Records the unit `words` placed at `base` and translated from `eip`,
+/// whose stretches start at `marks`.
+pub(crate) fn record(base: usize, words: &[u32], eip: u32, retired: u32, marks: &[Mark]) {
+    let size = words.len() * 4;
     if MEMORY.load(Ordering::Acquire) {
         let mut units = UNITS.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut marks = marks.to_vec();
@@ -202,14 +204,20 @@ pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[
             }),
         }
     }
-    static MAP: OnceLock<Option<Mutex<(File, File)>>> = OnceLock::new();
+    static MAP: OnceLock<Option<Mutex<(File, File, File)>>> = OnceLock::new();
     let Some(files) = MAP.get_or_init(|| {
         let directory = std::path::PathBuf::from(std::env::var_os("ADV_JIT_MAP_DIR")?);
-        let create =
-            |name: &str| File::create(directory.join(format!("{name}-{}.tsv", std::process::id())));
-        match std::fs::create_dir_all(&directory)
-            .and_then(|_| Ok((create("jit")?, create("insn")?)))
-        {
+        let pid = std::process::id();
+        let create = |name: &str, extension: &str| {
+            File::create(directory.join(format!("{name}-{pid}.{extension}")))
+        };
+        match std::fs::create_dir_all(&directory).and_then(|_| {
+            Ok((
+                create("jit", "tsv")?,
+                create("insn", "tsv")?,
+                create("code", "bin")?,
+            ))
+        }) {
             Ok(files) => Some(Mutex::new(files)),
             Err(error) => {
                 eprintln!("warning: JIT address map disabled: {error}");
@@ -227,6 +235,8 @@ pub(crate) fn record(base: usize, size: usize, eip: u32, retired: u32, marks: &[
     let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
     let _ = files.0.write_all(row.as_bytes());
     let _ = files.1.write_all(stretches.as_bytes());
+    let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let _ = files.2.write_all(&code);
 }
 
 /// `insn-{pid}.tsv` rows of a unit, keyed by its `jit-{pid}.tsv` row: Unix
@@ -268,7 +278,7 @@ mod tests {
         let mark = |offset, eip, part| Mark { offset, eip, part };
         record(
             0x1000,
-            0x40,
+            &[0; 16],
             0x401000,
             3,
             &[
@@ -276,7 +286,7 @@ mod tests {
                 mark(0, 0x401000, Part::Body),
             ],
         );
-        record(0x1040, 0x20, 0x401100, 2, &[]);
+        record(0x1040, &[0; 8], 0x401100, 2, &[]);
         let first = now_ns();
         assert_eq!(lookup(0x1010, first), Some(0x401000));
         assert_eq!(lookup(0x1050, first), Some(0x401100));
@@ -298,7 +308,7 @@ mod tests {
         );
         // A cleared cache places again from its bottom.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        record(0x1000, 0x30, 0x402000, 1, &[]);
+        record(0x1000, &[0; 12], 0x402000, 1, &[]);
         let second = now_ns();
         assert_eq!(lookup(0x1010, second), Some(0x402000));
         assert_eq!(lookup(0x1010, first), Some(0x401000));

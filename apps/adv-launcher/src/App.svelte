@@ -4,6 +4,7 @@
   import { call, onHostEvent } from "./lib/bridge";
   import AndroidStorageBanner from "./components/AndroidStorageBanner.svelte";
   import JitBanner from "./components/JitBanner.svelte";
+  import MemoryNotice from "./components/MemoryNotice.svelte";
   import UpdateNotice from "./components/UpdateNotice.svelte";
   import FolderChoice from "./components/FolderChoice.svelte";
   import Sidebar from "./components/Sidebar.svelte";
@@ -102,6 +103,7 @@
   });
 </script>
 
+{#if jit.active && jit.memoryMissing && !prefs.memoryNoticeSeen}<MemoryNotice />{/if}
 {#if backupError}<div class="backup-error" role="alert">{backupError}<button onclick={() => backupError = ""}>{t("关闭")}</button></div>{/if}
 
 {#key locale()}

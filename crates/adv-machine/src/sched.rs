@@ -623,6 +623,7 @@ mod active_tests {
             frame: 0,
             completed_frames: 0,
             frame_pacer: None,
+            load: crate::frame_load::FrameLoad::default(),
             pid: 0x1000,
             peb: crate::layout::PEB_ADDR,
             teb_pages: 1,

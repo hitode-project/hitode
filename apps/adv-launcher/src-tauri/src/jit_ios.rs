@@ -10,7 +10,7 @@ use std::{
     ffi::c_void,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -59,6 +59,7 @@ thread_local! {
 pub struct JitStatus {
     ready: bool,
     debuggable: bool,
+    increased_memory_limit: bool,
     error: Option<String>,
     waiting: bool,
     task: Option<&'static str>,
@@ -86,9 +87,10 @@ unsafe extern "C" {
     fn CFRelease(value: *const c_void);
 }
 
-/// Query the running host's signed entitlement, including inside LiveContainer.
-fn signing_allows_debugging() -> bool {
-    let key = NSString::from_str("get-task-allow");
+/// Whether the running host's signature grants `key`, including inside
+/// LiveContainer, where the host process carries LiveContainer's signature.
+fn entitled(key: &str) -> bool {
+    let key = NSString::from_str(key);
     // SAFETY: NSString bridges to CFString; both Copy/Create results are
     // released after use. This is the Security SPI used by StikJIT's preflight.
     unsafe {
@@ -108,6 +110,15 @@ fn signing_allows_debugging() -> bool {
         CFRelease(task);
         allowed
     }
+}
+
+fn signing_allows_debugging() -> bool {
+    entitled("get-task-allow")
+}
+
+/// Whether the signature raises the memory limit and address space (IOS-MEM-4).
+pub fn increased_memory_limit() -> bool {
+    entitled("com.apple.developer.kernel.increased-memory-limit")
 }
 
 fn require_embedded_helper() -> Result<(), String> {
@@ -146,6 +157,7 @@ pub async fn jit_status(app: AppHandle) -> JitStatus {
     JitStatus {
         ready: matches!(state, Some(Ok(()))),
         debuggable: signing_allows_debugging(),
+        increased_memory_limit: increased_memory_limit(),
         error: request
             .error
             .clone()
@@ -166,11 +178,6 @@ pub fn request_jit(app: AppHandle) -> Result<(), String> {
         return result;
     }
     require_embedded_helper()?;
-    // LiveContainer's "Launch with JIT" starts the player under StikDebug,
-    // which prepares the pool at launch (IOS-JIT-1); it cannot host the helper.
-    if std::env::var_os("LC_HOME_PATH").is_some() {
-        return Err("Launch with JIT in LiveContainer".into());
-    }
     let pairing =
         std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?;
     run_helper(app, Task::Enable, pairing)
@@ -223,7 +230,7 @@ fn run_helper(app: AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), String
     let result = app
         .run_on_main_thread(move || {
             if let Err(error) = start_helper(&handle, task, pairing) {
-                finish(&handle, Err(error));
+                finish(&handle, Err(extension_unavailable(error)));
             }
         })
         .map_err(|e| e.to_string());
@@ -268,6 +275,17 @@ fn check_pairing(bytes: &[u8]) -> Result<(), String> {
     } else {
         Err("invalidPairing".into())
     }
+}
+
+/// LiveContainer runs the helper extension only in builds that host guest
+/// extensions, with the app's helper process support on (IOS-JIT-2); there
+/// the settings row explains that instead of the raw failure.
+fn extension_unavailable(error: String) -> String {
+    if std::env::var_os("LC_HOME_PATH").is_none() {
+        return error;
+    }
+    log::warn!("JIT extension in LiveContainer: {error}");
+    "jitLiveContainerHelper".into()
 }
 
 fn finish(app: &AppHandle, result: Result<(), String>) {
@@ -351,9 +369,14 @@ fn start_helper(app: &AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), Str
         (extension, request)
     };
     EXTENSION.with(|slot| *slot.borrow_mut() = Some((extension, request)));
+    let last_port = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("remote-pairing-port");
     let app = app.clone();
     std::thread::spawn(move || {
-        let result = listen(listener, &token, task, pairing);
+        let result = listen(listener, &token, task, pairing, &last_port);
         finish(&app, result);
     });
     Ok(())
@@ -363,9 +386,37 @@ fn start_helper(app: &AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), Str
 struct Progress {
     stage: String,
     error: Option<String>,
+    /// The RemotePairing port that answered, on a successful enable.
+    port: Option<u16>,
 }
 
-fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> Result<(), String> {
+/// The ports to try for RemotePairing, most likely first (IOS-JIT-2):
+/// Bonjour's answer, the last port that worked, then the pre-iOS 27 port.
+fn remote_pairing_ports(last_port: &Path) -> Vec<u16> {
+    // The loopback instance is a local record and answers at once when present.
+    let advertised = crate::remote_pairing::port(Duration::from_millis(500));
+    let last = std::fs::read_to_string(last_port)
+        .ok()
+        .and_then(|text| text.trim().parse().ok());
+    let mut ports = Vec::new();
+    for port in [advertised, last, Some(crate::remote_pairing::FALLBACK)]
+        .into_iter()
+        .flatten()
+    {
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+fn listen(
+    listener: TcpListener,
+    token: &str,
+    task: Task,
+    pairing: Vec<u8>,
+    last_port: &Path,
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let (stream, _) = loop {
         match listener.accept() {
@@ -373,7 +424,11 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return Err(format!("JIT extension did not connect: {e}")),
+            Err(e) => {
+                return Err(extension_unavailable(format!(
+                    "JIT extension did not connect: {e}"
+                )));
+            }
         }
     };
     // Darwin sockets inherit O_NONBLOCK from the listener they were accepted on.
@@ -400,11 +455,9 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
         "pairing": pairing,
     });
     if task == Task::Enable {
-        // The loopback instance is a local record and answers at once; before
-        // iOS 27 none is visible on the device, so this bounds the wait.
-        let (port, source) = crate::remote_pairing::port(Duration::from_millis(500));
-        log::info!("JIT helper: RemotePairing port {port} ({source})");
-        request["remotePairingPort"] = port.into();
+        let ports = remote_pairing_ports(last_port);
+        log::info!("JIT helper: RemotePairing ports {ports:?}");
+        request["remotePairingPorts"] = ports.into();
     }
     writeln!(reader.get_mut(), "{request}").map_err(|e| e.to_string())?;
     reader
@@ -425,6 +478,11 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
                 "finished" => {
                     if task == Task::DownloadDdi && progress.error.is_none() {
                         *DDI.lock().unwrap() = Some(true);
+                    }
+                    if let Some(port) = progress.port {
+                        // Only a cache: a stale port costs one refused connection.
+                        let _ = std::fs::create_dir_all(last_port.parent().unwrap_or(last_port));
+                        let _ = std::fs::write(last_port, port.to_string());
                     }
                     return progress.error.map_or(Ok(()), Err);
                 }

@@ -14,6 +14,8 @@ use super::integer::Integer;
 use super::simd::{Kind, Loc};
 use super::trace::{Edge, Mode, Next, Trace};
 
+mod carried;
+
 type ExprId = usize;
 type VarId = usize;
 
@@ -86,6 +88,8 @@ struct Effect {
     limits: Vec<Limit>,
     access: Access,
     bytes: u32,
+    /// After the head loop exits: only its last iterations' block runs it.
+    tail: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +125,14 @@ pub(crate) struct Evaluation {
     gathered: Vec<Option<(i64, i64)>>,
     tables: Vec<Range>,
     entries: usize,
+    spans: Vec<(i64, i64, Option<i64>, bool, bool)>,
+}
+
+impl Evaluation {
+    /// The ranges the last evaluation admitted and the words it read since.
+    pub(crate) fn admitted(&self) -> &[Range] {
+        &self.ranges
+    }
 }
 
 pub(crate) struct Proof {
@@ -130,6 +142,36 @@ pub(crate) struct Proof {
     effects: Vec<Effect>,
     divisions: Vec<Option<Division>>,
     frame_cache: Option<FrameCache>,
+    outer: Option<Outer>,
+}
+
+/// The loop at the unit entry, whose iterations may run as blocks
+/// (A64-TR-9).
+#[derive(Clone, Copy)]
+struct Outer {
+    /// Its index, if a retained address depends on it.
+    counter: Option<VarId>,
+    count: ExprId,
+    /// Start and step of each register that is affine in the index.
+    regs: [Option<(ExprId, ExprId)>; 8],
+    /// Offset from ESP, start and step of affine frame dwords.
+    slots: [Option<(i32, ExprId, ExprId)>; 8],
+    /// Whether the iterations exchange only those registers and dwords.
+    split: bool,
+    /// Whether they write frame bytes, so each block needs its own frame.
+    frame: bool,
+}
+
+/// Iterations of an admitted head loop and its affine state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub iterations: u32,
+    pub regs: [Option<(u32, u32)>; 8],
+    /// Offset from ESP, start and step of affine frame dwords.
+    pub slots: [Option<(i32, u32, u32)>; 8],
+    /// The frame bytes `[lo, hi)` from ESP that the loop and the tail touch,
+    /// if the loop writes any: each block runs on a private copy.
+    pub frame: Option<(i32, i32)>,
 }
 
 pub(crate) struct FrameCache {
@@ -381,6 +423,7 @@ struct Builder<'a> {
     one: ExprId,
     remaining: usize,
     states: Vec<Vec<Option<State>>>,
+    outer: Option<Outer>,
 }
 
 impl Builder<'_> {
@@ -614,6 +657,10 @@ impl Builder<'_> {
         self.word(addr.base)
     }
 
+    fn tail(&self) -> bool {
+        self.graph.heads[0].is_none_or(|lp| !self.graph.loops[lp].inside[self.at])
+    }
+
     fn read(&mut self, state: &mut State, addr: Form, bytes: u8, record: bool) -> Value {
         let frame = self.frame_offset(&addr);
         if record {
@@ -628,6 +675,7 @@ impl Builder<'_> {
                         Access::Read
                     },
                     bytes: u32::from(bytes),
+                    tail: self.tail(),
                 },
             ));
         }
@@ -672,6 +720,7 @@ impl Builder<'_> {
                         Access::Write
                     },
                     bytes: u32::from(bytes),
+                    tail: self.tail(),
                 },
             ));
         }
@@ -1431,6 +1480,31 @@ impl Builder<'_> {
         after.cdq = false;
         after.entry_reads |= used | initial.entry_reads;
         after.limits = initial.limits;
+        if head == 0 {
+            let mut affine = [None; 8];
+            let starts = slots.iter().filter_map(|(&offset, recurrence)| {
+                let (_, delta) = recurrence.as_ref()?;
+                let start = match initial.slots.get(&offset) {
+                    Some(value) => value.as_ref()?.invariant()?,
+                    None => self.frame_word(offset).invariant()?,
+                };
+                Some((offset, start, *delta))
+            });
+            for (slot, affine) in starts.zip(&mut affine) {
+                *affine = Some(slot);
+            }
+            self.outer = Some(Outer {
+                counter: Some(var),
+                count,
+                regs: std::array::from_fn(|r| {
+                    let (_, delta) = recurring[r].as_ref()?;
+                    Some((initial.regs[r].as_ref()?.invariant()?, *delta))
+                }),
+                slots: affine,
+                split: false,
+                frame: false,
+            });
+        }
         for r in &mut after.regs {
             *r = self.final_value(r.take(), var, count);
         }
@@ -1553,6 +1627,7 @@ impl Builder<'_> {
                     && e.access == effect.access
                     && e.bytes == effect.bytes
                     && e.limits == effect.limits
+                    && e.tail == effect.tail
             }) {
                 out.push(effect);
             }
@@ -1622,6 +1697,7 @@ impl Proof {
             one: 0,
             remaining: PROOF_STEPS,
             states: Vec::new(),
+            outer: None,
         };
         b.zero = b.constant(0);
         b.one = b.constant(1);
@@ -1650,7 +1726,7 @@ impl Proof {
         if !effects.iter().any(|e| e.access == Access::Write) {
             return None;
         }
-        let mut frame: [Vec<(i32, i64)>; 2] = Default::default();
+        let mut frame: [Vec<(i32, i64)>; 4] = Default::default();
         effects.retain(|effect| {
             let Some(offset) = b.frame_offset(&effect.addr) else {
                 return true;
@@ -1661,13 +1737,11 @@ impl Proof {
                 _ => return true,
             };
             let end = i64::from(offset) + i64::from(effect.bytes);
-            frame[kind].push((offset, end));
+            frame[kind + 2 * usize::from(effect.tail)].push((offset, end));
             false
         });
-        for (mut spans, access) in frame
-            .into_iter()
-            .zip([Access::FrameRead, Access::FrameWrite])
-        {
+        for (kind, mut spans) in frame.into_iter().enumerate() {
+            let access = [Access::FrameRead, Access::FrameWrite][kind % 2];
             spans.sort_unstable();
             let mut len = 0;
             for i in 0..spans.len() {
@@ -1685,6 +1759,7 @@ impl Proof {
                     limits: Vec::new(),
                     access,
                     bytes: u32::try_from(end - i64::from(start)).ok()?,
+                    tail: kind >= 2,
                 });
             }
         }
@@ -1692,6 +1767,7 @@ impl Proof {
         // survive in final span expressions, not the speculative transfers.
         let mut ids = FxHashMap::default();
         let mut vars = Vec::new();
+        let outer = b.outer;
         for effect in &mut effects {
             effect
                 .limits
@@ -1746,7 +1822,178 @@ impl Proof {
             effects,
             divisions: divisions.into_iter().map(Option::flatten).collect(),
             frame_cache,
+            outer: outer.map(|mut outer| {
+                outer.counter = outer.counter.and_then(|var| ids.get(&var).copied());
+                outer
+            }),
         })
+    }
+
+    /// Proves that the head loop's iterations exchange only affine
+    /// registers and frame dwords. `decode` returns the instruction at an
+    /// address and length.
+    pub(crate) fn prove_split(
+        &mut self,
+        trace: &Trace,
+        decode: impl Fn(u32, u32) -> Option<iced_x86::Instruction>,
+    ) {
+        let Some(outer) = self.outer else {
+            return;
+        };
+        let zero = |step: ExprId| self.exprs[step] == Expr::Constant(0);
+        let mask = |f: &dyn Fn(ExprId) -> bool| {
+            (0..8).fold(0, |set, r| {
+                set | u8::from(outer.regs[r].is_some_and(|(_, step)| f(step))) << r
+            })
+        };
+        let affine = (mask(&|_| true), mask(&zero));
+        let slots: Vec<(i32, bool)> = outer
+            .slots
+            .iter()
+            .flatten()
+            .map(|&(offset, _, step)| (offset, zero(step)))
+            .collect();
+        let carried = carried::independent(trace, affine, &slots, &self.divisions, decode);
+        self.outer = Some(Outer {
+            split: carried.is_some(),
+            frame: carried.flatten().is_some(),
+            ..outer
+        });
+    }
+
+    pub(crate) fn splits(&self) -> bool {
+        self.outer.is_some_and(|outer| outer.split)
+    }
+
+    /// After a successful `evaluate`, the head loop's iterations if every
+    /// one writes only bytes no other iteration reads or writes. A write
+    /// needs a nonzero stride, and an effect it meets the same stride and a
+    /// common span within one stride. Tail effects meet only the last block.
+    pub(crate) fn plan(
+        &self,
+        cpu: &CpuState,
+        scratch: &mut Evaluation,
+        mut read: impl FnMut(u32) -> Option<u32>,
+    ) -> Option<Plan> {
+        let outer = self.outer.filter(|outer| outer.split)?;
+        let n = self.value(outer.count, cpu, scratch, &mut read)?;
+        if n < 2 {
+            return None;
+        }
+        let mut spans = std::mem::take(&mut scratch.spans);
+        spans.clear();
+        // Each block's frame bytes are its own: only the span matters.
+        let mut frame = (i64::MAX, i64::MIN);
+        for effect in &self.effects {
+            let Some((lo, hi)) =
+                self.interval(&effect.addr, &effect.limits, cpu, scratch, &mut read)?
+            else {
+                continue;
+            };
+            if outer.frame && matches!(effect.access, Access::FrameRead | Access::FrameWrite) {
+                frame = (frame.0.min(lo), frame.1.max(hi + i64::from(effect.bytes)));
+                continue;
+            }
+            let stride = if effect.tail {
+                Some(0)
+            } else if effect
+                .addr
+                .terms
+                .iter()
+                .any(|&(v, _)| Some(v) != outer.counter && self.varies(v, outer.counter))
+            {
+                None
+            } else {
+                match effect
+                    .addr
+                    .terms
+                    .iter()
+                    .find(|&&(v, _)| Some(v) == outer.counter)
+                {
+                    Some(&(_, k)) => {
+                        Some(i64::from(self.value(k, cpu, scratch, &mut read)? as i32))
+                    }
+                    None => Some(0),
+                }
+            };
+            let write = matches!(effect.access, Access::Write | Access::FrameWrite);
+            spans.push((lo, hi + i64::from(effect.bytes), stride, write, effect.tail));
+        }
+        let reach = i64::from(n - 1);
+        // An iteration's span, at index 0.
+        let first = |(lo, hi, stride, ..): (i64, i64, Option<i64>, bool, bool)| {
+            let stride = stride.unwrap_or(0);
+            let shift = reach * stride.abs();
+            if stride >= 0 {
+                (lo, hi - shift)
+            } else {
+                (lo + shift, hi)
+            }
+        };
+        let independent = spans.iter().enumerate().all(|(i, &a)| {
+            spans[i..].iter().enumerate().all(|(j, &b)| {
+                let (_, _, sa, wa, ta) = a;
+                let (_, _, sb, wb, tb) = b;
+                if !(wa || wb) || (ta && tb) {
+                    return true;
+                }
+                let disjoint = a.1 <= b.0 || b.1 <= a.0;
+                if ta || tb {
+                    return disjoint;
+                }
+                let Some(stride) = sa.filter(|&s| s != 0 && sb == Some(s)) else {
+                    return j != 0 && disjoint;
+                };
+                let ((a0, a1), (b0, b1)) = (first(a), first(b));
+                (disjoint && j != 0) || a1.max(b1) - a0.min(b0) <= stride.abs()
+            })
+        });
+        let private = spans
+            .iter()
+            .all(|&(lo, hi, ..)| hi <= frame.0 || frame.1 <= lo);
+        scratch.spans = spans;
+        if !independent || !private {
+            return None;
+        }
+        let mut regs = [None; 8];
+        for (reg, affine) in regs.iter_mut().zip(outer.regs) {
+            if let Some((start, step)) = affine {
+                *reg = Some((
+                    self.value(start, cpu, scratch, &mut read)?,
+                    self.value(step, cpu, scratch, &mut read)?,
+                ));
+            }
+        }
+        let mut slots = [None; 8];
+        for (slot, affine) in slots.iter_mut().zip(outer.slots) {
+            if let Some((offset, start, step)) = affine {
+                *slot = Some((
+                    offset,
+                    self.value(start, cpu, scratch, &mut read)?,
+                    self.value(step, cpu, scratch, &mut read)?,
+                ));
+            }
+        }
+        let esp = i64::from(cpu.regs[usize::from(ESP)]);
+        Some(Plan {
+            iterations: n,
+            regs,
+            slots,
+            frame: outer
+                .frame
+                .then(|| ((frame.0 - esp) as i32, (frame.1 - esp) as i32)),
+        })
+    }
+
+    /// Whether a gathered dword's address depends on the head loop index.
+    fn varies(&self, var: VarId, counter: Option<VarId>) -> bool {
+        match &self.vars[var] {
+            Var::Gathered(addr) => addr
+                .terms
+                .iter()
+                .any(|&(v, _)| Some(v) == counter || self.varies(v, counter)),
+            _ => false,
+        }
     }
 
     pub(crate) fn frame_cache(&self) -> Option<&FrameCache> {
@@ -2056,6 +2303,154 @@ mod tests {
         let mut trace = Trace::default();
         trace.build(&memory, CODE, &[], &|_, _| None, &|_| None, true);
         trace
+    }
+
+    /// A proof with its split decided from the same assembled bytes.
+    fn proved(assemble: impl Fn(&mut CodeAssembler)) -> Option<Proof> {
+        let mut a = CodeAssembler::new(32).unwrap();
+        assemble(&mut a);
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let t = trace(&assemble);
+        let mut proof = Proof::build(&t)?;
+        proof.prove_split(&t, |pc, len| {
+            let at = usize::try_from(pc - CODE).ok()?;
+            let bytes = code.get(at..at + len as usize)?;
+            Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+        });
+        Some(proof)
+    }
+
+    /// `head: body; add esi,4; add edi,4; dec ecx; jne head; int3`
+    fn row(body: impl Fn(&mut CodeAssembler)) -> impl Fn(&mut CodeAssembler) {
+        move |a| {
+            let mut head = a.create_label();
+            a.set_label(&mut head).unwrap();
+            body(a);
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+            a.int3().unwrap();
+        }
+    }
+
+    fn plan(proof: &Proof, count: u32) -> Option<Plan> {
+        let cpu = CpuState {
+            regs: [0, count, 0, 0, FRAME, 0, INPUT, OUTPUT],
+            ..CpuState::default()
+        };
+        let mut scratch = Evaluation::default();
+        proof.evaluate(&cpu, &mut scratch, |_| None)?;
+        proof.plan(&cpu, &mut scratch, |_| None)
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn splits_iterations_that_touch_only_their_own_bytes() {
+        let blend = |back: i32| {
+            row(move |a| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.add(eax, dword_ptr(edi + back)).unwrap();
+                a.shr(eax, 1).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            })
+        };
+        let proof = proved(blend(0)).expect("in-place blend proof");
+        assert!(proof.splits());
+        let blocks = plan(&proof, 1000).expect("in-place blocks");
+        assert_eq!(blocks.iterations, 1000);
+        assert_eq!(blocks.regs[1], Some((1000, u32::MAX)));
+        assert_eq!(blocks.regs[6], Some((INPUT, 4)));
+        assert_eq!(blocks.regs[7], Some((OUTPUT, 4)));
+        assert_eq!(blocks.regs[0], None, "EAX is written before it is read");
+        // The previous element is another iteration's output.
+        let proof = proved(blend(-4)).expect("previous-element proof");
+        assert!(proof.splits());
+        assert!(plan(&proof, 1000).is_none());
+        // A two-dword output overlaps the next iteration's.
+        let proof = proved(row(|a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.mov(dword_ptr(edi + 4), eax).unwrap();
+        }))
+        .unwrap();
+        assert!(plan(&proof, 1000).is_none());
+        // A store to one invariant address in every iteration.
+        let proof = proved(row(|a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.mov(dword_ptr(ebp), eax).unwrap();
+        }))
+        .unwrap();
+        assert!(plan(&proof, 1000).is_none());
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn a_guard_every_iteration_takes_alike_keeps_rows_splittable() {
+        // Rows of EBX dwords; the inner count lives in a frame slot that
+        // rows with no width skip. `guard` sets the flags the skip tests.
+        let rows = |guard: fn(&mut CodeAssembler)| {
+            move |a: &mut CodeAssembler| {
+                let (mut head, mut inner, mut skip) =
+                    (a.create_label(), a.create_label(), a.create_label());
+                a.set_label(&mut head).unwrap();
+                guard(a);
+                a.jle(skip).unwrap();
+                a.mov(dword_ptr(esp + 8), ebx).unwrap();
+                a.xor(edx, edx).unwrap();
+                a.set_label(&mut inner).unwrap();
+                a.mov(eax, dword_ptr(esi + edx * 4)).unwrap();
+                a.mov(dword_ptr(edi + edx * 4), eax).unwrap();
+                a.inc(edx).unwrap();
+                a.dec(dword_ptr(esp + 8)).unwrap();
+                a.jne(inner).unwrap();
+                a.set_label(&mut skip).unwrap();
+                a.add(esi, 0x100).unwrap();
+                a.add(edi, 0x100).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+                a.int3().unwrap();
+            }
+        };
+        let proof = proved(rows(|a| a.test(ebx, ebx).unwrap())).expect("uniform guard proof");
+        assert!(proof.splits());
+        // A guard on each row's data lets the last rows skip the slot.
+        let proof = proved(rows(|a| a.cmp(dword_ptr(esi), 0).unwrap())).expect("data guard proof");
+        assert!(!proof.splits());
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn iterations_that_exchange_state_do_not_split() {
+        let exchanges: [&dyn Fn(&mut CodeAssembler); 4] = [
+            // An integer accumulator.
+            &|a| {
+                a.add(ebx, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), ebx).unwrap();
+            },
+            // A carry from the previous iteration's add.
+            &|a| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.adc(eax, 0).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            },
+            // A running sum in a frame slot.
+            &|a| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.add(dword_ptr(esp + 4), eax).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            },
+            // x87 state.
+            &|a| {
+                a.fld(dword_ptr(esi)).unwrap();
+                a.fstp(dword_ptr(edi)).unwrap();
+            },
+        ];
+        for (i, body) in exchanges.into_iter().enumerate() {
+            let proof = proved(row(body)).expect("an exchanging proof");
+            assert!(!proof.splits(), "case {i}");
+        }
     }
 
     fn range(start: u32, bytes: u32, write: bool) -> Range {

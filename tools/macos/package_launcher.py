@@ -137,7 +137,7 @@ def package(platform: str, env: dict, side_by_side: str | None, trollstore: bool
         if trollstore:
             run([*command, '--no-sign'], env)
             ipa = out / 'Hitode-TrollStore.ipa'
-            run([sys.executable, ROOT / 'tools/ios/package_trollstore.py', source, ipa], env)
+            run([sys.executable, ROOT / 'tools/ios/sign_ipa.py', '--trollstore', source, ipa], env)
         else:
             run([*command, '--export-method', 'debugging'], env)
             ipa = out / 'Hitode.ipa'
