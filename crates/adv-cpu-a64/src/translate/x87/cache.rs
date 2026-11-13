@@ -1430,9 +1430,9 @@ impl Translator<'_> {
                 scratch.head_at[to] = Some(usize::MAX);
             }
         }
-        for index in start..=end {
-            if scratch.head_at[index].is_some() {
-                scratch.head_at[index] = Some(heads.len());
+        for (index, head) in (start..=end).zip(&mut scratch.head_at[start..=end]) {
+            if head.is_some() {
+                *head = Some(heads.len());
                 heads.push((index, None));
             }
         }
@@ -2253,11 +2253,11 @@ impl Translator<'_> {
                     && models.last().is_some_and(|m| m.0 == end)
             });
         let mut arithmetic = false;
-        for index in start..=end {
+        for (index, inst) in (start..=end).zip(&self.trace.insts[start..=end]) {
             if models.is_some_and(|models| models.binary_search_by_key(&index, |m| m.0).is_err()) {
                 continue;
             }
-            match self.trace.insts[index].op {
+            match inst.op {
                 Op::X87(X87 {
                     fast: Fast::Arith { .. },
                     ..
