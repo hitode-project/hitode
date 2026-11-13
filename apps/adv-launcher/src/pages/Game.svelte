@@ -1048,6 +1048,11 @@
     align-items: center;
     gap: 6px;
   }
+  .phone .textbar {
+    top: max(12px, var(--safe-top));
+    bottom: auto;
+    width: min(520px, calc(100% - max(32px, var(--safe-left) + var(--safe-right) + 24px)));
+  }
   .kbd {
     flex: 0 0 auto;
     width: 36px;
