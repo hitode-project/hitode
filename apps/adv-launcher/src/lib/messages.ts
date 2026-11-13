@@ -492,4 +492,8 @@ export const messages: Record<string, [string, string]> = {
   "从屏幕左或右边缘向内滑可打开菜单": ["Swipe from either edge to open the menu", "左右の端からスワイプしてメニューを開けます"],
   "退格": ["Backspace", "バックスペース"],
   "正在准备游戏…": ["Preparing game…", "ゲームを準備しています…"],
+  "游戏文件不会被删除。内部副本（{0}）正与库中其他 {1} 个游戏共用。": ["Game files will be kept. The internal copy ({0}) is shared with {1} other library game(s).", "ゲームファイルは削除されません。内部コピー（{0}）はライブラリの他の {1} 本のゲームと共有されています。"],
+  "Hitode 内部副本占用 {0}，仅移除不会删除它。": ["The Hitode internal copy uses {0}; removing alone keeps it.", "Hitode 内部コピーは {0} を使用しています。削除するだけではこのコピーは残ります。"],
+  "同时删除内部副本（含存档，不可撤销）": ["Also delete internal copy (includes saves, cannot be undone)", "内部コピーも削除（セーブデータ含む・取り消し不可）"],
+  "移除并删除副本（{0}）": ["Remove & delete copy ({0})", "削除してコピーも消去（{0}）"],
 };

@@ -6,6 +6,7 @@
   import Cover from "../components/Cover.svelte";
   import EmptyLibrary from "../components/EmptyLibrary.svelte";
   import Icon from "../components/Icon.svelte";
+  import { gameStorage, type GameCopy } from "../lib/game-storage.svelte";
   import ManageMenu from "../components/ManageMenu.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import Vndb from "../components/Vndb.svelte";
@@ -87,10 +88,11 @@
     moreButton?.focus();
   }
 
-  function remove(game: Game) {
+  async function remove(game: Game, copy: GameCopy | null = null) {
     const index = items.findIndex((g) => g.id === game.id);
-    selectedId = (items[index + 1] ?? items[index - 1])?.id ?? null;
-    void library.remove(game.id);
+    const nextId = (items[index + 1] ?? items[index - 1])?.id ?? null;
+    await gameStorage.removeGame(game.id, copy);
+    if (selectedId === game.id) selectedId = nextId;
     popup = "none";
   }
 
@@ -301,12 +303,12 @@
               </button>
               {#if popup === "menu"}
                 <ManageMenu {game} onclose={closePopup}
-                  onvndb={() => (popup = "vndb")} onrename={() => (popup = "rename")} onremove={() => remove(game)} />
+                  onvndb={() => (popup = "vndb")} onrename={() => (popup = "rename")} onremove={(copy) => remove(game, copy)} />
               {/if}
             </div>
           </div>
           {#if game.offline === "missing" && !permissionBlocked(game)}
-            <button class="quiet remove" onclick={() => remove(game)}>{t("从游戏库移除")}</button>
+            <button class="quiet remove" onclick={() => void remove(game)}>{t("从游戏库移除")}</button>
           {/if}
 
           <div class="rule"></div>

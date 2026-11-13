@@ -92,10 +92,10 @@
     removed();
   }
 
-  function removed() {
+  function removed(deletedFiles = false) {
     openId = null;
     manageId = null;
-    undoToast = true;
+    undoToast = !deletedFiles;
   }
 
   onMount(() => { if (grid) grid.scrollTop = scrollTop; });
