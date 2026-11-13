@@ -8,11 +8,45 @@ pub(super) struct Allocation {
     pub locations: Vec<Host>,
     pub regions: Vec<RecordId>,
     pub spill_cells: usize,
+    pub defs: Vec<Option<Op>>,
 }
 
 // spec: A64-OPT-6, A64-OPT-7
 pub(super) fn allocate(func: &Func) -> Allocation {
     let n = func.types.len();
+    let mut operations = vec![None; n];
+    let mut constants = vec![None; n];
+    let mut hints = vec![Vec::new(); n];
+    for data in &func.blocks {
+        for &(result, op) in &data.insts {
+            if let Some(v) = result {
+                operations[v.0 as usize] = Some(op);
+                if let Op::Constant(_, bits) = op {
+                    constants[v.0 as usize] = Some(bits);
+                }
+            }
+        }
+    }
+    // Backedges get first choice, in both directions: the argument may be
+    // allocated later than its parameter and can reuse its dying register.
+    for backedge in [true, false] {
+        for (b, data) in func.blocks.iter().enumerate() {
+            for target in data
+                .end
+                .targets()
+                .filter(|t| (t.block.0 as usize <= b) == backedge)
+            {
+                for (&p, &a) in func.blocks[target.block.0 as usize]
+                    .params
+                    .iter()
+                    .zip(&target.args)
+                {
+                    hints[p.0 as usize].push(a);
+                    hints[a.0 as usize].push(p);
+                }
+            }
+        }
+    }
     let mut regions = vec![None; func.blocks.len()];
     regions[0] = Some(func.blocks[0].head.unwrap().record);
     let mut work = vec![0];
@@ -40,7 +74,6 @@ pub(super) fn allocate(func: &Func) -> Allocation {
     let mut starts = vec![usize::MAX; n];
     let mut ends = vec![0; n];
     let mut hot = vec![false; n];
-    let mut constants = vec![None; n];
     let mut block_start = Vec::new();
     let mut block_end = Vec::new();
     let mut uses = vec![BTreeSet::new(); func.blocks.len()];
@@ -54,25 +87,36 @@ pub(super) fn allocate(func: &Func) -> Allocation {
             ends[p.0 as usize] = position;
             defs[b].insert(p);
         }
-        let mut read = |v: Value, pos: usize, warm: bool| {
-            let i = v.0 as usize;
-            ends[i] = ends[i].max(pos);
-            hot[i] |= warm;
-            if !defs[b].contains(&v) {
-                uses[b].insert(v);
+        let mut read = |v: Value, pos: usize, warm: bool, immediate: bool| {
+            let mut leaves = Vec::new();
+            super::super::recovery::leaves_of(v, &operations, immediate, &mut leaves);
+            for (v, immediate) in leaves {
+                let i = v.0 as usize;
+                ends[i] = ends[i].max(pos);
+                hot[i] |= warm && !(immediate && constants[i].is_some());
+                if !defs[b].contains(&v) {
+                    uses[b].insert(v);
+                }
             }
         };
         for v in func.records[region.0 as usize].uses() {
-            read(v, position, false);
+            read(v, position, false, false);
         }
         for (result, op) in &data.insts {
-            position += 1;
-            for v in op.uses() {
-                read(v, position, true);
+            position += 2;
+            if !matches!(op, Op::Flags { kind, .. } if *kind != FlagKind::UnorderedCompare) {
+                for v in op.uses() {
+                    read(
+                        v,
+                        position,
+                        true,
+                        constants[v.0 as usize].is_some_and(|bits| matches!(*op, Op::Int(kind, _, b) if b == v && int_immediate(kind, if func.ty(v) == Type::I64 { X } else { W }, T, T, bits as u64).is_some())),
+                    );
+                }
             }
             if op.can_fail() {
                 for v in func.records[region.0 as usize].uses() {
-                    read(v, position, false);
+                    read(v, position + 1, false, false);
                 }
             }
             if let Op::Store { after, .. } = op {
@@ -80,23 +124,25 @@ pub(super) fn allocate(func: &Func) -> Allocation {
             }
             // Definitions are added below, after collecting the block's uses.
             if let Some(v) = result {
-                starts[v.0 as usize] = position;
-                if let Op::Constant(_, bits) = op {
-                    constants[v.0 as usize] = Some(*bits);
-                }
+                starts[v.0 as usize] = position + 1;
             }
         }
-        position += 1;
+        position += 2;
         for target in data.end.targets() {
             for &v in &target.args {
-                read(v, position, true);
+                read(v, position, true, false);
             }
         }
         match data.end {
-            End::Branch { cond, .. } => read(cond, position, true),
+            End::Branch { cond, .. } => {
+                read(cond, position, true, false);
+                if let Some(Op::Test { flags, .. }) = operations[cond.0 as usize] {
+                    read(flags, position, true, false);
+                }
+            }
             End::Exit(id) => {
                 for v in func.records[id.0 as usize].uses() {
-                    read(v, position, false);
+                    read(v, position, false, false);
                 }
             }
             _ => {}
@@ -141,32 +187,47 @@ pub(super) fn allocate(func: &Func) -> Allocation {
     let mut order: Vec<_> = (0..n).collect();
     order.sort_by_key(|&i| starts[i]);
     let mut active: Vec<(usize, Host)> = Vec::new();
-    let mut locations = vec![Host::Spill(0); n];
+    let mut locations = vec![Host::Constant(0); n];
     let mut slots = 0;
     for i in order {
         active.retain(|&(end, _)| end >= starts[i]);
-        if let Some(bits) = constants[i] {
+        if matches!(operations[i], Some(Op::Flags { .. })) {
+            locations[i] = Host::Flags(i as u32);
+            continue;
+        }
+        if let Some(bits) = constants[i]
+            && !hot[i]
+        {
             locations[i] = Host::Constant(bits);
             continue;
         }
         let vector = matches!(func.types[i], Type::F64 | Type::V128);
-        let available = if hot[i] {
-            (0..if vector { 29 } else { 31 }).find_map(|reg| {
-                if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
-                    return None;
-                }
-                let loc = if vector {
-                    Host::Vector(reg)
-                } else {
-                    Host::Register(reg)
-                };
-                (!active.iter().any(|&(_, held)| held == loc)).then_some(loc)
-            })
+        let available = if hot[i] || operations[i].is_some() {
+            let preferences = hints[i]
+                .iter()
+                .filter_map(|v| match locations[v.0 as usize] {
+                    Host::Register(r) if !vector => Some(r.number() as u8),
+                    Host::Vector(r) if vector => Some(r.number() as u8),
+                    _ => None,
+                });
+            preferences
+                .chain(0..if vector { 29 } else { 31 })
+                .find_map(|reg| {
+                    if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
+                        return None;
+                    }
+                    let loc = if vector {
+                        Host::Vector(VReg::new(reg))
+                    } else {
+                        Host::Register(Reg::new(reg))
+                    };
+                    (!active.iter().any(|&(_, held)| held == loc)).then_some(loc)
+                })
         } else {
             None
         };
         let loc = available.unwrap_or_else(|| {
-            let loc = Host::Spill(slots);
+            let loc = Host::Spill(slots, func.types[i]);
             slots += 1;
             loc
         });
@@ -175,15 +236,10 @@ pub(super) fn allocate(func: &Func) -> Allocation {
             active.push((ends[i], loc));
         }
     }
-    let copies = func
-        .blocks
-        .iter()
-        .map(|b| b.params.len())
-        .max()
-        .unwrap_or(0);
     Allocation {
         locations,
         regions,
-        spill_cells: slots as usize + copies,
+        spill_cells: slots as usize,
+        defs: operations,
     }
 }

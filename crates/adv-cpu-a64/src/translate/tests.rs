@@ -1742,7 +1742,6 @@ mod opt_back {
 
     const AREA: u64 = 0x4000_0000;
     const PARAMETER: u64 = AREA;
-    const SPILL: u64 = AREA + 0x8000;
     const SAVED_FPCR: u64 = 1 << 25;
 
     struct Captured {
@@ -1789,7 +1788,6 @@ mod opt_back {
                 (offset_of!(runtime::Runtime, shadow), WINDOW_BASE),
                 (offset_of!(runtime::Runtime, countdown), budget),
                 (offset_of!(runtime::Runtime, opt_params), PARAMETER),
-                (offset_of!(runtime::Runtime, opt_spills), SPILL),
                 (offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00),
                 (
                     offset_of!(runtime::Runtime, computation_pending),
@@ -1821,7 +1819,6 @@ mod opt_back {
                     .flat_map(|p| p.to_le_bytes())
                     .collect::<Vec<_>>(),
             );
-            self.emu.write(SPILL, &vec![0; lowered.spill_cells * 16]);
             let state = vec![0; size_of::<CpuState>()];
             self.emu.write(CPU, &state);
             self.emu.set_sp(HOST_STACK);
@@ -1884,6 +1881,7 @@ mod opt_back {
             );
             let base = offset_of!(runtime::Runtime, opt_dump);
             let registers = runtime::RegisterDump {
+                sp: wide(base + offset_of!(runtime::RegisterDump, sp)),
                 x: std::array::from_fn(|i| wide(base + i * 8)),
                 v: std::array::from_fn(|i| {
                     let offset = base + offset_of!(runtime::RegisterDump, v) + i * 16;
@@ -1892,7 +1890,7 @@ mod opt_back {
             };
             let spills = self
                 .emu
-                .read(SPILL, lowered.spill_cells * 16)
+                .read(registers.sp, lowered.spill_cells * 16)
                 .as_chunks::<16>()
                 .0
                 .iter()
@@ -1903,10 +1901,9 @@ mod opt_back {
             let mut frame = Vec::new();
             let refund = materialize(
                 &lowered.records[record.0 as usize],
-                &Dump {
-                    registers: &registers,
-                    spills: &spills,
-                },
+                &registers,
+                &spills,
+                &lowered.flags,
                 &mut cpu,
                 |offset, bytes| frame.push((offset, bytes.to_vec())),
             );
@@ -2497,14 +2494,16 @@ mod opt_back {
     #[test]
     fn opt_back_memory_and_fault_records_use_the_private_alias() {
         let mut h = harness();
-        for width in [1, 2, 4, 8, 16] {
-            let ty = if width == 16 {
-                Type::V128
-            } else if width == 8 {
-                Type::I64
-            } else {
-                Type::I32
-            };
+        for (width, ty) in [
+            (1, Type::I32),
+            (1, Type::I64),
+            (2, Type::I32),
+            (2, Type::I64),
+            (4, Type::I32),
+            (4, Type::I64),
+            (8, Type::I64),
+            (16, Type::V128),
+        ] {
             let (mut f, b, p, _) = start(&[Type::I32, ty]);
             let after = f.record(record(0x1010));
             f.push(
@@ -2644,7 +2643,7 @@ mod opt_back {
         let params: Vec<_> = (1..=36).collect();
         let got = compare(&f, &params, &mut h);
         assert_eq!(got.cpu.regs[0], 666);
-        assert!(got.lowered.spill_cells > 36);
+        assert!(got.lowered.spill_cells > 0);
         assert!(got.spills.iter().any(|&v| v > 0));
         // Check a failure while all entry values must remain recoverable.
         let (mut f, b, p, entry) = start(&[Type::I64; 36]);
@@ -2806,5 +2805,387 @@ mod opt_back {
             h.emu.read(WINDOW_BASE + u64::from(DATA), 8),
             0x1234_abcdu64.to_le_bytes()
         );
+    }
+    // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_lazy_flag_tests_and_records_cover_every_condition() {
+        use iced_x86::ConditionCode as CC;
+        let conditions = [
+            CC::o,
+            CC::no,
+            CC::b,
+            CC::ae,
+            CC::e,
+            CC::ne,
+            CC::be,
+            CC::a,
+            CC::s,
+            CC::ns,
+            CC::p,
+            CC::np,
+            CC::l,
+            CC::ge,
+            CC::le,
+            CC::g,
+        ];
+        let kinds = [
+            FlagKind::Add,
+            FlagKind::AddCarry,
+            FlagKind::Sub,
+            FlagKind::SubBorrow,
+            FlagKind::Logic,
+            FlagKind::Increment,
+            FlagKind::Decrement,
+            FlagKind::Negate,
+            FlagKind::Shl,
+            FlagKind::Shr,
+            FlagKind::Sar,
+            FlagKind::MulSigned,
+            FlagKind::UnorderedCompare,
+        ];
+        let mut h = harness();
+        for kind in kinds {
+            for width in [1, 2, 4] {
+                for cc in conditions {
+                    let floating = kind == FlagKind::UnorderedCompare;
+                    let ty = if floating { Type::F64 } else { Type::I32 };
+                    let (mut f, b, p, _) = start(&[ty, ty, Type::Flags]);
+                    let flags = f
+                        .push(
+                            b,
+                            Op::Flags {
+                                kind,
+                                width,
+                                a: p[0],
+                                b: p[1],
+                                prior: Some(p[2]),
+                            },
+                        )
+                        .unwrap();
+                    let test = f.push(b, Op::Test { flags, cond: cc }).unwrap();
+                    if floating {
+                        f.push(b, Op::Validate);
+                    }
+                    let exit = finish(&mut f, b, test);
+                    f.records[exit.0 as usize].eflags =
+                        Some(Location::Recipe(Recipe::Eflags(flags)));
+                    let inputs: Vec<(u128, u128)> = if floating {
+                        [
+                            (1.0f64, 2.0f64),
+                            (2.0, 1.0),
+                            (0.0, -0.0),
+                            (f64::NAN, 1.0),
+                            (f64::from_bits(0x7ff0_0000_0000_0001), 0.0),
+                            (f64::from_bits(1), 0.0),
+                        ]
+                        .map(|(a, b)| (u128::from(a.to_bits()), u128::from(b.to_bits())))
+                        .to_vec()
+                    } else {
+                        vec![
+                            (0, 0),
+                            (0x7f, 0),
+                            (2, 1),
+                            (0xff, 0),
+                            (0xff, 1),
+                            (0x7fff, 1),
+                            (0x7fff_ffff, 1),
+                            (0x8000_0000, 1),
+                            (0xffff_ffff, 1),
+                            (0xa5a5_4321, 2),
+                            (0x1234_abcd, 7),
+                            (0xffff_ffff, 8),
+                            (0x8001, 9),
+                            (0xa5a5_4321, 16),
+                            (0x8000_0001, 17),
+                            (0x8000_0001, 31),
+                            (0xffff_ffff, 32),
+                            (0x1234_5678, 33),
+                        ]
+                    };
+                    for (x, y) in inputs {
+                        for prior in [0x202, 0xed7] {
+                            let params = [x, y, prior];
+                            let run = eval::run(&f, &params, &mut memory(&[], &[]), 10000);
+                            let got = h.run_opt(&f, &params, 10000, 0, 0);
+                            let expected = match run.outcome {
+                                eval::Outcome::Exit(r) | eval::Outcome::Fail(r) => r,
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(
+                                got.record, expected,
+                                "{kind:?}/{width}/{cc:?}, {params:x?}"
+                            );
+                            if expected == exit {
+                                assert_eq!(
+                                    got.cpu.regs[0], run.values[test.0 as usize] as u32,
+                                    "{kind:?}/{width}/{cc:?}, {params:x?}"
+                                );
+                            }
+                            compare_record(&f, &run.values, &got);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_lazy_flags_read_only_the_prior_bits_the_operation_keeps() {
+        use iced_x86::ConditionCode as CC;
+        let mut h = harness();
+        for kind in [
+            FlagKind::Increment,
+            FlagKind::Decrement,
+            FlagKind::AddCarry,
+            FlagKind::SubBorrow,
+            FlagKind::Shl,
+            FlagKind::Shr,
+            FlagKind::Sar,
+            FlagKind::MulSigned,
+        ] {
+            for cc in [
+                CC::o,
+                CC::no,
+                CC::b,
+                CC::ae,
+                CC::e,
+                CC::ne,
+                CC::be,
+                CC::a,
+                CC::s,
+                CC::ns,
+                CC::p,
+                CC::np,
+                CC::l,
+                CC::ge,
+                CC::le,
+                CC::g,
+            ] {
+                let (mut f, b, p, _) = start(&[Type::I32, Type::I32, Type::Flags]);
+                let prior = f
+                    .push(
+                        b,
+                        Op::Flags {
+                            kind: FlagKind::Sub,
+                            width: 4,
+                            a: p[1],
+                            b: p[0],
+                            prior: Some(p[2]),
+                        },
+                    )
+                    .unwrap();
+                let flags = f
+                    .push(
+                        b,
+                        Op::Flags {
+                            kind,
+                            width: 1,
+                            a: p[0],
+                            b: p[1],
+                            prior: Some(prior),
+                        },
+                    )
+                    .unwrap();
+                let test = f.push(b, Op::Test { flags, cond: cc }).unwrap();
+                let exit = finish(&mut f, b, test);
+                f.records[exit.0 as usize].eflags = Some(Location::Recipe(Recipe::Eflags(flags)));
+                for params in [
+                    [0xff, 0, 0x202],
+                    [0x80, 1, 0xed7],
+                    [0xff, 9, 0x202],
+                    [0x7f, 31, 0xed7],
+                ] {
+                    compare(&f, &params, &mut h);
+                }
+            }
+        }
+    }
+
+    fn body(lowered: &back::Lowered, block: usize) -> &[u32] {
+        let start = lowered.marks[block + 1].offset as usize / 4;
+        let end = lowered.marks[block + 2].offset as usize / 4;
+        &lowered.words[start..end]
+    }
+
+    // spec: A64-OPT-4, A64-OPT-7
+    #[test]
+    fn opt_back_emitted_word_counts_keep_common_operations_lean() {
+        let stubs = runtime::stubs();
+        let (mut f, b, p, _) = start(&[Type::I32]);
+        let k = f.push(b, Op::Constant(Type::I32, 7)).unwrap();
+        let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
+        finish(&mut f, b, v);
+        let lower = back::lower(&f, 0, &stubs);
+        assert_eq!(body(&lower, 0).len(), 2, "one ADD plus exit branch");
+        assert_eq!(
+            body(&lower, 0)[0],
+            add_imm(W, Reg::new(0), Reg::new(0), 7, false)
+        );
+
+        let (mut f, b, p, _) = start(&[Type::I32]);
+        let k = f.push(b, Op::Constant(Type::I32, 5)).unwrap();
+        let flags = f
+            .push(
+                b,
+                Op::Flags {
+                    kind: FlagKind::Sub,
+                    width: 4,
+                    a: p[0],
+                    b: k,
+                    prior: None,
+                },
+            )
+            .unwrap();
+        // The producer need not be adjacent to the Test.
+        f.push(b, Op::Constant(Type::I32, 123));
+        let test = f
+            .push(
+                b,
+                Op::Test {
+                    flags,
+                    cond: iced_x86::ConditionCode::a,
+                },
+            )
+            .unwrap();
+        let fall = f.block(None);
+        let taken = f.block(None);
+        f.end(
+            b,
+            End::Branch {
+                cond: test,
+                taken: Target {
+                    block: taken,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+                fall: Target {
+                    block: fall,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+            },
+        );
+        for block in [fall, taken] {
+            let exit = f.record(record(0x2000));
+            f.end(block, End::Exit(exit));
+        }
+        let lower = back::lower(&f, 0, &stubs);
+        assert_eq!(body(&lower, 0).len(), 2, "CMP plus conditional branch");
+        assert_eq!(body(&lower, 0)[0], cmp_imm(W, Reg::new(0), 5, false));
+        assert_eq!(body(&lower, 0)[1] & 0xff00_001f, b_cond(Cond::Hi, 0));
+
+        let (mut f, b, _, entry) = start(&[]);
+        f.records[entry.0 as usize].refund = 3;
+        f.push(b, Op::Validate);
+        let exit = f.record(record(0x2000));
+        f.end(b, End::Exit(exit));
+        let lower = back::lower(&f, 0, &stubs);
+        let start = lower.marks[1].offset as usize / 4;
+        assert_eq!(lower.words[start - 2], sub_imm(X, X9, X9, 3, false));
+        assert_eq!(lower.words[start - 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
+        assert_eq!(
+            body(&lower, 0).len(),
+            4,
+            "three-word Validate plus exit branch"
+        );
+        assert_eq!(
+            body(&lower, 0)[..2],
+            [mrs_fpsr(X16), and_imm(W, X16, X16, 0xffff_ff8f)]
+        );
+        assert_eq!(body(&lower, 0)[2] & 0xff00_001f, cbz(W, true, X16, 0));
+    }
+
+    // spec: A64-OPT-4, A64-OPT-7
+    #[test]
+    fn opt_back_counted_floating_loop_has_no_backedge_or_arithmetic_moves() {
+        let (mut f, entry, p, _) = start(&[Type::F64, Type::F64, Type::I32]);
+        let head_record = f.record(record(0x1100));
+        let head = f.block(Some(Head {
+            record: head_record,
+        }));
+        let sum = f.param(head, Type::F64);
+        let count = f.param(head, Type::I32);
+        f.end(
+            entry,
+            End::Jump(Target {
+                block: head,
+                args: vec![p[0], p[2]],
+                charge: 0,
+            }),
+        );
+        let one = f.push(entry, Op::Constant(Type::I32, 1)).unwrap();
+        let total = f.push(head, Op::Fp(FpOp::Add, sum, p[1])).unwrap();
+        f.push(head, Op::Validate);
+        let next = f.push(head, Op::Int(IntOp::Sub, count, one)).unwrap();
+        let done = f.block(None);
+        f.end(
+            head,
+            End::Branch {
+                cond: next,
+                taken: Target {
+                    block: head,
+                    args: vec![total, next],
+                    charge: 3,
+                },
+                fall: Target {
+                    block: done,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+            },
+        );
+        finish(&mut f, done, total);
+        let lower = back::lower(&f, 0, &runtime::stubs());
+        let head_code = body(&lower, 1);
+        assert_eq!(
+            head_code[0],
+            dfloat(Float::Fadd, VReg::new(0), VReg::new(0), VReg::new(1))
+        );
+        assert_eq!(head_code.len(), 7, "FADD, Validate, SUB, CMP, branch");
+        // After the done block's exit branch the taken edge contains only its
+        // two-word charge and branch; no register or memory copies.
+        let edge = lower.marks[3].offset as usize / 4 + 1;
+        assert_eq!(lower.words[edge], sub_imm(X, X9, X9, 3, false));
+        assert_eq!(lower.words[edge + 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
+        assert_eq!(lower.words[edge + 2] & 0xfc00_0000, crate::encode::b(0));
+        let mut h = harness();
+        compare(
+            &f,
+            &[u128::from(1f64.to_bits()), u128::from(0.5f64.to_bits()), 4],
+            &mut h,
+        );
+    }
+
+    // spec: A64-OPT-6, A64-OPT-7
+    #[test]
+    fn opt_back_integer_immediates_and_allocated_constants_match_reference() {
+        let mut h = harness();
+        for ty in [Type::I32, Type::I64] {
+            for op in [
+                IntOp::Add,
+                IntOp::Sub,
+                IntOp::And,
+                IntOp::Or,
+                IntOp::Xor,
+                IntOp::Shl,
+                IntOp::Shr,
+                IntOp::Sar,
+                IntOp::Mul,
+            ] {
+                for bits in [0, 7, 0x1000, 0xffff0000, 0x12345678, 0x123456789abcdef0] {
+                    let bits = if ty == Type::I32 {
+                        bits & 0xffffffff
+                    } else {
+                        bits
+                    };
+                    let (mut f, b, p, _) = start(&[ty]);
+                    let k = f.push(b, Op::Constant(ty, bits)).unwrap();
+                    let v = f.push(b, Op::Int(op, p[0], k)).unwrap();
+                    finish(&mut f, b, v);
+                    compare(&f, &[0x98765432], &mut h);
+                }
+            }
+        }
     }
 }

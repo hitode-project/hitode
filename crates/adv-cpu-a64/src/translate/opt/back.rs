@@ -1,11 +1,9 @@
-//! AArch64 emission for verified optimized computations. Values keep a single
-//! location for their live interval; cold records read those same locations.
-
+//! Register-allocated AArch64 computations with cold recovery recipes.
 mod alloc;
 mod flags;
 
 use super::ir::*;
-use super::recovery::{Host, Location, Recipe, Record, X87};
+use super::recovery::{FlagRecipe, Host, Record};
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
@@ -18,13 +16,13 @@ use std::mem::offset_of;
 const T: Reg = Reg::new(16);
 const U: Reg = Reg::new(17);
 const RT: Reg = Reg::new(29);
+const SP: Reg = Reg::new(31);
 const ALIAS: Reg = Reg::new(28);
 const COUNT: Reg = Reg::new(9);
 const A: VReg = VReg::new(29);
 const B: VReg = VReg::new(30);
 const C: VReg = VReg::new(31);
 const PARAMS: u32 = offset_of!(Runtime, opt_params) as u32;
-const SPILLS: u32 = offset_of!(Runtime, opt_spills) as u32;
 const FPCR: u32 = offset_of!(Runtime, opt_fpcr) as u32;
 const RECORD: u32 = offset_of!(Runtime, opt_record) as u32;
 
@@ -33,140 +31,144 @@ pub(crate) struct Lowered {
     pub sites: Vec<(usize, Site)>,
     pub marks: Vec<Mark>,
     pub records: Vec<Record<Host>>,
-    /// Required length of the per-thread spill area, in 16-byte cells.
+    pub flags: Vec<Option<FlagRecipe>>,
+    /// 16-byte cells at the captured SP, discarded by `opt_exit`.
     pub spill_cells: usize,
 }
 
-/// `at` and the stub offsets share a code origin. `opt_params` points to
-/// 16-byte cells in entry-source order; `opt_spills` holds `spill_cells` cells.
+/// `at` and the stub offsets share a code origin. Entry cells are 16 bytes.
 pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func);
+    let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let mut asm = Asm::new();
-    let blocks: Vec<_> = func.blocks.iter().map(|_| asm.label()).collect();
-    let cold: Vec<_> = func.records.iter().map(|_| asm.label()).collect();
-    let mut emit = Emitter {
+    let blocks = func.blocks.iter().map(|_| asm.label()).collect();
+    let cold = func.records.iter().map(|_| asm.label()).collect();
+    let mut branch_only = vec![true; func.types.len()];
+    for v in func
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.insts
+                .iter()
+                .flat_map(|(_, op)| op.uses())
+                .chain(b.end.targets().flat_map(|t| t.args.iter().copied()))
+        })
+        .chain(func.records.iter().flat_map(|r| r.uses()))
+    {
+        branch_only[v.0 as usize] = false;
+    }
+    let mut e = Emitter {
         func,
         asm,
         blocks,
         cold,
         locations: allocation.locations,
+        defs: allocation.defs,
+        flags,
         sites: Vec::new(),
         marks: Vec::new(),
         region: RecordId(0),
         checkpoints: Vec::new(),
-        // Parallel copies occupy the tail of the spill area.
-        copies: allocation.spill_cells
-            - func
-                .blocks
-                .iter()
-                .map(|b| b.params.len())
-                .max()
-                .unwrap_or(0),
+        edges: Vec::new(),
     };
-    // spec: A64-OPT-4
-    emit.mark(Part::Body, func.records[0].eip);
-    emit.asm.emit_all(&[
+    let first = func.blocks[0].head.unwrap().record;
+    // spec: A64-OPT-4, A64-OPT-7
+    e.mark(Part::Body, func.records[first.0 as usize].eip);
+    e.asm.emit_all(&[
         mrs_fpcr(T),
         str(X, T, RT, FPCR),
-        // Admission proves nearest rounding. Clear DN so SSE preserves NaN payloads.
         and_imm(X, T, T, !(1 << 25)),
         orr_imm(X, T, T, 1 << 24),
         msr_fpcr(T),
         msr_fpsr(Reg::ZR),
     ]);
-    for (i, &param) in func.blocks[0].params.iter().enumerate() {
-        emit.asm.emit(ldr(X, T, RT, PARAMS));
-        emit.asm.emit(ldr_v(VSize::Q, A, T, i as u32 * 16));
-        emit.put_vec(param, A);
+    let bytes = allocation.spill_cells as u64 * 16;
+    if bytes != 0 {
+        if let Some((n, shift)) = add_immediate(bytes) {
+            e.asm.emit(sub_imm(X, SP, SP, n, shift));
+        } else {
+            e.imm(T, bytes);
+            e.asm.emit(sub_ext(X, SP, SP, T, Extend::Uxtx, 0));
+        }
     }
-    let first = func.blocks[0].head.unwrap().record;
-    emit.charge(
-        i64::from(func.records[first.0 as usize].refund),
-        first,
-        false,
-    );
+    if !func.entry.is_empty() {
+        e.asm.emit(ldr(X, U, RT, PARAMS));
+    }
+    for (i, &p) in func.blocks[0].params.iter().enumerate() {
+        let loc = e.locations[p.0 as usize];
+        match loc {
+            Host::Register(n) => e.asm.emit(ldr(e.size(p), n, U, i as u32 * 16)),
+            Host::Vector(n) => e.asm.emit(vldr(mem_type(func.ty(p)), n, U, i as u32 * 16)),
+            _ => {
+                e.asm.emit(vldr(mem_type(func.ty(p)), A, U, i as u32 * 16));
+                e.copy(loc, Host::Vector(A), func.ty(p));
+            }
+        }
+    }
+    let refund = func.records[first.0 as usize].refund;
+    e.charge(i64::from(refund), first, false);
     for (b, data) in func.blocks.iter().enumerate() {
-        emit.asm.bind(emit.blocks[b]);
-        emit.region = allocation.regions[b];
-        emit.mark(Part::Body, func.records[emit.region.0 as usize].eip);
-        let fused = fused_branch(data).filter(|_| {
-            let End::Branch { cond, .. } = data.end else {
-                unreachable!()
-            };
-            !func.records.iter().any(|r| r.uses().any(|v| v == cond))
-                && func
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        block
-                            .insts
-                            .iter()
-                            .flat_map(|(_, op)| op.uses())
-                            .filter(|&v| v == cond)
-                            .count()
-                            + block
-                                .end
-                                .targets()
-                                .flat_map(|t| &t.args)
-                                .filter(|&&v| v == cond)
-                                .count()
-                            + usize::from(
-                                matches!(block.end, End::Branch { cond: c, .. } if c == cond),
-                            )
-                    })
-                    .sum::<usize>()
-                    == 1
-        });
-        for (i, &(result, op)) in data.insts.iter().enumerate() {
-            if fused.is_some() && i + 1 == data.insts.len() {
+        e.asm.bind(e.blocks[b]);
+        e.region = allocation.regions[b];
+        e.mark(Part::Body, func.records[e.region.0 as usize].eip);
+        for &(result, op) in &data.insts {
+            if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
             }
-            emit.op(result, op);
+            e.op(result, op);
         }
         match &data.end {
-            End::Jump(target) => emit.edge(target),
+            End::Jump(t) => e.edge(t, b + 1),
             End::Branch { cond, taken, fall } => {
-                let fall_label = emit.asm.label();
-                if let Some((a, b, width, condition)) = fused {
-                    emit.get_gp(a, T);
-                    emit.get_gp(b, U);
-                    if width < 4 {
-                        emit.asm.emit_all(&[
-                            lsl_imm(W, T, T, 32 - u32::from(width) * 8),
-                            lsl_imm(W, U, U, 32 - u32::from(width) * 8),
-                        ]);
-                    }
-                    emit.asm.emit(cmp(W, T, U, Lsl, 0));
-                    emit.asm.b_cond(condition.invert(), fall_label);
+                let condition = if let Some(Op::Test { flags, cond: cc }) = e.defs[cond.0 as usize]
+                    && branch_only[cond.0 as usize]
+                {
+                    e.condition(e.locations[flags.0 as usize], cc)
                 } else {
-                    emit.get_gp(*cond, T);
-                    emit.asm.cbz(W, false, T, fall_label);
-                }
-                emit.edge(taken);
-                emit.asm.bind(fall_label);
-                emit.edge(fall);
+                    let r = e.gp(*cond, T);
+                    e.asm.emit(cmp_imm(W, r, 0, false));
+                    Cond::Ne
+                };
+                let target = if e.moves(taken).is_empty() && taken.charge == 0 {
+                    e.blocks[taken.block.0 as usize]
+                } else {
+                    let label = e.asm.label();
+                    e.edges.push((label, taken.clone()));
+                    label
+                };
+                e.asm.b_cond(condition, target);
+                e.edge(fall, b + 1);
             }
-            End::Exit(id) => emit.asm.b(emit.cold[id.0 as usize]),
+            End::Exit(id) => e.asm.b(e.cold[id.0 as usize]),
             End::Unset => unreachable!(),
         }
     }
-    emit.checkpoints();
+    for (label, target) in std::mem::take(&mut e.edges) {
+        e.asm.bind(label);
+        e.edge(&target, usize::MAX);
+    }
+    e.checkpoints();
     // spec: A64-OPT-6
     for (i, record) in func.records.iter().enumerate() {
-        emit.asm.bind(emit.cold[i]);
-        emit.mark(Part::Cold, record.eip);
-        emit.imm(T, i as u64);
-        emit.asm.emit(str(W, T, RT, RECORD));
-        emit.asm
-            .emit(b(stubs.opt_exit as i32 - (at + emit.asm.offset()) as i32));
+        e.asm.bind(e.cold[i]);
+        e.mark(Part::Cold, record.eip);
+        e.imm(T, i as u64);
+        e.asm.emit(str(W, T, RT, RECORD));
+        e.asm
+            .emit(b(stubs.opt_exit as i32 - (at + e.asm.offset()) as i32));
     }
-    let records = func.records.iter().map(|r| emit.record(r)).collect();
+    let records = func
+        .records
+        .iter()
+        .map(|r| super::recovery::lower_record(r, &e.locations))
+        .collect();
     Lowered {
-        words: emit.asm.finish(),
-        sites: emit.sites,
-        marks: emit.marks,
+        words: e.asm.finish(),
+        sites: e.sites,
+        marks: e.marks,
         records,
+        flags: e.flags,
         spill_cells: allocation.spill_cells,
     }
 }
@@ -177,184 +179,187 @@ struct Emitter<'a> {
     blocks: Vec<Label>,
     cold: Vec<Label>,
     locations: Vec<Host>,
+    defs: Vec<Option<Op>>,
+    flags: Vec<Option<FlagRecipe>>,
     sites: Vec<(usize, Site)>,
     marks: Vec<Mark>,
     region: RecordId,
-    copies: usize,
     checkpoints: Vec<(Label, RecordId, Label)>,
+    edges: Vec<(Label, Target)>,
 }
 
 impl Emitter<'_> {
     fn mark(&mut self, part: Part, eip: u32) {
-        let mark = Mark {
+        self.marks.push(Mark {
             offset: self.asm.offset() as u32,
             eip,
             part,
-        };
-        if self.marks.last().is_some_and(|m| m.offset == mark.offset) {
-            *self.marks.last_mut().unwrap() = mark;
-        } else {
-            self.marks.push(mark);
-        }
+        });
     }
-
     fn imm(&mut self, reg: Reg, bits: u64) {
-        self.asm.emit(movz(X, reg, bits as u16, 0));
-        for shift in [16, 32, 48] {
+        let first = if bits == 0 {
+            0
+        } else {
+            bits.trailing_zeros() / 16 * 16
+        };
+        self.asm.emit(movz(X, reg, (bits >> first) as u16, first));
+        for shift in [0, 16, 32, 48] {
             let part = (bits >> shift) as u16;
-            if part != 0 {
+            if shift != first && part != 0 {
                 self.asm.emit(movk(X, reg, part, shift));
             }
         }
     }
-
-    fn size(&self, value: Value) -> Size {
-        if self.func.ty(value) == Type::I64 {
-            X
+    fn size(&self, v: Value) -> Size {
+        if self.func.ty(v) == Type::I64 { X } else { W }
+    }
+    fn gp(&mut self, v: Value, scratch: Reg) -> Reg {
+        self.gp_at(self.locations[v.0 as usize], scratch)
+    }
+    fn gp_at(&mut self, loc: Host, scratch: Reg) -> Reg {
+        if let Host::Register(r) = loc {
+            return r;
+        }
+        self.copy(Host::Register(scratch), loc, Type::I64);
+        scratch
+    }
+    fn vr(&mut self, v: Value, scratch: VReg) -> VReg {
+        self.v_at(self.locations[v.0 as usize], scratch)
+    }
+    fn v_at(&mut self, loc: Host, scratch: VReg) -> VReg {
+        if let Host::Vector(r) = loc {
+            return r;
+        }
+        self.copy(Host::Vector(scratch), loc, Type::V128);
+        scratch
+    }
+    fn rd(&self, v: Value) -> Reg {
+        if let Host::Register(n) = self.locations[v.0 as usize] {
+            n
         } else {
-            W
+            T
         }
     }
-
-    fn get_gp(&mut self, value: Value, reg: Reg) {
-        match self.locations[value.0 as usize] {
-            Host::Register(n) => self.asm.emit(mov(X, reg, Reg::new(n))),
-            Host::Vector(n) => self.asm.emit(fmov_from_v(X, reg, VReg::new(n))),
-            Host::Constant(bits) => self.imm(reg, bits as u64),
-            Host::Spill(n) => {
-                self.asm.emit(ldr(X, reg, RT, SPILLS));
-                self.asm.emit(ldr(X, reg, reg, n * 16));
-            }
+    fn vd(&self, v: Value) -> VReg {
+        if let Host::Vector(n) = self.locations[v.0 as usize] {
+            n
+        } else {
+            A
         }
     }
-
-    fn get_vec(&mut self, value: Value, reg: VReg) {
-        match self.locations[value.0 as usize] {
-            Host::Vector(n) => self.asm.emit(vmov(true, reg, VReg::new(n))),
-            Host::Register(n) => self.asm.emit(fmov_to_v(X, reg, Reg::new(n))),
-            Host::Constant(bits) => {
-                self.imm(T, bits as u64);
-                self.asm.emit(fmov_to_v(X, reg, T));
-                if bits >> 64 != 0 {
-                    self.imm(T, (bits >> 64) as u64);
-                    self.asm.emit(vins_general(3, reg, 1, T));
+    fn copy(&mut self, dst: Host, src: Host, ty: Type) {
+        if dst == src {
+            return;
+        }
+        use Host::*;
+        let size = scalar_size(ty);
+        match (dst, src) {
+            (Register(d), Register(s)) => self.asm.emit(mov(size, d, s)),
+            (Vector(d), Vector(s)) => self.asm.emit(vmov(true, d, s)),
+            (Register(d), Vector(s)) => self.asm.emit(fmov_from_v(size, d, s)),
+            (Vector(d), Register(s)) => self.asm.emit(fmov_to_v(size, d, s)),
+            (Register(d), Constant(n)) => self.imm(d, n as u64),
+            (Vector(d), Constant(n)) => {
+                self.imm(T, n as u64);
+                self.asm.emit(fmov_to_v(X, d, T));
+                if n >> 64 != 0 {
+                    self.imm(T, (n >> 64) as u64);
+                    self.asm.emit(vins_general(3, d, 1, T));
                 }
             }
-            Host::Spill(n) => {
-                self.asm.emit(ldr(X, T, RT, SPILLS));
-                self.asm.emit(ldr_v(VSize::Q, reg, T, n * 16));
+            (Register(d), Spill(n, ty)) => self.asm.emit(ldr(scalar_size(ty), d, SP, n * 16)),
+            (Vector(d), Spill(n, ty)) => self.asm.emit(vldr(mem_type(ty), d, SP, n * 16)),
+            (Spill(n, _), Register(s)) => self.asm.emit(str(size, s, SP, n * 16)),
+            (Spill(n, _), Vector(s)) => self.asm.emit(vstr(mem_type(ty), s, SP, n * 16)),
+            (Spill(..), _) => {
+                let tmp = if matches!(ty, Type::F64 | Type::V128) {
+                    Vector(B)
+                } else {
+                    Register(U)
+                };
+                self.copy(tmp, src, ty);
+                self.copy(dst, tmp, ty);
             }
+            _ => unreachable!("copies carry numeric values"),
         }
     }
-
-    fn put_gp(&mut self, value: Value) {
-        match self.locations[value.0 as usize] {
-            Host::Register(n) => self.asm.emit(mov(self.size(value), Reg::new(n), T)),
-            Host::Vector(n) => self.asm.emit(fmov_to_v(X, VReg::new(n), T)),
-            Host::Spill(n) => {
-                self.asm.emit_all(&[
-                    fmov_to_v(X, A, T),
-                    ldr(X, U, RT, SPILLS),
-                    str_v(VSize::Q, A, U, n * 16),
-                ]);
-            }
-            Host::Constant(_) => {}
-        }
-    }
-
-    fn put_vec(&mut self, value: Value, reg: VReg) {
-        match self.locations[value.0 as usize] {
-            Host::Register(n) => self
-                .asm
-                .emit(fmov_from_v(self.size(value), Reg::new(n), reg)),
-            Host::Vector(n) => self.asm.emit(vmov(true, VReg::new(n), reg)),
-            Host::Spill(n) => {
-                self.asm.emit(ldr(X, T, RT, SPILLS));
-                self.asm.emit(str_v(VSize::Q, reg, T, n * 16));
-            }
-            Host::Constant(_) => {}
-        }
-    }
-
-    fn edge(&mut self, target: &Target) {
-        // Snapshot all arguments before writing any parameter (including cycles).
-        for (i, &arg) in target.args.iter().enumerate() {
-            self.get_vec(arg, A);
-            self.asm.emit(ldr(X, T, RT, SPILLS));
-            self.asm
-                .emit(str_v(VSize::Q, A, T, (self.copies + i) as u32 * 16));
-        }
-        for (i, &param) in self.func.blocks[target.block.0 as usize]
+    fn moves(&self, target: &Target) -> Vec<(Host, Host, Type)> {
+        self.func.blocks[target.block.0 as usize]
             .params
             .iter()
-            .enumerate()
-        {
-            self.asm.emit(ldr(X, T, RT, SPILLS));
-            self.asm
-                .emit(ldr_v(VSize::Q, A, T, (self.copies + i) as u32 * 16));
-            self.put_vec(param, A);
+            .zip(&target.args)
+            .map(|(&p, &a)| {
+                (
+                    self.locations[p.0 as usize],
+                    self.locations[a.0 as usize],
+                    self.func.ty(p),
+                )
+            })
+            .filter(|(d, s, _)| d != s)
+            .collect()
+    }
+    fn edge(&mut self, target: &Target, next: usize) {
+        let mut moves = self.moves(target);
+        while !moves.is_empty() {
+            if let Some(i) = moves
+                .iter()
+                .position(|(dst, _, _)| !moves.iter().any(|(_, src, _)| src == dst))
+            {
+                let (dst, src, ty) = moves.remove(i);
+                self.copy(dst, src, ty);
+            } else {
+                let (dst, _, ty) = moves[0];
+                let scratch = if matches!(ty, Type::F64 | Type::V128) {
+                    Host::Vector(A)
+                } else {
+                    Host::Register(T)
+                };
+                self.copy(scratch, dst, ty);
+                for (_, src, _) in &mut moves {
+                    if *src == dst {
+                        *src = scratch;
+                    }
+                }
+            }
         }
-        let record = self.func.blocks[target.block.0 as usize]
-            .head
-            .map(|h| h.record);
         if target.charge != 0 {
+            let record = self.func.blocks[target.block.0 as usize]
+                .head
+                .map_or(self.region, |h| h.record);
             self.charge(
                 i64::from(target.charge),
-                record.unwrap_or(self.region),
+                record,
                 self.func.head_exit == Some(target.block),
             );
         }
-        self.asm.b(self.blocks[target.block.0 as usize]);
-    }
-
-    fn record(&self, record: &Record<Value>) -> Record<Host> {
-        let loc = |location: Location<Value>| match location {
-            Location::Constant(bits) => Location::Constant(bits),
-            Location::At(v) => Location::At(self.locations[v.0 as usize]),
-            Location::Recipe(Recipe::Eflags(v)) => {
-                Location::Recipe(Recipe::Eflags(self.locations[v.0 as usize]))
-            }
-            Location::Recipe(Recipe::C1 { op, a, b }) => Location::Recipe(Recipe::C1 {
-                op,
-                a: self.locations[a.0 as usize],
-                b: self.locations[b.0 as usize],
-            }),
-        };
-        Record {
-            eip: record.eip,
-            refund: record.refund,
-            regs: record.regs.map(|l| l.map(loc)),
-            eflags: record.eflags.map(loc),
-            x87: X87 {
-                top: record.x87.top,
-                valid: record.x87.valid,
-                control: record.x87.control,
-                stack: record.x87.stack.map(|l| l.map(loc)),
-                status: record.x87.status,
-                c1: record.x87.c1.map(loc),
-                ip: record.x87.ip.map(loc),
-                opcode: record.x87.opcode.map(loc),
-            },
-            xmm: record.xmm.map(|l| l.map(loc)),
-            frame: record
-                .frame
-                .iter()
-                .map(|&(o, w, l)| (o, w, loc(l)))
-                .collect(),
+        if target.block.0 as usize != next {
+            self.asm.b(self.blocks[target.block.0 as usize]);
         }
     }
-
     fn fail(&self) -> Label {
         self.cold[self.region.0 as usize]
     }
 
     fn charge(&mut self, charge: i64, record: RecordId, head_exit: bool) {
-        self.imm(T, charge.unsigned_abs());
-        self.asm.emit(if charge >= 0 {
-            sub(X, COUNT, COUNT, T, Lsl, 0)
+        let amount = charge.unsigned_abs();
+        if amount == 0 {
+            return;
+        }
+        let instruction = if amount <= 4095 {
+            if charge > 0 {
+                sub_imm(X, COUNT, COUNT, amount as u32, false)
+            } else {
+                add_imm(X, COUNT, COUNT, amount as u32, false)
+            }
         } else {
-            add(X, COUNT, COUNT, T, Lsl, 0)
-        });
+            self.imm(T, amount);
+            if charge > 0 {
+                sub(X, COUNT, COUNT, T, Lsl, 0)
+            } else {
+                add(X, COUNT, COUNT, T, Lsl, 0)
+            }
+        };
+        self.asm.emit(instruction);
         if head_exit {
             let resume = self.asm.label();
             self.asm.emit(ldr(W, T, RT, runtime::HEAD_EXIT));
@@ -369,8 +374,7 @@ impl Emitter<'_> {
         if charge > 0 {
             let checkpoint = self.asm.label();
             let resume = self.asm.label();
-            self.asm.emit(ubfx(X, T, COUNT, 63, 1));
-            self.asm.cbz(W, true, T, checkpoint);
+            self.asm.tbz(true, COUNT, 63, checkpoint);
             self.asm.bind(resume);
             self.checkpoints.push((checkpoint, record, resume));
         }
@@ -451,53 +455,79 @@ impl Emitter<'_> {
 
     fn op(&mut self, result: Option<Value>, op: Op) {
         let out = result.unwrap_or(Value(0));
+        let loc = result.map(|v| self.locations[v.0 as usize]);
+        let d = result.map_or(T, |v| self.rd(v));
+        let q = result.map_or(A, |v| self.vd(v));
         match op {
-            Op::Constant(..) => {}
+            Op::Constant(_, bits) => {
+                if !matches!(loc, Some(Host::Constant(_))) {
+                    self.copy(loc.unwrap(), Host::Constant(bits), self.func.ty(out));
+                }
+                return;
+            }
+            Op::Flags {
+                kind: FlagKind::UnorderedCompare,
+                a,
+                b,
+                ..
+            } => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                self.asm.emit(fcmp(a, b));
+            }
+            Op::Flags { .. } => {}
+            Op::Test { flags, cond } => {
+                let c = self.condition(self.locations[flags.0 as usize], cond);
+                self.asm.emit(cset(W, d, c));
+            }
             Op::Int(op, a, b) => {
-                self.get_gp(a, T);
-                self.get_gp(b, U);
                 let size = self.size(a);
-                let word = match op {
-                    IntOp::Add => add(size, T, T, U, Lsl, 0),
-                    IntOp::Sub => sub(size, T, T, U, Lsl, 0),
-                    IntOp::And => and(size, T, T, U, Lsl, 0),
-                    IntOp::Or => orr(size, T, T, U, Lsl, 0),
-                    IntOp::Xor => eor(size, T, T, U, Lsl, 0),
-                    IntOp::Shl => shiftv(size, Lsl, T, T, U),
-                    IntOp::Shr => shiftv(size, Lsr, T, T, U),
-                    IntOp::Sar => shiftv(size, Asr, T, T, U),
-                    IntOp::Mul => mul(size, T, T, U),
-                    IntOp::MulHighUnsigned if size == X => umulh(T, T, U),
-                    IntOp::MulHighSigned if size == X => {
-                        // SMULH has the same fields as UMULH, with U clear.
-                        umulh(T, T, U) & !(1 << 23)
-                    }
-                    IntOp::MulHighSigned | IntOp::MulHighUnsigned => {
-                        self.asm.emit(if op == IntOp::MulHighSigned {
-                            smull(T, T, U)
-                        } else {
-                            umull(T, T, U)
-                        });
-                        lsr_imm(X, T, T, 32)
+                let a = self.gp(a, T);
+                let immediate = match self.defs[b.0 as usize] {
+                    Some(Op::Constant(_, n)) => int_immediate(op, size, d, a, n as u64),
+                    _ => None,
+                };
+                let word = if let Some(word) = immediate {
+                    word
+                } else {
+                    let b = self.gp(b, U);
+                    match op {
+                        IntOp::Add => add(size, d, a, b, Lsl, 0),
+                        IntOp::Sub => sub(size, d, a, b, Lsl, 0),
+                        IntOp::And => and(size, d, a, b, Lsl, 0),
+                        IntOp::Or => orr(size, d, a, b, Lsl, 0),
+                        IntOp::Xor => eor(size, d, a, b, Lsl, 0),
+                        IntOp::Shl => shiftv(size, Lsl, d, a, b),
+                        IntOp::Shr => shiftv(size, Lsr, d, a, b),
+                        IntOp::Sar => shiftv(size, Asr, d, a, b),
+                        IntOp::Mul => mul(size, d, a, b),
+                        IntOp::MulHighSigned if size == X => smulh(d, a, b),
+                        IntOp::MulHighUnsigned if size == X => umulh(d, a, b),
+                        _ => {
+                            self.asm.emit(if op == IntOp::MulHighSigned {
+                                smull(d, a, b)
+                            } else {
+                                umull(d, a, b)
+                            });
+                            lsr_imm(X, d, d, 32)
+                        }
                     }
                 };
                 self.asm.emit(word);
-                self.put_gp(out);
             }
             Op::IntUnary(op, a) => {
-                self.get_gp(a, T);
                 let size = self.size(a);
+                let a = self.gp(a, T);
                 self.asm.emit(match op {
-                    IntUnary::Not => mvn(size, T, T),
-                    IntUnary::Neg => sub(size, T, Reg::ZR, T, Lsl, 0),
-                    IntUnary::ZeroExtend8 => ubfx(W, T, T, 0, 8),
-                    IntUnary::ZeroExtend16 => ubfx(W, T, T, 0, 16),
-                    IntUnary::SignExtend8 => sbfx(W, T, T, 0, 8),
-                    IntUnary::SignExtend16 => sbfx(W, T, T, 0, 16),
-                    IntUnary::High32 => lsr_imm(X, T, T, 32),
-                    IntUnary::Low32 | IntUnary::Widen => mov(W, T, T),
+                    IntUnary::Not => mvn(size, d, a),
+                    IntUnary::Neg => sub(size, d, Reg::ZR, a, Lsl, 0),
+                    IntUnary::ZeroExtend8 => ubfx(W, d, a, 0, 8),
+                    IntUnary::ZeroExtend16 => ubfx(W, d, a, 0, 16),
+                    IntUnary::SignExtend8 => sbfx(W, d, a, 0, 8),
+                    IntUnary::SignExtend16 => sbfx(W, d, a, 0, 16),
+                    IntUnary::High32 => lsr_imm(X, d, a, 32),
+                    _ => mov(W, d, a),
                 });
-                self.put_gp(out);
             }
             Op::Div {
                 signed,
@@ -506,81 +536,100 @@ impl Emitter<'_> {
                 divisor,
                 proved,
             } => {
-                self.get_gp(dividend, T);
-                self.get_gp(divisor, U);
+                let n = self.gp(dividend, T);
+                let mut b = self.gp(divisor, U);
                 if !proved {
-                    self.asm.cbz(W, false, U, self.fail());
+                    self.asm.cbz(W, false, b, self.fail());
+                }
+                if signed {
+                    self.asm.emit(sbfx(X, U, b, 0, 32));
+                    b = U;
+                }
+                let quotient = if remainder { T } else { d };
+                if remainder && n == T {
+                    self.asm.emit(fmov_to_v(X, C, n));
                 }
                 self.asm.emit(if signed {
-                    sbfx(X, U, U, 0, 32)
+                    sdiv(X, quotient, n, b)
                 } else {
-                    mov(W, U, U)
+                    udiv(X, quotient, n, b)
                 });
-                self.asm.emit_all(&[
-                    fmov_to_v(X, B, T),
-                    fmov_to_v(X, C, U),
-                    if signed {
-                        sdiv(X, T, T, U)
-                    } else {
-                        udiv(X, T, T, U)
-                    },
-                ]);
                 if !proved {
-                    self.asm.emit_all(&[
-                        if signed {
-                            sbfx(X, U, T, 0, 32)
-                        } else {
-                            mov(W, U, T)
-                        },
-                        cmp(X, T, U, Lsl, 0),
-                    ]);
+                    self.asm.emit(if signed {
+                        sbfx(X, U, quotient, 0, 32)
+                    } else {
+                        mov(W, U, quotient)
+                    });
+                    self.asm.emit(cmp(X, quotient, U, Lsl, 0));
                     self.asm.b_cond(Cond::Ne, self.fail());
                 }
                 if remainder {
-                    self.asm.emit_all(&[
-                        fmov_from_v(X, U, C),
-                        mul(X, T, T, U),
-                        fmov_from_v(X, U, B),
-                        sub(W, T, U, T, Lsl, 0),
-                    ]);
-                } else {
-                    self.asm.emit(mov(W, T, T));
+                    // The low 32 bits of n - q*d are the guest remainder.
+                    b = self.gp(divisor, U);
+                    if n != T {
+                        self.asm.emit(msub(W, d, quotient, b, n));
+                    } else {
+                        self.asm.emit_all(&[
+                            mul(W, T, quotient, b),
+                            fmov_from_v(X, U, C),
+                            sub(W, d, U, T, Lsl, 0),
+                        ]);
+                    }
                 }
-                self.put_gp(out);
-            }
-            Op::Flags {
-                kind,
-                width,
-                a,
-                b,
-                prior,
-            } => self.flags(out, kind, width, a, b, prior),
-            Op::Test { flags, cond } => {
-                self.test(flags, cond);
-                self.put_gp(out);
+                if signed && !remainder {
+                    self.asm.emit(mov(W, d, d));
+                }
             }
             Op::Select { cond, a, b } => {
-                self.get_vec(a, A);
-                self.get_vec(b, B);
-                self.get_gp(cond, T);
-                let done = self.asm.label();
-                self.asm.cbz(W, true, T, done);
-                self.asm.emit(vmov(true, A, B));
-                self.asm.bind(done);
-                self.put_vec(out, A);
+                let c = self.gp(cond, T);
+                self.asm.emit(cmp_imm(W, c, 0, false));
+                if matches!(self.func.ty(out), Type::F64 | Type::V128) {
+                    let a = self.vr(a, A);
+                    let b = self.vr(b, B);
+                    if self.func.ty(out) == Type::F64 {
+                        self.asm.emit(fcsel(q, a, b, Cond::Ne));
+                    } else {
+                        self.asm.emit_all(&[
+                            cset(W, T, Cond::Ne),
+                            sub(X, T, Reg::ZR, T, Lsl, 0),
+                            vdup(Arr::D2, C, T),
+                            vlogic(Logic::Bsl, true, C, a, b),
+                        ]);
+                        self.asm.emit(vmov(true, q, C));
+                    }
+                } else {
+                    let a = self.gp(a, T);
+                    let b = self.gp(b, U);
+                    self.asm.emit(csel(self.size(out), d, a, b, Cond::Ne));
+                }
             }
             Op::Bits { to, value } => {
-                self.get_vec(value, A);
-                if to != Type::V128 {
-                    self.asm
-                        .emit(fmov_from_v(if to == Type::I32 { W } else { X }, T, A));
-                    self.asm.emit(fmov_to_v(X, A, T));
+                let from = self.func.ty(value);
+                if matches!(to, Type::I32 | Type::I64) {
+                    if matches!(from, Type::F64 | Type::V128) {
+                        let v = self.vr(value, A);
+                        self.asm.emit(fmov_from_v(self.size(out), d, v));
+                    } else {
+                        let r = self.gp(value, T);
+                        self.asm.emit(mov(self.size(out), d, r));
+                    }
+                } else {
+                    if matches!(from, Type::I32 | Type::I64) {
+                        let r = self.gp(value, T);
+                        self.asm.emit(fmov_to_v(self.size(value), q, r));
+                    } else {
+                        let v = self.vr(value, A);
+                        if to == Type::F64 {
+                            self.asm.emit(fmov_d(q, v));
+                        } else if q != v {
+                            self.asm.emit(vmov(true, q, v));
+                        }
+                    }
                 }
-                self.put_vec(out, A);
             }
             Op::Fp(op, a, b) => {
-                self.get_vec(a, A);
-                self.get_vec(b, B);
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
                 self.asm.emit(dfloat(
                     match op {
                         FpOp::Add => Float::Fadd,
@@ -588,14 +637,13 @@ impl Emitter<'_> {
                         FpOp::Mul => Float::Fmul,
                         FpOp::Div => Float::Fdiv,
                     },
-                    A,
-                    A,
-                    B,
+                    q,
+                    a,
+                    b,
                 ));
-                self.put_vec(out, A);
             }
             Op::FpUnary(op, a) => {
-                self.get_vec(a, A);
+                let a = self.vr(a, A);
                 self.asm.emit(unary(
                     match op {
                         FpUnary::Neg => Unary::Fneg,
@@ -603,44 +651,74 @@ impl Emitter<'_> {
                         FpUnary::RoundZero => Unary::Frintz,
                         FpUnary::RoundDown => Unary::Frintm,
                     },
-                    A,
-                    A,
+                    q,
+                    a,
                 ));
-                self.put_vec(out, A);
             }
             Op::FromInt(a) => {
-                self.get_gp(a, T);
-                self.asm.emit_all(&[
-                    mrs_fpsr(U),
-                    and_imm(W, U, U, !0x10u32 as u64),
-                    msr_fpsr(U),
-                    scvtf(self.size(a), A, T),
-                    mrs_fpsr(T),
-                ]);
-                let ok = self.asm.label();
-                self.asm.tbz(false, T, 4, ok);
-                self.asm.b(self.fail());
-                self.asm.bind(ok);
-                self.put_vec(out, A);
+                let r = self.gp(a, T);
+                if self.size(a) == X {
+                    self.asm.emit_all(&[
+                        mrs_fpsr(U),
+                        and_imm(W, U, U, !0x10u32 as u64),
+                        msr_fpsr(U),
+                    ]);
+                }
+                self.asm.emit(scvtf(self.size(a), q, r));
+                if self.size(a) == X {
+                    self.asm.emit(mrs_fpsr(T));
+                    let ok = self.asm.label();
+                    self.asm.tbz(false, T, 4, ok);
+                    self.asm.b(self.fail());
+                    self.asm.bind(ok);
+                }
             }
             Op::ToInt { value, wide } => {
-                self.get_vec(value, A);
+                let a = self.vr(value, A);
                 self.asm
-                    .emit(fcvt_int(if wide { X } else { W }, true, T, A));
-                self.put_gp(out);
+                    .emit(fcvt_int(if wide { X } else { W }, true, d, a));
             }
-            Op::Vec(op, a, b) => self.vector(out, op, a, b),
+            Op::Vec(op, a, b) => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                match op {
+                    VecOp::SubI32 => self.asm.emit(vsame(Same::Sub, Arr::S4, q, a, b)),
+                    VecOp::LessF64 => self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a)),
+                    VecOp::ShlI64 | VecOp::ShrI64 => {
+                        self.asm
+                            .emit_all(&[fmov_from_v(X, T, b), cmp_imm(X, T, 63, false)]);
+                        let zero = self.asm.label();
+                        let done = self.asm.label();
+                        self.asm.b_cond(Cond::Hi, zero);
+                        if op == VecOp::ShrI64 {
+                            self.asm.emit(sub(X, T, Reg::ZR, T, Lsl, 0));
+                        }
+                        self.asm
+                            .emit_all(&[vdup(Arr::D2, C, T), vsame(Same::Ushl, Arr::D2, q, a, C)]);
+                        self.asm.b(done);
+                        self.asm.bind(zero);
+                        self.asm.emit(vzero(true, q));
+                        self.asm.bind(done);
+                    }
+                    _ => self.asm.emit(match op {
+                        VecOp::And => vlogic(Logic::And, true, q, a, b),
+                        VecOp::AndNot => vlogic(Logic::Bic, true, q, b, a),
+                        VecOp::Or => vlogic(Logic::Orr, true, q, a, b),
+                        _ => vlogic(Logic::Eor, true, q, a, b),
+                    }),
+                }
+            }
             Op::Load { ty, width, addr } => {
-                self.get_gp(addr, U);
+                let addr = self.gp(addr, U);
                 self.site();
-                let size = mem_size(width);
-                self.asm.emit(vldr_reg(size, A, ALIAS, U));
-                if ty == Type::I32 || ty == Type::I64 {
-                    self.asm
-                        .emit(fmov_from_v(if ty == Type::I32 { W } else { X }, T, A));
-                    self.put_gp(out);
+                if matches!(ty, Type::I32 | Type::I64) {
+                    self.asm.emit(match width {
+                        1 => ldr_narrow(Narrow::Byte, d, ALIAS, addr),
+                        2 => ldr_narrow(Narrow::Half, d, ALIAS, addr),
+                        _ => ldr_reg(if width == 8 { X } else { W }, d, ALIAS, addr, false),
+                    });
                 } else {
-                    self.put_vec(out, A);
+                    self.asm.emit(vldr_reg(mem_size(width), q, ALIAS, addr));
                 }
             }
             Op::Store {
@@ -649,131 +727,110 @@ impl Emitter<'_> {
                 value,
                 after,
             } => {
-                self.get_vec(value, A);
-                self.get_gp(addr, U);
-                self.site();
-                self.asm.emit(vstr_reg(mem_size(width), A, ALIAS, U));
+                let addr = self.gp(addr, U);
+                if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                    let value = self.gp(value, T);
+                    self.site();
+                    self.asm.emit(match width {
+                        1 => str_narrow(Narrow::Byte, value, ALIAS, addr),
+                        2 => str_narrow(Narrow::Half, value, ALIAS, addr),
+                        _ => str_reg(if width == 8 { X } else { W }, value, ALIAS, addr, false),
+                    });
+                } else {
+                    let value = self.vr(value, A);
+                    self.site();
+                    self.asm.emit(vstr_reg(mem_size(width), value, ALIAS, addr));
+                }
                 self.region = after;
                 self.mark(Part::Body, self.func.records[after.0 as usize].eip);
             }
             Op::X87Load { bits, denormal } => {
-                self.get_gp(bits, T);
-                self.asm.emit(and_imm(X, T, T, 0x7fff_ffff_ffff_ffff));
-                self.imm(U, 0x7ff0_0000_0000_0000);
-                self.asm.emit(cmp(X, T, U, Lsl, 0));
-                self.asm.b_cond(Cond::Hi, self.fail());
+                let r = self.gp(bits, U);
+                let nan = self.asm.label();
+                let done = self.asm.label();
+                self.asm
+                    .emit_all(&[ubfx(X, T, r, 52, 11), cmp_imm(W, T, 2047, false)]);
+                self.asm.b_cond(Cond::Eq, nan);
                 if denormal {
-                    let zero = self.asm.label();
-                    self.asm.cbz(X, false, T, zero);
-                    self.asm.emit(lsr_imm(X, T, T, 52));
-                    self.asm.cbz(X, false, T, self.fail());
-                    self.asm.bind(zero);
+                    self.asm.cbz(W, true, T, done);
+                    self.asm.emit(lsl_imm(X, T, r, 1));
+                    self.asm.cbz(X, true, T, self.fail());
                 }
-                self.get_vec(bits, A);
-                self.put_vec(out, A);
+                self.asm.b(done);
+                self.asm.bind(nan);
+                self.asm.emit(lsl_imm(X, T, r, 12));
+                self.asm.cbz(X, true, T, self.fail());
+                self.asm.bind(done);
+                self.asm.emit(fmov_to_v(X, q, r));
             }
             Op::Validate => {
-                // spec: A64-OPT-4
-                self.asm.emit(mrs_fpsr(T));
-                self.asm.emit(and_imm(W, T, T, 0xffff_ff8f));
+                self.asm
+                    .emit_all(&[mrs_fpsr(T), and_imm(W, T, T, 0xffff_ff8f)]);
                 self.asm.cbz(W, true, T, self.fail());
             }
         }
+        if let Some(loc) = loc
+            && !matches!(loc, Host::Constant(_) | Host::Flags(_))
+        {
+            let ty = self.func.ty(out);
+            let src = if matches!(ty, Type::F64 | Type::V128) {
+                Host::Vector(q)
+            } else {
+                Host::Register(d)
+            };
+            self.copy(loc, src, ty);
+        }
     }
+}
 
-    fn vector(&mut self, out: Value, op: VecOp, a: Value, b: Value) {
-        self.get_vec(a, A);
-        self.get_vec(b, B);
-        match op {
-            VecOp::And | VecOp::AndNot | VecOp::Or | VecOp::Xor => {
-                self.asm.emit(match op {
-                    VecOp::And => vlogic(Logic::And, true, A, A, B),
-                    VecOp::AndNot => vlogic(Logic::Bic, true, A, B, A),
-                    VecOp::Or => vlogic(Logic::Orr, true, A, A, B),
-                    _ => vlogic(Logic::Eor, true, A, A, B),
-                });
-            }
-            VecOp::SubI32 => self.asm.emit(vsame(Same::Sub, Arr::S4, A, A, B)),
-            VecOp::LessF64 => self.asm.emit(vcompare(Float::Fcmgt, false, true, A, B, A)),
-            VecOp::ShlI64 | VecOp::ShrI64 => {
-                self.asm
-                    .emit_all(&[fmov_from_v(X, T, B), cmp_imm(X, T, 63, false)]);
-                let zero = self.asm.label();
-                let done = self.asm.label();
-                self.asm.b_cond(Cond::Hi, zero);
-                if op == VecOp::ShrI64 {
-                    self.asm.emit(sub(X, T, Reg::ZR, T, Lsl, 0));
-                }
-                self.asm
-                    .emit_all(&[vdup(Arr::D2, B, T), vsame(Same::Ushl, Arr::D2, A, A, B)]);
-                self.asm.b(done);
-                self.asm.bind(zero);
-                self.asm.emit(vzero(true, A));
-                self.asm.bind(done);
+fn add_immediate(n: u64) -> Option<(u32, bool)> {
+    if n <= 4095 {
+        Some((n as u32, false))
+    } else if n & 4095 == 0 && n >> 12 <= 4095 {
+        Some(((n >> 12) as u32, true))
+    } else {
+        None
+    }
+}
+fn int_immediate(op: IntOp, size: Size, d: Reg, a: Reg, n: u64) -> Option<u32> {
+    Some(match op {
+        IntOp::Add | IntOp::Sub => {
+            let (n, shift) = add_immediate(n)?;
+            if op == IntOp::Add {
+                add_imm(size, d, a, n, shift)
+            } else {
+                sub_imm(size, d, a, n, shift)
             }
         }
-        self.put_vec(out, A);
-    }
-}
-
-fn mem_size(width: u8) -> VMem {
-    match width {
-        1 => VMem::B,
-        2 => VMem::H,
-        4 => VMem::S,
-        8 => VMem::D,
-        16 => VMem::Q,
-        _ => unreachable!(),
-    }
-}
-
-/// Fuse the adjacent compare/test/branch when the condition is in NZCV.
-fn fused_branch(data: &BlockData) -> Option<(Value, Value, u8, Cond)> {
-    use iced_x86::ConditionCode as CC;
-    let End::Branch { cond, .. } = data.end else {
-        return None;
-    };
-    let [
-        (
-            Some(flags),
-            Op::Flags {
-                kind: FlagKind::Sub,
-                width,
-                a,
-                b,
-                ..
-            },
-        ),
-        (
-            Some(test),
-            Op::Test {
-                flags: used,
-                cond: cc,
-            },
-        ),
-    ] = data.insts.get(data.insts.len().checked_sub(2)?..)?
-    else {
-        return None;
-    };
-    if test != &cond || flags != used {
-        return None;
-    }
-    let condition = match cc {
-        CC::o => Cond::Vs,
-        CC::no => Cond::Vc,
-        CC::b => Cond::Lo,
-        CC::ae => Cond::Hs,
-        CC::e => Cond::Eq,
-        CC::ne => Cond::Ne,
-        CC::be => Cond::Ls,
-        CC::a => Cond::Hi,
-        CC::s => Cond::Mi,
-        CC::ns => Cond::Pl,
-        CC::l => Cond::Lt,
-        CC::ge => Cond::Ge,
-        CC::le => Cond::Le,
-        CC::g => Cond::Gt,
+        IntOp::And | IntOp::Or | IntOp::Xor => {
+            bitmask(size, n)?;
+            match op {
+                IntOp::And => and_imm(size, d, a, n),
+                IntOp::Or => orr_imm(size, d, a, n),
+                _ => eor_imm(size, d, a, n),
+            }
+        }
+        IntOp::Shl | IntOp::Shr | IntOp::Sar => {
+            let n = (n & if size == X { 63 } else { 31 }) as u32;
+            match op {
+                IntOp::Shl => lsl_imm(size, d, a, n),
+                IntOp::Shr => lsr_imm(size, d, a, n),
+                _ => asr_imm(size, d, a, n),
+            }
+        }
         _ => return None,
-    };
-    Some((*a, *b, *width, condition))
+    })
+}
+fn scalar_size(ty: Type) -> Size {
+    if matches!(ty, Type::I32 | Type::Flags) {
+        W
+    } else {
+        X
+    }
+}
+fn mem_size(width: u8) -> VMem {
+    [VMem::B, VMem::H, VMem::S, VMem::D, VMem::Q][width.trailing_zeros() as usize]
+}
+fn mem_type(ty: Type) -> VMem {
+    [VMem::S, VMem::D, VMem::D, VMem::Q, VMem::S][ty as usize]
 }

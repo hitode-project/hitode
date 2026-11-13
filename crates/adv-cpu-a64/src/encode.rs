@@ -244,6 +244,11 @@ pub const fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9BA0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
 }
 
+/// `smulh xd, xn, xm`: the high 64 bits of the signed 128-bit product.
+pub const fn smulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9B40_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
 /// `umulh xd, xn, xm`: the high 64 bits of the unsigned 128-bit product.
 pub const fn umulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9BC0_7C00 | rm.number() << 16 | rn.number() << 5 | rd.number()
@@ -771,6 +776,16 @@ pub const fn csel(size: Size, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
         | (cond as u32) << 12
         | rn.number() << 5
         | rd.number()
+}
+
+/// `fmov dd, dn`, clearing the upper bits of the destination.
+pub const fn fmov_d(rd: VReg, rn: VReg) -> u32 {
+    0x1E60_4000 | rn.number() << 5 | rd.number()
+}
+
+/// `fcsel dd, dn, dm, cond`.
+pub const fn fcsel(rd: VReg, rn: VReg, rm: VReg, cond: Cond) -> u32 {
+    0x1E60_0C00 | rm.number() << 16 | (cond as u32) << 12 | rn.number() << 5 | rd.number()
 }
 
 /// `cfinv` (FEAT_FlagM): inverts C, which flips the carry sense.
@@ -1593,6 +1608,9 @@ mod tests {
             (msub(X, r(15), r(17), r(6), r(16)), "msub x15, x17, x6, x16"),
             (umull(r(16), r(19), r(6)), "umull x16, w19, w6"),
             (umulh(r(16), r(0), r(2)), "umulh x16, x0, x2"),
+            (smulh(r(16), r(0), r(2)), "smulh x16, x0, x2"),
+            (fcsel(v(3), v(4), v(5), Cond::Ne), "fcsel d3, d4, d5, ne"),
+            (fmov_d(v(3), v(4)), "fmov d3, d4"),
             (mrs_fpsr(r(17)), "mrs x17, fpsr"),
             (mul(X, r(0), r(1), r(2)), "mul x0, x1, x2"),
             (mul(W, r(0), r(1), r(2)), "mul w0, w1, w2"),

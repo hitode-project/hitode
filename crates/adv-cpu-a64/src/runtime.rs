@@ -139,8 +139,6 @@ pub struct Runtime {
     pub deferred: u32,
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
-    /// Per-thread optimized spills and parallel-copy scratch, in 16-byte cells.
-    pub opt_spills: u64,
     pub opt_fpcr: u64,
     pub opt_record: u32,
     pub opt_dump: RegisterDump,
@@ -189,7 +187,6 @@ impl Runtime {
             head_exit: 0,
             deferred: 0,
             opt_params: 0,
-            opt_spills: 0,
             opt_fpcr: 0,
             opt_record: 0,
             opt_dump: RegisterDump::default(),
@@ -203,6 +200,7 @@ impl Runtime {
 pub struct RegisterDump {
     pub x: [u64; 31],
     pub v: [u128; 32],
+    pub sp: u64,
 }
 
 /// Why translated code returned to the owner.
@@ -730,6 +728,13 @@ fn emit_opt_exit(asm: &mut Asm) {
         asm.emit(str_v(VSize::Q, v(n), RUNTIME, vectors + 16 * u32::from(n)));
     }
     asm.emit_all(&[
+        mov_sp(r(16), SP),
+        str(
+            X,
+            r(16),
+            RUNTIME,
+            dump + offset_of!(RegisterDump, sp) as u32,
+        ),
         ldr(X, r(16), RUNTIME, offset_of!(Runtime, opt_fpcr) as u32),
         msr_fpcr(r(16)),
         movz(W, r(16), Exit::Optimized as u16, 0),
