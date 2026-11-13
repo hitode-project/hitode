@@ -264,6 +264,8 @@ struct Buffer {
     spatial: Option<Deferred<Source>>,
     playing: bool,
     looping: bool,
+    retuned: bool,
+    min_lead_bytes: u32,
     base: u32,
     anchor: u64,
     queued_frames: u64,
@@ -311,51 +313,72 @@ impl Buffer {
                 play,
                 if device_connected {
                     write
+                } else if !self.playing
+                    || (!self.looping && self.progress(now) >= u64::from(self.len))
+                {
+                    play
                 } else {
-                    self.lead(play)
+                    self.staged_lead(play, 0)
                 },
             );
         }
-        let play = if self.len == 0 {
-            0
-        } else if self.looping {
-            (self.progress(now) % u64::from(self.len)) as u32
+        if self.len == 0 {
+            return (0, 0);
+        }
+        if device_connected && self.playing && !self.retuned {
+            // A fresh Play or SetCurrentPosition has not been mixed yet; hold
+            // play at the start anchor and expose the initial staged lead so
+            // neither cursor jumps or inverts when the first callback runs.
+            let play = self.base;
+            return (play, self.staged_lead(play, 0));
+        }
+        let progress = self.progress(now);
+        if !self.looping && progress >= u64::from(self.len) {
+            return (0, 0);
+        }
+        let align = self.format.align().max(1);
+        let play = ((progress % u64::from(self.len)) as u32) / align * align;
+        let write = if !self.playing {
+            play
+        } else if device_connected {
+            let elapsed = progress.saturating_sub(u64::from(self.base));
+            let carried = u64::from(self.min_lead_bytes).saturating_sub(elapsed);
+            self.staged_lead(play, carried)
         } else {
-            let progress = self.progress(now);
-            if progress >= u64::from(self.len) {
-                0
-            } else {
-                progress as u32
-            }
+            self.staged_lead(play, 0)
         };
-        // A live callback has not published a position for this generation yet.
-        (
-            play,
-            if device_connected {
-                self.base
-            } else {
-                self.lead(play)
-            },
-        )
+        (play, write)
     }
-    /// Without a live mixer frontier, a playing buffer's write cursor leads
-    /// its play cursor by 30 ms of frames, as Windows reports; a stopped
-    /// buffer's equals it.
-    fn lead(&self, play: u32) -> u32 {
+    /// Without a live mixer frontier (or before the first callback), a playing
+    /// buffer's write cursor leads its play cursor by the staged source window
+    /// (up to 30 ms, capped at half the buffer); a stopped buffer's equals it.
+    fn staged_lead(&self, play: u32, min_bytes: u64) -> u32 {
         if !self.playing || self.len == 0 {
             return play;
         }
-        let lead = u64::from(self.frequency * 3 / 100) * u64::from(self.format.align());
-        ((u64::from(play) + lead) % u64::from(self.len)) as u32
+        let align = u64::from(self.format.align().max(1));
+        let frames = u64::from(self.len) / align;
+        let lead = adv_device::ring::RingVoice::staged_lead_frames(frames, self.frequency) * align;
+        let lead = lead
+            .max(min_bytes)
+            .min(u64::from(self.len.saturating_sub(align as u32)));
+        let write = if self.looping {
+            u64::from(play) + lead
+        } else {
+            (u64::from(play) + lead).min(u64::from(self.len))
+        };
+        (write % u64::from(self.len)) as u32
     }
-    fn cursor(&self, now: u64) -> u32 {
-        self.cursors(now, false).0
+    fn cursor(&self, now: u64, device_connected: bool) -> u32 {
+        self.cursors(now, device_connected).0
     }
-    fn stop(&mut self, now: u64) {
+    fn stop(&mut self, now: u64, device_connected: bool) {
         self.base = self
-            .cursor(now)
+            .cursor(now, device_connected)
             .min(self.len.saturating_sub(self.format.align()));
         self.playing = false;
+        self.retuned = false;
+        self.min_lead_bytes = 0;
     }
 }
 /// Optional deterministic decoder validation, before host volume or resampling.
@@ -985,7 +1008,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 buf.queued_frames,
             )
         });
-        let cursor = s.buffer(&e.sys.objects, a).map(|buf| buf.cursor(now));
+        let connected = s.audio.device_connected();
+        let cursor = s
+            .buffer(&e.sys.objects, a)
+            .map(|buf| buf.cursor(now, connected));
         if let Some(trace) = s.trace.as_mut() {
             let _ = writeln!(
                 trace,
@@ -1299,6 +1325,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         .then(|| Deferred::new(Source::new(format.rate))),
                     playing: false,
                     looping: false,
+                    retuned: false,
+                    min_lead_bytes: 0,
                     base: 0,
                     anchor: now,
                     queued_frames: 0,
@@ -1419,6 +1447,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     spatial: orig_spatial,
                     playing: false,
                     looping: false,
+                    retuned: false,
+                    min_lead_bytes: 0,
                     base: 0,
                     anchor: now,
                     queued_frames: 0,
@@ -1692,6 +1722,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }
             buf.base = base;
             buf.anchor = now;
+            buf.retuned = false;
+            buf.min_lead_bytes = 0;
             buf.queued_frames = 0;
             buf.notice_bytes = u64::from(buf.base);
             buf.generation = generation;
@@ -1786,6 +1818,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if starting {
                 buf.base = base;
                 buf.anchor = now;
+                buf.retuned = false;
+                buf.min_lead_bytes = 0;
                 buf.queued_frames = 0;
                 buf.notice_bytes = u64::from(base);
             }
@@ -1799,7 +1833,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             if !s.audio.stop_ring_generation(buf.audio_id, generation) {
                 return Ok(INVALID_CALL);
             }
-            buf.stop(now);
+            buf.stop(now, s.audio.device_connected());
             buf.generation = generation;
             for &(offset, handle) in &buf.notifications {
                 if offset == u32::MAX {
@@ -1885,31 +1919,51 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 return Ok(INVALID);
             }
             let storage_addr = buf.storage_addr();
-            if let Some(lock) = buf.lock.take()
-                && let Some(dump) = buf.trace_chunks.as_mut()
-            {
-                let file_offset = dump.bytes;
-                for (address, len) in [(lock.p1, c), (lock.p2, args[4])] {
-                    if len != 0 {
-                        let mut bytes = vec![0; len as usize];
-                        e.cpu
-                            .read(address, &mut bytes)
-                            .map_err(|error| error.to_string())?;
-                        dump.writer
-                            .write_all(&bytes)
-                            .map_err(|error| error.to_string())?;
-                        dump.bytes += u64::from(len);
+            let storage_id = buf.storage.as_ref().map(|storage| storage.id);
+            if let Some(lock) = buf.lock.take() {
+                if let Some(dump) = buf.trace_chunks.as_mut() {
+                    let file_offset = dump.bytes;
+                    for (address, len) in [(lock.p1, c), (lock.p2, args[4])] {
+                        if len != 0 {
+                            let mut bytes = vec![0; len as usize];
+                            e.cpu
+                                .read(address, &mut bytes)
+                                .map_err(|error| error.to_string())?;
+                            dump.writer
+                                .write_all(&bytes)
+                                .map_err(|error| error.to_string())?;
+                            dump.bytes += u64::from(len);
+                        }
+                    }
+                    if let Some(trace) = s.trace.as_mut() {
+                        let _ = writeln!(
+                            trace,
+                            "dma-write us={now} id={a:08x} generation={} byte_offset={} count={} file_offset={file_offset} path={:?}",
+                            buf.trace_generation,
+                            lock.p1 - storage_addr,
+                            c + args[4],
+                            dump.path
+                        );
                     }
                 }
-                if let Some(trace) = s.trace.as_mut() {
-                    let _ = writeln!(
-                        trace,
-                        "dma-write us={now} id={a:08x} generation={} byte_offset={} count={} file_offset={file_offset} path={:?}",
-                        buf.trace_generation,
-                        lock.p1 - storage_addr,
-                        c + args[4],
-                        dump.path
-                    );
+                if let Some(storage_id) = storage_id {
+                    let sharing_audio_ids: Vec<u64> = s
+                        .buffer_ids
+                        .values()
+                        .filter_map(|&ident| {
+                            let other =
+                                s.com.get_identity(&e.sys.objects, ident)?.buffer.as_ref()?;
+                            (other.storage.as_ref()?.id == storage_id).then_some(other.audio_id)
+                        })
+                        .collect();
+                    for audio_id in sharing_audio_ids {
+                        if c != 0 {
+                            s.audio.committed(audio_id, lock.p1 - storage_addr, c);
+                        }
+                        if args[4] != 0 {
+                            s.audio.committed(audio_id, lock.p2 - storage_addr, args[4]);
+                        }
+                    }
                 }
             }
             0
@@ -2196,13 +2250,22 @@ fn spatialize(audio: &AudioControl, listener: &Listener, buf: &mut Buffer, now: 
 }
 /// Restarts `buf`'s playback clock at `rate` from its current position.
 fn retune(audio: &AudioControl, buf: &mut Buffer, rate: u32, now: u64) -> bool {
-    let base = buf.cursor(now);
+    let connected = audio.device_connected();
+    let (base, write) = buf.cursors(now, connected);
     let generation = buf.generation.wrapping_add(1);
     if audio
         .set_frequency_generation(buf.audio_id, rate, generation)
         .is_err()
     {
         return false;
+    }
+    if buf.playing && buf.len != 0 {
+        buf.retuned = true;
+        buf.min_lead_bytes =
+            ((u64::from(write) + u64::from(buf.len) - u64::from(base)) % u64::from(buf.len)) as u32;
+    } else {
+        buf.retuned = false;
+        buf.min_lead_bytes = 0;
     }
     buf.base = base;
     buf.anchor = now;
@@ -3142,7 +3205,9 @@ mod tests {
         );
         advance(&mut m, 25_000);
         assert_eq!(position(&mut m, b), 300);
-        assert_eq!(write_cursor(&mut m, b), 140);
+        // At 2000 Hz this 100-frame buffer is 50 ms long, so the 30 ms lead caps at half the
+        // buffer (50 frames = 200 bytes): (300 + 200) % 400 == 100.
+        assert_eq!(write_cursor(&mut m, b), 100);
         invoke(&mut m, "IDirectSoundBuffer8::Stop", &[b]);
         advance(&mut m, 500_000);
         assert_eq!(position(&mut m, b), 300);
@@ -3184,26 +3249,32 @@ mod tests {
             0
         );
         let mut reader = audio.stream().device_reader(1000, 2).unwrap();
-        let write = |m: &mut Machine<JitCpu>| {
+        let cursors = |m: &mut Machine<JitCpu>| {
             assert_eq!(
                 invoke(
                     m,
                     "IDirectSoundBuffer8::GetCurrentPosition",
-                    &[b, 0, DATA + 128]
+                    &[b, DATA + 124, DATA + 128]
                 ),
                 0
             );
-            m.cpu.read_u32(DATA + 128).unwrap()
+            (
+                m.cpu.read_u32(DATA + 124).unwrap(),
+                m.cpu.read_u32(DATA + 128).unwrap(),
+            )
         };
 
-        let mut first = [0.0; 48];
+        // Immediately after Play, 30 frames are staged ahead of play, so the first 32-byte half
+        // is not yet completely released.
+        assert_eq!(cursors(&mut m), (0, 30));
+        let mut first = [0.0; 2];
         reader.read(&mut first, 1_000_000);
-        assert_eq!(first, [0.5; 48]);
-        assert_eq!(write(&mut m), 24);
-        let mut first_tail = [0.0; 16];
+        assert_eq!(first, [0.5; 2]);
+        assert_eq!(cursors(&mut m).1, 31);
+        let mut first_tail = [0.0; 2];
         reader.read(&mut first_tail, 1_000_000);
-        assert_eq!(first_tail, [0.5; 16]);
-        assert_eq!(write(&mut m), 32);
+        assert_eq!(first_tail, [0.5; 2]);
+        assert_eq!(cursors(&mut m).1, 32);
         assert_eq!(
             invoke(
                 &mut m,
@@ -3223,7 +3294,7 @@ mod tests {
             0
         );
 
-        // Refill the released half while the callback is still using the other half.
+        // Refill the released first half while frames 2..32 are still staged in the mixer.
         assert_eq!(
             invoke(
                 &mut m,
@@ -3245,7 +3316,10 @@ mod tests {
         let mut second = [0.0; 64];
         reader.read(&mut second, 1_000_000);
         assert_eq!(second, [0.5; 64]);
-        assert_eq!(write(&mut m), 0);
+        assert_eq!(cursors(&mut m).1, 0);
+        let mut second_tail = [0.0; 60];
+        reader.read(&mut second_tail, 1_000_000);
+        assert_eq!(second_tail, [0.5; 60]);
         let mut wrapped = [0.0; 16];
         reader.read(&mut wrapped, 1_000_000);
         assert_eq!(wrapped, [-0.5; 16]);
@@ -3296,18 +3370,26 @@ mod tests {
                 assert_eq!(frame[0], 0.5);
                 assert_eq!(frame[1], if format.channels == 1 { 0.5 } else { -0.25 });
             }
+            // Frames 20..50 are already staged ahead of the play cursor; guest writes take effect
+            // starting at the write cursor (frame 50).
             m.cpu
                 .write(
                     ptr,
                     &vec![if format.bits == 8 { 128 } else { 0 }; bytes.len()],
                 )
                 .unwrap();
+            let mut staged = [0.0; 60];
+            stream.read_stereo(&mut staged, 1000);
+            for frame in staged.as_chunks::<2>().0 {
+                assert_eq!(frame[0], 0.5);
+                assert_eq!(frame[1], if format.channels == 1 { 0.5 } else { -0.25 });
+            }
             stream.read_stereo(&mut out, 1000);
             assert_eq!(
                 out, [0.0; 40],
-                "guest writes stay visible through the independent read alias"
+                "guest writes ahead of the write cursor stay visible through the read alias"
             );
-            assert_eq!(stream.rendered_samples(), (80, 40));
+            assert_eq!(stream.rendered_samples(), (140, 100));
         }
     }
     #[test]
@@ -4201,5 +4283,310 @@ mod tests {
         );
         invoke(&mut m, "IDirectSoundBuffer8::Release", &[primary]);
         invoke(&mut m, "IDirectSound8::Release", &[dev]);
+    }
+
+    #[test]
+    // spec: DEV-AUDIO-1
+    fn live_cursors_hold_staged_window_before_first_callback_and_across_seek() {
+        let audio = AudioControl::new(true);
+        let mut m = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 2,
+                bits: 16,
+            },
+            400,
+        );
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .storage_addr();
+        let first_half: Vec<u8> = 16384i16
+            .to_le_bytes()
+            .into_iter()
+            .cycle()
+            .take(200)
+            .collect();
+        let second_half: Vec<u8> = (-16384i16)
+            .to_le_bytes()
+            .into_iter()
+            .cycle()
+            .take(200)
+            .collect();
+        m.cpu.write(storage, &first_half).unwrap();
+        m.cpu.write(storage + 200, &second_half).unwrap();
+
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]),
+            0
+        );
+        let cursors = |m: &mut Machine<JitCpu>| {
+            assert_eq!(
+                invoke(
+                    m,
+                    "IDirectSoundBuffer8::GetCurrentPosition",
+                    &[b, DATA + 124, DATA + 128]
+                ),
+                0
+            );
+            (
+                m.cpu.read_u32(DATA + 124).unwrap(),
+                m.cpu.read_u32(DATA + 128).unwrap(),
+            )
+        };
+
+        // Before the first callback services Play, play stays anchored at base (0) while write
+        // already exposes the initial 30 ms (120-byte) staged lead, even if guest time advances.
+        advance(&mut m, 15_000);
+        assert_eq!(cursors(&mut m), (0, 120));
+
+        // First callback mixes 10 frames (40 bytes) and stages 30 frames ahead (write = 160).
+        let mut out = [0.0; 20];
+        reader.read(&mut out, 1_000_000);
+        assert!(out.iter().all(|&sample| (sample - 0.5).abs() < 1e-6));
+        assert_eq!(cursors(&mut m), (0, 160));
+
+        // Seeking mid-playback discards the old generation's staged tail and immediately reports
+        // the new staged window [200, 320) before the next callback arrives.
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[b, 200]),
+            0
+        );
+        advance(&mut m, 15_000);
+        assert_eq!(cursors(&mut m), (200, 320));
+
+        reader.read(&mut out, 1_000_000);
+        assert!(out.iter().all(|&sample| (sample + 0.5).abs() < 1e-6));
+        assert_eq!(cursors(&mut m), (200, 360));
+    }
+
+    #[test]
+    // spec: DEV-AUDIO-1
+    fn retune_resamples_staged_source_frames_without_rereading_or_rewinding_write_cursor() {
+        let audio = AudioControl::new(true);
+        let mut m = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            200,
+        );
+        let storage = m
+            .ext
+            .get::<Sound>()
+            .buffer(&m.sys.objects, b)
+            .unwrap()
+            .storage_addr();
+        m.cpu.write(storage, &[192; 200]).unwrap();
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]),
+            0
+        );
+        let mut first = [0.0; 20];
+        reader.read(&mut first, 1_000_000);
+        assert_eq!(first, [0.5; 20]);
+        assert_eq!(write_cursor(&mut m, b), 40);
+
+        // Overwrite already-committed bytes 0..40 in guest memory, then step down to 500 Hz.
+        // The write cursor must not rewind below 40 before the next callback, and the mixer must
+        // resample the staged +0.5 source frames 10..20 rather than rereading -0.5 from RAM.
+        m.cpu.write(storage, &[64; 40]).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::SetFrequency", &[b, 500]),
+            0
+        );
+        assert_eq!(write_cursor(&mut m, b), 40);
+        let mut half_rate = [0.0; 40];
+        reader.read(&mut half_rate, 1_000_000);
+        assert!(
+            half_rate.iter().all(|&sample| sample > 0.2)
+                && half_rate[4..].iter().all(|&sample| sample > 0.45),
+            "expected staged +0.5 frames after downward retune, got {half_rate:?}"
+        );
+
+        // Step up to 2000 Hz while frames 20..40 are still staged; those 20 source frames must
+        // play out over 10 device frames as +0.5 without rereading overwritten guest bytes.
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::SetFrequency", &[b, 2000]),
+            0
+        );
+        let mut double_rate = [0.0; 20];
+        reader.read(&mut double_rate, 1_000_000);
+        assert!(
+            double_rate.iter().all(|&sample| sample > 0.2)
+                && double_rate[4..].iter().all(|&sample| sample > 0.45),
+            "expected staged +0.5 frames after upward retune, got {double_rate:?}"
+        );
+    }
+
+    #[test]
+    // spec: DEV-AUDIO-1
+    fn short_ring_caps_staged_lead_at_half_buffer_and_non_looping_end_resets_both_cursors() {
+        let format = Format {
+            rate: 1000,
+            channels: 1,
+            bits: 8,
+        };
+
+        // Without live output: a 40-ms (40-byte) ring caps lead at 20 bytes (half the buffer)
+        // instead of 30 bytes, and a 1-frame ring stays at 0.
+        let mut offline = machine();
+        let short_offline = buffer(&mut offline, format, 40);
+        assert_eq!(
+            invoke(
+                &mut offline,
+                "IDirectSoundBuffer8::Play",
+                &[short_offline, 0, 0, 1]
+            ),
+            0
+        );
+        assert_eq!(position(&mut offline, short_offline), 0);
+        assert_eq!(write_cursor(&mut offline, short_offline), 20);
+        let single_frame = buffer(&mut offline, format, 1);
+        assert_eq!(
+            invoke(
+                &mut offline,
+                "IDirectSoundBuffer8::Play",
+                &[single_frame, 0, 0, 1]
+            ),
+            0
+        );
+        assert_eq!(position(&mut offline, single_frame), 0);
+        assert_eq!(write_cursor(&mut offline, single_frame), 0);
+
+        // With live output: a 40-byte ring stages 20 bytes on Play, and a non-looping buffer
+        // resets both cursors to (0, 0) as soon as the mixer finishes it, even before pump().
+        let audio = AudioControl::new(true);
+        let mut live = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let short_live = buffer(&mut live, format, 40);
+        let one_shot = buffer(&mut live, format, 40);
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+        assert_eq!(
+            invoke(
+                &mut live,
+                "IDirectSoundBuffer8::Play",
+                &[short_live, 0, 0, 1]
+            ),
+            0
+        );
+        assert_eq!(position(&mut live, short_live), 0);
+        assert_eq!(write_cursor(&mut live, short_live), 20);
+
+        assert_eq!(
+            invoke(
+                &mut live,
+                "IDirectSoundBuffer8::SetCurrentPosition",
+                &[one_shot, 12]
+            ),
+            0
+        );
+        assert_eq!(
+            invoke(&mut live, "IDirectSoundBuffer8::Play", &[one_shot, 0, 0, 0]),
+            0
+        );
+        let mut chunk = [0.0; 20];
+        reader.read(&mut chunk, 1_000_000);
+        // Hardware delay keeps playback clock behind pts, so non-looping play clamps at minimum
+        // 12 while staging through all 40 bytes wraps write to 0 (< dwBufferBytes).
+        assert_eq!(position(&mut live, one_shot), 12);
+        assert_eq!(write_cursor(&mut live, one_shot), 0);
+
+        let mut finish = [0.0; 60];
+        reader.read(&mut finish, 1_000_000);
+        // While the final 18 mixed frames are still draining through hardware delay, play stays
+        // clamped at minimum (12) and write stays at 0 without wrapping past 0.
+        assert_eq!(position(&mut live, one_shot), 12);
+        assert_eq!(write_cursor(&mut live, one_shot), 0);
+
+        // Once DAC playback passes the final frame, both cursors reset to (0, 0) even before pump.
+        reader.read(&mut [0.0; 20], 0);
+        assert_eq!(position(&mut live, one_shot), 0);
+        assert_eq!(write_cursor(&mut live, one_shot), 0);
+    }
+
+    #[test]
+    // spec: DEV-AUDIO-1
+    fn partial_preload_streaming_plays_sub_30ms_packets_without_silence_hole() {
+        let audio = AudioControl::new(true);
+        let mut m = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let b = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            100,
+        );
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+
+        let lock_write_unlock = |m: &mut Machine<JitCpu>, offset: u32, bytes: &[u8]| {
+            let len = bytes.len() as u32;
+            assert_eq!(
+                invoke(
+                    m,
+                    "IDirectSoundBuffer8::Lock",
+                    &[b, offset, len, DATA + 128, DATA + 132, 0, 0, 0]
+                ),
+                0
+            );
+            let p1 = m.cpu.read_u32(DATA + 128).unwrap();
+            let n1 = m.cpu.read_u32(DATA + 132).unwrap();
+            assert_eq!(n1, len);
+            m.cpu.write(p1, bytes).unwrap();
+            assert_eq!(
+                invoke(m, "IDirectSoundBuffer8::Unlock", &[b, p1, n1, 0, 0]),
+                0
+            );
+        };
+
+        // Preload a single 20-ms packet (< 30 ms write lead), start playback, mix 10 ms, and then
+        // deliver packet 2 at 20..40 ms (inside the active 30-ms write-cursor lead).
+        lock_write_unlock(&mut m, 0, &[192; 20]);
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[b, 0, 0, 1]),
+            0
+        );
+        let mut first_10ms = [0.0; 20];
+        reader.read(&mut first_10ms, 1_000_000);
+        assert_eq!(first_10ms, [0.5; 20]);
+        assert_eq!(write_cursor(&mut m, b), 40);
+
+        lock_write_unlock(&mut m, 20, &[192; 20]);
+        let mut next_30ms = [0.0; 60];
+        reader.read(&mut next_30ms, 1_000_000);
+        assert_eq!(
+            next_30ms, [0.5; 60],
+            "sub-30ms streaming packet unlocked inside write lead must not hit pre-staged silence"
+        );
     }
 }

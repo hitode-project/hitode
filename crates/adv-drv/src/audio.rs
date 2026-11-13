@@ -344,7 +344,7 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
                 streams.next
             };
             let audio = env.ext.get::<AudioControl>();
-            let voice = audio.add_ring(
+            let voice = audio.add_unbuffered_ring(
                 source_id(env.sys.pid, id),
                 RingConfig {
                     view: region.read_alias,
