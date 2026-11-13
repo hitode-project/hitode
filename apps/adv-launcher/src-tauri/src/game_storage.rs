@@ -276,7 +276,8 @@ fn location(app: &AppHandle, folder: &Path) -> Reply<Location> {
         display_path: folder.to_path_buf(),
         can_reveal: folder.is_dir()
             && (cfg!(desktop)
-                || (cfg!(target_os = "android") && folder.starts_with("/storage/emulated/0"))),
+                || (cfg!(target_os = "android")
+                    && crate::library::android_external_volume(folder).is_some())),
         copy: None,
     })
 }

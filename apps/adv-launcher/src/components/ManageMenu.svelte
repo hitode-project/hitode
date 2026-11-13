@@ -4,6 +4,7 @@
   import Icon from "./Icon.svelte";
   import { canReveal, reveal } from "../lib/reveal";
   import { library } from "../lib/library.svelte";
+  import { gameStorage, removeConfirmText, type GameCopy, type RemovableCopy } from "../lib/game-storage.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game } from "../lib/types";
 
@@ -14,13 +15,43 @@
     /** The dialogs open from the page, so the menu can close under them. */
     onvndb: () => void;
     onrename: () => void;
-    onremove: () => void;
+    onremove: (copy: GameCopy | null) => Promise<void> | void;
   }
 
   let { game, onclose, onvndb, onrename, onremove }: Props = $props();
 
   let confirming = $state(false);
+  let copyInfo = $state<RemovableCopy | null>(null);
+  let deleteCopy = $state(false);
+  let removing = $state(false);
+  let removeError = $state("");
+  const prompt = $derived(removeConfirmText(copyInfo, deleteCopy));
   let menu = $state<HTMLElement>();
+
+  $effect(() => {
+    if (!confirming) return;
+    let active = true;
+    deleteCopy = false;
+    removeError = "";
+    copyInfo = null;
+    void gameStorage.removableCopy(game.id).then((info) => {
+      if (active) copyInfo = info;
+    });
+    return () => { active = false; };
+  });
+
+  async function removeConfirmed() {
+    if (removing) return;
+    removing = true;
+    removeError = "";
+    try {
+      await onremove(prompt.targetCopy);
+    } catch (error) {
+      removeError = String(error);
+    } finally {
+      removing = false;
+    }
+  }
 
   function items(): HTMLElement[] {
     return menu ? Array.from(menu.querySelectorAll<HTMLElement>('[role^="menuitem"]')) : [];
@@ -106,11 +137,18 @@
   {:else}
     <div style="padding: 8px 10px 4px">
       <div style="font-size: 13px; font-weight: 500">{t("从游戏库移除？")}</div>
-      <div style="margin-top: 3px; font-size: 12px; color: var(--fg3)">{t("游戏文件不会被删除")}</div>
+      <div style="margin-top: 3px; font-size: 12px; color: var(--fg3)">{prompt.subtitle}</div>
     </div>
+    {#if prompt.canDeleteCopy}
+      <label class="mcopy">
+        <input type="checkbox" bind:checked={deleteCopy} disabled={removing} />
+        <span>{t("同时删除内部副本（含存档，不可撤销）")}</span>
+      </label>
+    {/if}
+    {#if removeError}<div class="merr" role="alert">{removeError}</div>{/if}
     <div style="display: flex; justify-content: flex-end; gap: 6px; padding: 8px 4px 4px">
-      <button class="mbtn" role="menuitem" onclick={() => (confirming = false)}>{t("取消")}</button>
-      <button class="mbtn danger" role="menuitem" onclick={onremove}>{t("移除")}</button>
+      <button class="mbtn" role="menuitem" disabled={removing} onclick={() => (confirming = false)}>{t("取消")}</button>
+      <button class="mbtn danger" role="menuitem" disabled={removing} onclick={() => void removeConfirmed()}>{prompt.action}</button>
     </div>
   {/if}
 </div>
@@ -217,6 +255,25 @@
   .mbtn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+  .mcopy {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    margin: 6px 10px 2px;
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--fg2);
+    cursor: pointer;
+  }
+  .mcopy input {
+    margin-top: 2px;
+    accent-color: var(--danger);
+  }
+  .merr {
+    margin: 4px 10px 0;
+    font-size: 11.5px;
+    color: var(--danger);
   }
   @media (prefers-reduced-motion: reduce) {
     .menu {

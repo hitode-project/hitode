@@ -1,6 +1,7 @@
 package org.hitode.storage
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
@@ -8,6 +9,7 @@ import android.os.Build
 import android.os.CancellationSignal
 import android.os.Environment
 import android.os.SystemClock
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.Settings
@@ -31,6 +33,11 @@ import kotlin.concurrent.thread
 @InvokeArg
 class FolderArgs {
     lateinit var uri: String
+}
+
+@InvokeArg
+class RequestStorageArgs {
+    var open: Boolean = false
 }
 
 @InvokeArg
@@ -102,24 +109,53 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun granted() = Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()
+    private fun supported() = Build.VERSION.SDK_INT >= 30
+
+    private fun granted() = supported() && Environment.isExternalStorageManager()
+
+    private fun storageRoots(): List<StorageRoot> {
+        if (!supported()) return emptyList()
+        val roots = activity.getSystemService(StorageManager::class.java)
+            ?.storageVolumes
+            ?.mapNotNull { volume ->
+                val mounted = volume.state == Environment.MEDIA_MOUNTED ||
+                    volume.state == Environment.MEDIA_MOUNTED_READ_ONLY
+                if (!mounted) return@mapNotNull null
+                val dir = volume.directory ?: return@mapNotNull null
+                val id = if (volume.isPrimary) "primary" else volume.uuid ?: return@mapNotNull null
+                StorageRoot(id, dir, writable = volume.state == Environment.MEDIA_MOUNTED)
+            }
+            .orEmpty()
+        return if (roots.any { it.id == "primary" }) roots
+        else roots + StorageRoot("primary", Environment.getExternalStorageDirectory())
+    }
 
     @Command
     fun storageStatus(invoke: Invoke) {
-        invoke.resolve(JSObject().put("granted", granted()))
+        invoke.resolve(JSObject().put("granted", granted()).put("supported", supported()))
     }
 
     @Command
     fun requestStorage(invoke: Invoke) {
-        if (Build.VERSION.SDK_INT < 30 || granted()) {
+        val open = runCatching { invoke.parseArgs(RequestStorageArgs::class.java).open }.getOrDefault(false)
+        if (!supported() || (!open && granted())) {
             storageStatus(invoke)
             return
         }
+        val appIntent = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:${activity.packageName}")
+        )
         try {
-            startActivityForResult(invoke, Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:${activity.packageName}")
-            ), "storageResult")
+            try {
+                startActivityForResult(invoke, appIntent, "storageResult")
+            } catch (_: ActivityNotFoundException) {
+                startActivityForResult(
+                    invoke,
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                    "storageResult"
+                )
+            }
         } catch (error: Exception) {
             invoke.reject(error.message)
         }
@@ -169,10 +205,33 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
             }
             val flags = result.data!!.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
             resolver.takePersistableUriPermission(uri, flags)
+            val roots = storageRoots()
+            val isGranted = granted()
             val path = if (uri.authority == "com.android.externalstorage.documents") {
-                primaryPath(id, granted())
+                writableFolderPath(id, isGranted, roots)
             } else null
-            invoke.resolve(JSObject().put("uri", uri.toString()).put("path", path))
+            val canGrant = path == null &&
+                canGrantDirectAccess(uri.authority, id, isGranted, supported(), roots)
+            invoke.resolve(
+                JSObject()
+                    .put("uri", uri.toString())
+                    .put("path", path)
+                    .put("canGrant", canGrant)
+            )
+        } catch (error: Exception) {
+            invoke.reject(error.message)
+        }
+    }
+
+    @Command
+    fun resolveFolder(invoke: Invoke) {
+        try {
+            val uri = Uri.parse(invoke.parseArgs(FolderArgs::class.java).uri)
+            val id = DocumentsContract.getTreeDocumentId(uri)
+            val path = if (uri.authority == "com.android.externalstorage.documents") {
+                writableFolderPath(id, granted(), storageRoots())
+            } else null
+            invoke.resolve(JSObject().put("path", path))
         } catch (error: Exception) {
             invoke.reject(error.message)
         }
@@ -226,16 +285,17 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /** Shared storage and Downloads documents name a real file under all-files access. */
+    /** External-storage volumes and Downloads documents name a real file under all-files access. */
     private fun directPath(uri: Uri): String? {
         if (!granted() || !DocumentsContract.isDocumentUri(activity, uri)) return null
         val id = DocumentsContract.getDocumentId(uri)
-        val path = when (uri.authority) {
-            "com.android.externalstorage.documents" -> primaryPath(id, true)
-            "com.android.providers.downloads.documents" -> id.removePrefix("raw:").takeIf { id.startsWith("raw:") }
+        return when (uri.authority) {
+            "com.android.externalstorage.documents" -> readableFilePath(id, true, storageRoots())
+            "com.android.providers.downloads.documents" -> id.removePrefix("raw:")
+                .takeIf { id.startsWith("raw:") }
+                ?.takeIf { File(it).let { file -> file.isFile && file.canRead() } }
             else -> null
         }
-        return path?.takeIf { File(it).isFile }
     }
 
     private fun entries(tree: Uri, parent: String, signal: CancellationSignal): List<Entry> {
@@ -441,7 +501,7 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
                 created = exported
                 exportEntries(File(args.source), exported)
                 val path = if (exported.authority == "com.android.externalstorage.documents") {
-                    primaryPath(DocumentsContract.getDocumentId(exported), granted())
+                    writableFolderPath(DocumentsContract.getDocumentId(exported), granted(), storageRoots())
                 } else null
                 invoke.resolve(JSObject().put("label", path ?: args.name).put("path", path))
             } catch (error: Exception) {

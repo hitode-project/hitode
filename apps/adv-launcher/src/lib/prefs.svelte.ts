@@ -35,6 +35,10 @@ export interface Prefs {
   touchMode: TouchMode;
   /** Phones and tablets: the touch controls beside the game are expanded. */
   touchControls: boolean;
+  /** Phones and tablets: hide all persistent in-game controls, including the pull handle. */
+  hideControls: boolean;
+  /** Phones and tablets: the hidden-controls recall hint has been shown once. */
+  hideControlsHintSeen: boolean;
   /** iOS: ask for JIT whenever the launcher opens, once a pairing file is imported. */
   autoJit: boolean;
   /** iOS: the LiveContainer folder-import guidance has been shown. */
@@ -73,6 +77,8 @@ const defaults: Prefs = {
   lastUpdateCheck: 0,
   touchMode: "direct",
   touchControls: true,
+  hideControls: false,
+  hideControlsHintSeen: false,
   autoJit: true,
   liveContainerImportHintSeen: false,
   hideJitWarnings: false,

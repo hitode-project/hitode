@@ -4,6 +4,7 @@ permissions = [
   "allow-storage-status",
   "allow-request-storage",
   "allow-pick-folder",
+  "allow-resolve-folder",
   "allow-folder-size",
   "allow-copy-folder",
   "allow-cancel-copy",

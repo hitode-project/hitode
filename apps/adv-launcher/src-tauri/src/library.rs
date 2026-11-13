@@ -401,13 +401,35 @@ pub fn reveal_path(path: PathBuf) -> Reply<()> {
     mobile_reveal_path()
 }
 
+/// Android external-storage volume root of `path`, and whether it is removable.
+pub(crate) fn android_external_volume(path: &Path) -> Option<(&Path, bool)> {
+    for ancestor in path.ancestors() {
+        match ancestor.parent() {
+            Some(p) if p == Path::new("/storage/emulated") => {
+                let id = ancestor.file_name()?.to_str()?;
+                return (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                    .then_some((ancestor, false));
+            }
+            Some(p) if p == Path::new("/storage") => {
+                let name = ancestor.file_name()?.to_str()?;
+                if name != "emulated" && name != "self" {
+                    return Some((ancestor, true));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn offline(folder: &Path) -> Option<Offline> {
     if folder.exists() {
         return None;
     }
     let disk = folder
         .ancestors()
-        .find(|p| p.parent() == Some(Path::new("/Volumes")));
+        .find(|p| p.parent() == Some(Path::new("/Volumes")))
+        .or_else(|| android_external_volume(folder).and_then(|(root, rem)| rem.then_some(root)));
     Some(if disk.is_some_and(|p| !p.exists()) {
         "disk"
     } else {
@@ -961,6 +983,33 @@ mod tests {
             Some(game.id)
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: AND-APP-9
+    #[test]
+    fn android_volumes_classify_primary_and_disconnected_removable_media() {
+        let p = Path::new;
+        assert_eq!(
+            android_external_volume(p("/storage/emulated/0/Games/Novel")),
+            Some((p("/storage/emulated/0"), false))
+        );
+        assert_eq!(
+            android_external_volume(p("/storage/9C33-6BBD/Games/Novel")),
+            Some((p("/storage/9C33-6BBD"), true))
+        );
+        for invalid in [
+            "/storage",
+            "/storage/emulated",
+            "/storage/emulated/bad/Games",
+            "/storage/self/primary/Games",
+            "/data/user/0/org.hitode.launcher/files/imports/1",
+        ] {
+            assert_eq!(android_external_volume(p(invalid)), None);
+        }
+        assert_eq!(
+            offline(p("/storage/emulated/0/Games/Novel")),
+            Some("missing")
+        );
+        assert_eq!(offline(p("/storage/9C33-6BBD/Games/Novel")), Some("disk"));
     }
 }
 

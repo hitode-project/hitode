@@ -11,6 +11,7 @@ export const icons = {
   folder: '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/>',
   "folder-plus": '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/><path d="M8 7v4M6 9h4"/>',
   "folder-question": '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/><path d="M6.6 7.4a1.4 1.4 0 1 1 1.9 1.3c-.3.1-.5.4-.5.7M8 11h.01"/>',
+  shield: '<path d="M8 1.8l5 2v3.6c0 3.2-2.1 5.6-5 6.8-2.9-1.2-5-3.6-5-6.8V3.8z"/>',
   disk: '<rect x="2" y="4.5" width="12" height="7" rx="1.5"/><path d="M4.5 9h.01M7 9h.01" stroke-width="1.8"/>',
   sliders: '<path d="M3 4.5h6M12 4.5h1M3 11.5h1M7 11.5h6"/><circle cx="10.5" cy="4.5" r="1.5"/><circle cx="5.5" cy="11.5" r="1.5"/>',
   search: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/>',
@@ -30,6 +31,7 @@ export const icons = {
   info: '<circle cx="8" cy="8" r="6"/><path d="M8 7.2v4M8 4.9h.01"/>',
   warning: '<path d="M8 2.2L14.3 13H1.7z"/><path d="M8 6.5v3M8 11.2h.01"/>',
   keyboard: '<rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 6.5h.01M6.5 6.5h.01M9 6.5h.01M11.5 6.5h.01M5 9.5h6"/>',
+  backspace: '<path d="M6 3.5h7a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H6L1.8 8z"/><path d="M8.3 6.2l3.4 3.6M11.7 6.2l-3.4 3.6"/>',
   exit: '<path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10.5 5l3 3-3 3M13.5 8H6"/>',
 } as const;
 

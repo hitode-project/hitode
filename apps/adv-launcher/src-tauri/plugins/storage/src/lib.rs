@@ -19,6 +19,8 @@ type Reply<T> = Result<T, String>;
 #[derive(Deserialize, Serialize)]
 pub struct StorageStatus {
     pub granted: bool,
+    #[serde(default)]
+    pub supported: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -27,6 +29,13 @@ pub struct Folder {
     pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed: Option<bool>,
+    #[serde(rename = "canGrant", skip_serializing_if = "Option::is_none")]
+    pub can_grant: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ResolvedFolder {
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -144,13 +153,32 @@ async fn storage_status<R: Runtime>(app: AppHandle<R>) -> Reply<StorageStatus> {
 }
 
 #[tauri::command]
-async fn request_storage<R: Runtime>(app: AppHandle<R>) -> Reply<StorageStatus> {
-    app.storage().call("requestStorage", json!({})).await
+async fn request_storage<R: Runtime>(
+    app: AppHandle<R>,
+    open: Option<bool>,
+) -> Reply<StorageStatus> {
+    app.storage()
+        .call("requestStorage", json!({ "open": open.unwrap_or(false) }))
+        .await
 }
 
 #[tauri::command]
 async fn pick_folder<R: Runtime>(app: AppHandle<R>) -> Reply<Folder> {
     app.storage().pick_folder().await
+}
+
+#[tauri::command]
+async fn resolve_folder<R: Runtime>(app: AppHandle<R>, uri: String) -> Reply<ResolvedFolder> {
+    #[cfg(target_os = "android")]
+    return app
+        .storage()
+        .call("resolveFolder", json!({ "uri": uri }))
+        .await;
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (app, uri);
+        Ok(ResolvedFolder { path: None })
+    }
 }
 
 #[tauri::command]
@@ -184,6 +212,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             storage_status,
             request_storage,
             pick_folder,
+            resolve_folder,
             folder_size,
             copy_folder,
             cancel_copy

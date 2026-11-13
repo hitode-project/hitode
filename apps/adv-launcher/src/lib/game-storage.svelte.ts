@@ -1,6 +1,8 @@
 import { call, preview } from "./bridge";
 import { PREVIEW_IMPORTS } from "./fake";
+import { t } from "./i18n.svelte";
 import { library } from "./library.svelte";
+import { storageSize } from "./storage";
 
 export interface GameCopy {
   id: string;
@@ -14,6 +16,26 @@ export interface GameLocation {
   displayPath: string;
   canReveal: boolean;
   copy: GameCopy | null;
+}
+
+export interface RemovableCopy {
+  copy: GameCopy;
+  sharedWith: number;
+}
+
+/** Confirmation subtitle and action label describing whether an internal Hitode copy exists. */
+export function removeConfirmText(info: RemovableCopy | null, deleteCopy: boolean) {
+  const canDeleteCopy = !!info && info.sharedWith === 0;
+  const targetCopy = canDeleteCopy && deleteCopy ? info.copy : null;
+  const subtitle = !info
+    ? t("游戏文件不会被删除")
+    : info.sharedWith > 0
+      ? t("游戏文件不会被删除。内部副本（{0}）正与库中其他 {1} 个游戏共用。", storageSize(info.copy.bytes), info.sharedWith)
+      : t("Hitode 内部副本占用 {0}，仅移除不会删除它。", storageSize(info.copy.bytes));
+  const action = targetCopy
+    ? t("移除并删除副本（{0}）", storageSize(targetCopy.bytes))
+    : t("移除");
+  return { canDeleteCopy, targetCopy, subtitle, action };
 }
 
 export interface ExportedCopy {
@@ -58,6 +80,20 @@ class GameStorage {
 
   linked(folder: GameCopy) {
     return library.games.filter((game) => !game.offline && this.contains(folder, game.path));
+  }
+
+  /** Returns this game's Hitode internal copy when present, and how many other library games share it. */
+  async removableCopy(gameId: string): Promise<RemovableCopy | null> {
+    const location = await this.location(gameId).catch(() => null);
+    if (!location || location.kind !== "copy" || !location.copy) return null;
+    const sharedWith = this.linked(location.copy).filter((item) => item.id !== gameId).length;
+    return { copy: location.copy, sharedWith };
+  }
+
+  /** Removes a library entry and, when requested, deletes its exclusive internal copy first. */
+  async removeGame(gameId: string, copy?: GameCopy | null) {
+    if (copy) await this.delete(copy);
+    await library.remove(gameId);
   }
 
   async reveal(gameId: string | null, folder?: GameCopy) {

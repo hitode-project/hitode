@@ -72,12 +72,12 @@ pub fn reveal_drive(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Opens a folder below the primary shared-storage root.
+/// Opens a folder on an external-storage volume.
 pub(crate) async fn reveal_folder(app: &AppHandle, folder: &std::path::Path) -> Result<(), String> {
-    let relative = folder
-        .strip_prefix("/storage/emulated/0")
-        .map_err(|_| "only folders in shared storage can be shown")?;
-    reveal_directory(app, relative, "revealFolder").await
+    if crate::library::android_external_volume(folder).is_none() {
+        return Err("only folders in shared storage can be shown".into());
+    }
+    reveal_directory(app, folder, "revealFolder").await
 }
 
 /// Opens a folder under Hitode's managed Files root.

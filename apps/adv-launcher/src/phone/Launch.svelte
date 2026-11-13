@@ -41,6 +41,10 @@
             <div class="hint">{t("未启用时，这次游戏会全程以解释模式运行，速度会慢很多。")}</div>
             {#if !jit.signingUnsupported && !jit.status?.externalOnly && (jit.status?.error || jit.requestError)}<div class="chip mono">{jit.note}</div>{/if}
           </div>
+        {:else if flow.recovery === "permission"}
+          <div class="state fade">
+            <div class="msg">{flow.reason}</div>
+          </div>
         {:else if flow.view === "failed"}
           <div class="state fade">
             <div class="msg">{t("游戏已停止")}</div>
@@ -79,7 +83,7 @@
     {:else if flow.recovery}
       <div class="acts fade">
         <button class="btn primary" disabled={flow.recovering} onclick={() => flow.recoverFolder()}>
-          {t(flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
+          {t(flow.recovery === "permission" ? "去授权" : flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
         </button>
         <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
         <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
@@ -87,6 +91,7 @@
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
+        <button class="btn quiet" onclick={() => flow.changeExe()}>{t("此游戏的设置…")}</button>
         <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
         <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
       </div>

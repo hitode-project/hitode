@@ -2,12 +2,13 @@
   import { t } from "../lib/i18n.svelte";
   import { onMount, untrack } from "svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
-  import { prefs, savePrefs } from "../lib/prefs.svelte";
+  import { prefs, savePrefs, type FastForward } from "../lib/prefs.svelte";
   import { filterOverride, gameFilter, setGameFilter } from "../lib/upscaling.svelte";
   import { playback } from "../lib/playback";
   import { loadGameSetup, saveGameSetup } from "../lib/fake-settings";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent, preview } from "../lib/bridge";
+  import { device } from "../lib/device.svelte";
   import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -38,12 +39,20 @@
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
   /** The menu was opened by the back gesture; shows the edge hint briefly. */
   let backHint = $state(false);
+  let pendingRecallHint = $state(false);
+  let recallHint = $state(false);
   let textBar = $state(false);
   let text = $state("");
   let textInput = $state<HTMLInputElement | null>(null);
+  let backspacePointer: number | null = null;
+  let backspaceFromPointer = false;
+  let backspaceReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+  let backspaceHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  let backspaceRepeatTimer: ReturnType<typeof setInterval> | undefined;
 
   type Scale = "int" | "fit" | "stretch";
   let scale = $state<Scale>(untrack(() => playback(gameId).scale));
+  let ff = $state<FastForward>(untrack(() => playback(gameId).toggle ? "toggle" : "hold"));
   let filterError = $state("");
   $effect(() => {
     const filter = gameFilter(gameId);
@@ -65,7 +74,7 @@
   }
   $effect(() => {
     if (!gameView) return;
-    const value = { ...playback(gameId), scale };
+    const value = { ...playback(gameId), scale, toggle: ff === "toggle" };
     void call("set_game_playback", { playback: value }, null).catch((e) => filterError = String(e));
   });
   let touchMode = $derived(prefs.touchMode);
@@ -85,7 +94,7 @@
     const timer = setInterval(() => {
       void call<boolean>("game_presented", {}, true).then((v) => (presented = v));
     }, 150);
-    const slow = setTimeout(() => (slowLoad = true), 10_000);
+    const slow = setTimeout(() => (slowLoad = true), 4_000);
     return () => {
       clearInterval(timer);
       clearTimeout(slow);
@@ -127,11 +136,20 @@
   const sparkline = $derived(
     frames.map((v, i) => `${((i * 148) / Math.max(1, frames.length - 1)).toFixed(1)},${graphY(v)}`).join(" "),
   );
+  function updateOverrides(patch: { scale?: Scale; ff?: FastForward }) {
+    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
+    Object.assign(setup.overrides, patch);
+    saveGameSetup(gameId, setup);
+  }
+
   function pickScale(value: Scale) {
     scale = value;
-    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
-    setup.overrides.scale = value;
-    saveGameSetup(gameId, setup);
+    updateOverrides({ scale: value });
+  }
+
+  function pickFf(value: FastForward) {
+    ff = value;
+    updateOverrides({ ff: value });
   }
 
   const started = Date.now();
@@ -141,6 +159,11 @@
     return () => clearInterval(timer);
   });
   const sessionMinutes = $derived(Math.max(0, Math.floor((now - started) / 60_000)));
+
+  const fastForwards: { value: FastForward; label: string }[] = [
+    { value: "hold", label: t("按住") },
+    { value: "toggle", label: t("切换") },
+  ];
 
   const scales: { value: Scale; label: string }[] = [
     { value: "int", label: t("整数倍") },
@@ -193,6 +216,27 @@
     return () => clearTimeout(timer);
   });
 
+  $effect(() => {
+    if (!phone || !prefs.hideControls || view !== "closed" || loading || dialogs.length || textBar || stopping) {
+      recallHint = false;
+      return;
+    }
+    if (pendingRecallHint || !prefs.hideControlsHintSeen) {
+      pendingRecallHint = false;
+      if (!prefs.hideControlsHintSeen) {
+        prefs.hideControlsHintSeen = true;
+        savePrefs();
+      }
+      recallHint = true;
+    }
+  });
+
+  $effect(() => {
+    if (!recallHint) return;
+    const timer = setTimeout(() => (recallHint = false), 2800);
+    return () => clearTimeout(timer);
+  });
+
   /** macOS: the window's title bar holds the pause button (see chrome.rs). */
   const titleBar = $derived(gameView && !phone);
 
@@ -220,6 +264,7 @@
       return true;
     });
     return () => {
+      stopBackspace(true);
       void call("set_pause_available", { available: false }, null).catch(() => {});
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
@@ -230,6 +275,56 @@
       stopScreen();
       stopBack();
     };
+  });
+
+  function sendBackspaceEdge(down: boolean) {
+    void call("game_key", { key: 0x08, down }, null).catch(() => {});
+  }
+
+  function tapBackspace() {
+    if (backspaceReleaseTimer !== undefined) {
+      clearTimeout(backspaceReleaseTimer);
+      sendBackspaceEdge(false);
+    }
+    sendBackspaceEdge(true);
+    backspaceReleaseTimer = setTimeout(() => {
+      backspaceReleaseTimer = undefined;
+      sendBackspaceEdge(false);
+    }, 60);
+  }
+
+  function stopBackspace(releaseNow = false) {
+    backspacePointer = null;
+    if (backspaceHoldTimer !== undefined) {
+      clearTimeout(backspaceHoldTimer);
+      backspaceHoldTimer = undefined;
+    }
+    if (backspaceRepeatTimer !== undefined) {
+      clearInterval(backspaceRepeatTimer);
+      backspaceRepeatTimer = undefined;
+    }
+    if (releaseNow && backspaceReleaseTimer !== undefined) {
+      clearTimeout(backspaceReleaseTimer);
+      backspaceReleaseTimer = undefined;
+      sendBackspaceEdge(false);
+    }
+  }
+
+  function startBackspace(event: PointerEvent) {
+    event.preventDefault();
+    backspaceFromPointer = true;
+    stopBackspace();
+    backspacePointer = event.pointerId;
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    tapBackspace();
+    backspaceHoldTimer = setTimeout(() => {
+      backspaceHoldTimer = undefined;
+      backspaceRepeatTimer = setInterval(tapBackspace, 85);
+    }, 420);
+  }
+
+  $effect(() => {
+    if (!textBar) stopBackspace(true);
   });
 
   function openTextBar() {
@@ -320,6 +415,7 @@
     {@const g = screen.layout?.game}
     <div class="loading over fade" style={g ? `left: ${g.x}px; top: ${g.y}px; width: ${g.width}px; height: ${g.height}px` : "inset: 0"}>
       <div class="spinner" role="progressbar" aria-label={t("加载中")}></div>
+      <div class="loading-msg">{t("正在准备游戏…")}</div>
       {#if slowLoad && !stopping}
         <button class="quiet" onclick={leave} {@attach region}>{t("退出游戏")}</button>
       {/if}
@@ -397,6 +493,14 @@
                 </div>
               </div>
               <div class="prow">
+                <span>{t("快进键")}</span>
+                <div class="seg" role="group" aria-label={t("快进键")}>
+                  {#each fastForwards as o (o.value)}
+                    <button class:on={ff === o.value} aria-pressed={ff === o.value} onclick={() => pickFf(o.value)}>{o.label}</button>
+                  {/each}
+                </div>
+              </div>
+              <div class="prow">
                 <span>{t("音量")}</span>
                 <div class="vol">
                   <button class="ibtn" class:on={muted} aria-label={t("静音")} aria-pressed={muted} onclick={() => { prefs.muted = !muted; savePrefs(); }}>
@@ -418,6 +522,22 @@
                 <div class="prow">
                   <span>{t("触控板模式")}</span>
                   <button class="sw" class:on={touchMode === "trackpad"} role="switch" aria-checked={touchMode === "trackpad"} aria-label={t("触控板模式")} onclick={() => { prefs.touchMode = touchMode === "trackpad" ? "direct" : "trackpad"; savePrefs(); }}></button>
+                </div>
+                <div class="prow">
+                  <span>{t("隐藏控件")}</span>
+                  <button
+                    class="sw"
+                    class:on={prefs.hideControls}
+                    role="switch"
+                    aria-checked={prefs.hideControls}
+                    aria-label={t("隐藏控件")}
+                    onclick={() => {
+                      const next = !prefs.hideControls;
+                      prefs.hideControls = next;
+                      pendingRecallHint = next;
+                      savePrefs();
+                    }}
+                  ></button>
                 </div>
               {/if}
               <div class="prow">
@@ -467,13 +587,13 @@
     </div>
   {:else if loading || dialogs.length}
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
-  {:else if phone && screen.layout}
+  {:else if phone && !prefs.hideControls && screen.layout}
     {#if !stopping}
-      <TouchControls layout={screen.layout} latchCtrl={playback(gameId).toggle} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <TouchControls layout={screen.layout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
-  {:else if phone}
+  {:else if phone && !prefs.hideControls}
     <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
-  {:else if !titleBar}
+  {:else if !phone && !titleBar}
     <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
       <Icon name="pause" />
     </button>
@@ -488,6 +608,12 @@
 
   {#if dialogs.length && view === "closed"}
     <GuestDialogs {dialogs} />
+  {/if}
+
+  {#if recallHint}
+    <div class="recall-hint over fade" role="status" aria-live="polite" {@attach shown}>
+      {t(device.platform === "android" ? "使用返回手势或返回键可打开菜单" : "从屏幕左或右边缘向内滑可打开菜单")}
+    </div>
   {/if}
 
   {#if backHint}
@@ -507,6 +633,24 @@
         autocomplete="off"
         spellcheck="false"
       />
+      <button
+        type="button"
+        class="text-key"
+        aria-label={t("退格")}
+        title={t("退格")}
+        onmousedown={(e) => e.preventDefault()}
+        onpointerdown={startBackspace}
+        onpointerup={(e) => { if (e.pointerId === backspacePointer) stopBackspace(); }}
+        onpointercancel={(e) => { if (e.pointerId === backspacePointer) stopBackspace(); }}
+        onlostpointercapture={() => stopBackspace()}
+        onclick={() => {
+          if (backspaceFromPointer) {
+            backspaceFromPointer = false;
+            return;
+          }
+          tapBackspace();
+        }}
+      ><Icon name="backspace" size={16} /></button>
       <button class="quiet" style="height: 38px; box-sizing: border-box" onclick={() => (textBar = false)}>{t("取消")}</button>
       <button class="primary" style="height: 38px" disabled={!text} onclick={send}>{t("发送")}</button>
     </div>
@@ -928,6 +1072,11 @@
     align-items: center;
     gap: 6px;
   }
+  .phone .textbar {
+    top: max(12px, var(--safe-top));
+    bottom: auto;
+    width: min(520px, calc(100% - max(32px, var(--safe-left) + var(--safe-right) + 24px)));
+  }
   .kbd {
     flex: 0 0 auto;
     width: 36px;
@@ -943,6 +1092,48 @@
     padding: 0 8px;
     font-size: 15px;
     color: var(--fg);
+  }
+  .text-key {
+    all: unset;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    width: 38px;
+    height: 38px;
+    border-radius: 19px;
+    display: grid;
+    place-items: center;
+    color: var(--fg2);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .text-key:hover {
+    background: var(--hover);
+    color: var(--fg);
+  }
+  .text-key:active {
+    background: var(--field);
+    color: var(--fg);
+  }
+  .text-key:focus-visible {
+    outline: 2px solid #8fb0f5;
+    outline-offset: 2px;
+  }
+  .recall-hint {
+    position: absolute;
+    left: 50%;
+    bottom: calc(18px + var(--safe-bottom));
+    transform: translateX(-50%);
+    max-width: calc(100% - 32px);
+    padding: 7px 14px;
+    border-radius: 999px;
+    background: rgba(20, 20, 22, 0.78);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 12px;
+    white-space: nowrap;
+    pointer-events: none;
   }
   .primary:focus-visible,
   .secondary:focus-visible,
@@ -1150,6 +1341,10 @@
     border: 2.5px solid rgba(255, 255, 255, 0.16);
     border-top-color: rgba(255, 255, 255, 0.8);
     animation: spin 0.9s linear infinite;
+  }
+  .loading-msg {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.68);
   }
   @keyframes spin {
     to {

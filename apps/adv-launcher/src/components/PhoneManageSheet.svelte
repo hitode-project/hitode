@@ -8,6 +8,7 @@
   import { canReveal, reveal, revealC } from "../lib/reveal";
   import { device } from "../lib/device.svelte";
   import { library } from "../lib/library.svelte";
+  import { gameStorage, removeConfirmText, type RemovableCopy } from "../lib/game-storage.svelte";
   import { nav, type Route } from "../lib/nav.svelte";
   import type { Game } from "../lib/types";
 
@@ -16,15 +17,33 @@
     game: Game;
     returnTo: string | null;
     onclose: () => void;
-    /** Called after the game was removed from the library. */
-    onremoved: () => void;
+    /** Called after the game was removed from the library; true if its internal copy was also deleted. */
+    onremoved: (deletedFiles: boolean) => void;
   }
 
   let { game, returnTo, onclose, onremoved }: Props = $props();
 
   let view = $state<"menu" | "confirm">("menu");
+  let copyInfo = $state<RemovableCopy | null>(null);
+  let deleteCopy = $state(false);
+  let removing = $state(false);
+  let removeError = $state("");
+  const prompt = $derived(removeConfirmText(copyInfo, deleteCopy));
+
+  $effect(() => {
+    if (view !== "confirm") return;
+    let active = true;
+    deleteCopy = false;
+    removeError = "";
+    copyInfo = null;
+    void gameStorage.removableCopy(game.id).then((info) => {
+      if (active) copyInfo = info;
+    });
+    return () => { active = false; };
+  });
 
   function back() {
+    if (removing) return true;
     if (metadata) metadata = false;
     else if (editing) editing = false;
     else if (view === "confirm") view = "menu";
@@ -76,9 +95,19 @@
     onclose();
   }
 
-  function remove() {
-    void library.remove(game.id);
-    onremoved();
+  async function remove() {
+    if (removing) return;
+    const target = prompt.targetCopy;
+    removing = true;
+    removeError = "";
+    try {
+      await gameStorage.removeGame(game.id, target);
+      onremoved(!!target);
+    } catch (error) {
+      removeError = String(error);
+    } finally {
+      removing = false;
+    }
   }
 
 </script>
@@ -143,10 +172,17 @@
       {:else}
         <div class="confirm">
           <div class="confirm-t">{t("从游戏库移除？")}</div>
-          <div class="confirm-s">{t("游戏文件不会被删除")}</div>
+          <div class="confirm-s">{prompt.subtitle}</div>
+          {#if prompt.canDeleteCopy}
+            <label class="copy-opt">
+              <input type="checkbox" bind:checked={deleteCopy} disabled={removing} />
+              <span>{t("同时删除内部副本（含存档，不可撤销）")}</span>
+            </label>
+          {/if}
+          {#if removeError}<div class="confirm-err" role="alert">{removeError}</div>{/if}
         </div>
-        <button class="cancel danger" onclick={remove}>{t("移除")}</button>
-        <button class="cancel" onclick={back}>{t("取消")}</button>
+        <button class="cancel danger" disabled={removing} onclick={() => void remove()}>{prompt.action}</button>
+        <button class="cancel" disabled={removing} onclick={back}>{t("取消")}</button>
       {/if}
     </div>
 </div>
@@ -320,6 +356,31 @@
     margin-top: 6px;
     font-size: 14px;
     color: var(--fg3);
+  }
+  .copy-opt {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 12px;
+    padding: 11px 14px;
+    border-radius: 12px;
+    background: var(--field);
+    font-size: 14px;
+    color: var(--fg2);
+    text-align: left;
+    cursor: pointer;
+  }
+  .copy-opt input {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    accent-color: var(--danger);
+  }
+  .confirm-err {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--danger);
   }
 
   .si:focus-visible, .cancel:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }

@@ -15,6 +15,7 @@ import {
 import { placeAmong, sortGames } from "./arrange";
 import { prefs, savePrefs } from "./prefs.svelte";
 import { minutesByDay } from "./stats";
+import { storageSize, takeCopyableUri } from "./storage";
 import type { Game, LibraryFilter } from "./types";
 
 const COVERS = 12;
@@ -65,20 +66,33 @@ class Library {
   now = $state(Date.now());
   /** A game the library screen should select when it opens next (after a game ends). */
   focus = $state<string | null>(null);
+  /** Game id currently running through `relocate`, and any copy progress status. */
+  relocating = $state<string | null>(null);
+  relocateStatus = $state("");
 
   /** Removed entries as the host returned them, for undo. */
   #removed: { entry: LibraryGame | null; game: Game; index: number } | null = null;
+  #loaded = !inTauri;
+  #seq = 0;
 
   constructor() {
     if (!inTauri) return;
     void this.refresh();
     onHostEvent("game_finished", () => void this.refresh());
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && !this.#loaded) void this.refresh();
+      });
+    }
   }
 
   async refresh(): Promise<void> {
     if (!inTauri) return;
+    const seq = ++this.#seq;
     try {
       const list = await libraryList();
+      if (seq !== this.#seq) return;
+      this.#loaded = true;
       this.now = Date.now();
       this.games = list.map((g) => toGame(g, this.now));
     } catch (error) {
@@ -183,15 +197,30 @@ class Library {
 
   /** 找回: points a missing game at the folder the user picks, keeping its main program if it is there. */
   async relocate(id: string): Promise<boolean> {
+    if (this.relocating !== null) return false;
     const game = this.get(id);
     if (!game) return false;
     if (!inTauri) {
       game.offline = null;
       return true;
     }
+    this.relocating = id;
+    this.relocateStatus = "";
+    let total = 0;
     try {
-      const folder = await libraryPickFolder();
+      const folder = await libraryPickFolder({
+        signal: new AbortController().signal,
+        onSize: (bytes) => {
+          total = bytes;
+          this.relocateStatus = storageSize(bytes);
+        },
+        onProgress: (progress) => {
+          this.relocateStatus = `${storageSize(total)} · ${total ? Math.min(100, Math.floor(progress.bytes * 100 / total)) : 100}%`;
+        },
+      });
+      takeCopyableUri();
       if (!folder) return false;
+      this.relocateStatus = "";
       const inspection = await libraryInspect(folder);
       if (!inspection) return false;
       const exes = inspection.exes.map((e) => e.path);
@@ -207,6 +236,9 @@ class Library {
     } catch (error) {
       console.error("relocating the game failed", error);
       return false;
+    } finally {
+      this.relocating = null;
+      this.relocateStatus = "";
     }
   }
 

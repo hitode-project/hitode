@@ -8,47 +8,36 @@
   import PhoneImportPage from "../components/PhoneImportPage.svelte";
   import PhoneImportPermission from "../components/PhoneImportPermission.svelte";
   import PhoneImportSwitch from "../components/PhoneImportSwitch.svelte";
+  import { inTauri } from "../lib/bridge";
   import { device } from "../lib/device.svelte";
-  import { hasStoragePermission } from "../lib/storage";
   import { depthLabel, SCAN_DEPTHS, SCAN_ENC_OPTIONS, scanLocked, scanNote, ScanPick } from "../lib/import-flow.svelte";
   import { nav } from "../lib/nav.svelte";
 
   const ios = $derived(device.platform === "ios");
-  // Storage access comes first: on iOS every folder is picked through Files, on
-  // Android once the permission is granted the folder picker opens directly.
-  let asking = $state(true);
-  let checking = $state(true);
-  let permissionError = $state("");
+  const platformReady = $derived(!inTauri || device.version !== "browser preview");
+  // On iOS every folder is picked through Files via the upfront sheet; on Android the
+  // system folder picker opens directly and prompts only if all-files access or copy is needed.
+  let sheetDone = $state(false);
+  const sheetOpen = $derived(platformReady && ios && !sheetDone);
 
   const scan = new ScanPick();
+  // The folder picker opens once iOS Files guidance (if applicable) is settled.
   $effect(() => {
-    const platform = device.platform;
-    let active = true;
-    checking = true;
-    void hasStoragePermission().then((granted) => {
-      if (active) { asking = platform === "ios" || !granted; checking = false; }
-    }, (error) => {
-      if (active) { permissionError = String(error); checking = false; }
-    });
-    return () => { active = false; };
-  });
-  // The folder picker opens once storage access is settled.
-  $effect(() => {
-    if (!asking) void scan.begin();
+    if (platformReady && (!ios || sheetDone)) void scan.begin();
   });
 </script>
 
 <PhoneImportPage>
-  <div class="base" inert={asking}>
+  <div class="base" inert={sheetOpen}>
     <PhoneImportHeader label={t("取消")} onclose={() => nav.back()} />
 
     <main class="scroll body">
       <div>
         <h1>{t("添加文件夹")}</h1>
-        {#if !asking}<div class="mono" style="margin-top: 6px">{scan.root}</div>{/if}
+        {#if !sheetOpen}<div class="mono" style="margin-top: 6px">{scan.root}</div>{/if}
       </div>
 
-      {#if !asking}
+      {#if !sheetOpen}
         <div style="display: flex; flex-direction: column; gap: 10px">
           <div class="lbl" id="p-lbl-depth">{t("子文件夹层数")}</div>
           <div class="seg" role="group" aria-labelledby="p-lbl-depth">
@@ -114,17 +103,15 @@
       {/if}
     </main>
 
-    {#if !asking}
+    {#if !sheetOpen}
       <PhoneImportFooter>
         <button class="primary" onclick={() => scan.add()} disabled={scan.adding || (!scan.done && scan.chosen.length === 0)}>{scan.addLabel}</button>
       </PhoneImportFooter>
     {/if}
   </div>
 
-  {#if permissionError}
-    <div class="status err" role="status">{permissionError}</div>
-  {:else if asking && !checking}
-    <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} />
+  {#if sheetOpen}
+    <PhoneImportPermission oncancel={() => nav.back()} onscan={() => (sheetDone = true)} />
   {/if}
 </PhoneImportPage>
 

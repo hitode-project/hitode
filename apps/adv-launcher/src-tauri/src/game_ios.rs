@@ -559,7 +559,7 @@ pub async fn game_mouse_button(
     .await
 }
 
-/// The overlay's keys: Enter, Esc, Space, Tab and Ctrl, as virtual keys.
+/// The overlay's keys: Backspace, Enter, Esc, Space, Tab and Ctrl, as virtual keys.
 #[tauri::command]
 pub async fn game_key(window: WebviewWindow, key: u32, down: bool) -> Result<(), String> {
     on_ui(window.app_handle(), move || {

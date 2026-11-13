@@ -36,7 +36,7 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-9 Game import
 
-**Rule**: All-files access MUST use primary-storage real paths, while other folders MUST copy through SAF into private storage before library discovery. Copies MUST report byte progress, publish complete by same-parent rename, and remove temporary directories on failure or cancellation without modifying sources. Shared Rust library, settings and playtime storage MUST live under `app_data_dir`, and `reveal_path` MUST open only shared-storage folders, in DocumentsUI.
+**Rule**: All-files access MUST use writable external-storage volume real paths, while other folders MUST copy through SAF into private storage before library discovery. Copies MUST report byte progress, publish complete by same-parent rename, and remove temporary directories on failure or cancellation without modifying sources. Shared Rust library, settings and playtime storage MUST live under `app_data_dir`, and `reveal_path` MUST open only external-storage volume folders, in DocumentsUI.
 **Applies to**: Android
 **Verification**: Test — permission screens and SAF providers also require device review.
 

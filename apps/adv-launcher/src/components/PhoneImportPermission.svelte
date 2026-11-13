@@ -5,24 +5,20 @@
   import { inTauri } from "../lib/bridge";
   import { jit } from "../lib/jit.svelte";
   import { prefs, savePrefs } from "../lib/prefs.svelte";
-  import { prepareFolder, requestStoragePermission, storageSize } from "../lib/storage";
+  import { prepareFolder, storageSize } from "../lib/storage";
   import { nav } from "../lib/nav.svelte";
 
   interface Props {
-    /** iOS picks folders through Files and needs no permission step. */
-    ios: boolean;
     oncancel: () => void;
     /** A folder was picked, and copied if it had to be: scan it. */
     onscan: () => void;
   }
 
-  let { ios, oncancel, onscan }: Props = $props();
+  let { oncancel, onscan }: Props = $props();
 
-  type Step = "ask" | "granted" | "copy";
+  type Step = "ask" | "copy";
 
   let step = $state<Step>("ask");
-  /** The granted step's buttons appear once the system screen has settled. */
-  let ready = $state(false);
   let busy = $state(false);
   let error = $state("");
   let copySize = $state(inTauri ? "…" : COPY_SIZE);
@@ -31,47 +27,29 @@
   let showLiveContainerHint = $state(false);
 
   $effect(() => {
-    if (ios && jit.status?.liveContainer && !prefs.liveContainerImportHintSeen) {
+    if (jit.status?.liveContainer && !prefs.liveContainerImportHintSeen) {
       showLiveContainerHint = true;
       prefs.liveContainerImportHintSeen = true;
       savePrefs();
     }
   });
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  $effect(() => () => { clearTimeout(timer); operation?.abort(); });
+  $effect(() => () => { operation?.abort(); });
 
   function go(next: Step) {
-    clearTimeout(timer);
     step = next;
-    ready = false;
     error = "";
   }
 
-  async function grant() {
-    busy = true;
-    error = "";
-    try {
-      if (await requestStoragePermission()) {
-        go("granted");
-        timer = setTimeout(() => (ready = true), 900);
-      }
-    } catch (cause) {
-      error = String(cause);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function selectFolder(copy: boolean) {
+  async function selectFolder() {
     operation = new AbortController();
     const controller = operation;
     busy = true;
     error = "";
     let total = 0;
     try {
-      if (await prepareFolder(copy, controller.signal,
-        (bytes) => { total = bytes; copySize = storageSize(bytes); if (!copy) go("copy"); },
+      if (await prepareFolder(false, controller.signal,
+        (bytes) => { total = bytes; copySize = storageSize(bytes); go("copy"); },
         (progress) => { copySize = `${storageSize(total)} · ${total ? Math.min(100, Math.floor(progress.bytes * 100 / total)) : 100}%`; },
       )) onscan();
     } catch (cause) {
@@ -119,37 +97,7 @@
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="perm-t" tabindex="-1" bind:this={sheet}>
     <span class="grab" aria-hidden="true"></span>
 
-    {#if !ios && step === "ask"}
-      <div class="step">
-        <div class="badge" aria-hidden="true">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M11.5 19H4.5A1.5 1.5 0 0 1 3 17.5v-11A1.5 1.5 0 0 1 4.5 5h4.2l2 2h8.8A1.5 1.5 0 0 1 21 8.5V11"></path><path d="M18 13.2l3.5 1.3v2.7c0 2.2-1.5 3.8-3.5 4.6-2-.8-3.5-2.4-3.5-4.6v-2.7z"></path></svg>
-        </div>
-        <h2 id="perm-t" class="ttl">{t("允许访问游戏文件夹")}</h2>
-        <p class="line">{error || t("游戏留在原处，启动器只读取，不会修改或上传。")}</p>
-        <div class="acts">
-          <button class="primary" onclick={grant} disabled={busy}>
-            <span>{t("去授权")}</span>
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h6v6M12 4l-7.5 7.5"></path></svg>
-          </button>
-          <button class="secondary" onclick={() => go("copy")} disabled={busy}>{t("改为复制到本机")}</button>
-          <button class="quiet" onclick={cancel}>{t("取消")}</button>
-        </div>
-      </div>
-    {:else if !ios && step === "granted"}
-      <div class="step">
-        <div class="badge ok" aria-hidden="true">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 12.5l3.6 3.6L17.5 8.5"></path></svg>
-        </div>
-        <h2 id="perm-t" class="ttl">{error || t("已授权")}</h2>
-        <div class="acts" class:wait={!ready}>
-          <button class="primary" disabled={!ready || busy} onclick={() => selectFolder(false)}>
-            <Icon name="folder" size={17} stroke={1.5} />
-            <span>{t("选择文件夹…")}</span>
-          </button>
-          <button class="quiet" onclick={cancel} disabled={!ready}>{t("取消")}</button>
-        </div>
-      </div>
-    {:else if step === "copy"}
+    {#if step === "copy"}
       <div class="step">
         <div class="badge" aria-hidden="true">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><rect x="6" y="2.5" width="12" height="19" rx="2.5"></rect><path d="M12 7.5v7M9 11.5l3 3 3-3"></path></svg>
@@ -157,7 +105,7 @@
         <h2 id="perm-t" class="ttl">{t("复制到本机")}</h2>
         <p class="line">{error || `${t("副本预计额外占用")} ${copySize}`}</p>
         <div class="acts">
-          <button class="primary" onclick={() => selectFolder(true)} disabled={busy}>
+          <button class="primary" onclick={selectFolder} disabled={busy}>
             <Icon name="folder" size={17} stroke={1.5} />
             <span>{t("选择文件夹…")}</span>
           </button>
@@ -175,7 +123,7 @@
           <p class="line">{t("请先返回 LiveContainer，长按 Hitode → 设置，打开“使用 LiveContainer 的包名”，再重新启动 Hitode，否则可能在“文件”里点“打开”后没有反应。")}</p>
         {/if}
         <div class="acts">
-          <button class="primary" onclick={() => selectFolder(false)} disabled={busy}>{t("打开“文件”")}</button>
+          <button class="primary" onclick={selectFolder} disabled={busy}>{t("打开“文件”")}</button>
           <button class="quiet" onclick={oncancel}>{t("取消")}</button>
         </div>
       </div>
@@ -251,11 +199,6 @@
     background: var(--tint);
     color: var(--badge);
   }
-  .badge.ok {
-    background: var(--accent);
-    color: var(--on-accent);
-    animation: pop 0.32s cubic-bezier(0.2, 0.9, 0.3, 1.3);
-  }
   .ttl {
     margin: 16px 0 0;
     font-size: 20px;
@@ -275,14 +218,8 @@
     flex-direction: column;
     gap: 8px;
     margin-top: 28px;
-    transition: opacity 0.2s ease;
   }
-  .acts.wait {
-    opacity: 0;
-    pointer-events: none;
-  }
-  .acts .primary,
-  .acts .secondary {
+  .acts .primary {
     height: 48px;
     padding: 0 28px;
     border-radius: 24px;
@@ -346,23 +283,11 @@
       opacity: 1;
     }
   }
-  @keyframes pop {
-    from {
-      transform: scale(0.6);
-    }
-    to {
-      transform: none;
-    }
-  }
   @media (prefers-reduced-motion: reduce) {
     .sheet,
     .scrim,
-    .step,
-    .badge.ok {
+    .step {
       animation: none;
-    }
-    .acts {
-      transition: none;
     }
   }
 </style>

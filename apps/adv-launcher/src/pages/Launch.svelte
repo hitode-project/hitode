@@ -31,7 +31,7 @@
           <div class="msg">{flow.reason}</div>
           <div class="acts">
             <button class="btn primary" disabled={flow.recovering} onclick={() => flow.recoverFolder()}>
-              {t(flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
+              {t(flow.recovery === "permission" ? "去授权" : flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
             </button>
             <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
             <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
@@ -43,6 +43,7 @@
           <div class="mono why">{flow.reason}</div>
           <div class="acts">
             <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
+            <button class="btn quiet" onclick={() => flow.changeExe()}>{t("此游戏的设置…")}</button>
             <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
             <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
           </div>

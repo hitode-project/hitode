@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
+  import AndroidStorageSetting from "../components/AndroidStorageSetting.svelte";
   import GameStorageSetting from "../components/GameStorageSetting.svelte";
   import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
   import { preview } from "../lib/bridge";
@@ -105,6 +106,15 @@
           <span class="t">{t("显示帧率")}</span>
           <SettingsSwitch touch={device.touch} label={t("显示帧率")} checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
         </div>
+        {#if device.touch}
+          <div class="row">
+            <span class="t two">
+              <span>{t("隐藏控件")}</span>
+              <span class="meta">{t(device.platform === "android" ? "使用返回手势或返回键呼出菜单" : "从屏幕左或右边缘向内滑呼出菜单")}</span>
+            </span>
+            <SettingsSwitch touch label={t("隐藏控件")} checked={prefs.hideControls} onchange={(v) => set("hideControls", v)} />
+          </div>
+        {/if}
       {/if}
     </section>
 
@@ -153,6 +163,7 @@
 
     <section class="sec" aria-labelledby="g-store">
       <h2 id="g-store">{t("存储")}</h2>
+      <AndroidStorageSetting />
       <GameStorageSetting />
       {#if preview}
         <div class="store">

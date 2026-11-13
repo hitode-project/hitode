@@ -16,6 +16,9 @@
       <header>
         <h1 lang="ja">{pick.title.trim() || pick.inspection.title}</h1>
         <div class="mono" style="margin-top: 8px">{pick.inspection.folder}</div>
+        {#if pick.canCopy}
+          <button class="quiet" style="margin: 4px 0 0 -8px" onclick={() => void pick.copyToHitode()}>{t("复制到 Hitode…")}</button>
+        {/if}
         {#if pick.inspection.inLibrary !== null}<div class="hint" style="margin-top: 6px">{t("这个文件夹里已有游戏")}</div>{/if}
       </header>
 
@@ -50,7 +53,7 @@
       {/if}
     {:else}
       <div class="status" class:err={pick.phase === "error"} role="status">
-        {pick.phase === "error" ? pick.error : pick.phase === "picking" ? t("正在选择文件夹…") : t("正在读取文件夹…")}
+        {pick.phase === "error" ? pick.error : pick.copyStatus || (pick.phase === "picking" ? t("正在选择文件夹…") : t("正在读取文件夹…"))}
       </div>
       {#if pick.phase === "error"}
         <button class="quiet" style="align-self: center" onclick={() => void pick.pick()}>{t("重新选择文件夹…")}</button>

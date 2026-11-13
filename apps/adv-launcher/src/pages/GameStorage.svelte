@@ -6,6 +6,7 @@
   import { storageSize } from "../lib/storage";
   import { device } from "../lib/device.svelte";
   import { t } from "../lib/i18n.svelte";
+  import { androidStorage } from "../lib/android-access.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import { gameStorage, type GameCopy, type GameLocation } from "../lib/game-storage.svelte";
@@ -18,12 +19,14 @@
   let dialog: HTMLDialogElement;
   let dialogOpen = $state(false);
   const game = $derived(gameId ? library.get(gameId) : undefined);
+  const blocked = $derived(!!game && androidStorage.blocked(game.path, game.offline));
   let location = $state<GameLocation | null>(null);
   let loading = $state(true);
   let busy = $state(false);
   let problem = $state("");
   let exportedPath = $state<string | null>(null);
-  const locationLabel = $derived(game?.offline === "disk" ? "所在磁盘未连接"
+  const locationLabel = $derived(blocked ? "需要文件访问权限"
+    : game?.offline === "disk" ? "所在磁盘未连接"
     : game?.offline ? location?.kind === "copy" ? "文件已移除" : "找不到文件夹"
     : location?.kind === "copy" ? "Hitode 内部副本" : location?.kind === "documents" ? "Hitode 文件夹" : "外部文件夹");
   const gameFolder = $derived(game?.offline ? null : location?.copy);
@@ -118,7 +121,8 @@
       <button class="quiet destructive" disabled={busy} onclick={() => show("delete", displayCopy(folder), folder)}>{t("删除本地副本")}</button>
     {/if}
     {#if game && !game.offline}
-      <button class="quiet" disabled={busy} onclick={() => void run(async () => { await library.relocate(game.id); })}>{t("重新定位…")}</button>
+      {@const relocating = library.relocating === game.id}
+      <button class="quiet" disabled={busy || relocating} onclick={() => void run(async () => { await library.relocate(game.id); })}>{t("重新定位…")}</button>
     {/if}
   </div>
 {/snippet}
@@ -129,15 +133,22 @@
     {#if !device.phone}<button class="quiet back" onclick={() => { if (!nav.requestBack()) nav.back(); }}><Icon name="chevron-left" size={15} />{t("返回")}</button>{/if}
     <h1>{t(gameId ? "游戏文件" : "游戏存储")}</h1>
     {#if problem}<p role="alert" class="destructive">{problem}</p>{/if}
-    {#if busy || loading}<p role="status" class="sub">{t(busy ? "正在处理…" : "正在读取文件夹…")}</p>{/if}
+    {#if busy || loading}<p role="status" class="sub">{game && library.relocating === game.id && library.relocateStatus ? library.relocateStatus : t(busy ? "正在处理…" : "正在读取文件夹…")}</p>{/if}
     {#if game}
       <div class="game">
         <Cover {game} style="width: 65px; flex: none" />
-        <div><h2>{game.title}</h2>{#if game.offline || location}<span class="sub">{t(locationLabel)}</span>{/if}</div>
+        <div><h2>{game.title}</h2>{#if game.offline || location || blocked}<span class="sub">{t(locationLabel)}</span>{/if}</div>
       </div>
-      <div class="mono path">{location?.displayPath ?? ""}</div>
-      {#if game.offline}
-        <button class="primary" disabled={busy} onclick={() => void run(async () => { if (preview) game.path = "~/Games/" + game.title; await library.relocate(game.id); })}>{t("重新定位…")}</button>
+      <div class="mono path">{blocked ? game.path : (location?.displayPath ?? "")}</div>
+      {#if blocked}
+        {@const relocating = library.relocating === game.id}
+        <div class="actions">
+          <button class="primary" disabled={busy || androidStorage.busy} onclick={() => androidStorage.request()}>{t("去授权")}</button>
+          <button class="quiet" disabled={busy || relocating} onclick={() => void run(async () => { await library.relocate(game.id); })}>{t("重新定位…")}</button>
+        </div>
+      {:else if game.offline}
+        {@const relocating = library.relocating === game.id}
+        <button class="primary" disabled={busy || relocating} onclick={() => void run(async () => { if (preview) game.path = "~/Games/" + game.title; await library.relocate(game.id); })}>{t("重新定位…")}</button>
       {:else if location}
         {#if gameFolder}<p class="sub">{storageSize(gameFolder.bytes)} · {t("关联 {0} 个游戏", gameStorage.linked(gameFolder).length)}</p>{/if}
         {@render actions(location.displayPath, gameFolder, location.canReveal)}

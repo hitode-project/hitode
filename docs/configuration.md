@@ -43,7 +43,8 @@ Automatic update checks default to on (`autoCheckUpdates`). The launcher checks 
 
 On iOS, JIT warnings are shown by default; "Don't remind me again" on the library banner persistently hides both the banner and game-launch warnings (`hideJitWarnings`).
 LiveContainer folder-import guidance is shown once and records `liveContainerImportHintSeen` when displayed.
-Both choices use `adv-launcher.prefs` and survive launcher restarts.
+On mobile, `hideControls` hides persistent in-game touch controls and the pull handle while playing (default off, leaving the pause menu reachable via system back on Android or left/right screen-edge swipes on iOS); its first display records `hideControlsHintSeen`.
+Both JIT and mobile guidance choices use `adv-launcher.prefs` and survive launcher restarts.
 
 The import page lists VNDB candidates for the game and links only the one the user picks; the default is no link. Searching accepts names, `v` identifiers and VNDB visual novel links, ten candidates per page.
 Searching automatically at import stays off until the user answers a one-time prompt on the first import; dismissing it keeps search manual. The choice lives in `adv-launcher.prefs` and the settings switch changes it. Only game names are sent.

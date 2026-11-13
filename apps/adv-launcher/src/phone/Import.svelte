@@ -20,6 +20,9 @@
       <div>
         <h1 lang="ja">{pick.title.trim() || pick.inspection.title}</h1>
         <div class="mono" style="margin-top: 6px">{pick.inspection.folder}</div>
+        {#if pick.canCopy}
+          <button class="quiet" style="margin: 4px 0 0 -8px" onclick={() => void pick.copyToHitode()}>{t("复制到 Hitode…")}</button>
+        {/if}
         {#if pick.inspection.inLibrary !== null}<div class="hint" style="margin-top: 6px">{t("这个文件夹里已有游戏")}</div>{/if}
       </div>
 
