@@ -32,9 +32,8 @@ fn modified(cpu: &mut dyn Guest) -> ArchitecturalState {
     state.x87.cs = 0x23;
     state.x87.ds = 0x2b;
     state.x87.tag = 0xffff;
-    for physical in 0..8 {
-        state.x87.regs[physical] =
-            X87Register::from_parts(0xa000000000000000 + physical as u64, 0x3fff);
+    for (physical, reg) in state.x87.regs.iter_mut().enumerate() {
+        *reg = X87Register::from_parts(0xa000000000000000 + physical as u64, 0x3fff);
     }
     state.x87.set_physical_tag(2, 0);
     state.x87.set_physical_tag(5, 0);

@@ -13,7 +13,7 @@ crate-type = ["staticlib", "rlib"]
 # Everything that talks to the device is iOS-only; the protocol module and
 # its tests build everywhere.
 [target.'cfg(target_os = "ios")'.dependencies]
-idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "tunnel_tcp_stack", "rsd", "debug_proxy", "mobile_image_mounter", "cryptexd", "tss"] }
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing", "tunnel_tcp_stack", "rsd", "debug_proxy", "mobile_image_mounter", "cryptexd", "tss", "dvt"] }
 tokio = { version = "1", features = ["rt", "net", "time"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }

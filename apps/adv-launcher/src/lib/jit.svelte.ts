@@ -23,11 +23,13 @@ const errors: Record<string, string> = {
   jitExternalRequired: "请用当前系统支持的外部工具启用 JIT：TrollStore、SideStore 或电脑端 SideJITServer。",
   invalidPairing: "这不是配对文件，请选择 StikDebug 使用的 pairingFile.plist",
   lockdownPairing: "这是 SideStore 等使用的旧格式配对文件，请选择 StikDebug 使用的 pairingFile.plist",
+  jitLiveContainerHelper: "LiveContainer 无法启动 Hitode 的 JIT 扩展。请用 iloader 重新安装“LiveContainer + SideStore（每夜构建版）”，长按 Hitode → 设置，打开“启用应用辅助进程”后重新启动 Hitode。",
 };
 
 const stages: Record<string, string> = {
   starting: "正在启动 JIT 助手…",
   connecting: "正在连接设备，请保持 LocalDevVPN 开启…",
+  scanning: "正在查找设备的配对端口…",
   checkingDdi: "正在检查开发者镜像…",
   downloading: "正在下载开发者镜像…",
   mounting: "正在挂载开发者镜像…",
@@ -38,6 +40,8 @@ const stages: Record<string, string> = {
 /** A host error, or a code the helper answers, in the user's words. */
 export function explainJit(error: string): string {
   if (error.startsWith("LocalDevVPN unreachable")) return t("连不上 LocalDevVPN，请确认它已开启并显示已连接");
+  if (error.startsWith("no RemotePairing service found")) return t("设备上找不到配对服务，请确认已开启开发者模式，重新连接 LocalDevVPN 后再试");
+  if (error.includes("Pair verify failed")) return t("这台设备不接受当前的配对文件，请用 iloader 重新生成 pairingFile.plist 并重新导入");
   return errors[error] ? t(errors[error]) : error;
 }
 
@@ -62,7 +66,7 @@ class Jit {
   readonly busy = $derived(!!this.status?.waiting && this.status.task !== "ddiStatus");
   readonly signingUnsupported = $derived(!!this.status && !this.status.ready && !this.status.debuggable);
   /** The host can use the embedded helper and has a pairing file. */
-  readonly configured = $derived(!!this.status && this.status.debuggable && this.status.pairingFile && !this.status.liveContainer && !this.status.externalOnly);
+  readonly configured = $derived(!!this.status && this.status.debuggable && this.status.pairingFile && !this.status.externalOnly);
 
   /** What the row and the banner say about the current state. */
   readonly note = $derived.by(() => {
@@ -92,7 +96,7 @@ class Jit {
   async refresh(): Promise<void> {
     this.status = await call<JitStatus | null>("jit_status", {}, null).catch(() => null);
     const status = this.status;
-    if (!status || status.ready || !status.debuggable || status.liveContainer || status.externalOnly) return;
+    if (!status || status.ready || !status.debuggable || status.externalOnly) return;
     if (status.waiting) return;
     // Enabling checks the image itself, so it goes first.
     if (prefs.autoJit && status.pairingFile && !this.#autoTried) {

@@ -32,9 +32,9 @@ struct Request {
     pid: u32,
     #[serde(default)]
     pairing: Vec<u8>,
-    /// RemotePairing's port, which the host discovers.
+    /// Ports where RemotePairing may listen, most likely first.
     #[serde(default)]
-    remote_pairing_port: u16,
+    remote_pairing_ports: Vec<u16>,
 }
 
 define_class!(
@@ -81,8 +81,8 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     // fresh download may be impossible while LocalDevVPN holds the VPN slot.
     let cache = PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/HitodeJIT");
     let output = std::sync::Mutex::new(stream);
-    let send = |stage: &str, error: Option<String>| {
-        let message = serde_json::json!({"stage": stage, "error": error});
+    let send = |stage: &str, error: Option<String>, port: Option<u16>| {
+        let message = serde_json::json!({"stage": stage, "error": error, "port": port});
         let _ = writeln!(output.lock().unwrap(), "{message}");
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -92,31 +92,48 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     let result = match request.mode {
         Mode::DdiStatus => {
             let present = crate::device::ddi_present(&cache, cryptex);
-            send(if present { "ddiPresent" } else { "ddiMissing" }, None);
-            Ok(())
+            send(
+                if present { "ddiPresent" } else { "ddiMissing" },
+                None,
+                None,
+            );
+            Ok(None)
         }
         Mode::DownloadDdi => runtime.block_on(async {
-            crate::device::download_ddi(&cache, cryptex, &|stage| send(stage, None))
+            crate::device::download_ddi(&cache, cryptex, &|stage| send(stage, None, None))
                 .await
-                .map(drop)
-                .map_err(|error| error.to_string())
+                .map(|_| None)
+                .map_err(|error| crate::describe(&*error))
         }),
         Mode::Enable => runtime.block_on(async {
-            tokio::time::timeout(
+            // The banner shows only the error, so it names the stage that failed.
+            let last = std::cell::RefCell::new("connecting".to_owned());
+            let result = tokio::time::timeout(
                 Duration::from_secs(240),
                 crate::device::enable(
                     request.pid,
                     &request.pairing,
-                    request.remote_pairing_port,
+                    &request.remote_pairing_ports,
                     &cache,
-                    &|stage| send(stage, None),
+                    &|stage| {
+                        stage.clone_into(&mut last.borrow_mut());
+                        send(stage, None, None);
+                    },
                 ),
             )
-            .await
-            .map_err(|_| "JIT helper timed out".to_string())?
-            .map_err(|error| error.to_string())
+            .await;
+            let stage = last.borrow();
+            match result {
+                Err(_) => Err(format!("JIT helper timed out ({stage})")),
+                Ok(result) => result
+                    .map(Some)
+                    .map_err(|error| format!("{} ({stage})", crate::describe(&*error))),
+            }
         }),
     };
-    send("finished", result.err());
+    match result {
+        Ok(port) => send("finished", None, port),
+        Err(error) => send("finished", Some(error), None),
+    }
     Ok(())
 }
