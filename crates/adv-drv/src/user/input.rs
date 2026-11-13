@@ -118,12 +118,12 @@ impl Queue {
             Event::Input(input) => input.mask,
             Event::Job(_) => 8,
         };
-        for bit in 0..4 {
+        for (bit, count) in self.counts.iter_mut().enumerate() {
             if mask & (1 << bit) != 0 {
                 if added {
-                    self.counts[bit] += 1;
+                    *count += 1;
                 } else {
-                    self.counts[bit] -= 1;
+                    *count -= 1;
                 }
             }
         }
