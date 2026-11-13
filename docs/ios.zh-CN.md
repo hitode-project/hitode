@@ -50,12 +50,13 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
 ### 安装步骤
 
 1. **在手机上下载 Hitode 的 IPA 安装包**，保存到"文件"app 里。
-   在 [最新版本的发布页](https://github.com/hitode-project/hitode/releases/latest) 下载 `Hitode-<版本号>-ios-unsigned.ipa`。选方式二的话，再从 [StikDebug 的发布页](https://github.com/StikDebug/StikDebug/releases/latest) 下载它的 IPA。
-2. **在电脑上安装 iloader。** 下载和使用方法见 [iloader 的说明页](https://github.com/nab138/iloader)。
+   在 [最新版本的发布页](https://github.com/hitode-project/hitode/releases/latest) 下载 `Hitode-<版本号>-ios.ipa`。选方式二的话，再从 [StikDebug 的发布页](https://github.com/StikDebug/StikDebug/releases/latest) 下载它的 IPA。
+2. **在电脑上安装 iloader 2.4.1 或更新版本。** 下载和使用方法见 [iloader 的说明页](https://github.com/nab138/iloader)。
+   从 2.4.1 起，iloader 安装的 app 默认开启内存扩展。没有它，游戏可能因为地址空间不足而无法启动。
 3. **用数据线连接手机，在 iloader 里登录 Apple ID。**
    手机上会弹出"要信任此电脑吗？"，选择"信任"。信任只能通过数据线完成；之后只要手机和电脑连着同一个 Wi-Fi，下文用到 iloader 的步骤都可以无线进行，iloader 会自动识别设备。
 4. **用 iloader 安装 LiveContainer + SideStore**，完成后桌面上会出现 LiveContainer 的图标。
-   方式一选“LiveContainer + SideStore（每夜构建版）”，它带有 Hitode 自己开启 JIT 所需的“启用应用辅助进程”。iloader 每次装的都是最新的每夜构建；这项功能从 2026-11-08 的构建（LiveContainer 3.8.13，提交 [9d6ea09b](https://github.com/LiveContainer/LiveContainer/commit/9d6ea09b05afa2c8fc537c372795a294db631311)）开始提供，之前装过的旧每夜构建版要重新安装一次。方式二、方式三选“LiveContainer + SideStore（稳定版）”即可。
+   方式一选“LiveContainer + SideStore（每夜构建版）”，它带有 Hitode 自己开启 JIT 所需的“启用应用辅助进程”。iloader 每次装的都是最新的每夜构建；这项功能从 2026-11-08 的构建（LiveContainer 3.8.13，提交 [9d6ea09b](https://github.com/LiveContainer/LiveContainer/commit/9d6ea09b05afa2c8fc537c372795a294db631311)）开始提供，之前装过的旧每夜构建版要重新安装一次。方式二、方式三选“LiveContainer + SideStore（稳定版）”即可。用 iloader 2.4.1 之前的版本装过 LiveContainer 的话，也要重新安装一次，才能开启内存扩展。
 5. **打开开发者模式。**
    到 设置 → 隐私与安全性 → 开发者模式，打开开关，然后按提示重启手机。不打开的话，自签的 app 都无法启动。详见 [Apple 的说明](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device)。
 6. **信任开发者。**
@@ -69,7 +70,7 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
      <img src="images/ios/livecontainer-bundle-id.png" alt="LiveContainer 中 Hitode 的设置：“带JIT启动”和修复一栏里的“使用 LiveContainer 的包名”都已打开" width="320">
 
      <img src="images/ios/livecontainer-jit-enabler.png" alt="LiveContainer 底部“设置”页的 JIT 一栏：“JIT启用工具”选为 StikDebug" width="320">
-   - **方式三**：打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 Hitode 的 IPA。完成后，桌面上会出现 Hitode 的图标。
+   - **方式三**：打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 Hitode 的 IPA。完成后，桌面上会出现 Hitode 的图标。如果打开 Hitode 后提示“未开启内存扩展”，就改用 iloader 的“导入 IPA”安装 Hitode。
 
    SideStore 的具体操作见 [SideStore 文档](https://docs.sidestore.io/)。方式二、方式三要通过 SideStore 安装一次，因为 SideStore 只能续签经它安装的 app。
    由于近期 Apple 改变了认证方式，各类第三方安装服务受到了不同程度的影响，如果 SideStore 暂时登录不上，可以先用 iloader 的"导入 IPA"安装（IPA 要下载到电脑上），之后用 iloader 续签；等 SideStore 能登录了，再在 SideStore 里安装一次，交给它续签。
@@ -192,6 +193,14 @@ Hitode 直接在原来的位置读取游戏文件夹，不会复制一份。
 ## 常见问题
 
 下面的小标题就是 Hitode 里显示的提示文字。
+
+### 未开启内存扩展
+
+当前安装没有内存扩展，游戏可能因为地址空间不足而无法启动。请用 iloader 2.4.1 或更新版本重新安装：装在 LiveContainer 里的 Hitode 用的是 LiveContainer 的签名，要重新安装 LiveContainer（见"安装"第 4 步），Hitode 本身不用重装；直接安装的 Hitode 用 iloader 的“导入 IPA”重新安装。
+
+### 设备的地址空间不足，游戏无法启动
+
+如果 Hitode 同时提示“未开启内存扩展”，按上一条重新安装即可。已经开启了内存扩展还出现这条提示的话，请彻底关闭 Hitode（在多任务界面上划掉）后重新打开再试。
 
 ### 当前签名不支持 JIT
 

@@ -59,6 +59,14 @@ The family runs one process at a time. Every window starts at guest address 0, s
 
 The app's address space ends a few GiB past the dyld shared region. WebKit reserves its 2 GiB JavaScript heap at the start of that range once a webview loads, after which no 4 GiB-aligned window fits. Reserved first, the window leaves WebKit to run without that heap.
 
+### IOS-MEM-4 Memory extension
+
+**Rule**: The iOS app MUST declare `com.apple.developer.kernel.increased-memory-limit`, and every published IPA MUST carry it in an ad-hoc signature naming no signer. The launcher MUST check its signature for it and, when missing, explain the reinstall once in a dialog, then warn in settings and the library. Failed window reservations MUST read as the same instruction, and iOS reports MUST record whether the extension is present.
+**Applies to**: iOS
+**Verification**: Review — signed entitlement queries require a sideloaded device, including the host process inside LiveContainer.
+
+The extension raises the memory limit and widens the address space. That decides whether IOS-MEM-3's 4 GiB-aligned window fits once the process has mapped its libraries. Inside LiveContainer the host process is LiveContainer's, so LiveContainer's own signature carries the extension. Installers that re-sign the app read its declared entitlements and enable the capability on the user's App ID. iloader 2.4.1 enables it for every app it installs, and free development teams may use it. Installations made before this rule lack it, so the dialog reaches upgrading users. The check uses the same `SecTaskCopyValueForEntitlement` query as IOS-JIT-3.
+
 ### IOS-APP-1 Game folder access
 
 **Rule**: Game imports MUST read folders selected through Files at their original locations by default. External directory permissions MUST persist as bookmarks and be restored before library access. Coordinated reads MUST make cloud files locally readable before discovery and game launch.

@@ -97,6 +97,9 @@ pub struct Platform {
     pub os: String,
     pub os_major: String,
     pub model: String,
+    /// iOS: whether the signature raises the memory limit (IOS-MEM-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub increased_memory_limit: Option<bool>,
     pub graphics: Graphics,
     pub settings: Settings,
 }
@@ -179,6 +182,7 @@ impl Platform {
                 .unwrap_or("unknown")
                 .into(),
             model: host_property(true),
+            increased_memory_limit: None,
             graphics,
             settings,
         }
@@ -546,6 +550,7 @@ mod tests {
                 os: "macos".into(),
                 os_major: "26".into(),
                 model: "Example1,1".into(),
+                increased_memory_limit: None,
                 graphics: Graphics {
                     api: GraphicsApi::Metal,
                     name: "Example GPU".into(),

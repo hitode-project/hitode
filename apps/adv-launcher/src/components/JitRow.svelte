@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
-  import { jit } from "../lib/jit.svelte";
+  import { explainJit, jit } from "../lib/jit.svelte";
   import { prefs } from "../lib/prefs.svelte";
   import { setPref } from "../lib/settings-form.svelte";
   import SettingsSwitch from "./SettingsSwitch.svelte";
@@ -10,6 +10,15 @@
 
 {#if status}
   <div class="jit">
+    {#if jit.memoryMissing}
+      <div class="row head">
+        <span class="t">
+          <span>{t("内存扩展")}</span>
+          <span class="note" role="status">{t("未开启")}</span>
+        </span>
+      </div>
+      <p class="advice">{explainJit("memoryLimitMissing")}</p>
+    {/if}
     <div class="row head">
       <span class="t">
         <span>{t("JIT 加速")}</span>
