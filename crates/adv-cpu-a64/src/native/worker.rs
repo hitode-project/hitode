@@ -363,9 +363,7 @@ struct Drained {
 
 const ESP: usize = 4;
 
-/// The distance between private frames: the span in cache lines.
-/// The distance between private frames: the span in cache lines.
-/// The distance between private frames, which keeps each copy of the span
+/// The distance between private frames, in cache lines, which keeps each copy of the span
 /// below every byte live at the real frame, including those between ESP and
 /// a span that starts above it.
 fn frame_stride((lo, hi): (i32, i32)) -> u32 {
@@ -1601,6 +1599,7 @@ mod tests {
     // spec: A64-TR-9
     #[test]
     fn private_frames_stay_below_the_words_at_esp() {
+        let _pool = exclusive_pool();
         fn word(executor: &Executor, addr: u32) -> u32 {
             u32::from_le_bytes(executor.memory().read(addr, 4).unwrap().try_into().unwrap())
         }
