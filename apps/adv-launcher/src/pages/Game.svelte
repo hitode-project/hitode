@@ -93,7 +93,7 @@
     const timer = setInterval(() => {
       void call<boolean>("game_presented", {}, true).then((v) => (presented = v));
     }, 150);
-    const slow = setTimeout(() => (slowLoad = true), 10_000);
+    const slow = setTimeout(() => (slowLoad = true), 4_000);
     return () => {
       clearInterval(timer);
       clearTimeout(slow);
@@ -400,6 +400,7 @@
     {@const g = screen.layout?.game}
     <div class="loading over fade" style={g ? `left: ${g.x}px; top: ${g.y}px; width: ${g.width}px; height: ${g.height}px` : "inset: 0"}>
       <div class="spinner" role="progressbar" aria-label={t("加载中")}></div>
+      <div class="loading-msg">{t("正在准备游戏…")}</div>
       {#if slowLoad && !stopping}
         <button class="quiet" onclick={leave} {@attach region}>{t("退出游戏")}</button>
       {/if}
@@ -1317,6 +1318,10 @@
     border: 2.5px solid rgba(255, 255, 255, 0.16);
     border-top-color: rgba(255, 255, 255, 0.8);
     animation: spin 0.9s linear infinite;
+  }
+  .loading-msg {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.68);
   }
   @keyframes spin {
     to {
