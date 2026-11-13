@@ -91,6 +91,7 @@
     {:else if flow.view === "failed"}
       <div class="acts fade">
         <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
+        <button class="btn quiet" onclick={() => flow.changeExe()}>{t("此游戏的设置…")}</button>
         <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
         <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
       </div>
