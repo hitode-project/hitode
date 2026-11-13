@@ -327,8 +327,8 @@ impl GameView {
             self.mouse(message, wparam, at);
         }
     }
-    /// Presses or releases a virtual key for the overlay's keys: Enter, Esc,
-    /// Space, Tab and Ctrl.
+    /// Presses or releases a virtual key for the overlay's keys: Backspace,
+    /// Enter, Esc, Space, Tab and Ctrl.
     pub fn overlay_key(&self, key: u32, down: bool) {
         if self.paused.get() {
             return;

@@ -31,6 +31,7 @@ export const icons = {
   info: '<circle cx="8" cy="8" r="6"/><path d="M8 7.2v4M8 4.9h.01"/>',
   warning: '<path d="M8 2.2L14.3 13H1.7z"/><path d="M8 6.5v3M8 11.2h.01"/>',
   keyboard: '<rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 6.5h.01M6.5 6.5h.01M9 6.5h.01M11.5 6.5h.01M5 9.5h6"/>',
+  backspace: '<path d="M6 3.5h7a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H6L1.8 8z"/><path d="M8.3 6.2l3.4 3.6M11.7 6.2l-3.4 3.6"/>',
   exit: '<path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10.5 5l3 3-3 3M13.5 8H6"/>',
 } as const;
 

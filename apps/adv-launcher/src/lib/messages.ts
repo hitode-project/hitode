@@ -490,4 +490,5 @@ export const messages: Record<string, [string, string]> = {
   "从屏幕左或右边缘向内滑呼出菜单": ["Swipe inward from left or right edge to open the menu", "画面の左右端から内側にスワイプしてメニューを開く"],
   "使用返回手势或返回键可打开菜单": ["Use system back to open the menu", "戻るジェスチャーまたは戻るキーでメニューを開けます"],
   "从屏幕左或右边缘向内滑可打开菜单": ["Swipe from either edge to open the menu", "左右の端からスワイプしてメニューを開けます"],
+  "退格": ["Backspace", "バックスペース"],
 };

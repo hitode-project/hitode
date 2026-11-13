@@ -44,6 +44,11 @@
   let textBar = $state(false);
   let text = $state("");
   let textInput = $state<HTMLInputElement | null>(null);
+  let backspacePointer: number | null = null;
+  let backspaceFromPointer = false;
+  let backspaceReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+  let backspaceHoldTimer: ReturnType<typeof setTimeout> | undefined;
+  let backspaceRepeatTimer: ReturnType<typeof setInterval> | undefined;
 
   type Scale = "int" | "fit" | "stretch";
   let scale = $state<Scale>(untrack(() => playback(gameId).scale));
@@ -244,6 +249,7 @@
       return true;
     });
     return () => {
+      stopBackspace(true);
       void call("set_pause_available", { available: false }, null).catch(() => {});
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
@@ -254,6 +260,56 @@
       stopScreen();
       stopBack();
     };
+  });
+
+  function sendBackspaceEdge(down: boolean) {
+    void call("game_key", { key: 0x08, down }, null).catch(() => {});
+  }
+
+  function tapBackspace() {
+    if (backspaceReleaseTimer !== undefined) {
+      clearTimeout(backspaceReleaseTimer);
+      sendBackspaceEdge(false);
+    }
+    sendBackspaceEdge(true);
+    backspaceReleaseTimer = setTimeout(() => {
+      backspaceReleaseTimer = undefined;
+      sendBackspaceEdge(false);
+    }, 60);
+  }
+
+  function stopBackspace(releaseNow = false) {
+    backspacePointer = null;
+    if (backspaceHoldTimer !== undefined) {
+      clearTimeout(backspaceHoldTimer);
+      backspaceHoldTimer = undefined;
+    }
+    if (backspaceRepeatTimer !== undefined) {
+      clearInterval(backspaceRepeatTimer);
+      backspaceRepeatTimer = undefined;
+    }
+    if (releaseNow && backspaceReleaseTimer !== undefined) {
+      clearTimeout(backspaceReleaseTimer);
+      backspaceReleaseTimer = undefined;
+      sendBackspaceEdge(false);
+    }
+  }
+
+  function startBackspace(event: PointerEvent) {
+    event.preventDefault();
+    backspaceFromPointer = true;
+    stopBackspace();
+    backspacePointer = event.pointerId;
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    tapBackspace();
+    backspaceHoldTimer = setTimeout(() => {
+      backspaceHoldTimer = undefined;
+      backspaceRepeatTimer = setInterval(tapBackspace, 85);
+    }, 420);
+  }
+
+  $effect(() => {
+    if (!textBar) stopBackspace(true);
   });
 
   function openTextBar() {
@@ -553,6 +609,24 @@
         autocomplete="off"
         spellcheck="false"
       />
+      <button
+        type="button"
+        class="text-key"
+        aria-label={t("退格")}
+        title={t("退格")}
+        onmousedown={(e) => e.preventDefault()}
+        onpointerdown={startBackspace}
+        onpointerup={(e) => { if (e.pointerId === backspacePointer) stopBackspace(); }}
+        onpointercancel={(e) => { if (e.pointerId === backspacePointer) stopBackspace(); }}
+        onlostpointercapture={() => stopBackspace()}
+        onclick={() => {
+          if (backspaceFromPointer) {
+            backspaceFromPointer = false;
+            return;
+          }
+          tapBackspace();
+        }}
+      ><Icon name="backspace" size={16} /></button>
       <button class="quiet" style="height: 38px; box-sizing: border-box" onclick={() => (textBar = false)}>{t("取消")}</button>
       <button class="primary" style="height: 38px" disabled={!text} onclick={send}>{t("发送")}</button>
     </div>
@@ -989,6 +1063,31 @@
     padding: 0 8px;
     font-size: 15px;
     color: var(--fg);
+  }
+  .text-key {
+    all: unset;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    width: 38px;
+    height: 38px;
+    border-radius: 19px;
+    display: grid;
+    place-items: center;
+    color: var(--fg2);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .text-key:hover {
+    background: var(--hover);
+    color: var(--fg);
+  }
+  .text-key:active {
+    background: var(--field);
+    color: var(--fg);
+  }
+  .text-key:focus-visible {
+    outline: 2px solid #8fb0f5;
+    outline-offset: 2px;
   }
   .recall-hint {
     position: absolute;
