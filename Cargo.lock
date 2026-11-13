@@ -155,7 +155,6 @@ dependencies = [
  "iced-x86",
  "log",
  "naga",
- "png 0.17.16",
  "rustc-hash 2.1.3",
  "sha2 0.10.9",
  "xxhash-rust",
