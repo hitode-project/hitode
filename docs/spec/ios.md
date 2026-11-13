@@ -65,7 +65,7 @@ The app's address space ends a few GiB past the dyld shared region. WebKit reser
 **Applies to**: iOS
 **Verification**: Review — the Files picker and iCloud downloads run only on a device.
 
-The launcher holds selected directories' security scopes while it runs. Game folders remain at their selected locations; saves and registry use the game's independent private data directory. Finder file sharing also places games in Documents, where the launcher reads them in place.
+The launcher holds selected directories' security scopes while it runs. Game folders remain at their selected locations, and games write them in place. Per HOST-LIB-5, what games write elsewhere lands on drive C: in the app's Documents. The registry stays in the shared prefix in app data, so deleting the app removes both. Finder file sharing also places games in Documents, where the launcher reads them in place.
 
 ### IOS-APP-2 Native view
 
