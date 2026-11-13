@@ -1939,7 +1939,7 @@ mod opt_back {
             refund: 0,
             regs: [Some(Location::Constant(0)); 8],
             eflags: Some(Location::Constant(0x202)),
-            x87: X87 {
+            x87: Some(X87 {
                 top: 0,
                 valid: 0,
                 control: 0x027f,
@@ -1948,7 +1948,7 @@ mod opt_back {
                 c1: Some(Location::Constant(0)),
                 ip: Some(Location::Constant(0x1234)),
                 opcode: Some(Location::Constant(0x321)),
-            },
+            }),
             xmm: [Some(Location::Constant(0)); 8],
             frame: Vec::new(),
         }
@@ -1984,8 +1984,9 @@ mod opt_back {
             }
             Type::Flags => r.eflags = Some(Location::Recipe(Recipe::Eflags(value))),
             Type::F64 => {
-                r.x87.valid = 1;
-                r.x87.stack[0] = Some(Location::At(value));
+                let x87 = r.x87.as_mut().unwrap();
+                x87.valid = 1;
+                x87.stack[0] = Some(Location::At(value));
             }
             Type::V128 => r.xmm[0] = Some(Location::At(value)),
         }
@@ -2015,6 +2016,7 @@ mod opt_back {
 
     fn compare_record(f: &Func, values: &[u128], got: &Captured) {
         let r = &f.records[got.record.0 as usize];
+        let x87 = r.x87.as_ref().expect("harness records hold x87 state");
         let locate = |l: Location<Value>| eval::locate(&l, values);
         for (i, l) in r.regs.iter().enumerate() {
             if let Some(l) = l {
@@ -2025,11 +2027,11 @@ mod opt_back {
             assert_eq!(got.cpu.eflags, locate(l) as u32, "eflags");
         }
         assert_eq!(got.cpu.eip, r.eip);
-        assert_eq!(got.cpu.x87.top(), r.x87.top as usize);
-        assert_eq!(got.cpu.x87.control, r.x87.control);
+        assert_eq!(got.cpu.x87.top(), x87.top as usize);
+        assert_eq!(got.cpu.x87.control, x87.control);
         for i in 0..8 {
-            if r.x87.valid >> i & 1 != 0 {
-                if r.x87.stack[i].is_some() {
+            if x87.valid >> i & 1 != 0 {
+                if x87.stack[i].is_some() {
                     assert_eq!(got.cpu.x87.tag >> (2 * i) & 3, got.cpu.x87.regs[i].tag());
                 }
             } else {
@@ -2041,18 +2043,18 @@ mod opt_back {
         }
         assert_eq!(
             got.cpu.x87.status & !((7 << 11) | (1 << 9)),
-            r.x87.status & !((7 << 11) | (1 << 9))
+            x87.status & !((7 << 11) | (1 << 9))
         );
-        if let Some(l) = r.x87.ip {
+        if let Some(l) = x87.ip {
             assert_eq!(got.cpu.x87.ip, locate(l) as u32);
         }
-        if let Some(l) = r.x87.opcode {
+        if let Some(l) = x87.opcode {
             assert_eq!(got.cpu.x87.opcode, locate(l) as u16);
         }
-        if let Some(l) = r.x87.c1 {
+        if let Some(l) = x87.c1 {
             assert_eq!(u128::from(got.cpu.x87.status >> 9 & 1), locate(l));
         }
-        for (i, l) in r.x87.stack.iter().enumerate() {
+        for (i, l) in x87.stack.iter().enumerate() {
             if let Some(l) = l {
                 let bits = locate(*l) as u64;
                 let reg = got.cpu.x87.regs[i];
@@ -2426,9 +2428,9 @@ mod opt_back {
     fn opt_back_failures_recover_the_region_and_restore_fpcr() {
         let mut h = harness();
         let (mut f, b, p, entry) = start(&[Type::F64, Type::F64]);
-        f.records[entry.0 as usize].x87.valid = 3;
-        f.records[entry.0 as usize].x87.stack[0] = Some(Location::At(p[0]));
-        f.records[entry.0 as usize].x87.stack[1] = Some(Location::At(p[1]));
+        f.records[entry.0 as usize].x87.as_mut().unwrap().valid = 3;
+        f.records[entry.0 as usize].x87.as_mut().unwrap().stack[0] = Some(Location::At(p[0]));
+        f.records[entry.0 as usize].x87.as_mut().unwrap().stack[1] = Some(Location::At(p[1]));
         let v = f.push(b, Op::Fp(FpOp::Mul, p[0], p[1])).unwrap();
         f.push(b, Op::Validate);
         finish(&mut f, b, v);
@@ -2459,6 +2461,7 @@ mod opt_back {
                     Op::X87Load {
                         bits: p[0],
                         denormal,
+                        single: false,
                     },
                 )
                 .unwrap();
@@ -2470,6 +2473,32 @@ mod opt_back {
                 -0.0,
                 f64::INFINITY,
                 3.5,
+            ] {
+                compare(&f, &[u128::from(x.to_bits())], &mut h);
+            }
+        }
+        {
+            let (mut f, b, p, entry) = start(&[Type::I32]);
+            f.records[entry.0 as usize].regs[0] = Some(Location::At(p[0]));
+            let v = f
+                .push(
+                    b,
+                    Op::X87Load {
+                        bits: p[0],
+                        denormal: false,
+                        single: true,
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            for x in [
+                f32::NAN,
+                f32::from_bits(0x7f80_0001),
+                f32::from_bits(1),
+                -0.0,
+                f32::INFINITY,
+                f32::MIN_POSITIVE,
+                -3.75,
             ] {
                 compare(&f, &[u128::from(x.to_bits())], &mut h);
             }
@@ -2677,12 +2706,12 @@ mod opt_back {
         let v = f.push(b, Op::Fp(FpOp::Div, p[0], p[1])).unwrap();
         f.push(b, Op::Validate);
         let exit = finish(&mut f, b, v);
-        f.records[exit.0 as usize].x87.c1 = Some(Location::Recipe(Recipe::C1 {
+        f.records[exit.0 as usize].x87.as_mut().unwrap().c1 = Some(Location::Recipe(Recipe::C1 {
             op: FpOp::Div,
             a: p[0],
             b: p[1],
         }));
-        f.records[exit.0 as usize].x87.top = 3;
+        f.records[exit.0 as usize].x87.as_mut().unwrap().top = 3;
         let got = compare(
             &f,
             &[u128::from(1f64.to_bits()), u128::from(10f64.to_bits())],
@@ -2691,6 +2720,74 @@ mod opt_back {
         assert_eq!(got.cpu.x87.status >> 9 & 1, 1);
         assert_eq!(got.registers.x[28], WINDOW_BASE);
         assert_eq!(got.registers.x[29], CONTEXT);
+    }
+
+    // spec: A64-OPT-7
+    #[test]
+    fn opt_back_loop_values_keep_registers_under_pressure() {
+        let stubs = runtime::stubs();
+        let mut h = harness();
+        // Entry values live across the loop, more than there are registers.
+        let (mut f, b, p, _) = start(&[Type::I64; 36]);
+        let looped = f.record(record(0x1000));
+        let head = f.block(Some(Head { record: looped }));
+        let count = f.param(head, Type::I32);
+        let total = f.param(head, Type::I64);
+        let ten = f.push(b, Op::Constant(Type::I32, 10)).unwrap();
+        f.end(
+            b,
+            End::Jump(Target {
+                block: head,
+                args: vec![ten, p[0]],
+                charge: 0,
+            }),
+        );
+        let one = f.push(head, Op::Constant(Type::I32, 1)).unwrap();
+        let wide = f.push(head, Op::Constant(Type::I64, 3)).unwrap();
+        let next = f.push(head, Op::Int(IntOp::Sub, count, one)).unwrap();
+        let sum = f.push(head, Op::Int(IntOp::Add, total, wide)).unwrap();
+        let latch = f.block(None);
+        let done = f.block(None);
+        f.end(
+            head,
+            End::Branch {
+                cond: next,
+                taken: Target {
+                    block: latch,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+                fall: Target {
+                    block: done,
+                    args: Vec::new(),
+                    charge: 0,
+                },
+            },
+        );
+        f.end(
+            latch,
+            End::Jump(Target {
+                block: head,
+                args: vec![next, sum],
+                charge: 1,
+            }),
+        );
+        let mut result = sum;
+        for &v in &p[1..] {
+            result = f.push(done, Op::Int(IntOp::Add, result, v)).unwrap();
+        }
+        finish(&mut f, done, result);
+        let params: Vec<_> = (1..=36).collect();
+        let got = compare(&f, &params, &mut h);
+        assert_eq!(got.cpu.regs[0], 666 + 30);
+        let lowered = back::lower(&f, 0, stubs.opt_exit);
+        let spill = |&w: &u32| w & 0x3b00_0000 == 0x3900_0000 && (w >> 5) & 31 == 31;
+        for block in [head, latch] {
+            assert!(
+                !body(&lowered, block.0 as usize).iter().any(spill),
+                "the loop touches no spill cell"
+            );
+        }
     }
 
     // spec: A64-OPT-6, A64-OPT-7
@@ -2709,8 +2806,12 @@ mod opt_back {
         f.records[head_record.0 as usize].regs[0] = Some(Location::At(n));
         f.records[head_record.0 as usize].regs[1] = Some(Location::At(x));
         f.records[head_record.0 as usize].regs[2] = Some(Location::At(y));
-        f.records[head_record.0 as usize].x87.ip = Some(Location::At(x));
-        f.records[head_record.0 as usize].x87.opcode = Some(Location::At(y));
+        f.records[head_record.0 as usize].x87.as_mut().unwrap().ip = Some(Location::At(x));
+        f.records[head_record.0 as usize]
+            .x87
+            .as_mut()
+            .unwrap()
+            .opcode = Some(Location::At(y));
         f.end(
             entry,
             End::Jump(Target {
@@ -3028,6 +3129,24 @@ mod opt_back {
             body(&lower, 0)[0],
             add_imm(W, Reg::new(0), Reg::new(0), 7, false)
         );
+
+        // A negative addend subtracts; a power-of-two factor shifts.
+        let (mut f, b, p, _) = start(&[Type::I32]);
+        let k = f.push(b, Op::Constant(Type::I32, 0xffff_fffc)).unwrap();
+        let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
+        let k = f.push(b, Op::Constant(Type::I32, 8)).unwrap();
+        let v = f.push(b, Op::Int(IntOp::Mul, v, k)).unwrap();
+        finish(&mut f, b, v);
+        let lower = back::lower(&f, 0, stubs.opt_exit);
+        assert_eq!(
+            body(&lower, 0)[..2],
+            [
+                sub_imm(W, Reg::new(0), Reg::new(0), 4, false),
+                lsl_imm(W, Reg::new(0), Reg::new(0), 3)
+            ]
+        );
+        let mut h = harness();
+        assert_eq!(compare(&f, &[7], &mut h).cpu.regs[0], 24);
 
         let (mut f, b, p, _) = start(&[Type::I32]);
         let k = f.push(b, Op::Constant(Type::I32, 5)).unwrap();

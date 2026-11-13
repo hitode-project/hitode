@@ -19,8 +19,12 @@ pub(crate) enum Error {
     Pending(Block),
     /// Arrivals at a block disagree on the region start.
     Region(Block),
+    /// A frame commit followed by an operation that can fail, or in a
+    /// block that does not end by jumping to heads.
+    Commit(Block),
     /// A record activated twice, reading a value not available where it
-    /// is activated, or incomplete at an exit.
+    /// is activated, incomplete at an exit, or without EFLAGS at the head
+    /// of a charged arrival.
     Record(RecordId),
 }
 
@@ -71,7 +75,10 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
     let mut activate = |id: RecordId, at: Position, complete: bool| {
         let record = &func.records[id.0 as usize];
         let seen = std::mem::replace(&mut activated[id.0 as usize], true);
-        if seen || complete && !record.complete() || !record.uses().all(|v| available(v, at)) {
+        if seen
+            || complete && !record.complete(func.kept)
+            || !record.uses().all(|v| available(v, at))
+        {
             return Err(Error::Record(id));
         }
         Ok(())
@@ -116,7 +123,7 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
                 let Some(head) = blocks[target.block.0 as usize].head else {
                     return Err(Error::Shape(target.block));
                 };
-                if !func.records[head.record.0 as usize].complete() {
+                if func.records[head.record.0 as usize].eflags.is_none() {
                     return Err(Error::Record(head.record));
                 }
             }
@@ -127,6 +134,7 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
 
 fn typed(func: &Func, op: &Op) -> bool {
     let is = |v: Value, ty: Type| func.ty(v) == ty;
+    let int_ty = |ty: Type| matches!(ty, Type::I32 | Type::I64);
     let int = |v: Value| matches!(func.ty(v), Type::I32 | Type::I64);
     match *op {
         Op::Int(_, a, b) => int(a) && func.ty(a) == func.ty(b),
@@ -142,8 +150,12 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::Fp(_, a, b) => is(a, Type::F64) && is(b, Type::F64),
         Op::FpUnary(_, a) | Op::ToInt { value: a, .. } => is(a, Type::F64),
         Op::Vec(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
-        Op::Load { addr, .. } | Op::Store { addr, .. } => is(addr, Type::I32),
-        Op::X87Load { bits, .. } => is(bits, Type::I64),
+        Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),
+        Op::FrameLoad { ty, base, .. } => (int_ty(ty) || ty == Type::F64) && is(base, Type::I64),
+        Op::FrameStore { base, value, .. } => {
+            (int(value) || is(value, Type::F64)) && is(base, Type::I64)
+        }
+        Op::X87Load { bits, single, .. } => is(bits, if single { Type::I32 } else { Type::I64 }),
         Op::Constant(..) | Op::Bits { .. } | Op::Validate => true,
     }
 }
@@ -162,12 +174,24 @@ fn effects(func: &Func) -> Result<(), Error> {
         if let Some(head) = block.head {
             region = head.record;
         }
+        // Frame memory may change only when no failure can still return to
+        // the region start: after validation, and with nothing that can
+        // fail before the heads the block jumps to (A64-OPT-3).
+        let mut committed = false;
         for (_, op) in &block.insts {
             if let Op::Store { after, .. } = *op {
                 if pending {
                     return Err(Error::Pending(Block(b as u32)));
                 }
                 region = after;
+            }
+            if matches!(op, Op::FrameStore { .. }) {
+                if pending {
+                    return Err(Error::Pending(Block(b as u32)));
+                }
+                committed = true;
+            } else if committed && op.can_fail() {
+                return Err(Error::Commit(Block(b as u32)));
             }
             pending = match op {
                 Op::Validate => false,
@@ -176,6 +200,16 @@ fn effects(func: &Func) -> Result<(), Error> {
         }
         if pending && matches!(block.end, End::Exit(_)) {
             return Err(Error::Pending(Block(b as u32)));
+        }
+        let ends_at_heads = match block.end {
+            End::Jump(_) | End::Branch { .. } => block
+                .end
+                .targets()
+                .all(|t| blocks[t.block.0 as usize].head.is_some()),
+            End::Exit(_) | End::Unset => false,
+        };
+        if committed && !ends_at_heads {
+            return Err(Error::Commit(Block(b as u32)));
         }
         for target in block.end.targets() {
             let t = target.block.0 as usize;
@@ -287,7 +321,7 @@ mod tests {
             refund: 0,
             regs: regs.map(|r| r.map(Location::At)),
             eflags: Some(Location::Constant(0)),
-            x87: X87 {
+            x87: Some(X87 {
                 top: 0,
                 valid: 0,
                 control: 0x27f,
@@ -296,7 +330,7 @@ mod tests {
                 c1: Some(Location::Constant(0)),
                 ip: Some(Location::Constant(0)),
                 opcode: Some(Location::Constant(0)),
-            },
+            }),
             xmm: [Some(Location::Constant(0)); 8],
             frame: Vec::new(),
         }
@@ -418,7 +452,7 @@ mod tests {
 
     // spec: A64-OPT-6
     #[test]
-    fn a_charged_edge_reaches_a_head_with_a_complete_record() {
+    fn a_charged_edge_reaches_a_head_with_exact_flags() {
         let (mut f, body, eax, _) = skeleton();
         let tail = f.block(None);
         let exit = f.record(record([Some(eax); 8]));
@@ -431,11 +465,14 @@ mod tests {
         f.end(body, End::Jump(to_tail));
         assert_eq!(verify(&f), Err(Error::Shape(tail)));
         let mut partial = record([Some(eax); 8]);
-        partial.regs[5] = None;
+        partial.eflags = None;
         let start = f.record(partial);
         f.blocks[tail.0 as usize].head = Some(Head { record: start });
         assert_eq!(verify(&f), Err(Error::Record(start)));
-        f.records[start.0 as usize] = record([Some(eax); 8]);
+        // A register no execution from there reads may be absent.
+        let mut dead = record([Some(eax); 8]);
+        dead.regs[5] = None;
+        f.records[start.0 as usize] = dead;
         assert_eq!(verify(&f), Ok(()));
     }
 
@@ -466,6 +503,9 @@ mod tests {
         assert_eq!(verify(&f), Err(Error::Record(early)));
         f.records[early.0 as usize] = record([Some(eax); 8]);
         assert_eq!(verify(&f), Err(Error::Record(exit)));
+        // A register the form never writes keeps its entry value.
+        f.kept = 1 << 3;
+        assert_eq!(verify(&f), Ok(()));
     }
 
     #[test]

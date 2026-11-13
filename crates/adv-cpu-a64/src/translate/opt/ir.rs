@@ -112,6 +112,17 @@ pub(crate) enum FlagKind {
     UnorderedCompare,
 }
 
+impl FlagKind {
+    /// Whether the flags depend on operand `b`: a logical result's flags,
+    /// and a step's or negation's, come from `a` alone.
+    pub(crate) fn reads_b(self) -> bool {
+        !matches!(
+            self,
+            FlagKind::Logic | FlagKind::Increment | FlagKind::Decrement | FlagKind::Negate
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Constant(Type, u128),
@@ -177,11 +188,32 @@ pub(crate) enum Op {
         value: Value,
         after: RecordId,
     },
-    /// The x87 reading of binary64 bits. Fails on NaN, and on nonzero
-    /// denormals when `denormal`.
+    /// The host address of a guest address: the base frame accesses add
+    /// their offsets to.
+    Host(Value),
+    /// A frame cell of 4 or 8 bytes, or 8 bytes as F64, at `offset` from
+    /// the host address `base`. Admission maps the frame, so it cannot fail; it reads the
+    /// cell's value whenever no value of the cell is held (A64-OPT-3).
+    FrameLoad {
+        ty: Type,
+        base: Value,
+        offset: i32,
+    },
+    /// Commits a frame cell's value to memory on an edge into a loop head,
+    /// after validation: only operations that cannot fail follow it before
+    /// the head (A64-OPT-3).
+    FrameStore {
+        base: Value,
+        offset: i32,
+        value: Value,
+    },
+    /// The x87 reading of binary64 bits, or of binary32 bits widened
+    /// exactly when `single`. Fails on NaN, and on nonzero denormals when
+    /// `denormal` or `single`, since FZ would flush a binary32 denormal.
     X87Load {
         bits: Value,
         denormal: bool,
+        single: bool,
     },
     /// Fails when IOC, DZC, OFC, UFC or IDC is set.
     Validate,
@@ -197,6 +229,8 @@ impl Op {
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::Load { addr: a, .. }
+            | Op::Host(a)
+            | Op::FrameLoad { base: a, .. }
             | Op::X87Load { bits: a, .. }
             | Op::Test { flags: a, .. } => [Some(a), None, None],
             Op::Int(_, a, b)
@@ -209,6 +243,9 @@ impl Op {
             }
             | Op::Store {
                 addr: a, value: b, ..
+            }
+            | Op::FrameStore {
+                base: a, value: b, ..
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b } => [Some(cond), Some(a), Some(b)],
@@ -237,6 +274,17 @@ impl Op {
                 | Op::X87Load { .. }
                 | Op::Validate
         )
+    }
+
+    /// Whether the operation must stay although nothing uses its result.
+    pub(crate) fn effect(&self) -> bool {
+        self.can_fail() || self.floating() || matches!(self, Op::FrameStore { .. })
+    }
+
+    /// Whether the result depends only on the operands, so that equal
+    /// operations may share one result or move.
+    pub(crate) fn pure(&self) -> bool {
+        !self.effect() && !matches!(self, Op::FrameLoad { .. })
     }
 }
 
@@ -289,6 +337,8 @@ pub(crate) struct BlockData {
     pub insts: Vec<(Option<Value>, Op)>,
     pub end: End,
     pub head: Option<Head>,
+    /// The guest instruction the block translates, for profiles.
+    pub eip: Option<u32>,
 }
 
 /// Where a parameter of block 0 comes from when the job enters. Admission
@@ -303,15 +353,22 @@ pub(crate) enum Source {
     Xmm(u8),
     /// A valid x87 physical register as binary64, F64.
     X87(u8),
+    /// The x87 last instruction pointer and opcode, I32.
+    X87Ip,
+    X87Opcode,
     /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
     /// Narrower accesses extract from these.
-    Frame { offset: i32, width: u8 },
+    Frame {
+        offset: i32,
+        width: u8,
+    },
 }
 
 impl Source {
     pub(crate) fn ty(self) -> Type {
         match self {
-            Source::Reg(_) | Source::Frame { width: 4, .. } => Type::I32,
+            Source::Reg(_) | Source::X87Ip | Source::X87Opcode => Type::I32,
+            Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,
             Source::Xmm(_) => Type::V128,
@@ -331,6 +388,9 @@ pub(crate) struct Func {
     /// edges to it also check the head-exit word. Block 0 may be an entry
     /// prologue that jumps there.
     pub head_exit: Option<Block>,
+    /// Registers (bits 0–7) and XMM registers (bits 8–15) the form never
+    /// writes: records leave them at their entry values.
+    pub kept: u16,
 }
 
 impl Func {
@@ -340,6 +400,7 @@ impl Func {
             insts: Vec::new(),
             end: End::Unset,
             head,
+            eip: None,
         });
         Block(self.blocks.len() as u32 - 1)
     }
@@ -377,7 +438,11 @@ impl Func {
 
     fn result(&self, op: &Op) -> Option<Type> {
         Some(match *op {
-            Op::Constant(ty, _) | Op::Bits { to: ty, .. } | Op::Load { ty, .. } => ty,
+            Op::Constant(ty, _)
+            | Op::Bits { to: ty, .. }
+            | Op::Load { ty, .. }
+            | Op::FrameLoad { ty, .. } => ty,
+            Op::Host(_) => Type::I64,
             Op::Int(_, a, _) | Op::Select { a, .. } => self.ty(a),
             Op::IntUnary(IntUnary::Low32 | IntUnary::High32, _) => Type::I32,
             Op::IntUnary(IntUnary::Widen, _) => Type::I64,
@@ -387,7 +452,7 @@ impl Func {
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
             Op::Vec(..) => Type::V128,
-            Op::Store { .. } | Op::Validate => return None,
+            Op::Store { .. } | Op::FrameStore { .. } | Op::Validate => return None,
         })
     }
 }

@@ -12,7 +12,9 @@ use crate::translate::computation::Proof;
 use crate::translate::decode::{self, Cc, EBP, ESP, Mem, Part, Src};
 use crate::translate::trace::{Edge, Mode, Next};
 
+mod cells;
 mod integer;
+mod live;
 mod model;
 mod passes;
 mod simd;
@@ -23,6 +25,8 @@ mod x87;
 pub(crate) struct Built {
     pub func: Func,
     pub assumed: Assumed,
+    /// Appended-path instructions that leave instead of running.
+    pub cuts: usize,
 }
 
 /// Entry facts checked by admission before selecting this form.
@@ -30,14 +34,17 @@ pub(crate) struct Built {
 pub(crate) struct Assumed {
     pub control: u16,
     pub status: u16,
-    pub ip: u32,
-    pub opcode: u16,
     pub mxcsr: u32,
     pub top: u8,
     pub tags: u16,
-    pub esp_low: u8,
+    /// ESP modulo 16, when the unit aligns ESP.
+    pub esp_low: Option<u8>,
     pub denormal: bool,
-    pub frame: Option<(i32, i32)>,
+    /// Whether the form runs x87 instructions, so that the x87 facts hold.
+    pub x87: bool,
+    /// The MXCSR bits the form assumes: all of them when it runs SSE
+    /// floating-point or control instructions, else the control bits.
+    pub mxcsr_mask: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,7 +60,26 @@ pub(crate) enum Reject {
     Dynamic(usize),
     StaticX87(usize),
     /// A head where observed flags differ between arrivals (A64-FLAG-3).
-    Flags,
+    Flags(usize),
+}
+
+impl Reject {
+    /// The trace position of the instruction refused, when there is one.
+    pub(crate) fn index(&self) -> Option<usize> {
+        match *self {
+            Reject::Empty => None,
+            Reject::Interpret(i)
+            | Reject::Helper(i)
+            | Reject::Mmx(i)
+            | Reject::Unsupported(i)
+            | Reject::Mode(i)
+            | Reject::Stack(i)
+            | Reject::Escape(i)
+            | Reject::Dynamic(i)
+            | Reject::StaticX87(i)
+            | Reject::Flags(i) => Some(i),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -70,23 +96,22 @@ struct State {
     floats: BTreeMap<i32, Value>,
     dirty: std::collections::BTreeSet<i32>,
     truncations: BTreeMap<(i32, u8), Value>,
+    /// Live frame cells by offset, zero-extended to I32 up to four bytes
+    /// and to I64 above.
     frame: BTreeMap<i32, Value>,
 }
 
-impl State {
-    fn values(&self) -> Vec<Value> {
-        self.regs
-            .iter()
-            .copied()
-            .chain([self.flags])
-            .chain(self.xmm)
-            .chain(self.x87.into_iter().flatten())
-            .chain(self.frame.values().copied())
-            .collect()
-    }
-}
-
 type Offsets = [Option<i32>; 8];
+
+/// Where a record's region starts, which decides the components it holds.
+#[derive(Clone, Copy)]
+enum Start {
+    /// On entry to a trace instruction.
+    Entry(usize),
+    /// After a trace instruction.
+    After(usize),
+    Exit,
+}
 
 struct Front<'a> {
     unit: &'a Unit,
@@ -98,62 +123,199 @@ struct Front<'a> {
     index: usize,
     offsets: Vec<Offsets>,
     models: Vec<model::Model>,
+    /// Offsets of the frame bytes the unit accesses, ascending.
+    frame: Vec<i32>,
+    /// The frame cells, by offset and width: every access covers whole
+    /// cells, so a slot accessed at one width is one cell.
+    cells: BTreeMap<i32, u8>,
+    live: live::Live,
+    /// The cells each instruction's block holds as values.
+    held: Vec<std::collections::BTreeSet<i32>>,
+    /// At a loop head that lacks registers, the cells its arrivals keep as
+    /// values; they commit the others.
+    carried: Vec<Option<std::collections::BTreeSet<i32>>>,
+    /// The host address of entry ESP plus `bias`.
+    base: Value,
+    bias: i32,
     state: State,
     loads: BTreeMap<Value, usize>,
     stores: BTreeMap<RecordId, usize>,
     pending_store: Option<(u8, Value, Value)>,
 }
 
+/// Builds the optimized form of `unit`. An instruction on an appended path
+/// (a branch target the compiler laid out away from the fall-through) that
+/// the form refuses leaves at its EIP instead, so that a cold path does not
+/// keep its hot loop in the ordinary form.
 pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, Reject> {
+    let mut cut = vec![false; unit.trace.len()];
+    let mut view = None::<Unit>;
+    loop {
+        let reject = match build_trace(view.as_ref().unwrap_or(unit), proof, at) {
+            Ok((func, assumed)) => {
+                let cuts = cut.iter().filter(|&&c| c).count();
+                return Ok(Built {
+                    func,
+                    assumed,
+                    cuts,
+                });
+            }
+            Err(reject) => reject,
+        };
+        match reject.index() {
+            Some(i) if i >= unit.trace.primary && cut.get(i) == Some(&false) => cut[i] = true,
+            _ => return Err(reject),
+        }
+        view = Some(Unit {
+            trace: unit.trace.cut(&cut),
+            ..Unit::default()
+        });
+    }
+}
+
+fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assumed), Reject> {
     if unit.trace.insts.is_empty() {
         return Err(Reject::Empty);
     }
+    let insts = &unit.trace.insts;
+    let x87 = insts
+        .iter()
+        .any(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)));
+    let simd = |pick: fn(&crate::translate::simd::Simd) -> bool| {
+        insts
+            .iter()
+            .any(|i| matches!(i.op, decode::Op::Simd(s) if pick(&s)))
+    };
+    let floating = simd(|s| s.floating());
+    let control = simd(|s| {
+        matches!(
+            s.kind,
+            crate::translate::simd::Kind::StoreControl | crate::translate::simd::Kind::LoadControl
+        )
+    });
+    // Precision exceptions are sticky and the form's arithmetic may raise
+    // them, so a form that computes assumes they are already raised.
+    let mut forced = at.clone();
+    forced.x87.status |= if x87 { 0x20 } else { 0 };
+    forced.mxcsr |= if floating { 0x20 } else { 0 };
+    let at = &forced;
     let assumed = Assumed {
         control: at.x87.control,
         status: at.x87.status & !0x3800,
-        ip: at.x87.ip,
-        opcode: at.x87.opcode,
         mxcsr: at.mxcsr,
         top: at.x87.top() as u8,
         tags: at.x87.tag,
-        esp_low: (at.regs[ESP as usize] & 15) as u8,
+        esp_low: insts
+            .iter()
+            .any(|i| matches!(i.op, decode::Op::Alu(decode::Alu::And, Src::Reg(ESP), _)))
+            .then_some((at.regs[ESP as usize] & 15) as u8),
         denormal: at.x87.status & 2 != 0,
-        frame: None,
+        x87,
+        mxcsr_mask: if floating || control {
+            u32::MAX
+        } else {
+            0xffc0
+        },
     };
-    let (offsets, frame) = layout(unit, assumed.esp_low)?;
-    let models = model::analyze(unit, at, &offsets)?;
-    let words: Vec<i32> = frame
-        .iter()
-        .map(|p| p & !3)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let common: Vec<Source> = (0..8)
+    let (offsets, frame, cells) = layout(unit, assumed.esp_low.unwrap_or(0))?;
+    let mut arrivals = vec![Vec::new(); unit.trace.len()];
+    for (from, ins) in unit.trace.insts.iter().enumerate() {
+        let fall = match ins.next {
+            Next::Edge(e) => Some(e),
+            Next::Fall => Some(Edge::Internal(from + 1)),
+            Next::Dynamic => None,
+        };
+        for e in [fall, ins.taken].into_iter().flatten() {
+            if let Edge::Internal(to) = e {
+                arrivals[to].push(from);
+            }
+        }
+    }
+    let models = model::analyze(unit, at, &offsets, &[])?;
+    let live = live::analyze(unit, proof, &offsets, &frame, &models);
+    let plan = cells::Cells {
+        cells: &cells,
+        frame: &frame,
+    };
+    let carried = plan.carried(unit, &arrivals, &live);
+    let models = model::analyze(unit, at, &offsets, &plan.kept(&carried))?;
+    let held = plan.held(unit, &live, &carried, &models);
+    let mut func = Func {
+        kept: live.kept,
+        ..Func::default()
+    };
+    let entry_block = func.block(None);
+    // Dead registers hold placeholders that no operation or record reads.
+    let unused = [
+        func.push(entry_block, Op::Constant(Type::I32, 0)).unwrap(),
+        func.push(entry_block, Op::Constant(Type::V128, 0)).unwrap(),
+    ];
+    let fixed: Vec<Source> = (0..8)
         .map(Source::Reg)
         .chain([Source::Eflags])
         .chain((0..8).map(Source::Xmm))
-        .chain(
-            (0..8)
-                .filter(|i| assumed.tags >> (2 * i) & 3 != 3)
-                .map(Source::X87),
-        )
         .collect();
-    let mut func = Func::default();
-    let entry_block = func.block(None);
-    let params: Vec<Value> = common
+    // Registers and EFLAGS, live ones as parameters of `block`.
+    let registers = |func: &mut Func, block: Block, live: &live::Set| -> Vec<Value> {
+        fixed
+            .iter()
+            .map(|s| match *s {
+                Source::Reg(r) if !live.reg(usize::from(r)) => unused[0],
+                Source::Xmm(r) if !live.reg(8 + usize::from(r)) => unused[1],
+                _ => func.param(block, s.ty()),
+            })
+            .collect()
+    };
+    let params = registers(&mut func, entry_block, &live.entry[0]);
+    let mut entry_sources: Vec<Source> = fixed
         .iter()
-        .map(|s| func.param(entry_block, s.ty()))
+        .copied()
+        .filter(|s| match *s {
+            Source::Reg(r) => live.entry[0].reg(usize::from(r)),
+            Source::Xmm(r) => live.entry[0].reg(8 + usize::from(r)),
+            _ => true,
+        })
         .collect();
     let mut x87 = [None; 8];
-    for (&source, &p) in common[17..].iter().zip(&params[17..]) {
-        let Source::X87(i) = source else {
-            unreachable!()
-        };
-        x87[i as usize] = Some(p);
+    for i in (0..8u8).filter(|i| assumed.x87 && assumed.tags >> (2 * i) & 3 != 3) {
+        let source = Source::X87(i);
+        x87[usize::from(i)] = Some(func.param(entry_block, source.ty()));
+        entry_sources.push(source);
     }
-    let words: BTreeMap<i32, Value> = words
+    // The last instruction pointer and opcode vary from job to job.
+    let metadata = assumed.x87.then(|| {
+        entry_sources.extend([Source::X87Ip, Source::X87Opcode]);
+        [
+            func.param(entry_block, Type::I32),
+            func.param(entry_block, Type::I32),
+        ]
+    });
+    // Frame loads and commits address entry ESP plus the lowest cell
+    // offset, so that their immediate offsets are small and non-negative.
+    let bias = cells.keys().next().copied().unwrap_or(0);
+    let low = func
+        .push(
+            entry_block,
+            Op::Constant(Type::I32, u128::from(bias as u32)),
+        )
+        .unwrap();
+    let low = func
+        .push(entry_block, Op::Int(IntOp::Add, params[ESP as usize], low))
+        .unwrap();
+    let base = func.push(entry_block, Op::Host(low)).unwrap();
+    let entry_cells: Vec<Source> = cells
         .iter()
-        .map(|&p| (p, func.param(entry_block, Type::I32)))
+        .filter(|&(offset, _)| held[0].contains(offset))
+        .map(|(&offset, &width)| Source::Frame { offset, width })
+        .collect();
+    let entry_frame: BTreeMap<i32, Value> = entry_cells
+        .iter()
+        .map(|s| {
+            let Source::Frame { offset, .. } = *s else {
+                unreachable!()
+            };
+            (offset, func.param(entry_block, s.ty()))
+        })
         .collect();
     let entry_state = State {
         regs: params[..8].try_into().unwrap(),
@@ -163,28 +325,42 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
         top: assumed.top,
         control: assumed.control,
         c1: Some(Location::Constant(u64::from(at.x87.status & 0x200 != 0))),
-        ip: Location::Constant(u64::from(at.x87.ip)),
-        opcode: Location::Constant(u64::from(at.x87.opcode)),
+        ip: metadata.map_or(Location::Constant(u64::from(at.x87.ip)), |[ip, _]| {
+            Location::At(ip)
+        }),
+        opcode: metadata.map_or(Location::Constant(u64::from(at.x87.opcode)), |[_, op]| {
+            Location::At(op)
+        }),
         floats: BTreeMap::new(),
         dirty: Default::default(),
         truncations: BTreeMap::new(),
-        frame: BTreeMap::new(),
+        frame: entry_frame,
     };
     let states: Vec<State> = models
         .iter()
         .enumerate()
         .map(|(i, model)| {
             let block = func.block(None);
-            let params: Vec<Value> = common[..17]
-                .iter()
-                .map(|s| func.param(block, s.ty()))
-                .collect();
+            func.blocks[block.0 as usize].eip = Some(unit.trace.insts[i].pc);
+            let params = registers(&mut func, block, &live.entry[i]);
             let x87 = std::array::from_fn(|s| {
-                (model.valid >> s & 1 != 0).then(|| func.param(block, Type::F64))
+                (assumed.x87 && model.valid >> s & 1 != 0).then(|| func.param(block, Type::F64))
             });
-            let frame = frame
+            // A cell holding a binary64 the x87 stored on some arrival is
+            // held as F64; where the x87 stored it on every arrival, the
+            // value also serves float reads without a check.
+            let float = |offset: i32| cells[&offset] == 8 && model.stored.contains(&offset);
+            let frame: BTreeMap<i32, Value> = cells
                 .iter()
-                .map(|&p| (p, func.param(block, Type::I32)))
+                .filter(|&(offset, _)| held[i].contains(offset))
+                .map(|(&offset, &width)| {
+                    let ty = if float(offset) {
+                        Type::F64
+                    } else {
+                        Source::Frame { offset, width }.ty()
+                    };
+                    (offset, func.param(block, ty))
+                })
                 .collect();
             let truncations = model
                 .truncations
@@ -194,7 +370,10 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
             let floats = model
                 .floats
                 .iter()
-                .map(|&p| (p, func.param(block, Type::F64)))
+                .map(|&p| match frame.get(&p) {
+                    Some(&cell) if float(p) => (p, cell),
+                    _ => (p, func.param(block, Type::F64)),
+                })
                 .collect();
             let ip = Location::At(func.param(block, Type::I32));
             let opcode = Location::At(func.param(block, Type::I32));
@@ -225,15 +404,7 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
         })
         .collect::<Result<_, Reject>>()?;
     func.head_exit = unit.trace.returns_at_head().then_some(Block(1));
-    func.entry = common
-        .into_iter()
-        .chain(
-            words
-                .keys()
-                .copied()
-                .map(|offset| Source::Frame { offset, width: 4 }),
-        )
-        .collect();
+    func.entry = entry_sources.into_iter().chain(entry_cells).collect();
     let mut f = Front {
         unit,
         proof,
@@ -244,22 +415,20 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
         index: 0,
         offsets,
         models,
+        frame: frame.clone(),
+        cells: cells.clone(),
+        live,
+        held,
+        carried,
+        base,
+        bias,
         state: entry_state,
         loads: BTreeMap::new(),
         stores: BTreeMap::new(),
         pending_store: None,
     };
-    if let (Some(&lo), Some(&hi)) = (frame.first(), frame.last()) {
-        f.assumed.frame = Some((lo & !3, (hi & !3) + 4));
-    }
-    let entry = f.record(unit.trace.insts[0].pc, unit.trace.owed(0));
+    let entry = f.record(unit.trace.insts[0].pc, unit.trace.owed(0), Start::Entry(0));
     f.func.blocks[0].head = Some(Head { record: entry });
-    for &p in &frame {
-        let shift = f.imm(((p & 3) * 8) as u32);
-        let byte = f.int(IntOp::Shr, words[&(p & !3)], shift);
-        let byte = f.mask(byte, 1);
-        f.state.frame.insert(p, byte);
-    }
     let args = f.arguments(0)?;
     f.func.end(
         entry_block,
@@ -269,42 +438,49 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
             charge: 0,
         }),
     );
+    // The region start in effect when each translated instruction ends.
+    let mut regions: Vec<Option<RecordId>> = vec![None; unit.trace.len()];
     for (i, state) in states.into_iter().enumerate() {
         f.index = i;
         f.block = Block(i as u32 + 1);
         f.state = state;
         let inst = unit.trace.insts[i];
+        // A head by the IR's definition: arrivals from later instructions
+        // (loops), charged arrivals, or arrivals from different regions.
+        // Other merges continue the region their arrivals share.
+        let from = &arrivals[i];
+        let mut region = from.first().and_then(|&p| regions[p]);
         if unit.trace.head(i)
-            || unit.trace.merge[i]
-            || unit.trace.insts.iter().enumerate().any(|(from, ins)| {
-                let fall = match ins.next {
-                    Next::Edge(e) => Some(e),
-                    Next::Fall => Some(Edge::Internal(from + 1)),
-                    _ => None,
-                };
-                [fall, ins.taken].into_iter().flatten().any(
-                    |e| matches!(e, Edge::Internal(to) if to == i && unit.trace.net(from, to) > 0),
-                )
-            })
+            || from.iter().any(|&p| unit.trace.net(p, i) > 0)
+            || from
+                .iter()
+                .any(|&p| regions[p].is_none() || regions[p] != region)
         {
             if f.state.c1.is_none() {
                 return Err(Reject::StaticX87(i));
             }
-            let record = f.record(inst.pc, unit.trace.owed(i));
+            let record = f.record(inst.pc, unit.trace.owed(i), Start::Entry(i));
             f.func.blocks[i + 1].head = Some(Head { record });
+            region = Some(record);
         }
         f.instruction()?;
         if let Some((width, addr, value)) = f.pending_store.take() {
-            let after = f.record(inst.next_pc, unit.trace.unused(i));
+            let after = f.record(inst.next_pc, unit.trace.unused(i), Start::After(i));
+            let r = &mut f.func.records[after.0 as usize];
+            if unit.trace.observe_out[i] == crate::translate::flags::FlagSet::NONE {
+                r.eflags = None;
+            }
             if !metadata_live(unit, i + 1) {
-                let r = &mut f.func.records[after.0 as usize];
-                r.x87.c1 = None;
-                r.x87.ip = None;
-                r.x87.opcode = None;
+                if let Some(x87) = &mut r.x87 {
+                    x87.c1 = None;
+                    x87.ip = None;
+                    x87.opcode = None;
+                }
             } else if f.state.c1.is_none() {
                 return Err(Reject::StaticX87(i));
             }
             f.stores.insert(after, i);
+            region = Some(after);
             f.func.push(
                 f.block,
                 Op::Store {
@@ -332,19 +508,19 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
             End::Jump(f.target(fall)?)
         };
         f.func.end(f.block, end);
+        regions[i] = region;
     }
     passes::run(&mut f.func, proof, &f.loads, &f.stores);
-    if f.func.blocks[1..]
-        .iter()
-        .any(|b| b.params.iter().any(|&p| f.func.ty(p) == Type::Flags))
-    {
-        return Err(Reject::Flags);
+    if let Some(b) = (1..f.func.blocks.len()).find(|&b| {
+        f.func.blocks[b]
+            .params
+            .iter()
+            .any(|&p| f.func.ty(p) == Type::Flags)
+    }) {
+        return Err(Reject::Flags(b - 1));
     }
     debug_assert_eq!(super::verify::verify(&f.func), Ok(()));
-    Ok(Built {
-        func: f.func,
-        assumed: f.assumed,
-    })
+    Ok((f.func, f.assumed))
 }
 
 impl Front<'_> {
@@ -400,6 +576,18 @@ impl Front<'_> {
     fn frame_offset(&self, mem: Mem) -> Option<i32> {
         frame_offset(mem, &self.offsets[self.index])
     }
+    /// Whether any byte of the cell at `offset` is in `set`.
+    fn cell_live(&self, set: &live::Set, offset: i32, width: u8) -> bool {
+        (offset..offset + i32::from(width))
+            .any(|p| self.frame.binary_search(&p).is_ok_and(|j| set.byte(j)))
+    }
+    /// The cells `[offset, offset + width)` covers, by offset and width.
+    fn covered(&self, offset: i32, width: u8) -> Vec<(i32, u8)> {
+        self.cells
+            .range(offset..offset + i32::from(width))
+            .map(|(&start, &w)| (start, w))
+            .collect()
+    }
     fn read(&mut self, mem: Mem, width: u8, ty: Type) -> Result<Value, Reject> {
         if let Some(offset) = self.frame_offset(mem) {
             if let Some(bits) = self.models[self.index].load(mem, width, &self.offsets[self.index])
@@ -407,12 +595,18 @@ impl Front<'_> {
                 return Ok(self.constant(ty, u128::from(bits)));
             }
             let integer = if width > 4 { Type::I64 } else { Type::I32 };
+            let cells = self.covered(offset, width);
+            if let [(start, w)] = cells[..]
+                && (start, w) == (offset, width)
+            {
+                let value = self.cell(start);
+                return Ok(self.bits(ty, value));
+            }
             let mut out = self.constant(integer, 0);
-            for byte in 0..i32::from(width) {
-                let pos = offset + byte;
-                let part = self.state.frame[&pos];
+            for (start, _) in cells {
+                let part = self.cell(start);
                 let part = self.bits(integer, part);
-                let shift = self.constant(integer, byte as u128 * 8);
+                let shift = self.constant(integer, (start - offset) as u128 * 8);
                 let part = self.int(IntOp::Shl, part, shift);
                 out = self.int(IntOp::Or, out, part);
             }
@@ -424,6 +618,40 @@ impl Front<'_> {
             Ok(value)
         }
     }
+    /// Whether block `i` holds the cell at `start` as F64: an x87 binary64
+    /// store wrote it on some arrival.
+    pub(super) fn float_cell(&self, i: usize, start: i32) -> bool {
+        self.cells[&start] == 8
+            && self.held[i].contains(&start)
+            && self.models[i].stored.contains(&start)
+    }
+    /// A frame cell's value: the one held, or else memory's, which holds
+    /// the cell's value whenever no value is held.
+    fn cell(&mut self, start: i32) -> Value {
+        if let Some(&value) = self.state.frame.get(&start) {
+            return value;
+        }
+        let ty = Source::Frame {
+            offset: start,
+            width: self.cells[&start],
+        }
+        .ty();
+        let value = self.cell_value(start, ty);
+        self.state.frame.insert(start, value);
+        value
+    }
+    /// As `cell`, as `ty` and without keeping a loaded value: an edge's
+    /// arguments load on that edge only.
+    pub(super) fn cell_value(&mut self, start: i32, ty: Type) -> Value {
+        match self.state.frame.get(&start) {
+            Some(&value) => self.bits(ty, value),
+            None => self.value(Op::FrameLoad {
+                ty,
+                base: self.base,
+                offset: start - self.bias,
+            }),
+        }
+    }
     fn write(&mut self, mem: Mem, width: u8, value: Value) -> Result<(), Reject> {
         if let Some(offset) = self.frame_offset(mem) {
             let integer = if width > 4 { Type::I64 } else { Type::I32 };
@@ -433,15 +661,27 @@ impl Front<'_> {
             self.state.truncations.retain(|&(start, w), _| {
                 start + i32::from(w) <= offset || offset + i32::from(width) <= start
             });
+            let cells = self.covered(offset, width);
+            if cells[..] == [(offset, 8)] && self.func.ty(value) == Type::F64 {
+                self.state.frame.insert(offset, value);
+                self.state.dirty.extend(offset..offset + 8);
+                return Ok(());
+            }
             let value = self.bits(integer, value);
-            for byte in 0..i32::from(width) {
-                let pos = offset + byte;
-                let shift = self.constant(integer, byte as u128 * 8);
+            for (start, w) in cells {
+                let shift = self.constant(integer, (start - offset) as u128 * 8);
                 let part = self.int(IntOp::Shr, value, shift);
-                let part = self.bits(Type::I32, part);
-                let part = self.mask(part, 1);
-                self.state.frame.insert(pos, part);
-                self.state.dirty.insert(pos);
+                let cell = if w > 4 { Type::I64 } else { Type::I32 };
+                let part = self.bits(cell, part);
+                let part = match w {
+                    4 | 8 => part,
+                    _ => {
+                        let mask = self.constant(cell, (1u128 << (w * 8)) - 1);
+                        self.int(IntOp::And, part, mask)
+                    }
+                };
+                self.state.frame.insert(start, part);
+                self.state.dirty.extend(start..start + i32::from(w));
             }
         } else {
             let addr = self.address(mem)?;
@@ -449,14 +689,24 @@ impl Front<'_> {
         }
         Ok(())
     }
-    fn record(&mut self, eip: u32, refund: u32) -> RecordId {
-        self.func.record(IrRecord {
+    /// The record of a region start, holding the components `at` keeps live
+    /// that the form may have changed.
+    fn record(&mut self, eip: u32, refund: u32, at: Start) -> RecordId {
+        let live = match at {
+            Start::Entry(i) => &self.live.entry[i],
+            Start::After(i) => &self.live.after[i],
+            Start::Exit => &self.live.all,
+        };
+        let held = |bit: usize, v: Value| {
+            (live.reg(bit) && self.live.kept >> bit & 1 == 0).then_some(Location::At(v))
+        };
+        let record = IrRecord {
             eip,
             refund,
-            regs: self.state.regs.map(|v| Some(Location::At(v))),
+            regs: std::array::from_fn(|r| held(r, self.state.regs[r])),
             eflags: Some(Location::Recipe(Recipe::Eflags(self.state.flags))),
-            xmm: self.state.xmm.map(|v| Some(Location::At(v))),
-            x87: X87 {
+            xmm: std::array::from_fn(|r| held(8 + r, self.state.xmm[r])),
+            x87: self.assumed.x87.then(|| X87 {
                 top: self.state.top,
                 valid: self
                     .state
@@ -470,30 +720,93 @@ impl Front<'_> {
                 c1: self.state.c1,
                 ip: Some(self.state.ip),
                 opcode: Some(self.state.opcode),
-            },
+            }),
             frame: self
                 .state
                 .frame
                 .iter()
-                .filter(|(offset, _)| self.state.dirty.contains(offset))
-                .map(|(&offset, &value)| (offset, 1, Location::At(value)))
+                .map(|(&offset, &value)| (offset, self.cells[&offset], value))
+                .filter(|&(offset, width, _)| {
+                    self.state.dirty.contains(&offset) && self.cell_live(live, offset, width)
+                })
+                .map(|(offset, width, value)| (offset, width, Location::At(value)))
                 .collect(),
-        })
+        };
+        self.func.record(record)
+    }
+    /// The dirty cells outside `kept` that execution can read where `live`
+    /// holds, with their values.
+    fn commits(
+        &self,
+        kept: &std::collections::BTreeSet<i32>,
+        live: &live::Set,
+    ) -> Vec<(i32, Value)> {
+        self.state
+            .frame
+            .iter()
+            .filter(|&(c, _)| {
+                let width = self.cells[c];
+                !kept.contains(c)
+                    && (*c..*c + i32::from(width)).any(|b| self.state.dirty.contains(&b))
+                    && self.cell_live(live, *c, width)
+            })
+            .map(|(&c, &v)| (c, v))
+            .collect()
+    }
+    fn commit(&mut self, commits: Vec<(i32, Value)>) {
+        for (offset, value) in commits {
+            self.func.push(
+                self.block,
+                Op::FrameStore {
+                    base: self.base,
+                    offset: offset - self.bias,
+                    value,
+                },
+            );
+        }
     }
     fn target(&mut self, edge: Edge) -> Result<Target, Reject> {
         match edge {
-            Edge::Internal(i) => Ok(Target {
-                block: Block(i as u32 + 1),
-                args: self.arguments(i)?,
-                charge: self.unit.trace.net(self.index, i) as i32,
-            }),
+            Edge::Internal(i) => {
+                let target = Target {
+                    block: Block(i as u32 + 1),
+                    args: Vec::new(),
+                    charge: self.unit.trace.net(self.index, i) as i32,
+                };
+                // Dirty cells the head does not carry commit on this edge
+                // alone, after validation (A64-OPT-3).
+                let commits = match &self.carried[i] {
+                    Some(kept) => self.commits(kept, &self.live.entry[i]),
+                    None => Vec::new(),
+                };
+                if commits.is_empty() {
+                    return Ok(Target {
+                        args: self.arguments(i)?,
+                        ..target
+                    });
+                }
+                let from = std::mem::replace(&mut self.block, self.func.block(None));
+                let args = self.arguments(i)?;
+                self.commit(commits);
+                let edge = std::mem::replace(&mut self.block, from);
+                self.func.end(edge, End::Jump(Target { args, ..target }));
+                Ok(Target {
+                    block: edge,
+                    args: Vec::new(),
+                    charge: 0,
+                })
+            }
             Edge::Interpret(_) => Err(Reject::Interpret(self.index)),
             Edge::Exit(eip) => {
                 if self.state.c1.is_none() {
                     return Err(Reject::StaticX87(self.index));
                 }
                 let block = self.func.block(None);
-                let record = self.record(eip, self.unit.trace.unused(self.index));
+                // A cut instruction leaves at its own EIP without retiring.
+                let inst = self.unit.trace.insts[self.index];
+                let cut = inst.op == decode::Op::Nop && inst.pc == eip;
+                let refund = self.unit.trace.unused(self.index) + u32::from(cut);
+                let record = self.record(eip, refund, Start::Exit);
                 self.func.end(block, End::Exit(record));
                 Ok(Target {
                     block,
@@ -512,7 +825,11 @@ fn frame_offset(mem: Mem, offsets: &[Option<i32>; 8]) -> Option<i32> {
     Some(offsets[mem.base? as usize]?.wrapping_add(mem.disp as i32))
 }
 
-fn layout(unit: &Unit, esp_low: u8) -> Result<(Vec<Offsets>, Vec<i32>), Reject> {
+/// Register frame offsets at each instruction, the frame bytes accessed, and
+/// the cells their accesses cut them into.
+type Layout = (Vec<Offsets>, Vec<i32>, BTreeMap<i32, u8>);
+
+fn layout(unit: &Unit, esp_low: u8) -> Result<Layout, Reject> {
     let trace = &unit.trace;
     let mut offsets = vec![None; trace.len()];
     let mut entry = [None; 8];
@@ -521,6 +838,7 @@ fn layout(unit: &Unit, esp_low: u8) -> Result<(Vec<Offsets>, Vec<i32>), Reject> 
     let mut slots = vec![BTreeMap::<i32, i32>::new(); trace.len()];
     let mut work = vec![0];
     let mut frame = std::collections::BTreeSet::new();
+    let mut cuts = std::collections::BTreeSet::new();
     while let Some(i) = work.pop() {
         let mut regs = offsets[i].unwrap();
         let mut saved = slots[i].clone();
@@ -535,9 +853,8 @@ fn layout(unit: &Unit, esp_low: u8) -> Result<(Vec<Offsets>, Vec<i32>), Reject> 
         };
         let mut access = |mem, width| {
             if let Some(start) = frame_offset(mem, &regs) {
-                for pos in start..start + i32::from(width) {
-                    frame.insert(pos);
-                }
+                frame.extend(start..start + i32::from(width));
+                cuts.extend([start, start + i32::from(width)]);
             }
         };
         match inst.op {
@@ -790,9 +1107,26 @@ fn layout(unit: &Unit, esp_low: u8) -> Result<(Vec<Offsets>, Vec<i32>), Reject> 
             }
         }
     }
+    // A cell runs from a cut or a gap to the next one.
+    let mut cells = BTreeMap::new();
+    let mut open: Option<i32> = None;
+    for &p in &frame {
+        if let Some(start) = open
+            && (cuts.contains(&p) || !frame.contains(&(p - 1)))
+        {
+            cells.insert(start, (p - start) as u8);
+            open = None;
+        }
+        open.get_or_insert(p);
+        if !frame.contains(&(p + 1)) {
+            let start = open.take().unwrap();
+            cells.insert(start, (p + 1 - start) as u8);
+        }
+    }
     Ok((
         offsets.into_iter().map(|r| r.unwrap_or(entry)).collect(),
         frame.into_iter().collect(),
+        cells,
     ))
 }
 

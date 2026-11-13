@@ -4,7 +4,13 @@ use crate::translate::simd::{Kind, Loc, Simd};
 
 impl Front<'_> {
     pub(super) fn simd(&mut self, s: Simd) -> Result<(), Reject> {
-        if s.memory() && (s.aligned || s.width == 16) {
+        // Frame cells are at most eight bytes, and an aligned access must
+        // not fault where the guest's would: its address is a constant.
+        let constant =
+            s.mem.base.is_none() && s.mem.index.is_none() && s.mem.disp.is_multiple_of(16);
+        if s.memory()
+            && (s.aligned && !constant || s.width == 16 && self.frame_offset(s.mem).is_some())
+        {
             return Err(Reject::Unsupported(self.index));
         }
         if s.kind == Kind::StoreControl {

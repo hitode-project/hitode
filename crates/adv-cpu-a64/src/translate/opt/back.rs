@@ -114,7 +114,10 @@ pub(crate) fn lower(func: &Func, at: usize, opt_exit: usize) -> Lowered {
         }
         e.asm.bind(e.blocks[b]);
         e.region = allocation.regions[b];
-        e.mark(Part::Body, func.records[e.region.0 as usize].eip);
+        e.mark(
+            Part::Body,
+            data.eip.unwrap_or(func.records[e.region.0 as usize].eip),
+        );
         for &(result, op) in &data.insts {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
@@ -374,6 +377,59 @@ impl<'a> Emitter<'a> {
                 Some(t)
             }
             _ => None,
+        }
+    }
+    /// A frame cell access at `offset` from the host address in `base`,
+    /// through U when the offset needs computing.
+    fn frame(&mut self, load: bool, size: Size, rt: Reg, base: Reg, offset: i32) {
+        let bytes = if size == X { 8 } else { 4 };
+        let emit = |rn: Reg, offset: i32| {
+            let scaled = offset >= 0 && offset % bytes == 0 && offset / bytes < 4096;
+            match (load, scaled) {
+                (true, true) => ldr(size, rt, rn, offset as u32),
+                (false, true) => str(size, rt, rn, offset as u32),
+                (true, false) => ldur(size, rt, rn, offset),
+                (false, false) => stur(size, rt, rn, offset),
+            }
+        };
+        let fits = |offset: i32| {
+            offset >= 0 && offset % bytes == 0 && offset / bytes < 4096
+                || (-256..256).contains(&offset)
+        };
+        if fits(offset) {
+            self.asm.emit(emit(base, offset));
+        } else {
+            let n = offset.unsigned_abs();
+            let mut from = base;
+            for (part, shift) in [(n & 0xfff, false), (n >> 12, true)] {
+                if part != 0 {
+                    self.asm.emit(if offset < 0 {
+                        sub_imm(X, U, from, part, shift)
+                    } else {
+                        add_imm(X, U, from, part, shift)
+                    });
+                    from = U;
+                }
+            }
+            self.asm.emit(emit(U, 0));
+        }
+    }
+    /// An F64 frame cell access, as `frame` is an integer one.
+    fn vframe(&mut self, load: bool, rt: VReg, base: Reg, offset: i32) {
+        let scaled = offset >= 0 && offset % 8 == 0 && offset / 8 < 4096;
+        if scaled || (-256..256).contains(&offset) {
+            self.asm.emit(match (load, scaled) {
+                (true, true) => vldr(VMem::D, rt, base, offset as u32),
+                (false, true) => vstr(VMem::D, rt, base, offset as u32),
+                (true, false) => vldur(VMem::D, rt, base, offset),
+                (false, false) => vstur(VMem::D, rt, base, offset),
+            });
+        } else if load {
+            self.frame(true, X, T, base, offset);
+            self.asm.emit(fmov_to_v(X, rt, T));
+        } else {
+            self.asm.emit(fmov_from_v(X, T, rt));
+            self.frame(false, X, T, base, offset);
         }
     }
     fn fail(&self) -> Label {
@@ -767,6 +823,34 @@ impl<'a> Emitter<'a> {
                     self.asm.emit(vldr_reg(mem_size(width), q, ALIAS, addr));
                 }
             }
+            Op::Host(addr) => {
+                let addr = self.gp(addr, U);
+                self.asm.emit(add_ext(X, d, ALIAS, addr, Extend::Uxtw, 0));
+            }
+            Op::FrameLoad { ty, base, offset } => {
+                let base = self.gp(base, U);
+                if ty == Type::F64 {
+                    self.vframe(true, q, base, offset);
+                } else {
+                    let size = if ty == Type::I64 { X } else { W };
+                    self.frame(true, size, d, base, offset);
+                }
+            }
+            Op::FrameStore {
+                base,
+                offset,
+                value,
+            } => {
+                let base = self.gp(base, U);
+                if self.func.ty(value) == Type::F64 {
+                    let value = self.vr(value, A);
+                    self.vframe(false, value, base, offset);
+                } else {
+                    let size = self.size(value);
+                    let value = self.gp(value, T);
+                    self.frame(false, size, value, base, offset);
+                }
+            }
             Op::Store {
                 width,
                 addr,
@@ -790,24 +874,39 @@ impl<'a> Emitter<'a> {
                 self.region = after;
                 self.mark(Part::Body, self.func.records[after.0 as usize].eip);
             }
-            Op::X87Load { bits, denormal } => {
+            Op::X87Load {
+                bits,
+                denormal,
+                single,
+            } => {
                 let r = self.gp(bits, U);
                 let nan = self.asm.label();
                 let done = self.asm.label();
-                self.asm
-                    .emit_all(&[ubfx(X, T, r, 52, 11), cmp_imm(W, T, 2047, false)]);
+                // Exponent position and width, and the bits above the fraction.
+                let (size, low, exponent, high) = if single {
+                    (W, 23, 8, 9)
+                } else {
+                    (X, 52, 11, 12)
+                };
+                self.asm.emit_all(&[
+                    ubfx(size, T, r, low, exponent),
+                    cmp_imm(W, T, (1 << exponent) - 1, false),
+                ]);
                 self.asm.b_cond(Cond::Eq, nan);
-                if denormal {
+                if denormal || single {
                     self.asm.cbz(W, true, T, done);
-                    self.asm.emit(lsl_imm(X, T, r, 1));
-                    self.asm.cbz(X, true, T, self.fail());
+                    self.asm.emit(lsl_imm(size, T, r, 1));
+                    self.asm.cbz(size, true, T, self.fail());
                 }
                 self.asm.b(done);
                 self.asm.bind(nan);
-                self.asm.emit(lsl_imm(X, T, r, 12));
-                self.asm.cbz(X, true, T, self.fail());
+                self.asm.emit(lsl_imm(size, T, r, high));
+                self.asm.cbz(size, true, T, self.fail());
                 self.asm.bind(done);
-                self.asm.emit(fmov_to_v(X, q, r));
+                self.asm.emit(fmov_to_v(size, q, r));
+                if single {
+                    self.asm.emit(unary(Unary::Widen, q, q));
+                }
             }
             Op::Validate => {
                 self.asm
@@ -841,13 +940,23 @@ fn add_immediate(n: u64) -> Option<(u32, bool)> {
 fn int_immediate(op: IntOp, size: Size, d: Reg, a: Reg, n: u64) -> Option<u32> {
     Some(match op {
         IntOp::Add | IntOp::Sub => {
-            let (n, shift) = add_immediate(n)?;
-            if op == IntOp::Add {
+            // A negative addend subtracts its magnitude, and the reverse.
+            let mask = if size == X {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            let (add, (n, shift)) = match add_immediate(n) {
+                Some(n) => (op == IntOp::Add, n),
+                None => (op == IntOp::Sub, add_immediate(n.wrapping_neg() & mask)?),
+            };
+            if add {
                 add_imm(size, d, a, n, shift)
             } else {
                 sub_imm(size, d, a, n, shift)
             }
         }
+        IntOp::Mul if n.is_power_of_two() => lsl_imm(size, d, a, n.trailing_zeros()),
         IntOp::And | IntOp::Or | IntOp::Xor => {
             bitmask(size, n)?;
             match op {

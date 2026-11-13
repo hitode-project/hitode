@@ -38,14 +38,15 @@ pub(super) fn run(
         }
     };
     settle(func);
-    if entry_flags(func) {
+    // A head's arrival may be another head's parameter, which settling
+    // replaces with the entry's flags.
+    while entry_flags(func) {
         settle(func);
     }
     hoist(func, proof, loads);
     while propagate(func) {}
     join(func);
     group_stores(func, proof, loads, stores);
-    prune_records(func);
     dead(func);
     validations(func);
 }
@@ -60,6 +61,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
         | Op::Load { addr: a, .. }
+        | Op::Host(a)
+        | Op::FrameLoad { base: a, .. }
         | Op::X87Load { bits: a, .. }
         | Op::Test { flags: a, .. } => f(a),
         Op::Int(_, a, b)
@@ -72,6 +75,9 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         }
         | Op::Store {
             addr: a, value: b, ..
+        }
+        | Op::FrameStore {
+            base: a, value: b, ..
         } => {
             f(a);
             f(b);
@@ -102,12 +108,11 @@ fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
         .iter_mut()
         .chain([&mut record.eflags])
         .chain(record.xmm.iter_mut())
-        .chain(record.x87.stack.iter_mut())
-        .chain([
-            &mut record.x87.c1,
-            &mut record.x87.ip,
-            &mut record.x87.opcode,
-        ])
+        .chain(record.x87.iter_mut().flat_map(|x| {
+            x.stack
+                .iter_mut()
+                .chain([&mut x.c1, &mut x.ip, &mut x.opcode])
+        }))
         .flatten()
         .chain(record.frame.iter_mut().map(|(_, _, loc)| loc))
     {
@@ -165,13 +170,18 @@ fn entry_flags(func: &mut Func) -> bool {
         };
         let params = func.blocks[b].params.clone();
         for (p, &param) in params.iter().enumerate() {
+            let arrivals: Vec<Value> = func
+                .blocks
+                .iter()
+                .flat_map(|block| block.end.targets())
+                .filter(|t| t.block.0 as usize == b)
+                .map(|t| t.args[p])
+                .collect();
             if func.ty(param) != Type::Flags
-                || !func
-                    .blocks
+                || arrivals.iter().all(|&v| v == base)
+                || !arrivals
                     .iter()
-                    .flat_map(|block| block.end.targets())
-                    .filter(|t| t.block.0 as usize == b)
-                    .all(|t| from_entry(t.args[p], param, observed[param.0 as usize]))
+                    .all(|&v| from_entry(v, param, observed[param.0 as usize]))
             {
                 continue;
             }
@@ -346,6 +356,18 @@ fn propagate(func: &mut Func) -> bool {
             let Some(r) = *result else {
                 continue;
             };
+            // Constants go right, where immediates encode.
+            if let Op::Int(kind, a, b) = *op
+                && matches!(
+                    kind,
+                    IntOp::Add | IntOp::And | IntOp::Or | IntOp::Xor | IntOp::Mul
+                )
+                && constant(&defs, a).is_some()
+                && constant(&defs, b).is_none()
+            {
+                *op = Op::Int(kind, b, a);
+                changed = true;
+            }
             if let Some(v) = identity(*op, &defs) {
                 let v = resolve(v, &alias);
                 if r != v {
@@ -362,8 +384,7 @@ fn propagate(func: &mut Func) -> bool {
                 }
             }
             defs[r.0 as usize] = Some(*op);
-            if !op.can_fail() && !op.floating() || block_index == 0 && matches!(op, Op::Load { .. })
-            {
+            if op.pure() || block_index == 0 && matches!(op, Op::Load { .. }) {
                 if let Some((_, other)) = numbered.iter().find(|(other, _)| other == op) {
                     alias[r.0 as usize] = *other;
                     changed = true;
@@ -443,14 +464,57 @@ fn constant(defs: &[Option<Op>], v: Value) -> Option<u128> {
     }
 }
 
+/// How many low bits of an integer value may be set: the rest are zero.
+fn significant(defs: &[Option<Op>], v: Value, depth: u8) -> u32 {
+    let bits = |v| {
+        if depth == 0 {
+            64
+        } else {
+            significant(defs, v, depth - 1)
+        }
+    };
+    match defs[v.0 as usize] {
+        Some(Op::Constant(_, c)) => 128 - c.leading_zeros(),
+        Some(Op::Load {
+            ty: Type::I32 | Type::I64,
+            width,
+            ..
+        }) => u32::from(width) * 8,
+        Some(Op::IntUnary(IntUnary::ZeroExtend8, _)) => 8,
+        Some(Op::IntUnary(IntUnary::ZeroExtend16, _)) => 16,
+        Some(Op::IntUnary(IntUnary::Widen, a)) => bits(a).min(32),
+        Some(Op::Int(IntOp::And, a, b)) => bits(a).min(bits(b)),
+        Some(Op::Int(IntOp::Or | IntOp::Xor, a, b)) => bits(a).max(bits(b)),
+        Some(Op::Int(IntOp::Shr, a, b)) => match constant(defs, b) {
+            Some(k) if k < 32 => bits(a).saturating_sub(k as u32),
+            _ => 64,
+        },
+        _ => 64,
+    }
+}
+
 fn identity(op: Op, defs: &[Option<Op>]) -> Option<Value> {
+    // A mask or zero extension that keeps every bit its operand may set.
+    let keeps = |a: Value, mask: u128| {
+        let bits = significant(defs, a, 8);
+        bits < 64 && mask & ((1 << bits) - 1) == (1 << bits) - 1
+    };
     match op {
+        Op::Int(IntOp::And, a, b) if constant(defs, b).is_some_and(|m| keeps(a, m)) => Some(a),
+        Op::Int(IntOp::And, a, b) if constant(defs, a).is_some_and(|m| keeps(b, m)) => Some(b),
+        Op::IntUnary(IntUnary::ZeroExtend8, a) if keeps(a, 0xff) => Some(a),
+        Op::IntUnary(IntUnary::ZeroExtend16, a) if keeps(a, 0xffff) => Some(a),
         Op::Int(
             IntOp::Add | IntOp::Sub | IntOp::Or | IntOp::Xor | IntOp::Shl | IntOp::Shr | IntOp::Sar,
             a,
             b,
         ) if constant(defs, b) == Some(0) => Some(a),
+        Op::Int(IntOp::Add | IntOp::Or | IntOp::Xor, a, b) if constant(defs, a) == Some(0) => {
+            Some(b)
+        }
+        Op::Int(IntOp::And | IntOp::Or, a, b) if a == b => Some(a),
         Op::Int(IntOp::Mul, a, b) if constant(defs, b) == Some(1) => Some(a),
+        Op::Int(IntOp::Mul, a, b) if constant(defs, a) == Some(1) => Some(b),
         Op::Select { cond, a, b } => {
             if a == b {
                 Some(a)
@@ -713,7 +777,7 @@ fn dead(func: &mut Func) {
             }
         }
         for (_, op) in &block.insts {
-            if op.can_fail() || op.floating() {
+            if op.effect() {
                 for v in op.uses() {
                     live[v.0 as usize] = true;
                 }
@@ -779,9 +843,9 @@ fn dead(func: &mut Func) {
         for &i in removed[b].iter().rev() {
             block.params.remove(i);
         }
-        block.insts.retain(|(r, op)| {
-            r.is_some_and(|r| live[r.0 as usize]) || op.can_fail() || op.floating()
-        });
+        block
+            .insts
+            .retain(|(r, op)| r.is_some_and(|r| live[r.0 as usize]) || op.effect());
         for t in match &mut block.end {
             End::Jump(t) => vec![t],
             End::Branch { taken, fall, .. } => vec![taken, fall],
@@ -801,7 +865,7 @@ fn validations(func: &mut Func) {
         for (b, block) in func.blocks.iter().enumerate() {
             let mut p = pending[b];
             for (_, op) in &block.insts {
-                p = if matches!(op, Op::Validate | Op::Store { .. }) {
+                p = if matches!(op, Op::Validate | Op::Store { .. } | Op::FrameStore { .. }) {
                     false
                 } else {
                     p || op.floating()
@@ -824,7 +888,7 @@ fn validations(func: &mut Func) {
         let mut p = pending[b];
         let mut insts = Vec::new();
         for inst in std::mem::take(&mut block.insts) {
-            if matches!(inst.1, Op::Store { .. }) && p {
+            if matches!(inst.1, Op::Store { .. } | Op::FrameStore { .. }) && p {
                 insts.push((None, Op::Validate));
                 p = false;
             }
@@ -840,113 +904,88 @@ fn validations(func: &mut Func) {
     }
 }
 
-fn prune_records(func: &mut Func) {
-    use std::collections::BTreeSet;
-    let mut incoming = vec![BTreeSet::<Value>::new(); func.blocks.len()];
-    let mut after = vec![Vec::new(); func.blocks.len()];
+/// Moves loads that read invariant memory, and the operations their
+/// addresses need, out of loops into block 0. Only blocks that run on every
+/// iteration give them up: hoisting from a side path would hold a register
+/// across the loop for code that rarely runs. Other operations stay where
+/// they are used, so they hold no register across the loop either. Nothing
+/// moves when the loads would not fit in registers beside what loop heads
+/// carry.
+fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
+    let every = per_iteration(func);
+    let mut available = vec![false; func.types.len()];
+    for &p in &func.blocks[0].params {
+        available[p.0 as usize] = true;
+    }
+    for &(r, _) in &func.blocks[0].insts {
+        if let Some(r) = r {
+            available[r.0 as usize] = true;
+        }
+    }
+    let invariant = |r: Value, op: Op| {
+        op.pure()
+            || matches!(op, Op::Load { .. })
+                && loads.get(&r).is_some_and(|&i| proof.invariant_read(i))
+    };
+    // What could move, then what hoisted loads need.
+    let mut movable = available.clone();
+    let mut ops = BTreeMap::new();
     loop {
         let mut changed = false;
-        for (b, block) in func.blocks.iter().enumerate().rev() {
-            let mut live = BTreeSet::new();
-            for t in block.end.targets() {
-                for &v in &incoming[t.block.0 as usize] {
-                    if let Some(i) = func.blocks[t.block.0 as usize]
-                        .params
-                        .iter()
-                        .position(|&p| p == v)
-                    {
-                        live.insert(t.args[i]);
-                    } else {
-                        live.insert(v);
-                    }
+        for (b, block) in func.blocks.iter().enumerate().skip(1) {
+            for &(r, op) in &block.insts {
+                if let Some(r) = r
+                    && every[b]
+                    && !movable[r.0 as usize]
+                    && invariant(r, op)
+                    && op.uses().all(|v| movable[v.0 as usize])
+                {
+                    movable[r.0 as usize] = true;
+                    ops.insert(r, op);
+                    changed = true;
                 }
             }
-            match block.end {
-                End::Branch { cond, .. } => {
-                    live.insert(cond);
-                }
-                End::Exit(r) => live.extend(func.records[r.0 as usize].uses()),
-                _ => {}
-            }
-            let mut positions = vec![BTreeSet::new(); block.insts.len()];
-            for (i, (result, op)) in block.insts.iter().enumerate().rev() {
-                positions[i] = live.clone();
-                let used = result.is_some_and(|r| live.remove(&r));
-                if used || op.can_fail() || op.floating() {
-                    live.extend(op.uses());
-                }
-            }
-            if let Some(head) = block.head {
-                live.extend(func.records[head.record.0 as usize].uses());
-            }
-            if incoming[b] != live {
-                incoming[b] = live;
-                changed = true;
-            }
-            after[b] = positions;
         }
         if !changed {
             break;
         }
     }
-    for (b, block) in func.blocks.iter().enumerate() {
-        for (i, (_, op)) in block.insts.iter().enumerate() {
-            let Op::Store { after: id, .. } = op else {
-                continue;
-            };
-            let record = &mut func.records[id.0 as usize];
-            let live = &after[b][i];
-            let keep = |loc: &Option<Location<Value>>| {
-                loc.is_some_and(|loc| match loc {
-                    Location::At(v) | Location::Recipe(Recipe::Eflags(v)) => live.contains(&v),
-                    Location::Recipe(Recipe::C1 { a, b, .. }) => {
-                        live.contains(&a) || live.contains(&b)
-                    }
-                    Location::Constant(_) => true,
-                })
-            };
-            for loc in record
-                .regs
-                .iter_mut()
-                .chain([&mut record.eflags])
-                .chain(record.xmm.iter_mut())
-                .chain(record.x87.stack.iter_mut())
-            {
-                if !keep(loc) {
-                    *loc = None;
-                }
-            }
-        }
+    let mut needed = vec![false; func.types.len()];
+    let mut work: Vec<Value> = ops
+        .iter()
+        .filter(|(_, op)| matches!(op, Op::Load { .. }))
+        .map(|(&r, _)| r)
+        .collect();
+    // A hoisted value holds a register across every loop: where loop heads
+    // already carry more than the registers hold, it would only spill, and
+    // its reload would cost what the load costs.
+    let general = |v: &Value| matches!(func.ty(*v), Type::I32 | Type::I64 | Type::Flags);
+    let carried = func
+        .blocks
+        .iter()
+        .filter(|b| b.head.is_some())
+        .map(|b| b.params.iter().filter(|v| general(v)).count())
+        .max()
+        .unwrap_or(0);
+    if carried + work.iter().filter(|v| general(v)).count() > super::cells::CARRIED {
+        return;
     }
-}
-
-fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
-    let mut available = vec![false; func.types.len()];
-    for &p in &func.blocks[0].params {
-        available[p.0 as usize] = true;
-    }
-    for (r, _) in &func.blocks[0].insts {
-        if let Some(r) = r {
-            available[r.0 as usize] = true;
+    while let Some(r) = work.pop() {
+        if std::mem::replace(&mut needed[r.0 as usize], true) {
+            continue;
         }
+        work.extend(ops[&r].uses().filter(|v| ops.contains_key(v)));
     }
     loop {
         let mut moved = Vec::new();
         for block in &mut func.blocks[1..] {
-            block.insts.retain(|&(r, op)| {
-                let Some(r) = r else {
-                    return true;
-                };
-                let invariant = !op.can_fail() && !op.floating()
-                    || matches!(op, Op::Load { .. })
-                        && loads.get(&r).is_some_and(|&i| proof.invariant_read(i));
-                if invariant && op.uses().all(|v| available[v.0 as usize]) {
+            block.insts.retain(|&(r, op)| match r {
+                Some(r) if needed[r.0 as usize] && op.uses().all(|v| available[v.0 as usize]) => {
                     moved.push((Some(r), op));
                     available[r.0 as usize] = true;
                     false
-                } else {
-                    true
                 }
+                _ => true,
             });
         }
         if moved.is_empty() {
@@ -954,6 +993,54 @@ fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
         }
         func.blocks[0].insts.extend(moved);
     }
+}
+
+/// Blocks that run on every iteration of a loop that encloses them: the
+/// loop head dominates them and they dominate one of its backedges.
+fn per_iteration(func: &Func) -> Vec<bool> {
+    let count = func.blocks.len();
+    let words = count.div_ceil(64);
+    let mut predecessors = vec![Vec::new(); count];
+    for (b, data) in func.blocks.iter().enumerate() {
+        for t in data.end.targets() {
+            predecessors[t.block.0 as usize].push(b);
+        }
+    }
+    let has = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 != 0;
+    let mut dominators = vec![vec![u64::MAX; words]; count];
+    dominators[0] = vec![0; words];
+    dominators[0][0] = 1;
+    loop {
+        let mut changed = false;
+        for b in 1..count {
+            let mut set = vec![u64::MAX; words];
+            for &p in &predecessors[b] {
+                for (s, d) in set.iter_mut().zip(&dominators[p]) {
+                    *s &= d;
+                }
+            }
+            set[b / 64] |= 1 << (b % 64);
+            if set != dominators[b] {
+                dominators[b] = set;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut every = vec![false; count];
+    for (latch, data) in func.blocks.iter().enumerate() {
+        for head in data.end.targets().map(|t| t.block.0 as usize) {
+            if !has(&dominators[latch], head) {
+                continue;
+            }
+            for b in 0..count {
+                every[b] |= has(&dominators[b], head) && has(&dominators[latch], b);
+            }
+        }
+    }
+    every
 }
 
 fn join(func: &mut Func) {
@@ -1011,7 +1098,7 @@ fn group_stores(
                         proof.disjoint_effects(stores[after], load)
                     })
                 }),
-                (_, Op::Div { .. } | Op::Validate) => false,
+                (_, Op::Div { .. } | Op::Validate | Op::FrameStore { .. }) => false,
                 _ => true,
             };
             if !cross {

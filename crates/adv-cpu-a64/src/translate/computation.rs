@@ -144,6 +144,9 @@ pub(crate) struct Proof {
     divisions: Vec<Option<Division>>,
     frame_cache: Option<FrameCache>,
     outer: Option<Outer>,
+    /// Each trace instruction as decoded once from guest bytes, for the
+    /// split proof and the optimizer's component effects.
+    instructions: Vec<Option<iced_x86::Instruction>>,
 }
 
 /// The loop at the unit entry, whose iterations may run as blocks
@@ -1834,17 +1837,23 @@ impl Proof {
                 outer.counter = outer.counter.and_then(|var| ids.get(&var).copied());
                 outer
             }),
+            instructions: Vec::new(),
         })
     }
 
-    /// Proves that the head loop's iterations exchange only affine
-    /// registers and frame dwords. `decode` returns the instruction at an
-    /// address and length.
+    /// Decodes the trace's instructions, then proves that the head loop's
+    /// iterations exchange only affine registers and frame dwords. `decode`
+    /// returns the instruction at an address and length.
     pub(crate) fn prove_split(
         &mut self,
         trace: &Trace,
         decode: impl Fn(u32, u32) -> Option<iced_x86::Instruction>,
     ) {
+        self.instructions = trace
+            .insts
+            .iter()
+            .map(|inst| decode(inst.pc, inst.next_pc.wrapping_sub(inst.pc)))
+            .collect();
         let Some(outer) = self.outer else {
             return;
         };
@@ -1861,7 +1870,8 @@ impl Proof {
             .flatten()
             .map(|&(offset, _, step)| (offset, zero(step)))
             .collect();
-        let carried = carried::independent(trace, affine, &slots, &self.divisions, decode);
+        let carried =
+            carried::independent(trace, affine, &slots, &self.divisions, &self.instructions);
         self.outer = Some(Outer {
             split: carried.is_some(),
             frame: carried.flatten().is_some(),
@@ -2002,6 +2012,11 @@ impl Proof {
                 .any(|&(v, _)| Some(v) == counter || self.varies(v, counter)),
             _ => false,
         }
+    }
+
+    /// The trace instruction at `index` as decoded for the split proof.
+    pub(crate) fn instruction(&self, index: usize) -> Option<&iced_x86::Instruction> {
+        self.instructions.get(index)?.as_ref()
     }
 
     /// Whether this instruction's non-frame read is invariant in the unit.

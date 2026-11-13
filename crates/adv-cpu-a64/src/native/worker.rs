@@ -212,10 +212,9 @@ fn run(
     let optimized = code.optimized.as_deref().and_then(|o| {
         let cells =
             crate::translate::opt::admit(&o.entry, &o.assumed, cpu, |addr, width| unsafe {
-                match width {
-                    4 => u64::from(host(addr).cast::<u32>().read_unaligned()),
-                    _ => host(addr).cast::<u64>().read_unaligned(),
-                }
+                let mut bytes = [0; 8];
+                std::ptr::copy_nonoverlapping(host(addr), bytes.as_mut_ptr(), usize::from(width));
+                u64::from_le_bytes(bytes)
             })?;
         Some((o, cells))
     });

@@ -244,6 +244,34 @@ fn step(
                 .ok()?;
             u128::from_le_bytes(bytes)
         }
+        // The host address of guest memory is the guest address itself.
+        Op::Host(addr) => get(addr) & 0xffff_ffff,
+        Op::FrameLoad { ty, base, offset } => {
+            let mut bytes = [0u8; 16];
+            let width = if ty == Type::I32 { 4 } else { 8 };
+            memory
+                .read_into(
+                    (get(base) as u32).wrapping_add_signed(offset),
+                    &mut bytes[..width],
+                )
+                .ok()?;
+            u128::from_le_bytes(bytes)
+        }
+        Op::FrameStore {
+            base,
+            offset,
+            value,
+        } => {
+            let width = if func.ty(value) == Type::I32 { 4 } else { 8 };
+            let bytes = get(value).to_le_bytes();
+            memory
+                .write(
+                    (get(base) as u32).wrapping_add_signed(offset),
+                    &bytes[..width],
+                )
+                .ok()?;
+            0
+        }
         Op::Store {
             width, addr, value, ..
         } => {
@@ -253,10 +281,19 @@ fn step(
                 .ok()?;
             0
         }
-        Op::X87Load { bits, denormal } => {
-            let x = f(bits);
-            let tiny = x != 0.0 && x.abs() < f64::MIN_POSITIVE;
-            if x.is_nan() || denormal && tiny {
+        Op::X87Load {
+            bits,
+            denormal,
+            single,
+        } => {
+            let (x, tiny) = if single {
+                let x = f32::from_bits(get(bits) as u32);
+                (f64::from(x), x != 0.0 && x.abs() < f32::MIN_POSITIVE)
+            } else {
+                let x = f(bits);
+                (x, denormal && x != 0.0 && x.abs() < f64::MIN_POSITIVE)
+            };
+            if x.is_nan() || tiny {
                 return None;
             }
             float(x)?
@@ -520,7 +557,7 @@ pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::ir::{Head, Source, Target};
-    use super::super::recovery::{IrRecord, X87};
+    use super::super::recovery::IrRecord;
     use super::*;
 
     fn record() -> IrRecord {
@@ -529,16 +566,7 @@ mod tests {
             refund: 0,
             regs: [None; 8],
             eflags: None,
-            x87: X87 {
-                top: 0,
-                valid: 0,
-                control: 0x27f,
-                stack: [None; 8],
-                status: 0,
-                c1: None,
-                ip: None,
-                opcode: None,
-            },
+            x87: None,
             xmm: [None; 8],
             frame: Vec::new(),
         }
@@ -643,6 +671,7 @@ mod tests {
             Op::X87Load {
                 bits: raw,
                 denormal: true,
+                single: false,
             },
         );
         f.end(b, End::Exit(exit));
@@ -664,9 +693,6 @@ mod tests {
         let mut full = record();
         full.regs = [Some(Location::Constant(0)); 8];
         full.eflags = Some(Location::Constant(0));
-        full.x87.c1 = Some(Location::Constant(0));
-        full.x87.ip = Some(Location::Constant(0));
-        full.x87.opcode = Some(Location::Constant(0));
         full.xmm = [Some(Location::Constant(0)); 8];
         let entry = f.record(IrRecord {
             refund: 3,

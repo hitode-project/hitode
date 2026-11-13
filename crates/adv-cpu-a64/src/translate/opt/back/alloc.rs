@@ -1,5 +1,12 @@
 //! Block-order linear scan. Record reads extend lifetimes to every possible
-//! recovery, but do not by themselves earn a register.
+//! recovery, but do not by themselves earn a register. Each value weighs its
+//! definition and executed uses, eight times more per enclosing loop; without
+//! a free register, the lightest value is spilled, the one that ends last
+//! among equals, so values that inner loops use keep their registers.
+//! Positions follow reverse postorder, which keeps side paths and exits next
+//! to their branches. Integer constants come last: one takes a register
+//! that stays free for its whole life, or is rebuilt at its uses. Spill
+//! cells are reused once their values are dead.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -71,20 +78,25 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         .into_iter()
         .map(|r| r.unwrap_or(RecordId(0)))
         .collect();
+    let depth = loop_depth(func);
+    let mut weight = vec![0u64; n];
     let mut starts = vec![usize::MAX; n];
     let mut ends = vec![0; n];
     let mut hot = vec![false; n];
-    let mut block_start = Vec::new();
-    let mut block_end = Vec::new();
+    let mut block_start = vec![0; func.blocks.len()];
+    let mut block_end = vec![0; func.blocks.len()];
     let mut uses = vec![BTreeSet::new(); func.blocks.len()];
     let mut defs = uses.clone();
     let mut position = 0;
-    for (b, data) in func.blocks.iter().enumerate() {
-        block_start.push(position);
+    for b in sequence(func) {
+        let data = &func.blocks[b];
+        block_start[b] = position;
         let mut region = regions[b];
+        let scale = 8u64.pow(depth[b].min(6));
         for &p in &data.params {
             starts[p.0 as usize] = position;
             ends[p.0 as usize] = position;
+            weight[p.0 as usize] += scale;
             defs[b].insert(p);
         }
         let mut read = |v: Value, pos: usize, warm: bool, immediate: bool| {
@@ -94,6 +106,7 @@ pub(super) fn allocate(func: &Func) -> Allocation {
                 let i = v.0 as usize;
                 ends[i] = ends[i].max(pos);
                 hot[i] |= warm && !(immediate && constants[i].is_some());
+                weight[i] += if warm { scale } else { 0 };
                 if !defs[b].contains(&v) {
                     uses[b].insert(v);
                 }
@@ -149,8 +162,11 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         }
         // SSA local definitions never belong to live-in, even if used later.
         defs[b].extend(data.insts.iter().filter_map(|(r, _)| *r));
+        for v in data.insts.iter().filter_map(|(r, _)| *r) {
+            weight[v.0 as usize] += scale;
+        }
         uses[b].retain(|v| !defs[b].contains(v));
-        block_end.push(position);
+        block_end[b] = position;
         position += 1;
     }
     let mut live_in = uses.clone();
@@ -186,54 +202,108 @@ pub(super) fn allocate(func: &Func) -> Allocation {
     }
     let mut order: Vec<_> = (0..n).collect();
     order.sort_by_key(|&i| starts[i]);
-    let mut active: Vec<(usize, Host)> = Vec::new();
+    // Registers held until an end, and spill cells free from an end on.
+    let mut active: Vec<(usize, Host, usize)> = Vec::new();
+    let mut cells: Vec<(usize, u32)> = Vec::new();
     let mut locations = vec![Host::Constant(0); n];
     let mut slots = 0;
+    let mut spill = |i: usize, cells: &mut Vec<(usize, u32)>| {
+        let cell = match cells.iter().position(|&(end, _)| end < starts[i]) {
+            Some(k) => cells.swap_remove(k).1,
+            None => {
+                slots += 1;
+                slots - 1
+            }
+        };
+        cells.push((ends[i], cell));
+        Host::Spill(cell, func.types[i])
+    };
     for i in order {
-        active.retain(|&(end, _)| end >= starts[i]);
+        active.retain(|&(end, ..)| end >= starts[i]);
         if matches!(operations[i], Some(Op::Flags { .. })) {
             locations[i] = Host::Flags(i as u32);
             continue;
         }
         if let Some(bits) = constants[i]
-            && !hot[i]
+            && (!hot[i] || matches!(func.types[i], Type::I32 | Type::I64))
         {
             locations[i] = Host::Constant(bits);
             continue;
         }
         let vector = matches!(func.types[i], Type::F64 | Type::V128);
-        let available = if hot[i] || operations[i].is_some() {
-            let preferences = hints[i]
-                .iter()
-                .filter_map(|v| match locations[v.0 as usize] {
-                    Host::Register(r) if !vector => Some(r.number() as u8),
-                    Host::Vector(r) if vector => Some(r.number() as u8),
-                    _ => None,
-                });
-            preferences
-                .chain(0..if vector { 29 } else { 31 })
-                .find_map(|reg| {
-                    if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
-                        return None;
-                    }
-                    let loc = if vector {
-                        Host::Vector(VReg::new(reg))
-                    } else {
-                        Host::Register(Reg::new(reg))
-                    };
-                    (!active.iter().any(|&(_, held)| held == loc)).then_some(loc)
-                })
-        } else {
-            None
-        };
-        let loc = available.unwrap_or_else(|| {
-            let loc = Host::Spill(slots, func.types[i]);
-            slots += 1;
-            loc
-        });
-        locations[i] = loc;
-        if available.is_some() {
-            active.push((ends[i], loc));
+        let class = |loc: Host| matches!(loc, Host::Vector(_)) == vector;
+        let preferences = hints[i]
+            .iter()
+            .filter_map(|v| match locations[v.0 as usize] {
+                Host::Register(r) if !vector => Some(r.number() as u8),
+                Host::Vector(r) if vector => Some(r.number() as u8),
+                _ => None,
+            });
+        let free = preferences
+            .chain(0..if vector { 29 } else { 31 })
+            .find_map(|reg| {
+                if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
+                    return None;
+                }
+                let loc = if vector {
+                    Host::Vector(VReg::new(reg))
+                } else {
+                    Host::Register(Reg::new(reg))
+                };
+                (!active.iter().any(|&(_, held, _)| held == loc)).then_some(loc)
+            });
+        if let Some(loc) = free {
+            locations[i] = loc;
+            active.push((ends[i], loc, i));
+            continue;
+        }
+        // Without a free register, the lighter of the lightest held value
+        // and this one keeps a spill cell for the rest of its life.
+        let victim = active
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(_, held, _))| class(held))
+            .min_by_key(|&(_, &(end, _, held))| (weight[held], std::cmp::Reverse(end)))
+            .map(|(k, _)| k);
+        match victim {
+            Some(k) if (weight[active[k].2], ends[i]) < (weight[i], active[k].0) => {
+                let (_, loc, held) = active.swap_remove(k);
+                locations[held] = spill(held, &mut cells);
+                locations[i] = loc;
+                active.push((ends[i], loc, i));
+            }
+            _ => locations[i] = spill(i, &mut cells),
+        }
+    }
+    // An integer constant takes a register only where one stays free for its
+    // whole life; elsewhere it is rebuilt at its uses and never displaces a
+    // variable.
+    let mut held: Vec<Vec<(usize, usize)>> = vec![Vec::new(); 32];
+    for (i, loc) in locations.iter().enumerate() {
+        if let Host::Register(r) = loc {
+            held[r.number() as usize].push((starts[i], ends[i]));
+        }
+    }
+    let mut wanted: Vec<usize> = (0..n)
+        .filter(|&i| {
+            hot[i]
+                && constants[i].is_some()
+                && matches!(func.types[i], Type::I32 | Type::I64)
+                && starts[i] <= ends[i]
+        })
+        .collect();
+    wanted.sort_by_key(|&i| std::cmp::Reverse(weight[i]));
+    for i in wanted {
+        let free = (0..31u8)
+            .filter(|r| ![9, 16, 17, 18, 28, 29].contains(r))
+            .find(|&r| {
+                held[usize::from(r)]
+                    .iter()
+                    .all(|&(start, end)| end < starts[i] || ends[i] < start)
+            });
+        if let Some(r) = free {
+            held[usize::from(r)].push((starts[i], ends[i]));
+            locations[i] = Host::Register(Reg::new(r));
         }
     }
     Allocation {
@@ -242,4 +312,75 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         spill_cells: slots as usize,
         defs: operations,
     }
+}
+
+/// Blocks in reverse postorder from block 0, the order positions follow:
+/// a branch's side paths and exits come right after it, ahead of the code
+/// that follows, so values they read are not held across unrelated code.
+fn sequence(func: &Func) -> Vec<usize> {
+    let count = func.blocks.len();
+    let mut seen = vec![false; count];
+    let mut post = Vec::with_capacity(count);
+    let mut stack = vec![(0, false)];
+    while let Some((b, done)) = stack.pop() {
+        if done {
+            post.push(b);
+            continue;
+        }
+        if std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        stack.push((b, true));
+        // The earliest target is explored first, so it finishes first and
+        // comes after the others: those are the side paths and exits.
+        let mut next: Vec<usize> = func.blocks[b]
+            .end
+            .targets()
+            .map(|t| t.block.0 as usize)
+            .filter(|&t| !seen[t])
+            .collect();
+        next.sort_unstable_by(|x, y| y.cmp(x));
+        stack.extend(next.into_iter().map(|t| (t, false)));
+    }
+    post.reverse();
+    post
+}
+
+/// How many loops enclose each block. A backedge goes to a block no later
+/// in block order; its loop is what reaches the edge without passing the
+/// target, unless that includes block 0, as when an appended path rejoins.
+fn loop_depth(func: &Func) -> Vec<u32> {
+    let count = func.blocks.len();
+    let mut predecessors = vec![Vec::new(); count];
+    for (b, data) in func.blocks.iter().enumerate() {
+        for t in data.end.targets() {
+            predecessors[t.block.0 as usize].push(b);
+        }
+    }
+    let mut loops = std::collections::BTreeMap::<usize, Vec<bool>>::new();
+    for (source, data) in func.blocks.iter().enumerate() {
+        for head in data.end.targets().map(|t| t.block.0 as usize) {
+            if head > source || head == 0 {
+                continue;
+            }
+            let mut body = vec![false; count];
+            body[head] = true;
+            let mut work = vec![source];
+            while let Some(b) = work.pop() {
+                if !std::mem::replace(&mut body[b], true) {
+                    work.extend(&predecessors[b]);
+                }
+            }
+            if body[0] {
+                continue;
+            }
+            let merged = loops.entry(head).or_insert_with(|| vec![false; count]);
+            for (m, b) in merged.iter_mut().zip(body) {
+                *m |= b;
+            }
+        }
+    }
+    (0..count)
+        .map(|b| loops.values().filter(|body| body[b]).count() as u32)
+        .collect()
 }

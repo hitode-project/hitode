@@ -4,14 +4,42 @@ use adv_cpu_core::floating::fast::{Fast, Source as Operand};
 
 impl Front<'_> {
     pub(super) fn arguments(&mut self, to: usize) -> Result<Vec<Value>, Reject> {
-        let mut args = self.state.values();
+        let live = &self.live.entry[to];
+        let mut args: Vec<Value> = (0..8)
+            .filter(|&r| live.reg(r))
+            .map(|r| self.state.regs[r])
+            .chain([self.state.flags])
+            .chain(
+                (0..8)
+                    .filter(|&r| live.reg(8 + r))
+                    .map(|r| self.state.xmm[r]),
+            )
+            .chain(self.state.x87.into_iter().flatten())
+            .collect();
+        for start in self.held[to].clone() {
+            let ty = if self.float_cell(to, start) {
+                Type::F64
+            } else {
+                Source::Frame {
+                    offset: start,
+                    width: self.cells[&start],
+                }
+                .ty()
+            };
+            let value = self.cell_value(start, ty);
+            args.push(value);
+        }
         args.extend(
             self.models[to]
                 .truncations
                 .iter()
                 .map(|k| self.state.truncations[k]),
         );
-        args.extend(self.models[to].floats.iter().map(|k| self.state.floats[k]));
+        for k in self.models[to].floats.clone() {
+            if !self.float_cell(to, k) {
+                args.push(self.state.floats[&k]);
+            }
+        }
         let ip = self.location(self.state.ip);
         let opcode = self.location(self.state.opcode);
         args.extend([ip, opcode]);
@@ -51,7 +79,7 @@ impl Front<'_> {
     pub(super) fn x87(&mut self, x: Instruction) -> Result<(), Reject> {
         let mut metadata = true;
         match x.fast {
-            Fast::Load(src @ (Operand::F64 | Operand::I32 | Operand::St(_))) => {
+            Fast::Load(src @ (Operand::F64 | Operand::F32 | Operand::I32 | Operand::St(_))) => {
                 let value = self.x87_source(src, x.mem)?;
                 self.x87_push(value)?;
                 self.state.c1 = Some(Location::Constant(0));
@@ -99,7 +127,8 @@ impl Front<'_> {
                     self.state.truncations.insert((offset, width), value);
                 }
                 self.x87_pop();
-                self.state.c1 = None;
+                // Chopping never rounds the magnitude up.
+                self.state.c1 = Some(Location::Constant(0));
             }
             Fast::StoreSt { index, pop } => {
                 let value = self.st(0)?;
@@ -133,7 +162,7 @@ impl Front<'_> {
             Fast::Arith {
                 op,
                 dest,
-                source: src @ (Operand::F64 | Operand::St(_)),
+                source: src @ (Operand::F64 | Operand::F32 | Operand::St(_)),
                 reverse,
                 pop,
             } => {
@@ -224,6 +253,16 @@ impl Front<'_> {
                 Ok(self.value(Op::X87Load {
                     bits,
                     denormal: !self.assumed.denormal,
+                    single: false,
+                }))
+            }
+            Operand::F32 => {
+                let mem = mem.ok_or(Reject::Unsupported(self.index))?;
+                let bits = self.read(mem, 4, Type::I32)?;
+                Ok(self.value(Op::X87Load {
+                    bits,
+                    denormal: true,
+                    single: true,
                 }))
             }
             Operand::I32 => self.integer_load(mem.ok_or(Reject::Unsupported(self.index))?, 4),

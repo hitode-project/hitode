@@ -47,10 +47,21 @@ fn built(code: &[u8], at: &CpuState) -> (Unit, Proof, Built) {
         &|_| None,
         true,
     );
-    let proof = Proof::build(&unit.trace).expect("synthetic range proof");
+    let mut proof = Proof::build(&unit.trace).expect("synthetic range proof");
+    prove(&mut proof, &unit, code);
     let built = build(&unit, &proof, at).unwrap();
     assert_eq!(verify::verify(&built.func), Ok(()));
     (unit, proof, built)
+}
+
+/// Decodes the unit's instructions from `code` for the proof.
+fn prove(proof: &mut Proof, unit: &Unit, code: &[u8]) {
+    proof.prove_split(&unit.trace, |pc, len| {
+        let bytes = code
+            .get(usize::try_from(pc - CODE).ok()?..)?
+            .get(..len as usize)?;
+        Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+    });
 }
 
 fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
@@ -59,6 +70,8 @@ fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
         .map(|s| match *s {
             Source::Reg(i) => u128::from(at.regs[i as usize]),
             Source::Eflags => u128::from(at.eflags),
+            Source::X87Ip => u128::from(at.x87.ip),
+            Source::X87Opcode => u128::from(at.x87.opcode),
             Source::Xmm(i) => u128::from_le_bytes(at.xmm[i as usize]),
             Source::X87(i) => {
                 let x = at.x87.regs[i as usize];
@@ -122,61 +135,76 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
         assert_eq!(interpreter.step(&mut cpu, &mut reference), Step::Executed);
     }
     assert_eq!(cpu.eip, record.eip, "retirement");
+    // An exit leaves the registers it does not hold at their entry values.
+    let exit = matches!(run.outcome, eval::Outcome::Exit(_));
     for (i, loc) in record.regs.iter().enumerate() {
-        if let Some(loc) = loc {
-            assert_eq!(
+        match loc {
+            Some(loc) => assert_eq!(
                 eval::locate(loc, &run.values) as u32,
                 cpu.regs[i],
                 "reg {i}"
-            );
+            ),
+            None if exit => assert_eq!(at.regs[i], cpu.regs[i], "kept reg {i}"),
+            None => {}
         }
     }
     if let Some(loc) = &record.eflags {
         assert_eq!(eval::locate(loc, &run.values) as u32, cpu.eflags);
     }
     for (i, loc) in record.xmm.iter().enumerate() {
-        if let Some(loc) = loc {
-            assert_eq!(
+        match loc {
+            Some(loc) => assert_eq!(
                 eval::locate(loc, &run.values).to_le_bytes(),
                 cpu.xmm[i],
                 "xmm {i}"
-            );
+            ),
+            None if exit => assert_eq!(at.xmm[i], cpu.xmm[i], "kept xmm {i}"),
+            None => {}
         }
     }
-    assert_eq!(record.x87.top, cpu.x87.top() as u8);
-    assert_eq!(record.x87.control, cpu.x87.control);
-    assert_eq!(record.x87.status, cpu.x87.status & !(0x3800 | 0x200));
-    if let Some(loc) = &record.x87.c1 {
-        assert_eq!(
-            eval::locate(loc, &run.values) != 0,
-            cpu.x87.status & 0x200 != 0,
-            "C1"
-        );
-    }
-    if let Some(loc) = &record.x87.ip {
-        assert_eq!(eval::locate(loc, &run.values) as u32, cpu.x87.ip, "x87 IP");
-    }
-    if let Some(loc) = &record.x87.opcode {
-        assert_eq!(
-            eval::locate(loc, &run.values) as u16,
-            cpu.x87.opcode,
-            "x87 opcode"
-        );
-    }
-    for i in 0..8 {
-        assert_eq!(
-            record.x87.valid >> i & 1 != 0,
-            cpu.x87.physical_tag(i) != 3,
-            "occupancy {i}"
-        );
-        if let Some(loc) = &record.x87.stack[i] {
-            let value = f64::from_bits(eval::locate(loc, &run.values) as u64);
-            assert_eq!(
-                adv_cpu_core::floating::fast::extended(value),
-                cpu.x87.regs[i],
-                "ST physical {i}"
-            );
+    match &record.x87 {
+        Some(x87) => {
+            assert_eq!(x87.top, cpu.x87.top() as u8);
+            assert_eq!(x87.control, cpu.x87.control);
+            assert_eq!(x87.status, cpu.x87.status & !(0x3800 | 0x200));
+            if let Some(loc) = &x87.c1 {
+                assert_eq!(
+                    eval::locate(loc, &run.values) != 0,
+                    cpu.x87.status & 0x200 != 0,
+                    "C1"
+                );
+            }
+            if let Some(loc) = &x87.ip {
+                assert_eq!(eval::locate(loc, &run.values) as u32, cpu.x87.ip, "x87 IP");
+            }
+            if let Some(loc) = &x87.opcode {
+                assert_eq!(
+                    eval::locate(loc, &run.values) as u16,
+                    cpu.x87.opcode,
+                    "x87 opcode"
+                );
+            }
+            for i in 0..8 {
+                assert_eq!(
+                    x87.valid >> i & 1 != 0,
+                    cpu.x87.physical_tag(i) != 3,
+                    "occupancy {i}"
+                );
+                if let Some(loc) = &x87.stack[i] {
+                    let value = f64::from_bits(eval::locate(loc, &run.values) as u64);
+                    assert_eq!(
+                        adv_cpu_core::floating::fast::extended(value),
+                        cpu.x87.regs[i],
+                        "ST physical {i}"
+                    );
+                }
+            }
         }
+        None => assert_eq!(
+            (at.x87.control, at.x87.status, at.x87.tag),
+            (cpu.x87.control, cpu.x87.status, cpu.x87.tag),
+            "x87 state kept"
+        ),
     }
     for &(offset, width, loc) in &record.frame {
         let bytes = eval::locate(&loc, &run.values).to_le_bytes();
@@ -196,6 +224,43 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
         None,
         "first differing memory byte"
     );
+    if fail {
+        // Execution resumed from the record, whose absent registers keep
+        // their entry values, runs as the reference does.
+        let mut resumed = cpu.clone();
+        for i in 0..8 {
+            resumed.regs[i] =
+                record.regs[i].map_or(at.regs[i], |loc| eval::locate(&loc, &run.values) as u32);
+            resumed.xmm[i] = record.xmm[i].map_or(at.xmm[i], |loc| {
+                eval::locate(&loc, &run.values).to_le_bytes()
+            });
+        }
+        resumed.eflags = record
+            .eflags
+            .map_or(at.eflags, |loc| eval::locate(&loc, &run.values) as u32);
+        let end = CODE + code.len() as u32;
+        let finish = |cpu: &mut CpuState, memory: &mut Memory| {
+            let mut interpreter = Interpreter::new();
+            for _ in 0..10_000 {
+                if cpu.eip == end {
+                    return None;
+                }
+                let step = interpreter.step(cpu, memory);
+                if step != Step::Executed {
+                    return Some(format!("{step:?}"));
+                }
+            }
+            panic!("no end");
+        };
+        let stopped = finish(&mut resumed, &mut optimized);
+        assert_eq!(stopped, finish(&mut cpu, &mut reference), "resumed stop");
+        assert_eq!(resumed.eip, cpu.eip, "resumed EIP");
+        assert_eq!(resumed.regs, cpu.regs, "resumed registers");
+        assert_eq!(resumed.xmm, cpu.xmm, "resumed XMM");
+        optimized.read_into(DATA, &mut lhs).unwrap();
+        reference.read_into(DATA, &mut rhs).unwrap();
+        assert!(lhs == rhs, "resumed memory");
+    }
     built
 }
 
@@ -209,7 +274,7 @@ fn row(a: &mut CodeAssembler, body: impl FnOnce(&mut CodeAssembler)) {
     a.jne(head).unwrap();
 }
 
-// spec: A64-OPT-2, A64-OPT-3, A64-OPT-6
+// spec: A64-OPT-1, A64-OPT-2, A64-OPT-3, A64-OPT-6
 #[test]
 fn integer_loop_and_overlapping_frame_bytes() {
     let code = assemble(|a| {
@@ -226,8 +291,10 @@ fn integer_loop_and_overlapping_frame_bytes() {
         m.write(DATA, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
             .unwrap();
     });
-    assert_eq!(built.assumed.frame, Some((-8, -4)));
-    assert_eq!(built.assumed.esp_low, 0);
+    // An integer unit that never aligns ESP assumes only MXCSR's controls.
+    assert_eq!(built.assumed.esp_low, None);
+    assert!(!built.assumed.x87);
+    assert_eq!(built.assumed.mxcsr_mask, 0xffc0);
     assert_eq!(count(&built, |op| matches!(op, Op::Load { .. })), 1);
     assert_eq!(count(&built, |op| matches!(op, Op::Store { .. })), 1);
 }
@@ -331,6 +398,39 @@ fn x87_arithmetic_and_c1_on_an_exit() {
     });
 }
 
+// spec: A64-OPT-1
+#[test]
+fn a_computing_form_assumes_precision_raised_and_takes_the_last_instruction() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fmul(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.x87.status = 0;
+    let (_, _, built) = built(&code, &at);
+    assert_eq!(built.assumed.status & 0x20, 0x20);
+    let admit =
+        |cpu: &CpuState| super::super::admit(&built.func.entry, &built.assumed, cpu, |_, _| 0);
+    assert!(
+        admit(&at).is_none(),
+        "a clear precision flag runs the ordinary form"
+    );
+    at.x87.status = 0x20;
+    at.x87.ip = 0x1234;
+    at.x87.opcode = 0x5a;
+    let params = admit(&at).expect("the last instruction is a parameter");
+    let ip = built
+        .func
+        .entry
+        .iter()
+        .position(|s| *s == Source::X87Ip)
+        .unwrap();
+    assert_eq!(params[ip], 0x1234);
+}
+
 // spec: A64-OPT-2, A64-OPT-3
 #[test]
 fn control_word_truncation_and_binary64_frame_bytes() {
@@ -368,6 +468,30 @@ fn control_word_truncation_and_binary64_frame_bytes() {
             .flat_map(|b| &b.insts)
             .any(|(_, op)| matches!(op, Op::FpUnary(FpUnary::RoundZero, _)))
     );
+}
+
+// spec: A64-OPT-2, A64-OPT-3
+#[test]
+fn control_word_through_an_extended_register() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.fnstcw(word_ptr(esp - 16)).unwrap();
+            a.movzx(eax, word_ptr(esp - 16)).unwrap();
+            a.or(eax, 0xc00).unwrap();
+            a.mov(dword_ptr(esp - 12), eax).unwrap();
+            a.fldcw(word_ptr(esp - 12)).unwrap();
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fistp(qword_ptr(esp - 8)).unwrap();
+            a.fldcw(word_ptr(esp - 16)).unwrap();
+            a.movsx(edx, byte_ptr(esp - 8)).unwrap();
+            a.mov(dword_ptr(edi), edx).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    differential(&code, &at, |m| {
+        m.write(DATA, &(-3.75f64).to_le_bytes()).unwrap();
+    });
 }
 
 // spec: A64-OPT-2, A64-OPT-3
@@ -525,6 +649,15 @@ fn a_frame_float_copy_needs_no_second_x87_load_check() {
         m.write(DATA, &2.5f64.to_le_bytes()).unwrap();
     });
     assert_eq!(count(&built, |op| matches!(op, Op::X87Load { .. })), 1);
+    assert!(
+        built
+            .func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.params)
+            .all(|&p| built.func.ty(p) != Type::I64),
+        "the frame cell is held as the F64 stored, not also as its bits"
+    );
 }
 
 // spec: A64-OPT-5, A64-OPT-6
@@ -686,7 +819,7 @@ fn loop_heads_take_unobserved_flags_from_entry() {
             a.mov(dword_ptr(edi), eax).unwrap();
         })
     });
-    assert_eq!(rejected(&carried, &initial()), Reject::Flags);
+    assert!(matches!(rejected(&carried, &initial()), Reject::Flags(_)));
 }
 
 // spec: A64-OPT-2, A64-OPT-6
@@ -795,4 +928,429 @@ fn a_memory_fault_recovers_the_last_store_boundary() {
     let mut at = initial();
     at.regs[6] = 0x50000;
     compare(&code, &at, |_| {}, true);
+}
+
+// spec: A64-OPT-6
+#[test]
+fn a_failure_after_a_grouped_store_resumes_with_the_registers_it_reads() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(ebx, eax).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            // Grouping moves the store past these, but a failure after it
+            // runs them again from its record.
+            a.mov(edx, ebx).unwrap();
+            a.mov(ebx, 5).unwrap();
+            a.mov(eax, edx).unwrap();
+            a.cdq().unwrap();
+            a.idiv(dword_ptr(esi + 4)).unwrap();
+            a.mov(dword_ptr(edi + 4), eax).unwrap();
+        })
+    });
+    compare(
+        &code,
+        &initial(),
+        |m| m.write(DATA, &[9, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+        true,
+    );
+}
+
+// spec: A64-OPT-6
+#[test]
+fn loop_heads_hold_only_live_registers_the_form_changes() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |_| {});
+    let func = &built.func;
+    let head = func.blocks[1..]
+        .iter()
+        .filter_map(|b| b.head)
+        .map(|h| &func.records[h.record.0 as usize])
+        .find(|r| r.eip == CODE)
+        .expect("loop head");
+    assert_eq!(head.regs[0], None, "EAX is written before it is read");
+    assert_eq!(head.regs[3], None, "EBX keeps its entry value");
+    assert!(head.regs[1].is_some(), "ECX counts the rows");
+    assert!(head.xmm.iter().all(Option::is_none));
+}
+
+// spec: A64-OPT-2
+#[test]
+fn masks_of_narrow_loads_and_self_tests_fold_away() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.and(eax, 0xff).unwrap();
+            a.movzx(edx, al).unwrap();
+            a.add(edx, eax).unwrap();
+            a.test(edx, edx).unwrap();
+            a.mov(dword_ptr(edi), edx).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[0x81, 0, 0, 0, 0xff, 0, 0, 0, 3, 0, 0, 0])
+            .unwrap();
+    });
+    let masks = count(&built, |op| {
+        matches!(
+            op,
+            Op::Int(IntOp::And, ..) | Op::IntUnary(IntUnary::ZeroExtend8, _)
+        )
+    });
+    assert_eq!(
+        masks, 0,
+        "a byte load clears the upper bits; TEST of one register ANDs nothing"
+    );
+}
+
+// spec: A64-OPT-3
+#[test]
+fn a_frame_dword_accessed_whole_stays_one_value() {
+    let code = assemble(|a| {
+        a.mov(dword_ptr(esp - 8), 5).unwrap();
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(dword_ptr(esp - 8), eax).unwrap();
+            a.mov(edx, dword_ptr(esp - 8)).unwrap();
+            a.mov(dword_ptr(edi), edx).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
+            .unwrap();
+    });
+    let shifts = count(&built, |op| {
+        matches!(op, Op::Int(IntOp::Shl | IntOp::Shr | IntOp::Or, ..))
+    });
+    assert_eq!(shifts, 0, "no byte splitting or reassembly");
+}
+
+// spec: A64-OPT-6
+#[test]
+fn a_refused_instruction_on_a_cold_path_leaves_there() {
+    let code = assemble(|a| {
+        let mut cold = a.create_label();
+        let mut back = a.create_label();
+        let mut done = a.create_label();
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.js(cold).unwrap();
+            a.set_label(&mut back).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        });
+        a.jmp(done).unwrap();
+        a.set_label(&mut cold).unwrap();
+        a.cvtsi2ss(xmm0, eax).unwrap();
+        a.jmp(back).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
+            .unwrap();
+    });
+    assert_eq!(built.cuts, 1);
+    // A negative value takes the cold path, and the form leaves exactly at
+    // the refused instruction.
+    differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 3, 0, 0, 0])
+            .unwrap();
+    });
+}
+
+// spec: A64-FLAG-3, A64-OPT-6
+#[test]
+fn nested_loop_heads_take_unobserved_flags_from_entry() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(edx, 2).unwrap();
+            let mut inner = a.create_label();
+            a.set_label(&mut inner).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(inner).unwrap();
+        })
+    });
+    differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+            .unwrap();
+    });
+}
+
+// spec: A64-OPT-2
+#[test]
+fn displacements_go_where_immediates_encode() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi + 4)).unwrap();
+            a.mov(dword_ptr(edi - 4), eax).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0])
+            .unwrap();
+    });
+    let defs: BTreeMap<Value, Op> = built
+        .func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|&(r, op)| Some((r?, op)))
+        .collect();
+    let left = count(
+        &built,
+        |op| matches!(op, Op::Int(_, a, _) if matches!(defs.get(a), Some(Op::Constant(..)))),
+    );
+    assert_eq!(left, 0, "a constant operand is the right one");
+}
+
+// spec: A64-OPT-2
+#[test]
+fn loads_on_side_paths_stay_in_the_loop() {
+    let code = assemble(|a| {
+        let mut skip = a.create_label();
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.js(skip).unwrap();
+            a.add(eax, dword_ptr(ebp)).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 3, 0, 0, 0])
+            .unwrap();
+        m.write(DATA + 128, &[5, 0, 0, 0]).unwrap();
+    });
+    assert!(
+        !built.func.blocks[0]
+            .insts
+            .iter()
+            .any(|(_, op)| matches!(op, Op::Load { .. })),
+        "a load that not every iteration runs is not hoisted"
+    );
+}
+
+// spec: A64-OPT-3, A64-OPT-4
+#[test]
+fn a_binary64_stored_on_one_path_stays_f64_past_the_merge() {
+    let code = assemble(|a| {
+        let mut skip = a.create_label();
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.js(skip).unwrap();
+            a.fild(dword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(esp - 8)).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.fld(qword_ptr(esp - 8)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 3, 0, 0, 0])
+            .unwrap();
+        m.write(FRAME - 8, &1.5f64.to_le_bytes()).unwrap();
+    });
+    // The merge holds the cell as F64; only entry reads its bits.
+    assert!(
+        built.func.blocks[1..]
+            .iter()
+            .flat_map(|b| &b.params)
+            .all(|&p| built.func.ty(p) != Type::I64)
+    );
+    // Not every arrival stored it, so the load after the merge checks.
+    assert_eq!(count(&built, |op| matches!(op, Op::X87Load { .. })), 1);
+}
+
+// spec: A64-OPT-3
+#[test]
+fn a_loop_short_of_registers_commits_cells_it_does_not_read_on() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            // A division may raise, which reads every frame cell.
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.cdq().unwrap();
+            a.mov(ebx, 11).unwrap();
+            a.idiv(ebx).unwrap();
+            for k in 0..24u32 {
+                a.mov(dword_ptr(esp - 8 - 4 * k as i32), eax).unwrap();
+                a.add(eax, k + 1).unwrap();
+            }
+            a.add(dword_ptr(esp - 4), eax).unwrap();
+            a.mov(eax, dword_ptr(esp - 28)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
+            .unwrap();
+        m.write(FRAME - 4, &[9, 0, 0, 0]).unwrap();
+    });
+    // Offsets count from the lowest cell, at ESP - 100.
+    let commits: Vec<i32> = built
+        .func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|(_, op)| match *op {
+            Op::FrameStore { offset, .. } => Some(offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commits.len(),
+        24,
+        "each cell written and not read on commits once"
+    );
+    assert!(!commits.contains(&96), "the running sum stays a value");
+}
+
+/// Builds the optimized form of the unit at an entry of a PE image and
+/// prints the instruction the front end refuses, if any:
+/// `ADV_OPT_PROBE=<image>:<hex entry>`. Faster than a run per refusal.
+#[test]
+#[ignore = "needs ADV_OPT_PROBE"]
+fn probe_an_image_unit() {
+    let spec = std::env::var("ADV_OPT_PROBE").expect("ADV_OPT_PROBE=<image>:<hex entry>");
+    let (path, entry) = spec.rsplit_once(':').unwrap();
+    let entry = u32::from_str_radix(entry.trim_start_matches("0x"), 16).unwrap();
+    let image = std::fs::read(path).unwrap();
+    let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+    let half = |at: usize| u16::from_le_bytes(image[at..at + 2].try_into().unwrap());
+    let pe = word(0x3c) as usize;
+    let optional = pe + 24;
+    let base = word(optional + 28);
+    let size = word(optional + 56) as usize;
+    let mut memory = Memory::new(base, size).unwrap();
+    memory.protect(base, size, 3).unwrap();
+    let mut section = optional + usize::from(half(pe + 20));
+    let mut executable = Vec::new();
+    for _ in 0..half(pe + 6) {
+        let (virtual_size, address) = (word(section + 8), word(section + 12));
+        let (raw_size, raw) = (word(section + 16) as usize, word(section + 20) as usize);
+        let bytes = &image[raw..raw + raw_size.min(virtual_size as usize)];
+        memory.write(base + address, bytes).unwrap();
+        if word(section + 36) & 0x2000_0000 != 0 {
+            executable.push((base + address, virtual_size as usize));
+        }
+        section += 40;
+    }
+    for (address, len) in executable {
+        memory
+            .protect(address, len.next_multiple_of(4096), 5)
+            .unwrap();
+    }
+    let mut unit = Unit::default();
+    unit.build(&mut memory, entry, &[], &|_, _| None, &|_| None, true);
+    let mut proof = Proof::build(&unit.trace).expect("a computation proof");
+    proof.prove_split(&unit.trace, |pc, len| {
+        let mut bytes = [0; 15];
+        let bytes = bytes.get_mut(..len as usize)?;
+        memory.read_into(pc, bytes).ok()?;
+        Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+    });
+    let mut at = initial();
+    at.x87.control = 0x27f;
+    at.x87.tag = 0xffff;
+    at.regs[ESP as usize] = 0x0019_f000;
+    println!(
+        "{} trace instructions, primary {}, {} merges",
+        unit.trace.len(),
+        unit.trace.primary,
+        unit.trace.merge.iter().filter(|&&m| m).count()
+    );
+    if std::env::var_os("ADV_OPT_DEBUG").is_some() {
+        for (i, inst) in unit.trace.insts.iter().enumerate() {
+            let next = match inst.next {
+                crate::translate::trace::Next::Edge(e) => Some(e),
+                _ => None,
+            };
+            for e in [next, inst.taken].into_iter().flatten() {
+                if let crate::translate::trace::Edge::Internal(t) = e
+                    && t <= i
+                {
+                    println!(
+                        "backedge {i} ({:#x}) -> {t} ({:#x})",
+                        inst.pc, unit.trace.insts[t].pc
+                    );
+                }
+            }
+        }
+    }
+    match build(&unit, &proof, &at) {
+        Ok(built) if std::env::var_os("ADV_OPT_DEBUG").is_some() => {
+            let lowered = super::super::back::lower(&built.func, 0, 0);
+            println!(
+                "lowered: {} words, {} spill cells",
+                lowered.words.len(),
+                lowered.spill_cells
+            );
+        }
+        Ok(built) => println!(
+            "built: {} blocks, {} heads, {} operations, {} validations, {} cuts",
+            built.func.blocks.len(),
+            built
+                .func
+                .blocks
+                .iter()
+                .filter(|b| b.head.is_some())
+                .count(),
+            built
+                .func
+                .blocks
+                .iter()
+                .map(|b| b.insts.len())
+                .sum::<usize>(),
+            built
+                .func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|(_, op)| matches!(op, Op::Validate))
+                .count(),
+            built.cuts
+        ),
+        Err(reject) => {
+            if let Some(at) = reject.index() {
+                for (i, inst) in unit.trace.insts.iter().enumerate() {
+                    let into = |e: Option<crate::translate::trace::Edge>| matches!(e, Some(crate::translate::trace::Edge::Internal(t)) if t == at);
+                    let fall = match inst.next {
+                        crate::translate::trace::Next::Fall => {
+                            Some(crate::translate::trace::Edge::Internal(i + 1))
+                        }
+                        crate::translate::trace::Next::Edge(e) => Some(e),
+                        _ => None,
+                    };
+                    if i.abs_diff(at) < 6 || into(fall) || into(inst.taken) {
+                        println!(
+                            "{i:4} {:#x} {:?} next {:?} taken {:?} live_in {:?} observe_in {:?}",
+                            inst.pc,
+                            inst.op,
+                            inst.next,
+                            inst.taken,
+                            unit.trace.live_in[i],
+                            unit.trace.observe_in[i]
+                        );
+                    }
+                }
+            }
+            let inst = reject.index().map(|i| unit.trace.insts[i]);
+            println!(
+                "{reject:?} at {:#x}: {:?}",
+                inst.map_or(0, |i| i.pc),
+                inst.map(|i| i.op)
+            );
+        }
+    }
 }

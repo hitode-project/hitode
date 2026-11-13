@@ -1,6 +1,7 @@
 //! Recovery records (A64-OPT-6). A record describes the guest state at a
 //! region start: where each component lives, or `None` when no execution
-//! from there reads it. The IR names values; emission replaces them by host
+//! from there reads it or the form never changes it, so that the state's
+//! own value stands. The IR names values; emission replaces them by host
 //! locations, and the owner's materializer builds `CpuState` and frame bytes
 //! from a record and the captured host registers.
 
@@ -53,7 +54,9 @@ pub(crate) struct Record<L> {
     pub refund: u32,
     pub regs: [Option<Location<L>>; 8],
     pub eflags: Option<Location<L>>,
-    pub x87: X87<L>,
+    /// `None` when the form runs no x87 instruction: the state's own x87
+    /// registers stand.
+    pub x87: Option<X87<L>>,
     pub xmm: [Option<Location<L>>; 8],
     /// Frame bytes whose values differ from memory: offset from entry ESP,
     /// width in bytes and value.
@@ -65,9 +68,8 @@ impl<L: Copy> Record<L> {
     pub(crate) fn uses(&self) -> impl Iterator<Item = L> + '_ {
         let x87 = self
             .x87
-            .stack
             .iter()
-            .chain([&self.x87.c1, &self.x87.ip, &self.x87.opcode]);
+            .flat_map(|x| x.stack.iter().chain([&x.c1, &x.ip, &x.opcode]));
         let held = self.regs.iter().chain([&self.eflags]).chain(x87);
         held.chain(&self.xmm)
             .flatten()
@@ -80,16 +82,19 @@ impl<L: Copy> Record<L> {
             .flatten()
     }
 
-    /// Whether every component is present, as exits and recall points
-    /// require (A64-OPT-6).
-    pub(crate) fn complete(&self) -> bool {
-        self.regs.iter().all(Option::is_some)
+    /// Whether every component is present but the registers in `kept`
+    /// (bits 0–7, XMM registers at 8–15), as exits require (A64-OPT-6).
+    pub(crate) fn complete(&self, kept: u16) -> bool {
+        let held = |bit: usize, loc: &Option<Location<L>>| loc.is_some() || kept >> bit & 1 != 0;
+        self.regs.iter().enumerate().all(|(r, loc)| held(r, loc))
+            && self.xmm.iter().enumerate().all(|(r, loc)| held(8 + r, loc))
             && self.eflags.is_some()
-            && self.x87.c1.is_some()
-            && self.x87.ip.is_some()
-            && self.x87.opcode.is_some()
-            && self.xmm.iter().all(Option::is_some)
-            && (0..8).all(|i| self.x87.valid >> i & 1 == 0 || self.x87.stack[i].is_some())
+            && self.x87.as_ref().is_none_or(|x| {
+                x.c1.is_some()
+                    && x.ip.is_some()
+                    && x.opcode.is_some()
+                    && (0..8).all(|i| x.valid >> i & 1 == 0 || x.stack[i].is_some())
+            })
     }
 }
 
@@ -148,7 +153,7 @@ impl Locations<'_> {
         use iced_x86::Mnemonic as M;
         let r = self.flags[index as usize].unwrap();
         let a = self.get(r.a);
-        let b = self.get(r.b);
+        let b = if r.kind.reads_b() { self.get(r.b) } else { 0 };
         let mut out = r.prior.map_or(0, |p| self.get(p) as u32);
         match r.kind {
             Add | AddCarry | Sub | SubBorrow => {
@@ -267,25 +272,8 @@ pub(crate) fn materialize(
         cpu.eflags = values.locate(location) as u32;
     }
     cpu.eip = record.eip;
-    for (i, location) in record.x87.stack.iter().enumerate() {
-        if record.x87.valid >> i & 1 != 0
-            && let Some(location) = location
-        {
-            let value = binary80(values.locate(*location) as u64);
-            cpu.x87.regs[i] = value;
-            cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
-        }
-    }
-    cpu.x87.control = record.x87.control;
-    cpu.x87.status = record.x87.status & !((7 << 11) | (1 << 9)) | u16::from(record.x87.top) << 11;
-    if let Some(location) = record.x87.c1 {
-        cpu.x87.status |= (values.locate(location) as u16 & 1) << 9;
-    }
-    if let Some(location) = record.x87.ip {
-        cpu.x87.ip = values.locate(location) as u32;
-    }
-    if let Some(location) = record.x87.opcode {
-        cpu.x87.opcode = values.locate(location) as u16;
+    if let Some(x87) = &record.x87 {
+        materialize_x87(x87, &values, cpu);
     }
     for (reg, location) in cpu.xmm.iter_mut().zip(record.xmm) {
         if let Some(location) = location {
@@ -299,6 +287,29 @@ pub(crate) fn materialize(
         );
     }
     record.refund
+}
+
+fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::CpuState) {
+    for (i, location) in x87.stack.iter().enumerate() {
+        if x87.valid >> i & 1 != 0
+            && let Some(location) = location
+        {
+            let value = binary80(values.locate(*location) as u64);
+            cpu.x87.regs[i] = value;
+            cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
+        }
+    }
+    cpu.x87.control = x87.control;
+    cpu.x87.status = x87.status & !((7 << 11) | (1 << 9)) | u16::from(x87.top) << 11;
+    if let Some(location) = x87.c1 {
+        cpu.x87.status |= (values.locate(location) as u16 & 1) << 9;
+    }
+    if let Some(location) = x87.ip {
+        cpu.x87.ip = values.locate(location) as u32;
+    }
+    if let Some(location) = x87.opcode {
+        cpu.x87.opcode = values.locate(location) as u16;
+    }
 }
 
 /// The binary64 bits of an x87 register that holds a binary64 value
@@ -359,16 +370,16 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
         refund: record.refund,
         regs: record.regs.map(|l| l.map(loc)),
         eflags: record.eflags.map(loc),
-        x87: X87 {
-            top: record.x87.top,
-            valid: record.x87.valid,
-            control: record.x87.control,
-            stack: record.x87.stack.map(|l| l.map(loc)),
-            status: record.x87.status,
-            c1: record.x87.c1.map(loc),
-            ip: record.x87.ip.map(loc),
-            opcode: record.x87.opcode.map(loc),
-        },
+        x87: record.x87.as_ref().map(|x| X87 {
+            top: x.top,
+            valid: x.valid,
+            control: x.control,
+            stack: x.stack.map(|l| l.map(loc)),
+            status: x.status,
+            c1: x.c1.map(loc),
+            ip: x.ip.map(loc),
+            opcode: x.opcode.map(loc),
+        }),
         xmm: record.xmm.map(|l| l.map(loc)),
         frame: record
             .frame
@@ -425,14 +436,16 @@ pub(crate) fn leaves_of(
     {
         leaves_of(a, defs, false, out);
         let encodable = matches!(defs[b.0 as usize], Some(Op::Constant(_, bits)) if bits <= 4095 || bits & 4095 == 0 && bits >> 12 <= 4095);
-        leaves_of(
-            b,
-            defs,
-            width == 4
-                && matches!(kind, super::ir::FlagKind::Add | super::ir::FlagKind::Sub)
-                && encodable,
-            out,
-        );
+        if kind.reads_b() {
+            leaves_of(
+                b,
+                defs,
+                width == 4
+                    && matches!(kind, super::ir::FlagKind::Add | super::ir::FlagKind::Sub)
+                    && encodable,
+                out,
+            );
+        }
         if let Some(prior) = prior {
             leaves_of(prior, defs, false, out);
         }

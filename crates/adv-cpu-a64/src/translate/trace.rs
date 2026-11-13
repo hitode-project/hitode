@@ -756,6 +756,39 @@ impl Trace {
         index as u16
     }
 
+    /// A copy in which each `cut` instruction leaves at its own EIP instead
+    /// of running, analysed again. It has no helpers: only forms that refuse
+    /// them build from it.
+    pub(crate) fn cut(&self, cut: &[bool]) -> Trace {
+        let mut insts = self.insts.clone();
+        for (inst, _) in insts.iter_mut().zip(cut).filter(|(_, cut)| **cut) {
+            *inst = Inst {
+                call: None,
+                locked: None,
+                op: Op::Nop,
+                effects: Op::Nop.effects(),
+                mode: Mode::Plain,
+                next: Next::Edge(Edge::Exit(inst.pc)),
+                taken: None,
+                spin: false,
+                ..*inst
+            };
+        }
+        let mut trace = Trace {
+            insts,
+            code: self.code.clone(),
+            frames: self.frames.clone(),
+            slots: self.slots.clone(),
+            primary: self.primary,
+            failure: self.failure,
+            bodies: self.bodies.clone(),
+            memory_pages: self.memory_pages,
+            ..Trace::default()
+        };
+        trace.analyze();
+        trace
+    }
+
     fn analyze(&mut self) {
         let len = self.insts.len();
         self.region_end.clear();

@@ -15,6 +15,9 @@ pub(super) struct Model {
     pub control: Option<u16>,
     pub c1: C1,
     pub floats: std::collections::BTreeSet<i32>,
+    /// Frame positions where an x87 binary64 store on some path wrote the
+    /// bytes last: the cell is best held as F64 there.
+    pub stored: std::collections::BTreeSet<i32>,
     pub dirty: std::collections::BTreeSet<i32>,
     pub truncations: std::collections::BTreeSet<(i32, u8)>,
     regs: [(u32, u32); 8],
@@ -23,10 +26,13 @@ pub(super) struct Model {
     flags: Option<u32>,
 }
 
+/// `kept` gives, for a loop head whose arrivals commit frame cells, the
+/// frame bytes that may stay dirty on arrival (A64-OPT-3).
 pub(super) fn analyze(
     unit: &Unit,
     at: &CpuState,
     offsets: &[[Option<i32>; 8]],
+    kept: &[Option<std::collections::BTreeSet<i32>>],
 ) -> Result<Vec<Model>, Reject> {
     let entry = Model {
         top: at.x87.top() as u8,
@@ -34,6 +40,7 @@ pub(super) fn analyze(
         control: Some(at.x87.control),
         c1: C1::Constant(at.x87.status & 0x200 != 0),
         floats: Default::default(),
+        stored: Default::default(),
         dirty: Default::default(),
         truncations: Default::default(),
         regs: [(0, 0); 8],
@@ -84,6 +91,15 @@ pub(super) fn analyze(
             let Some(Edge::Internal(to)) = edge else {
                 continue;
             };
+            let mut committed;
+            let m = match kept.get(to) {
+                Some(Some(kept)) => {
+                    committed = m.clone();
+                    committed.dirty.retain(|b| kept.contains(b));
+                    &committed
+                }
+                _ => &m,
+            };
             let changed = if let Some(old) = &mut states[to] {
                 if old.top != m.top || old.valid != m.valid {
                     return Err(Reject::StaticX87(to));
@@ -97,6 +113,7 @@ pub(super) fn analyze(
                     a.0 &= a.1;
                 }
                 old.floats.retain(|p| m.floats.contains(p));
+                old.stored.extend(m.stored.iter().copied());
                 old.dirty.extend(m.dirty.iter().copied());
                 old.truncations.retain(|k| m.truncations.contains(k));
                 old.bytes.retain(|p, v| m.bytes.get(p) == Some(v));
@@ -174,6 +191,8 @@ impl Model {
                 if let Some(p) = frame_offset(mem, offsets) {
                     self.floats
                         .retain(|&start| start + 8 <= p || p + i32::from(width) <= start);
+                    self.stored
+                        .retain(|&start| start + 8 <= p || p + i32::from(width) <= start);
                     self.truncations.retain(|&(start, w)| {
                         start + i32::from(w) <= p || p + i32::from(width) <= start
                     });
@@ -233,7 +252,9 @@ impl Model {
                             self.valid &= !(1 << self.top);
                             self.top = (self.top + 1) & 7;
                         }
-                        self.c1 = if integer {
+                        // Chopping never rounds the magnitude up.
+                        let chop = self.control.is_some_and(|c| c & 0x0c00 == 0x0c00);
+                        self.c1 = if integer && !chop {
                             C1::Unknown
                         } else {
                             C1::Constant(false)
@@ -248,6 +269,9 @@ impl Model {
                                 self.floats.retain(|&start| {
                                     start + 8 <= p || p + i32::from(width) <= start
                                 });
+                                self.stored.retain(|&start| {
+                                    start + 8 <= p || p + i32::from(width) <= start
+                                });
                                 self.truncations.retain(|&(start, w)| {
                                     start + i32::from(w) <= p || p + i32::from(width) <= start
                                 });
@@ -259,6 +283,7 @@ impl Model {
                                     self.truncations.insert((p, width));
                                 } else if width == 8 {
                                     self.floats.insert(p);
+                                    self.stored.insert(p);
                                 }
                             }
                         }
@@ -366,12 +391,24 @@ impl Model {
                 self.write(Part::Reg(r), 4, v, offsets);
             }
             D::Leave => self.regs[EBP as usize] = (0, 0),
-            D::Imul(dst, ..)
-            | D::Extend(dst, ..)
-            | D::Neg(dst)
-            | D::Not(dst)
-            | D::Step(_, dst)
-            | D::Lea(dst, _) => self.regs[dst as usize] = (0, 0),
+            D::Extend(dst, src, signed) => {
+                let (src, width) = match src {
+                    decode::Narrow8or16::Byte(r) => (Part::Reg(r), 1),
+                    decode::Narrow8or16::Word(r) => (Part::Reg(r), 2),
+                    decode::Narrow8or16::Mem(mem, word) => (Part::Mem(mem), 1 + u8::from(word)),
+                };
+                let v = self
+                    .read(src, width, offsets)
+                    .map(|v| match (signed, width) {
+                        (false, _) => v,
+                        (true, 1) => v as u8 as i8 as u32,
+                        (true, _) => v as u16 as i16 as u32,
+                    });
+                self.write(Part::Reg(dst), 4, v, offsets);
+            }
+            D::Imul(dst, ..) | D::Neg(dst) | D::Not(dst) | D::Step(_, dst) | D::Lea(dst, _) => {
+                self.regs[dst as usize] = (0, 0)
+            }
             D::Carry(_, dst, _) => {
                 self.regs[dst as usize] = (0, 0);
                 self.flags = None;

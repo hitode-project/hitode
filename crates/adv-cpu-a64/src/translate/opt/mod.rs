@@ -28,8 +28,12 @@
 //! constant, and admission makes the frame span disjoint from every other
 //! range of the job. Memory is then the frame bytes and the rest, and the
 //! frame bytes behave as variables. Recovery writes back the bytes whose
-//! values differ from memory; before a validation only region-start values
-//! may reach frame memory, so the write-back restores the state at `p`.
+//! values differ from memory and that execution from `p` can read; before a
+//! validation only region-start values may reach frame memory, so the
+//! write-back restores the state at `p` in every byte that matters. A commit
+//! of frame values to memory on an edge into a loop head follows validation,
+//! and nothing that can fail follows it before the head starts a region, so
+//! no failure returns past it.
 //!
 //! **Floating point.** Let `a` and `b` be non-NaN binary64 values.
 //! Under precision 53 and rounding to nearest, x87 rounds `a op b` once to 53
@@ -47,7 +51,10 @@
 //! effect points, and frame memory holds only values from `p`. Guest memory at
 //! a failure therefore equals the reference memory at `p`, and the record
 //! gives every component execution from `p` can read, so the recovered state
-//! is the reference state at `p` in every observable respect. No assumption
+//! is the reference state at `p` in every observable respect. Liveness is
+//! computed over the guest instructions from `p`, so moving IR operations
+//! across a store leaves its record intact. A component the form never
+//! changes still holds its entry value, so records omit it. No assumption
 //! about faults is needed: a load from a wrong address faults and recovers
 //! like any failure. A store executes only after validation, with an address
 //! and a path the reference shares, and stores keep their order, so the
@@ -79,14 +86,13 @@ pub(crate) fn admit(
 ) -> Option<Vec<u128>> {
     let x87 = &cpu.x87;
     let esp = cpu.regs[4];
-    let holds = x87.control == assumed.control
-        && x87.status & !0x3800 == assumed.status
-        && x87.ip == assumed.ip
-        && x87.opcode == assumed.opcode
-        && x87.top() as u8 == assumed.top
-        && x87.tag == assumed.tags
-        && cpu.mxcsr == assumed.mxcsr
-        && (esp & 15) as u8 == assumed.esp_low;
+    let holds = (!assumed.x87
+        || x87.control == assumed.control
+            && x87.status & !0x3800 == assumed.status
+            && x87.top() as u8 == assumed.top
+            && x87.tag == assumed.tags)
+        && (cpu.mxcsr ^ assumed.mxcsr) & assumed.mxcsr_mask == 0
+        && assumed.esp_low.is_none_or(|low| (esp & 15) as u8 == low);
     if !holds {
         return None;
     }
@@ -98,6 +104,8 @@ pub(crate) fn admit(
                 Source::Eflags => u128::from(cpu.eflags),
                 Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
                 Source::X87(i) => u128::from(recovery::binary64(x87.regs[usize::from(i)])?),
+                Source::X87Ip => u128::from(x87.ip),
+                Source::X87Opcode => u128::from(x87.opcode),
                 Source::Frame { offset, width } => {
                     u128::from(frame(esp.wrapping_add_signed(offset), width))
                 }
