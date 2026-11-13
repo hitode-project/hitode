@@ -299,8 +299,12 @@ struct Drained {
 const ESP: usize = 4;
 
 /// The distance between private frames: the span in cache lines.
+/// The distance between private frames: the span in cache lines.
+/// The distance between private frames, which keeps each copy of the span
+/// below every byte live at the real frame, including those between ESP and
+/// a span that starts above it.
 fn frame_stride((lo, hi): (i32, i32)) -> u32 {
-    ((hi - lo) as u32).next_multiple_of(64)
+    ((hi - lo.min(0)) as u32).next_multiple_of(64)
 }
 
 impl Blocks {
@@ -740,13 +744,14 @@ impl<'a> Session<'a> {
         let count = plan.iterations.div_ceil(size);
         // Private frames lie below ESP, one stride per thread.
         if let Some(frame) = plan.frame {
-            let below = (helpers as u32 + 1) * frame_stride(frame);
+            let stride = frame_stride(frame);
+            let below = (helpers as u32 + 1) * stride;
             let start = context.cpu().regs[ESP]
                 .wrapping_sub(below)
                 .wrapping_add(frame.0 as u32);
             let region = Range {
                 start,
-                end: u64::from(start) + u64::from(below),
+                end: u64::from(start) + u64::from(below - stride) + (frame.1 - frame.0) as u64,
                 write: true,
             };
             if !self.admission.private(self.memory, &self.active, &region) {
@@ -1435,6 +1440,62 @@ mod tests {
         blocks.settle(prefix.cpu_mut(), None, 3 * N / 8);
         assert_eq!(prefix.cpu().regs[4], ESP_START);
         assert_eq!(word(&executor, ESP_START + 12), SRC + 3 * N / 2);
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn private_frames_stay_below_the_words_at_esp() {
+        fn word(executor: &Executor, addr: u32) -> u32 {
+            u32::from_le_bytes(executor.memory().read(addr, 4).unwrap().try_into().unwrap())
+        }
+        if Pool::get().is_none_or(|pool| pool.limit < 2) {
+            return;
+        }
+        const STACK: u32 = 0x300_0000;
+        const ESP_START: u32 = STACK + 0x8000;
+        // Saved registers sit at [ESP, ESP + 16); the loop's frame span,
+        // [ESP + 16, ESP + 0x44), is narrower than a stride but ends above it.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(esp + 16), eax).unwrap();
+        a.mov(edx, dword_ptr(esp + 16)).unwrap();
+        a.mov(dword_ptr(edi), edx).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.sub(dword_ptr(esp + 0x40), 1).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 4;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        memory.map(STACK, 0x1_0000, READ | WRITE).unwrap();
+        let src: Vec<u8> = (0..N).flat_map(|i| (i * 7).to_le_bytes()).collect();
+        memory.write(SRC, &src).unwrap();
+        executor.state.eip = CODE;
+        executor.state.regs[4] = ESP_START;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        let start = Some(executor.save_context().unwrap());
+        let saved: Vec<u8> = (1..=4u32)
+            .flat_map(|i| (i * 0x1111_1111).to_le_bytes())
+            .collect();
+        let reset = |memory: &mut Memory| {
+            memory.write(DST, &vec![0; len]).unwrap();
+            memory.write(STACK, &[0; 0x1_0000]).unwrap();
+            memory.write(ESP_START, &saved).unwrap();
+            memory.write(ESP_START + 0x40, &N.to_le_bytes()).unwrap();
+        };
+        let check = [(DST, len), (ESP_START, 0x44)];
+        let (_, whole) = whole_then_split(&mut executor, &mut native, &start, stop, reset, &check);
+        assert_eq!(whole.cpu().regs[4], ESP_START);
+        assert_eq!(executor.memory().read(ESP_START, 16).unwrap(), saved);
+        assert_eq!(word(&executor, DST + 4 * (N - 1)), (N - 1) * 7);
     }
 
     // spec: A64-CTL-9 A64-TR-9

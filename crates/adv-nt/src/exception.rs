@@ -177,8 +177,11 @@ fn enter_dispatcher(
     frame[LAYOUT_SIZE as usize..].copy_from_slice(tail);
     if let Err(error) = env.cpu.write(stack, &frame) {
         return Outcome::Fail(format!(
-            "exception {:#010x} at {:#010x}: could not write frame: {error}",
-            record.code, record.address
+            "exception {:#010x} at {:#010x}, parameters {:x?}, registers {:x?}: could not write frame: {error}",
+            record.code,
+            record.address,
+            &record.information[..record.count],
+            checkpoint.state.regs
         ));
     }
     debug_assert_eq!(env.cpu.read_u32(stack).ok(), Some(stack + RECORD));
