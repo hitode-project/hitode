@@ -570,3 +570,368 @@ fn dmo_wrapper_publishes_decoder_pins_once_for_windows_media_decoders() {
     );
     assert_eq!(pins(&mut m), 2);
 }
+
+#[test]
+fn allocator_get_buffer_blocks_until_release_or_decommit_and_honors_nowait() {
+    let mut m = machine();
+    let allocator = sample::create_allocator(&mut env(&mut m), 1, 64).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IMemAllocator::GetBuffer",
+            &[allocator, DATA, 0, 0, 0]
+        ),
+        S_OK
+    );
+    let first = m.cpu.read_u32(DATA).unwrap();
+    assert_ne!(first, 0);
+    // AM_GBF_NOWAIT (4) returns VFW_E_TIMEOUT immediately when all buffers are out.
+    assert_eq!(
+        method(
+            &mut m,
+            "IMemAllocator::GetBuffer",
+            &[allocator, DATA + 4, 0, 0, 4]
+        ),
+        VFW_E_TIMEOUT
+    );
+
+    let start_blocking_get = |m: &mut Machine<JitCpu>, out: u32| -> Outcome {
+        m.resolve_import("quartz.dll", "IMemAllocator::GetBuffer")
+            .unwrap();
+        let thunk = m
+            .sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.module == "quartz.dll" && t.name == "IMemAllocator::GetBuffer")
+            .unwrap()
+            .0;
+        let handler = m.sys.thunks.get(thunk).f.handler;
+        m.cpu.set_reg(Reg::Esp, STACK);
+        for (i, arg) in [allocator, out, 0, 0, 0].into_iter().enumerate() {
+            m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+        }
+        handler(&mut Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        })
+    };
+
+    let Outcome::Block {
+        wait: adv_machine::Wait::Object {
+            handle,
+            deadline: None,
+        },
+        then,
+        ..
+    } = start_blocking_get(&mut m, DATA + 8)
+    else {
+        panic!("exhausted committed allocator must block on its wake event");
+    };
+    assert_eq!(method(&mut m, "IMediaSample::Release", &[first]), 0);
+    assert!(matches!(
+        m.sys.objects.get(handle),
+        Some(adv_machine::Object::Event { signaled: true, .. })
+    ));
+    let resumed = then(
+        &mut env(&mut m),
+        adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+    );
+    assert!(matches!(resumed, Outcome::Return(S_OK)));
+    let recycled = m.cpu.read_u32(DATA + 8).unwrap();
+    assert_eq!(recycled, first);
+
+    let Outcome::Block { then, .. } = start_blocking_get(&mut m, DATA + 12) else {
+        panic!("allocator must block again once its buffer is taken");
+    };
+    assert_eq!(
+        method(&mut m, "IMemAllocator::Decommit", &[allocator]),
+        S_OK
+    );
+    let decommitted = then(
+        &mut env(&mut m),
+        adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+    );
+    assert!(matches!(decommitted, Outcome::Return(VFW_E_NOT_COMMITTED)));
+    assert_eq!(method(&mut m, "IMediaSample::Release", &[recycled]), 0);
+    assert_eq!(method(&mut m, "IMemAllocator::Release", &[allocator]), 0);
+}
+
+#[test]
+// spec: MEDIA-DMO-4, MEDIA-FAIL-2
+fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let control = query(&mut m, graph, IID_IMEDIACONTROL);
+    let seeking = query(&mut m, graph, IID_IMEDIASEEKING);
+    let sink = query(&mut m, graph, IID_IMEDIAEVENTSINK);
+    let events = query(&mut m, graph, IID_IMEDIAEVENTEX);
+
+    let dmo_filter = activate(&mut m, dmo::CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+    let wrapper = query(&mut m, dmo_filter, dmo::IID_IDMOWRAPPERFILTER);
+    m.cpu.write(DATA + 64, &dmo::CLSID_WMV_DECODER).unwrap();
+    m.cpu.write(DATA + 80, &[0; 16]).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IDMOWrapperFilter::Init",
+            &[wrapper, DATA + 64, DATA + 80]
+        ),
+        S_OK
+    );
+
+    // Guest filters: source (0x500400) and renderer (0x500500), plus upstream
+    // connector pin (0x500600) and IMediaSeeking (0x500700).
+    let (source, renderer, connector, upstream_seek) =
+        (DATA + 0x400, DATA + 0x500, DATA + 0x600, DATA + 0x700);
+    for (i, obj) in [source, renderer, connector, upstream_seek]
+        .into_iter()
+        .enumerate()
+    {
+        let table = obj + 4;
+        m.cpu.write_u32(obj, table).unwrap();
+        for slot in 0..18u32 {
+            m.cpu
+                .write_u32(table + slot * 4, 0x7100_0000 + (i as u32) * 0x100 + slot)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, source, 0],
+            &[
+                (0x7100_0001, &[source], 2),
+                (0x7100_000d, &[source, graph, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(&mut m, "IFilterGraph2::AddFilter", &[graph, dmo_filter, 0]),
+        S_OK
+    );
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, renderer, 0],
+            &[
+                (0x7100_0101, &[renderer], 2),
+                (0x7100_010d, &[renderer, graph, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+
+    let input_pin = m.ext.get::<State>().filters[&dmo_filter].pins[0];
+    let mut learn = dmo::learn_upstream(&mut env(&mut m), input_pin, connector);
+    // 1. connector->QueryPinInfo writes `source`.
+    let Outcome::Call {
+        target, args, then, ..
+    } = learn
+    else {
+        panic!("expected QueryPinInfo");
+    };
+    assert_eq!(target, 0x7100_0208);
+    m.cpu.write_u32(args[1], source).unwrap();
+    learn = then(&mut env(&mut m), adv_machine::Resume::Returned(S_OK));
+    // 2. source->QueryInterface(IID_IMEDIASEEKING) writes `upstream_seek`.
+    let Outcome::Call {
+        target, args, then, ..
+    } = learn
+    else {
+        panic!("expected QueryInterface");
+    };
+    assert_eq!(target, 0x7100_0000);
+    m.cpu.write_u32(args[2], upstream_seek).unwrap();
+    learn = then(&mut env(&mut m), adv_machine::Resume::Returned(S_OK));
+    // 3. source->Release.
+    let Outcome::Call { target, then, .. } = learn else {
+        panic!("expected source Release");
+    };
+    assert_eq!(target, 0x7100_0002);
+    learn = then(&mut env(&mut m), adv_machine::Resume::Returned(1));
+    // 4. upstream_seek->GetDuration writes 90_000_000.
+    let Outcome::Call {
+        target, args, then, ..
+    } = learn
+    else {
+        panic!("expected GetDuration");
+    };
+    assert_eq!(target, 0x7100_030a);
+    m.cpu.write(args[1], &90_000_000i64.to_le_bytes()).unwrap();
+    assert!(matches!(
+        then(&mut env(&mut m), adv_machine::Resume::Returned(S_OK)),
+        Outcome::Return(S_OK)
+    ));
+
+    assert_eq!(
+        method(&mut m, "IMediaSeeking::GetDuration", &[seeking, DATA]),
+        S_OK
+    );
+    let mut dur = [0u8; 8];
+    m.cpu.read(DATA, &mut dur).unwrap();
+    assert_eq!(i64::from_le_bytes(dur), 90_000_000);
+
+    // SetPositions forwards to upstream IMediaSeeking (slot 14).
+    m.cpu
+        .write(DATA + 16, &25_000_000i64.to_le_bytes())
+        .unwrap();
+    m.cpu
+        .write(DATA + 24, &80_000_000i64.to_le_bytes())
+        .unwrap();
+    let seek_thunk = {
+        m.resolve_import("quartz.dll", "IMediaSeeking::SetPositions")
+            .unwrap();
+        m.sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.module == "quartz.dll" && t.name == "IMediaSeeking::SetPositions")
+            .unwrap()
+            .0
+    };
+    m.cpu.set_reg(Reg::Esp, STACK);
+    for (i, arg) in [seeking, DATA + 16, 1, DATA + 24, 1]
+        .into_iter()
+        .enumerate()
+    {
+        m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+    }
+    let handler = m.sys.thunks.get(seek_thunk).f.handler;
+    let outcome = handler(&mut Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: seek_thunk,
+    });
+    let Outcome::Call {
+        target, args, then, ..
+    } = outcome
+    else {
+        panic!("SetPositions must call upstream seeker");
+    };
+    assert_eq!(
+        (target, args[0], args[2], args[4]),
+        (0x7100_030e, upstream_seek, 1, 1)
+    );
+    let mut forwarded = [0u8; 8];
+    m.cpu.read(args[1], &mut forwarded).unwrap();
+    assert_eq!(i64::from_le_bytes(forwarded), 25_000_000);
+    assert!(matches!(
+        then(&mut env(&mut m), adv_machine::Resume::Returned(S_OK)),
+        Outcome::Return(S_OK)
+    ));
+
+    // Pause and Run invoke downstream renderer first and upstream source last.
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaControl::Pause",
+            &[control],
+            &[
+                (0x7100_0105, &[renderer], S_OK),
+                (0x7100_0005, &[source], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaControl::Run",
+            &[control],
+            &[
+                (0x7100_0106, &[renderer, 0, 0], S_OK),
+                (0x7100_0006, &[source, 0, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+
+    // Genuine stream failure (E_FAIL) while running delivers EC_ERRORABORT.
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventSink::Notify",
+            &[sink, 3, 0x8000_4005, 0]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        (
+            m.cpu.read_u32(DATA).unwrap(),
+            m.cpu.read_u32(DATA + 4).unwrap()
+        ),
+        (3, 0x8000_4005)
+    );
+
+    // Decommitting the DMO input allocator suppresses VFW_E_NOT_COMMITTED aborts.
+    let mem_input = query(&mut m, input_pin, IID_IMEMINPUTPIN);
+    assert_eq!(
+        method(&mut m, "IMemInputPin::GetAllocator", &[mem_input, DATA]),
+        S_OK
+    );
+    let in_alloc = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(method(&mut m, "IMemAllocator::Decommit", &[in_alloc]), S_OK);
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventSink::Notify",
+            &[sink, 3, VFW_E_NOT_COMMITTED, 0]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0]
+        ),
+        0x8000_4004
+    );
+    assert_eq!(method(&mut m, "IMemAllocator::Commit", &[in_alloc]), S_OK);
+
+    // Stop invokes upstream source FIRST and downstream renderer LAST, and
+    // ignores any VFW_E_NOT_COMMITTED abort raised while stopping.
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaControl::Stop",
+            &[control],
+            &[
+                (0x7100_0004, &[source], S_OK),
+                (0x7100_0104, &[renderer], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventSink::Notify",
+            &[sink, 3, VFW_E_NOT_COMMITTED, 0]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0]
+        ),
+        0x8000_4004
+    );
+}

@@ -124,7 +124,7 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 ### MEDIA-DMO-4 Upstream seeking and control
 
 **Rule**: Connected DMO graphs MUST derive duration from upstream IMediaSeeking and forward seeks to that source. Pause and Run MUST invoke the upstream source last, and Stop MUST invoke it first.
-**Verification**: Review — no existing test records upstream seek forwarding and all three control-call orders.
+**Verification**: Test
 
 ## Synchronous Windows Media reader
 

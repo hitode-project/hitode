@@ -53,6 +53,7 @@ pub(crate) const VFW_E_INVALID_DIRECTION: u32 = 0x8004_0208;
 pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;
 pub(crate) const VFW_E_NOT_COMMITTED: u32 = 0x8004_0211;
 pub(crate) const VFW_E_WRONG_STATE: u32 = 0x8004_0227;
+pub(crate) const VFW_E_TIMEOUT: u32 = 0x8004_022e;
 pub(crate) const VFW_E_NOT_FOUND: u32 = 0x8004_0216;
 pub(crate) const VFW_E_ENUM_OUT_OF_SYNC: u32 = 0x8004_0203;
 pub(crate) const VFW_E_UNSUPPORTED_STREAM: u32 = 0x8004_0265;
@@ -577,7 +578,10 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             state.pins.remove(&canonical);
         }
         Obj::Allocator => {
-            state.allocators.remove(&canonical);
+            if let Some(allocator) = state.allocators.remove(&canonical) {
+                let wake = allocator.wake;
+                env.sys.objects.close(wake);
+            }
         }
         Obj::Sample => {
             state.samples.remove(&canonical);

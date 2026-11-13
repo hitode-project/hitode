@@ -2,16 +2,19 @@
 //! allocator's lifetime; when its last guest reference goes it returns to the
 //! free list instead of being destroyed.
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Env, Outcome};
+use adv_machine::{Env, Handle, Object, Outcome, Wait};
 
 use super::*;
+
+const AM_GBF_NOWAIT: u32 = 4;
 
 pub(crate) struct Allocator {
     pub face: u32,
     samples: Vec<u32>,
     pub free: Vec<u32>,
     size: u32,
-    committed: bool,
+    pub committed: bool,
+    pub wake: Handle,
 }
 
 #[derive(Clone)]
@@ -37,6 +40,10 @@ const MAX_BUFFER_SIZE: u32 = 64 << 20;
 pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Result<u32, u32> {
     let faces = super::create(env, &[Face::MemAllocator], Obj::Allocator)?;
     let allocator = faces[0];
+    let wake = env.sys.objects.insert(Object::Event {
+        manual_reset: true,
+        signaled: false,
+    });
     state(env).allocators.insert(
         allocator,
         Allocator {
@@ -45,6 +52,7 @@ pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Resu
             free: Vec::new(),
             size,
             committed: true,
+            wake,
         },
     );
     add_samples(env, allocator, count, size)?;
@@ -87,7 +95,18 @@ fn add_samples(env: &mut Env<'_>, allocator: u32, count: u32, size: u32) -> Resu
 
 /// A free sample with one reference held by the caller.
 pub(crate) fn take(env: &mut Env<'_>, allocator: u32) -> Option<u32> {
-    let sample = state(env).allocators.get_mut(&allocator)?.free.pop()?;
+    let (sample, empty_wake) = {
+        let a = state(env).allocators.get_mut(&allocator)?;
+        if !a.committed {
+            return None;
+        }
+        let sample = a.free.pop()?;
+        let empty_wake = a.free.is_empty().then_some(a.wake);
+        (sample, empty_wake)
+    };
+    if let Some(wake) = empty_wake {
+        env.sys.reset_event(wake);
+    }
     add_ref(env, sample);
     let s = state(env).samples.get_mut(&sample).unwrap();
     s.actual = 0;
@@ -101,15 +120,49 @@ pub(crate) fn take(env: &mut Env<'_>, allocator: u32) -> Option<u32> {
 
 /// Called whenever a host object's external references reach zero.
 pub(crate) fn returned(env: &mut Env<'_>, canonical: u32) {
-    let state = state(env);
-    let Some(sample) = state.samples.get(&canonical) else {
-        return;
+    let wake = {
+        let state = state(env);
+        let Some(sample) = state.samples.get(&canonical) else {
+            return;
+        };
+        if let Some(allocator) = state.allocators.get_mut(&sample.allocator)
+            && !allocator.free.contains(&canonical)
+        {
+            allocator.free.push(canonical);
+            Some(allocator.wake)
+        } else {
+            None
+        }
     };
-    if let Some(allocator) = state.allocators.get_mut(&sample.allocator)
-        && !allocator.free.contains(&canonical)
-    {
-        allocator.free.push(canonical);
+    if let Some(wake) = wake {
+        env.sys.set_event(wake);
     }
+}
+
+pub(crate) fn commit(env: &mut Env<'_>, allocator: u32) -> bool {
+    let Some((wake, has_free)) = state(env).allocators.get_mut(&allocator).map(|a| {
+        a.committed = true;
+        (a.wake, !a.free.is_empty())
+    }) else {
+        return false;
+    };
+    if has_free {
+        env.sys.set_event(wake);
+    } else {
+        env.sys.reset_event(wake);
+    }
+    true
+}
+
+pub(crate) fn decommit(env: &mut Env<'_>, allocator: u32) -> bool {
+    let Some(wake) = state(env).allocators.get_mut(&allocator).map(|a| {
+        a.committed = false;
+        a.wake
+    }) else {
+        return false;
+    };
+    env.sys.set_event(wake);
+    true
 }
 
 pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<Outcome> {
@@ -161,27 +214,14 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
             })
         }
         "GetProperties" => r(if properties(env, a1) { S_OK } else { E_POINTER }),
-        "Commit" => {
-            state(env).allocators.get_mut(&this)?.committed = true;
-            r(S_OK)
-        }
-        "Decommit" => {
-            state(env).allocators.get_mut(&this)?.committed = false;
-            r(S_OK)
-        }
+        "Commit" => commit(env, this).then_some(Outcome::Return(S_OK)),
+        "Decommit" => decommit(env, this).then_some(Outcome::Return(S_OK)),
         "GetBuffer" => {
+            if a1 == 0 {
+                return r(E_POINTER);
+            }
             let _ = env.cpu.write_u32(a1, 0);
-            if !state(env).allocators[&this].committed {
-                return r(VFW_E_NOT_COMMITTED);
-            }
-            match take(env, this) {
-                Some(sample) => {
-                    let _ = env.cpu.write_u32(a1, sample);
-                    r(S_OK)
-                }
-                // Only the host stream draws from these allocators.
-                None => r(VFW_E_WRONG_STATE),
-            }
+            Some(get_buffer(env, this, a1, env.arg(4)))
         }
         "ReleaseBuffer" => {
             release(env, a1);
@@ -189,6 +229,41 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
         }
         _ => None,
     }
+}
+
+fn get_buffer(env: &mut Env<'_>, this: u32, output: u32, flags: u32) -> Outcome {
+    let Some((committed, empty_pool, wake)) = state(env)
+        .allocators
+        .get(&this)
+        .map(|a| (a.committed, a.samples.is_empty(), a.wake))
+    else {
+        return Outcome::Return(E_UNEXPECTED);
+    };
+    if !committed {
+        return Outcome::Return(VFW_E_NOT_COMMITTED);
+    }
+    if empty_pool {
+        return Outcome::Return(VFW_E_WRONG_STATE);
+    }
+    if let Some(sample) = take(env, this) {
+        return Outcome::Return(if env.cpu.write_u32(output, sample).is_ok() {
+            S_OK
+        } else {
+            release(env, sample);
+            E_POINTER
+        });
+    }
+    if flags & AM_GBF_NOWAIT != 0 {
+        return Outcome::Return(VFW_E_TIMEOUT);
+    }
+    env.sys.reset_event(wake);
+    Outcome::block(
+        Wait::Object {
+            handle: wake,
+            deadline: None,
+        },
+        move |env, _| get_buffer(env, this, output, flags),
+    )
 }
 
 fn sample_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> {

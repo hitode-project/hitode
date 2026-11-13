@@ -305,8 +305,7 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 "Pause" => graph::PAUSED,
                 _ => graph::RUNNING,
             };
-            state(env).filters.get_mut(&filter).unwrap().state = value;
-            super::dmo::state_changed(env, filter, value);
+            set_state(env, filter, value);
             r(S_OK)
         }
         "GetState" => {
@@ -394,6 +393,31 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
         "QueryVendorInfo" => r(E_NOTIMPL),
         _ => None,
     }
+}
+
+pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
+    let outputs: Vec<u32> = {
+        let s = state(env);
+        let Some(f) = s.filters.get_mut(&filter) else {
+            return;
+        };
+        f.state = value;
+        f.pins
+            .iter()
+            .filter_map(|p| {
+                let pin = &s.pins[p];
+                (pin.dir == OUTPUT && pin.allocator != 0).then_some(pin.allocator)
+            })
+            .collect()
+    };
+    for allocator in outputs {
+        if value == graph::STOPPED {
+            sample::decommit(env, allocator);
+        } else {
+            sample::commit(env, allocator);
+        }
+    }
+    super::dmo::state_changed(env, filter, value);
 }
 
 fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
