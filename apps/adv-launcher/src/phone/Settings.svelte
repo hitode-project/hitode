@@ -113,6 +113,13 @@
           <span class="t">{t("显示帧率")}</span>
           <SettingsSwitch touch label={t("显示帧率")} checked={prefs.showFps} onchange={(v) => set("showFps", v)} />
         </div>
+        <div class="row">
+          <span class="t two">
+            <span>{t("隐藏控件")}</span>
+            <span class="meta">{t(device.platform === "android" ? "使用返回手势或返回键呼出菜单" : "从屏幕左或右边缘向内滑呼出菜单")}</span>
+          </span>
+          <SettingsSwitch touch label={t("隐藏控件")} checked={prefs.hideControls} onchange={(v) => set("hideControls", v)} />
+        </div>
       {/if}
     </section>
 

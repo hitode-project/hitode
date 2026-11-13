@@ -8,6 +8,7 @@
   import { loadGameSetup, saveGameSetup } from "../lib/fake-settings";
   import Icon from "../components/Icon.svelte";
   import { call, onHostEvent, preview } from "../lib/bridge";
+  import { device } from "../lib/device.svelte";
   import { pauser, runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -38,6 +39,8 @@
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
   /** The menu was opened by the back gesture; shows the edge hint briefly. */
   let backHint = $state(false);
+  let pendingRecallHint = $state(false);
+  let recallHint = $state(false);
   let textBar = $state(false);
   let text = $state("");
   let textInput = $state<HTMLInputElement | null>(null);
@@ -190,6 +193,27 @@
   $effect(() => {
     if (!backHint) return;
     const timer = setTimeout(() => (backHint = false), 900);
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    if (!phone || !prefs.hideControls || view !== "closed" || loading || dialogs.length || textBar || stopping) {
+      recallHint = false;
+      return;
+    }
+    if (pendingRecallHint || !prefs.hideControlsHintSeen) {
+      pendingRecallHint = false;
+      if (!prefs.hideControlsHintSeen) {
+        prefs.hideControlsHintSeen = true;
+        savePrefs();
+      }
+      recallHint = true;
+    }
+  });
+
+  $effect(() => {
+    if (!recallHint) return;
+    const timer = setTimeout(() => (recallHint = false), 2800);
     return () => clearTimeout(timer);
   });
 
@@ -419,6 +443,22 @@
                   <span>{t("触控板模式")}</span>
                   <button class="sw" class:on={touchMode === "trackpad"} role="switch" aria-checked={touchMode === "trackpad"} aria-label={t("触控板模式")} onclick={() => { prefs.touchMode = touchMode === "trackpad" ? "direct" : "trackpad"; savePrefs(); }}></button>
                 </div>
+                <div class="prow">
+                  <span>{t("隐藏控件")}</span>
+                  <button
+                    class="sw"
+                    class:on={prefs.hideControls}
+                    role="switch"
+                    aria-checked={prefs.hideControls}
+                    aria-label={t("隐藏控件")}
+                    onclick={() => {
+                      const next = !prefs.hideControls;
+                      prefs.hideControls = next;
+                      pendingRecallHint = next;
+                      savePrefs();
+                    }}
+                  ></button>
+                </div>
               {/if}
               <div class="prow">
                 <span>{t("帧率显示")}</span>
@@ -467,13 +507,13 @@
     </div>
   {:else if loading || dialogs.length}
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
-  {:else if phone && screen.layout}
+  {:else if phone && !prefs.hideControls && screen.layout}
     {#if !stopping}
       <TouchControls layout={screen.layout} latchCtrl={playback(gameId).toggle} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
-  {:else if phone}
+  {:else if phone && !prefs.hideControls}
     <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
-  {:else if !titleBar}
+  {:else if !phone && !titleBar}
     <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
       <Icon name="pause" />
     </button>
@@ -488,6 +528,12 @@
 
   {#if dialogs.length && view === "closed"}
     <GuestDialogs {dialogs} />
+  {/if}
+
+  {#if recallHint}
+    <div class="recall-hint over fade" role="status" aria-live="polite" {@attach shown}>
+      {t(device.platform === "android" ? "使用返回手势或返回键可打开菜单" : "从屏幕左或右边缘向内滑可打开菜单")}
+    </div>
   {/if}
 
   {#if backHint}
@@ -943,6 +989,23 @@
     padding: 0 8px;
     font-size: 15px;
     color: var(--fg);
+  }
+  .recall-hint {
+    position: absolute;
+    left: 50%;
+    bottom: calc(18px + var(--safe-bottom));
+    transform: translateX(-50%);
+    max-width: calc(100% - 32px);
+    padding: 7px 14px;
+    border-radius: 999px;
+    background: rgba(20, 20, 22, 0.78);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 12px;
+    white-space: nowrap;
+    pointer-events: none;
   }
   .primary:focus-visible,
   .secondary:focus-visible,
