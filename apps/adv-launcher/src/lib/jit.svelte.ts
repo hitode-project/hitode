@@ -1,4 +1,4 @@
-import { call } from "./bridge";
+import { call, isAclError } from "./bridge";
 import { device } from "./device.svelte";
 import { t } from "./i18n.svelte";
 import { prefs } from "./prefs.svelte";
@@ -103,7 +103,9 @@ class Jit {
     // Ask the helper once per run; the answer stays in the host afterwards.
     if (status.ddi === null && !this.#ddiAsked) {
       this.#ddiAsked = true;
-      void call("check_ddi", {}, null).catch(() => {});
+      void call("check_ddi", {}, null).catch((error) => {
+        if (isAclError(error)) this.#ddiAsked = false;
+      });
     }
   }
 

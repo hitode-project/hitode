@@ -19,12 +19,16 @@
   let asking = $state(true);
   let checking = $state(true);
   let permissionError = $state("");
+  let retryCount = $state(0);
+  const sheetOpen = $derived(asking && !checking && !permissionError);
 
   const scan = new ScanPick();
   $effect(() => {
     const platform = device.platform;
+    void retryCount;
     let active = true;
     checking = true;
+    permissionError = "";
     void hasStoragePermission().then((granted) => {
       if (active) { asking = platform === "ios" || !granted; checking = false; }
     }, (error) => {
@@ -39,7 +43,7 @@
 </script>
 
 <PhoneImportPage>
-  <div class="base" inert={asking}>
+  <div class="base" inert={sheetOpen}>
     <PhoneImportHeader label={t("取消")} onclose={() => nav.back()} />
 
     <main class="scroll body">
@@ -48,7 +52,10 @@
         {#if !asking}<div class="mono" style="margin-top: 6px">{scan.root}</div>{/if}
       </div>
 
-      {#if !asking}
+      {#if permissionError}
+        <div class="status err" role="status">{permissionError}</div>
+        <button class="quiet" style="align-self: center" onclick={() => (retryCount += 1)}>{t("重试")}</button>
+      {:else if !asking}
         <div style="display: flex; flex-direction: column; gap: 10px">
           <div class="lbl" id="p-lbl-depth">{t("子文件夹层数")}</div>
           <div class="seg" role="group" aria-labelledby="p-lbl-depth">
@@ -121,9 +128,7 @@
     {/if}
   </div>
 
-  {#if permissionError}
-    <div class="status err" role="status">{permissionError}</div>
-  {:else if asking && !checking}
+  {#if sheetOpen}
     <PhoneImportPermission {ios} oncancel={() => nav.back()} onscan={() => (asking = false)} />
   {/if}
 </PhoneImportPage>

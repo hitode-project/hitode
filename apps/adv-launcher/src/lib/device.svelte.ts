@@ -1,5 +1,5 @@
 import { flushSync } from "svelte";
-import { hostInfo } from "./bridge";
+import { hostInfo, inTauri } from "./bridge";
 
 function guessPlatform(): string {
   const ua = navigator.userAgent;
@@ -37,15 +37,24 @@ class Device {
     const resize = () => this.#resize(narrow.matches, roomy.matches);
     narrow.addEventListener("change", resize);
     roomy.addEventListener("change", resize);
-    hostInfo().then(
-      (info) => {
-        this.platform = info.platform;
-        this.version = info.version;
-        this.gameView = info.gameView;
-      },
-      // Outside Tauri the user agent guess stands.
-      () => {},
-    );
+    if (inTauri) {
+      const load = () => {
+        hostInfo().then(
+          (info) => {
+            this.platform = info.platform;
+            this.version = info.version;
+            this.gameView = info.gameView;
+          },
+          (error) => {
+            console.error("host_info failed", error);
+          },
+        );
+      };
+      load();
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && this.version === "browser preview") load();
+      });
+    }
   }
 
   /**

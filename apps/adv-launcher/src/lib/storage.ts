@@ -1,19 +1,25 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
 import { chooseFolder } from "./folder-choice.svelte";
-import { hostInfo, inTauri } from "./bridge";
+import { hostInfo, inTauri, invokeHost } from "./bridge";
 import { hasStoragePermission as fakeStatus, requestStoragePermission as fakeRequest } from "./fake-import";
 
 /** Phones pick folders through the storage plugin: SAF on Android, Files on iOS. */
-const platform = inTauri ? hostInfo().then((info) => info.platform) : Promise.resolve("");
-const mobile = platform.then((os) => os === "android" || os === "ios");
+async function hostPlatform(): Promise<string> {
+  return inTauri ? (await hostInfo()).platform : "";
+}
+
+async function isMobile(): Promise<boolean> {
+  const os = await hostPlatform();
+  return os === "android" || os === "ios";
+}
 
 export async function hasStoragePermission(): Promise<boolean> {
-  if (await mobile) return (await invoke<{ granted: boolean }>("plugin:storage|storage_status")).granted;
+  if (await isMobile()) return (await invokeHost<{ granted: boolean }>("plugin:storage|storage_status")).granted;
   return inTauri || fakeStatus();
 }
 
 export async function requestStoragePermission(): Promise<boolean> {
-  if (await mobile) return (await invoke<{ granted: boolean }>("plugin:storage|request_storage")).granted;
+  if (await isMobile()) return (await invokeHost<{ granted: boolean }>("plugin:storage|request_storage")).granted;
   fakeRequest();
   return true;
 }
@@ -42,31 +48,31 @@ export async function prepareFolder(
   onSize: (bytes: number) => void,
   onProgress: (progress: CopyProgress) => void,
 ): Promise<boolean> {
-  if (!(await mobile)) return true;
-  const folder = await invoke<Folder>("plugin:storage|pick_folder");
+  if (!(await isMobile())) return true;
+  const folder = await invokeHost<Folder>("plugin:storage|pick_folder");
   if (!folder.uri || signal.aborted) return false;
   if (folder.managed && folder.path) {
     preparedFolder = folder.path;
     return true;
   }
   if (!copy && folder.path) {
-    const mode = (await platform) === "android" ? await chooseFolder(signal, null) : "original";
+    const mode = (await hostPlatform()) === "android" ? await chooseFolder(signal, null) : "original";
     if (!mode || signal.aborted) return false;
     if (mode === "original") {
       preparedFolder = folder.path;
       return true;
     }
   }
-  const size = await invoke<number>("plugin:storage|folder_size", { uri: folder.uri });
+  const size = await invokeHost<number>("plugin:storage|folder_size", { uri: folder.uri });
   if (!await chooseFolder(signal, size, !copy && !folder.path) || signal.aborted) return false;
   onSize(size);
   const progress = new Channel<CopyProgress>();
   progress.onmessage = onProgress;
   const id = crypto.randomUUID();
-  const cancel = () => { void invoke("plugin:storage|cancel_copy", { id }); };
+  const cancel = () => { void invokeHost("plugin:storage|cancel_copy", { id }); };
   signal.addEventListener("abort", cancel, { once: true });
   try {
-    const result = await invoke<{ path: string }>("plugin:storage|copy_folder", { uri: folder.uri, id, progress });
+    const result = await invokeHost<{ path: string }>("plugin:storage|copy_folder", { uri: folder.uri, id, progress });
     if (signal.aborted) return false;
     preparedFolder = result.path;
     return true;
@@ -76,7 +82,7 @@ export async function prepareFolder(
 }
 
 export async function pickStorageFolder(options?: FolderPickOptions): Promise<string | null | undefined> {
-  if (!(await mobile)) return undefined;
+  if (!(await isMobile())) return undefined;
   const { signal, onSize, onProgress } = options ?? {
     signal: new AbortController().signal, onSize: () => {}, onProgress: () => {},
   };

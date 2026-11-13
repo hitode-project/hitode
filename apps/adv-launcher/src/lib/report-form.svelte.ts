@@ -1,6 +1,5 @@
 import { t } from "./i18n.svelte";
-import { invoke } from "@tauri-apps/api/core";
-import { call, inTauri } from "./bridge";
+import { call, inTauri, invokeHost } from "./bridge";
 import { device } from "./device.svelte";
 import { playback } from "./playback";
 import { prefs } from "./prefs.svelte";
@@ -252,8 +251,8 @@ export class ReportForm {
         this.attachReport = true;
       }
       if (!inTauri) window.open(url, "_blank", "noopener");
-      else if (device.platform === "android") await invoke("open_issue_in_browser", { url });
-      else await invoke("plugin:opener|open_url", { url, with: device.platform === "ios" ? "inAppBrowser" : undefined });
+      else if (device.platform === "android") await invokeHost("open_issue_in_browser", { url });
+      else await invokeHost("plugin:opener|open_url", device.platform === "ios" ? { url, with: "inAppBrowser" } : { url });
     } catch {
       this.view = "form";
       this.deliveryError = t("没能打开问题页，请再试一次");

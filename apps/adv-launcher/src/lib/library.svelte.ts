@@ -68,17 +68,27 @@ class Library {
 
   /** Removed entries as the host returned them, for undo. */
   #removed: { entry: LibraryGame | null; game: Game; index: number } | null = null;
+  #loaded = !inTauri;
+  #seq = 0;
 
   constructor() {
     if (!inTauri) return;
     void this.refresh();
     onHostEvent("game_finished", () => void this.refresh());
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && !this.#loaded) void this.refresh();
+      });
+    }
   }
 
   async refresh(): Promise<void> {
     if (!inTauri) return;
+    const seq = ++this.#seq;
     try {
       const list = await libraryList();
+      if (seq !== this.#seq) return;
+      this.#loaded = true;
       this.now = Date.now();
       this.games = list.map((g) => toGame(g, this.now));
     } catch (error) {

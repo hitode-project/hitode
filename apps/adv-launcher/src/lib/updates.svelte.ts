@@ -1,4 +1,4 @@
-import { call, inTauri } from "./bridge";
+import { call, inTauri, isAclError } from "./bridge";
 import { prefs, savePrefs } from "./prefs.svelte";
 
 interface Update {
@@ -22,6 +22,7 @@ class Updates {
     const now = Date.now();
     if (automatic && (!inTauri || now - prefs.lastUpdateCheck < DAY)) return;
     const previous = this.status;
+    const previousCheck = prefs.lastUpdateCheck;
     this.status = "checking";
     if (inTauri) {
       prefs.lastUpdateCheck = now;
@@ -29,7 +30,11 @@ class Updates {
     }
     try {
       this.status = (await call<Update | null>("check_update", {}, null)) ?? "failed";
-    } catch {
+    } catch (error) {
+      if (inTauri && isAclError(error)) {
+        prefs.lastUpdateCheck = previousCheck;
+        savePrefs();
+      }
       this.status = automatic ? previous : "failed";
     }
   }
