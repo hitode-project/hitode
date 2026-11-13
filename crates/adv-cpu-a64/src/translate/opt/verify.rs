@@ -11,7 +11,9 @@ pub(crate) enum Error {
     Shape(Block),
     /// A use the definition does not dominate.
     Undominated(Value),
-    /// An operand of the wrong type, or a jump with the wrong arguments.
+    /// An operand of the wrong type, a jump with the wrong arguments, or a
+    /// `Flags` parameter outside block 0: flags reach a head only as the
+    /// entry EFLAGS (A64-FLAG-3).
     Type(Block),
     /// An effect point reached with an unvalidated floating-point result.
     Pending(Block),
@@ -37,6 +39,12 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
     let sources = func.entry.iter().map(|s| s.ty());
     if !sources.eq(blocks[0].params.iter().map(|&p| func.ty(p))) {
         return Err(Error::Type(Block(0)));
+    }
+    if let Some(b) = blocks[1..]
+        .iter()
+        .position(|b| b.params.iter().any(|&p| func.ty(p) == Type::Flags))
+    {
+        return Err(Error::Type(Block(b as u32 + 1)));
     }
     let dom = dominators(func);
     let mut defs = vec![None; func.types.len()];

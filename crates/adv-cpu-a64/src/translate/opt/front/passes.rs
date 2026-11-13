@@ -1,6 +1,7 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
 use super::*;
+use crate::translate::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 
 pub(super) fn run(
@@ -29,12 +30,16 @@ pub(super) fn run(
             }
         }
     }
-    loop {
+    let settle = |func: &mut Func| loop {
         let mut changed = propagate(func);
         changed |= reachable(func);
         if !changed {
             break;
         }
+    };
+    settle(func);
+    if entry_flags(func) {
+        settle(func);
     }
     hoist(func, proof, loads);
     while propagate(func) {}
@@ -87,7 +92,11 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
 }
 
 fn map_record(record: &mut IrRecord, aliases: &[Value]) {
-    let f = |v: &mut Value| *v = resolve(*v, aliases);
+    substitute(record, |v| resolve(v, aliases));
+}
+
+fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
+    let f = |v: &mut Value| *v = map(*v);
     for loc in record
         .regs
         .iter_mut()
@@ -110,6 +119,185 @@ fn map_record(record: &mut IrRecord, aliases: &[Value]) {
             }
             Location::Constant(_) => {}
         }
+    }
+}
+
+/// A64-FLAG-3: a Flags parameter becomes the entry EFLAGS when every arrival
+/// takes each observed flag, and every flag besides the six status flags,
+/// from the entry EFLAGS or from the parameter itself. A charged arrival first
+/// reaches a head of its own whose record keeps that arrival's exact flags,
+/// since its checkpoint may leave there.
+fn entry_flags(func: &mut Func) -> bool {
+    let Some(i) = func.entry.iter().position(|s| *s == Source::Eflags) else {
+        return false;
+    };
+    let base = func.blocks[0].params[i];
+    let mut defs = vec![None; func.types.len()];
+    for block in &func.blocks {
+        for &(r, op) in &block.insts {
+            if let Some(r) = r {
+                defs[r.0 as usize] = Some(op);
+            }
+        }
+    }
+    let observed = observed(func, &defs);
+    let from_entry = |mut v: Value, param: Value, bits: FlagSet| loop {
+        if v == base || v == param {
+            return true;
+        }
+        let Some(Op::Flags {
+            kind,
+            prior: Some(prior),
+            ..
+        }) = defs[v.0 as usize]
+        else {
+            return false;
+        };
+        if bits.minus(kept(kind)).any(FlagSet::ALL) {
+            return false;
+        }
+        v = prior;
+    };
+    let mut changed = false;
+    for b in 1..func.blocks.len() {
+        let Some(head) = func.blocks[b].head else {
+            continue;
+        };
+        let params = func.blocks[b].params.clone();
+        for (p, &param) in params.iter().enumerate() {
+            if func.ty(param) != Type::Flags
+                || !func
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.end.targets())
+                    .filter(|t| t.block.0 as usize == b)
+                    .all(|t| from_entry(t.args[p], param, observed[param.0 as usize]))
+            {
+                continue;
+            }
+            changed = true;
+            let mut edges = Vec::new();
+            for (s, block) in func.blocks.iter_mut().enumerate() {
+                for (k, target) in targets_mut(&mut block.end).into_iter().enumerate() {
+                    if target.block.0 as usize == b && target.charge > 0 {
+                        edges.push((s, k, target.args.clone()));
+                    }
+                    if target.block.0 as usize == b {
+                        target.args[p] = base;
+                    }
+                }
+            }
+            for (s, k, args) in edges {
+                let mut record = func.records[head.record.0 as usize].clone();
+                substitute(&mut record, |v| {
+                    params.iter().position(|&q| q == v).map_or(v, |j| args[j])
+                });
+                let record = func.record(record);
+                let split = func.block(Some(Head { record }));
+                let mut ends = targets_mut(&mut func.blocks[s].end);
+                let target = &mut ends[k];
+                let through = std::mem::take(&mut target.args);
+                target.block = split;
+                func.blocks[split.0 as usize].end = End::Jump(Target {
+                    block: Block(b as u32),
+                    args: through,
+                    charge: 0,
+                });
+            }
+        }
+    }
+    changed
+}
+
+/// The status flags of each Flags value that tests, exits and checkpoints
+/// may see. A region start's record observes nothing by itself: recovery
+/// there continues with the same uses.
+fn observed(func: &Func, defs: &[Option<Op>]) -> Vec<FlagSet> {
+    let mut seen = vec![FlagSet::NONE; func.types.len()];
+    let mut charged = vec![false; func.blocks.len()];
+    for block in &func.blocks {
+        for t in block.end.targets() {
+            charged[t.block.0 as usize] |= t.charge > 0;
+        }
+    }
+    let flags = |record: RecordId| match func.records[record.0 as usize].eflags {
+        Some(Location::Recipe(Recipe::Eflags(v)) | Location::At(v)) => Some(v),
+        _ => None,
+    };
+    for (b, block) in func.blocks.iter().enumerate() {
+        for &(_, op) in &block.insts {
+            if let Op::Test { flags, cond } = op {
+                seen[flags.0 as usize] = seen[flags.0 as usize].or(FlagSet::of(cond));
+            }
+        }
+        if let End::Exit(record) = block.end
+            && let Some(v) = flags(record)
+        {
+            seen[v.0 as usize] = FlagSet::ALL;
+        }
+        if let Some(head) = block.head
+            && charged[b]
+            && let Some(v) = flags(head.record)
+            && !block.params.contains(&v)
+        {
+            seen[v.0 as usize] = FlagSet::ALL;
+        }
+        for t in block.end.targets().filter(|t| t.charge > 0) {
+            for &v in &t.args {
+                seen[v.0 as usize] = FlagSet::ALL;
+            }
+        }
+    }
+    let join = |seen: &mut [FlagSet], v: Value, bits: FlagSet| {
+        let new = seen[v.0 as usize].or(bits);
+        std::mem::replace(&mut seen[v.0 as usize], new) != new
+    };
+    loop {
+        let mut changed = false;
+        for (v, def) in defs.iter().enumerate() {
+            if let Some(Op::Flags {
+                kind,
+                prior: Some(prior),
+                ..
+            }) = *def
+            {
+                let read = match kind {
+                    FlagKind::AddCarry | FlagKind::SubBorrow => FlagSet::CF,
+                    FlagKind::Shl | FlagKind::Shr | FlagKind::Sar => seen[v],
+                    _ => FlagSet::NONE,
+                };
+                let passed = seen[v].minus(seen[v].minus(kept(kind)));
+                changed |= join(&mut seen, prior, read.or(passed));
+            }
+        }
+        for block in &func.blocks {
+            for t in block.end.targets().filter(|t| t.charge <= 0) {
+                let params = &func.blocks[t.block.0 as usize].params;
+                for (&arg, &param) in t.args.iter().zip(params) {
+                    let bits = seen[param.0 as usize];
+                    changed |= join(&mut seen, arg, bits);
+                }
+            }
+        }
+        if !changed {
+            return seen;
+        }
+    }
+}
+
+/// The status flags a kind leaves as its prior had them.
+fn kept(kind: FlagKind) -> FlagSet {
+    match kind {
+        FlagKind::Increment | FlagKind::Decrement => FlagSet::CF,
+        _ => FlagSet::NONE,
+    }
+}
+
+fn targets_mut(end: &mut End) -> Vec<&mut Target> {
+    match end {
+        End::Jump(t) => vec![t],
+        End::Branch { taken, fall, .. } => vec![taken, fall],
+        _ => Vec::new(),
     }
 }
 

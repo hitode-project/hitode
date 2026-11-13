@@ -3099,70 +3099,93 @@ mod opt_back {
     // spec: A64-OPT-4, A64-OPT-7
     #[test]
     fn opt_back_counted_floating_loop_has_no_backedge_or_arithmetic_moves() {
-        let (mut f, entry, p, _) = start(&[Type::F64, Type::F64, Type::I32]);
-        let head_record = f.record(record(0x1100));
-        let head = f.block(Some(Head {
-            record: head_record,
-        }));
-        let sum = f.param(head, Type::F64);
-        let count = f.param(head, Type::I32);
-        f.end(
-            entry,
-            End::Jump(Target {
-                block: head,
-                args: vec![p[0], p[2]],
-                charge: 0,
-            }),
-        );
-        let one = f.push(entry, Op::Constant(Type::I32, 1)).unwrap();
-        let total = f.push(head, Op::Fp(FpOp::Add, sum, p[1])).unwrap();
-        f.push(head, Op::Validate);
-        let next = f.push(head, Op::Int(IntOp::Sub, count, one)).unwrap();
-        let done = f.block(None);
-        f.end(
-            head,
-            End::Branch {
-                cond: next,
-                taken: Target {
+        for split in [false, true] {
+            let (mut f, entry, p, _) = start(&[Type::F64, Type::F64, Type::I32]);
+            let head_record = f.record(record(0x1100));
+            let head = f.block(Some(Head {
+                record: head_record,
+            }));
+            let sum = f.param(head, Type::F64);
+            let count = f.param(head, Type::I32);
+            f.end(
+                entry,
+                End::Jump(Target {
+                    block: head,
+                    args: vec![p[0], p[2]],
+                    charge: 0,
+                }),
+            );
+            let one = f.push(entry, Op::Constant(Type::I32, 1)).unwrap();
+            let total = f.push(head, Op::Fp(FpOp::Add, sum, p[1])).unwrap();
+            f.push(head, Op::Validate);
+            let next = f.push(head, Op::Int(IntOp::Sub, count, one)).unwrap();
+            let done = f.block(None);
+            // A charged arrival may reach its head through a head of its own
+            // (A64-FLAG-3); that head is laid out inline on the edge.
+            let taken = if split {
+                let record = f.record(record(0x1100));
+                let through = f.block(Some(Head { record }));
+                f.end(
+                    through,
+                    End::Jump(Target {
+                        block: head,
+                        args: vec![total, next],
+                        charge: 0,
+                    }),
+                );
+                Target {
+                    block: through,
+                    args: Vec::new(),
+                    charge: 3,
+                }
+            } else {
+                Target {
                     block: head,
                     args: vec![total, next],
                     charge: 3,
+                }
+            };
+            f.end(
+                head,
+                End::Branch {
+                    cond: next,
+                    taken,
+                    fall: Target {
+                        block: done,
+                        args: Vec::new(),
+                        charge: 0,
+                    },
                 },
-                fall: Target {
-                    block: done,
-                    args: Vec::new(),
-                    charge: 0,
-                },
-            },
-        );
-        finish(&mut f, done, total);
-        let lower = back::lower(&f, 0, &runtime::stubs());
-        let head_code = body(&lower, 1);
-        assert_eq!(
-            head_code[0],
-            dfloat(Float::Fadd, VReg::new(0), VReg::new(0), VReg::new(1))
-        );
-        assert_eq!(
-            head_code.len(),
-            9,
-            "FADD, Validate, SUB, CBZ, then the inline backedge"
-        );
-        // The exit edge is bare, so the loop leaves with one CBZ and the
-        // taken backedge holds only its two-word charge and branch; no
-        // register or memory copies.
-        assert_eq!(
-            head_code[5] & 0xff00_0000,
-            cbz(W, false, Reg::new(0), 0) & 0xff00_0000
-        );
-        assert_eq!(head_code[6], sub_imm(X, X9, X9, 3, false));
-        assert_eq!(head_code[7] & 0xfff8_001f, tbz(true, X9, 63, 0));
-        assert_eq!(head_code[8] & 0xfc00_0000, crate::encode::b(0));
-        let mut h = harness();
-        compare(
-            &f,
-            &[u128::from(1f64.to_bits()), u128::from(0.5f64.to_bits()), 4],
-            &mut h,
-        );
+            );
+            finish(&mut f, done, total);
+            let lower = back::lower(&f, 0, &runtime::stubs());
+            let head_code = body(&lower, 1);
+            assert_eq!(
+                head_code[0],
+                dfloat(Float::Fadd, VReg::new(0), VReg::new(0), VReg::new(1))
+            );
+            assert_eq!(
+                head_code.len(),
+                9,
+                "FADD, Validate, SUB, CBZ, then the inline backedge"
+            );
+            // The exit edge is bare, so the loop leaves with one CBZ and the
+            // taken backedge holds only its two-word charge and branch; no
+            // register or memory copies.
+            assert_eq!(
+                head_code[5] & 0xff00_0000,
+                cbz(W, false, Reg::new(0), 0) & 0xff00_0000
+            );
+            assert_eq!(head_code[6], sub_imm(X, X9, X9, 3, false));
+            assert_eq!(head_code[7] & 0xfff8_001f, tbz(true, X9, 63, 0));
+            assert_eq!(head_code[8] & 0xfc00_0000, crate::encode::b(0));
+            let mut h = harness();
+            compare(
+                &f,
+                &[u128::from(1f64.to_bits()), u128::from(0.5f64.to_bits()), 4],
+                &mut h,
+            );
+        }
     }
 
     // spec: A64-OPT-6, A64-OPT-7

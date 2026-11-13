@@ -646,6 +646,49 @@ fn rejects_unproved_modes_escaping_frames_and_unsupported_forms() {
     assert!(matches!(rejected(&sse, &initial()), Reject::Unsupported(_)));
 }
 
+// spec: A64-FLAG-3, A64-OPT-6
+#[test]
+fn loop_heads_take_unobserved_flags_from_entry() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |_| {});
+    let func = &built.func;
+    let eflags = func
+        .entry
+        .iter()
+        .position(|s| *s == Source::Eflags)
+        .unwrap();
+    let base = func.blocks[0].params[eflags];
+    let mut splits = 0;
+    for block in &func.blocks {
+        for t in block.end.targets().filter(|t| t.charge > 0) {
+            let head = func.blocks[t.block.0 as usize].head.unwrap();
+            let Some(Location::Recipe(Recipe::Eflags(v))) =
+                func.records[head.record.0 as usize].eflags
+            else {
+                panic!("a checkpoint record names its arrival's flags");
+            };
+            assert_ne!(v, base, "a checkpoint keeps the arrival's exact flags");
+            splits += 1;
+        }
+    }
+    assert!(splits > 0);
+
+    // ADC reads the carry the previous iteration's ADD wrote.
+    let carried = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.adc(eax, 0).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    assert_eq!(rejected(&carried, &initial()), Reject::Flags);
+}
+
 // spec: A64-OPT-2, A64-OPT-6
 #[test]
 fn x87_register_and_popping_arithmetic_forms() {

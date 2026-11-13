@@ -52,6 +52,8 @@ pub(crate) enum Reject {
     Escape(usize),
     Dynamic(usize),
     StaticX87(usize),
+    /// A head where observed flags differ between arrivals (A64-FLAG-3).
+    Flags,
 }
 
 #[derive(Clone)]
@@ -332,6 +334,12 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
         f.func.end(f.block, end);
     }
     passes::run(&mut f.func, proof, &f.loads, &f.stores);
+    if f.func.blocks[1..]
+        .iter()
+        .any(|b| b.params.iter().any(|&p| f.func.ty(p) == Type::Flags))
+    {
+        return Err(Reject::Flags);
+    }
     debug_assert_eq!(super::verify::verify(&f.func), Ok(()));
     Ok(Built {
         func: f.func,

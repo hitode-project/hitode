@@ -109,6 +109,9 @@ pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
     let refund = func.records[first.0 as usize].refund;
     e.charge(i64::from(refund), first, false);
     for (b, data) in func.blocks.iter().enumerate() {
+        if e.through(Block(b as u32)).is_some() {
+            continue;
+        }
         e.asm.bind(e.blocks[b]);
         e.region = allocation.regions[b];
         e.mark(Part::Body, func.records[e.region.0 as usize].eip);
@@ -131,7 +134,9 @@ pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
                 // Branch straight to a target whose edge needs no code and
                 // place the other edge inline, so a charged backedge costs no
                 // extra taken branch.
-                let bare = |e: &Emitter, t: &Target| e.moves(t).is_empty() && t.charge == 0;
+                let bare = |e: &Emitter, t: &Target| {
+                    e.moves(t).is_empty() && t.charge == 0 && e.through(t.block).is_none()
+                };
                 let (jump, inline, when) = if bare(&e, taken) {
                     (taken, fall, true)
                 } else {
@@ -198,7 +203,7 @@ struct Emitter<'a> {
     edges: Vec<(Label, Target)>,
 }
 
-impl Emitter<'_> {
+impl<'a> Emitter<'a> {
     fn mark(&mut self, part: Part, eip: u32) {
         self.marks.push(Mark {
             offset: self.asm.offset() as u32,
@@ -336,14 +341,34 @@ impl Emitter<'_> {
             let record = self.func.blocks[target.block.0 as usize]
                 .head
                 .map_or(self.region, |h| h.record);
+            let lands = self.through(target.block).map_or(target.block, |t| t.block);
             self.charge(
                 i64::from(target.charge),
                 record,
-                self.func.head_exit == Some(target.block),
+                self.func.head_exit == Some(lands),
             );
         }
-        if target.block.0 as usize != next {
+        if let Some(through) = self.through(target.block) {
+            self.edge(through, next);
+        } else if target.block.0 as usize != next {
             self.asm.b(self.blocks[target.block.0 as usize]);
+        }
+    }
+    /// A head that only names the record of one charged arrival and jumps on
+    /// with charge 0. Its code is laid out inline on that arrival's edge.
+    fn through(&self, block: Block) -> Option<&'a Target> {
+        let data = &self.func.blocks[block.0 as usize];
+        match &data.end {
+            End::Jump(t)
+                if data.head.is_some()
+                    && block.0 != 0
+                    && data.params.is_empty()
+                    && data.insts.is_empty()
+                    && t.charge == 0 =>
+            {
+                Some(t)
+            }
+            _ => None,
         }
     }
     fn fail(&self) -> Label {
