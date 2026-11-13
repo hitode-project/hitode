@@ -12,6 +12,8 @@ pub(super) struct Output {
     pool: PresentPool,
     pictures: [Arc<crate::frame::DecodedPicture>; 4],
     scaler: Option<software::scaling::Context>,
+    source: Pixel,
+    color: YuvColor,
     width: u32,
     height: u32,
     format: Format,
@@ -34,8 +36,54 @@ pub(super) fn color(space: ff::color::Space, range: ff::color::Range) -> YuvColo
 }
 
 impl Output {
-    pub(super) fn new(device: &Device, decoder: &ff::decoder::Video) -> Result<Self, Error> {
+    fn build_scaler(
+        source: Pixel,
+        width: u32,
+        height: u32,
+        format: Format,
+        color: YuvColor,
+    ) -> Result<Option<software::scaling::Context>, Error> {
+        let mut scaler = (!matches!(
+            source,
+            Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12 | Pixel::NV21
+        ))
+        .then(|| {
+            software::scaling::Context::get(
+                source,
+                width,
+                height,
+                if format == Format::Nv21 {
+                    Pixel::NV21
+                } else {
+                    Pixel::NV12
+                },
+                width,
+                height,
+                software::scaling::Flags::BILINEAR,
+            )
+        })
+        .transpose()?;
+        if let Some(scaler) = &mut scaler {
+            configure(
+                scaler,
+                color,
+                matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full),
+            );
+        }
+        Ok(scaler)
+    }
+
+    pub(super) fn new(
+        device: &Device,
+        decoder: &ff::decoder::Video,
+        source: Pixel,
+    ) -> Result<Self, Error> {
         let (width, height) = (decoder.width(), decoder.height());
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err(Error::Decode(
+                "invalid or excessive video dimensions".into(),
+            ));
+        }
         let color = color(decoder.color_space(), decoder.color_range());
         let format = [Format::Nv12, Format::Nv21]
             .into_iter()
@@ -66,37 +114,13 @@ impl Output {
             ))
         });
         drop(buffers);
-        let mut scaler = (!matches!(
-            decoder.format(),
-            Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12 | Pixel::NV21
-        ))
-        .then(|| {
-            software::scaling::Context::get(
-                decoder.format(),
-                width,
-                height,
-                if format == Format::Nv21 {
-                    Pixel::NV21
-                } else {
-                    Pixel::NV12
-                },
-                width,
-                height,
-                software::scaling::Flags::BILINEAR,
-            )
-        })
-        .transpose()?;
-        if let Some(scaler) = &mut scaler {
-            configure(
-                scaler,
-                color,
-                matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full),
-            );
-        }
+        let scaler = Self::build_scaler(source, width, height, format, color)?;
         Ok(Self {
             pool,
             pictures,
             scaler,
+            source,
+            color,
             width,
             height,
             format,
@@ -111,6 +135,16 @@ impl Output {
         // The pool and scaler were sized for the stream's first dimensions.
         if (decoded.width(), decoded.height()) != (self.width, self.height) {
             return Err(Error::Decode("video dimensions changed mid-stream".into()));
+        }
+        if decoded.format() != self.source {
+            self.scaler = Self::build_scaler(
+                decoded.format(),
+                self.width,
+                self.height,
+                self.format,
+                self.color,
+            )?;
+            self.source = decoded.format();
         }
         for picture in &mut self.pictures {
             if let Some(picture) = Arc::get_mut(picture) {
@@ -573,6 +607,81 @@ mod ownership_tests {
         assert!(held.len() > 4);
         for (picture, bgra) in &held {
             assert_eq!(&picture.bgra(), bgra);
+        }
+    }
+
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn h264_mp4_decodes_through_videotoolbox_into_nv12_planes() {
+        let mp4 =
+            include_bytes!("../../../adv-runtime/tests/fixtures/media/synthetic.mp4").to_vec();
+        let mut decoder = crate::media::Decoder::open_memory(mp4.clone()).unwrap();
+        let mut frames = 0;
+        for time in (0..600_000).step_by(100_000) {
+            if let Some(frame) = decoder.frame_at(time).unwrap().video {
+                assert_eq!((frame.width, frame.height), (64, 48));
+                assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
+                assert_eq!(frame.bgra().len(), 64 * 48 * 4);
+                frames += 1;
+            }
+        }
+        assert!(frames >= 3);
+
+        let input = crate::media::demux(mp4).unwrap();
+        let stream = input
+            .streams
+            .iter()
+            .find(|s| matches!(s.format, crate::media::CodecFormat::Video { .. }))
+            .unwrap();
+        let mut packet_decoder = crate::media::PacketDecoder::open(&stream.format).unwrap();
+        let mut pts = Vec::new();
+        for packet in &stream.packets {
+            for decoded in packet_decoder
+                .decode(&packet.data, Some(packet.time_100ns))
+                .unwrap()
+            {
+                if let crate::media::Decoded::Video(frame) = decoded {
+                    pts.push(frame.pts_us);
+                }
+            }
+        }
+        for decoded in packet_decoder.drain().unwrap() {
+            if let crate::media::Decoded::Video(frame) = decoded {
+                pts.push(frame.pts_us);
+            }
+        }
+        assert!(pts.len() >= 3);
+        assert!(pts.iter().any(|&t| t > 0));
+
+        // Verify a 720p H.264 stream exercises the live VideoToolbox hardware session when ffmpeg CLI is present.
+        let ffmpeg = std::env::var_os("FFMPEG_DIR")
+            .map(|d| std::path::PathBuf::from(d).join("bin/ffmpeg"))
+            .unwrap_or_else(|| "ffmpeg".into());
+        let tmp = std::env::temp_dir().join(format!("adv-vt-720p-{}.mp4", std::process::id()));
+        if std::process::Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=1280x720:rate=30:duration=0.2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+            ])
+            .arg(&tmp)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let bytes = std::fs::read(&tmp).unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            let mut hd = crate::media::Decoder::open_memory(bytes).unwrap();
+            let frame = hd.frame_at(100_000).unwrap().video.expect("720p frame");
+            assert_eq!((frame.width, frame.height), (1280, 720));
+            assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
         }
     }
 }
