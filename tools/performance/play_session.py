@@ -205,6 +205,8 @@ def run(args: argparse.Namespace) -> None:
                     "--wine-prefix", str(output / "prefix")])
     if getattr(args, "host_profile", False):
         command.extend(["--host-profile", str(output / "host-services.csv")])
+    if getattr(args, "schedule_profile", False):
+        command.extend(["--schedule-profile", str(output / "schedule.tsv")])
     for mount in getattr(args, "cdrom", []):
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
@@ -378,6 +380,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--wine", required=True, type=Path, help="Wine distribution; keep its prefix under OUTPUT")
     parser.add_argument("--host-profile", action="store_true", help="record host service costs under OUTPUT")
+    parser.add_argument("--schedule-profile", action="store_true",
+                        help="record scheduling boundaries in OUTPUT/schedule.tsv for analyze_schedule.py")
     parser.add_argument("--cdrom", action="append", default=[], metavar="DRIVE=IMAGE",
                         help="mount an image in the guest; repeat for multiple drives")
     parser.add_argument("--auto-dialog-ms", type=int, default=50,

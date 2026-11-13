@@ -3,7 +3,8 @@
 //! run; normal dispatch, waits and guest memory access resume after the drain.
 //! Schedule trace: compute_offer reports the prepared EIP and compute_submit
 //! starts a worker assignment. compute_done reports retired instructions,
-//! execution ns, and flags (local=1, owner=2).
+//! execution ns, and flags (local=1, owner=2). compute_opt follows it with the
+//! instructions retired in optimized forms, when there are any.
 //! compute_round reports offered contexts, scope wall ns, and admitted contexts.
 
 use std::time::{Duration, Instant};
@@ -300,6 +301,10 @@ fn complete<C>(sys: &mut Sys, regs: &mut [Option<C>], done: Completion<C>, local
         ns,
         u64::from(local) | u64::from(done.requires_owner) << 1,
     );
+    if done.optimized != 0 {
+        sys.schedule_trace
+            .event("compute_opt", id, done.optimized, 0, 0);
+    }
     done.requires_owner
 }
 
@@ -438,6 +443,7 @@ mod tests {
             id,
             context: context + 1,
             retired: 1,
+            optimized: 0,
             elapsed: Duration::from_micros(1),
             helpers: Duration::ZERO,
             requires_owner,

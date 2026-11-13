@@ -9,6 +9,7 @@ Usage:
   python3 tools/performance/macos_sample.py code RUN_DIRECTORY [--thread adv-execution]
                                             [--region HEX] [--from MS --to MS]
                                             [--listing 5]
+  python3 tools/performance/macos_sample.py loops RUN_DIRECTORY --region HEX
 
 record runs /usr/bin/sample for consecutive one-second slices and writes
 slice-<unix ms>.txt files into RUN_DIRECTORY. Start the process with
@@ -31,6 +32,12 @@ pass over each guest instruction's inline code (without Cold, X87Publish,
 X87Wide and SimdPublish), in the unit holding the most samples; sampled counts cover every unit of the region. --listing prints
 the hottest guest instructions' code with per-instruction samples. Needs the
 capstone Python package.
+
+loops needs no samples. For every unit placed for one guest region, ordinary
+(mode a64) or a computation's optimized form (a64-opt), it lists each loop a
+backward branch closes, innermost first, with its host instructions split into
+stack accesses (spills and reloads), other memory, branches and the rest. Two
+forms of the same loop compare by these static counts.
 Read shares, not times: each slice also contains the sampler's attach.
 Output stays local; none of it belongs in the repository.
 """
@@ -286,6 +293,63 @@ def code(directory, thread, region, start, end, listing):
             print(f"{weight:6} {part:10} {kind:14} {mnemonic} {operands}")
 
 
+def loop_bodies(insns):
+    """The host instructions of each loop a backward branch closes, innermost first."""
+    bodies = []
+    for index, insn in enumerate(insns):
+        if insn.mnemonic in BRANCHES or insn.mnemonic.startswith("b."):
+            target = next((op.imm for op in insn.operands if op.type == 2), None)
+            if target is not None and target <= insn.address:
+                first = next(i for i, other in enumerate(insns) if other.address >= target)
+                bodies.append(insns[first:index + 1])
+    return sorted(bodies, key=len)
+
+
+def loop_kinds(body):
+    """Stack accesses (spills and reloads), other memory, branches and the rest."""
+    kinds = Counter()
+    for insn in body:
+        memory = [op for op in insn.operands if op.type == 3]
+        if memory and insn.reg_name(memory[0].mem.base) == "sp":
+            kinds["stack"] += 1
+        elif memory:
+            kinds["memory"] += 1
+        elif insn.mnemonic in BRANCHES or insn.mnemonic.startswith("b."):
+            kinds["branch"] += 1
+        else:
+            kinds["other"] += 1
+    return kinds
+
+
+def loops(directory, region):
+    import capstone
+    arch = getattr(capstone, "CS_ARCH_AARCH64", None) or capstone.CS_ARCH_ARM64
+    disassembler = capstone.Cs(arch, capstone.CS_MODE_ARM)
+    disassembler.detail = True
+    found = False
+    for path in sorted(directory.glob("jit-*.tsv")):
+        blob = path.with_name(f"code-{path.stem.split('-', 1)[1]}.bin")
+        if not blob.exists():
+            continue
+        at = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            ns, _, size, guest, mode = line.split("\t")[:5]
+            size = int(size)
+            if int(guest) == region:
+                found = True
+                with blob.open("rb") as handle:
+                    handle.seek(at)
+                    code = handle.read(size)
+                print(f"unit {mode} at {ns}: {size // 4} host instructions")
+                for body in loop_bodies(list(disassembler.disasm(code, 0))):
+                    kinds = loop_kinds(body)
+                    print(f"  loop {body[0].address:#06x}-{body[-1].address:#06x}: {len(body):4} host "
+                          + " ".join(f"{k} {kinds[k]}" for k in ("stack", "memory", "branch", "other")))
+            at += size
+    if not found:
+        raise SystemExit(f"no unit for region {region:08x}: run with ADV_JIT_MAP_DIR set to this directory")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -307,8 +371,13 @@ if __name__ == "__main__":
     coding.add_argument("--from", dest="start", type=int)
     coding.add_argument("--to", dest="end", type=int)
     coding.add_argument("--listing", type=int, default=5)
+    looping = commands.add_parser("loops")
+    looping.add_argument("directory", type=Path)
+    looping.add_argument("--region", type=lambda text: int(text, 16), required=True)
     args = parser.parse_args()
-    if args.command == "record":
+    if args.command == "loops":
+        loops(args.directory, args.region)
+    elif args.command == "record":
         record(args.directory, args.pid, args.seconds)
     elif args.command == "code":
         code(args.directory, args.thread, args.region, args.start, args.end, args.listing)

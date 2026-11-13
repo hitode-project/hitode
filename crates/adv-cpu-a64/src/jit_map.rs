@@ -2,11 +2,15 @@
 //! execution counts, and never change translation.
 //!
 //! `ADV_JIT_MAP_DIR` writes `jit-{pid}.tsv` rows for an external sampler,
+//! with mode `a64`, or `a64-opt` for a computation's optimized form;
 //! `insn-{pid}.tsv` rows with the guest instruction and [`Part`] of every
-//! stretch of a unit, and `code-{pid}.bin`, the units' code as placed (before
-//! links are patched), concatenated in `jit-{pid}.tsv` row order. [`enable_memory`] keeps the same in process for
-//! an in-process sampler, with the names of the shared stubs. A cleared cache reuses addresses,
-//! so attribution takes the newest unit placed before the sample.
+//! stretch of a unit; and `code-{pid}.bin`, the units' code as placed (before
+//! links are patched), concatenated in `jit-{pid}.tsv` row order.
+//! `opt-{pid}.tsv` says, per computation entry, whether its optimized form was
+//! built or why not. [`enable_memory`] keeps the same in process for an
+//! in-process sampler, with the names of the shared stubs. A cleared cache
+//! reuses addresses, so attribution takes the newest unit placed before the
+//! sample.
 // The translator needs these types on every host; native execution records units.
 #![cfg_attr(not(native), allow(dead_code))]
 
@@ -182,7 +186,14 @@ fn now_ns() -> u128 {
 
 /// Records the unit `words` placed at `base` and translated from `eip`,
 /// whose stretches start at `marks`.
-pub(crate) fn record(base: usize, words: &[u32], eip: u32, retired: u32, marks: &[Mark]) {
+pub(crate) fn record(
+    base: usize,
+    words: &[u32],
+    eip: u32,
+    retired: u32,
+    marks: &[Mark],
+    mode: &str,
+) {
     let size = words.len() * 4;
     if MEMORY.load(Ordering::Acquire) {
         let mut units = UNITS.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -204,8 +215,26 @@ pub(crate) fn record(base: usize, words: &[u32], eip: u32, retired: u32, marks: 
             }),
         }
     }
-    static MAP: OnceLock<Option<Mutex<(File, File, File)>>> = OnceLock::new();
-    let Some(files) = MAP.get_or_init(|| {
+    let Some(files) = files() else {
+        return;
+    };
+    // Decimal TSV: Unix ns, native base, bytes, guest start, mode,
+    // guest span (unknown here, 0), retired guest instructions.
+    let ns = now_ns();
+    let row = format!("{ns}\t{base}\t{size}\t{eip}\t{mode}\t0\t{retired}\n");
+    let stretches = stretches(ns, base, size, marks, mode);
+    let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _ = files.0.write_all(row.as_bytes());
+    let _ = files.1.write_all(stretches.as_bytes());
+    let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let _ = files.2.write_all(&code);
+}
+
+type Files = Mutex<(File, File, File, File)>;
+
+fn files() -> Option<&'static Files> {
+    static MAP: OnceLock<Option<Files>> = OnceLock::new();
+    MAP.get_or_init(|| {
         let directory = std::path::PathBuf::from(std::env::var_os("ADV_JIT_MAP_DIR")?);
         let pid = std::process::id();
         let create = |name: &str, extension: &str| {
@@ -216,6 +245,7 @@ pub(crate) fn record(base: usize, words: &[u32], eip: u32, retired: u32, marks: 
                 create("jit", "tsv")?,
                 create("insn", "tsv")?,
                 create("code", "bin")?,
+                create("opt", "tsv")?,
             ))
         }) {
             Ok(files) => Some(Mutex::new(files)),
@@ -224,32 +254,36 @@ pub(crate) fn record(base: usize, words: &[u32], eip: u32, retired: u32, marks: 
                 None
             }
         }
-    }) else {
-        return;
-    };
-    // Decimal TSV: Unix ns, native base, bytes, guest start, mode,
-    // guest span (unknown here, 0), retired guest instructions.
-    let ns = now_ns();
-    let row = format!("{ns}\t{base}\t{size}\t{eip}\ta64\t0\t{retired}\n");
-    let stretches = stretches(ns, base, size, marks);
-    let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
-    let _ = files.0.write_all(row.as_bytes());
-    let _ = files.1.write_all(stretches.as_bytes());
-    let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    let _ = files.2.write_all(&code);
+    })
+    .as_ref()
+}
+
+/// Whether `ADV_JIT_MAP_DIR` writes maps.
+pub(crate) fn enabled() -> bool {
+    files().is_some()
+}
+
+/// An `opt-{pid}.tsv` row: Unix ns, computation entry, then `outcome`
+/// (the result, the refused instruction and its operation).
+pub(crate) fn optimized(eip: u32, outcome: &str) {
+    if let Some(files) = files() {
+        let row = format!("{}\t{eip}\t{outcome}\n", now_ns());
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = files.3.write_all(row.as_bytes());
+    }
 }
 
 /// `insn-{pid}.tsv` rows of a unit, keyed by its `jit-{pid}.tsv` row: Unix
 /// ns, native base, start and end offsets of each stretch, guest
 /// instruction, part and class (a64 has none).
-fn stretches(ns: u128, base: usize, size: usize, marks: &[Mark]) -> String {
+fn stretches(ns: u128, base: usize, size: usize, marks: &[Mark], mode: &str) -> String {
     let mut marks = marks.to_vec();
     marks.sort_by_key(|mark| mark.offset);
     let mut rows = String::new();
     for (n, mark) in marks.iter().enumerate() {
         let end = marks.get(n + 1).map_or(size, |next| next.offset as usize);
         let (start, eip, part) = (mark.offset, mark.eip, mark.part);
-        rows += &format!("{ns}\t{base}\t{start}\t{end}\t{eip}\t{part:?}\ta64\n");
+        rows += &format!("{ns}\t{base}\t{start}\t{end}\t{eip}\t{part:?}\t{mode}\n");
     }
     rows
 }
@@ -285,8 +319,9 @@ mod tests {
                 mark(0x20, 0x401004, Part::Cold),
                 mark(0, 0x401000, Part::Body),
             ],
+            "a64",
         );
-        record(0x1040, &[0; 8], 0x401100, 2, &[]);
+        record(0x1040, &[0; 8], 0x401100, 2, &[], "a64");
         let first = now_ns();
         assert_eq!(lookup(0x1010, first), Some(0x401000));
         assert_eq!(lookup(0x1050, first), Some(0x401100));
@@ -308,7 +343,7 @@ mod tests {
         );
         // A cleared cache places again from its bottom.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        record(0x1000, &[0; 12], 0x402000, 1, &[]);
+        record(0x1000, &[0; 12], 0x402000, 1, &[], "a64");
         let second = now_ns();
         assert_eq!(lookup(0x1010, second), Some(0x402000));
         assert_eq!(lookup(0x1010, first), Some(0x401000));
@@ -328,7 +363,7 @@ mod tests {
             mark(0, 0x401000, Part::X87Entry),
         ];
         assert_eq!(
-            stretches(7, 0x1000, 0x40, &marks),
+            stretches(7, 0x1000, 0x40, &marks, "a64"),
             "7\t4096\t0\t32\t4198400\tX87Entry\ta64\n7\t4096\t32\t64\t4198404\tCold\ta64\n"
         );
     }

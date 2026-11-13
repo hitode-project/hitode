@@ -179,6 +179,7 @@ ADV_JIT_MAP_DIR=<run> <launcher or adv-run> ...
 python3 tools/performance/macos_sample.py record <run> --pid <pid> --seconds 30
 python3 tools/performance/macos_sample.py report <run> [--thread <name>] [--from <ms> --to <ms>] [--instructions]
 python3 tools/performance/macos_sample.py code <run> [--thread <name>] [--region <hex>] [--listing <n>]   # generated code by host-instruction role
+python3 tools/performance/macos_sample.py loops <run> --region <hex>   # loops of each generated form of a guest region
 python tools/performance/compare_loop_profiles.py <base> <cand>
 # before running: what a module will ask of the CPU
 python tools/survey/module_profile.py <module> [--json <out>]
@@ -186,9 +187,10 @@ python tools/survey/module_profile.py <module> [--json <out>]
 
 - `native_sample.py --while-key ctrl` samples only while the key is held, to measure skipping. Count work that a native game spreads over threads against the single Hitode thread.
 - `macos_sample.py code` disassembles the sampled region from `code-<pid>.bin` (needs `capstone`) and splits its host instructions by register role (A64-REG-1): guest memory, `CpuState` and `Runtime` accesses, branches, flags, countdown, x87 state words, floating-point arithmetic and moves. Static counts cover the inline path; samples on the consumer of a load usually wait for the load.
+- `ADV_JIT_MAP_DIR` marks each region row with its form, `a64` or the optimized `a64-opt`, and writes `opt-<pid>.tsv`: per computation entry, whether its optimized form was built or the reject and the instruction refused. `macos_sample.py loops` lists every form of a guest region by backward branch, innermost first, with host instruction, stack, memory and branch counts, so the optimized and ordinary forms of a unit compare without timing.
 - `native_hotspots.py --summary` gives host instructions per guest instruction, split by check, body, pure and slow, and the share of stack accesses. Untagged code counts toward the next tag, so the check share is a lower bound.
 - JIT code has no unwind information, so host stacks stop at native regions. They answer who calls a host function, not which guest code ran.
-- `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames. Its checkpoint reports include bounded wait-source, wake lateness and ready-to-dispatch distributions, also in windowed runs. Its `input_responses` follow each click, key or wheel press to the frames after it and split the execution thread into guest runs, polling-round waits and all-blocked waits, so a felt stall in a windowed run gets its cause. `--host-profile <csv>` gives API service time.
+- `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames; `play_session.py --schedule-profile` writes it into the run. Its `compute_done` rows give each computation job's retired instructions, and `compute_opt` rows the part an optimized form retired. Its checkpoint reports include bounded wait-source, wake lateness and ready-to-dispatch distributions, also in windowed runs. Its `input_responses` follow each click, key or wheel press to the frames after it and split the execution thread into guest runs, polling-round waits and all-blocked waits, so a felt stall in a windowed run gets its cause. `--host-profile <csv>` gives API service time.
 - `ADV_LOOP_COVERAGE=1` with `--report` writes `*.loops.tsv` for `loop_coverage.py`. It ranks by instruction weight, not time.
 - `ADV_INTERP_PROFILE=<file>` profiles the interpreter.
 - On macOS, `play_session.py` writes cumulative process CPU time and memory to each checkpoint's `*.process.json`. Subtract CPU time and `wall_seconds` between checkpoints for whole-process core usage; 1.0 means one fully occupied core.

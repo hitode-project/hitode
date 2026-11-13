@@ -573,6 +573,8 @@ pub struct Completion<C> {
     pub id: u32,
     pub context: C,
     pub retired: u64,
+    /// The part of `retired` run in optimized forms.
+    pub optimized: u64,
     pub elapsed: Duration,
     /// Time other threads spent on its blocks, beyond `elapsed`.
     pub helpers: Duration,

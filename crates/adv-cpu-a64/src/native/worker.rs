@@ -138,8 +138,6 @@ pub(super) struct Optimized {
     pub records: Vec<Record<Host>>,
     pub flags: Vec<Option<FlagRecipe>>,
     pub cells: usize,
-    /// Jobs that ran this form, for diagnostics.
-    pub runs: std::sync::atomic::AtomicU64,
 }
 
 pub(super) struct Faults<'a> {
@@ -222,7 +220,6 @@ fn run(
     let entry_esp = cpu.regs[ESP];
     let code = optimized.as_ref().map_or(code, |(o, _)| &o.code);
     if let Some((o, cells)) = &optimized {
-        o.runs.fetch_add(1, Ordering::Relaxed);
         runtime.opt_params = cells.as_ptr() as u64;
         runtime.opt_save = saved.as_mut_ptr() as u64;
         runtime.opt_cells = o.cells as u64;
@@ -305,6 +302,7 @@ fn run(
             id,
             context: Some(context),
             retired,
+            optimized: if optimized.is_some() { retired } else { 0 },
             elapsed,
             helpers: Duration::ZERO,
             requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
@@ -351,6 +349,7 @@ struct Blocks {
 #[derive(Default)]
 struct Drained {
     retired: u64,
+    optimized: u64,
     elapsed: Duration,
     sticky: u32,
     blocks: u32,
@@ -475,6 +474,7 @@ impl Blocks {
                 "a proved block left its iterations"
             );
             out.retired += done.retired;
+            out.optimized += done.optimized;
             out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
             if last {
                 out.last = Some((done, thread));
@@ -853,6 +853,7 @@ impl<'a> Session<'a> {
             }
             total.blocks += drained.blocks;
             total.retired += drained.retired;
+            total.optimized += drained.optimized;
             total.sticky |= drained.sticky;
             total.last = total.last.or(drained.last);
             helped += drained.elapsed;
@@ -871,6 +872,7 @@ impl<'a> Session<'a> {
                     id,
                     context: Some(blocks.at(iterations)),
                     retired: 0,
+                    optimized: 0,
                     elapsed: Duration::ZERO,
                     helpers: Duration::ZERO,
                     requires_owner: false,
@@ -886,6 +888,7 @@ impl<'a> Session<'a> {
         self.counts.blocks += u64::from(total.blocks);
         completion.id = id;
         completion.retired = total.retired;
+        completion.optimized = total.optimized;
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
         completion.context.as_mut().unwrap().cpu_mut().mxcsr |= total.sticky;
@@ -1507,13 +1510,8 @@ mod tests {
             &mut |scope| done = scope.run_local(1, &start),
         );
         let done = done.expect("admitted loop");
-        let optimized = native.computation[&CODE].code.optimized.as_ref();
-        let runs = optimized
-            .expect("optimized form")
-            .runs
-            .load(Ordering::Relaxed);
-        assert!(runs >= 1);
         assert_eq!(done.retired, u64::from(N) * 7);
+        assert_eq!(done.optimized, done.retired);
         assert_eq!(executor.memory().read(DST, len).unwrap(), expected);
         let cpu = done.context.as_ref().unwrap().cpu();
         assert_eq!(cpu.eip, stop);
@@ -2166,6 +2164,7 @@ mod tests {
                 id: 1,
                 context: Some(expected_first),
                 retired: first_retired,
+                optimized: 0,
                 elapsed: Duration::from_micros(10),
                 helpers: Duration::ZERO,
                 requires_owner: false,

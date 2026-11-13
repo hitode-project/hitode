@@ -1702,7 +1702,7 @@ impl Native {
             .map(|&(offset, site)| (entry + offset, site))
             .collect();
         sites.sort_unstable_by_key(|&(pc, _)| pc);
-        crate::jit_map::record(entry, code.words, eip, retired, code.marks);
+        crate::jit_map::record(entry, code.words, eip, retired, code.marks, "a64");
         Some(worker::Code {
             entry,
             end: entry + code.words.len() * 4,
@@ -1724,7 +1724,20 @@ impl Native {
         }
         // SAFETY: the owner's state is live while it translates.
         let at = unsafe { &*self.runtime.cpu };
-        let built = translate::opt::front::build(unit, proof, at).ok()?;
+        let built = match translate::opt::front::build(unit, proof, at) {
+            Ok(built) => built,
+            Err(reject) => {
+                if crate::jit_map::enabled() {
+                    let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
+                    let at = inst.map_or(String::from("0\t-"), |inst| {
+                        format!("{}\t{:?}", inst.pc, inst.op)
+                    });
+                    crate::jit_map::optimized(eip, &format!("{reject:?}\t{at}"));
+                }
+                return None;
+            }
+        };
+        crate::jit_map::optimized(eip, &format!("built\t{}\t-", built.cuts));
         let lowered =
             translate::opt::back::lower(&built.func, self.cache.next(), self.stubs.opt_exit);
         let entry = self.cache.append(&lowered.words)?;
@@ -1740,6 +1753,7 @@ impl Native {
             eip,
             unit.trace.prepaid(0),
             &lowered.marks,
+            "a64-opt",
         );
         Some(Arc::new(worker::Optimized {
             code: worker::Code {
@@ -1753,7 +1767,6 @@ impl Native {
             records: lowered.records,
             flags: lowered.flags,
             cells: lowered.spill_cells,
-            runs: Default::default(),
         }))
     }
 
@@ -1893,7 +1906,7 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
-        crate::jit_map::record(unit, words, eip, retired, marks);
+        crate::jit_map::record(unit, words, eip, retired, marks, "a64");
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
