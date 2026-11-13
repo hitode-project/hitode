@@ -368,6 +368,10 @@ impl PoolState {
         }
     }
 
+    pub(crate) fn target_age(&self, id: PoolId, size: (u32, u32)) -> Option<u32> {
+        self.target(id, size).1
+    }
+
     fn target(&self, id: PoolId, size: (u32, u32)) -> (Target, Option<u32>) {
         let pool = self.pools.iter().find(|p| p.id == id && p.size == size);
         let buffer = pool
@@ -624,15 +628,23 @@ pub fn plan(
         (viewport.w / canvas.0).max(1),
         (viewport.h / canvas.1).max(1),
     );
-    // Native-size and downscaled views bypass super-resolution (HOST-VIEW-7).
-    let upscale =
+    // Native-size, downscaled and 720p+ video frames bypass super-resolution (HOST-VIEW-7).
+    let canvas_upscale =
         settings.upscaler != Upscaler::Off && viewport.w > canvas.0 && viewport.h > canvas.1;
-    let output_needed = !upscale
-        && ((!integer && prescale != (1, 1))
-            || (!caps.rotates && settings.rotation != Rotation::None)
-            || ((!caps.scales || (integer && !caps.nearest)) && viewport_size != canvas));
+    let hd_video = frame
+        .video
+        .iter()
+        .any(|v| u64::from(v.source.0) * u64::from(v.source.1) >= 1280 * 720);
+    let upscale = canvas_upscale && !hd_video;
+    let needs_output = |upscaled: bool| {
+        !upscaled
+            && ((!integer && prescale != (1, 1))
+                || (!caps.rotates && settings.rotation != Rotation::None)
+                || ((!caps.scales || (integer && !caps.nearest)) && viewport_size != canvas))
+    };
+    let output_needed = needs_output(upscale);
     // This decision deliberately excludes frame damage, videos and pool state.
-    let swap_role = if caps.presentable_compressed || (!upscale && !output_needed) {
+    let swap_role = if caps.presentable_compressed || (!canvas_upscale && !needs_output(false)) {
         SwapRole::Presentable { canvas }
     } else {
         SwapRole::Private

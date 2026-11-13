@@ -1269,6 +1269,13 @@ impl Display {
         let started = Instant::now();
         let retained = matches!(frame.base, Base::Retained { .. });
         self.windows.changes(&mut frame.info, &frame.windows);
+        let previous_software_upscale = self.recorder.latest().is_some_and(|r| {
+            r.plan
+                .stages
+                .iter()
+                .any(|s| matches!(s, Stage::Upscale { video: false, .. }))
+        }) && self.pools.target_age(UPSCALE, frame.info.canvas)
+            == Some(1);
         let (settings, planned) = self.plan(&frame.info, reading);
         let mut targets = self.targets(queue, &planned)?;
         let retired = self.update_leases(&mut frame.video);
@@ -1328,7 +1335,8 @@ impl Display {
                     }
             );
             let software = matches!(frame.info.base, BaseKind::Software { .. })
-                && matches!(stage, Stage::Upscale { video: false, .. });
+                && matches!(stage, Stage::Upscale { video: false, .. })
+                && previous_software_upscale;
             let damage = software.then(|| {
                 frame
                     .info

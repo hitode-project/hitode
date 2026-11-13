@@ -1863,3 +1863,160 @@ fn window_layers_upload_once_capture_over_the_frame_and_leave() {
     let third = shown(&mut display, &mut q, frame(3, &image, none()));
     assert!(third.layers.windows.is_empty());
 }
+
+// spec: HOST-VIEW-7, HOST-VIEW-10
+#[test]
+fn hd_video_bypasses_upscaling_and_resumes_clean_software_damage() {
+    let (d, mut q, mut display, history) = setup();
+    display
+        .settings(
+            &mut q,
+            Settings {
+                view: (160, 120),
+                upscaler: Upscaler::Anime4k,
+                ..settings()
+            },
+        )
+        .unwrap();
+    let software = |serial, pixels: &[u8], damage, video: Vec<(VideoGeometry, Video)>| {
+        let buffer = d
+            .create_buffer(&BufferDesc {
+                size: pixels.len() as u64,
+                usage: BufferUsage::STORAGE,
+                memory: Memory::Upload,
+                label: "software canvas",
+            })
+            .unwrap();
+        unsafe { buffer.mapped().unwrap().as_mut() }.copy_from_slice(pixels);
+        let mut info = info(serial, BaseKind::Software { indexed: false }, damage);
+        let mut videos = Vec::new();
+        for (geom, layer) in video {
+            info.video.push(geom);
+            videos.push(layer);
+        }
+        Frame {
+            info,
+            base: Base::Software {
+                buffer,
+                pitch: 256,
+                extent: (64, 48),
+                format: crate::stages::ingest::PixelFormat::Bgra32,
+                palette: None,
+            },
+            video: videos,
+            windows: vec![],
+            published_at: std::time::Instant::now(),
+            on_read: None,
+        }
+    };
+    let mut pixels: Vec<u8> = (0..64 * 48 * 4).map(|i| (i * 11 % 251) as u8).collect();
+    display
+        .present(&mut q, software(100, &pixels, all(), vec![]))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !display.upscaler_ready(&mut q) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "upscaler build timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    display
+        .present(&mut q, software(1, &pixels, all(), vec![]))
+        .unwrap();
+    let runs_before = display.totals().upscaled_runs;
+
+    let mut pool = d
+        .create_present_pool(&PoolDesc {
+            color: Some(adv_gpu::present::YuvColor::Bt709Limited),
+            width: 1280,
+            height: 720,
+            format: DECODED,
+            count: 2,
+            storage: false,
+            label: "hd video",
+        })
+        .unwrap();
+    let mut vimg = pool.acquire_cpu().unwrap();
+    vimg.write(|p| {
+        p[0].data.fill(96);
+        p[1].data.fill(128);
+    });
+    let raw = vimg.image().clone();
+    // Mutate part of the software base while a 720p video bypasses upscaling.
+    let mid_change = Rect {
+        x: 8,
+        y: 8,
+        w: 8,
+        h: 8,
+    };
+    for y in mid_change.y..mid_change.y + mid_change.h {
+        for x in mid_change.x..mid_change.x + mid_change.w {
+            let at = ((y * 64 + x) * 4) as usize;
+            pixels[at..at + 3].copy_from_slice(&[20, 220, 40]);
+        }
+    }
+    let hd_geom = VideoGeometry {
+        source_uv: None,
+        background: None,
+        id: 11,
+        source: (1280, 720),
+        rect: Rect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 48,
+        },
+        changed: true,
+    };
+    let hd_video = Video {
+        hide_cursor: false,
+        id: 11,
+        image: raw,
+        planes: None,
+        geometry: crate::stages::video::Geometry {
+            destination: hd_geom.rect,
+            source_uv: [0., 0., 1., 1.],
+            background: None,
+            color: adv_gpu::present::YuvColor::Bt709Limited,
+        },
+        update: Some(vimg),
+    };
+    display
+        .present(
+            &mut q,
+            software(2, &pixels, cells(&[mid_change]), vec![(hd_geom, hd_video)]),
+        )
+        .unwrap();
+    assert_eq!(display.totals().upscaled_runs, runs_before);
+    assert_eq!(
+        history.lock().unwrap().last().unwrap().layers.video.len(),
+        1
+    );
+
+    // Video ends with a second small change elsewhere; both changes must appear.
+    let end_change = Rect {
+        x: 40,
+        y: 24,
+        w: 8,
+        h: 8,
+    };
+    for y in end_change.y..end_change.y + end_change.h {
+        for x in end_change.x..end_change.x + end_change.w {
+            let at = ((y * 64 + x) * 4) as usize;
+            pixels[at..at + 3].copy_from_slice(&[240, 30, 180]);
+        }
+    }
+    display
+        .present(&mut q, software(3, &pixels, cells(&[end_change]), vec![]))
+        .unwrap();
+    assert_eq!(display.totals().upscaled_runs, runs_before + 1);
+    let resumed_image = display.upscaled_copy(&mut q);
+    let resumed = read(&d, &mut q, &resumed_image);
+    display
+        .present(&mut q, software(4, &pixels, all(), vec![]))
+        .unwrap();
+    let whole_image = display.upscaled_copy(&mut q);
+    let whole = read(&d, &mut q, &whole_image);
+    assert_eq!(resumed, whole);
+}

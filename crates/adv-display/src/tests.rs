@@ -307,15 +307,30 @@ fn bases_and_ingest_merging() {
     }
 }
 
-// spec: HOST-VIEW-3
+// spec: HOST-VIEW-3, HOST-VIEW-7
 #[test]
 fn video_layers_or_canvas_composition() {
-    for (upscaler, yuv_layers, cursor, layered) in [
-        (Upscaler::Off, true, None, true),
-        (Upscaler::Off, true, Some(rect(5, 5, 2, 2)), true),
-        (Upscaler::Off, true, Some(rect(15, 25, 2, 2)), false),
-        (Upscaler::Off, false, None, false),
-        (Upscaler::Anime4k, true, None, false),
+    for (upscaler, source, yuv_layers, cursor, layered) in [
+        (Upscaler::Off, (160, 120), true, None, true),
+        (
+            Upscaler::Off,
+            (160, 120),
+            true,
+            Some(rect(5, 5, 2, 2)),
+            true,
+        ),
+        (
+            Upscaler::Off,
+            (160, 120),
+            true,
+            Some(rect(15, 25, 2, 2)),
+            false,
+        ),
+        (Upscaler::Off, (160, 120), false, None, false),
+        (Upscaler::Anime4k, (160, 120), true, None, false),
+        (Upscaler::Anime4k, (1280, 720), true, None, true),
+        (Upscaler::Anime4k, (1920, 1080), true, None, true),
+        (Upscaler::Anime4k, (1280, 720), false, None, false),
     ] {
         let mut f = frame();
         f.damage = none();
@@ -323,7 +338,7 @@ fn video_layers_or_canvas_composition() {
             source_uv: None,
             background: None,
             id: 7,
-            source: (160, 120),
+            source,
             rect: rect(10, 20, 100, 80),
             changed: true,
         });
@@ -343,15 +358,16 @@ fn video_layers_or_canvas_composition() {
             &PoolState::default(),
         );
         assert_eq!(p.layers.video.len(), usize::from(layered));
+        let hd = u64::from(source.0) * u64::from(source.1) >= 1280 * 720;
         if layered {
             let (id, layer) = &p.layers.video[0];
             assert_eq!(*id, 7);
             assert_eq!(layer.source, Source::Video(7));
-            assert_eq!(layer.crop, rect(0, 0, 160, 120));
+            assert_eq!(layer.crop, rect(0, 0, source.0, source.1));
             assert_eq!(layer.dst, rect(20, 40, 200, 160));
-            assert_eq!(layer.damage, Region::whole((160, 120)));
+            assert_eq!(layer.damage, Region::whole(source));
             assert!(p.stages.is_empty());
-        } else if upscaler == Upscaler::Off {
+        } else if upscaler == Upscaler::Off || hd {
             assert!(matches!(
                 p.stages[0],
                 Stage::Video {
@@ -737,13 +753,14 @@ fn swap_role_depends_only_on_settings_caps_and_canvas() {
                     base,
                     ..frame()
                 };
-                for video in [false, true] {
-                    if video {
+                for source in [None, Some((10, 10)), Some((1920, 1080))] {
+                    f.video.clear();
+                    if let Some(source) = source {
                         f.video.push(VideoGeometry {
                             source_uv: None,
                             background: None,
                             id: 3,
-                            source: (10, 10),
+                            source,
                             rect: rect(0, 0, 10, 10),
                             changed: true,
                         });
