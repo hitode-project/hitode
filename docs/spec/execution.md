@@ -55,6 +55,13 @@ Cached successors MUST match entry EIP and block-cache generation. They MUST pas
 With software-checked memory, executable permission alone MUST NOT prevent `Memory::direct` writes to ordinary writable bytes outside observed dependencies.
 Native host protection MUST retain its executable-page write barrier.
 
+### EXEC-CORE-8 x87 data pointer
+
+**Rule**: The x87 data pointer and data selector MUST change only when an x87 instruction with a memory operand records an unmasked exception. FLDENV, FRSTOR and FXRSTOR still load them.
+**Verification**: Test
+
+This is the behavior of processors that report FDP_EXCPTN_ONLY. Translated forms then need not store the operand address of every x87 memory access.
+
 ## Host calls
 
 ### EXEC-CALL-1 Host call bookkeeping

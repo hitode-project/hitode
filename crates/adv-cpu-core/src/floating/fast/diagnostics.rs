@@ -112,7 +112,7 @@ fn reason(op: &NativeX87, state: &CpuState, memory: &Memory) -> Reason {
             let Some(mut a) = operand(dest) else {
                 return Reason::Operand;
             };
-            let Some((mut b, _)) = load(source, i, state, memory, i32::MAX) else {
+            let Some(mut b) = load(source, i, state, memory, i32::MAX) else {
                 return Reason::Operand;
             };
             if !bounded(a, RANGE) || !bounded(b, RANGE) {

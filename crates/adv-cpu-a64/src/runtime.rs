@@ -372,7 +372,6 @@ pub(crate) const X87_TAG: u32 = field(offset_of!(CpuState, x87.tag));
 pub(crate) const X87_CONTROL: u32 = field(offset_of!(CpuState, x87.control));
 pub(crate) const X87_OPCODE: u32 = field(offset_of!(CpuState, x87.opcode));
 pub(crate) const X87_IP: u32 = field(offset_of!(CpuState, x87.ip));
-pub(crate) const X87_DP: u32 = field(offset_of!(CpuState, x87.dp));
 pub(crate) const MMX_MODE: u32 = field(offset_of!(CpuState, mmx_mode));
 pub(crate) const MXCSR: u32 = field(offset_of!(CpuState, mxcsr));
 pub(crate) const EFLAGS: u32 = field(offset_of!(CpuState, eflags));

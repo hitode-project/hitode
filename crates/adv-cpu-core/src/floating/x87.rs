@@ -249,7 +249,7 @@ fn source(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<Ext,
             _ => return Err(tx.unsupported(i)),
         };
         exceptions(tx, sf::flags());
-        tx.state.x87.dp = address;
+        tx.dp = Some(address);
         Ok(value)
     } else {
         let index = if i.op_count() == 2 {
@@ -393,7 +393,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
                     bytes[..width].copy_from_slice(&bits.to_le_bytes()[..width]);
                 }
                 tx.store(memory, addr, &bytes[..width])?;
-                tx.state.x87.dp = addr;
+                tx.dp = Some(addr);
             } else {
                 set(tx, st_index(i.op0_register()).unwrap_or(0), value);
             }
@@ -705,7 +705,7 @@ fn bcd(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Ste
         tx.store(memory, address, &bytes)?;
         pop(tx);
     }
-    tx.state.x87.dp = address;
+    tx.dp = Some(address);
     Ok(())
 }
 fn environment(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {

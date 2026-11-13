@@ -25,12 +25,11 @@ pub(super) fn source(
     i: &Instruction,
     state: &CpuState,
     memory: &Memory,
-) -> Option<(Ext, Option<u32>)> {
+) -> Option<Ext> {
     if let Source::St(index) = source {
-        Some((operand(state, index)?, None))
+        operand(state, index)
     } else {
-        let (value, at) = load(source, i, state, memory, i32::MAX)?;
-        Some((extended(value), at))
+        Some(extended(load(source, i, state, memory, i32::MAX)?))
     }
 }
 

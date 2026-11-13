@@ -112,21 +112,20 @@ impl Translator<'_> {
     }
 
     /// What cached instruction `x` does once its values are in host
-    /// registers; whether it records the data pointer and the instruction
-    /// pointer and opcode, and its integer path if any. C1 need not be
+    /// registers; whether it records the instruction pointer and opcode, and
+    /// its integer path if any. C1 need not be
     /// computed when `c1_dead`.
     pub(super) fn pair_body(
         &mut self,
         x: X87,
         bail: Label,
         c1_dead: bool,
-    ) -> (bool, bool, Option<Generic>) {
-        let dp = x.mem.is_some();
+    ) -> (bool, Option<Generic>) {
         let mut generic = None;
         match x.fast {
             Fast::Leaf(m) => {
                 self.pair_leaf(m, x, bail);
-                return (false, false, None);
+                return (false, None);
             }
             Fast::Load80 => {
                 let to = self.x87_alloc();
@@ -149,12 +148,12 @@ impl Translator<'_> {
                 if x.fast == Fast::StoreStatus {
                     self.x87_status();
                 }
-                let done = self.x87_body(x, bail);
+                let metadata = self.x87_body(x, bail);
                 if x.fast == Fast::LoadControl {
                     self.x87.guarded = false;
                     self.emit(mov(W, X8, X0));
                 }
-                return (done.0, done.1, None);
+                return (metadata, None);
             }
             Fast::Load(Source::St(index)) => {
                 self.x87_push_copy(index);
@@ -222,7 +221,7 @@ impl Translator<'_> {
             }
             Fast::Round | Fast::Scale | Fast::Examine => unreachable!("not cached"),
         }
-        (dp, true, generic)
+        (true, generic)
     }
 
     /// Publish the run's x87 image around its arithmetic leaf, keeping the run open.

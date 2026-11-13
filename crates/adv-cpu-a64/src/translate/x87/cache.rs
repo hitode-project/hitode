@@ -1620,10 +1620,7 @@ impl Translator<'_> {
             }
         }
         let c1_dead = self.c1_dead(index, x, self.x87.model);
-        let (dp, metadata, generic) = self.pair_body(x, bail, c1_dead);
-        if dp {
-            self.emit(str(W, X6, X5, runtime::X87_DP));
-        }
+        let (metadata, generic) = self.pair_body(x, bail, c1_dead);
         let mut model = self.x87.model;
         if metadata {
             model.ip = Some(self.trace.insts[index].pc);

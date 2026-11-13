@@ -358,14 +358,14 @@ fn load(
     state: &CpuState,
     memory: &Memory,
     range: i32,
-) -> Option<(f64, Option<u32>)> {
+) -> Option<f64> {
     let x87 = &state.x87;
     if let Source::St(index) = source {
         let slot = x87.physical_index(usize::from(index));
         if x87.physical_tag(slot) == 3 {
             return None;
         }
-        return Some((double(x87.regs[slot], range)?, None));
+        return double(x87.regs[slot], range);
     }
     let at = address(i, state)?;
     let value = match source {
@@ -389,7 +389,7 @@ fn load(
         Source::St(_) => unreachable!(),
     };
     // Memory operands of arithmetic obey the same bound as registers.
-    bounded(value, range).then_some((value, Some(at)))
+    bounded(value, range).then_some(value)
 }
 
 fn rounded_up(error: f64, result: f64) -> bool {
@@ -438,7 +438,7 @@ pub fn pc64_opportunity(
     let Some(mut a) = double(state.x87.regs[target], i32::MAX) else {
         return X87Pc64::Operand;
     };
-    let Some((mut b, _)) = load(source, i, state, memory, i32::MAX) else {
+    let Some(mut b) = load(source, i, state, memory, i32::MAX) else {
         return X87Pc64::Operand;
     };
     if !bounded(a, RANGE) || !bounded(b, RANGE) {
@@ -503,7 +503,6 @@ pub fn execute(
     // (logical index relative to the final top, value) writes, applied last.
     let mut writes: [(usize, Ext); 2] = [(usize::MAX, Ext::default()); 2];
     let mut tags_freed = [usize::MAX; 2];
-    let mut dp = None;
     let mut metadata = true;
     let mut new_control = None;
     let pc = state.eip;
@@ -521,14 +520,13 @@ pub fn execute(
         | Fast::Leaf(_) => unreachable!(),
         Fast::Wait => metadata = false,
         Fast::Load(source) => {
-            let (value, at) = raw::source(source, i, state, memory)?;
+            let value = raw::source(source, i, state, memory)?;
             let target = top.wrapping_sub(1) & 7;
             if !empty(target) {
                 return None;
             }
             top = target;
             writes[0] = (target, value);
-            dp = at;
             status &= !C1;
         }
         Fast::Constant(one) => {
@@ -562,7 +560,6 @@ pub fn execute(
                 status |= PE | if up { C1 } else { 0 };
             }
             store(memory, at, &bits.to_le_bytes()[..usize::from(width)])?;
-            dp = Some(at);
             if pop {
                 tags_freed[0] = physical;
                 top = (top + 1) & 7;
@@ -599,7 +596,7 @@ pub fn execute(
                 return None;
             }
             let mut a = double(x87.regs[target], RANGE)?;
-            let (mut b, at) = load(source, i, state, memory, RANGE)?;
+            let mut b = load(source, i, state, memory, RANGE)?;
             if reverse {
                 std::mem::swap(&mut a, &mut b);
             }
@@ -639,7 +636,6 @@ pub fn execute(
                 status |= PE | if up { C1 } else { 0 };
             }
             writes[0] = (target, extended(result));
-            dp = at.or(dp);
             if pop {
                 tags_freed[0] = slot(top, 0);
                 top = (top + 1) & 7;
@@ -651,7 +647,7 @@ pub fn execute(
                 return None;
             }
             let a = raw::ordinary(x87.regs[first])?;
-            let (b, at) = raw::source(source, i, state, memory)?;
+            let b = raw::source(source, i, state, memory)?;
             let comparison = raw::compare(a, b);
             status = (status & !(C0 | C1 | C2 | C3))
                 | if comparison.is_eq() {
@@ -661,7 +657,6 @@ pub fn execute(
                 } else {
                     0
                 };
-            dp = at;
             for (n, freed) in tags_freed.iter_mut().take(usize::from(pops)).enumerate() {
                 *freed = slot(top, n);
             }
@@ -747,9 +742,6 @@ pub fn execute(
         if let Some(opcode) = op.opcode {
             x87.opcode = opcode;
         }
-    }
-    if let Some(at) = dp {
-        x87.dp = at;
     }
     state.mmx = state.x87.regs.map(Ext::significand);
     state.eip = i.next_ip32();
