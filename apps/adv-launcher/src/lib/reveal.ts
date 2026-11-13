@@ -1,15 +1,18 @@
+import { isAndroidExternalPath } from "./android-storage";
 import { inTauri } from "./bridge";
 import { device } from "./device.svelte";
 import { revealDrive, revealPath } from "./host";
 
+export { isAndroidExternalPath };
+
 /**
  * Whether the system file manager can show `path`: anything in the macOS
- * desktop app; on Android, folders in shared storage, not private copies.
+ * desktop app; on Android, folders on external-storage volumes, not private copies.
  */
 export function canReveal(path = ""): boolean {
   if (!inTauri) return false;
   if (device.platform === "macos") return !device.phone;
-  return device.platform === "android" && /^\/storage\/emulated\/0(\/|$)/.test(path);
+  return device.platform === "android" && isAndroidExternalPath(path);
 }
 
 /** Shows drive C:, where games keep data outside their folders. */

@@ -8,10 +8,14 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
+import java.io.File
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -168,18 +172,37 @@ class MainActivity : TauriActivity() {
     external fun nativeSurfaceDestroyed(surface: Surface, width: Int, height: Int)
     /** Called by the native trackpad cursor (AND-APP-14). */
     /**
-     * Opens a primary-storage folder in the system Files app (DocumentsUI),
-     * asked for by name so file-handling apps do not offer themselves.
-     * `relative` is the folder below the storage root. DocumentsUI stacks
-     * every ancestor folder for Back, so it opens as its own task beside the
-     * launcher (split screen on large screens) rather than on top of it.
+     * Opens an external-storage volume folder in the system Files app
+     * (DocumentsUI), asked for by name so file-handling apps do not offer
+     * themselves. DocumentsUI stacks every ancestor folder for Back, so it
+     * opens as its own task beside the launcher (split screen on large screens)
+     * rather than on top of it.
      */
-    fun revealFolder(relative: String): Boolean {
+    fun revealFolder(path: String): Boolean {
+        val documentId = externalDocumentId(File(path)) ?: return false
         val uri = DocumentsContract.buildDocumentUri(
             "com.android.externalstorage.documents",
-            "primary:$relative"
+            documentId
         )
         return revealDirectory(uri)
+    }
+
+    private fun externalDocumentId(target: File): String? {
+        val normalized = target.toPath().normalize()
+        if (Build.VERSION.SDK_INT >= 30) {
+            val manager = getSystemService(StorageManager::class.java)
+            for (volume in manager?.storageVolumes.orEmpty()) {
+                val root = volume.directory?.toPath()?.normalize() ?: continue
+                if (!normalized.startsWith(root)) continue
+                val id = if (volume.isPrimary) "primary" else volume.uuid ?: continue
+                val relative = root.relativize(normalized).toString().replace(File.separatorChar, '/')
+                return "$id:$relative"
+            }
+        }
+        val primary = Environment.getExternalStorageDirectory().toPath().normalize()
+        if (!normalized.startsWith(primary)) return null
+        val relative = primary.relativize(normalized).toString().replace(File.separatorChar, '/')
+        return "primary:$relative"
     }
 
     fun revealImport(relative: String): Boolean {
