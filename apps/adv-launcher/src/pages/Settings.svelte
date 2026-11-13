@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
+  import AndroidStorageSetting from "../components/AndroidStorageSetting.svelte";
   import GameStorageSetting from "../components/GameStorageSetting.svelte";
   import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
   import { preview } from "../lib/bridge";
@@ -153,6 +154,7 @@
 
     <section class="sec" aria-labelledby="g-store">
       <h2 id="g-store">{t("存储")}</h2>
+      <AndroidStorageSetting />
       <GameStorageSetting />
       {#if preview}
         <div class="store">

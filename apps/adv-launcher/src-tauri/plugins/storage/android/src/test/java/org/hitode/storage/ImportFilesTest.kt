@@ -76,6 +76,64 @@ class ImportFilesTest {
     }
 
     // spec: AND-APP-9
+    @Test fun grantEligibilityRequiresSupportedSdkAndWritableVolume() {
+        assertTrue(
+            canGrantDirectAccess(
+                "com.android.externalstorage.documents",
+                "primary:Games/Novel",
+                granted = false,
+                supported = true,
+                roots,
+            )
+        )
+        assertTrue(
+            canGrantDirectAccess(
+                "com.android.externalstorage.documents",
+                "9C33-6BBD:Games/Novel",
+                granted = false,
+                supported = true,
+                roots,
+            )
+        )
+        assertFalse(
+            canGrantDirectAccess(
+                "com.android.externalstorage.documents",
+                "primary:Games/Novel",
+                granted = true,
+                supported = true,
+                roots,
+            )
+        )
+        assertFalse(
+            canGrantDirectAccess(
+                "com.android.externalstorage.documents",
+                "primary:Games/Novel",
+                granted = false,
+                supported = false,
+                roots,
+            )
+        )
+        assertFalse(
+            canGrantDirectAccess(
+                "com.android.externalstorage.documents",
+                "RO00-1111:Games/Novel",
+                granted = false,
+                supported = true,
+                roots,
+            )
+        )
+        assertFalse(
+            canGrantDirectAccess(
+                "com.android.providers.downloads.documents",
+                "raw:/storage/emulated/0/Download",
+                granted = false,
+                supported = true,
+                roots,
+            )
+        )
+    }
+
+    // spec: AND-APP-9
     @Test fun failedCopyLeavesNeitherPartialDestinationNorStaging() {
         val parent = Files.createTempDirectory("import-test").toFile()
         try {

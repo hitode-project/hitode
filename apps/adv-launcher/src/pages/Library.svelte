@@ -19,6 +19,7 @@
   import { trendBars } from "../lib/stats";
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
   import { library } from "../lib/library.svelte";
+  import { androidStorage } from "../lib/android-access.svelte";
   import { nav } from "../lib/nav.svelte";
   import { device } from "../lib/device.svelte";
   import { canReveal, reveal } from "../lib/reveal";
@@ -93,8 +94,12 @@
     popup = "none";
   }
 
+  function permissionBlocked(game: Game): boolean {
+    return androidStorage.blocked(game.path, game.offline);
+  }
+
   function offlineLabel(game: Game): string {
-    return game.offline === "disk" ? t("未连接") : t("找不到");
+    return game.offline === "disk" ? t("未连接") : permissionBlocked(game) ? t("无权限") : t("找不到");
   }
 
 
@@ -185,23 +190,28 @@
         }}
       >
         {#each items as game (game.id)}
+          {@const blocked = permissionBlocked(game)}
           <button
             class="card"
             data-id={game.id}
             class:on={current?.id === game.id}
-            class:gone={game.offline !== null}
+            class:gone={game.offline !== null || blocked}
             onclick={() => pick(game)}
-            ondblclick={() => game.offline === null && nav.go({ name: "launch", gameId: game.id })}
-            aria-label={game.offline
-              ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
-              : game.title}
+            ondblclick={() => game.offline === null && !blocked && nav.go({ name: "launch", gameId: game.id })}
+            aria-label={game.offline === "disk"
+              ? `${game.title}，${t("磁盘未连接")}`
+              : blocked
+                ? `${game.title}，${t("需要文件访问权限")}`
+                : game.offline
+                  ? `${game.title}，${t("找不到文件夹")}`
+                  : game.title}
           >
             <Cover {game}>
               {#snippet children({ hidden })}
                 {#if hidden}<span class="veil">{t("已遮挡")}</span>{/if}
-                {#if game.offline}
+                {#if game.offline || blocked}
                   <span class="badge" aria-hidden="true">
-                    <Icon name="unlink" size={12} stroke={1.6} />
+                    <Icon name={blocked ? "shield" : "unlink"} size={12} stroke={1.6} />
                     <span>{offlineLabel(game)}</span>
                   </span>
                 {/if}
@@ -244,23 +254,29 @@
           <h2 lang="ja">{game.title}</h2>
           {#if bylineLabel(game.brand, game.year)}<div class="byline" lang="ja">{bylineLabel(game.brand, game.year)}</div>{/if}
 
-          {#if game.offline}
+          {#if game.offline || permissionBlocked(game)}
+            {@const blocked = permissionBlocked(game)}
             <div class="notice" role="status" style="margin-top: 22px">
-              <Icon name={game.offline === "disk" ? "disk" : "folder-question"} />
+              <Icon name={blocked ? "shield" : game.offline === "disk" ? "disk" : "folder-question"} />
               <div style="min-width: 0">
                 <div style="color: var(--fg); font-weight: 500">
-                  {game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹")}
+                  {blocked ? t("需要文件访问权限") : game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹")}
                 </div>
                 <div class="mono" style="margin-top: 2px">{game.path}</div>
               </div>
             </div>
           {/if}
 
-          <div class="actions" style="margin-top: {game.offline ? 12 : 22}px">
-            {#if game.offline === "missing"}
-              <button class="primary" onclick={() => void library.relocate(game.id)}>
+          <div class="actions" style="margin-top: {game.offline || permissionBlocked(game) ? 12 : 22}px">
+            {#if permissionBlocked(game)}
+              <button class="primary" disabled={androidStorage.busy} onclick={() => void androidStorage.request()}>
+                <span>{t("去授权")}</span>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h6v6M12 4l-7.5 7.5"></path></svg>
+              </button>
+            {:else if game.offline === "missing"}
+              <button class="primary" disabled={library.relocating === game.id} onclick={() => void library.relocate(game.id)}>
                 <Icon name="folder" size={15} stroke={1.5} />
-                <span>{t("重新定位…")}</span>
+                <span>{library.relocating === game.id && library.relocateStatus ? library.relocateStatus : t("重新定位…")}</span>
               </button>
             {:else}
               <button
@@ -289,7 +305,7 @@
               {/if}
             </div>
           </div>
-          {#if game.offline === "missing"}
+          {#if game.offline === "missing" && !permissionBlocked(game)}
             <button class="quiet remove" onclick={() => remove(game)}>{t("从游戏库移除")}</button>
           {/if}
 
@@ -316,8 +332,8 @@
               </label>
             </dd>
           </dl>
-          {#if canReveal()}
-            <button class="quiet locate" title={game.path} disabled={game.offline !== null} onclick={() => reveal(game.path)}>
+          {#if canReveal(game.path)}
+            <button class="quiet locate" title={game.path} disabled={game.offline !== null || permissionBlocked(game)} onclick={() => reveal(game.path)}>
               <Icon name="folder" size={15} />
               <span>{t("在访达中显示")}</span>
             </button>

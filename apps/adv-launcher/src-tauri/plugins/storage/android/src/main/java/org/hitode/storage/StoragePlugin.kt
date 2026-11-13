@@ -1,6 +1,7 @@
 package org.hitode.storage
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
@@ -32,6 +33,11 @@ import kotlin.concurrent.thread
 @InvokeArg
 class FolderArgs {
     lateinit var uri: String
+}
+
+@InvokeArg
+class RequestStorageArgs {
+    var open: Boolean = false
 }
 
 @InvokeArg
@@ -103,10 +109,12 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun granted() = Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()
+    private fun supported() = Build.VERSION.SDK_INT >= 30
+
+    private fun granted() = supported() && Environment.isExternalStorageManager()
 
     private fun storageRoots(): List<StorageRoot> {
-        if (Build.VERSION.SDK_INT < 30) return emptyList()
+        if (!supported()) return emptyList()
         val roots = activity.getSystemService(StorageManager::class.java)
             ?.storageVolumes
             ?.mapNotNull { volume ->
@@ -124,20 +132,30 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun storageStatus(invoke: Invoke) {
-        invoke.resolve(JSObject().put("granted", granted()))
+        invoke.resolve(JSObject().put("granted", granted()).put("supported", supported()))
     }
 
     @Command
     fun requestStorage(invoke: Invoke) {
-        if (Build.VERSION.SDK_INT < 30 || granted()) {
+        val open = runCatching { invoke.parseArgs(RequestStorageArgs::class.java).open }.getOrDefault(false)
+        if (!supported() || (!open && granted())) {
             storageStatus(invoke)
             return
         }
+        val appIntent = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:${activity.packageName}")
+        )
         try {
-            startActivityForResult(invoke, Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:${activity.packageName}")
-            ), "storageResult")
+            try {
+                startActivityForResult(invoke, appIntent, "storageResult")
+            } catch (_: ActivityNotFoundException) {
+                startActivityForResult(
+                    invoke,
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                    "storageResult"
+                )
+            }
         } catch (error: Exception) {
             invoke.reject(error.message)
         }
@@ -187,10 +205,33 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
             }
             val flags = result.data!!.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
             resolver.takePersistableUriPermission(uri, flags)
+            val roots = storageRoots()
+            val isGranted = granted()
+            val path = if (uri.authority == "com.android.externalstorage.documents") {
+                writableFolderPath(id, isGranted, roots)
+            } else null
+            val canGrant = path == null &&
+                canGrantDirectAccess(uri.authority, id, isGranted, supported(), roots)
+            invoke.resolve(
+                JSObject()
+                    .put("uri", uri.toString())
+                    .put("path", path)
+                    .put("canGrant", canGrant)
+            )
+        } catch (error: Exception) {
+            invoke.reject(error.message)
+        }
+    }
+
+    @Command
+    fun resolveFolder(invoke: Invoke) {
+        try {
+            val uri = Uri.parse(invoke.parseArgs(FolderArgs::class.java).uri)
+            val id = DocumentsContract.getTreeDocumentId(uri)
             val path = if (uri.authority == "com.android.externalstorage.documents") {
                 writableFolderPath(id, granted(), storageRoots())
             } else null
-            invoke.resolve(JSObject().put("uri", uri.toString()).put("path", path))
+            invoke.resolve(JSObject().put("path", path))
         } catch (error: Exception) {
             invoke.reject(error.message)
         }

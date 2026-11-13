@@ -10,9 +10,11 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import UpdateNotice from "../components/UpdateNotice.svelte";
+  import AndroidStorageBanner from "../components/AndroidStorageBanner.svelte";
   import JitBanner from "../components/JitBanner.svelte";
   import PhoneManageSheet from "../components/PhoneManageSheet.svelte";
   import PhoneArrangeSheet from "../components/PhoneArrangeSheet.svelte";
+  import { androidStorage } from "../lib/android-access.svelte";
   import { sortGames } from "../lib/arrange";
   import { CardSize } from "../lib/card-size.svelte";
   import { cardDrag } from "../lib/card-drag";
@@ -76,8 +78,12 @@
     if (searching) queueMicrotask(() => searchInput?.focus());
   }
 
+  function permissionBlocked(game: Game): boolean {
+    return androidStorage.blocked(game.path, game.offline);
+  }
+
   function offlineLabel(game: Game): string {
-    return game.offline === "disk" ? t("未连接") : t("找不到");
+    return game.offline === "disk" ? t("未连接") : permissionBlocked(game) ? t("无权限") : t("找不到");
   }
 
 
@@ -148,6 +154,7 @@
   </header>
   <JitBanner />
   <UpdateNotice />
+  <AndroidStorageBanner />
   {@render categories()}
   <main class="empty">
     <div aria-hidden="true" class="stack">
@@ -176,6 +183,7 @@
   </header>
   <JitBanner />
   <UpdateNotice />
+  <AndroidStorageBanner />
 
   {#if searching}
     <div class="search">
@@ -212,21 +220,26 @@
       }}
     >
       {#each items as game (game.id)}
+        {@const blocked = permissionBlocked(game)}
         <button
           class="card"
           data-id={game.id}
-          class:gone={game.offline !== null}
+          class:gone={game.offline !== null || blocked}
           onclick={() => (openId = game.id)}
-          aria-label={game.offline
-            ? `${game.title}，${game.offline === "disk" ? t("磁盘未连接") : t("找不到文件夹")}`
-            : game.title}
+          aria-label={game.offline === "disk"
+            ? `${game.title}，${t("磁盘未连接")}`
+            : blocked
+              ? `${game.title}，${t("需要文件访问权限")}`
+              : game.offline
+                ? `${game.title}，${t("找不到文件夹")}`
+                : game.title}
         >
           <Cover {game} style="border-radius: 5px">
             {#snippet children({ hidden })}
               {#if hidden}<span class="veil">{t("已遮挡")}</span>{/if}
-              {#if game.offline}
+              {#if game.offline || blocked}
                 <span class="badge" aria-hidden="true">
-                  <Icon name="unlink" size={10} stroke={1.6} />
+                  <Icon name={blocked ? "shield" : "unlink"} size={10} stroke={1.6} />
                   <span>{offlineLabel(game)}</span>
                 </span>
               {/if}
@@ -241,6 +254,7 @@
 
 {#if current}
   {@const game = current}
+  {@const blocked = permissionBlocked(game)}
   <div class="page" role="dialog" aria-label={t("游戏详情")}>
     <div class="pbd {game.cover}" style:background-size="cover" style:background-position="center" style:background-image={game.coverUrl ? `url("${game.coverUrl}")` : undefined} aria-hidden="true"></div>
     <div class="pscrim" aria-hidden="true"></div>
@@ -269,21 +283,26 @@
         {#if bylineLabel(game.brand, game.year)}<div class="byline" lang="ja">{bylineLabel(game.brand, game.year)}</div>{/if}
       </div>
 
-      {#if game.offline}
+      {#if game.offline || blocked}
         <div class="notice phone-notice" role="status">
-          <Icon name={game.offline === "disk" ? "disk" : "folder-question"} />
+          <Icon name={blocked ? "shield" : game.offline === "disk" ? "disk" : "folder-question"} />
           <div style="min-width: 0">
-            <div style="font-weight: 500">{game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹")}</div>
+            <div style="font-weight: 500">{blocked ? t("需要文件访问权限") : game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹")}</div>
             <div class="mono" style="margin-top: 2px">{game.path}</div>
           </div>
         </div>
       {/if}
 
-      <div class="actions" style="margin-top: {game.offline ? 12 : 26}px">
-        {#if game.offline === "missing"}
-          <button class="primary" onclick={() => void library.relocate(game.id)}>
+      <div class="actions" style="margin-top: {game.offline || blocked ? 12 : 26}px">
+        {#if blocked}
+          <button class="primary" disabled={androidStorage.busy} onclick={() => void androidStorage.request()}>
+            <span>{t("去授权")}</span>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4h6v6M12 4l-7.5 7.5"></path></svg>
+          </button>
+        {:else if game.offline === "missing"}
+          <button class="primary" disabled={library.relocating === game.id} onclick={() => void library.relocate(game.id)}>
             <Icon name="folder" size={16} stroke={1.5} />
-            <span>{t("重新定位…")}</span>
+            <span>{library.relocating === game.id && library.relocateStatus ? library.relocateStatus : t("重新定位…")}</span>
           </button>
         {:else}
           <button
@@ -299,7 +318,7 @@
           <Icon name="more" size={18} />
         </button>
       </div>
-      {#if game.offline === "missing"}
+      {#if game.offline === "missing" && !blocked}
         <button class="quiet remove" onclick={() => remove(game)}>{t("从游戏库移除")}</button>
       {/if}
 

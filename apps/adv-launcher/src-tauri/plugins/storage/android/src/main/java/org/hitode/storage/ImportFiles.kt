@@ -50,6 +50,17 @@ internal fun readableFilePath(
     ?.takeIf { it.isFile && it.canRead() }
     ?.path
 
+internal fun canGrantDirectAccess(
+    authority: String?,
+    documentId: String,
+    granted: Boolean,
+    supported: Boolean,
+    roots: List<StorageRoot>,
+): Boolean = !granted &&
+    supported &&
+    authority == "com.android.externalstorage.documents" &&
+    storagePath(documentId, granted = true, roots, requireWritable = true) != null
+
 /** Publish a complete same-parent copy; exceptions leave no partial destination. */
 internal fun publishFolder(dest: File, copy: (File) -> Unit) {
     if (dest.exists()) throw IOException("Import destination already exists")

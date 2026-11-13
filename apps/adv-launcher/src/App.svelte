@@ -2,10 +2,12 @@
   import { untrack } from "svelte";
   import { t, locale } from "./lib/i18n.svelte";
   import { call, onHostEvent } from "./lib/bridge";
+  import AndroidStorageBanner from "./components/AndroidStorageBanner.svelte";
   import JitBanner from "./components/JitBanner.svelte";
   import UpdateNotice from "./components/UpdateNotice.svelte";
   import FolderChoice from "./components/FolderChoice.svelte";
   import Sidebar from "./components/Sidebar.svelte";
+  import { androidStorage } from "./lib/android-access.svelte";
   import { device } from "./lib/device.svelte";
   import { jit } from "./lib/jit.svelte";
   import { nav } from "./lib/nav.svelte";
@@ -93,6 +95,9 @@
     if (jit.active) jit.start();
   });
   $effect(() => {
+    if (device.platform === "android") void androidStorage.refresh();
+  });
+  $effect(() => {
     void call("set_tracking", { enabled: prefs.trackPlayTime }, null).catch(console.error);
   });
 </script>
@@ -117,7 +122,7 @@
       class:inset={device.touch && !phonePage}
     >
       {#if !phonePage}<JitBanner />{/if}
-      {#if !phonePage && route.name === "library"}<UpdateNotice />{/if}
+      {#if !phonePage && route.name === "library"}<UpdateNotice /><AndroidStorageBanner />{/if}
       {#if route.name === "library" || route.name === "install"}
         {@const filter = route.name === "library" ? route.filter : "all"}
         {#if phonePage}<PhoneLibrary {filter} />{:else}<Library {filter} />{/if}

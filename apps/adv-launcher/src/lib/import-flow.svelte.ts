@@ -15,7 +15,7 @@ import {
 import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
-import { storageSize, type FolderPickOptions } from "./storage";
+import { copyExternalFolder, storageSize, takeCopyableUri, type FolderPickOptions } from "./storage";
 
 // UI state of the three adding flows, shared by the desktop and phone pages.
 // Construct each class during component initialisation: they own effects.
@@ -149,6 +149,7 @@ export class ScanPick {
     this.#began = true;
     try {
       const root = await pickFolder(copyOptions(this.#picker.signal, (status) => (this.copyStatus = status)));
+      takeCopyableUri();
       if (this.#picker.signal.aborted) return;
       this.copyStatus = "";
       if (!root) {
@@ -269,6 +270,7 @@ export class ImportPick {
   phase = $state<Phase>("picking");
   error = $state("");
   copyStatus = $state("");
+  copyableUri = $state<string | null>(null);
   #picker = new AbortController();
   inspection = $state<FolderInspection | null>(null);
   exe = $state(-1);
@@ -296,6 +298,7 @@ export class ImportPick {
   readonly noExe = $derived(this.phase === "ready" && !this.exes.some((e) => !e.disabled));
   readonly encs = $derived(encChoices(this.title || (this.inspection?.title ?? "")));
   readonly canAdd = $derived(this.phase === "ready" && !this.noExe && this.exe >= 0 && this.title.trim() !== "" && !this.adding);
+  readonly canCopy = $derived(this.copyableUri !== null && this.phase === "ready" && !this.addedId && !this.adding);
 
   constructor() {
     $effect(() => () => this.#picker.abort());
@@ -312,6 +315,7 @@ export class ImportPick {
     this.phase = "picking";
     try {
       const folder = await pickFolder(copyOptions(controller.signal, (status) => (this.copyStatus = status)));
+      const copyable = takeCopyableUri();
       if (controller.signal.aborted) return;
       this.copyStatus = "";
       if (!folder) {
@@ -322,7 +326,7 @@ export class ImportPick {
       this.phase = "reading";
       const inspection = inTauri ? await libraryInspect(folder) : fakeInspection();
       if (!inspection) throw new Error(t("读不到这个文件夹"));
-      this.#show(inspection);
+      this.#show(inspection, copyable);
     } catch (error) {
       if (controller.signal.aborted) return;
       this.error = String(error);
@@ -330,8 +334,50 @@ export class ImportPick {
     }
   }
 
-  #show(inspection: FolderInspection): void {
+  /** Copies an in-place external folder into Hitode's private storage and re-inspects it. */
+  async copyToHitode(): Promise<void> {
+    const uri = this.copyableUri;
+    if (!uri || !this.canCopy) return;
+    this.#picker.abort();
+    this.#picker = new AbortController();
+    const controller = this.#picker;
+    this.copyStatus = "";
+    try {
+      const folder = await copyExternalFolder(uri, {
+        ...copyOptions(controller.signal, (status) => (this.copyStatus = status)),
+        onStart: () => {
+          this.phase = "picking";
+        },
+      });
+      if (controller.signal.aborted) return;
+      this.copyStatus = "";
+      if (!folder) {
+        this.phase = "ready";
+        return;
+      }
+      this.phase = "reading";
+      const inspection = inTauri ? await libraryInspect(folder) : fakeInspection();
+      if (!inspection) throw new Error(t("读不到这个文件夹"));
+      const previousExe = this.exes[this.exe]?.name.toLowerCase();
+      const customTitle = this.title.trim() !== "" && this.title !== this.inspection?.title ? this.title : null;
+      const previousEnc = this.enc;
+      const previousVndb = this.vndb;
+      this.#show(inspection, null);
+      if (customTitle !== null) this.title = customTitle;
+      const sameExe = previousExe ? inspection.exes.findIndex((e) => e.arch !== "x64" && e.path.toLowerCase() === previousExe) : -1;
+      if (sameExe >= 0) this.exe = sameExe;
+      this.enc = previousEnc;
+      this.vndb = previousVndb;
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      this.error = String(error);
+      this.phase = "error";
+    }
+  }
+
+  #show(inspection: FolderInspection, copyable: string | null): void {
     this.inspection = inspection;
+    this.copyableUri = copyable;
     this.title = inspection.title;
     this.vndb = null;
     this.addedId = null;

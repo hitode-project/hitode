@@ -37,7 +37,7 @@
     </section>
 
     {#if scan.phase !== "ready"}
-      <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…")}</div>
+      <div class="status" class:err={scan.phase === "error"} role="status">{scan.phase === "error" ? scan.error : scan.copyStatus || (scan.phase === "picking" ? t("正在选择文件夹…") : t("正在查找游戏…"))}</div>
     {:else}
         <section aria-labelledby="h-found" style="display: flex; flex-direction: column; gap: 10px">
       <div style="display: flex; align-items: baseline; gap: 12px; padding: 0 2px">

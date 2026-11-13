@@ -31,7 +31,7 @@
           <div class="msg">{flow.reason}</div>
           <div class="acts">
             <button class="btn primary" disabled={flow.recovering} onclick={() => flow.recoverFolder()}>
-              {t(flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
+              {t(flow.recovery === "permission" ? "去授权" : flow.recovery === "missing" ? "重新定位…" : "重新选择文件夹…")}
             </button>
             <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
             <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>

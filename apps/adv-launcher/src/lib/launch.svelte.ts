@@ -1,6 +1,8 @@
 import { t } from "./i18n.svelte";
 import { untrack } from "svelte";
+import { androidStorage } from "./android-access.svelte";
 import { inTauri, onHostEvent } from "./bridge";
+import { device } from "./device.svelte";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
 import { jit } from "./jit.svelte";
 import { library } from "./library.svelte";
@@ -197,7 +199,7 @@ export class LaunchFlow {
   view = $state<LaunchState>("prepare");
   /** Why the game stopped or cannot start. */
   reason = $state("");
-  recovery = $state<"missing" | "access" | null>(null);
+  recovery = $state<"missing" | "access" | "permission" | null>(null);
   recovering = $state(false);
   #gameId: () => string;
   #alive = true;
@@ -236,6 +238,11 @@ export class LaunchFlow {
       this.view = "prepare";
     }
     const game = library.get(id);
+    if (game && androidStorage.blocked(game.path, game.offline)) {
+      this.recovery = "permission";
+      this.#fail("unsupported", t("需要文件访问权限"));
+      return;
+    }
     if (game?.offline) {
       this.#fail("unsupported", game.offline === "disk" ? t("所在磁盘未连接") : t("找不到文件夹"));
       if (game.offline === "missing") this.recovery = "missing";
@@ -258,9 +265,14 @@ export class LaunchFlow {
         // Builds without the command answer "Command start_game not found".
         if (/start_game.*not found/i.test(message)) this.#fail("unsupported", t(UNSUPPORTED_PLATFORM));
         else if (message === "launch_missing_file" || message === "launch_folder_access") {
-          const missing = message === "launch_missing_file";
-          this.recovery = missing ? "missing" : "access";
-          this.#fail("failed", t(missing ? "找不到游戏文件" : "无法访问游戏文件夹"));
+          if (device.platform === "android" && androidStorage.supported && !androidStorage.granted) {
+            this.recovery = "permission";
+            this.#fail("failed", t("需要文件访问权限"));
+          } else {
+            const missing = message === "launch_missing_file";
+            this.recovery = missing ? "missing" : "access";
+            this.#fail("failed", t(missing ? "找不到游戏文件" : "无法访问游戏文件夹"));
+          }
         } else this.#fail("failed", launchError(message));
       },
     );
@@ -289,7 +301,10 @@ export class LaunchFlow {
   async recoverFolder(): Promise<void> {
     this.recovering = true;
     try {
-      if (await library.relocate(this.#gameId()) && this.#alive) this.retry();
+      const recovered = this.recovery === "permission"
+        ? await androidStorage.request()
+        : await library.relocate(this.#gameId());
+      if (recovered && this.#alive) this.retry();
     } finally {
       this.recovering = false;
     }

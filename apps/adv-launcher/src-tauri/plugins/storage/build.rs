@@ -3,6 +3,7 @@ fn main() {
         "storage_status",
         "request_storage",
         "pick_folder",
+        "resolve_folder",
         "folder_size",
         "copy_folder",
         "cancel_copy",
