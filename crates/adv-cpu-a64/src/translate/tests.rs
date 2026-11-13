@@ -2141,6 +2141,7 @@ mod opt_back {
                 IntUnary::Low32,
                 IntUnary::High32,
                 IntUnary::Widen,
+                IntUnary::SignWiden,
             ] {
                 let (mut f, b, p, _) = start(&[ty]);
                 let v = f.push(b, Op::IntUnary(op, p[0])).unwrap();
@@ -2156,22 +2157,42 @@ mod opt_back {
                 );
             }
         }
+        // A remainder reads its dividend from a register, or else from a
+        // constant rebuilt beside the quotient.
         for signed in [false, true] {
-            for remainder in [false, true] {
+            for remainder in [None, Some(false), Some(true)] {
                 for proved in [false, true] {
                     let (mut f, b, p, _) = start(&[Type::I64, Type::I32]);
-                    let v = f
+                    let quotient = f
                         .push(
                             b,
                             Op::Div {
                                 signed,
-                                remainder,
                                 dividend: p[0],
                                 divisor: p[1],
                                 proved,
                             },
                         )
                         .unwrap();
+                    let v = match remainder {
+                        None => quotient,
+                        Some(constant) => {
+                            let dividend = if constant {
+                                f.push(b, Op::Constant(Type::I64, 17)).unwrap()
+                            } else {
+                                p[0]
+                            };
+                            f.push(
+                                b,
+                                Op::Remainder {
+                                    quotient,
+                                    dividend,
+                                    divisor: p[1],
+                                },
+                            )
+                            .unwrap()
+                        }
+                    };
                     finish(&mut f, b, v);
                     for (n, d) in [(17u64, 3u32), ((-17i64) as u64, 3), (u64::MAX, 0xffff_ffff)] {
                         if proved && (!signed && n / u64::from(d) > u64::from(u32::MAX)) {
@@ -2511,7 +2532,6 @@ mod opt_back {
                     b,
                     Op::Div {
                         signed,
-                        remainder: false,
                         dividend: p[0],
                         divisor: p[1],
                         proved: false,
@@ -2693,7 +2713,6 @@ mod opt_back {
                 b,
                 Op::Div {
                     signed: false,
-                    remainder: false,
                     dividend: p[0],
                     divisor: zero,
                     proved: false,

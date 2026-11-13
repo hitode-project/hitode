@@ -628,12 +628,12 @@ impl<'a> Emitter<'a> {
                     IntUnary::SignExtend8 => sbfx(W, d, a, 0, 8),
                     IntUnary::SignExtend16 => sbfx(W, d, a, 0, 16),
                     IntUnary::High32 => lsr_imm(X, d, a, 32),
+                    IntUnary::SignWiden => sbfx(X, d, a, 0, 32),
                     _ => mov(W, d, a),
                 });
             }
             Op::Div {
                 signed,
-                remainder,
                 dividend,
                 divisor,
                 proved,
@@ -647,39 +647,37 @@ impl<'a> Emitter<'a> {
                     self.asm.emit(sbfx(X, U, b, 0, 32));
                     b = U;
                 }
-                let quotient = if remainder { T } else { d };
-                if remainder && n == T {
-                    self.asm.emit(fmov_to_v(X, C, n));
-                }
                 self.asm.emit(if signed {
-                    sdiv(X, quotient, n, b)
+                    sdiv(X, d, n, b)
                 } else {
-                    udiv(X, quotient, n, b)
+                    udiv(X, d, n, b)
                 });
                 if !proved {
                     self.asm.emit(if signed {
-                        sbfx(X, U, quotient, 0, 32)
+                        sbfx(X, U, d, 0, 32)
                     } else {
-                        mov(W, U, quotient)
+                        mov(W, U, d)
                     });
-                    self.asm.emit(cmp(X, quotient, U, Lsl, 0));
+                    self.asm.emit(cmp(X, d, U, Lsl, 0));
                     self.asm.b_cond(Cond::Ne, self.fail());
                 }
-                if remainder {
-                    // The low 32 bits of n - q*d are the guest remainder.
-                    b = self.gp(divisor, U);
-                    if n != T {
-                        self.asm.emit(msub(W, d, quotient, b, n));
-                    } else {
-                        self.asm.emit_all(&[
-                            mul(W, T, quotient, b),
-                            fmov_from_v(X, U, C),
-                            sub(W, d, U, T, Lsl, 0),
-                        ]);
-                    }
-                }
-                if signed && !remainder {
+                if signed {
                     self.asm.emit(mov(W, d, d));
+                }
+            }
+            Op::Remainder {
+                quotient,
+                dividend,
+                divisor,
+            } => {
+                let q = self.gp(quotient, T);
+                let b = self.gp(divisor, U);
+                if let Host::Register(n) = self.locations[dividend.0 as usize] {
+                    self.asm.emit(msub(W, d, q, b, n));
+                } else {
+                    self.asm.emit(mul(W, T, q, b));
+                    let n = self.gp(dividend, U);
+                    self.asm.emit(sub(W, d, n, T, Lsl, 0));
                 }
             }
             Op::Select { cond, a, b } => {
@@ -712,8 +710,15 @@ impl<'a> Emitter<'a> {
                         let v = self.vr(value, A);
                         self.asm.emit(fmov_from_v(self.size(out), d, v));
                     } else {
+                        // An I32 in a register keeps its upper half zero, as
+                        // does an I64 shifted right by 32, so neither needs
+                        // an instruction in place.
                         let r = self.gp(value, T);
-                        self.asm.emit(mov(self.size(out), d, r));
+                        let high = matches!(self.defs[value.0 as usize], Some(Op::Int(IntOp::Shr, _, k))
+                            if matches!(self.defs[k.0 as usize], Some(Op::Constant(_, 32..))));
+                        if !(r == d && (from == Type::I32 || high)) {
+                            self.asm.emit(mov(self.size(out), d, r));
+                        }
                     }
                 } else {
                     if matches!(from, Type::I32 | Type::I64) {

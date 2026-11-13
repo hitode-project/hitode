@@ -135,19 +135,17 @@ impl Front<'_> {
                 let hi = self.int(IntOp::Shl, hi, shift);
                 let dividend = self.int(IntOp::Or, lo, hi);
                 let proved = signed && self.proof.division(self.index).is_some();
-                self.state.regs[0] = self.value(Op::Div {
+                let quotient = self.value(Op::Div {
                     signed,
-                    remainder: false,
                     dividend,
                     divisor,
                     proved,
                 });
-                self.state.regs[2] = self.value(Op::Div {
-                    signed,
-                    remainder: true,
+                self.state.regs[0] = quotient;
+                self.state.regs[2] = self.value(Op::Remainder {
+                    quotient,
                     dividend,
                     divisor,
-                    proved,
                 });
             }
             D::Integer(Integer::NarrowNeg(r, width)) => self.unary(M::Neg, Part::Reg(r), width)?,

@@ -89,7 +89,12 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
                 f(p);
             }
         }
-        Op::Select { cond, a, b } => {
+        Op::Select { cond, a, b }
+        | Op::Remainder {
+            quotient: cond,
+            dividend: a,
+            divisor: b,
+        } => {
             f(cond);
             f(a);
             f(b);
@@ -368,13 +373,17 @@ fn propagate(func: &mut Func) -> bool {
                 *op = Op::Int(kind, b, a);
                 changed = true;
             }
-            if let Some(v) = identity(*op, &defs) {
+            if let Some(v) = identity(*op, &defs, &func.types) {
                 let v = resolve(v, &alias);
                 if r != v {
                     alias[r.0 as usize] = v;
                     changed = true;
                     continue;
                 }
+            }
+            if let Some(widened) = sign_widened(*op, &defs, &func.types) {
+                *op = widened;
+                changed = true;
             }
             if let Some(bits) = fold(*op, &defs, &func.types) {
                 let constant = Op::Constant(func.types[r.0 as usize], bits);
@@ -493,11 +502,44 @@ fn significant(defs: &[Option<Op>], v: Value, depth: u8) -> u32 {
     }
 }
 
-fn identity(op: Op, defs: &[Option<Op>]) -> Option<Value> {
+fn identity(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<Value> {
     // A mask or zero extension that keeps every bit its operand may set.
     let keeps = |a: Value, mask: u128| {
         let bits = significant(defs, a, 8);
         bits < 64 && mask & ((1 << bits) - 1) == (1 << bits) - 1
+    };
+    let size = |ty: Type| match ty {
+        Type::I32 => 4,
+        Type::V128 => 16,
+        _ => 8,
+    };
+    let bits_of = |v: Value| match defs[v.0 as usize] {
+        Some(Op::Bits { value, .. }) => Some(value),
+        _ => None,
+    };
+    // The I64 whose low (`high` false) or high dword `v` zero-extends.
+    let half = |v: Value, high: bool| {
+        let mut whole = bits_of(bits_of(v)?)?;
+        if high {
+            let Some(Op::Int(IntOp::Shr, x, k)) = defs[whole.0 as usize] else {
+                return None;
+            };
+            (constant(defs, k) == Some(32)).then_some(())?;
+            whole = x;
+        }
+        (types[v.0 as usize] == Type::I64
+            && types[bits_of(v)?.0 as usize] == Type::I32
+            && types[whole.0 as usize] == Type::I64)
+            .then_some(whole)
+    };
+    // `low` | `shifted` rejoins the dwords of one I64 when `shifted` moves
+    // the high dword up by 32.
+    let joined = |low: Value, shifted: Value| {
+        let Some(Op::Int(IntOp::Shl, high, k)) = defs[shifted.0 as usize] else {
+            return None;
+        };
+        let whole = half(low, false)?;
+        (constant(defs, k) == Some(32) && half(high, true)? == whole).then_some(whole)
     };
     match op {
         Op::Int(IntOp::And, a, b) if constant(defs, b).is_some_and(|m| keeps(a, m)) => Some(a),
@@ -522,8 +564,45 @@ fn identity(op: Op, defs: &[Option<Op>]) -> Option<Value> {
                 constant(defs, cond).map(|c| if c != 0 { a } else { b })
             }
         }
+        Op::Int(IntOp::Or, a, b) => joined(a, b).or_else(|| joined(b, a)),
+        // A round trip through a type at least as wide loses no bits.
+        Op::Bits { to, value } => {
+            let x = bits_of(value)?;
+            (types[x.0 as usize] == to && size(types[value.0 as usize]) >= size(to)).then_some(x)
+        }
         _ => None,
     }
+}
+
+/// An I64 joined from an I32 and its sign, as CDQ before IDIV builds it,
+/// is that I32 sign-extended.
+fn sign_widened(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<Op> {
+    let Op::Int(IntOp::Or, a, b) = op else {
+        return None;
+    };
+    let def = |v: Value| defs[v.0 as usize];
+    let widened = |low: Value, shifted: Value| {
+        let Some(Op::Bits { value: x, .. }) = def(low) else {
+            return None;
+        };
+        let Some(Op::Int(IntOp::Shl, high, k)) = def(shifted) else {
+            return None;
+        };
+        let Some(Op::Bits { value: sign, .. }) = def(high) else {
+            return None;
+        };
+        let Some(Op::Int(IntOp::Sar, y, n)) = def(sign) else {
+            return None;
+        };
+        (types[low.0 as usize] == Type::I64
+            && types[high.0 as usize] == Type::I64
+            && types[x.0 as usize] == Type::I32
+            && y == x
+            && constant(defs, k) == Some(32)
+            && constant(defs, n) == Some(31))
+        .then_some(Op::IntUnary(IntUnary::SignWiden, x))
+    };
+    widened(a, b).or_else(|| widened(b, a))
 }
 
 fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
@@ -550,10 +629,11 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
                     IntUnary::Low32 => x & u128::from(u32::MAX),
                     IntUnary::High32 => x >> 32,
                     IntUnary::Widen => x & u128::from(u32::MAX),
+                    IntUnary::SignWiden => u128::from(x as u32 as i32 as i64 as u64),
                 },
                 if matches!(op, IntUnary::Low32 | IntUnary::High32) {
                     Type::I32
-                } else if op == IntUnary::Widen {
+                } else if matches!(op, IntUnary::Widen | IntUnary::SignWiden) {
                     Type::I64
                 } else {
                     types[v.0 as usize]
@@ -640,7 +720,6 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
         }
         Op::Div {
             signed,
-            remainder,
             dividend,
             divisor,
             ..
@@ -657,19 +736,23 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
                 if q < i128::from(i32::MIN) || q > i128::from(i32::MAX) {
                     return None;
                 }
-                (if remainder { a % b } else { q }) as i32 as u32 as u128
+                q as i32 as u32 as u128
             } else {
                 let q = dividend / u64::from(divisor);
                 if q > u64::from(u32::MAX) {
                     return None;
                 }
-                u128::from(if remainder {
-                    dividend % u64::from(divisor)
-                } else {
-                    q
-                })
+                u128::from(q)
             }
         }
+        Op::Remainder {
+            quotient,
+            dividend,
+            divisor,
+        } => u128::from(
+            (c(dividend)? as u32)
+                .wrapping_sub((c(quotient)? as u32).wrapping_mul(c(divisor)? as u32)),
+        ),
         _ => return None,
     })
 }

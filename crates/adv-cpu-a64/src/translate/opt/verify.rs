@@ -142,6 +142,11 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::Div {
             dividend, divisor, ..
         } => is(dividend, Type::I64) && is(divisor, Type::I32),
+        Op::Remainder {
+            quotient,
+            dividend,
+            divisor,
+        } => is(quotient, Type::I32) && is(dividend, Type::I64) && is(divisor, Type::I32),
         Op::Flags { a, prior, .. } => {
             (int(a) || is(a, Type::F64)) && prior.is_none_or(|p| is(p, Type::Flags))
         }

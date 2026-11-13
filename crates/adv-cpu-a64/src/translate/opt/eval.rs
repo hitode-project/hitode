@@ -130,11 +130,11 @@ fn step(
                 IntUnary::SignExtend16 => narrow(x as i16 as u64),
                 IntUnary::Low32 | IntUnary::Widen => narrow(x),
                 IntUnary::High32 => narrow(x >> 32),
+                IntUnary::SignWiden => u128::from(x as u32 as i32 as i64 as u64),
             }
         }
         Op::Div {
             signed,
-            remainder,
             dividend,
             divisor,
             ..
@@ -143,18 +143,22 @@ fn step(
             if d == 0 {
                 return None;
             }
-            let (q, r) = if signed {
-                let (n, d) = (n as i64, i64::from(d as i32));
-                let q = n.checked_div(d)?;
-                i32::try_from(q).ok()?;
-                (q as u64, (n % d) as u64)
+            let q = if signed {
+                let q = (n as i64).checked_div(i64::from(d as i32))?;
+                i32::try_from(q).ok()? as u32
             } else {
-                let q = n / u64::from(d);
-                u32::try_from(q).ok()?;
-                (q, n % u64::from(d))
+                u32::try_from(n / u64::from(d)).ok()?
             };
-            u128::from(if remainder { r } else { q } as u32)
+            u128::from(q)
         }
+        Op::Remainder {
+            quotient,
+            dividend,
+            divisor,
+        } => u128::from(
+            (get(dividend) as u32)
+                .wrapping_sub((get(quotient) as u32).wrapping_mul(get(divisor) as u32)),
+        ),
         Op::Flags {
             kind,
             width,

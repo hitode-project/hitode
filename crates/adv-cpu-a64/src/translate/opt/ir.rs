@@ -58,6 +58,8 @@ pub(crate) enum IntUnary {
     High32,
     /// An I32 zero-extended to I64.
     Widen,
+    /// An I32 sign-extended to I64.
+    SignWiden,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,14 +130,20 @@ pub(crate) enum Op {
     Constant(Type, u128),
     Int(IntOp, Value, Value),
     IntUnary(IntUnary, Value),
-    /// Divides the I64 `dividend` by the I32 `divisor`. Unless `proved`, a
-    /// zero divisor or a quotient that does not fit fails.
+    /// The quotient of the I64 `dividend` by the I32 `divisor`. Unless
+    /// `proved`, a zero divisor or a quotient that does not fit fails.
     Div {
         signed: bool,
-        remainder: bool,
         dividend: Value,
         divisor: Value,
         proved: bool,
+    },
+    /// The low 32 bits of `dividend` minus `quotient` times `divisor`: the
+    /// remainder of the `Div` that gave `quotient`.
+    Remainder {
+        quotient: Value,
+        dividend: Value,
+        divisor: Value,
     },
     /// EFLAGS after `kind` on `width`-byte operands, as the interpreter
     /// computes them. Flags the operation keeps, and the carry that ADC, SBB,
@@ -248,7 +256,12 @@ impl Op {
                 base: a, value: b, ..
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
-            Op::Select { cond, a, b } => [Some(cond), Some(a), Some(b)],
+            Op::Select { cond, a, b }
+            | Op::Remainder {
+                quotient: cond,
+                dividend: a,
+                divisor: b,
+            } => [Some(cond), Some(a), Some(b)],
         };
         list.into_iter().flatten()
     }
@@ -445,9 +458,12 @@ impl Func {
             Op::Host(_) => Type::I64,
             Op::Int(_, a, _) | Op::Select { a, .. } => self.ty(a),
             Op::IntUnary(IntUnary::Low32 | IntUnary::High32, _) => Type::I32,
-            Op::IntUnary(IntUnary::Widen, _) => Type::I64,
+            Op::IntUnary(IntUnary::Widen | IntUnary::SignWiden, _) => Type::I64,
             Op::IntUnary(_, a) => self.ty(a),
-            Op::Div { .. } | Op::Test { .. } | Op::ToInt { wide: false, .. } => Type::I32,
+            Op::Div { .. }
+            | Op::Remainder { .. }
+            | Op::Test { .. }
+            | Op::ToInt { wide: false, .. } => Type::I32,
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,

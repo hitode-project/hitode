@@ -660,6 +660,62 @@ fn a_frame_float_copy_needs_no_second_x87_load_check() {
     );
 }
 
+#[test]
+fn a_division_keeping_both_results_divides_once() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.mov(ebx, 11).unwrap();
+            a.cdq().unwrap();
+            a.idiv(ebx).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.mov(dword_ptr(edi + 4), edx).unwrap();
+        })
+    });
+    let built = differential(&code, &initial(), |m| {
+        m.write(DATA, &(-17i32).to_le_bytes()).unwrap();
+    });
+    assert_eq!(count(&built, |op| matches!(op, Op::Div { .. })), 1);
+    assert_eq!(
+        count(&built, |op| matches!(
+            op,
+            Op::IntUnary(IntUnary::SignWiden, _)
+        )),
+        1,
+        "the dividend CDQ builds is EAX sign-extended"
+    );
+}
+
+// spec: A64-OPT-3
+#[test]
+fn a_double_copied_by_dwords_reads_back_as_the_stored_value() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(esp - 8)).unwrap();
+            a.mov(eax, dword_ptr(esp - 8)).unwrap();
+            a.mov(edx, dword_ptr(esp - 4)).unwrap();
+            a.mov(dword_ptr(esp - 16), eax).unwrap();
+            a.mov(dword_ptr(esp - 12), edx).unwrap();
+            a.fld(qword_ptr(esp - 16)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    let built = differential(&code, &at, |m| {
+        m.write(DATA, &2.5f64.to_le_bytes()).unwrap();
+    });
+    assert_eq!(
+        count(&built, |op| matches!(
+            op,
+            Op::Int(IntOp::Or | IntOp::Shl, ..)
+        )),
+        0,
+        "the dwords rejoin to the stored binary64 itself"
+    );
+}
+
 // spec: A64-OPT-5, A64-OPT-6
 #[test]
 fn a_load_failure_after_a_store_keeps_rounding_metadata() {
