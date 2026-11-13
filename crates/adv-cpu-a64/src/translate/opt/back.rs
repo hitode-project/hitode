@@ -121,24 +121,34 @@ pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
         match &data.end {
             End::Jump(t) => e.edge(t, b + 1),
             End::Branch { cond, taken, fall } => {
-                let condition = if let Some(Op::Test { flags, cond: cc }) = e.defs[cond.0 as usize]
+                let test = if let Some(Op::Test { flags, cond: cc }) = e.defs[cond.0 as usize]
                     && branch_only[cond.0 as usize]
                 {
-                    e.condition(e.locations[flags.0 as usize], cc)
+                    Ok(e.condition(e.locations[flags.0 as usize], cc))
                 } else {
-                    let r = e.gp(*cond, T);
-                    e.asm.emit(cmp_imm(W, r, 0, false));
-                    Cond::Ne
+                    Err(e.gp(*cond, T))
                 };
-                let target = if e.moves(taken).is_empty() && taken.charge == 0 {
-                    e.blocks[taken.block.0 as usize]
+                // Branch straight to a target whose edge needs no code and
+                // place the other edge inline, so a charged backedge costs no
+                // extra taken branch.
+                let bare = |e: &Emitter, t: &Target| e.moves(t).is_empty() && t.charge == 0;
+                let (jump, inline, when) = if bare(&e, taken) {
+                    (taken, fall, true)
+                } else {
+                    (fall, taken, false)
+                };
+                let target = if bare(&e, jump) {
+                    e.blocks[jump.block.0 as usize]
                 } else {
                     let label = e.asm.label();
-                    e.edges.push((label, taken.clone()));
+                    e.edges.push((label, jump.clone()));
                     label
                 };
-                e.asm.b_cond(condition, target);
-                e.edge(fall, b + 1);
+                match test {
+                    Ok(c) => e.asm.b_cond(if when { c } else { c.invert() }, target),
+                    Err(r) => e.asm.cbz(W, when, r, target),
+                }
+                e.edge(inline, b + 1);
             }
             End::Exit(id) => e.asm.b(e.cold[id.0 as usize]),
             End::Unset => unreachable!(),

@@ -3142,13 +3142,21 @@ mod opt_back {
             head_code[0],
             dfloat(Float::Fadd, VReg::new(0), VReg::new(0), VReg::new(1))
         );
-        assert_eq!(head_code.len(), 7, "FADD, Validate, SUB, CMP, branch");
-        // After the done block's exit branch the taken edge contains only its
-        // two-word charge and branch; no register or memory copies.
-        let edge = lower.marks[3].offset as usize / 4 + 1;
-        assert_eq!(lower.words[edge], sub_imm(X, X9, X9, 3, false));
-        assert_eq!(lower.words[edge + 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
-        assert_eq!(lower.words[edge + 2] & 0xfc00_0000, crate::encode::b(0));
+        assert_eq!(
+            head_code.len(),
+            9,
+            "FADD, Validate, SUB, CBZ, then the inline backedge"
+        );
+        // The exit edge is bare, so the loop leaves with one CBZ and the
+        // taken backedge holds only its two-word charge and branch; no
+        // register or memory copies.
+        assert_eq!(
+            head_code[5] & 0xff00_0000,
+            cbz(W, false, Reg::new(0), 0) & 0xff00_0000
+        );
+        assert_eq!(head_code[6], sub_imm(X, X9, X9, 3, false));
+        assert_eq!(head_code[7] & 0xfff8_001f, tbz(true, X9, 63, 0));
+        assert_eq!(head_code[8] & 0xfc00_0000, crate::encode::b(0));
         let mut h = harness();
         compare(
             &f,
