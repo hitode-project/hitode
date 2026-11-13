@@ -132,6 +132,9 @@ pub struct Runtime {
     pub computation_pending: u64,
     pub computation_pending_mask: u32,
     pub completed: u64,
+    /// The most `completed` an optimized form refills to; past it a
+    /// checkpoint leaves, so the owner's run stays within its fuel.
+    pub completed_limit: u64,
     /// Nonzero: the proved form leaves when this many returns to its head
     /// have counted it down to zero.
     pub head_exit: u32,
@@ -190,6 +193,7 @@ impl Runtime {
             computation_pending: 0,
             computation_pending_mask: 0,
             completed: 0,
+            completed_limit: u64::MAX,
             head_exit: 0,
             deferred: 0,
             opt_params: 0,
@@ -347,6 +351,7 @@ pub(crate) const COMPUTATION_PENDING: u32 = field(offset_of!(Runtime, computatio
 pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
+pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));

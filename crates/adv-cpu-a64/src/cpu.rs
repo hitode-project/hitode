@@ -524,7 +524,7 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
-    fn allow_computation(&self) -> bool {
+    fn allow_computation(&mut self) -> bool {
         self.handler.allow_computation()
     }
 

@@ -302,6 +302,8 @@ pub struct Context {
     pub(crate) wait_objects: Vec<u64>,
     /// Its last block was a yield (Sleep(0)): it is polling, not waiting on anything.
     pub(crate) yielded: bool,
+    /// The frame in which it last reached a prepared computation.
+    pub(crate) computed: Option<u32>,
     /// Its next timed wait keeps its exact deadline instead of the next tick.
     pub(crate) exact_deadline: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
@@ -709,6 +711,7 @@ mod active_tests {
             frames: Vec::new(),
             state: super::State::Ready { resume: None },
             yielded: false,
+            computed: None,
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
@@ -719,6 +722,27 @@ mod active_tests {
         });
         sys.wakes.insert(id, id);
         id
+    }
+
+    // spec: PROC-MACH-1
+    #[test]
+    fn a_computation_is_offered_only_beside_a_ready_computing_peer() {
+        let mut sys = wait_sys();
+        let (a, b) = (spawn(&mut sys), spawn(&mut sys));
+        sys.current = a;
+        // A ready peer that has not computed leaves the work in place.
+        assert!(!sys.computing_peer());
+        sys.current = b;
+        assert!(sys.computing_peer());
+        sys.current = a;
+        assert!(sys.computing_peer());
+        // A peer that last computed two frames ago no longer counts.
+        sys.completed_frames += 2;
+        assert!(!sys.computing_peer());
+        sys.current = b;
+        assert!(sys.computing_peer());
+        sys.contexts[a as usize].yielded = true;
+        assert!(!sys.computing_peer());
     }
 
     // spec: PROC-MACH-10

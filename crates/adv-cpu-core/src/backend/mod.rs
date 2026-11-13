@@ -468,9 +468,10 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
-    /// Whether reaching a prepared computation should return to the scheduler.
+    /// The current context reached a prepared computation: whether it
+    /// should return to the scheduler, for a peer to run beside it.
     /// Instruction debugging and host-call tracing keep execution on the owner.
-    fn allow_computation(&self) -> bool {
+    fn allow_computation(&mut self) -> bool {
         false
     }
 

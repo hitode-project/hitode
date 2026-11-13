@@ -1793,6 +1793,7 @@ mod opt_back {
                 (offset_of!(runtime::Runtime, window), WINDOW_BASE),
                 (offset_of!(runtime::Runtime, shadow), WINDOW_BASE),
                 (offset_of!(runtime::Runtime, countdown), budget),
+                (offset_of!(runtime::Runtime, completed_limit), u64::MAX),
                 (offset_of!(runtime::Runtime, opt_params), PARAMETER),
                 (offset_of!(runtime::Runtime, recall), CONTEXT + 0x3f00),
                 (

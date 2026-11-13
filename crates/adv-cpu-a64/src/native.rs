@@ -373,6 +373,9 @@ pub(crate) struct Diagnostics {
     /// Proofs whose head loop splits, and how its blocks ran.
     pub split_proofs: u64,
     pub split: worker::SplitCounts,
+    /// Optimized forms the owner ran in place, and their instructions.
+    pub optimized_runs: u64,
+    pub optimized_retired: u64,
 }
 
 pub(crate) struct Run {
@@ -928,12 +931,14 @@ impl Native {
         self.skip_offer.take()
     }
 
+    /// Whether the computation reached at EIP goes to the job layer
+    /// because a peer runs beside it; otherwise the owner runs it.
     fn offer_computation(&self) -> bool {
         self.computation_enabled
             && (self.bridge.is_null()
                 // SAFETY: this query occurs only within the owning run.
-                || unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler.as_ref().is_some_and(|handler| handler.allow_computation()))
+                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
     }
 
     /// A single context may offer a loop whose blocks split.
@@ -996,8 +1001,7 @@ impl Native {
         self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
-        if self.nominated.is_some()
-            && (self.offer_split() || self.offer_computation())
+        if self.computation_enabled
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
@@ -1055,9 +1059,10 @@ impl Native {
                 (entry?, self.cache.used().saturating_sub(before))
             }
         };
+        // Reaching the computation tells peers it is here, offered or not.
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && (prepared.proof.splits() && self.offer_split() || self.offer_computation())
+            && (self.offer_computation() || prepared.proof.splits() && self.offer_split())
             && prepared.worth_offering()
         {
             return Ok(Some(Run {
@@ -1092,6 +1097,16 @@ impl Native {
             );
         }
         self.cache.sync();
+        if let Some((exit, retired)) = self.run_optimized(cpu, memory, fuel) {
+            if retired != 0 {
+                self.progressed();
+            }
+            return Ok(Some(Run {
+                exit,
+                retired,
+                translated,
+            }));
+        }
         self.faults.end.set(self.cache.next());
         let runtime: *mut Runtime = &mut *self.runtime;
         let faults: *const Faults = &self.faults;
@@ -1133,7 +1148,7 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
-            Exit::Optimized => unreachable!("optimized forms run only on computation workers"),
+            Exit::Optimized => unreachable!("optimized forms leave through `worker::execute`"),
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
@@ -1167,6 +1182,63 @@ impl Native {
             retired,
             translated,
         }))
+    }
+
+    /// Runs the optimized form of the computation at EIP in place when its
+    /// ranges and entry facts admit (A64-OPT-1). It leaves at a checkpoint
+    /// once owner work is pending, and refills only while within `fuel`.
+    fn run_optimized(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &Memory,
+        fuel: u64,
+    ) -> Option<(Exit, u32)> {
+        static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let prepared = self.computation.get(&cpu.eip)?;
+        prepared.code.optimized.as_ref()?;
+        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
+            return None;
+        }
+        let alias = alias_base(memory);
+        let optimized = worker::admit(&prepared.code, cpu, alias)?;
+        let entry = worker::Entry {
+            enter: self.enter,
+            window: self.runtime.window,
+            alias,
+            fault: self.stubs.fault,
+        };
+        let budget = fuel.min(SLICE);
+        let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
+            (word.as_ptr(), self.pending_mask)
+        });
+        let runtime = &mut *self.runtime;
+        runtime.countdown = budget;
+        runtime.recall = NEVER.as_ptr() as u64;
+        runtime.recall_mask = 0;
+        runtime.computation_pending = pending as u64;
+        runtime.computation_pending_mask = mask;
+        runtime.head_exit = 0;
+        runtime.deferred = 0;
+        runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
+        let shadow = runtime.shadow;
+        let (exit, retired) =
+            worker::execute(runtime, cpu, entry, &prepared.code, Some(&optimized));
+        runtime.shadow = shadow;
+        self.diagnostics.optimized_runs += 1;
+        self.diagnostics.optimized_retired += retired;
+        if let Some(forms) = &mut self.retired_forms {
+            forms[0] += retired;
+        }
+        if exit == Exit::Fault {
+            self.diagnostics.faults += 1;
+        }
+        // A recall here is pending owner work, which dispatch sees.
+        let exit = if exit == Exit::Recall {
+            Exit::Dispatch
+        } else {
+            exit
+        };
+        Some((exit, retired as u32))
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
@@ -1291,6 +1363,13 @@ impl Native {
     /// Whether the run's deadline has passed.
     pub(crate) fn past(&self) -> bool {
         self.deadline.is_some_and(|at| ticks() >= at)
+    }
+
+    /// Keeps the loop at `head` in ordinary units, for tests of their
+    /// mechanisms.
+    #[cfg(test)]
+    pub(crate) fn keep_ordinary(&mut self, head: u32) {
+        self.rejected_candidates.insert(head);
     }
 
     #[cfg(test)]
@@ -1776,7 +1855,6 @@ impl Native {
     /// loop traces.
     fn sample(&mut self, memory: &Memory, eip: u32) {
         if self.computation_enabled
-            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.enclosing_computation(eip)
             && !self.is_stop(candidate)
         {

@@ -6,6 +6,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use adv_cpu_core::CpuState;
 use adv_cpu_core::backend::{Completion, Computation};
 use adv_sync::WakeEvent;
 use rustc_hash::FxHashMap;
@@ -202,24 +203,75 @@ fn run(
     signals: &Signals,
     recall_mask: u32,
 ) -> Done {
+    runtime.countdown = u64::from(COMPUTATION_SLICE);
+    runtime.recall = signals.recall.as_ptr() as u64;
+    runtime.recall_mask = recall_mask;
+    runtime.computation_pending = signals.pending.0.as_ptr() as u64;
+    runtime.computation_pending_mask = signals.pending.1;
+    runtime.head_exit = head_exit;
+    runtime.deferred = 0;
+    let started = Instant::now();
     let cpu = context.cpu_mut();
     cpu.settle_flags();
     cpu.refresh_mmx();
+    let optimized = admit(code, cpu, entry.alias);
+    let (exit, retired) = execute(runtime, cpu, entry, code, optimized.as_ref());
+    let elapsed = started.elapsed();
+    record_branch(cpu, runtime.branch, cpu.eip);
+    context.finish_computation(exit);
+    Done {
+        deadline_recall: (exit == Exit::Recall || runtime.deferred != 0)
+            && signals.pending.0.load(Ordering::Acquire)
+                & signals.pending.1
+                & adv_sync::pending::DEADLINE
+                != 0,
+        completion: Completion {
+            id,
+            context: Some(context),
+            retired,
+            optimized: if optimized.is_some() { retired } else { 0 },
+            elapsed,
+            helpers: Duration::ZERO,
+            requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
+        },
+    }
+}
+
+/// The optimized form of `code` and its entry cells, if it has one whose
+/// entry facts hold at `cpu`. `alias` reaches the admitted frame.
+pub(super) fn admit<'a>(
+    code: &'a Code,
+    cpu: &CpuState,
+    alias: u64,
+) -> Option<(&'a Optimized, Vec<u128>)> {
+    let o = code.optimized.as_deref()?;
+    // SAFETY: admission granted the frame's ranges.
+    let cells = crate::translate::opt::admit(&o.entry, &o.assumed, cpu, |addr, width| unsafe {
+        let mut bytes = [0; 8];
+        let at = alias.wrapping_add(u64::from(addr)) as *const u8;
+        std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), usize::from(width));
+        u64::from_le_bytes(bytes)
+    })?;
+    Some((o, cells))
+}
+
+/// Enters `code`, or `optimized`, its admitted form, on this thread. The
+/// caller sets the countdown, recall, head exit and limit fields of
+/// `runtime`, and holds the admitted ranges unshared. Returns the exit,
+/// with an optimized one resolved to `Recall` or `Dispatch`, and the
+/// instructions retired.
+pub(super) fn execute(
+    runtime: &mut Runtime,
+    cpu: &mut CpuState,
+    entry: Entry,
+    code: &Code,
+    optimized: Option<&(&Optimized, Vec<u128>)>,
+) -> (Exit, u64) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
-    // SAFETY: admission leased the job's ranges, the frame among them.
-    let optimized = code.optimized.as_deref().and_then(|o| {
-        let cells =
-            crate::translate::opt::admit(&o.entry, &o.assumed, cpu, |addr, width| unsafe {
-                let mut bytes = [0; 8];
-                std::ptr::copy_nonoverlapping(host(addr), bytes.as_mut_ptr(), usize::from(width));
-                u64::from_le_bytes(bytes)
-            })?;
-        Some((o, cells))
-    });
-    let mut saved = vec![0u128; optimized.as_ref().map_or(0, |(o, _)| o.cells)];
+    let mut saved = vec![0u128; optimized.map_or(0, |(o, _)| o.cells)];
     let entry_esp = cpu.regs[ESP];
-    let code = optimized.as_ref().map_or(code, |(o, _)| &o.code);
-    if let Some((o, cells)) = &optimized {
+    let code = optimized.map_or(code, |(o, _)| &o.code);
+    if let Some((o, cells)) = optimized {
         runtime.opt_params = cells.as_ptr() as u64;
         runtime.opt_save = saved.as_mut_ptr() as u64;
         runtime.opt_cells = o.cells as u64;
@@ -229,39 +281,30 @@ fn run(
         stub: entry.fault,
         capture: FaultCapture::default(),
     };
+    let countdown = runtime.countdown;
     runtime.cpu = cpu;
     runtime.window = entry.window;
     runtime.shadow = entry.alias;
-    runtime.countdown = u64::from(COMPUTATION_SLICE);
-    runtime.recall = signals.recall.as_ptr() as u64;
-    runtime.recall_mask = recall_mask;
-    runtime.computation_pending = signals.pending.0.as_ptr() as u64;
-    runtime.computation_pending_mask = signals.pending.1;
     runtime.completed = 0;
-    runtime.head_exit = head_exit;
-    runtime.deferred = 0;
     runtime.opt_recalled = 0;
     runtime.branch = 0;
     runtime.fault_simd = faults.capture.simd.as_ptr() as u64;
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
-    let started = Instant::now();
-    // SAFETY: the session retains this code and mapping through completion.
+    // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
     unsafe {
         // Instruction-cache maintenance is done by the publishing owner.
-        // Its ISB does not synchronize this worker's instruction stream.
+        // Its ISB does not synchronize this thread's instruction stream.
         std::arch::asm!("isb", options(nostack, preserves_flags));
         (entry.enter)(runtime, code.entry);
     }
-    let elapsed = started.elapsed();
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
     let mut exit = Exit::from_raw(runtime.exit).expect("computation exit");
     // An optimized form may leave with a negative countdown.
-    let mut retired =
-        (runtime.completed + u64::from(COMPUTATION_SLICE)).wrapping_sub(runtime.countdown);
+    let mut retired = (runtime.completed + countdown).wrapping_sub(runtime.countdown);
     if exit == Exit::Optimized {
-        let (o, _) = optimized.as_ref().expect("optimized entry");
+        let (o, _) = optimized.expect("optimized entry");
         let record = &o.records[runtime.opt_record as usize];
         // SAFETY: as above, the frame lies in the leased ranges.
         let refund = recovery::materialize(
@@ -289,25 +332,8 @@ fn run(
         faults.capture.recover(cpu, site, runtime.temps);
         retired -= u64::from(site.refund);
     }
-    record_branch(cpu, runtime.branch, cpu.eip);
     cpu.refresh_mmx();
-    context.finish_computation(exit);
-    Done {
-        deadline_recall: (exit == Exit::Recall || runtime.deferred != 0)
-            && signals.pending.0.load(Ordering::Acquire)
-                & signals.pending.1
-                & adv_sync::pending::DEADLINE
-                != 0,
-        completion: Completion {
-            id,
-            context: Some(context),
-            retired,
-            optimized: if optimized.is_some() { retired } else { 0 },
-            elapsed,
-            helpers: Duration::ZERO,
-            requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
-        },
-    }
+    (exit, retired)
 }
 
 /// How split loops ran, for reports.
@@ -602,6 +628,12 @@ pub(super) struct Admission {
 }
 
 impl Admission {
+    /// Whether the owner may run the computation at `cpu` itself, with no
+    /// job active: its ranges evaluate and are ordinary memory.
+    pub(super) fn alone(&mut self, proof: &Proof, cpu: &CpuState, memory: &Memory) -> bool {
+        self.ranges(proof, cpu, memory, &[]).is_some()
+    }
+
     fn ranges<'a>(
         &'a mut self,
         proof: &Proof,
@@ -1754,6 +1786,114 @@ mod tests {
             serial += result.retired;
         }
         panic!("serial continuation did not offer the prepared head");
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn a_computation_without_a_computing_peer_runs_optimized_on_the_owner() {
+        use adv_cpu_core::trap::{Bridge, ExecutionTrap};
+
+        /// No peer runs beside this context.
+        struct Alone(u32);
+        impl ExecutionTrap for Alone {
+            fn allow_computation(&mut self) -> bool {
+                self.0 += 1;
+                false
+            }
+
+            fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
+                unreachable!("no host calls")
+            }
+        }
+
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut loop_head = a.create_label();
+        a.set_label(&mut loop_head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(loop_head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let head = CODE + 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let memory = executor.memory_mut();
+        memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
+        memory.write(INPUT, &0x1234_5678u32.to_le_bytes()).unwrap();
+        memory.map(OUTPUT, SPACE as usize, READ | WRITE).unwrap();
+        native.first_visits = false;
+        native.set_computation_offer(true, None);
+        let mut alone = Alone(0);
+        let mut bridge = Bridge {
+            timestamp: Default::default(),
+            memory,
+            error: None,
+            trap: None,
+            calls: 0,
+            handler: Some(&mut alone),
+            parked: false,
+            deadline: None,
+            clock_due: true,
+            unclocked_bytes: 0,
+            bulk_calls: 0,
+            bulk_bytes: 0,
+            cliffs: Default::default(),
+            scratch: Default::default(),
+        };
+        let bridge = (&raw mut bridge).cast();
+        let mut cpu = adv_cpu_core::CpuState::default();
+        let start = |cpu: &mut adv_cpu_core::CpuState, eip| {
+            cpu.eip = eip;
+            cpu.regs[1] = COUNT;
+            cpu.regs[6] = INPUT;
+            cpu.regs[7] = OUTPUT;
+        };
+        let mut run = |native: &mut Native, cpu: &mut adv_cpu_core::CpuState, fuel| {
+            let run = native
+                .run(cpu, executor.memory_mut(), stop, fuel, bridge)
+                .unwrap()
+                .unwrap();
+            assert_ne!(run.exit, Exit::Computation);
+            assert!(u64::from(run.retired) <= fuel);
+            run.retired
+        };
+
+        // Budget exits nominate the loop and the next entry proves it.
+        start(&mut cpu, CODE);
+        while native.diagnostics.optimized_runs == 0 {
+            assert_ne!(cpu.eip, stop, "the loop never ran optimized");
+            run(&mut native, &mut cpu, 1 << 16);
+        }
+        assert!(native.computation[&head].code.optimized.is_some());
+
+        // Fuel just above one budget: each run leaves at the first refill,
+        // and the runs retire the loop exactly.
+        start(&mut cpu, CODE);
+        let before = native.diagnostics.optimized_runs;
+        let mut retired = 0;
+        while cpu.eip != stop {
+            retired += run(&mut native, &mut cpu, (1 << 16) + 1000);
+        }
+        assert_eq!(retired, 1 + 5 * COUNT);
+        assert!(native.diagnostics.optimized_runs > before + 1);
+
+        // Unbounded fuel runs the whole loop at once; pending owner work
+        // leaves at a checkpoint.
+        start(&mut cpu, head);
+        assert_eq!(run(&mut native, &mut cpu, 1 << 40), 5 * COUNT);
+        assert_eq!(cpu.eip, stop);
+        native.interrupt = Some(Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)));
+        start(&mut cpu, head);
+        let first = run(&mut native, &mut cpu, 1 << 40);
+        assert!(first < 5 * COUNT);
+        assert_ne!(cpu.eip, stop);
+        assert!(alone.0 > 0);
+        assert_eq!(
+            executor.memory().read(OUTPUT + 4 * (COUNT - 1), 4).unwrap(),
+            [0x78, 0x56, 0x34, 0x12]
+        );
     }
 
     // spec: A64-CTL-10 A64-TR-9

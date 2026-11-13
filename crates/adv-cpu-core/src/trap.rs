@@ -5,7 +5,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
-    fn allow_computation(&self) -> bool {
+    /// The current context reached a prepared computation: whether to
+    /// offer it to the scheduler instead of running it in place.
+    fn allow_computation(&mut self) -> bool {
         false
     }
 

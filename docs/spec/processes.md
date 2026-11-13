@@ -12,6 +12,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 Completed contexts MAY receive fresh admission within the same scope while other computations remain active.
 **Verification**: Test
 
+A context that reaches a proved computation offers it only beside a ready peer
+that reached one in the same frame or the one before. Otherwise the owner runs
+it in place in its optimized form (A64-OPT-1). A peer doing other work holds the
+owner too briefly to repay the job layer's round trip.
+
 A single context may offer a loop whose blocks split (A64-TR-9). Owner work per
 frame selects how much splitting saves. It excludes settled polling and counts
 split loops at their serial cost, so splitting does not change it. Splitting SHOULD save

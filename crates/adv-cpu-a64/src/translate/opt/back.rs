@@ -524,8 +524,11 @@ impl<'a> Emitter<'a> {
                 sub(X, T, T, COUNT, Lsl, 0),
                 ldr(X, U, RT, runtime::COMPLETED),
                 add(X, T, T, U, Lsl, 0),
-                str(X, T, RT, runtime::COMPLETED),
+                ldr(X, U, RT, runtime::COMPLETED_LIMIT),
+                cmp(X, T, U, Lsl, 0),
             ]);
+            self.asm.b_cond(Cond::Hi, leave);
+            self.asm.emit(str(X, T, RT, runtime::COMPLETED));
             self.imm(COUNT, u64::from(runtime::COMPUTATION_SLICE - refund));
             self.asm.b(resume);
             self.asm.bind(leave);

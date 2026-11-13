@@ -485,6 +485,7 @@ impl Sys {
             frames: Vec::new(),
             state: State::Ready { resume: None },
             yielded: false,
+            computed: None,
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
@@ -566,6 +567,21 @@ impl Sys {
             self.finished_contexts.pop();
         }
         Ok(())
+    }
+
+    /// Records that the current context reached a prepared computation.
+    /// Whether a ready peer reached one in this frame or the last, so the
+    /// two can run side by side. A peer doing other work holds the owner
+    /// too briefly to repay the job layer's round trip (PROC-MACH-1).
+    fn computing_peer(&mut self) -> bool {
+        let (current, frame) = (self.current, self.completed_frames);
+        self.contexts[current as usize].computed = Some(frame);
+        self.active_contexts().any(|c| {
+            c.id != current
+                && c.is_ready()
+                && !c.yielded
+                && c.computed.is_some_and(|at| frame.wrapping_sub(at) <= 1)
+        })
     }
 
     fn active_contexts(&self) -> impl Iterator<Item = &Context> {
@@ -1899,15 +1915,12 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
-    fn allow_computation(&self) -> bool {
-        self.computation
+    fn allow_computation(&mut self) -> bool {
+        self.sys.computing_peer()
+            && self.computation
             && !DEBUGGER_ATTACHED.get()
             && !self.sys.trace.enabled()
             && self.sys.call_limit.is_none()
-            && self
-                .sys
-                .active_contexts()
-                .any(|c| c.id != self.sys.current && c.is_ready() && !c.yielded)
     }
 
     fn split_share(&self) -> f32 {

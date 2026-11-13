@@ -638,6 +638,9 @@ mod tests {
         let ordinary = m.spawn("test", ORDINARY, &[], 0x1_0000).unwrap();
         assert!(m.sys.set_initial_registers(ordinary, &[(Reg::Eax, 17)]));
         m.sys.suspend_context(ordinary).unwrap();
+        // Context 0 already reached the computation in this frame, so context
+        // 1 offers it beside 0 instead of running it in place.
+        m.sys.contexts[0].computed = Some(m.sys.completed_frames);
         assert!(matches!(m.run(), RunResult::Exited(_)));
         assert_eq!(m.sys.context(0).exit_code(), Some(23));
         assert_eq!(m.sys.context(1).exit_code(), Some(42));

@@ -112,6 +112,8 @@ fn native_regions_preserve_state_and_instruction_budgets_in_all_configurations()
         ] {
             let mut a = executor(&p, config, false);
             let mut b = executor(&p, config, true);
+            // Native regions are a mechanism of ordinary units.
+            a.native.as_mut().unwrap().keep_ordinary(CODE);
             compare(&mut a, &mut b, &p, budget);
             compare(&mut a, &mut b, &p, 100_000);
             assert_eq!(
