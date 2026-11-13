@@ -41,6 +41,10 @@ export interface Prefs {
   liveContainerImportHintSeen: boolean;
   /** iOS: permanently dismiss library and game-launch JIT warnings. */
   hideJitWarnings: boolean;
+  /** iOS: permanently dismiss the library's missing memory extension warning. */
+  hideMemoryWarning: boolean;
+  /** iOS: the one-time missing memory extension dialog has been shown. */
+  memoryNoticeSeen: boolean;
   librarySort: LibrarySort;
   /** Pinching the library grid changes the covers per row. */
   pinchZoom: boolean;
@@ -72,6 +76,8 @@ const defaults: Prefs = {
   autoJit: true,
   liveContainerImportHintSeen: false,
   hideJitWarnings: false,
+  hideMemoryWarning: false,
+  memoryNoticeSeen: false,
   librarySort: "recent",
   pinchZoom: true,
   cardWide: 132,

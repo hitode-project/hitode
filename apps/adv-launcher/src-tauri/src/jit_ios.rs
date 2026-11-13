@@ -59,6 +59,7 @@ thread_local! {
 pub struct JitStatus {
     ready: bool,
     debuggable: bool,
+    increased_memory_limit: bool,
     error: Option<String>,
     waiting: bool,
     task: Option<&'static str>,
@@ -86,9 +87,10 @@ unsafe extern "C" {
     fn CFRelease(value: *const c_void);
 }
 
-/// Query the running host's signed entitlement, including inside LiveContainer.
-fn signing_allows_debugging() -> bool {
-    let key = NSString::from_str("get-task-allow");
+/// Whether the running host's signature grants `key`, including inside
+/// LiveContainer, where the host process carries LiveContainer's signature.
+fn entitled(key: &str) -> bool {
+    let key = NSString::from_str(key);
     // SAFETY: NSString bridges to CFString; both Copy/Create results are
     // released after use. This is the Security SPI used by StikJIT's preflight.
     unsafe {
@@ -108,6 +110,15 @@ fn signing_allows_debugging() -> bool {
         CFRelease(task);
         allowed
     }
+}
+
+fn signing_allows_debugging() -> bool {
+    entitled("get-task-allow")
+}
+
+/// Whether the signature raises the memory limit and address space (IOS-MEM-4).
+pub fn increased_memory_limit() -> bool {
+    entitled("com.apple.developer.kernel.increased-memory-limit")
 }
 
 fn require_embedded_helper() -> Result<(), String> {
@@ -146,6 +157,7 @@ pub async fn jit_status(app: AppHandle) -> JitStatus {
     JitStatus {
         ready: matches!(state, Some(Ok(()))),
         debuggable: signing_allows_debugging(),
+        increased_memory_limit: increased_memory_limit(),
         error: request
             .error
             .clone()
