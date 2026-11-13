@@ -14,6 +14,9 @@ use super::{ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Runtime, Site, re
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
 use crate::translate::computation::{Evaluation, Plan, Proof, Range};
+use crate::translate::opt::front::Assumed;
+use crate::translate::opt::ir::Source;
+use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
 
 /// A helper's wake latency until helpers have shown theirs: it starts
 /// claiming this long after the owner.
@@ -123,6 +126,20 @@ pub(super) struct Code {
     pub entry: usize,
     pub end: usize,
     pub sites: Arc<[(usize, Site)]>,
+    /// The optimized form, run instead when a job meets its assumptions.
+    pub optimized: Option<Arc<Optimized>>,
+}
+
+/// An optimized form of the same unit (A64-OPT-1).
+pub(super) struct Optimized {
+    pub code: Code,
+    pub entry: Vec<Source>,
+    pub assumed: Assumed,
+    pub records: Vec<Record<Host>>,
+    pub flags: Vec<Option<FlagRecipe>>,
+    pub cells: usize,
+    /// Jobs that ran this form, for diagnostics.
+    pub runs: std::sync::atomic::AtomicU64,
 }
 
 pub(super) struct Faults<'a> {
@@ -190,6 +207,27 @@ fn run(
     let cpu = context.cpu_mut();
     cpu.settle_flags();
     cpu.refresh_mmx();
+    let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
+    // SAFETY: admission leased the job's ranges, the frame among them.
+    let optimized = code.optimized.as_deref().and_then(|o| {
+        let cells =
+            crate::translate::opt::admit(&o.entry, &o.assumed, cpu, |addr, width| unsafe {
+                match width {
+                    4 => u64::from(host(addr).cast::<u32>().read_unaligned()),
+                    _ => host(addr).cast::<u64>().read_unaligned(),
+                }
+            })?;
+        Some((o, cells))
+    });
+    let mut saved = vec![0u128; optimized.as_ref().map_or(0, |(o, _)| o.cells)];
+    let entry_esp = cpu.regs[ESP];
+    let code = optimized.as_ref().map_or(code, |(o, _)| &o.code);
+    if let Some((o, cells)) = &optimized {
+        o.runs.fetch_add(1, Ordering::Relaxed);
+        runtime.opt_params = cells.as_ptr() as u64;
+        runtime.opt_save = saved.as_mut_ptr() as u64;
+        runtime.opt_cells = o.cells as u64;
+    }
     let faults = Faults {
         code,
         stub: entry.fault,
@@ -206,6 +244,7 @@ fn run(
     runtime.completed = 0;
     runtime.head_exit = head_exit;
     runtime.deferred = 0;
+    runtime.opt_recalled = 0;
     runtime.branch = 0;
     runtime.fault_simd = faults.capture.simd.as_ptr() as u64;
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
@@ -221,10 +260,33 @@ fn run(
     let elapsed = started.elapsed();
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
-    let exit = Exit::from_raw(runtime.exit).expect("computation exit");
-    let mut retired = runtime.completed + u64::from(COMPUTATION_SLICE) - runtime.countdown;
+    let mut exit = Exit::from_raw(runtime.exit).expect("computation exit");
+    // An optimized form may leave with a negative countdown.
+    let mut retired =
+        (runtime.completed + u64::from(COMPUTATION_SLICE)).wrapping_sub(runtime.countdown);
     if exit == Exit::Optimized {
-        unreachable!("optimized worker entry is not installed");
+        let (o, _) = optimized.as_ref().expect("optimized entry");
+        let record = &o.records[runtime.opt_record as usize];
+        // SAFETY: as above, the frame lies in the leased ranges.
+        let refund = recovery::materialize(
+            record,
+            &runtime.opt_dump,
+            &saved,
+            &o.flags,
+            cpu,
+            |offset, bytes| unsafe {
+                let at = host(entry_esp.wrapping_add_signed(offset));
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+            },
+        );
+        retired = retired.wrapping_sub(u64::from(refund));
+        // Every exit but a recall, failures included, continues where the
+        // owner dispatches.
+        exit = if runtime.opt_recalled != 0 {
+            Exit::Recall
+        } else {
+            Exit::Dispatch
+        };
     }
     if exit == Exit::Fault {
         let site = super::site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
@@ -1025,6 +1087,13 @@ mod tests {
     const COUNT: u32 = 40_000;
     const SPACE: u32 = 0x4_0000;
 
+    /// The pool is process-wide: tests that need its workers take turns,
+    /// or a parallel test's blocks can fill it.
+    fn exclusive_pool() -> std::sync::MutexGuard<'static, ()> {
+        static POOL: Mutex<()> = Mutex::new(());
+        POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn fixture(a: &mut CodeAssembler) -> (Executor, Native) {
         let words = a.assemble(u64::from(CODE)).unwrap();
         let mut executor = Executor::interpreted_address_space().unwrap();
@@ -1054,6 +1123,7 @@ mod tests {
     // spec: A64-CTL-7 A64-CTL-9 A64-CTL-10 A64-TR-9
     #[test]
     fn disjoint_jobs_keep_their_prefixes_across_recall_and_refill() {
+        let _pool = exclusive_pool();
         let mut a = CodeAssembler::new(32).unwrap();
         a.nop().unwrap();
         let mut loop_head = a.create_label();
@@ -1319,6 +1389,7 @@ mod tests {
     // spec: A64-CTL-7 A64-CTL-8 A64-TR-9
     #[test]
     fn a_single_context_runs_its_head_loop_as_exact_blocks() {
+        let _pool = exclusive_pool();
         if Pool::get().is_none_or(|pool| pool.limit < 2) {
             return;
         }
@@ -1375,9 +1446,91 @@ mod tests {
         );
     }
 
+    // spec: A64-OPT-1 A64-OPT-6
+    #[test]
+    fn an_admitted_x87_loop_runs_its_optimized_form_exactly() {
+        const N: u32 = 4096;
+        // head: dst[i] *= src[i] in binary64.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(edi)).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 8;
+        let value = |i: u32, scale: f64| 1.0 + f64::from(i) / scale;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        let src: Vec<u8> = (0..N)
+            .flat_map(|i| value(i, 1024.0).to_le_bytes())
+            .collect();
+        let dst: Vec<u8> = (0..N).flat_map(|i| value(i, 3.0).to_le_bytes()).collect();
+        memory.write(SRC, &src).unwrap();
+        memory.write(DST, &dst).unwrap();
+        let expected: Vec<u8> = (0..N)
+            .flat_map(|i| (value(i, 1024.0) * value(i, 3.0)).to_le_bytes())
+            .collect();
+        executor.state.eip = CODE;
+        executor.state.regs[1] = N;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        executor.state.x87.control = 0x27f;
+        executor.state.x87.status = 0x20;
+        let start = Some(executor.save_context().unwrap());
+        native.candidates.push(CODE);
+        native.set_computation_offer(true, None);
+        let mut cpu = start.as_ref().unwrap().cpu().clone();
+        let offer = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.exit, Exit::Computation);
+        let mut retired = 0;
+        let mut done = None;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |scope| done = scope.run_local(1, &start),
+        );
+        let done = done.expect("admitted loop");
+        let optimized = native.computation[&CODE].code.optimized.as_ref();
+        let runs = optimized
+            .expect("optimized form")
+            .runs
+            .load(Ordering::Relaxed);
+        assert!(runs >= 1);
+        assert_eq!(done.retired, u64::from(N) * 7);
+        assert_eq!(executor.memory().read(DST, len).unwrap(), expected);
+        let cpu = done.context.as_ref().unwrap().cpu();
+        assert_eq!(cpu.eip, stop);
+        assert_eq!(
+            (cpu.regs[1], cpu.regs[6], cpu.regs[7]),
+            (0, SRC + N * 8, DST + N * 8)
+        );
+        assert_eq!(cpu.x87.tag, 0xffff);
+    }
+
     // spec: A64-TR-9
     #[test]
     fn blocks_run_frame_writing_iterations_on_private_frames() {
+        let _pool = exclusive_pool();
         fn word(executor: &Executor, addr: u32) -> u32 {
             u32::from_le_bytes(executor.memory().read(addr, 4).unwrap().try_into().unwrap())
         }
@@ -1729,6 +1882,7 @@ mod tests {
     // spec: A64-MEM-5 A64-MEM-9
     #[test]
     fn private_fault_capture_preserves_the_exact_prefix() {
+        let _pool = exclusive_pool();
         let mut a = CodeAssembler::new(32).unwrap();
         a.mov(eax, 42).unwrap();
         a.mov(dword_ptr(edi), eax).unwrap();
@@ -1770,6 +1924,7 @@ mod tests {
                 .iter()
                 .map(|&(offset, site)| (at + offset, site))
                 .collect(),
+            optimized: None,
         };
         let entry = Entry {
             enter: native.enter,

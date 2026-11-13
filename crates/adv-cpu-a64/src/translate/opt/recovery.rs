@@ -301,6 +301,30 @@ pub(crate) fn materialize(
     record.refund
 }
 
+/// The binary64 bits of an x87 register that holds a binary64 value
+/// exactly; `None` for NaN, unnormals and values binary64 cannot hold.
+pub(crate) fn binary64(reg: adv_cpu_core::state::X87Register) -> Option<u64> {
+    let (m, se) = (reg.significand(), reg.sign_exponent());
+    let sign = u64::from(se & 0x8000) << 48;
+    let e = i32::from(se & 0x7fff);
+    if m == 0 {
+        return (e == 0).then_some(sign);
+    }
+    if m >> 63 == 0 {
+        return None;
+    }
+    if e == 0x7fff {
+        return (m == 1 << 63).then_some(sign | 0x7ff << 52);
+    }
+    let exp = e - 16383;
+    if exp >= -1022 {
+        return (exp <= 1023 && m & 0x7ff == 0)
+            .then(|| sign | ((exp + 1023) as u64) << 52 | (m >> 11) & ((1 << 52) - 1));
+    }
+    let shift = u32::try_from(-1011 - exp).ok().filter(|&s| s < 64)?;
+    (m & ((1 << shift) - 1) == 0).then_some(sign | m >> shift)
+}
+
 fn binary80(bits: u64) -> adv_cpu_core::state::X87Register {
     let sign = ((bits >> 48) as u16) & 0x8000;
     let exponent = (bits >> 52) & 0x7ff;

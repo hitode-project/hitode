@@ -854,6 +854,7 @@ impl Native {
                 interpret: base + stubs.interpret,
                 call: base + stubs.call,
                 fault: base + stubs.fault,
+                opt_exit: base + stubs.opt_exit,
             },
             units: FxHashMap::default(),
             pages: FxHashMap::default(),
@@ -1046,8 +1047,12 @@ impl Native {
             }
             None => {
                 let before = self.cache.used();
-                let entry = self.translate(memory, cpu.eip)?;
-                (entry, self.cache.used().saturating_sub(before))
+                let eip = cpu.eip;
+                // Optimized forms take their entry facts from this state.
+                self.runtime.cpu = cpu;
+                let entry = self.translate(memory, eip);
+                self.runtime.cpu = std::ptr::null_mut();
+                (entry?, self.cache.used().saturating_sub(before))
             }
         };
         if self.skip_offer != Some(cpu.eip)
@@ -1650,9 +1655,10 @@ impl Native {
                     .map(|probe| probe.proof)
                     .or_else(|| computation_proof(memory, &work.unit.trace));
                 if let Some(proof) = proof
-                    && let Some(code) =
+                    && let Some(mut code) =
                         self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
                 {
+                    code.optimized = self.emit_optimized(&work.unit, eip, &proof);
                     let iterates = work.unit.trace.returns_at_head();
                     self.diagnostics.split_proofs += u64::from(proof.splits());
                     self.computation
@@ -1701,7 +1707,54 @@ impl Native {
             entry,
             end: entry + code.words.len() * 4,
             sites: sites.into(),
+            optimized: None,
         })
+    }
+
+    /// The optimized form of an admitted unit, assuming the owner's current
+    /// x87, MXCSR and stack-alignment facts (A64-OPT-1).
+    fn emit_optimized(
+        &mut self,
+        unit: &translate::Unit,
+        eip: u32,
+        proof: &translate::computation::Proof,
+    ) -> Option<Arc<worker::Optimized>> {
+        if self.runtime.cpu.is_null() {
+            return None;
+        }
+        // SAFETY: the owner's state is live while it translates.
+        let at = unsafe { &*self.runtime.cpu };
+        let built = translate::opt::front::build(unit, proof, at).ok()?;
+        let lowered =
+            translate::opt::back::lower(&built.func, self.cache.next(), self.stubs.opt_exit);
+        let entry = self.cache.append(&lowered.words)?;
+        let mut sites: Vec<_> = lowered
+            .sites
+            .iter()
+            .map(|&(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        crate::jit_map::record(
+            entry,
+            &lowered.words,
+            eip,
+            unit.trace.prepaid(0),
+            &lowered.marks,
+        );
+        Some(Arc::new(worker::Optimized {
+            code: worker::Code {
+                entry,
+                end: entry + lowered.words.len() * 4,
+                sites: sites.into(),
+                optimized: None,
+            },
+            entry: built.func.entry,
+            assumed: built.assumed,
+            records: lowered.records,
+            flags: lowered.flags,
+            cells: lowered.spill_cells,
+            runs: Default::default(),
+        }))
     }
 
     /// A budget exit samples where owner time goes. It nominates the

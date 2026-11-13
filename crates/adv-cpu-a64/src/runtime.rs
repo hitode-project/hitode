@@ -140,7 +140,13 @@ pub struct Runtime {
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
     pub opt_fpcr: u64,
+    /// Where `opt_exit` saves the form's `opt_cells` spill cells before it
+    /// discards their stack frame.
+    pub opt_save: u64,
+    pub opt_cells: u64,
     pub opt_record: u32,
+    /// Nonzero when an optimized form left at a checkpoint for a recall.
+    pub opt_recalled: u32,
     pub opt_dump: RegisterDump,
 }
 
@@ -188,7 +194,10 @@ impl Runtime {
             deferred: 0,
             opt_params: 0,
             opt_fpcr: 0,
+            opt_save: 0,
+            opt_cells: 0,
             opt_record: 0,
+            opt_recalled: 0,
             opt_dump: RegisterDump::default(),
         }
     }
@@ -339,6 +348,7 @@ pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
+pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
@@ -727,6 +737,9 @@ fn emit_opt_exit(asm: &mut Asm) {
     for n in 0..32 {
         asm.emit(str_v(VSize::Q, v(n), RUNTIME, vectors + 16 * u32::from(n)));
     }
+    // The dump holds every register now; save the spill cells, which the
+    // caller's next frames would overwrite.
+    let (copy, done) = (asm.label(), asm.label());
     asm.emit_all(&[
         mov_sp(r(16), SP),
         str(
@@ -735,6 +748,19 @@ fn emit_opt_exit(asm: &mut Asm) {
             RUNTIME,
             dump + offset_of!(RegisterDump, sp) as u32,
         ),
+        ldr(X, r(15), RUNTIME, offset_of!(Runtime, opt_save) as u32),
+        ldr(X, r(17), RUNTIME, offset_of!(Runtime, opt_cells) as u32),
+    ]);
+    asm.bind(copy);
+    asm.cbz(X, false, r(17), done);
+    asm.emit_all(&[
+        ldp(X, Post, r(0), r(1), r(16), 16),
+        stp(X, Post, r(0), r(1), r(15), 16),
+        sub_imm(X, r(17), r(17), 1, false),
+    ]);
+    asm.b(copy);
+    asm.bind(done);
+    asm.emit_all(&[
         ldr(X, r(16), RUNTIME, offset_of!(Runtime, opt_fpcr) as u32),
         msr_fpcr(r(16)),
         movz(W, r(16), Exit::Optimized as u16, 0),

@@ -73,6 +73,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             access: host,
             interpret: host,
             fault: host,
+            opt_exit: host,
         };
         let features = Features { flagm: false };
         let no_calls = |_, _| None;
@@ -126,6 +127,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         access: HOST_CODE as usize,
         interpret: HOST_CODE as usize,
         fault: HOST_CODE as usize,
+        opt_exit: HOST_CODE as usize,
     };
     translate(
         &mut work,
@@ -328,6 +330,7 @@ impl Harness {
             access: addr(self.forbidden),
             interpret: addr(self.forbidden),
             fault: addr(self.forbidden),
+            opt_exit: addr(self.forbidden),
         };
         translate(
             &mut work,
@@ -917,6 +920,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
             access: HOST_CODE as usize,
             interpret: HOST_CODE as usize,
             fault: HOST_CODE as usize,
+            opt_exit: HOST_CODE as usize,
         };
         for writable_tail in [false, true] {
             if writable_tail {
@@ -1011,6 +1015,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
             access: at,
             interpret: at,
             fault: at,
+            opt_exit: at,
         },
         &|_, _| None,
         &|_| None,
@@ -1192,6 +1197,7 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
             access: at,
             interpret: at,
             fault: at,
+            opt_exit: at,
         };
         let mut totals = Vec::new();
         for facts in [None, Some(&proof)] {
@@ -1776,7 +1782,7 @@ mod opt_back {
                 ret(Reg::LR),
             ]);
             let at = code.len() * 4;
-            let lowered = back::lower(func, at, &self.stubs);
+            let lowered = back::lower(func, at, self.stubs.opt_exit);
             code.extend_from_slice(&lowered.words);
             let mut context = vec![0; size_of::<runtime::Runtime>()];
             let mut put = |offset: usize, value: &[u8]| {
@@ -3016,7 +3022,7 @@ mod opt_back {
         let k = f.push(b, Op::Constant(Type::I32, 7)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
         finish(&mut f, b, v);
-        let lower = back::lower(&f, 0, &stubs);
+        let lower = back::lower(&f, 0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "one ADD plus exit branch");
         assert_eq!(
             body(&lower, 0)[0],
@@ -3070,7 +3076,7 @@ mod opt_back {
             let exit = f.record(record(0x2000));
             f.end(block, End::Exit(exit));
         }
-        let lower = back::lower(&f, 0, &stubs);
+        let lower = back::lower(&f, 0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "CMP plus conditional branch");
         assert_eq!(body(&lower, 0)[0], cmp_imm(W, Reg::new(0), 5, false));
         assert_eq!(body(&lower, 0)[1] & 0xff00_001f, b_cond(Cond::Hi, 0));
@@ -3080,7 +3086,7 @@ mod opt_back {
         f.push(b, Op::Validate);
         let exit = f.record(record(0x2000));
         f.end(b, End::Exit(exit));
-        let lower = back::lower(&f, 0, &stubs);
+        let lower = back::lower(&f, 0, stubs.opt_exit);
         let start = lower.marks[1].offset as usize / 4;
         assert_eq!(lower.words[start - 2], sub_imm(X, X9, X9, 3, false));
         assert_eq!(lower.words[start - 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
@@ -3158,7 +3164,7 @@ mod opt_back {
                 },
             );
             finish(&mut f, done, total);
-            let lower = back::lower(&f, 0, &runtime::stubs());
+            let lower = back::lower(&f, 0, runtime::stubs().opt_exit);
             let head_code = body(&lower, 1);
             assert_eq!(
                 head_code[0],

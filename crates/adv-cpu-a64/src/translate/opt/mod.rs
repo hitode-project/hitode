@@ -63,3 +63,45 @@ pub(crate) mod front;
 pub(crate) mod ir;
 pub(crate) mod recovery;
 pub(crate) mod verify;
+
+use adv_cpu_core::CpuState;
+
+use front::Assumed;
+use ir::Source;
+
+/// The entry cells of an optimized form when `cpu` meets the facts it
+/// assumes, or `None`. `frame` reads `width` guest bytes at an address.
+pub(crate) fn admit(
+    entry: &[Source],
+    assumed: &Assumed,
+    cpu: &CpuState,
+    frame: impl Fn(u32, u8) -> u64,
+) -> Option<Vec<u128>> {
+    let x87 = &cpu.x87;
+    let esp = cpu.regs[4];
+    let holds = x87.control == assumed.control
+        && x87.status & !0x3800 == assumed.status
+        && x87.ip == assumed.ip
+        && x87.opcode == assumed.opcode
+        && x87.top() as u8 == assumed.top
+        && x87.tag == assumed.tags
+        && cpu.mxcsr == assumed.mxcsr
+        && (esp & 15) as u8 == assumed.esp_low;
+    if !holds {
+        return None;
+    }
+    entry
+        .iter()
+        .map(|&source| {
+            Some(match source {
+                Source::Reg(i) => u128::from(cpu.regs[usize::from(i)]),
+                Source::Eflags => u128::from(cpu.eflags),
+                Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
+                Source::X87(i) => u128::from(recovery::binary64(x87.regs[usize::from(i)])?),
+                Source::Frame { offset, width } => {
+                    u128::from(frame(esp.wrapping_add_signed(offset), width))
+                }
+            })
+        })
+        .collect()
+}

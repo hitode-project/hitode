@@ -52,7 +52,7 @@ mod native_region;
 mod ops;
 // The optimizing tier lands before its back end and integration use it.
 #[allow(dead_code)]
-mod opt;
+pub(crate) mod opt;
 pub(crate) mod parts;
 mod residency;
 mod simd;
@@ -271,6 +271,8 @@ pub struct Stubs {
     pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,
+    /// Where an optimized form leaves through a record.
+    pub opt_exit: usize,
 }
 
 const X0: Reg = Reg::new(0);

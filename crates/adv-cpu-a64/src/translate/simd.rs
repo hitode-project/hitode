@@ -2324,6 +2324,7 @@ mod tests {
                 access: 0,
                 interpret: 0,
                 fault: 0,
+                opt_exit: 0,
             },
             &|_, _| None,
             &|_| None,

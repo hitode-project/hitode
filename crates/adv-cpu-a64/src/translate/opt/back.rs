@@ -9,7 +9,7 @@ use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::jit_map::{Mark, Part};
-use crate::runtime::{self, Runtime, Stubs};
+use crate::runtime::{self, Runtime};
 use crate::translate::{Carry, Overflow, Sense, Site};
 use std::mem::offset_of;
 
@@ -36,8 +36,8 @@ pub(crate) struct Lowered {
     pub spill_cells: usize,
 }
 
-/// `at` and the stub offsets share a code origin. Entry cells are 16 bytes.
-pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
+/// `at` and `opt_exit` share a code origin. Entry cells are 16 bytes.
+pub(crate) fn lower(func: &Func, at: usize, opt_exit: usize) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func);
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
@@ -171,7 +171,12 @@ pub(crate) fn lower(func: &Func, at: usize, stubs: &Stubs) -> Lowered {
         e.imm(T, i as u64);
         e.asm.emit(str(W, T, RT, RECORD));
         e.asm
-            .emit(b(stubs.opt_exit as i32 - (at + e.asm.offset()) as i32));
+            .emit(b(opt_exit as i32 - (at + e.asm.offset()) as i32));
+    }
+    // A host fault leaves through its region's record like a failed check.
+    for (offset, site) in &mut e.sites {
+        let cold = e.cold[site.opt_record.expect("optimized site") as usize];
+        site.resume = (e.asm.position(cold) as i64 - *offset as i64) as i32;
     }
     let records = func
         .records
@@ -419,7 +424,9 @@ impl<'a> Emitter<'a> {
         for (label, record, resume) in std::mem::take(&mut self.checkpoints) {
             self.asm.bind(label);
             self.mark(Part::Cold, self.func.records[record.0 as usize].eip);
-            let leave = self.cold[record.0 as usize];
+            // A recall leaves through the record as the ordinary form's
+            // budget exit does.
+            let leave = self.asm.label();
             let recalled = if self.func.head_exit.is_some() {
                 self.asm.label()
             } else {
@@ -465,6 +472,10 @@ impl<'a> Emitter<'a> {
             ]);
             self.imm(COUNT, u64::from(runtime::COMPUTATION_SLICE - refund));
             self.asm.b(resume);
+            self.asm.bind(leave);
+            self.asm
+                .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::OPT_RECALLED)]);
+            self.asm.b(self.cold[record.0 as usize]);
         }
     }
 

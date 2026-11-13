@@ -77,6 +77,7 @@ fn no_operation_calls(p: &Program) {
         interpret: at + 0x10018,
         call: at + 0x10020,
         fault: at + 0x10024,
+        opt_exit: at + 0x10024,
     };
     translate(
         &mut work,
