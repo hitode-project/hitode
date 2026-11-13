@@ -2,7 +2,7 @@
   import { t } from "../lib/i18n.svelte";
   import { onMount, untrack } from "svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
-  import { prefs, savePrefs } from "../lib/prefs.svelte";
+  import { prefs, savePrefs, type FastForward } from "../lib/prefs.svelte";
   import { filterOverride, gameFilter, setGameFilter } from "../lib/upscaling.svelte";
   import { playback } from "../lib/playback";
   import { loadGameSetup, saveGameSetup } from "../lib/fake-settings";
@@ -52,6 +52,7 @@
 
   type Scale = "int" | "fit" | "stretch";
   let scale = $state<Scale>(untrack(() => playback(gameId).scale));
+  let ff = $state<FastForward>(untrack(() => playback(gameId).toggle ? "toggle" : "hold"));
   let filterError = $state("");
   $effect(() => {
     const filter = gameFilter(gameId);
@@ -73,7 +74,7 @@
   }
   $effect(() => {
     if (!gameView) return;
-    const value = { ...playback(gameId), scale };
+    const value = { ...playback(gameId), scale, toggle: ff === "toggle" };
     void call("set_game_playback", { playback: value }, null).catch((e) => filterError = String(e));
   });
   let touchMode = $derived(prefs.touchMode);
@@ -135,11 +136,20 @@
   const sparkline = $derived(
     frames.map((v, i) => `${((i * 148) / Math.max(1, frames.length - 1)).toFixed(1)},${graphY(v)}`).join(" "),
   );
+  function updateOverrides(patch: { scale?: Scale; ff?: FastForward }) {
+    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
+    Object.assign(setup.overrides, patch);
+    saveGameSetup(gameId, setup);
+  }
+
   function pickScale(value: Scale) {
     scale = value;
-    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
-    setup.overrides.scale = value;
-    saveGameSetup(gameId, setup);
+    updateOverrides({ scale: value });
+  }
+
+  function pickFf(value: FastForward) {
+    ff = value;
+    updateOverrides({ ff: value });
   }
 
   const started = Date.now();
@@ -149,6 +159,11 @@
     return () => clearInterval(timer);
   });
   const sessionMinutes = $derived(Math.max(0, Math.floor((now - started) / 60_000)));
+
+  const fastForwards: { value: FastForward; label: string }[] = [
+    { value: "hold", label: t("按住") },
+    { value: "toggle", label: t("切换") },
+  ];
 
   const scales: { value: Scale; label: string }[] = [
     { value: "int", label: t("整数倍") },
@@ -478,6 +493,14 @@
                 </div>
               </div>
               <div class="prow">
+                <span>{t("快进键")}</span>
+                <div class="seg" role="group" aria-label={t("快进键")}>
+                  {#each fastForwards as o (o.value)}
+                    <button class:on={ff === o.value} aria-pressed={ff === o.value} onclick={() => pickFf(o.value)}>{o.label}</button>
+                  {/each}
+                </div>
+              </div>
+              <div class="prow">
                 <span>{t("音量")}</span>
                 <div class="vol">
                   <button class="ibtn" class:on={muted} aria-label={t("静音")} aria-pressed={muted} onclick={() => { prefs.muted = !muted; savePrefs(); }}>
@@ -566,7 +589,7 @@
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
   {:else if phone && !prefs.hideControls && screen.layout}
     {#if !stopping}
-      <TouchControls layout={screen.layout} latchCtrl={playback(gameId).toggle} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <TouchControls layout={screen.layout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
   {:else if phone && !prefs.hideControls}
     <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
