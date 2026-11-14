@@ -1,7 +1,6 @@
 use super::*;
 use crate::translate::decode::{Alu, Narrow8or16, ShiftKind};
 use crate::translate::integer::Integer;
-use crate::translate::parts::Count;
 
 impl Front<'_> {
     pub(super) fn instruction(&mut self) -> Result<(), Reject> {
@@ -73,7 +72,7 @@ impl Front<'_> {
                     Some(n) => self.imm(n),
                     None => self.state.regs[1],
                 };
-                self.shift(kind, part(dst), 4, count)?;
+                self.shift(kind, dst, count)?;
             }
             D::Push(src) => {
                 let value = self.src(src)?;
@@ -147,36 +146,6 @@ impl Front<'_> {
                     dividend,
                     divisor,
                 });
-            }
-            D::Integer(Integer::NarrowNeg(r, width)) => self.unary(M::Neg, Part::Reg(r), width)?,
-            D::Integer(Integer::MemoryNeg(dst, width)) => self.unary(M::Neg, dst, width)?,
-            D::Integer(Integer::Complement(dst, width)) => self.unary(M::Not, dst, width)?,
-            D::Integer(Integer::NarrowShift(kind, r, width, count)) => {
-                let count = self.imm(count);
-                self.shift(kind, Part::Reg(r), width, count)?;
-            }
-            D::Integer(Integer::Extend(dst, src, dw, sw, signed)) => {
-                let value = self.extend(src, sw, signed)?;
-                self.put_part(dst, dw, value)?;
-            }
-            D::Parts(p) => {
-                if let Some(count) = p.count {
-                    let kind = match p.kind {
-                        M::Shl | M::Sal => ShiftKind::Shl,
-                        M::Shr => ShiftKind::Shr,
-                        M::Sar => ShiftKind::Sar,
-                        _ => return Err(Reject::Unsupported(self.index)),
-                    };
-                    let count = match count {
-                        Count::Imm(n) => self.imm(u32::from(n)),
-                        Count::Cl => self.state.regs[1],
-                    };
-                    self.shift(kind, p.dst, p.width, count)?;
-                } else if let Some((src, _)) = p.source {
-                    self.binary(p.kind, p.dst, src, p.width)?;
-                } else {
-                    return Err(Reject::Unsupported(self.index));
-                }
             }
             D::Helper(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
             D::Simd(s) if s.mmx() => return Err(Reject::Mmx(self.index)),
@@ -329,22 +298,17 @@ impl Front<'_> {
         };
         Ok(self.value(Op::IntUnary(op, value)))
     }
-    fn shift(&mut self, kind: ShiftKind, dst: Part, width: u8, count: Value) -> Result<(), Reject> {
-        let a = self.part(dst, width)?;
-        let input = if kind == ShiftKind::Sar {
-            self.extend(dst, width, true)?
-        } else {
-            a
-        };
+    fn shift(&mut self, kind: ShiftKind, dst: Src, count: Value) -> Result<(), Reject> {
+        let a = self.src(dst)?;
         let (op, flag) = match kind {
             ShiftKind::Shl => (IntOp::Shl, FlagKind::Shl),
             ShiftKind::Shr => (IntOp::Shr, FlagKind::Shr),
             ShiftKind::Sar => (IntOp::Sar, FlagKind::Sar),
             _ => return Err(Reject::Unsupported(self.index)),
         };
-        let result = self.int(op, input, count);
-        self.flags(flag, width, a, count);
-        self.put_part(dst, width, result)
+        let result = self.int(op, a, count);
+        self.flags(flag, 4, a, count);
+        self.put(dst, result)
     }
     fn push(&mut self, value: Value) -> Result<(), Reject> {
         let mem = Mem {
