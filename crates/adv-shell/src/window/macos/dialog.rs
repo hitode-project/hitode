@@ -39,7 +39,7 @@ fn kind(control: &DialogControl) -> Kind {
             _ => Kind::Push,
         },
         "static" => match control.style & 0x1f {
-            7..=9 => Kind::Frame,
+            7..=9 | 16..=18 => Kind::Frame,
             _ => Kind::Label,
         },
         "edit" => Kind::Edit,
@@ -509,8 +509,18 @@ impl HostDialog {
                 offset.1 + control.rect.bottom,
             );
             let native = self.controls.entry(control.target.hwnd).or_insert_with(|| {
+                let kind = kind(control);
                 let view = create(mtm, target, control);
-                self.content.addSubview(&view);
+                if matches!(kind, Kind::Group | Kind::Frame | Kind::Unavailable) {
+                    let first = self.content.subviews().firstObject();
+                    self.content.addSubview_positioned_relativeTo(
+                        &view,
+                        NSWindowOrderingMode::Below,
+                        first.as_deref(),
+                    );
+                } else {
+                    self.content.addSubview(&view);
+                }
                 if !control.supported {
                     log::warn!(
                         "native dialog control unavailable: class={} guest={:#x}",
@@ -520,7 +530,7 @@ impl HostDialog {
                 }
                 Control {
                     view,
-                    kind: kind(control),
+                    kind,
                     source: DialogControl {
                         // Forces the first projection of every property.
                         text: "\u{0}".into(),

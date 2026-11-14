@@ -192,7 +192,7 @@ fn kind(control: &DialogControl) -> &'static str {
             _ => "push",
         },
         "static" => match control.style & 0x1f {
-            7..=9 => "frame",
+            7..=9 | 16..=18 => "frame",
             _ => "label",
         },
         "edit" => "edit",
@@ -454,5 +454,44 @@ pub fn touch_mode(mode: &str) -> Result<adv_shell::mobile::TouchMode, String> {
         "direct" => Ok(adv_shell::mobile::TouchMode::Direct),
         "trackpad" => Ok(adv_shell::mobile::TouchMode::Trackpad),
         _ => Err(format!("unknown touch mode {mode}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(class: &str, style: u32, supported: bool) -> DialogControl {
+        DialogControl {
+            target: DialogTarget {
+                dialog: 1,
+                hwnd: 2,
+                parent: 1,
+                id: 100,
+                created_us: 0,
+            },
+            class: class.into(),
+            style,
+            ex_style: 0,
+            text: String::new(),
+            rect: Default::default(),
+            visible: true,
+            enabled: true,
+            check: 0,
+            selection: -1,
+            items: Vec::new(),
+            range: None,
+            value: 0,
+            font: None,
+            supported,
+        }
+    }
+
+    #[test]
+    fn etched_static_maps_to_frame() {
+        for style in [0x5000_0010, 0x5000_0011, 0x5000_0012] {
+            assert_eq!(kind(&control("Static", style, true)), "frame");
+        }
+        assert_eq!(kind(&control("Static", 0x5000_000e, false)), "unavailable");
     }
 }

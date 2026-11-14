@@ -22,7 +22,7 @@ mod mac {
     use objc2::runtime::AnyObject;
     use objc2::{MainThreadMarker, msg_send};
     use objc2_app_kit::{
-        NSApplication, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSPopUpButton,
+        NSApplication, NSBox, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSPopUpButton,
         NSTextField, NSView, NSWindow,
     };
     use objc2_core_foundation::{
@@ -697,6 +697,51 @@ mod mac {
         std::fs::write(&path, png.to_vec()).unwrap();
         window.set_dialogs(&DialogSet::default()).unwrap();
         println!("ok dialog captions ({})", path.display());
+
+        // An etched static frame covering earlier buttons becomes an NSBox
+        // ordered behind them so clicks still land on the buttons.
+        let mut yes = control(0x221, "Button", 0x5001_0001, "Yes", 0);
+        (yes.rect.left, yes.rect.top, yes.rect.right, yes.rect.bottom) = (28, 48, 116, 69);
+        let mut no = control(0x222, "Button", 0x5001_0000, "No", 0);
+        (no.rect.left, no.rect.top, no.rect.right, no.rect.bottom) = (124, 48, 212, 69);
+        let mut frame = control(0x223, "Static", 0x5000_0012, "", 0);
+        (
+            frame.rect.left,
+            frame.rect.top,
+            frame.rect.right,
+            frame.rect.bottom,
+        ) = (2, 3, 240, 77);
+        let mut framed_dialog = set.dialogs[0].clone();
+        framed_dialog.text = "Confirm".into();
+        framed_dialog.style = 0;
+        framed_dialog.client_size = (242, 78);
+        framed_dialog.controls = vec![yes, no, frame];
+        window
+            .set_dialogs(&DialogSet {
+                dialogs: vec![framed_dialog],
+            })
+            .unwrap();
+        let panel = find_window(mtm, "Confirm");
+        let views = subviews(&panel);
+        assert!(views[0].downcast_ref::<NSBox>().is_some());
+        let yes_button = views[1].downcast_ref::<NSButton>().unwrap();
+        let content = panel.contentView().unwrap();
+        let yes_frame = yes_button.frame();
+        let superview = unsafe { content.superview() };
+        let center = content.convertPoint_toView(
+            NSPoint::new(
+                yes_frame.origin.x + yes_frame.size.width / 2.0,
+                yes_frame.origin.y + yes_frame.size.height / 2.0,
+            ),
+            superview.as_deref(),
+        );
+        let hit = content.hitTest(center);
+        assert_eq!(
+            hit.and_then(|v| v.downcast_ref::<NSButton>().map(|b| b.title().to_string())),
+            Some("Yes".into())
+        );
+        window.set_dialogs(&DialogSet::default()).unwrap();
+        println!("ok etched frame ordering");
 
         // Exercise delegate notifications without showing a window, sleeping
         // the machine, or terminating the test process.

@@ -75,9 +75,11 @@
     !c.text.includes("\n") && c.height < 2 * (c.fontSize ?? d.fontSize) * 1.25;
   const justify = ["flex-start", "center", "flex-end"];
   /** Group boxes sit under the controls they frame. */
+  const background = (c: DialogControl) =>
+    c.kind === "group" || c.kind === "frame" || c.kind === "unavailable";
   const framed = (d: GuestDialog) => [
-    ...d.controls.filter((c) => c.kind === "group" || c.kind === "frame"),
-    ...d.controls.filter((c) => c.kind !== "group" && c.kind !== "frame"),
+    ...d.controls.filter(background),
+    ...d.controls.filter((c) => !background(c)),
   ];
 </script>
 
@@ -220,6 +222,9 @@
   .toggle:disabled,
   .off {
     opacity: 0.45;
+  }
+  .off {
+    pointer-events: none;
   }
   .group,
   .frame {
