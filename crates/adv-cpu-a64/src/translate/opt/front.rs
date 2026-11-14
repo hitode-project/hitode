@@ -522,7 +522,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
     }) {
         return Err(Reject::Flags(b - 1));
     }
-    debug_assert_eq!(super::verify::verify(&f.func), Ok(()));
+    assert_eq!(super::verify::verify(&f.func), Ok(()));
     Ok((f.func, f.assumed))
 }
 
