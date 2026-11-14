@@ -675,6 +675,26 @@ fn reads_that_a_store_may_reach_keep_their_order() {
     }
 }
 
+// spec: A64-OPT-2
+#[test]
+fn a_constant_shift_by_zero_keeps_the_flags() {
+    let code = assemble(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.xor(ecx, ecx).unwrap();
+        a.mov(eax, 2).unwrap();
+        a.cmp(eax, 5).unwrap();
+        a.shl(eax, cl).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.lea(edi, dword_ptr(edi + 4)).unwrap();
+        a.dec(edx).unwrap();
+        a.jne(top).unwrap();
+    });
+    let mut at = initial();
+    at.regs[2] = 3;
+    differential(&code, &at, |_| {});
+}
+
 // spec: A64-OPT-2, A64-OPT-3, A64-OPT-6
 #[test]
 fn a_frame_float_copy_needs_no_second_x87_load_check() {

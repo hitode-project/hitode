@@ -787,6 +787,8 @@ fn flags_constant(kind: FlagKind, width: u8, x: u32, y: u32, mut out: u32) -> Op
                 width,
             );
         }
+        // A count of zero keeps the flags.
+        FlagKind::Shl | FlagKind::Shr | FlagKind::Sar if y & 31 == 0 => {}
         FlagKind::Shl | FlagKind::Shr | FlagKind::Sar => {
             integer::shift(
                 &mut out,
