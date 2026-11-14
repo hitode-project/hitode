@@ -2860,7 +2860,10 @@ mod opt_back {
                 },
             )
             .unwrap();
-        let done = f.block(None);
+        let done_record = f.record(record(0x1200));
+        let done = f.block(Some(Head {
+            record: done_record,
+        }));
         f.end(
             head,
             End::Branch {

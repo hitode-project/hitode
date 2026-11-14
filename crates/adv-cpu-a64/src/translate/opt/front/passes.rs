@@ -944,6 +944,9 @@ fn dead(func: &mut Func) {
 }
 
 fn validations(func: &mut Func) {
+    let heads: Vec<bool> = func.blocks.iter().map(|b| b.head.is_some()).collect();
+    let end_validates =
+        |end: &End| matches!(end, End::Exit(_)) || end.targets().any(|t| heads[t.block.0 as usize]);
     let mut pending = vec![false; func.blocks.len()];
     loop {
         let mut changed = false;
@@ -956,11 +959,13 @@ fn validations(func: &mut Func) {
                     p || op.floating()
                 };
             }
-            for t in block.end.targets() {
-                let to = t.block.0 as usize;
-                if func.blocks[to].head.is_none() && p && !pending[to] {
-                    pending[to] = true;
-                    changed = true;
+            if !end_validates(&block.end) {
+                for t in block.end.targets() {
+                    let to = t.block.0 as usize;
+                    if !heads[to] && p && !pending[to] {
+                        pending[to] = true;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -968,7 +973,6 @@ fn validations(func: &mut Func) {
             break;
         }
     }
-    let heads: Vec<bool> = func.blocks.iter().map(|b| b.head.is_some()).collect();
     for (b, block) in func.blocks.iter_mut().enumerate() {
         let mut p = pending[b];
         let mut insts = Vec::new();
@@ -980,9 +984,7 @@ fn validations(func: &mut Func) {
             p |= inst.1.floating();
             insts.push(inst);
         }
-        if p && (matches!(block.end, End::Exit(_))
-            || block.end.targets().any(|t| heads[t.block.0 as usize]))
-        {
+        if p && end_validates(&block.end) {
             insts.push((None, Op::Validate));
         }
         block.insts = insts;

@@ -438,12 +438,13 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         f.state = state;
         let inst = unit.trace.insts[i];
         // A head by the IR's definition: arrivals from later instructions
-        // (loops), charged arrivals, or arrivals from different regions.
-        // Other merges continue the region their arrivals share.
+        // (loops), edges that adjust the countdown, or arrivals from
+        // different regions. Other merges continue the region their arrivals
+        // share.
         let from = &arrivals[i];
         let mut region = from.first().and_then(|&p| regions[p]);
         if unit.trace.head(i)
-            || from.iter().any(|&p| unit.trace.net(p, i) > 0)
+            || from.iter().any(|&p| unit.trace.net(p, i) != 0)
             || from
                 .iter()
                 .any(|&p| regions[p].is_none() || regions[p] != region)

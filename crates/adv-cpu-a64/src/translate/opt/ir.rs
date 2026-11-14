@@ -301,9 +301,9 @@ pub(crate) struct Target {
     pub block: Block,
     pub args: Vec<Value>,
     /// Instructions the edge charges to the countdown, as the trace's edge
-    /// net: a positive charge checks the countdown and may leave at the
-    /// target, which is then a head with a complete record; a negative one
-    /// refunds.
+    /// net: a nonzero edge reaches a head, and a positive charge checks the
+    /// countdown and may leave there through its complete record; a negative
+    /// one refunds.
     pub charge: i32,
 }
 
@@ -332,8 +332,9 @@ impl End {
 }
 
 /// A region start that arrivals reach with no unvalidated result: block 0,
-/// loop heads, targets of charged edges, and merges of arrivals from
-/// different regions. Code at a head comes only from its arrivals' charges.
+/// loop heads, targets of edges that adjust the countdown, and merges of
+/// arrivals from different regions. Code at a head comes only from its
+/// arrivals' charges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
     pub record: RecordId,

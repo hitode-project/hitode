@@ -6,8 +6,8 @@ use super::ir::{Block, End, Func, Op, RecordId, Type, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
-    /// Block 0 is not a head, a charged edge reaches a block that is not,
-    /// or a block has no end.
+    /// Block 0 is not a head, an edge that adjusts the countdown reaches a
+    /// block that is not, or a block has no end.
     Shape(Block),
     /// A use the definition does not dominate.
     Undominated(Value),
@@ -119,11 +119,11 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
             if types(params) != types(&target.args) {
                 return Err(Error::Type(Block(b as u32)));
             }
-            if target.charge > 0 {
+            if target.charge != 0 {
                 let Some(head) = blocks[target.block.0 as usize].head else {
                     return Err(Error::Shape(target.block));
                 };
-                if func.records[head.record.0 as usize].eflags.is_none() {
+                if target.charge > 0 && func.records[head.record.0 as usize].eflags.is_none() {
                     return Err(Error::Record(head.record));
                 }
             }
@@ -462,13 +462,17 @@ mod tests {
         let tail = f.block(None);
         let exit = f.record(record([Some(eax); 8]));
         f.end(tail, End::Exit(exit));
-        let to_tail = Target {
-            block: tail,
-            args: Vec::new(),
-            charge: 1,
-        };
-        f.end(body, End::Jump(to_tail));
-        assert_eq!(verify(&f), Err(Error::Shape(tail)));
+        for charge in [-1, 1] {
+            f.end(
+                body,
+                End::Jump(Target {
+                    block: tail,
+                    args: Vec::new(),
+                    charge,
+                }),
+            );
+            assert_eq!(verify(&f), Err(Error::Shape(tail)));
+        }
         let mut partial = record([Some(eax); 8]);
         partial.eflags = None;
         let start = f.record(partial);

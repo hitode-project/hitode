@@ -893,6 +893,38 @@ fn rejects_unproved_modes_escaping_frames_and_unsupported_forms() {
     assert!(matches!(rejected(&sse, &initial()), Reject::Unsupported(_)));
 }
 
+// spec: A64-OPT-6
+#[test]
+fn a_failure_after_a_refunded_branch_keeps_retirement_exact() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            let mut cold = a.create_label();
+            let mut done = a.create_label();
+            a.mov(eax, dword_ptr(esi + 8)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.jnz(cold).unwrap();
+            a.xor(eax, eax).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut cold).unwrap();
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.set_label(&mut done).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    compare(
+        &code,
+        &at,
+        |m| {
+            m.write(DATA, &f64::NAN.to_le_bytes()).unwrap();
+            m.write(DATA + 8, &1u32.to_le_bytes()).unwrap();
+        },
+        true,
+    );
+}
+
 // spec: A64-FLAG-3, A64-OPT-6
 #[test]
 fn loop_heads_take_unobserved_flags_from_entry() {
