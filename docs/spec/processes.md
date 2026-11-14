@@ -12,12 +12,23 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 Completed contexts MAY receive fresh admission within the same scope while other computations remain active.
 **Verification**: Test
 
-A single context may offer a loop whose blocks split (A64-TR-9). Owner work per
-frame selects how much splitting saves. It excludes settled polling and counts
-split loops at their serial cost, so splitting does not change it. Splitting SHOULD save
-the work beyond 60% of the frame period, which frames that left the owner idle set.
-A held key or button removes the deadline. A helper is worth waking only for four
-wake latencies of work, and a split wakes the fewest helpers that save its share.
+A context that reaches a proved computation offers it only beside a ready peer
+that reached one in the same frame or the one before. Otherwise the owner runs
+it in place in its optimized form (A64-OPT-1). A peer doing other work holds the
+owner too briefly to repay the job layer's round trip.
+
+A single context may offer a loop whose blocks split (A64-TR-9). The owner
+decides when it reaches the loop. Owner work is the time since the last frame
+outside host sleeps with no ready context, with split loops at their serial cost,
+so splitting does not change it. The frame's expected work is the larger of the
+last frame's and the work so far plus the loop's last cost. Splitting SHOULD save
+the part past 60% of the frame period that earlier splits in the frame did not.
+The period is 1/60 s, or the median interval of three frames in a row that each
+slept 2 ms to a timeout and ran a tenth longer than that. A game that limits its
+own frames and the owner's limit on spinning frames thus both set it, and any
+other frame restores 1/60 s. A held key or button removes the deadline. A helper
+is worth waking only for four wake latencies of work, and a split wakes the
+fewest helpers that save what it needs.
 
 ### PROC-MACH-2 Waits and wakeups
 

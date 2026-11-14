@@ -271,6 +271,28 @@ fn forwarded_body(
 }
 
 impl Trace {
+    /// A copy for analysis elsewhere, without the helpers that only
+    /// ordinary code runs.
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            insts: self.insts.clone(),
+            code: self.code.clone(),
+            region_end: self.region_end.clone(),
+            merge: self.merge.clone(),
+            live_in: self.live_in.clone(),
+            live_out: self.live_out.clone(),
+            observe_in: self.observe_in.clone(),
+            observe_out: self.observe_out.clone(),
+            frames: self.frames.clone(),
+            slots: self.slots.clone(),
+            primary: self.primary,
+            failure: self.failure,
+            helpers: Vec::new(),
+            bodies: self.bodies.clone(),
+            memory_pages: self.memory_pages,
+        }
+    }
+
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry. `redirect` gives, for a function entry whose calls go
     /// elsewhere, the target and the bytes the function must still begin
@@ -754,6 +776,39 @@ impl Trace {
             self.frames.len() - 1
         });
         index as u16
+    }
+
+    /// A copy in which each `cut` instruction leaves at its own EIP instead
+    /// of running, analysed again. It has no helpers: only forms that refuse
+    /// them build from it.
+    pub(crate) fn cut(&self, cut: &[bool]) -> Trace {
+        let mut insts = self.insts.clone();
+        for (inst, _) in insts.iter_mut().zip(cut).filter(|(_, cut)| **cut) {
+            *inst = Inst {
+                call: None,
+                locked: None,
+                op: Op::Nop,
+                effects: Op::Nop.effects(),
+                mode: Mode::Plain,
+                next: Next::Edge(Edge::Exit(inst.pc)),
+                taken: None,
+                spin: false,
+                ..*inst
+            };
+        }
+        let mut trace = Trace {
+            insts,
+            code: self.code.clone(),
+            frames: self.frames.clone(),
+            slots: self.slots.clone(),
+            primary: self.primary,
+            failure: self.failure,
+            bodies: self.bodies.clone(),
+            memory_pages: self.memory_pages,
+            ..Trace::default()
+        };
+        trace.analyze();
+        trace
     }
 
     fn analyze(&mut self) {

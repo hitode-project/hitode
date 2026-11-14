@@ -2161,50 +2161,117 @@ fn x87_directed_store_loops_run_natively() {
     }
 }
 
-/// Data on a code page: each store faults until the instruction is checked,
-/// then takes `access` without leaving translated code.
+/// Data on a code page: each store faults until the instruction is checked.
+/// Then a store whose line and the next hold no code takes the alias, and
+/// one next to code takes `access`, without leaving translated code.
 // spec: A64-MEM-6, A64-MEM-7, A64-CTL-10
 #[cfg(native)]
 #[test]
 fn stores_to_data_on_a_code_page_stop_faulting() {
     const ITERATIONS: u32 = 2000;
+    let assemble = |data: u32| {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.mov(ecx, data).unwrap();
+        a.mov(edx, ITERATIONS).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(ecx)).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(ecx), eax).unwrap();
+        a.push(eax).unwrap();
+        a.pop(ebx).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(top).unwrap();
+        a.nop().unwrap();
+        a.assemble(u64::from(CODE)).unwrap()
+    };
+    let end = CODE + assemble(CODE).len() as u32;
+    for (data, alias) in [(CODE + 0x800, true), (end.next_multiple_of(4), false)] {
+        let code = assemble(data);
+        let stop = CODE + code.len() as u32 - 1;
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        let memory = executor.memory_mut();
+        memory.protect(CODE, 0x1_0000, 7).unwrap();
+        memory.write(CODE, &code).unwrap();
+        memory
+            .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
+            .unwrap();
+        executor.state.eip = CODE;
+        executor.state.regs[4] = STACK_TOP;
+        let outcome = executor.run(stop, u64::MAX >> 1).unwrap();
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let sum = (1..=ITERATIONS).sum::<u32>();
+        assert_eq!(executor.state.regs[0], sum);
+        assert_eq!(executor.state.regs[3], sum);
+        let stored = executor.memory().read(data, 4).unwrap();
+        assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
+        // The loop's unit, then the one it loops through, each fault until
+        // the store is checked.
+        let native = executor.native.as_ref().unwrap();
+        let faults = native.unchecked_faults;
+        let checked = u64::from(crate::native::CHECK_AFTER);
+        assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
+        let accesses = native.diagnostics.accesses;
+        assert_eq!(accesses == 0, alias, "{accesses} accesses at {data:#x}");
+    }
+}
+
+/// A string store that starts on a data line of a code page and runs on
+/// into the page's code invalidates it: the page's string base is the
+/// alias only when it holds no code at all.
+// spec: A64-MEM-7, A64-CTL-10
+#[cfg(native)]
+#[test]
+fn string_stores_across_a_code_page_rewrite_its_code() {
+    const ITERATIONS: u32 = 200;
+    const FUNCTION: u32 = CODE + 0xc00;
+    let function = |value: u32| {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(eax, value).unwrap();
+        a.ret().unwrap();
+        a.assemble(u64::from(FUNCTION)).unwrap()
+    };
     let mut a = CodeAssembler::new(32).unwrap();
     let mut top = a.create_label();
-    a.mov(ecx, CODE + 0x800).unwrap();
     a.mov(edx, ITERATIONS).unwrap();
+    a.xor(ebx, ebx).unwrap();
     a.set_label(&mut top).unwrap();
-    a.mov(eax, dword_ptr(ecx)).unwrap();
-    a.add(eax, edx).unwrap();
-    a.mov(dword_ptr(ecx), eax).unwrap();
-    a.push(eax).unwrap();
-    a.pop(ebx).unwrap();
+    a.mov(esi, edx).unwrap();
+    a.and(esi, 1).unwrap();
+    a.shl(esi, 9).unwrap();
+    a.add(esi, DATA as i32).unwrap();
+    a.mov(edi, FUNCTION - 0x100).unwrap();
+    a.mov(ecx, 0x110).unwrap();
+    a.rep().movsb().unwrap();
+    a.mov(eax, FUNCTION).unwrap();
+    a.call(eax).unwrap();
+    a.add(ebx, eax).unwrap();
     a.dec(edx).unwrap();
     a.jnz(top).unwrap();
     a.nop().unwrap();
     let code = a.assemble(u64::from(CODE)).unwrap();
-    let stop = CODE + code.len() as u32 - 1;
-
     let mut executor = Executor::new(BASE, LEN).unwrap();
     let memory = executor.memory_mut();
     memory.protect(CODE, 0x1_0000, 7).unwrap();
     memory.write(CODE, &code).unwrap();
+    memory.write(FUNCTION, &function(1)).unwrap();
+    memory.protect(DATA, DATA_LEN, 3).unwrap();
+    // Two copies of the function's page tail, returning 1 and 2.
+    for (copy, value) in [(0, 1), (0x200, 2)] {
+        memory.write(DATA + copy + 0x100, &function(value)).unwrap();
+    }
     memory
         .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
         .unwrap();
     executor.state.eip = CODE;
     executor.state.regs[4] = STACK_TOP;
-    let outcome = executor.run(stop, u64::MAX >> 1).unwrap();
-    assert_eq!(outcome, RunOutcome::ReachedStop);
-    let sum = (1..=ITERATIONS).sum::<u32>();
-    assert_eq!(executor.state.regs[0], sum);
-    assert_eq!(executor.state.regs[3], sum);
-    let stored = executor.memory().read(CODE + 0x800, 4).unwrap();
-    assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
-    // The loop's unit, then the one it loops through, each fault until
-    // the store is checked.
-    let faults = executor.native.as_ref().unwrap().unchecked_faults;
-    let checked = u64::from(crate::native::CHECK_AFTER);
-    assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
+    let stop = CODE + code.len() as u32 - 1;
+    assert_eq!(
+        executor.run(stop, u64::MAX >> 1).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    let expected: u32 = (1..=ITERATIONS).map(|n| 1 + (n & 1)).sum();
+    assert_eq!(executor.state.regs[3], expected);
 }
 
 /// Checked accesses leave dirty MMX registers in place: an access the
@@ -2264,6 +2331,123 @@ fn refused_checked_accesses_keep_dirty_mmx() {
                 executor.native.as_ref().unwrap().diagnostics.refused > 0,
                 "{context}: refused through `access`"
             );
+        }
+    }
+}
+
+/// A unit that starts at an MMX loop's head, as one does after a budget
+/// exit re-enters the loop, loads what the head holds for arrivals from
+/// outside; the body makes the x87 state MMX-ready as before.
+// spec: A64-REG-5, A64F-FP-4
+#[cfg(native)]
+#[test]
+fn loop_heads_that_start_a_unit_establish_their_entry() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let (mut top, mut skip) = (a.create_label(), a.create_label());
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, dword_ptr(esi)).unwrap();
+    a.movd(mm0, eax).unwrap();
+    a.test(eax, 0xff00_0000u32 as i32).unwrap();
+    a.jz(skip).unwrap();
+    a.paddusb(mm0, mm1).unwrap();
+    a.movd(dword_ptr(edi), mm0).unwrap();
+    a.set_label(&mut skip).unwrap();
+    a.add(esi, 4).unwrap();
+    a.add(edi, 4).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let data: Vec<u8> = (0..DATA_LEN).map(|i| (i * 37 % 251) as u8).collect();
+    for ready in [true, false] {
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[1] = 64;
+        state.regs[4] = STACK_TOP;
+        state.regs[6] = DATA;
+        state.regs[7] = DATA + 0x800;
+        state.mmx[1] = 0x0102_0304_0506_0708;
+        state.x87.regs[1] = adv_cpu_core::X87Register::from_parts(state.mmx[1], 0xffff);
+        if ready {
+            state.x87.tag = 0;
+        } else {
+            state.x87.status = 3 << 11;
+        }
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code: code.clone(),
+            data: data.clone(),
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        // Short budgets re-enter the head from outside again and again.
+        while executor.run(program.stop, 7).unwrap() == RunOutcome::Budget {}
+        assert_eq!(executor.state.regs, state.regs, "ready {ready}");
+        assert_eq!(executor.state.eip, state.eip, "ready {ready}");
+        assert_eq!(executor.state.mmx, state.mmx, "ready {ready}");
+        assert_eq!(executor.state.x87, state.x87, "ready {ready}");
+        assert!(snapshot(executor.memory()) == memory, "ready {ready}");
+        assert!(executor.stats.native_entries > 1, "ready {ready}");
+    }
+}
+
+/// A merge inside a loop holds an MMX register only one arm writes. Where
+/// its x87 alias holds x87 data, the cache leaves for the interpreter
+/// rather than load it, so no exit publishes it unwritten.
+// spec: A64-REG-5
+#[cfg(native)]
+#[test]
+fn merges_never_publish_mmx_registers_their_path_left_unwritten() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let (mut top, mut skip) = (a.create_label(), a.create_label());
+    a.set_label(&mut top).unwrap();
+    a.cmp(eax, ebx).unwrap();
+    a.jae(skip).unwrap();
+    a.pmullw(mm2, mm5).unwrap();
+    a.set_label(&mut skip).unwrap();
+    a.add(esi, 4).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    for arm in [false, true] {
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[0] = u32::from(!arm);
+        state.regs[1] = 5;
+        state.regs[4] = STACK_TOP;
+        state.mmx[2] = 0x1111_2222_3333_4444;
+        state.mmx[5] = 0x0003_0005_0007_0009;
+        // mm2 holds x87 data; mm5 is MMX data.
+        state.x87.regs[2] = adv_cpu_core::X87Register::from_parts(state.mmx[2], 0x4003);
+        state.x87.regs[5] = adv_cpu_core::X87Register::from_parts(state.mmx[5], 0xffff);
+        state.x87.tag = 0;
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code: code.clone(),
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, _) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        for budget in [3, 7, u64::MAX >> 1] {
+            let mut executor = Executor::new(BASE, LEN).unwrap();
+            executor.native.as_mut().unwrap().first_visits = false;
+            load(executor.memory_mut(), &program);
+            executor.state = program.state.clone();
+            while executor.run(program.stop, budget).unwrap() == RunOutcome::Budget {}
+            assert_eq!(executor.state.mmx, state.mmx, "arm {arm} budget {budget}");
+            assert_eq!(executor.state.x87, state.x87, "arm {arm} budget {budget}");
+            assert_eq!(executor.state.regs, state.regs, "arm {arm} budget {budget}");
         }
     }
 }

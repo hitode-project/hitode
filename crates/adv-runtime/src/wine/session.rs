@@ -553,13 +553,15 @@ fn run(
             wait = wait.min(deadline.saturating_duration_since(Instant::now()));
         }
         let started = Instant::now();
-        let result = wake.wait(Some(wait));
+        let signaled = match wake.wait(Some(wait)) {
+            Ok(signaled) => signaled,
+            Err(error) => return Stop::Failed(error.to_string()),
+        };
+        let waited = started.elapsed();
+        machine.sys.host_idle(waited, !signaled);
         if let Some(metrics) = metrics.as_deref_mut() {
             metrics.idle_waits += 1;
-            metrics.wait_time += started.elapsed();
-        }
-        if let Err(error) = result {
-            return Stop::Failed(error.to_string());
+            metrics.wait_time += waited;
         }
         let _ = machine.visit_context(None, adv_nt::server::run);
     }
@@ -1025,6 +1027,7 @@ impl Session {
             self.metrics.idle_waits += 1;
             self.metrics.wait_time += waited;
             let sys = &mut self.machine.sys;
+            sys.host_idle(waited, !signaled);
             if let Some(diagnostics) = &mut sys.stats.wait_diagnostics {
                 diagnostics.host_wait(
                     Some(wait),

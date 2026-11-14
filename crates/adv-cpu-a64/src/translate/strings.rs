@@ -289,7 +289,7 @@ impl Translator<'_> {
             eor(W, X4, X4, page, Lsl, 0),
         ]);
         self.asm.cbz(W, false, X4, same);
-        self.checked_base(address, store, base, slow);
+        self.checked_base(address, store, true, base, slow);
         self.emit(lsr_imm(W, page, address, PAGE_SHIFT));
         self.asm.bind(same);
         self.emit(mov(X, element, base));
@@ -299,7 +299,7 @@ impl Translator<'_> {
             self.asm.b(done);
             self.asm.bind(crossing);
             self.emit(add_imm(W, X5, address, u32::from(width) - 1, false));
-            self.checked_base(X5, store, base, slow);
+            self.checked_base(X5, store, true, base, slow);
             self.emit_all(&[
                 lsr_imm(W, page, X5, PAGE_SHIFT),
                 eor(X, X4, element, base, Lsl, 0),
@@ -310,11 +310,11 @@ impl Translator<'_> {
             let last = self.asm.label();
             self.emit(eor(X, X4, element, WINDOW, Lsl, 0));
             self.asm.cbz(X, true, X4, last);
-            self.checked_alias(address, store, slow);
+            self.checked_alias(address, store, true, slow);
             self.emit(mov(X, element, base));
             self.asm.b(done);
             self.asm.bind(last);
-            self.checked_alias(X5, store, slow);
+            self.checked_alias(X5, store, true, slow);
             self.asm.bind(done);
         }
     }

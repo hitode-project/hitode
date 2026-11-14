@@ -481,7 +481,6 @@ impl Executor {
                 self.verifier.is_none() && bridge.handler.is_some(),
                 self.offered.take().filter(|&pc| pc == self.state.eip),
             );
-            native.split_share = bridge.handler.as_ref().map_or(0.0, |h| h.split_share());
             native.set_body_services(
                 bridge
                     .handler
@@ -705,6 +704,9 @@ impl Executor {
                     Exit::Computation => {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);
+                    }
+                    Exit::Optimized => {
+                        unreachable!("optimized forms run only on computation workers")
                     }
                     Exit::Recall => unreachable!("only computation entries can be recalled"),
                     Exit::Reschedule => return Ok(RunOutcome::Reschedule),

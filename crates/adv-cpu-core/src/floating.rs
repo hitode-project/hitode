@@ -168,6 +168,7 @@ pub fn execute(
         pc,
         opcode,
         write: None,
+        dp: None,
         x87_exception: false,
         sse_exception: false,
     };
@@ -195,7 +196,9 @@ pub fn execute(
         tx.state.commit_mmx();
         tx.state.x87.status = (tx.state.x87.status & !0x82ff) | (pending.status & 0x82ff);
         tx.state.x87.ip = pending.ip;
-        tx.state.x87.dp = pending.dp;
+        if let Some(dp) = tx.dp {
+            tx.state.x87.dp = dp;
+        }
         tx.state.x87.cs = pending.cs;
         tx.state.x87.ds = pending.ds;
         tx.state.x87.opcode = pending.opcode;
@@ -327,6 +330,8 @@ struct Transaction<'a> {
     pc: u32,
     opcode: Option<u16>,
     write: Option<PendingWrite>,
+    /// The memory operand an unmasked x87 exception records (EXEC-CORE-8).
+    dp: Option<u32>,
     x87_exception: bool,
     sse_exception: bool,
 }
@@ -459,6 +464,7 @@ pub unsafe extern "C" fn x87_leaf(state: *mut CpuState, code: u32, pc: u32, opco
         pc,
         opcode: Some(opcode as u16),
         write: None,
+        dp: None,
         x87_exception: false,
         sse_exception: false,
     };
@@ -482,6 +488,41 @@ mod leaf_tests {
     use super::*;
     use crate::X87Register as Ext;
     use iced_x86::Code;
+
+    // spec: EXEC-CORE-8
+    #[test]
+    fn the_data_pointer_records_only_unmasked_exceptions() {
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        memory
+            .protect(0x10000, 4096, crate::memory::READ | crate::memory::WRITE)
+            .unwrap();
+        memory.write(0x10000, &1.0f64.to_le_bytes()).unwrap();
+        memory.write(0x10008, &0.0f64.to_le_bytes()).unwrap();
+        let mut state = CpuState {
+            eip: 0x8000,
+            ..Default::default()
+        };
+        // Zero divide unmasked.
+        state.x87.control = 0x37b;
+        state.x87.dp = 0xdead;
+        let mut step = |bytes: &[u8], state: &mut CpuState| {
+            let i = iced_x86::Decoder::with_ip(32, bytes, u64::from(state.eip), 0).decode();
+            execute(&i, Operation::X87, None, state, &mut memory, true)
+        };
+        // fld qword [0x10000]
+        assert_eq!(
+            step(&[0xdd, 0x05, 0, 0, 0x01, 0], &mut state),
+            Step::Executed
+        );
+        assert_eq!(state.x87.dp, 0xdead);
+        // fdiv qword [0x10008]
+        assert_eq!(
+            step(&[0xdc, 0x35, 0x08, 0, 0x01, 0], &mut state),
+            Step::Executed
+        );
+        assert_ne!(state.x87.status & 0x80, 0, "the exception is pending");
+        assert_eq!(state.x87.dp, 0x10008);
+    }
 
     // spec: A64F-FP-8
     #[test]

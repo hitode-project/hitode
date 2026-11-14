@@ -1,39 +1,43 @@
-//! Frame load (PROC-MACH-1): how much of a frame's splittable loop work the
-//! backend should save by running it in blocks on other threads. Owner work
-//! counts every run except settled polling, and a split loop at its serial
-//! cost, so splitting does not change the measure it is chosen from. Owner
-//! work may fill 60% of the frame period; frames that left the owner idle
-//! set that period, whoever paced them.
+//! Frame load (PROC-MACH-1): how much of a loop's work the backend should
+//! save by running it in blocks on other threads. Owner work is the time
+//! since the last frame outside host idle, with split loops at their serial
+//! cost, so splitting does not change the measure it is chosen from. It may
+//! fill 60% of the frame period: 1/60 s, unless frames keep sleeping to
+//! their own longer interval.
+use adv_cpu::backend::Pace;
 use std::time::{Duration, Instant};
 
-/// The period until frames show their own: 60 frames per second.
 const DEFAULT_PERIOD_NS: u64 = 1_000_000_000 / 60;
 /// Owner work may fill this share of the period: a 40% margin.
 const LOAD: (u64, u64) = (3, 5);
-/// A frame that left the owner idle for a quarter of its interval was paced
-/// by a wait, not by its work.
-const PACED: (u64, u64) = (3, 4);
+/// A frame that slept this long to a timeout was paced by a wait.
+const PACED_IDLE_NS: u64 = 2_000_000;
+/// Consecutive paced frames, each a tenth longer than the default period,
+/// that set the period to their median interval.
+const PACED_FRAMES: usize = 3;
 
 #[derive(Debug)]
 pub struct FrameLoad {
-    work_ns: u64,
-    split_ns: u64,
-    /// Serial time of the last frame's offered loops.
-    splittable_ns: u64,
-    period_ns: u64,
     last: Option<Instant>,
-    share: f32,
+    idle_ns: u64,
+    timed_ns: u64,
+    saved_ns: u64,
+    /// Work of the last frame.
+    work_ns: u64,
+    paced: Vec<u64>,
+    period_ns: u64,
 }
 
 impl Default for FrameLoad {
     fn default() -> Self {
         Self {
-            work_ns: 0,
-            split_ns: 0,
-            splittable_ns: 0,
-            period_ns: DEFAULT_PERIOD_NS,
             last: None,
-            share: 0.0,
+            idle_ns: 0,
+            timed_ns: 0,
+            saved_ns: 0,
+            work_ns: 0,
+            paced: Vec::with_capacity(PACED_FRAMES),
+            period_ns: DEFAULT_PERIOD_NS,
         }
     }
 }
@@ -43,45 +47,66 @@ fn nanos(time: Duration) -> u64 {
 }
 
 impl FrameLoad {
-    /// An ordinary owner run that was not settled polling.
-    pub(crate) fn ran(&mut self, time: Duration) {
-        self.work_ns = self.work_ns.saturating_add(nanos(time));
+    /// The host slept, until its timeout or a signal.
+    pub(crate) fn idle(&mut self, time: Duration, timed_out: bool) {
+        self.idle_ns = self.idle_ns.saturating_add(nanos(time));
+        if timed_out {
+            self.timed_ns = self.timed_ns.saturating_add(nanos(time));
+        }
     }
 
-    /// An owner computation, with the time its helpers spent.
-    pub(crate) fn computed(&mut self, time: Duration, helpers: Duration) {
-        let serial = nanos(time).saturating_add(nanos(helpers));
-        self.work_ns = self.work_ns.saturating_add(serial);
-        self.split_ns = self.split_ns.saturating_add(serial);
+    /// An owner computation whose helpers spent `helpers` beside it.
+    pub(crate) fn computed(&mut self, helpers: Duration) {
+        self.saved_ns = self.saved_ns.saturating_add(nanos(helpers));
+    }
+
+    fn work(&self, now: Instant) -> u64 {
+        self.last.map_or(0, |last| {
+            nanos(now - last)
+                .saturating_sub(self.idle_ns)
+                .saturating_add(self.saved_ns)
+        })
+    }
+
+    pub(crate) fn pace(&self, now: Instant) -> Pace {
+        Pace {
+            work_ns: self.work(now),
+            last_ns: self.work_ns,
+            saved_ns: self.saved_ns,
+            limit_ns: self.period_ns * LOAD.0 / LOAD.1,
+        }
+    }
+
+    pub(crate) fn period_ns(&self) -> u64 {
+        self.period_ns
     }
 
     /// A completed frame: returns its owner work in ns.
     pub(crate) fn frame(&mut self, now: Instant) -> u64 {
-        let work = std::mem::take(&mut self.work_ns);
-        if let Some(interval) = self.last.map(|last| nanos(now - last))
-            && work * PACED.1 <= interval * PACED.0
-        {
-            self.period_ns = interval;
+        let work = self.work(now);
+        if let Some(last) = self.last {
+            let interval = nanos(now - last);
+            if self.timed_ns >= PACED_IDLE_NS && interval * 10 > DEFAULT_PERIOD_NS * 11 {
+                if self.paced.len() == PACED_FRAMES {
+                    self.paced.remove(0);
+                }
+                self.paced.push(interval);
+                if self.paced.len() == PACED_FRAMES {
+                    let mut sorted = self.paced.clone();
+                    sorted.sort_unstable();
+                    self.period_ns = sorted[PACED_FRAMES / 2];
+                }
+            } else {
+                self.paced.clear();
+                self.period_ns = DEFAULT_PERIOD_NS;
+            }
         }
         self.last = Some(now);
-        let split = std::mem::take(&mut self.split_ns);
-        if split != 0 {
-            self.splittable_ns = split;
-        }
-        let need = work.saturating_sub(self.period_ns * LOAD.0 / LOAD.1);
-        // Until the frame offers its loops, any idle helper may serve.
-        self.share = if need == 0 {
-            0.0
-        } else if self.splittable_ns == 0 {
-            1.0
-        } else {
-            (need as f64 / self.splittable_ns as f64).min(1.0) as f32
-        };
+        self.idle_ns = 0;
+        self.timed_ns = 0;
+        self.saved_ns = 0;
+        self.work_ns = work;
         work
-    }
-
-    pub fn share(&self) -> f32 {
-        self.share
     }
 }
 
@@ -93,23 +118,54 @@ mod tests {
 
     // spec: PROC-MACH-1
     #[test]
-    fn splitting_saves_only_the_work_past_the_margin() {
+    fn splitting_saves_the_expected_work_past_the_margin() {
         let mut load = FrameLoad::default();
         let start = Instant::now();
         load.frame(start);
-        load.ran(6 * MS);
-        load.frame(start + 16 * MS);
-        assert_eq!(load.share(), 0.0);
-        assert_eq!(load.period_ns, 16_000_000);
-        // 12 ms of work against a 9.6 ms limit, before any loop was offered.
-        load.ran(12 * MS);
-        load.frame(start + 32 * MS);
-        assert_eq!(load.share(), 1.0);
-        // Splitting keeps the serial measure: 4 ms of split loops must save 2.4 ms.
-        load.ran(8 * MS);
-        load.computed(2 * MS, 2 * MS);
-        load.frame(start + 44 * MS);
-        assert!((load.share() - 0.6).abs() < 1e-6);
-        assert_eq!(load.period_ns, 16_000_000);
+        // 6 ms of work, then a vsync wait.
+        load.idle(10 * MS, true);
+        assert_eq!(load.frame(start + 16 * MS), 6_000_000);
+        // 9 ms of work against a 10 ms limit: a 4 ms loop must save the 3 ms
+        // past it.
+        let pace = load.pace(start + 25 * MS);
+        let limit = DEFAULT_PERIOD_NS * 3 / 5;
+        assert_eq!(pace.limit_ns, limit);
+        assert_eq!(pace.need(4_000_000), 13_000_000 - limit);
+        assert_eq!(pace.need(0), 0);
+        // Split, it took 2 ms and its helpers 2 ms: owner work keeps the serial
+        // measure and the next loop need not save what this one did.
+        load.computed(2 * MS);
+        let pace = load.pace(start + 28 * MS);
+        assert_eq!(pace.work_ns, 14_000_000);
+        assert_eq!(pace.need(1_000_000), 1_000_000);
+        assert_eq!(load.frame(start + 30 * MS), 16_000_000);
+        // The last frame's work predicts this one's from its start.
+        assert_eq!(
+            load.pace(start + 31 * MS).need(8_000_000),
+            16_000_000 - limit
+        );
+    }
+
+    // spec: PROC-MACH-1
+    #[test]
+    fn frames_set_the_period_only_after_three_timed_sleeps() {
+        let mut load = FrameLoad::default();
+        let mut now = Instant::now();
+        load.frame(now);
+        for _ in 0..2 {
+            load.idle(20 * MS, true);
+            now += 33 * MS;
+            load.frame(now);
+            assert_eq!(load.period_ns, DEFAULT_PERIOD_NS);
+        }
+        load.idle(20 * MS, true);
+        now += 34 * MS;
+        load.frame(now);
+        assert_eq!(load.period_ns, 33_000_000);
+        // Signalled waits do not pace frames: the period falls back at once.
+        load.idle(20 * MS, false);
+        now += 33 * MS;
+        load.frame(now);
+        assert_eq!(load.period_ns, DEFAULT_PERIOD_NS);
     }
 }

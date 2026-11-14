@@ -1044,7 +1044,11 @@ fn samples_text(shared: &Shared, since: u64) -> String {
             hex(row.eip),
             hex(row.inst),
             row.part,
-            row.host.map_or_else(|| "-".into(), |pc| format!("{pc:#x}")),
+            // The sampled PC, also in generated code, which the JIT map
+            // files resolve to the unit's form.
+            sample.frames[..usize::from(sample.depth)]
+                .first()
+                .map_or_else(|| "-".into(), |pc| format!("{pc:#x}")),
         ));
     }
     text.join("\n")

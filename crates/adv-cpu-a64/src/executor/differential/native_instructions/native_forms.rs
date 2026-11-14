@@ -77,6 +77,7 @@ fn no_operation_calls(p: &Program) {
         interpret: at + 0x10018,
         call: at + 0x10020,
         fault: at + 0x10024,
+        opt_exit: at + 0x10024,
     };
     translate(
         &mut work,
@@ -485,6 +486,7 @@ fn native_forms_short_simd_sequences_match_memory_aliases_and_faults() {
                         std::array::from_fn(|lane| value.wrapping_add((n * 71 + lane * 37) as u8))
                     });
                     p.state.mmx = [u64::from_le_bytes([value; 8]); 8];
+                    mmx_data(&mut p.state);
                     p.data[..16].copy_from_slice(&p.state.xmm[2]);
                     for config in pixel_loops::configs() {
                         check(&p, config, None, true);
@@ -854,6 +856,7 @@ fn native_forms_simd_loops_preserve_cached_registers_across_backedges() {
         .try_into()
         .unwrap();
     p.data[16..20].copy_from_slice(&0x1f80u32.to_le_bytes());
+    mmx_data(&mut p.state);
     for config in pixel_loops::configs() {
         check(&p, config, None, true);
     }

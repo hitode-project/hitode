@@ -114,6 +114,9 @@ pub struct Runtime {
     /// Values of 8- and 16-byte checked accesses, shared with the owner;
     /// 16-byte aligned for `ldr q`.
     pub access_vector: [u8; 16],
+    /// `Memory::code_lines`, biased to guest zero: which 64-byte lines of
+    /// each page hold watched code.
+    pub code_lines: u64,
     #[cfg(test)]
     pub channel_batches: u64,
     #[cfg(test)]
@@ -132,11 +135,25 @@ pub struct Runtime {
     pub computation_pending: u64,
     pub computation_pending_mask: u32,
     pub completed: u64,
+    /// The most `completed` an optimized form refills to; past it a
+    /// checkpoint leaves, so the owner's run stays within its fuel.
+    pub completed_limit: u64,
     /// Nonzero: the proved form leaves when this many returns to its head
     /// have counted it down to zero.
     pub head_exit: u32,
     /// Checkpoints that kept running past a recall to reach the head.
     pub deferred: u32,
+    /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
+    pub opt_params: u64,
+    pub opt_fpcr: u64,
+    /// Where `opt_exit` saves the form's `opt_cells` spill cells before it
+    /// discards their stack frame.
+    pub opt_save: u64,
+    pub opt_cells: u64,
+    pub opt_record: u32,
+    /// Nonzero when an optimized form left at a checkpoint for a recall.
+    pub opt_recalled: u32,
+    pub opt_dump: RegisterDump,
 }
 
 impl Runtime {
@@ -166,6 +183,7 @@ impl Runtime {
             classes: 0,
             alias: 0,
             alias_classes: 0,
+            code_lines: 0,
             interpret: 0,
             exit: 0,
             temps: [0; 2],
@@ -179,10 +197,27 @@ impl Runtime {
             computation_pending: 0,
             computation_pending_mask: 0,
             completed: 0,
+            completed_limit: u64::MAX,
             head_exit: 0,
             deferred: 0,
+            opt_params: 0,
+            opt_fpcr: 0,
+            opt_save: 0,
+            opt_cells: 0,
+            opt_record: 0,
+            opt_recalled: 0,
+            opt_dump: RegisterDump::default(),
         }
     }
+}
+
+/// Host state shared by optimized exits and signal-context capture.
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+pub struct RegisterDump {
+    pub x: [u64; 31],
+    pub v: [u128; 32],
+    pub sp: u64,
 }
 
 /// Why translated code returned to the owner.
@@ -208,6 +243,8 @@ pub enum Exit {
     /// An ordinary unit exhausted its instruction budget at EIP. The owner
     /// samples EIP, then dispatches.
     Budget = 8,
+    /// An optimized record and register dump await materialization.
+    Optimized = 9,
 }
 
 impl Exit {
@@ -222,6 +259,7 @@ impl Exit {
             6 => Some(Self::Recall),
             7 => Some(Self::Computation),
             8 => Some(Self::Budget),
+            9 => Some(Self::Optimized),
             _ => None,
         }
     }
@@ -231,6 +269,7 @@ impl Exit {
 pub struct Stubs {
     pub code: Vec<u32>,
     pub enter: usize,
+    pub opt_exit: usize,
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
     pub fault: usize,
@@ -316,7 +355,9 @@ pub(crate) const COMPUTATION_PENDING: u32 = field(offset_of!(Runtime, computatio
 pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
+pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
+pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
@@ -325,6 +366,7 @@ pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
 pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
+pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
 pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));
@@ -340,7 +382,6 @@ pub(crate) const X87_TAG: u32 = field(offset_of!(CpuState, x87.tag));
 pub(crate) const X87_CONTROL: u32 = field(offset_of!(CpuState, x87.control));
 pub(crate) const X87_OPCODE: u32 = field(offset_of!(CpuState, x87.opcode));
 pub(crate) const X87_IP: u32 = field(offset_of!(CpuState, x87.ip));
-pub(crate) const X87_DP: u32 = field(offset_of!(CpuState, x87.dp));
 pub(crate) const MMX_MODE: u32 = field(offset_of!(CpuState, mmx_mode));
 pub(crate) const MXCSR: u32 = field(offset_of!(CpuState, mxcsr));
 pub(crate) const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
@@ -399,10 +440,13 @@ pub fn stubs() -> Stubs {
     emit_interpret(&mut asm, INTERPRET);
     let call = asm.offset();
     emit_interpret(&mut asm, CALL);
+    let opt_exit = asm.offset();
+    emit_opt_exit(&mut asm);
     Stubs {
         call,
         code: asm.finish(),
         enter,
+        opt_exit,
         exit,
         fault,
         dispatch,
@@ -679,6 +723,58 @@ fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[
         str(X, r(9), RUNTIME, COUNTDOWN),
         str(X, r(28), RUNTIME, SHADOW),
+        ldr(X, r(16), RUNTIME, HOST_SP),
+        mov_sp(SP, r(16)),
+    ]);
+    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
+        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
+    }
+    for (i, (a, b)) in SAVED.into_iter().enumerate() {
+        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
+    }
+    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
+}
+
+// spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
+fn emit_opt_exit(asm: &mut Asm) {
+    let dump = offset_of!(Runtime, opt_dump) as u32;
+    // Capture before borrowing any allocatable register. x16/x17 are emission scratch.
+    for n in 0..31 {
+        asm.emit(str(X, r(n), RUNTIME, dump + 8 * u32::from(n)));
+    }
+    let vectors = dump + offset_of!(RegisterDump, v) as u32;
+    for n in 0..32 {
+        asm.emit(str_v(VSize::Q, v(n), RUNTIME, vectors + 16 * u32::from(n)));
+    }
+    // The dump holds every register now; save the spill cells, which the
+    // caller's next frames would overwrite.
+    let (copy, done) = (asm.label(), asm.label());
+    asm.emit_all(&[
+        mov_sp(r(16), SP),
+        str(
+            X,
+            r(16),
+            RUNTIME,
+            dump + offset_of!(RegisterDump, sp) as u32,
+        ),
+        ldr(X, r(15), RUNTIME, offset_of!(Runtime, opt_save) as u32),
+        ldr(X, r(17), RUNTIME, offset_of!(Runtime, opt_cells) as u32),
+    ]);
+    asm.bind(copy);
+    asm.cbz(X, false, r(17), done);
+    asm.emit_all(&[
+        ldp(X, Post, r(0), r(1), r(16), 16),
+        stp(X, Post, r(0), r(1), r(15), 16),
+        sub_imm(X, r(17), r(17), 1, false),
+    ]);
+    asm.b(copy);
+    asm.bind(done);
+    asm.emit_all(&[
+        ldr(X, r(16), RUNTIME, offset_of!(Runtime, opt_fpcr) as u32),
+        msr_fpcr(r(16)),
+        movz(W, r(16), Exit::Optimized as u16, 0),
+        str(W, r(16), RUNTIME, EXIT),
+        str(X, r(9), RUNTIME, COUNTDOWN),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
     ]);

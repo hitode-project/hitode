@@ -178,8 +178,11 @@ fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decod
             | Mnemonic::Shld
             | Mnemonic::Shrd
     );
-    let last = ins.op_count() - 1;
-    if counted && (ins.op_kind(last) != OpKind::Immediate8 || ins.immediate8() & 31 == 0) {
+    let by_count = counted && {
+        let last = ins.op_count() - 1;
+        ins.op_kind(last) != OpKind::Immediate8 || ins.immediate8() & 31 == 0
+    };
+    if by_count {
         out.reads |= modified;
     } else {
         out.defines |= modified;
@@ -217,9 +220,9 @@ pub(super) fn independent(
     (affine, still): (u8, u8),
     slots: &[(i32, bool)],
     divisions: &[Option<Division>],
-    decode: impl Fn(u32, u32) -> Option<Instruction>,
+    instructions: &[Option<Instruction>],
 ) -> Option<Option<(i32, i32)>> {
-    let graph = Graph::build(trace)?;
+    let graph = Graph::build(trace).ok()?;
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
     let mut info = InstructionInfoFactory::new();
@@ -244,8 +247,7 @@ pub(super) fn independent(
         {
             return None;
         }
-        let ins = decode(inst.pc, inst.next_pc.wrapping_sub(inst.pc))?;
-        decoded_at[at] = Some(decoded(&ins, &mut info)?);
+        decoded_at[at] = Some(decoded(instructions[at].as_ref()?, &mut info)?);
     }
     // ESP relative to the head on entry to each instruction: every path
     // agrees, and the loop returns to the head with it unchanged.
@@ -326,11 +328,8 @@ pub(super) fn independent(
     let frame_written = written[1..].iter().any(|&w| w != 0);
     // The last block runs the tail on its private frame too.
     if frame_written {
-        for inst in (0..n)
-            .filter(|&at| !lp.inside[at])
-            .map(|at| &trace.insts[at])
-        {
-            stack(&decode(inst.pc, inst.next_pc.wrapping_sub(inst.pc))?)?;
+        for at in (0..n).filter(|&at| !lp.inside[at]) {
+            stack(instructions[at].as_ref()?)?;
         }
     }
     // Components the loop never writes keep their entry value.

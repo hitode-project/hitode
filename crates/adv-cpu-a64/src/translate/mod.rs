@@ -50,6 +50,9 @@ mod flags;
 mod integer;
 mod native_region;
 mod ops;
+// The optimizing tier lands before its back end and integration use it.
+#[allow(dead_code)]
+pub(crate) mod opt;
 pub(crate) mod parts;
 mod residency;
 mod simd;
@@ -116,6 +119,8 @@ pub struct Site {
     /// cached in host registers must be published first; 0 for the fault
     /// stub itself.
     pub resume: i32,
+    /// Optimized region record, when this access belongs to an optimized form.
+    pub opt_record: Option<u32>,
 }
 
 /// A unit as the front end leaves it, for a back end to lower (A64-TR-7):
@@ -266,6 +271,8 @@ pub struct Stubs {
     pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,
+    /// Where an optimized form leaves through a record.
+    pub opt_exit: usize,
 }
 
 const X0: Reg = Reg::new(0);
@@ -396,6 +403,8 @@ enum Cold {
         vector: simd::Vector,
         entry: residency::Entry,
         target: Label,
+        /// Where a register it cannot load leaves, the edge charged.
+        leave: Label,
     },
     /// A backward edge whose check failed: undo it, then leave if the
     /// branch is taken.
@@ -525,6 +534,11 @@ struct Translator<'a> {
     x87_scratch: &'a mut x87::Scratch,
     /// Sites inside such runs and the stubs that publish before faulting.
     x87_sites: Vec<(usize, Label)>,
+    /// Where an MMX register the cache cannot load leaves, when not before
+    /// the current instruction (`simd::Translator::register`).
+    unloadable: Option<Label>,
+    /// MMX registers checked for loading (`simd::Translator::register`).
+    aliased: u8,
     /// The x87 control word when translating, which runs specialize for.
     control: u16,
     pe: bool,
@@ -658,6 +672,8 @@ impl Jit<'_> {
             x87: x87::Cache::for_trace(trace),
             x87_scratch,
             x87_sites: Vec::new(),
+            unloadable: None,
+            aliased: 0,
             control: self.control,
             pe: self.pe,
             computation,
@@ -824,11 +840,17 @@ impl Translator<'_> {
         }
         if trace.head(index) || trace.merge[index] {
             // Control may arrive from elsewhere, holding the entry; edges
-            // arrive through `jump` and `branch`.
-            if index > 0 && trace.insts[index - 1].next == Next::Fall {
-                self.coerce(self.entry[index]);
+            // arrive through `jump` and `branch`. A region head's code
+            // establishes its entry itself.
+            let entry = if trace.head(index) {
+                residency::Entry::default()
             } else {
-                self.vector = simd::Vector::at(self.entry[index]);
+                self.entry[index]
+            };
+            if index > 0 && trace.insts[index - 1].next == Next::Fall {
+                self.coerce(entry);
+            } else {
+                self.vector = simd::Vector::at(entry);
             }
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
@@ -856,6 +878,7 @@ impl Translator<'_> {
                 x87: None,
             });
             self.state = State::CANONICAL;
+            self.enter_simd(self.entry[index], prepaid);
         } else if trace.merge[index] {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
@@ -1054,18 +1077,33 @@ impl Translator<'_> {
                     });
                     target = label;
                 }
+                let mut unloadable = None;
                 if !self.holds(self.entry[to]) {
                     // Only paths that dropped the cache get here.
-                    let load = self.asm.label();
+                    let (load, leave) = (self.asm.label(), self.asm.label());
                     self.push_cold(Cold::Load {
                         label: load,
                         vector: self.vector,
                         entry: self.entry[to],
                         target,
+                        leave,
                     });
                     target = load;
+                    unloadable = Some(leave);
                 }
                 let test = self.test(cc);
+                if let Some(label) = unloadable {
+                    self.push_cold(Cold::Leave {
+                        label,
+                        state: self.state,
+                        simd_dirty: self.vector.dirty,
+                        refund: self.trace.owed(to),
+                        exit: Exit::Interpret,
+                        eip: self.trace.insts[to].pc,
+                        link: false,
+                        x87: self.x87_leaving(),
+                    });
+                }
                 if let Some(done) = self.head_exit(to) {
                     let (check, count, back) =
                         (self.asm.label(), self.asm.label(), self.asm.label());
@@ -1286,6 +1324,7 @@ impl Translator<'_> {
                 checked: self.checking,
                 simd_dirty: self.vector.dirty,
                 resume: 0,
+                opt_record: None,
             },
         ));
         self.x87_site();
@@ -1384,6 +1423,36 @@ impl Translator<'_> {
 
     /// Restores pending N/Z/V without changing C or the other flag sources.
     fn host_nzv(&mut self, flags: FlagSet) {
+        let wanted = flags.any(FlagSet::ZF.or(FlagSet::SF.or(FlagSet::OF)));
+        if self.features.flagm
+            && wanted
+            && let Some(result) = self.state.nz
+            && self.state.overflow != Overflow::Host
+        {
+            // V is pending, so a compare may set it; C goes back after.
+            let result = self.narrow(result);
+            self.emit(cset(W, X13, Cond::Hs));
+            match self.state.overflow {
+                // The step again from its operand: N, Z and V as it sets them.
+                Overflow::Step(a, increment) if self.state.nz == Some(a) => {
+                    self.state.overflow = Overflow::Host;
+                    self.emit_all(&if increment {
+                        [
+                            sub_imm(W, X14, result, 1, false),
+                            adds_imm(W, Reg::ZR, X14, 1, false),
+                        ]
+                    } else {
+                        [
+                            add_imm(W, X14, result, 1, false),
+                            subs_imm(W, Reg::ZR, X14, 1, false),
+                        ]
+                    });
+                }
+                _ => self.emit(tst(W, result, result, Lsl, 0)),
+            }
+            self.state.nz = None;
+            self.insert_flags(Some((X13, 0)), None);
+        }
         if flags.any(FlagSet::ZF.or(FlagSet::SF))
             && let Some(result) = self.state.nz.take()
         {
@@ -1413,8 +1482,8 @@ impl Translator<'_> {
             }
             Overflow::Step(a, increment) => {
                 let a = self.narrow(a);
-                let expected = self.imm(if increment { 0x8000_0000 } else { 0x7fff_ffff }, X14);
-                self.emit_all(&[eor(W, X17, a, expected, Lsl, 0), clz(W, X17, X17)]);
+                let expected = if increment { 0x8000_0000 } else { 0x7fff_ffff };
+                self.emit_all(&[eor_imm(W, X17, a, expected), clz(W, X17, X17)]);
                 (X17, 5)
             }
         };
@@ -1799,10 +1868,13 @@ impl Translator<'_> {
                 vector,
                 entry,
                 target,
+                leave,
             } => {
                 self.asm.bind(label);
                 self.vector = vector;
+                self.unloadable = Some(leave);
                 self.coerce(entry);
+                self.unloadable = None;
                 self.asm.b(target);
             }
             Cold::Refuse {

@@ -18,7 +18,6 @@ pub fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> Opt
     let mut top = state.x87.top();
     let mut write = None;
     let mut freed = None;
-    let mut dp = None;
     let mut flags = None;
     let mut metadata = true;
     let epoch = memory.epoch;
@@ -45,7 +44,6 @@ pub fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> Opt
                 return None;
             }
             write = Some((top, value));
-            dp = Some(at);
             status &= !C1;
         }
         M::Fstp if i.op0_kind() == OpKind::Memory && i.memory_size().size() == 10 => {
@@ -57,7 +55,6 @@ pub fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> Opt
             store(memory, at, &value.0)?;
             freed = Some(top);
             top = (top + 1) & 7;
-            dp = Some(at);
             status &= !C1;
         }
         M::Fxam => {
@@ -121,9 +118,6 @@ pub fn execute(op: &NativeX87, state: &mut CpuState, memory: &mut Memory) -> Opt
         if let Some(opcode) = op.opcode {
             state.x87.opcode = opcode;
         }
-    }
-    if let Some(at) = dp {
-        state.x87.dp = at;
     }
     if let Some(flags) = flags {
         state.eflags = flags;

@@ -5,7 +5,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
-    fn allow_computation(&self) -> bool {
+    /// The current context reached a prepared computation: whether to
+    /// offer it to the scheduler instead of running it in place.
+    fn allow_computation(&mut self) -> bool {
         false
     }
 
@@ -18,11 +20,10 @@ pub trait ExecutionTrap {
         Ok(false)
     }
 
-    /// The share of a frame's splittable loop work that running it in blocks
-    /// on other threads should save (A64-TR-9), 1 when a loop's blocks are
-    /// worth any idle thread, or 0 when the frame meets its deadline.
-    fn split_share(&self) -> f32 {
-        0.0
+    /// The frame's pace when a loop whose blocks split is reached
+    /// (PROC-MACH-1), or `None` when nothing may split.
+    fn pace(&self) -> Option<crate::backend::Pace> {
+        None
     }
 
     /// Shared service storage retained by the execution owner for this run.

@@ -53,6 +53,7 @@ use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
+mod compile;
 mod worker;
 
 const CACHE_LEN: usize = 64 << 20;
@@ -373,6 +374,9 @@ pub(crate) struct Diagnostics {
     /// Proofs whose head loop splits, and how its blocks ran.
     pub split_proofs: u64,
     pub split: worker::SplitCounts,
+    /// Optimized forms the owner ran in place, and their instructions.
+    pub optimized_runs: u64,
+    pub optimized_retired: u64,
 }
 
 pub(crate) struct Run {
@@ -774,12 +778,15 @@ pub(crate) struct Native {
     promoted: FxHashSet<u32>,
     probed: Option<Probed>,
     computation_enabled: bool,
-    /// The handler's split share for this run (A64-TR-9).
-    pub(crate) split_share: f32,
+    /// The frame's pace when the owner last reached a loop whose blocks
+    /// split (A64-TR-9).
+    pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     skip_offer: Option<u32>,
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
     admission: worker::Admission,
+    /// Builds optimized forms, which `install_optimized` adopts.
+    compiler: compile::Compiler,
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
@@ -854,6 +861,7 @@ impl Native {
                 interpret: base + stubs.interpret,
                 call: base + stubs.call,
                 fault: base + stubs.fault,
+                opt_exit: base + stubs.opt_exit,
             },
             units: FxHashMap::default(),
             pages: FxHashMap::default(),
@@ -894,11 +902,12 @@ impl Native {
             promoted: FxHashSet::default(),
             probed: None,
             computation_enabled: false,
-            split_share: 0.0,
+            pace: std::cell::Cell::new(None),
             skip_offer: None,
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
             admission: worker::Admission::default(),
+            compiler: compile::Compiler::new(),
             features: features(),
             runtime,
             clock: std::ptr::null_mut(),
@@ -927,17 +936,26 @@ impl Native {
         self.skip_offer.take()
     }
 
+    /// Whether the computation reached at EIP goes to the job layer
+    /// because a peer runs beside it; otherwise the owner runs it.
     fn offer_computation(&self) -> bool {
         self.computation_enabled
             && (self.bridge.is_null()
                 // SAFETY: this query occurs only within the owning run.
-                || unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler.as_ref().is_some_and(|handler| handler.allow_computation()))
+                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
     }
 
-    /// A single context may offer a loop whose blocks split.
-    fn offer_split(&self) -> bool {
-        self.computation_enabled && self.split_share > 0.0
+    /// A single context may offer a loop whose blocks split when the
+    /// frame's pace needs it to save time on a loop of serial `cost` ns.
+    fn offer_split(&self, cost: u64) -> bool {
+        if !self.bridge.is_null() {
+            // SAFETY: this query occurs only within the owning run.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            self.pace
+                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
+        }
+        self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
     }
 
     fn is_stop(&self, eip: u32) -> bool {
@@ -972,7 +990,7 @@ impl Native {
             &mut self.admission,
             (retired, &mut self.retired_forms),
             worker::Notifications { pending, wake },
-            (self.split_share, &mut self.diagnostics.split),
+            (self.pace.get(), &mut self.diagnostics.split),
         ) {
             visit(&mut session);
         }
@@ -995,8 +1013,8 @@ impl Native {
         self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
-        if self.nominated.is_some()
-            && (self.offer_split() || self.offer_computation())
+        self.install_optimized(false);
+        if self.computation_enabled
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
@@ -1046,13 +1064,27 @@ impl Native {
             }
             None => {
                 let before = self.cache.used();
-                let entry = self.translate(memory, cpu.eip)?;
-                (entry, self.cache.used().saturating_sub(before))
+                let eip = cpu.eip;
+                // Optimized forms take their entry facts from this state.
+                self.runtime.cpu = cpu;
+                let entry = self.translate(memory, eip);
+                self.runtime.cpu = std::ptr::null_mut();
+                (entry?, self.cache.used().saturating_sub(before))
             }
         };
+        if self
+            .computation
+            .get(&cpu.eip)
+            .is_some_and(worker::Prepared::wants_form)
+        {
+            self.request_optimized(cpu.eip, cpu.clone());
+        }
+        // Reaching the computation tells peers it is here, offered or not,
+        // and takes the frame's pace for a split.
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && (prepared.proof.splits() && self.offer_split() || self.offer_computation())
+            && (self.offer_computation()
+                | (prepared.proof.splits() && self.offer_split(prepared.cost())))
             && prepared.worth_offering()
         {
             return Ok(Some(Run {
@@ -1087,6 +1119,16 @@ impl Native {
             );
         }
         self.cache.sync();
+        if let Some((exit, retired)) = self.run_optimized(cpu, memory, fuel) {
+            if retired != 0 {
+                self.progressed();
+            }
+            return Ok(Some(Run {
+                exit,
+                retired,
+                translated,
+            }));
+        }
         self.faults.end.set(self.cache.next());
         let runtime: *mut Runtime = &mut *self.runtime;
         let faults: *const Faults = &self.faults;
@@ -1128,6 +1170,7 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
+            Exit::Optimized => unreachable!("optimized forms leave through `worker::execute`"),
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
@@ -1161,6 +1204,65 @@ impl Native {
             retired,
             translated,
         }))
+    }
+
+    /// Runs the optimized form of the computation at EIP in place when its
+    /// ranges and entry facts admit (A64-OPT-1). It leaves at a checkpoint
+    /// once owner work is pending, and refills only while within `fuel`.
+    fn run_optimized(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &Memory,
+        fuel: u64,
+    ) -> Option<(Exit, u32)> {
+        static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let prepared = self.computation.get(&cpu.eip)?;
+        prepared.code.optimized.as_ref()?;
+        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
+            return None;
+        }
+        let alias = alias_base(memory);
+        let optimized = worker::admit(&prepared.code, cpu, alias);
+        prepared.admitted(optimized.is_some());
+        let optimized = optimized?;
+        let entry = worker::Entry {
+            enter: self.enter,
+            window: self.runtime.window,
+            alias,
+            fault: self.stubs.fault,
+        };
+        let budget = fuel.min(SLICE);
+        let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
+            (word.as_ptr(), self.pending_mask)
+        });
+        let runtime = &mut *self.runtime;
+        runtime.countdown = budget;
+        runtime.recall = NEVER.as_ptr() as u64;
+        runtime.recall_mask = 0;
+        runtime.computation_pending = pending as u64;
+        runtime.computation_pending_mask = mask;
+        runtime.head_exit = 0;
+        runtime.deferred = 0;
+        runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
+        let shadow = runtime.shadow;
+        let (exit, retired) =
+            worker::execute(runtime, cpu, entry, &prepared.code, Some(&optimized));
+        runtime.shadow = shadow;
+        self.diagnostics.optimized_runs += 1;
+        self.diagnostics.optimized_retired += retired;
+        if let Some(forms) = &mut self.retired_forms {
+            forms[0] += retired;
+        }
+        if exit == Exit::Fault {
+            self.diagnostics.faults += 1;
+        }
+        // A recall here is pending owner work, which dispatch sees.
+        let exit = if exit == Exit::Recall {
+            Exit::Dispatch
+        } else {
+            exit
+        };
+        Some((exit, retired as u32))
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
@@ -1287,6 +1389,13 @@ impl Native {
         self.deadline.is_some_and(|at| ticks() >= at)
     }
 
+    /// Keeps the loop at `head` in ordinary units, for tests of their
+    /// mechanisms.
+    #[cfg(test)]
+    pub(crate) fn keep_ordinary(&mut self, head: u32) {
+        self.rejected_candidates.insert(head);
+    }
+
     #[cfg(test)]
     pub(crate) fn switch_counts(&self) -> (usize, usize) {
         (
@@ -1366,6 +1475,9 @@ impl Native {
         self.runtime.alias = alias_base(memory);
         self.runtime.alias_classes =
             (memory.perms.as_ptr() as usize).wrapping_sub((memory.base >> 12) as usize) as u64;
+        self.runtime.code_lines = (memory.code_lines() as usize)
+            .wrapping_sub((memory.base >> 12) as usize * size_of::<u64>())
+            as u64;
         memory.fast.body_table((memory.base >> 12) as usize);
         // Drop this temporary Arc before a helper can modify the tables.
         drop(memory.native_permissions());
@@ -1654,8 +1766,14 @@ impl Native {
                 {
                     let iterates = work.unit.trace.returns_at_head();
                     self.diagnostics.split_proofs += u64::from(proof.splits());
+                    let trace = work.unit.trace.detached();
                     self.computation
-                        .insert(eip, worker::Prepared::new(code, iterates, proof));
+                        .insert(eip, worker::Prepared::new(code, iterates, proof, trace));
+                    // SAFETY: the owner's state is live while it translates.
+                    if let Some(at) = unsafe { self.runtime.cpu.as_ref() } {
+                        let at = at.clone();
+                        self.request_optimized(eip, at);
+                    }
                 }
             }
             self.helpers.extend(work.helpers());
@@ -1695,12 +1813,81 @@ impl Native {
             .map(|&(offset, site)| (entry + offset, site))
             .collect();
         sites.sort_unstable_by_key(|&(pc, _)| pc);
-        crate::jit_map::record(entry, code.words, eip, retired, code.marks);
+        crate::jit_map::record(entry, code.words, eip, retired, code.marks, "a64");
         Some(worker::Code {
             entry,
             end: entry + code.words.len() * 4,
             sites: sites.into(),
+            optimized: None,
         })
+    }
+
+    /// Asks for an optimized form of the computation prepared at `eip`,
+    /// taking its facts from `at`, the state at an entry.
+    fn request_optimized(&mut self, eip: u32, at: CpuState) {
+        let prepared = &self.computation[&eip];
+        prepared.requested();
+        crate::jit_map::optimized(eip, format_args!("requested\t-\t-"));
+        self.compiler.request(compile::Request {
+            eip,
+            generation: self.generation,
+            code: prepared.code.entry,
+            trace: prepared.trace.detached(),
+            proof: prepared.proof.clone(),
+            at,
+        });
+        self.install_optimized(false);
+    }
+
+    /// Adopts the built forms whose computation is still the one they were
+    /// built for; `wait` also takes those still being built.
+    fn install_optimized(&mut self, wait: bool) {
+        while let Some(done) = self.compiler.next(wait) {
+            let Some(prepared) = self
+                .computation
+                .get_mut(&done.eip)
+                .filter(|p| done.generation == self.generation && p.code.entry == done.code)
+            else {
+                continue;
+            };
+            prepared.built();
+            let Some(mut form) = done.form else {
+                continue;
+            };
+            let lowered = &mut form.lowered;
+            lowered.place(self.cache.next(), self.stubs.opt_exit);
+            let Some(entry) = self.cache.append(&lowered.words) else {
+                continue;
+            };
+            let mut sites: Vec<_> = lowered
+                .sites
+                .iter()
+                .map(|&(offset, site)| (entry + offset, site))
+                .collect();
+            sites.sort_unstable_by_key(|&(pc, _)| pc);
+            crate::jit_map::optimized(done.eip, format_args!("installed\t-\t-"));
+            crate::jit_map::record(
+                entry,
+                &lowered.words,
+                done.eip,
+                form.prepaid,
+                &lowered.marks,
+                "a64-opt",
+            );
+            prepared.code.optimized = Some(Arc::new(worker::Optimized {
+                code: worker::Code {
+                    entry,
+                    end: entry + lowered.words.len() * 4,
+                    sites: sites.into(),
+                    optimized: None,
+                },
+                entry: form.built.func.entry,
+                assumed: form.built.assumed,
+                records: std::mem::take(&mut lowered.records),
+                flags: std::mem::take(&mut lowered.flags),
+                cells: lowered.spill_cells,
+            }));
+        }
     }
 
     /// A budget exit samples where owner time goes. It nominates the
@@ -1709,7 +1896,6 @@ impl Native {
     /// loop traces.
     fn sample(&mut self, memory: &Memory, eip: u32) {
         if self.computation_enabled
-            && (self.offer_split() || self.offer_computation())
             && let Some((candidate, end)) = self.enclosing_computation(eip)
             && !self.is_stop(candidate)
         {
@@ -1734,21 +1920,37 @@ impl Native {
         // enclosing loop's extent is recorded now. Nomination then tries the
         // outermost first and falls back inward as proofs are rejected.
         let mut outer: Option<(u32, u32)> = None;
-        for entry in nearby {
+        // Nearby traces without a loop, and with loops elsewhere.
+        let (mut flat, mut elsewhere) = (0, 0);
+        for &entry in &nearby {
             let trace = self.loop_trace(memory, entry, &self.stops);
-            let Some((head, end)) = translate::computation_extent(&trace)
-                .filter(|&(head, end)| head <= eip && eip < end)
-            else {
+            let extent = translate::computation_extent(&trace);
+            let Some((head, end)) = extent.filter(|&(head, end)| head <= eip && eip < end) else {
+                if extent.is_some() {
+                    elsewhere += 1;
+                } else {
+                    flat += 1;
+                }
                 continue;
             };
-            self.record_extent((head, end));
+            if self.record_extent((head, end)) {
+                crate::jit_map::optimized(head, format_args!("extent\t{end}\t-"));
+            }
             let size = end - head;
             if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
                 outer = Some((entry, size));
             }
         }
+        if outer.is_none() {
+            let tried = nearby.len();
+            crate::jit_map::optimized(
+                eip,
+                format_args!("unlooped\t-\t{tried} tried, {flat} flat, {elsewhere} elsewhere"),
+            );
+        }
         for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
             if self.promoted.insert(entry) {
+                crate::jit_map::optimized(entry, format_args!("promoted\t{eip}\t-"));
                 self.diagnostics.promotions += 1;
                 self.drop_unit(entry);
             }
@@ -1756,13 +1958,16 @@ impl Native {
         self.forget_dynamic();
     }
 
-    fn record_extent(&mut self, extent: (u32, u32)) {
-        if !self.computation_extents.contains(&extent) {
-            if self.computation_extents.len() == 64 {
-                self.computation_extents.remove(0);
-            }
-            self.computation_extents.push(extent);
+    /// Whether the extent is new.
+    fn record_extent(&mut self, extent: (u32, u32)) -> bool {
+        if self.computation_extents.contains(&extent) {
+            return false;
         }
+        if self.computation_extents.len() == 64 {
+            self.computation_extents.remove(0);
+        }
+        self.computation_extents.push(extent);
+        true
     }
 
     fn enclosing_computation(&self, eip: u32) -> Option<(u32, u32)> {
@@ -1839,7 +2044,7 @@ impl Native {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
         let entry = Entry { unit, retired };
-        crate::jit_map::record(unit, words, eip, retired, marks);
+        crate::jit_map::record(unit, words, eip, retired, marks, "a64");
         self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
@@ -1855,7 +2060,8 @@ fn computation_proof(
 
     // The proved form has no owner-dependent call, shadow entry, indirect
     // table, permissions helper or other runtime service.
-    if trace.insts.iter().any(|inst| {
+    let entry = trace.insts.first().map_or(0, |inst| inst.pc);
+    if let Some(inst) = trace.insts.iter().find(|inst| {
         inst.mode == Mode::Real
             || inst.locked.is_some()
             || inst.spin
@@ -1871,9 +2077,20 @@ fn computation_proof(
                     | Op::JmpIndirect(_)
             )
     }) {
+        let (pc, op) = (inst.pc, &inst.op);
+        crate::jit_map::optimized(entry, format_args!("excluded\t{pc}\t{op:?}"));
         return None;
     }
-    let mut proof = translate::computation::Proof::build(trace)?;
+    let mut proof = match translate::computation::Proof::build(trace) {
+        Ok(proof) => proof,
+        Err(refusal) => {
+            let inst = trace.insts.get(refusal.at);
+            let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
+            let why = refusal.why;
+            crate::jit_map::optimized(entry, format_args!("{why}\t{pc}\t{op:?}"));
+            return None;
+        }
+    };
     proof.prove_split(trace, |pc, len| {
         let mut bytes = [0; 15];
         let bytes = bytes.get_mut(..usize::try_from(len).ok()?)?;
@@ -1954,6 +2171,7 @@ mod tests {
             checked: false,
             simd_dirty: 0,
             resume: 0,
+            opt_record: None,
         };
         let words = [
             load,
@@ -2182,6 +2400,7 @@ mod tests {
                 checked: false,
                 simd_dirty: 0,
                 resume: 0,
+                opt_record: None,
             },
             [0; 2],
         );

@@ -531,7 +531,8 @@ def speed_symbols(session, samples):
     """Resolve the recorded host frames together, preserving each sample's chain."""
     addresses = set()
     for sample in samples:
-        if sample.get("pc", "-") != "-":
+        # A guest sample's PC is in generated code, which has no symbols.
+        if sample.get("pc", "-") != "-" and sample.get("kind") != "Guest":
             addresses.add(sample["pc"])
         addresses.update(f for f in sample.get("callers", "-").split(",") if f not in ("", "-"))
     info = getattr(session, "info", {})

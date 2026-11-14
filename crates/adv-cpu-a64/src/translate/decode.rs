@@ -1055,7 +1055,7 @@ impl Op {
             // interpreter.
             Op::Simd(simd) => (
                 F::NONE,
-                if matches!(simd.kind, super::simd::Kind::FlagCompare(_)) {
+                if matches!(simd.kind, super::simd::Kind::FlagCompare(..)) {
                     F::ALL
                 } else {
                     F::NONE

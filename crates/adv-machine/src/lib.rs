@@ -485,6 +485,7 @@ impl Sys {
             frames: Vec::new(),
             state: State::Ready { resume: None },
             yielded: false,
+            computed: None,
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
@@ -566,6 +567,21 @@ impl Sys {
             self.finished_contexts.pop();
         }
         Ok(())
+    }
+
+    /// Records that the current context reached a prepared computation.
+    /// Whether a ready peer reached one in this frame or the last, so the
+    /// two can run side by side. A peer doing other work holds the owner
+    /// too briefly to repay the job layer's round trip (PROC-MACH-1).
+    fn computing_peer(&mut self) -> bool {
+        let (current, frame) = (self.current, self.completed_frames);
+        self.contexts[current as usize].computed = Some(frame);
+        self.active_contexts().any(|c| {
+            c.id != current
+                && c.is_ready()
+                && !c.yielded
+                && c.computed.is_some_and(|at| frame.wrapping_sub(at) <= 1)
+        })
     }
 
     fn active_contexts(&self) -> impl Iterator<Item = &Context> {
@@ -897,6 +913,12 @@ impl Sys {
         }
     }
 
+    /// The host slept with no ready context, until its timeout or a signal:
+    /// pacing slack, not owner work (PROC-MACH-1).
+    pub fn host_idle(&mut self, time: std::time::Duration, timed_out: bool) {
+        self.load.idle(time, timed_out);
+    }
+
     /// Mark a fully committed frame, after every guest draw callback has returned.
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
@@ -911,7 +933,7 @@ impl Sys {
             self.current,
             u64::from(self.completed_frames),
             work,
-            (self.load.share() * 1000.0) as u64,
+            self.load.period_ns(),
         );
     }
 
@@ -1899,24 +1921,21 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
-    fn allow_computation(&self) -> bool {
-        self.computation
+    fn allow_computation(&mut self) -> bool {
+        self.sys.computing_peer()
+            && self.computation
             && !DEBUGGER_ATTACHED.get()
             && !self.sys.trace.enabled()
             && self.sys.call_limit.is_none()
-            && self
-                .sys
-                .active_contexts()
-                .any(|c| c.id != self.sys.current && c.is_ready() && !c.yielded)
     }
 
-    fn split_share(&self) -> f32 {
+    fn pace(&self) -> Option<adv_cpu::backend::Pace> {
         if !self.computation
             || DEBUGGER_ATTACHED.get()
             || self.sys.trace.enabled()
             || self.sys.call_limit.is_some()
         {
-            0.0
+            None
         } else if self
             .sys
             .frame_pacer
@@ -1924,9 +1943,9 @@ impl TrapHandler for Dispatch<'_> {
             .is_some_and(|p| p.input_held())
         {
             // Skipping has no frame deadline: any helper worth waking serves.
-            1.0
+            Some(Default::default())
         } else {
-            self.sys.load.share()
+            Some(self.sys.load.pace(std::time::Instant::now()))
         }
     }
 
@@ -3112,9 +3131,6 @@ impl<B: Backend> Machine<B> {
                     c.progress.saw_event();
                 }
                 c.progress.ran(retired);
-                if !c.progress.settled() {
-                    self.sys.load.ran(run_elapsed);
-                }
             }
             if self.sys.schedule_trace.enabled() {
                 self.sys.schedule_trace.event(

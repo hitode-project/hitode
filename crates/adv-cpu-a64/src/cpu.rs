@@ -524,7 +524,7 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
-    fn allow_computation(&self) -> bool {
+    fn allow_computation(&mut self) -> bool {
         self.handler.allow_computation()
     }
 
@@ -545,8 +545,8 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.body_services()
     }
 
-    fn split_share(&self) -> f32 {
-        self.handler.split_share()
+    fn pace(&self) -> Option<adv_cpu_core::backend::Pace> {
+        self.handler.pace()
     }
 
     fn diagnostics(&self) -> u8 {
@@ -711,14 +711,6 @@ impl Backend for Cpu {
             if m.state.eip == self.park {
                 return Exit::Parked;
             }
-            if let Some(budget) = self.budget
-                && start.elapsed() >= budget
-            {
-                return Exit::BudgetExceeded {
-                    pc: m.state.eip,
-                    budget,
-                };
-            }
             // The deadline bounds the run, not the fuel: a short fuel would
             // leave units that do not fit it to the interpreter.
             let images = Rc::clone(&m.images);
@@ -733,7 +725,17 @@ impl Backend for Cpu {
                     m.state.eip = self.park;
                     return Exit::Parked;
                 }
-                Ok(RunOutcome::Budget) => continue,
+                Ok(RunOutcome::Budget) => {
+                    if let Some(budget) = self.budget
+                        && start.elapsed() >= budget
+                    {
+                        return Exit::BudgetExceeded {
+                            pc: m.state.eip,
+                            budget,
+                        };
+                    }
+                    continue;
+                }
                 Ok(RunOutcome::Reschedule) => return Exit::Reschedule,
                 Ok(RunOutcome::Computation) => return Exit::Computation,
                 Ok(RunOutcome::Interrupted) => {

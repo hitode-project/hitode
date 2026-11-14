@@ -177,7 +177,7 @@ impl Translator<'_> {
         if let Some(opcode) = opcode {
             self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
         }
-        self.emit_all(&[str(W, X6, X5, runtime::X87_DP), msr_nzcv(X4)]);
+        self.emit(msr_nzcv(X4));
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
@@ -213,7 +213,7 @@ impl Translator<'_> {
                 ldrh(X8, X5, runtime::X87_CONTROL),
             ]);
         }
-        let (dp, metadata) = self.x87_body(x, slow);
+        let metadata = self.x87_body(x, slow);
         if x.fast != Fast::Wait {
             self.emit_all(&[
                 bfi(W, X13, X15, 11, 3),
@@ -229,9 +229,6 @@ impl Translator<'_> {
                 self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
             }
         }
-        if dp {
-            self.emit(str(W, X6, X5, runtime::X87_DP));
-        }
         self.emit(msr_nzcv(X4));
         self.asm.b(done);
         self.asm.bind(slow);
@@ -245,9 +242,8 @@ impl Translator<'_> {
     }
 
     /// What instruction `x` does once its checks have run; whether it
-    /// records the data pointer and the instruction pointer and opcode.
-    fn x87_body(&mut self, x: X87, slow: Label) -> (bool, bool) {
-        let mut dp = x.mem.is_some();
+    /// records the instruction pointer and opcode.
+    fn x87_body(&mut self, x: X87, slow: Label) -> bool {
         let mut metadata = true;
         match x.fast {
             Fast::Load80 | Fast::Store80 | Fast::Leaf(_) => unreachable!("cached forms"),
@@ -327,7 +323,7 @@ impl Translator<'_> {
                     movz(W, X16, 0x8080, 0),
                     bic(W, X13, X13, X16, Lsl, 0),
                 ]);
-                (dp, metadata) = (false, false);
+                metadata = false;
             }
             Fast::StoreControl | Fast::StoreStatus => {
                 let value = if x.fast == Fast::StoreControl {
@@ -346,10 +342,10 @@ impl Translator<'_> {
                         self.emit(bfi(W, super::host(0), value, 0, 16));
                     }
                 }
-                (dp, metadata) = (false, false);
+                metadata = false;
             }
         }
-        (dp, metadata)
+        metadata
     }
 
     fn x87_round(&mut self, slow: Label) {

@@ -50,6 +50,10 @@ fn seeded(mut p: Program) -> Program {
     p.state.mmx[1] = 0;
     p.state.xmm[6] = [93, 0].repeat(8).try_into().unwrap();
     p.state.mmx[6] = 93 * 0x0001000100010001;
+    // The blend only reads mm1 and mm6: MMX data, as earlier MMX code left.
+    for n in [1, 6] {
+        p.state.x87.regs[n] = adv_cpu_core::X87Register::from_parts(p.state.mmx[n], 0xffff);
+    }
     p.state.x87.status = 3 << 11;
     p
 }

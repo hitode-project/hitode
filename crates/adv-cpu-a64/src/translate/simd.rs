@@ -6,9 +6,13 @@
 //! publish dirty MMX to MMX and the aliased x87 significand and exponent
 //! (0xffff), and dirty XMM to XMM. Direct faults record the dirty mask and
 //! recover that prefix from the signal context before re-executing the
-//! interrupted instruction. Region heads hold nothing; a merge holds its
-//! entry (`translate::residency`): internal edges publish what it does not
-//! count dirty and load what they lack of it.
+//! interrupted instruction. A merge holds its entry (`translate::residency`):
+//! internal edges publish what it does not count dirty and load what they
+//! lack of it. A region head's own code checks its entry's MXCSR guards for
+//! arrivals from outside, leaving for the interpreter where one fails, and
+//! loads its registers. Loading an MMX register an instruction only reads,
+//! or one a merge holds, leaves for the interpreter unless its x87 alias is
+//! MMX data: a merge may count it dirty, and publishing sets the exponent.
 //! A helper may change any register, so the cache is forgotten after one;
 //! d8-d15 survive the Rust calls between, and the `access`
 //! stubs keep v0-v7 and v16-v23.
@@ -137,8 +141,9 @@ pub enum Kind {
     /// Scalar double to single precision.
     Narrow(bool),
     Approximate(bool, bool),
-    /// COMIS/UCOMIS, using the interpreter for NaNs.
-    FlagCompare(bool),
+    /// COMIS/UCOMIS, using the interpreter for NaNs: double precision,
+    /// and whether a quiet NaN also raises invalid (COMIS).
+    FlagCompare(bool, bool),
     /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
     Compare(bool, bool),
     /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
@@ -187,7 +192,7 @@ impl Simd {
                 | Kind::FromInt(_)
                 | Kind::Widen(_)
                 | Kind::Narrow(..)
-                | Kind::FlagCompare(_)
+                | Kind::FlagCompare(..)
                 | Kind::Compare(..)
                 | Kind::MinMax(..)
                 | Kind::Sqrt(..)
@@ -222,7 +227,7 @@ impl Simd {
                 | Kind::MinMax(_, _, true)
                 | Kind::Compare(_, true)
                 | Kind::Double(..)
-                | Kind::FlagCompare(true)
+                | Kind::FlagCompare(true, _)
                 | Kind::Narrow(..)
                 | Kind::ScalarToInt(true, _)
         )
@@ -237,7 +242,7 @@ impl Simd {
             | Kind::Compare(scalar, _)
             | Kind::MinMax(_, scalar, _)
             | Kind::Widen(scalar) => scalar,
-            Kind::FlagCompare(_) | Kind::Narrow(true) | Kind::ScalarToInt(..) => true,
+            Kind::FlagCompare(..) | Kind::Narrow(true) | Kind::ScalarToInt(..) => true,
             _ => false,
         }
     }
@@ -290,11 +295,11 @@ impl Simd {
                 let bits = Arr::new(u32::from(log2), self.full()).bits();
                 u32::from(self.imm) < bits || op == ShiftImm::Sshr
             }
-            Kind::FlagCompare(_) => true,
+            Kind::FlagCompare(..) => true,
             _ => !self.floating(),
         };
         let writes = match self.kind {
-            Kind::FlagCompare(_) | Kind::MaskMove => 0,
+            Kind::FlagCompare(..) | Kind::MaskMove => 0,
             _ => bit(self.dst),
         };
         (
@@ -544,8 +549,8 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
             matches!(mnemonic, M::Rsqrtps | M::Rsqrtss),
             matches!(mnemonic, M::Rcpss | M::Rsqrtss),
         ),
-        M::Comiss | M::Ucomiss => Kind::FlagCompare(false),
-        M::Comisd | M::Ucomisd => Kind::FlagCompare(true),
+        M::Comiss | M::Ucomiss => Kind::FlagCompare(false, mnemonic == M::Comiss),
+        M::Comisd | M::Ucomisd => Kind::FlagCompare(true, mnemonic == M::Comisd),
         M::Cmpps => Kind::Compare(false, false),
         M::Cmpss => Kind::Compare(true, false),
         M::Cmppd => Kind::Compare(false, true),
@@ -589,7 +594,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         | Kind::Double(..)
         | Kind::Widen(_)
         | Kind::Narrow(..)
-        | Kind::FlagCompare(_)
+        | Kind::FlagCompare(..)
         | Kind::Compare(..)
         | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
         Kind::Move if matches!(mnemonic, M::Movq2dq | M::Movdq2q) => {
@@ -747,6 +752,15 @@ fn vmem(bytes: u8) -> VMem {
 
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
+        // A register it also writes is only published once written.
+        let (reads, writes) = simd.footprint();
+        let loads = reads as u8 & !self.vector.mmx;
+        self.aliased |= loads & writes as u8;
+        for n in 0..8 {
+            if loads & !writes as u8 & 1 << n != 0 {
+                self.mmx_aliased(n);
+            }
+        }
         let mmx = simd.mmx();
         let first_pe = mmx && simd.floating() && simd.inexact() && !self.vector.guards.fp_pe;
         let ready = self.vector.guards.ready;
@@ -976,7 +990,7 @@ impl Translator<'_> {
             | Kind::FromInt(_)
             | Kind::Widen(_)
             | Kind::Narrow(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::Sqrt(..) => {
@@ -1168,7 +1182,7 @@ impl Translator<'_> {
             | Kind::FromInt(_)
             | Kind::Widen(_)
             | Kind::Narrow(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::MaskMove
@@ -1434,8 +1448,8 @@ impl Translator<'_> {
             self.asm.tbz(false, X6, 7, skip);
             self.emit(add_imm(X, X16, guest, lane, false));
             self.asm.tbz(true, X16, 32, slow);
-            self.checked_base(X16, true, super::X2, slow);
-            self.checked_alias(X16, true, slow);
+            self.checked_base(X16, true, false, super::X2, slow);
+            self.checked_alias(X16, true, false, slow);
             self.asm.bind(skip);
         }
         self.emit(ldr(X, super::X2, RUNTIME, runtime::ALIAS));
@@ -1505,7 +1519,7 @@ impl Translator<'_> {
             | Kind::Double(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
-            | Kind::FlagCompare(_) => [Some(self.register(simd.dst)), Some(s)],
+            | Kind::FlagCompare(..) => [Some(self.register(simd.dst)), Some(s)],
             _ => [None, Some(s)],
         };
         let operands = Operands { s, inputs };
@@ -1541,7 +1555,7 @@ impl Translator<'_> {
             self.pe_ready(first_pe && !simd.mmx());
             return;
         }
-        if matches!(simd.kind, Kind::FlagCompare(_)) {
+        if matches!(simd.kind, Kind::FlagCompare(..)) {
             self.emit_all(&[
                 fmov_from_v(W, X16, V0),
                 fmov_from_v(W, X17, V2),
@@ -1640,7 +1654,7 @@ impl Translator<'_> {
             // Any NaN may raise IE: the slow path tells.
             Kind::MinMax(..)
             | Kind::Compare(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Widen(_)
             | Kind::ScalarToInt(..) => {
                 let inputs: Vec<VReg> = operands.inputs.into_iter().flatten().collect();
@@ -1934,7 +1948,7 @@ impl Translator<'_> {
                     ]);
                 }
             }
-            Kind::FlagCompare(double) => {
+            Kind::FlagCompare(double, _) => {
                 let d = d.unwrap();
                 // Relational comparisons send every NaN to the original helper,
                 // which distinguishes COMIS from UCOMIS exception behavior.
@@ -2078,9 +2092,46 @@ impl Translator<'_> {
         if *bit & mask == 0 {
             *bit |= mask;
             self.cpu();
+            if let Loc::Mmx(n) = loc {
+                assert!(self.aliased & 1 << n != 0, "MMX {n} loads unchecked");
+                self.aliased &= !(1 << n);
+            }
             self.at_cpu(true, size, v, offset);
         }
         v
+    }
+
+    /// Loads `loc` at a merge's arrival.
+    fn arrive_load(&mut self, loc: Loc) {
+        if let Loc::Mmx(n) = loc
+            && self.vector.mmx & 1 << n == 0
+        {
+            self.mmx_aliased(n);
+        }
+        self.register(loc);
+    }
+
+    /// Before the cache loads MMX register `n`, while x16 and x17 are free:
+    /// leaves for the interpreter unless the register is already MMX data,
+    /// its x87 exponent 0xffff or a pending MMX write's. A merge may count a
+    /// loaded register dirty, and publishing sets that exponent.
+    fn mmx_aliased(&mut self, n: u8) {
+        self.aliased |= 1 << n;
+        self.cpu();
+        let leave = match self.unloadable {
+            Some(leave) => leave,
+            None => self.bail(),
+        };
+        let ok = self.asm.label();
+        let exponent = runtime::X87_REGS + 10 * u32::from(n) + 8;
+        self.emit_all(&[ldrh(X17, X5, exponent), add_imm(W, X17, X17, 1, false)]);
+        self.asm.tbz(true, X17, 16, ok);
+        // `CpuState::commit_mmx` will write it.
+        self.emit(ldr(W, X16, X5, runtime::MMX_MODE));
+        self.asm.tbz(false, X16, 0, leave);
+        self.asm.tbz(false, X16, 2, ok);
+        self.asm.tbz(false, X16, 8 + u32::from(n), leave);
+        self.asm.bind(ok);
     }
 
     /// The host register of a destination register, holding its value if
@@ -2132,10 +2183,61 @@ impl Translator<'_> {
         self.as_part(Part::SimdLoad, |t| {
             for n in 0..8 {
                 if entry.regs & (1 << n) != 0 {
-                    t.register(Loc::Mmx(n));
+                    t.arrive_load(Loc::Mmx(n));
                 }
                 if entry.regs & (1 << (8 + n)) != 0 {
-                    t.register(Loc::Xmm(n));
+                    t.arrive_load(Loc::Xmm(n));
+                }
+            }
+        });
+        self.vector = Vector::at(entry);
+    }
+
+    /// Establishes a region head's entry for arrivals from outside the unit:
+    /// checks its MXCSR guards, leaving for the interpreter (a job for its
+    /// owner) where one fails, and loads its registers. The head's countdown
+    /// check has charged `refund`.
+    pub(super) fn enter_simd(&mut self, entry: Entry, refund: u32) {
+        let guards = entry.guards;
+        if guards.fp_masked || guards.fp_default {
+            let leave = self.asm.label();
+            self.push_cold(Cold::Leave {
+                label: leave,
+                state: self.state,
+                simd_dirty: 0,
+                refund,
+                // A job returns to its owner, which runs the head.
+                exit: if self.computation {
+                    Exit::Recall
+                } else {
+                    Exit::Interpret
+                },
+                eip: self.trace.insts[self.index].pc,
+                link: false,
+                x87: None,
+            });
+            // NZCV holds guest flags; exceptions masked, no DAZ or FTZ, and
+            // nearest rounding where the body needs it.
+            self.as_part(Part::SimdGuard, |t| {
+                t.cpu();
+                t.emit_all(&[
+                    ldr(W, X13, X5, runtime::MXCSR),
+                    and_imm(W, X17, X13, 0xffc0),
+                    eor_imm(W, X17, X17, 0x1f80),
+                ]);
+                if !guards.fp_default {
+                    t.emit(and_imm(W, X17, X17, u64::from(!0x6000u32)));
+                }
+                t.asm.cbz(W, true, X17, leave);
+            });
+        }
+        self.as_part(Part::SimdLoad, |t| {
+            for n in 0..8 {
+                if entry.regs & (1 << n) != 0 {
+                    t.arrive_load(Loc::Mmx(n));
+                }
+                if entry.regs & (1 << (8 + n)) != 0 {
+                    t.arrive_load(Loc::Xmm(n));
                 }
             }
         });
@@ -2324,6 +2426,7 @@ mod tests {
                 access: 0,
                 interpret: 0,
                 fault: 0,
+                opt_exit: 0,
             },
             &|_, _| None,
             &|_| None,
