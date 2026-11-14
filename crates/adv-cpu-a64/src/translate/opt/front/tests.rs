@@ -1346,7 +1346,7 @@ fn probe_an_image_unit() {
     }
     match build(&unit, &proof, &at) {
         Ok(built) if std::env::var_os("ADV_OPT_DEBUG").is_some() => {
-            let lowered = super::super::back::lower(&built.func, 0, 0);
+            let lowered = super::super::back::lower(&built.func);
             println!(
                 "lowered: {} words, {} spill cells",
                 lowered.words.len(),

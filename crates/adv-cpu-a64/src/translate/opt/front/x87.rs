@@ -35,7 +35,7 @@ impl Front<'_> {
                 .iter()
                 .map(|k| self.state.truncations[k]),
         );
-        for k in self.models[to].floats.clone() {
+        for &k in self.models[to].floats.clone().iter() {
             if !self.float_cell(to, k) {
                 args.push(self.state.floats[&k]);
             }

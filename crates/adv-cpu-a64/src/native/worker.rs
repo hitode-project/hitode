@@ -27,12 +27,24 @@ const WAKE_NS: f64 = 50_000.0;
 const BLOCKS_PER_THREAD: f64 = 4.0;
 /// The owner's fixed work in a split besides its blocks: admission and merge.
 const ROUND_NS: f64 = 10_000.0;
+/// Entries in a row the optimized form must miss before another is built
+/// for the state at the next, and how many more may be built.
+const MISSES: u8 = 4;
+const RESPECIALIZE: u8 = 2;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
 
 pub(super) struct Prepared {
     pub code: Code,
     pub proof: Proof,
+    /// What the optimized form is built from, again when entry states
+    /// keep missing its facts.
+    pub trace: Arc<crate::translate::Trace>,
+    /// Consecutive entries the optimized form did not admit.
+    misses: std::cell::Cell<u8>,
+    /// Optimized forms requested, and whether one is being built.
+    forms: std::cell::Cell<u8>,
+    building: std::cell::Cell<bool>,
     skip: std::cell::Cell<u32>,
     mode: std::cell::Cell<Mode>,
     /// Instructions and time per outer iteration, once a job showed them.
@@ -49,7 +61,7 @@ enum Mode {
 
 impl Prepared {
     /// `iterates` when the code can stop after one outer iteration.
-    pub fn new(code: Code, iterates: bool, proof: Proof) -> Self {
+    pub fn new(code: Code, iterates: bool, proof: Proof, trace: crate::translate::Trace) -> Self {
         let mode = if iterates {
             Mode::Whole(0)
         } else {
@@ -58,10 +70,43 @@ impl Prepared {
         Self {
             code,
             proof,
+            trace: Arc::new(trace),
+            misses: std::cell::Cell::new(0),
+            forms: std::cell::Cell::new(0),
+            building: std::cell::Cell::new(false),
             skip: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
             per_iteration: std::cell::Cell::new(None),
         }
+    }
+
+    /// Counts an entry whose state the optimized form did or did not admit.
+    pub fn admitted(&self, admitted: bool) {
+        self.misses.set(if admitted {
+            0
+        } else {
+            self.misses.get().saturating_add(1)
+        });
+    }
+
+    /// Whether to build a form for the state at this entry: the first one,
+    /// or up to `RESPECIALIZE` more after `MISSES` entries it did not admit.
+    pub fn wants_form(&self) -> bool {
+        !self.building.get()
+            && match self.forms.get() {
+                0 => true,
+                forms => forms <= RESPECIALIZE && self.misses.get() >= MISSES,
+            }
+    }
+
+    pub fn requested(&self) {
+        self.forms.set(self.forms.get() + 1);
+        self.building.set(true);
+        self.misses.set(0);
+    }
+
+    pub fn built(&self) {
+        self.building.set(false);
     }
 
     /// The code and whether a job stops after one outer iteration.
@@ -169,6 +214,8 @@ struct Task {
 struct Done {
     completion: Completion<Option<ExecutionContext>>,
     deadline_recall: bool,
+    /// Whether the optimized form admitted the entry state, if there is one.
+    admitted: Option<bool>,
 }
 
 const RECALL: u32 = 1;
@@ -220,6 +267,7 @@ fn run(
     record_branch(cpu, runtime.branch, cpu.eip);
     context.finish_computation(exit);
     Done {
+        admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
         deadline_recall: (exit == Exit::Recall || runtime.deferred != 0)
             && signals.pending.0.load(Ordering::Acquire)
                 & signals.pending.1
@@ -934,7 +982,11 @@ impl<'a> Session<'a> {
         iteration: bool,
         done: Done,
     ) -> Completion<Option<ExecutionContext>> {
-        self.prepared[&entry].observe(entry, iteration, &done);
+        let prepared = &self.prepared[&entry];
+        prepared.observe(entry, iteration, &done);
+        if let Some(admitted) = done.admitted {
+            prepared.admitted(admitted);
+        }
         let retired = done.completion.retired;
         *self.retired += retired;
         if let Some(forms) = self.forms {
@@ -1050,6 +1102,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             let done = Done {
                 completion,
                 deadline_recall: false,
+                admitted: None,
             };
             return Some(self.account(guest_entry, false, done));
         }
@@ -1788,24 +1841,22 @@ mod tests {
         panic!("serial continuation did not offer the prepared head");
     }
 
-    // spec: A64-OPT-1
-    #[test]
-    fn a_computation_without_a_computing_peer_runs_optimized_on_the_owner() {
-        use adv_cpu_core::trap::{Bridge, ExecutionTrap};
+    /// No peer runs beside this context.
+    struct Alone;
 
-        /// No peer runs beside this context.
-        struct Alone(u32);
-        impl ExecutionTrap for Alone {
-            fn allow_computation(&mut self) -> bool {
-                self.0 += 1;
-                false
-            }
-
-            fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
-                unreachable!("no host calls")
-            }
+    impl adv_cpu_core::trap::ExecutionTrap for Alone {
+        fn allow_computation(&mut self) -> bool {
+            false
         }
 
+        fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
+            unreachable!("no host calls")
+        }
+    }
+
+    /// A copy loop of COUNT words from INPUT, entered at CODE with its
+    /// head at CODE + 1, and the address after it.
+    fn copy_loop() -> (Executor, Native, u32) {
         let mut a = CodeAssembler::new(32).unwrap();
         a.nop().unwrap();
         let mut loop_head = a.create_label();
@@ -1817,7 +1868,6 @@ mod tests {
         a.jne(loop_head).unwrap();
         a.int3().unwrap();
         let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
-        let head = CODE + 1;
         let (mut executor, mut native) = fixture(&mut a);
         let memory = executor.memory_mut();
         memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
@@ -1825,14 +1875,33 @@ mod tests {
         memory.map(OUTPUT, SPACE as usize, READ | WRITE).unwrap();
         native.first_visits = false;
         native.set_computation_offer(true, None);
-        let mut alone = Alone(0);
-        let mut bridge = Bridge {
+        (executor, native, stop)
+    }
+
+    fn start(cpu: &mut CpuState, eip: u32) {
+        cpu.eip = eip;
+        cpu.regs[1] = COUNT;
+        cpu.regs[6] = INPUT;
+        cpu.regs[7] = OUTPUT;
+    }
+
+    /// One owner run of the copy loop with no peer beside it.
+    fn alone(
+        native: &mut Native,
+        executor: &mut Executor,
+        cpu: &mut CpuState,
+        stop: u32,
+        fuel: u64,
+    ) -> u32 {
+        let mut handler = Alone;
+        let memory = executor.memory_mut();
+        let mut bridge = adv_cpu_core::trap::Bridge {
             timestamp: Default::default(),
             memory,
             error: None,
             trap: None,
             calls: 0,
-            handler: Some(&mut alone),
+            handler: Some(&mut handler),
             parked: false,
             deadline: None,
             clock_due: true,
@@ -1842,22 +1911,23 @@ mod tests {
             cliffs: Default::default(),
             scratch: Default::default(),
         };
-        let bridge = (&raw mut bridge).cast();
-        let mut cpu = adv_cpu_core::CpuState::default();
-        let start = |cpu: &mut adv_cpu_core::CpuState, eip| {
-            cpu.eip = eip;
-            cpu.regs[1] = COUNT;
-            cpu.regs[6] = INPUT;
-            cpu.regs[7] = OUTPUT;
-        };
-        let mut run = |native: &mut Native, cpu: &mut adv_cpu_core::CpuState, fuel| {
-            let run = native
-                .run(cpu, executor.memory_mut(), stop, fuel, bridge)
-                .unwrap()
-                .unwrap();
-            assert_ne!(run.exit, Exit::Computation);
-            assert!(u64::from(run.retired) <= fuel);
-            run.retired
+        let run = native
+            .run(cpu, memory, stop, fuel, (&raw mut bridge).cast())
+            .unwrap()
+            .unwrap();
+        assert_ne!(run.exit, Exit::Computation);
+        assert!(u64::from(run.retired) <= fuel);
+        run.retired
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn a_computation_without_a_computing_peer_runs_optimized_on_the_owner() {
+        let (mut executor, mut native, stop) = copy_loop();
+        let head = CODE + 1;
+        let mut cpu = CpuState::default();
+        let mut run = |native: &mut Native, cpu: &mut CpuState, fuel| {
+            alone(native, &mut executor, cpu, stop, fuel)
         };
 
         // Budget exits nominate the loop and the next entry proves it.
@@ -1886,14 +1956,81 @@ mod tests {
         assert_eq!(cpu.eip, stop);
         native.interrupt = Some(Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)));
         start(&mut cpu, head);
-        let first = run(&mut native, &mut cpu, 1 << 40);
-        assert!(first < 5 * COUNT);
+        assert!(run(&mut native, &mut cpu, 1 << 40) < 5 * COUNT);
         assert_ne!(cpu.eip, stop);
-        assert!(alone.0 > 0);
         assert_eq!(
             executor.memory().read(OUTPUT + 4 * (COUNT - 1), 4).unwrap(),
             [0x78, 0x56, 0x34, 0x12]
         );
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn background_forms_install_at_a_later_entry_unless_stale() {
+        let (mut executor, mut native, stop) = copy_loop();
+        native.compiler = super::super::compile::Compiler::background();
+        let head = CODE + 1;
+        let mut cpu = CpuState::default();
+        start(&mut cpu, CODE);
+        while !native.computation.contains_key(&head) {
+            assert_ne!(cpu.eip, stop, "the loop was never proved");
+            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+        }
+        native.install_optimized(true);
+        assert!(native.computation[&head].code.optimized.is_some());
+
+        // A form requested for a unit that is dropped before it installs
+        // takes no code space.
+        native.request_optimized(head, cpu.clone());
+        native.cut(head, head + 1);
+        let used = native.cache.used();
+        native.install_optimized(true);
+        assert!(!native.computation.contains_key(&head));
+        assert_eq!(native.cache.used(), used);
+
+        // The loop proves again, and runs optimized once its form installs.
+        start(&mut cpu, CODE);
+        let mut retired = 0;
+        while cpu.eip != stop {
+            retired += alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+        }
+        assert_eq!(retired, 1 + 5 * COUNT);
+        native.install_optimized(true);
+        start(&mut cpu, head);
+        let before = native.diagnostics.optimized_runs;
+        assert_eq!(
+            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 40),
+            5 * COUNT
+        );
+        assert_eq!(native.diagnostics.optimized_runs, before + 1);
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn entry_states_the_form_keeps_missing_build_at_most_two_more() {
+        let (mut executor, mut native, stop) = copy_loop();
+        let head = CODE + 1;
+        let mut cpu = CpuState::default();
+        start(&mut cpu, CODE);
+        while native.diagnostics.optimized_runs == 0 {
+            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+        }
+        // Every form assumes MXCSR's control bits: each new rounding mode
+        // misses MISSES entries, then the next entry builds for it.
+        for (mode, rebuilds) in [(1, true), (2, true), (3, false)] {
+            cpu.mxcsr = 0x1f80 | mode << 13;
+            for _ in 0..MISSES {
+                let before = native.diagnostics.optimized_runs;
+                start(&mut cpu, head);
+                alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+                assert_eq!(native.diagnostics.optimized_runs, before);
+            }
+            let before = native.diagnostics.optimized_runs;
+            start(&mut cpu, head);
+            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+            assert_eq!(native.diagnostics.optimized_runs > before, rebuilds);
+        }
+        assert_eq!(native.computation[&head].forms.get(), 1 + RESPECIALIZE);
     }
 
     // spec: A64-CTL-10 A64-TR-9
@@ -2310,6 +2447,7 @@ mod tests {
                 requires_owner: false,
             },
             deadline_recall: false,
+            admitted: None,
         };
         prepared.observe(CODE, false, &sample);
         assert!(prepared.mode.get() == Mode::Trial);

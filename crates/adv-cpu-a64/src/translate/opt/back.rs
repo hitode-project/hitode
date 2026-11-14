@@ -34,10 +34,21 @@ pub(crate) struct Lowered {
     pub flags: Vec<Option<FlagRecipe>>,
     /// 16-byte cells at the captured SP, discarded by `opt_exit`.
     pub spill_cells: usize,
+    /// The word every record leaves through, a branch to `opt_exit` once
+    /// the code is placed.
+    pub exit: usize,
 }
 
-/// `at` and `opt_exit` share a code origin. Entry cells are 16 bytes.
-pub(crate) fn lower(func: &Func, at: usize, opt_exit: usize) -> Lowered {
+impl Lowered {
+    /// Makes the exit word branch to `opt_exit` from code placed at `at`.
+    pub(crate) fn place(&mut self, at: usize, opt_exit: usize) {
+        self.words[self.exit] = b(opt_exit as i32 - (at + self.exit * 4) as i32);
+    }
+}
+
+/// Code at any address; `Lowered::place` binds its exit. Entry cells are
+/// 16 bytes.
+pub(crate) fn lower(func: &Func) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func);
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
@@ -168,14 +179,17 @@ pub(crate) fn lower(func: &Func, at: usize, opt_exit: usize) -> Lowered {
     }
     e.checkpoints();
     // spec: A64-OPT-6
+    let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
         e.asm.bind(e.cold[i]);
         e.mark(Part::Cold, record.eip);
         e.imm(T, i as u64);
         e.asm.emit(str(W, T, RT, RECORD));
-        e.asm
-            .emit(b(opt_exit as i32 - (at + e.asm.offset()) as i32));
+        e.asm.b(exit);
     }
+    e.asm.bind(exit);
+    // Permanently undefined until placed.
+    e.asm.emit(0);
     // A host fault leaves through its region's record like a failed check.
     for (offset, site) in &mut e.sites {
         let cold = e.cold[site.opt_record.expect("optimized site") as usize];
@@ -186,7 +200,9 @@ pub(crate) fn lower(func: &Func, at: usize, opt_exit: usize) -> Lowered {
         .iter()
         .map(|r| super::recovery::lower_record(r, &e.locations))
         .collect();
+    let exit = e.asm.position(exit) / 4;
     Lowered {
+        exit,
         words: e.asm.finish(),
         sites: e.sites,
         marks: e.marks,

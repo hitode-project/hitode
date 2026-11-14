@@ -53,6 +53,7 @@ use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
+mod compile;
 mod worker;
 
 const CACHE_LEN: usize = 64 << 20;
@@ -783,6 +784,8 @@ pub(crate) struct Native {
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
     admission: worker::Admission,
+    /// Builds optimized forms, which `install_optimized` adopts.
+    compiler: compile::Compiler,
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
@@ -903,6 +906,7 @@ impl Native {
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
             admission: worker::Admission::default(),
+            compiler: compile::Compiler::new(),
             features: features(),
             runtime,
             clock: std::ptr::null_mut(),
@@ -1001,6 +1005,7 @@ impl Native {
         self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
+        self.install_optimized(false);
         if self.computation_enabled
             && let Some((candidate, end)) = self.nominated.take()
         {
@@ -1059,6 +1064,13 @@ impl Native {
                 (entry?, self.cache.used().saturating_sub(before))
             }
         };
+        if self
+            .computation
+            .get(&cpu.eip)
+            .is_some_and(worker::Prepared::wants_form)
+        {
+            self.request_optimized(cpu.eip, cpu.clone());
+        }
         // Reaching the computation tells peers it is here, offered or not.
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
@@ -1200,7 +1212,9 @@ impl Native {
             return None;
         }
         let alias = alias_base(memory);
-        let optimized = worker::admit(&prepared.code, cpu, alias)?;
+        let optimized = worker::admit(&prepared.code, cpu, alias);
+        prepared.admitted(optimized.is_some());
+        let optimized = optimized?;
         let entry = worker::Entry {
             enter: self.enter,
             window: self.runtime.window,
@@ -1734,14 +1748,19 @@ impl Native {
                     .map(|probe| probe.proof)
                     .or_else(|| computation_proof(memory, &work.unit.trace));
                 if let Some(proof) = proof
-                    && let Some(mut code) =
+                    && let Some(code) =
                         self.emit_computation(&mut work.unit, eip, (control, pe), &proof)
                 {
-                    code.optimized = self.emit_optimized(&work.unit, eip, &proof);
                     let iterates = work.unit.trace.returns_at_head();
                     self.diagnostics.split_proofs += u64::from(proof.splits());
+                    let trace = work.unit.trace.detached();
                     self.computation
-                        .insert(eip, worker::Prepared::new(code, iterates, proof));
+                        .insert(eip, worker::Prepared::new(code, iterates, proof, trace));
+                    // SAFETY: the owner's state is live while it translates.
+                    if let Some(at) = unsafe { self.runtime.cpu.as_ref() } {
+                        let at = at.clone();
+                        self.request_optimized(eip, at);
+                    }
                 }
             }
             self.helpers.extend(work.helpers());
@@ -1790,63 +1809,72 @@ impl Native {
         })
     }
 
-    /// The optimized form of an admitted unit, assuming the owner's current
-    /// x87, MXCSR and stack-alignment facts (A64-OPT-1).
-    fn emit_optimized(
-        &mut self,
-        unit: &translate::Unit,
-        eip: u32,
-        proof: &translate::computation::Proof,
-    ) -> Option<Arc<worker::Optimized>> {
-        if self.runtime.cpu.is_null() {
-            return None;
-        }
-        // SAFETY: the owner's state is live while it translates.
-        let at = unsafe { &*self.runtime.cpu };
-        let built = match translate::opt::front::build(unit, proof, at) {
-            Ok(built) => built,
-            Err(reject) => {
-                if crate::jit_map::enabled() {
-                    let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
-                    let at = inst.map_or(String::from("0\t-"), |inst| {
-                        format!("{}\t{:?}", inst.pc, inst.op)
-                    });
-                    crate::jit_map::optimized(eip, &format!("{reject:?}\t{at}"));
-                }
-                return None;
-            }
-        };
-        crate::jit_map::optimized(eip, &format!("built\t{}\t-", built.cuts));
-        let lowered =
-            translate::opt::back::lower(&built.func, self.cache.next(), self.stubs.opt_exit);
-        let entry = self.cache.append(&lowered.words)?;
-        let mut sites: Vec<_> = lowered
-            .sites
-            .iter()
-            .map(|&(offset, site)| (entry + offset, site))
-            .collect();
-        sites.sort_unstable_by_key(|&(pc, _)| pc);
-        crate::jit_map::record(
-            entry,
-            &lowered.words,
+    /// Asks for an optimized form of the computation prepared at `eip`,
+    /// taking its facts from `at`, the state at an entry.
+    fn request_optimized(&mut self, eip: u32, at: CpuState) {
+        let prepared = &self.computation[&eip];
+        prepared.requested();
+        crate::jit_map::optimized(eip, "requested\t-\t-");
+        self.compiler.request(compile::Request {
             eip,
-            unit.trace.prepaid(0),
-            &lowered.marks,
-            "a64-opt",
-        );
-        Some(Arc::new(worker::Optimized {
-            code: worker::Code {
+            generation: self.generation,
+            code: prepared.code.entry,
+            trace: prepared.trace.detached(),
+            proof: prepared.proof.clone(),
+            at,
+        });
+        self.install_optimized(false);
+    }
+
+    /// Adopts the built forms whose computation is still the one they were
+    /// built for; `wait` also takes those still being built.
+    fn install_optimized(&mut self, wait: bool) {
+        while let Some(done) = self.compiler.next(wait) {
+            let Some(prepared) = self
+                .computation
+                .get_mut(&done.eip)
+                .filter(|p| done.generation == self.generation && p.code.entry == done.code)
+            else {
+                continue;
+            };
+            prepared.built();
+            let Some(mut form) = done.form else {
+                continue;
+            };
+            let lowered = &mut form.lowered;
+            lowered.place(self.cache.next(), self.stubs.opt_exit);
+            let Some(entry) = self.cache.append(&lowered.words) else {
+                continue;
+            };
+            let mut sites: Vec<_> = lowered
+                .sites
+                .iter()
+                .map(|&(offset, site)| (entry + offset, site))
+                .collect();
+            sites.sort_unstable_by_key(|&(pc, _)| pc);
+            crate::jit_map::optimized(done.eip, "installed\t-\t-");
+            crate::jit_map::record(
                 entry,
-                end: entry + lowered.words.len() * 4,
-                sites: sites.into(),
-                optimized: None,
-            },
-            entry: built.func.entry,
-            assumed: built.assumed,
-            records: lowered.records,
-            flags: lowered.flags,
-            cells: lowered.spill_cells,
-        }))
+                &lowered.words,
+                done.eip,
+                form.prepaid,
+                &lowered.marks,
+                "a64-opt",
+            );
+            prepared.code.optimized = Some(Arc::new(worker::Optimized {
+                code: worker::Code {
+                    entry,
+                    end: entry + lowered.words.len() * 4,
+                    sites: sites.into(),
+                    optimized: None,
+                },
+                entry: form.built.func.entry,
+                assumed: form.built.assumed,
+                records: std::mem::take(&mut lowered.records),
+                flags: std::mem::take(&mut lowered.flags),
+                cells: lowered.spill_cells,
+            }));
+        }
     }
 
     /// A budget exit samples where owner time goes. It nominates the

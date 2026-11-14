@@ -1782,7 +1782,8 @@ mod opt_back {
                 ret(Reg::LR),
             ]);
             let at = code.len() * 4;
-            let lowered = back::lower(func, at, self.stubs.opt_exit);
+            let mut lowered = back::lower(func);
+            lowered.place(at, self.stubs.opt_exit);
             code.extend_from_slice(&lowered.words);
             let mut context = vec![0; size_of::<runtime::Runtime>()];
             let mut put = |offset: usize, value: &[u8]| {
@@ -2800,7 +2801,8 @@ mod opt_back {
         let params: Vec<_> = (1..=36).collect();
         let got = compare(&f, &params, &mut h);
         assert_eq!(got.cpu.regs[0], 666 + 30);
-        let lowered = back::lower(&f, 0, stubs.opt_exit);
+        let mut lowered = back::lower(&f);
+        lowered.place(0, stubs.opt_exit);
         let spill = |&w: &u32| w & 0x3b00_0000 == 0x3900_0000 && (w >> 5) & 31 == 31;
         for block in [head, latch] {
             assert!(
@@ -3143,7 +3145,8 @@ mod opt_back {
         let k = f.push(b, Op::Constant(Type::I32, 7)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
         finish(&mut f, b, v);
-        let lower = back::lower(&f, 0, stubs.opt_exit);
+        let mut lower = back::lower(&f);
+        lower.place(0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "one ADD plus exit branch");
         assert_eq!(
             body(&lower, 0)[0],
@@ -3157,7 +3160,8 @@ mod opt_back {
         let k = f.push(b, Op::Constant(Type::I32, 8)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Mul, v, k)).unwrap();
         finish(&mut f, b, v);
-        let lower = back::lower(&f, 0, stubs.opt_exit);
+        let mut lower = back::lower(&f);
+        lower.place(0, stubs.opt_exit);
         assert_eq!(
             body(&lower, 0)[..2],
             [
@@ -3215,7 +3219,8 @@ mod opt_back {
             let exit = f.record(record(0x2000));
             f.end(block, End::Exit(exit));
         }
-        let lower = back::lower(&f, 0, stubs.opt_exit);
+        let mut lower = back::lower(&f);
+        lower.place(0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "CMP plus conditional branch");
         assert_eq!(body(&lower, 0)[0], cmp_imm(W, Reg::new(0), 5, false));
         assert_eq!(body(&lower, 0)[1] & 0xff00_001f, b_cond(Cond::Hi, 0));
@@ -3225,7 +3230,8 @@ mod opt_back {
         f.push(b, Op::Validate);
         let exit = f.record(record(0x2000));
         f.end(b, End::Exit(exit));
-        let lower = back::lower(&f, 0, stubs.opt_exit);
+        let mut lower = back::lower(&f);
+        lower.place(0, stubs.opt_exit);
         let start = lower.marks[1].offset as usize / 4;
         assert_eq!(lower.words[start - 2], sub_imm(X, X9, X9, 3, false));
         assert_eq!(lower.words[start - 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
@@ -3303,7 +3309,8 @@ mod opt_back {
                 },
             );
             finish(&mut f, done, total);
-            let lower = back::lower(&f, 0, runtime::stubs().opt_exit);
+            let mut lower = back::lower(&f);
+            lower.place(0, runtime::stubs().opt_exit);
             let head_code = body(&lower, 1);
             assert_eq!(
                 head_code[0],

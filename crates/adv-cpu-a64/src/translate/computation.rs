@@ -136,6 +136,7 @@ impl Evaluation {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Proof {
     exprs: Vec<Expr>,
     vars: Vec<Var>,
@@ -178,6 +179,7 @@ pub(crate) struct Plan {
     pub frame: Option<(i32, i32)>,
 }
 
+#[derive(Clone)]
 pub(crate) struct FrameCache {
     pub head: usize,
     /// Byte displacements from ESP on entry to the loop.

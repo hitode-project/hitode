@@ -393,7 +393,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                 x87,
                 frame,
                 floats,
-                dirty: model.dirty.clone(),
+                dirty: (*model.dirty).clone(),
                 truncations,
                 top: model.top,
                 control: model.control.ok_or(Reject::Mode(i))?,

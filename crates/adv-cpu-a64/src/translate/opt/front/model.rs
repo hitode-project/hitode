@@ -1,6 +1,8 @@
 //! Constants proven on every arrival, independently of SSA identities.
 use super::*;
 use adv_cpu_core::floating::fast::{Fast, Op as Arithmetic};
+use std::collections::BTreeSet;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum C1 {
@@ -8,22 +10,47 @@ pub(super) enum C1 {
     Round(FpOp),
     Unknown,
 }
+/// The frame sets are shared between the models of consecutive
+/// instructions and copied only where one changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Model {
     pub top: u8,
     pub valid: u8,
     pub control: Option<u16>,
     pub c1: C1,
-    pub floats: std::collections::BTreeSet<i32>,
+    pub floats: Rc<BTreeSet<i32>>,
     /// Frame positions where an x87 binary64 store on some path wrote the
     /// bytes last: the cell is best held as F64 there.
-    pub stored: std::collections::BTreeSet<i32>,
-    pub dirty: std::collections::BTreeSet<i32>,
-    pub truncations: std::collections::BTreeSet<(i32, u8)>,
+    pub stored: Rc<BTreeSet<i32>>,
+    pub dirty: Rc<BTreeSet<i32>>,
+    pub truncations: Rc<BTreeSet<(i32, u8)>>,
     regs: [(u32, u32); 8],
     mxcsr: u32,
-    bytes: BTreeMap<i32, u8>,
+    bytes: Rc<BTreeMap<i32, u8>>,
     flags: Option<u32>,
+}
+
+fn retain<T: Ord + Clone>(set: &mut Rc<BTreeSet<T>>, keep: impl Fn(&T) -> bool) {
+    if !set.iter().all(&keep) {
+        Rc::make_mut(set).retain(keep);
+    }
+}
+
+fn extend<T: Ord + Clone>(set: &mut Rc<BTreeSet<T>>, from: &Rc<BTreeSet<T>>) {
+    if !Rc::ptr_eq(set, from) && !from.is_subset(set) {
+        Rc::make_mut(set).extend(from.iter().cloned());
+    }
+}
+
+/// Clears the frame facts a write of `width` bytes at `p` overlaps.
+fn overwrite(m: &mut Model, p: i32, width: u8) {
+    let apart = |start: i32, w: u8| start + i32::from(w) <= p || p + i32::from(width) <= start;
+    retain(&mut m.floats, |&start| apart(start, 8));
+    retain(&mut m.stored, |&start| apart(start, 8));
+    retain(&mut m.truncations, |&(start, w)| apart(start, w));
+    if !(p..p + i32::from(width)).all(|b| m.dirty.contains(&b)) {
+        Rc::make_mut(&mut m.dirty).extend(p..p + i32::from(width));
+    }
 }
 
 /// `kept` gives, for a loop head whose arrivals commit frame cells, the
@@ -32,7 +59,7 @@ pub(super) fn analyze(
     unit: &Unit,
     at: &CpuState,
     offsets: &[[Option<i32>; 8]],
-    kept: &[Option<std::collections::BTreeSet<i32>>],
+    kept: &[Option<BTreeSet<i32>>],
 ) -> Result<Vec<Model>, Reject> {
     let entry = Model {
         top: at.x87.top() as u8,
@@ -45,7 +72,7 @@ pub(super) fn analyze(
         truncations: Default::default(),
         regs: [(0, 0); 8],
         mxcsr: at.mxcsr,
-        bytes: BTreeMap::new(),
+        bytes: Default::default(),
         flags: None,
     };
     let mut states = vec![None; unit.trace.len()];
@@ -95,7 +122,7 @@ pub(super) fn analyze(
             let m = match kept.get(to) {
                 Some(Some(kept)) => {
                     committed = m.clone();
-                    committed.dirty.retain(|b| kept.contains(b));
+                    retain(&mut committed.dirty, |b| kept.contains(b));
                     &committed
                 }
                 _ => &m,
@@ -112,11 +139,13 @@ pub(super) fn analyze(
                     a.1 &= b.1 & !(a.0 ^ b.0);
                     a.0 &= a.1;
                 }
-                old.floats.retain(|p| m.floats.contains(p));
-                old.stored.extend(m.stored.iter().copied());
-                old.dirty.extend(m.dirty.iter().copied());
-                old.truncations.retain(|k| m.truncations.contains(k));
-                old.bytes.retain(|p, v| m.bytes.get(p) == Some(v));
+                retain(&mut old.floats, |p| m.floats.contains(p));
+                extend(&mut old.stored, &m.stored);
+                extend(&mut old.dirty, &m.dirty);
+                retain(&mut old.truncations, |k| m.truncations.contains(k));
+                if !old.bytes.iter().all(|(p, v)| m.bytes.get(p) == Some(v)) {
+                    Rc::make_mut(&mut old.bytes).retain(|p, v| m.bytes.get(p) == Some(v));
+                }
                 if old.flags != m.flags {
                     old.flags = None;
                 }
@@ -189,19 +218,15 @@ impl Model {
             }
             Part::Mem(mem) => {
                 if let Some(p) = frame_offset(mem, offsets) {
-                    self.floats
-                        .retain(|&start| start + 8 <= p || p + i32::from(width) <= start);
-                    self.stored
-                        .retain(|&start| start + 8 <= p || p + i32::from(width) <= start);
-                    self.truncations.retain(|&(start, w)| {
-                        start + i32::from(w) <= p || p + i32::from(width) <= start
-                    });
-                    for b in 0..i32::from(width) {
-                        self.dirty.insert(p + b);
-                        if let Some(x) = value {
-                            self.bytes.insert(p + b, (x >> (b * 8)) as u8);
-                        } else {
-                            self.bytes.remove(&(p + b));
+                    overwrite(self, p, width);
+                    let byte = |b: i32| value.map(|x| (x >> (b * 8)) as u8);
+                    if (0..i32::from(width)).any(|b| self.bytes.get(&(p + b)).copied() != byte(b)) {
+                        let bytes = Rc::make_mut(&mut self.bytes);
+                        for b in 0..i32::from(width) {
+                            match byte(b) {
+                                Some(x) => bytes.insert(p + b, x),
+                                None => bytes.remove(&(p + b)),
+                            };
                         }
                     }
                 }
@@ -266,24 +291,18 @@ impl Model {
                                 unreachable!()
                             };
                             if let Some(p) = frame_offset(mem, offsets) {
-                                self.floats.retain(|&start| {
-                                    start + 8 <= p || p + i32::from(width) <= start
-                                });
-                                self.stored.retain(|&start| {
-                                    start + 8 <= p || p + i32::from(width) <= start
-                                });
-                                self.truncations.retain(|&(start, w)| {
-                                    start + i32::from(w) <= p || p + i32::from(width) <= start
-                                });
-                                for b in 0..i32::from(width) {
-                                    self.dirty.insert(p + b);
-                                    self.bytes.remove(&(p + b));
+                                overwrite(self, p, width);
+                                if self.bytes.range(p..p + i32::from(width)).next().is_some() {
+                                    let bytes = Rc::make_mut(&mut self.bytes);
+                                    for b in 0..i32::from(width) {
+                                        bytes.remove(&(p + b));
+                                    }
                                 }
                                 if integer {
-                                    self.truncations.insert((p, width));
+                                    Rc::make_mut(&mut self.truncations).insert((p, width));
                                 } else if width == 8 {
-                                    self.floats.insert(p);
-                                    self.stored.insert(p);
+                                    Rc::make_mut(&mut self.floats).insert(p);
+                                    Rc::make_mut(&mut self.stored).insert(p);
                                 }
                             }
                         }
