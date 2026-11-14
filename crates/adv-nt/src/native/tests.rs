@@ -377,7 +377,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
         0,
         &ORDINARY,
     );
-    debugger_attached(true);
+    observe_host_calls(true);
     run_body(
         &mut Env {
             cpu: &mut cpu,
@@ -389,7 +389,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
         1,
         &ORDINARY,
     );
-    debugger_attached(false);
+    observe_host_calls(false);
     assert_eq!(machine.ext.get::<Boundary>().bodies[1].timed_calls, 1);
     let boundary = machine.ext.get_mut::<Boundary>();
     let row = boundary.bodies[0];
