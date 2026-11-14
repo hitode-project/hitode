@@ -1475,6 +1475,9 @@ impl Native {
         self.runtime.alias = alias_base(memory);
         self.runtime.alias_classes =
             (memory.perms.as_ptr() as usize).wrapping_sub((memory.base >> 12) as usize) as u64;
+        self.runtime.code_lines = (memory.code_lines() as usize)
+            .wrapping_sub((memory.base >> 12) as usize * size_of::<u64>())
+            as u64;
         memory.fast.body_table((memory.base >> 12) as usize);
         // Drop this temporary Arc before a helper can modify the tables.
         drop(memory.native_permissions());

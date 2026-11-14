@@ -2161,50 +2161,59 @@ fn x87_directed_store_loops_run_natively() {
     }
 }
 
-/// Data on a code page: each store faults until the instruction is checked,
-/// then takes `access` without leaving translated code.
+/// Data on a code page: each store faults until the instruction is checked.
+/// Then a store whose line and the next hold no code takes the alias, and
+/// one next to code takes `access`, without leaving translated code.
 // spec: A64-MEM-6, A64-MEM-7, A64-CTL-10
 #[cfg(native)]
 #[test]
 fn stores_to_data_on_a_code_page_stop_faulting() {
     const ITERATIONS: u32 = 2000;
-    let mut a = CodeAssembler::new(32).unwrap();
-    let mut top = a.create_label();
-    a.mov(ecx, CODE + 0x800).unwrap();
-    a.mov(edx, ITERATIONS).unwrap();
-    a.set_label(&mut top).unwrap();
-    a.mov(eax, dword_ptr(ecx)).unwrap();
-    a.add(eax, edx).unwrap();
-    a.mov(dword_ptr(ecx), eax).unwrap();
-    a.push(eax).unwrap();
-    a.pop(ebx).unwrap();
-    a.dec(edx).unwrap();
-    a.jnz(top).unwrap();
-    a.nop().unwrap();
-    let code = a.assemble(u64::from(CODE)).unwrap();
-    let stop = CODE + code.len() as u32 - 1;
-
-    let mut executor = Executor::new(BASE, LEN).unwrap();
-    let memory = executor.memory_mut();
-    memory.protect(CODE, 0x1_0000, 7).unwrap();
-    memory.write(CODE, &code).unwrap();
-    memory
-        .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
-        .unwrap();
-    executor.state.eip = CODE;
-    executor.state.regs[4] = STACK_TOP;
-    let outcome = executor.run(stop, u64::MAX >> 1).unwrap();
-    assert_eq!(outcome, RunOutcome::ReachedStop);
-    let sum = (1..=ITERATIONS).sum::<u32>();
-    assert_eq!(executor.state.regs[0], sum);
-    assert_eq!(executor.state.regs[3], sum);
-    let stored = executor.memory().read(CODE + 0x800, 4).unwrap();
-    assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
-    // The loop's unit, then the one it loops through, each fault until
-    // the store is checked.
-    let faults = executor.native.as_ref().unwrap().unchecked_faults;
-    let checked = u64::from(crate::native::CHECK_AFTER);
-    assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
+    let assemble = |data: u32| {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        a.mov(ecx, data).unwrap();
+        a.mov(edx, ITERATIONS).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.mov(eax, dword_ptr(ecx)).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(ecx), eax).unwrap();
+        a.push(eax).unwrap();
+        a.pop(ebx).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(top).unwrap();
+        a.nop().unwrap();
+        a.assemble(u64::from(CODE)).unwrap()
+    };
+    let end = CODE + assemble(CODE).len() as u32;
+    for (data, alias) in [(CODE + 0x800, true), (end.next_multiple_of(4), false)] {
+        let code = assemble(data);
+        let stop = CODE + code.len() as u32 - 1;
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        let memory = executor.memory_mut();
+        memory.protect(CODE, 0x1_0000, 7).unwrap();
+        memory.write(CODE, &code).unwrap();
+        memory
+            .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
+            .unwrap();
+        executor.state.eip = CODE;
+        executor.state.regs[4] = STACK_TOP;
+        let outcome = executor.run(stop, u64::MAX >> 1).unwrap();
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let sum = (1..=ITERATIONS).sum::<u32>();
+        assert_eq!(executor.state.regs[0], sum);
+        assert_eq!(executor.state.regs[3], sum);
+        let stored = executor.memory().read(data, 4).unwrap();
+        assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), sum);
+        // The loop's unit, then the one it loops through, each fault until
+        // the store is checked.
+        let native = executor.native.as_ref().unwrap();
+        let faults = native.unchecked_faults;
+        let checked = u64::from(crate::native::CHECK_AFTER);
+        assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
+        let accesses = native.diagnostics.accesses;
+        assert_eq!(accesses == 0, alias, "{accesses} accesses at {data:#x}");
+    }
 }
 
 /// Checked accesses leave dirty MMX registers in place: an access the

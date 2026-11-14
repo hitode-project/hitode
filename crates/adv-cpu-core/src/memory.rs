@@ -180,6 +180,9 @@ pub struct Memory {
     watched: Vec<bool>,
     /// Bytes of each watched page that were fetched or captured as code.
     code: BTreeMap<usize, Box<[u64; PAGE_SIZE / 64]>>,
+    /// The 64-byte lines of each page that hold such bytes, bit `i` for
+    /// line `i`, so translated stores can tell data on a code page.
+    code_lines: Vec<u64>,
     pub mapped: Arc<Vec<bool>>,
     /// Pages changed since the controller last looked, each with its version
     /// before the first change, and the changed bytes while they stay few.
@@ -396,6 +399,7 @@ impl Memory {
                 .or_insert_with(|| Box::new([0; PAGE_SIZE / 64]));
             for (word, mask) in bit_words(bytes) {
                 bits[word] |= mask;
+                self.code_lines[page] |= 1 << word;
             }
             if !self.watched[page] {
                 self.watched[page] = true;
@@ -413,6 +417,11 @@ impl Memory {
                 self.epoch += 1;
             }
         }
+    }
+
+    /// The code line masks, one per page from `base`; they only gain bits.
+    pub fn code_lines(&self) -> *const u64 {
+        self.code_lines.as_ptr()
     }
 
     /// Software-checked memory changes code only when a store reaches bytes
@@ -484,6 +493,7 @@ impl Memory {
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code_lines: vec![0; len / PAGE_SIZE],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -528,6 +538,7 @@ impl Memory {
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
+            code_lines: vec![0; len / PAGE_SIZE],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -603,6 +614,7 @@ impl Memory {
         memory.fast = FastPermissions::new(len / PAGE_SIZE);
         memory.versions = vec![origin; len / PAGE_SIZE];
         memory.watched = vec![false; len / PAGE_SIZE];
+        memory.code_lines = vec![0; len / PAGE_SIZE];
         memory.resident_pages = vec![false; len / PAGE_SIZE];
         memory.mapped = Arc::new(vec![false; len / PAGE_SIZE]);
         memory.reservation = Some(reservation);

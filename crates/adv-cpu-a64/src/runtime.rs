@@ -114,6 +114,9 @@ pub struct Runtime {
     /// Values of 8- and 16-byte checked accesses, shared with the owner;
     /// 16-byte aligned for `ldr q`.
     pub access_vector: [u8; 16],
+    /// `Memory::code_lines`, biased to guest zero: which 64-byte lines of
+    /// each page hold watched code.
+    pub code_lines: u64,
     #[cfg(test)]
     pub channel_batches: u64,
     #[cfg(test)]
@@ -180,6 +183,7 @@ impl Runtime {
             classes: 0,
             alias: 0,
             alias_classes: 0,
+            code_lines: 0,
             interpret: 0,
             exit: 0,
             temps: [0; 2],
@@ -362,6 +366,7 @@ pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
 pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
+pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
 pub(crate) const CPU_STATE: u32 = CPU;
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));

@@ -304,19 +304,42 @@ impl Translator<'_> {
         self.asm.bind(done);
     }
 
-    /// Verify the alias class after the window class granted the guest permission.
+    /// Verify the alias class after the window class granted the guest
+    /// permission. A store to a writable page that is not shared takes the
+    /// alias unless its line or the next holds watched code (A64-CTL-10):
+    /// the raw class marks a guest RWX page, the derived class a watched
+    /// data page. Every alias access is at most 64 bytes.
     pub(super) fn checked_alias(&mut self, address: Reg, store: bool, slow: Label) {
-        self.check_class(address, runtime::ALIAS_CLASSES, store, slow, slow);
-        if store {
-            // Watching a writable data page sets the store barrier in the
-            // derived classes, without changing its raw guest permissions.
-            self.emit_all(&[
-                ldr(X, X3, RUNTIME, runtime::BODY_CLASSES),
+        if !store {
+            self.check_class(address, runtime::ALIAS_CLASSES, false, slow, slow);
+            return;
+        }
+        let (lines, done) = (self.asm.label(), self.asm.label());
+        let bit = |permission: u8| permission.trailing_zeros();
+        let class = |table| {
+            [
+                ldr(X, X3, RUNTIME, table),
                 lsr_imm(W, X4, address, PAGE_SHIFT),
                 ldr_narrow(Narrow::Byte, X4, X3, X4),
-            ]);
-            self.asm.tbz(true, X4, EXEC.trailing_zeros(), slow);
-        }
+            ]
+        };
+        self.emit_all(&class(runtime::ALIAS_CLASSES));
+        self.asm.tbz(false, X4, bit(WRITE), slow);
+        self.asm.tbz(true, X4, bit(SHARED), slow);
+        self.asm.tbz(true, X4, bit(EXEC), lines);
+        self.emit_all(&class(runtime::BODY_CLASSES));
+        self.asm.tbz(false, X4, bit(EXEC), done);
+        self.asm.bind(lines);
+        self.emit_all(&[
+            ldr(X, X3, RUNTIME, runtime::CODE_LINES),
+            lsr_imm(W, X4, address, PAGE_SHIFT),
+            ldr_reg(X, X3, X3, X4, true),
+            lsr_imm(W, X4, address, 6),
+            shiftv(X, Shift::Lsr, X3, X3, X4),
+            and_imm(X, X3, X3, 3),
+        ]);
+        self.asm.cbz(X, true, X3, slow);
+        self.asm.bind(done);
     }
 
     /// Test guest permission and excluded classes with the same scratch and NZCV contract.
