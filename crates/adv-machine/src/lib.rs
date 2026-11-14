@@ -88,12 +88,12 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
 type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>;
 
 thread_local! {
-    static DEBUGGER_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OBSERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The debugger lifetime on the execution owner.
-pub fn debugger_attached(attached: bool) {
-    DEBUGGER_ATTACHED.set(attached);
+/// Host-call observation the debugger turned on, on the execution owner.
+pub fn observe_host_calls(on: bool) {
+    OBSERVING.set(on);
 }
 
 /// Host-side machine state shared by all handlers.
@@ -317,7 +317,7 @@ impl Sys {
 
     /// Modes that require host-call observations (EXEC-CALL-1).
     pub fn diagnostics(&self) -> u8 {
-        u8::from(DEBUGGER_ATTACHED.get())
+        u8::from(OBSERVING.get())
             | (u8::from(self.trace.enabled()) << 1)
             | (u8::from(
                 self.stats.enabled
@@ -1924,14 +1924,14 @@ impl TrapHandler for Dispatch<'_> {
     fn allow_computation(&mut self) -> bool {
         self.sys.computing_peer()
             && self.computation
-            && !DEBUGGER_ATTACHED.get()
+            && !OBSERVING.get()
             && !self.sys.trace.enabled()
             && self.sys.call_limit.is_none()
     }
 
     fn pace(&self) -> Option<adv_cpu::backend::Pace> {
         if !self.computation
-            || DEBUGGER_ATTACHED.get()
+            || OBSERVING.get()
             || self.sys.trace.enabled()
             || self.sys.call_limit.is_some()
         {

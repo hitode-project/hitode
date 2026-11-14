@@ -18,6 +18,8 @@ runner as they are; these are shaped here:
                             sample shares, retired instructions, ns/inst, MIPS
                             and hottest guest units by execution form
   damage on|off            show or hide GPU damage tints
+  observe on|off            record every host call for `calls` and `boundary`;
+                            stops direct bodies and computation while on
   boundary [reset]          native body host work and tail calls
   d3d9 [reset|frame [2]]    D3D9 counts, or a trace of one or two consecutive frames
                             whole surfaces changed, flushes by reason; `frame`

@@ -133,13 +133,14 @@ pub fn declines(ext: &Ext) -> u64 {
 }
 
 thread_local! {
-    static DEBUGGER_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OBSERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The shell's existing debugger lifetime, on the guest execution thread.
-pub fn debugger_attached(attached: bool) {
-    DEBUGGER_ATTACHED.set(attached);
-    adv_machine::debugger_attached(attached);
+/// Host-call observation the debugger turned on, on the guest execution
+/// thread: bodies are then timed with their arguments.
+pub fn observe_host_calls(on: bool) {
+    OBSERVING.set(on);
+    adv_machine::observe_host_calls(on);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -418,7 +419,7 @@ fn run(env: &mut Env<'_>) -> Outcome {
 
 fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
     let diagnostics = env.sys.diagnostics() != 0;
-    let timed = DEBUGGER_ATTACHED.get();
+    let timed = OBSERVING.get();
     let arguments = if timed {
         std::array::from_fn(|i| {
             if i < usize::from(body.conv.argc()) {

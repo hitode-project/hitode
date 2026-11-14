@@ -22,7 +22,7 @@ pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_
 pub use adv_drv::user::input::Pointer;
 pub use adv_nt::native::{
     BodyCount as NativeBodyCount, Boundary as NativeBoundary,
-    debugger_attached as native_debugger_attached,
+    observe_host_calls as native_observe_host_calls,
 };
 pub use debug_views::DebugTarget;
 

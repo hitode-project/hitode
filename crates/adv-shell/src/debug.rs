@@ -172,6 +172,9 @@ pub(crate) struct Debugger {
     /// The longest busy gap waiting for its snapshot, and when it ended.
     stall: Option<(u64, u64)>,
     stall_snapshots: usize,
+    /// Whether `observe on` routes every host call through the recorded
+    /// path, which also stops direct bodies and computation (EXEC-CALL-1).
+    observing: bool,
 }
 
 impl Debugger {
@@ -205,7 +208,6 @@ impl Debugger {
         eprintln!("debug: serving the abstract socket hitode-debug");
         #[cfg(not(target_os = "android"))]
         eprintln!("debug: serving {}", socket.display());
-        adv_runtime::native_debugger_attached(true);
         Ok(Self {
             shared,
             receiver,
@@ -227,6 +229,7 @@ impl Debugger {
             snapshot_baseline: HashMap::new(),
             stall: None,
             stall_snapshots: 0,
+            observing: false,
         })
     }
 
@@ -347,9 +350,22 @@ impl Debugger {
                 let frames = args.get(1).map_or(Ok(32), |n| number(n))?;
                 runtime.stack_scan(context, frames as usize)
             }
+            "observe" => {
+                match args.first() {
+                    Some(&"on") => self.observing = true,
+                    Some(&"off") => self.observing = false,
+                    None => {}
+                    Some(_) => return Err("observe [on|off]".into()),
+                }
+                adv_runtime::native_observe_host_calls(self.observing);
+                Ok(format!(
+                    "host-call observation {}",
+                    if self.observing { "on" } else { "off" }
+                ))
+            }
             "calls" => {
                 let count = args.first().map_or(Ok(64), |n| number(n))?;
-                Ok(runtime.calls_report(count as usize))
+                Ok(self.observed(runtime.calls_report(count as usize)))
             }
             "gaps" => Ok(runtime.api_gaps_report()),
             "modules" => Ok(runtime.modules_report()),
@@ -362,7 +378,10 @@ impl Debugger {
                 runtime.disassemble(address, args.get(1).map_or(Ok(16), |n| number(n))? as usize)
             }
             "slow" => Ok(self.slow(runtime, args.first() == Some(&"reset"))),
-            "boundary" => Ok(self.boundary(runtime, args.first() == Some(&"reset"))),
+            "boundary" => {
+                let table = self.boundary(runtime, args.first() == Some(&"reset"));
+                Ok(self.observed(table))
+            }
             "d3d9" => Ok(self.d3d9(
                 runtime,
                 args.first() == Some(&"reset"),
@@ -389,6 +408,18 @@ impl Debugger {
     }
 
     /// Slow-path runs by EIP since the last `slow reset`, busiest first.
+    /// Calls and native body work are recorded only while observing, which
+    /// would change the execution being measured.
+    fn observed(&self, report: String) -> String {
+        if self.observing {
+            report
+        } else {
+            format!(
+                "host-call observation is off; `observe on` records calls and body work\n{report}"
+            )
+        }
+    }
+
     fn slow(&mut self, runtime: &impl DebugTarget<Backend = Cpu>, reset: bool) -> String {
         #[cfg(target_arch = "aarch64")]
         {
@@ -575,7 +606,7 @@ impl Debugger {
             hot_text(&self.shared, since, runtime),
         );
         section("threads", threads(runtime));
-        section("calls", runtime.calls_report(256));
+        section("calls", self.observed(runtime.calls_report(256)));
         section("gaps", runtime.api_gaps_report());
         let reset = std::mem::take(&mut self.slow_baseline);
         self.slow_baseline = std::mem::take(&mut self.snapshot_baseline);
@@ -624,7 +655,7 @@ impl Debugger {
 
 impl Drop for Debugger {
     fn drop(&mut self) {
-        adv_runtime::native_debugger_attached(false);
+        adv_runtime::native_observe_host_calls(false);
         self.shared.stopped.store(true, Ordering::Release);
         let _ = std::fs::remove_file(&self.socket);
     }
@@ -1304,7 +1335,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
 const HELP: &str = "\
 answered at once: damage on|off, ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
-at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
+at a guest boundary: observe [on|off], threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
   modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], d3d9 [reset|frame [2]],
   report, snap [LABEL]
 client reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
@@ -1477,6 +1508,49 @@ mod boundary_tests {
             String::new()
         }
     }
+    // spec: EXEC-CALL-1
+    #[test]
+    fn serving_keeps_execution_until_observation_is_asked() {
+        let target = Target(
+            adv_machine::Machine::new(
+                Cpu::new(adv_machine::layout::PARK_ADDR, false).unwrap(),
+                Empty,
+                adv_machine::Clock::virtual_time(),
+            )
+            .unwrap(),
+        );
+        let root = std::env::temp_dir().join(format!("adv-observe-debug-{}", std::process::id()));
+        let mut debugger = Debugger::start(
+            "observe test".into(),
+            &root,
+            WakeEvent::new().unwrap(),
+            #[cfg(any(host_view, feature = "gpu"))]
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.0.sys.diagnostics(), 0);
+        assert!(
+            debugger
+                .execute("calls", &target)
+                .unwrap()
+                .contains("observation is off")
+        );
+        debugger.execute("observe on", &target).unwrap();
+        assert_ne!(target.0.sys.diagnostics(), 0);
+        assert!(
+            !debugger
+                .execute("calls", &target)
+                .unwrap()
+                .contains("observation is off")
+        );
+        debugger.execute("observe off", &target).unwrap();
+        assert_eq!(target.0.sys.diagnostics(), 0);
+        debugger.execute("observe on", &target).unwrap();
+        drop(debugger);
+        assert_eq!(target.0.sys.diagnostics(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     // spec: NAT-BODY-15
     #[test]
     fn boundary_command_ranks_resets_and_snapshots() {
