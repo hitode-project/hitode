@@ -147,15 +147,20 @@ def furthest(steps):
 
 
 def enclosing(region, steps, extents):
-    """The loop entry that speaks for a region: itself, else the enclosing
-    extent that got furthest (installed first), else the widest."""
-    if any(step not in LOOP_STEPS for step, _, _ in steps.get(region, ())):
+    """The loop entry that speaks for a region: itself, else the loop it
+    promoted, else the narrowest extent enclosing that loop (installed
+    first). Extents reach into inlined callees, so the narrowest is nearest."""
+    own = steps.get(region, ())
+    if any(step not in LOOP_STEPS for step, _, _ in own):
         return region
-    heads = [head for head, end in extents.items() if head <= region < end]
+    head = next((int(at) for step, at, _ in own if step == "promoted" and at.isdigit()), region)
+    if any(step not in LOOP_STEPS for step, _, _ in steps.get(head, ())):
+        return head
+    heads = [h for h, end in extents.items() if h <= head < end]
     if not heads:
         return region if region in steps else None
     installed = [h for h in heads if furthest(steps[h])[0] in DONE]
-    return max(installed or heads, key=lambda head: extents[head] - head)
+    return min(installed or heads, key=lambda h: extents[h] - h)
 
 
 def jit_samples(directory, thread, jit):
