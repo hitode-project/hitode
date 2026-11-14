@@ -586,15 +586,10 @@ impl<'a> Emitter<'a> {
                 }
                 return;
             }
-            Op::Flags {
-                kind: FlagKind::UnorderedCompare,
-                a,
-                b,
-                ..
-            } => {
+            Op::Flags { kind, a, b, .. } if kind.floating() => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.asm.emit(fcmp(a, b));
+                self.asm.emit(compare(kind, a, b));
             }
             Op::Flags { .. } => {}
             Op::Test { flags, cond } => {
@@ -1010,4 +1005,14 @@ fn mem_size(width: u8) -> VMem {
 }
 fn mem_type(ty: Type) -> VMem {
     [VMem::S, VMem::D, VMem::D, VMem::Q, VMem::S][ty as usize]
+}
+
+/// The NZCV compare of a floating `Flags` kind; `comisd` raises invalid
+/// for a quiet NaN as well.
+pub(super) fn compare(kind: FlagKind, a: VReg, b: VReg) -> u32 {
+    if kind == FlagKind::OrderedCompare {
+        fcmpe(a, b)
+    } else {
+        fcmp(a, b)
+    }
 }

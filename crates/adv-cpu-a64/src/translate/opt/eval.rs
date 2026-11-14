@@ -378,10 +378,11 @@ fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32, fpsr: &mut u32
             let overflow = product != integer::signed(low, width);
             out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
         }
-        FlagKind::UnorderedCompare => {
+        FlagKind::UnorderedCompare | FlagKind::OrderedCompare => {
             let p = input(f64::from_bits(a as u64), fpsr);
             let q = input(f64::from_bits(b as u64), fpsr);
-            if signaling(p) || signaling(q) {
+            let ordered = kind == FlagKind::OrderedCompare;
+            if signaling(p) || signaling(q) || ordered && (p.is_nan() || q.is_nan()) {
                 *fpsr |= IOC;
             }
             let set = if p.is_nan() || q.is_nan() {

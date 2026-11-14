@@ -117,7 +117,7 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         }
         for (result, op) in &data.insts {
             position += 2;
-            if !matches!(op, Op::Flags { kind, .. } if *kind != FlagKind::UnorderedCompare) {
+            if !matches!(op, Op::Flags { kind, .. } if !kind.floating()) {
                 for v in op.uses() {
                     read(
                         v,

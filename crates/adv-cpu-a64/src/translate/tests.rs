@@ -2411,33 +2411,36 @@ mod opt_back {
                 compare(&f, &[bits], &mut h);
             }
         }
-        let (mut f, b, p, _) = start(&[Type::F64, Type::F64, Type::Flags]);
-        let v = f
-            .push(
-                b,
-                Op::Flags {
-                    kind: FlagKind::UnorderedCompare,
-                    width: 8,
-                    a: p[0],
-                    b: p[1],
-                    prior: Some(p[2]),
-                },
-            )
-            .unwrap();
-        f.push(b, Op::Validate);
-        finish(&mut f, b, v);
-        for (x, y) in [
-            (1.0f64, 2.0f64),
-            (2.0, 1.0),
-            (0.0, -0.0),
-            (f64::NAN, 1.0),
-            (f64::from_bits(0x7ff0_0000_0000_0001), 0.0),
-        ] {
-            compare(
-                &f,
-                &[u128::from(x.to_bits()), u128::from(y.to_bits()), 0xed7],
-                &mut h,
-            );
+        // A quiet NaN fails validation only in the ordered compare.
+        for kind in [FlagKind::UnorderedCompare, FlagKind::OrderedCompare] {
+            let (mut f, b, p, _) = start(&[Type::F64, Type::F64, Type::Flags]);
+            let v = f
+                .push(
+                    b,
+                    Op::Flags {
+                        kind,
+                        width: 8,
+                        a: p[0],
+                        b: p[1],
+                        prior: Some(p[2]),
+                    },
+                )
+                .unwrap();
+            f.push(b, Op::Validate);
+            finish(&mut f, b, v);
+            for (x, y) in [
+                (1.0f64, 2.0f64),
+                (2.0, 1.0),
+                (0.0, -0.0),
+                (f64::NAN, 1.0),
+                (f64::from_bits(0x7ff0_0000_0000_0001), 0.0),
+            ] {
+                compare(
+                    &f,
+                    &[u128::from(x.to_bits()), u128::from(y.to_bits()), 0xed7],
+                    &mut h,
+                );
+            }
         }
     }
 
@@ -2969,12 +2972,13 @@ mod opt_back {
             FlagKind::Sar,
             FlagKind::MulSigned,
             FlagKind::UnorderedCompare,
+            FlagKind::OrderedCompare,
         ];
         let mut h = harness();
         for kind in kinds {
             for width in [1, 2, 4] {
                 for cc in conditions {
-                    let floating = kind == FlagKind::UnorderedCompare;
+                    let floating = kind.floating();
                     let ty = if floating { Type::F64 } else { Type::I32 };
                     let (mut f, b, p, _) = start(&[ty, ty, Type::Flags]);
                     let flags = f

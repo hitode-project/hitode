@@ -62,9 +62,6 @@ impl Front<'_> {
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
             Kind::Double(op, true) => {
-                if self.assumed.mxcsr & 0xffc0 != 0x1f80 {
-                    return Err(Reject::Mode(self.index));
-                }
                 let op = match op {
                     Float::Fadd => FpOp::Add,
                     Float::Fsub => FpOp::Sub,
@@ -86,11 +83,15 @@ impl Front<'_> {
                 let value = self.bits(Type::F64, src);
                 self.value(Op::ToInt { value, wide: false })
             }
-            Kind::FlagCompare(true) => {
+            Kind::FlagCompare(true, ordered) => {
                 let a = self.bits(Type::F64, dst);
                 let b = self.bits(Type::F64, src);
                 self.state.flags = self.value(Op::Flags {
-                    kind: FlagKind::UnorderedCompare,
+                    kind: if ordered {
+                        FlagKind::OrderedCompare
+                    } else {
+                        FlagKind::UnorderedCompare
+                    },
                     width: 8,
                     a,
                     b,

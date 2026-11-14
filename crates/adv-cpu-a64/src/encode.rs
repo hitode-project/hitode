@@ -1055,6 +1055,11 @@ pub const fn fcmp(rn: VReg, rm: VReg) -> u32 {
     0x1E60_2000 | rm.number() << 16 | rn.number() << 5
 }
 
+/// `fcmpe dn, dm`: also raises invalid for a quiet NaN.
+pub const fn fcmpe(rn: VReg, rm: VReg) -> u32 {
+    fcmp(rn, rm) | 0x10
+}
+
 /// `fcmp dn, #0.0`.
 pub const fn fcmp_zero(rn: VReg) -> u32 {
     0x1E60_2008 | rn.number() << 5

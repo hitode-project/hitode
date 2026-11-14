@@ -108,9 +108,16 @@ pub(crate) enum FlagKind {
     MulSigned,
     /// `ucomisd`: ZF, PF and CF from an unordered comparison.
     UnorderedCompare,
+    /// `comisd`: the same flags, but a quiet NaN also raises invalid.
+    OrderedCompare,
 }
 
 impl FlagKind {
+    /// Whether it compares F64 operands.
+    pub(crate) fn floating(self) -> bool {
+        matches!(self, FlagKind::UnorderedCompare | FlagKind::OrderedCompare)
+    }
+
     /// Whether the flags depend on operand `b`: a logical result's flags,
     /// and a step's or negation's, come from `a` alone.
     pub(crate) fn reads_b(self) -> bool {
@@ -145,7 +152,7 @@ pub(crate) enum Op {
     /// computes them. Flags the operation keeps, and the carry that ADC, SBB,
     /// INC and DEC read, come from `prior`. `Logic` takes its result as `a`;
     /// shifts take the unmasked count as `b`, and a zero count keeps `prior`.
-    /// `UnorderedCompare` compares F64 operands.
+    /// `UnorderedCompare` and `OrderedCompare` compare F64 operands.
     Flags {
         kind: FlagKind,
         width: u8,
@@ -266,7 +273,7 @@ impl Op {
     pub(crate) fn floating(&self) -> bool {
         match *self {
             Op::Fp(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
-            Op::Flags { kind, .. } => kind == FlagKind::UnorderedCompare,
+            Op::Flags { kind, .. } => kind.floating(),
             _ => false,
         }
     }

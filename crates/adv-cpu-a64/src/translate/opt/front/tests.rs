@@ -891,6 +891,59 @@ fn rejects_unproved_modes_escaping_frames_and_unsupported_forms() {
         })
     });
     assert!(matches!(rejected(&sse, &initial()), Reject::Unsupported(_)));
+    // SSE floating point needs MXCSR's default control, here truncating
+    // rounding or unmasked precision.
+    let convert = assemble(|a| {
+        row(a, |a| {
+            a.cvtsi2sd(xmm0, dword_ptr(esi)).unwrap();
+            a.movsd_2(qword_ptr(edi), xmm0).unwrap();
+        })
+    });
+    for mxcsr in [0x7fa0, 0x0f20] {
+        let mut at = initial();
+        at.mxcsr = mxcsr;
+        assert!(matches!(rejected(&convert, &at), Reject::Mode(_)));
+    }
+}
+
+// spec: A64F-FP-5, A64-OPT-6
+#[test]
+fn an_ordered_compare_of_a_quiet_nan_leaves_for_the_interpreter() {
+    let code = |ordered: bool| {
+        assemble(move |a| {
+            row(a, |a| {
+                let mut unordered = a.create_label();
+                let mut done = a.create_label();
+                a.movsd_2(xmm0, qword_ptr(esi)).unwrap();
+                a.movsd_2(xmm1, qword_ptr(esi + 8)).unwrap();
+                if ordered {
+                    a.comisd(xmm0, xmm1).unwrap();
+                } else {
+                    a.ucomisd(xmm0, xmm1).unwrap();
+                }
+                a.jp(unordered).unwrap();
+                a.mov(eax, 0).unwrap();
+                a.jmp(done).unwrap();
+                a.set_label(&mut unordered).unwrap();
+                a.mov(eax, 1).unwrap();
+                a.set_label(&mut done).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            })
+        })
+    };
+    let mut at = initial();
+    at.regs[1] = 1;
+    for ordered in [false, true] {
+        compare(
+            &code(ordered),
+            &at,
+            |m| {
+                m.write(DATA, &f64::NAN.to_le_bytes()).unwrap();
+                m.write(DATA + 8, &1.0f64.to_le_bytes()).unwrap();
+            },
+            ordered,
+        );
+    }
 }
 
 // spec: A64-OPT-6

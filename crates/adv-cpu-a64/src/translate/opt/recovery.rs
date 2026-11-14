@@ -205,7 +205,7 @@ impl Locations<'_> {
                     product != integer::signed(product as u32 & integer::mask(r.width), r.width);
                 out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
             }
-            UnorderedCompare => {
+            UnorderedCompare | OrderedCompare => {
                 let input = |bits| {
                     let x = f64::from_bits(bits);
                     if x.is_subnormal() {

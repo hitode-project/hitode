@@ -185,7 +185,17 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
             .iter()
             .any(|i| matches!(i.op, decode::Op::Simd(s) if pick(&s)))
     };
-    let floating = simd(|s| s.floating());
+    let floating = insts
+        .iter()
+        .position(|i| matches!(i.op, decode::Op::Simd(s) if s.floating()));
+    // SSE floating point runs with MXCSR's default control: exceptions
+    // masked, nearest rounding, no DAZ or FTZ (A64F-FP-5).
+    if let Some(i) = floating
+        && at.mxcsr & 0xffc0 != 0x1f80
+    {
+        return Err(Reject::Mode(i));
+    }
+    let floating = floating.is_some();
     let control = simd(|s| {
         matches!(
             s.kind,

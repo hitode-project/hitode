@@ -4,7 +4,7 @@ use iced_x86::ConditionCode as CC;
 
 // Positive conditions: O, B, E, BE, S, P, L, LE; their partners invert.
 // A cleared mask bit selects a recipe over just the needed guest status bits.
-const CONDITIONS: [(u8, [Cond; 8]); 13] = {
+const CONDITIONS: [(u8, [Cond; 8]); 14] = {
     use Cond::*;
     [
         (0xd7, [Vs, Hs, Eq, Eq, Mi, Eq, Lt, Le]), // Add
@@ -20,10 +20,17 @@ const CONDITIONS: [(u8, [Cond; 8]); 13] = {
         (0, [Eq; 8]),
         (0, [Eq; 8]),
         (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // UCOMISD
+        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // COMISD
     ]
 };
 
 impl Emitter<'_> {
+    fn compare_floats(&mut self, kind: FlagKind, a: Host, b: Host) {
+        let a = self.v_at(a, A);
+        let b = self.v_at(b, B);
+        self.asm.emit(super::compare(kind, a, b));
+    }
+
     pub(super) fn condition(&mut self, flags: Host, cc: CC) -> Cond {
         if let Some(cond) = self.native(flags, cc) {
             return cond;
@@ -75,10 +82,8 @@ impl Emitter<'_> {
         if mask & (1 << column) == 0 {
             return None;
         }
-        if kind == FlagKind::UnorderedCompare {
-            let a = self.v_at(a, A);
-            let b = self.v_at(b, B);
-            self.asm.emit(fcmp(a, b));
+        if kind.floating() {
+            self.compare_floats(kind, a, b);
         } else {
             self.arithmetic(flags, Reg::ZR);
         }
@@ -208,12 +213,10 @@ impl Emitter<'_> {
             ]);
             return;
         }
-        if kind == UnorderedCompare {
+        if kind.floating() {
             if bit == 6 {
-                let a = self.v_at(a, A);
-                let b = self.v_at(b, B);
+                self.compare_floats(kind, a, b);
                 self.asm.emit_all(&[
-                    fcmp(a, b),
                     cset(W, T, Cond::Eq),
                     cset(W, U, Cond::Vs),
                     orr(W, T, T, U, Lsl, 0),

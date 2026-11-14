@@ -20,7 +20,8 @@ pub(super) fn run(
                         | FlagKind::Sub
                         | FlagKind::Logic
                         | FlagKind::Negate
-                        | FlagKind::UnorderedCompare,
+                        | FlagKind::UnorderedCompare
+                        | FlagKind::OrderedCompare,
                     prior,
                     ..
                 } = op

@@ -137,8 +137,9 @@ pub enum Kind {
     /// Scalar double to single precision.
     Narrow(bool),
     Approximate(bool, bool),
-    /// COMIS/UCOMIS, using the interpreter for NaNs.
-    FlagCompare(bool),
+    /// COMIS/UCOMIS, using the interpreter for NaNs: double precision,
+    /// and whether a quiet NaN also raises invalid (COMIS).
+    FlagCompare(bool, bool),
     /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
     Compare(bool, bool),
     /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
@@ -187,7 +188,7 @@ impl Simd {
                 | Kind::FromInt(_)
                 | Kind::Widen(_)
                 | Kind::Narrow(..)
-                | Kind::FlagCompare(_)
+                | Kind::FlagCompare(..)
                 | Kind::Compare(..)
                 | Kind::MinMax(..)
                 | Kind::Sqrt(..)
@@ -222,7 +223,7 @@ impl Simd {
                 | Kind::MinMax(_, _, true)
                 | Kind::Compare(_, true)
                 | Kind::Double(..)
-                | Kind::FlagCompare(true)
+                | Kind::FlagCompare(true, _)
                 | Kind::Narrow(..)
                 | Kind::ScalarToInt(true, _)
         )
@@ -237,7 +238,7 @@ impl Simd {
             | Kind::Compare(scalar, _)
             | Kind::MinMax(_, scalar, _)
             | Kind::Widen(scalar) => scalar,
-            Kind::FlagCompare(_) | Kind::Narrow(true) | Kind::ScalarToInt(..) => true,
+            Kind::FlagCompare(..) | Kind::Narrow(true) | Kind::ScalarToInt(..) => true,
             _ => false,
         }
     }
@@ -290,11 +291,11 @@ impl Simd {
                 let bits = Arr::new(u32::from(log2), self.full()).bits();
                 u32::from(self.imm) < bits || op == ShiftImm::Sshr
             }
-            Kind::FlagCompare(_) => true,
+            Kind::FlagCompare(..) => true,
             _ => !self.floating(),
         };
         let writes = match self.kind {
-            Kind::FlagCompare(_) | Kind::MaskMove => 0,
+            Kind::FlagCompare(..) | Kind::MaskMove => 0,
             _ => bit(self.dst),
         };
         (
@@ -544,8 +545,8 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
             matches!(mnemonic, M::Rsqrtps | M::Rsqrtss),
             matches!(mnemonic, M::Rcpss | M::Rsqrtss),
         ),
-        M::Comiss | M::Ucomiss => Kind::FlagCompare(false),
-        M::Comisd | M::Ucomisd => Kind::FlagCompare(true),
+        M::Comiss | M::Ucomiss => Kind::FlagCompare(false, mnemonic == M::Comiss),
+        M::Comisd | M::Ucomisd => Kind::FlagCompare(true, mnemonic == M::Comisd),
         M::Cmpps => Kind::Compare(false, false),
         M::Cmpss => Kind::Compare(true, false),
         M::Cmppd => Kind::Compare(false, true),
@@ -589,7 +590,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         | Kind::Double(..)
         | Kind::Widen(_)
         | Kind::Narrow(..)
-        | Kind::FlagCompare(_)
+        | Kind::FlagCompare(..)
         | Kind::Compare(..)
         | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
         Kind::Move if matches!(mnemonic, M::Movq2dq | M::Movdq2q) => {
@@ -976,7 +977,7 @@ impl Translator<'_> {
             | Kind::FromInt(_)
             | Kind::Widen(_)
             | Kind::Narrow(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::Sqrt(..) => {
@@ -1168,7 +1169,7 @@ impl Translator<'_> {
             | Kind::FromInt(_)
             | Kind::Widen(_)
             | Kind::Narrow(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::MaskMove
@@ -1505,7 +1506,7 @@ impl Translator<'_> {
             | Kind::Double(..)
             | Kind::Compare(..)
             | Kind::MinMax(..)
-            | Kind::FlagCompare(_) => [Some(self.register(simd.dst)), Some(s)],
+            | Kind::FlagCompare(..) => [Some(self.register(simd.dst)), Some(s)],
             _ => [None, Some(s)],
         };
         let operands = Operands { s, inputs };
@@ -1541,7 +1542,7 @@ impl Translator<'_> {
             self.pe_ready(first_pe && !simd.mmx());
             return;
         }
-        if matches!(simd.kind, Kind::FlagCompare(_)) {
+        if matches!(simd.kind, Kind::FlagCompare(..)) {
             self.emit_all(&[
                 fmov_from_v(W, X16, V0),
                 fmov_from_v(W, X17, V2),
@@ -1640,7 +1641,7 @@ impl Translator<'_> {
             // Any NaN may raise IE: the slow path tells.
             Kind::MinMax(..)
             | Kind::Compare(..)
-            | Kind::FlagCompare(_)
+            | Kind::FlagCompare(..)
             | Kind::Widen(_)
             | Kind::ScalarToInt(..) => {
                 let inputs: Vec<VReg> = operands.inputs.into_iter().flatten().collect();
@@ -1934,7 +1935,7 @@ impl Translator<'_> {
                     ]);
                 }
             }
-            Kind::FlagCompare(double) => {
+            Kind::FlagCompare(double, _) => {
                 let d = d.unwrap();
                 // Relational comparisons send every NaN to the original helper,
                 // which distinguishes COMIS from UCOMIS exception behavior.
