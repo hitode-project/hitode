@@ -1,7 +1,65 @@
 //! Prepared off the callback thread. Processing uses only preallocated buffers.
-use rubato::{
-    Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
+//!
+//! A fixed rate pair places output frame n at n * frequency / rate input
+//! frames, so every fraction is a multiple of 1 / phases with phases =
+//! rate / gcd(rate, frequency). Sinc tables of exactly that many phases give
+//! the filter at the exact position with one product per frame; other pairs
+//! interpolate cubically between 128 phases, four products per frame. Tables
+//! depend only on their phase count and cutoff and are shared by every
+//! converter.
+use rubato::sinc_interpolator::SincInterpolator;
+use rubato::sinc_interpolator::sinc_interpolator_neon::NeonInterpolator;
+use rubato::{Resampler, SincFixedOut, SincInterpolationType, WindowFunction};
+use std::sync::{Arc, Mutex};
+
+const SINC_LEN: usize = 256;
+/// Exact tables up to the 640 phases of 11025 Hz into 48 kHz.
+const EXACT_PHASES: u32 = 640;
+const CUBIC_PHASES: usize = 128;
+
+struct Shared(Arc<NeonInterpolator<f32>>);
+impl SincInterpolator<f32> for Shared {
+    fn get_sinc_interpolated(&self, wave: &[f32], index: usize, subindex: usize) -> f32 {
+        self.0.get_sinc_interpolated(wave, index, subindex)
+    }
+    fn len(&self) -> usize {
+        SINC_LEN
+    }
+    fn nbr_sincs(&self) -> usize {
+        self.0.nbr_sincs()
+    }
+}
+
+/// As rubato's own construction: downsampling lowers the cutoff by the ratio.
+fn table(phases: usize, ratio: f64) -> Result<Shared, String> {
+    type Tables = Vec<(usize, u32, Arc<NeonInterpolator<f32>>)>;
+    static TABLES: Mutex<Tables> = Mutex::new(Vec::new());
+    let cutoff = if ratio >= 1.0 {
+        0.95
+    } else {
+        0.95 * ratio as f32
+    };
+    let mut tables = TABLES.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some((.., table)) = tables
+        .iter()
+        .find(|&&(count, bits, _)| (count, bits) == (phases, cutoff.to_bits()))
+    {
+        return Ok(Shared(table.clone()));
+    }
+    let table = Arc::new(
+        NeonInterpolator::new(SINC_LEN, phases, cutoff, WindowFunction::BlackmanHarris2)
+            .map_err(|error| error.to_string())?,
+    );
+    tables.push((phases, cutoff.to_bits(), table.clone()));
+    Ok(Shared(table))
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
 
 pub(crate) struct Converter {
     inner: Option<SincFixedOut<f32>>,
@@ -19,17 +77,19 @@ impl Converter {
         let inner = if frequency == rate {
             None
         } else {
+            let ratio = f64::from(rate) / f64::from(frequency);
+            let phases = rate / gcd(rate, frequency);
+            let (interpolation, phases) = if phases <= EXACT_PHASES {
+                (SincInterpolationType::Nearest, phases as usize)
+            } else {
+                (SincInterpolationType::Cubic, CUBIC_PHASES)
+            };
             Some(
-                SincFixedOut::<f32>::new(
-                    f64::from(rate) / f64::from(frequency),
+                SincFixedOut::<f32>::new_with_interpolator(
+                    ratio,
                     1.0,
-                    SincInterpolationParameters {
-                        sinc_len: 256,
-                        f_cutoff: 0.95,
-                        oversampling_factor: 128,
-                        interpolation: SincInterpolationType::Cubic,
-                        window: WindowFunction::BlackmanHarris2,
-                    },
+                    interpolation,
+                    Box::new(table(phases, ratio)?),
                     128,
                     2,
                 )
@@ -133,6 +193,111 @@ mod tests {
             }
         }
     }
+    fn sine(frame: usize) -> f64 {
+        (frame as f64 * std::f64::consts::TAU * 997.0 / 44_100.0).sin() * 0.5
+    }
+
+    fn converted(mut converter: Converter, frames: usize) -> Vec<f64> {
+        let mut input = 0;
+        (0..frames)
+            .map(|_| {
+                let sample = converter.next(|| {
+                    input += 1;
+                    let value = sine(input - 1) as f32;
+                    [value, -value]
+                });
+                assert_eq!(sample[0], -sample[1]);
+                f64::from(sample[0])
+            })
+            .collect()
+    }
+
+    /// Rubato building its own table: cubic phases, or exact ones otherwise.
+    fn rubato<T: rubato::Sample>(
+        frequency: u32,
+        rate: u32,
+        (cubic, phases): (bool, usize),
+        frames: usize,
+        wide: fn(T) -> f64,
+    ) -> Vec<f64> {
+        let mut resampler = SincFixedOut::<T>::new(
+            f64::from(rate) / f64::from(frequency),
+            1.0,
+            rubato::SincInterpolationParameters {
+                sinc_len: SINC_LEN,
+                f_cutoff: 0.95,
+                oversampling_factor: phases,
+                interpolation: if cubic {
+                    SincInterpolationType::Cubic
+                } else {
+                    SincInterpolationType::Nearest
+                },
+                window: WindowFunction::BlackmanHarris2,
+            },
+            128,
+            2,
+        )
+        .unwrap();
+        let mut input = resampler.input_buffer_allocate(true);
+        let mut output = resampler.output_buffer_allocate(true);
+        let (mut consumed, mut out) = (0, Vec::new());
+        while out.len() < frames {
+            for i in 0..resampler.input_frames_next() {
+                let value = T::coerce(sine(consumed) as f32 as f64);
+                input[0][i] = value;
+                input[1][i] = -value;
+                consumed += 1;
+            }
+            resampler
+                .process_into_buffer(&input, &mut output, None)
+                .unwrap();
+            out.extend(output[0].iter().map(|&value| wide(value)));
+        }
+        out.truncate(frames);
+        out
+    }
+
+    #[test]
+    fn shared_tables_reproduce_rubato_construction() {
+        for (frequency, rate, table) in [
+            (44_100, 48_000, (false, 160)),
+            (22_050, 48_000, (false, 320)),
+            (48_000, 44_100, (false, 147)),
+            (44_101, 48_000, (true, CUBIC_PHASES)),
+        ] {
+            // A second converter reuses the first one's table.
+            for _ in 0..2 {
+                assert_eq!(
+                    converted(Converter::new(frequency, rate).unwrap(), 4096),
+                    rubato(frequency, rate, table, 4096, <f64 as From<f32>>::from),
+                    "{frequency} -> {rate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_phases_stay_closer_to_the_filter_than_cubic_phases() {
+        let ideal = rubato(44_100, 48_000, (false, 160), 8192, |value: f64| value);
+        let error = |output: Vec<f64>| {
+            output[1024..]
+                .iter()
+                .zip(&ideal[1024..])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max)
+        };
+        let exact = error(converted(Converter::new(44_100, 48_000).unwrap(), 8192));
+        let cubic = error(rubato(
+            44_100,
+            48_000,
+            (true, CUBIC_PHASES),
+            8192,
+            <f64 as From<f32>>::from,
+        ));
+        assert!(exact < 1e-6, "f32 rounding only: {exact}");
+        assert!(exact * 100.0 < cubic, "exact {exact}, cubic {cubic}");
+    }
+
     #[test]
     fn equal_rates_preserve_samples_without_filter_latency() {
         let mut converter = Converter::new(44100, 44100).unwrap();
