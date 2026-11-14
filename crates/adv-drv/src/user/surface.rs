@@ -41,6 +41,8 @@ struct Surface {
     view: Option<(u32, u32, u32, u32)>,
     /// Whether win32u has flushed it: only drawn windows show.
     drawn: bool,
+    /// Created with win32u's `layered` flag: `pixels` hold premultiplied alpha.
+    layered: bool,
 }
 
 /// The driver's window surfaces, by address.
@@ -94,9 +96,12 @@ fn call(
 
 /// CreateWindowSurface(hwnd, layered, surface_rect, surface).
 fn create(env: &mut Env<'_>) -> Outcome {
-    let (hwnd, bounds, output) = (env.arg(0), env.arg(2), env.arg(3));
+    let (hwnd, layered, bounds, output) = (env.arg(0), env.arg(1) != 0, env.arg(2), env.arg(3));
     let previous = check!(env.cpu.read_u32(output));
     if previous != 0 && env.cpu.read_u32(previous).ok() == Some(surface_funcs(env)) {
+        if let Some(surface) = env.ext.get_or_default::<Surfaces>().0.get_mut(&previous) {
+            surface.layered = layered;
+        }
         return Outcome::Return(1);
     }
     // The desktop presents nothing, but its DCs span the virtual screen:
@@ -115,11 +120,11 @@ fn create(env: &mut Env<'_>) -> Outcome {
     }
     let (width, height) = (width as u32, height as u32);
     if previous == 0 {
-        return wrap(env, hwnd, bounds, output, width, height);
+        return wrap(env, hwnd, layered, bounds, output, width, height);
     }
     call(env, "window_surface_release", [previous], move |env, _| {
         check!(env.cpu.write_u32(output, 0));
-        wrap(env, hwnd, bounds, output, width, height)
+        wrap(env, hwnd, layered, bounds, output, width, height)
     })
 }
 
@@ -133,6 +138,7 @@ fn storage(pitch: u32, height: u32) -> u32 {
 fn wrap(
     env: &mut Env<'_>,
     hwnd: u32,
+    layered: bool,
     bounds: u32,
     output: u32,
     width: u32,
@@ -179,10 +185,10 @@ fn wrap(
                             surface(
                                 env,
                                 hwnd,
+                                layered,
                                 bounds,
                                 output,
-                                pixels,
-                                bitmap,
+                                (pixels, bitmap),
                                 (width, height, pitch),
                             )
                         })
@@ -196,10 +202,10 @@ fn wrap(
 fn surface(
     env: &mut Env<'_>,
     hwnd: u32,
+    layered: bool,
     bounds: u32,
     output: u32,
-    pixels: u32,
-    bitmap: u32,
+    (pixels, bitmap): (u32, u32),
     (width, height, pitch): (u32, u32, u32),
 ) -> Outcome {
     // A top-down 32-bit BITMAPINFOHEADER: planes 1 and 32 bits share a word.
@@ -233,6 +239,7 @@ fn surface(
             height,
             view: None,
             drawn: false,
+            layered,
         };
         env.ext
             .get_or_default::<Surfaces>()
@@ -254,7 +261,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
     };
     surface.drawn = true;
     let hwnd = surface.hwnd;
-    if !window(env.ext, hwnd).is_some_and(|window| window.visible) {
+    if !super::client_geometry(env.ext, hwnd).is_some_and(|(_, visible)| visible) {
         return Outcome::Return(1);
     }
     let dirty = check!(rect(env, dirty));
@@ -280,6 +287,49 @@ fn area(rect: [i32; 4]) -> i64 {
 fn shows(ext: &Ext, hwnd: u32) -> bool {
     window(ext, hwnd).is_some_and(|w| w.visible && w.parent == 0 && w.style & WS_MINIMIZE == 0)
         && !super::project::projected(ext, hwnd)
+}
+
+/// Whether a child window can show as a layered overlay plane above its root.
+fn shows_layered_child(ext: &Ext, hwnd: u32) -> bool {
+    let Some(w) = window(ext, hwnd) else {
+        return false;
+    };
+    w.parent != 0
+        && w.style & WS_MINIMIZE == 0
+        && !super::project::projected(ext, hwnd)
+        && super::client_geometry(ext, hwnd).is_some_and(|(_, visible)| visible)
+        && drawn_surface(ext, hwnd).is_some_and(|address| ext.get::<Surfaces>().0[&address].layered)
+}
+
+/// Whether `child` equals `ancestor` or has `ancestor` in its parent chain.
+fn has_ancestor(ext: &Ext, mut child: u32, ancestor: u32) -> bool {
+    let mut depth = 0;
+    while child != 0 && depth < 64 {
+        if child == ancestor {
+            return true;
+        }
+        let Some(w) = window(ext, child) else {
+            return false;
+        };
+        child = w.parent;
+        depth += 1;
+    }
+    false
+}
+
+/// Whether changing position or visibility of `hwnd` can affect window planes.
+pub(super) fn needs_compose(ext: &Ext, hwnd: u32) -> bool {
+    ext.try_get::<Shown>().is_some_and(|shown| {
+        shown
+            .0
+            .iter()
+            .any(|&(child, _)| has_ancestor(ext, child, hwnd))
+    }) || ext.try_get::<Surfaces>().is_some_and(|surfaces| {
+        surfaces
+            .0
+            .values()
+            .any(|s| s.layered && has_ancestor(ext, s.hwnd, hwnd))
+    })
 }
 
 /// The windows shown as planes, bottom first, with their screen rectangles
@@ -498,22 +548,51 @@ fn place_planes(
         .iter()
         .position(|&hwnd| hwnd == base)
         .map_or(order, |at| &order[..at]);
-    let (mut planes, mut damage, mut moves, mut shown) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut emit = Vec::new();
+    let layered_children = |root: u32, emit: &mut Vec<(u32, bool)>| {
+        for &child in order.iter().rev() {
+            if child != root
+                && super::input::top_level(env.ext, child) == root
+                && shows_layered_child(env.ext, child)
+            {
+                emit.push((child, false));
+            }
+        }
+    };
+    layered_children(base, &mut emit);
     for &hwnd in front.iter().rev() {
         if !shows(env.ext, hwnd) {
             continue;
         }
+        if drawn_surface(env.ext, hwnd).is_some() {
+            emit.push((hwnd, true));
+        }
+        layered_children(hwnd, &mut emit);
+    }
+    let (mut planes, mut damage, mut moves, mut shown) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (hwnd, top_level) in emit {
         let Some(address) = drawn_surface(env.ext, hwnd) else {
             continue;
         };
         let surface = &env.ext.get::<Surfaces>().0[&address];
-        let [left, top, right, bottom] = window(env.ext, hwnd).unwrap().extent;
-        let (width, height) = (right - left, bottom - top);
-        let x = left.clamp(base_left, (base_right - width).max(base_left));
-        let y = top.clamp(base_top, (base_bottom - height).max(base_top));
-        if (x, y) != (left, top) {
-            moves.push((hwnd, x, y));
+        let w = window(env.ext, hwnd).unwrap();
+        let [ex_l, ex_t, ex_r, ex_b] = w.extent;
+        let (width, height) = (ex_r - ex_l, ex_b - ex_t);
+        let (left, top) = if top_level {
+            (ex_l, ex_t)
+        } else if let Some((origin, _)) = super::client_geometry(env.ext, hwnd) {
+            (origin.0 + ex_l - w.client[0], origin.1 + ex_t - w.client[1])
+        } else {
+            continue;
+        };
+        let (right, bottom) = (left + width, top + height);
+        if top_level {
+            let x = left.clamp(base_left, (base_right - width).max(base_left));
+            let y = top.clamp(base_top, (base_bottom - height).max(base_top));
+            if (x, y) != (left, top) {
+                moves.push((hwnd, x, y));
+            }
         }
         let plane = Plane {
             id: hwnd,
@@ -523,6 +602,7 @@ fn place_planes(
             y: top - base_top,
             width: (width.max(0) as u32).min(surface.width),
             height: (height.max(0) as u32).min(surface.height),
+            layered: surface.layered,
         };
         if let Some((_, [l, t, r, b])) = drawn.filter(|&(at, _)| at == address) {
             let side = |at: i32, from: i32| (from + at).max(0) as u32;
@@ -593,5 +673,92 @@ mod tests {
         let (x, y) = (8, 31);
         let start = y * pitch + x * 4;
         assert!(start + pitch * (height - y) <= super::storage(pitch, height));
+    }
+
+    // spec: WINE-GFX-10
+    #[test]
+    fn reparented_layered_child_visibility_follows_ancestor_and_surface_flag() {
+        let (base, child) = (0x10030, 0x10040);
+        let mut ext = adv_machine::Ext::default();
+        let windows = &mut ext.get_or_default::<super::super::Windows>().0;
+        windows.insert(
+            base,
+            super::super::Window {
+                visible: true,
+                origin: (10, 40),
+                client: [10, 40, 810, 640],
+                extent: [0, 0, 810, 640],
+                ..Default::default()
+            },
+        );
+        windows.insert(
+            child,
+            super::super::Window {
+                visible: true,
+                parent: base,
+                client: [0, 0, 800, 600],
+                extent: [0, 0, 800, 600],
+                ..Default::default()
+            },
+        );
+        ext.get_or_default::<super::Surfaces>().0.insert(
+            0x2000,
+            super::Surface {
+                hwnd: child,
+                pixels: 0x3000,
+                width: 800,
+                height: 600,
+                view: None,
+                drawn: true,
+                layered: true,
+            },
+        );
+        assert!(super::shows(&ext, base));
+        assert!(!super::shows(&ext, child));
+        assert!(super::shows_layered_child(&ext, child));
+        assert_eq!(
+            super::super::client_geometry(&ext, child),
+            Some(((10, 40), true))
+        );
+        ext.get_mut::<super::super::Windows>()
+            .0
+            .get_mut(&base)
+            .unwrap()
+            .visible = false;
+        assert!(!super::shows_layered_child(&ext, child));
+    }
+
+    // spec: WINE-GFX-10
+    #[test]
+    fn intermediate_parent_change_triggers_compose_for_layered_descendant() {
+        let (root, mid, child, sibling) = (0x10050, 0x10054, 0x10058, 0x1005c);
+        let mut ext = adv_machine::Ext::default();
+        let windows = &mut ext.get_or_default::<super::super::Windows>().0;
+        for (hwnd, parent) in [(root, 0), (mid, root), (child, mid), (sibling, root)] {
+            windows.insert(
+                hwnd,
+                super::super::Window {
+                    visible: true,
+                    parent,
+                    ..Default::default()
+                },
+            );
+        }
+        ext.get_or_default::<super::Surfaces>().0.insert(
+            0x2100,
+            super::Surface {
+                hwnd: child,
+                pixels: 0x3100,
+                width: 64,
+                height: 64,
+                view: None,
+                drawn: true,
+                layered: true,
+            },
+        );
+        assert!(super::needs_compose(&ext, child));
+        assert!(super::needs_compose(&ext, mid));
+        assert!(super::needs_compose(&ext, root));
+        assert!(!super::needs_compose(&ext, sibling));
     }
 }

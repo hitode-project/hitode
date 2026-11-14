@@ -419,7 +419,7 @@ impl Tree {
             None => {
                 let layer = CALayer::new();
                 unsafe { layer.setContentsGravity(kCAGravityResize) };
-                let opaque = id != LayerId::Host(HostLayer::Damage);
+                let opaque = !matches!(id, LayerId::Host(HostLayer::Damage) | LayerId::Window(_));
                 layer.setOpaque(opaque);
                 // Core Animation's contentsOpaque (HOST-VIEW-11) ignores the
                 // IOSurface's alpha channel.

@@ -414,12 +414,12 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
                     Outcome::Return(0)
                 }
             };
-            if parent != 0 {
-                return shown(env);
-            }
             env.ext
                 .get_or_default::<Order>()
                 .place(hwnd, insert_after, flags);
+            if parent != 0 && !surface::needs_compose(env.ext, hwnd) {
+                return shown(env);
+            }
             Outcome::call(long, [hwnd, GWL_STYLE], move |env, style| {
                 if let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) {
                     window.style = style.value();

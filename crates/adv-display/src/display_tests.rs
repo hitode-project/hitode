@@ -1813,6 +1813,7 @@ fn window_layers_upload_once_capture_over_the_frame_and_leave() {
             id: 3,
             size: (4, 2),
             pixels: red.clone().into(),
+            layered: false,
             version,
         });
         f

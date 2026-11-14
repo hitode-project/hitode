@@ -245,6 +245,7 @@ mod tests {
             y: 1,
             width: 2,
             height: 2,
+            layered: false,
         };
         store.set_planes(vec![plane], &[], (8, 4), &memory).unwrap();
         store.present_native(base, None, &mut gpu).unwrap();

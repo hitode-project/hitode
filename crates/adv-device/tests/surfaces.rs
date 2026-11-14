@@ -135,6 +135,7 @@ fn returning_from_software_to_native_publishes_whole_damage_once() {
         y: 0,
         width: 1,
         height: 1,
+        layered: false,
     };
     let before = store.stats.presentations;
     store.set_planes(vec![plane], &[], (5, 4), &memory).unwrap();
@@ -2117,6 +2118,7 @@ fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
         y: 5,
         width: 4,
         height: 3,
+        layered: false,
     };
     let base = logical_pixels(&s, id, &m);
     let mut shown = |s: &mut Store, m: &Memory| {
@@ -2161,4 +2163,94 @@ fn window_planes_cover_the_base_and_expose_it_again_without_a_base_draw() {
     s.present_planes(7, &m).unwrap();
     s.flush(&m, FlushReason::Immediate).unwrap();
     assert!(!consumer.update());
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+// spec: WINE-GFX-10
+fn layered_planes_blend_premultiplied_alpha_over_base() {
+    let mut m = Memory::new(false);
+    let mut s = Store::new(2, 1, 16, 4096, Snapshot::default()).unwrap();
+    let id = s.create(2, 1, false, PixelFormat::Bgra32, &mut m).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    // Two solid opaque base pixels: pure blue and pure green.
+    m.write(s[id].pixels, &[200, 0, 0, 255, 0, 200, 0, 255])
+        .unwrap();
+    s.present(id, &m, s[id].rect()).unwrap();
+    s.flush(&m, FlushReason::Immediate).unwrap();
+    let _ = consumer.update();
+
+    let layer_pixels = 40000;
+    // Pixel 0: transparent black; Pixel 1: half-opaque premultiplied red (128, a=128).
+    m.write(layer_pixels, &[0, 0, 0, 0, 0, 0, 128, 128])
+        .unwrap();
+    let plane = adv_device::surface::Plane {
+        id: 2,
+        pixels: layer_pixels,
+        pitch: 8,
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 1,
+        layered: true,
+    };
+    s.set_planes(vec![plane], &[], (2, 1), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    s.flush(&m, FlushReason::Immediate).unwrap();
+    assert!(consumer.update());
+    let mut out = Snapshot::default();
+    consumer.current().snapshot(&mut out).unwrap();
+    assert_eq!(
+        out.bgra,
+        // Pixel 0 unchanged; Pixel 1 blends G = (200 * 127 + 127) / 255 = 100, R = 128.
+        vec![200, 0, 0, 255, 0, 100, 128, 255]
+    );
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+// spec: WINE-GFX-10
+fn layered_planes_blend_premultiplied_alpha_over_rgb565_base() {
+    let mut m = Memory::new(false);
+    let mut s = Store::new(2, 1, 16, 4096, Snapshot::default()).unwrap();
+    let id = s.create(2, 1, false, PixelFormat::Rgb565, &mut m).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    // Solid blue and pure green encoded as RGB565 (little-endian).
+    let blue = s[id].encode_pixel([255, 0, 0, 0]);
+    let green = s[id].encode_pixel([0, 255, 0, 0]);
+    m.write(s[id].pixels, &[blue[0], blue[1], green[0], green[1]])
+        .unwrap();
+    s.present(id, &m, s[id].rect()).unwrap();
+    s.flush(&m, FlushReason::Immediate).unwrap();
+    let _ = consumer.update();
+
+    let layer_pixels = 40000;
+    // Pixel 0: transparent black; Pixel 1: half-opaque premultiplied red (128, a=128).
+    m.write(layer_pixels, &[0, 0, 0, 0, 0, 0, 128, 128])
+        .unwrap();
+    let plane = adv_device::surface::Plane {
+        id: 2,
+        pixels: layer_pixels,
+        pitch: 8,
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 1,
+        layered: true,
+    };
+    s.set_planes(vec![plane], &[], (2, 1), &m).unwrap();
+    s.present_planes(7, &m).unwrap();
+    s.flush(&m, FlushReason::Immediate).unwrap();
+    assert!(consumer.update());
+    let mut out = Snapshot::default();
+    consumer.current().snapshot(&mut out).unwrap();
+    let blended_green = ((255 * 127 + 127) / 255) as u8;
+    let blended =
+        PixelFormat::Rgb565.decode(&PixelFormat::Rgb565.encode([0, blended_green, 128, 0])[..2]);
+    assert_eq!(
+        out.bgra,
+        vec![255, 0, 0, 0, blended[0], blended[1], blended[2], 0]
+    );
 }
