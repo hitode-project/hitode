@@ -243,6 +243,8 @@ struct Loop {
     taken: bool,
     exit: Option<usize>,
     inside: Vec<bool>,
+    /// The loop one level in that shares this head.
+    nested: Option<usize>,
 }
 
 struct Graph {
@@ -310,10 +312,6 @@ impl Graph {
         let mut loops = Vec::new();
         let mut heads = vec![None; n];
         for &(tail, head) in &back {
-            // A second latch of one head, as a `continue` makes.
-            if heads[head].is_some() {
-                return refuse("graph: shared head", tail);
-            }
             let mut inside = vec![false; n];
             inside[head] = true;
             let mut pending = vec![tail];
@@ -360,7 +358,6 @@ impl Graph {
             }) {
                 return refuse("graph: early exit", i);
             }
-            heads[head] = Some(loops.len());
             loops.push(Loop {
                 head,
                 tail,
@@ -369,7 +366,32 @@ impl Graph {
                 taken,
                 exit,
                 inside,
+                nested: None,
             });
+        }
+        // Latches of one head nest when one body strictly holds the other,
+        // as an outer loop that branches back to its inner loop's head; the
+        // head names the outermost. Equal bodies are one loop with two
+        // latches, as a `continue` makes.
+        let size = |lp: &Loop| lp.inside.iter().filter(|&&i| i).count();
+        let mut by_size: Vec<_> = (0..loops.len()).collect();
+        by_size.sort_by_key(|&i| std::cmp::Reverse(size(&loops[i])));
+        for &i in &by_size {
+            let head = loops[i].head;
+            match heads[head] {
+                None => heads[head] = Some(i),
+                Some(mut outer) => {
+                    while let Some(next) = loops[outer].nested {
+                        outer = next;
+                    }
+                    let (a, b) = (&loops[outer], &loops[i]);
+                    if size(a) == size(b) || b.inside.iter().zip(&a.inside).any(|(&b, &a)| b && !a)
+                    {
+                        return refuse("graph: shared head", b.tail);
+                    }
+                    loops[outer].nested = Some(i);
+                }
+            }
         }
         for (i, a) in loops.iter().enumerate() {
             for b in &loops[..i] {
@@ -960,9 +982,7 @@ impl Builder<'_> {
             }
             Op::Step(up, reg) => {
                 let inc = self.imm(if up { 1 } else { u32::MAX });
-                let value = state.regs[usize::from(reg)]
-                    .clone()
-                    .map(|a| self.plus(a, inc));
+                let value = self.register(state, reg).map(|a| self.plus(a, inc));
                 state.test = value.clone().map(Test::Zero);
                 state.put(reg, value);
             }
@@ -976,9 +996,7 @@ impl Builder<'_> {
             }
             Op::Not(reg) | Op::Neg(reg) => {
                 let m = self.constant(u32::MAX);
-                let value = state.regs[usize::from(reg)]
-                    .clone()
-                    .map(|a| self.scale(a, m));
+                let value = self.register(state, reg).map(|a| self.scale(a, m));
                 let value = if matches!(inst.op, Op::Not(_)) {
                     let minus_one = self.form(m);
                     value.map(|a| self.plus(a, minus_one))
@@ -1308,7 +1326,12 @@ impl Builder<'_> {
             let Some(mut state) = states[at].take() else {
                 continue;
             };
-            if let Some(child) = self.graph.heads[at].filter(|&c| Some(c) != lp) {
+            // At a loop's own head, the walk enters the loop nested there.
+            let child = match lp {
+                Some(lp) if self.graph.loops[lp].head == at => self.graph.loops[lp].nested,
+                _ => self.graph.heads[at],
+            };
+            if let Some(child) = child {
                 let after = self.loop_body(child, state, record)?;
                 if let Some(to) = self.graph.loops[child].exit {
                     self.join(&mut states[to], after);
@@ -1674,11 +1697,12 @@ impl Builder<'_> {
         let mut best_count = 1;
         for lp in &self.graph.loops {
             let head = lp.head;
-            if self
-                .graph
-                .loops
-                .iter()
-                .any(|other| other.head != head && lp.inside[other.head])
+            if lp.nested.is_some()
+                || self
+                    .graph
+                    .loops
+                    .iter()
+                    .any(|other| other.head != head && lp.inside[other.head])
             {
                 continue;
             }
@@ -3328,5 +3352,45 @@ mod tests {
         // A row the guard would skip is not one the proof walked.
         cpu.regs[1] = 0;
         assert!(proof.evaluate(&cpu, &mut scratch, read(0)).is_none());
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn nests_an_outer_loop_that_branches_back_to_its_inner_head() {
+        // Rows of pixels: the row loop resets the pixel count from a frame
+        // slot and branches straight back to the pixel loop's head.
+        let t = trace(|a| {
+            let (mut pixel, mut skip) = (a.create_label(), a.create_label());
+            a.set_label(&mut pixel).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, 0xff00_0000u32 as i32).unwrap();
+            a.je(skip).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(pixel).unwrap();
+            a.add(edi, dword_ptr(ebp - 0x5c)).unwrap();
+            a.add(esi, dword_ptr(ebp - 0x54)).unwrap();
+            a.mov(ecx, dword_ptr(ebp - 0x4c)).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(pixel).unwrap();
+            a.int3().unwrap();
+        });
+        let proof = Proof::build(&t).expect("nested loops sharing a head");
+        let cpu = CpuState {
+            regs: [0, 4, 3, 0, FRAME - 0x100, FRAME, INPUT, OUTPUT],
+            ..CpuState::default()
+        };
+        let read = |addr: u32| match addr.wrapping_sub(FRAME) as i32 {
+            -0x4c => Some(4),
+            -0x54 | -0x5c => Some(0xf0),
+            _ => None,
+        };
+        let mut scratch = Evaluation::default();
+        let ranges = proof.evaluate(&cpu, &mut scratch, read).unwrap();
+        assert!(ranges.contains(&range(INPUT, 0x200 + 16, false)));
+        assert!(ranges.contains(&range(OUTPUT, 0x200 + 16, true)));
     }
 }

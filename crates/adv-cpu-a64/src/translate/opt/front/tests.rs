@@ -1494,3 +1494,43 @@ fn a_guarded_blend_with_counters_at_a_frame_pointer() {
         }
     });
 }
+
+// spec: A64-TR-9, A64-OPT-2
+#[test]
+fn rows_whose_loop_branches_back_to_the_pixel_loop_head() {
+    const BASE: u32 = FRAME + 0x80;
+    // The row loop resets the pixel count from a frame slot and branches
+    // straight back to the pixel loop's head; transparent pixels are kept.
+    let code = assemble(|a| {
+        let (mut pixel, mut skip) = (a.create_label(), a.create_label());
+        a.set_label(&mut pixel).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.test(eax, 0xff00_0000u32 as i32).unwrap();
+        a.je(skip).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(pixel).unwrap();
+        a.add(edi, dword_ptr(ebp - 0x5c)).unwrap();
+        a.add(esi, dword_ptr(ebp - 0x54)).unwrap();
+        a.mov(ecx, dword_ptr(ebp - 0x4c)).unwrap();
+        a.dec(edx).unwrap();
+        a.jne(pixel).unwrap();
+    });
+    let mut at = initial();
+    at.regs = [0, 4, 3, 0, FRAME, BASE, DATA, DATA + 0x800];
+    differential(&code, &at, |m| {
+        for i in 0..12u32 {
+            let src = DATA + (i / 4) * 0x100 + (i % 4) * 4;
+            let alpha = [0u8, 0xff, 0x80, 0][i as usize % 4];
+            m.write(src, &[i as u8 + 1, 0x20, 0x30, alpha]).unwrap();
+        }
+        m.write(DATA + 0x800, &[0x55; 0x300]).unwrap();
+        for (offset, value) in [(-0x4c, 4u32), (-0x54, 0xf0), (-0x5c, 0xf0)] {
+            m.write(BASE.wrapping_add_signed(offset), &value.to_le_bytes())
+                .unwrap();
+        }
+    });
+}
