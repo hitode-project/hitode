@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Summarize --schedule-profile boundaries (host wall intervals, not CPU time).
 
-Usage: python tools/performance/analyze_schedule.py RUN_DIRECTORY
-Reads schedule.tsv from the first reset-metrics mark to the final report event.
+Usage: python tools/performance/analyze_schedule.py RUN_DIRECTORY [--window-s S]
+Reads schedule.tsv from the first reset-metrics mark (or the last S seconds) to
+the final report event.
 Only completed lock-wait attempts wholly inside that window enter the lock table.
 A failed reacquire starts a new attempt; it is not attributed to the old owner.
 End-PC attribution is a boundary observation, not instruction-level profiling.
@@ -156,6 +157,66 @@ def thread_budget(runs, waits, rounds, begin, end):
     return {name: round(ms, 3) for name, ms in budget.items()}
 
 
+def owner_frame_budget(rows, runs, lo, hi):
+    """Execution-thread wall per guest frame by layer: guest code, inline host
+    services, host sleeps, computation rounds and the rest (scheduler, gaps),
+    beside the owner work and period the frame load measured."""
+    frames = [r for r in rows if r["event"] == "frame" and lo < r["time_ns"] <= hi]
+    if not frames:
+        return {}
+    wall = Counter()
+    for begin, end, _, _, run_wall, host in runs:
+        share = overlap(begin, end, lo, hi) / max(end - begin, 1)
+        wall["host_services"] += host * share
+        wall["guest"] += max(0, run_wall - host) * share
+    for row in rows:
+        time = row["time_ns"]
+        if row["event"] == "host_wait":
+            wall["host_wait"] += overlap(time - row["b"], time, lo, hi)
+        elif row["event"] == "compute_round":
+            wall["compute_rounds"] += overlap(time - row["b"], time, lo, hi)
+    wall["other"] = max(0, hi - lo - sum(wall.values()))
+    n = len(frames)
+    per_frame = {name: round(ns / n / 1e6, 3) for name, ns in wall.most_common()}
+    return {
+        "frames": n,
+        "interval_ms": round((hi - lo) / n / 1e6, 3),
+        "wall_ms": per_frame,
+        "owner_work_ms": round(sum(r["b"] for r in frames) / n / 1e6, 3),
+        "period_ms": round(sum(r["c"] for r in frames) / n / 1e6, 3),
+    }
+
+
+def computation_share(rows, lo, hi, top=8):
+    """Computation jobs, their retired instructions and the share retired in
+    optimized forms, in total and by the entry each context was offered."""
+    entry, retired, optimized, jobs = {}, Counter(), Counter(), Counter()
+    last = {}
+    for row in rows:
+        event, context = row["event"], row["context"]
+        if event == "compute_offer":
+            entry[context] = row["a"]
+        if not lo <= row["time_ns"] < hi:
+            continue
+        if event == "compute_done":
+            pc = last[context] = entry.get(context, 0)
+            retired[pc] += row["a"]
+            jobs[pc] += 1
+        elif event == "compute_opt":
+            optimized[last.get(context, 0)] += row["a"]
+    total = sum(retired.values())
+    return {
+        "jobs": sum(jobs.values()),
+        "retired": total,
+        "optimized_share": round(sum(optimized.values()) / max(total, 1), 4),
+        "entries": [
+            {"entry": hex(pc), "jobs": jobs[pc], "retired": n,
+             "optimized_share": round(optimized[pc] / max(n, 1), 4)}
+            for pc, n in retired.most_common(top)
+        ],
+    }
+
+
 def input_responses(rows, runs, lo, hi, window_ms=1500):
     """For each press, the frames and execution-thread budget until the next press
     or `window_ms`. The longest gap there is the stall a player would feel."""
@@ -254,9 +315,11 @@ def trace_model(rows):
             "open_waits": len(waits), "segments": segments}
 
 
-def analyze(rows):
+def analyze(rows, window_ns=None):
     model = trace_model(rows)
     lo, hi, runs, records, segments = (model[k] for k in ("lo", "hi", "runs", "waits", "segments"))
+    if window_ns is not None:
+        lo = max(lo, hi - window_ns)
     active, pcs = Counter(), Counter()
     states = defaultdict(Counter)
     for begin, end, context, end_pc, wall, host in runs:
@@ -326,6 +389,9 @@ def analyze(rows):
             "budget": thread_budget(runs, waits, [], lo, hi),
         },
         "input_responses": input_responses(rows, runs, lo, hi),
+        "owner_frame_note": "execution-thread wall per guest frame; compute rounds and host waits are owner scopes",
+        "owner_frame": owner_frame_budget(rows, runs, lo, hi),
+        "computation": computation_share(rows, lo, hi),
     }
     return summary, selected
 
@@ -333,9 +399,11 @@ def analyze(rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("run_directory", type=Path)
+    parser.add_argument("--window-s", type=float, help="analyze only the last S seconds")
     args = parser.parse_args()
+    window = None if args.window_s is None else int(args.window_s * 1e9)
     try:
-        summary, waits = analyze(read_trace(args.run_directory / "schedule.tsv"))
+        summary, waits = analyze(read_trace(args.run_directory / "schedule.tsv"), window)
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"schedule analysis: {error}\n")
     for filename, value in (("causal-summary.json", summary), ("waits.json", waits)):

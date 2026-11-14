@@ -95,6 +95,27 @@ class ScheduleAnalysisTests(unittest.TestCase):
                          [(23, "idle"), (10, "lock_wait"), (7, "execution")])
         self.assertEqual(longest[1]["producer_state_ms"], {"lock_wait": 8, "execution": 1})
 
+    def test_owner_frames_split_wall_by_layer_inside_the_window(self):
+        rows = [
+            row(0, "mark"), row(0, "compute_offer", 2, 0x400),
+            row(1, "run_start", 1), row(5, "run_end", 1, 0, 4_000_000, 1_000_000),
+            row(8, "host_wait", 0, 3_000_000, 3_000_000), row(8, "frame", 1, 1, 7_000_000, 16_000_000),
+            row(9, "run_start", 1), row(11, "run_end", 1, 0, 2_000_000, 0),
+            row(14, "compute_done", 2, 100, 3_000_000), row(14, "compute_opt", 2, 75),
+            row(14, "compute_round", 0, 1, 3_000_000, 1),
+            row(16, "frame", 1, 2, 5_000_000, 16_000_000), row(16, "observe"),
+        ]
+        frames = analyze(rows)[0]["owner_frame"]
+        self.assertEqual(frames["wall_ms"], {"guest": 2.5, "host_wait": 1.5, "compute_rounds": 1.5,
+                                             "other": 2, "host_services": 0.5})
+        self.assertEqual((frames["owner_work_ms"], frames["period_ms"]), (6, 16))
+        computation = analyze(rows)[0]["computation"]
+        self.assertEqual((computation["retired"], computation["optimized_share"]), (100, 0.75))
+        self.assertEqual(computation["entries"][0]["entry"], "0x400")
+        # The last 8 ms hold the second frame only.
+        frames = analyze(rows, 8_000_000)[0]["owner_frame"]
+        self.assertEqual((frames["frames"], frames["wall_ms"]["guest"]), (1, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
