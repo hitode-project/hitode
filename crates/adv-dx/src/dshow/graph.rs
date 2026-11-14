@@ -45,6 +45,7 @@ pub(crate) struct Graph {
     /// The guest site set through IObjectWithSite, holding one reference.
     site: u32,
     pub state: u32,
+    stopping: bool,
     events: VecDeque<(u32, u32, u32)>,
     event: Handle,
     public_event: Option<u32>,
@@ -131,6 +132,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             members: Vec::new(),
             site: 0,
             state: STOPPED,
+            stopping: false,
             events: VecDeque::new(),
             event,
             public_event,
@@ -188,9 +190,12 @@ pub(crate) fn release_method(env: &mut Env<'_>, this: u32) -> Outcome {
 }
 
 fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
+    super::dmo::begin_stop(env, graph);
+    super::vmr::begin_stop(env, graph);
     stop_sessions(env, graph);
     video::detach(env, graph);
     g(env, graph).state = STOPPED;
+    g(env, graph).stopping = true;
     let members: Vec<(u32, Option<u32>)> = state(env).graphs[&graph]
         .members
         .iter()
@@ -526,8 +531,8 @@ fn each_guest_filter(
     args: Vec<u32>,
     then: Then,
 ) -> Outcome {
-    // Guest sources pushing into host decoders start after, and stop before,
-    // every other guest filter, as a graph orders filters downstream-first.
+    // Guest sources pushing into host decoders start after every other guest
+    // filter, as a graph orders Pause and Run downstream-first.
     let sources = super::dmo::upstream_filters(env, graph);
     let (mut feeding, mut rest): (Vec<u32>, Vec<u32>) = g(env, graph)
         .members
@@ -536,14 +541,8 @@ fn each_guest_filter(
         .filter(|m| m.host.is_none())
         .map(|m| m.filter)
         .partition(|filter| sources.contains(filter));
-    let order = if slot == 4 {
-        feeding.append(&mut rest);
-        feeding
-    } else {
-        rest.append(&mut feeding);
-        rest
-    };
-    let calls = order
+    rest.append(&mut feeding);
+    let calls = rest
         .into_iter()
         .map(|filter| Call(filter, slot, args.clone()))
         .collect();
@@ -557,10 +556,7 @@ fn set_host_states(env: &mut Env<'_>, graph: u32, value: u32) {
         .filter_map(|m| m.host)
         .collect();
     for host in hosts {
-        if let Some(filter) = state(env).filters.get_mut(&host) {
-            filter.state = value;
-            super::dmo::state_changed(env, host, value);
-        }
+        filter::set_state(env, host, value);
     }
 }
 
@@ -620,7 +616,7 @@ pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             graph_state.state = RUNNING;
             set_host_states(env, graph, RUNNING);
             wake_sessions(env, graph);
-            then(env, Vec::new())
+            flush_posts(env, then)
         }),
     )
 }
@@ -635,10 +631,52 @@ pub(crate) fn stop(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         graph_state.position = graph_state.position(now);
         graph_state.origin = None;
         graph_state.state = STOPPED;
+        graph_state.stopping = true;
     }
-    set_host_states(env, graph, STOPPED);
-    stop_sessions(env, graph);
-    each_guest_filter(env, graph, 4, vec![], then)
+    // Wake blocked host stages first, then stop upstream guest sources before
+    // host stages and downstream guest renderers (MEDIA-DMO-4).
+    super::dmo::begin_stop(env, graph);
+    super::vmr::begin_stop(env, graph);
+    let mut sources = super::dmo::upstream_filters(env, graph);
+    sources.extend(super::vmr::upstream_filters(env, graph));
+    let (feeding, rest): (Vec<u32>, Vec<u32>) = g(env, graph)
+        .members
+        .iter()
+        .rev()
+        .filter(|m| m.host.is_none())
+        .map(|m| m.filter)
+        .partition(|filter| sources.contains(filter));
+    let upstream_calls = feeding
+        .into_iter()
+        .map(|filter| Call(filter, 4, vec![]))
+        .collect();
+    chain(
+        env,
+        upstream_calls,
+        Vec::new(),
+        Box::new(move |env, mut results| {
+            if state(env).graphs.contains_key(&graph) {
+                set_host_states(env, graph, STOPPED);
+                stop_sessions(env, graph);
+            }
+            let downstream_calls = rest
+                .into_iter()
+                .map(|filter| Call(filter, 4, vec![]))
+                .collect();
+            chain(
+                env,
+                downstream_calls,
+                Vec::new(),
+                Box::new(move |env, more| {
+                    if let Some(graph_state) = state(env).graphs.get_mut(&graph) {
+                        graph_state.stopping = false;
+                    }
+                    results.extend(more);
+                    then(env, results)
+                }),
+            )
+        }),
+    )
 }
 
 fn start_sessions(env: &mut Env<'_>, graph: u32) {
@@ -652,6 +690,7 @@ fn start_sessions(env: &mut Env<'_>, graph: u32) {
         expected += stream::start(env, graph, host);
     }
     expected += super::dmo::renderers(env, graph);
+    expected += super::vmr::renderers(env, graph);
     let graph_state = g(env, graph);
     graph_state.expected = expected;
     graph_state.completed = 0;
@@ -681,9 +720,18 @@ fn stop_sessions(env: &mut Env<'_>, graph: u32) {
 
 /// IMediaEventSink::Notify and host renderer completion.
 pub(crate) fn notify(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32) {
+    let decommitting =
+        code == EC_ERRORABORT && p1 == VFW_E_NOT_COMMITTED && super::dmo::decommitting(env, graph);
     let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
         return;
     };
+    if code == EC_ERRORABORT
+        && p1 == VFW_E_NOT_COMMITTED
+        && (graph_state.state == STOPPED || graph_state.stopping || decommitting)
+    {
+        log::debug!("DirectShow: graph {graph:#x} ignored decommit abort");
+        return;
+    }
     match code {
         EC_COMPLETE if graph_state.default_complete => {
             graph_state.completed += 1;

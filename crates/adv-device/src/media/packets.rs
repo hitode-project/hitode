@@ -4,7 +4,7 @@
 use ff::{Rational, codec, format, frame, media, software};
 use ffmpeg_next as ff;
 
-use super::native::Input;
+use super::native::{Input, configure_video_context, transfer_hardware};
 use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream};
 
 #[cfg(not(feature = "gpu"))]
@@ -244,7 +244,11 @@ impl Decoder {
             }
         }
         let mut context = codec::Context::from_parameters(parameters)?;
-        context.set_threading(codec::threading::Config::count(1));
+        if matches!(format, CodecFormat::Video { .. }) {
+            configure_video_context(&mut context);
+        } else {
+            context.set_threading(codec::threading::Config::count(1));
+        }
         let mut decoder = context.decoder();
         decoder.set_packet_time_base(HUNDRED_NS);
         let kind = match format {
@@ -341,21 +345,24 @@ impl Decoder {
                     let decoded = &mut decoded;
                     match decoder.receive_frame(decoded) {
                         Ok(()) => {
+                            transfer_hardware(decoded)?;
                             #[cfg(feature = "gpu")]
                             if output.is_none() {
                                 *output = Some(super::planes::Output::new(
                                     self.device.as_ref().unwrap(),
                                     decoder,
+                                    decoded.format(),
                                 )?);
                             }
 
                             #[cfg(not(feature = "gpu"))]
                             let result = convert_video(scaler, decoded);
                             #[cfg(feature = "gpu")]
-                            let result = Ok(output.as_mut().unwrap().convert(
-                                decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
-                                decoded,
-                            )?);
+                            let result: Result<_, ff::Error> =
+                                Ok(output.as_mut().unwrap().convert(
+                                    decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
+                                    decoded,
+                                )?);
                             result.map(|f| Some(Decoded::Video(f)))
                         }
                         Err(error) => Err(error),

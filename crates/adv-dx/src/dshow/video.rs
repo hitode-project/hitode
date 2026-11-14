@@ -69,19 +69,27 @@ pub(crate) fn info(env: &Env<'_>, graph: u32) -> Option<media::VideoInfo> {
         .pins
         .iter()
         .find_map(|id| state.pins.get(id).filter(|p| p.dir == INPUT))?;
-    if input.peer == 0 || !state.pins.contains_key(&input.peer) {
+    if input.peer == 0 {
         return None;
     }
-    let source = filter::upstream_source(env, input.peer)?;
-    state
-        .filters
-        .get(&source)?
-        .source
-        .as_ref()?
-        .info
-        .as_ref()?
-        .video
-        .clone()
+    if state.pins.contains_key(&input.peer)
+        && let Some(source) = filter::upstream_source(env, input.peer)
+        && let Some(video) = state
+            .filters
+            .get(&source)?
+            .source
+            .as_ref()?
+            .info
+            .as_ref()?
+            .video
+            .clone()
+    {
+        return Some(video);
+    }
+    input
+        .mt
+        .as_ref()
+        .and_then(super::vmr::video_info_from_media_type)
 }
 
 pub(crate) fn latest(env: &Env<'_>, graph: u32) -> Option<VideoFrame> {

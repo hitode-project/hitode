@@ -115,7 +115,7 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-1 Shared playback
 
 **Rule**: DirectSound and waveOut MUST share mixing and playback time. Stable PCM views, generations, and retirement acknowledgments MUST prevent reads from retired or reused storage.
-With live output, the DirectSound write cursor MUST follow the source bytes committed by the mixer, including when locking from that cursor. Without live output, a playing buffer's write cursor MUST lead its play cursor by 30 ms of frames, and a stopped buffer's MUST equal it.
+With live output, the mixer MUST stage up to 30 ms or half the buffer, and write MUST follow committed bytes. Without live output, a playing write cursor MUST lead play by that window, and a stopped or ended buffer's cursors MUST match.
 **Verification**: Test
 
 ### DEV-AUDIO-2 Control delivery

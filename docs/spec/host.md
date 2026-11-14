@@ -97,7 +97,7 @@ Settings and compositor notifications MUST poke the owner even without guest com
 
 ### HOST-VIEW-7 Spatial upscaling
 
-**Rule**: Selected upscalers MUST process the composed game frame on the host GPU without modifying guest pixels. Software, GPU and video inputs MUST share the same filter. Native-size and downscaled output MUST bypass super-resolution.
+**Rule**: Selected upscalers MUST process the composed game frame on the host GPU without modifying guest pixels. Software, GPU and sub-720p video inputs MUST share the same filter. Native-size, downscaled and 720p or larger video frames MUST bypass super-resolution.
 **Verification**: Test
 
 Models whose upstream source declares FP16 compute in half precision when the GPU offers shader f16. Otherwise their passes run in single precision with the same f16-rounded weights. Before a half-precision model is shown, it runs once against its single-precision form on a small canvas. If any channel differs by more than 8/255, the device computes every model in single precision.

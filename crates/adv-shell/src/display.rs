@@ -398,6 +398,7 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
             id: w.id,
             size: (w.width, w.height),
             pixels: w.pixels.clone(),
+            layered: w.layered,
             version: w.version,
         })
         .collect();

@@ -72,7 +72,7 @@ pub(crate) struct SourceState {
 pub struct RingState {
     sequence: AtomicU64,
     position: AtomicU64,
-    write_position: AtomicU32,
+    write_position: AtomicU64,
     minimum_position: AtomicU64,
     pts: AtomicU64,
     frequency: AtomicU32,
@@ -119,22 +119,33 @@ impl RingState {
         }
         let align = align.max(1);
         let mut position = i128::from(base);
-        if playing || (!looping && base >= u64::from(bytes) && now < pts) {
+        let draining_end = !looping && base >= u64::from(bytes) && now < pts;
+        if playing || draining_end {
             let delta = i128::from(now) - i128::from(pts);
             position += delta * i128::from(frequency) * i128::from(align) / 1_000_000;
         }
+        if !looping && position >= i128::from(bytes) {
+            return Some((0, 0));
+        }
+        let bounded = position.max(i128::from(minimum));
         let play = if looping {
-            position
-                .max(i128::from(minimum))
-                .rem_euclid(i128::from(bytes)) as u32
-                / align
-                * align
-        } else if position >= i128::from(bytes) {
+            bounded.rem_euclid(i128::from(bytes)) as u32 / align * align
+        } else {
+            bounded as u32 / align * align
+        };
+        let write_cursor = if playing {
+            let mut effective_write = write;
+            if write > base && bounded + i128::from(align) > i128::from(write) {
+                let lead = write - base;
+                effective_write = (bounded + i128::from(lead)) as u64;
+            }
+            (effective_write % u64::from(bytes)) as u32 / align * align
+        } else if draining_end {
             0
         } else {
-            position.max(0) as u32 / align * align
+            play
         };
-        Some((play, if playing { write } else { play }))
+        Some((play, write_cursor))
     }
 }
 
@@ -176,6 +187,7 @@ enum Command {
     Stop(u64, Option<u64>),
     Position(u64, u32, u64, Option<u64>),
     Written(u64, u32, u32, u64),
+    Committed(u64, u32, u32),
     Gain(u64, [f32; 2]),
     Retune(u64, u32, Converter, Option<u64>),
     Notices(u64, Vec<(u32, u32)>),
@@ -480,7 +492,24 @@ impl AudioControl {
             .store(suspended, Ordering::Release);
         self.send(Command::Suspend(suspended))
     }
-    pub fn add_ring(&self, source: u64, mut config: RingConfig) -> Result<Arc<RingState>, String> {
+    pub fn add_ring(&self, source: u64, config: RingConfig) -> Result<Arc<RingState>, String> {
+        self.insert_ring(source, config, true)
+    }
+    /// Add a shared PCM ring whose caller owns packet holding (such as WASAPI
+    /// `IAudioRenderClient`), without pre-staging DirectSound write-cursor lead.
+    pub fn add_unbuffered_ring(
+        &self,
+        source: u64,
+        config: RingConfig,
+    ) -> Result<Arc<RingState>, String> {
+        self.insert_ring(source, config, false)
+    }
+    fn insert_ring(
+        &self,
+        source: u64,
+        mut config: RingConfig,
+        stage_lead: bool,
+    ) -> Result<Arc<RingState>, String> {
         let local = self.local.borrow();
         if local.retired_owners.contains(&((source >> 32) as u32)) {
             return Err("audio process owner has exited".into());
@@ -493,7 +522,7 @@ impl AudioControl {
         config.output_rate = self.stream.shared.rate.load(Ordering::Acquire);
         let frequency = config.frequency;
         let align = u32::from(config.channels) * u32::from(config.bits) / 8;
-        let voice = RingVoice::new(config)?;
+        let voice = RingVoice::with_staging(config, stage_lead)?;
         let state = Arc::new(RingState::default());
         if !self.send(Command::Ring(source, voice, state.clone())) {
             return Err("audio command limit".into());
@@ -569,6 +598,9 @@ impl AudioControl {
             .clock
             .now_us(self.local.borrow().guest_us);
         self.send(Command::Written(source, offset, len, now))
+    }
+    pub fn committed(&self, source: u64, offset: u32, len: u32) -> bool {
+        self.send(Command::Committed(source, offset, len))
     }
     pub fn set_notifications(&self, source: u64, entries: Vec<(u32, u32)>) -> bool {
         self.send(Command::Notices(source, entries))
@@ -785,6 +817,7 @@ impl Engine {
                 | Command::Stop(id, ..)
                 | Command::Position(id, ..)
                 | Command::Written(id, ..)
+                | Command::Committed(id, ..)
                 | Command::Gain(id, ..)
                 | Command::Retune(id, ..)
                 | Command::Notices(id, ..)
@@ -903,6 +936,9 @@ impl Engine {
                                     voice.lead.refill(now);
                                 }
                                 voice.written(offset, len)
+                            }
+                            (Voice::Ring { voice, .. }, Command::Committed(_, offset, len)) => {
+                                voice.committed(offset, len)
                             }
                             (Voice::Ring { voice, .. }, Command::Notices(_, entries)) => {
                                 let old = voice.set_notifications(entries);
@@ -1048,13 +1084,23 @@ impl Engine {
                         generation,
                     } => {
                         let before = voice.missing_frames;
-                        voice.render(output, channels, self.rate, &mut missing);
+                        let was_playing = voice.playing;
+                        let played_frames = voice.render(output, channels, self.rate, &mut missing);
                         shared
                             .counters
                             .missing_stream_frames
                             .fetch_add(voice.missing_frames - before, Ordering::Relaxed);
                         audible += u64::from(voice.audible);
                         let due = pts + output.len() as f64 / f64::from(channels) * step;
+                        let state_pts = if voice.playing {
+                            due as u64
+                        } else if was_playing {
+                            (pts + played_frames as f64 * step) as u64
+                        } else if state.generation.load(Ordering::Relaxed) == *generation {
+                            state.pts.load(Ordering::Relaxed)
+                        } else {
+                            pts as u64
+                        };
                         state.sequence.fetch_add(1, Ordering::AcqRel);
                         std::sync::atomic::fence(Ordering::Release);
                         state
@@ -1062,11 +1108,11 @@ impl Engine {
                             .store(voice.total_position(), Ordering::Relaxed);
                         state
                             .write_position
-                            .store(voice.write_position(), Ordering::Relaxed);
+                            .store(voice.total_write_position(), Ordering::Relaxed);
                         state
                             .minimum_position
                             .store(voice.minimum_position(), Ordering::Relaxed);
-                        state.pts.store(due as u64, Ordering::Relaxed);
+                        state.pts.store(state_pts, Ordering::Relaxed);
                         state.frequency.store(voice.frequency(), Ordering::Relaxed);
                         state.bytes.store(voice.bytes, Ordering::Relaxed);
                         state.align.store(voice.alignment(), Ordering::Relaxed);
@@ -1082,7 +1128,7 @@ impl Engine {
                                     source: *source,
                                     generation: *generation,
                                     event,
-                                    due_us: due as u64,
+                                    due_us: state_pts,
                                 })
                                 .is_ok();
                             sent |= success;
@@ -1714,5 +1760,45 @@ mod tests {
             assert!(observed.stream().alarm_epoch() > 0);
             assert_eq!(reference.stream().alarm_epoch(), 0);
         }
+    }
+
+    // spec: DEV-AUDIO-1
+    #[test]
+    fn ring_cursors_preserve_staged_lead_across_callback_boundaries_and_jitter() {
+        let control = AudioControl::new(true);
+        let state = control
+            .add_ring(
+                1,
+                RingConfig {
+                    view: Arc::new(Samples),
+                    bytes: 400,
+                    channels: 2,
+                    bits: 16,
+                    frequency: 1000,
+                    output_rate: 1000,
+                    notifications: vec![],
+                },
+            )
+            .unwrap();
+        assert!(control.play_ring(1, true, 1));
+        let mut reader = control.stream().device_reader(1000, 2).unwrap();
+
+        // Mix 10 frames (40 bytes) starting at cursor 0 (due at 10_000 us, staged through 160).
+        reader.read(&mut [0.0; 20], 0);
+        assert_eq!(state.cursors(0, 1), Some((0, 160)));
+        assert_eq!(state.cursors(5_000, 1), Some((20, 160)));
+        // At now == due (10_000 us), play reaches 40 while write stays 120 bytes (30 ms) ahead.
+        assert_eq!(state.cursors(10_000, 1), Some((40, 160)));
+        // Under 10 ms of callback jitter (now = 20_000 us), play advances smoothly to 80 while
+        // write remains at exact committed byte 160 without collapsing to play or exposing 164.
+        assert_eq!(state.cursors(20_000, 1), Some((80, 160)));
+
+        // Non-looping seek clamps play at minimum before pts and resets to (0, 0) once ended.
+        assert!(control.stop_ring_generation(1, 2));
+        assert!(control.play_ring_at(1, false, 3, Some(48)));
+        reader.read(&mut [0.0; 20], 0);
+        assert_eq!(state.cursors(0, 3), Some((48, 208)));
+        reader.read(&mut [0.0; 200], 0);
+        assert_eq!(state.cursors(500_000, 3), Some((0, 0)));
     }
 }

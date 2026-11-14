@@ -4,7 +4,7 @@
 //! plane rows over it, bottom first, leaving the base untouched in guest memory.
 use super::Rect;
 #[cfg(not(feature = "gpu"))]
-use super::{PixelFormat, Surface, SurfaceMemory, encode_pixel};
+use super::{PixelFormat, Surface, SurfaceMemory, convert::decode_pixel, encode_pixel};
 
 /// A window's guest `Bgra32` rows at a signed position in base pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct Plane {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Premultiplied `Bgra32` alpha instead of opaque fill.
+    pub layered: bool,
 }
 
 impl Plane {
@@ -68,7 +70,11 @@ pub(crate) fn compose_row(
         let source = m.read(at, (right - left) as usize * 4)?;
         let out = &mut row[left as usize * bytes..right as usize * bytes];
         if s.format == PixelFormat::Bgra32 {
-            out.copy_from_slice(&source);
+            if plane.layered {
+                blend_premultiplied(out, &source);
+            } else {
+                out.copy_from_slice(&source);
+            }
         } else {
             for (pixel, out) in source
                 .as_chunks::<4>()
@@ -76,11 +82,48 @@ pub(crate) fn compose_row(
                 .iter()
                 .zip(out.chunks_exact_mut(bytes))
             {
-                let encoded = encode_pixel(s.format, s.palette.as_deref(), *pixel);
+                if plane.layered && pixel[3] == 0 {
+                    continue;
+                }
+                let src = if plane.layered && pixel[3] < 255 {
+                    let mut dst = decode_pixel(s.format, s.palette.as_deref(), out);
+                    blend_pixel(&mut dst, *pixel);
+                    dst
+                } else {
+                    *pixel
+                };
+                let encoded = encode_pixel(s.format, s.palette.as_deref(), src);
                 out.copy_from_slice(&encoded[..bytes]);
             }
         }
         copied += source.len() as u64;
     }
     Ok(copied)
+}
+
+/// Premultiplied `Bgra32` source-over blend of one pixel into `dst`.
+#[cfg(not(feature = "gpu"))]
+fn blend_pixel(d: &mut [u8; 4], s: [u8; 4]) {
+    let a = s[3];
+    if a == 255 {
+        *d = s;
+    } else if a != 0 {
+        let inv = 255 - u32::from(a);
+        for (dc, sc) in d.iter_mut().zip(s) {
+            *dc = sc.saturating_add(((u32::from(*dc) * inv + 127) / 255) as u8);
+        }
+    }
+}
+
+/// Premultiplied `Bgra32` source-over blend into `dst`.
+#[cfg(not(feature = "gpu"))]
+fn blend_premultiplied(dst: &mut [u8], src: &[u8]) {
+    for (d, s) in dst
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
+        blend_pixel(d, *s);
+    }
 }

@@ -8,7 +8,7 @@ use adv_sync::WakeEvent;
 use ff::{codec, format, frame, media};
 use ffmpeg_next as ff;
 
-use super::super::native::Input;
+use super::super::native::{Input, configure_video_context, transfer_hardware};
 use super::super::{CodecFormat, Error};
 use super::{Command, Event, Info, Output, Track};
 
@@ -428,10 +428,10 @@ impl Decode {
     fn open(parameters: codec::Parameters, tb: ff::Rational) -> Result<Self, Error> {
         let medium = parameters.medium();
         let mut context = codec::Context::from_parameters(parameters)?;
-        context.set_threading(codec::threading::Config::count(1));
-        #[cfg(target_vendor = "apple")]
         if medium == media::Type::Video {
-            hardware(&mut context);
+            configure_video_context(&mut context);
+        } else {
+            context.set_threading(codec::threading::Config::count(1));
         }
         let mut decoder = context.decoder();
         decoder.set_packet_time_base(tb);
@@ -570,21 +570,8 @@ impl Decode {
                         key: raw.flags & ff::ffi::AV_FRAME_FLAG_KEY != 0,
                         data,
                     };
-                    if let Data::Video(frame) = &sample.data
-                        && frame.format() == format::Pixel::VIDEOTOOLBOX
-                    {
-                        let mut software = frame::Video::empty();
-                        let result = unsafe {
-                            ff::ffi::av_hwframe_transfer_data(
-                                software.as_mut_ptr(),
-                                frame.as_ptr(),
-                                0,
-                            )
-                        };
-                        if result < 0 {
-                            return Err(ff::Error::from(result).into());
-                        }
-                        sample.data = Data::Video(software);
+                    if let Data::Video(frame) = &mut sample.data {
+                        transfer_hardware(frame)?;
                     }
                     samples.push(sample);
                 }
@@ -603,54 +590,6 @@ impl Decode {
         match self {
             Self::Video(d) => d.flush(),
             Self::Audio(d) => d.flush(),
-        }
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-fn hardware(context: &mut codec::Context) {
-    unsafe extern "C" fn select(
-        _context: *mut ff::ffi::AVCodecContext,
-        mut formats: *const ff::ffi::AVPixelFormat,
-    ) -> ff::ffi::AVPixelFormat {
-        unsafe {
-            let first = *formats;
-            while *formats != ff::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-                if *formats == ff::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
-                    return *formats;
-                }
-                formats = formats.add(1);
-            }
-            first
-        }
-    }
-    unsafe {
-        let raw = context.as_mut_ptr();
-        let decoder = ff::ffi::avcodec_find_decoder((*raw).codec_id);
-        if decoder.is_null() {
-            return;
-        }
-        for index in 0.. {
-            let config = ff::ffi::avcodec_get_hw_config(decoder, index);
-            if config.is_null() {
-                break;
-            }
-            if (*config).device_type != ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX {
-                continue;
-            }
-            let mut device = std::ptr::null_mut();
-            if ff::ffi::av_hwdevice_ctx_create(
-                &mut device,
-                (*config).device_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            ) >= 0
-            {
-                (*raw).hw_device_ctx = device;
-                (*raw).get_format = Some(select);
-            }
-            break;
         }
     }
 }
