@@ -643,6 +643,11 @@ Every presenter's frames carry only that content, while the host shows caption, 
 **Rule**: A shown top-level window MUST be read before its first flush. A dialog the host projects, such as a message box, MUST NOT present frames. Its icon MUST NOT show as an unavailable control.
 **Verification**: Test
 
+### WINE-UI-9 Detached menu bars
+
+**Rule**: A menu bar moved from the presented window MUST follow its root or submenu handles to its new window. The new window MUST remain the command target when hidden. A detached bar with at most one row of content MUST NOT present a window plane.
+**Verification**: Test
+
 ## Audio
 
 ### WINE-AUD-1 Builtin render driver

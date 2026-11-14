@@ -126,6 +126,9 @@ impl Info {
     fn is(&self, class: &str) -> bool {
         self.class.eq_ignore_ascii_case(class)
     }
+    fn has_menu_bar(&self) -> bool {
+        self.top_level() && !self.is("#32768") && !self.menu.is_empty()
+    }
     fn combo_list(&self) -> bool {
         self.top_level() && self.is("ComboLBox") && self.style & 0x30 == 0
     }
@@ -158,11 +161,42 @@ struct Part {
 #[derive(Default)]
 struct Projection {
     parts: HashMap<CtxId, Part>,
+    /// The last menu attached to the presented top-level window.
+    menu_origin: Option<MenuOrigin>,
     popup: Option<(u32, Arc<AtomicBool>)>,
     choice: Option<VecDeque<MenuCommand>>,
     /// Threads with a read under way, and when each last finished one.
     reading: BTreeSet<CtxId>,
     read: HashMap<CtxId, Instant>,
+}
+
+struct MenuOrigin {
+    window: u32,
+    root: u32,
+    submenus: Vec<u32>,
+}
+
+impl MenuOrigin {
+    fn new(window: &Info) -> Self {
+        Self {
+            window: window.hwnd,
+            root: window.id,
+            submenus: window
+                .menu
+                .iter()
+                .map(|item| item.submenu)
+                .filter(|&id| id != 0)
+                .collect(),
+        }
+    }
+
+    fn matches(&self, window: &Info) -> bool {
+        window.id == self.root
+            || window
+                .menu
+                .iter()
+                .any(|item| self.submenus.contains(&item.submenu))
+    }
 }
 
 impl Drop for Projection {
@@ -196,6 +230,22 @@ fn windows(ext: &Ext) -> impl Iterator<Item = &Info> {
 
 fn info(ext: &Ext, hwnd: u32) -> Option<&Info> {
     windows(ext).find(|info| info.hwnd == hwnd)
+}
+
+fn presented_top(ext: &Ext) -> Option<u32> {
+    input::presented_window(ext).map(|hwnd| input::top_level(ext, hwnd))
+}
+
+/// Find the window now holding the presented window's detached menu bar.
+fn detached_menu(ext: &Ext, presented: Option<u32>) -> Option<&Info> {
+    let base = info(ext, presented?)?;
+    let origin = ext.try_get::<Projection>()?.menu_origin.as_ref()?;
+    if base.id != 0 || origin.window != base.hwnd {
+        return None;
+    }
+    let mut holders = windows(ext).filter(|window| window.has_menu_bar() && origin.matches(window));
+    let holder = holders.next()?;
+    holders.next().is_none().then_some(holder)
 }
 
 /// Read every guest thread's windows again, at most every [`REFRESH`].
@@ -309,13 +359,19 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
     set
 }
 
-/// Whether the host shows `hwnd` as a native dialog or popup instead of frames.
-/// Window surfaces ask on every flush, so this classifies `hwnd` alone,
-/// exactly as [`dialogs`] would, without building the dialog set.
+/// Whether the host projects `hwnd` natively instead of presenting its surface.
 pub fn projected(ext: &Ext, hwnd: u32) -> bool {
     let children = |parent| windows(ext).filter(|info| info.parent == parent).collect();
-    info(ext, hwnd)
-        .is_some_and(|info| info.is("#32768") || info.combo_popup() || is_dialog(info, &children))
+    info(ext, hwnd).is_some_and(|info| {
+        info.is("#32768")
+            || info.combo_popup()
+            || is_dialog(info, &children)
+            // A detached bar can use an empty or one-row client area as a
+            // placeholder. Windows with client content still show as planes.
+            || (info.client.1 <= 1
+                && info.has_menu_bar()
+                && detached_menu(ext, presented_top(ext)).is_some_and(|holder| holder.hwnd == hwnd))
+    })
 }
 
 fn target(dialog: u32, info: &Info) -> DialogTarget {
@@ -353,10 +409,10 @@ fn is_dialog<'a>(info: &Info, children: &impl Fn(u32) -> Vec<&'a Info>) -> bool 
             .any(|child| child.is("Button") && child.style & 0xf <= 1)
 }
 
-/// The active popup, or the menu bar of the presented window or first visible
-/// window with one.
+/// The active popup, the presented window's attached or detached menu bar,
+/// or the first visible window with a menu bar.
 pub fn menu_bar(ext: &Ext) -> MenuBar {
-    let presented = input::presented_window(ext);
+    let presented = presented_top(ext);
     if let Some((hwnd, active)) = ext
         .try_get::<Projection>()
         .and_then(|state| state.popup.as_ref())
@@ -430,11 +486,11 @@ pub fn menu_bar(ext: &Ext) -> MenuBar {
             }),
         };
     }
-    let owner = windows(ext)
-        .filter(|info| {
-            info.top_level() && info.visible() && !info.is("#32768") && !info.menu.is_empty()
-        })
-        .min_by_key(|info| (Some(info.hwnd) != presented, info.hwnd));
+    let owner = detached_menu(ext, presented).or_else(|| {
+        windows(ext)
+            .filter(|info| info.visible() && info.has_menu_bar())
+            .min_by_key(|info| (Some(info.hwnd) != presented, info.hwnd))
+    });
     let Some(owner) = owner else {
         return MenuBar::default();
     };
@@ -1082,7 +1138,11 @@ fn state(env: &mut Env<'_>, context: CtxId, part: Part, buffer: u32, done: Done)
             asks.push((index, Ask::Font));
             list.push(("GetObjectW", vec![info.font, LOGFONT, at]));
         }
-        if info.top_level() && info.style & WS_CHILD == 0 && info.id != 0 && info.visible() {
+        if info.top_level()
+            && info.style & WS_CHILD == 0
+            && info.id != 0
+            && (info.visible() || !info.is("#32768"))
+        {
             asks.push((index, Ask::Menu));
             list.push(("GetMenuItemCount", vec![info.id]));
         }
@@ -1300,7 +1360,15 @@ fn menu(
 }
 
 fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome {
+    let presented = presented_top(env.ext);
     let projection = projection(env.ext);
+    if let Some(base) = part
+        .windows
+        .iter()
+        .find(|info| Some(info.hwnd) == presented && info.has_menu_bar())
+    {
+        projection.menu_origin = Some(MenuOrigin::new(base));
+    }
     projection.reading.remove(&context);
     projection.read.insert(context, Instant::now());
     let popup = part
@@ -1325,7 +1393,7 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
         .and_then(|path| path.front())
         .map(|command| command.menu);
     projection.parts.insert(context, part);
-    // A window read as a dialog now shows natively, not as a plane.
+    // A window projected natively now leaves the planes.
     if let Err(error) = super::surface::compose(env, None) {
         return Outcome::Fail(error);
     }
@@ -1347,6 +1415,13 @@ pub(super) fn hidden(ext: &mut Ext, hwnd: u32) {
 /// Forget a destroyed window.
 pub(super) fn forget(ext: &mut Ext, hwnd: u32) {
     if let Some(projection) = ext.try_get_mut::<Projection>() {
+        if projection
+            .menu_origin
+            .as_ref()
+            .is_some_and(|origin| origin.window == hwnd)
+        {
+            projection.menu_origin = None;
+        }
         if projection
             .popup
             .as_ref()
@@ -1455,6 +1530,67 @@ fn click_next(env: &mut Env<'_>, menu: u32, done: Done) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: WINE-UI-9
+    #[test]
+    fn a_reparented_menu_keeps_its_target_when_hidden() {
+        use super::super::{Window, Windows};
+
+        let mut ext = Ext::default();
+        ext.insert(input::Presentation::default());
+        ext.get_or_default::<Windows>()
+            .0
+            .insert(1, Window::default());
+        input::prepare(&ext, 1, (0, 0));
+        input::presented(&ext);
+
+        let bar = |hwnd, id, submenu, style, height| Info {
+            hwnd,
+            id,
+            style,
+            client: (200, height),
+            menu: vec![MenuItem {
+                text: Vec::new(),
+                flags: 0,
+                supported: true,
+                command: MenuCommand {
+                    window: hwnd,
+                    root: id,
+                    ..Default::default()
+                },
+                submenu,
+                children: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let state = projection(&mut ext);
+        state.menu_origin = Some(MenuOrigin::new(&bar(1, 10, 11, WS_VISIBLE, 100)));
+        state.parts.insert(
+            1,
+            Part {
+                windows: vec![
+                    Info {
+                        hwnd: 1,
+                        style: WS_VISIBLE,
+                        ..Default::default()
+                    },
+                    bar(2, 20, 21, WS_VISIBLE, 1),
+                    bar(3, 30, 11, 0, 1),
+                ],
+                ..Default::default()
+            },
+        );
+        let menu = menu_bar(&ext);
+        assert_eq!((menu.key.window, menu.key.menu), (3, 30));
+        assert_eq!(
+            (menu.items[0].command.window, menu.items[0].command.root),
+            (3, 30)
+        );
+        assert!(projected(&ext, 3));
+        assert!(!projected(&ext, 2));
+        forget(&mut ext, 3);
+        assert_eq!(menu_bar(&ext).key.window, 2);
+    }
 
     // spec: WINE-UI-1
     #[test]
