@@ -25,6 +25,7 @@ pub use host::{Host, Opened, ReadFile};
 mod sample;
 mod stream;
 mod video;
+mod vmr;
 pub use video::{VideoProvider, VideoWindowGeometry, pump_video, set_video_provider};
 
 /// Playback performed by the native graph, retained after graph release.
@@ -236,9 +237,11 @@ pub(crate) enum Face {
     MemAllocator,
     MediaSample,
     DmoWrapper,
+    VmrFilterConfig,
+    VmrWindowlessControl,
 }
 
-const FACES: [(Face, &str); 21] = [
+const FACES: [(Face, &str); 23] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -260,6 +263,8 @@ const FACES: [(Face, &str); 21] = [
     (Face::MemAllocator, "IMemAllocator"),
     (Face::MediaSample, "IMediaSample"),
     (Face::DmoWrapper, "IDMOWrapperFilter"),
+    (Face::VmrFilterConfig, "IVMRFilterConfig"),
+    (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
 ];
 
 impl Face {
@@ -290,6 +295,8 @@ impl Face {
             Face::MemAllocator => &[IID_IMEMALLOCATOR],
             Face::MediaSample => &[IID_IMEDIASAMPLE],
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
+            Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
+            Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
         }
     }
 }
@@ -348,19 +355,27 @@ fn error_text_a(env: &mut Env<'_>, _hr: i32, _output: AnsiStr, _capacity: u32) -
     0
 }
 
+fn interface_methods(interface: &str) -> Vec<(&'static str, Conv, u16)> {
+    let from_abi: Vec<_> = adv_abi::signature::com_signatures()
+        .iter()
+        .filter(|signature| signature.module == interface)
+        .filter_map(|signature| Some((signature.name, signature.conv?, signature.com_slot?)))
+        .collect();
+    if !from_abi.is_empty() {
+        return from_abi;
+    }
+    vmr::interface_methods(interface)
+        .map(|methods| methods.to_vec())
+        .unwrap_or_default()
+}
+
 pub fn register(registry: &mut Registry) {
     registry.register(error_text_a_ABI);
     for (face, interface) in FACES {
-        for signature in adv_abi::signature::com_signatures()
-            .iter()
-            .filter(|signature| signature.module == interface)
-        {
-            let (Some(conv), Some(slot)) = (signature.conv, signature.com_slot) else {
-                continue;
-            };
+        for (name, conv, slot) in interface_methods(interface) {
             registry.add_with_data(
                 "quartz.dll",
-                &format!("{interface}::{}", signature.name),
+                &format!("{interface}::{name}"),
                 conv,
                 dispatch,
                 data(face, slot),
@@ -388,6 +403,10 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(CLSID_AUDIO_RENDER, filter::create_audio_renderer);
     classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
     classes.register(CLSID_WMASF_READER, filter::create_asf_reader);
+    classes.register(
+        vmr::CLSID_VIDEO_MIXING_RENDERER,
+        filter::create_vmr_renderer,
+    );
 }
 
 /// Classes exported by the native graph front. Wine retains its audio
@@ -401,6 +420,7 @@ pub fn has_graph_class(class: &Iid) -> bool {
         CLSID_MPEG_AUDIO_CODEC,
         dmo::CLSID_DMO_WRAPPER,
         CLSID_WMASF_READER,
+        vmr::CLSID_VIDEO_MIXING_RENDERER,
     ]
     .contains(class)
 }
@@ -411,21 +431,22 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
     }
     let mut tables = BTreeMap::new();
     for (face, interface) in FACES {
-        let methods: Vec<_> = adv_abi::signature::com_signatures()
+        let methods = interface_methods(interface);
+        let slots = methods
             .iter()
-            .filter(|signature| signature.module == interface)
-            .collect();
-        let table = alloc(env, methods.len() as u32 * 4).ok_or("DirectShow vtable allocation")?;
-        for signature in methods {
-            let slot = u32::from(signature.com_slot.ok_or("COM slot")?);
-            let name = format!("{interface}::{}", signature.name);
+            .map(|&(_, _, slot)| usize::from(slot) + 1)
+            .max()
+            .unwrap_or(0);
+        let table = alloc(env, slots as u32 * 4).ok_or("DirectShow vtable allocation")?;
+        for (name, _, slot) in methods {
+            let name = format!("{interface}::{name}");
             let method = env
                 .sys
                 .thunks
                 .publish(env.cpu, "quartz.dll", &name)
                 .map_err(|e| e.to_string())?;
             env.cpu
-                .write_u32(table + slot * 4, method)
+                .write_u32(table + u32::from(slot) * 4, method)
                 .map_err(|e| e.to_string())?;
         }
         tables.insert(face, table);
@@ -573,6 +594,9 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             if let Some(dmo) = filter.dmo {
                 dmo::destroyed(env, dmo);
             }
+            if let Some(vmr) = filter.vmr {
+                vmr::destroyed(env, vmr);
+            }
         }
         Obj::Pin => {
             state.pins.remove(&canonical);
@@ -643,6 +667,7 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::EnumMediaTypes
         | Face::DmoWrapper => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
+        Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
     };
     outcome.unwrap_or_else(|| {
         log::debug!("DirectShow {}::{method}: not implemented", face.interface());

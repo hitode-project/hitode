@@ -818,8 +818,10 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 ### WINE-MEDIA-8 Native DirectShow graphs
 
-**Rule**: Wine's `quartz.dll` MUST activate implemented DirectShow classes through `adv_dx::dshow`. The DMO wrapper MUST activate through `qasf.dll`. Native file graphs MUST decode through `adv_device` and mix audio through the session's native DirectSound service.
+**Rule**: Wine's `quartz.dll` MUST activate DirectShow classes, including VMR-7, through `adv_dx::dshow`, with the DMO wrapper via `qasf.dll`. Native file graphs MUST decode through `adv_device` and mix audio through the session's native DirectSound service. Host video renderers MUST accept pushed uncompressed RGB frames over `IMemInputPin`.
 **Verification**: Test
+
+Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB frames to presentation frames.
 
 ### WINE-MEDIA-9 Native synchronous reader
 

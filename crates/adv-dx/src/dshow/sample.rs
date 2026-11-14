@@ -26,7 +26,7 @@ pub(crate) struct Sample {
     pub time: Option<(i64, i64)>,
     media_time: Option<(i64, i64)>,
     pub sync_point: bool,
-    preroll: bool,
+    pub preroll: bool,
     pub discontinuity: bool,
 }
 

@@ -191,6 +191,7 @@ pub(crate) fn release_method(env: &mut Env<'_>, this: u32) -> Outcome {
 
 fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     super::dmo::begin_stop(env, graph);
+    super::vmr::begin_stop(env, graph);
     stop_sessions(env, graph);
     video::detach(env, graph);
     g(env, graph).state = STOPPED;
@@ -615,7 +616,7 @@ pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             graph_state.state = RUNNING;
             set_host_states(env, graph, RUNNING);
             wake_sessions(env, graph);
-            then(env, Vec::new())
+            flush_posts(env, then)
         }),
     )
 }
@@ -632,10 +633,12 @@ pub(crate) fn stop(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         graph_state.state = STOPPED;
         graph_state.stopping = true;
     }
-    // Wake blocked host decoders first, then stop upstream guest sources before
+    // Wake blocked host stages first, then stop upstream guest sources before
     // host stages and downstream guest renderers (MEDIA-DMO-4).
     super::dmo::begin_stop(env, graph);
-    let sources = super::dmo::upstream_filters(env, graph);
+    super::vmr::begin_stop(env, graph);
+    let mut sources = super::dmo::upstream_filters(env, graph);
+    sources.extend(super::vmr::upstream_filters(env, graph));
     let (feeding, rest): (Vec<u32>, Vec<u32>) = g(env, graph)
         .members
         .iter()
@@ -687,6 +690,7 @@ fn start_sessions(env: &mut Env<'_>, graph: u32) {
         expected += stream::start(env, graph, host);
     }
     expected += super::dmo::renderers(env, graph);
+    expected += super::vmr::renderers(env, graph);
     let graph_state = g(env, graph);
     graph_state.expected = expected;
     graph_state.completed = 0;

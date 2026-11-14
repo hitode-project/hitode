@@ -78,13 +78,27 @@ impl Output {
         decoder: &ff::decoder::Video,
         source: Pixel,
     ) -> Result<Self, Error> {
-        let (width, height) = (decoder.width(), decoder.height());
+        Self::new_raw(
+            device,
+            decoder.width(),
+            decoder.height(),
+            source,
+            color(decoder.color_space(), decoder.color_range()),
+        )
+    }
+
+    pub(super) fn new_raw(
+        device: &Device,
+        width: u32,
+        height: u32,
+        source: Pixel,
+        color: YuvColor,
+    ) -> Result<Self, Error> {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err(Error::Decode(
                 "invalid or excessive video dimensions".into(),
             ));
         }
-        let color = color(decoder.color_space(), decoder.color_range());
         let format = [Format::Nv12, Format::Nv21]
             .into_iter()
             .find(|&format| {
