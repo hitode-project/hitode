@@ -123,6 +123,9 @@ pub(crate) struct Evaluation {
     ranges: Vec<Range>,
     parameters: Vec<Range>,
     outputs: Vec<Range>,
+    /// Ordinary reads, and those of them `Proof::invariant` hoists.
+    reads: Vec<Range>,
+    invariant: Vec<Range>,
     frame: Vec<Range>,
     /// Dwords at constant offsets from the entry EBP, whose values the
     /// proof follows like frame dwords.
@@ -2187,28 +2190,25 @@ impl Proof {
     }
 
     /// Whether this instruction's non-frame read is invariant in the unit.
-    /// Admission separates such a span from every write span.
     pub(crate) fn invariant_read(&self, index: usize) -> bool {
-        let effects: Vec<_> = self
+        let mut effects = self
             .effects
             .iter()
             .filter(|e| e.access == Access::Read && e.indices.contains(&index))
-            .collect();
-        let written = |read: &Effect| {
-            let Some(at) = self.followed(read) else {
-                return false;
-            };
-            self.effects.iter().any(|e| {
-                e.access == Access::Write
-                    && self.followed(e).is_some_and(|w| {
-                        w < at + i64::from(read.bytes) && at < w + i64::from(e.bytes)
-                    })
-            })
-        };
-        !effects.is_empty()
-            && effects
+            .peekable();
+        effects.peek().is_some() && effects.all(|e| self.invariant(e))
+    }
+
+    /// Whether a read takes one address that no write in the unit reaches,
+    /// so it may move out of the loop. Admission separates it from writes
+    /// the proof cannot place against it.
+    fn invariant(&self, read: &Effect) -> bool {
+        read.access == Access::Read
+            && read.addr.terms.is_empty()
+            && self
+                .effects
                 .iter()
-                .all(|e| e.addr.terms.is_empty() && !written(e))
+                .all(|w| w.access != Access::Write || self.apart(w, read) != Some(false))
     }
 
     /// The offset from the entry EBP of an effect on a dword whose value
@@ -2217,23 +2217,32 @@ impl Proof {
         self.based_offset(effect.addr.invariant()?)
     }
 
-    /// Disjoint bytes of two effects in the same iteration. Different
-    /// nonzero strides are separated by admission; equal strides require
-    /// a constant displacement from the same symbolic base.
+    /// Disjoint bytes of two effects in the same iteration. Admission
+    /// separates followed dwords from ordinary accesses and invariant reads
+    /// from writes; others need a constant displacement from the same
+    /// symbolic address.
     pub(crate) fn disjoint_effects(&self, store: usize, load: usize) -> bool {
-        let writes: Vec<_> = self
-            .effects
-            .iter()
-            .filter(|e| e.access == Access::Write && e.indices.contains(&store))
-            .collect();
-        let reads: Vec<_> = self
-            .effects
-            .iter()
-            .filter(|e| e.access == Access::Read && e.indices.contains(&load))
-            .collect();
-        if writes.is_empty() || reads.is_empty() {
-            return false;
-        }
+        let effects = |access, index| {
+            self.effects
+                .iter()
+                .filter(move |e| e.access == access && e.indices.contains(&index))
+        };
+        let mut writes = effects(Access::Write, store).peekable();
+        let reads: Vec<_> = effects(Access::Read, load).collect();
+        writes.peek().is_some()
+            && !reads.is_empty()
+            && writes.all(|a| {
+                reads.iter().all(|b| {
+                    self.followed(a).is_some() != self.followed(b).is_some()
+                        || self.invariant(b)
+                        || self.apart(a, b) == Some(true)
+                })
+            })
+    }
+
+    /// Whether two effects' bytes are disjoint, when their addresses differ
+    /// by a constant: the same loop terms and symbolic base.
+    fn apart(&self, a: &Effect, b: &Effect) -> Option<bool> {
         fn base(
             exprs: &[Expr],
             id: ExprId,
@@ -2254,44 +2263,20 @@ impl Proof {
                 }
             }
         }
-        writes.iter().all(|a| {
-            reads.iter().all(|b| {
-                // Admission keeps other writes off followed dwords, but a
-                // followed dword's own store may reach any other read.
-                match (self.followed(a).is_some(), self.followed(b).is_some()) {
-                    (false, true) => return true,
-                    (true, false) => return false,
-                    (false, false) if b.addr.terms.is_empty() => return true,
-                    _ => {}
-                }
-                if let Some(counter) = self.outer.and_then(|o| o.counter) {
-                    let stride = |e: &Effect| {
-                        e.addr.terms.iter().find(|(v, _)| *v == counter).map_or(
-                            Some(0),
-                            |&(_, k)| match self.exprs[k] {
-                                Expr::Constant(n) => Some(n),
-                                _ => None,
-                            },
-                        )
-                    };
-                    if stride(a).zip(stride(b)).is_some_and(|(a, b)| a != b) {
-                        return true;
-                    }
-                }
-                if a.addr.terms != b.addr.terms {
-                    return false;
-                }
-                let (mut at, mut bt) = (BTreeMap::new(), BTreeMap::new());
-                let (mut ac, mut bc) = (0u32, 0u32);
-                base(&self.exprs, a.addr.base, 1, &mut at, &mut ac);
-                base(&self.exprs, b.addr.base, 1, &mut bt, &mut bc);
-                at.retain(|_, k| *k != 0);
-                bt.retain(|_, k| *k != 0);
-                let delta = bc.wrapping_sub(ac);
-                at == bt
-                    && u64::from(delta) >= u64::from(a.bytes)
-                    && u64::from(delta) + u64::from(b.bytes) <= 1 << 32
-            })
+        if a.addr.terms != b.addr.terms {
+            return None;
+        }
+        let symbolic = |e: &Effect| {
+            let (mut terms, mut constant) = (BTreeMap::new(), 0u32);
+            base(&self.exprs, e.addr.base, 1, &mut terms, &mut constant);
+            terms.retain(|_, k| *k != 0);
+            (terms, constant)
+        };
+        let ((at, ac), (bt, bc)) = (symbolic(a), symbolic(b));
+        let delta = bc.wrapping_sub(ac);
+        (at == bt).then(|| {
+            u64::from(delta) >= u64::from(a.bytes)
+                && u64::from(delta) + u64::from(b.bytes) <= 1 << 32
         })
     }
 
@@ -2318,6 +2303,8 @@ impl Proof {
         scratch.ranges.clear();
         scratch.parameters.clear();
         scratch.outputs.clear();
+        scratch.reads.clear();
+        scratch.invariant.clear();
         scratch.frame.clear();
         scratch.based.clear();
         scratch.gathered.clear();
@@ -2375,16 +2362,24 @@ impl Proof {
                     scratch.ranges.push(range);
                 }
                 Access::Write => scratch.outputs.push(range),
-                Access::Read => scratch.ranges.push(range),
+                Access::Read => {
+                    scratch.ranges.push(range);
+                    scratch.reads.push(range);
+                    if self.invariant(effect) {
+                        scratch.invariant.push(range);
+                    }
+                }
             }
         }
         // Values followed through stores hold only if no other write
         // reaches them, and ESP and EBP dwords do not alias each other.
         let followed = || scratch.frame.iter().chain(&scratch.based);
+        // A hoisted read must see no write in the loop either.
         for &output in &scratch.outputs {
             if followed()
                 .chain(&scratch.parameters)
                 .chain(&scratch.tables)
+                .chain(&scratch.invariant)
                 .any(|&range| range.intersects(output))
             {
                 return None;
@@ -2395,11 +2390,14 @@ impl Proof {
                 return None;
             }
         }
+        // Followed stores stay in registers, so no read from memory may
+        // reach them.
         for &written in followed().filter(|r| r.write) {
             if scratch
                 .parameters
                 .iter()
-                .any(|&parameter| parameter.intersects(written))
+                .chain(&scratch.reads)
+                .any(|&read| read.intersects(written))
             {
                 return None;
             }
@@ -2851,6 +2849,41 @@ mod tests {
         assert!(
             proof.evaluate(&cpu, &mut scratch, |_| None).is_none(),
             "denied parameter access"
+        );
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn hoisted_reads_and_followed_stores_stay_apart_from_other_accesses() {
+        let t = trace(row(|a| {
+            a.mov(eax, dword_ptr(ebx)).unwrap();
+            a.add(eax, dword_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.mov(dword_ptr(esp + 8), eax).unwrap();
+        }));
+        let proof = Proof::build(&t).expect("a row with an invariant read");
+        let invariant = t
+            .insts
+            .iter()
+            .position(|i| matches!(i.op, Op::Mov(_, Src::Mem(m)) if m.base == Some(3)))
+            .unwrap();
+        assert!(proof.invariant_read(invariant));
+        let mut cpu = CpuState {
+            regs: [0, 4, 0, PARAMS, FRAME, 0, INPUT, OUTPUT],
+            ..CpuState::default()
+        };
+        let mut scratch = Evaluation::default();
+        assert!(proof.evaluate(&cpu, &mut scratch, |_| None).is_some());
+        cpu.regs[3] = OUTPUT + 8;
+        assert!(
+            proof.evaluate(&cpu, &mut scratch, |_| None).is_none(),
+            "a hoisted read that a store reaches"
+        );
+        cpu.regs[3] = PARAMS;
+        cpu.regs[6] = FRAME;
+        assert!(
+            proof.evaluate(&cpu, &mut scratch, |_| None).is_none(),
+            "a read from memory reaching a frame store held in a register"
         );
     }
 

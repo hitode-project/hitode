@@ -632,6 +632,49 @@ fn independent_loads_hoist_and_stores_share_validation() {
     );
 }
 
+// spec: A64-OPT-5
+#[test]
+fn reads_that_a_store_may_reach_keep_their_order() {
+    let forms: [fn(&mut CodeAssembler); 3] = [
+        // Accumulates into one dword: its read must not leave the loop.
+        |a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.add(eax, dword_ptr(edi)).unwrap();
+            a.mov(dword_ptr(esi), eax).unwrap();
+        },
+        // Reads back the dword it just stored.
+        |a| {
+            a.mov(dword_ptr(esi), ecx).unwrap();
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        },
+        // Strides that meet on the second iteration.
+        |a| {
+            a.mov(dword_ptr(ebx + ecx * 4), ecx).unwrap();
+            a.movzx(eax, word_ptr(ebx + ecx * 2 + 4)).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        },
+    ];
+    for form in forms {
+        let code = assemble(|a| {
+            let mut top = a.create_label();
+            a.set_label(&mut top).unwrap();
+            form(a);
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(top).unwrap();
+        });
+        let mut at = initial();
+        at.regs = [0, 5, 0, DATA + 0x200, FRAME, FRAME, DATA, DATA + 0x100];
+        differential(&code, &at, |m| {
+            for i in 0..8u32 {
+                m.write(DATA + 0x100 + 4 * i, &(i + 1).to_le_bytes())
+                    .unwrap();
+            }
+        });
+    }
+}
+
 // spec: A64-OPT-2, A64-OPT-3, A64-OPT-6
 #[test]
 fn a_frame_float_copy_needs_no_second_x87_load_check() {
