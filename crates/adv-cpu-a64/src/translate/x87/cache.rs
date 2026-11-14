@@ -1430,7 +1430,7 @@ impl Translator<'_> {
                 scratch.head_at[to] = Some(usize::MAX);
             }
         }
-        for (index, head) in (start..=end).zip(&mut scratch.head_at[start..=end]) {
+        for (index, head) in (start..).zip(&mut scratch.head_at[start..=end]) {
             if head.is_some() {
                 *head = Some(heads.len());
                 heads.push((index, None));
@@ -2078,6 +2078,11 @@ impl Translator<'_> {
         };
         self.remark(Part::X87Entry);
         self.flush_simd();
+        if cyclic {
+            // Backedges skip this prologue for the loop entry, bringing the
+            // XMM registers the head counts dirty; runs hold no MMX writes.
+            self.vector.dirty = self.entry[start].dirty & 0xff00;
+        }
         self.canonicalize();
         self.cpu();
         let sparse = cyclic && merges.windows(2).any(|m| m[1].0 > m[0].0 + 1);
@@ -2250,7 +2255,7 @@ impl Translator<'_> {
                     && models.last().is_some_and(|m| m.0 == end)
             });
         let mut arithmetic = false;
-        for (index, inst) in (start..=end).zip(&self.trace.insts[start..=end]) {
+        for (index, inst) in (start..).zip(&self.trace.insts[start..=end]) {
             if models.is_some_and(|models| models.binary_search_by_key(&index, |m| m.0).is_err()) {
                 continue;
             }
