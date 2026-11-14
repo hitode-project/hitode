@@ -2335,6 +2335,123 @@ fn refused_checked_accesses_keep_dirty_mmx() {
     }
 }
 
+/// A unit that starts at an MMX loop's head, as one does after a budget
+/// exit re-enters the loop, loads what the head holds for arrivals from
+/// outside; the body makes the x87 state MMX-ready as before.
+// spec: A64-REG-5, A64F-FP-4
+#[cfg(native)]
+#[test]
+fn loop_heads_that_start_a_unit_establish_their_entry() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let (mut top, mut skip) = (a.create_label(), a.create_label());
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, dword_ptr(esi)).unwrap();
+    a.movd(mm0, eax).unwrap();
+    a.test(eax, 0xff00_0000u32 as i32).unwrap();
+    a.jz(skip).unwrap();
+    a.paddusb(mm0, mm1).unwrap();
+    a.movd(dword_ptr(edi), mm0).unwrap();
+    a.set_label(&mut skip).unwrap();
+    a.add(esi, 4).unwrap();
+    a.add(edi, 4).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let data: Vec<u8> = (0..DATA_LEN).map(|i| (i * 37 % 251) as u8).collect();
+    for ready in [true, false] {
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[1] = 64;
+        state.regs[4] = STACK_TOP;
+        state.regs[6] = DATA;
+        state.regs[7] = DATA + 0x800;
+        state.mmx[1] = 0x0102_0304_0506_0708;
+        state.x87.regs[1] = adv_cpu_core::X87Register::from_parts(state.mmx[1], 0xffff);
+        if ready {
+            state.x87.tag = 0;
+        } else {
+            state.x87.status = 3 << 11;
+        }
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code: code.clone(),
+            data: data.clone(),
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        // Short budgets re-enter the head from outside again and again.
+        while executor.run(program.stop, 7).unwrap() == RunOutcome::Budget {}
+        assert_eq!(executor.state.regs, state.regs, "ready {ready}");
+        assert_eq!(executor.state.eip, state.eip, "ready {ready}");
+        assert_eq!(executor.state.mmx, state.mmx, "ready {ready}");
+        assert_eq!(executor.state.x87, state.x87, "ready {ready}");
+        assert!(snapshot(executor.memory()) == memory, "ready {ready}");
+        assert!(executor.stats.native_entries > 1, "ready {ready}");
+    }
+}
+
+/// A merge inside a loop holds an MMX register only one arm writes. Where
+/// its x87 alias holds x87 data, the cache leaves for the interpreter
+/// rather than load it, so no exit publishes it unwritten.
+// spec: A64-REG-5
+#[cfg(native)]
+#[test]
+fn merges_never_publish_mmx_registers_their_path_left_unwritten() {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let (mut top, mut skip) = (a.create_label(), a.create_label());
+    a.set_label(&mut top).unwrap();
+    a.cmp(eax, ebx).unwrap();
+    a.jae(skip).unwrap();
+    a.pmullw(mm2, mm5).unwrap();
+    a.set_label(&mut skip).unwrap();
+    a.add(esi, 4).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    for arm in [false, true] {
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[0] = u32::from(!arm);
+        state.regs[1] = 5;
+        state.regs[4] = STACK_TOP;
+        state.mmx[2] = 0x1111_2222_3333_4444;
+        state.mmx[5] = 0x0003_0005_0007_0009;
+        // mm2 holds x87 data; mm5 is MMX data.
+        state.x87.regs[2] = adv_cpu_core::X87Register::from_parts(state.mmx[2], 0x4003);
+        state.x87.regs[5] = adv_cpu_core::X87Register::from_parts(state.mmx[5], 0xffff);
+        state.x87.tag = 0;
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code: code.clone(),
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, _) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        for budget in [3, 7, u64::MAX >> 1] {
+            let mut executor = Executor::new(BASE, LEN).unwrap();
+            executor.native.as_mut().unwrap().first_visits = false;
+            load(executor.memory_mut(), &program);
+            executor.state = program.state.clone();
+            while executor.run(program.stop, budget).unwrap() == RunOutcome::Budget {}
+            assert_eq!(executor.state.mmx, state.mmx, "arm {arm} budget {budget}");
+            assert_eq!(executor.state.x87, state.x87, "arm {arm} budget {budget}");
+            assert_eq!(executor.state.regs, state.regs, "arm {arm} budget {budget}");
+        }
+    }
+}
+
 /// A fault in the middle of an x87 run, with results only in host
 /// registers and renamed slots: the state it leaves is the interpreter's
 /// before the faulting instruction, for a store and for an operand.

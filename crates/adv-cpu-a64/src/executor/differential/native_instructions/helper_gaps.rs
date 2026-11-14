@@ -320,6 +320,7 @@ fn byte_sign_masks_cover_both_register_classes_and_biased_destinations() {
         program.state.xmm[7] = program.state.xmm[1];
         program.state.mmx[0] = u64::from_le_bytes(program.state.xmm[1][..8].try_into().unwrap());
         program.state.mmx[7] = program.state.mmx[0];
+        mmx_data(&mut program.state);
         program.state.x87.status = 5 << 11;
         for config in configs() {
             for budget in [1, 2, 3, 4, 100] {

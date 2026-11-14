@@ -8,7 +8,9 @@
 //!
 //! A register is in the entry if every path from the merge reads it before
 //! writing it, dropping the cache or leaving, so a load an arrival makes
-//! replaces the one the merge's code would make. A loop head also holds
+//! replaces the one the merge's code would make; a path through a backedge
+//! continues at its head, so merges inside a loop keep what the head holds,
+//! and their arrivals publish nothing the loop carries. A loop head also holds
 //! the registers its body writes when no instruction there drops the cache:
 //! the loop's entry loads them once, and its backedges then publish
 //! nothing, as a peeled first iteration would achieve with twice the code.
@@ -19,13 +21,20 @@
 //!
 //! Any dirty set is correct: an arrival publishes what it holds dirty
 //! outside it, and a clean register counted dirty is only published again.
-//! A merge counts dirty what some arrival brings dirty, so no edge
-//! publishes a register the merge's code keeps writing.
+//! Publishing MMX also sets the x87 exponent, so the cache loads only MMX
+//! registers whose alias already holds MMX data (`simd`). A merge counts
+//! dirty what some arrival brings dirty, so no edge publishes a register
+//! the merge's code keeps writing.
 //!
 //! An entry also holds the guards (`Guards`) every arrival has passed, so
 //! loops stop rechecking pending x87 exceptions and MXCSR each iteration.
 //! Guards cost nothing to keep and cannot be re-established on an edge, so
-//! every arrival counts, fall-through and jumps included.
+//! every arrival counts, fall-through and jumps included. A region head,
+//! where a loop starts once a countdown expiry re-enters it, counts only
+//! the unit's own edges: its code loads the registers and checks MXCSR for
+//! arrivals from outside. It keeps no x87 readiness or PE: checking them
+//! there would fail on every entry after EMMS, and its body establishes
+//! them as before.
 
 use super::decode::Op;
 use super::simd::Guards;
@@ -82,7 +91,11 @@ pub(super) fn can_drop_after(
     }
     let mut guards = Guards::default();
     for index in index + 1..trace.len() {
-        if trace.head(index) || trace.merge[index] {
+        // A region head checks its own guards for arrivals that fall in.
+        if trace.head(index) {
+            return true;
+        }
+        if trace.merge[index] {
             return entries[index].guards.meet(guards) == entries[index].guards;
         }
         if footprint(trace, index, checked).is_none() {
@@ -142,8 +155,11 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             None => 0,
         };
     }
-    // The primary path's loop heads also hold what their bodies write.
-    // A join from an appended path does not enclose a body in emission order.
+    // The primary path's loop heads also hold what their bodies write, and
+    // merges inside a body hold what its head does: their arrivals already
+    // hold it. A join from an appended path does not enclose a body in
+    // emission order.
+    let mut bodies = Vec::new();
     for (index, inst) in trace.insts[..trace.primary].iter().enumerate() {
         let jump = match inst.next {
             Next::Edge(edge) => Some(edge),
@@ -156,6 +172,14 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
                     (head..=index).try_fold(0, |writes, n| footprints[n].map(|(_, w)| writes | w))
             {
                 need[head] |= writes;
+                bodies.push((head, index));
+            }
+        }
+    }
+    for &(head, end) in &bodies {
+        for n in head + 1..=end {
+            if trace.merge[n] {
+                need[n] |= need[head];
             }
         }
     }
@@ -173,12 +197,23 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
         let mut held = vec![(u16::MAX, Guards::ALL); len];
         let mut state = Entry::default();
         for index in 0..len {
-            if trace.head(index) {
+            if trace.head(index) && !trace.merge[index] {
+                // Only the unit's own edges count at a head.
                 entry[index] = Entry::default();
-            } else if trace.merge[index] && trace.insts[index - 1].next == Next::Fall {
+            } else if !trace.head(index)
+                && trace.merge[index]
+                && trace.insts[index - 1].next == Next::Fall
+            {
                 held[index].1 = held[index].1.meet(state.guards);
             }
-            if trace.head(index) || trace.merge[index] {
+            if trace.head(index) {
+                // The guards the body establishes from none, which the
+                // head's code checks: by monotony the backedges keep them.
+                state = Entry {
+                    guards: Guards::default(),
+                    ..entry[index]
+                };
+            } else if trace.merge[index] {
                 state = entry[index];
             }
             let inst = trace.insts[index];
@@ -202,7 +237,13 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             }
         }
         let mut changed = false;
-        for (entry, &(regs, guards)) in entry.iter_mut().zip(&held) {
+        for (index, (entry, &(regs, mut guards))) in entry.iter_mut().zip(&held).enumerate() {
+            if trace.head(index) {
+                // Its code can check MXCSR but not establish what an MMX
+                // instruction or a first inexact result writes.
+                guards.ready = false;
+                guards.fp_pe = false;
+            }
             let narrowed = Entry {
                 regs: entry.regs & regs,
                 dirty: 0,
@@ -223,7 +264,7 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
         let mut dirty = 0;
         for index in 0..len {
             if trace.head(index) {
-                dirty = 0;
+                dirty = entry[index].dirty;
             } else if trace.merge[index] {
                 if trace.insts[index - 1].next == Next::Fall {
                     arrived[index] |= dirty;
@@ -338,6 +379,44 @@ mod tests {
                 ..Entry::default()
             }
         );
+    }
+
+    // spec: A64-REG-5
+    #[test]
+    fn merges_inside_a_loop_keep_what_it_carries() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let (mut top, mut skip) = (a.create_label(), a.create_label());
+        a.movq(mm1, qword_ptr(esi)).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.paddw(mm0, mm1).unwrap();
+        a.test(eax, eax).unwrap();
+        a.jz(skip).unwrap();
+        a.paddw(mm2, mm0).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.ret().unwrap();
+        let bytes = a.assemble(0x10000).unwrap();
+        let mut memory = Memory::new(0x10000, 0x1000).unwrap();
+        memory.protect(0x10000, 0x1000, 7).unwrap();
+        memory.write(0x10000, &bytes).unwrap();
+        let mut trace = Trace::default();
+        trace.build(
+            &memory,
+            0x10000,
+            &[0x10000 + bytes.len() as u32],
+            &|_, _| None,
+            &|_| None,
+            true,
+        );
+        let (head, skip) = (1, 5);
+        assert!(trace.merge[head] && trace.merge[skip]);
+        let entries = entries(&trace, &|_| false);
+        // The head holds mm0-mm2; the skipped arm's merge holds them too, so
+        // the jz publishes nothing and the backedge keeps the head's entry.
+        assert_eq!(entries[head].regs, 0b111);
+        assert_eq!(entries[skip].regs, 0b111);
+        assert_eq!(entries[skip].dirty, 0b111);
     }
 
     // spec: A64-REG-5

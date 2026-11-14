@@ -1400,6 +1400,8 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     m.write(STACK, &STOP.to_le_bytes()).unwrap();
     m.state.regs = regs(count, SRC, SRC);
     m.state.eip = CODE;
+    // mm0 holds MMX data, as MMX code leaves it, so the loop head loads it.
+    m.state.x87.regs[0] = adv_cpu::X87Register::from_parts(0, 0xffff);
     // Finish compilation before starting the interrupt producer.
     assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
     let flag = Arc::new(AtomicU32::new(0));

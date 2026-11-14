@@ -30,6 +30,14 @@ fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {
     }
 }
 
+/// Makes every MMX register's x87 alias MMX data, as MMX code leaves it, so
+/// the cache may load registers a form only reads (A64-REG-5).
+fn mmx_data(state: &mut CpuState) {
+    for (reg, &bits) in state.x87.regs.iter_mut().zip(&state.mmx) {
+        *reg = adv_cpu_core::X87Register::from_parts(bits, 0xffff);
+    }
+}
+
 fn executor(program: &Program, config: Config, interpreted: bool) -> Executor {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     let native = executor.native.as_mut().unwrap();
