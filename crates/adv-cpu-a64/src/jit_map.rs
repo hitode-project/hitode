@@ -260,7 +260,8 @@ fn files() -> Option<&'static Files> {
 
 /// An `opt-{pid}.tsv` row: Unix ns, computation entry, then `outcome`: the
 /// step, an address or count, and an operation. Steps follow a hot loop from
-/// its promotion and extent through the proof's refusal (its stage, then the
+/// its promotion and extent (or `unlooped`, when no nearby trace has a loop
+/// around the sampled EIP) through the proof's refusal (its stage, then the
 /// instruction it stopped at) or the optimized form's request, build or
 /// reject, and install. Formatting happens only with a map.
 pub(crate) fn optimized(eip: u32, outcome: std::fmt::Arguments<'_>) {

@@ -10,6 +10,8 @@ Usage:
                                             [--region HEX] [--from MS --to MS]
                                             [--listing 5]
   python3 tools/performance/macos_sample.py loops RUN_DIRECTORY --region HEX
+  python3 tools/performance/macos_sample.py coverage RUN_DIRECTORY... [--thread adv-execution]
+                                            [--top 15]
 
 record runs /usr/bin/sample for consecutive one-second slices and writes
 slice-<unix ms>.txt files into RUN_DIRECTORY. Start the process with
@@ -38,6 +40,15 @@ loops needs no samples. For every unit placed for one guest region, ordinary
 backward branch closes, innermost first, with its host instructions split into
 stack accesses (spills and reloads), other memory, branches and the rest. Two
 forms of the same loop compare by these static counts.
+coverage joins the JIT samples with the loop steps of opt-<pid>.tsv. Per hot
+region it gives the share of its samples in optimized forms, and for the rest
+the loop that encloses it and the furthest step that loop reached: installed
+(the form exists but runs were not admitted), a proof or form refusal with the
+instruction, only promoted, or no loop at all. Several run directories also get
+a summary by step, each run weighted equally, which ranks what to cover next.
+A samples.tsv in the directory, the live debugger's `samples` output (run with
+ADV_DEBUG=1), takes the place of the slices: that sampler runs in process and
+keeps its rate on a loaded machine.
 Read shares, not times: each slice also contains the sampler's attach.
 Output stays local; none of it belongs in the repository.
 """
@@ -102,6 +113,109 @@ def record(directory, pid, seconds):
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if done.returncode:
             break
+
+
+LOOP_STEPS = ("promoted", "extent")
+DONE = ("installed", "built", "requested")
+
+
+def loop_steps(directory):
+    """Per loop entry its opt-<pid>.tsv steps in order, and each head's extent end."""
+    steps, extents = defaultdict(list), {}
+    for path in sorted(directory.glob("opt-*.tsv")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            _, eip, step, at, detail = (line.split("\t") + ["-", "-"])[:5]
+            if step == "extent":
+                extents[int(eip)] = max(extents.get(int(eip), 0), int(at))
+            steps[int(eip)].append((step, at, detail))
+    return steps, extents
+
+
+def furthest(steps):
+    """The furthest step an entry reached, with the refused instruction if any."""
+    names = [step for step, _, _ in steps]
+    for done in DONE[:2]:
+        if done in names:
+            return done, ""
+    # A request ends in a form or its reject.
+    refusals = [s for s in steps if s[0] not in LOOP_STEPS]
+    if refusals:
+        step, at, detail = refusals[-1]
+        where = f"{int(at):08x} " if at.isdigit() and int(at) else ""
+        return step, where + detail
+    return ("promoted" if "promoted" in names else "no loop"), ""
+
+
+def enclosing(region, steps, extents):
+    """The loop entry that speaks for a region: itself, else the enclosing
+    extent that got furthest (installed first), else the widest."""
+    if any(step not in LOOP_STEPS for step, _, _ in steps.get(region, ())):
+        return region
+    heads = [head for head, end in extents.items() if head <= region < end]
+    if not heads:
+        return region if region in steps else None
+    installed = [h for h in heads if furthest(steps[h])[0] in DONE]
+    return max(installed or heads, key=lambda head: extents[head] - head)
+
+
+def jit_samples(directory, thread, jit):
+    """(JIT map entry or None, count) for each sample in generated code."""
+    debugger = directory / "samples.tsv"
+    if debugger.exists():
+        lines = debugger.read_text(encoding="utf-8").splitlines()
+        start = next((i for i, line in enumerate(lines) if line.startswith("unix_us\t")), len(lines))
+        header = lines[start].split("\t") if start < len(lines) else []
+        for line in lines[start + 1:]:
+            row = dict(zip(header, line.split("\t")))
+            if row.get("kind") == "Guest" and row.get("pc", "-") != "-":
+                yield jit.lookup(int(row["pc"], 16), int(row["unix_us"]) * 1000), 1
+        return
+    for path in sorted(directory.glob("slice-*.txt")):
+        at = int(path.stem.split("-")[1])
+        for name, address, count in thread_leaves(path.read_text(encoding="utf-8", errors="replace"), thread):
+            if name.startswith("???") and address is not None:
+                yield jit.lookup(address, at * 1_000_000 + 1_000_000_000), count
+
+
+def coverage(directories, thread, top):
+    summary, runs = Counter(), 0
+    for directory in directories:
+        jit = JitMap(directory)
+        steps, extents = loop_steps(directory)
+        regions, optimized = Counter(), Counter()
+        for found, count in jit_samples(directory, thread, jit):
+            region = found["region"] if found else None
+            regions[region] += count
+            if found and found["mode"] == "a64-opt":
+                optimized[region] += count
+        total = sum(regions.values())
+        if not total:
+            print(f"== {directory}: no JIT samples")
+            continue
+        runs += 1
+        rows = top
+        print(f"== {directory}: {total} JIT samples, {100 * sum(optimized.values()) / total:.1f}% optimized")
+        print("  share  opt%  region    loop      step         detail")
+        for region, count in regions.most_common():
+            share = count / total
+            if region is None:
+                state, detail, loop = "unmapped", "", None
+            else:
+                loop = enclosing(region, steps, extents)
+                state, detail = furthest(steps[loop]) if loop is not None else ("no loop", "")
+            summary["optimized"] += optimized[region] / total
+            rest = (count - optimized[region]) / total
+            summary[state if state not in DONE else "not admitted"] += rest
+            if rows:
+                rows -= 1
+                name = f"{region:08x}" if region is not None else "unmapped"
+                head = f"{loop:08x}" if loop is not None else "-"
+                print(f"  {100 * share:5.1f} {100 * optimized[region] / count:5.0f}  {name}  {head:8}  "
+                      f"{state:12} {detail[:70]}")
+    if runs > 1:
+        print(f"\nJIT samples by step, {runs} runs weighted equally")
+        for state, share in summary.most_common():
+            print(f"  {100 * share / runs:5.1f}%  {state}")
 
 
 def report(directory, thread, start, end, top, instructions):
@@ -371,11 +485,17 @@ if __name__ == "__main__":
     coding.add_argument("--from", dest="start", type=int)
     coding.add_argument("--to", dest="end", type=int)
     coding.add_argument("--listing", type=int, default=5)
+    covering = commands.add_parser("coverage")
+    covering.add_argument("directories", type=Path, nargs="+")
+    covering.add_argument("--thread", default="adv-execution")
+    covering.add_argument("--top", type=int, default=15)
     looping = commands.add_parser("loops")
     looping.add_argument("directory", type=Path)
     looping.add_argument("--region", type=lambda text: int(text, 16), required=True)
     args = parser.parse_args()
-    if args.command == "loops":
+    if args.command == "coverage":
+        coverage(args.directories, args.thread, args.top)
+    elif args.command == "loops":
         loops(args.directory, args.region)
     elif args.command == "record":
         record(args.directory, args.pid, args.seconds)

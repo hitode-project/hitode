@@ -222,7 +222,7 @@ pub(super) fn independent(
     divisions: &[Option<Division>],
     instructions: &[Option<Instruction>],
 ) -> Option<Option<(i32, i32)>> {
-    let graph = Graph::build(trace)?;
+    let graph = Graph::build(trace).ok()?;
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
     let mut info = InstructionInfoFactory::new();

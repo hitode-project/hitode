@@ -1917,11 +1917,17 @@ impl Native {
         // enclosing loop's extent is recorded now. Nomination then tries the
         // outermost first and falls back inward as proofs are rejected.
         let mut outer: Option<(u32, u32)> = None;
-        for entry in nearby {
+        // Nearby traces without a loop, and with loops elsewhere.
+        let (mut flat, mut elsewhere) = (0, 0);
+        for &entry in &nearby {
             let trace = self.loop_trace(memory, entry, &self.stops);
-            let Some((head, end)) = translate::computation_extent(&trace)
-                .filter(|&(head, end)| head <= eip && eip < end)
-            else {
+            let extent = translate::computation_extent(&trace);
+            let Some((head, end)) = extent.filter(|&(head, end)| head <= eip && eip < end) else {
+                if extent.is_some() {
+                    elsewhere += 1;
+                } else {
+                    flat += 1;
+                }
                 continue;
             };
             if self.record_extent((head, end)) {
@@ -1931,6 +1937,13 @@ impl Native {
             if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
                 outer = Some((entry, size));
             }
+        }
+        if outer.is_none() {
+            let tried = nearby.len();
+            crate::jit_map::optimized(
+                eip,
+                format_args!("unlooped\t-\t{tried} tried, {flat} flat, {elsewhere} elsewhere"),
+            );
         }
         for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
             if self.promoted.insert(entry) {

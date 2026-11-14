@@ -253,10 +253,12 @@ struct Graph {
 }
 
 impl Graph {
-    fn build(trace: &Trace) -> Option<Self> {
+    /// Fails with the shape that stops it and the instruction it stops at.
+    fn build(trace: &Trace) -> Result<Self, Refusal> {
+        let refuse = |why, at| Err(Refusal { why, at });
         let n = trace.len();
         if n == 0 {
-            return None;
+            return refuse("graph: empty", 0);
         }
         let internal = |edge| match edge {
             Edge::Internal(to) => Some(to),
@@ -278,7 +280,10 @@ impl Graph {
         let mut incoming = vec![Vec::new(); n];
         for (from, edges) in edges.iter().enumerate() {
             for &to in edges.iter().flatten() {
-                incoming.get_mut(to)?.push(from);
+                let Some(arrivals) = incoming.get_mut(to) else {
+                    return refuse("graph: edge", from);
+                };
+                arrivals.push(from);
             }
         }
         fn visit(
@@ -300,13 +305,14 @@ impl Graph {
         let mut back = Vec::new();
         visit(&edges, 0, &mut vec![0; n], &mut back);
         if back.is_empty() {
-            return None;
+            return refuse("graph: no loop", 0);
         }
         let mut loops = Vec::new();
         let mut heads = vec![None; n];
         for &(tail, head) in &back {
+            // A second latch of one head, as a `continue` makes.
             if heads[head].is_some() {
-                return None;
+                return refuse("graph: shared head", tail);
             }
             let mut inside = vec![false; n];
             inside[head] = true;
@@ -317,10 +323,13 @@ impl Graph {
                 }
             }
             // Only the head may be entered from outside the loop.
-            if (head != 0 && inside[0])
-                || (0..n).any(|i| inside[i] && i != head && incoming[i].iter().any(|&p| !inside[p]))
+            if head != 0 && inside[0] {
+                return refuse("graph: side entry", 0);
+            }
+            if let Some(i) =
+                (0..n).find(|&i| inside[i] && i != head && incoming[i].iter().any(|&p| !inside[p]))
             {
-                return None;
+                return refuse("graph: side entry", i);
             }
             let mut test = tail;
             let (condition, taken, exit) = loop {
@@ -337,19 +346,19 @@ impl Graph {
                     }
                 }
                 let [prev] = incoming[test].as_slice() else {
-                    return None;
+                    return refuse("graph: no test", tail);
                 };
                 if *prev == head || !inside[*prev] {
-                    return None;
+                    return refuse("graph: no test", tail);
                 }
                 test = *prev;
             };
             // A conditional latch may branch to a short appended tail before
             // reentering its head. Other edges may leave only for the owner.
-            if (0..n)
-                .any(|i| inside[i] && i != test && edges[i].iter().flatten().any(|&to| !inside[to]))
-            {
-                return None;
+            if let Some(i) = (0..n).find(|&i| {
+                inside[i] && i != test && edges[i].iter().flatten().any(|&to| !inside[to])
+            }) {
+                return refuse("graph: early exit", i);
             }
             heads[head] = Some(loops.len());
             loops.push(Loop {
@@ -368,7 +377,7 @@ impl Graph {
                     && a.inside.iter().zip(&b.inside).any(|(&a, &b)| a && !b)
                     && a.inside.iter().zip(&b.inside).any(|(&a, &b)| b && !a)
                 {
-                    return None;
+                    return refuse("graph: overlap", a.head);
                 }
             }
         }
@@ -389,7 +398,10 @@ impl Graph {
                 }
             }
         }
-        (order.len() == n).then_some(Self {
+        if order.len() != n {
+            return refuse("graph: order", 0);
+        }
+        Ok(Self {
             edges,
             order,
             loops,
@@ -1813,12 +1825,12 @@ impl Proof {
     }
 
     fn prove(trace: &Trace, refused: &Cell<Option<Refusal>>) -> Option<Self> {
-        let Some(graph) = Graph::build(trace) else {
-            refused.set(Some(Refusal {
-                why: "graph",
-                at: 0,
-            }));
-            return None;
+        let graph = match Graph::build(trace) {
+            Ok(graph) => graph,
+            Err(refusal) => {
+                refused.set(Some(refusal));
+                return None;
+            }
         };
         let mut b = Builder {
             trace,
