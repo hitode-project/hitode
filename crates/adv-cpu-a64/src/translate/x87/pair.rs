@@ -292,7 +292,7 @@ impl Translator<'_> {
         self.asm.tbz(true, X16, 12, bail);
         if self.checking {
             self.emit(msr_nzcv(super::X4));
-            self.checked_base(super::X6, store, X2, fail);
+            self.checked_base(super::X6, store, false, X2, fail);
             self.emit(mrs_nzcv(super::X4));
         } else {
             self.emit(mov(X, X2, self.data_view()));

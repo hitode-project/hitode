@@ -421,7 +421,7 @@ impl Translator<'_> {
             self.emit(mov(W, X5, host(ESP)));
         }
         self.page_crossing(X5, span, slow);
-        self.checked_base(X5, push, X6, slow);
+        self.checked_base(X5, push, false, X6, slow);
         if push {
             for index in 0..8u8 {
                 self.emit(add_imm(

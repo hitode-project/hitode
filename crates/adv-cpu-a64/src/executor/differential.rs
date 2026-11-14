@@ -2216,6 +2216,64 @@ fn stores_to_data_on_a_code_page_stop_faulting() {
     }
 }
 
+/// A string store that starts on a data line of a code page and runs on
+/// into the page's code invalidates it: the page's string base is the
+/// alias only when it holds no code at all.
+// spec: A64-MEM-7, A64-CTL-10
+#[cfg(native)]
+#[test]
+fn string_stores_across_a_code_page_rewrite_its_code() {
+    const ITERATIONS: u32 = 200;
+    const FUNCTION: u32 = CODE + 0xc00;
+    let function = |value: u32| {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(eax, value).unwrap();
+        a.ret().unwrap();
+        a.assemble(u64::from(FUNCTION)).unwrap()
+    };
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(edx, ITERATIONS).unwrap();
+    a.xor(ebx, ebx).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(esi, edx).unwrap();
+    a.and(esi, 1).unwrap();
+    a.shl(esi, 9).unwrap();
+    a.add(esi, DATA as i32).unwrap();
+    a.mov(edi, FUNCTION - 0x100).unwrap();
+    a.mov(ecx, 0x110).unwrap();
+    a.rep().movsb().unwrap();
+    a.mov(eax, FUNCTION).unwrap();
+    a.call(eax).unwrap();
+    a.add(ebx, eax).unwrap();
+    a.dec(edx).unwrap();
+    a.jnz(top).unwrap();
+    a.nop().unwrap();
+    let code = a.assemble(u64::from(CODE)).unwrap();
+    let mut executor = Executor::new(BASE, LEN).unwrap();
+    let memory = executor.memory_mut();
+    memory.protect(CODE, 0x1_0000, 7).unwrap();
+    memory.write(CODE, &code).unwrap();
+    memory.write(FUNCTION, &function(1)).unwrap();
+    memory.protect(DATA, DATA_LEN, 3).unwrap();
+    // Two copies of the function's page tail, returning 1 and 2.
+    for (copy, value) in [(0, 1), (0x200, 2)] {
+        memory.write(DATA + copy + 0x100, &function(value)).unwrap();
+    }
+    memory
+        .protect(STACK, (STACK_TOP + 0x1000 - STACK) as usize, 3)
+        .unwrap();
+    executor.state.eip = CODE;
+    executor.state.regs[4] = STACK_TOP;
+    let stop = CODE + code.len() as u32 - 1;
+    assert_eq!(
+        executor.run(stop, u64::MAX >> 1).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    let expected: u32 = (1..=ITERATIONS).map(|n| 1 + (n & 1)).sum();
+    assert_eq!(executor.state.regs[3], expected);
+}
+
 /// Checked accesses leave dirty MMX registers in place: an access the
 /// owner refuses faults with them as a host fault would, for loads, stores,
 /// narrow forms and the stack.

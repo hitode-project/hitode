@@ -1434,8 +1434,8 @@ impl Translator<'_> {
             self.asm.tbz(false, X6, 7, skip);
             self.emit(add_imm(X, X16, guest, lane, false));
             self.asm.tbz(true, X16, 32, slow);
-            self.checked_base(X16, true, super::X2, slow);
-            self.checked_alias(X16, true, slow);
+            self.checked_base(X16, true, false, super::X2, slow);
+            self.checked_alias(X16, true, false, slow);
             self.asm.bind(skip);
         }
         self.emit(ldr(X, super::X2, RUNTIME, runtime::ALIAS));
