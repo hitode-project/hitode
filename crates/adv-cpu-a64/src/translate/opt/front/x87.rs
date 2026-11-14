@@ -29,12 +29,6 @@ impl Front<'_> {
             let value = self.cell_value(start, ty);
             args.push(value);
         }
-        args.extend(
-            self.models[to]
-                .truncations
-                .iter()
-                .map(|k| self.state.truncations[k]),
-        );
         for &k in self.models[to].floats.clone().iter() {
             if !self.float_cell(to, k) {
                 args.push(self.state.floats[&k]);
@@ -123,9 +117,6 @@ impl Front<'_> {
                 });
                 let mem = x.mem.ok_or(Reject::Unsupported(self.index))?;
                 self.write(mem, width, integer)?;
-                if let Some(offset) = self.frame_offset(mem) {
-                    self.state.truncations.insert((offset, width), value);
-                }
                 self.x87_pop();
                 // Chopping never rounds the magnitude up.
                 self.state.c1 = Some(Location::Constant(0));
@@ -231,11 +222,6 @@ impl Front<'_> {
         Ok(())
     }
     fn integer_load(&mut self, mem: Mem, width: u8) -> Result<Value, Reject> {
-        if let Some(offset) = self.frame_offset(mem)
-            && let Some(&value) = self.state.truncations.get(&(offset, width))
-        {
-            return Ok(self.value(Op::FpUnary(FpUnary::RoundZero, value)));
-        }
         let integer = self.read(mem, width, if width == 8 { Type::I64 } else { Type::I32 })?;
         Ok(self.value(Op::FromInt(integer)))
     }

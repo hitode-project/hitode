@@ -95,7 +95,6 @@ struct State {
     opcode: Location<Value>,
     floats: BTreeMap<i32, Value>,
     dirty: std::collections::BTreeSet<i32>,
-    truncations: BTreeMap<(i32, u8), Value>,
     /// Live frame cells by offset, zero-extended to I32 up to four bytes
     /// and to I64 above.
     frame: BTreeMap<i32, Value>,
@@ -333,7 +332,6 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         }),
         floats: BTreeMap::new(),
         dirty: Default::default(),
-        truncations: BTreeMap::new(),
         frame: entry_frame,
     };
     let states: Vec<State> = models
@@ -362,11 +360,6 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                     (offset, func.param(block, ty))
                 })
                 .collect();
-            let truncations = model
-                .truncations
-                .iter()
-                .map(|&key| (key, func.param(block, Type::F64)))
-                .collect();
             let floats = model
                 .floats
                 .iter()
@@ -394,7 +387,6 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                 frame,
                 floats,
                 dirty: (*model.dirty).clone(),
-                truncations,
                 top: model.top,
                 control: model.control.ok_or(Reject::Mode(i))?,
                 c1,
@@ -658,9 +650,6 @@ impl Front<'_> {
             self.state
                 .floats
                 .retain(|&start, _| start + 8 <= offset || offset + i32::from(width) <= start);
-            self.state.truncations.retain(|&(start, w), _| {
-                start + i32::from(w) <= offset || offset + i32::from(width) <= start
-            });
             let cells = self.covered(offset, width);
             if cells[..] == [(offset, 8)] && self.func.ty(value) == Type::F64 {
                 self.state.frame.insert(offset, value);

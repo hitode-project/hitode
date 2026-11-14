@@ -454,20 +454,15 @@ fn control_word_truncation_and_binary64_frame_bytes() {
     });
     let mut at = initial();
     at.regs[1] = 1;
-    let built = differential(&code, &at, |m| {
-        m.write(DATA, &(-3.75f64).to_le_bytes()).unwrap();
-    });
-    assert_eq!(count(&built, |op| matches!(op, Op::Load { .. })), 1);
-    assert_eq!(count(&built, |op| matches!(op, Op::Store { .. })), 2);
-    assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 1);
-    assert!(
-        built
-            .func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .any(|(_, op)| matches!(op, Op::FpUnary(FpUnary::RoundZero, _)))
-    );
+    // A fraction of a negative number reloads as positive zero.
+    for value in [-3.75f64, -0.5] {
+        let built = differential(&code, &at, |m| {
+            m.write(DATA, &value.to_le_bytes()).unwrap();
+        });
+        assert_eq!(count(&built, |op| matches!(op, Op::Load { .. })), 1);
+        assert_eq!(count(&built, |op| matches!(op, Op::Store { .. })), 2);
+        assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 1);
+    }
 }
 
 // spec: A64-OPT-2, A64-OPT-3

@@ -190,16 +190,6 @@ fn step(
             match op {
                 FpUnary::Neg => float(-x)?,
                 FpUnary::Abs => float(x.abs())?,
-                FpUnary::RoundZero | FpUnary::RoundDown => {
-                    let x = input(x, fpsr);
-                    if x.is_nan() {
-                        float(quiet(x, fpsr))?
-                    } else if op == FpUnary::RoundZero {
-                        float(x.trunc())?
-                    } else {
-                        float(x.floor())?
-                    }
-                }
             }
         }
         Op::FromInt(a) => {

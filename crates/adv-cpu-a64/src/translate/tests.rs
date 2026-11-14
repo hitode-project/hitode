@@ -2229,12 +2229,7 @@ mod opt_back {
                 );
             }
         }
-        for op in [
-            FpUnary::Neg,
-            FpUnary::Abs,
-            FpUnary::RoundZero,
-            FpUnary::RoundDown,
-        ] {
+        for op in [FpUnary::Neg, FpUnary::Abs] {
             let (mut f, b, p, _) = start(&[Type::F64]);
             let v = f.push(b, Op::FpUnary(op, p[0])).unwrap();
             f.push(b, Op::Validate);

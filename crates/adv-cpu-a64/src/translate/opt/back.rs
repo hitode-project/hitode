@@ -774,8 +774,6 @@ impl<'a> Emitter<'a> {
                     match op {
                         FpUnary::Neg => Unary::Fneg,
                         FpUnary::Abs => Unary::Fabs,
-                        FpUnary::RoundZero => Unary::Frintz,
-                        FpUnary::RoundDown => Unary::Frintm,
                     },
                     q,
                     a,

@@ -23,7 +23,6 @@ pub(super) struct Model {
     /// bytes last: the cell is best held as F64 there.
     pub stored: Rc<BTreeSet<i32>>,
     pub dirty: Rc<BTreeSet<i32>>,
-    pub truncations: Rc<BTreeSet<(i32, u8)>>,
     regs: [(u32, u32); 8],
     mxcsr: u32,
     bytes: Rc<BTreeMap<i32, u8>>,
@@ -47,7 +46,6 @@ fn overwrite(m: &mut Model, p: i32, width: u8) {
     let apart = |start: i32, w: u8| start + i32::from(w) <= p || p + i32::from(width) <= start;
     retain(&mut m.floats, |&start| apart(start, 8));
     retain(&mut m.stored, |&start| apart(start, 8));
-    retain(&mut m.truncations, |&(start, w)| apart(start, w));
     if !(p..p + i32::from(width)).all(|b| m.dirty.contains(&b)) {
         Rc::make_mut(&mut m.dirty).extend(p..p + i32::from(width));
     }
@@ -69,7 +67,6 @@ pub(super) fn analyze(
         floats: Default::default(),
         stored: Default::default(),
         dirty: Default::default(),
-        truncations: Default::default(),
         regs: [(0, 0); 8],
         mxcsr: at.mxcsr,
         bytes: Default::default(),
@@ -142,7 +139,6 @@ pub(super) fn analyze(
                 retain(&mut old.floats, |p| m.floats.contains(p));
                 extend(&mut old.stored, &m.stored);
                 extend(&mut old.dirty, &m.dirty);
-                retain(&mut old.truncations, |k| m.truncations.contains(k));
                 if !old.bytes.iter().all(|(p, v)| m.bytes.get(p) == Some(v)) {
                     Rc::make_mut(&mut old.bytes).retain(|p, v| m.bytes.get(p) == Some(v));
                 }
@@ -298,9 +294,7 @@ impl Model {
                                         bytes.remove(&(p + b));
                                     }
                                 }
-                                if integer {
-                                    Rc::make_mut(&mut self.truncations).insert((p, width));
-                                } else if width == 8 {
+                                if !integer && width == 8 {
                                     Rc::make_mut(&mut self.floats).insert(p);
                                     Rc::make_mut(&mut self.stored).insert(p);
                                 }

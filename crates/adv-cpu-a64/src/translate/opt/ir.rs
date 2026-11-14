@@ -74,10 +74,6 @@ pub(crate) enum FpOp {
 pub(crate) enum FpUnary {
     Neg,
     Abs,
-    /// Rounds toward zero to an integral value (FRINTZ).
-    RoundZero,
-    /// Rounds toward minus infinity to an integral value (FRINTM).
-    RoundDown,
 }
 
 /// SSE2 operations on 128-bit values. Shifts take their count from the low
@@ -270,7 +266,6 @@ impl Op {
     pub(crate) fn floating(&self) -> bool {
         match *self {
             Op::Fp(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
-            Op::FpUnary(op, _) => matches!(op, FpUnary::RoundZero | FpUnary::RoundDown),
             Op::Flags { kind, .. } => kind == FlagKind::UnorderedCompare,
             _ => false,
         }
