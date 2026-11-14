@@ -162,7 +162,8 @@ pub fn supported(class: &str, style: u32, list_box: bool) -> bool {
     // Owner-drawn buttons retain guest input/state; the platform adapter can
     // project their captions without inventing or running the guest painter.
     (class.eq_ignore_ascii_case("Button") && matches!(style & 0xf, 0..=9 | 11))
-        || (class.eq_ignore_ascii_case("Static") && matches!(style & 0x1f, 0..=3 | 7..=9 | 11..=12))
+        || (class.eq_ignore_ascii_case("Static")
+            && matches!(style & 0x1f, 0..=3 | 7..=9 | 11..=12 | 16..=18))
         || class.eq_ignore_ascii_case("Edit")
         || (class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3)
         || (class.eq_ignore_ascii_case("ListBox") && list_box)
@@ -323,5 +324,14 @@ mod tests {
         assert_eq!(control("Static", 0x5002_0002, "").alignment(), 2);
         assert_eq!(control("Static", 0x5002_0080, "").alignment(), 0);
         assert_eq!(control("Button", 1, "").alignment(), 0);
+    }
+
+    #[test]
+    fn static_etched_frames_and_lines_are_supported() {
+        for style in [0x5000_0010, 0x5000_0011, 0x5000_0012] {
+            assert!(supported("Static", style, false), "{style:#x}");
+        }
+        assert!(!supported("Static", 0x5000_000d, false));
+        assert!(!supported("Static", 0x5000_000e, false));
     }
 }
