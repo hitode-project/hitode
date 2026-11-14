@@ -124,6 +124,9 @@ def build() -> Path:
             sys.exit(str(error))
     key = hashlib.sha256("\0".join(str(t) for t in targets).encode()).hexdigest()[:24]
     directory = cache / "sets" / key
+    # Temporary-file cleanup removes old files but leaves their directories.
+    if any(not (directory / target.name).exists() for target in targets):
+        shutil.rmtree(directory, ignore_errors=True)
     if not directory.exists():
         directory.parent.mkdir(parents=True, exist_ok=True)
         scratch = Path(tempfile.mkdtemp(dir=directory.parent))
