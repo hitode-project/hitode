@@ -1410,3 +1410,87 @@ fn probe_an_image_unit() {
         }
     }
 }
+
+// spec: A64-TR-9, A64-OPT-2
+#[test]
+fn a_guarded_blend_with_counters_at_a_frame_pointer() {
+    const TABLE: i32 = DATA as i32 + 0x8000;
+    const BASE: u32 = FRAME + 0x40;
+    // Rows of pixels: transparent ones are skipped, opaque ones copied and
+    // the rest blended through a table. The pixel count lives in ESI and at
+    // [ebp+0xc], and a guard skips rows without pixels.
+    let code = assemble(|a| {
+        let (mut row, mut pixel, mut skip, mut store, mut tail, mut blend) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.set_label(&mut row).unwrap();
+        a.test(ecx, ecx).unwrap();
+        a.jle(tail).unwrap();
+        a.mov(esi, ecx).unwrap();
+        a.mov(dword_ptr(ebp + 0xc), ecx).unwrap();
+        a.set_label(&mut pixel).unwrap();
+        a.mov(dl, byte_ptr(eax + 3)).unwrap();
+        a.test(dl, dl).unwrap();
+        a.je(skip).unwrap();
+        a.cmp(dl, 0xff).unwrap();
+        a.jne(blend).unwrap();
+        a.movzx(ecx, byte_ptr(eax)).unwrap();
+        a.mov(byte_ptr(ebx), cl).unwrap();
+        a.movzx(ecx, byte_ptr(eax + 2)).unwrap();
+        a.jmp(store).unwrap();
+        a.set_label(&mut blend).unwrap();
+        a.movzx(esi, dl).unwrap();
+        a.shl(esi, 8).unwrap();
+        a.movzx(ecx, byte_ptr(ebx)).unwrap();
+        a.movzx(ecx, byte_ptr(ecx + esi + TABLE)).unwrap();
+        a.mov(byte_ptr(ebx), cl).unwrap();
+        a.movzx(ecx, byte_ptr(eax + 2)).unwrap();
+        a.mov(esi, dword_ptr(ebp + 0xc)).unwrap();
+        a.set_label(&mut store).unwrap();
+        a.mov(byte_ptr(ebx + 2), cl).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(ebx, 4).unwrap();
+        a.add(eax, 4).unwrap();
+        a.dec(esi).unwrap();
+        a.mov(dword_ptr(ebp + 0xc), esi).unwrap();
+        a.jne(pixel).unwrap();
+        a.mov(edx, dword_ptr(ebp - 4)).unwrap();
+        a.set_label(&mut tail).unwrap();
+        a.mov(ecx, dword_ptr(ebp + 0x18)).unwrap();
+        a.sub(ecx, edx).unwrap();
+        a.add(ebx, ecx).unwrap();
+        a.mov(ecx, dword_ptr(ebp + 0x1c)).unwrap();
+        a.sub(ecx, edx).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.dec(dword_ptr(ebp + 0x14)).unwrap();
+        a.mov(ecx, dword_ptr(ebp + 0x10)).unwrap();
+        a.jne(row).unwrap();
+    });
+    let mut at = initial();
+    at.regs = [DATA, 4, 0, DATA + 0x800, FRAME, BASE, 0, 0];
+    differential(&code, &at, |m| {
+        for (i, alpha) in [0u8, 0xff, 0x80, 0x40].repeat(3).into_iter().enumerate() {
+            let src = DATA + (i as u32 / 4) * 0x100 + (i as u32 % 4) * 4;
+            m.write(src, &[i as u8 + 1, 0x20, i as u8 + 0x30, alpha])
+                .unwrap();
+        }
+        let table: Vec<u8> = (0..0x1_0000u32).map(|i| ((i * 7) >> 3) as u8).collect();
+        m.write(TABLE as u32, &table).unwrap();
+        m.write(DATA + 0x800, &[0x55; 0x300]).unwrap();
+        for (offset, value) in [
+            (-4, 16u32),
+            (0x10, 4),
+            (0x14, 3),
+            (0x18, 0x100),
+            (0x1c, 0x100),
+        ] {
+            m.write(BASE.wrapping_add_signed(offset), &value.to_le_bytes())
+                .unwrap();
+        }
+    });
+}

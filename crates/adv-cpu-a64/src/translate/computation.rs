@@ -2,6 +2,7 @@
 //! address-bearing integer values. Native instruction lowering still owns all
 //! results, flags, exceptional exits and floating-point state.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
 use adv_cpu_core::CpuState;
@@ -123,6 +124,9 @@ pub(crate) struct Evaluation {
     parameters: Vec<Range>,
     outputs: Vec<Range>,
     frame: Vec<Range>,
+    /// Dwords at constant offsets from the entry EBP, whose values the
+    /// proof follows like frame dwords.
+    based: Vec<Range>,
     gathered: Vec<Option<(i64, i64)>>,
     tables: Vec<Range>,
     entries: usize,
@@ -207,11 +211,15 @@ enum Test {
     Zero(Form),
 }
 
+/// A dword at a constant offset from the entry ESP or EBP, whose value
+/// the proof follows through stores like a register's.
+type Slot = (u8, i32);
+
 #[derive(Clone)]
 struct State {
     regs: [Value; 8],
     // A missing slot has not been touched; a present None is opaque.
-    slots: BTreeMap<i32, Value>,
+    slots: BTreeMap<Slot, Value>,
     limits: Vec<Limit>,
     test: Option<Test>,
     cdq: bool,
@@ -414,9 +422,19 @@ pub(crate) fn candidate(trace: &Trace) -> Option<u32> {
         .map(|head| trace.insts[head].pc)
 }
 
+/// Why a trace has no proof: the stage that refused it and the trace
+/// position it stopped at, for the JIT map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub why: &'static str,
+    pub at: usize,
+}
+
 struct Builder<'a> {
     trace: &'a Trace,
     graph: &'a Graph,
+    /// The first refusal: the walk gives up on its first failure.
+    refused: &'a Cell<Option<Refusal>>,
     exprs: Vec<Expr>,
     interned: FxHashMap<Expr, ExprId>,
     vars: Vec<Var>,
@@ -433,6 +451,13 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
+    fn refuse<T>(&self, why: &'static str, at: usize) -> Option<T> {
+        if self.refused.get().is_none() {
+            self.refused.set(Some(Refusal { why, at }));
+        }
+        None
+    }
+
     fn expr(&mut self, expr: Expr) -> ExprId {
         *self.interned.entry(expr).or_insert_with(|| {
             let id = self.exprs.len();
@@ -640,11 +665,31 @@ impl Builder<'_> {
         }
     }
 
-    fn frame_address(&mut self, offset: i32) -> Form {
-        let sp = self.expr(Expr::Register(ESP));
+    fn slot_of(&self, form: &Form) -> Option<Slot> {
+        let id = form.invariant()?;
+        let base = |id: ExprId| match self.exprs[id] {
+            Expr::Register(r @ (ESP | EBP)) => Some(r),
+            _ => None,
+        };
+        match self.exprs[id] {
+            Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
+                (_, Expr::Constant(c)) => Some((base(a)?, c as i32)),
+                (Expr::Constant(c), _) => Some((base(b)?, c as i32)),
+                _ => None,
+            },
+            _ => Some((base(id)?, 0)),
+        }
+    }
+
+    fn slot_address(&mut self, (base, offset): Slot) -> Form {
+        let sp = self.expr(Expr::Register(base));
         let offset = self.constant(offset as u32);
         let base = self.add(sp, offset);
         self.form(base)
+    }
+
+    fn frame_address(&mut self, offset: i32) -> Form {
+        self.slot_address((ESP, offset))
     }
 
     fn check(&mut self, check: Check) {
@@ -658,8 +703,8 @@ impl Builder<'_> {
         self.form(value)
     }
 
-    fn frame_word(&mut self, offset: i32) -> Form {
-        let addr = self.frame_address(offset);
+    fn slot_word(&mut self, slot: Slot) -> Form {
+        let addr = self.slot_address(slot);
         self.word(addr.base)
     }
 
@@ -689,8 +734,8 @@ impl Builder<'_> {
         if bytes != 4 {
             return None;
         }
-        if let Some(offset) = frame
-            && let Some(value) = state.slots.get(&offset)
+        if let Some(slot) = self.slot_of(&addr)
+            && let Some(value) = state.slots.get(&slot)
         {
             return value.clone();
         }
@@ -705,14 +750,14 @@ impl Builder<'_> {
 
     fn write(&mut self, state: &mut State, addr: Form, bytes: u8, value: Value, record: bool) {
         let frame = self.frame_offset(&addr);
-        if let Some(offset) = frame {
+        if let Some((base, offset)) = self.slot_of(&addr) {
             // An opaque store poisons every overlapping dword, including a
             // read at an offset that has not appeared yet.
             for delta in -3..i32::from(bytes) {
-                state.slots.insert(offset.wrapping_add(delta), None);
+                state.slots.insert((base, offset.wrapping_add(delta)), None);
             }
             if bytes == 4 {
-                state.slots.insert(offset, value);
+                state.slots.insert((base, offset), value);
             }
         }
         if record {
@@ -873,7 +918,14 @@ impl Builder<'_> {
                 let b = self.src(state, src, record)?;
                 if op == Alu::Cmp {
                     state.test = a.zip(b).map(|(a, b)| Test::Compare(a, b));
-                } else if op != Alu::Test {
+                } else if op == Alu::Test {
+                    // A value tested against itself sets the flags of a
+                    // compare with zero.
+                    if dst == src {
+                        let zero = self.form(self.zero);
+                        state.test = a.map(|a| Test::Compare(a, zero));
+                    }
+                } else {
                     let stack_align = match (&a, &b, op, dst) {
                         (Some(a), Some(b), Alu::And, Src::Reg(ESP)) => {
                             let offset = self.frame_offset(a)?;
@@ -1144,15 +1196,15 @@ impl Builder<'_> {
         a: &Form,
         back: &Form,
         first: &State,
-        slots: &BTreeMap<i32, Value>,
+        slots: &BTreeMap<Slot, Value>,
     ) -> Value {
-        let offset = first
+        let slot = first
             .slots
             .iter()
-            .find_map(|(&offset, value)| (value.as_ref() == Some(back)).then_some(offset))?;
-        let word = match slots.get(&offset) {
+            .find_map(|(&slot, value)| (value.as_ref() == Some(back)).then_some(slot))?;
+        let word = match slots.get(&slot) {
             Some(value) => value.clone()?,
-            None => self.frame_word(offset),
+            None => self.slot_word(slot),
         };
         self.cached_word(a, &word)
     }
@@ -1208,12 +1260,12 @@ impl Builder<'_> {
         for (offset, b) in incoming.slots {
             let a = slots
                 .remove(&offset)
-                .unwrap_or_else(|| Some(self.frame_word(offset)));
+                .unwrap_or_else(|| Some(self.slot_word(offset)));
             let value = self.join_value(a, &state.limits, b, &incoming.limits, 0);
             state.slots.insert(offset, value);
         }
         for (offset, a) in slots {
-            let b = Some(self.frame_word(offset));
+            let b = Some(self.slot_word(offset));
             let value = self.join_value(a, &state.limits, b, &incoming.limits, 0);
             state.slots.insert(offset, value);
         }
@@ -1251,7 +1303,14 @@ impl Builder<'_> {
                 }
                 continue;
             }
-            self.operation(at, &mut state, record)?;
+            if self.operation(at, &mut state, record).is_none() {
+                let why = if self.remaining == 0 {
+                    "steps"
+                } else {
+                    "instruction"
+                };
+                return self.refuse(why, at);
+            }
             if let Some(lp) = lp {
                 let info = &self.graph.loops[lp];
                 if at == info.test {
@@ -1263,7 +1322,10 @@ impl Builder<'_> {
                 }
             }
             let inside = |to| lp.is_none_or(|l| self.graph.loops[l].inside[to]);
-            let [fall, taken] = self.graph.edges[at].map(|edge| edge.filter(|&to| inside(to)));
+            let [fall, mut taken] = self.graph.edges[at].map(|edge| edge.filter(|&to| inside(to)));
+            if fall.is_some() && taken.is_some() && self.enters_loop(at, &state) {
+                taken = None;
+            }
             if let Some(to) = fall {
                 if taken.is_some() {
                     let mut fall = state.clone();
@@ -1280,15 +1342,57 @@ impl Builder<'_> {
                 self.join(&mut states[to], state);
             }
         }
-        if states.iter().any(Option::is_some) {
-            return None;
+        if let Some(at) = states.iter().position(Option::is_some) {
+            return self.refuse("order", at);
         }
         self.states.push(states);
-        if lp.is_some() {
-            Some(Some((back?, exit?)))
-        } else {
-            Some(None)
+        match lp {
+            Some(lp) => match (back, exit) {
+                (Some(back), Some(exit)) => Some(Some((back, exit))),
+                _ => self.refuse("loop", self.graph.loops[lp].head),
+            },
+            None => Some(None),
         }
+    }
+
+    /// A forward branch over a child loop, on a value that is the same in
+    /// every iteration, as compilers guard a loop that may run zero times:
+    /// the walk enters the loop, and admission checks the value does.
+    fn enters_loop(&mut self, at: usize, state: &State) -> bool {
+        let inst = &self.trace.insts[at];
+        let Op::Jcc(Cc::Flags(cond), target) = inst.op else {
+            return false;
+        };
+        let pc = |i: usize| self.trace.insts[i].pc;
+        if !self
+            .graph
+            .loops
+            .iter()
+            .any(|l| inst.pc < pc(l.head) && pc(l.head) < target)
+        {
+            return false;
+        }
+        // A result's own zero and sign flags, or a compare with zero, which
+        // also clears overflow: the loop runs when the branch is not taken,
+        // so the value is nonzero, positive or not negative.
+        let (value, compared) = match &state.test {
+            Some(Test::Zero(a)) => (a, false),
+            Some(Test::Compare(a, b)) if b.invariant() == Some(self.zero) => (a, true),
+            _ => return false,
+        };
+        let Some(value) = value.invariant() else {
+            return false;
+        };
+        match cond {
+            Cond::e => self.check(Check::Positive(value, u32::MAX)),
+            Cond::le if compared => self.check(Check::Positive(value, i32::MAX as u32)),
+            Cond::s | Cond::l if compared || cond == Cond::s => {
+                let next = self.add(value, self.one);
+                self.check(Check::Positive(next, 1 << 31));
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn trip(&mut self, lp: usize, test: Test, var: VarId) -> Option<ExprId> {
@@ -1433,7 +1537,7 @@ impl Builder<'_> {
                 .slots
                 .get(&offset)
                 .cloned()
-                .unwrap_or_else(|| Some(self.frame_word(offset)));
+                .unwrap_or_else(|| Some(self.slot_word(offset)));
             let r = self.recurrence(a, b.clone(), var);
             before
                 .slots
@@ -1465,7 +1569,7 @@ impl Builder<'_> {
                     .slots
                     .get(&offset)
                     .cloned()
-                    .unwrap_or_else(|| Some(self.frame_word(offset)));
+                    .unwrap_or_else(|| Some(self.slot_word(offset)));
                 if recurrence
                     .as_ref()
                     .is_some_and(|rec| !self.inductive(rec, &back))
@@ -1483,18 +1587,24 @@ impl Builder<'_> {
             self.divisions.truncate(divisions);
             self.frame_heads.truncate(frame_heads);
         };
-        let count = self.trip(lp, after.test.take()?, var)?;
+        let test = self.graph.loops[lp].test;
+        let Some(count) = after.test.take().and_then(|t| self.trip(lp, t, var)) else {
+            return self.refuse("trip", test);
+        };
         self.vars[var] = Var::Counter(Some(count));
         after.cdq = false;
         after.entry_reads |= used | initial.entry_reads;
         after.limits = initial.limits;
         if head == 0 {
             let mut affine = [None; 8];
-            let starts = slots.iter().filter_map(|(&offset, recurrence)| {
+            let starts = slots.iter().filter_map(|(&slot, recurrence)| {
                 let (_, delta) = recurrence.as_ref()?;
-                let start = match initial.slots.get(&offset) {
+                let (ESP, offset) = slot else {
+                    return None;
+                };
+                let start = match initial.slots.get(&slot) {
                     Some(value) => value.as_ref()?.invariant()?,
-                    None => self.frame_word(offset).invariant()?,
+                    None => self.slot_word(slot).invariant()?,
                 };
                 Some((offset, start, *delta))
             });
@@ -1692,11 +1802,28 @@ fn gcd(a: u64, b: u64) -> u64 {
 }
 
 impl Proof {
-    pub(crate) fn build(trace: &Trace) -> Option<Self> {
-        let graph = Graph::build(trace)?;
+    pub(crate) fn build(trace: &Trace) -> Result<Self, Refusal> {
+        let refused = Cell::new(None);
+        Self::prove(trace, &refused).ok_or_else(|| {
+            refused.get().unwrap_or(Refusal {
+                why: "proof",
+                at: 0,
+            })
+        })
+    }
+
+    fn prove(trace: &Trace, refused: &Cell<Option<Refusal>>) -> Option<Self> {
+        let Some(graph) = Graph::build(trace) else {
+            refused.set(Some(Refusal {
+                why: "graph",
+                at: 0,
+            }));
+            return None;
+        };
         let mut b = Builder {
             trace,
             graph: &graph,
+            refused,
             exprs: Vec::new(),
             interned: FxHashMap::default(),
             vars: Vec::new(),
@@ -1732,11 +1859,13 @@ impl Proof {
         )?;
         let frame_cache = b.frame_cache();
         let mut effects = Vec::new();
-        for (_, effect) in std::mem::take(&mut b.effects) {
-            b.expand(effect, &mut effects)?;
+        for (at, effect) in std::mem::take(&mut b.effects) {
+            if b.expand(effect, &mut effects).is_none() {
+                return b.refuse("expand", at);
+            }
         }
         if !effects.iter().any(|e| e.access == Access::Write) {
-            return None;
+            return b.refuse("unwritten", 0);
         }
         let mut frame: [Vec<(i32, i64)>; 4] = Default::default();
         effects.retain(|effect| {
@@ -2029,7 +2158,27 @@ impl Proof {
             .iter()
             .filter(|e| e.access == Access::Read && e.indices.contains(&index))
             .collect();
-        !effects.is_empty() && effects.iter().all(|e| e.addr.terms.is_empty())
+        let written = |read: &Effect| {
+            let Some(at) = self.followed(read) else {
+                return false;
+            };
+            self.effects.iter().any(|e| {
+                e.access == Access::Write
+                    && self.followed(e).is_some_and(|w| {
+                        w < at + i64::from(read.bytes) && at < w + i64::from(e.bytes)
+                    })
+            })
+        };
+        !effects.is_empty()
+            && effects
+                .iter()
+                .all(|e| e.addr.terms.is_empty() && !written(e))
+    }
+
+    /// The offset from the entry EBP of an effect on a dword whose value
+    /// the proof follows through the loop's own stores.
+    fn followed(&self, effect: &Effect) -> Option<i64> {
+        self.based_offset(effect.addr.invariant()?)
     }
 
     /// Disjoint bytes of two effects in the same iteration. Different
@@ -2071,8 +2220,13 @@ impl Proof {
         }
         writes.iter().all(|a| {
             reads.iter().all(|b| {
-                if b.addr.terms.is_empty() {
-                    return true;
+                // Admission keeps other writes off followed dwords, but a
+                // followed dword's own store may reach any other read.
+                match (self.followed(a).is_some(), self.followed(b).is_some()) {
+                    (false, true) => return true,
+                    (true, false) => return false,
+                    (false, false) if b.addr.terms.is_empty() => return true,
+                    _ => {}
                 }
                 if let Some(counter) = self.outer.and_then(|o| o.counter) {
                     let stride = |e: &Effect| {
@@ -2129,6 +2283,7 @@ impl Proof {
         scratch.parameters.clear();
         scratch.outputs.clear();
         scratch.frame.clear();
+        scratch.based.clear();
         scratch.gathered.clear();
         scratch.gathered.resize(self.vars.len(), None);
         scratch.tables.clear();
@@ -2175,14 +2330,23 @@ impl Proof {
                     scratch.frame.push(range);
                     scratch.ranges.push(range);
                 }
+                _ if effect
+                    .addr
+                    .invariant()
+                    .is_some_and(|a| self.based_expression(a)) =>
+                {
+                    scratch.based.push(range);
+                    scratch.ranges.push(range);
+                }
                 Access::Write => scratch.outputs.push(range),
                 Access::Read => scratch.ranges.push(range),
             }
         }
+        // Values followed through stores hold only if no other write
+        // reaches them, and ESP and EBP dwords do not alias each other.
+        let followed = || scratch.frame.iter().chain(&scratch.based);
         for &output in &scratch.outputs {
-            if scratch
-                .frame
-                .iter()
+            if followed()
                 .chain(&scratch.parameters)
                 .chain(&scratch.tables)
                 .any(|&range| range.intersects(output))
@@ -2191,19 +2355,24 @@ impl Proof {
             }
         }
         for &table in &scratch.tables {
+            if followed().any(|&f| f.write && f.intersects(table)) {
+                return None;
+            }
+        }
+        for &written in followed().filter(|r| r.write) {
             if scratch
-                .frame
+                .parameters
                 .iter()
-                .any(|&f| f.write && f.intersects(table))
+                .any(|&parameter| parameter.intersects(written))
             {
                 return None;
             }
         }
-        for &frame in scratch.frame.iter().filter(|r| r.write) {
+        for &based in &scratch.based {
             if scratch
-                .parameters
+                .frame
                 .iter()
-                .any(|&parameter| parameter.intersects(frame))
+                .any(|&frame| (frame.write || based.write) && frame.intersects(based))
             {
                 return None;
             }
@@ -2351,6 +2520,8 @@ impl Proof {
                 scratch.ranges.push(range);
                 if self.stack_expression(addr) {
                     scratch.frame.push(range);
+                } else if self.based_expression(addr) {
+                    scratch.based.push(range);
                 } else {
                     scratch.parameters.push(range);
                 }
@@ -2375,6 +2546,22 @@ impl Proof {
         };
         scratch.values[id] = Some(value);
         Some(value)
+    }
+
+    fn based_expression(&self, id: ExprId) -> bool {
+        self.based_offset(id).is_some()
+    }
+
+    fn based_offset(&self, id: ExprId) -> Option<i64> {
+        match self.exprs[id] {
+            Expr::Register(EBP) => Some(0),
+            Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
+                (Expr::Register(EBP), Expr::Constant(c))
+                | (Expr::Constant(c), Expr::Register(EBP)) => Some(i64::from(c as i32)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn stack_expression(&self, id: ExprId) -> bool {
@@ -2420,7 +2607,7 @@ mod tests {
         assemble(&mut a);
         let code = a.assemble(u64::from(CODE)).unwrap();
         let t = trace(&assemble);
-        let mut proof = Proof::build(&t)?;
+        let mut proof = Proof::build(&t).ok()?;
         proof.prove_split(&t, |pc, len| {
             let at = usize::try_from(pc - CODE).ok()?;
             let bytes = code.get(at..at + len as usize)?;
@@ -2684,6 +2871,7 @@ mod tests {
         );
         assert!(
             Proof::build(&blend(true))
+                .ok()
                 .is_none_or(|proof| proof.evaluate(&cpu, &mut scratch, read).is_none()),
             "a sign-extended index is unbounded"
         );
@@ -2771,11 +2959,80 @@ mod tests {
         assert!(ranges.contains(&range(TABLE, 0x1_0000, false)));
         assert!(ranges.contains(&range(INPUT, 0x200 + 12 + 4, false)));
         assert!(ranges.contains(&range(OUTPUT, 0x200 + 9 + 2, true)));
+        // The proof enters every row's pixel loop, which sets the latch step,
+        // so its entry value does not matter; admission keeps rows nonempty.
         cpu.regs[3] = 2;
-        assert!(
-            proof.evaluate(&cpu, &mut scratch, read).is_none(),
-            "the skipped row's latch step is the constant only when admitted"
-        );
+        assert!(proof.evaluate(&cpu, &mut scratch, read).is_some());
+        cpu.regs[0] = 0;
+        assert!(proof.evaluate(&cpu, &mut scratch, read).is_none());
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn follows_a_counter_kept_beside_its_register_at_a_frame_pointer() {
+        const TABLE: u32 = 0x60000;
+        // Rows of pixels blended in place through a table. The pixel count
+        // lives in ESI and at [ebp+0xc]; the blend arm borrows ESI and
+        // reloads it, and the row count is decremented in memory.
+        let t = trace(|a| {
+            let (mut row, mut pixel, mut skip) =
+                (a.create_label(), a.create_label(), a.create_label());
+            a.set_label(&mut row).unwrap();
+            a.mov(ecx, dword_ptr(ebp + 0x10)).unwrap();
+            a.mov(esi, ecx).unwrap();
+            a.mov(dword_ptr(ebp + 0xc), ecx).unwrap();
+            a.set_label(&mut pixel).unwrap();
+            a.mov(dl, byte_ptr(eax + 3)).unwrap();
+            a.test(dl, dl).unwrap();
+            a.je(skip).unwrap();
+            a.movzx(esi, dl).unwrap();
+            a.shl(esi, 8).unwrap();
+            a.movzx(ecx, byte_ptr(ebx)).unwrap();
+            a.movzx(ecx, byte_ptr(ecx + esi + TABLE as i32)).unwrap();
+            a.mov(byte_ptr(ebx), cl).unwrap();
+            a.mov(esi, dword_ptr(ebp + 0xc)).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.add(ebx, 4).unwrap();
+            a.add(eax, 4).unwrap();
+            a.dec(esi).unwrap();
+            a.mov(dword_ptr(ebp + 0xc), esi).unwrap();
+            a.jne(pixel).unwrap();
+            a.add(ebx, dword_ptr(ebp + 0x18)).unwrap();
+            a.add(eax, dword_ptr(ebp + 0x18)).unwrap();
+            a.dec(dword_ptr(ebp + 0x14)).unwrap();
+            a.jne(row).unwrap();
+            a.int3().unwrap();
+        });
+        let proof = Proof::build(&t).expect("a counter followed through its frame dword");
+        // The reload sees the loop's own store, so it is not invariant; the
+        // width it starts from is.
+        let load = |disp: u32| {
+            t.insts
+                .iter()
+                .position(|i| matches!(i.op, Op::Mov(Src::Reg(_), Src::Mem(m)) if m.disp == disp))
+                .unwrap()
+        };
+        assert!(!proof.invariant_read(load(0xc)));
+        assert!(proof.invariant_read(load(0x10)));
+        let mut cpu = CpuState {
+            regs: [INPUT, 0, 0, OUTPUT, FRAME - 0x100, FRAME, 0, 0],
+            ..CpuState::default()
+        };
+        let read = |addr| match addr - FRAME {
+            0x10 => Some(4),
+            0x14 => Some(3),
+            0x18 => Some(0x100 - 16),
+            _ => None,
+        };
+        let mut scratch = Evaluation::default();
+        let ranges = proof.evaluate(&cpu, &mut scratch, read).unwrap();
+        assert!(ranges.contains(&range(TABLE, 0x1_0000, false)));
+        assert!(ranges.contains(&range(OUTPUT, 0x200 + 13, true)));
+        assert!(ranges.contains(&range(FRAME + 0xc, 4, true)));
+        assert!(ranges.contains(&range(FRAME + 0x14, 4, true)));
+        // Pixels written over the followed dwords would change them.
+        cpu.regs[3] = FRAME;
+        assert!(proof.evaluate(&cpu, &mut scratch, read).is_none());
     }
 
     // spec: A64-TR-9
@@ -2922,7 +3179,7 @@ mod tests {
                 a.jnz(again).unwrap();
                 a.int3().unwrap();
             });
-            let proof = Proof::build(&t);
+            let proof = Proof::build(&t).ok();
             if change == 0 {
                 let mut cpu = CpuState::default();
                 cpu.regs[4] = FRAME;
@@ -2968,7 +3225,96 @@ mod tests {
                 a.jne(again).unwrap();
                 a.int3().unwrap();
             });
-            assert!(Proof::build(&t).is_none());
+            let refusal = Proof::build(&t).err().expect("no proof");
+            if barrier {
+                // The refusal names the stage and the instruction it stopped at.
+                let at = Refusal {
+                    why: "instruction",
+                    at: 0,
+                };
+                assert_eq!(refusal, at);
+            }
         }
+    }
+    // spec: A64-TR-9
+    #[test]
+    fn enters_a_loop_its_guard_skips_only_when_it_runs_zero_times() {
+        const TABLE: i32 = 0x60000;
+        // Rows of pixels: a guarded inner loop that skips transparent
+        // pixels, copies opaque ones and blends the rest through a table.
+        let t = trace(|a| {
+            let (mut row, mut pixel, mut skip, mut store, mut tail, mut blend) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.set_label(&mut row).unwrap();
+            a.test(ecx, ecx).unwrap();
+            a.jle(tail).unwrap();
+            a.mov(esi, ecx).unwrap();
+            a.mov(dword_ptr(ebp + 0xc), ecx).unwrap();
+            a.set_label(&mut pixel).unwrap();
+            a.mov(dl, byte_ptr(eax + 3)).unwrap();
+            a.test(dl, dl).unwrap();
+            a.je(skip).unwrap();
+            a.cmp(dl, 0xff).unwrap();
+            a.jne(blend).unwrap();
+            a.movzx(ecx, byte_ptr(eax)).unwrap();
+            a.mov(byte_ptr(ebx), cl).unwrap();
+            a.movzx(ecx, byte_ptr(eax + 2)).unwrap();
+            a.jmp(store).unwrap();
+            a.set_label(&mut blend).unwrap();
+            a.movzx(esi, dl).unwrap();
+            a.shl(esi, 8).unwrap();
+            a.movzx(ecx, byte_ptr(ebx)).unwrap();
+            a.movzx(ecx, byte_ptr(ecx + esi + TABLE)).unwrap();
+            a.mov(byte_ptr(ebx), cl).unwrap();
+            a.mov(esi, dword_ptr(ebp + 0xc)).unwrap();
+            a.set_label(&mut store).unwrap();
+            a.mov(byte_ptr(ebx + 2), cl).unwrap();
+            a.set_label(&mut skip).unwrap();
+            a.add(ebx, 4).unwrap();
+            a.add(eax, 4).unwrap();
+            a.dec(esi).unwrap();
+            a.mov(dword_ptr(ebp + 0xc), esi).unwrap();
+            a.jne(pixel).unwrap();
+            a.mov(edx, dword_ptr(ebp - 4)).unwrap();
+            a.set_label(&mut tail).unwrap();
+            a.mov(ecx, dword_ptr(ebp + 0x18)).unwrap();
+            a.sub(ecx, edx).unwrap();
+            a.add(ebx, ecx).unwrap();
+            a.mov(ecx, dword_ptr(ebp + 0x1c)).unwrap();
+            a.sub(ecx, edx).unwrap();
+            a.add(eax, ecx).unwrap();
+            a.dec(dword_ptr(ebp + 0x14)).unwrap();
+            a.mov(ecx, dword_ptr(ebp + 0x10)).unwrap();
+            a.jne(row).unwrap();
+            a.int3().unwrap();
+        });
+        let proof = Proof::build(&t).expect("a guarded row loop");
+        let mut cpu = CpuState {
+            regs: [INPUT, 4, 0, OUTPUT, FRAME - 0x100, FRAME, 0, 0],
+            ..CpuState::default()
+        };
+        let read = |width: u32| {
+            move |addr: u32| match addr.wrapping_sub(FRAME) {
+                0x10 => Some(width),
+                0x14 => Some(3),
+                0x18 | 0x1c => Some(0x100),
+                0xffff_fffc => Some(width * 4),
+                _ => None,
+            }
+        };
+        let mut scratch = Evaluation::default();
+        let ranges = proof.evaluate(&cpu, &mut scratch, read(4)).unwrap();
+        assert!(ranges.contains(&range(INPUT, 0x200 + 16, false)));
+        assert!(ranges.contains(&range(OUTPUT, 0x200 + 15, true)));
+        assert!(ranges.contains(&range(FRAME + 0x14, 4, true)));
+        // A row the guard would skip is not one the proof walked.
+        cpu.regs[1] = 0;
+        assert!(proof.evaluate(&cpu, &mut scratch, read(0)).is_none());
     }
 }

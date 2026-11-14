@@ -1824,7 +1824,7 @@ impl Native {
     fn request_optimized(&mut self, eip: u32, at: CpuState) {
         let prepared = &self.computation[&eip];
         prepared.requested();
-        crate::jit_map::optimized(eip, "requested\t-\t-");
+        crate::jit_map::optimized(eip, format_args!("requested\t-\t-"));
         self.compiler.request(compile::Request {
             eip,
             generation: self.generation,
@@ -1862,7 +1862,7 @@ impl Native {
                 .map(|&(offset, site)| (entry + offset, site))
                 .collect();
             sites.sort_unstable_by_key(|&(pc, _)| pc);
-            crate::jit_map::optimized(done.eip, "installed\t-\t-");
+            crate::jit_map::optimized(done.eip, format_args!("installed\t-\t-"));
             crate::jit_map::record(
                 entry,
                 &lowered.words,
@@ -1924,7 +1924,9 @@ impl Native {
             else {
                 continue;
             };
-            self.record_extent((head, end));
+            if self.record_extent((head, end)) {
+                crate::jit_map::optimized(head, format_args!("extent\t{end}\t-"));
+            }
             let size = end - head;
             if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
                 outer = Some((entry, size));
@@ -1932,6 +1934,7 @@ impl Native {
         }
         for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
             if self.promoted.insert(entry) {
+                crate::jit_map::optimized(entry, format_args!("promoted\t{eip}\t-"));
                 self.diagnostics.promotions += 1;
                 self.drop_unit(entry);
             }
@@ -1939,13 +1942,16 @@ impl Native {
         self.forget_dynamic();
     }
 
-    fn record_extent(&mut self, extent: (u32, u32)) {
-        if !self.computation_extents.contains(&extent) {
-            if self.computation_extents.len() == 64 {
-                self.computation_extents.remove(0);
-            }
-            self.computation_extents.push(extent);
+    /// Whether the extent is new.
+    fn record_extent(&mut self, extent: (u32, u32)) -> bool {
+        if self.computation_extents.contains(&extent) {
+            return false;
         }
+        if self.computation_extents.len() == 64 {
+            self.computation_extents.remove(0);
+        }
+        self.computation_extents.push(extent);
+        true
     }
 
     fn enclosing_computation(&self, eip: u32) -> Option<(u32, u32)> {
@@ -2038,7 +2044,8 @@ fn computation_proof(
 
     // The proved form has no owner-dependent call, shadow entry, indirect
     // table, permissions helper or other runtime service.
-    if trace.insts.iter().any(|inst| {
+    let entry = trace.insts.first().map_or(0, |inst| inst.pc);
+    if let Some(inst) = trace.insts.iter().find(|inst| {
         inst.mode == Mode::Real
             || inst.locked.is_some()
             || inst.spin
@@ -2054,9 +2061,20 @@ fn computation_proof(
                     | Op::JmpIndirect(_)
             )
     }) {
+        let (pc, op) = (inst.pc, &inst.op);
+        crate::jit_map::optimized(entry, format_args!("excluded\t{pc}\t{op:?}"));
         return None;
     }
-    let mut proof = translate::computation::Proof::build(trace)?;
+    let mut proof = match translate::computation::Proof::build(trace) {
+        Ok(proof) => proof,
+        Err(refusal) => {
+            let inst = trace.insts.get(refusal.at);
+            let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
+            let why = refusal.why;
+            crate::jit_map::optimized(entry, format_args!("{why}\t{pc}\t{op:?}"));
+            return None;
+        }
+    };
     proof.prove_split(trace, |pc, len| {
         let mut bytes = [0; 15];
         let bytes = bytes.get_mut(..usize::try_from(len).ok()?)?;

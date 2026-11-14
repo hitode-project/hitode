@@ -6,8 +6,8 @@
 //! `insn-{pid}.tsv` rows with the guest instruction and [`Part`] of every
 //! stretch of a unit; and `code-{pid}.bin`, the units' code as placed (before
 //! links are patched), concatenated in `jit-{pid}.tsv` row order.
-//! `opt-{pid}.tsv` says, per computation entry, whether its optimized form was
-//! built or why not. [`enable_memory`] keeps the same in process for an
+//! `opt-{pid}.tsv` follows each hot loop from its promotion to the stage
+//! that refused it or to its installed optimized form. [`enable_memory`] keeps the same in process for an
 //! in-process sampler, with the names of the shared stubs. A cleared cache
 //! reuses addresses, so attribution takes the newest unit placed before the
 //! sample.
@@ -258,14 +258,12 @@ fn files() -> Option<&'static Files> {
     .as_ref()
 }
 
-/// Whether `ADV_JIT_MAP_DIR` writes maps.
-pub(crate) fn enabled() -> bool {
-    files().is_some()
-}
-
-/// An `opt-{pid}.tsv` row: Unix ns, computation entry, then `outcome`
-/// (the result, the refused instruction and its operation).
-pub(crate) fn optimized(eip: u32, outcome: &str) {
+/// An `opt-{pid}.tsv` row: Unix ns, computation entry, then `outcome`: the
+/// step, an address or count, and an operation. Steps follow a hot loop from
+/// its promotion and extent through the proof's refusal (its stage, then the
+/// instruction it stopped at) or the optimized form's request, build or
+/// reject, and install. Formatting happens only with a map.
+pub(crate) fn optimized(eip: u32, outcome: std::fmt::Arguments<'_>) {
     if let Some(files) = files() {
         let row = format!("{}\t{eip}\t{outcome}\n", now_ns());
         let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());

@@ -54,10 +54,8 @@ fn compile(request: Request) -> Compiled {
     let form = match front::build(&unit, &proof, &at) {
         Ok(built) => {
             let lowered = back::lower(&built.func);
-            crate::jit_map::optimized(
-                eip,
-                &format!("built\t{}\t{}us", built.cuts, started.elapsed().as_micros()),
-            );
+            let (cuts, us) = (built.cuts, started.elapsed().as_micros());
+            crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
             Some(Form {
                 lowered,
                 built,
@@ -65,13 +63,9 @@ fn compile(request: Request) -> Compiled {
             })
         }
         Err(reject) => {
-            if crate::jit_map::enabled() {
-                let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
-                let at = inst.map_or(String::from("0\t-"), |inst| {
-                    format!("{}\t{:?}", inst.pc, inst.op)
-                });
-                crate::jit_map::optimized(eip, &format!("{reject:?}\t{at}"));
-            }
+            let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
+            let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
+            crate::jit_map::optimized(eip, format_args!("{reject:?}\t{pc}\t{op:?}"));
             None
         }
     };
