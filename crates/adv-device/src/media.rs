@@ -382,6 +382,80 @@ impl Decoder {
     }
 }
 
+/// Converts pushed host BGRA frames into presentable [`VideoFrame`]s.
+#[derive(Default)]
+pub struct RawVideoOutput {
+    #[cfg(all(feature = "gpu", feature = "media"))]
+    output: Option<planes::Output>,
+    #[cfg(all(feature = "gpu", feature = "media"))]
+    dimensions: (u32, u32),
+}
+
+impl RawVideoOutput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_bgra(
+        &mut self,
+        pts_us: u64,
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+    ) -> Result<VideoFrame, Error> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if width == 0 || height == 0 || expected != Some(bgra.len()) {
+            return Err(Error::Decode("invalid pushed BGRA frame dimensions".into()));
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Ok(VideoFrame {
+                pts_us,
+                width,
+                height,
+                bgra,
+            })
+        }
+        #[cfg(all(feature = "gpu", feature = "media"))]
+        {
+            if self.output.is_none() || self.dimensions != (width, height) {
+                let device = crate::gpu::Gpu::execution(false)
+                    .map_err(|error| Error::Decode(error.to_string()))?
+                    .device()
+                    .clone();
+                let output = planes::Output::new_raw(
+                    &device,
+                    width,
+                    height,
+                    ffmpeg_next::format::Pixel::BGRA,
+                    adv_gpu::present::YuvColor::Bt709Full,
+                )?;
+                self.output = Some(output);
+                self.dimensions = (width, height);
+            }
+            let mut frame =
+                ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::BGRA, width, height);
+            let row_bytes = width as usize * 4;
+            let dst_stride = frame.stride(0);
+            let dst = frame.data_mut(0);
+            for y in 0..height as usize {
+                let src_start = y * row_bytes;
+                let dst_start = y * dst_stride;
+                dst[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&bgra[src_start..src_start + row_bytes]);
+            }
+            self.output.as_mut().unwrap().convert(pts_us, &mut frame)
+        }
+        #[cfg(all(feature = "gpu", not(feature = "media")))]
+        {
+            let _ = pts_us;
+            Err(Error::Unavailable)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(feature = "media"))]

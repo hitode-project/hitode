@@ -50,6 +50,7 @@ pub(crate) struct Dmo {
     audio: Option<u64>,
     wake: Handle,
     flushing: bool,
+    stopping: bool,
     /// A frame was delivered since the last start or flush (paused preroll).
     prerolled: bool,
     discontinuity: bool,
@@ -139,6 +140,7 @@ pub(crate) fn wrapper_method(env: &mut Env<'_>, filter: u32, method: &str) -> Op
         audio: None,
         wake,
         flushing: false,
+        stopping: false,
         prerolled: false,
         discontinuity: true,
         segment: 0,
@@ -340,12 +342,47 @@ pub(crate) fn disconnected(env: &mut Env<'_>, pin: u32) {
     }
 }
 
+/// Release blocked streaming calls before upstream guest sources are asked to stop.
+pub(crate) fn begin_stop(env: &mut Env<'_>, graph: u32) {
+    let wakes: Vec<Handle> = state(env)
+        .filters
+        .values_mut()
+        .filter(|f| f.graph == graph)
+        .filter_map(|f| {
+            let d = f.dmo.as_mut()?;
+            d.stopping = true;
+            Some(d.wake)
+        })
+        .collect();
+    for wake in wakes {
+        env.sys.set_event(wake);
+    }
+}
+
+/// Whether a DMO input in `graph` is flushing, stopping, or has a decommitted allocator.
+pub(crate) fn decommitting(env: &Env<'_>, graph: u32) -> bool {
+    let s = env.ext.get::<State>();
+    s.filters
+        .values()
+        .filter(|f| f.graph == graph)
+        .filter_map(|f| f.dmo.as_ref())
+        .any(|d| {
+            d.flushing
+                || d.stopping
+                || (d.input_allocator != 0
+                    && s.allocators
+                        .get(&d.input_allocator)
+                        .is_some_and(|a| !a.committed))
+        })
+}
+
 /// Graph state changes reach host filters here.
 pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32) {
     let Some(dmo) = dmo(env, filter) else {
         return;
     };
     let wake = dmo.wake;
+    dmo.stopping = false;
     if value == graph::STOPPED {
         dmo.prerolled = false;
         dmo.discontinuity = true;
@@ -483,7 +520,7 @@ fn receive_then(env: &mut Env<'_>, filter: u32, sample: u32, done: Done) -> Outc
     let Some(d) = dmo(env, filter) else {
         return done(env, E_UNEXPECTED);
     };
-    if d.flushing {
+    if d.flushing || d.stopping {
         return done(env, S_FALSE);
     }
     if filter_state == graph::STOPPED {
@@ -583,7 +620,7 @@ fn when_due(
     let Some(d) = dmo(env, filter) else {
         return then(env, Ready::Stopped);
     };
-    if d.flushing {
+    if d.flushing || d.stopping {
         return then(env, Ready::Flushing);
     }
     let (prerolled, wake) = (d.prerolled, d.wake);
@@ -674,7 +711,7 @@ fn push_audio(
     let Some(d) = dmo(env, filter) else {
         return then(env, VFW_E_WRONG_STATE);
     };
-    if d.flushing {
+    if d.flushing || d.stopping {
         return then(env, S_FALSE);
     }
     let (wake, segment) = (d.wake, d.segment);
@@ -814,6 +851,9 @@ fn end_of_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Out
 }
 
 fn finish_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Outcome {
+    if dmo(env, filter).is_some_and(|d| d.flushing || d.stopping) {
+        return Outcome::Return(S_OK);
+    }
     if let Some(peer) = downstream {
         // A guest renderer reports EC_COMPLETE itself.
         return guest_call(env, peer, 14, vec![], |_, _| Outcome::Return(S_OK));

@@ -17,6 +17,8 @@ pub struct Window {
     pub size: (u32, u32),
     /// Top-down `Bgra32` rows of `size.0 * 4` bytes.
     pub pixels: Arc<[u8]>,
+    /// Premultiplied alpha in `pixels` instead of opaque fill.
+    pub layered: bool,
     /// Changes whenever `pixels` do.
     pub version: u64,
 }
@@ -92,17 +94,19 @@ impl Windows {
             })?;
             // SAFETY: the buffer is new and not submitted yet.
             let bytes = unsafe { upload.mapped().unwrap().as_mut() };
-            // GDI leaves alpha undefined: windows are opaque.
+            // GDI leaves alpha undefined on non-layered windows; layered windows
+            // carry premultiplied alpha.
             for (out, pixel) in bytes
                 .as_chunks_mut::<4>()
                 .0
                 .iter_mut()
                 .zip(window.pixels.as_chunks::<4>().0)
             {
+                let a = if window.layered { pixel[3] } else { 255 };
                 *out = if adv_gpu::present::COLOR_FORMAT == adv_gpu::Format::Rgba8Unorm {
-                    [pixel[2], pixel[1], pixel[0], 255]
+                    [pixel[2], pixel[1], pixel[0], a]
                 } else {
-                    [pixel[0], pixel[1], pixel[2], 255]
+                    [pixel[0], pixel[1], pixel[2], a]
                 };
             }
             let mut encoder = queue.encoder("guest window");
@@ -175,9 +179,24 @@ pub(crate) fn overlay(bgra: &mut [u8], canvas: (u32, u32), windows: &[((i32, i32
             let from = (row as usize * width as usize + (left - x) as usize) * 4;
             let to = (target as usize * canvas.0 as usize + left as usize) * 4;
             let len = (right - left) as usize * 4;
-            bgra[to..to + len].copy_from_slice(&window.pixels[from..from + len]);
-            for pixel in bgra[to..to + len].as_chunks_mut::<4>().0 {
-                pixel[3] = 255;
+            if window.layered {
+                for (dst, src) in bgra[to..to + len]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(window.pixels[from..from + len].as_chunks::<4>().0)
+                {
+                    let inv = 255 - u32::from(src[3]);
+                    for (d, s) in dst[..3].iter_mut().zip(&src[..3]) {
+                        *d = s.saturating_add(((u32::from(*d) * inv + 127) / 255) as u8);
+                    }
+                    dst[3] = 255;
+                }
+            } else {
+                bgra[to..to + len].copy_from_slice(&window.pixels[from..from + len]);
+                for pixel in bgra[to..to + len].as_chunks_mut::<4>().0 {
+                    pixel[3] = 255;
+                }
             }
         }
     }

@@ -558,6 +558,16 @@ fn basic_call(env: &mut Env<'_>, graph: u32, method: &str, info: &VideoInfo) -> 
     }
 }
 
+pub(crate) fn current_image_dib(
+    env: &Env<'_>,
+    graph: u32,
+    info: &VideoInfo,
+) -> Result<Vec<u8>, u32> {
+    let frame = super::latest(env, graph).ok_or(E_FAIL)?;
+    let source = window(env, graph).effective_source(info);
+    dib(&frame, source)
+}
+
 fn current_image(env: &mut Env<'_>, graph: u32, info: &VideoInfo) -> u32 {
     let (size, output) = (env.arg(1), env.arg(2));
     if !writable(env, size, 4) || (output != 0 && !env.cpu.accessible(size, 4, Prot::READ)) {
@@ -566,11 +576,7 @@ fn current_image(env: &mut Env<'_>, graph: u32, info: &VideoInfo) -> u32 {
     if env.ext.get::<State>().graphs[&graph].state != graph::PAUSED {
         return VFW_E_NOT_PAUSED;
     }
-    let Some(frame) = super::latest(env, graph) else {
-        return E_FAIL;
-    };
-    let source = window(env, graph).effective_source(info);
-    let bytes = match dib(&frame, source) {
+    let bytes = match current_image_dib(env, graph, info) {
         Ok(bytes) => bytes,
         Err(error) => return error,
     };

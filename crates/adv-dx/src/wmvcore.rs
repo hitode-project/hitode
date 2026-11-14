@@ -1,12 +1,13 @@
 //! Windows Media Format SDK synchronous readers. The common demuxer supplies
 //! compressed samples from guest IStreams. Wine assembly also opens filenames
-//! and prepares decoded outputs on a host worker, using the same sample objects.
+//! and decodes uncompressed outputs on demand, using the same sample objects.
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::media::{self, CodecFormat, Demuxed};
 use adv_machine::{Env, Outcome};
 use adv_os::com::{Com, Iid, QueryError};
 use std::collections::BTreeMap;
+use std::sync::{Arc, mpsc};
 
 use crate::dshow::{
     self, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, E_UNEXPECTED, MEDIA_TYPE_SIZE,
@@ -98,16 +99,28 @@ impl Face {
     }
 }
 
+const DECODE_AHEAD: usize = 4;
+
+struct DecodedStream {
+    rx: mpsc::Receiver<Result<media::Packet, u32>>,
+    head: Option<Result<media::Packet, u32>>,
+    eof: bool,
+    delivered: u64,
+}
+
 struct Stream {
     number: u16,
     selected: bool,
     compressed: bool,
-    /// Next packet to deliver and the end of the requested range.
+    /// Next compressed packet to deliver and the active requested range.
     cursor: usize,
+    start_100ns: u64,
     end_100ns: u64,
     discontinuity: bool,
     /// Guest IWMReaderAllocatorEx with one reference held, or 0.
     allocator: u32,
+    epoch: u64,
+    decoded: Option<DecodedStream>,
 }
 
 #[derive(Default)]
@@ -115,8 +128,8 @@ struct Reader {
     /// The opened IStream with one reference held, or 0.
     source: u32,
     file: Option<u32>,
-    media: Option<Demuxed>,
-    decoded: Option<Demuxed>,
+    media: Option<Arc<Demuxed>>,
+    can_decode: bool,
     streams: Vec<Stream>,
     /// Eight guest bytes for output pointers of nested guest calls.
     scratch: u32,
@@ -124,7 +137,7 @@ struct Reader {
 
 impl Reader {
     /// Select every stream of `media`, positioned at its start.
-    fn open(&mut self, media: Demuxed) {
+    fn open(&mut self, media: Demuxed, can_decode: bool) {
         self.streams = media
             .streams
             .iter()
@@ -133,12 +146,16 @@ impl Reader {
                 selected: true,
                 compressed: false,
                 cursor: 0,
+                start_100ns: 0,
                 end_100ns: u64::MAX,
                 discontinuity: true,
                 allocator: 0,
+                epoch: 0,
+                decoded: None,
             })
             .collect();
-        self.media = Some(media);
+        self.media = Some(Arc::new(media));
+        self.can_decode = can_decode;
     }
 }
 
@@ -503,7 +520,7 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                 .filter(|&p| p != 0)
                 .collect();
             reader.media = None;
-            reader.decoded = None;
+            reader.can_decode = false;
             Some(release_guests(env, held, S_OK))
         }
         _ if !opened => r(NS_E_INVALID_REQUEST),
@@ -552,7 +569,15 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let Some(index) = stream_index(env, this, a1 as u16) else {
                 return r(NS_E_INVALID_STREAM);
             };
-            reader(env, this)?.streams[index].compressed = a2 != 0;
+            let stream = &mut reader(env, this)?.streams[index];
+            let compressed = a2 != 0;
+            if stream.compressed != compressed {
+                stream.compressed = compressed;
+                stream.epoch = stream.epoch.wrapping_add(1);
+                if compressed {
+                    stream.decoded = None;
+                }
+            }
             r(S_OK)
         }
         "GetReadStreamSamples" => {
@@ -757,9 +782,21 @@ fn finish_open(env: &mut Env<'_>, this: u32, stream: u32, bytes: Vec<u8>) -> Out
     let Some(reader) = reader(env, this) else {
         return Outcome::Return(E_UNEXPECTED);
     };
-    reader.open(demuxed);
+    reader.open(demuxed, false);
     reader.source = stream;
     guest_call(env, stream, 1, vec![], |_, _| Outcome::Return(S_OK))
+}
+
+fn clean_point(packets: &[media::Packet], start: u64) -> usize {
+    let first = packets.partition_point(|p| p.time_100ns < start);
+    let mut cursor = packets[..first.min(packets.len())]
+        .iter()
+        .rposition(|p| p.key)
+        .unwrap_or(first.min(packets.len()));
+    if first < packets.len() && packets[first].time_100ns == start && packets[first].key {
+        cursor = first;
+    }
+    cursor
 }
 
 /// Position every stream at the last clean point at or before `start`.
@@ -776,22 +813,12 @@ fn set_range(env: &mut Env<'_>, this: u32, start: u64, duration: i64) {
         u64::MAX
     };
     for (index, stream) in reader.streams.iter_mut().enumerate() {
-        let media = if stream.compressed {
-            media
-        } else {
-            reader.decoded.as_ref().unwrap_or(media)
-        };
-        let packets = &media.streams[index].packets;
-        let first = packets.partition_point(|p| p.time_100ns < start);
-        stream.cursor = packets[..first.min(packets.len())]
-            .iter()
-            .rposition(|p| p.key)
-            .unwrap_or(first.min(packets.len()));
-        if first < packets.len() && packets[first].time_100ns == start && packets[first].key {
-            stream.cursor = first;
-        }
+        stream.cursor = clean_point(&media.streams[index].packets, start);
+        stream.start_100ns = start;
         stream.end_100ns = end;
         stream.discontinuity = true;
+        stream.epoch = stream.epoch.wrapping_add(1);
+        stream.decoded = None;
     }
 }
 
@@ -803,29 +830,68 @@ pub struct NativeSamples {
 }
 
 fn prepare_native(env: &mut Env<'_>, this: u32, bytes: Vec<u8>) -> Outcome {
-    let (send, receive) = std::sync::mpsc::channel();
+    let size = bytes.len();
+    let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = media::demux(bytes)
-            .and_then(|media| {
-                let mut decoded = media.clone();
-                for (input, output) in media.streams.iter().zip(&mut decoded.streams) {
-                    let mut decoder = media::PacketDecoder::open(&input.format)?;
-                    output.packets.clear();
-                    for packet in &input.packets {
-                        for frame in decoder.decode(&packet.data, Some(packet.time_100ns))? {
-                            output.packets.push(decoded_packet(frame, &input.format));
-                        }
-                    }
-                    for frame in decoder.drain()? {
-                        output.packets.push(decoded_packet(frame, &input.format));
-                    }
-                }
-                Ok((media, decoded))
-            })
-            .map_err(|_| NS_E_INVALID_INPUT_FORMAT);
+        let result = media::demux(bytes).map_err(|error| {
+            log::warn!("IWMSyncReader::Open: {size} bytes: {error}");
+            NS_E_INVALID_INPUT_FORMAT
+        });
         let _ = send.send(result);
     });
     prepared_native(env, this, receive)
+}
+
+fn spawn_decoded(media: Arc<Demuxed>, index: usize, start_100ns: u64) -> DecodedStream {
+    let (tx, rx) = mpsc::sync_channel(DECODE_AHEAD);
+    std::thread::spawn(move || {
+        let input = &media.streams[index];
+        let mut decoder = match media::PacketDecoder::open(&input.format) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                log::warn!("IWMSyncReader::GetNextSample: {error}");
+                let _ = tx.send(Err(NS_E_INVALID_INPUT_FORMAT));
+                return;
+            }
+        };
+        let start_index = clean_point(&input.packets, start_100ns);
+        for packet in &input.packets[start_index..] {
+            let frames = match decoder.decode(&packet.data, Some(packet.time_100ns)) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    log::warn!("IWMSyncReader::GetNextSample: {error}");
+                    let _ = tx.send(Err(NS_E_INVALID_INPUT_FORMAT));
+                    return;
+                }
+            };
+            for frame in frames {
+                let item = decoded_packet(frame, &input.format);
+                if item.time_100ns >= start_100ns && tx.send(Ok(item)).is_err() {
+                    return;
+                }
+            }
+        }
+        match decoder.drain() {
+            Ok(frames) => {
+                for frame in frames {
+                    let item = decoded_packet(frame, &input.format);
+                    if item.time_100ns >= start_100ns && tx.send(Ok(item)).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("IWMSyncReader::GetNextSample: {error}");
+                let _ = tx.send(Err(NS_E_INVALID_INPUT_FORMAT));
+            }
+        }
+    });
+    DecodedStream {
+        rx,
+        head: None,
+        eof: false,
+        delivered: 0,
+    }
 }
 
 fn decoded_packet(frame: media::Decoded, format: &CodecFormat) -> media::Packet {
@@ -855,17 +921,24 @@ fn decoded_packet(frame: media::Decoded, format: &CodecFormat) -> media::Packet 
     }
 }
 
-type Prepared = std::sync::mpsc::Receiver<Result<(Demuxed, Demuxed), u32>>;
+type Prepared = mpsc::Receiver<Result<Demuxed, u32>>;
 fn prepared_native(env: &mut Env<'_>, this: u32, receive: Prepared) -> Outcome {
     match receive.try_recv() {
-        Ok(Ok((media, decoded))) => {
-            let reader = reader(env, this).unwrap();
-            reader.open(media);
-            reader.decoded = Some(decoded);
+        Ok(Ok(demuxed)) => {
+            log::info!(
+                "IWMSyncReader::Open: {} with {} streams, {} ms",
+                demuxed.container,
+                demuxed.streams.len(),
+                demuxed.duration_100ns / 10_000
+            );
+            let Some(reader) = reader(env, this) else {
+                return Outcome::Return(E_UNEXPECTED);
+            };
+            reader.open(demuxed, true);
             Outcome::Return(S_OK)
         }
         Ok(Err(hr)) => Outcome::Return(hr),
-        Err(std::sync::mpsc::TryRecvError::Empty) => Outcome::block(
+        Err(mpsc::TryRecvError::Empty) => Outcome::block(
             adv_machine::Wait::Until(env.sys.clock.now_us() + 1000),
             move |env, _| prepared_native(env, this, receive),
         ),
@@ -876,6 +949,15 @@ fn prepared_native(env: &mut Env<'_>, this: u32, receive: Prepared) -> Outcome {
 fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
     let number = env.arg(1) as u16;
     let outputs: [u32; 6] = std::array::from_fn(|i| env.arg(2 + i as u32));
+    let [sample_out, time_out, duration_out, flags_out, _, _] = outputs;
+    if sample_out == 0 || time_out == 0 || duration_out == 0 || flags_out == 0 {
+        return Outcome::Return(E_INVALIDARG);
+    }
+    let _ = env.cpu.write_u32(sample_out, 0);
+    poll_next_sample(env, this, number, outputs)
+}
+
+fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]) -> Outcome {
     let [
         sample_out,
         time_out,
@@ -884,29 +966,67 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
         output_out,
         number_out,
     ] = outputs;
-    if sample_out == 0 || time_out == 0 || duration_out == 0 || flags_out == 0 {
-        return Outcome::Return(E_INVALIDARG);
-    }
-    let _ = env.cpu.write_u32(sample_out, 0);
     let Some(state) = reader(env, this) else {
         return Outcome::Return(E_UNEXPECTED);
     };
-    let media = state.media.as_ref().unwrap();
-    let candidates = state
-        .streams
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.selected && (number == 0 || s.number == number));
-    let mut chosen = None;
+    let Reader {
+        media: Some(media),
+        can_decode,
+        streams,
+        scratch,
+        ..
+    } = state
+    else {
+        return Outcome::Return(NS_E_INVALID_REQUEST);
+    };
+    let media = Arc::clone(media);
+    let can_decode = *can_decode;
+    let scratch = *scratch;
     let mut any = false;
-    for (index, stream) in candidates {
+    let mut waiting = false;
+    for (index, stream) in streams.iter_mut().enumerate() {
+        if !stream.selected || (number != 0 && stream.number != number) {
+            continue;
+        }
         any = true;
-        let media = if stream.compressed {
-            media
+        if !stream.compressed && can_decode {
+            if stream.decoded.is_none() {
+                stream.decoded = Some(spawn_decoded(Arc::clone(&media), index, stream.start_100ns));
+            }
+            let decoded = stream.decoded.as_mut().unwrap();
+            if decoded.head.is_none() && !decoded.eof {
+                match decoded.rx.try_recv() {
+                    Ok(item) => decoded.head = Some(item),
+                    Err(mpsc::TryRecvError::Disconnected) => decoded.eof = true,
+                    Err(mpsc::TryRecvError::Empty) => waiting = true,
+                }
+            }
+        }
+    }
+    if !any {
+        return Outcome::Return(NS_E_INVALID_REQUEST);
+    }
+    if waiting {
+        return Outcome::block(
+            adv_machine::Wait::Until(env.sys.clock.now_us() + 500),
+            move |env, _| poll_next_sample(env, this, number, outputs),
+        );
+    }
+    let mut chosen = None;
+    for (index, stream) in streams.iter().enumerate() {
+        if !stream.selected || (number != 0 && stream.number != number) {
+            continue;
+        }
+        let packet = if stream.compressed || !can_decode {
+            media.streams[index].packets.get(stream.cursor)
         } else {
-            state.decoded.as_ref().unwrap_or(media)
+            match stream.decoded.as_ref().unwrap().head.as_ref() {
+                Some(Ok(packet)) => Some(packet),
+                Some(Err(hr)) => return Outcome::Return(*hr),
+                None => None,
+            }
         };
-        let Some(packet) = media.streams[index].packets.get(stream.cursor) else {
+        let Some(packet) = packet else {
             continue;
         };
         if packet.time_100ns >= stream.end_100ns {
@@ -916,14 +1036,11 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
             chosen = Some((index, packet.time_100ns));
         }
     }
-    if !any {
-        return Outcome::Return(NS_E_INVALID_REQUEST);
-    }
     let Some((index, _)) = chosen else {
         return Outcome::Return(NS_E_NO_MORE_SAMPLES);
     };
-    let stream = &state.streams[index];
-    if !stream.compressed && state.decoded.is_none() {
+    let stream = &streams[index];
+    if !stream.compressed && !can_decode {
         adv_abi::warn_unavailable(
             env,
             "IWMSyncReader::GetNextSample",
@@ -931,19 +1048,28 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
         );
         return Outcome::Return(E_NOTIMPL);
     }
-    let (cursor, allocator, discontinuity, stream_number, scratch) = (
+    let (compressed, cursor, epoch, delivered, allocator, discontinuity, stream_number) = (
+        stream.compressed,
         stream.cursor,
+        stream.epoch,
+        stream.decoded.as_ref().map_or(0, |d| d.delivered),
         stream.allocator,
         stream.discontinuity,
         stream.number,
-        state.scratch,
     );
-    let media = if stream.compressed {
-        media
+    let packet = if compressed {
+        &media.streams[index].packets[cursor]
     } else {
-        state.decoded.as_ref().unwrap_or(media)
+        stream
+            .decoded
+            .as_ref()
+            .unwrap()
+            .head
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
     };
-    let packet = &media.streams[index].packets[cursor];
     let (time, duration, key, data) = (
         packet.time_100ns,
         packet.duration_100ns,
@@ -960,10 +1086,20 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
         // Another thread may have moved this stream meanwhile; only advance it from
         // the sample just delivered.
         if let Some(stream) = reader(env, this).and_then(|r| r.streams.get_mut(index))
-            && stream.cursor == cursor
+            && stream.epoch == epoch
         {
-            stream.cursor += 1;
-            stream.discontinuity = false;
+            if compressed {
+                if stream.cursor == cursor {
+                    stream.cursor += 1;
+                    stream.discontinuity = false;
+                }
+            } else if let Some(decoded) = stream.decoded.as_mut()
+                && decoded.delivered == delivered
+            {
+                decoded.head = None;
+                decoded.delivered += 1;
+                stream.discontinuity = false;
+            }
         }
         env.ext.get_or_default::<NativeSamples>().samples += 1;
         let _ = env.cpu.write_u32(sample_out, buffer);

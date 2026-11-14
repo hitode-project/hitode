@@ -35,6 +35,8 @@ pub struct WindowLayer {
     pub height: u32,
     /// Top-down `Bgra32` rows of `width * 4` bytes.
     pub pixels: Arc<[u8]>,
+    /// Premultiplied alpha in `pixels` instead of opaque fill.
+    pub layered: bool,
     /// Changes whenever `pixels` do.
     pub version: u64,
 }

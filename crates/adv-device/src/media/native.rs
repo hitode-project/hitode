@@ -217,7 +217,7 @@ struct Video {
     stream: usize,
     time_base: Rational,
     #[cfg(not(feature = "gpu"))]
-    scaler: software::scaling::Context,
+    scaler: Option<(format::Pixel, software::scaling::Context)>,
     /// Built at the first decoded frame, whose format the header may omit.
     #[cfg(feature = "gpu")]
     output: Option<super::planes::Output>,
@@ -273,14 +273,128 @@ fn micros(pts: i64, tb: Rational) -> i64 {
     .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+pub(super) fn configure_video_context(context: &mut codec::Context) {
+    #[cfg(target_vendor = "apple")]
+    let hw = videotoolbox(context);
+    #[cfg(not(target_vendor = "apple"))]
+    let hw = false;
+    let threads = if hw {
+        1
+    } else {
+        // SAFETY: `context` owns a valid `AVCodecContext` populated from stream parameters.
+        let (w, h) = unsafe {
+            let raw = context.as_ptr();
+            ((*raw).width.max(0) as u64, (*raw).height.max(0) as u64)
+        };
+        if w * h >= 1280 * 720 { 4 } else { 1 }
+    };
+    context.set_threading(codec::threading::Config::count(threads));
+}
+
+#[cfg(target_vendor = "apple")]
+fn videotoolbox(context: &mut codec::Context) -> bool {
+    unsafe extern "C" fn select(
+        context: *mut ff::ffi::AVCodecContext,
+        formats: *const ff::ffi::AVPixelFormat,
+    ) -> ff::ffi::AVPixelFormat {
+        unsafe {
+            if (*context).width >= 128 && (*context).height >= 128 {
+                let mut cursor = formats;
+                while *cursor != ff::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                    if *cursor == ff::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
+                        return *cursor;
+                    }
+                    cursor = cursor.add(1);
+                }
+            }
+            ff::ffi::avcodec_default_get_format(context, formats)
+        }
+    }
+    // SAFETY: queries FFmpeg's static decoder table and attaches a refcounted hwdevice context.
+    unsafe {
+        let raw = context.as_mut_ptr();
+        // VideoToolbox hardware sessions reject sub-macroblock / tiny icon clips (< 128 px).
+        // Packet streams with unknown header dimensions (0x0) defer this check to `select`.
+        if ((*raw).width != 0 && (*raw).width < 128) || ((*raw).height != 0 && (*raw).height < 128)
+        {
+            return false;
+        }
+        let decoder = ff::ffi::avcodec_find_decoder((*raw).codec_id);
+        if decoder.is_null() {
+            return false;
+        }
+        for index in 0.. {
+            let config = ff::ffi::avcodec_get_hw_config(decoder, index);
+            if config.is_null() {
+                break;
+            }
+            if (*config).device_type != ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX {
+                continue;
+            }
+            let mut device = ptr::null_mut();
+            if ff::ffi::av_hwdevice_ctx_create(
+                &mut device,
+                (*config).device_type,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            ) >= 0
+            {
+                (*raw).hw_device_ctx = device;
+                (*raw).get_format = Some(select);
+                return true;
+            }
+            break;
+        }
+        false
+    }
+}
+
+pub(super) fn transfer_hardware(decoded: &mut frame::Video) -> Result<(), Error> {
+    #[cfg(target_vendor = "apple")]
+    if decoded.format() == format::Pixel::VIDEOTOOLBOX {
+        let mut software = frame::Video::empty();
+        // SAFETY: `decoded` holds a live VideoToolbox hardware frame and `software` is fresh.
+        unsafe {
+            let status =
+                ff::ffi::av_hwframe_transfer_data(software.as_mut_ptr(), decoded.as_ptr(), 0);
+            if status < 0 {
+                return Err(ff::Error::from(status).into());
+            }
+            let status = ff::ffi::av_frame_copy_props(software.as_mut_ptr(), decoded.as_ptr());
+            if status < 0 {
+                return Err(ff::Error::from(status).into());
+            }
+        }
+        *decoded = software;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = decoded;
+    Ok(())
+}
+
 #[cfg(not(feature = "gpu"))]
 fn convert(
     video: &mut Video,
     pts_us: u64,
     decoded: &mut frame::Video,
 ) -> Result<VideoFrame, Error> {
+    transfer_hardware(decoded)?;
+    let (pixel, w, h) = (decoded.format(), decoded.width(), decoded.height());
+    if video.scaler.as_ref().is_none_or(|(p, _)| *p != pixel) {
+        let context = software::scaling::Context::get(
+            pixel,
+            w,
+            h,
+            format::Pixel::BGRA,
+            w,
+            h,
+            software::scaling::Flags::BILINEAR,
+        )?;
+        video.scaler = Some((pixel, context));
+    }
     let mut bgra = frame::Video::empty();
-    video.scaler.run(decoded, &mut bgra)?;
+    video.scaler.as_mut().unwrap().1.run(decoded, &mut bgra)?;
     let (width, height) = (bgra.width(), bgra.height());
     let row = width as usize * 4;
     let mut pixels = Vec::with_capacity(row * height as usize);
@@ -301,8 +415,13 @@ fn convert(
     pts_us: u64,
     decoded: &mut frame::Video,
 ) -> Result<VideoFrame, Error> {
+    transfer_hardware(decoded)?;
     if video.output.is_none() {
-        video.output = Some(super::planes::Output::new(&video.device, &video.decoder)?);
+        video.output = Some(super::planes::Output::new(
+            &video.device,
+            &video.decoder,
+            decoded.format(),
+        )?);
     }
     video.output.as_mut().unwrap().convert(pts_us, decoded)
 }
@@ -310,8 +429,7 @@ fn convert(
 fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
     let (index, time_base, rate) = (stream.index(), stream.time_base(), stream.avg_frame_rate());
     let mut context = codec::Context::from_parameters(stream.parameters())?;
-    // One decoder thread: a visual novel never needs a worker per logical CPU.
-    context.set_threading(codec::threading::Config::count(1));
+    configure_video_context(&mut context);
     let mut decoder = context.decoder();
     decoder.set_packet_time_base(time_base);
     let decoder = decoder.video()?;
@@ -321,16 +439,6 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
             "invalid or excessive video dimensions".into(),
         ));
     }
-    #[cfg(not(feature = "gpu"))]
-    let scaler = software::scaling::Context::get(
-        decoder.format(),
-        w,
-        h,
-        format::Pixel::BGRA,
-        w,
-        h,
-        software::scaling::Flags::BILINEAR,
-    )?;
     #[cfg(feature = "gpu")]
     let device = crate::gpu::Gpu::execution(false)
         .map_err(|e| Error::Decode(e.to_string()))?
@@ -346,7 +454,7 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         stream: index,
         time_base,
         #[cfg(not(feature = "gpu"))]
-        scaler,
+        scaler: None,
         #[cfg(feature = "gpu")]
         output: None,
         #[cfg(feature = "gpu")]

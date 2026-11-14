@@ -67,6 +67,10 @@ fn media() -> Demuxed {
 }
 
 fn reader_with(m: &mut Machine<JitCpu>, media: Option<Demuxed>) -> u32 {
+    reader_mode(m, media, false)
+}
+
+fn reader_mode(m: &mut Machine<JitCpu>, media: Option<Demuxed>, can_decode: bool) -> u32 {
     let mut env = env(m);
     let scratch = dshow::alloc(&mut env, 8).unwrap();
     let mut reader = Reader {
@@ -74,7 +78,7 @@ fn reader_with(m: &mut Machine<JitCpu>, media: Option<Demuxed>) -> u32 {
         ..Reader::default()
     };
     if let Some(media) = media {
-        reader.open(media);
+        reader.open(media, can_decode);
     }
     create(
         &mut env,
@@ -396,5 +400,149 @@ fn header_and_profile_describe_the_opened_streams() {
             &[reader, 9, DATA + 48]
         ),
         NS_E_INVALID_STREAM
+    );
+}
+
+#[test]
+fn native_reader_avoids_decoding_streams_read_as_compressed_samples() {
+    let mut m = machine();
+    // Synthetic compressed packets carry arbitrary bytes; opening a native-capable
+    // reader must leave decoders unopened so compressed stream reading succeeds.
+    let reader = reader_mode(&mut m, Some(media()), true);
+    {
+        let mut e = env(&mut m);
+        let state = super::reader(&mut e, reader).unwrap();
+        assert!(state.streams.iter().all(|s| s.decoded.is_none()));
+    }
+    read_compressed(&mut m, reader);
+    let first = next(&mut m, reader, VIDEO).unwrap();
+    assert_eq!((first.time_ms, first.data), (0, vec![0xb0, 0, 0x5a]));
+    let mut e = env(&mut m);
+    let state = super::reader(&mut e, reader).unwrap();
+    assert!(state.streams.iter().all(|s| s.decoded.is_none()));
+}
+
+#[cfg(feature = "media")]
+#[test]
+fn native_reader_decodes_uncompressed_streams_on_demand_and_drops_on_mode_switch() {
+    use adv_cpu::backend::Reg;
+    use adv_machine::Resume;
+
+    fn call_blocking(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
+        m.resolve_import("wmvcore.dll", name).unwrap();
+        let thunk = m
+            .sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.module == "wmvcore.dll" && t.name == name)
+            .unwrap()
+            .0;
+        let handler = m.sys.thunks.get(thunk).f.handler;
+        m.cpu.set_reg(Reg::Esp, crate::dshow::tests::STACK);
+        for (i, &arg) in args.iter().enumerate() {
+            m.cpu
+                .write_u32(crate::dshow::tests::STACK + 4 + i as u32 * 4, arg)
+                .unwrap();
+        }
+        let mut outcome = handler(&mut Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        });
+        loop {
+            match outcome {
+                Outcome::Return(hr) => return hr,
+                Outcome::Block { then, .. } => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    outcome = then(
+                        &mut Env {
+                            context: m.sys.current,
+                            cpu: &mut m.cpu,
+                            sys: &mut m.sys,
+                            ext: &mut m.ext,
+                            thunk,
+                        },
+                        Resume::Woke(adv_machine::WakeReason::Timeout),
+                    );
+                }
+                _ => panic!("unexpected outcome"),
+            }
+        }
+    }
+
+    let pcm = Demuxed {
+        container: "asf".to_owned(),
+        duration_100ns: 400 * MS,
+        streams: vec![PacketStream {
+            number: AUDIO,
+            format: CodecFormat::Audio {
+                format_tag: 1,
+                channels: 1,
+                rate: 8_000,
+                bytes_per_second: 16_000,
+                block_align: 2,
+                bits: 16,
+                extradata: Vec::new(),
+            },
+            bit_rate: 128_000,
+            max_packet: 16,
+            packets: vec![
+                Packet {
+                    time_100ns: 0,
+                    duration_100ns: MS,
+                    key: true,
+                    data: vec![0x00, 0x10, 0x00, 0x20],
+                },
+                Packet {
+                    time_100ns: 100 * MS,
+                    duration_100ns: MS,
+                    key: true,
+                    data: vec![0x00, 0x30, 0x00, 0x40],
+                },
+            ],
+        }],
+    };
+    let mut m = machine();
+    let reader = reader_mode(&mut m, Some(pcm), true);
+    let hr = call_blocking(
+        &mut m,
+        "IWMSyncReader2::GetNextSample",
+        &[
+            reader,
+            u32::from(AUDIO),
+            DATA,
+            DATA + 8,
+            DATA + 16,
+            DATA + 24,
+            DATA + 28,
+            DATA + 32,
+        ],
+    );
+    assert_eq!(hr, S_OK);
+    let buffer = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, "INSSBuffer::Release", &[buffer]), 0);
+    {
+        let mut e = env(&mut m);
+        assert!(
+            super::reader(&mut e, reader).unwrap().streams[0]
+                .decoded
+                .is_some()
+        );
+    }
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetReadStreamSamples",
+            &[reader, u32::from(AUDIO), 1]
+        ),
+        S_OK
+    );
+    let mut e = env(&mut m);
+    assert!(
+        super::reader(&mut e, reader).unwrap().streams[0]
+            .decoded
+            .is_none()
     );
 }

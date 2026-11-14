@@ -1766,12 +1766,13 @@ impl<P: Presenter> Surfaces<P> {
                         width: plane.width,
                         height: plane.height,
                         pixels: pixels.into(),
+                        layered: plane.layered,
                         version: self.windows.version,
                     }
                 }
             });
         }
-        let key = |w: &crate::frame::WindowLayer| (w.id, w.at, w.version);
+        let key = |w: &crate::frame::WindowLayer| (w.id, w.at, w.layered, w.version);
         if !windows
             .iter()
             .map(key)

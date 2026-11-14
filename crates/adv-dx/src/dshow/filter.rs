@@ -48,6 +48,7 @@ pub(crate) struct Filter {
     pub source: Option<Source>,
     pub source_path: Vec<u16>,
     pub dmo: Option<super::dmo::Dmo>,
+    pub vmr: Option<super::vmr::Vmr>,
 }
 
 pub(crate) struct Pin {
@@ -133,6 +134,17 @@ pub(crate) fn create_audio_renderer(
     )
 }
 
+pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
+    create_filter(
+        env,
+        iid,
+        outer,
+        output,
+        Role::VideoRenderer,
+        super::vmr::CLSID_VIDEO_MIXING_RENDERER,
+    )
+}
+
 fn create_filter(
     env: &mut Env<'_>,
     iid: Iid,
@@ -161,12 +173,19 @@ fn create_filter(
 }
 
 pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u32, u32> {
+    let is_vmr = role == Role::VideoRenderer && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER;
     let faces: &[Face] = match role {
         Role::FileSource => &[Face::BaseFilter, Face::FileSource],
         Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper],
+        Role::VideoRenderer if is_vmr => &[
+            Face::BaseFilter,
+            Face::VmrFilterConfig,
+            Face::VmrWindowlessControl,
+        ],
         _ => &[Face::BaseFilter],
     };
     let base = super::create(env, faces, Obj::Filter)?[0];
+    let vmr = (role == Role::VideoRenderer).then(|| super::vmr::Vmr::new(env));
     state(env).filters.insert(
         base,
         Filter {
@@ -179,6 +198,7 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
             source: None,
             source_path: Vec::new(),
             dmo: None,
+            vmr,
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
@@ -193,6 +213,7 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
             (OUTPUT, "Out", MEDIATYPE_AUDIO),
         ],
         Role::AudioRenderer => &[(INPUT, "Audio Input pin (rendered)", MEDIATYPE_AUDIO)],
+        Role::VideoRenderer if is_vmr => &[(INPUT, "VMR Input0", MEDIATYPE_VIDEO)],
         Role::VideoRenderer => &[(INPUT, "Video Input pin (rendered)", MEDIATYPE_VIDEO)],
         // Pins follow the decoder chosen by IDMOWrapperFilter::Init.
         Role::DmoDecoder => &[],
@@ -305,8 +326,7 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 "Pause" => graph::PAUSED,
                 _ => graph::RUNNING,
             };
-            state(env).filters.get_mut(&filter).unwrap().state = value;
-            super::dmo::state_changed(env, filter, value);
+            set_state(env, filter, value);
             r(S_OK)
         }
         "GetState" => {
@@ -396,16 +416,51 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
     }
 }
 
+pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
+    let outputs: Vec<u32> = {
+        let s = state(env);
+        let Some(f) = s.filters.get_mut(&filter) else {
+            return;
+        };
+        f.state = value;
+        f.pins
+            .iter()
+            .filter_map(|p| {
+                let pin = &s.pins[p];
+                (pin.dir == OUTPUT && pin.allocator != 0).then_some(pin.allocator)
+            })
+            .collect()
+    };
+    for allocator in outputs {
+        if value == graph::STOPPED {
+            sample::decommit(env, allocator);
+        } else {
+            sample::commit(env, allocator);
+        }
+    }
+    super::dmo::state_changed(env, filter, value);
+    super::vmr::state_changed(env, filter, value);
+}
+
 fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
-    if role_of(env, pin) == Role::DmoDecoder
-        && matches!(
-            method,
-            "EndOfStream" | "BeginFlush" | "EndFlush" | "NewSegment"
-        )
-        && let Some(outcome) = super::dmo::pin_method(env, pin, method)
-    {
-        return Some(outcome);
+    if matches!(
+        method,
+        "EndOfStream" | "BeginFlush" | "EndFlush" | "NewSegment"
+    ) {
+        match role_of(env, pin) {
+            Role::DmoDecoder => {
+                if let Some(outcome) = super::dmo::pin_method(env, pin, method) {
+                    return Some(outcome);
+                }
+            }
+            Role::VideoRenderer => {
+                if let Some(outcome) = super::vmr::pin_method(env, pin, method) {
+                    return Some(outcome);
+                }
+            }
+            _ => {}
+        }
     }
     let a1 = env.arg(1);
     match method {
@@ -517,8 +572,10 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
 /// pushed samples are rejected explicitly rather than accepted and discarded.
 fn input_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
-    if role_of(env, pin) == Role::DmoDecoder {
-        return super::dmo::input_method(env, pin, method);
+    match role_of(env, pin) {
+        Role::DmoDecoder => return super::dmo::input_method(env, pin, method),
+        Role::VideoRenderer => return super::vmr::input_method(env, pin, method),
+        _ => {}
     }
     match method {
         "GetAllocator" => {
@@ -563,6 +620,9 @@ fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
     }
     if p.dir == INPUT && state.filters[&p.filter].role == Role::DmoDecoder {
         return super::dmo::accepts_input(mt).is_some();
+    }
+    if p.dir == INPUT && state.filters[&p.filter].role == Role::VideoRenderer {
+        return super::vmr::accepts_input(mt);
     }
     true
 }
