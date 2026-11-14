@@ -3373,4 +3373,24 @@ mod opt_back {
             }
         }
     }
+
+    // spec: A64-CTL-7, A64-OPT-6
+    #[test]
+    fn opt_back_widens_checkpoint_bit_tests_across_large_forms() {
+        let (mut f, b, p, entry) = start(&[Type::I32]);
+        f.records[entry.0 as usize].refund = 3;
+        // Three words per Validate puts the entry checkpoint past 32 KiB.
+        for _ in 0..3000 {
+            f.push(b, Op::Validate);
+        }
+        let exit = finish(&mut f, b, p[0]);
+        let mut h = harness();
+        let ran = h.run_opt(&f, &[0x1234], 10, 0, 0);
+        assert!(ran.lowered.words.len() > 8192);
+        assert_eq!(ran.record, exit);
+        assert_eq!(10 - ran.countdown, 3);
+        let cut = h.run_opt(&f, &[0x1234], 2, 1, 0);
+        assert_eq!(cut.record, entry);
+        assert_eq!(2 - cut.countdown, 0);
+    }
 }

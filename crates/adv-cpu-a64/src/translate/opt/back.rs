@@ -51,8 +51,42 @@ impl Lowered {
 pub(crate) fn lower(func: &Func) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func);
-    let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let mut asm = Asm::new();
+    // A bit test whose target lands out of range is emitted wide, and the
+    // form again, as the ordinary translator does.
+    let (mut e, exit) = loop {
+        let (mut e, exit) = emit(func, &allocation, asm);
+        if !e.asm.widen_bit_tests() {
+            break (e, exit);
+        }
+        asm = e.asm;
+        asm.rewind();
+    };
+    // A host fault leaves through its region's record like a failed check.
+    for (offset, site) in &mut e.sites {
+        let cold = e.cold[site.opt_record.expect("optimized site") as usize];
+        site.resume = (e.asm.position(cold) as i64 - *offset as i64) as i32;
+    }
+    let records = func
+        .records
+        .iter()
+        .map(|r| super::recovery::lower_record(r, &e.locations))
+        .collect();
+    let exit = e.asm.position(exit) / 4;
+    Lowered {
+        exit,
+        words: e.asm.finish(),
+        sites: e.sites,
+        marks: e.marks,
+        records,
+        flags: e.flags,
+        spill_cells: allocation.spill_cells,
+    }
+}
+
+/// Emits the form into `asm`, returning its emitter and exit label.
+fn emit<'a>(func: &'a Func, allocation: &alloc::Allocation, mut asm: Asm) -> (Emitter<'a>, Label) {
+    let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let cold = func.records.iter().map(|_| asm.label()).collect();
     let mut branch_only = vec![true; func.types.len()];
@@ -74,8 +108,8 @@ pub(crate) fn lower(func: &Func) -> Lowered {
         asm,
         blocks,
         cold,
-        locations: allocation.locations,
-        defs: allocation.defs,
+        locations: allocation.locations.clone(),
+        defs: allocation.defs.clone(),
         flags,
         sites: Vec::new(),
         marks: Vec::new(),
@@ -190,26 +224,7 @@ pub(crate) fn lower(func: &Func) -> Lowered {
     e.asm.bind(exit);
     // Permanently undefined until placed.
     e.asm.emit(0);
-    // A host fault leaves through its region's record like a failed check.
-    for (offset, site) in &mut e.sites {
-        let cold = e.cold[site.opt_record.expect("optimized site") as usize];
-        site.resume = (e.asm.position(cold) as i64 - *offset as i64) as i32;
-    }
-    let records = func
-        .records
-        .iter()
-        .map(|r| super::recovery::lower_record(r, &e.locations))
-        .collect();
-    let exit = e.asm.position(exit) / 4;
-    Lowered {
-        exit,
-        words: e.asm.finish(),
-        sites: e.sites,
-        marks: e.marks,
-        records,
-        flags: e.flags,
-        spill_cells: allocation.spill_cells,
-    }
+    (e, exit)
 }
 
 struct Emitter<'a> {
