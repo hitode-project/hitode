@@ -545,8 +545,8 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.body_services()
     }
 
-    fn split_share(&self) -> f32 {
-        self.handler.split_share()
+    fn pace(&self) -> Option<adv_cpu_core::backend::Pace> {
+        self.handler.pace()
     }
 
     fn diagnostics(&self) -> u8 {

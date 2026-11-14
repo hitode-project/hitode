@@ -286,7 +286,7 @@ fn complete<C>(sys: &mut Sys, regs: &mut [Option<C>], done: Completion<C>, local
     sys.wakes.mark_turn(id, false);
     let ns = done.elapsed.as_nanos() as u64;
     if local {
-        sys.load.computed(done.elapsed, done.helpers);
+        sys.load.computed(done.helpers);
         sys.scheduling
             .context_run(id as usize, done.elapsed, 0, true);
         sys.stats.total.cpu_runs += 1;

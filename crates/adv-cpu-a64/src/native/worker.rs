@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use adv_cpu_core::CpuState;
-use adv_cpu_core::backend::{Completion, Computation};
+use adv_cpu_core::backend::{Completion, Computation, Pace};
 use adv_sync::WakeEvent;
 use rustc_hash::FxHashMap;
 
@@ -49,6 +49,8 @@ pub(super) struct Prepared {
     mode: std::cell::Cell<Mode>,
     /// Instructions and time per outer iteration, once a job showed them.
     per_iteration: std::cell::Cell<Option<(u64, f64)>>,
+    /// Serial ns of the last job that showed them.
+    cost: std::cell::Cell<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,6 +79,7 @@ impl Prepared {
             skip: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
             per_iteration: std::cell::Cell::new(None),
+            cost: std::cell::Cell::new(0),
         }
     }
 
@@ -115,6 +118,11 @@ impl Prepared {
             &self.code,
             matches!(self.mode.get(), Mode::Trial | Mode::Iteration),
         )
+    }
+
+    /// The serial ns a job of this computation last took, 0 until one ran.
+    pub fn cost(&self) -> u64 {
+        self.cost.get()
     }
 
     pub fn worth_offering(&self) -> bool {
@@ -804,7 +812,7 @@ pub(super) struct Session<'a> {
     send: SyncSender<Done>,
     recv: Receiver<Done>,
     runtime: Runtime,
-    share: f32,
+    pace: Option<Pace>,
     counts: &'a mut SplitCounts,
 }
 
@@ -816,7 +824,7 @@ impl<'a> Session<'a> {
         admission: &'a mut Admission,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
         notifications: Notifications,
-        (share, counts): (f32, &'a mut SplitCounts),
+        (pace, counts): (Option<Pace>, &'a mut SplitCounts),
     ) -> Option<Self> {
         let pool = Pool::get()?;
         let (send, recv) = sync_channel(pool.limit);
@@ -837,7 +845,7 @@ impl<'a> Session<'a> {
                 pending: notifications.pending,
             },
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
-            share,
+            pace,
             counts,
         })
     }
@@ -859,8 +867,8 @@ impl<'a> Session<'a> {
     }
 
     /// Runs the admitted head loop as blocks of about one budget slice, on
-    /// the owner and the fewest idle workers that save the session's share
-    /// of its serial time.
+    /// the owner and the fewest idle workers that save what the frame's
+    /// pace needs of its serial time.
     fn split(
         &mut self,
         id: u32,
@@ -868,6 +876,7 @@ impl<'a> Session<'a> {
         code: &Code,
         plan: Plan,
         (retired, ns): (u64, f64),
+        pace: Pace,
     ) -> Option<Completion<Option<ExecutionContext>>> {
         let slice = (u64::from(COMPUTATION_SLICE) / retired).clamp(1, u64::from(u32::MAX)) as u32;
         let serial = f64::from(plan.iterations) * ns;
@@ -877,7 +886,8 @@ impl<'a> Session<'a> {
             0 => WAKE_NS,
             claimed => counts.claim_ns as f64 / claimed as f64,
         };
-        let helpers = helpers(serial, (wake, f64::from(slice) * ns), self.share, most);
+        let need = pace.need(serial as u64) as f64;
+        let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
         if helpers == 0 {
             return None;
         }
@@ -1007,14 +1017,17 @@ impl<'a> Session<'a> {
     }
 }
 
-/// The fewest helpers whose blocks cut `serial` ns by `share`, or all that
-/// are worth waking, given the `wake` latency and the most a `slice` block
-/// takes. One is worth waking only if its part of the loop exceeds four
-/// wake latencies.
-fn helpers(serial: f64, (wake, slice): (f64, f64), share: f32, most: usize) -> usize {
+/// The fewest helpers whose blocks cut `serial` ns by `need` ns, or all
+/// that are worth waking, given the `wake` latency and the most a `slice`
+/// block takes. One is worth waking only if its part of the loop exceeds
+/// four wake latencies.
+fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> usize {
+    if need <= 0.0 {
+        return 0;
+    }
     let worth = ((serial - wake) / (4.0 * wake) - 1.0).max(0.0) as usize;
     let most = most.min(worth);
-    let target = serial * f64::from(1.0 - share);
+    let target = serial - need;
     (1..=most)
         .find(|&h| {
             let part = (serial - wake) / (h + 1) as f64;
@@ -1031,6 +1044,7 @@ fn learn(prepared: &Prepared, done: &Completion<Option<ExecutionContext>>, itera
     }
     let n = u64::from(iterations);
     let ns = (done.elapsed + done.helpers).as_nanos() as f64;
+    prepared.cost.set(ns as u64);
     prepared
         .per_iteration
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
@@ -1095,9 +1109,9 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             })
             .flatten();
         if let Some(plan) = plan
-            && self.share > 0.0
+            && let Some(pace) = self.pace
             && let Some(per_iteration) = prepared.per_iteration.get()
-            && let Some(completion) = self.split(id, context, &code, plan, per_iteration)
+            && let Some(completion) = self.split(id, context, &code, plan, per_iteration, pace)
         {
             let done = Done {
                 completion,
@@ -1351,11 +1365,12 @@ mod tests {
     fn helpers_save_the_share_past_their_wake() {
         // A 400 us loop that must lose 10%: one helper once wakes are known
         // to take 12 us, none while a wake is assumed to take 50 us.
-        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.1, 7), 1);
-        assert_eq!(helpers(400_000.0, (50_000.0, 1e9), 0.1, 7), 0);
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 40_000.0, 7), 1);
+        assert_eq!(helpers(400_000.0, (50_000.0, 1e9), 40_000.0, 7), 0);
         // Half of it needs two; a held key takes every helper worth one.
-        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.5, 7), 2);
-        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 1.0, 7), 7);
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 200_000.0, 7), 2);
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 400_000.0, 7), 7);
+        assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.0, 7), 0);
     }
 
     const SRC: u32 = 0x100_0000;
@@ -1388,7 +1403,7 @@ mod tests {
             .unwrap();
         assert_eq!(offer.exit, Exit::Computation);
         assert!(native.computation[&CODE].proof.splits());
-        native.split_share = 1.0;
+        native.pace.set(Some(Pace::default()));
         let mut results = Vec::new();
         let mut memories = Vec::new();
         // The first job shows the iteration's cost; the second splits.

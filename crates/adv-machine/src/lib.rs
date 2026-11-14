@@ -913,6 +913,12 @@ impl Sys {
         }
     }
 
+    /// The host slept with no ready context, until its timeout or a signal:
+    /// pacing slack, not owner work (PROC-MACH-1).
+    pub fn host_idle(&mut self, time: std::time::Duration, timed_out: bool) {
+        self.load.idle(time, timed_out);
+    }
+
     /// Mark a fully committed frame, after every guest draw callback has returned.
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
@@ -927,7 +933,7 @@ impl Sys {
             self.current,
             u64::from(self.completed_frames),
             work,
-            (self.load.share() * 1000.0) as u64,
+            self.load.period_ns(),
         );
     }
 
@@ -1923,13 +1929,13 @@ impl TrapHandler for Dispatch<'_> {
             && self.sys.call_limit.is_none()
     }
 
-    fn split_share(&self) -> f32 {
+    fn pace(&self) -> Option<adv_cpu::backend::Pace> {
         if !self.computation
             || DEBUGGER_ATTACHED.get()
             || self.sys.trace.enabled()
             || self.sys.call_limit.is_some()
         {
-            0.0
+            None
         } else if self
             .sys
             .frame_pacer
@@ -1937,9 +1943,9 @@ impl TrapHandler for Dispatch<'_> {
             .is_some_and(|p| p.input_held())
         {
             // Skipping has no frame deadline: any helper worth waking serves.
-            1.0
+            Some(Default::default())
         } else {
-            self.sys.load.share()
+            Some(self.sys.load.pace(std::time::Instant::now()))
         }
     }
 
@@ -3125,9 +3131,6 @@ impl<B: Backend> Machine<B> {
                     c.progress.saw_event();
                 }
                 c.progress.ran(retired);
-                if !c.progress.settled() {
-                    self.sys.load.ran(run_elapsed);
-                }
             }
             if self.sys.schedule_trace.enabled() {
                 self.sys.schedule_trace.event(

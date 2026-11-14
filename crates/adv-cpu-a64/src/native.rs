@@ -778,8 +778,9 @@ pub(crate) struct Native {
     promoted: FxHashSet<u32>,
     probed: Option<Probed>,
     computation_enabled: bool,
-    /// The handler's split share for this run (A64-TR-9).
-    pub(crate) split_share: f32,
+    /// The frame's pace when the owner last reached a loop whose blocks
+    /// split (A64-TR-9).
+    pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     skip_offer: Option<u32>,
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
@@ -901,7 +902,7 @@ impl Native {
             promoted: FxHashSet::default(),
             probed: None,
             computation_enabled: false,
-            split_share: 0.0,
+            pace: std::cell::Cell::new(None),
             skip_offer: None,
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
@@ -945,9 +946,16 @@ impl Native {
                     .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
     }
 
-    /// A single context may offer a loop whose blocks split.
-    fn offer_split(&self) -> bool {
-        self.computation_enabled && self.split_share > 0.0
+    /// A single context may offer a loop whose blocks split when the
+    /// frame's pace needs it to save time on a loop of serial `cost` ns.
+    fn offer_split(&self, cost: u64) -> bool {
+        if !self.bridge.is_null() {
+            // SAFETY: this query occurs only within the owning run.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            self.pace
+                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
+        }
+        self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
     }
 
     fn is_stop(&self, eip: u32) -> bool {
@@ -982,7 +990,7 @@ impl Native {
             &mut self.admission,
             (retired, &mut self.retired_forms),
             worker::Notifications { pending, wake },
-            (self.split_share, &mut self.diagnostics.split),
+            (self.pace.get(), &mut self.diagnostics.split),
         ) {
             visit(&mut session);
         }
@@ -1071,10 +1079,12 @@ impl Native {
         {
             self.request_optimized(cpu.eip, cpu.clone());
         }
-        // Reaching the computation tells peers it is here, offered or not.
+        // Reaching the computation tells peers it is here, offered or not,
+        // and takes the frame's pace for a split.
         if self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && (self.offer_computation() || prepared.proof.splits() && self.offer_split())
+            && (self.offer_computation()
+                | (prepared.proof.splits() && self.offer_split(prepared.cost())))
             && prepared.worth_offering()
         {
             return Ok(Some(Run {

@@ -467,6 +467,28 @@ pub trait GuestExt: Guest {
 
 impl<G: Guest + ?Sized> GuestExt for G {}
 
+/// A frame's owner work at serial cost (PROC-MACH-1): so far, in the whole
+/// last frame, and the part splitting already saved, against the limit.
+/// The default has no limit: splitting saves all it can.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pace {
+    pub work_ns: u64,
+    pub last_ns: u64,
+    pub saved_ns: u64,
+    pub limit_ns: u64,
+}
+
+impl Pace {
+    /// What splitting a loop of serial `cost` ns should save: the frame's
+    /// expected work past the limit and what splitting already saved.
+    pub fn need(&self, cost: u64) -> u64 {
+        self.last_ns
+            .max(self.work_ns.saturating_add(cost))
+            .saturating_sub(self.limit_ns.saturating_add(self.saved_ns))
+            .min(cost)
+    }
+}
+
 pub trait TrapHandler {
     /// The current context reached a prepared computation: whether it
     /// should return to the scheduler, for a peer to run beside it.
@@ -485,11 +507,10 @@ pub trait TrapHandler {
         TrapAction::Continue
     }
 
-    /// The share of a frame's splittable loop work that running it in blocks
-    /// on other threads should save (A64-TR-9), 1 when a loop's blocks are
-    /// worth any idle thread, or 0 when the frame meets its deadline.
-    fn split_share(&self) -> f32 {
-        0.0
+    /// The frame's pace when a loop whose blocks split is reached
+    /// (PROC-MACH-1), or `None` when nothing may split.
+    fn pace(&self) -> Option<Pace> {
+        None
     }
 
     /// Shared service storage retained by the execution owner for this run.

@@ -481,7 +481,6 @@ impl Executor {
                 self.verifier.is_none() && bridge.handler.is_some(),
                 self.offered.take().filter(|&pc| pc == self.state.eip),
             );
-            native.split_share = bridge.handler.as_ref().map_or(0.0, |h| h.split_share());
             native.set_body_services(
                 bridge
                     .handler
