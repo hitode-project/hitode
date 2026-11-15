@@ -4,8 +4,8 @@
 //! Surface handles are borrowed only for the call, then released. A receiver
 //! retaining a window must acquire its own reference. Touch actions are Android
 //! DOWN (0), UP (1), MOVE (2), CANCEL (3), with coordinates in view pixels.
-//! Kotlin captures one Router target for the whole gesture. Before Tauri setup,
-//! new gestures belong to the webview; afterwards they use its OverlayState.
+//! Kotlin captures one Router target per pointer. Before Tauri setup,
+//! new presses belong to the webview; afterwards they use its OverlayState.
 //! `set_game_mode(app, active)` and `reveal_folder` call MainActivity on the
 //! webview thread.
 

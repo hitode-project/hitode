@@ -546,13 +546,15 @@ pub async fn set_touch_mode(window: WebviewWindow, mode: String) -> Result<(), S
 #[tauri::command]
 pub async fn game_mouse_button(
     window: WebviewWindow,
-    right: bool,
+    right: Option<bool>,
+    button: Option<u8>,
     down: bool,
 ) -> Result<(), String> {
+    let code = button.unwrap_or(if right.unwrap_or(false) { 1 } else { 0 });
     on_ui(window.app_handle(), move || {
         HOST.with_borrow(|host| {
             let view = host.view.as_ref().ok_or("no game is running")?;
-            view.mouse_button(right, down);
+            view.mouse_button_code(code, down);
             Ok(())
         })
     })

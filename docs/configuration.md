@@ -44,6 +44,7 @@ Automatic update checks default to on (`autoCheckUpdates`). The launcher checks 
 On iOS, JIT warnings are shown by default; "Don't remind me again" on the library banner persistently hides both the banner and game-launch warnings (`hideJitWarnings`).
 LiveContainer folder-import guidance is shown once and records `liveContainerImportHintSeen` when displayed.
 On mobile, `hideControls` hides persistent in-game touch controls and the pull handle while playing (default off, leaving the pause menu reachable via system back on Android or left/right screen-edge swipes on iOS); its first display records `hideControlsHintSeen`.
+Reusable mobile custom key layouts (opacity, auto-dim, per-key scale, hold/toggle mode and 4-way/8-way D-pads) and per-game layout selections use `adv-launcher.key-layouts` (default off, using the standard touch controls); an active custom layout hides the default sidebars and pull handle.
 Both JIT and mobile guidance choices use `adv-launcher.prefs` and survive launcher restarts.
 
 The import page lists VNDB candidates for the game and links only the one the user picks; the default is no link. Searching accepts names, `v` identifiers and VNDB visual novel links, ten candidates per page.
