@@ -706,6 +706,7 @@ pub(crate) fn bind_relocated(
     else {
         return;
     };
+    identity::note_read_path(cpu, ext, &module);
     let bodies = BODIES
         .iter()
         .chain(dib::BODIES)

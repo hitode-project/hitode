@@ -81,6 +81,16 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Partial rendering MUST return `VFW_S_PARTIAL_RENDER` with a capability warning. Generic external-splitter readers and unsupported filter automation objects MUST fail explicitly.
 **Verification**: Review — existing rollback tests do not cover partial-render warnings and both unsupported automation boundaries.
 
+### MEDIA-GRAPH-8 Virtualized file contents
+
+**Rule**: File sources MUST read the host descriptor only while the guest's read path keeps its mapped entry bytes. The read path is kernelbase ReadFile and ntdll NtReadFile. Once guest code hooks it, as file virtualizers do, the contents MUST come through the guest's ReadFile.
+**Verification**: Test
+
+### MEDIA-GRAPH-9 Event timeouts
+
+**Rule**: GetEvent MUST zero the event code before it waits, so a timeout returns `E_ABORT` with code zero.
+**Verification**: Test
+
 ## Stream delivery
 
 ### MEDIA-STREAM-1 Pull delivery

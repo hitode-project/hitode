@@ -1,15 +1,15 @@
 //! Native media fronts, with Wine kept under separate names for other exports
 //! and classes. Files still open through Wine and retain its sharing lock.
 use std::fs::File;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use adv_abi::dll::{Export, Import, ModuleImage};
 use adv_abi::{Conv, Registry};
-use adv_cpu::backend::Backend;
-use adv_device::media::Decoder;
+use adv_cpu::backend::{Backend, GuestExt};
+use adv_device::media::{Decoder, ReadSeek};
 use adv_device::surface::SurfaceStore;
 use adv_machine::{Env, Machine, Outcome, Wait};
 use adv_nt::process::{module_base, module_export};
@@ -212,7 +212,12 @@ fn close(env: &mut Env<'_>, handle: u32) {
     let _ = adv_nt::server::close(env, handle);
 }
 
-type FileOpened = Box<dyn FnOnce(&mut Env<'_>, Result<(File, u32), u32>) -> Outcome>;
+type Contents = Box<dyn ReadSeek>;
+type FileOpened = Box<dyn FnOnce(&mut Env<'_>, Result<(Contents, u32), u32>) -> Outcome>;
+/// Opens `filename` as the guest does. Its contents come from the host
+/// descriptor, unless guest code hooked the file read path: a file
+/// virtualizer answers reads of a placeholder handle itself, so the
+/// contents are then read through the guest's ReadFile.
 fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
     let target = match export(env, "kernel32.dll", "CreateFileW") {
         Ok(target) => target,
@@ -226,6 +231,9 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
             if handle == u32::MAX {
                 return then(env, Err(0x8004_0216));
             }
+            if adv_nt::identity::reads_hooked(env.cpu, env.ext) {
+                return guest_contents(env, handle, then);
+            }
             let result = adv_nt::server::handle_fd(env, handle)
                 .map_err(|_| 0x8000_4005u32)
                 .and_then(|fd| {
@@ -233,7 +241,7 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
                     let fd = unsafe { BorrowedFd::borrow_raw(fd.fd) }
                         .try_clone_to_owned()
                         .map_err(|_| 0x8000_4005u32)?;
-                    Ok((File::from(fd), handle))
+                    Ok((Box::new(File::from(fd)) as Contents, handle))
                 });
             if result.is_err() {
                 close(env, handle);
@@ -241,6 +249,45 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
             then(env, result)
         },
     )
+}
+
+/// Bytes each guest ReadFile reads.
+const CHUNK: u32 = 4 << 20;
+fn guest_contents(env: &mut Env<'_>, handle: u32, then: FileOpened) -> Outcome {
+    let read = match export(env, "kernel32.dll", "ReadFile") {
+        Ok(read) => read,
+        Err(error) => return Outcome::Fail(error),
+    };
+    // The chunk, then the count ReadFile writes.
+    let Some(buffer) = (super::allocator().allocate)(env, CHUNK + 4) else {
+        close(env, handle);
+        return then(env, Err(0x8007_000e));
+    };
+    read_chunks(read, handle, buffer, Vec::new(), then)
+}
+fn read_chunks(
+    read: u32,
+    handle: u32,
+    buffer: u32,
+    mut bytes: Vec<u8>,
+    then: FileOpened,
+) -> Outcome {
+    let args = [handle, buffer, CHUNK, buffer + CHUNK, 0];
+    Outcome::call(read, args, move |env, result| {
+        let count = env.cpu.read_u32(buffer + CHUNK).unwrap_or(0) as usize;
+        let start = bytes.len();
+        bytes.resize(start + count, 0);
+        let copied = env.cpu.read(buffer, &mut bytes[start..]).is_ok();
+        if result.value() != 0 && copied && count != 0 {
+            return read_chunks(read, handle, buffer, bytes, then);
+        }
+        (super::allocator().free)(env, buffer);
+        if result.value() == 0 || !copied {
+            close(env, handle);
+            return then(env, Err(0x8000_4005));
+        }
+        then(env, Ok((Box::new(Cursor::new(bytes)), handle)))
+    })
 }
 
 fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcome {

@@ -875,6 +875,8 @@ fn deadline(env: &Env<'_>, timeout: u32) -> Option<u64> {
 }
 
 fn get_event(env: &mut Env<'_>, graph: u32, outputs: [u32; 3], timeout: u32) -> Outcome {
+    // A timeout leaves no event code; callers preset one and test it.
+    let _ = env.cpu.write_u32(outputs[0], 0);
     let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
         return Outcome::Return(E_ABORT);
     };
