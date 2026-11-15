@@ -44,6 +44,9 @@ wine.mkdir()
 for name in ['COPYING.LIB', 'LICENSE', 'AUTHORS']:
     shutil.copy2(WINE_SOURCE / name, wine / name)
 shutil.copy2(ROOT / 'vendor/wine/NOTICE', wine / 'NOTICE')
+(wine / 'patches').mkdir()
+for patch in sorted((ROOT / 'tools/wine/patches').glob('*.patch')):
+    shutil.copy2(patch, wine / 'patches' / patch.name)
 for lib in sorted((WINE_SOURCE / 'libs').iterdir()):
     texts = [f for f in lib.iterdir() if f.is_file()
              and f.name.upper().split('.')[0] in {'LICENSE', 'LICENSE_LLVM', 'COPYING', 'COPYRIGHT', 'AUTHORS'}]
@@ -53,7 +56,7 @@ for lib in sorted((WINE_SOURCE / 'libs').iterdir()):
 sources.append({'name': 'wine', 'versionInfo': '11.0', 'license': 'LGPL-2.1-or-later',
                 'downloadLocation': 'https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz',
                 'sha256': 'c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701',
-                'configuration': 'tools/wine/build-media.sh'})
+                'configuration': 'tools/wine/build-media.sh', 'patches': 'tools/wine/patches'})
 
 (out / 'freetype').mkdir()
 for name in ['LICENSE.TXT', 'FTL.TXT', 'GPLv2.TXT']:
@@ -111,9 +114,10 @@ for name in ['svelte', '@tauri-apps/api']:
     f'Its complete source is the v{VERSION} tag of https://github.com/hitode-project/hitode.\n'
     'This archive holds the license texts of the bundled components; dependencies.json lists\n'
     'their exact versions and source locations.\n'
-    'The packages embed an unmodified Wine 11.0 build (LGPL-2.1-or-later). Its source,\n'
-    'wine-11.0.tar.xz, is attached to the same release; tools/wine/build-media.sh in the\n'
-    'Hitode source records how it is configured and built. Wine loads FreeType 2.13.3\n'
+    'The packages embed a Wine 11.0 build (LGPL-2.1-or-later). Its source, wine-11.0.tar.xz,\n'
+    'is attached to the same release; the patches applied to it are in wine/patches/, and\n'
+    'tools/wine/build-media.sh in the Hitode source records how it is configured and built.\n'
+    'Wine loads FreeType 2.13.3\n'
     '(FreeType License, see freetype/) for font rendering.\n'
     'The Android app also contains AndroidX and Kotlin standard libraries (Apache-2.0),\n'
     'fetched by Gradle as recorded in the source tree.\n')

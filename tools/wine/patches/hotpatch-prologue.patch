@@ -1,0 +1,45 @@
+include: give every WINAPI function of a Wine PE module the hot-patch prologue
+
+Windows builds its system DLLs with /hotpatch, so every exported function
+starts with mov edi,edi; push ebp; mov ebp,esp: five bytes of whole
+instructions. Inline hooks rely on it: they copy the first five bytes into
+a trampoline and overwrite them with a jump. Wine marks only some functions
+DECLSPEC_HOTPATCH. In the others the fifth byte can fall inside an
+instruction, and the trampoline then runs the rest of it as code. A
+localization patch that hooks gdi32's CreateFontA crashes this way.
+
+On i386, WINAPI and WINAPIV functions of Wine's PE modules now carry
+ms_hook_prologue, which also places 16 bytes of int3 padding before each
+function, as Windows does. Unix libraries and other targets are unchanged.
+
+--- a/include/minwindef.h
++++ b/include/minwindef.h
+@@ -154,7 +154,14 @@
+ #endif
+ 
+ #define CALLBACK    __stdcall
+-#define WINAPI      __stdcall
++#if defined(__WINESRC__) && !defined(WINE_UNIX_LIB) && defined(__i386__) && defined(__GNUC__)
++/* Like the functions of Windows' system DLLs, every WINAPI function of a
++ * Wine PE module starts with the hot-patch prologue. Applied to a function
++ * pointer type, the attribute is ignored with a warning. */
++# define WINAPI     __stdcall __attribute__((__ms_hook_prologue__))
++#else
++# define WINAPI     __stdcall
++#endif
+ #define APIPRIVATE  __stdcall
+ #define PASCAL      __stdcall
+ #define CDECL       __cdecl
+@@ -162,7 +169,11 @@
+ #define APIENTRY    WINAPI
+ #define CONST       __ONLY_IN_WINELIB(const)
+ #ifndef WINAPIV
+-# define WINAPIV CDECL
++# if defined(__WINESRC__) && !defined(WINE_UNIX_LIB) && defined(__i386__) && defined(__GNUC__)
++#  define WINAPIV CDECL __attribute__((__ms_hook_prologue__))
++# else
++#  define WINAPIV CDECL
++# endif
+ #endif
+ 
+ /* Misc. constants. */

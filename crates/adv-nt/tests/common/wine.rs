@@ -45,6 +45,18 @@ pub fn debug_dist() -> Option<PathBuf> {
     Some(debug)
 }
 
+/// The RVA the identity table of `module` in `dist` gives the data symbol
+/// `name`, as native bodies resolve it at bind time.
+pub fn variable(dist: &Path, module: &str, name: &str) -> Option<u32> {
+    let table = dist.join(format!("share/hitode/identity/{module}.tsv"));
+    std::fs::read_to_string(&table)
+        .unwrap_or_else(|error| panic!("{}: {error}", table.display()))
+        .lines()
+        .filter_map(|row| row.split_once('\t'))
+        .find(|(_, symbol)| *symbol == name)
+        .map(|(rva, _)| u32::from_str_radix(rva, 16).unwrap())
+}
+
 /// The installation and the probes built from the current sources.
 pub struct Wine {
     pub dist: PathBuf,

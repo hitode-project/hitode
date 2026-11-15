@@ -1,0 +1,35 @@
+dwrite: key glyph bitmaps by rendering mode and round bitmap origins
+
+DirectWrite on Windows keeps the glyph bitmaps of different rendering modes
+apart and places run bitmaps on whole pixel rows, rounding each glyph's
+vertical origin to the nearest pixel with halves toward positive infinity
+(WINE-UNIX-7). Wine's glyph cache keys every bitmap with the natural
+measuring mode, so an aliased and an antialiased analysis of one glyph
+share whichever bitmap came first, and its analyses keep fractional
+vertical origins.
+
+Both behaviours are decided inside dwrite's own C code, so the fix belongs
+there: patching the built module's bytes at load time ties the fix to one
+build's code layout and breaks whenever the module is rebuilt.
+
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -196,7 +196,7 @@
+ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface, DWRITE_RENDERING_MODE1 rendering_mode,
+         unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
+ {
+-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL };
++    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = rendering_mode };
+     struct get_glyph_bitmap_params params;
+     const RECT *bbox = &bitmap->bbox;
+     unsigned int bitmap_size, _1bpp;
+@@ -6223,6 +6223,9 @@
+         for (i = 0; i < desc->run->glyphCount; ++i)
+             transform_point(&analysis->origins[i], &analysis->m);
+     }
++    /* Bitmaps sit on whole pixel rows, half pixels rounded down the page. */
++    for (i = 0; i < desc->run->glyphCount; ++i)
++        analysis->origins[i].y = floor(analysis->origins[i].y + 0.5);
+ 
+     *ret = &analysis->IDWriteGlyphRunAnalysis_iface;
+     return S_OK;

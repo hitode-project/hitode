@@ -3,10 +3,12 @@
 //! `tools/wine/identity.py` writes a table for every module of the Wine
 //! distribution to `share/hitode/identity/<module>.tsv`: a hash of the
 //! image's headers, then each function's RVA, size, a hash of its bytes
-//! with relocations masked, and its name. A mapped image whose
+//! with relocations masked, and its name. The RVA and name of each data
+//! symbol with a unique name follow, so native code finds Wine's data by
+//! name instead of pinning addresses. A mapped image whose
 //! headers hash to the table's is that build, so its addresses name
-//! functions and its functions can be found by name. Tables load on first
-//! use and are shared by every process.
+//! functions and its functions and data can be found by name. Tables load on
+//! first use and are shared by every process.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -30,26 +32,36 @@ pub struct Table {
     pub header: u64,
     /// By RVA.
     pub functions: Vec<Function>,
+    /// Data symbol RVAs, by name.
+    pub variables: HashMap<Box<str>, u32>,
 }
 
 impl Table {
     fn parse(text: &str) -> Option<Self> {
         let mut lines = text.lines();
         let header = u64::from_str_radix(lines.next()?, 16).ok()?;
-        let functions = lines
-            .map(|line| {
-                let mut fields = line.splitn(4, '\t');
-                let mut hex = || u32::from_str_radix(fields.next()?, 16).ok();
-                let (rva, size, hash) = (hex()?, hex()?, hex()?);
-                Some(Function {
-                    rva,
-                    size,
-                    hash,
-                    name: fields.next()?.into(),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self { header, functions })
+        let (mut functions, mut variables) = (Vec::new(), HashMap::new());
+        for line in lines {
+            let fields: Vec<_> = line.splitn(4, '\t').collect();
+            let hex = |field: &str| u32::from_str_radix(field, 16).ok();
+            match fields[..] {
+                [rva, size, hash, name] => functions.push(Function {
+                    rva: hex(rva)?,
+                    size: hex(size)?,
+                    hash: hex(hash)?,
+                    name: name.into(),
+                }),
+                [rva, name] => {
+                    variables.insert(name.into(), hex(rva)?);
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            header,
+            functions,
+            variables,
+        })
     }
 
     /// The function containing `rva`.
@@ -61,6 +73,11 @@ impl Table {
 
     pub fn named(&self, name: &str) -> Option<&Function> {
         self.functions.iter().find(|f| &*f.name == name)
+    }
+
+    /// The RVA of the data symbol `name`.
+    pub fn variable(&self, name: &str) -> Option<u32> {
+        self.variables.get(name).copied()
     }
 }
 
@@ -247,7 +264,11 @@ mod tests {
     #[test]
     fn tables_name_addresses_inside_functions() {
         let table =
-            Table::parse("00000000000000ff\n1000\t20\t1\tfirst\n1040\t8\t2\tsecond\n").unwrap();
+            Table::parse("00000000000000ff\n1000\t20\t1\tfirst\n1040\t8\t2\tsecond\n2000\tdatum\n")
+                .unwrap();
+        assert_eq!(table.variable("datum"), Some(0x2000));
+        assert_eq!(table.variable("first"), None);
+        assert!(table.at(0x2000).is_none());
         assert_eq!(table.header, 0xff);
         assert_eq!(table.at(0x101f).map(|f| &*f.name), Some("first"));
         assert!(table.at(0x1020).is_none());

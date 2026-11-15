@@ -6,6 +6,44 @@ use adv_machine::Conv;
 mod layout;
 use layout::{dib as d, *};
 
+data_layout! {
+    "DIB";
+    "win32u.so" => [funcs_8888, funcs_32, funcs_24, funcs_555, funcs_16, funcs_8, funcs_4, funcs_1, table_1, table_4, table_8],
+}
+
+/// The primitive table a dib_info points at, which fixes its pixel format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Funcs8888,
+    Funcs32,
+    Funcs24,
+    Funcs555,
+    Funcs16,
+    Funcs8,
+    Funcs4,
+    Funcs1,
+    Other,
+}
+use Kind::*;
+impl Kind {
+    fn of(rva: u32) -> Self {
+        let l = layout();
+        [
+            (l.funcs_8888, Funcs8888),
+            (l.funcs_32, Funcs32),
+            (l.funcs_24, Funcs24),
+            (l.funcs_555, Funcs555),
+            (l.funcs_16, Funcs16),
+            (l.funcs_8, Funcs8),
+            (l.funcs_4, Funcs4),
+            (l.funcs_1, Funcs1),
+        ]
+        .into_iter()
+        .find_map(|(at, kind)| (at == rva).then_some(kind))
+        .unwrap_or(Other)
+    }
+}
+
 struct Access<'a, M: Mem> {
     mem: &'a mut M,
     stop: Option<Stop>,
@@ -34,7 +72,7 @@ struct Args<'a, M: Mem> {
     args: [u32; 7],
     base: u32,
     bpp: u32,
-    kind: u32,
+    kind: Kind,
 }
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -203,26 +241,26 @@ macro_rules! bodies {
     };
 }
 bodies! {
-    solid_rects, 5 => [solid_rects_32: 32, FUNCS_32; solid_rects_24: 24, FUNCS_24; solid_rects_16: 16, FUNCS_16];
-    solid_line, 5 => [solid_line_32: 32, FUNCS_32; solid_line_24: 24, FUNCS_24; solid_line_16: 16, FUNCS_16];
-    pattern_rects, 6 => [pattern_rects_32: 32, FUNCS_32; pattern_rects_24: 24, FUNCS_24; pattern_rects_16: 16, FUNCS_16];
-    copy_rect, 6 => [copy_rect_32: 32, FUNCS_32; copy_rect_24: 24, FUNCS_24; copy_rect_16: 16, FUNCS_16];
-    blend_rects, 6 => [blend_rects_8888: 32, FUNCS_8888; blend_rects_32: 32, FUNCS_32; blend_rects_24: 24, FUNCS_24; blend_rects_555: 16, FUNCS_555; blend_rects_16: 16, FUNCS_16];
-    gradient_rect, 4 => [gradient_rect_8888: 32, FUNCS_8888; gradient_rect_32: 32, FUNCS_32; gradient_rect_24: 24, FUNCS_24; gradient_rect_555: 16, FUNCS_555; gradient_rect_16: 16, FUNCS_16];
-    mask_rect, 5 => [mask_rect_32: 32, FUNCS_32; mask_rect_24: 24, FUNCS_24; mask_rect_16: 16, FUNCS_16];
-    draw_glyph, 6 => [draw_glyph_8888: 32, FUNCS_8888; draw_glyph_32: 32, FUNCS_32; draw_glyph_24: 24, FUNCS_24; draw_glyph_555: 16, FUNCS_555; draw_glyph_16: 16, FUNCS_16];
-    draw_subpixel_glyph, 6 => [draw_subpixel_glyph_8888: 32, FUNCS_8888; draw_subpixel_glyph_32: 32, FUNCS_32; draw_subpixel_glyph_24: 24, FUNCS_24; draw_subpixel_glyph_555: 16, FUNCS_555; draw_subpixel_glyph_16: 16, FUNCS_16];
-    stretch_row, 7 => [stretch_row_32: 32, FUNCS_32; stretch_row_24: 24, FUNCS_24; stretch_row_16: 16, FUNCS_16];
-    shrink_row, 7 => [shrink_row_32: 32, FUNCS_32; shrink_row_24: 24, FUNCS_24; shrink_row_16: 16, FUNCS_16];
-    convert_to, 4 => [convert_to_8888: 32, FUNCS_8888; convert_to_32: 32, FUNCS_32; convert_to_24: 24, FUNCS_24; convert_to_555: 16, FUNCS_555; convert_to_16: 16, FUNCS_16; convert_to_8: 8, FUNCS_8; convert_to_4: 4, FUNCS_4; convert_to_1: 1, FUNCS_1];
-    halftone, 4 => [halftone_888: 32, FUNCS_8888; halftone_32: 32, FUNCS_32; halftone_24: 24, FUNCS_24; halftone_555: 16, FUNCS_555; halftone_16: 16, FUNCS_16];
+    solid_rects, 5 => [solid_rects_32: 32, Funcs32; solid_rects_24: 24, Funcs24; solid_rects_16: 16, Funcs16];
+    solid_line, 5 => [solid_line_32: 32, Funcs32; solid_line_24: 24, Funcs24; solid_line_16: 16, Funcs16];
+    pattern_rects, 6 => [pattern_rects_32: 32, Funcs32; pattern_rects_24: 24, Funcs24; pattern_rects_16: 16, Funcs16];
+    copy_rect, 6 => [copy_rect_32: 32, Funcs32; copy_rect_24: 24, Funcs24; copy_rect_16: 16, Funcs16];
+    blend_rects, 6 => [blend_rects_8888: 32, Funcs8888; blend_rects_32: 32, Funcs32; blend_rects_24: 24, Funcs24; blend_rects_555: 16, Funcs555; blend_rects_16: 16, Funcs16];
+    gradient_rect, 4 => [gradient_rect_8888: 32, Funcs8888; gradient_rect_32: 32, Funcs32; gradient_rect_24: 24, Funcs24; gradient_rect_555: 16, Funcs555; gradient_rect_16: 16, Funcs16];
+    mask_rect, 5 => [mask_rect_32: 32, Funcs32; mask_rect_24: 24, Funcs24; mask_rect_16: 16, Funcs16];
+    draw_glyph, 6 => [draw_glyph_8888: 32, Funcs8888; draw_glyph_32: 32, Funcs32; draw_glyph_24: 24, Funcs24; draw_glyph_555: 16, Funcs555; draw_glyph_16: 16, Funcs16];
+    draw_subpixel_glyph, 6 => [draw_subpixel_glyph_8888: 32, Funcs8888; draw_subpixel_glyph_32: 32, Funcs32; draw_subpixel_glyph_24: 24, Funcs24; draw_subpixel_glyph_555: 16, Funcs555; draw_subpixel_glyph_16: 16, Funcs16];
+    stretch_row, 7 => [stretch_row_32: 32, Funcs32; stretch_row_24: 24, Funcs24; stretch_row_16: 16, Funcs16];
+    shrink_row, 7 => [shrink_row_32: 32, Funcs32; shrink_row_24: 24, Funcs24; shrink_row_16: 16, Funcs16];
+    convert_to, 4 => [convert_to_8888: 32, Funcs8888; convert_to_32: 32, Funcs32; convert_to_24: 24, Funcs24; convert_to_555: 16, Funcs555; convert_to_16: 16, Funcs16; convert_to_8: 8, Funcs8; convert_to_4: 4, Funcs4; convert_to_1: 1, Funcs1];
+    halftone, 4 => [halftone_888: 32, Funcs8888; halftone_32: 32, Funcs32; halftone_24: 24, Funcs24; halftone_555: 16, Funcs555; halftone_16: 16, Funcs16];
 }
 
 #[derive(Clone)]
 struct Dib {
     bpp: u32,
     pixel_bpp: u32,
-    kind: u32,
+    kind: Kind,
     width: i32,
     height: i32,
     left: i32,
@@ -240,7 +278,7 @@ impl Dib {
     fn read(cpu: &mut Access<'_, impl Mem>, at: u32, base: u32) -> Option<Self> {
         let mut bytes = [0; d::SIZE];
         read_into(cpu, at, &mut bytes)?;
-        let kind = word(&bytes, d::funcs).wrapping_sub(base);
+        let kind = Kind::of(word(&bytes, d::funcs).wrapping_sub(base));
         Some(Self {
             bpp: word(&bytes, d::bit_count),
             pixel_bpp: word(&bytes, d::bit_count),
@@ -424,9 +462,9 @@ impl Dib {
         mem.load(at, len, writable)
     }
     fn rgb(&self, pixel: u32) -> [u32; 3] {
-        if self.kind == FUNCS_8888 || self.kind == FUNCS_24 {
+        if self.kind == Funcs8888 || self.kind == Funcs24 {
             [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255]
-        } else if self.kind == FUNCS_555 {
+        } else if self.kind == Funcs555 {
             [
                 ((pixel >> 7) & 248) | ((pixel >> 12) & 7),
                 ((pixel >> 2) & 248) | ((pixel >> 7) & 7),
@@ -437,9 +475,9 @@ impl Dib {
         }
     }
     fn pack(&self, rgb: [u32; 3]) -> u32 {
-        if self.kind == FUNCS_8888 || self.kind == FUNCS_24 {
+        if self.kind == Funcs8888 || self.kind == Funcs24 {
             (rgb[0] & 255) << 16 | (rgb[1] & 255) << 8 | (rgb[2] & 255)
-        } else if self.kind == FUNCS_555 {
+        } else if self.kind == Funcs555 {
             ((rgb[0] << 7) & 0x7c00) | ((rgb[1] << 2) & 0x3e0) | ((rgb[2] >> 3) & 31)
         } else {
             (0..3).fold(0, |p, i| {
@@ -453,9 +491,9 @@ impl Dib {
         } else {
             (
                 match self.bpp {
-                    1 => base.wrapping_add(TABLE_1),
-                    4 => base.wrapping_add(TABLE_4),
-                    8 => base.wrapping_add(TABLE_8),
+                    1 => base.wrapping_add(layout().table_1),
+                    4 => base.wrapping_add(layout().table_4),
+                    8 => base.wrapping_add(layout().table_8),
                     _ => 0,
                 },
                 1u32.wrapping_shl(self.bpp),
@@ -1044,7 +1082,7 @@ fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
             continue;
         }
         for y in t..b {
-            if dst.kind == FUNCS_8888 {
+            if dst.kind == Funcs8888 {
                 let da = dst.at(l, y);
                 let sa = src.at(l.wrapping_add(sx), y.wrapping_add(sy));
                 let len = width.wrapping_mul(4) as u32 as usize;
@@ -1062,7 +1100,7 @@ fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                 let at = dst.at(x, y);
                 let d = mem.pixel(at, dst.size())?;
                 let rgb = dst.rgb(d);
-                let out = if dst.kind == FUNCS_8888 {
+                let out = if dst.kind == Funcs8888 {
                     blend_8888_pixel(d, s, alpha, src_alpha, src.compression)
                 } else if src_alpha {
                     let a = ((s >> 24) * alpha + 127) / 255;
@@ -1077,7 +1115,7 @@ fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                         | blend_color(rgb[1], s >> 8, alpha) << 8
                         | blend_color(rgb[0], s >> 16, alpha) << 16
                 };
-                let out = if dst.kind == FUNCS_8888 {
+                let out = if dst.kind == Funcs8888 {
                     out
                 } else {
                     dst.pack([(out >> 16) & 255, (out >> 8) & 255, out & 255])
@@ -1223,7 +1261,7 @@ fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
             } else {
                 let value = dst.pack(std::array::from_fn(|i| (c[i] / 256) as u8 as u32));
                 value
-                    | if dst.kind == FUNCS_8888 {
+                    | if dst.kind == Funcs8888 {
                         ((c[3] / 256) as u8 as u32) << 24
                     } else {
                         0
@@ -1450,11 +1488,11 @@ fn bayer16(x: i32, y: i32) -> u32 {
 type Row = fn(&[u8], &mut [u8], &Dib, &Dib);
 fn row_kernel(src: &Dib, dst: &Dib) -> Option<Row> {
     let index = |kind| match kind {
-        FUNCS_8888 => Some(0),
-        FUNCS_24 => Some(1),
-        FUNCS_555 => Some(2),
-        FUNCS_32 => Some(3),
-        FUNCS_16 => Some(4),
+        Funcs8888 => Some(0),
+        Funcs24 => Some(1),
+        Funcs555 => Some(2),
+        Funcs32 => Some(3),
+        Funcs16 => Some(4),
         _ => None,
     };
     macro_rules! targets {
@@ -1607,12 +1645,12 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     } else {
         0
     };
-    let raw = (dst.kind == FUNCS_8888 && src.kind == FUNCS_8888)
-        || (dst.kind == FUNCS_24 && src.kind == FUNCS_24)
-        || (dst.kind == FUNCS_555 && src.kind == FUNCS_555)
-        || (matches!(dst.kind, FUNCS_32 | FUNCS_16)
-            && src.kind != FUNCS_8888
-            && src.kind != FUNCS_555
+    let raw = (dst.kind == Funcs8888 && src.kind == Funcs8888)
+        || (dst.kind == Funcs24 && src.kind == Funcs24)
+        || (dst.kind == Funcs555 && src.kind == Funcs555)
+        || (matches!(dst.kind, Funcs32 | Funcs16)
+            && src.kind != Funcs8888
+            && src.kind != Funcs555
             && src.bpp == dst.pixel_bpp
             && src.masks == dst.masks);
     let same_palette = if src.bpp <= 8 && src.bpp == dst.pixel_bpp {

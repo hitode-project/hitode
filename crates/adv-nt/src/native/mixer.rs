@@ -129,7 +129,7 @@ pub(super) fn prepare(
     let prepared = Prepared {
         nt,
         entry,
-        fir: module.base + FIR_RVA,
+        fir: module.base + table.variable("fir").ok_or("missing mixer FIR table")?,
         get,
         put,
         malloc,
