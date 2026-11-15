@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import { call } from "../lib/bridge";
   import { device } from "../lib/device.svelte";
@@ -176,35 +176,40 @@
   $effect(() => {
     const _pid = profile.id;
     const _edit = editing;
-    releaseAllActive();
-    if (_edit) {
-      tempCollapsed = false;
-      idleDim = false;
-      if (idleTimer !== undefined) {
-        clearTimeout(idleTimer);
-        idleTimer = undefined;
+    untrack(() => {
+      releaseAllActive();
+      if (_edit) {
+        tempCollapsed = false;
+        idleDim = false;
+        if (idleTimer !== undefined) {
+          clearTimeout(idleTimer);
+          idleTimer = undefined;
+        }
+      } else {
+        selectedId = null;
+        topPopover = null;
+        forkOpen = false;
+        guideX = null;
+        guideY = null;
+        bumpActivity();
       }
-    } else {
-      selectedId = null;
-      topPopover = null;
-      forkOpen = false;
-      guideX = null;
-      guideY = null;
-      bumpActivity();
-    }
+    });
     void _pid;
   });
 
   $effect(() => {
-    if (anyActiveInput || !profile.autoDim || editing || tempCollapsed) {
-      idleDim = false;
-      if (idleTimer !== undefined) {
-        clearTimeout(idleTimer);
-        idleTimer = undefined;
+    const stop = anyActiveInput || !profile.autoDim || editing || tempCollapsed;
+    untrack(() => {
+      if (stop) {
+        idleDim = false;
+        if (idleTimer !== undefined) {
+          clearTimeout(idleTimer);
+          idleTimer = undefined;
+        }
+      } else {
+        bumpActivity();
       }
-    } else {
-      bumpActivity();
-    }
+    });
   });
 
   onDestroy(() => {
