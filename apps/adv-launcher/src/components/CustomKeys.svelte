@@ -60,9 +60,17 @@
   let idleDim = $state(false);
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
+  interface DpadKnob {
+    x: number;
+    y: number;
+    active: boolean;
+  }
+  const IDLE_KNOB: DpadKnob = { x: 0, y: 0, active: false };
+
   let heldCounts = $state<Record<string, number>>({});
   let latchedIds = $state<Record<string, boolean>>({});
   let dpadStates = $state<Record<string, DpadState>>({});
+  let dpadKnobs = $state<Record<string, DpadKnob>>({});
   const pointerItem = new Map<number, string>();
   const dpadPointer = new Map<string, number>();
 
@@ -139,12 +147,14 @@
     if (Object.keys(heldCounts).length) heldCounts = {};
     if (Object.keys(latchedIds).length) latchedIds = {};
     if (Object.keys(dpadStates).length) dpadStates = {};
+    if (Object.keys(dpadKnobs).length) dpadKnobs = {};
   }
 
   const anyActiveInput = $derived(
     Object.values(heldCounts).some((n) => n > 0) ||
       Object.values(latchedIds).some(Boolean) ||
-      Object.values(dpadStates).some((s) => s.up || s.down || s.left || s.right),
+      Object.values(dpadStates).some((s) => s.up || s.down || s.left || s.right) ||
+      Object.values(dpadKnobs).some((k) => k.active),
   );
 
   function bumpActivity() {
@@ -325,9 +335,17 @@
   }
 
   function applyDpadVector(item: DpadItem, clientX: number, clientY: number) {
-    const { cx, cy } = itemCenter(item, bounds);
+    const { cx, cy, width } = itemCenter(item, bounds);
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    const maxTravel = Math.max(16, width * 0.22);
+    const dist = Math.hypot(dx, dy);
+    const kx = dist > maxTravel ? (dx / dist) * maxTravel : dx;
+    const ky = dist > maxTravel ? (dy / dist) * maxTravel : dy;
+    dpadKnobs = { ...dpadKnobs, [item.id]: { x: kx, y: ky, active: true } };
+
     const deadzone = Math.max(10, Math.round(13 * item.scale));
-    const next = dpadDirections(clientX - cx, clientY - cy, deadzone, item.eightWay);
+    const next = dpadDirections(dx, dy, deadzone, item.eightWay);
     const prev = dpadStates[item.id] ?? IDLE_DPAD;
     if (
       prev.up === next.up &&
@@ -355,6 +373,7 @@
     if (prev.left) void call("game_key", { key: vks.left, down: false }, null).catch(() => {});
     if (prev.right) void call("game_key", { key: vks.right, down: false }, null).catch(() => {});
     dpadStates = { ...dpadStates, [item.id]: IDLE_DPAD };
+    dpadKnobs = { ...dpadKnobs, [item.id]: IDLE_KNOB };
     bumpActivity();
   }
 
@@ -588,7 +607,7 @@
     const { cx, cy, width, height } = itemCenter(selectedItem, bounds);
     const screenW = layout?.width ?? vw;
     const screenH = layout?.height ?? vh;
-    const popW = Math.min(selectedItem.type === "key" ? 384 : 288, Math.max(240, screenW - 20));
+    const popW = Math.min(selectedItem.type === "key" ? 384 : 328, Math.max(240, screenW - 20));
     const popH = selectedItem.type === "key" ? gridMaxHeight + 140 : 138;
     const gap = 10;
     const minTop = Math.max(54, bounds.y + 46);
@@ -654,10 +673,13 @@
   {/if}
 {/snippet}
 
-{#snippet dpadFace(item: DpadItem, st: DpadState)}
+{#snippet dpadFace(item: DpadItem, st: DpadState, knob: DpadKnob, size: number)}
   {@const labels = item.bind === "wasd" ? ["W", "D", "S", "A"] : item.bind === "numpad" ? ["8", "6", "2", "4"] : null}
+  {@const sx = size > 0 ? (knob.x / size) * 120 : 0}
+  {@const sy = size > 0 ? (knob.y / size) * 120 : 0}
   <svg viewBox="0 0 120 120" width="100%" height="100%" aria-hidden="true">
     <circle cx="60" cy="60" r="56" class="dp-ring" />
+    <circle cx="60" cy="60" r="19" class="dp-well" />
     {#if item.eightWay}
       <line x1="29" y1="29" x2="35" y2="35" class="dp-diag" class:on={st.up && st.left} />
       <line x1="91" y1="29" x2="85" y2="35" class="dp-diag" class:on={st.up && st.right} />
@@ -666,34 +688,42 @@
     {/if}
     <g class="dp-dir" class:on={st.up}>
       {#if labels}
-        <text x="60" y="25" text-anchor="middle" dominant-baseline="central">{labels[0]}</text>
+        <text x="60" y="23" text-anchor="middle" dominant-baseline="central">{labels[0]}</text>
       {:else}
-        <path d="M53 27L60 19L67 27" />
+        <path d="M53 25L60 17L67 25" />
       {/if}
     </g>
     <g class="dp-dir" class:on={st.right}>
       {#if labels}
-        <text x="95" y="60" text-anchor="middle" dominant-baseline="central">{labels[1]}</text>
+        <text x="97" y="60" text-anchor="middle" dominant-baseline="central">{labels[1]}</text>
       {:else}
-        <path d="M93 53L101 60L93 67" />
+        <path d="M95 53L103 60L95 67" />
       {/if}
     </g>
     <g class="dp-dir" class:on={st.down}>
       {#if labels}
-        <text x="60" y="95" text-anchor="middle" dominant-baseline="central">{labels[2]}</text>
+        <text x="60" y="97" text-anchor="middle" dominant-baseline="central">{labels[2]}</text>
       {:else}
-        <path d="M53 93L60 101L67 93" />
+        <path d="M53 95L60 103L67 95" />
       {/if}
     </g>
     <g class="dp-dir" class:on={st.left}>
       {#if labels}
-        <text x="25" y="60" text-anchor="middle" dominant-baseline="central">{labels[3]}</text>
+        <text x="23" y="60" text-anchor="middle" dominant-baseline="central">{labels[3]}</text>
       {:else}
-        <path d="M27 53L19 60L27 67" />
+        <path d="M25 53L17 60L25 67" />
       {/if}
     </g>
-    <circle cx="60" cy="60" r="13" class="dp-hub" />
+    {#if knob.active && (sx !== 0 || sy !== 0)}
+      <line x1="60" y1="60" x2={60 + sx} y2={60 + sy} class="dp-stem" />
+    {/if}
   </svg>
+  <span
+    class="dp-puck"
+    class:active={knob.active}
+    style="transform: translate3d(calc(-50% + {knob.x.toFixed(1)}px), calc(-50% + {knob.y.toFixed(1)}px), 0)"
+    aria-hidden="true"
+  ></span>
 {/snippet}
 
 {#if editing}
@@ -747,7 +777,7 @@
             aria-label={t("方向盘")}
             {...editItemHandlers(item)}
           >
-            {@render dpadFace(item, IDLE_DPAD)}
+            {@render dpadFace(item, IDLE_DPAD, IDLE_KNOB, box.width)}
           </div>
         {/if}
       {/each}
@@ -1146,6 +1176,7 @@
         </button>
       {:else}
         {@const st = dpadStates[item.id] ?? IDLE_DPAD}
+        {@const knob = dpadKnobs[item.id] ?? IDLE_KNOB}
         <div
           role="group"
           class="dpad"
@@ -1154,7 +1185,7 @@
           {@attach region}
           {...playDpadHandlers(item)}
         >
-          {@render dpadFace(item, st)}
+          {@render dpadFace(item, st, knob, box.width)}
         </div>
       {/if}
     {/each}
@@ -1274,15 +1305,53 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  .dpad svg {
+    display: block;
+    pointer-events: none;
+  }
+
   .dp-ring {
     fill: none;
     stroke: rgba(255, 255, 255, 0.06);
     stroke-width: 1;
   }
-  .dp-hub {
-    fill: rgba(255, 255, 255, 0.05);
-    stroke: rgba(255, 255, 255, 0.12);
+  .dp-well {
+    fill: rgba(0, 0, 0, 0.22);
+    stroke: rgba(255, 255, 255, 0.09);
     stroke-width: 1;
+  }
+  .dp-stem {
+    stroke: rgba(158, 192, 255, 0.34);
+    stroke-width: 3;
+    stroke-linecap: round;
+  }
+  .dp-puck {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 34%;
+    height: 34%;
+    box-sizing: border-box;
+    border-radius: 50%;
+    background: radial-gradient(circle at 38% 35%, rgba(255, 255, 255, 0.28), rgba(200, 210, 228, 0.14) 72%);
+    border: 1.2px solid rgba(255, 255, 255, 0.3);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.34), inset 0 1px 1px rgba(255, 255, 255, 0.22);
+    pointer-events: none;
+    will-change: transform;
+    transition:
+      transform 0.15s cubic-bezier(0.22, 1, 0.36, 1),
+      background 0.12s ease,
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+  .dp-puck.active {
+    background: radial-gradient(circle at 38% 35%, rgba(182, 208, 255, 0.56), rgba(98, 146, 246, 0.34) 74%);
+    border-color: rgba(168, 202, 255, 0.92);
+    box-shadow: 0 4px 14px rgba(34, 72, 168, 0.42), inset 0 1px 2px rgba(255, 255, 255, 0.38);
+    transition:
+      background 0.08s ease,
+      border-color 0.08s ease,
+      box-shadow 0.08s ease;
   }
   .dp-diag {
     stroke: rgba(255, 255, 255, 0.16);
@@ -1619,10 +1688,15 @@
     color: #fff;
     font-weight: 500;
   }
+  .insp-head .del-btn {
+    margin-right: 2px;
+  }
   .dpad-segs {
     display: flex;
     align-items: center;
     gap: 6px;
+    flex: 1;
+    min-width: 0;
   }
 
   .kgrid {
@@ -1752,6 +1826,7 @@
     .play-layer,
     .items-layer,
     .vkey,
+    .dp-puck,
     .mini-sw,
     .mini-sw::after {
       transition: none;
