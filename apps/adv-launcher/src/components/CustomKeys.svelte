@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import Icon from "./Icon.svelte";
   import { call } from "../lib/bridge";
   import { device } from "../lib/device.svelte";
@@ -69,6 +69,7 @@
   // Edit-mode UI states
   let selectedId = $state<string | null>(null);
   let activeTab = $state<KeyCategory>("common");
+  let kgridEl = $state<HTMLDivElement | null>(null);
   let topPopover = $state<"profiles" | "opacity" | null>(null);
   let forkOpen = $state(false);
   let forkName = $state("");
@@ -389,6 +390,11 @@
   }
 
   // Edit-mode drag & selection handlers
+  function pickTab(cat: KeyCategory) {
+    activeTab = cat;
+    if (kgridEl) kgridEl.scrollTop = 0;
+  }
+
   function selectItemForEdit(item: OverlayItem) {
     selectedId = item.id;
     topPopover = null;
@@ -399,6 +405,9 @@
           break;
         }
       }
+      void tick().then(() => {
+        kgridEl?.querySelector<HTMLElement>(".kchip.on")?.scrollIntoView({ block: "nearest" });
+      });
     }
   }
 
@@ -572,14 +581,17 @@
     void created;
   }
 
+  const gridMaxHeight = $derived(Math.max(108, Math.min(156, (layout?.height ?? vh) - 204)));
+
   const inspectorStyle = $derived.by(() => {
     if (!editing || !selectedItem || drag?.moved) return "";
     const { cx, cy, width, height } = itemCenter(selectedItem, bounds);
-    const popW = selectedItem.type === "key" ? 304 : 264;
-    const popH = selectedItem.type === "key" ? 248 : 124;
     const screenW = layout?.width ?? vw;
     const screenH = layout?.height ?? vh;
+    const popW = Math.min(selectedItem.type === "key" ? 384 : 288, Math.max(240, screenW - 20));
+    const popH = selectedItem.type === "key" ? gridMaxHeight + 140 : 138;
     const gap = 10;
+    const minTop = Math.max(54, bounds.y + 46);
 
     // Prefer placing beside the item horizontally when vertical room is tight on landscape phones.
     const roomRight = screenW - (cx + width / 2 + gap) - 10;
@@ -589,18 +601,18 @@
 
     if (roomRight >= popW) {
       left = cx + width / 2 + gap;
-      top = Math.min(screenH - popH - 10, Math.max(54, cy - popH / 2));
+      top = Math.min(screenH - popH - 8, Math.max(minTop, cy - popH / 2));
     } else if (roomLeft >= popW) {
       left = cx - width / 2 - gap - popW;
-      top = Math.min(screenH - popH - 10, Math.max(54, cy - popH / 2));
+      top = Math.min(screenH - popH - 8, Math.max(minTop, cy - popH / 2));
     } else {
       left = Math.min(screenW - popW - 10, Math.max(10, cx - popW / 2));
       const preferAbove = cy > screenH * 0.54;
       top = preferAbove
-        ? Math.max(54, cy - height / 2 - gap - popH)
-        : Math.min(screenH - popH - 10, cy + height / 2 + gap);
+        ? Math.max(minTop, cy - height / 2 - gap - popH)
+        : Math.min(screenH - popH - 8, cy + height / 2 + gap);
     }
-    return `left: ${Math.round(left)}px; top: ${Math.round(top)}px; width: ${popW}px`;
+    return `left: ${Math.round(left)}px; top: ${Math.round(Math.max(8, top))}px; width: ${popW}px`;
   });
 
   const layerOpacity = $derived(
@@ -919,7 +931,7 @@
                   role="tab"
                   aria-selected={activeTab === cat}
                   class:on={activeTab === cat}
-                  onclick={() => (activeTab = cat)}
+                  onclick={() => pickTab(cat)}
                 >
                   {t(label)}
                 </button>
@@ -930,17 +942,23 @@
             </button>
           </div>
 
-          <div class="kgrid" class:alpha={activeTab === "alpha"}>
+          <div
+            bind:this={kgridEl}
+            class="kgrid"
+            class:alpha={activeTab === "alpha"}
+            style="max-height: {gridMaxHeight}px"
+          >
             {#each KEY_CATALOG[activeTab] as b (b.kind + ":" + b.label)}
               <button
                 type="button"
                 class="kchip"
                 class:on={bindingEquals(selectedItem.binding, b)}
-                onclick={() => {
+                {...tap(() => {
                   selectedItem.binding = { ...b };
                   if (!bindingCanLatch(b)) selectedItem.latch = false;
                   saveKeyLayouts();
-                }}
+                  haptic();
+                })}
               >
                 {bindingLabel(b)}
               </button>
@@ -1307,7 +1325,7 @@
     position: absolute;
     left: 50%;
     transform: translateX(-50%);
-    height: 38px;
+    height: 42px;
     padding: 0 5px;
     border-radius: 999px;
     background: rgba(22, 23, 27, 0.88);
@@ -1323,8 +1341,8 @@
   .tbtn {
     all: unset;
     box-sizing: border-box;
-    height: 28px;
-    padding: 0 10px;
+    height: 32px;
+    padding: 0 11px;
     border-radius: 999px;
     display: inline-flex;
     align-items: center;
@@ -1333,6 +1351,7 @@
     color: rgba(240, 240, 242, 0.88);
     white-space: nowrap;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
   .tbtn:hover,
   .tbtn.on {
@@ -1348,8 +1367,8 @@
   .tdone {
     all: unset;
     box-sizing: border-box;
-    height: 28px;
-    padding: 0 13px;
+    height: 32px;
+    padding: 0 14px;
     border-radius: 999px;
     background: #ececea;
     color: #151517;
@@ -1357,6 +1376,7 @@
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
 
   .popover {
@@ -1424,14 +1444,15 @@
   .del-btn {
     all: unset;
     box-sizing: border-box;
-    width: 28px;
-    height: 28px;
-    border-radius: 7px;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
     display: grid;
     place-items: center;
-    color: rgba(255, 145, 135, 0.82);
+    color: rgba(255, 145, 135, 0.85);
     cursor: pointer;
     flex: 0 0 auto;
+    -webkit-tap-highlight-color: transparent;
   }
   .pdel:hover,
   .del-btn:hover {
@@ -1509,8 +1530,9 @@
     width: 100%;
     margin: 4px 0 0;
     accent-color: #96b8ff;
-    height: 20px;
+    height: 28px;
     cursor: pointer;
+    touch-action: pan-x;
   }
 
   .mini-sw {
@@ -1547,31 +1569,49 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 6px;
+    gap: 10px;
     margin-bottom: 8px;
   }
   .tabs,
   .mseg {
     display: inline-flex;
     padding: 2px;
-    border-radius: 8px;
+    border-radius: 9px;
     background: rgba(255, 255, 255, 0.07);
-    gap: 1px;
+    gap: 2px;
     max-width: 100%;
+    min-width: 0;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x;
     scrollbar-width: none;
   }
-  .tabs button,
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .tabs button {
+    all: unset;
+    box-sizing: border-box;
+    height: 32px;
+    padding: 0 9.5px;
+    border-radius: 7px;
+    font-size: 12px;
+    color: rgba(236, 236, 238, 0.72);
+    cursor: pointer;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+  }
   .mseg button {
     all: unset;
     box-sizing: border-box;
-    height: 24px;
-    padding: 0 6.5px;
-    border-radius: 6px;
-    font-size: 11.5px;
-    color: rgba(236, 236, 238, 0.68);
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 7px;
+    font-size: 12px;
+    color: rgba(236, 236, 238, 0.72);
     cursor: pointer;
     white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
   }
   .tabs button.on,
   .mseg button.on {
@@ -1588,12 +1628,21 @@
   .kgrid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 4px;
-    max-height: 118px;
+    gap: 6px;
+    padding-right: 2px;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     touch-action: pan-y;
     overscroll-behavior: contain;
-    scrollbar-width: none;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  }
+  .kgrid::-webkit-scrollbar {
+    width: 3px;
+  }
+  .kgrid::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.22);
+    border-radius: 3px;
   }
   .kgrid.alpha {
     grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -1601,22 +1650,29 @@
   .kchip {
     all: unset;
     box-sizing: border-box;
-    height: 27px;
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.06);
-    color: rgba(240, 240, 242, 0.88);
-    font-size: 11.5px;
+    height: 36px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.07);
+    color: rgba(242, 242, 245, 0.9);
+    font-size: 12.5px;
     display: grid;
     place-items: center;
     cursor: pointer;
     white-space: nowrap;
+    touch-action: pan-y;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 0.08s ease, transform 0.08s ease;
   }
   .kchip:hover {
     background: rgba(255, 255, 255, 0.12);
   }
+  .kchip:active {
+    background: rgba(255, 255, 255, 0.18);
+    transform: scale(0.96);
+  }
   .kchip.on {
-    background: rgba(98, 144, 245, 0.34);
-    box-shadow: inset 0 0 0 1px rgba(148, 184, 255, 0.8);
+    background: rgba(98, 144, 245, 0.36);
+    box-shadow: inset 0 0 0 1px rgba(148, 184, 255, 0.85);
     color: #fff;
     font-weight: 500;
   }
@@ -1628,8 +1684,8 @@
   }
   .size-row .lbl {
     flex: 0 0 auto;
-    color: rgba(236, 236, 238, 0.72);
-    font-size: 11.5px;
+    color: rgba(236, 236, 238, 0.75);
+    font-size: 12px;
   }
   .size-row .range {
     flex: 1;
@@ -1639,16 +1695,17 @@
     all: unset;
     box-sizing: border-box;
     flex: 0 0 auto;
-    min-width: 38px;
-    height: 22px;
-    padding: 0 5px;
-    border-radius: 5px;
-    background: rgba(255, 255, 255, 0.07);
-    color: rgba(236, 236, 238, 0.86);
-    font-size: 11px;
+    min-width: 44px;
+    height: 28px;
+    padding: 0 7px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(236, 236, 238, 0.9);
+    font-size: 11.5px;
     text-align: center;
-    line-height: 22px;
+    line-height: 28px;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
   .pct:hover {
     background: rgba(255, 255, 255, 0.14);
@@ -1663,13 +1720,14 @@
   .sync-btn {
     all: unset;
     box-sizing: border-box;
-    height: 24px;
-    padding: 0 8px;
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.07);
-    color: rgba(236, 236, 238, 0.8);
-    font-size: 11.5px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(236, 236, 238, 0.85);
+    font-size: 12px;
     cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
   .sync-btn:hover {
     background: rgba(255, 255, 255, 0.14);
