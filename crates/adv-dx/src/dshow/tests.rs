@@ -242,6 +242,24 @@ fn graph_faces_share_identity_and_report_state() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
+#[test]
+// spec: MEDIA-GRAPH-9
+fn event_timeouts_leave_no_event_code() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let events = query(&mut m, graph, IID_IMEDIAEVENTEX);
+    m.cpu.write_u32(DATA, 1).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0]
+        ),
+        0x8000_4004
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+}
+
 /// Run a quartz method that calls back into the guest exactly once per item
 /// of `expected`, checking each call's target and arguments.
 fn method_calls(

@@ -250,6 +250,46 @@ pub fn intact(
     fnv1a64(&code) as u32 == function.hash
 }
 
+/// The functions every guest file read passes through, by module.
+const READ_PATH: &[(&str, &str)] = &[("kernelbase.dll", "ReadFile"), ("ntdll.dll", "NtReadFile")];
+/// The bytes an inline hook rewrites: a jump at the entry, or a hot patch's
+/// jump in the five bytes before it.
+const HOOK_SPAN: u32 = 10;
+
+/// The entry bytes of the read path as the loader mapped them, before any
+/// guest code ran.
+#[derive(Default)]
+struct ReadPath(Vec<(u32, [u8; HOOK_SPAN as usize])>);
+
+/// Records the read path's entries in `module`, a distribution image just mapped.
+pub(crate) fn note_read_path(cpu: &dyn Guest, ext: &mut Ext, module: &Module) {
+    let Some(table) = module.table() else {
+        return;
+    };
+    let path = ext.get_or_default::<ReadPath>();
+    for &(_, name) in READ_PATH.iter().filter(|(owner, _)| *owner == module.name) {
+        let Some(function) = table.named(name) else {
+            continue;
+        };
+        let at = module.base + function.rva - 5;
+        let mut bytes = [0; HOOK_SPAN as usize];
+        if cpu.read(at, &mut bytes).is_ok() {
+            path.0.push((at, bytes));
+        }
+    }
+}
+
+/// Whether guest code hooked the file read path, so that file contents may
+/// come from the guest (a file virtualizer) rather than the host descriptor.
+pub fn reads_hooked(cpu: &dyn Guest, ext: &Ext) -> bool {
+    ext.try_get::<ReadPath>().is_some_and(|path| {
+        path.0.iter().any(|(at, mapped)| {
+            let mut bytes = [0; HOOK_SPAN as usize];
+            cpu.read(*at, &mut bytes).is_err() || bytes != *mapped
+        })
+    })
+}
+
 pub fn fnv1a64(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
@@ -315,6 +355,45 @@ mod tests {
         };
         assert!(module(b"MZ").table().is_some());
         assert!(module(b"MZ\0").table().is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // spec: MEDIA-GRAPH-8
+    #[test]
+    fn hooks_on_the_read_path_are_seen() {
+        use adv_cpu::backend::{Guest, Prot};
+        const BASE: u32 = 0x7bc0_0000;
+        let directory = std::env::temp_dir().join(format!("read-path-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let table = directory.join("ntdll.dll.tsv");
+        std::fs::write(
+            &table,
+            format!("{:016x}\n1010\t10\t0\tNtReadFile\n", fnv1a64(b"MZ")),
+        )
+        .unwrap();
+        let module = Module {
+            base: BASE,
+            size: 0x2000,
+            name: "ntdll.dll".into(),
+            header: fnv1a64(b"MZ"),
+            path: None,
+            table: Some(table),
+        };
+        let mut cpu = adv_cpu::Cpu::new(0x1000, false).unwrap();
+        cpu.map(BASE, 0x2000, Prot::RWX).unwrap();
+        // mov eax, 6; mov edx, imm32; call edx
+        cpu.write(
+            BASE + 0x1010,
+            &[0xb8, 6, 0, 0, 0, 0xba, 0xc4, 0xe0, 0xc0, 0x7b, 0xff, 0xd2],
+        )
+        .unwrap();
+        let mut ext = Ext::default();
+        assert!(!reads_hooked(&cpu, &ext));
+        note_read_path(&cpu, &mut ext, &module);
+        assert!(!reads_hooked(&cpu, &ext));
+        cpu.write(BASE + 0x1010, &[0xe9, 0x23, 0x06, 0x9b, 0x84])
+            .unwrap();
+        assert!(reads_hooked(&cpu, &ext));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
