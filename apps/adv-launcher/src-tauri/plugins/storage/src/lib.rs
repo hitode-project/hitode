@@ -21,6 +21,8 @@ pub struct StorageStatus {
     pub granted: bool,
     #[serde(default)]
     pub supported: bool,
+    #[serde(default)]
+    pub legacy: bool,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -63,7 +63,7 @@
         </div>
         <h2 id="folder-choice-title" class="ttl">{t("允许访问游戏文件夹")}</h2>
         {#if error || denied}
-          <p class="line">{error || t("尚未开启。若开关置灰，请在系统“应用信息”右上角允许“受限设置”。")}</p>
+          <p class="line">{error || t(androidStorage.legacy ? "尚未开启。若系统不再弹窗，请再次点击“去授权”前往应用信息开启存储权限。" : "尚未开启。若开关置灰，请在系统“应用信息”右上角允许“受限设置”。")}</p>
         {/if}
         <div class="acts">
           <button class="primary" disabled={busy} onclick={() => void grant(prompt)}>
