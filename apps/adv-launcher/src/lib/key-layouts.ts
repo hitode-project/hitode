@@ -7,12 +7,20 @@ function cornerInset(radius: number, depth: number): number {
 }
 
 export type SystemKeyKind = "menu" | "hide" | "kbd";
+export type MouseKeyButton = "left" | "middle" | "right";
 
 export type KeyBinding =
   | { kind: "vk"; vk: number; label: string }
-  | { kind: "mouse"; right: boolean; label: string }
+  | { kind: "mouse"; button?: MouseKeyButton; right?: boolean; label: string }
   | { kind: "wheel"; notches: number; label: string }
   | { kind: "sys"; sys: SystemKeyKind; label: string };
+
+export function mouseButtonOf(binding: Extract<KeyBinding, { kind: "mouse" }>): MouseKeyButton {
+  if (binding.button === "left" || binding.button === "middle" || binding.button === "right") {
+    return binding.button;
+  }
+  return binding.right ? "right" : "left";
+}
 
 export interface KeyItem {
   id: string;
@@ -24,7 +32,7 @@ export interface KeyItem {
   binding: KeyBinding;
 }
 
-export type DpadBind = "arrows" | "wasd";
+export type DpadBind = "arrows" | "wasd" | "numpad";
 
 export interface DpadItem {
   id: string;
@@ -60,54 +68,26 @@ export const BASE_KEY_SIZE = 46;
 export const BASE_DPAD_SIZE = 124;
 const PAD = 8;
 
-export type KeyCategory = "common" | "system" | "nav" | "alpha";
+export type KeyCategory = "common" | "alpha" | "symbol" | "fn" | "numpad" | "system";
 
 export const KEY_CATALOG: Record<KeyCategory, KeyBinding[]> = {
   common: [
     { kind: "vk", vk: 0x0d, label: "Enter" },
     { kind: "vk", vk: 0x1b, label: "Esc" },
     { kind: "vk", vk: 0x20, label: "Space" },
+    { kind: "vk", vk: 0x08, label: "退格" },
+    { kind: "vk", vk: 0x09, label: "Tab" },
     { kind: "vk", vk: 0x11, label: "Ctrl" },
     { kind: "vk", vk: 0x10, label: "Shift" },
     { kind: "vk", vk: 0x12, label: "Alt" },
-    { kind: "vk", vk: 0x09, label: "Tab" },
-    { kind: "vk", vk: 0x08, label: "退格" },
+    { kind: "vk", vk: 0x14, label: "Caps" },
     { kind: "vk", vk: 0x5a, label: "Z" },
     { kind: "vk", vk: 0x58, label: "X" },
     { kind: "vk", vk: 0x43, label: "C" },
-    { kind: "vk", vk: 0x70, label: "F1" },
-    { kind: "vk", vk: 0x71, label: "F2" },
-    { kind: "vk", vk: 0x73, label: "F4" },
-    { kind: "vk", vk: 0x74, label: "F5" },
-    { kind: "vk", vk: 0x78, label: "F9" },
-    { kind: "vk", vk: 0x7b, label: "F12" },
-  ],
-  system: [
-    { kind: "sys", sys: "menu", label: "菜单" },
-    { kind: "sys", sys: "hide", label: "显隐" },
-    { kind: "sys", sys: "kbd", label: "键盘" },
-    { kind: "mouse", right: false, label: "左键" },
-    { kind: "mouse", right: true, label: "右键" },
-    { kind: "wheel", notches: 1, label: "滚轮 ↑" },
-    { kind: "wheel", notches: -1, label: "滚轮 ↓" },
-  ],
-  nav: [
     { kind: "vk", vk: 0x26, label: "↑" },
     { kind: "vk", vk: 0x28, label: "↓" },
     { kind: "vk", vk: 0x25, label: "←" },
     { kind: "vk", vk: 0x27, label: "→" },
-    { kind: "vk", vk: 0x21, label: "PgUp" },
-    { kind: "vk", vk: 0x22, label: "PgDn" },
-    { kind: "vk", vk: 0x24, label: "Home" },
-    { kind: "vk", vk: 0x23, label: "End" },
-    { kind: "vk", vk: 0x2d, label: "Ins" },
-    { kind: "vk", vk: 0x2e, label: "Del" },
-    { kind: "vk", vk: 0x72, label: "F3" },
-    { kind: "vk", vk: 0x75, label: "F6" },
-    { kind: "vk", vk: 0x76, label: "F7" },
-    { kind: "vk", vk: 0x77, label: "F8" },
-    { kind: "vk", vk: 0x79, label: "F10" },
-    { kind: "vk", vk: 0x7a, label: "F11" },
   ],
   alpha: [
     ...Array.from({ length: 26 }, (_, i): KeyBinding => {
@@ -119,6 +99,80 @@ export const KEY_CATALOG: Record<KeyCategory, KeyBinding[]> = {
       return { kind: "vk", vk: 0x30 + d, label: String(d) };
     }),
   ],
+  symbol: [
+    { kind: "vk", vk: 0xc0, label: "`~" },
+    { kind: "vk", vk: 0xbd, label: "-_" },
+    { kind: "vk", vk: 0xbb, label: "=+" },
+    { kind: "vk", vk: 0xdb, label: "[{" },
+    { kind: "vk", vk: 0xdd, label: "]}" },
+    { kind: "vk", vk: 0xdc, label: "\\|" },
+    { kind: "vk", vk: 0xba, label: ";:" },
+    { kind: "vk", vk: 0xde, label: "'\"" },
+    { kind: "vk", vk: 0xbc, label: ",<" },
+    { kind: "vk", vk: 0xbe, label: ".>" },
+    { kind: "vk", vk: 0xbf, label: "/?" },
+    { kind: "vk", vk: 0xe2, label: "<>" },
+    { kind: "vk", vk: 0x1e2, label: "JIS _" },
+    { kind: "vk", vk: 0x1dc, label: "JIS ¥" },
+  ],
+  fn: [
+    ...Array.from({ length: 12 }, (_, i): KeyBinding => ({
+      kind: "vk",
+      vk: 0x70 + i,
+      label: `F${i + 1}`,
+    })),
+    { kind: "vk", vk: 0x2d, label: "Ins" },
+    { kind: "vk", vk: 0x2e, label: "Del" },
+    { kind: "vk", vk: 0x24, label: "Home" },
+    { kind: "vk", vk: 0x23, label: "End" },
+    { kind: "vk", vk: 0x21, label: "PgUp" },
+    { kind: "vk", vk: 0x22, label: "PgDn" },
+    { kind: "vk", vk: 0x2c, label: "PrtSc" },
+    { kind: "vk", vk: 0x91, label: "ScrLk" },
+    { kind: "vk", vk: 0x13, label: "Pause" },
+    { kind: "vk", vk: 0x5d, label: "Apps" },
+    { kind: "vk", vk: 0xa1, label: "RShift" },
+    { kind: "vk", vk: 0xa3, label: "RCtrl" },
+    { kind: "vk", vk: 0xa5, label: "RAlt" },
+    { kind: "vk", vk: 0x1d, label: "無変換" },
+    { kind: "vk", vk: 0x1c, label: "変換" },
+    { kind: "vk", vk: 0x15, label: "かな" },
+    ...Array.from({ length: 12 }, (_, i): KeyBinding => ({
+      kind: "vk",
+      vk: 0x7c + i,
+      label: `F${i + 13}`,
+    })),
+  ],
+  numpad: [
+    { kind: "vk", vk: 0x67, label: "Num 7" },
+    { kind: "vk", vk: 0x68, label: "Num 8" },
+    { kind: "vk", vk: 0x69, label: "Num 9" },
+    { kind: "vk", vk: 0x6f, label: "Num /" },
+    { kind: "vk", vk: 0x64, label: "Num 4" },
+    { kind: "vk", vk: 0x65, label: "Num 5" },
+    { kind: "vk", vk: 0x66, label: "Num 6" },
+    { kind: "vk", vk: 0x6a, label: "Num *" },
+    { kind: "vk", vk: 0x61, label: "Num 1" },
+    { kind: "vk", vk: 0x62, label: "Num 2" },
+    { kind: "vk", vk: 0x63, label: "Num 3" },
+    { kind: "vk", vk: 0x6d, label: "Num -" },
+    { kind: "vk", vk: 0x60, label: "Num 0" },
+    { kind: "vk", vk: 0x6e, label: "Num ." },
+    { kind: "vk", vk: 0x10d, label: "Num ↵" },
+    { kind: "vk", vk: 0x6b, label: "Num +" },
+    { kind: "vk", vk: 0x90, label: "NumLk" },
+    { kind: "vk", vk: 0x6c, label: "Num ," },
+  ],
+  system: [
+    { kind: "sys", sys: "menu", label: "菜单" },
+    { kind: "sys", sys: "hide", label: "显隐" },
+    { kind: "sys", sys: "kbd", label: "键盘" },
+    { kind: "mouse", button: "left", right: false, label: "左键" },
+    { kind: "mouse", button: "middle", label: "中键" },
+    { kind: "mouse", button: "right", right: true, label: "右键" },
+    { kind: "wheel", notches: 1, label: "滚轮 ↑" },
+    { kind: "wheel", notches: -1, label: "滚轮 ↓" },
+  ],
 };
 
 export function bindingEquals(a: KeyBinding, b: KeyBinding): boolean {
@@ -127,7 +181,7 @@ export function bindingEquals(a: KeyBinding, b: KeyBinding): boolean {
     case "vk":
       return b.kind === "vk" && a.vk === b.vk;
     case "mouse":
-      return b.kind === "mouse" && a.right === b.right;
+      return b.kind === "mouse" && mouseButtonOf(a) === mouseButtonOf(b);
     case "wheel":
       return b.kind === "wheel" && a.notches === b.notches;
     case "sys":
@@ -290,9 +344,9 @@ export function dpadDirections(
 }
 
 export function dpadVkMap(bind: DpadBind): { up: number; down: number; left: number; right: number } {
-  return bind === "wasd"
-    ? { up: 0x57, down: 0x53, left: 0x41, right: 0x44 }
-    : { up: 0x26, down: 0x28, left: 0x25, right: 0x27 };
+  if (bind === "wasd") return { up: 0x57, down: 0x53, left: 0x41, right: 0x44 };
+  if (bind === "numpad") return { up: 0x68, down: 0x62, left: 0x64, right: 0x66 };
+  return { up: 0x26, down: 0x28, left: 0x25, right: 0x27 };
 }
 
 export function defaultProfiles(): KeyProfile[] {
@@ -336,11 +390,16 @@ function validBinding(raw: unknown): KeyBinding | null {
   if (!raw || typeof raw !== "object") return null;
   const b = raw as Record<string, unknown>;
   if (typeof b.label !== "string" || !b.label) return null;
-  if (b.kind === "vk" && typeof b.vk === "number" && Number.isInteger(b.vk) && b.vk > 0 && b.vk <= 0xff) {
+  if (b.kind === "vk" && typeof b.vk === "number" && Number.isInteger(b.vk) && b.vk > 0 && b.vk <= 0x1ff) {
     return { kind: "vk", vk: b.vk, label: b.label };
   }
-  if (b.kind === "mouse" && typeof b.right === "boolean") {
-    return { kind: "mouse", right: b.right, label: b.label };
+  if (b.kind === "mouse") {
+    if (b.button === "left" || b.button === "middle" || b.button === "right") {
+      return { kind: "mouse", button: b.button, right: b.button === "right", label: b.label };
+    }
+    if (typeof b.right === "boolean") {
+      return { kind: "mouse", button: b.right ? "right" : "left", right: b.right, label: b.label };
+    }
   }
   if (b.kind === "wheel" && (b.notches === 1 || b.notches === -1)) {
     return { kind: "wheel", notches: b.notches, label: b.label };
@@ -366,7 +425,7 @@ function validItem(raw: unknown, fallbackIdx: number): OverlayItem | null {
       rx,
       ry,
       scale,
-      bind: it.bind === "wasd" ? "wasd" : "arrows",
+      bind: it.bind === "wasd" ? "wasd" : it.bind === "numpad" ? "numpad" : "arrows",
       eightWay: it.eightWay !== false,
     };
   }

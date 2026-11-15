@@ -6,6 +6,7 @@ import {
   dpadDirections,
   dpadVkMap,
   itemCenter,
+  KEY_CATALOG,
   normalizeStoredKeyLayouts,
   pointToNormalized,
   safeBounds,
@@ -71,6 +72,33 @@ test("dpadDirections distinguishes 4-way cardinal from 8-way diagonals", () => {
     right: true,
   });
   assert.deepEqual(dpadVkMap("wasd"), { up: 0x57, down: 0x53, left: 0x41, right: 0x44 });
+  assert.deepEqual(dpadVkMap("numpad"), { up: 0x68, down: 0x62, left: 0x64, right: 0x66 });
+});
+
+test("extended key catalog and storage round-trip symbols, numpad, JIS and middle mouse", () => {
+  assert.ok(KEY_CATALOG.symbol.length >= 14);
+  assert.ok(KEY_CATALOG.numpad.length >= 18);
+  assert.ok(KEY_CATALOG.fn.length >= 30);
+
+  const normalized = normalizeStoredKeyLayouts({
+    profiles: [
+      {
+        id: "quirky",
+        name: "Quirky",
+        opacity: 0.8,
+        autoDim: true,
+        items: [
+          { id: "ne", type: "key", rx: 0.5, ry: 0.5, scale: 1, latch: false, binding: { kind: "vk", vk: 0x10d, label: "Num ↵" } },
+          { id: "ro", type: "key", rx: 0.6, ry: 0.5, scale: 1, latch: false, binding: { kind: "vk", vk: 0x1e2, label: "JIS _" } },
+          { id: "mmb", type: "key", rx: 0.7, ry: 0.5, scale: 1, latch: true, binding: { kind: "mouse", button: "middle", label: "中键" } },
+          { id: "dp", type: "dpad", rx: 0.2, ry: 0.7, scale: 1, bind: "numpad", eightWay: true },
+        ],
+      },
+    ],
+    games: { g1: "quirky" },
+  });
+  const quirky = normalized.profiles.find((p) => p.id === "quirky");
+  assert.equal(quirky?.items.length, 4);
 });
 
 test("scale snapping and stored layout normalization preserve built-in presets", () => {

@@ -14,6 +14,7 @@
     IDLE_DPAD,
     itemCenter,
     KEY_CATALOG,
+    mouseButtonOf,
     pointToNormalized,
     safeBounds,
     type DpadItem,
@@ -109,7 +110,9 @@
     if (binding.kind === "vk") {
       void call("game_key", { key: binding.vk, down }, null).catch(() => {});
     } else if (binding.kind === "mouse") {
-      void call("game_mouse_button", { right: binding.right, down }, null).catch(() => {});
+      const btn = mouseButtonOf(binding);
+      const button = btn === "middle" ? 2 : btn === "right" ? 1 : 0;
+      void call("game_mouse_button", { right: btn === "right", button, down }, null).catch(() => {});
     }
   }
 
@@ -390,7 +393,7 @@
     selectedId = item.id;
     topPopover = null;
     if (item.type === "key") {
-      for (const cat of ["common", "system", "nav", "alpha"] as const) {
+      for (const cat of ["common", "alpha", "symbol", "fn", "numpad", "system"] as const) {
         if (KEY_CATALOG[cat].some((b) => bindingEquals(b, item.binding))) {
           activeTab = cat;
           break;
@@ -572,8 +575,8 @@
   const inspectorStyle = $derived.by(() => {
     if (!editing || !selectedItem || drag?.moved) return "";
     const { cx, cy, width, height } = itemCenter(selectedItem, bounds);
-    const popW = selectedItem.type === "key" ? 268 : 244;
-    const popH = selectedItem.type === "key" ? 220 : 124;
+    const popW = selectedItem.type === "key" ? 304 : 264;
+    const popH = selectedItem.type === "key" ? 248 : 124;
     const screenW = layout?.width ?? vw;
     const screenH = layout?.height ?? vh;
     const gap = 10;
@@ -640,7 +643,7 @@
 {/snippet}
 
 {#snippet dpadFace(item: DpadItem, st: DpadState)}
-  {@const labels = item.bind === "wasd" ? ["W", "D", "S", "A"] : null}
+  {@const labels = item.bind === "wasd" ? ["W", "D", "S", "A"] : item.bind === "numpad" ? ["8", "6", "2", "4"] : null}
   <svg viewBox="0 0 120 120" width="100%" height="100%" aria-hidden="true">
     <circle cx="60" cy="60" r="56" class="dp-ring" />
     {#if item.eightWay}
@@ -896,7 +899,7 @@
         {#if selectedItem.type === "key"}
           <div class="insp-head">
             <div class="tabs" role="tablist">
-              {#each [["common", "常用"], ["system", "系统"], ["nav", "方向"], ["alpha", "字母"]] as const as [cat, label] (cat)}
+              {#each [["common", "常用"], ["alpha", "字母"], ["symbol", "符号"], ["fn", "功能"], ["numpad", "小键"], ["system", "系统"]] as const as [cat, label] (cat)}
                 <button
                   type="button"
                   role="tab"
@@ -1018,6 +1021,16 @@
                 >
                   WASD
                 </button>
+                <button
+                  type="button"
+                  class:on={selectedItem.bind === "numpad"}
+                  onclick={() => {
+                    selectedItem.bind = "numpad";
+                    saveKeyLayouts();
+                  }}
+                >
+                  Num
+                </button>
               </div>
               <div class="mseg">
                 <button
@@ -1131,7 +1144,6 @@
     background-color: rgba(8, 9, 12, 0.34);
     background-image: radial-gradient(rgba(255, 255, 255, 0.14) 1px, transparent 1px);
     background-size: 20px 20px;
-    touch-action: none;
     user-select: none;
     -webkit-user-select: none;
   }
@@ -1361,6 +1373,8 @@
     gap: 2px;
     max-height: 150px;
     overflow-y: auto;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
     scrollbar-width: none;
   }
   .pitem {
@@ -1529,13 +1543,16 @@
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.07);
     gap: 1px;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
   .tabs button,
   .mseg button {
     all: unset;
     box-sizing: border-box;
     height: 24px;
-    padding: 0 8px;
+    padding: 0 6.5px;
     border-radius: 6px;
     font-size: 11.5px;
     color: rgba(236, 236, 238, 0.68);
@@ -1558,8 +1575,10 @@
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 4px;
-    max-height: 92px;
+    max-height: 118px;
     overflow-y: auto;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
     scrollbar-width: none;
   }
   .kgrid.alpha {
