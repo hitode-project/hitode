@@ -5,9 +5,9 @@ use adv_os::vfs::{FileObj, FileStream};
 
 use super::*;
 use crate::dshow::filter::{Role, Source};
+use crate::dshow::host::Opened;
 
 const CLSID_ASYNC_READER: Iid = amovie(0xe436_ebb5);
-type Opened = Box<dyn FnOnce(&mut Env<'_>, Result<(Decoder, u32), u32>) -> Outcome>;
 
 fn path(env: &Env<'_>, pointer: u32) -> Result<Vec<u16>, u32> {
     if pointer == 0 {
@@ -92,7 +92,7 @@ fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
                 VFW_E_UNSUPPORTED_STREAM
             });
             match result {
-                Ok(decoder) => then(env, Ok((decoder, handle))),
+                Ok(decoder) => then(env, Ok((decoder, Some(handle)))),
                 Err(error) => {
                     host::close(env, handle);
                     then(env, Err(error))
@@ -102,11 +102,17 @@ fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
     )
 }
 
-fn attach(env: &mut Env<'_>, filter: u32, decoder: Decoder, handle: u32, filename: Vec<u16>) {
+fn attach(
+    env: &mut Env<'_>,
+    filter: u32,
+    decoder: Decoder,
+    handle: Option<u32>,
+    filename: Vec<u16>,
+) {
     env.ext.get_or_default::<Playback>().sources += 1;
     let info = decoder.info().clone();
     let source = Source {
-        file_handle: Some(handle),
+        file_handle: handle,
         duration_us: info.duration_us,
         decoder: Some(decoder),
         info: Some(info),
@@ -154,7 +160,9 @@ pub(super) fn add(env: &mut Env<'_>, graph: u32, filename: u32, name: u32, outpu
             let filter = match filter::new_filter(env, Role::FileSource, CLSID_ASYNC_READER) {
                 Ok(filter) => filter,
                 Err(error) => {
-                    host::close(env, handle);
+                    if let Some(handle) = handle {
+                        host::close(env, handle);
+                    }
                     return Outcome::Return(error);
                 }
             };
