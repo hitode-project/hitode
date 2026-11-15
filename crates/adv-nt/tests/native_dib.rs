@@ -197,18 +197,23 @@ impl Rng {
         self.0
     }
 }
-const FORMATS: [(&str, u32, u32); 8] = [
-    ("8888", 32, FUNCS_8888),
-    ("32", 32, FUNCS_32),
-    ("24", 24, FUNCS_24),
-    ("555", 16, FUNCS_555),
-    ("16", 16, FUNCS_16),
-    ("8", 8, FUNCS_8),
-    ("4", 4, FUNCS_4),
-    ("1", 1, FUNCS_1),
+const FORMATS: [(&str, u32); 8] = [
+    ("8888", 32),
+    ("32", 32),
+    ("24", 24),
+    ("555", 16),
+    ("16", 16),
+    ("8", 8),
+    ("4", 4),
+    ("1", 1),
 ];
+/// The address of win32u's `funcs_<format>` primitive table.
+fn funcs(format: &str) -> u32 {
+    let dist = wine::dist().unwrap();
+    BASE + wine::variable(&dist, "win32u.so", &format!("funcs_{format}")).unwrap()
+}
 fn dib(data: &mut [u8], address: u32, format: usize, bits: u32, seed: u32) {
-    let (_, bpp, funcs) = FORMATS[format];
+    let (name, bpp) = FORMATS[format];
     let stride = (32 * bpp).div_ceil(32) * 4;
     set(data, address, d::bit_count, bpp);
     set(data, address, d::width, 32);
@@ -278,7 +283,7 @@ fn dib(data: &mut [u8], address: u32, format: usize, bits: u32, seed: u32) {
             ((1 << lens[i]) - 1) << shifts[i],
         );
     }
-    set(data, address, d::funcs, BASE + funcs);
+    set(data, address, d::funcs, funcs(name));
     if bpp <= 8 {
         set(data, address, d::color_table, PALETTE);
         set(data, address, d::color_table_size, 1 << bpp);
@@ -788,7 +793,7 @@ fn changed_elf_function_is_not_bound() {
     );
 }
 
-// spec: NAT-BODY-4
+// spec: NAT-BODY-4, NAT-ID-1
 #[test]
 fn dib_layout_matches_dwarf() {
     let Some(debug) = wine::debug_dist() else {
@@ -892,23 +897,19 @@ fn dib_layout_matches_dwarf() {
             );
         }
     }
-    for line in source.lines().filter(|l| l.starts_with("pub const")) {
-        let name = line
-            .split("pub const ")
-            .nth(1)
-            .unwrap()
-            .split(':')
-            .next()
-            .unwrap();
-        let expected =
-            u32::from_str_radix(line.split("= 0x").nth(1).unwrap().trim_end_matches(';'), 16)
-                .unwrap();
+    // The data symbols dib's Layout binds, as the identity table gives them.
+    let dist = wine::dist().unwrap();
+    let names = include_str!("../src/native/dib.rs")
+        .split("\"win32u.so\" => [")
+        .nth(1)
+        .unwrap()
+        .split(']')
+        .next()
+        .unwrap();
+    for name in names.split(',').map(str::trim) {
         let entry = entries
             .iter()
-            .find(|e| {
-                e.contains(&format!("\"{}\"", name.to_ascii_lowercase()))
-                    && e.contains("DW_OP_addr")
-            })
+            .find(|e| e.contains(&format!("\"{name}\"")) && e.contains("DW_OP_addr"))
             .unwrap();
         let actual = entry
             .split("DW_OP_addr 0x")
@@ -917,7 +918,11 @@ fn dib_layout_matches_dwarf() {
             .split(')')
             .next()
             .unwrap();
-        assert_eq!(expected, u32::from_str_radix(actual, 16).unwrap(), "{name}");
+        assert_eq!(
+            wine::variable(&dist, "win32u.so", name),
+            Some(u32::from_str_radix(actual, 16).unwrap()),
+            "{name}"
+        );
     }
 }
 
@@ -1066,7 +1071,7 @@ fn dib_headers_and_faults_complete_at_entry() {
         }
         let mut data = warm;
         match case {
-            0 => set(&mut data, DST, d::funcs, BASE + FUNCS_8),
+            0 => set(&mut data, DST, d::funcs, funcs("8")),
             1 => set(&mut data, DST, d::width, 100000),
             2 => {
                 set(&mut data, RECTS, rect::left, 0);
@@ -2466,7 +2471,7 @@ fn wrapped_coordinates_and_fields_match_i386() {
             &format!("wrapped case {case}"),
         );
     }
-    for (format, &(suffix, bpp, _)) in FORMATS.iter().take(5).enumerate() {
+    for (format, &(suffix, bpp)) in FORMATS.iter().take(5).enumerate() {
         for blend in [0x017f0000, 0x01ff0000, 0x007f0000] {
             let mut data = fixture(format, 0);
             dib(&mut data, SRC, 0, SOURCE_BITS, 0);

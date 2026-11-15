@@ -52,6 +52,7 @@ pub mod api {
     pub const CLIPPER_SET_CLIP_LIST: u32 = 235;
     pub const GET_BLT_STATUS: u32 = 236;
     pub const GET_FLIP_STATUS: u32 = 237;
+    pub const FLIP_TO_GDI: u32 = 238;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -174,6 +175,7 @@ const IID_CLIPPER: [u8; 16] = [
 const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
+const NOT_FOUND: u32 = 0x887600ff;
 const SURFACE_LOST: u32 = 0x887601c2;
 const NO_CLIPPER_ATTACHED: u32 = 0x88760238;
 const INVALID_CLIP_LIST: u32 = 0x8876006e;
@@ -213,6 +215,9 @@ pub struct DirectDraw {
     primary_owner: Option<u32>,
     /// Surfaces lost to another DirectDraw object's exclusive mode.
     lost: BTreeSet<u32>,
+    /// Primaries whose chain has flipped an odd number of times, so the
+    /// front shows the back buffer's memory instead of GDI's.
+    flipped: BTreeSet<u32>,
 }
 
 impl DirectDraw {
@@ -237,6 +242,7 @@ impl DirectDraw {
             attached_refs: BTreeMap::new(),
             primary_owner: None,
             lost: BTreeSet::new(),
+            flipped: BTreeSet::new(),
         }
     }
 
@@ -252,6 +258,28 @@ impl DirectDraw {
             self.submitted = Some(sid);
         }
         Ok(())
+    }
+
+    /// Exchanges the memory of `dst` and `src` and presents `dst`.
+    fn flip<P: Presenter>(
+        &mut self,
+        surfaces: &mut Surfaces<P>,
+        m: &mut dyn SurfaceMemory,
+        dst: u32,
+        src: u32,
+    ) -> Result<u32, String> {
+        if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
+            return Ok(BUSY);
+        }
+        surfaces.flush(m, surface::FlushReason::Immediate)?;
+        let front = surfaces[dst].pixels;
+        surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
+        surfaces.get_mut(src).unwrap().pixels = front;
+        if self.attached.get(&dst) == Some(&src) && !self.flipped.remove(&dst) {
+            self.flipped.insert(dst);
+        }
+        self.present(surfaces, dst, m, surfaces[dst].rect())?;
+        Ok(0)
     }
 
     /// Screen origin of the window a clipper names; primary-surface blits are relative to it.
@@ -339,6 +367,7 @@ impl DirectDraw {
                 (4, api::CREATE_CLIPPER),
                 (6, api::CREATE_SURFACE),
                 (8, api::ENUM_MODES),
+                (10, api::FLIP_TO_GDI),
                 (11, api::GET_CAPS),
                 (12, api::GET_DISPLAY_MODE),
                 (18, api::INITIALIZE),
@@ -580,6 +609,7 @@ impl DirectDraw {
                 self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
                 self.attached.remove(&sid);
+                self.flipped.remove(&sid);
                 if let Some(back) = self.attached_refs.remove(&sid) {
                     self.release_com(objects, surfaces, back);
                 }
@@ -1080,6 +1110,7 @@ impl DirectDraw {
                         };
                         self.attached.insert(primary, back);
                         self.attached_refs.insert(primary, back_ref);
+                        self.flipped.remove(&primary);
                     }
                     primary
                 } else {
@@ -1204,7 +1235,7 @@ impl DirectDraw {
                     return Ok(INVALID);
                 };
                 let Some(&back) = self.attached.get(&sid) else {
-                    return Ok(0x887600ff);
+                    return Ok(NOT_FOUND);
                 };
                 let Some(p) =
                     self.com_version(objects, surfaces, Kind::Surface(back), legacy, m)?
@@ -1224,15 +1255,24 @@ impl DirectDraw {
                     self.attached.get(&dst).copied()
                 };
                 let Some(src) = src else { return Ok(INVALID) };
-                if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
-                    return Ok(BUSY);
+                self.flip(surfaces, m, dst, src)?
+            }
+            api::FLIP_TO_GDI => {
+                // The GDI surface is the front buffer the primary was created
+                // with; only the DirectDraw object that created it has one.
+                let Some(primary) = surfaces
+                    .primary_id()
+                    .filter(|_| matches!(kind, Kind::Device))
+                    .filter(|_| self.primary_owner == Some(object.modern))
+                else {
+                    return Ok(NOT_FOUND);
+                };
+                match self.attached.get(&primary) {
+                    Some(&back) if self.flipped.contains(&primary) => {
+                        self.flip(surfaces, m, primary, back)?
+                    }
+                    _ => 0,
                 }
-                surfaces.flush(m, surface::FlushReason::Immediate)?;
-                let front = surfaces[dst].pixels;
-                surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
-                surfaces.get_mut(src).unwrap().pixels = front;
-                self.present(surfaces, dst, m, surfaces[dst].rect())?;
-                0
             }
             api::BLT_FAST => {
                 let (Some(dst), Some(src)) = (

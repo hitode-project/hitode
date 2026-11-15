@@ -52,9 +52,17 @@ fn fixture() -> (Machine<JitCpu>, u32, u32) {
     let dc_pointer = base + 0x380000;
     let font_pointer = base + 0x381000;
     let attr = base + 0x382000;
+    // The fixture's win32u has no identity table: its data symbols sit
+    // 0x100 apart below the shared handle table.
+    let synthetic = layout::Layout::resolve(|_, name| {
+        let index = layout::Layout::NAMES.iter().position(|n| *n == name)?;
+        Some(0x1f0000 + 0x100 * index as u32)
+    })
+    .unwrap();
+    assert_eq!(*layout::LAYOUT.get_or_init(|| synthetic), synthetic);
     machine
         .cpu
-        .write_u32(base + layout::GDI_SHARED, shared)
+        .write_u32(base + layout::layout().gdi_shared, shared)
         .unwrap();
     for (handle, pointer, kind) in [(dc, dc_pointer, 1), (font, font_pointer, 10)] {
         let entry = shared + handle * layout::handle::SIZE;

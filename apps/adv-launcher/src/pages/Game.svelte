@@ -14,11 +14,18 @@
   import { nav } from "../lib/nav.svelte";
   import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
-  import { screen, trackScreen } from "../lib/screen.svelte";
+  import { screen, trackScreen, type GameLayout } from "../lib/screen.svelte";
   import { tap } from "../lib/tap";
+  import CustomKeys from "../components/CustomKeys.svelte";
   import TouchControls from "../components/TouchControls.svelte";
   import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
   import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
+  import {
+    gameKeyProfile,
+    gameKeyProfileId,
+    keyProfiles,
+    setGameKeyProfile,
+  } from "../lib/key-layouts.svelte";
 
   /**
    * The in-game overlay. The native game view is under this transparent page;
@@ -37,6 +44,15 @@
 
   type View = "closed" | "menu" | "confirm";
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
+  let editingKeys = $state(false);
+  const activeProfileId = $derived(phone ? gameKeyProfileId(gameId) : null);
+  const activeProfile = $derived(phone ? gameKeyProfile(gameId) : null);
+  const customWithoutMenu = $derived(
+    activeProfile !== null &&
+      !activeProfile.items.some(
+        (it) => it.type === "key" && it.binding.kind === "sys" && it.binding.sys === "menu",
+      ),
+  );
   /** The menu was opened by the back gesture; shows the edge hint briefly. */
   let backHint = $state(false);
   let pendingRecallHint = $state(false);
@@ -152,6 +168,33 @@
     updateOverrides({ ff: value });
   }
 
+  let vw = $state(typeof window !== "undefined" ? window.innerWidth : 844);
+  let vh = $state(typeof window !== "undefined" ? window.innerHeight : 390);
+  const previewLayout = $derived.by((): GameLayout | null => {
+    if (gameView || !phone) return null;
+    if (scale === "stretch") {
+      return {
+        width: vw,
+        height: vh,
+        game: { x: 0, y: 0, width: vw, height: vh },
+        cutouts: [],
+        cornerRadius: 20,
+        gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+      };
+    }
+    const gw = Math.min(vw, Math.round((vh * 4) / 3));
+    const gh = Math.min(vh, Math.round((gw * 3) / 4));
+    return {
+      width: vw,
+      height: vh,
+      game: { x: Math.round((vw - gw) / 2), y: Math.round((vh - gh) / 2), width: gw, height: gh },
+      cutouts: [],
+      cornerRadius: 20,
+      gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+    };
+  });
+  const effectiveLayout = $derived(screen.layout ?? previewLayout);
+
   const started = Date.now();
   let now = $state(Date.now());
   onMount(() => {
@@ -186,11 +229,26 @@
 
   function openMenu() {
     textBar = false;
+    editingKeys = false;
     view = "menu";
+  }
+
+  function openKeyEditor() {
+    if (!activeProfileId) {
+      setGameKeyProfile(gameId, keyProfiles()[0]?.id ?? "rpg");
+    }
+    if (prefs.hideControls) {
+      prefs.hideControls = false;
+      savePrefs();
+    }
+    textBar = false;
+    view = "closed";
+    editingKeys = true;
   }
 
   function dismissLayer(): boolean {
     if (textBar) textBar = false;
+    else if (editingKeys) editingKeys = false;
     else if (forceAsk) forceAsk = false;
     else if (view === "confirm") view = "menu";
     else if (view === "menu") view = "closed";
@@ -217,7 +275,16 @@
   });
 
   $effect(() => {
-    if (!phone || !prefs.hideControls || view !== "closed" || loading || dialogs.length || textBar || stopping) {
+    if (
+      !phone ||
+      (!prefs.hideControls && !customWithoutMenu) ||
+      view !== "closed" ||
+      editingKeys ||
+      loading ||
+      dialogs.length ||
+      textBar ||
+      stopping
+    ) {
       recallHint = false;
       return;
     }
@@ -329,6 +396,7 @@
 
   function openTextBar() {
     view = "closed";
+    editingKeys = false;
     textBar = true;
     queueMicrotask(() => textInput?.focus());
   }
@@ -373,15 +441,16 @@
   });
   function leave() {
     view = "closed";
+    editingKeys = false;
     textBar = false;
     forceAsk = false;
     quit();
   }
 
-  // The game is paused while the pause menu is open; once a quit is
-  // requested the host resumes it so it can answer.
+  // The game is paused while the pause menu or key editor is open; once a quit
+  // is requested the host resumes it so it can answer.
   $effect(() => {
-    if (!gameView || view === "closed") return;
+    if (!gameView || (view === "closed" && !editingKeys)) return;
     return pauser.hold();
   });
 
@@ -398,7 +467,13 @@
   }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window
+  {onkeydown}
+  onresize={() => {
+    vw = window.innerWidth;
+    vh = window.innerHeight;
+  }}
+/>
 
 <div class="game" class:phone>
   {#if !gameView}
@@ -520,6 +595,23 @@
               </div>
               {#if phone}
                 <div class="prow">
+                  <span>{t("键位方案")}</span>
+                  <select
+                    class="pselect"
+                    aria-label={t("键位方案")}
+                    value={activeProfileId ?? ""}
+                    onchange={(e) => {
+                      const val = e.currentTarget.value;
+                      setGameKeyProfile(gameId, val || null);
+                    }}
+                  >
+                    <option value="">{t("默认")}</option>
+                    {#each keyProfiles() as p (p.id)}
+                      <option value={p.id}>{p.builtin && p.name === "快捷键" ? t("快捷键") : p.name}</option>
+                    {/each}
+                  </select>
+                </div>
+                <div class="prow">
                   <span>{t("触控板模式")}</span>
                   <button class="sw" class:on={touchMode === "trackpad"} role="switch" aria-checked={touchMode === "trackpad"} aria-label={t("触控板模式")} onclick={() => { prefs.touchMode = touchMode === "trackpad" ? "direct" : "trackpad"; savePrefs(); }}></button>
                 </div>
@@ -550,6 +642,12 @@
           <div class="group">
             {#if guestMenu && !guestMenu.popup}
               <button class="qrow" onclick={() => { view = "closed"; menuOpen = true; }}>{t("游戏菜单…")}</button>
+            {/if}
+            {#if phone}
+              <button class="qrow" onclick={openKeyEditor}>
+                <span>{t("自定义键位…")}</span>
+                <span class="end"><Icon name="sliders" /></span>
+              </button>
             {/if}
             <button class="qrow" onclick={openTextBar}>
               <span>{t("输入文字…")}</span>
@@ -587,9 +685,33 @@
     </div>
   {:else if loading || dialogs.length}
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
-  {:else if phone && !prefs.hideControls && screen.layout}
+  {:else if phone && editingKeys && activeProfile}
+    <CustomKeys
+      {gameId}
+      profile={activeProfile}
+      layout={effectiveLayout}
+      editing={true}
+      latchCtrl={ff === "toggle"}
+      onmenu={openMenu}
+      onkeyboard={openTextBar}
+      ondone={() => (editingKeys = false)}
+    />
+  {:else if phone && !prefs.hideControls && activeProfile}
     {#if !stopping}
-      <TouchControls layout={screen.layout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <CustomKeys
+        {gameId}
+        profile={activeProfile}
+        layout={effectiveLayout}
+        editing={false}
+        latchCtrl={ff === "toggle"}
+        onmenu={openMenu}
+        onkeyboard={openTextBar}
+        ondone={() => (editingKeys = false)}
+      />
+    {/if}
+  {:else if phone && !prefs.hideControls && effectiveLayout}
+    {#if !stopping}
+      <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
   {:else if phone && !prefs.hideControls}
     <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
@@ -867,6 +989,21 @@
     gap: 12px;
     min-height: 44px;
     font-size: 13px;
+  }
+  .pselect {
+    max-width: 164px;
+    min-width: 120px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--field);
+    color: var(--fg);
+    font: inherit;
+    font-size: 13px;
+  }
+  .pselect:focus-visible {
+    outline: 2px solid #8fb0f5;
+    outline-offset: 2px;
   }
   .seg {
     display: inline-flex;

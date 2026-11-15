@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 #[cfg(unix)]
@@ -202,7 +202,15 @@ impl Debugger {
             stopped: AtomicBool::new(false),
         });
         let directory = socket_dir();
-        let socket = directory.join(format!("{}-{}.sock", std::process::id(), unix_us()));
+        // Debuggers a process starts within one microsecond, as parallel
+        // tests do, differ in their sequence number.
+        static STARTED: AtomicU32 = AtomicU32::new(0);
+        let socket = directory.join(format!(
+            "{}-{}-{}.sock",
+            std::process::id(),
+            unix_us(),
+            STARTED.fetch_add(1, Ordering::Relaxed)
+        ));
         listen(&directory, &socket, shared.clone())?;
         #[cfg(target_os = "android")]
         eprintln!("debug: serving the abstract socket hitode-debug");

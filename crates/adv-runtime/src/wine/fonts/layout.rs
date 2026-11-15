@@ -1,4 +1,5 @@
-//! Offsets and module RVAs from the pinned Wine 11 win32u.so DWARF.
+//! Offsets from the pinned Wine 11 win32u.so DWARF, and the data symbols
+//! the font bodies resolve from its identity table.
 #![allow(non_upper_case_globals, dead_code)]
 pub mod attr {
     pub const SIZE: u32 = 0xc0;
@@ -239,14 +240,10 @@ pub mod handle {
     pub const Flags: u32 = 0xf;
     pub const UserPointer: u32 = 0x10;
 }
-pub const GDI_SHARED: u32 = 0x1f194c;
-pub const FONT_FUNCS: u32 = 0x1f1884;
-pub const FONT_DRIVER: u32 = 0x1d0620;
-pub const DIB_DRIVER: u32 = 0x1d4be0;
-pub const HKCU_KEY: u32 = 0x1e678c;
-pub const ANSI_CP: u32 = 0x1e6760;
-pub const OEM_CP: u32 = 0x1f1600;
-pub const UTF8_CP: u32 = 0x1f1640;
+adv_nt::data_layout! {
+    "font";
+    "win32u.so" => [gdi_shared, font_driver, dib_driver, hkcu_key, ansi_cp, oem_cp, utf8_cp],
+}
 /// `CPTABLEINFO`, as `RtlInitCodePageTable` fills it.
 pub mod cptable {
     pub const SIZE: usize = 0x2c;

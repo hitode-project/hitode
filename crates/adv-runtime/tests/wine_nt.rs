@@ -300,7 +300,7 @@ fn k_security() {
     assert_eq!(lines, expected.map(|name| format!("{name} ok")), "{text}");
 }
 
-// spec: NT-SYS-1, NT-SYS-2, NT-SYS-3, NT-SYS-4, WINE-SYS-3
+// spec: NT-SYS-1, NT-SYS-2, NT-SYS-3, NT-SYS-4, WINE-SYS-3, WINE-SRC-4, WINE-SRC-5
 #[test]
 fn m_system() {
     let Some((stop, text)) = probe("m_system", "nt_m_system.exe", |_, _| {}) else {
@@ -312,6 +312,8 @@ fn m_system() {
         ": ok",
         &[
             "displaced-image-base",
+            "restore-unprotected-thunk",
+            "hook-five-bytes",
             "create-section-ex",
             "map-view-ex-shared",
             "map-view-ex-alignment",

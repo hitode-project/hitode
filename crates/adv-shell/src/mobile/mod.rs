@@ -6,6 +6,6 @@ pub use lifecycle::{Lifecycle, State};
 mod gesture;
 pub use gesture::{Button, Gesture, Gestures, TouchMode, mouse};
 mod keys;
-pub use keys::{key_message, overlay_scan_code};
+pub use keys::{key_message, overlay_key, overlay_scan_code};
 mod layout;
 pub use layout::{Insets, Layout, Occlusion, Rect, iphone_housing};

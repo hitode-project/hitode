@@ -83,17 +83,14 @@ fn set_last_error(env: &mut Env<'_>, value: u32) {
         .cpu
         .write_u32(env.ctx().teb + adv_machine::layout::teb::LAST_ERROR, value);
 }
-fn module(env: &Env<'_>) -> Option<u32> {
-    env.ext
-        .try_get::<adv_nt::identity::Images>()?
-        .0
-        .values()
-        .find(|m| m.name == "win32u.so")
-        .map(|m| m.base)
+/// The address of the win32u data symbol `pick` selects.
+fn data(env: &Env<'_>, pick: fn(&layout::Layout) -> u32) -> Option<u32> {
+    let images = env.ext.try_get::<adv_nt::identity::Images>()?;
+    let module = images.0.values().find(|m| m.name == "win32u.so")?;
+    Some(module.base + pick(layout::bound(images).ok()?))
 }
 fn object(env: &Env<'_>, handle: u32, kind: u8) -> Option<u32> {
-    let base = module(env)?;
-    let shared = env.cpu.read_u32(base + layout::GDI_SHARED).ok()?;
+    let shared = env.cpu.read_u32(data(env, |l| l.gdi_shared)?).ok()?;
     let entry = shared + (handle & 0xffff) * layout::handle::SIZE;
     if env.cpu.read_u8(entry + layout::handle::Type).ok()? != kind {
         return None;

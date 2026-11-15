@@ -36,9 +36,11 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-9 Game import
 
-**Rule**: All-files access MUST use writable external-storage volume real paths, while other folders MUST copy through SAF into private storage before library discovery. Copies MUST report byte progress, publish complete by same-parent rename, and remove temporary directories on failure or cancellation without modifying sources. Shared Rust library, settings and playtime storage MUST live under `app_data_dir`, and `reveal_path` MUST open only external-storage volume folders, in DocumentsUI.
+**Rule**: Direct access MUST use writable external-storage volume real paths, while other folders MUST copy through SAF into private storage before discovery. Copies MUST report byte progress, publish complete by same-parent rename, and remove temporary directories on failure or cancellation without modifying sources. Shared Rust library, settings and playtime storage MUST live under `app_data_dir`, and `reveal_path` MUST open only external-storage volume folders, in DocumentsUI.
 **Applies to**: Android
 **Verification**: Test — permission screens and SAF providers also require device review.
+
+API 30+ grants direct access through `MANAGE_EXTERNAL_STORAGE`. API 29 uses legacy external-storage permissions with `requestLegacyExternalStorage`, where only primary storage is writable and removable volumes stay copied through SAF.
 
 ### AND-APP-10 Native view
 
@@ -56,7 +58,7 @@ SurfaceControl MUST retain its own window reference. Window replacement and loss
 
 ### AND-APP-12 Touch routing
 
-**Rule**: Each Android gesture MUST retain the overlay Router target selected at the first press until ACTION_UP or ACTION_CANCEL. Hit testing MUST divide view pixels by display density, with the overlay owning all input when no game runs. Game gestures MUST forward each pointer's ID, action and view coordinates through JNI, while overlay gestures MUST use normal view dispatch.
+**Rule**: Each Android pointer MUST retain the overlay Router target selected at its press until its release or `ACTION_CANCEL`. Hit testing MUST divide view pixels by display density, with the overlay owning all input when no game runs. Game pointers MUST forward their ID, action and view coordinates through JNI, while overlay pointers MUST dispatch to the webview.
 **Applies to**: Android
 **Verification**: Review — MotionEvent dispatch runs on a device; the overlay Router has unit tests.
 
@@ -100,7 +102,7 @@ The provider MUST return the document path from the appropriate root so Files ca
 
 ### AND-APP-18 System navigation during play
 
-**Rule**: Android Back MUST dismiss the top launcher layer or open the pause menu during play. Direct touches starting in system gesture areas MUST NOT reach the guest. The system navigation bar MUST remain available during play.
+**Rule**: Android Back MUST dismiss the top launcher layer or open the pause menu during play. Direct touches starting in system gesture or transient bar edges MUST NOT reach the guest. Immersive system bars MUST remain reachable by edge swipe during play.
 **Applies to**: Android
 **Verification**: Review — system Back and edge touch dispatch require an Android device.
 

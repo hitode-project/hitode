@@ -115,15 +115,16 @@ class MainActivity : TauriActivity() {
         applyGameBars()
     }
 
+    fun reapplyGameBars() {
+        if (gameMode) applyGameBars()
+    }
+
     private fun applyGameBars() {
         val bars = WindowCompat.getInsetsController(window, window.decorView)
         bars.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        if (gameMode) {
-            // Keep Android Back, Home and Overview available during play.
-            bars.hide(WindowInsetsCompat.Type.statusBars())
-            bars.show(WindowInsetsCompat.Type.navigationBars())
-        } else bars.show(WindowInsetsCompat.Type.systemBars())
+        if (gameMode) bars.hide(WindowInsetsCompat.Type.systemBars())
+        else bars.show(WindowInsetsCompat.Type.systemBars())
     }
 
     private fun requestAudioFocus() {

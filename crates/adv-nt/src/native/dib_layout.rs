@@ -1,4 +1,4 @@
-//! Field offsets and data addresses from the pinned win32u.so DWARF.
+//! Field offsets from the pinned win32u.so DWARF.
 #![allow(non_upper_case_globals, dead_code)]
 
 pub mod dib {
@@ -118,14 +118,3 @@ pub mod masks {
     pub const and_: usize = 0x00;
     pub const xor_: usize = 0x04;
 }
-pub const FUNCS_8888: u32 = 0x1d01a0;
-pub const FUNCS_32: u32 = 0x1d0140;
-pub const FUNCS_24: u32 = 0x1d00e0;
-pub const FUNCS_555: u32 = 0x1d0080;
-pub const FUNCS_16: u32 = 0x1d0020;
-pub const FUNCS_8: u32 = 0x1cffc0;
-pub const FUNCS_4: u32 = 0x1cff60;
-pub const FUNCS_1: u32 = 0x1cff00;
-pub const TABLE_1: u32 = 0x15c200;
-pub const TABLE_4: u32 = 0x15c1c0;
-pub const TABLE_8: u32 = 0x15bdc0;

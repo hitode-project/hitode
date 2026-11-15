@@ -25,6 +25,16 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: System call numbers MUST come from the vendored `ntsyscalls.h` through `tools/wine/syscalls.py`.
 **Verification**: Check — `tools/check.py` runs `tools/wine/syscalls.py --check`.
 
+### WINE-SRC-4 Userland patches
+
+**Rule**: The Wine distribution MUST build from the pinned release source with only `tools/wine/patches` applied. kernel32's `VirtualProtect`, `VirtualQuery`, `FlushInstructionCache` and exception-filter thunks MUST NOT share a page with its other import thunks.
+**Verification**: Test
+
+### WINE-SRC-5 Hot-patch prologue
+
+**Rule**: Every `WINAPI` and `WINAPIV` function of the i386 PE modules MUST start with `mov edi,edi; push ebp; mov ebp,esp`. A hook that copies an export's first five bytes MUST therefore copy whole instructions.
+**Verification**: Test
+
 ## Server
 
 ### WINE-SRV-1 In-process server
@@ -351,7 +361,7 @@ Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tab
 **Rule**: DirectWrite MUST keep glyph bitmaps of different rendering modes separate. DirectWrite MUST round glyph bitmap origins vertically to the nearest pixel, with half pixels rounded toward positive infinity.
 **Verification**: Test
 
-Identity checks admit the pinned DirectWrite PE module's bitmap cache key and raster origin corrections at load time.
+The pinned Wine source carries both through `tools/wine/patches`.
 
 ## Threads
 
@@ -394,8 +404,10 @@ Identity checks admit the pinned DirectWrite PE module's bitmap cache key and ra
 
 ### NAT-ID-1 Code identity
 
-**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value.
+**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value. Native bodies MUST find Wine data by the symbol names the table lists, never by pinned addresses.
 **Verification**: Test
+
+A family of bodies whose data symbols the table lacks keeps Wine's code.
 
 ### NAT-ID-2 Unix code identity
 
@@ -425,7 +437,7 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 
 ### NAT-BODY-4 DIB primitives
 
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-6 CRT bodies

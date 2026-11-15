@@ -1,4 +1,4 @@
-/* Build: i686-w64-mingw32-gcc -O2 -Wall -o nt_m_system.exe nt_m_system.c -ladvapi32 */
+/* Build: i686-w64-mingw32-gcc -O2 -Wall -o nt_m_system.exe nt_m_system.c -ladvapi32 -lgdi32 */
 #define _WIN32_WINNT 0x0a00
 #include <windows.h>
 #include <winternl.h>
@@ -46,6 +46,55 @@ static int displaced_image_base(void)
     return ok;
 }
 
+/* A hooking program makes a kernel32 thunk's page PAGE_READWRITE, writes it
+ * and calls kernel32's VirtualProtect to restore it. With DEP on, that only
+ * works when VirtualProtect is on another page, as on Windows. */
+static int restore_unprotected_thunk(void)
+{
+    volatile BYTE *target = (BYTE *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetFilePointer");
+    DWORD old, flags = 0;
+    GetProcessDEPPolicy(GetCurrentProcess(), &flags, &(BOOL){0});
+    if (!(flags & PROCESS_DEP_ENABLE) || !VirtualProtect((void *)target, 6, PAGE_READWRITE, &old)) return 0;
+    target[0] = target[0];
+    return VirtualProtect((void *)target, 6, old, &old)
+        && SetFilePointer(INVALID_HANDLE_VALUE, 0, NULL, FILE_CURRENT) == INVALID_SET_FILE_POINTER;
+}
+
+/* An inline hook that copies an export's first five bytes into its trampoline,
+ * as Windows' hot-patch prologue allows. */
+typedef HFONT (WINAPI *create_font_fn)(INT, INT, INT, INT, INT, DWORD, DWORD, DWORD, DWORD, DWORD,
+                                       DWORD, DWORD, DWORD, LPCSTR);
+static create_font_fn create_font_original;
+static int hooked_calls;
+
+static HFONT WINAPI hook_create_font(INT height, INT width, INT escapement, INT orientation, INT weight,
+                                     DWORD italic, DWORD underline, DWORD strikeout, DWORD charset,
+                                     DWORD precision, DWORD clip, DWORD quality, DWORD pitch, LPCSTR name)
+{
+    hooked_calls++;
+    return create_font_original(height, width, escapement, orientation, weight, italic, underline,
+                                strikeout, charset, precision, clip, quality, pitch, name);
+}
+
+static int hook_five_bytes(void)
+{
+    BYTE *target = (BYTE *)GetProcAddress(GetModuleHandleA("gdi32.dll"), "CreateFontA");
+    BYTE *trampoline = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    DWORD old;
+    HFONT font;
+    if (!target || !trampoline || !VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    memcpy(trampoline, target, 5);
+    trampoline[5] = 0xe9;
+    *(DWORD *)(trampoline + 6) = (DWORD)(target + 5 - (trampoline + 10));
+    create_font_original = (create_font_fn)trampoline;
+    target[0] = 0xe9;
+    *(DWORD *)(target + 1) = (DWORD)((BYTE *)hook_create_font - (target + 5));
+    VirtualProtect(target, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, 5);
+    font = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, "SimHei");
+    return font && hooked_calls == 1 && DeleteObject(font);
+}
+
 int main(void)
 {
     HMODULE nt = GetModuleHandleA("ntdll.dll"), kb = GetModuleHandleA("kernelbase.dll");
@@ -63,6 +112,8 @@ int main(void)
     void *placeholder;
 
     check("displaced-image-base", displaced_image_base());
+    check("restore-unprotected-thunk", restore_unprotected_thunk());
+    check("hook-five-bytes", hook_five_bytes());
     mapping = mapping2(INVALID_HANDLE_VALUE, NULL, SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, 65536, NULL, NULL, 0);
     check("create-section-ex", mapping != NULL);
     view = map3(mapping, GetCurrentProcess(), NULL, 0, 65536, 0, PAGE_READWRITE, NULL, 0);

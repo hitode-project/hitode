@@ -62,5 +62,4 @@ pub mod notify {
     pub const dwOffset: usize = 0;
 }
 
-pub const FIR_RVA: u32 = 0x25020;
 pub const FIR_LEN: usize = 7907;

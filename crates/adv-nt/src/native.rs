@@ -26,6 +26,69 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 use crate::identity::{self, Images};
 
+/// RVAs of the Wine data a family of bodies reads, named after Wine's
+/// symbols. The family resolves them from the mapped modules' identity
+/// tables when it binds; a process holding another build's layout keeps
+/// Wine's code for that family. Expands to `Layout`, the `LAYOUT` it bound,
+/// and `layout`, `bind` and `bound`.
+#[macro_export]
+macro_rules! data_layout {
+    ($family:literal; $($module:literal => [$($field:ident),* $(,)?]),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) struct Layout {
+            $($(pub $field: u32,)*)*
+        }
+        impl Layout {
+            #[cfg(test)]
+            #[allow(dead_code)]
+            pub(super) const NAMES: &[&str] = &[$($(stringify!($field),)*)*];
+
+            /// The layout `rva` gives each module's data symbol.
+            pub(super) fn resolve(
+                rva: impl Fn(&str, &str) -> Option<u32>,
+            ) -> std::result::Result<Self, String> {
+                Ok(Self {
+                    $($($field: rva($module, stringify!($field)).ok_or(concat!(
+                        "no ", $module, " data symbol ", stringify!($field)
+                    ))?,)*)*
+                })
+            }
+        }
+        pub(super) static LAYOUT: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
+
+        /// The layout the family bound with.
+        #[allow(dead_code)]
+        pub(super) fn layout() -> &'static Layout {
+            LAYOUT.get().expect(concat!($family, " bodies bind with a layout"))
+        }
+
+        /// Resolves the layout of the mapped modules.
+        pub(super) fn bind(
+            images: &$crate::identity::Images,
+        ) -> std::result::Result<(), String> {
+            let layout = Layout::resolve(|module, name| {
+                images.0.values().find(|image| image.name == module)?.table()?.variable(name)
+            })?;
+            if *LAYOUT.get_or_init(|| layout) != layout {
+                return Err(concat!("another build's ", $family, " layout is bound").into());
+            }
+            Ok(())
+        }
+
+        /// The bound layout, resolved from `images` on first use.
+        #[allow(dead_code)]
+        pub(super) fn bound(
+            images: &$crate::identity::Images,
+        ) -> std::result::Result<&'static Layout, String> {
+            if let Some(layout) = LAYOUT.get() {
+                return Ok(layout);
+            }
+            bind(images)?;
+            Ok(layout())
+        }
+    };
+}
+
 mod crt;
 mod dib;
 mod fonts;
@@ -643,6 +706,7 @@ pub(crate) fn bind_relocated(
     else {
         return;
     };
+    identity::note_read_path(cpu, ext, &module);
     let bodies = BODIES
         .iter()
         .chain(dib::BODIES)
@@ -663,9 +727,6 @@ pub(crate) fn bind_relocated(
     };
     if own {
         own_calls::bind(cpu, sys, ext, base, &module.name, &table, relocated);
-    }
-    if text && module.name == "dwrite.dll" {
-        fonts::fix_dwrite_rasterization(cpu, sys, base, &table, relocated);
     }
     if !bodies {
         return;
@@ -769,6 +830,7 @@ fn bind_one(
         if name.starts_with("kernelbase.dll!CompareString")
             || name.starts_with("kernelbase.dll!lstrcmp")
         {
+            nls::bind(ext.get::<Images>())?;
             direct.inputs[2] = Some(adv_cpu::body::Input::Const(
                 ext.get::<Images>().containing(entry).unwrap().base,
             ));
@@ -782,6 +844,7 @@ fn bind_one(
             ));
         }
         if name.starts_with("win32u.so!") {
+            dib::bind(ext.get::<Images>())?;
             if let Some(image) = ext
                 .try_get::<Images>()
                 .and_then(|images| images.containing(entry))

@@ -14,16 +14,22 @@ fn write(env: &mut Env<'_>, pointer: u32, bytes: &[u8]) -> Outcome {
 }
 /// The tables Wine's `update_codepage` fills: win32u's own ANSI and OEM
 /// conversions read them.
-fn code_pages(env: &mut Env<'_>, module: u32) {
+fn code_pages(env: &mut Env<'_>) {
     let teb = env.sys.contexts[env.context as usize].teb;
     let peb = env.cpu.read_u32(teb + 0x30).unwrap();
     for (data, table) in [
-        (0, layout::UTF8_CP),
-        (env.cpu.read_u32(peb + 0x58).unwrap(), layout::ANSI_CP),
-        (env.cpu.read_u32(peb + 0x5c).unwrap(), layout::OEM_CP),
+        (0, super::data(env, |l| l.utf8_cp)),
+        (
+            env.cpu.read_u32(peb + 0x58).unwrap(),
+            super::data(env, |l| l.ansi_cp),
+        ),
+        (
+            env.cpu.read_u32(peb + 0x5c).unwrap(),
+            super::data(env, |l| l.oem_cp),
+        ),
     ] {
         let info = code_page_table(env, data);
-        env.cpu.write(module + table, &info).unwrap();
+        env.cpu.write(table.unwrap(), &info).unwrap();
     }
 }
 
@@ -102,9 +108,9 @@ pub(super) fn run(env: &mut Env<'_>, name: &'static str) -> Outcome {
         "font_init" => {
             let user = adv_nt::environment::user_key(env).unwrap();
             let key = adv_nt::registry::open_for_reading(env, 0, &user).unwrap();
-            let module = super::module(env).unwrap();
-            env.cpu.write_u32(module + layout::HKCU_KEY, key).unwrap();
-            code_pages(env, module);
+            let hkcu = super::data(env, |l| l.hkcu_key).unwrap();
+            env.cpu.write_u32(hkcu, key).unwrap();
+            code_pages(env);
             return Outcome::Return(96);
         }
         "init_freetype_lib" => return Outcome::Return(0),
@@ -368,7 +374,7 @@ fn create_dc(env: &mut Env<'_>, slot: u32) -> Outcome {
     let Some(dev) = (allocator.allocate)(env, 16) else {
         return Outcome::Return(0);
     };
-    let table = module(env).unwrap() + layout::FONT_DRIVER;
+    let table = data(env, |l| l.font_driver).unwrap();
     let priority = env.cpu.read_u32(table + layout::funcs::priority).unwrap();
     let mut slot = slot;
     loop {

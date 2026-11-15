@@ -44,6 +44,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Measured on Windows 11
 
+### GFX-DDRAW-8 GDI surface
+
+**Rule**: FlipToGDISurface MUST flip the primary's chain until its front shows the memory the primary was created with, and return DD_OK when it already does. A DirectDraw object without its own primary MUST get DDERR_NOTFOUND.
+**Verification**: Test
+**Basis**: Wine 11 DirectDraw
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
