@@ -1,9 +1,13 @@
 //! Assembly seams for Wine's files, notifications and guest allocation.
 use super::*;
 
-pub type Opened =
-    Box<dyn FnOnce(&mut Env<'_>, Result<(adv_device::media::Decoder, u32), u32>) -> Outcome>;
-pub type ReadFile = Box<dyn FnOnce(&mut Env<'_>, Result<(Vec<u8>, u32), u32>) -> Outcome>;
+/// A source opened by file name, with the handle that keeps its sharing lock.
+/// Contents read out through the guest come without one: their handle was
+/// closed through the guest as it was opened.
+pub type Opened = Box<
+    dyn FnOnce(&mut Env<'_>, Result<(adv_device::media::Decoder, Option<u32>), u32>) -> Outcome,
+>;
+pub type ReadFile = Box<dyn FnOnce(&mut Env<'_>, Result<(Vec<u8>, Option<u32>), u32>) -> Outcome>;
 
 #[derive(Clone, Copy)]
 pub struct Host {
