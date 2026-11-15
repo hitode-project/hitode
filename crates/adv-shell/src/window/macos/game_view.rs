@@ -154,8 +154,9 @@ impl GameView {
         &self,
         software: bool,
         wake: adv_sync::WakeEvent,
+        cache_dir: Option<std::path::PathBuf>,
     ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
-        let (device, queue) = crate::display::open(software)?;
+        let (device, queue) = crate::display::open(software, cache_dir)?;
         crate::display::apple_channel(
             device,
             queue,

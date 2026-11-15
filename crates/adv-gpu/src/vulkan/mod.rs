@@ -73,12 +73,15 @@ pub(crate) struct Context {
     /// Set when extended dynamic state is in use.
     eds: Option<Eds>,
     cache_prefix: [u8; 28],
+    health_dir: Option<std::path::PathBuf>,
+    degraded: crate::health::Mask,
+    crashed: bool,
     #[cfg(target_os = "android")]
     ahb: ash::android::external_memory_android_hardware_buffer::Device,
     #[cfg(target_os = "android")]
-    semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    ahb_ubwc: bool,
     #[cfg(target_os = "android")]
-    vendor: u32,
+    semaphore_fd: ash::khr::external_semaphore_fd::Device,
     #[cfg(target_os = "android")]
     video_format: Option<video::VideoFormat>,
 }
@@ -412,13 +415,7 @@ impl Device {
             vendor: format!("0x{:04x}", id(16)),
             device: format!("0x{:04x}", id(20)),
             driver: caps.driver.clone(),
-            tier: if caps.modern.contains(Modern::BINDLESS) {
-                "bindless"
-            } else if caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
-                "push_descriptors"
-            } else {
-                "descriptor_sets"
-            },
+            tier: crate::health::format_tier(caps.modern, self.0.degraded, self.0.crashed),
         }
     }
     pub(crate) fn caps(&self) -> &Caps {
@@ -426,6 +423,9 @@ impl Device {
     }
     pub(crate) fn lost(&self) -> Option<String> {
         self.0.lost.load(Ordering::Relaxed).then(|| LOST.into())
+    }
+    pub(crate) fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::health::guard_compile(self.0.health_dir.as_deref(), &self.0.cache_prefix, probe, f)
     }
 }
 

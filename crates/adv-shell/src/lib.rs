@@ -111,6 +111,13 @@ pub struct Options {
 }
 
 impl Options {
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub(crate) fn gpu_cache_dir(&self) -> PathBuf {
+        self.d3d9_shader_cache
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("artifacts/gpu"))
+    }
+
     /// Host execution policy, shared by both personalities before guest execution.
     fn configure_machine(
         &self,

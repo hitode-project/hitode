@@ -92,16 +92,7 @@ fn start(
             }
             machine.sys.frame_pacer = Some(Arc::new(pacer));
         }
-        Session::configure_graphics(
-            machine,
-            options.d3d9_sm3,
-            Some(
-                options
-                    .d3d9_shader_cache
-                    .clone()
-                    .unwrap_or_else(|| options.data_dir.join("artifacts/gpu")),
-            ),
-        );
+        Session::configure_graphics(machine, options.d3d9_sm3, Some(options.gpu_cache_dir()));
         if let Some(gpu) = host.gpu {
             Session::attach_gpu(machine, gpu, gpu_wake)?;
         }
@@ -124,6 +115,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
             options.gpu_software,
             (options.width, options.height),
             wake.clone(),
+            Some(options.gpu_cache_dir()),
         )?;
         let debug_display =
             super::debug::requested(options.debug).then(|| display_startup.debug_settings());
@@ -919,7 +911,7 @@ fn drive(
             vendor: adapter.vendor,
             device: adapter.device,
             driver: adapter.driver,
-            tier: adapter.tier.into(),
+            tier: adapter.tier,
         }),
         settings: worker
             .is_none()

@@ -538,8 +538,9 @@ impl GameView {
         &self,
         software: bool,
         wake: adv_sync::WakeEvent,
+        cache_dir: Option<std::path::PathBuf>,
     ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
-        let (device, queue) = crate::display::open(software)?;
+        let (device, queue) = crate::display::open(software, cache_dir)?;
         #[cfg(target_os = "android")]
         {
             let caps = crate::display::platform_caps(Some(&device));

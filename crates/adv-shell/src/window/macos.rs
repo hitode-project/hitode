@@ -688,7 +688,7 @@ impl Window {
         software: bool,
         wake: WakeEvent,
     ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
-        self.view.create_display(software, wake)
+        self.view.create_display(software, wake, None)
     }
     pub fn native_client_size(&self) -> Result<(u32, u32), String> {
         self.view.native_client_size()
