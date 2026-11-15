@@ -5,6 +5,7 @@ import { hostInfo, inTauri, invokeHost } from "./bridge";
 export interface StorageStatus {
   granted: boolean;
   supported: boolean;
+  legacy?: boolean;
 }
 
 /** Phones pick folders through the storage plugin: SAF on Android, Files on iOS. */

@@ -493,6 +493,7 @@ export const messages: Record<string, [string, string]> = {
   "复制到 Hitode…": ["Copy into Hitode…", "Hitode にコピー…"],
   "正在计算大小…": ["Calculating size…", "サイズを計算中…"],
   "尚未开启。若开关置灰，请在系统“应用信息”右上角允许“受限设置”。": ["Not turned on yet. If the switch is grayed out, open the top-right menu in App info and allow Restricted settings.", "まだ有効になっていません。スイッチがグレーアウトしている場合は、システム「アプリ情報」の右上メニューから「制限付き設定」を許可してください。"],
+  "尚未开启。若系统不再弹窗，请再次点击“去授权”前往应用信息开启存储权限。": ["Not turned on yet. If the system prompt does not appear, tap Grant access again to enable storage permission in App info.", "まだ有効になっていません。確認ダイアログが表示されない場合は、もう一度「アクセスを許可」をタップしてアプリ情報からストレージ権限を有効にしてください。"],
   "文件访问权限已关闭": ["File access is off", "ファイルアクセス権限がオフです"],
   "{0} 个游戏无法读取": ["{0} games unreadable", "{0}本のゲームを読み込めません"],
   "去开启": ["Turn on", "有効にする"],
