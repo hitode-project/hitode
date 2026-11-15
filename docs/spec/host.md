@@ -25,7 +25,6 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 ### HOST-OVL-4 Multiple pointers
 
 **Rule**: Each pointer MUST be routed on its own.
-**Applies to**: Hosts other than Android, which routes whole gestures under AND-APP-12
 **Verification**: Test
 
 ### HOST-OVL-5 Keyboard
@@ -86,7 +85,7 @@ Settings and compositor notifications MUST poke the owner even without guest com
 
 ### HOST-VIEW-5 Key translation
 
-**Rule**: Physical keys MUST be delivered as US virtual keys with set 1 scan codes, and no two key positions MUST share a scan code. Key messages MUST follow the Win32 `lParam` layout.
+**Rule**: Physical and overlay keys MUST be delivered as US virtual keys with set 1 scan codes, with distinct scan codes per key. Key messages MUST follow the Win32 `lParam` layout.
 **Verification**: Test
 
 ### HOST-VIEW-6 Embedded window sizing

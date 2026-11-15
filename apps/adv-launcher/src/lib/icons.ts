@@ -33,6 +33,8 @@ export const icons = {
   keyboard: '<rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 6.5h.01M6.5 6.5h.01M9 6.5h.01M11.5 6.5h.01M5 9.5h6"/>',
   backspace: '<path d="M6 3.5h7a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H6L1.8 8z"/><path d="M8.3 6.2l3.4 3.6M11.7 6.2l-3.4 3.6"/>',
   exit: '<path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10.5 5l3 3-3 3M13.5 8H6"/>',
+  menu: '<path d="M3 4.5h10M3 8h10M3 11.5h10"/>',
+  trash: '<path d="M3 4.5h10M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M4.5 4.5l.6 8.2a1.2 1.2 0 0 0 1.2 1.1h3.4a1.2 1.2 0 0 0 1.2-1.1l.6-8.2"/>',
 } as const;
 
 export type IconName = keyof typeof icons;

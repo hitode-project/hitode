@@ -306,10 +306,22 @@ impl GameView {
     /// Presses or releases a mouse button at the mouse position, for the
     /// overlay's buttons; dragging moves with it held.
     pub fn mouse_button(&self, right: bool, down: bool) {
+        self.mouse_button_code(if right { 1 } else { 0 }, down);
+    }
+    /// Presses or releases left (`0`), right (`1`) or middle (`2`) at the mouse position.
+    pub fn mouse_button_code(&self, button: u8, down: bool) {
         if self.paused.get() {
             return;
         }
-        let flag = if right { 2 } else { 1 };
+        let (flag, message) = match (button, down) {
+            (0, true) => (1, 0x201),
+            (0, false) => (1, 0x202),
+            (1, true) => (2, 0x204),
+            (1, false) => (2, 0x205),
+            (2, true) => (0x10, 0x207),
+            (2, false) => (0x10, 0x208),
+            _ => return,
+        };
         let held = self.buttons.get();
         if down == (held & flag != 0) {
             return;
@@ -317,30 +329,27 @@ impl GameView {
         let buttons = if down { held | flag } else { held & !flag };
         self.buttons.set(buttons);
         let at = self.cursor_position();
-        let message = match (right, down) {
-            (false, true) => 0x201,
-            (false, false) => 0x202,
-            (true, true) => 0x204,
-            (true, false) => 0x205,
-        };
         for (message, wparam) in [(0x200, held), (message, buttons)] {
             self.mouse(message, wparam, at);
         }
     }
-    /// Presses or releases a virtual key for the overlay's keys: Backspace,
-    /// Enter, Esc, Space, Tab and Ctrl.
-    pub fn overlay_key(&self, key: u32, down: bool) {
+    /// Presses or releases a virtual key for the overlay's keys.
+    pub fn overlay_key(&self, code: u32, down: bool) {
         if self.paused.get() {
             return;
         }
-        let Some(scan) = crate::mobile::overlay_scan_code(key) else {
+        let Some((key, scan)) = crate::mobile::overlay_key(code) else {
             return;
         };
         if key == 0x11 {
             self.control.set(down);
         }
-        self.keys.borrow().set(key, down);
-        let (message, wparam, lparam) = input::message(key, scan, down, false, false);
+        let repeat = down && self.keys.borrow().get(key) & 0x80 != 0;
+        let alt = (self.keys.borrow().get(0x12) & 0x80 != 0 || (key == 0x12 && down))
+            && self.keys.borrow().get(0x11) & 0x80 == 0
+            && !(key == 0x11 && down);
+        let (message, wparam, lparam) = input::message(key, scan, down, repeat, alt);
+        crate::frontend::update_keys(&self.keys.borrow(), message, wparam, lparam);
         self.push(Event::Input {
             message,
             wparam,
@@ -354,9 +363,9 @@ impl GameView {
         }
     }
     fn release_buttons(&self) {
-        for (flag, right) in [(1, false), (2, true)] {
+        for (flag, button) in [(1, 0), (2, 1), (0x10, 2)] {
             if self.buttons.get() & flag != 0 {
-                self.mouse_button(right, false);
+                self.mouse_button_code(button, false);
             }
         }
     }
