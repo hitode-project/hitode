@@ -673,13 +673,10 @@
   {/if}
 {/snippet}
 
-{#snippet dpadFace(item: DpadItem, st: DpadState, knob: DpadKnob, size: number)}
+{#snippet dpadFace(item: DpadItem, st: DpadState, knob: DpadKnob)}
   {@const labels = item.bind === "wasd" ? ["W", "D", "S", "A"] : item.bind === "numpad" ? ["8", "6", "2", "4"] : null}
-  {@const sx = size > 0 ? (knob.x / size) * 120 : 0}
-  {@const sy = size > 0 ? (knob.y / size) * 120 : 0}
   <svg viewBox="0 0 120 120" width="100%" height="100%" aria-hidden="true">
     <circle cx="60" cy="60" r="56" class="dp-ring" />
-    <circle cx="60" cy="60" r="19" class="dp-well" />
     {#if item.eightWay}
       <line x1="29" y1="29" x2="35" y2="35" class="dp-diag" class:on={st.up && st.left} />
       <line x1="91" y1="29" x2="85" y2="35" class="dp-diag" class:on={st.up && st.right} />
@@ -714,9 +711,6 @@
         <path d="M25 53L17 60L25 67" />
       {/if}
     </g>
-    {#if knob.active && (sx !== 0 || sy !== 0)}
-      <line x1="60" y1="60" x2={60 + sx} y2={60 + sy} class="dp-stem" />
-    {/if}
   </svg>
   <span
     class="dp-puck"
@@ -777,7 +771,7 @@
             aria-label={t("方向盘")}
             {...editItemHandlers(item)}
           >
-            {@render dpadFace(item, IDLE_DPAD, IDLE_KNOB, box.width)}
+            {@render dpadFace(item, IDLE_DPAD, IDLE_KNOB)}
           </div>
         {/if}
       {/each}
@@ -1185,7 +1179,7 @@
           {@attach region}
           {...playDpadHandlers(item)}
         >
-          {@render dpadFace(item, st, knob, box.width)}
+          {@render dpadFace(item, st, knob)}
         </div>
       {/if}
     {/each}
@@ -1315,43 +1309,29 @@
     stroke: rgba(255, 255, 255, 0.06);
     stroke-width: 1;
   }
-  .dp-well {
-    fill: rgba(0, 0, 0, 0.22);
-    stroke: rgba(255, 255, 255, 0.09);
-    stroke-width: 1;
-  }
-  .dp-stem {
-    stroke: rgba(158, 192, 255, 0.34);
-    stroke-width: 3;
-    stroke-linecap: round;
-  }
   .dp-puck {
     position: absolute;
     left: 50%;
     top: 50%;
-    width: 34%;
-    height: 34%;
+    width: 28%;
+    height: 28%;
     box-sizing: border-box;
     border-radius: 50%;
-    background: radial-gradient(circle at 38% 35%, rgba(255, 255, 255, 0.28), rgba(200, 210, 228, 0.14) 72%);
-    border: 1.2px solid rgba(255, 255, 255, 0.3);
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.34), inset 0 1px 1px rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.2);
     pointer-events: none;
     will-change: transform;
     transition:
-      transform 0.15s cubic-bezier(0.22, 1, 0.36, 1),
-      background 0.12s ease,
-      border-color 0.12s ease,
-      box-shadow 0.12s ease;
+      transform 0.14s cubic-bezier(0.22, 1, 0.36, 1),
+      background-color 0.1s ease,
+      border-color 0.1s ease;
   }
   .dp-puck.active {
-    background: radial-gradient(circle at 38% 35%, rgba(182, 208, 255, 0.56), rgba(98, 146, 246, 0.34) 74%);
-    border-color: rgba(168, 202, 255, 0.92);
-    box-shadow: 0 4px 14px rgba(34, 72, 168, 0.42), inset 0 1px 2px rgba(255, 255, 255, 0.38);
+    background: rgba(94, 140, 244, 0.34);
+    border-color: rgba(146, 182, 255, 0.82);
     transition:
-      background 0.08s ease,
-      border-color 0.08s ease,
-      box-shadow 0.08s ease;
+      background-color 0.08s ease,
+      border-color 0.08s ease;
   }
   .dp-diag {
     stroke: rgba(255, 255, 255, 0.16);
