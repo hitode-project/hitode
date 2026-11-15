@@ -790,6 +790,20 @@
         onpointerdown={(e) => e.stopPropagation()}
       >
         <div class="plist">
+          <div class="pitem">
+            <button
+              type="button"
+              class="pname"
+              onclick={() => {
+                setGameKeyProfile(gameId, null);
+                topPopover = null;
+                selectedId = null;
+                ondone();
+              }}
+            >
+              <span>{t("默认")}</span>
+            </button>
+          </div>
           {#each keyProfiles() as p (p.id)}
             <div class="pitem" class:active={p.id === profile.id}>
               <button

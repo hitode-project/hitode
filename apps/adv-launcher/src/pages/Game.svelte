@@ -14,7 +14,7 @@
   import { nav } from "../lib/nav.svelte";
   import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
-  import { screen, trackScreen } from "../lib/screen.svelte";
+  import { screen, trackScreen, type GameLayout } from "../lib/screen.svelte";
   import { tap } from "../lib/tap";
   import CustomKeys from "../components/CustomKeys.svelte";
   import TouchControls from "../components/TouchControls.svelte";
@@ -167,6 +167,33 @@
     ff = value;
     updateOverrides({ ff: value });
   }
+
+  let vw = $state(typeof window !== "undefined" ? window.innerWidth : 844);
+  let vh = $state(typeof window !== "undefined" ? window.innerHeight : 390);
+  const previewLayout = $derived.by((): GameLayout | null => {
+    if (gameView || !phone) return null;
+    if (scale === "stretch") {
+      return {
+        width: vw,
+        height: vh,
+        game: { x: 0, y: 0, width: vw, height: vh },
+        cutouts: [],
+        cornerRadius: 20,
+        gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+      };
+    }
+    const gw = Math.min(vw, Math.round((vh * 4) / 3));
+    const gh = Math.min(vh, Math.round((gw * 3) / 4));
+    return {
+      width: vw,
+      height: vh,
+      game: { x: Math.round((vw - gw) / 2), y: Math.round((vh - gh) / 2), width: gw, height: gh },
+      cutouts: [],
+      cornerRadius: 20,
+      gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+    };
+  });
+  const effectiveLayout = $derived(screen.layout ?? previewLayout);
 
   const started = Date.now();
   let now = $state(Date.now());
@@ -440,7 +467,13 @@
   }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window
+  {onkeydown}
+  onresize={() => {
+    vw = window.innerWidth;
+    vh = window.innerHeight;
+  }}
+/>
 
 <div class="game" class:phone>
   {#if !gameView}
@@ -656,7 +689,7 @@
     <CustomKeys
       {gameId}
       profile={activeProfile}
-      layout={screen.layout}
+      layout={effectiveLayout}
       editing={true}
       latchCtrl={ff === "toggle"}
       onmenu={openMenu}
@@ -668,7 +701,7 @@
       <CustomKeys
         {gameId}
         profile={activeProfile}
-        layout={screen.layout}
+        layout={effectiveLayout}
         editing={false}
         latchCtrl={ff === "toggle"}
         onmenu={openMenu}
@@ -676,9 +709,9 @@
         ondone={() => (editingKeys = false)}
       />
     {/if}
-  {:else if phone && !prefs.hideControls && screen.layout}
+  {:else if phone && !prefs.hideControls && effectiveLayout}
     {#if !stopping}
-      <TouchControls layout={screen.layout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
     {/if}
   {:else if phone && !prefs.hideControls}
     <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
