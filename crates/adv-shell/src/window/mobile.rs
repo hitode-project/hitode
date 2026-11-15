@@ -327,8 +327,7 @@ impl GameView {
             self.mouse(message, wparam, at);
         }
     }
-    /// Presses or releases a virtual key for the overlay's keys: Backspace,
-    /// Enter, Esc, Space, Tab and Ctrl.
+    /// Presses or releases a virtual key for the overlay's keys.
     pub fn overlay_key(&self, key: u32, down: bool) {
         if self.paused.get() {
             return;
@@ -339,8 +338,11 @@ impl GameView {
         if key == 0x11 {
             self.control.set(down);
         }
+        let repeat = down && self.keys.borrow().get(key) & 0x80 != 0;
         self.keys.borrow().set(key, down);
-        let (message, wparam, lparam) = input::message(key, scan, down, false, false);
+        let alt =
+            self.keys.borrow().get(0x12) & 0x80 != 0 && self.keys.borrow().get(0x11) & 0x80 == 0;
+        let (message, wparam, lparam) = input::message(key, scan, down, repeat, alt);
         self.push(Event::Input {
             message,
             wparam,
