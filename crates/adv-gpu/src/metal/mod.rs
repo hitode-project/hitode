@@ -73,8 +73,16 @@ impl Device {
             vendor: vendor.into(),
             device: caps.adapter.clone(),
             driver: caps.driver.clone(),
-            tier: "metal",
+            tier: "metal".into(),
         }
+    }
+
+    pub(crate) fn guard_compile<T>(
+        &self,
+        _probe: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        f()
     }
 
     pub(crate) fn caps(&self) -> &Caps {

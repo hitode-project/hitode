@@ -46,6 +46,7 @@ fn main() {
         disable: adv_gpu::caps::Modern::from_test_env(),
         ring_size: 4 << 20,
         label: "encode cost",
+        ..Default::default()
     })
     .expect("open device");
     let caps = device.caps();

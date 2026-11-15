@@ -209,11 +209,12 @@ impl Pipelines {
         })
     }
 }
-/// A model build: its choice and canvas, the result once sent, then its
-/// half-precision check until the GPU ran it. A failed build stays here, so
-/// the view stays unscaled instead of retrying.
+/// A model build: its choice, canvas and precision, the result once sent, then
+/// its half-precision check until the GPU ran it. A failed single-precision
+/// build stays here, so the view stays unscaled instead of retrying.
 struct Building {
     key: (Upscaler, (u32, u32)),
+    half: bool,
     result: std::sync::mpsc::Receiver<adv_gpu::Result<(Upscaled, Option<upscale::Check>)>>,
     checking: Option<(Upscaled, upscale::Check, Token)>,
     failed: bool,
@@ -363,6 +364,25 @@ impl Display {
     #[cfg(test)]
     pub(crate) fn upscaler_ready(&mut self, queue: &mut Queue) -> bool {
         self.install(queue).unwrap() || self.upscaled.is_some()
+    }
+    #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+    pub(crate) fn inject_failed_build(&mut self, choice: Upscaler, canvas: (u32, u32), half: bool) {
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        send.send(Err(adv_gpu::Error::Compile(
+            "blocked after driver crash: upscale:f16".into(),
+        )))
+        .unwrap();
+        self.building = Some(Building {
+            key: (choice, canvas),
+            half,
+            result,
+            checking: None,
+            failed: false,
+        });
+    }
+    #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+    pub(crate) fn single_precision_forced(&self) -> bool {
+        self.single
     }
     /// The base image the compositor shows last.
     #[cfg(test)]
@@ -1046,13 +1066,17 @@ impl Display {
             let spawned = std::thread::Builder::new()
                 .name("adv-upscale-build".into())
                 .spawn(move || {
-                    let _ = send.send(Upscaled::new(&device, choice, canvas, half));
+                    let probe = format!("upscale:{choice:?}:{}", if half { "f16" } else { "f32" });
+                    let built = device
+                        .guard_compile(&probe, || Upscaled::new(&device, choice, canvas, half));
+                    let _ = send.send(built);
                     if let Some(wake) = wake {
                         wake();
                     }
                 });
             self.building = Some(Building {
                 key,
+                half,
                 result,
                 checking: None,
                 failed: spawned.is_err(),
@@ -1093,8 +1117,16 @@ impl Display {
                     return Ok(false);
                 }
                 Ok(Err(error)) => {
-                    eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
-                    building.failed = true;
+                    if building.half {
+                        eprintln!(
+                            "[display] {choice:?} half precision failed ({error:?}); using single"
+                        );
+                        self.single = true;
+                        self.building = None;
+                    } else {
+                        eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
+                        building.failed = true;
+                    }
                     return Ok(false);
                 }
                 Err(_) => return Ok(false),

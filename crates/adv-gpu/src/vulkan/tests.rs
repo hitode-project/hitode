@@ -1680,3 +1680,33 @@ fn precompiled_workgroup_atomic_arrays_start_zero_after_round_trip() {
         assert!(bytes(&result).iter().all(|&byte| byte == 0));
     }
 }
+
+// spec: GFX-CACHE-4
+#[test]
+fn startup_canaries_and_health_cache_round_trip() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-health-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for disable in [Modern::empty(), Modern::all()] {
+        let (device, mut queue) = test_device!(DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            disable,
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        });
+        assert!(open::canary_render(&device, &mut queue).unwrap());
+        assert!(open::canary_compute(&device, &mut queue).unwrap());
+        assert_eq!(device.guard_compile("canary:test", || Ok(7)).unwrap(), 7);
+    }
+    assert!(dir.join("vulkan-health.bin").exists());
+    assert!(!dir.join("vulkan-probe.bin").exists());
+    // Warm reopen reuses the verified profile without leaving a probe sentinel.
+    let (_warm_device, _warm_queue) = test_device!(DeviceOptions {
+        software: !cfg!(target_os = "android"),
+        validation: !cfg!(target_os = "android"),
+        cache_dir: Some(dir.clone()),
+        ..DeviceOptions::default()
+    });
+    assert!(!dir.join("vulkan-probe.bin").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

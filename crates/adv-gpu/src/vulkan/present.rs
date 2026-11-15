@@ -41,7 +41,7 @@ struct HardwareBufferDesc {
     rfu1: u64,
 }
 impl HardwareBufferDesc {
-    fn new(width: u32, height: u32, vendor: u32, yuv: bool) -> Self {
+    fn new(width: u32, height: u32, ubwc: bool, yuv: bool) -> Self {
         Self {
             width,
             height,
@@ -52,7 +52,7 @@ impl HardwareBufferDesc {
                 | if yuv {
                     CPU_WRITE_OFTEN
                 } else {
-                    GPU_FRAMEBUFFER | if vendor == QUALCOMM { VENDOR_0 } else { 0 }
+                    GPU_FRAMEBUFFER | if ubwc { VENDOR_0 } else { 0 }
                 },
             ..Self::default()
         }
@@ -130,17 +130,23 @@ impl PresentBuffer {
         video: Option<&Arc<VideoPool>>,
     ) -> Result<(crate::Image, Self)> {
         let context = &device.0;
-        let (handle, memory, buffer, format) = allocate(
+        let yuv = desc.format == Format::Nv21;
+        let want_ubwc = !yuv && context.ahb_ubwc;
+        let (handle, memory, buffer, format) = match allocate(
             &context.device,
             &context.ahb,
-            &HardwareBufferDesc::new(
-                desc.width,
-                desc.height,
-                context.vendor,
-                desc.format == Format::Nv21,
-            ),
+            &HardwareBufferDesc::new(desc.width, desc.height, want_ubwc, yuv),
             desc.storage,
-        )?;
+        ) {
+            Ok(imported) => imported,
+            Err(Error::Unavailable(_)) if want_ubwc => allocate(
+                &context.device,
+                &context.ahb,
+                &HardwareBufferDesc::new(desc.width, desc.height, false, false),
+                desc.storage,
+            )?,
+            Err(error) => return Err(error),
+        };
         if let Some(format) = format
             && format.external != context.video_format.unwrap().external
         {
@@ -372,25 +378,54 @@ fn allocate(
     }
 }
 
-/// Presentable caps of [`FORMAT`]. Compression follows the vendor:
+/// Presentable caps of [`FORMAT`] and whether Qualcomm UBWC (`VENDOR_0`)
+/// imports cleanly. Compression follows the vendor once import succeeds:
 /// `VK_EXT_image_compression_control` reports lossless and uncompressed
 /// images alike as `DEFAULT`, so no query proves it; `present_cost` does.
-pub(super) fn capabilities(vendor: u32) -> FormatCaps {
-    if unsafe { AHardwareBuffer_isSupported(&HardwareBufferDesc::new(64, 64, vendor, false)) } == 0
-    {
-        FormatCaps::empty()
-    } else if matches!(vendor, QUALCOMM | ARM) {
-        FormatCaps::PRESENTABLE | FormatCaps::PRESENTABLE_COMPRESSED
-    } else {
-        FormatCaps::PRESENTABLE
+pub(super) fn rgb_capabilities(
+    device: &ash::Device,
+    ahb: &ash::android::external_memory_android_hardware_buffer::Device,
+    vendor: u32,
+    allow_ubwc: bool,
+) -> Result<(FormatCaps, bool)> {
+    let try_mode = |ubwc: bool| -> Result<bool> {
+        let requested = HardwareBufferDesc::new(64, 64, ubwc, false);
+        if unsafe { AHardwareBuffer_isSupported(&requested) } == 0 {
+            return Ok(false);
+        }
+        match allocate(device, ahb, &requested, false) {
+            Ok((image, memory, _buffer, _)) => {
+                unsafe {
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None);
+                }
+                Ok(true)
+            }
+            Err(Error::Unavailable(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+    if vendor == QUALCOMM && allow_ubwc && try_mode(true)? {
+        return Ok((
+            FormatCaps::PRESENTABLE | FormatCaps::PRESENTABLE_COMPRESSED,
+            true,
+        ));
     }
+    if !try_mode(false)? {
+        return Ok((FormatCaps::empty(), false));
+    }
+    let mut caps = FormatCaps::PRESENTABLE;
+    if vendor == ARM {
+        caps |= FormatCaps::PRESENTABLE_COMPRESSED;
+    }
+    Ok((caps, false))
 }
 
 pub(super) fn yuv_capabilities(
     device: &ash::Device,
     ahb: &ash::android::external_memory_android_hardware_buffer::Device,
 ) -> Result<Option<super::video::VideoFormat>> {
-    let requested = HardwareBufferDesc::new(64, 64, 0, true);
+    let requested = HardwareBufferDesc::new(64, 64, false, true);
     if unsafe { AHardwareBuffer_isSupported(&requested) } == 0 {
         return Ok(None);
     }

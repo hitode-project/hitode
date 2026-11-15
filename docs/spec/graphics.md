@@ -382,8 +382,8 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-CACHE-4 Cache location
 
-**Rule**: Disk caches MUST write only under an explicitly selected host cache directory. Backends without native pipeline caching MUST retain portable WGSL caching.
-**Verification**: Review — no existing test checks absence of filesystem writes without configuration across all backends.
+**Rule**: Disk caches and Vulkan health sentinels MUST write only under an explicitly selected host cache directory. Backends without native pipeline caching MUST retain portable WGSL caching. Checksum-validated Vulkan health archives MUST partition by adapter identity, cap at four partitions, and mask crashing probe steps.
+**Verification**: Test — health sentinel recovery and partition caps; filesystem-write absence across all backends also requires review.
 
 ### GFX-CACHE-5 Repeated shader creation
 

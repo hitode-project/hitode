@@ -55,10 +55,11 @@
 //! backends are designed around modern features and carry a small
 //! compatibility tier for older drivers instead of raising the floor.
 //!
-//! - Vulkan requires 1.1 with Android hardware buffers, external fence and
-//!   semaphore fds and YCbCr sampling, which every Adreno 6xx and Mali G76 or
-//!   later reports. The design center is the modern set; each member has a
-//!   mechanical stand-in confined to the backend:
+//! - Vulkan requires 1.1 with Android hardware buffers, external semaphore fds
+//!   and the foreign queue family, which every Adreno 6xx and Mali G76 or
+//!   later reports; YCbCr external sampling is optional and gated per device.
+//!   The design center is the modern set; each member has a mechanical
+//!   stand-in confined to the backend:
 //!
 //!   | Modern feature | Stand-in on older drivers |
 //!   |---|---|
@@ -76,10 +77,15 @@
 //!
 //!   Detection is per feature at [`Device::open`], not one switch between
 //!   tiers: a device may render dynamically and still bind through push
-//!   descriptors. A quirk table keyed by vendor, driver version and feature
-//!   overrides drivers that report a feature they break; it starts empty and
-//!   grows only from real driver bugs. [`Caps::modern`] records the choices,
-//!   and [`queue::DeviceOptions::disable`] forces stand-ins, which is how CI
+//!   descriptors. Startup canaries verify graphics, 4444 clears, compute and
+//!   presentable buffers on cold driver versions, progressively masking broken
+//!   extensions or modern paths down to the Vulkan 1.1 floor; when
+//!   [`queue::DeviceOptions::cache_dir`] is set, crash sentinels and verified
+//!   health profiles persist per driver fingerprint so even hard ICD crashes
+//!   recover automatically on the next launch. A quirk table keyed by vendor,
+//!   driver version and feature overrides known broken drivers ahead of time.
+//!   [`Caps::modern`] records the choices, and
+//!   [`queue::DeviceOptions::disable`] forces stand-ins, which is how CI
 //!   covers both tiers on lavapipe.
 //! - Metal requires Apple5 (A12): memoryless and losslessly compressed
 //!   targets, tile shaders and raster order groups. SIMD-group matrices from
@@ -121,6 +127,8 @@ macro_rules! test_device {
     };
 }
 
+#[cfg(all(feature = "backend", any(test, not(target_vendor = "apple"))))]
+pub(crate) mod health;
 #[cfg(all(feature = "backend", target_vendor = "apple"))]
 mod metal;
 #[cfg(all(feature = "backend", target_vendor = "apple"))]

@@ -2021,3 +2021,27 @@ fn hd_video_bypasses_upscaling_and_resumes_clean_software_damage() {
     let whole = read(&d, &mut q, &whole_image);
     assert_eq!(resumed, whole);
 }
+
+// spec: HOST-VIEW-7
+#[test]
+fn half_precision_compile_failure_falls_back_to_single_precision() {
+    let (d, mut q, mut display, _history) = setup();
+    let mut cfg = settings();
+    cfg.view = (128, 96);
+    cfg.upscaler = Upscaler::Anime4k;
+    display.settings(&mut q, cfg).unwrap();
+
+    // Inject a failed half-precision build (as when `guard_compile` or driver FP16 compilation fails).
+    display.inject_failed_build(Upscaler::Anime4k, (64, 48), true);
+    assert!(!display.upscaler_ready(&mut q));
+    assert!(display.single_precision_forced());
+
+    // Subsequent presentation rebuilds and runs in single precision instead of staying unscaled.
+    let source = private(&d, &mut q);
+    display.present(&mut q, frame(1, &source, all())).unwrap();
+    while !display.upscaler_ready(&mut q) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    display.present(&mut q, frame(2, &source, all())).unwrap();
+    assert!(display.totals().upscaled_runs >= 1);
+}

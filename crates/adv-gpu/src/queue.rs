@@ -22,6 +22,9 @@ pub struct DeviceOptions {
     pub disable: crate::caps::Modern,
     pub ring_size: u64,
     pub label: &'static str,
+    /// Host cache directory for persistent driver health profiles and crash
+    /// sentinels (GFX-CACHE-4); `None` keeps probe results in process memory.
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 /// Shared handle to one GPU device. Creation calls are allowed from any
@@ -39,7 +42,7 @@ pub struct AdapterIdentity {
     pub vendor: String,
     pub device: String,
     pub driver: String,
-    pub tier: &'static str,
+    pub tier: String,
 }
 
 impl Device {
@@ -114,6 +117,12 @@ impl Device {
     /// Set once the device is lost; see [`crate::Error::DeviceLost`].
     pub fn lost(&self) -> Option<String> {
         self.inner.lost()
+    }
+    /// Guards a background shader or pipeline build with a persistent crash
+    /// sentinel when `cache_dir` is configured, blocking repeats after a
+    /// driver compiler crash on this adapter and driver version.
+    pub fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.inner.guard_compile(probe, f)
     }
 }
 

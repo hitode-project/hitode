@@ -58,7 +58,7 @@ pub async fn report_base<R: Runtime>(
                     vendor: identity.vendor,
                     device: identity.device,
                     driver: identity.driver,
-                    tier: identity.tier.into(),
+                    tier: identity.tier,
                 }
             }
         };

@@ -51,6 +51,7 @@ fn options() -> DeviceOptions {
         disable: Modern::from_test_env(),
         ring_size: 4 << 20,
         label: "conformance",
+        ..Default::default()
     }
 }
 
