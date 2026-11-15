@@ -109,8 +109,10 @@ fn machine(dist: &Path, pe: &Pe, image: &[u8], table: &str) -> Machine<Cpu> {
     let ntdll =
         Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/ntdll.dll")).unwrap()).unwrap();
     map(&mut m, &ntdll);
-    // futex_queues address and 12-byte queue stride from the pinned code.
-    m.ext.insert(Futex(ntdll.image_base + 0xa5960));
+    // ntdll's futex_queues, whose queues are 12 bytes apart.
+    m.ext.insert(Futex(
+        ntdll.image_base + wine::variable(dist, "ntdll.dll", "futex_queues").unwrap(),
+    ));
     let ntdll_image = std::fs::read(dist.join("lib/wine/i386-windows/ntdll.dll")).unwrap();
     adv_nt::identity::note_ntdll(
         &mut m,
@@ -574,7 +576,7 @@ fn mixer_matches_wine() {
     }
 }
 
-// spec: NAT-BODY-3
+// spec: NAT-BODY-3, NAT-ID-1
 #[test]
 fn mixer_layout_matches_dwarf() {
     let Some(debug) = wine::debug_dist() else {
@@ -670,8 +672,8 @@ fn mixer_layout_matches_dwarf() {
         .unwrap();
     let pe = Pe::parse(&std::fs::read(dll).unwrap()).unwrap();
     assert_eq!(
-        FIR_RVA,
-        u32::from_str_radix(address, 16).unwrap() - pe.image_base
+        wine::variable(&wine::dist().unwrap(), "dsound.dll", "fir"),
+        Some(u32::from_str_radix(address, 16).unwrap() - pe.image_base)
     );
     assert!(fir.contains(&format!("float[{FIR_LEN}]")));
     let function = text

@@ -2004,12 +2004,13 @@ fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
     assert_eq!(adv_nt::native::declines(&native.ext), 0);
 }
 
-// spec: NAT-BODY-20
+// spec: NAT-BODY-20, NAT-ID-1
 #[test]
 fn nls_layout_matches_dwarf() {
     let Some(debug) = wine::debug_dist() else {
         return;
     };
+    let dist = dist().unwrap();
     let source = include_str!("../src/native/nls.rs");
     for module in ["kernelbase", "ntdll"] {
         let dll = debug.join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
@@ -2089,7 +2090,6 @@ fn nls_layout_matches_dwarf() {
         if module == "kernelbase" {
             for (block, name) in [
                 ("cp", "_CPTABLEINFO"),
-                ("kb", ""),
                 ("sort", "@sort"),
                 ("sortguid", "sortguid"),
                 ("compression", "sort_compression"),
@@ -2123,32 +2123,37 @@ fn nls_layout_matches_dwarf() {
                     } else {
                         value.parse().unwrap()
                     };
-                    let actual = if block == "kb" {
-                        variable(field)
-                    } else {
-                        member(name, field)
-                    };
-                    assert_eq!(actual, expected, "{module}: {block}.{field}");
+                    assert_eq!(member(name, field), expected, "{module}: {block}.{field}");
                 }
             }
         } else {
-            for (constant, actual) in [
-                ("NT_NLS_INFO", variable("nls_info")),
-                ("NT_UPPER_CASE", member("_NLSTABLEINFO", "UpperCaseTable")),
-            ] {
-                let value = source
-                    .split(&format!("const {constant}: u32 = 0x"))
-                    .nth(1)
-                    .unwrap()
-                    .split(';')
-                    .next()
-                    .unwrap();
-                assert_eq!(
-                    actual,
-                    u32::from_str_radix(value, 16).unwrap(),
-                    "{constant}"
-                );
-            }
+            let value = source
+                .split("const NT_UPPER_CASE: u32 = 0x")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            assert_eq!(
+                member("_NLSTABLEINFO", "UpperCaseTable"),
+                u32::from_str_radix(value, 16).unwrap(),
+                "NT_UPPER_CASE"
+            );
+        }
+        // The data symbols nls::Layout binds, as the identity tables give them.
+        let names = source
+            .split(&format!("\"{module}.dll\" => ["))
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        for name in names.split(',').map(str::trim) {
+            assert_eq!(
+                wine::variable(&dist, &format!("{module}.dll"), name),
+                Some(variable(name)),
+                "{module}: {name}"
+            );
         }
     }
 }

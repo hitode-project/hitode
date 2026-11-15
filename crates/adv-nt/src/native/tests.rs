@@ -190,6 +190,14 @@ fn native_body_decline_allocation_gate() {
     for byte in cpu.bytes.iter_mut() {
         *byte = random() as u8;
     }
+    // The fuzzed memory maps no win32u.so; DIB bodies see its data symbols
+    // 0x60 apart.
+    let synthetic = dib::Layout::resolve(|_, name| {
+        let index = dib::Layout::NAMES.iter().position(|n| *n == name)?;
+        Some(0x1d_0000 + 0x60 * index as u32)
+    })
+    .unwrap();
+    assert_eq!(*dib::LAYOUT.get_or_init(|| synthetic), synthetic);
     let mut calls = 0;
     for (index, body) in BODIES.iter().chain(dib::BODIES).enumerate() {
         let function = body.body;

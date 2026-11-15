@@ -14,6 +14,8 @@
 
 # Vendored Wine sources stay byte-identical to the upstream release.
 /vendor/wine/** -whitespace
+# Unified diffs keep a space on blank context lines.
+/tools/wine/patches/*.patch -whitespace
 /vendor/wine/nls/*.nls binary
 
 # Bundled General MIDI SoundFont.

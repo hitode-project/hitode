@@ -349,7 +349,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         }
         M::Mov => match two()? {
             (Src::Imm(_), _) | (Src::Mem(_), Src::Mem(_)) => return None,
-            (dst, src) => Op::Mov(dst, src),
+            (dst, src) => mov(dst, src),
         },
         // An address, with no segment base.
         M::Lea => Op::Lea(
@@ -637,6 +637,15 @@ fn register(src: Src) -> Option<u8> {
     }
 }
 
+/// A move of a register to itself, such as the hot-patch prologue's
+/// `mov edi, edi`, changes nothing, flags included.
+fn mov(dst: Src, src: Src) -> Op {
+    match (dst, src) {
+        (Src::Reg(dst), Src::Reg(src)) if dst == src => Op::Nop,
+        _ => Op::Mov(dst, src),
+    }
+}
+
 /// The `Op` and length of the instruction at the start of `bytes`, at
 /// `pc`, for the forms it knows; `None` leaves the rest to iced and `plan`.
 pub fn quick(bytes: &[u8], pc: u32) -> Option<(Op, u32)> {
@@ -711,11 +720,11 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
         }
         0x89 => {
             let (reg, rm) = b.modrm()?;
-            Op::Mov(rm, Src::Reg(reg))
+            mov(rm, Src::Reg(reg))
         }
         0x8b => {
             let (reg, rm) = b.modrm()?;
-            Op::Mov(Src::Reg(reg), rm)
+            mov(Src::Reg(reg), rm)
         }
         0x8d => match b.modrm()? {
             (reg, Src::Mem(mem)) => Op::Lea(reg, mem),
@@ -1277,6 +1286,22 @@ pub(super) mod tests {
         ] {
             assert_eq!(iced(bytes, 0), None);
         }
+    }
+
+    // spec: A64-TR-1
+    #[test]
+    fn self_moves_decode_as_nop() {
+        // mov edi, edi of the hot-patch prologue, in both encodings.
+        for bytes in [&[0x8b, 0xff][..], &[0x89, 0xff]] {
+            assert_eq!(quick(bytes, 0), Some((Op::Nop, 2)));
+            assert_eq!(iced(bytes, 0), Some((Op::Nop, 2)));
+        }
+        let other = [0x8b, 0xfe];
+        assert_eq!(
+            quick(&other, 0),
+            Some((Op::Mov(Src::Reg(7), Src::Reg(6)), 2))
+        );
+        assert_eq!(iced(&other, 0), quick(&other, 0));
     }
 
     // spec: A64-TR-1, A64-FLAG-2

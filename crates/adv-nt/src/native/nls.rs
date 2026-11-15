@@ -46,7 +46,7 @@ impl From<Stop> for Error {
     }
 }
 
-// Offsets and RVAs checked against the pinned modules' DWARF.
+// Offsets checked against the pinned modules' DWARF.
 #[allow(non_upper_case_globals)]
 mod cp {
     pub const SIZE: u32 = 0x2c;
@@ -56,24 +56,10 @@ mod cp {
     pub const MultiByteTable: u32 = 28;
     pub const DBCSOffsets: u32 = 40;
 }
-#[allow(non_upper_case_globals)]
-mod kb {
-    pub const locale_section: u32 = 0x871a0;
-    pub const ansi_cpinfo: u32 = 0xc0b00;
-    pub const oem_cpinfo: u32 = 0xc0ac0;
-    pub const codepages: u32 = 0xbf480;
-    pub const nb_codepages: u32 = 0xbf460;
-    pub const sort: u32 = 0xbf420;
-    pub const lcids_index: u32 = 0xc0a94;
-    pub const lcnames_index: u32 = 0xc0a90;
-    pub const locale_table: u32 = 0xc0a8c;
-    pub const locale_strings: u32 = 0xc0a88;
-    pub const locale_sorts: u32 = 0xbf458;
-    pub const current_locale_sort: u32 = 0xbf454;
-    pub const system_lcid: u32 = 0xc0aa8;
-    pub const user_lcid: u32 = 0xc0aa4;
-    pub const system_locale: u32 = 0xc0a84;
-    pub const user_locale: u32 = 0xc0a80;
+data_layout! {
+    "comparison";
+    "kernelbase.dll" => [locale_section, ansi_cpinfo, oem_cpinfo, codepages, nb_codepages, sort, lcids_index, lcnames_index, locale_table, locale_strings, locale_sorts, current_locale_sort, system_lcid, user_lcid, system_locale, user_locale],
+    "ntdll.dll" => [nls_info],
 }
 #[allow(non_upper_case_globals)]
 mod sort {
@@ -149,7 +135,6 @@ mod teb {
     pub const LastErrorValue: u32 = 0x34;
     pub const CurrentLocale: u32 = 0xc4;
 }
-const NT_NLS_INFO: u32 = 0x723e0;
 const NT_UPPER_CASE: u32 = 0x58;
 
 const IGNORECASE: u32 = 1;
@@ -385,7 +370,7 @@ fn get_codepage_table<M: Mem>(m: &mut Memory<'_, M>, base: u32, code: u32) -> Re
             default: m.word(at + cp::UniDefaultChar)?,
         })
     };
-    for (id, field) in [(0, kb::ansi_cpinfo), (1, kb::oem_cpinfo)] {
+    for (id, field) in [(0, layout().ansi_cpinfo), (1, layout().oem_cpinfo)] {
         let at = base + field;
         if code == id || code == u32::from(m.word(at + cp::CodePage)?) {
             return load(m, at);
@@ -394,12 +379,12 @@ fn get_codepage_table<M: Mem>(m: &mut Memory<'_, M>, base: u32, code: u32) -> Re
     // Execution has one owner. An unowned locale lock protects no concurrent
     // writer, so already-published entries can be read without taking it.
     // A held lock or an uncached page needs Wine's wait/load/publication path.
-    if m.dword(base + kb::locale_section + critical::LockCount)? != u32::MAX {
+    if m.dword(base + layout().locale_section + critical::LockCount)? != u32::MAX {
         return Err(Stop::Guest.into());
     }
-    let count = m.dword(base + kb::nb_codepages)?;
+    let count = m.dword(base + layout().nb_codepages)?;
     for i in 0..count {
-        let at = base + kb::codepages + i * cp::SIZE;
+        let at = base + layout().codepages + i * cp::SIZE;
         if code == u32::from(m.word(at + cp::CodePage)?) {
             return load(m, at);
         }
@@ -615,8 +600,8 @@ fn compare_locale_names<M: Mem>(m: &mut Memory<'_, M>, a: u32, b: u32) -> Result
 }
 // Wine find_lcid_entry.
 fn find_lcid_entry<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> Result<Option<u32>> {
-    let header = m.dword(base + kb::locale_table)?;
-    let index = m.dword(base + kb::lcids_index)?;
+    let header = m.dword(base + layout().locale_table)?;
+    let index = m.dword(base + layout().lcids_index)?;
     let (mut min, mut max) = (
         0i32,
         i32::from(m.word(header + locale_header::nb_lcids)?) - 1,
@@ -695,9 +680,9 @@ fn find_lcname_entry<M: Mem>(
     base: u32,
     name: u32,
 ) -> Result<Option<(u32, u32)>> {
-    let header = m.dword(base + kb::locale_table)?;
-    let index = m.dword(base + kb::lcnames_index)?;
-    let strings = m.dword(base + kb::locale_strings)?;
+    let header = m.dword(base + layout().locale_table)?;
+    let index = m.dword(base + layout().lcnames_index)?;
+    let strings = m.dword(base + layout().locale_strings)?;
     let count = u32::from(m.word(header + locale_header::nb_lcnames)?);
     let delta = name.wrapping_sub(strings.wrapping_add(2));
     if delta <= u32::from(u16::MAX) * 2
@@ -726,7 +711,7 @@ fn find_lcname_entry<M: Mem>(
 }
 // Wine get_locale_data.
 fn get_locale_data<M: Mem>(m: &mut Memory<'_, M>, base: u32, index: u16) -> Result<u32> {
-    let header = m.dword(base + kb::locale_table)?;
+    let header = m.dword(base + layout().locale_table)?;
     let offset = m.dword(header + locale_header::locales_offset)?;
     let size = m.word(header + locale_header::locale_size)?;
     Ok(header + offset + u32::from(index) * u32::from(size))
@@ -734,8 +719,10 @@ fn get_locale_data<M: Mem>(m: &mut Memory<'_, M>, base: u32, index: u16) -> Resu
 // Wine NlsValidateLocale, flags zero (get_lcid_codepage's only caller here).
 fn nls_validate_locale<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> Result<Option<u32>> {
     match lcid {
-        0x800 => return Ok(Some(m.dword(base + kb::system_locale)?)),
-        0 | 0x400 | 0xc00 | 0x1000 | 0x1400 => return Ok(Some(m.dword(base + kb::user_locale)?)),
+        0x800 => return Ok(Some(m.dword(base + layout().system_locale)?)),
+        0 | 0x400 | 0xc00 | 0x1000 | 0x1400 => {
+            return Ok(Some(m.dword(base + layout().user_locale)?));
+        }
         _ => (),
     }
     let Some(entry) = find_lcid_entry(m, base, lcid)? else {
@@ -744,7 +731,7 @@ fn nls_validate_locale<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> R
     let index = m.word(entry + lcid_index::idx)?;
     let mut locale = get_locale_data(m, base, index)?;
     if m.word(locale + locale_data::inotneutral)? == 0 {
-        let strings = m.dword(base + kb::locale_strings)?;
+        let strings = m.dword(base + layout().locale_strings)?;
         let name = strings + 2 * (m.dword(locale + locale_data::ssortlocale)? + 1);
         if let Some((entry, _)) = find_lcname_entry(m, base, name)? {
             let index = m.word(entry + lcname_index::idx)?;
@@ -760,9 +747,9 @@ fn get_lcid_codepage<M: Mem>(
     lcid: u32,
     flags: u32,
 ) -> Result<u32> {
-    let mut code = u32::from(m.word(base + kb::ansi_cpinfo + cp::CodePage)?);
+    let mut code = u32::from(m.word(base + layout().ansi_cpinfo + cp::CodePage)?);
     if flags & USE_CP_ACP == 0
-        && lcid != m.dword(base + kb::system_lcid)?
+        && lcid != m.dword(base + layout().system_lcid)?
         && let Some(locale) = nls_validate_locale(m, base, lcid)?
     {
         code = u32::from(m.word(locale + locale_data::idefaultansicodepage)?);
@@ -777,12 +764,12 @@ fn get_language_sort<M: Mem>(
     mut name: u32,
 ) -> Result<Option<u32>> {
     if name == 0 {
-        let current = m.dword(base + kb::current_locale_sort)?;
+        let current = m.dword(base + layout().current_locale_sort)?;
         if current != 0 {
             return Ok(Some(current));
         }
-        let locale = m.dword(base + kb::user_locale)?;
-        let strings = m.dword(base + kb::locale_strings)?;
+        let locale = m.dword(base + layout().user_locale)?;
+        let strings = m.dword(base + layout().locale_strings)?;
         name = strings + 2 * (m.dword(locale + locale_data::sname)? + 1);
     } else if m.word(name)? == 0x21 {
         const SYSTEM: &[u8] = b"!x-sys-default-locale";
@@ -802,15 +789,15 @@ fn get_language_sort<M: Mem>(
             }
         }
         if equal {
-            let locale = m.dword(base + kb::system_locale)?;
-            let strings = m.dword(base + kb::locale_strings)?;
+            let locale = m.dword(base + layout().system_locale)?;
+            let strings = m.dword(base + layout().locale_strings)?;
             name = strings + 2 * (m.dword(locale + locale_data::sname)? + 1);
         }
     }
     let Some((_, index)) = find_lcname_entry(m, base, name)? else {
         return Ok(None);
     };
-    let sorts = m.dword(base + kb::locale_sorts)?;
+    let sorts = m.dword(base + layout().locale_sorts)?;
     let sort = m.dword(sorts + 4 * index)?;
     if sort == 0 {
         return Err(Stop::Guest.into());
@@ -822,8 +809,8 @@ fn get_language_sort<M: Mem>(
 fn resolve_lcid<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> Result<Option<u32>> {
     let name = match lcid {
         0 | 0x400 | 0x800 | 0xc00 | 0x1000 | 0x1400 => 0,
-        _ if lcid == m.dword(base + kb::user_lcid)?
-            || lcid == m.dword(base + kb::system_lcid)? =>
+        _ if lcid == m.dword(base + layout().user_lcid)?
+            || lcid == m.dword(base + layout().system_lcid)? =>
         {
             0
         }
@@ -831,7 +818,7 @@ fn resolve_lcid<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> Result<O
             let Some(entry) = find_lcid_entry(m, base, lcid)? else {
                 return Ok(None);
             };
-            let strings = m.dword(base + kb::locale_strings)?;
+            let strings = m.dword(base + layout().locale_strings)?;
             strings + 2 * (u32::from(m.word(entry + lcid_index::name)?) + 1)
         }
     };
@@ -875,7 +862,7 @@ struct Sort {
 }
 impl Sort {
     fn load<M: Mem>(m: &mut Memory<'_, M>, base: u32) -> Result<Self> {
-        let at = base + kb::sort;
+        let at = base + layout().sort;
         Ok(Self {
             index_page: ReadPage::new(),
             key_page: ReadPage::new(),
@@ -967,7 +954,7 @@ fn compare_string_ordinal<M: Mem>(
         return Ok(2);
     }
     let table = if ignore_case {
-        m.dword(nt + NT_NLS_INFO + NT_UPPER_CASE)?
+        m.dword(nt + layout().nls_info + NT_UPPER_CASE)?
     } else {
         0
     };
@@ -1134,7 +1121,7 @@ fn compare<M: Mem>(m: &mut Memory<'_, M>, args: [u32; 7], kind: u32) -> Result<u
             && bytes1 != 0
             && (bytes1 != u32::MAX || m.byte(s1)? != 0)
             && flags & USE_CP_ACP == 0
-            && locale != m.dword(base + kb::system_lcid)?
+            && locale != m.dword(base + layout().system_lcid)?
         {
             let code = get_lcid_codepage(m, base, locale, flags)?;
             get_codepage_table(m, base, code)?;
@@ -1279,6 +1266,13 @@ pub(super) fn check_comparison_memory(cpu: &mut dyn adv_cpu::backend::Guest) {
     use adv_cpu::backend::{GuestExt, Prot};
     use adv_cpu::body::{BodyContext, GuestMem, Scratch};
     const BASE: u32 = 0x1000000;
+    // Each datum 0x800 apart, clear of the test's own structures.
+    let synthetic = Layout::resolve(|_, name| {
+        let index = Layout::NAMES.iter().position(|n| *n == name)?;
+        Some(0x80000 + 0x800 * index as u32)
+    })
+    .unwrap();
+    assert_eq!(*LAYOUT.get_or_init(|| synthetic), synthetic);
     cpu.map(BASE, 0x200000, Prot::RW).unwrap();
     let (thread, stack, guid, keys, mb) = (
         BASE + 0x1000,
@@ -1288,16 +1282,16 @@ pub(super) fn check_comparison_memory(cpu: &mut dyn adv_cpu::backend::Guest) {
         BASE + 0x131000,
     );
     for (at, value) in [
-        (BASE + kb::current_locale_sort, guid),
-        (BASE + kb::user_lcid, 0x411),
-        (BASE + kb::system_lcid, 0x411),
-        (BASE + kb::sort + sort::keys, keys),
-        (BASE + kb::ansi_cpinfo + cp::MultiByteTable, mb),
+        (BASE + layout().current_locale_sort, guid),
+        (BASE + layout().user_lcid, 0x411),
+        (BASE + layout().system_lcid, 0x411),
+        (BASE + layout().sort + sort::keys, keys),
+        (BASE + layout().ansi_cpinfo + cp::MultiByteTable, mb),
         (thread + teb::CurrentLocale, 0x411),
     ] {
         cpu.write_u32(at, value).unwrap();
     }
-    cpu.write(BASE + kb::ansi_cpinfo, &1252u16.to_le_bytes())
+    cpu.write(BASE + layout().ansi_cpinfo, &1252u16.to_le_bytes())
         .unwrap();
     for ch in 0..=u16::MAX {
         cpu.write_u32(
@@ -1409,28 +1403,31 @@ pub(super) fn check_comparison_memory(cpu: &mut dyn adv_cpu::backend::Guest) {
     );
     assert_eq!(cpu.read_u32(thread + teb::CurrentLocale).unwrap(), 0);
     let locale = BASE + 0x132000;
-    cpu.write_u32(BASE + kb::user_locale, locale).unwrap();
+    cpu.write_u32(BASE + layout().user_locale, locale).unwrap();
     cpu.write(
         locale + locale_data::idefaultansicodepage,
         &932u16.to_le_bytes(),
     )
     .unwrap();
-    cpu.write_u32(BASE + kb::nb_codepages, 1).unwrap();
-    cpu.write(BASE + kb::codepages, &932u16.to_le_bytes())
+    cpu.write_u32(BASE + layout().nb_codepages, 1).unwrap();
+    cpu.write(BASE + layout().codepages, &932u16.to_le_bytes())
         .unwrap();
-    cpu.write_u32(BASE + kb::codepages + cp::MultiByteTable, mb)
+    cpu.write_u32(BASE + layout().codepages + cp::MultiByteTable, mb)
         .unwrap();
     for (i, arg) in [0x400, 0, a, 1, a, 1].iter().enumerate() {
         cpu.write_u32(stack + 4 * i as u32, *arg).unwrap();
     }
-    cpu.write_u32(BASE + kb::locale_section + critical::LockCount, 0)
+    cpu.write_u32(BASE + layout().locale_section + critical::LockCount, 0)
         .unwrap();
     assert_eq!(
         (COMPARE_A.full)(&mut GuestMem::new(cpu, &mut scratch), inputs),
         Err(Stop::Guest)
     );
-    cpu.write_u32(BASE + kb::locale_section + critical::LockCount, u32::MAX)
-        .unwrap();
+    cpu.write_u32(
+        BASE + layout().locale_section + critical::LockCount,
+        u32::MAX,
+    )
+    .unwrap();
     assert_eq!(
         (COMPARE_A.full)(&mut GuestMem::new(cpu, &mut scratch), inputs)
             .unwrap()

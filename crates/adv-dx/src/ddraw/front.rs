@@ -275,6 +275,7 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::DISPLAY_MODE, display_mode_ABI),
     (api::DISPLAY_MODE_OLD, display_mode_old_ABI),
     (api::RESTORE_MODE, restore_mode_ABI),
+    (api::FLIP_TO_GDI, flip_to_gdi_ABI),
     (api::GET_DISPLAY_MODE, get_display_mode_ABI),
     (api::ENUM_MODES, modes::enum_modes_ABI),
     (api::GET_CAPS, get_caps_ABI),
@@ -528,6 +529,10 @@ fn display_mode_old(
 #[win32(ddraw, name = "IDirectDraw7::RestoreDisplayMode", level = implement)]
 fn restore_mode(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
     call(env, api::RESTORE_MODE, &[this.addr()])
+}
+#[win32(ddraw, name = "IDirectDraw7::FlipToGDISurface", level = implement)]
+fn flip_to_gdi(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    call(env, api::FLIP_TO_GDI, &[this.addr()])
 }
 #[win32(ddraw, name = "IDirectDraw7::GetDisplayMode", level = implement)]
 fn get_display_mode(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {

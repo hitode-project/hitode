@@ -199,8 +199,7 @@ pub(super) fn render(
         .map_or(request.quality, |f| f.quality);
     let target = physdev(env, dc);
     let monochrome = target.is_some_and(|(dev, _)| {
-        env.cpu.read_u32(dev).ok() == module(env).map(|base| base + layout::DIB_DRIVER)
-            && palette_dib(env, dev)
+        env.cpu.read_u32(dev).ok() == data(env, |l| l.dib_driver) && palette_dib(env, dev)
     });
     let mut run = Run {
         glyphs: Vec::with_capacity(units.len()),
@@ -299,7 +298,7 @@ pub(super) fn render(
     let Some((dev, function)) = physdev(env, dc) else {
         return Outcome::Return(0);
     };
-    if env.cpu.read_u32(dev).unwrap() == module(env).unwrap() + layout::DIB_DRIVER {
+    if env.cpu.read_u32(dev).unwrap() == data(env, |l| l.dib_driver).unwrap() {
         return compose(env, dev, &run);
     }
     // Metafile/path/printer drivers receive the positioned glyph run, and obtain
@@ -923,7 +922,7 @@ pub(super) fn rule(
     let Some((dev, _)) = physdev(env, dc) else {
         return Outcome::Return(0);
     };
-    if env.cpu.read_u32(dev).unwrap() == module(env).unwrap() + layout::DIB_DRIVER {
+    if env.cpu.read_u32(dev).unwrap() == data(env, |l| l.dib_driver).unwrap() {
         compose(env, dev, &run)
     } else {
         fill_driver(env, hdc, q, color, clip)

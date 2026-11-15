@@ -9,11 +9,14 @@ lib/wine/i386-windows the table records a hash of the stripped image's
 headers, which the runtime compares with the headers of a mapped image,
 and every function from the COFF symbol table of the unstripped image
 except import thunks: its RVA, size, a hash of its bytes with base
-relocations masked, and its undecorated name. Each module's table is
+relocations masked, and its undecorated name. Rows of two fields follow:
+the RVA and name of each static data symbol whose name is unique in the
+module, which native code resolves instead of pinning addresses. Each module's table is
 written to STRIPPED_DIST/share/hitode/identity/<module>.tsv, so the runtime
 reads only the tables of the modules it maps. Unix i386 ELF modules use
 their ELF and program headers, STT_FUNC symbols (including local symbols),
-and the dwords patched by dynamic relocations.
+local STT_OBJECT symbols for the data rows, and the dwords patched by dynamic
+relocations.
 """
 
 import re
@@ -98,6 +101,30 @@ class Image:
                 found.setdefault(va + value, name.rstrip(b"\0").decode())
         return sorted(found.items())
 
+    def variables(self):
+        """(rva, name) of every static data symbol outside code sections.
+
+        Wine keeps module state file-static; the external data symbols are
+        mostly the GUIDs every module links from the uuid libraries.
+        """
+        data, strings = self.data, self.symbols + 18 * self.symbol_count
+        found, index = [], 0
+        while index < self.symbol_count:
+            at = self.symbols + 18 * index
+            name, value, section, kind, storage, aux = struct.unpack_from("<8sIhHBB", data, at)
+            index += 1 + aux
+            # IMAGE_SYM_CLASS_STATIC; section symbols carry an aux record.
+            if kind == DT_FUNCTION or section <= 0 or storage != 3 or aux:
+                continue
+            if name[:4] == b"\0\0\0\0":
+                start = strings + struct.unpack_from("<I", name, 4)[0]
+                name = data[start : data.index(b"\0", start)]
+            name = name.rstrip(b"\0").decode()
+            va, _, _, _, flags = self.sections[section - 1]
+            if not flags & IMAGE_SCN_CNT_CODE and not name.startswith((".", "__imp_", "_imp__")):
+                found.append((va + value, undecorate(name)))
+        return found
+
     def code_end(self, rva: int) -> int:
         for va, vsize, _, _, _ in self.sections:
             if va <= rva < va + vsize:
@@ -124,7 +151,21 @@ def module_rows(debug: Image, stripped: Image) -> list[str]:
             continue
         digest = fnv1a64(code) & 0xFFFFFFFF
         rows.append(f"{rva:x}\t{end - rva:x}\t{digest:08x}\t{undecorate(symbol)}")
-    return rows
+    return rows + variable_rows(debug.variables())
+
+
+def variable_rows(variables) -> list[str]:
+    """Rows of the data symbols whose names name one address.
+
+    GCC names a function-local static `name.N`, N counting statics across
+    the translation unit, so the suffix moves with unrelated source edits;
+    the row keeps the source name.
+    """
+    addresses: dict[str, set[int]] = {}
+    for rva, name in variables:
+        addresses.setdefault(re.sub(r"\.\d+$", "", name), set()).add(rva)
+    unique = sorted((rvas.pop(), name) for name, rvas in addresses.items() if len(rvas) == 1)
+    return [f"{rva:x}\t{name}" for rva, name in unique]
 
 
 class Elf:
@@ -157,20 +198,28 @@ class Elf:
 
     masked = Image.masked
 
-    def functions(self):
-        found = {}
-        for _, kind, _, _, offset, size, link, _, _, entsize in self.sections:
-            if kind != 2:  # SHT_SYMTAB, including static functions
+    def symbols(self, kind: int, local: bool = False):
+        """(value, size, name) of every sized symbol of `kind`, locals
+        included, or only the locals."""
+        for _, section_kind, _, _, offset, size, link, _, _, entsize in self.sections:
+            if section_kind != 2:  # SHT_SYMTAB
                 continue
             strings = self.sections[link][4]
             for at in range(offset, offset + size, entsize):
                 name, value, length, info, _, section = struct.unpack_from("<IIIBBH", self.data, at)
-                if info & 0xf != 2 or not length or not section:
+                if info & 0xf != kind or not length or not section or (local and info >> 4):
                     continue
                 start = strings + name
-                name = self.data[start : self.data.index(b"\0", start)].decode()
-                found.setdefault(value, (length, name))
+                yield value, length, self.data[start : self.data.index(b"\0", start)].decode()
+
+    def functions(self):
+        found = {}
+        for value, length, name in self.symbols(2):  # STT_FUNC
+            found.setdefault(value, (length, name))
         return sorted(found.items())
+
+    def variables(self):
+        return [(value, name) for value, _, name in self.symbols(1, local=True)]  # STT_OBJECT
 
 
 def elf_rows(debug: Elf, stripped: Elf) -> list[str]:
@@ -178,7 +227,7 @@ def elf_rows(debug: Elf, stripped: Elf) -> list[str]:
     for rva, (size, name) in debug.functions():
         code = stripped.masked(rva, size)
         rows.append(f"{rva:x}\t{size:x}\t{fnv1a64(code) & 0xffffffff:08x}\t{name}")
-    return rows
+    return rows + variable_rows(debug.variables())
 
 
 def main(argv: list[str]) -> int:

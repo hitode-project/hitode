@@ -700,3 +700,70 @@ fn clip_lists_limit_blits_and_fills_like_windows() {
         0x88760237
     );
 }
+
+#[test]
+// spec: GFX-DDRAW-8
+fn flip_to_gdi_surface_shows_the_primary_memory_again() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    // The address of the surface's current memory, as Lock reports it.
+    let lock = |m: &mut Machine<JitCpu>, surface: u32| {
+        m.cpu.write_u32(DATA + 64, 124).unwrap();
+        assert_eq!(call(m, api::LOCK, &[surface, 0, DATA + 64, 0x1, 0]), 0);
+        let pixels = m.cpu.read_u32(DATA + 100).unwrap();
+        assert_eq!(call(m, api::UNLOCK, &[surface, 0]), 0);
+        pixels
+    };
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[device]), 0x887600ff);
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[device, 0, 0x11]), 0);
+    assert_eq!(
+        call(&mut m, api::DISPLAY_MODE, &[device, 8, 8, 32, 0, 0]),
+        0
+    );
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    // DDSD_CAPS | DDSD_BACKBUFFERCOUNT; primary, flip, complex.
+    desc[4..8].copy_from_slice(&0x21u32.to_le_bytes());
+    desc[20..24].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x218u32.to_le_bytes());
+    m.cpu.write(DATA + 256, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 256, DATA, 0]),
+        0
+    );
+    let primary = m.cpu.read_u32(DATA).unwrap();
+    m.cpu.write_u32(DATA + 4, 4).unwrap();
+    assert_eq!(
+        call(&mut m, api::GET_ATTACHED, &[primary, DATA + 4, DATA + 8]),
+        0
+    );
+    let back = m.cpu.read_u32(DATA + 8).unwrap();
+    let gdi = lock(&mut m, primary);
+    let other = lock(&mut m, back);
+    assert_ne!(gdi, other);
+
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[device]), 0);
+    assert_eq!(lock(&mut m, primary), gdi);
+    assert_eq!(call(&mut m, api::FLIP, &[primary, 0, 1]), 0);
+    assert_eq!(lock(&mut m, primary), other);
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[device]), 0);
+    assert_eq!(lock(&mut m, primary), gdi);
+    assert_eq!(lock(&mut m, back), other);
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[device]), 0);
+    assert_eq!(lock(&mut m, primary), gdi);
+    // Two flips leave GDI's memory in front.
+    assert_eq!(call(&mut m, api::FLIP, &[primary, 0, 1]), 0);
+    assert_eq!(call(&mut m, api::FLIP, &[primary, back, 1]), 0);
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[device]), 0);
+    assert_eq!(lock(&mut m, primary), gdi);
+
+    // Only the object that created the primary has a GDI surface.
+    m.cpu.write(DATA + 512, &IID_DDRAW7).unwrap();
+    assert_eq!(call(&mut m, api::DD_CREATE, &[0, DATA, DATA + 512, 0]), 0);
+    let second = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[second]), 0x887600ff);
+}
