@@ -185,6 +185,7 @@ pub(crate) struct DevicePlan {
     pub(crate) use_4444: bool,
     pub(crate) use_mirror_clamp: bool,
     pub(crate) use_tile_properties: bool,
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     pub(crate) use_ahb_ubwc: bool,
 }
 

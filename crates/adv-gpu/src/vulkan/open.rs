@@ -229,6 +229,10 @@ impl Device {
                 }
             }
 
+            // Reap temporary buffers, views, samplers and bindless heap slots
+            // dropped at the end of each canary before handing the device back.
+            queue.poll()?;
+
             save_verified(
                 cache_dir,
                 &prefix,
