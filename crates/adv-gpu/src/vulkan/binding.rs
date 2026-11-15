@@ -319,6 +319,16 @@ impl Heap {
     pub(super) fn free(&self, kind: usize, index: u32) {
         self.state.lock().unwrap().free[kind].push(index);
     }
+    /// Restores ascending allocation order (`0, 1, 2, ...`) once startup
+    /// canaries have reaped every temporary descriptor.
+    pub(super) fn reset_free_order(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (kind, list) in state.free.iter_mut().enumerate() {
+            debug_assert_eq!(list.len(), self.counts[kind] as usize);
+            let tail = list.len().saturating_sub(8);
+            list[tail..].sort_unstable_by(|a, b| b.cmp(a));
+        }
+    }
     pub(super) fn uniform(
         &self,
         context: &Context,

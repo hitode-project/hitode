@@ -1694,6 +1694,23 @@ fn startup_canaries_and_health_cache_round_trip() {
             cache_dir: Some(dir.clone()),
             ..DeviceOptions::default()
         });
+        assert!(device.inner.0.retired.lock().unwrap().is_empty());
+        if let Some(heap) = &device.inner.0.heap {
+            for kind in 0..4 {
+                assert_eq!(heap.used(kind), 0);
+            }
+            let first = device
+                .create_buffer(&BufferDesc {
+                    size: 16,
+                    usage: BufferUsage::STORAGE,
+                    memory: Memory::Device,
+                    label: "first storage slot",
+                })
+                .unwrap();
+            assert_eq!(first.inner.0.storage, Some(0));
+            drop(first);
+            queue.poll().unwrap();
+        }
         assert!(open::canary_render(&device, &mut queue).unwrap());
         assert!(open::canary_compute(&device, &mut queue).unwrap());
         assert_eq!(device.guard_compile("canary:test", || Ok(7)).unwrap(), 7);
