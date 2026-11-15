@@ -83,7 +83,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-8 Virtualized file contents
 
-**Rule**: File sources MUST read the host descriptor only while the guest's read path keeps its mapped entry bytes. The read path is kernelbase ReadFile and ntdll NtReadFile. Once guest code hooks it, as file virtualizers do, the contents MUST come through the guest's ReadFile.
+**Rule**: File sources MUST read the host descriptor only while the guest's read path keeps its mapped entry bytes. The read path is kernelbase ReadFile and ntdll NtReadFile. Once guest code hooks it, the contents MUST come through the guest's ReadFile, and the handle MUST close through the guest's CloseHandle.
 **Verification**: Test
 
 ### MEDIA-GRAPH-9 Event timeouts

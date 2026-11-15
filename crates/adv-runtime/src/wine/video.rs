@@ -211,13 +211,19 @@ fn export(env: &Env<'_>, module: &str, name: &str) -> Result<u32, String> {
 fn close(env: &mut Env<'_>, handle: u32) {
     let _ = adv_nt::server::close(env, handle);
 }
+fn release(env: &mut Env<'_>, handle: Option<u32>) {
+    if let Some(handle) = handle {
+        close(env, handle);
+    }
+}
 
 type Contents = Box<dyn ReadSeek>;
-type FileOpened = Box<dyn FnOnce(&mut Env<'_>, Result<(Contents, u32), u32>) -> Outcome>;
+type FileOpened = Box<dyn FnOnce(&mut Env<'_>, Result<(Contents, Option<u32>), u32>) -> Outcome>;
 /// Opens `filename` as the guest does. Its contents come from the host
 /// descriptor, unless guest code hooked the file read path: a file
 /// virtualizer answers reads of a placeholder handle itself, so the
-/// contents are then read through the guest's ReadFile.
+/// contents are then read through the guest's ReadFile, and the handle is
+/// closed through the guest too, so the hooks that saw it open see it close.
 fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
     let target = match export(env, "kernel32.dll", "CreateFileW") {
         Ok(target) => target,
@@ -241,7 +247,7 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
                     let fd = unsafe { BorrowedFd::borrow_raw(fd.fd) }
                         .try_clone_to_owned()
                         .map_err(|_| 0x8000_4005u32)?;
-                    Ok((Box::new(File::from(fd)) as Contents, handle))
+                    Ok((Box::new(File::from(fd)) as Contents, Some(handle)))
                 });
             if result.is_err() {
                 close(env, handle);
@@ -260,8 +266,7 @@ fn guest_contents(env: &mut Env<'_>, handle: u32, then: FileOpened) -> Outcome {
     };
     // The chunk, then the count ReadFile writes.
     let Some(buffer) = (super::allocator().allocate)(env, CHUNK + 4) else {
-        close(env, handle);
-        return then(env, Err(0x8007_000e));
+        return guest_close(env, handle, move |env| then(env, Err(0x8007_000e)));
     };
     read_chunks(read, handle, buffer, Vec::new(), then)
 }
@@ -282,12 +287,23 @@ fn read_chunks(
             return read_chunks(read, handle, buffer, bytes, then);
         }
         (super::allocator().free)(env, buffer);
-        if result.value() == 0 || !copied {
-            close(env, handle);
-            return then(env, Err(0x8000_4005));
-        }
-        then(env, Ok((Box::new(Cursor::new(bytes)), handle)))
+        let contents = if result.value() == 0 || !copied {
+            Err(0x8000_4005)
+        } else {
+            Ok((Box::new(Cursor::new(bytes)) as Contents, None))
+        };
+        guest_close(env, handle, move |env| then(env, contents))
     })
+}
+fn guest_close(
+    env: &mut Env<'_>,
+    handle: u32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    match export(env, "kernel32.dll", "CloseHandle") {
+        Ok(target) => Outcome::call(target, [handle], move |env, _| then(env)),
+        Err(error) => Outcome::Fail(error),
+    }
 }
 
 fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcome {
@@ -309,14 +325,14 @@ fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcom
 }
 fn opened(
     env: &mut Env<'_>,
-    handle: u32,
+    handle: Option<u32>,
     receive: Receiver<Result<Decoder, u32>>,
     then: adv_dx::dshow::Opened,
 ) -> Outcome {
     match receive.try_recv() {
         Ok(Ok(decoder)) => then(env, Ok((decoder, handle))),
         Ok(Err(hr)) => {
-            close(env, handle);
+            release(env, handle);
             then(env, Err(hr))
         }
         Err(TryRecvError::Empty) => {
@@ -325,7 +341,7 @@ fn opened(
             })
         }
         Err(TryRecvError::Disconnected) => {
-            close(env, handle);
+            release(env, handle);
             then(env, Err(0x8000_4005))
         }
     }
@@ -354,14 +370,14 @@ fn read_file(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::ReadFile) ->
 }
 fn read_bytes(
     env: &mut Env<'_>,
-    handle: u32,
+    handle: Option<u32>,
     receive: Receiver<Result<Vec<u8>, u32>>,
     then: adv_dx::dshow::ReadFile,
 ) -> Outcome {
     match receive.try_recv() {
         Ok(Ok(bytes)) => then(env, Ok((bytes, handle))),
         Ok(Err(hr)) => {
-            close(env, handle);
+            release(env, handle);
             then(env, Err(hr))
         }
         Err(TryRecvError::Empty) => {
@@ -370,7 +386,7 @@ fn read_bytes(
             })
         }
         Err(TryRecvError::Disconnected) => {
-            close(env, handle);
+            release(env, handle);
             then(env, Err(0x8000_4005))
         }
     }

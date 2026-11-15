@@ -482,8 +482,8 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                             outcome,
                             Box::new(move |env, result| {
                                 if result[0] == S_OK {
-                                    reader(env, this).unwrap().file = Some(file);
-                                } else {
+                                    reader(env, this).unwrap().file = file;
+                                } else if let Some(file) = file {
                                     dshow::host::close(env, file);
                                 }
                                 Outcome::Return(result[0])
