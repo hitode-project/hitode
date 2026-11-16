@@ -300,7 +300,7 @@ fn update_surface(
             &mut state.upload_scratch,
             (source_format, address, pitch),
             (from.w, from.h),
-            format::covers(rectangle, &target.image),
+            (&target.image, rectangle),
         )
         .ok_or(INVALID)?;
         Ok((
@@ -425,17 +425,18 @@ fn color_fill(
         Ok(rect) => rect,
         Err(error) => return Outcome::Return(error),
     };
-    if !matches!(r.desc.Format, 21 | 22) || r.desc.MultiSampleType != 0 {
+    if r.desc.MultiSampleType != 0 {
         adv_abi::warn_unavailable(
             env,
             "IDirect3DDevice9::ColorFill",
             &format!(
-                "fills support single-sample formats 21/22: format={} multisample={}",
-                r.desc.Format, r.desc.MultiSampleType
+                "fills support single-sample surfaces: multisample={}",
+                r.desc.MultiSampleType
             ),
         );
         return Outcome::Return(UNAVAILABLE);
     }
+    let format = r.desc.Format;
     let provider = env.ext.get::<State>().provider;
     let Some(target) = r.surface.and_then(|id| (provider.target)(env.ext, id)) else {
         return Outcome::Return(INVALID);
@@ -449,11 +450,14 @@ fn color_fill(
             None,
         ),
     };
-    let mut texel = color.to_le_bytes();
-    if r.desc.Format == 22 {
-        texel[3] = 255;
-    }
-    let pixels = texel.repeat(to.w as usize * to.h as usize);
+    // The fill takes the path of a locked write of the packed color, so a
+    // readback returns exactly the packed bytes.
+    let Some((pixels, pitch)) = format::pack(format, color).and_then(|texel| {
+        let pixels = texel.repeat(to.w as usize * to.h as usize);
+        format::upload(format, pixels, format::pitch(format, to.w)?, to.w, to.h)
+    }) else {
+        return Outcome::Return(INVALID);
+    };
     let admission = env.ext.get_mut::<State>().admit_upload();
     dispatch(
         env,
@@ -463,7 +467,7 @@ fn color_fill(
             level,
             target,
             pixels: Pixels::Host(Arc::new(pixels), UploadKey::Admission(admission)),
-            pitch: to.w * 4,
+            pitch,
             rectangle: to,
         },
     )

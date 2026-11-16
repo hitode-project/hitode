@@ -62,13 +62,13 @@ pub(super) fn create_offscreen(
     }
     if !matches!(pool, 0 | 2 | 3)
         || format::bytes(format).is_none()
-        || (pool == 0 && !matches!(format, 21 | 22))
+        || (pool == 0 && format == 28)
         || !shared.is_null()
     {
         let reason = if format::bytes(format).is_none() {
-            "pixel format is unsupported (supported: 21/22/23/26/28; DEFAULT: 21/22)"
-        } else if pool == 0 && !matches!(format, 21 | 22) {
-            "DEFAULT offscreen GPU surfaces support formats 21/22"
+            "pixel format is unsupported (supported: 21/22/23/26/28; DEFAULT: 21/22/23/26)"
+        } else if pool == 0 && format == 28 {
+            "DEFAULT offscreen GPU surfaces support formats 21/22/23/26"
         } else {
             "pool or shared-handle combination is unsupported (supported: DEFAULT/SYSTEMMEM/SCRATCH)"
         };
@@ -82,8 +82,9 @@ pub(super) fn create_offscreen(
     let Some(length) = format::length(format, width, height) else {
         return Outcome::Return(INVALID);
     };
-    // DEFAULT plain surfaces have one GPU image owned by this Resource. Its
-    // guest storage is a reusable lock mapping, synchronized at lock/unlock.
+    // DEFAULT plain surfaces have one BGRA8 GPU image owned by this Resource.
+    // Its guest storage is a reusable lock mapping in the declared format,
+    // converted at lock/unlock.
     // SYSTEMMEM/SCRATCH remain CPU storage without a parallel GPU copy.
     let surface = if pool == 0 {
         let target = match env.ext.get::<State>().gpu.as_ref() {
@@ -408,7 +409,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
         &mut state.upload_scratch,
         (format, address, pitch),
         (lock.rectangle.w, lock.rectangle.h),
-        format::covers(lock.rectangle, &target.image),
+        (&target.image, lock.rectangle),
     ) else {
         return Outcome::Return(INVALID);
     };

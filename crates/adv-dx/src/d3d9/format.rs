@@ -45,7 +45,8 @@ pub(super) fn covers(rectangle: Rect, image: &Image) -> bool {
         && rectangle.h == image.height()
 }
 
-/// Snapshot admitted guest rows, staging native formats without conversion.
+/// Snapshot admitted guest rows for `destination`, staging them unconverted
+/// when its image stores the guest format and expanding to BGRA8 otherwise.
 /// The caller has checked that the complete source rectangle is readable.
 pub(super) fn snapshot(
     cpu: &dyn adv_cpu::backend::Guest,
@@ -54,10 +55,11 @@ pub(super) fn snapshot(
     scratch: &mut Vec<u8>,
     source: (u32, u32, u32),
     size: (u32, u32),
-    whole: bool,
+    destination: (&Image, Rect),
 ) -> Option<(super::Pixels, u32)> {
     let (format, address, pitch) = source;
     let (width, height) = size;
+    let whole = covers(destination.1, destination.0);
     let mut key = |hash: Option<Xxh3>| match hash {
         Some(hash) => UploadKey::Content(hash.digest128()),
         None => {
@@ -66,7 +68,7 @@ pub(super) fn snapshot(
         }
     };
     let mut hash = whole.then(Xxh3::new);
-    if gpu.stores(texel(format)?) {
+    if destination.0.texel_format() == texel(format)? {
         let row_bytes = self::pitch(format, width)?;
         let staged = gpu
             .stage(row_bytes, height, |write| {
@@ -165,6 +167,20 @@ pub(super) fn upload(
     }
 }
 
+/// One texel of `format` holding the D3DCOLOR `color`, channels truncated.
+pub(super) fn pack(format: u32, color: u32) -> Option<Vec<u8>> {
+    let [b, g, r, a] = color.to_le_bytes().map(u16::from);
+    Some(match format {
+        21 | 22 => color.to_le_bytes().to_vec(),
+        23 => (r >> 3 << 11 | g >> 2 << 5 | b >> 3).to_le_bytes().to_vec(),
+        26 => (a >> 4 << 12 | r >> 4 << 8 | g >> 4 << 4 | b >> 4)
+            .to_le_bytes()
+            .to_vec(),
+        28 => vec![a as u8],
+        _ => return None,
+    })
+}
+
 /// Explicit staging copies convert back to the declared guest pixel layout.
 pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
     bytes(format)?;
@@ -215,6 +231,15 @@ mod tests {
         let address = fixture.packet([1u8, 2, 3, 4]);
         let state = fixture.m.ext.get_mut::<super::super::State>();
         let gpu = state.gpu.as_mut().unwrap();
+        let image = gpu
+            .texture(2, 1, 1, adv_device::gpu::TexelFormat::Bgra8)
+            .unwrap();
+        let part = Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
         let mut capture = || {
             snapshot(
                 &fixture.m.cpu,
@@ -223,7 +248,7 @@ mod tests {
                 &mut state.upload_scratch,
                 (21, address, 4),
                 (1, 1),
-                false,
+                (&image, part),
             )
             .unwrap()
             .0
