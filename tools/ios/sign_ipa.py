@@ -3,7 +3,8 @@
 
 The signature names no signer; it carries the entitlements that installers
 re-signing the app enable on their own App ID, such as the memory extension
-(IOS-MEM-4). --trollstore adds TrollStore's JIT entitlement (IOS-JIT-3).
+(IOS-MEM-4). --trollstore adds TrollStore's JIT entitlement (IOS-JIT-3) and
+extended virtual addressing, which sideload installers drop (IOS-MEM-4).
 """
 
 import argparse
@@ -21,6 +22,7 @@ def sign(source: Path, output: Path, trollstore: bool) -> None:
         entitlements = plistlib.load(file)
     if trollstore:
         entitlements['get-task-allow'] = True
+        entitlements['com.apple.developer.kernel.extended-virtual-addressing'] = True
     with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
         root = Path(temporary)
         subprocess.run(['ditto', '-x', '-k', source, root], check=True)
@@ -42,6 +44,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path, help='unsigned Hitode IPA')
     parser.add_argument('output', type=Path, help='signed IPA')
-    parser.add_argument('--trollstore', action='store_true', help='add the JIT entitlement for TrollStore')
+    parser.add_argument('--trollstore', action='store_true', help='add the JIT and extended addressing entitlements for TrollStore')
     args = parser.parse_args()
     sign(args.source, args.output, args.trollstore)

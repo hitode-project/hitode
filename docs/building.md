@@ -223,7 +223,7 @@ APPLE_DEVELOPMENT_TEAM=<team> python3 tools/macos/package_launcher.py ios
 - Select game folders through Files to read them at their original locations, including outside the app's container. Directory access is restored from bookmarks after relaunch, and cloud files are downloaded before discovery and game launch. Games already in Documents through Finder or `devicectl device copy to --domain-type appDataContainer` are also read in place. Saves and registry stay in the app's private data directory.
 - The AppIcon images are not committed. `python3 apps/adv-launcher/scripts/icons.py` writes them to `src-tauri/icons/ios/`; the Xcode build copies them into `gen/apple/Assets.xcassets/AppIcon.appiconset/` and fails when they are missing.
 
-For TrollStore, install `ldid` (for example with `brew install ldid`) and run `python3 tools/macos/package_launcher.py ios --trollstore`. This writes `target/package/ios/Hitode-TrollStore.ipa` with `get-task-allow` on the main executable and needs no Apple signing team. Install and launch it with JIT from TrollStore.
+For TrollStore, install `ldid` (for example with `brew install ldid`) and run `python3 tools/macos/package_launcher.py ios --trollstore`. This writes `target/package/ios/Hitode-TrollStore.ipa` with `get-task-allow` and extended virtual addressing on the main executable and needs no Apple signing team. Install and launch it with JIT from TrollStore.
 
 ## Local output
 
