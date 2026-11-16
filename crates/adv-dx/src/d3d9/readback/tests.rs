@@ -442,3 +442,46 @@ fn cpu_surface_and_texture_level_locks_keep_pending_draws_recorded() {
     assert_eq!(f.m.ext.get::<State>().frames.flushes[2], before[2] + 1);
     f.okay("IDirect3DSurface9::UnlockRect", &[target]);
 }
+
+// spec: GFX-REC-1
+#[test]
+fn front_buffer_data_captures_presented_pixels_and_validates_inputs() {
+    let mut f = super::super::stretch::tests::Fixture::new();
+    let (width, height) = (16, 12);
+    let destination = f.surface(width, height, 21, 2);
+    f.okay(
+        "IDirect3DDevice9::Clear",
+        &[f.device, 0, 0, 1, 0xff224466, 1f32.to_bits(), 0],
+    );
+    let outcome = f.call(
+        "IDirect3DDevice9::GetFrontBufferData",
+        &[f.device, 0, destination],
+    );
+    assert_eq!(f.finish(outcome), 0);
+    let locked = f.lock(destination, 0, 0x10);
+    assert_eq!(f.m.cpu.read_u32(locked.pBits).unwrap(), 0xff224466);
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+
+    // Reject wrong swap-chain index, format, pool and size with D3DERR_INVALIDCALL.
+    let bad_chain = f.call(
+        "IDirect3DDevice9::GetFrontBufferData",
+        &[f.device, 1, destination],
+    );
+    assert_eq!(f.finish(bad_chain), INVALID);
+    let wrong_format = f.surface(width, height, 22, 2);
+    let bad_format = f.call(
+        "IDirect3DDevice9::GetFrontBufferData",
+        &[f.device, 0, wrong_format],
+    );
+    assert_eq!(f.finish(bad_format), INVALID);
+    let wrong_size = f.surface(8, 6, 21, 2);
+    let bad_size = f.call(
+        "IDirect3DDevice9::GetFrontBufferData",
+        &[f.device, 0, wrong_size],
+    );
+    assert_eq!(f.finish(bad_size), INVALID);
+    assert!(matches!(
+        f.call("IDirect3DDevice9::GetNPatchMode", &[f.device]),
+        Outcome::ReturnF32(v) if v == 0.0
+    ));
+}

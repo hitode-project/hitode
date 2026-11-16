@@ -44,10 +44,13 @@ const DDRAW: usize = 0;
 #[cfg(feature = "gpu")]
 const D3D9: usize = 1;
 const GDI32: &str = "gdi32.dll";
-const DDRAW_EXPORTS: [&str; 4] = [
+const DDRAW_EXPORTS: [&str; 7] = [
     "DirectDrawCreate",
+    "DirectDrawCreateClipper",
     "DirectDrawCreateEx",
     "DirectDrawEnumerateA",
+    "DirectDrawEnumerateExA",
+    "DirectDrawEnumerateExW",
     "DirectDrawEnumerateW",
 ];
 #[cfg(feature = "gpu")]

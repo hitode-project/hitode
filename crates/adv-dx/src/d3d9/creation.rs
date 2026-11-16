@@ -66,6 +66,13 @@ pub(super) fn register(registry: &mut Registry) {
         get_software_ABI,
         set_dialogs_ABI,
         set_npatch_ABI,
+        get_npatch_ABI,
+        create_volume_texture_ABI,
+        create_cube_texture_ABI,
+        process_vertices_ABI,
+        draw_rect_patch_ABI,
+        draw_tri_patch_ABI,
+        delete_patch_ABI,
     ] {
         registry.register(api);
     }
@@ -137,6 +144,135 @@ fn set_npatch(env: &mut Env<'_>, this: GuestPtr<()>, segments: f32) -> u32 {
         return UNAVAILABLE;
     }
     0
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::GetNPatchMode", level = implement)]
+fn get_npatch(_env: &mut Env<'_>, _this: GuestPtr<()>) -> f32 {
+    0.0
+}
+
+fn unavailable_resource(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    output: GuestPtr<u32>,
+    name: &'static str,
+    reason: &'static str,
+) -> u32 {
+    if output.is_null() || output.write(env.cpu, 0).is_err() || device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    adv_abi::warn_unavailable(env, name, reason);
+    UNAVAILABLE
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::CreateVolumeTexture", level = implement)]
+fn create_volume_texture(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _width: u32,
+    _height: u32,
+    _depth: u32,
+    _levels: u32,
+    _usage: u32,
+    _format: u32,
+    _pool: i32,
+    output: GuestPtr<u32>,
+    _shared: GuestPtr<()>,
+) -> u32 {
+    unavailable_resource(
+        env,
+        this,
+        output,
+        "IDirect3DDevice9::CreateVolumeTexture",
+        "volume textures are unsupported",
+    )
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::CreateCubeTexture", level = implement)]
+fn create_cube_texture(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _edge: u32,
+    _levels: u32,
+    _usage: u32,
+    _format: u32,
+    _pool: i32,
+    output: GuestPtr<u32>,
+    _shared: GuestPtr<()>,
+) -> u32 {
+    unavailable_resource(
+        env,
+        this,
+        output,
+        "IDirect3DDevice9::CreateCubeTexture",
+        "cube textures are unsupported",
+    )
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::ProcessVertices", level = implement)]
+fn process_vertices(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _src_start: u32,
+    _dest_index: u32,
+    _count: u32,
+    dest_buffer: GuestPtr<()>,
+    _decl: GuestPtr<()>,
+    _flags: u32,
+) -> u32 {
+    if device(env, this.addr()).is_none() || dest_buffer.is_null() {
+        return INVALID;
+    }
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3DDevice9::ProcessVertices",
+        "fixed-function software vertex processing is unsupported",
+    );
+    UNAVAILABLE
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::DrawRectPatch", level = implement)]
+fn draw_rect_patch(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _handle: u32,
+    _segments: GuestPtr<()>,
+    _info: GuestPtr<()>,
+) -> u32 {
+    if device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3DDevice9::DrawRectPatch",
+        "higher-order patch surfaces are unsupported",
+    );
+    UNAVAILABLE
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::DrawTriPatch", level = implement)]
+fn draw_tri_patch(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    _handle: u32,
+    _segments: GuestPtr<()>,
+    _info: GuestPtr<()>,
+) -> u32 {
+    if device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3DDevice9::DrawTriPatch",
+        "higher-order patch surfaces are unsupported",
+    );
+    UNAVAILABLE
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::DeletePatch", level = implement)]
+fn delete_patch(env: &mut Env<'_>, this: GuestPtr<()>, _handle: u32) -> u32 {
+    let _ = device(env, this.addr());
+    INVALID
 }
 #[cfg(test)]
 mod tests;

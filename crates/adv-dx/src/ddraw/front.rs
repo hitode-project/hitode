@@ -9,6 +9,7 @@ use adv_cpu::backend::{Backend, Guest};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
 mod enumeration;
+mod extras;
 mod modes;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
@@ -63,6 +64,7 @@ impl State {
 
 pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
+    extras::register(registry);
     registry.register(get_device_identifier_ABI);
     registry.register(get_fourcc_codes_ABI);
     registry.register(wait_for_vertical_blank_ABI);
@@ -317,7 +319,70 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::COMPACT, compact_ABI),
     (api::RESTORE_ALL_SURFACES, restore_all_surfaces_ABI),
     (api::TEST_COOPERATIVE_LEVEL, test_cooperative_level_ABI),
+    (api::DD_CREATE_CLIPPER, dd_create_clipper_ABI),
+    (api::GET_GDI_SURFACE, get_gdi_surface_ABI),
+    (api::GET_DD_INTERFACE, get_dd_interface_ABI),
+    (api::PAGE_LOCK, page_lock_ABI),
+    (api::PAGE_UNLOCK, page_unlock_ABI),
+    (api::GET_UNIQUENESS, get_uniqueness_ABI),
+    (api::CHANGE_UNIQUENESS, change_uniqueness_ABI),
+    (api::SURFACE_CAPS, surface_caps_ABI),
+    (api::SURFACE_INITIALIZE, surface_initialize_ABI),
 ];
+#[win32(ddraw, name = "DirectDrawCreateClipper", level = implement)]
+fn dd_create_clipper(
+    env: &mut Env<'_>,
+    flags: u32,
+    clipper: GuestPtr<()>,
+    outer: GuestPtr<()>,
+) -> Outcome {
+    call(
+        env,
+        api::DD_CREATE_CLIPPER,
+        &[flags, clipper.addr(), outer.addr()],
+    )
+}
+#[win32(ddraw, name = "IDirectDraw7::GetGDISurface", level = implement)]
+fn get_gdi_surface(env: &mut Env<'_>, this: GuestPtr<()>, surface: GuestPtr<()>) -> Outcome {
+    call(env, api::GET_GDI_SURFACE, &[this.addr(), surface.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetDDInterface", level = implement)]
+fn get_dd_interface(env: &mut Env<'_>, this: GuestPtr<()>, dd: GuestPtr<()>) -> Outcome {
+    call(env, api::GET_DD_INTERFACE, &[this.addr(), dd.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::PageLock", level = implement)]
+fn page_lock(env: &mut Env<'_>, this: GuestPtr<()>, flags: u32) -> Outcome {
+    call(env, api::PAGE_LOCK, &[this.addr(), flags])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::PageUnlock", level = implement)]
+fn page_unlock(env: &mut Env<'_>, this: GuestPtr<()>, flags: u32) -> Outcome {
+    call(env, api::PAGE_UNLOCK, &[this.addr(), flags])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetUniquenessValue", level = implement)]
+fn get_uniqueness(env: &mut Env<'_>, this: GuestPtr<()>, value: GuestPtr<()>) -> Outcome {
+    call(env, api::GET_UNIQUENESS, &[this.addr(), value.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::ChangeUniquenessValue", level = implement)]
+fn change_uniqueness(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    call(env, api::CHANGE_UNIQUENESS, &[this.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::GetCaps", level = implement)]
+fn surface_caps(env: &mut Env<'_>, this: GuestPtr<()>, caps: GuestPtr<()>) -> Outcome {
+    call(env, api::SURFACE_CAPS, &[this.addr(), caps.addr()])
+}
+#[win32(ddraw, name = "IDirectDrawSurface7::Initialize", level = implement)]
+fn surface_initialize(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    dd: GuestPtr<()>,
+    desc: GuestPtr<()>,
+) -> Outcome {
+    call(
+        env,
+        api::SURFACE_INITIALIZE,
+        &[this.addr(), dd.addr(), desc.addr()],
+    )
+}
 #[win32(ddraw, name = "IDirectDraw7::CreateClipper", level = implement)]
 fn create_clipper(
     env: &mut Env<'_>,
@@ -892,6 +957,7 @@ fn get_dc(env: &mut Env<'_>, object: u32, output: u32) -> Outcome {
                     Box::new(move |_, _| Outcome::Fail(format!("DirectDraw: {error}"))),
                 );
             }
+            env.ext.get_mut::<State>().draw.surface_dcs.insert(dc, sid);
             Outcome::Return(0)
         }),
     )
@@ -918,6 +984,7 @@ fn release_dc(env: &mut Env<'_>, object: u32, dc: u32) -> Outcome {
                     if result.is_err() {
                         return Outcome::Return(INVALID);
                     }
+                    env.ext.get_mut::<State>().draw.surface_dcs.remove(&dc);
                     let store = env.ext.get_mut::<SurfaceStore>();
                     if store.primary_id() == Some(sid) {
                         let memory = (provider.memory)(env.cpu);

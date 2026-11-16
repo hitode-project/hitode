@@ -1070,10 +1070,7 @@ fn repeat_keeps_refresh_wait_and_reset_release_and_unsupported_capture_commit_co
     assert_eq!(f.m.ext.get::<Presents>().published, [1]);
     clear(&mut f, 0xff112233);
     let outcome = f.call("IDirect3DDevice9::GetFrontBufferData", &[f.device, 0, 0]);
-    assert!(
-        matches!(outcome, Outcome::Fail(_)),
-        "strict unsupported ABI failure is preserved"
-    );
+    assert!(matches!(outcome, Outcome::Return(INVALID)));
     let owner = id(&mut f);
     assert!(frame(&mut env(&mut f), owner).commands.is_empty());
     assert_eq!(
@@ -1647,7 +1644,7 @@ fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundar
         ));
         clear(&mut f, 0xff778899);
         let result = f.call("IDirect3DSwapChain9::GetFrontBufferData", &[chain, 0]);
-        assert!(matches!(result, Outcome::Fail(_)));
+        assert!(matches!(result, Outcome::Return(INVALID)));
         let owner = id(&mut f);
         assert!(frame(&mut env(&mut f), owner).commands.is_empty());
     }
