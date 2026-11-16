@@ -202,6 +202,7 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
             submitted: |_, _, _| {},
             completed: |_, _| None,
             released: |_, _| {},
+            vsync: |_| None,
         },
     )
     .unwrap();
@@ -981,4 +982,186 @@ fn windowed_primary_screen_rectangles(cooperative_window: u32) {
     assert_eq!(call(&mut m, api::BLT, &[source, DATA, primary, 0, 0, 0]), 0);
     assert_eq!(call(&mut m, api::COOPERATIVE, &[device, 7, 0x11]), 0);
     assert_eq!(call(&mut m, api::BLT, &[primary, DATA, source, 0, 0, 0]), 0);
+}
+
+#[test]
+// spec: GFX-DDRAW-12
+fn timing_memory_and_caps_match_virtual_display_profile() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    m.cpu.write_u32(DATA + 0x200, 0x17c).unwrap();
+    assert_eq!(call(&mut m, api::GET_CAPS, &[device, DATA + 0x200, 0]), 0);
+    assert_eq!(
+        m.cpu.read_u32(DATA + 0x204).unwrap() & 0x0002_0000,
+        0x0002_0000
+    );
+
+    // GetMonitorFrequency validation and output.
+    m.cpu.write_u32(DATA + 16, 0xdeadbeef).unwrap();
+    assert!(matches!(
+        front::get_monitor_frequency(&mut env(&mut m), GuestPtr::new(0), GuestPtr::new(DATA + 16)),
+        Outcome::Return(0x88760082)
+    ));
+    assert!(matches!(
+        front::get_monitor_frequency(&mut env(&mut m), GuestPtr::new(device), GuestPtr::new(0),),
+        Outcome::Return(0x80070057)
+    ));
+    assert!(matches!(
+        front::get_monitor_frequency(&mut env(&mut m), GuestPtr::new(device), GuestPtr::new(CODE),),
+        Outcome::Return(0x80070057)
+    ));
+    assert!(matches!(
+        front::get_monitor_frequency(
+            &mut env(&mut m),
+            GuestPtr::new(device),
+            GuestPtr::new(DATA + 16),
+        ),
+        Outcome::Return(0)
+    ));
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 60);
+
+    // GetVerticalBlankStatus shares the virtual scan window and host vsync hook.
+    let vblank = |m: &mut Machine<JitCpu>, out| match front::get_vertical_blank_status(
+        &mut env(m),
+        GuestPtr::new(device),
+        GuestPtr::new(out),
+    ) {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    assert_eq!(vblank(&mut m, 0), 0x80070057);
+    m.sys.clock.advance_to(m.sys.clock.epoch_us + 8_333);
+    assert_eq!(vblank(&mut m, DATA + 16), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+    m.sys.clock.advance_to(m.sys.clock.epoch_us + 16_650);
+    assert_eq!(vblank(&mut m, DATA + 16), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 1);
+    m.ext.get_mut::<front::State>().provider.vsync = |_| {
+        Some((
+            std::time::Duration::from_millis(8),
+            std::time::Duration::from_millis(16),
+        ))
+    };
+    assert_eq!(vblank(&mut m, DATA + 16), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+
+    // GetAvailableVidMem validates caps and optional output pointers.
+    let vidmem = |m: &mut Machine<JitCpu>, caps, total, free| match front::get_available_vid_mem(
+        &mut env(m),
+        GuestPtr::new(device),
+        GuestPtr::new(caps),
+        GuestPtr::new(total),
+        GuestPtr::new(free),
+    ) {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+    m.cpu.write(DATA + 64, &[0u8; 16]).unwrap();
+    assert_eq!(vidmem(&mut m, 0, DATA + 16, DATA + 20), 0x80070057);
+    assert_eq!(vidmem(&mut m, DATA + 64, 0, 0), 0x80070057);
+    m.cpu.write_u32(DATA + 64, 0x800).unwrap();
+    assert_eq!(vidmem(&mut m, DATA + 64, DATA + 16, DATA + 20), 0x80070057);
+    m.cpu.write_u32(DATA + 64, 0x4000).unwrap();
+    assert_eq!(vidmem(&mut m, DATA + 64, DATA + 16, 0), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 64 * 1024 * 1024);
+    m.cpu.write_u32(DATA + 20, 0).unwrap();
+    assert_eq!(vidmem(&mut m, DATA + 64, 0, DATA + 20), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 32 * 1024 * 1024);
+}
+
+#[test]
+// spec: GFX-DDRAW-12
+fn cooperative_status_compact_and_restore_all_surfaces_follow_exclusive_ownership() {
+    let mut registry = Registry::default();
+    registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+        Outcome::ExitThread(0)
+    });
+    let (mut m, first) = setup(false, false, registry);
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+
+    // Normal mode rejects Compact and reports DD_OK cooperative status.
+    assert_eq!(call(&mut m, api::COMPACT, &[first]), 0x887600e1);
+    assert_eq!(call(&mut m, api::TEST_COOPERATIVE_LEVEL, &[first]), 0);
+    assert_eq!(call(&mut m, api::RESTORE_ALL_SURFACES, &[first]), 0);
+
+    // Invoke vtable slots 3 (Compact), 25 (RestoreAllSurfaces), 26 (TestCooperativeLevel) as guest.
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[first, 7, 0x11]), 0);
+    let table = m.cpu.read_u32(first).unwrap();
+    let compact = m.cpu.read_u32(table + 3 * 4).unwrap();
+    let restore_all = m.cpu.read_u32(table + 25 * 4).unwrap();
+    let test_coop = m.cpu.read_u32(table + 26 * 4).unwrap();
+    let done = m.resolve_import("test", "done").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(first)
+        .call(compact)
+        .mov_mem_eax(DATA + 32)
+        .push_imm(first)
+        .call(restore_all)
+        .mov_mem_eax(DATA + 36)
+        .push_imm(first)
+        .call(test_coop)
+        .mov_mem_eax(DATA + 40)
+        .call(done)
+        .hlt();
+    m.cpu.write(CODE, &code.bytes).unwrap();
+    m.spawn("ddraw status caller", CODE, &[], 65536).unwrap();
+    assert!(matches!(m.run(), RunResult::Exited(_)));
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 36).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 40).unwrap(), 0);
+
+    // Create a primary on first, then create a second DirectDraw object.
+    assert_eq!(call(&mut m, api::DISPLAY_MODE, &[first, 8, 8, 32, 0, 0]), 0);
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x200u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[first, DATA + 64, DATA, 0]),
+        0
+    );
+    let first_primary = m.cpu.read_u32(DATA).unwrap();
+    m.cpu.write(DATA + 128, &IID_DDRAW7).unwrap();
+    assert_eq!(call(&mut m, api::DD_CREATE, &[0, DATA, DATA + 128, 0]), 0);
+    let second = m.cpu.read_u32(DATA).unwrap();
+
+    // Non-owner sees DDERR_EXCLUSIVEMODEALREADYSET while first owns exclusive mode.
+    assert_eq!(
+        call(&mut m, api::TEST_COOPERATIVE_LEVEL, &[second]),
+        0x88760245
+    );
+    assert_eq!(
+        call(&mut m, api::RESTORE_ALL_SURFACES, &[second]),
+        0x88760245
+    );
+
+    // Second preempting exclusive mode loses first's exclusive status and primary.
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[second, 7, 0x11]), 0);
+    assert_eq!(
+        call(&mut m, api::TEST_COOPERATIVE_LEVEL, &[first]),
+        0x887600e1
+    );
+    assert_eq!(call(&mut m, api::COMPACT, &[first]), 0x887600e1);
+    assert_eq!(call(&mut m, api::IS_LOST, &[first_primary]), 0x887601c2);
+    assert_eq!(
+        call(&mut m, api::RESTORE_ALL_SURFACES, &[first]),
+        0x88760245
+    );
+    assert_eq!(call(&mut m, api::RESTORE_ALL_SURFACES, &[second]), 0);
+    assert_eq!(call(&mut m, api::IS_LOST, &[first_primary]), 0x887601c2);
+
+    // Returning second to normal mode allows first to restore its own surfaces.
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[second, 0, 8]), 0);
+    assert_eq!(call(&mut m, api::TEST_COOPERATIVE_LEVEL, &[second]), 0);
+    assert_eq!(call(&mut m, api::RESTORE_ALL_SURFACES, &[first]), 0);
+    assert_eq!(call(&mut m, api::IS_LOST, &[first_primary]), 0);
 }
