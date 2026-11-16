@@ -78,7 +78,11 @@ pub fn run() {
     #[cfg(target_os = "ios")]
     {
         // Before the webview, which would take the only range it fits.
-        if let Err(error) = adv_shell::reserve_guest_window() {
+        let reserved = adv_shell::reserve_guest_window();
+        if let Some(space) = adv_shell::guest_address_space() {
+            log::info!("address space at launch: {space}");
+        }
+        if let Err(error) = reserved {
             log::error!("guest window: {error}");
         }
         game::prepare_jit();

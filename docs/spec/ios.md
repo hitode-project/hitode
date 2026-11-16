@@ -67,6 +67,14 @@ The app's address space ends a few GiB past the dyld shared region. WebKit reser
 
 The extension raises the memory limit and widens the address space. That decides whether IOS-MEM-3's 4 GiB-aligned window fits once the process has mapped its libraries. Inside LiveContainer the host process is LiveContainer's, so LiveContainer's own signature carries the extension. Installers that re-sign the app read its declared entitlements and enable the capability on the user's App ID. iloader 2.4.1 enables it for every app it installs, and free development teams may use it. Installations made before this rule lack it, so the dialog reaches upgrading users. The check uses the same `SecTaskCopyValueForEntitlement` query as IOS-JIT-3.
 
+### IOS-MEM-5 Address space record
+
+**Rule**: The launch reservation MUST record the mappable range's end and the window's base, logged and carried in iOS reports. Without a window, the record MUST also hold up to 16 merged mapped ranges above the lowest candidate. A failed reservation with the memory extension MUST ask for a report instead of a restart.
+**Applies to**: iOS
+**Verification**: Test
+
+The record tells apart a device whose kernel withholds the jumbo map from one where something else holds the candidate ranges. The kernel grants the jumbo map for the memory extension only on devices that configure an entitled memory limit; without it, the map of a device with more than 3 GiB ends at `0x4_5800_0000`. The layout at launch is the only useful one: once WebKit loads, its heap fills the free range. A restart repeats the same launch, so it cannot help.
+
 ### IOS-APP-1 Game folder access
 
 **Rule**: Game imports MUST read folders selected through Files at their original locations by default. External directory permissions MUST persist as bookmarks and be restored before library access. Coordinated reads MUST make cloud files locally readable before discovery and game launch.

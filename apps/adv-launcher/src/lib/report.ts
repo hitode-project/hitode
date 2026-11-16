@@ -48,8 +48,16 @@ export interface ReportPlatform {
   model: string;
   /** iOS: whether the signature raises the memory limit. */
   increased_memory_limit?: boolean;
+  /** iOS: the address space the launch reservation saw. */
+  address_space?: ReportAddressSpace;
   graphics: ReportGraphics;
   settings: ReportSettings;
+}
+/** Host addresses as `0x` hex; `mapped` only when no window fit. */
+export interface ReportAddressSpace {
+  max: string;
+  window?: string;
+  mapped?: string[];
 }
 export interface ReportGame {
   exe_sha256: string;
