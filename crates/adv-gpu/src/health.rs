@@ -98,6 +98,7 @@ pub(crate) enum ProbeStep {
     CanaryPack4444 = 3,
     CanaryCompute = 4,
     CanaryPresent = 5,
+    StartupInit = 6,
 }
 
 impl ProbeStep {
@@ -108,6 +109,7 @@ impl ProbeStep {
             3 => Some(Self::CanaryPack4444),
             4 => Some(Self::CanaryCompute),
             5 => Some(Self::CanaryPresent),
+            6 => Some(Self::StartupInit),
             _ => None,
         }
     }
@@ -547,6 +549,35 @@ pub(crate) fn next_fallback(step: ProbeStep, active: Mask, disabled: Mask) -> Op
             }
             None
         }
+        ProbeStep::StartupInit => {
+            // Post-open display pipelines fail first on bindless fragment storage
+            // (Adreno) before float controls, dynamic state, dynamic rendering,
+            // push descriptors, sync2/timeline, or optional hardware features.
+            for step_mod in [
+                Modern::BINDLESS,
+                Modern::EXTENDED_DYNAMIC_STATE,
+                Modern::DYNAMIC_RENDERING | Modern::LOAD_STORE_OP_NONE,
+                Modern::PUSH_DESCRIPTORS,
+                Modern::SYNCHRONIZATION2 | Modern::TIMELINE_SEMAPHORES,
+            ] {
+                let live = active.modern & step_mod;
+                if !live.is_empty()
+                    && let Some(next) = add_mod(live)
+                {
+                    return Some(next);
+                }
+            }
+            let render_opts = active.optional & (Optional::IEEE_F32 | Optional::WEIGHTED_SAMPLING);
+            if !render_opts.is_empty()
+                && let Some(next) = add_opt(render_opts)
+            {
+                return Some(next);
+            }
+            if !active.optional.is_empty() {
+                return add_opt(active.optional);
+            }
+            None
+        }
     }
 }
 
@@ -965,6 +996,33 @@ pub(crate) fn save_verified(
     write_archive(dir, &entries);
 }
 
+/// Clears the cached verification flag if warm startup initialization later
+/// fails down to the floor.
+#[cfg_attr(target_vendor = "apple", allow(dead_code))]
+pub(crate) fn invalidate_health(
+    cache_dir: Option<&Path>,
+    prefix: &[u8; 28],
+    caller_disable: Modern,
+) {
+    let Some(dir) = cache_dir else {
+        let mut map = PROCESS_CACHE.lock().unwrap();
+        if let Some(entry) = map.get_mut(&(*prefix, caller_disable.bits())) {
+            entry.verified = false;
+        }
+        return;
+    };
+    if !caller_disable.is_empty() {
+        return;
+    }
+    let _guard = STORE_LOCK.lock().unwrap();
+    let mut entries = read_archive(dir);
+    reap_sentinel_locked(dir, &mut entries);
+    if let Some(entry) = entries.iter_mut().find(|e| &e.prefix == prefix) {
+        entry.health.verified = false;
+        write_archive(dir, &entries);
+    }
+}
+
 /// Runs one startup probe step inside a crash sentinel when `cache_dir` is set.
 pub(crate) fn run_probe_step<T>(
     cache_dir: Option<&Path>,
@@ -1203,6 +1261,28 @@ mod tests {
             disabled
                 .optional
                 .contains(Optional::DEVICE_EXTENSIONS | Optional::AHB_UBWC)
+        );
+
+        // StartupInit prioritizes stripping BINDLESS cleanly before touching float controls.
+        let active = Mask {
+            modern: Modern::all(),
+            optional: Optional::IEEE_F32 | Optional::SHADER_F16,
+        };
+        let first = next_fallback(ProbeStep::StartupInit, active, Mask::empty()).unwrap();
+        assert_eq!(first.modern, Modern::BINDLESS);
+        assert!(first.optional.is_empty());
+        let second = next_fallback(
+            ProbeStep::StartupInit,
+            Mask {
+                modern: Modern::all() & !Modern::BINDLESS,
+                optional: Optional::IEEE_F32 | Optional::SHADER_F16,
+            },
+            first,
+        )
+        .unwrap();
+        assert_eq!(
+            second.modern,
+            Modern::BINDLESS | Modern::EXTENDED_DYNAMIC_STATE
         );
     }
 

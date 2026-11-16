@@ -458,8 +458,10 @@ impl Device {
                             let created = unsafe {
                                 self.0.device.create_compute_pipelines(cache, &[info], None)
                             };
-                            self.0
-                                .result(created.map(|h| h[0]).map_err(|(_, error)| error))
+                            self.0.result_in(
+                                created.map(|h| h[0]).map_err(|(_, error)| error),
+                                &format!("compute pipeline: {}", desc.label),
+                            )
                         })?,
                     );
                 pipelines.compute.insert(key, compiled.clone());
@@ -673,7 +675,10 @@ impl Device {
                 .device
                 .create_graphics_pipelines(cache, &[info], None)
         };
-        context.result(created.map(|h| h[0]).map_err(|(_, error)| error))
+        context.result_in(
+            created.map(|h| h[0]).map_err(|(_, error)| error),
+            &format!("graphics pipeline: {}", desc.label),
+        )
     }
 }
 pub(super) fn topology(t: Topology) -> vk::PrimitiveTopology {

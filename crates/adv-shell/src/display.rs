@@ -215,6 +215,7 @@ pub(crate) fn platform_caps(device: Option<&Device>) -> plan::CompositorCaps {
         tile: device.map_or((0, 0), |d| d.caps().limits.tile),
     }
 }
+#[allow(dead_code)]
 pub(crate) fn open(
     software: bool,
     cache_dir: Option<std::path::PathBuf>,
@@ -227,13 +228,34 @@ pub(crate) fn open(
     })
     .map_err(|e| e.to_string())
 }
+#[cfg(any(
+    target_os = "android",
+    target_os = "macos",
+    all(test, feature = "media")
+))]
+pub(crate) fn open_with<T>(
+    software: bool,
+    cache_dir: Option<std::path::PathBuf>,
+    init: impl FnMut(Device, Queue) -> adv_gpu::Result<Result<T, String>>,
+) -> Result<T, String> {
+    Device::open_with(
+        &adv_gpu::queue::DeviceOptions {
+            software,
+            label: "session display",
+            cache_dir,
+            ..Default::default()
+        },
+        init,
+    )
+    .map_err(|e| e.to_string())?
+}
 pub(crate) fn channel(
     device: Device,
     queue: Queue,
     compositor: Box<dyn Compositor>,
     view: (u32, u32),
     wake: WakeEvent,
-) -> Result<(Startup, Ui), String> {
+) -> adv_gpu::Result<(Startup, Ui)> {
     let settings = plan::Settings {
         view,
         rotation: plan::Rotation::None,
@@ -245,8 +267,7 @@ pub(crate) fn channel(
     };
     #[cfg(target_os = "android")]
     let caps = compositor.caps();
-    let display =
-        Display::new(device.clone(), compositor, settings.clone()).map_err(|e| e.to_string())?;
+    let display = Display::new(device.clone(), compositor, settings.clone())?;
     let shared = Arc::new(Shared {
         #[cfg(target_os = "macos")]
         damage_hud: display.damage_hud(),
@@ -286,11 +307,12 @@ pub(crate) fn headless(
     wake: WakeEvent,
     cache_dir: Option<std::path::PathBuf>,
 ) -> Result<Startup, String> {
-    let (device, queue) = open(software, cache_dir)?;
-    let c = Box::new(adv_display::compositor::HeadlessCompositor::new(
-        platform_caps(Some(&device)),
-    ));
-    Ok(channel(device, queue, c, view, wake)?.0)
+    open_with(software, cache_dir, |device, queue| {
+        let c = Box::new(adv_display::compositor::HeadlessCompositor::new(
+            platform_caps(Some(&device)),
+        ));
+        Ok(Ok(channel(device, queue, c, view, wake.clone())?.0))
+    })
 }
 #[cfg(target_vendor = "apple")]
 pub(crate) fn apple_channel(
@@ -308,7 +330,8 @@ pub(crate) fn apple_channel(
         platform_caps(Some(&device)),
         objc2::MainThreadMarker::new().unwrap(),
     );
-    let (startup, mut ui) = channel(device, queue, Box::new(c), view, wake)?;
+    let (startup, mut ui) =
+        channel(device, queue, Box::new(c), view, wake).map_err(|e| e.to_string())?;
     ui.update(view, scale);
     Ok((startup, ui))
 }

@@ -1727,3 +1727,72 @@ fn startup_canaries_and_health_cache_round_trip() {
     assert!(!dir.join("vulkan-probe.bin").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// spec: GFX-CACHE-4
+#[test]
+fn open_with_post_open_failure_steps_down_and_persists_health() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-post-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let probe = crate::Device::open(&DeviceOptions {
+        software: !cfg!(target_os = "android"),
+        validation: !cfg!(target_os = "android"),
+        ..DeviceOptions::default()
+    });
+    let Ok((probe_dev, _)) = probe else {
+        return;
+    };
+    let had_bindless = probe_dev.caps().modern.contains(Modern::BINDLESS);
+    drop(probe_dev);
+    if !had_bindless {
+        return;
+    }
+
+    let mut seen = Vec::new();
+    let recovered = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| {
+            let bindless = device.caps().modern.contains(Modern::BINDLESS);
+            seen.push(bindless);
+            if bindless {
+                return Err(Error::Unavailable(
+                    "Vulkan (graphics pipeline: synthetic): ERROR_UNKNOWN".into(),
+                ));
+            }
+            Ok(device)
+        },
+    )
+    .unwrap();
+    assert_eq!(seen, vec![true, false]);
+    assert!(!recovered.caps().modern.contains(Modern::BINDLESS));
+    assert!(
+        recovered
+            .adapter_identity()
+            .tier
+            .contains("masked: bindless")
+    );
+    drop(recovered);
+
+    // Warm reopen directly starts without bindless on the persisted profile.
+    let mut warm_seen = Vec::new();
+    let warm = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| {
+            warm_seen.push(device.caps().modern.contains(Modern::BINDLESS));
+            Ok(device)
+        },
+    )
+    .unwrap();
+    assert_eq!(warm_seen, vec![false]);
+    assert!(!warm.caps().modern.contains(Modern::BINDLESS));
+    let _ = std::fs::remove_dir_all(&dir);
+}

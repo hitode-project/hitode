@@ -522,12 +522,15 @@ impl Device {
                 usage |= native;
             }
         }
-        let handle = self.0.result(unsafe {
-            self.0.device.create_buffer(
-                &vk::BufferCreateInfo::default().size(desc.size).usage(usage),
-                None,
-            )
-        })?;
+        let handle = self.0.result_in(
+            unsafe {
+                self.0.device.create_buffer(
+                    &vk::BufferCreateInfo::default().size(desc.size).usage(usage),
+                    None,
+                )
+            },
+            &format!("buffer: {}", desc.label),
+        )?;
         let requirements = unsafe { self.0.device.get_buffer_memory_requirements(handle) };
         let allocation = match self
             .0
@@ -837,9 +840,10 @@ impl Device {
                 QueryKind::Occlusion => vk::QueryType::OCCLUSION,
             })
             .query_count(count);
-        let handle = self
-            .0
-            .result(unsafe { self.0.device.create_query_pool(&info, None) })?;
+        let handle = self.0.result_in(
+            unsafe { self.0.device.create_query_pool(&info, None) },
+            "query pool",
+        )?;
         let period = unsafe {
             self.0
                 .instance

@@ -156,15 +156,19 @@ impl GameView {
         wake: adv_sync::WakeEvent,
         cache_dir: Option<std::path::PathBuf>,
     ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
-        let (device, queue) = crate::display::open(software, cache_dir)?;
-        crate::display::apple_channel(
-            device,
-            queue,
-            self.layer().unwrap(),
-            self.native_scale(),
-            self.native_client_size()?,
-            wake,
-        )
+        let layer = self.layer().unwrap();
+        let scale = self.native_scale();
+        let size = self.native_client_size()?;
+        crate::display::open_with(software, cache_dir, |device, queue| {
+            Ok(crate::display::apple_channel(
+                device,
+                queue,
+                layer.clone(),
+                scale,
+                size,
+                wake.clone(),
+            ))
+        })
     }
 
     pub(crate) fn native_scale(&self) -> f64 {

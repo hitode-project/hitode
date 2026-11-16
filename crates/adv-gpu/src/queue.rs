@@ -50,6 +50,15 @@ impl Device {
     pub fn open(options: &DeviceOptions) -> Result<(Device, Queue)> {
         imp::Device::open(options)
     }
+
+    /// Open the platform's device and queue, then run caller startup `init`
+    /// under crash sentinels and progressive Vulkan fallback.
+    pub fn open_with<T>(
+        options: &DeviceOptions,
+        mut init: impl FnMut(Device, Queue) -> Result<T>,
+    ) -> Result<T> {
+        imp::Device::open_with(options, &mut init)
+    }
     pub fn adapter_identity(&self) -> AdapterIdentity {
         self.inner.adapter_identity()
     }
