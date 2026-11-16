@@ -32,6 +32,12 @@ pub use debug_views::DebugTarget;
 pub fn reserve_guest_window() -> Result<(), String> {
     adv_cpu::virtual_memory::GuestWindow::preserve()
 }
+
+/// What `reserve_guest_window` saw (IOS-MEM-5).
+#[cfg(target_os = "ios")]
+pub fn guest_address_space() -> Option<adv_cpu::virtual_memory::AddressSpace> {
+    adv_cpu::virtual_memory::GuestWindow::launch_address_space()
+}
 pub use adv_device::ui::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
     MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, WindowView,

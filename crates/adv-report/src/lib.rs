@@ -71,6 +71,9 @@ impl Report {
         if let Some(gaps) = &self.api_gaps {
             gaps.validate()?;
         }
+        if let Some(space) = &self.platform.address_space {
+            space.validate()?;
+        }
         Ok(())
     }
 }
@@ -100,8 +103,71 @@ pub struct Platform {
     /// iOS: whether the signature raises the memory limit (IOS-MEM-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub increased_memory_limit: Option<bool>,
+    /// iOS: the address space the launch reservation saw (IOS-MEM-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_space: Option<AddressSpace>,
     pub graphics: Graphics,
     pub settings: Settings,
+}
+
+/// Mapped ranges an address space record holds at most.
+pub const MAPPED_RANGES: usize = 16;
+
+/// Host addresses as `0x` lowercase hex.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressSpace {
+    /// The end of the range the app may map.
+    pub max: String,
+    /// The guest window's base; absent when no window fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// When no window fit, the mapped ranges above the lowest candidate
+    /// window, as `start-end`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapped: Vec<String>,
+}
+impl AddressSpace {
+    pub fn new(
+        max: u64,
+        window: Option<u64>,
+        mapped: impl IntoIterator<Item = std::ops::Range<u64>>,
+    ) -> Self {
+        Self {
+            max: format!("{max:#x}"),
+            window: window.map(|base| format!("{base:#x}")),
+            mapped: mapped
+                .into_iter()
+                .map(|range| format!("{:#x}-{:#x}", range.start, range.end))
+                .collect(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        fn address(text: &str) -> bool {
+            text.strip_prefix("0x").is_some_and(|digits| {
+                (1..=16).contains(&digits.len())
+                    && digits
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        }
+        let ranges = self.mapped.iter().all(|range| {
+            range
+                .split_once('-')
+                .is_some_and(|(start, end)| address(start) && address(end))
+        });
+        if !address(&self.max)
+            || !self.window.as_deref().is_none_or(address)
+            || !ranges
+            || self.mapped.len() > MAPPED_RANGES
+        {
+            return Err(
+                "report address space must hold hex addresses and at most 16 ranges".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +249,7 @@ impl Platform {
                 .into(),
             model: host_property(true),
             increased_memory_limit: None,
+            address_space: None,
             graphics,
             settings,
         }
@@ -551,6 +618,7 @@ mod tests {
                 os_major: "26".into(),
                 model: "Example1,1".into(),
                 increased_memory_limit: None,
+                address_space: None,
                 graphics: Graphics {
                     api: GraphicsApi::Metal,
                     name: "Example GPU".into(),
@@ -648,6 +716,37 @@ mod tests {
         assert!(to_json(&other).is_err());
         assert!(serde_json::from_str::<Report>(&serde_json::to_string(&other).unwrap()).is_err());
         assert!(to_json(&report()).unwrap().starts_with("{\n  \"schema\""));
+    }
+
+    // spec: REPORT-PLAT-1, IOS-MEM-5
+    #[test]
+    fn address_spaces_are_hex_and_bounded() {
+        let mut report = report();
+        report.platform.increased_memory_limit = Some(true);
+        report.platform.address_space = Some(AddressSpace::new(
+            0x4_5800_0000,
+            None,
+            [0x2_fffe_0000..0x3_0002_0000, 0x3_8000_0000..0x3_9000_0000],
+        ));
+        let json = to_json(&report).unwrap();
+        assert!(json.contains(
+            r#""increased_memory_limit": true,
+    "address_space": {
+      "max": "0x458000000",
+      "mapped": [
+        "0x2fffe0000-0x300020000",
+        "0x380000000-0x390000000"
+      ]
+    },"#
+        ));
+        assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), report);
+        let space = report.platform.address_space.as_mut().unwrap();
+        space.mapped = vec!["0x1-0x2".into(); MAPPED_RANGES + 1];
+        assert!(to_json(&report).is_err());
+        let space = report.platform.address_space.as_mut().unwrap();
+        space.mapped.clear();
+        space.window = Some("C:\\Games".into());
+        assert!(to_json(&report).is_err());
     }
 
     // spec: REPORT-FMT-3

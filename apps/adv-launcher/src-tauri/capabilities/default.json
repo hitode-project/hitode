@@ -8,7 +8,11 @@
     "core:window:allow-start-dragging",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "https://vndb.org/*" }, { "url": "https://github.com/hitode-project/*" }]
+      "allow": [
+        { "url": "https://vndb.org/*" },
+        { "url": "https://github.com/hitode-project/*" },
+        { "url": "https://github.com/hitode-project/*", "app": "inAppBrowser" }
+      ]
     }
   ]
 }

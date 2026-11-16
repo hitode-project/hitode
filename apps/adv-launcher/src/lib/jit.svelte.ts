@@ -27,7 +27,7 @@ const errors: Record<string, string> = {
   lockdownPairing: "这是 SideStore 等使用的旧格式配对文件，请选择 StikDebug 使用的 pairingFile.plist",
   memoryLimitMissing: "当前安装没有内存扩展，游戏可能因地址空间不足无法启动。请用 iloader 2.4.1 或更新版本重新安装 Hitode；装在 LiveContainer 里的话，重新安装 LiveContainer。",
   noGuestWindow: "设备的地址空间不足，游戏无法启动。请用 iloader 2.4.1 或更新版本重新安装 Hitode；装在 LiveContainer 里的话，重新安装 LiveContainer。",
-  noGuestWindowExtended: "设备的地址空间不足，游戏无法启动。请彻底关闭 Hitode 后重新打开再试。",
+  noGuestWindowExtended: "设备的地址空间不足，游戏无法启动，重新打开 Hitode 也无法解决。请在游戏菜单里选“报告问题…”提交报告，报告会附上排查需要的地址空间信息。",
   jitLiveContainerHelper: "LiveContainer 无法启动 Hitode 的 JIT 扩展。请用 iloader 重新安装“LiveContainer + SideStore（每夜构建版）”，长按 Hitode → 设置，打开“启用应用辅助进程”后重新启动 Hitode。",
 };
 

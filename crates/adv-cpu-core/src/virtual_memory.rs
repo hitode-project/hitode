@@ -15,6 +15,8 @@ mod window;
 pub use direct::DirectFaultView;
 #[cfg(unix)]
 pub use direct::{FaultClassification, GuestAccess, GuestPageProtection};
+#[cfg(target_vendor = "apple")]
+pub use window::AddressSpace;
 #[cfg(unix)]
 pub use window::{GUARD as WINDOW_GUARD, GuestWindow};
 

@@ -43,6 +43,64 @@ pub struct GuestWindow {
 /// The preserved window while no family holds it.
 static PRESERVED: Mutex<Option<Arc<GuestWindow>>> = Mutex::new(None);
 
+/// The address space the first `preserve` saw.
+#[cfg(target_vendor = "apple")]
+static LAUNCH: OnceLock<AddressSpace> = OnceLock::new();
+
+/// Mapped ranges an address space record keeps at most, as reports allow.
+#[cfg(target_vendor = "apple")]
+const MAPPED_RANGES: usize = 16;
+
+/// The address space a launch reservation saw (IOS-MEM-5).
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressSpace {
+    /// The end of the range the app may map.
+    pub max: u64,
+    /// The window's base; none when no window fit.
+    pub window: Option<u64>,
+    /// When no window fit, the mapped ranges from the lowest candidate's
+    /// guard up to `max`, merged where they touch.
+    pub mapped: Vec<std::ops::Range<u64>>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl AddressSpace {
+    fn observe(found: &Result<GuestWindow, usize>) -> Self {
+        let max = darwin::max_address();
+        match found {
+            Ok(window) => Self {
+                max,
+                window: Some(window.base as u64),
+                mapped: Vec::new(),
+            },
+            Err(from) => Self {
+                max,
+                window: None,
+                mapped: darwin::mapped(*from as u64, max),
+            },
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl std::fmt::Display for AddressSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "max {:#x}", self.max)?;
+        if let Some(window) = self.window {
+            write!(f, ", window {window:#x}")?;
+        }
+        for range in &self.mapped {
+            write!(f, ", mapped {:#x}-{:#x}", range.start, range.end)?;
+        }
+        Ok(())
+    }
+}
+
+fn missed(from: usize) -> String {
+    format!("no 4 GiB-aligned guest window fits the address space above {from:#x}")
+}
+
 // SAFETY: the window only owns an address range; the views placed in it
 // belong to their memories, and the tenant is atomic.
 unsafe impl Send for GuestWindow {}
@@ -93,11 +151,20 @@ impl GuestWindow {
     pub fn preserve() -> Result<(), String> {
         let mut slot = PRESERVED.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_none() {
-            let mut window = Self::with_layout(true)?;
+            let found = Self::search();
+            #[cfg(target_vendor = "apple")]
+            let _ = LAUNCH.set(AddressSpace::observe(&found));
+            let mut window = found.map_err(missed)?;
             window.preserved = true;
             *slot = Some(Arc::new(window));
         }
         Ok(())
+    }
+
+    /// What the first `preserve` saw (IOS-MEM-5).
+    #[cfg(target_vendor = "apple")]
+    pub fn launch_address_space() -> Option<AddressSpace> {
+        LAUNCH.get().cloned()
     }
 
     /// The preserved window, unless a family holds it.
@@ -140,7 +207,7 @@ impl GuestWindow {
 
     pub(crate) fn with_layout(compact: bool) -> Result<Self, String> {
         if compact {
-            return Self::search();
+            return Self::search().map_err(missed);
         }
         // Over-reserve by one span so an aligned window fits, then trim.
         let over = LEN + SPAN;
@@ -178,23 +245,22 @@ impl GuestWindow {
     /// itself, never reserving more than one window: an iOS app's whole
     /// address space may hold little more. Darwin ignores hints outside
     /// the range it allocates from, so the search starts inside it.
-    fn search() -> Result<Self, String> {
+    /// Failing, it returns where the lowest candidate's guard starts.
+    fn search() -> Result<Self, usize> {
         // SAFETY: a fresh inaccessible reservation at an OS-chosen address.
         let raw = unsafe { reserve(std::ptr::null_mut(), LEN, 0) };
         if raw == libc::MAP_FAILED {
-            return Err(format!(
-                "reserve guest window: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(SPAN - GUARD);
         }
         release(raw, LEN);
-        let mut base = (raw as usize).next_multiple_of(SPAN);
+        let first = (raw as usize).next_multiple_of(SPAN);
+        let mut base = first;
         for _ in 0..64 {
             let low = base - GUARD;
             // SAFETY: hints only; the kernel picks a free range.
             let raw = unsafe { reserve(low as *mut u8, LEN, 0) };
             if raw as usize == low {
-                return Self::found(low, LEN, base);
+                return Ok(Self::found(low, LEN, base));
             }
             release(raw, LEN);
             // The kernel searches upward from a taken hint, so nothing fits
@@ -212,23 +278,23 @@ impl GuestWindow {
             // SAFETY: as above.
             let raw = unsafe { reserve(base as *mut u8, SPAN + GUARD, 0) };
             if raw as usize == base && unmapped(low, GUARD) {
-                return Self::found(base, SPAN + GUARD, base);
+                return Ok(Self::found(base, SPAN + GUARD, base));
             }
             release(raw, SPAN + GUARD);
             base = next;
         }
-        Err("no 4 GiB-aligned guest window fits the address space".into())
+        Err(first - GUARD)
     }
 
-    fn found(start: usize, len: usize, base: usize) -> Result<Self, String> {
-        Ok(Self {
-            start: NonNull::new(start as *mut u8).ok_or("guest window at null")?,
+    fn found(start: usize, len: usize, base: usize) -> Self {
+        Self {
+            start: NonNull::new(start as *mut u8).expect("the kernel never maps at null"),
             len,
             base,
             compact: true,
             tenant: AtomicUsize::new(0),
             preserved: false,
-        })
+        }
     }
 
     /// Host address of guest address 0.
@@ -291,6 +357,93 @@ fn unmapped(address: usize, len: usize) -> bool {
         let result = unsafe { libc::msync(page_address as *mut _, page, libc::MS_ASYNC) };
         result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
     })
+}
+
+#[cfg(target_vendor = "apple")]
+mod darwin {
+    use std::ops::Range;
+
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn task_info(
+            task: libc::mach_port_t,
+            flavor: u32,
+            info: *mut i32,
+            count: *mut u32,
+        ) -> libc::c_int;
+        fn mach_vm_region(
+            task: libc::mach_port_t,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: libc::c_int,
+            info: *mut i32,
+            count: *mut u32,
+            object_name: *mut libc::mach_port_t,
+        ) -> libc::c_int;
+    }
+
+    /// `TASK_VM_INFO` up to revision 2's `max_address`, in 64-bit words.
+    const VM_INFO_WORDS: usize = 21;
+
+    /// The end of the range the task may map; 0 when the kernel will not say.
+    pub fn max_address() -> u64 {
+        const TASK_VM_INFO: u32 = 22;
+        let mut info = [0u64; VM_INFO_WORDS];
+        let mut count = (VM_INFO_WORDS * 2) as u32;
+        // SAFETY: the buffer holds `count` 32-bit words.
+        let result = unsafe {
+            task_info(
+                mach_task_self_,
+                TASK_VM_INFO,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if result == 0 && count as usize >= VM_INFO_WORDS * 2 {
+            info[VM_INFO_WORDS - 1]
+        } else {
+            0
+        }
+    }
+
+    /// Mapped ranges in `[from, to)`, merged where they touch, at most
+    /// `MAPPED_RANGES` of them.
+    pub fn mapped(from: u64, to: u64) -> Vec<Range<u64>> {
+        const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+        let mut ranges: Vec<Range<u64>> = Vec::new();
+        let mut address = from;
+        while address < to {
+            let (mut size, mut name) = (0, 0);
+            let mut info = [0i32; 9];
+            let mut count = info.len() as u32;
+            // SAFETY: out-parameters for the region at or above `address`.
+            let result = unsafe {
+                mach_vm_region(
+                    mach_task_self_,
+                    &mut address,
+                    &mut size,
+                    VM_REGION_BASIC_INFO_64,
+                    info.as_mut_ptr(),
+                    &mut count,
+                    &mut name,
+                )
+            };
+            if result != 0 || address >= to {
+                break;
+            }
+            // The region holding `from` may start below it.
+            let (start, end) = (address.max(from), (address + size).min(to));
+            if let Some(last) = ranges.last_mut().filter(|last| last.end == start) {
+                last.end = end;
+            } else if ranges.len() == super::MAPPED_RANGES {
+                break;
+            } else {
+                ranges.push(start..end);
+            }
+            address = end;
+        }
+        ranges
+    }
 }
 
 unsafe fn reserve(address: *mut u8, len: usize, fixed: libc::c_int) -> *mut libc::c_void {
@@ -397,6 +550,28 @@ mod tests {
         assert_eq!(again.base(), base);
         assert_eq!(again.tenant.load(Ordering::Relaxed), 0);
         assert!(!unmapped(base, page));
+    }
+
+    // spec: IOS-MEM-5
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn mapped_ranges_merge_where_they_touch_and_skip_holes() {
+        assert!(darwin::max_address() > 0);
+        let page = crate::virtual_memory::os::page_size().unwrap() as u64;
+        // SAFETY: a fresh reservation, then a hole where its third page was.
+        let raw = unsafe { reserve(std::ptr::null_mut(), 4 * page as usize, 0) } as u64;
+        unsafe { libc::munmap((raw + 2 * page) as *mut _, page as usize) };
+        assert_eq!(
+            darwin::mapped(raw + page / 2, raw + 4 * page),
+            [
+                raw + page / 2..raw + 2 * page,
+                raw + 3 * page..raw + 4 * page
+            ]
+        );
+        unsafe {
+            libc::munmap(raw as *mut _, 2 * page as usize);
+            libc::munmap((raw + 3 * page) as *mut _, page as usize);
+        }
     }
 
     #[test]

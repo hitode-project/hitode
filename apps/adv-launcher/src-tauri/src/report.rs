@@ -66,6 +66,8 @@ pub async fn report_base<R: Runtime>(
         #[cfg(target_os = "ios")]
         let platform = Platform {
             increased_memory_limit: Some(crate::jit_ios::increased_memory_limit()),
+            address_space: adv_shell::guest_address_space()
+                .map(|space| adv_report::AddressSpace::new(space.max, space.window, space.mapped)),
             ..platform
         };
         Ok(ReportBase {
