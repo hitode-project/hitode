@@ -50,6 +50,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Wine 11 DirectDraw
 
+### GFX-DDRAW-9 Scan-line queries
+
+**Rule**: GetScanLine MUST validate device state and writable output pointers on legacy and modern vtables. The virtual 60 Hz adapter MUST use display height and machine time that progresses during virtual-time polling. Its scan MUST include one blanking row, returning DDERR_VERTICALBLANKINPROGRESS without writing output.
+**Verification**: Test
+**Basis**: Microsoft `IDirectDraw7::GetScanLine`; the virtual scan model follows the existing raster-status model.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

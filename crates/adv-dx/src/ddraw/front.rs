@@ -63,6 +63,7 @@ pub fn register(registry: &mut Registry) {
     registry.register(get_device_identifier_ABI);
     registry.register(get_fourcc_codes_ABI);
     registry.register(wait_for_vertical_blank_ABI);
+    registry.register(get_scan_line_ABI);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
@@ -413,6 +414,40 @@ fn create_surface(
 #[win32(ddraw, name = "IDirectDraw7::SetCooperativeLevel", level = implement)]
 fn cooperative(env: &mut Env<'_>, this: GuestPtr<()>, arg1: Handle, arg2: u32) -> Outcome {
     call(env, api::COOPERATIVE, &[this.addr(), arg1.0, arg2])
+}
+/// The virtual 60 Hz adapter scans the visible rows and one blanking row.
+/// Querying the guest clock also advances virtual-time polling loops.
+#[win32(ddraw, name = "IDirectDraw7::GetScanLine", level = state)]
+fn get_scan_line(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome {
+    let state = env.ext.get::<State>();
+    let Some(object) = state
+        .draw
+        .com
+        .as_ref()
+        .and_then(|com| com.get::<ComState>(&env.sys.objects, this.addr()))
+        .filter(|object| matches!(object.kind, Kind::Device))
+    else {
+        return Outcome::Return(0x88760082); // DDERR_INVALIDOBJECT
+    };
+    if !object.initialized {
+        return Outcome::Return(0x800401f0); // DDERR_NOTINITIALIZED
+    }
+    if output.is_null()
+        || adv_abi::guest::check_range(env.cpu, output.addr(), 4, adv_cpu::backend::Prot::WRITE)
+            .is_err()
+    {
+        return Outcome::Return(INVALID);
+    }
+    let height = env.ext.get::<SurfaceStore>().height;
+    let now = env.sys.clock.guest_now_us();
+    // Integer phase avoids drift and overflow at long runtimes. Match the
+    // 60 Hz profile advertised by DirectDraw display-mode enumeration.
+    let phase = (now % 1_000_000) * 60 % 1_000_000;
+    let line = (phase * (u64::from(height) + 1) / 1_000_000) as u32;
+    if line >= height {
+        return Outcome::Return(0x88760219); // DDERR_VERTICALBLANKINPROGRESS
+    }
+    Outcome::Return(output.write(env.cpu, line).map_or(INVALID, |()| 0))
 }
 #[win32(ddraw, name = "IDirectDraw7::WaitForVerticalBlank", level = state)]
 fn wait_for_vertical_blank(

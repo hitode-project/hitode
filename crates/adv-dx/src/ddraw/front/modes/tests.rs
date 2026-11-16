@@ -767,3 +767,93 @@ fn flip_to_gdi_surface_shows_the_primary_memory_again() {
     let second = m.cpu.read_u32(DATA).unwrap();
     assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[second]), 0x887600ff);
 }
+
+#[test]
+// spec: GFX-DDRAW-9
+fn scan_line_guest_vtable_reports_progress_blank_and_invalid_outputs() {
+    for jit in [false, true] {
+        for legacy in [false, true] {
+            for (time, output, expected_hr, expected_line) in [
+                (0, DATA + 32, 0, Some(0)),
+                (8_333, DATA + 32, 0, Some(300)),
+                (16_650, DATA + 32, 0x88760219, None),
+                (16_667, DATA + 32, 0, Some(0)),
+                (0, 0, 0x80070057, None),
+                (0, DATA + 4094, 0x80070057, None),
+                (0, CODE, 0x80070057, None),
+            ] {
+                let mut registry = Registry::default();
+                registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+                    Outcome::ExitThread(0)
+                });
+                let (mut m, this) = setup(jit, legacy, registry);
+                m.sys.clock.advance_to(m.sys.clock.now_us() + time);
+                let done = m.resolve_import("test", "done").unwrap();
+                let table = m.cpu.read_u32(this).unwrap();
+                let method = m.cpu.read_u32(table + 16 * 4).unwrap();
+                m.cpu.write_u32(DATA + 32, 0xdeadbeef).unwrap();
+                let mut code = Asm::new(CODE);
+                code.bytes.extend_from_slice(&[0x89, 0xe0]);
+                code.mov_mem_eax(DATA + 40)
+                    .push_imm(output)
+                    .push_imm(this)
+                    .call(method)
+                    .mov_mem_eax(DATA + 36);
+                code.bytes.extend_from_slice(&[0x89, 0xe0]);
+                code.mov_mem_eax(DATA + 44).call(done).hlt();
+                m.cpu.write(CODE, &code.bytes).unwrap();
+                m.spawn("scan line caller", CODE, &[], 65536).unwrap();
+                let result = m.run();
+                assert!(
+                    matches!(result, RunResult::Exited(_)),
+                    "scan-line guest call failed: {result:?}"
+                );
+                assert_eq!(m.cpu.read_u32(DATA + 36).unwrap(), expected_hr);
+                assert_eq!(
+                    m.cpu.read_u32(DATA + 32).unwrap(),
+                    expected_line.unwrap_or(0xdeadbeef)
+                );
+                assert_eq!(
+                    m.cpu.read_u32(DATA + 40).unwrap(),
+                    m.cpu.read_u32(DATA + 44).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+// spec: GFX-DDRAW-9
+fn scan_line_polling_progresses_and_checks_device_state() {
+    let (mut m, this) = setup(false, false, Registry::default());
+    let query = |m: &mut Machine<JitCpu>, device| match front::get_scan_line(
+        &mut env(m),
+        GuestPtr::new(device),
+        GuestPtr::new(DATA + 32),
+    ) {
+        Outcome::Return(hr) => hr,
+        _ => panic!("scan line must return synchronously"),
+    };
+    m.cpu.write_u32(DATA + 32, 0xdeadbeef).unwrap();
+    assert_eq!(query(&mut m, 0), 0x88760082);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0xdeadbeef);
+    let com = m.ext.get::<front::State>().draw.com.unwrap();
+    com.get_mut::<ComState>(&mut m.sys.objects, this)
+        .unwrap()
+        .initialized = false;
+    assert_eq!(query(&mut m, this), 0x800401f0);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0xdeadbeef);
+    com.get_mut::<ComState>(&mut m.sys.objects, this)
+        .unwrap()
+        .initialized = true;
+    assert_eq!(query(&mut m, this), 0);
+    let first = m.cpu.read_u32(DATA + 32).unwrap();
+    for _ in 0..100 {
+        assert_eq!(query(&mut m, this), 0);
+    }
+    assert!(m.cpu.read_u32(DATA + 32).unwrap() > first);
+    m.ext.get_mut::<SurfaceStore>().height = 480;
+    m.sys.clock.advance_to(m.sys.clock.epoch_us + 8_333);
+    assert_eq!(query(&mut m, this), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 240);
+}
