@@ -720,6 +720,14 @@ mod tests {
             super::super::client_geometry(&ext, child),
             Some(((10, 40), true))
         );
+        // Child geometry follows parent movement without a new child report.
+        let windows = &mut ext.get_mut::<super::super::Windows>().0;
+        windows.get_mut(&base).unwrap().origin = (-20, 80);
+        windows.get_mut(&child).unwrap().client = [3, 5, 803, 605];
+        assert_eq!(
+            super::super::client_geometry(&ext, child),
+            Some(((-17, 85), true))
+        );
         ext.get_mut::<super::super::Windows>()
             .0
             .get_mut(&base)

@@ -12,6 +12,7 @@ mod enumeration;
 mod modes;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
+    pub hwnd: u32,
     pub width: u32,
     pub height: u32,
     pub origin: (i32, i32),
@@ -20,6 +21,7 @@ pub struct WindowGeometry {
 pub struct Provider {
     pub dc: MemoryDc,
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
+    /// Resolve a window; zero selects the current presented game window.
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
     pub submitted: fn(&Ext, u32, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
@@ -182,7 +184,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     }
     let binding = match id {
         api::COOPERATIVE if words[2] == 8 => Some((words[1], None)),
-        api::CLIPPER_SET_HWND => Some((words[2], Some(words[0]))),
+        api::CLIPPER_SET_HWND if words[2] != 0 => Some((words[2], Some(words[0]))),
         api::BLT => {
             let state = env.ext.get::<State>();
             let primary = env.ext.get::<SurfaceStore>().primary_id();
@@ -190,14 +192,20 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
                 .draw
                 .surface_id(&env.sys.objects, words[0])
                 .filter(|&sid| Some(sid) == primary)
-                .and_then(|sid| state.draw.surface_clippers.get(&sid))
-                .and_then(|clipper| {
-                    state
-                        .draw
-                        .clipper_windows
-                        .get(clipper)
-                        .filter(|&&hwnd| hwnd != 0)
-                        .map(|&hwnd| (hwnd, Some(*clipper)))
+                .and_then(|sid| {
+                    if let Some(&clipper) = state.draw.surface_clippers.get(&sid) {
+                        return state
+                            .draw
+                            .clipper_windows
+                            .get(&clipper)
+                            .filter(|&&hwnd| hwnd != 0)
+                            .map(|&hwnd| (hwnd, Some(clipper)));
+                    }
+                    // A window-backed primary still uses screen coordinates
+                    // when the application has not attached a clipper.
+                    let owner = state.draw.primary_owner?;
+                    let device = state.draw.com?.get::<ComState>(&env.sys.objects, owner)?;
+                    device.windowed.then_some((device.focus_window, None))
                 })
         }
         _ => None,
@@ -208,6 +216,13 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let (result, presented, changed, submitted) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
+        // Refresh for each operation; never retain an origin across movement,
+        // a mode change, or a different primary owner.
+        state.draw.primary_origin = if id == api::BLT {
+            geometry.map(|(geometry, _)| geometry.origin)
+        } else {
+            None
+        };
         if let Some((geometry, clipper)) = geometry {
             if let Err(error) = store.configure_window(geometry.width, geometry.height, &mut memory)
             {
@@ -222,6 +237,12 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
         let result = state
             .draw
             .call(id, words, store, &mut env.sys.objects, &mut memory);
+        if matches!(result, Ok(0))
+            && state.draw.submitted.is_some()
+            && let Some((geometry, _)) = geometry
+        {
+            state.binding = state.draw.primary_owner.map(|owner| (owner, geometry.hwnd));
+        }
         if id == api::COOPERATIVE && matches!(result, Ok(0)) {
             state.binding = state
                 .device(&env.sys.objects, words[0])

@@ -56,6 +56,18 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Microsoft `IDirectDraw7::GetScanLine`; the virtual scan model follows the existing raster-status model.
 
+### GFX-DDRAW-10 Window-backed primary copies
+
+**Rule**: Windowed primary copies without a clipper MUST translate screen coordinates using their owning device's current window content origin. Movement, including ancestor movement for child windows, MUST refresh the screen origin without another SetCooperativeLevel call. Offscreen destinations and exclusive-mode primaries MUST retain surface-local coordinates.
+**Verification**: Test
+**Basis**: DirectDraw primary screen coordinates mapped onto the virtual adapter's window-backed surface.
+
+### GFX-DDRAW-11 Unspecified cooperative window
+
+**Rule**: Each windowed primary copy with no cooperative window or clipper MUST resolve geometry from the current presented game window. Successful copies MUST submit their frames to that resolved window. Clearing a clipper window MUST NOT resolve a fallback window or resize the primary.
+**Verification**: Test
+**Basis**: Microsoft `IDirectDraw7::SetCooperativeLevel` permits a null window in normal mode.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
