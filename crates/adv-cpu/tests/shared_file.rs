@@ -39,7 +39,7 @@ fn guest_reads_see_writes_through_other_mappings_and_cannot_write() {
     cpu.map(STACK & !4095, 4096, Prot::RW).unwrap();
     cpu.write(CODE, &code).unwrap();
     // An offset that is no multiple of a 16 KiB host page.
-    cpu.map_shared_file(DATA, 2 * PAGE as u32, file.as_fd(), PAGE, Prot::READ)
+    cpu.map_shared_file(DATA, 2 * PAGE as u32, file.as_fd(), PAGE, Prot::READ, false)
         .unwrap();
 
     for value in [0x1234_5678u32, 0x9abc_def0] {
@@ -58,7 +58,7 @@ fn guest_reads_see_writes_through_other_mappings_and_cannot_write() {
     assert!(!cpu.accessible(DATA, PAGE as u32, Prot::WRITE));
     assert!(cpu.write(DATA, &[1]).is_err());
     assert!(
-        cpu.map_shared_file(DATA, PAGE as u32, file.as_fd(), 0, Prot::READ)
+        cpu.map_shared_file(DATA, PAGE as u32, file.as_fd(), 0, Prot::READ, false)
             .is_err()
     );
 }

@@ -95,6 +95,30 @@ static int hook_five_bytes(void)
     return font && hooked_calls == 1 && DeleteObject(font);
 }
 
+/* spec: A64-MEM-13, A64-CTL-10 */
+static int shared_executable_views(void)
+{
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, 0, 65536, NULL);
+    if (!section) return 0;
+    HANDLE duplicate;
+    if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE)) return 0;
+    section = duplicate;
+    BYTE *rw = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+    void *rx = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, 65536);
+    if (!rw || !rx) return 0;
+    const BYTE code[] = {0xb8, 1, 0, 0, 0, 0xc3}; /* mov eax, 1; ret */
+    memcpy(rw, code, sizeof(code));
+    int (__cdecl *call)(void) = rx;
+    int ok = call() == 1 && call() == 1;
+    rw[1] = 2;
+    ok = ok && call() == 2 && call() == 2;
+    UnmapViewOfFile(rw);
+    UnmapViewOfFile(rx);
+    CloseHandle(section);
+    return ok;
+}
+
 int main(void)
 {
     HMODULE nt = GetModuleHandleA("ntdll.dll"), kb = GetModuleHandleA("kernelbase.dll");
@@ -114,6 +138,7 @@ int main(void)
     check("displaced-image-base", displaced_image_base());
     check("restore-unprotected-thunk", restore_unprotected_thunk());
     check("hook-five-bytes", hook_five_bytes());
+    check("shared-executable-views", shared_executable_views());
     mapping = mapping2(INVALID_HANDLE_VALUE, NULL, SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, 65536, NULL, NULL, 0);
     check("create-section-ex", mapping != NULL);
     view = map3(mapping, GetCurrentProcess(), NULL, 0, 65536, 0, PAGE_READWRITE, NULL, 0);

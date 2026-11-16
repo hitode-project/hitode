@@ -65,6 +65,7 @@ mod x87;
 
 use iced_x86::ConditionCode;
 
+pub(crate) use decode::Fetcher;
 pub use decode::Helper;
 #[cfg(native)]
 pub(crate) use decode::Op;

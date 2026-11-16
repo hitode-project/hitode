@@ -416,11 +416,14 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
         return 0;
     }
     // A first visit runs in the owner; the point links on the next one.
-    if native.first_visit(eip) {
+    let entry = native.units.get(&eip).copied();
+    if entry.is_none()
+        && (!crate::translate::Fetcher::fetchable(memory, eip) || native.first_visit(eip))
+    {
         return 0;
     }
     let before = native.cache.used();
-    let unit = match native.link(memory, point, eip) {
+    let unit = match native.link(memory, point, eip, entry) {
         Ok(unit) => unit,
         Err(error) => {
             owner.error = Some(error);
@@ -1031,6 +1034,7 @@ impl Native {
         }
         let (entry, translated) = match self.units.get(&cpu.eip).copied() {
             Some(entry) => (entry, 0),
+            None if !crate::translate::Fetcher::fetchable(memory, cpu.eip) => return Ok(None),
             None if !self.candidates.contains(&cpu.eip) && self.first_visit(cpu.eip) => {
                 let visit = if self.candidates.is_empty() {
                     translate::first::run(cpu, memory, stop, fuel.min(SLICE))
@@ -1276,10 +1280,16 @@ impl Native {
     /// The unit at `eip`, translated if needed; a nonzero `point` is
     /// patched into a branch to it. The caller keeps stops unlinked: the
     /// owner must see them.
-    fn link(&mut self, memory: &mut Memory, point: usize, eip: u32) -> Result<usize, String> {
+    fn link(
+        &mut self,
+        memory: &mut Memory,
+        point: usize,
+        eip: u32,
+        entry: Option<Entry>,
+    ) -> Result<usize, String> {
         let generation = self.generation;
-        let entry = match self.units.get(&eip) {
-            Some(&entry) => entry,
+        let entry = match entry {
+            Some(entry) => entry,
             None => self.translate(memory, eip)?,
         };
         // Translating may have cleared the cache and the link point with it.
@@ -1608,7 +1618,11 @@ impl Native {
             let unit = match self.units.get(&target) {
                 Some(entry) => entry.unit,
                 // A full cache waits for the next miss to clear it.
-                None if main && index <= first && self.ran(target) => {
+                None if main
+                    && index <= first
+                    && self.ran(target)
+                    && crate::translate::Fetcher::fetchable(memory, target) =>
+                {
                     match self.emit(memory, target) {
                         Some(entry) => entry.unit,
                         None => break,
@@ -1894,7 +1908,7 @@ impl Native {
     /// computation enclosing EIP. Once EIP has `promotion` samples, it and
     /// the nearby entry with the widest computation extent around it take
     /// loop traces.
-    fn sample(&mut self, memory: &Memory, eip: u32) {
+    fn sample(&mut self, memory: &mut Memory, eip: u32) {
         if self.computation_enabled
             && let Some((candidate, end)) = self.enclosing_computation(eip)
             && !self.is_stop(candidate)
@@ -1980,7 +1994,7 @@ impl Native {
             .max_by_key(|&(head, end)| end - head)
     }
 
-    fn prove_candidate(&self, memory: &Memory, eip: u32, end: u32) -> Option<Probed> {
+    fn prove_candidate(&self, memory: &mut Memory, eip: u32, end: u32) -> Option<Probed> {
         // The installed owner trace watches the code. Reuse this proof
         // only if that trace has identical decoded effects and edges.
         let mut stops = self.stops.clone();
@@ -1996,7 +2010,7 @@ impl Native {
     }
 
     /// The trace a hot entry at `eip` takes.
-    fn loop_trace(&self, memory: &Memory, eip: u32, stops: &[u32]) -> translate::Trace {
+    fn loop_trace(&self, memory: &mut Memory, eip: u32, stops: &[u32]) -> translate::Trace {
         let mut trace = translate::Trace::default();
         let handler = if self.bridge.is_null() {
             None

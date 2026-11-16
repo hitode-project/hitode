@@ -384,11 +384,11 @@ mod tests {
         let mut memory = adv_cpu_core::Memory::new(0x10000, 4096).unwrap();
         memory.protect(0x10000, 4096, 7).unwrap();
         memory.write(0x10000, &code).unwrap();
-        let mut fetcher = Fetcher::new(&memory);
+        let mut fetcher = Fetcher::new();
         fetcher.helpers = Some(Vec::new());
         let (mut pc, mut ops) = (0x10000, Vec::new());
         while pc < 0x10000 + code.len() as u32 {
-            let (op, len) = fetcher.fetch(pc).unwrap();
+            let (op, len) = fetcher.fetch(&mut memory, pc).unwrap();
             ops.push(op);
             pc += len;
         }

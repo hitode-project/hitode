@@ -334,6 +334,7 @@ pub fn duplicate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
                 src_handle,
                 dst_process,
                 reply.handle,
+                options,
             );
         }
         status::check(reply.header.error)

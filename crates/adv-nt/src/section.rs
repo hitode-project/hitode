@@ -254,7 +254,49 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// Initial page capability ceilings for data section handles created here.
 #[derive(Default)]
-struct SectionProtections(std::collections::HashMap<u32, u8>);
+struct SectionProtections(std::collections::HashMap<u32, std::rc::Rc<SectionState>>);
+
+struct SectionState {
+    caps: u8,
+    coherent: std::cell::Cell<bool>,
+    file: std::cell::Cell<Option<adv_cpu::shared_memory::FileIdentity>>,
+}
+
+impl SectionState {
+    fn revoke(&self, cpu: &mut dyn adv_cpu::backend::Guest) {
+        self.coherent.set(false);
+        if let Some(file) = self.file.get() {
+            cpu.revoke_shared_file_coherence(file);
+        }
+    }
+}
+
+/// Query current handle flags immediately before an inheriting child is created.
+pub(crate) fn revoke_inherited_coherence(env: &mut Env<'_>) {
+    let Some(sections) = env.ext.try_get::<SectionProtections>() else {
+        return;
+    };
+    let sections: Vec<_> = sections
+        .0
+        .iter()
+        .map(|(&handle, state)| (handle, state.clone()))
+        .collect();
+    for (handle, section) in sections {
+        if !section.coherent.get() {
+            continue;
+        }
+        // A zero mask queries the flags, as ObjectHandleFlagInformation does.
+        let mut request = crate::protocol::SetHandleInfoRequest {
+            handle,
+            ..Default::default()
+        };
+        match server::request(env, &mut request, &[], &mut []) {
+            Ok((reply, _))
+                if status::check(reply.header.error).is_ok() && reply.old_flags & 1 == 0 => {}
+            _ => section.revoke(env.cpu),
+        }
+    }
+}
 
 /// Forgets tracked section protection state when `handle` closes.
 pub fn forget(env: &mut Env<'_>, handle: u32) {
@@ -263,29 +305,38 @@ pub fn forget(env: &mut Env<'_>, handle: u32) {
     }
 }
 
-/// Copies a data section's protection ceiling across in-process handle duplication.
+/// Copies section state locally, or revokes coherence when a handle leaves.
 pub(crate) fn duplicate_handle(
     env: &mut Env<'_>,
     src_process: u32,
     src_handle: u32,
     dst_process: u32,
     dst_handle: u32,
+    options: u32,
 ) {
-    if dst_handle == 0
-        || crate::information::current_process(env, src_process).is_err()
-        || crate::information::current_process(env, dst_process).is_err()
-    {
-        return;
-    }
-    if let Some(caps) = env
+    let Some(section) = env
         .ext
         .try_get::<SectionProtections>()
-        .and_then(|sections| sections.0.get(&src_handle).copied())
-    {
-        env.ext
-            .get_or_default::<SectionProtections>()
-            .0
-            .insert(dst_handle, caps);
+        .and_then(|sections| sections.0.get(&src_handle).cloned())
+    else {
+        return;
+    };
+    if crate::information::current_process(env, src_process).is_err() {
+        return;
+    }
+    let local = dst_handle != 0 && crate::information::current_process(env, dst_process).is_ok();
+    if dst_handle != 0 {
+        if local {
+            env.ext
+                .get_or_default::<SectionProtections>()
+                .0
+                .insert(dst_handle, section);
+        } else {
+            section.revoke(env.cpu);
+        }
+    }
+    if options & 1 != 0 && !(local && src_handle == dst_handle) {
+        forget(env, src_handle);
     }
 }
 
@@ -324,10 +375,16 @@ pub fn create_mapping(
     match reply.header.error {
         status::SUCCESS | status::OBJECT_NAME_EXISTS => {
             if flags & SEC_IMAGE == 0 && reply.header.error == status::SUCCESS {
-                env.ext
-                    .get_or_default::<SectionProtections>()
-                    .0
-                    .insert(reply.handle, caps);
+                env.ext.get_or_default::<SectionProtections>().0.insert(
+                    reply.handle,
+                    std::rc::Rc::new(SectionState {
+                        caps,
+                        coherent: std::cell::Cell::new(
+                            file == 0 && attributes.is_none_or(|a| a.name.is_none()),
+                        ),
+                        file: std::cell::Cell::new(None),
+                    }),
+                );
             }
             Ok((reply.handle, reply.header.error))
         }
@@ -443,7 +500,7 @@ fn view_access(protection: u32) -> Result<u32, Error> {
 
 /// Maps a view of `requested` bytes, or the rest of the section, from
 /// `offset` in data section `mapping`. A read-only or read-write view
-/// shares the file's pages; a copy-on-write or executable view is a copy
+/// shares the file's pages; a copy-on-write view is a copy
 /// of the file's contents.
 fn map_data(
     env: &mut Env<'_>,
@@ -459,7 +516,7 @@ fn map_data(
     if let Some(sec_caps) = env
         .ext
         .try_get::<SectionProtections>()
-        .and_then(|sections| sections.0.get(&mapping).copied())
+        .and_then(|sections| sections.0.get(&mapping).map(|s| s.caps))
         && view_caps & !sec_caps != 0
     {
         return Err(SECTION_PROTECTION.into());
@@ -507,6 +564,21 @@ fn map_data(
             PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE => {
                 // SAFETY: the server's descriptor stays open while fd lives.
                 let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
+                let coherent = if let Some(section) = env
+                    .ext
+                    .try_get::<SectionProtections>()
+                    .and_then(|sections| sections.0.get(&mapping))
+                {
+                    if section.coherent.get() {
+                        section.file.set(Some(
+                            adv_cpu::shared_memory::file_identity(file)
+                                .map_err(|_| status::NO_MEMORY)?,
+                        ));
+                    }
+                    section.coherent.get()
+                } else {
+                    false
+                };
                 let memory = env.ext.get_or_default::<Memory>();
                 memory::map_shared_view_at(
                     env.cpu,
@@ -516,6 +588,7 @@ fn map_data(
                     offset,
                     protection,
                     (base, size),
+                    coherent,
                 )?
             }
             _ => {
