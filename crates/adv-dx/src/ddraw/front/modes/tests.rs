@@ -15,7 +15,7 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 
 #[test]
-// spec: GFX-DDRAW-1
+// spec: GFX-DDRAW-1 GFX-DDRAW-11
 fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachment() {
     #[derive(Clone, Copy)]
     struct WindowPoint(i32, i32);
@@ -23,9 +23,10 @@ fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachmen
     m.ext.insert(WindowPoint(100, 50));
     m.ext.get_mut::<front::State>().provider.window = |ext, _, hwnd| {
         let point = ext.get::<WindowPoint>();
-        (hwnd == 7).then_some(front::WindowGeometry {
-            width: 4,
-            height: 2,
+        (hwnd == 0 || hwnd == 7).then_some(front::WindowGeometry {
+            hwnd: 7,
+            width: if hwnd == 0 { 8 } else { 4 },
+            height: if hwnd == 0 { 6 } else { 2 },
             origin: (point.0, point.1),
         })
     };
@@ -96,7 +97,15 @@ fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachmen
         assert_eq!(call(&mut m, api::BLT, &[primary, DATA, source, 0, 0, 0]), 0);
         assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, expected);
     }
+    // Clearing a clipper must not resolve the fallback window or resize a locked primary.
+    assert_eq!(
+        call(&mut m, api::LOCK, &[primary, 0, DATA + 64, 0x821, 0]),
+        0
+    );
     assert_eq!(call(&mut m, api::CLIPPER_SET_HWND, &[clipper, 0, 0]), 0);
+    let store = m.ext.get::<SurfaceStore>();
+    assert_eq!((store.width, store.height), (4, 2));
+    assert_eq!(call(&mut m, api::UNLOCK, &[primary, 0]), 0);
     assert!(
         !m.ext
             .get::<front::State>()
@@ -766,4 +775,210 @@ fn flip_to_gdi_surface_shows_the_primary_memory_again() {
     assert_eq!(call(&mut m, api::DD_CREATE, &[0, DATA, DATA + 512, 0]), 0);
     let second = m.cpu.read_u32(DATA).unwrap();
     assert_eq!(call(&mut m, api::FLIP_TO_GDI, &[second]), 0x887600ff);
+}
+
+#[test]
+// spec: GFX-DDRAW-9
+fn scan_line_guest_vtable_reports_progress_blank_and_invalid_outputs() {
+    for jit in [false, true] {
+        for legacy in [false, true] {
+            for (time, output, expected_hr, expected_line) in [
+                (0, DATA + 32, 0, Some(0)),
+                (8_333, DATA + 32, 0, Some(300)),
+                (16_650, DATA + 32, 0x88760219, None),
+                (16_667, DATA + 32, 0, Some(0)),
+                (0, 0, 0x80070057, None),
+                (0, DATA + 4094, 0x80070057, None),
+                (0, CODE, 0x80070057, None),
+            ] {
+                let mut registry = Registry::default();
+                registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+                    Outcome::ExitThread(0)
+                });
+                let (mut m, this) = setup(jit, legacy, registry);
+                m.sys.clock.advance_to(m.sys.clock.now_us() + time);
+                let done = m.resolve_import("test", "done").unwrap();
+                let table = m.cpu.read_u32(this).unwrap();
+                let method = m.cpu.read_u32(table + 16 * 4).unwrap();
+                m.cpu.write_u32(DATA + 32, 0xdeadbeef).unwrap();
+                let mut code = Asm::new(CODE);
+                code.bytes.extend_from_slice(&[0x89, 0xe0]);
+                code.mov_mem_eax(DATA + 40)
+                    .push_imm(output)
+                    .push_imm(this)
+                    .call(method)
+                    .mov_mem_eax(DATA + 36);
+                code.bytes.extend_from_slice(&[0x89, 0xe0]);
+                code.mov_mem_eax(DATA + 44).call(done).hlt();
+                m.cpu.write(CODE, &code.bytes).unwrap();
+                m.spawn("scan line caller", CODE, &[], 65536).unwrap();
+                let result = m.run();
+                assert!(
+                    matches!(result, RunResult::Exited(_)),
+                    "scan-line guest call failed: {result:?}"
+                );
+                assert_eq!(m.cpu.read_u32(DATA + 36).unwrap(), expected_hr);
+                assert_eq!(
+                    m.cpu.read_u32(DATA + 32).unwrap(),
+                    expected_line.unwrap_or(0xdeadbeef)
+                );
+                assert_eq!(
+                    m.cpu.read_u32(DATA + 40).unwrap(),
+                    m.cpu.read_u32(DATA + 44).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+// spec: GFX-DDRAW-9
+fn scan_line_polling_progresses_and_checks_device_state() {
+    let (mut m, this) = setup(false, false, Registry::default());
+    let query = |m: &mut Machine<JitCpu>, device| match front::get_scan_line(
+        &mut env(m),
+        GuestPtr::new(device),
+        GuestPtr::new(DATA + 32),
+    ) {
+        Outcome::Return(hr) => hr,
+        _ => panic!("scan line must return synchronously"),
+    };
+    m.cpu.write_u32(DATA + 32, 0xdeadbeef).unwrap();
+    assert_eq!(query(&mut m, 0), 0x88760082);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0xdeadbeef);
+    let com = m.ext.get::<front::State>().draw.com.unwrap();
+    com.get_mut::<ComState>(&mut m.sys.objects, this)
+        .unwrap()
+        .initialized = false;
+    assert_eq!(query(&mut m, this), 0x800401f0);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0xdeadbeef);
+    com.get_mut::<ComState>(&mut m.sys.objects, this)
+        .unwrap()
+        .initialized = true;
+    assert_eq!(query(&mut m, this), 0);
+    let first = m.cpu.read_u32(DATA + 32).unwrap();
+    for _ in 0..100 {
+        assert_eq!(query(&mut m, this), 0);
+    }
+    assert!(m.cpu.read_u32(DATA + 32).unwrap() > first);
+    m.ext.get_mut::<SurfaceStore>().height = 480;
+    m.sys.clock.advance_to(m.sys.clock.epoch_us + 8_333);
+    assert_eq!(query(&mut m, this), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 240);
+}
+
+#[test]
+// spec: GFX-DDRAW-10
+fn windowed_primary_without_clipper_translates_screen_rectangles() {
+    windowed_primary_screen_rectangles(7);
+}
+
+#[test]
+// spec: GFX-DDRAW-10 GFX-DDRAW-11
+fn windowed_primary_without_hwnd_uses_presented_window() {
+    windowed_primary_screen_rectangles(0);
+}
+
+fn windowed_primary_screen_rectangles(cooperative_window: u32) {
+    #[derive(Clone, Copy)]
+    struct ClientOrigin(i32, i32);
+    let (mut m, device) = setup(false, false, Registry::default());
+    m.ext.insert(ClientOrigin(100, 50));
+    m.ext.insert(std::cell::Cell::new(0u32));
+    m.ext.get_mut::<front::State>().provider.submitted = |ext, hwnd, _| {
+        ext.get::<std::cell::Cell<u32>>().set(hwnd);
+    };
+    m.ext.get_mut::<front::State>().provider.window = |ext, _, hwnd| {
+        let origin = ext.get::<ClientOrigin>();
+        (hwnd == 0 || hwnd == 7).then_some(front::WindowGeometry {
+            hwnd: 7,
+            width: 4,
+            height: 2,
+            origin: (origin.0, origin.1),
+        })
+    };
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| {
+        let hr = match front::call(&mut env(m), id, args) {
+            Outcome::Return(hr) => hr,
+            _ => panic!("synchronous authored call"),
+        };
+        #[cfg(feature = "gpu")]
+        {
+            let (capture, surfaces) = m.ext.get2_installed_mut::<SurfaceCapture, SurfaceStore>();
+            capture.update(surfaces);
+        }
+        hr
+    };
+    assert_eq!(
+        call(&mut m, api::COOPERATIVE, &[device, cooperative_window, 8]),
+        0
+    );
+    let mut desc = [0u8; 124];
+    for (offset, value) in [(0, 124u32), (4, 7), (8, 2), (12, 4), (104, 0x200)] {
+        desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 64, DATA, 0]),
+        0
+    );
+    let primary = m.cpu.read_u32(DATA).unwrap();
+    desc[104..108].copy_from_slice(&0x40u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[device, DATA + 64, DATA, 0]),
+        0
+    );
+    let source = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(
+        call(&mut m, api::LOCK, &[source, 0, DATA + 64, 0x821, 0]),
+        0
+    );
+    let pixels = m.cpu.read_u32(DATA + 100).unwrap();
+    assert_eq!(call(&mut m, api::UNLOCK, &[source, 0]), 0);
+    // Match the optional DDBLTFX accepted by both ASYNC and WAIT calls.
+    m.cpu.write(DATA + 256, &[0u8; 100]).unwrap();
+    m.cpu.write_u32(DATA + 256, 100).unwrap();
+    for (index, (origin, flags)) in [
+        (ClientOrigin(100, 50), 0x200),
+        (ClientOrigin(140, 75), 0x0100_0000),
+        (ClientOrigin(-20, -10), 0x200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.ext.insert(origin);
+        let mut expected = vec![0u8; 32];
+        for pixel in expected.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[index as u8 + 1, 20, 30, 255]);
+        }
+        m.cpu.write(pixels, &expected).unwrap();
+        for (offset, value) in [origin.0, origin.1, origin.0 + 4, origin.1 + 2]
+            .into_iter()
+            .enumerate()
+        {
+            m.cpu
+                .write_u32(DATA + offset as u32 * 4, value as u32)
+                .unwrap();
+        }
+        let before = m.ext.get::<SurfaceStore>().stats.presentations;
+        assert_eq!(
+            call(
+                &mut m,
+                api::BLT,
+                &[primary, DATA, source, 0, flags, DATA + 256]
+            ),
+            0
+        );
+        assert!(m.ext.get::<SurfaceStore>().stats.presentations > before);
+        assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, expected);
+        assert_eq!(m.ext.get::<std::cell::Cell<u32>>().get(), 7);
+    }
+    // Offscreen destinations and exclusive-mode primaries retain local coordinates.
+    for (offset, value) in [0u32, 0, 4, 2].into_iter().enumerate() {
+        m.cpu.write_u32(DATA + offset as u32 * 4, value).unwrap();
+    }
+    assert_eq!(call(&mut m, api::BLT, &[source, DATA, primary, 0, 0, 0]), 0);
+    assert_eq!(call(&mut m, api::COOPERATIVE, &[device, 7, 0x11]), 0);
+    assert_eq!(call(&mut m, api::BLT, &[primary, DATA, source, 0, 0, 0]), 0);
 }

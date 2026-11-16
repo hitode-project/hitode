@@ -383,7 +383,7 @@ pub(super) fn compose(env: &mut Env<'_>, drawn: Option<(u32, [i32; 4])>) -> Resu
     let current =
         super::input::frame_window(env.ext).map(|(hwnd, _)| super::input::top_level(env.ext, hwnd));
     let source = env.ext.get::<SurfaceStore>().base_source();
-    let front = super::input::front_window(env.ext, source);
+    let mut front = super::input::front_window(env.ext, source);
     env.ext.get_or_default::<Surfaces>();
     let ext = &*env.ext;
     let base = ext
@@ -403,8 +403,27 @@ pub(super) fn compose(env: &mut Env<'_>, drawn: Option<(u32, [i32; 4])>) -> Resu
         env.ext.get_or_default::<Shown>().0.clear();
         return Ok(());
     };
+    // Only a fresh draw into shared screen content transfers ownership.
+    // Plane/geometry recomposition and nonclient dirt keep the current frame.
+    if front == Some(base)
+        && super::input::front_shares_gdi(env.ext)
+        && drawn.is_some_and(|(address, [left, top, right, bottom])| {
+            let surface = &env.ext.get::<Surfaces>().0[&address];
+            surface.hwnd == base
+                && client_part(surface, &window(env.ext, base).unwrap()).is_some_and(
+                    |(x, y, w, h)| {
+                        i64::from(left).max(i64::from(x)) < i64::from(right).min(i64::from(x + w))
+                            && i64::from(top).max(i64::from(y))
+                                < i64::from(bottom).min(i64::from(y + h))
+                    },
+                )
+        })
+    {
+        super::input::front_released(env.ext, source.unwrap());
+        front = None;
+    }
     // A new base presents whole; the current one presents what its flush changed.
-    // A front's window shows the front's frames, never its window surface.
+    // A front keeps its frame until a shared-content draw takes over.
     let address = drawn_surface(env.ext, base).filter(|_| Some(base) != front);
     let dirty = match drawn {
         _ if Some(base) != current => Some([0, 0, i32::MAX, i32::MAX]),
@@ -643,6 +662,130 @@ fn destroy(env: &mut Env<'_>) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    // spec: WINE-GFX-4 WINE-GFX-10 WINE-GFX-11
+    #[test]
+    fn fresh_base_content_resumes_after_front_presentation() {
+        use adv_abi::{Env, Registry};
+        use adv_cpu::{
+            JitCpu,
+            backend::{Guest, Prot},
+        };
+        use adv_device::surface::{
+            MemoryOperations, MemoryView, PixelFormat, Snapshot, SurfaceStore,
+        };
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        use std::borrow::Cow;
+        fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
+            MemoryView::new(
+                cpu,
+                MemoryOperations {
+                    read: |cpu, at, len| {
+                        let mut bytes = vec![0; len];
+                        cpu.read(at, &mut bytes).map_err(|e| e.to_string())?;
+                        Ok(Cow::Owned(bytes))
+                    },
+                    write: |cpu, at, bytes| cpu.write(at, bytes).map_err(|e| e.to_string()),
+                    writable: |cpu, at, len| {
+                        adv_abi::guest::check_range(cpu, at, len as u32, Prot::WRITE)
+                            .map_err(|e| e.to_string())
+                    },
+                    copy: |cpu, src, dst, len| {
+                        cpu.copy_memory(src, dst, len).map_err(|e| e.to_string())
+                    },
+                },
+            )
+        }
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        m.cpu.map(0x410000, 4096, Prot::RW).unwrap();
+        m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
+        m.ext.insert(crate::Provider {
+            memory,
+            completed: |_, _| None,
+        });
+        let mut store = SurfaceStore::new(4, 2, 0x500000, 65536, Snapshot::default()).unwrap();
+        let video = store
+            .create(4, 2, false, PixelFormat::Bgra32, &mut memory(&mut m.cpu))
+            .unwrap();
+        let video_pixels = [10, 20, 30, 255].repeat(8);
+        m.cpu.write(store[video].pixels, &video_pixels).unwrap();
+        store
+            .present(video, &memory(&mut m.cpu), store[video].rect())
+            .unwrap();
+        m.ext.insert(store);
+        let hwnd = 7;
+        m.ext.get_or_default::<super::super::Windows>().0.insert(
+            hwnd,
+            super::super::Window {
+                visible: true,
+                client: [0, 1, 4, 3],
+                extent: [0, 0, 4, 3],
+                origin: (0, 1),
+                ..Default::default()
+            },
+        );
+        let address = 0x2000;
+        m.ext.get_or_default::<super::Surfaces>().0.insert(
+            address,
+            super::Surface {
+                hwnd,
+                pixels: 0x410000,
+                width: 4,
+                height: 3,
+                view: None,
+                drawn: true,
+                layered: false,
+            },
+        );
+        m.ext.get_or_default::<super::super::input::Presentation>();
+        super::super::input::shared_front_frame(&m.ext, hwnd, video);
+        super::super::input::presented(&m.ext);
+        let gdi_pixels = [40, 50, 60, 255].repeat(12);
+        m.cpu.write(0x410000, &gdi_pixels).unwrap();
+        let compose = |m: &mut Machine<JitCpu>, drawn| {
+            super::compose(
+                &mut Env {
+                    context: m.sys.current,
+                    cpu: &mut m.cpu,
+                    sys: &mut m.sys,
+                    ext: &mut m.ext,
+                    thunk: 0,
+                },
+                drawn,
+            )
+            .unwrap();
+        };
+        // Geometry-only recomposition and nonclient dirt keep the current video.
+        compose(&mut m, None);
+        compose(&mut m, Some((address, [0, 1, 0, 1])));
+        compose(&mut m, Some((address, [0, 0, 4, 1])));
+        assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, video_pixels);
+        let before = m.ext.get::<SurfaceStore>().stats.presentations;
+        compose(&mut m, Some((address, [0, 1, 4, 3])));
+        assert!(m.ext.get::<SurfaceStore>().stats.presentations > before);
+        assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, gdi_pixels[16..]);
+        assert_eq!(super::super::input::front_window(&m.ext, Some(video)), None);
+        // An exclusive front (such as D3D9) still ignores GDI surface flushes.
+        super::super::input::front_frame(&m.ext, hwnd, video);
+        let store = m.ext.get_mut::<SurfaceStore>();
+        store
+            .present(video, &memory(&mut m.cpu), store[video].rect())
+            .unwrap();
+        compose(&mut m, None);
+        super::super::input::shared_front_frame(&m.ext, 0, video + 1);
+        compose(&mut m, Some((address, [0, 1, 4, 3])));
+        assert_eq!(m.ext.get::<SurfaceStore>().presenter.bgra, video_pixels);
+        super::super::input::shared_front_frame(&m.ext, hwnd, video);
+        assert_eq!(
+            super::super::input::front_window(&m.ext, Some(video)),
+            Some(hwnd)
+        );
+    }
+
     // spec: WINE-GFX-10
     #[test]
     fn z_order_follows_set_window_pos_placement() {
@@ -719,6 +862,14 @@ mod tests {
         assert_eq!(
             super::super::client_geometry(&ext, child),
             Some(((10, 40), true))
+        );
+        // Child geometry follows parent movement without a new child report.
+        let windows = &mut ext.get_mut::<super::super::Windows>().0;
+        windows.get_mut(&base).unwrap().origin = (-20, 80);
+        windows.get_mut(&child).unwrap().client = [3, 5, 803, 605];
+        assert_eq!(
+            super::super::client_geometry(&ext, child),
+            Some(((-17, 85), true))
         );
         ext.get_mut::<super::super::Windows>()
             .0

@@ -92,9 +92,16 @@ pub fn install<B: Backend>(
         adv_dx::ddraw::Provider {
             dc: memory_dc::<DDRAW>(),
             memory: guest_memory,
-            window: geometry,
+            window: |ext, objects, hwnd| {
+                let hwnd = if hwnd == 0 {
+                    adv_drv::user::input::presented_window(ext)?
+                } else {
+                    hwnd
+                };
+                geometry(ext, objects, hwnd)
+            },
             completed: frame_completed,
-            submitted: adv_drv::user::input::front_frame,
+            submitted: adv_drv::user::input::shared_front_frame,
             released: adv_drv::user::input::front_released,
         },
     )?;
@@ -154,10 +161,12 @@ fn geometry(
 ) -> Option<adv_dx::ddraw::WindowGeometry> {
     let [left, top, right, bottom] = adv_drv::user::window(ext, hwnd)?.client;
     let (width, height) = (right.checked_sub(left)?, bottom.checked_sub(top)?);
+    let (origin, _) = adv_drv::user::client_geometry(ext, hwnd)?;
     (width > 0 && height > 0).then_some(adv_dx::ddraw::WindowGeometry {
+        hwnd,
         width: width as u32,
         height: height as u32,
-        origin: (left, top),
+        origin,
     })
 }
 

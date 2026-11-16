@@ -213,6 +213,8 @@ pub struct DirectDraw {
     /// The live DirectDraw object (its modern interface) that created the
     /// primary surface; none once that object is gone.
     primary_owner: Option<u32>,
+    /// Current screen origin of the window-backed primary for this operation.
+    primary_origin: Option<(i32, i32)>,
     /// Surfaces lost to another DirectDraw object's exclusive mode.
     lost: BTreeSet<u32>,
     /// Primaries whose chain has flipped an odd number of times, so the
@@ -241,6 +243,7 @@ impl DirectDraw {
             attached: BTreeMap::new(),
             attached_refs: BTreeMap::new(),
             primary_owner: None,
+            primary_origin: None,
             lost: BTreeSet::new(),
             flipped: BTreeSet::new(),
         }
@@ -298,6 +301,7 @@ struct ComState {
     kind: Kind,
     initialized: bool,
     focus_window: u32,
+    windowed: bool,
     old: u32,
     modern: u32,
     legacy_descriptors: Vec<u32>,
@@ -488,6 +492,7 @@ impl DirectDraw {
             kind,
             initialized: true,
             focus_window: 0,
+            windowed: false,
             old,
             modern,
             legacy_descriptors: if matches!(kind, Kind::Clipper) {
@@ -824,6 +829,7 @@ impl DirectDraw {
                 } else if a[2] == 8 || a[2] & 0x11 == 0x11 {
                     let device = com.get_mut::<ComState>(objects, a[0]).unwrap();
                     device.focus_window = a[1];
+                    device.windowed = a[2] == 8;
                     let device = device.modern;
                     // Exclusive mode loses the surfaces of every other
                     // DirectDraw object, so a primary another object made, or
@@ -1416,6 +1422,7 @@ impl DirectDraw {
                         .get(&dst)
                         .and_then(|clipper| self.clipper_origins.get(clipper))
                         .copied()
+                        .or(self.primary_origin)
                 } else {
                     None
                 };
