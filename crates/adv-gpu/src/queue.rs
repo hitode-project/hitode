@@ -133,6 +133,12 @@ impl Device {
     pub fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         self.inner.guard_compile(probe, f)
     }
+    /// Guards a guest shader or render-pipeline build: arms a crash sentinel
+    /// and demotes one Vulkan tier step for the next launch if the driver
+    /// crashes or rejects valid lowered SPIR-V.
+    pub fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.inner.guard_guest_pipeline(f)
+    }
 }
 
 /// Completion of one submission. Tokens are ordered: a completed token implies

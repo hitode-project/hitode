@@ -810,12 +810,36 @@ impl CacheState {
             ));
         }
         let data = cache_data(&self.data, &context.cache_prefix).unwrap_or(&[]);
-        let handle = context.result(unsafe {
+        let raw = unsafe {
             context.device.create_pipeline_cache(
                 &vk::PipelineCacheCreateInfo::default().initial_data(data),
                 None,
             )
-        })?;
+        };
+        let handle = match raw {
+            Ok(handle) => handle,
+            Err(
+                error @ (vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            ) => {
+                return Err(context
+                    .result_in::<()>(Err(error), "pipeline cache")
+                    .unwrap_err());
+            }
+            Err(_) if !data.is_empty() => context.result_in(
+                unsafe {
+                    context
+                        .device
+                        .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                },
+                "pipeline cache",
+            )?,
+            Err(error) => {
+                return Err(context
+                    .result_in::<()>(Err(error), "pipeline cache")
+                    .unwrap_err());
+            }
+        };
         self.data.clear();
         self.device = Some((context.clone(), handle));
         Ok(handle)

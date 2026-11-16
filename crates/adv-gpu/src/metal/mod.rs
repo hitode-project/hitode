@@ -85,6 +85,10 @@ impl Device {
         f()
     }
 
+    pub(crate) fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        f()
+    }
+
     pub(crate) fn open_with<T>(
         options: &DeviceOptions,
         init: &mut dyn FnMut(crate::Device, crate::Queue) -> Result<T>,

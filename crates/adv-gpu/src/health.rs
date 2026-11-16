@@ -9,8 +9,8 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 pub(crate) const VK_1_1: u32 = (1 << 22) | (1 << 12);
@@ -20,6 +20,7 @@ pub(crate) const VK_1_4: u32 = (1 << 22) | (4 << 12);
 
 const ARCHIVE_FILE: &str = "vulkan-health.bin";
 const SENTINEL_FILE: &str = "vulkan-probe.bin";
+const GUEST_SENTINEL_FILE: &str = "vulkan-guest-probe.bin";
 const ARCHIVE_MAGIC: &[u8; 8] = b"ADVVKHL1";
 const SENTINEL_MAGIC: &[u8; 8] = b"ADVVKPR1";
 const ARCHIVE_VERSION: u32 = 1;
@@ -99,6 +100,7 @@ pub(crate) enum ProbeStep {
     CanaryCompute = 4,
     CanaryPresent = 5,
     StartupInit = 6,
+    GuestPipeline = 7,
 }
 
 impl ProbeStep {
@@ -110,6 +112,7 @@ impl ProbeStep {
             4 => Some(Self::CanaryCompute),
             5 => Some(Self::CanaryPresent),
             6 => Some(Self::StartupInit),
+            7 => Some(Self::GuestPipeline),
             _ => None,
         }
     }
@@ -551,14 +554,13 @@ pub(crate) fn next_fallback(step: ProbeStep, active: Mask, disabled: Mask) -> Op
         }
         ProbeStep::StartupInit => {
             // Post-open display pipelines fail first on bindless fragment storage
-            // (Adreno) before float controls, dynamic state, dynamic rendering,
-            // push descriptors, sync2/timeline, or optional hardware features.
+            // (Adreno) before dynamic state, dynamic rendering, push descriptors,
+            // shader float controls, sync2/timeline, or optional YCbCr/AHB bits.
             for step_mod in [
                 Modern::BINDLESS,
                 Modern::EXTENDED_DYNAMIC_STATE,
                 Modern::DYNAMIC_RENDERING | Modern::LOAD_STORE_OP_NONE,
                 Modern::PUSH_DESCRIPTORS,
-                Modern::SYNCHRONIZATION2 | Modern::TIMELINE_SEMAPHORES,
             ] {
                 let live = active.modern & step_mod;
                 if !live.is_empty()
@@ -573,8 +575,34 @@ pub(crate) fn next_fallback(step: ProbeStep, active: Mask, disabled: Mask) -> Op
             {
                 return Some(next);
             }
+            let sync = active.modern & (Modern::SYNCHRONIZATION2 | Modern::TIMELINE_SEMAPHORES);
+            if !sync.is_empty()
+                && let Some(next) = add_mod(sync)
+            {
+                return Some(next);
+            }
             if !active.optional.is_empty() {
                 return add_opt(active.optional);
+            }
+            None
+        }
+        ProbeStep::GuestPipeline => {
+            for step_mod in [
+                Modern::BINDLESS,
+                Modern::EXTENDED_DYNAMIC_STATE,
+                Modern::DYNAMIC_RENDERING | Modern::LOAD_STORE_OP_NONE,
+                Modern::PUSH_DESCRIPTORS,
+            ] {
+                let live = active.modern & step_mod;
+                if !live.is_empty()
+                    && let Some(next) = add_mod(live)
+                {
+                    return Some(next);
+                }
+            }
+            let render_opts = active.optional & (Optional::IEEE_F32 | Optional::WEIGHTED_SAMPLING);
+            if !render_opts.is_empty() {
+                return add_opt(render_opts);
             }
             None
         }
@@ -663,7 +691,14 @@ enum Sentinel {
 
 type ProcessCache = HashMap<([u8; 28], u32), AdapterHealth>;
 
-static STORE_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+struct StoreState {
+    active_probe: HashMap<PathBuf, usize>,
+    active_guest: HashMap<PathBuf, usize>,
+}
+
+static STORE_LOCK: LazyLock<Mutex<StoreState>> =
+    LazyLock::new(|| Mutex::new(StoreState::default()));
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PROCESS_CACHE: LazyLock<Mutex<ProcessCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -868,20 +903,24 @@ fn parse_sentinel(bytes: &[u8]) -> Option<Sentinel> {
     }
 }
 
-fn arm_sentinel(dir: &Path, sentinel: &Sentinel) {
+fn arm_sentinel_at(dir: &Path, file: &str, sentinel: &Sentinel) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let bytes = encode_sentinel(sentinel);
-    let path = dir.join(SENTINEL_FILE);
+    let path = dir.join(file);
     let _ = std::fs::File::create(&path).and_then(|mut f| {
         f.write_all(&bytes)?;
         f.sync_all()
     });
 }
 
-fn disarm_sentinel(dir: &Path) {
-    let _ = std::fs::remove_file(dir.join(SENTINEL_FILE));
+fn arm_sentinel(dir: &Path, sentinel: &Sentinel) {
+    arm_sentinel_at(dir, SENTINEL_FILE, sentinel);
+}
+
+fn disarm_sentinel_at(dir: &Path, file: &str) {
+    let _ = std::fs::remove_file(dir.join(file));
 }
 
 fn touch_entry<'a>(entries: &'a mut Vec<ArchiveEntry>, prefix: &[u8; 28]) -> &'a mut AdapterHealth {
@@ -900,14 +939,14 @@ fn touch_entry<'a>(entries: &'a mut Vec<ArchiveEntry>, prefix: &[u8; 28]) -> &'a
     &mut entries.last_mut().unwrap().health
 }
 
-fn reap_sentinel_locked(dir: &Path, entries: &mut Vec<ArchiveEntry>) {
-    let path = dir.join(SENTINEL_FILE);
+fn reap_sentinel_file(dir: &Path, file: &str, entries: &mut Vec<ArchiveEntry>) -> bool {
+    let path = dir.join(file);
     let Ok(bytes) = std::fs::read(&path) else {
-        return;
+        return false;
     };
     let _ = std::fs::remove_file(&path);
     let Some(sentinel) = parse_sentinel(&bytes) else {
-        return;
+        return false;
     };
     match sentinel {
         Sentinel::Probe {
@@ -921,7 +960,7 @@ fn reap_sentinel_locked(dir: &Path, entries: &mut Vec<ArchiveEntry>) {
             health.degraded = health.degraded.union(penalty);
             health.crashed = true;
             health.verified = false;
-            write_archive(dir, entries);
+            true
         }
         Sentinel::Compile { prefix, probe } => {
             let health = touch_entry(entries, &prefix);
@@ -932,8 +971,21 @@ fn reap_sentinel_locked(dir: &Path, entries: &mut Vec<ArchiveEntry>) {
                 }
                 health.blocked_compiles.push(probe);
             }
-            write_archive(dir, entries);
+            true
         }
+    }
+}
+
+fn reap_sentinel_locked(dir: &Path, state: &StoreState, entries: &mut Vec<ArchiveEntry>) {
+    let mut dirty = false;
+    if !state.active_probe.contains_key(dir) {
+        dirty |= reap_sentinel_file(dir, SENTINEL_FILE, entries);
+    }
+    if !state.active_guest.contains_key(dir) {
+        dirty |= reap_sentinel_file(dir, GUEST_SENTINEL_FILE, entries);
+    }
+    if dirty {
+        write_archive(dir, entries);
     }
 }
 
@@ -951,9 +1003,9 @@ pub(crate) fn load_health(
             .cloned()
             .unwrap_or_default();
     };
-    let _guard = STORE_LOCK.lock().unwrap();
+    let state = STORE_LOCK.lock().unwrap();
     let mut entries = read_archive(dir);
-    reap_sentinel_locked(dir, &mut entries);
+    reap_sentinel_locked(dir, &state, &mut entries);
     // Non-empty `caller_disable` is used by diagnostics and tests; honor disk
     // crash masks while forcing fresh verification when caller masks differ.
     let mut health = entries
@@ -986,9 +1038,9 @@ pub(crate) fn save_verified(
     if !caller_disable.is_empty() {
         return;
     }
-    let _guard = STORE_LOCK.lock().unwrap();
+    let state = STORE_LOCK.lock().unwrap();
     let mut entries = read_archive(dir);
-    reap_sentinel_locked(dir, &mut entries);
+    reap_sentinel_locked(dir, &state, &mut entries);
     let health = touch_entry(&mut entries, prefix);
     health.degraded = degraded;
     health.verified = true;
@@ -1014,9 +1066,9 @@ pub(crate) fn invalidate_health(
     if !caller_disable.is_empty() {
         return;
     }
-    let _guard = STORE_LOCK.lock().unwrap();
+    let state = STORE_LOCK.lock().unwrap();
     let mut entries = read_archive(dir);
-    reap_sentinel_locked(dir, &mut entries);
+    reap_sentinel_locked(dir, &state, &mut entries);
     if let Some(entry) = entries.iter_mut().find(|e| &e.prefix == prefix) {
         entry.health.verified = false;
         write_archive(dir, &entries);
@@ -1033,7 +1085,8 @@ pub(crate) fn run_probe_step<T>(
     f: impl FnOnce() -> T,
 ) -> T {
     if let Some(dir) = cache_dir {
-        let _guard = STORE_LOCK.lock().unwrap();
+        let mut state = STORE_LOCK.lock().unwrap();
+        *state.active_probe.entry(dir.to_path_buf()).or_insert(0) += 1;
         arm_sentinel(
             dir,
             &Sentinel::Probe {
@@ -1048,8 +1101,14 @@ pub(crate) fn run_probe_step<T>(
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
             if let Some(dir) = self.0 {
-                let _guard = STORE_LOCK.lock().unwrap();
-                disarm_sentinel(dir);
+                let mut state = STORE_LOCK.lock().unwrap();
+                if let Some(count) = state.active_probe.get_mut(dir) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.active_probe.remove(dir);
+                        disarm_sentinel_at(dir, SENTINEL_FILE);
+                    }
+                }
             }
         }
     }
@@ -1071,9 +1130,9 @@ pub(crate) fn guard_compile<T>(
     let trimmed =
         String::from_utf8_lossy(&probe.as_bytes()[..probe.len().min(MAX_PROBE_LEN)]).into_owned();
     {
-        let _guard = STORE_LOCK.lock().unwrap();
+        let mut state = STORE_LOCK.lock().unwrap();
         let mut entries = read_archive(dir);
-        reap_sentinel_locked(dir, &mut entries);
+        reap_sentinel_locked(dir, &state, &mut entries);
         if entries
             .iter()
             .any(|e| &e.prefix == prefix && e.health.blocked_compiles.contains(&trimmed))
@@ -1082,6 +1141,7 @@ pub(crate) fn guard_compile<T>(
                 "blocked after driver crash: {trimmed}"
             )));
         }
+        *state.active_probe.entry(dir.to_path_buf()).or_insert(0) += 1;
         arm_sentinel(
             dir,
             &Sentinel::Compile {
@@ -1093,12 +1153,108 @@ pub(crate) fn guard_compile<T>(
     struct Guard<'a>(&'a Path);
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
-            let _guard = STORE_LOCK.lock().unwrap();
-            disarm_sentinel(self.0);
+            let mut state = STORE_LOCK.lock().unwrap();
+            if let Some(count) = state.active_probe.get_mut(self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    state.active_probe.remove(self.0);
+                    disarm_sentinel_at(self.0, SENTINEL_FILE);
+                }
+            }
         }
     }
     let _disarm = Guard(dir);
     f()
+}
+
+fn record_runtime_demotion(
+    cache_dir: Option<&Path>,
+    prefix: &[u8; 28],
+    caller_disable: Modern,
+    penalty: Mask,
+) {
+    let Some(dir) = cache_dir else {
+        let mut map = PROCESS_CACHE.lock().unwrap();
+        let entry = map.entry((*prefix, caller_disable.bits())).or_default();
+        entry.degraded = entry.degraded.union(penalty);
+        entry.verified = false;
+        return;
+    };
+    if !caller_disable.is_empty() {
+        return;
+    }
+    let state = STORE_LOCK.lock().unwrap();
+    let mut entries = read_archive(dir);
+    reap_sentinel_locked(dir, &state, &mut entries);
+    let health = touch_entry(&mut entries, prefix);
+    health.degraded = health.degraded.union(penalty);
+    health.verified = false;
+    write_archive(dir, &entries);
+}
+
+/// Guards runtime guest shader and render-pipeline compilation: arms a
+/// concurrent-safe crash sentinel and demotes one Vulkan tier step for the
+/// next launch if the driver crashes or rejects valid lowered SPIR-V.
+pub(crate) fn guard_guest_pipeline<T>(
+    cache_dir: Option<&Path>,
+    prefix: &[u8; 28],
+    caller_disable: Modern,
+    active: Mask,
+    disabled: Mask,
+    demoted: &AtomicBool,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(penalty) = next_fallback(ProbeStep::GuestPipeline, active, disabled) else {
+        return f();
+    };
+    if demoted.load(Ordering::Relaxed) {
+        return f();
+    }
+    let armed_dir = cache_dir.filter(|_| caller_disable.is_empty());
+    if let Some(dir) = armed_dir {
+        let mut state = STORE_LOCK.lock().unwrap();
+        let mut entries = read_archive(dir);
+        reap_sentinel_locked(dir, &state, &mut entries);
+        let count = state.active_guest.entry(dir.to_path_buf()).or_insert(0);
+        if *count == 0 {
+            arm_sentinel_at(
+                dir,
+                GUEST_SENTINEL_FILE,
+                &Sentinel::Probe {
+                    prefix: *prefix,
+                    step: ProbeStep::GuestPipeline,
+                    active,
+                    disabled,
+                },
+            );
+        }
+        *count += 1;
+    }
+    struct GuestGuard<'a>(Option<&'a Path>);
+    impl Drop for GuestGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0 {
+                let mut state = STORE_LOCK.lock().unwrap();
+                if let Some(count) = state.active_guest.get_mut(dir) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.active_guest.remove(dir);
+                        disarm_sentinel_at(dir, GUEST_SENTINEL_FILE);
+                    }
+                }
+            }
+        }
+    }
+    let result = {
+        let _disarm = GuestGuard(armed_dir);
+        f()
+    };
+    if matches!(result, Err(Error::Unavailable(_) | Error::Compile(_)))
+        && !demoted.swap(true, Ordering::Relaxed)
+    {
+        record_runtime_demotion(cache_dir, prefix, caller_disable, penalty);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1409,6 +1565,173 @@ mod tests {
         for id in 2..6u8 {
             assert!(load_health(Some(&dir), &[id; 28], Modern::empty()).verified);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // spec: GFX-CACHE-4
+    #[test]
+    fn startup_init_strips_float_controls_before_timeline_and_keeps_ycbcr_until_floor() {
+        let mut disabled = Mask::empty();
+        let mut active = Mask {
+            modern: Modern::BINDLESS
+                | Modern::PUSH_DESCRIPTORS
+                | Modern::TIMELINE_SEMAPHORES
+                | Modern::SYNCHRONIZATION2,
+            optional: Optional::IEEE_F32 | Optional::YCBCR,
+        };
+        let mut order = Vec::new();
+        while let Some(next) = next_fallback(ProbeStep::StartupInit, active, disabled) {
+            let delta = Mask {
+                modern: next.modern & !disabled.modern,
+                optional: next.optional & !disabled.optional,
+            };
+            order.push(delta);
+            active.modern &= !next.modern;
+            active.optional &= !next.optional;
+            disabled = next;
+        }
+        assert_eq!(
+            order,
+            vec![
+                Mask {
+                    modern: Modern::BINDLESS,
+                    optional: Optional::empty(),
+                },
+                Mask {
+                    modern: Modern::PUSH_DESCRIPTORS,
+                    optional: Optional::empty(),
+                },
+                Mask {
+                    modern: Modern::empty(),
+                    optional: Optional::IEEE_F32,
+                },
+                Mask {
+                    modern: Modern::SYNCHRONIZATION2 | Modern::TIMELINE_SEMAPHORES,
+                    optional: Optional::empty(),
+                },
+                Mask {
+                    modern: Modern::empty(),
+                    optional: Optional::YCBCR,
+                },
+            ]
+        );
+    }
+
+    // spec: GFX-CACHE-4
+    #[test]
+    fn guest_pipeline_sentinel_is_concurrent_safe_and_demotes_on_crash_or_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "adv-gpu-guest-health-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prefix = [9u8; 28];
+        let active = Mask {
+            modern: Modern::BINDLESS
+                | Modern::EXTENDED_DYNAMIC_STATE
+                | Modern::DYNAMIC_RENDERING
+                | Modern::PUSH_DESCRIPTORS
+                | Modern::TIMELINE_SEMAPHORES,
+            optional: Optional::IEEE_F32 | Optional::YCBCR,
+        };
+        let demoted = AtomicBool::new(false);
+
+        // Nested/concurrent guest pipeline compiles keep `vulkan-guest-probe.bin`
+        // armed until the outermost finishes and never interfere with `guard_compile`.
+        let res = guard_guest_pipeline(
+            Some(&dir),
+            &prefix,
+            Modern::empty(),
+            active,
+            Mask::empty(),
+            &demoted,
+            || {
+                assert!(dir.join(GUEST_SENTINEL_FILE).exists());
+                // A live in-process sentinel is not falsely reaped as a crash.
+                assert!(!load_health(Some(&dir), &prefix, Modern::empty()).crashed);
+                let inner = guard_guest_pipeline(
+                    Some(&dir),
+                    &prefix,
+                    Modern::empty(),
+                    active,
+                    Mask::empty(),
+                    &demoted,
+                    || {
+                        let up = guard_compile(Some(&dir), &prefix, "upscale:test", || Ok(11))?;
+                        assert!(!dir.join(SENTINEL_FILE).exists());
+                        assert!(dir.join(GUEST_SENTINEL_FILE).exists());
+                        Ok(up)
+                    },
+                )?;
+                assert!(dir.join(GUEST_SENTINEL_FILE).exists());
+                Ok(inner + 1)
+            },
+        )
+        .unwrap();
+        assert_eq!(res, 12);
+        assert!(!dir.join(GUEST_SENTINEL_FILE).exists());
+        assert!(!demoted.load(Ordering::Relaxed));
+
+        // OOM does not demote the adapter tier.
+        let oom: Result<()> = guard_guest_pipeline(
+            Some(&dir),
+            &prefix,
+            Modern::empty(),
+            active,
+            Mask::empty(),
+            &demoted,
+            || Err(Error::OutOfMemory),
+        );
+        assert_eq!(oom, Err(Error::OutOfMemory));
+        assert!(!demoted.load(Ordering::Relaxed));
+        assert!(
+            load_health(Some(&dir), &prefix, Modern::empty())
+                .degraded
+                .is_empty()
+        );
+
+        // Driver rejection (`Unavailable`) demotes one step (`BINDLESS`) for next launch.
+        let err: Result<()> = guard_guest_pipeline(
+            Some(&dir),
+            &prefix,
+            Modern::empty(),
+            active,
+            Mask::empty(),
+            &demoted,
+            || Err(Error::Unavailable("Vulkan: ERROR_UNKNOWN".into())),
+        );
+        assert!(matches!(err, Err(Error::Unavailable(_))));
+        assert!(demoted.load(Ordering::Relaxed));
+        let after_err = load_health(Some(&dir), &prefix, Modern::empty());
+        assert_eq!(after_err.degraded.modern, Modern::BINDLESS);
+        assert!(!after_err.verified);
+        assert!(!after_err.crashed);
+
+        // Simulate a native crash mid-guest compile on the stepped-down session.
+        let stepped_active = Mask {
+            modern: active.modern & !Modern::BINDLESS,
+            optional: active.optional,
+        };
+        arm_sentinel_at(
+            &dir,
+            GUEST_SENTINEL_FILE,
+            &Sentinel::Probe {
+                prefix,
+                step: ProbeStep::GuestPipeline,
+                active: stepped_active,
+                disabled: after_err.degraded,
+            },
+        );
+        let after_crash = load_health(Some(&dir), &prefix, Modern::empty());
+        assert!(after_crash.crashed);
+        assert!(!after_crash.verified);
+        assert_eq!(
+            after_crash.degraded.modern,
+            Modern::BINDLESS | Modern::EXTENDED_DYNAMIC_STATE
+        );
+        assert!(!dir.join(GUEST_SENTINEL_FILE).exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

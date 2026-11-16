@@ -445,9 +445,10 @@ impl Pipelines {
             "vulkan"
         };
         let identity = format!(
-            "native-2/{backend}/{}/{}/{:?}/{}",
+            "native-2/{backend}/{}/{}/{:x}/{:?}/{}",
             device.caps().adapter,
             device.caps().driver,
+            device.caps().modern.bits(),
             Format::Bgra8Unorm,
             std::env::consts::ARCH
         );
@@ -819,72 +820,67 @@ fn build(
         } => program_source(source, textures, modes, streams)?,
     };
     let bindings = bindings(&source)?;
-    let shader = device
-        .create_shader(ShaderDesc {
-            source: Source::Wgsl(&source),
-            identity: digest(source.as_bytes()),
-            label: "native executor",
-        })
-        .map_err(gpu_error)?;
     let r = recipe.raster;
-    let desc = p::RenderPipelineDesc {
-        vertex: shader
-            .entry("vertex_main", Stage::Vertex)
-            .map_err(gpu_error)?,
-        fragment: Some(
-            shader
-                .entry("fragment_main", Stage::Fragment)
-                .map_err(gpu_error)?,
-        ),
-        bindings,
-        primitive: p::Primitive {
-            topology: match r.topology {
-                gpu::Topology::Points => p::Topology::Points,
-                gpu::Topology::Lines => p::Topology::Lines,
-                gpu::Topology::LineStrip => p::Topology::LineStrip,
-                gpu::Topology::Triangles => p::Topology::Triangles,
-                gpu::Topology::TriangleStrip => p::Topology::TriangleStrip,
-            },
-            cull: match r.cull {
-                gpu::Cull::None => p::Cull::None,
-                gpu::Cull::Clockwise => p::Cull::Back,
-                gpu::Cull::CounterClockwise => p::Cull::Front,
-            },
-            front_ccw: true,
-            wireframe: false,
-            unclipped_depth: false,
-        },
-        colors: recipe
-            .colors
-            .iter()
-            .map(|&f| p::ColorTarget {
-                format: FORMATS[f as usize],
-                blend: r
-                    .color_blend
-                    .map(|b| (blend(b), blend(r.alpha_blend.unwrap_or(b)))),
-                write_mask: r.color_write,
-            })
-            .collect(),
-        depth_stencil: recipe.depth.map(|f| p::DepthStencil {
-            format: FORMATS[f as usize],
-            depth_compare: compare(r.depth.unwrap_or(gpu::Compare::Always)),
-            depth_write: r.depth_write && r.depth.is_some(),
-            stencil: r.stencil.map(|s| (stencil(s.front), stencil(s.back))),
-            stencil_read_mask: r.stencil.map_or(255, |s| s.read_mask as u8),
-            stencil_write_mask: r.stencil.map_or(255, |s| s.write_mask as u8),
-            depth_bias: false,
-        }),
-        samples: 1,
-        alpha_to_coverage: false,
-        label: "native executor",
-    };
-    // Backend identity removes dynamic state from its driver-object key; the
-    // device shares that compilation while retaining each description's state.
-    let identity = device.pipeline_identity(&desc);
-    let pipeline = device
-        .create_render_pipeline(&desc, cache)
-        .map_err(gpu_error)?;
-    Ok(Built { pipeline, identity })
+    let source_identity = digest(source.as_bytes());
+    device
+        .guard_guest_pipeline(|| {
+            let shader = device.create_shader(ShaderDesc {
+                source: Source::Wgsl(&source),
+                identity: source_identity,
+                label: "native executor",
+            })?;
+            let desc = p::RenderPipelineDesc {
+                vertex: shader.entry("vertex_main", Stage::Vertex)?,
+                fragment: Some(shader.entry("fragment_main", Stage::Fragment)?),
+                bindings,
+                primitive: p::Primitive {
+                    topology: match r.topology {
+                        gpu::Topology::Points => p::Topology::Points,
+                        gpu::Topology::Lines => p::Topology::Lines,
+                        gpu::Topology::LineStrip => p::Topology::LineStrip,
+                        gpu::Topology::Triangles => p::Topology::Triangles,
+                        gpu::Topology::TriangleStrip => p::Topology::TriangleStrip,
+                    },
+                    cull: match r.cull {
+                        gpu::Cull::None => p::Cull::None,
+                        gpu::Cull::Clockwise => p::Cull::Back,
+                        gpu::Cull::CounterClockwise => p::Cull::Front,
+                    },
+                    front_ccw: true,
+                    wireframe: false,
+                    unclipped_depth: false,
+                },
+                colors: recipe
+                    .colors
+                    .iter()
+                    .map(|&f| p::ColorTarget {
+                        format: FORMATS[f as usize],
+                        blend: r
+                            .color_blend
+                            .map(|b| (blend(b), blend(r.alpha_blend.unwrap_or(b)))),
+                        write_mask: r.color_write,
+                    })
+                    .collect(),
+                depth_stencil: recipe.depth.map(|f| p::DepthStencil {
+                    format: FORMATS[f as usize],
+                    depth_compare: compare(r.depth.unwrap_or(gpu::Compare::Always)),
+                    depth_write: r.depth_write && r.depth.is_some(),
+                    stencil: r.stencil.map(|s| (stencil(s.front), stencil(s.back))),
+                    stencil_read_mask: r.stencil.map_or(255, |s| s.read_mask as u8),
+                    stencil_write_mask: r.stencil.map_or(255, |s| s.write_mask as u8),
+                    depth_bias: false,
+                }),
+                samples: 1,
+                alpha_to_coverage: false,
+                label: "native executor",
+            };
+            // Backend identity removes dynamic state from its driver-object key; the
+            // device shares that compilation while retaining each description's state.
+            let identity = device.pipeline_identity(&desc);
+            let pipeline = device.create_render_pipeline(&desc, cache)?;
+            Ok(Built { pipeline, identity })
+        })
+        .map_err(gpu_error)
 }
 fn compare(c: gpu::Compare) -> p::Compare {
     match c {

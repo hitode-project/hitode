@@ -1796,3 +1796,53 @@ fn open_with_post_open_failure_steps_down_and_persists_health() {
     assert!(!warm.caps().modern.contains(Modern::BINDLESS));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// spec: GFX-CACHE-4
+#[test]
+fn guest_pipeline_failure_demotes_tier_for_next_open() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-guest-demote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let initial = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| Ok(device),
+    );
+    let Ok(device) = initial else {
+        return;
+    };
+    if !device.caps().modern.contains(Modern::BINDLESS) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let failed: Result<()> = device.guard_guest_pipeline(|| {
+        Err(Error::Unavailable(
+            "Vulkan (graphics pipeline: native executor): ERROR_UNKNOWN".into(),
+        ))
+    });
+    assert!(matches!(failed, Err(Error::Unavailable(_))));
+    assert!(!dir.join("vulkan-guest-probe.bin").exists());
+    drop(device);
+
+    let reopened = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| Ok(device),
+    )
+    .unwrap();
+    assert!(!reopened.caps().modern.contains(Modern::BINDLESS));
+    assert!(
+        reopened
+            .adapter_identity()
+            .tier
+            .contains("masked: bindless")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
