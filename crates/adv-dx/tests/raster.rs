@@ -171,8 +171,9 @@ fn failed_com_publication_reclaims_all_unpublished_interface_allocations() {
     }
 }
 
+// spec: PERS-SCOPE-13
 #[test]
-fn directdraw_versions_share_canonical_unknown_and_one_reference_lifetime() {
+fn directdraw_versions_share_canonical_unknown_and_count_apart() {
     let mut f = Fixture::new();
     let device = f.device;
     let old_iid = [
@@ -185,9 +186,11 @@ fn directdraw_versions_share_canonical_unknown_and_one_reference_lifetime() {
     assert_eq!((from_old, from_new), (device, device));
     assert_eq!(f.objects.object_count(), 1);
     assert!(f.objects.close(old).is_none());
-    assert_eq!(f.dd(dd::RELEASE, &[from_old]), 3);
-    assert_eq!(f.dd(dd::RELEASE, &[from_new]), 2);
-    assert_eq!(f.dd(dd::RELEASE, &[device]), 1);
+    // Each version keeps its own count; the object lives while any does.
+    assert_eq!(f.dd(dd::RELEASE, &[from_old]), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[from_new]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[device]), 0);
+    assert_eq!(f.objects.object_count(), 1);
     assert_eq!(f.dd(dd::RELEASE, &[old]), 0);
     assert_eq!(f.objects.object_count(), 0);
     assert_eq!(f.dd(dd::ADDREF, &[device]), 0x80070057);
@@ -227,8 +230,8 @@ fn surface_versions_and_clipper_replacement_release_their_retained_objects() {
     let old = f.query(surface, old_iid);
     let unknown = f.query(old, adv_os::com::IUNKNOWN);
     assert_eq!(unknown, surface);
-    assert_eq!(f.dd(dd::RELEASE, &[unknown]), 2);
-    assert_eq!(f.dd(dd::RELEASE, &[old]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[unknown]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[old]), 0);
     assert_eq!(f.dd(dd::CREATE_CLIPPER, &[f.device, 0, 32, 0]), 0);
     let clipper = f.memory.u32(32).unwrap();
     assert_eq!(f.dd(dd::SET_CLIPPER, &[surface, clipper]), 0);

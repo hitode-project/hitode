@@ -49,9 +49,9 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-SCOPE-13 Per-interface reference counts
 
-**Rule**: An interface registered as separately counted MUST keep its own public count, which AddRef, Release and QueryInterface report. The object MUST live while any count or internal reference remains. DirectSound MUST count a device's IUnknown and each buffer's listener, 3D, notify and property-set interfaces separately.
+**Rule**: A separately counted interface MUST keep its own AddRef, Release and QueryInterface count, and the object MUST outlive every count and internal reference. DirectSound MUST count a device's IUnknown and each buffer interface separately. DirectDraw MUST count each device and surface interface version separately.
 **Verification**: Test
-**Basis**: Wine dsound `dsound8` and `ds3d` tests, which pass on Windows.
+**Basis**: Wine dsound `dsound8`, `ds3d` and ddraw `refcount` tests, which pass on Windows.
 
 ## Exports and diagnostics
 

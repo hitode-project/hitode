@@ -469,7 +469,7 @@ impl DirectDraw {
             && let Some(value) = com.get_identity(objects, identity)
         {
             let pointer = if legacy { value.old } else { value.modern };
-            return Ok(com.add_ref_identity(objects, identity).map(|_| pointer));
+            return Ok(com.add_ref::<ComState>(objects, pointer).map(|_| pointer));
         }
         let vtable = if matches!(kind, Kind::Clipper) {
             if let Some(table) = self.clipper_vtable {
@@ -503,17 +503,37 @@ impl DirectDraw {
         } else {
             self.table(surfaces, matches!(kind, Kind::Surface(_)), legacy, m)?
         };
-        // Distinct layouts may expose different interface pointers, but all
-        // versions share the same canonical IUnknown and reference ownership.
+        // Like Windows, every interface version has its own pointer and
+        // reference count; all share the canonical IUnknown and the object.
         let mut layouts = match kind {
             Kind::Clipper => vec![(IID_CLIPPER, vtable)],
-            Kind::Surface(_) => vec![(IID_SURFACE, vtable), (IID_SURFACE7, vtable)],
-            Kind::Device => vec![
-                (IID_DDRAW, self.table(surfaces, false, true, m)?),
-                (IID_DDRAW2, self.table(surfaces, false, false, m)?),
-                (IID_DDRAW7, self.table(surfaces, false, false, m)?),
-            ],
+            Kind::Surface(_) => [
+                IID_SURFACE,
+                IID_SURFACE2,
+                IID_SURFACE3,
+                IID_SURFACE4,
+                IID_SURFACE7,
+            ]
+            .map(|iid| (iid, vtable))
+            .to_vec(),
+            Kind::Device => {
+                let modern = self.table(surfaces, false, false, m)?;
+                vec![
+                    (IID_DDRAW, self.table(surfaces, false, true, m)?),
+                    (IID_DDRAW2, modern),
+                    (IID_DDRAW4, modern),
+                    (IID_DDRAW7, modern),
+                ]
+            }
         };
+        // Versions before DirectDraw4 exchange DDSURFACEDESC.
+        let legacy_iids = [
+            IID_DDRAW,
+            IID_DDRAW2,
+            IID_SURFACE,
+            IID_SURFACE2,
+            IID_SURFACE3,
+        ];
         let mut pointers = Vec::new();
         for (_, table) in &mut layouts {
             let result = surfaces.alloc(16, m).and_then(|p| {
@@ -552,11 +572,11 @@ impl DirectDraw {
             windowed: false,
             old,
             modern,
-            legacy_descriptors: if matches!(kind, Kind::Clipper) {
-                Vec::new()
-            } else {
-                pointers[..pointers.len() - 1].to_vec()
-            },
+            legacy_descriptors: layouts
+                .iter()
+                .filter(|(iid, _)| legacy_iids.contains(iid))
+                .map(|&(_, p)| p)
+                .collect(),
         };
         let Some(identity) = com.create(objects, canonical, initial_iid, value) else {
             for p in pointers {
@@ -564,18 +584,10 @@ impl DirectDraw {
             }
             return Ok(None);
         };
-        match kind {
-            Kind::Device => layouts.push((IID_DDRAW4, modern)),
-            Kind::Surface(_) => layouts.extend([
-                (IID_SURFACE2, old),
-                (IID_SURFACE3, old),
-                (IID_SURFACE4, modern),
-            ]),
-            Kind::Clipper => (),
-        }
         if !layouts
             .into_iter()
-            .all(|(iid, p)| com.register_interface(objects, identity, iid, p))
+            .filter(|&(_, p)| p != canonical)
+            .all(|(iid, p)| com.register_separate(objects, identity, iid, p))
         {
             com.release_identity(objects, identity);
             for p in pointers {
@@ -626,11 +638,14 @@ impl DirectDraw {
         com.get_mut::<ComState>(objects, pointer)
             .unwrap()
             .initialized = false;
-        let target = com
-            .resolve_interface::<ComState>(objects, pointer, iid)
-            .unwrap();
+        // The requested version takes the creation reference.
+        let target = com.query::<ComState>(objects, pointer, iid);
+        self.release_com(objects, surfaces, pointer);
+        let Ok(target) = target else {
+            return Ok(0x8007000e);
+        };
         if let Err(error) = m.arg_put_u32(output, target) {
-            self.release_com(objects, surfaces, pointer);
+            self.release_com(objects, surfaces, target);
             return Err(error);
         }
         Ok(0)
