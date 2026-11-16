@@ -1,4 +1,5 @@
 //! DirectSound PCM buffers. Guest-visible clocks stay independent of device consumption.
+use crate::argument::CallError;
 use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
@@ -935,7 +936,7 @@ fn object(
 }
 /// The shared buffer always owns an empty effects chain. Nonempty requests fail
 /// without publishing an effect object or discarding a requested DSP as success.
-fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
+fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, CallError> {
     let args: [u32; 5] = std::array::from_fn(|i| e.arg(i as u32));
     let com = e.ext.get::<Sound>().com;
     let Some(buffer) = com
@@ -953,9 +954,9 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
             return Ok(INVALID);
         }
         for address in [args[1], args[3]] {
-            check_range(e.cpu, address, 16, Prot::READ).map_err(|error| error.to_string())?;
+            check_range(e.cpu, address, 16, Prot::READ)?;
         }
-        check_range(e.cpu, args[4], 4, Prot::WRITE).map_err(|error| error.to_string())?;
+        check_range(e.cpu, args[4], 4, Prot::WRITE)?;
         // The native empty-chain failure preserves *ppObject, including a
         // caller's sentinel. No interface reference or COM header is allocated.
         return Ok(OBJECT_NOT_FOUND);
@@ -984,16 +985,14 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
     if args[2] == 0 {
         return Ok(INVALID);
     }
-    check_range(e.cpu, args[2], count * 32, Prot::READ).map_err(|error| error.to_string())?;
+    check_range(e.cpu, args[2], count * 32, Prot::READ)?;
     if args[3] != 0 {
-        check_range(e.cpu, args[3], count * 4, Prot::WRITE).map_err(|error| error.to_string())?;
+        check_range(e.cpu, args[3], count * 4, Prot::WRITE)?;
     }
     let mut registered_class = false;
     for index in 0..count {
         let mut descriptor = [0; 32];
-        e.cpu
-            .read(args[2] + index * 32, &mut descriptor)
-            .map_err(|error| error.to_string())?;
+        e.cpu.read(args[2] + index * 32, &mut descriptor)?;
         let word = |offset| u32::from_le_bytes(descriptor[offset..offset + 4].try_into().unwrap());
         if word(0) != 32 || word(4) & !3 != 0 || word(4) == 3 || word(24) != 0 || word(28) != 0 {
             return Ok(INVALID);
@@ -1006,9 +1005,7 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
     }
     if args[3] != 0 {
         for index in 0..count {
-            e.cpu
-                .write_u32(args[3] + index * 4, 5)
-                .map_err(|error| error.to_string())?; // DSFXR_UNKNOWN
+            e.cpu.write_u32(args[3] + index * 4, 5)?; // DSFXR_UNKNOWN
         }
     }
     let hr = if registered_class {
@@ -1027,7 +1024,7 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, String> {
     Ok(hr)
 }
 
-fn result(e: &mut Env<'_>) -> Result<u32, String> {
+fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
     e.ext.get::<Sound>().audio.sync_clock(e.sys.clock.now_us());
     let full = e.sys.thunks.get(e.thunk).name.clone();
     let name = full.split("::").last().unwrap();
@@ -1084,7 +1081,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         }
     }
     if matches!(name, "#1" | "DirectSoundCreate" | "DirectSoundCreate8") {
-        e.cpu.write_u32(b, 0).map_err(|e| e.to_string())?;
+        e.cpu.write_u32(b, 0)?;
         if !e.ext.get::<Sound>().enabled {
             return Ok(NO_DRIVER);
         }
@@ -1110,7 +1107,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         else {
             return Ok(OUT_OF_MEMORY);
         };
-        e.cpu.write_u32(b, obj).map_err(|e| e.to_string())?;
+        e.cpu.write_u32(b, obj)?;
         return Ok(0);
     }
     let com = e.ext.get::<Sound>().com;
@@ -1131,16 +1128,16 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         return Ok(release(e, a));
     }
     if name == "QueryInterface" {
-        e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+        e.cpu.write_u32(c, 0)?;
         let mut iid = [0; 16];
-        e.cpu.read(b, &mut iid).map_err(|e| e.to_string())?;
+        e.cpu.read(b, &mut iid)?;
         let ptr = match com.query::<Object>(&mut e.sys.objects, a, iid) {
             Ok(ptr) => ptr,
             Err(QueryError::NoInterface) => return Ok(NO_INTERFACE),
             Err(QueryError::ReferenceLimit) => return Ok(OUT_OF_MEMORY),
             Err(QueryError::InvalidObject) => return Ok(INVALID),
         };
-        e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
+        e.cpu.write_u32(c, ptr)?;
         return Ok(0);
     }
     if let Kind::Device {
@@ -1169,18 +1166,18 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 if e.arg(3) != 0 {
                     return Ok(0x80040110);
                 }
-                check_range(e.cpu, b, 4, Prot::READ).map_err(|error| error.to_string())?;
-                let size = e.cpu.read_u32(b).map_err(|e| e.to_string())?;
+                check_range(e.cpu, b, 4, Prot::READ)?;
+                let size = e.cpu.read_u32(b)?;
                 if !matches!(size, 20 | 36) {
-                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                    e.cpu.write_u32(c, 0)?;
                     return Ok(INVALID);
                 }
-                check_range(e.cpu, b, size, Prot::READ).map_err(|error| error.to_string())?;
-                let flags = e.cpu.read_u32(b + 4).map_err(|e| e.to_string())?;
+                check_range(e.cpu, b, size, Prot::READ)?;
+                let flags = e.cpu.read_u32(b + 4)?;
                 let fx = flags & CTRL_FX != 0;
-                check_range(e.cpu, c, 4, Prot::WRITE).map_err(|error| error.to_string())?;
+                check_range(e.cpu, c, 4, Prot::WRITE)?;
                 if !fx {
-                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                    e.cpu.write_u32(c, 0)?;
                 }
                 // Software PCM supports 3D and an empty FX chain, without
                 // hardware voices or effect-DSP constructors.
@@ -1216,14 +1213,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     );
                     return Ok(UNSUPPORTED);
                 }
-                let len = e.cpu.read_u32(b + 8).map_err(|e| e.to_string())?;
-                let fp = e.cpu.read_u32(b + 16).map_err(|e| e.to_string())?;
+                let len = e.cpu.read_u32(b + 8)?;
+                let fp = e.cpu.read_u32(b + 16)?;
                 let primary = flags & 1 != 0;
                 if fx && (!version8 || primary) {
                     return Ok(if !version8 { 0x887800be } else { INVALID });
                 }
                 if fx {
-                    check_range(e.cpu, fp, 16, Prot::READ).map_err(|error| error.to_string())?;
+                    check_range(e.cpu, fp, 16, Prot::READ)?;
                 }
                 let format = if primary && fp == 0 {
                     Format::default()
@@ -1249,9 +1246,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     return Ok(INVALID);
                 }
                 if fx {
-                    if e.cpu.read_u32(fp + 8).map_err(|error| error.to_string())?
-                        != format.rate * format.align()
-                    {
+                    if e.cpu.read_u32(fp + 8)? != format.rate * format.align() {
                         return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
                     }
                     if format.bits != 16 || format.float {
@@ -1270,7 +1265,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     {
                         return Ok(0x887800b4); // DSERR_BUFFERTOOSMALL; preserve output.
                     }
-                    e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                    e.cpu.write_u32(c, 0)?;
                 }
                 let audio_id = e.ext.get::<Sound>().next_audio_id;
                 let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
@@ -1298,7 +1293,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         Err(error) => {
                             let _ = e.sys.vm.free(e.cpu, base);
                             release(e, ptr);
-                            return Err(format!("shared audio mapping: {error}"));
+                            return Err(CallError::Fail(format!("shared audio mapping: {error}")));
                         }
                     };
                     (base, Some(region))
@@ -1311,7 +1306,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                             .free(e.cpu, base)
                             .map_err(|error| error.to_string())?;
                         release(e, ptr);
-                        return Err(error.to_string());
+                        return Err(CallError::Fail(error.to_string()));
                     }
                 }
                 let s = e.ext.get_mut::<Sound>();
@@ -1408,14 +1403,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         .set_stereo_gain(audio_id, mix(&s.listener.applied, buffer).0);
                 }
                 s.buffer_ids.insert(audio_id, id);
-                e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(c, ptr)?;
                 Ok(0)
             }
             "DuplicateSoundBuffer" => {
                 if c == 0 {
                     return Ok(INVALID);
                 }
-                e.cpu.write_u32(c, 0).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(c, 0)?;
                 if b == 0 {
                     return Ok(INVALID);
                 }
@@ -1529,37 +1524,41 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 }
                 com.get_identity_mut(&mut e.sys.objects, id).unwrap().buffer = Some(dup_buffer);
                 s.buffer_ids.insert(audio_id, id);
-                e.cpu.write_u32(c, ptr).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(c, ptr)?;
                 Ok(0)
             }
             "GetCaps" => {
-                if e.cpu.read_u32(b).map_err(|e| e.to_string())? < 96 {
+                if e.cpu.read_u32(b)? < 96 {
                     return Ok(INVALID);
                 }
                 let mut caps = [0u8; 96];
                 for (off, value) in [(0, 96u32), (4, 0xf3f), (8, 100), (12, 200000), (16, 1)] {
                     caps[off..off + 4].copy_from_slice(&value.to_le_bytes());
                 }
-                e.cpu.write(b, &caps).map_err(|e| e.to_string())?;
+                e.cpu.write(b, &caps)?;
                 Ok(0)
             }
             "SetCooperativeLevel" => Ok(if (1..=4).contains(&c) { 0 } else { INVALID }),
             "GetSpeakerConfig" => {
-                e.cpu.write_u32(b, 4).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(b, 4)?;
                 Ok(0)
             }
             "SetSpeakerConfig" => Ok(if b & 0xff == 4 { 0 } else { UNSUPPORTED }),
             "Compact" => Ok(0),
             "VerifyCertification" => {
-                e.cpu.write_u32(b, 1).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(b, 1)?;
                 Ok(0)
             }
-            _ => Err(format!("unimplemented audio method {full}")),
+            _ => Err(CallError::Fail(format!(
+                "unimplemented audio method {full}"
+            ))),
         };
     }
     if let Kind::Notify(parent) = kind {
         if name != "SetNotificationPositions" {
-            return Err(format!("unimplemented audio method {full}"));
+            return Err(CallError::Fail(format!(
+                "unimplemented audio method {full}"
+            )));
         }
         if b > 1024 {
             return Ok(INVALID);
@@ -1571,8 +1570,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         }
         let mut entries = Vec::new();
         for i in 0..b {
-            let offset = e.cpu.read_u32(c + i * 8).map_err(|e| e.to_string())?;
-            let handle = e.cpu.read_u32(c + i * 8 + 4).map_err(|e| e.to_string())?;
+            let offset = e.cpu.read_u32(c + i * 8)?;
+            let handle = e.cpu.read_u32(c + i * 8 + 4)?;
             let event = match e.ext.get::<Sound>().host.events {
                 Some(events) => (events.valid)(e, handle),
                 None => matches!(
@@ -1670,7 +1669,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         .unwrap();
     let value = match name {
         "GetCaps" => {
-            if e.cpu.read_u32(b).map_err(|e| e.to_string())? < 20 {
+            if e.cpu.read_u32(b)? < 20 {
                 return Ok(INVALID);
             }
             let flags = if buf.flags & LOC_DEFER != 0 {
@@ -1679,19 +1678,17 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 buf.flags | 8
             };
             for (i, v) in [20, flags, buf.len, 0, 0].into_iter().enumerate() {
-                e.cpu
-                    .write_u32(b + i as u32 * 4, v)
-                    .map_err(|e| e.to_string())?;
+                e.cpu.write_u32(b + i as u32 * 4, v)?;
             }
             0
         }
         "GetCurrentPosition" => {
             let (play, write) = buf.cursors(now, s.audio.device_connected());
             if b != 0 {
-                e.cpu.write_u32(b, play).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(b, play)?;
             }
             if c != 0 {
-                e.cpu.write_u32(c, write).map_err(|e| e.to_string())?;
+                e.cpu.write_u32(c, write)?;
             }
             0
         }
@@ -1699,15 +1696,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             let bytes = buf.format.bytes();
             let needed = bytes.len() as u32;
             if args[3] != 0 {
-                e.cpu
-                    .write_u32(args[3], needed)
-                    .map_err(|e| e.to_string())?;
+                e.cpu.write_u32(args[3], needed)?;
             }
             if b != 0 {
                 if c < needed {
                     return Ok(INVALID);
                 }
-                e.cpu.write(b, &bytes).map_err(|e| e.to_string())?;
+                e.cpu.write(b, &bytes)?;
             }
             0
         }
@@ -1727,7 +1722,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     ) | if buf.playing && buf.looping { 4 } else { 0 }
                 }
             };
-            e.cpu.write_u32(b, value).map_err(|e| e.to_string())?;
+            e.cpu.write_u32(b, value)?;
             0
         }
         "SetVolume" => {
@@ -1957,7 +1952,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                 (args[6], lock.n2),
             ] {
                 if ptr != 0 {
-                    e.cpu.write_u32(ptr, value).map_err(|e| e.to_string())?;
+                    e.cpu.write_u32(ptr, value)?;
                 } else if ptr == args[3] || ptr == args[4] {
                     return Ok(INVALID);
                 }
@@ -2033,7 +2028,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             }
             0
         }
-        _ => return Err(format!("unimplemented audio method {full}")),
+        _ => {
+            return Err(CallError::Fail(format!(
+                "unimplemented audio method {full}"
+            )));
+        }
     };
     let ready = std::mem::take(&mut s.ready_notices);
     notify(e, ready)?;
@@ -2044,7 +2043,7 @@ type SourceUpdate = Box<dyn Fn(&mut Source)>;
 
 /// `IDirectSound3DListener` on a primary buffer and `IDirectSound3DBuffer`
 /// on a secondary one; `parent` is the buffer's own interface.
-fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u32, String> {
+fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u32, CallError> {
     let args: [u32; 8] = std::array::from_fn(|i| e.arg(i as u32));
     let float = |i: usize| f32::from_bits(args[i]);
     let vector = |i: usize| Vector::from_words([args[i], args[i + 1], args[i + 2]]);
@@ -2073,10 +2072,7 @@ fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u3
         return Ok(INVALID);
     }
     let apply = apply.unwrap_or(spatial::IMMEDIATE);
-    let write_float = |cpu: &mut dyn Guest, value: f32| {
-        cpu.write_u32(out, value.to_bits())
-            .map_err(|error| error.to_string())
-    };
+    let write_float = |cpu: &mut dyn Guest, value: f32| cpu.write_u32(out, value.to_bits());
     let valid_size = |cpu: &dyn Guest, at: u32| {
         at != 0
             && cpu
@@ -2166,9 +2162,9 @@ fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u3
                 true
             }
             _ => {
-                return Err(format!(
+                return Err(CallError::Fail(format!(
                     "unimplemented audio method IDirectSound3DListener::{name}"
-                ));
+                )));
             }
         };
         if applied {
@@ -2201,24 +2197,14 @@ fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u3
             current.write(e.cpu, out)?;
         }
         "GetConeAngles" => {
-            e.cpu
-                .write_u32(out, current.inside_cone)
-                .map_err(|e| e.to_string())?;
-            e.cpu
-                .write_u32(args[2], current.outside_cone)
-                .map_err(|e| e.to_string())?;
+            e.cpu.write_u32(out, current.inside_cone)?;
+            e.cpu.write_u32(args[2], current.outside_cone)?;
         }
         "GetConeOrientation" => current.cone.write(e.cpu, out)?,
-        "GetConeOutsideVolume" => e
-            .cpu
-            .write_u32(out, current.cone_outside_volume as u32)
-            .map_err(|e| e.to_string())?,
+        "GetConeOutsideVolume" => e.cpu.write_u32(out, current.cone_outside_volume as u32)?,
         "GetMaxDistance" => write_float(e.cpu, current.max_distance)?,
         "GetMinDistance" => write_float(e.cpu, current.min_distance)?,
-        "GetMode" => e
-            .cpu
-            .write_u32(out, current.mode)
-            .map_err(|e| e.to_string())?,
+        "GetMode" => e.cpu.write_u32(out, current.mode)?,
         "GetPosition" => current.position.write(e.cpu, out)?,
         "GetVelocity" => current.velocity.write(e.cpu, out)?,
         "SetAllParameters" => {
@@ -2268,9 +2254,9 @@ fn spatial_call(e: &mut Env<'_>, name: &str, parent: u32, now: u64) -> Result<u3
             update = Some(Box::new(move |source| source.velocity = velocity));
         }
         _ => {
-            return Err(format!(
+            return Err(CallError::Fail(format!(
                 "unimplemented audio method IDirectSound3DBuffer::{name}"
-            ));
+            )));
         }
     }
     let Some(update) = update else {
@@ -2343,7 +2329,7 @@ fn retune(audio: &AudioControl, buf: &mut Buffer, rate: u32, now: u64) -> bool {
 fn call(e: &mut Env<'_>) -> Outcome {
     match result(e) {
         Ok(v) => Outcome::Return(v),
-        Err(err) => Outcome::Fail(err),
+        Err(err) => err.outcome(e),
     }
 }
 
@@ -2795,6 +2781,43 @@ mod tests {
                 assert_ne!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
             }
         }
+    }
+    // spec: PERS-SCOPE-12
+    #[test]
+    fn inaccessible_argument_pointers_answer_invalid_param() {
+        let mut m = machine();
+        let d = device(&mut m);
+        let name = "IDirectSound8::GetCaps";
+        m.resolve_import("dsound.dll", name).unwrap();
+        let thunk = m
+            .sys
+            .thunks
+            .iter()
+            .find(|(_, t)| t.module == "dsound.dll" && t.name == name)
+            .unwrap()
+            .0;
+        for caps in [0, 0x10] {
+            m.cpu.set_reg(Reg::Esp, STACK);
+            m.cpu.write_u32(STACK + 4, d).unwrap();
+            m.cpu.write_u32(STACK + 8, caps).unwrap();
+            let outcome = call(&mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk,
+            });
+            assert!(
+                matches!(outcome, Outcome::Return(INVALID)),
+                "caps {caps:#x}"
+            );
+        }
+        let warnings = &m.ext.get::<adv_abi::ApiDiagnostics>().warnings;
+        assert!(warnings.contains_key(&(
+            format!("dsound.dll!{name}"),
+            "inaccessible argument (guest memory fault at 0x00000000 (+4)); returning E_INVALIDARG"
+                .to_owned()
+        )));
     }
     // spec: DEV-AUDIO-6
     #[test]

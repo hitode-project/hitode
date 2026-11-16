@@ -2,6 +2,7 @@
 //! IDirectDrawClipper objects. Objects and vtables live in guest memory from the surface
 //! arena, so a guest can read or patch them; every vtable slot points at a registry thunk.
 //! Pixels belong to the shared surface store; assembly lends a memory DC over them.
+use crate::argument::{Arguments, CallError};
 use std::collections::{BTreeMap, BTreeSet};
 
 use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
@@ -289,7 +290,7 @@ impl DirectDraw {
         sid: u32,
         m: &dyn SurfaceMemory,
         damage: Rect,
-    ) -> Result<(), String> {
+    ) -> Result<(), CallError> {
         surfaces.present_from(self.context, sid, m, damage)?;
         if !damage.clipped(surfaces[sid].rect()).empty() {
             self.submitted = Some(sid);
@@ -304,7 +305,7 @@ impl DirectDraw {
         m: &mut dyn SurfaceMemory,
         dst: u32,
         src: u32,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, CallError> {
         if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
             return Ok(BUSY);
         }
@@ -350,7 +351,7 @@ impl DirectDraw {
         surface: bool,
         legacy: bool,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, CallError> {
         if let Some(v) = if surface {
             self.surface_vtable
         } else if legacy {
@@ -456,7 +457,7 @@ impl DirectDraw {
         kind: Kind,
         legacy: bool,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<Option<u32>, CallError> {
         if self.com.is_none() {
             self.com = CommonCom::new(objects);
         }
@@ -527,7 +528,7 @@ impl DirectDraw {
                     for p in pointers {
                         surfaces.release(p, 16);
                     }
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -603,7 +604,7 @@ impl DirectDraw {
         outer: u32,
         output: u32,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, CallError> {
         if outer != 0 {
             return Ok(0x80040110);
         }
@@ -628,7 +629,7 @@ impl DirectDraw {
         let target = com
             .resolve_interface::<ComState>(objects, pointer, iid)
             .unwrap();
-        if let Err(error) = m.put_u32(output, target) {
+        if let Err(error) = m.arg_put_u32(output, target) {
             self.release_com(objects, surfaces, pointer);
             return Err(error);
         }
@@ -649,7 +650,7 @@ impl DirectDraw {
         sid: u32,
         legacy: bool,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<Option<u32>, CallError> {
         self.com_version(objects, surfaces, Kind::Surface(sid), legacy, m)
     }
 
@@ -753,7 +754,7 @@ fn unbounded<P: Presenter>(
     p: u32,
     (ox, oy): (i32, i32),
     m: &dyn SurfaceMemory,
-) -> Result<Option<BlitRect>, String> {
+) -> Result<Option<BlitRect>, CallError> {
     if p == 0 {
         let r = surfaces[id].rect();
         return Ok(Some(BlitRect {
@@ -764,10 +765,10 @@ fn unbounded<P: Presenter>(
         }));
     }
     let (left, top, right, bottom) = (
-        i64::from(m.u32(p)? as i32) - i64::from(ox),
-        i64::from(m.u32(p + 4)? as i32) - i64::from(oy),
-        i64::from(m.u32(p + 8)? as i32) - i64::from(ox),
-        i64::from(m.u32(p + 12)? as i32) - i64::from(oy),
+        i64::from(m.arg_u32(p)? as i32) - i64::from(ox),
+        i64::from(m.arg_u32(p + 4)? as i32) - i64::from(oy),
+        i64::from(m.arg_u32(p + 8)? as i32) - i64::from(ox),
+        i64::from(m.arg_u32(p + 12)? as i32) - i64::from(oy),
     );
     Ok((right > left && bottom > top).then(|| BlitRect {
         x: left,
@@ -799,16 +800,16 @@ fn rect<P: Presenter>(
     id: u32,
     p: u32,
     m: &dyn SurfaceMemory,
-) -> Result<Rect, String> {
+) -> Result<Rect, CallError> {
     let s = &surfaces[id];
     if p == 0 {
         return Ok(s.rect());
     }
     let (x, y, r, b) = (
-        m.u32(p)? as i32,
-        m.u32(p + 4)? as i32,
-        m.u32(p + 8)? as i32,
-        m.u32(p + 12)? as i32,
+        m.arg_u32(p)? as i32,
+        m.arg_u32(p + 4)? as i32,
+        m.arg_u32(p + 8)? as i32,
+        m.arg_u32(p + 12)? as i32,
     );
     if x < 0 || y < 0 || r <= x || b <= y || r as u32 > s.width || b as u32 > s.height {
         return Err("invalid surface rectangle".into());
@@ -830,7 +831,7 @@ impl DirectDraw {
         surfaces: &mut Surfaces<P>,
         objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, CallError> {
         if id == api::UNIMPLEMENTED_COM {
             return Err("unimplemented DirectDraw COM method".into());
         }
@@ -838,7 +839,7 @@ impl DirectDraw {
             if a[1] == 0 {
                 return Ok(INVALID);
             }
-            m.put_u32(a[1], 0)?;
+            m.arg_put_u32(a[1], 0)?;
             if a[0] != 0 || a[2] != 0 {
                 return Ok(INVALID);
             }
@@ -847,13 +848,14 @@ impl DirectDraw {
                 return Ok(0x8007000e);
             };
             self.clipper_windows.insert(clipper, 0);
-            m.put_u32(a[1], clipper)?;
+            m.arg_put_u32(a[1], clipper)?;
             return Ok(0);
         }
         if id == api::DD_CREATE || id == api::DD_CREATE_OLD {
-            m.put_u32(a[1], 0)?;
+            m.arg_put_u32(a[1], 0)?;
             if a[0] != 0
-                || (id == api::DD_CREATE && (a[3] != 0 || m.read(a[2], 16)?.as_ref() != IID_DDRAW7))
+                || (id == api::DD_CREATE
+                    && (a[3] != 0 || m.arg_read(a[2], 16)?.as_ref() != IID_DDRAW7))
                 || (id == api::DD_CREATE_OLD && a[2] != 0)
             {
                 return Ok(INVALID);
@@ -863,7 +865,7 @@ impl DirectDraw {
             else {
                 return Ok(0x8007000e);
             };
-            m.put_u32(a[1], p)?;
+            m.arg_put_u32(a[1], p)?;
             return Ok(0);
         }
         let Some(com) = self.com else {
@@ -897,11 +899,11 @@ impl DirectDraw {
                 }
             }
             api::QUERY => {
-                m.put_u32(a[2], 0)?;
-                let iid: [u8; 16] = m.read(a[1], 16)?.as_ref().try_into().unwrap();
+                m.arg_put_u32(a[2], 0)?;
+                let iid: [u8; 16] = m.arg_read(a[1], 16)?.as_ref().try_into().unwrap();
                 match com.query::<ComState>(objects, a[0], iid) {
                     Ok(pointer) => {
-                        m.put_u32(a[2], pointer)?;
+                        m.arg_put_u32(a[2], pointer)?;
                         0
                     }
                     Err(QueryError::NoInterface) => 0x80004002,
@@ -961,7 +963,7 @@ impl DirectDraw {
                 }
             }
             api::CREATE_CLIPPER => {
-                m.put_u32(a[2], 0)?;
+                m.arg_put_u32(a[2], 0)?;
                 if !matches!(kind, Kind::Device) || a[1] != 0 || a[3] != 0 {
                     return Ok(INVALID);
                 }
@@ -970,7 +972,7 @@ impl DirectDraw {
                     return Ok(0x8007000e);
                 };
                 self.clipper_windows.insert(clipper, 0);
-                m.put_u32(a[2], clipper)?;
+                m.arg_put_u32(a[2], clipper)?;
                 0
             }
             api::CLIPPER_INITIALIZE => {
@@ -1009,11 +1011,11 @@ impl DirectDraw {
                 }
                 // RGNDATAHEADER: dwSize 32, iType RDH_RECTANGLES, nCount,
                 // nRgnSize, rcBound; the rectangles follow it.
-                if m.u32(a[1])? != 32 || m.u32(a[1] + 4)? != 1 {
+                if m.arg_u32(a[1])? != 32 || m.arg_u32(a[1] + 4)? != 1 {
                     return Ok(INVALID_CLIP_LIST);
                 }
-                let count = m.u32(a[1] + 8)?;
-                let bytes = m.read(a[1] + 32, count as usize * 16)?;
+                let count = m.arg_u32(a[1] + 8)?;
+                let bytes = m.arg_read(a[1] + 32, count as usize * 16)?;
                 let rects = bytes
                     .as_chunks::<16>()
                     .0
@@ -1037,7 +1039,7 @@ impl DirectDraw {
                 if !matches!(kind, Kind::Clipper) {
                     return Ok(INVALID);
                 }
-                m.put_u32(a[1], *self.clipper_windows.get(&a[0]).unwrap_or(&0))?;
+                m.arg_put_u32(a[1], *self.clipper_windows.get(&a[0]).unwrap_or(&0))?;
                 0
             }
             api::SET_COLOR_KEY => {
@@ -1052,8 +1054,12 @@ impl DirectDraw {
                 if a[2] == 0 {
                     self.color_keys.remove(&(sid, kinds));
                 } else {
-                    let low = m.u32(a[2])?;
-                    let high = if a[1] & 1 != 0 { m.u32(a[2] + 4)? } else { low };
+                    let low = m.arg_u32(a[2])?;
+                    let high = if a[1] & 1 != 0 {
+                        m.arg_u32(a[2] + 4)?
+                    } else {
+                        low
+                    };
                     self.color_keys.insert((sid, kinds), (low, high));
                 }
                 0
@@ -1068,8 +1074,8 @@ impl DirectDraw {
                 let Some(&(low, high)) = self.color_keys.get(&(sid, a[1])) else {
                     return Ok(NO_COLOR_KEY);
                 };
-                m.put_u32(a[2], low)?;
-                m.put_u32(a[2] + 4, high)?;
+                m.arg_put_u32(a[2], low)?;
+                m.arg_put_u32(a[2] + 4, high)?;
                 0
             }
             // Blits and flips complete synchronously, so DDGBS/DDGFS_CANBLT
@@ -1092,7 +1098,7 @@ impl DirectDraw {
                     return Ok(NO_CLIPPER_ATTACHED);
                 };
                 com.add_ref::<ComState>(objects, clipper);
-                m.put_u32(a[1], clipper)?;
+                m.arg_put_u32(a[1], clipper)?;
                 0
             }
             api::SET_CLIPPER => {
@@ -1148,14 +1154,14 @@ impl DirectDraw {
                 if !matches!(kind, Kind::Device) {
                     return Ok(INVALID);
                 }
-                let len = m.u32(a[1])?;
+                let len = m.arg_u32(a[1])?;
                 if !matches!(len, 108 | 124) {
                     return Ok(INVALID);
                 }
                 let sid = surfaces.primary(m)?;
                 let mut desc = desc(surfaces, sid, 0);
                 desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.write(a[1], &desc[..len as usize])?;
+                m.arg_write(a[1], &desc[..len as usize])?;
                 0
             }
             api::GET_CAPS => {
@@ -1164,7 +1170,7 @@ impl DirectDraw {
                 }
                 for &p in &a[1..3] {
                     if p != 0 {
-                        let len = m.u32(p)?;
+                        let len = m.arg_u32(p)?;
                         if !(4..=380).contains(&len) {
                             return Ok(INVALID);
                         }
@@ -1183,22 +1189,22 @@ impl DirectDraw {
                                 caps[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
                             }
                         }
-                        m.write(p, &caps)?;
+                        m.arg_write(p, &caps)?;
                     }
                 }
                 0
             }
             api::CREATE_SURFACE => {
-                m.put_u32(a[2], 0)?;
-                let desc_len = m.u32(a[1])?;
+                m.arg_put_u32(a[2], 0)?;
+                let desc_len = m.arg_u32(a[1])?;
                 if !matches!(kind, Kind::Device) || a[3] != 0 || !matches!(desc_len, 108 | 124) {
                     return Ok(INVALID);
                 }
-                let flags = m.u32(a[1] + 4)?;
-                let caps = m.u32(a[1] + 104)?;
+                let flags = m.arg_u32(a[1] + 4)?;
+                let caps = m.arg_u32(a[1] + 104)?;
                 if flags & 1 == 0
                     || flags & !0x1027 != 0
-                    || (desc_len == 124 && m.read(a[1] + 108, 12)?.iter().any(|&b| b != 0))
+                    || (desc_len == 124 && m.arg_read(a[1] + 108, 12)?.iter().any(|&b| b != 0))
                 {
                     return Ok(UNSUPPORTED);
                 }
@@ -1207,7 +1213,7 @@ impl DirectDraw {
                 let sid = if caps & 0x200 != 0 {
                     let primary = surfaces.primary(m)?;
                     self.primary_owner = Some(owner_modern);
-                    if caps & 0x18 == 0x18 && flags & 0x20 != 0 && m.u32(a[1] + 20)? > 0 {
+                    if caps & 0x18 == 0x18 && flags & 0x20 != 0 && m.arg_u32(a[1] + 20)? > 0 {
                         if self.attached.contains_key(&primary) {
                             return Ok(BUSY);
                         }
@@ -1238,10 +1244,10 @@ impl DirectDraw {
                         surfaces.display_format
                     } else {
                         match (
-                            m.u32(a[1] + 84)?,
-                            m.u32(a[1] + 88)?,
-                            m.u32(a[1] + 92)?,
-                            m.u32(a[1] + 96)?,
+                            m.arg_u32(a[1] + 84)?,
+                            m.arg_u32(a[1] + 88)?,
+                            m.arg_u32(a[1] + 92)?,
+                            m.arg_u32(a[1] + 96)?,
                         ) {
                             (32, 0xff0000, 0xff00, 0xff) => PixelFormat::Bgra32,
                             (16, 0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
@@ -1249,7 +1255,7 @@ impl DirectDraw {
                             _ => return Ok(UNSUPPORTED),
                         }
                     };
-                    let (w, h) = (m.u32(a[1] + 12)?, m.u32(a[1] + 8)?);
+                    let (w, h) = (m.arg_u32(a[1] + 12)?, m.arg_u32(a[1] + 8)?);
                     if surface::size(w, h).is_err() {
                         return Ok(INVALID);
                     }
@@ -1266,7 +1272,7 @@ impl DirectDraw {
                     }
                     return Ok(0x8007000e);
                 };
-                m.put_u32(a[2], p)?;
+                m.arg_put_u32(a[2], p)?;
                 self.surface_owners.insert(sid, owner_device_id);
                 0
             }
@@ -1275,7 +1281,7 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                let len = m.u32(a[2])?;
+                let len = m.arg_u32(a[2])?;
                 if !matches!(len, 108 | 124) || a[4] != 0 {
                     return Ok(INVALID);
                 }
@@ -1291,7 +1297,7 @@ impl DirectDraw {
                 let p = surfaces[sid].row(rect.x, rect.y);
                 let mut desc = desc(surfaces, sid, p);
                 desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.write(a[2], &desc[..len as usize])?;
+                m.arg_write(a[2], &desc[..len as usize])?;
                 surfaces.get_mut(sid).unwrap().locked = Some((rect, a[3] & 0x10 != 0));
                 surfaces.stats.locks += 1;
                 0
@@ -1324,13 +1330,13 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                let len = m.u32(a[1])?;
+                let len = m.arg_u32(a[1])?;
                 if !matches!(len, 108 | 124) {
                     return Ok(INVALID);
                 }
                 let mut desc = desc(surfaces, sid, 0);
                 desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.write(a[1], &desc[..len as usize])?;
+                m.arg_write(a[1], &desc[..len as usize])?;
                 0
             }
             api::COMPACT => {
@@ -1377,7 +1383,7 @@ impl DirectDraw {
                 if a[1] == 0 {
                     return Ok(INVALID);
                 }
-                m.put_u32(a[1], 0)?;
+                m.arg_put_u32(a[1], 0)?;
                 let Some(primary) = surfaces
                     .primary_id()
                     .filter(|_| matches!(kind, Kind::Device))
@@ -1393,14 +1399,14 @@ impl DirectDraw {
                 else {
                     return Ok(0x8007000e);
                 };
-                m.put_u32(a[1], pointer)?;
+                m.arg_put_u32(a[1], pointer)?;
                 0
             }
             api::GET_DD_INTERFACE => {
                 if a[1] == 0 {
                     return Ok(INVALID);
                 }
-                m.put_u32(a[1], 0)?;
+                m.arg_put_u32(a[1], 0)?;
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
@@ -1416,7 +1422,7 @@ impl DirectDraw {
                 let iid = if legacy { IID_DDRAW } else { IID_DDRAW7 };
                 match com.query::<ComState>(objects, canonical, iid) {
                     Ok(pointer) => {
-                        m.put_u32(a[1], pointer)?;
+                        m.arg_put_u32(a[1], pointer)?;
                         0
                     }
                     Err(QueryError::ReferenceLimit) => 0x8007000e,
@@ -1462,7 +1468,7 @@ impl DirectDraw {
                 if a[1] == 0 {
                     return Ok(INVALID);
                 }
-                m.put_u32(a[1], surfaces[sid].version as u32)?;
+                m.arg_put_u32(a[1], surfaces[sid].version as u32)?;
                 0
             }
             api::CHANGE_UNIQUENESS => {
@@ -1481,10 +1487,10 @@ impl DirectDraw {
                     return Ok(INVALID);
                 }
                 let caps = u32::from_le_bytes(desc(surfaces, sid, 0)[104..108].try_into().unwrap());
-                m.put_u32(a[1], caps)?;
+                m.arg_put_u32(a[1], caps)?;
                 if !legacy {
                     for offset in [4u32, 8, 12] {
-                        m.put_u32(a[1] + offset, 0)?;
+                        m.arg_put_u32(a[1] + offset, 0)?;
                     }
                 }
                 0
@@ -1516,11 +1522,11 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                m.write(a[1], &desc(surfaces, sid, 0)[72..104])?;
+                m.arg_write(a[1], &desc(surfaces, sid, 0)[72..104])?;
                 0
             }
             api::GET_ATTACHED => {
-                m.put_u32(a[2], 0)?;
+                m.arg_put_u32(a[2], 0)?;
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
@@ -1532,7 +1538,7 @@ impl DirectDraw {
                 else {
                     return Ok(0x8007000e);
                 };
-                m.put_u32(a[2], p)?;
+                m.arg_put_u32(a[2], p)?;
                 0
             }
             api::FLIP => {
@@ -1645,7 +1651,7 @@ impl DirectDraw {
                     if s.locked.is_some() {
                         return Ok(BUSY);
                     }
-                    let (color, bounds) = (m.u32(a[5] + 80)?, s.rect());
+                    let (color, bounds) = (m.arg_u32(a[5] + 80)?, s.rect());
                     let mut damage = Rect::default();
                     for dr in dr {
                         let dr = dr.clipped(bounds);
@@ -1673,7 +1679,7 @@ impl DirectDraw {
                 // its fields. Native still validates its x86 size and readable
                 // structure, but ignores unrequested effects and color keys.
                 if a[5] != 0 {
-                    let Ok(fx) = m.read(a[5], 100) else {
+                    let Ok(fx) = m.arg_read(a[5], 100) else {
                         return Ok(INVALID);
                     };
                     if fx[..4] != 100u32.to_le_bytes() {
@@ -1684,7 +1690,7 @@ impl DirectDraw {
                     if a[5] == 0 {
                         return Ok(INVALID);
                     }
-                    Some((m.u32(a[5] + 92)?, m.u32(a[5] + 96)?))
+                    Some((m.arg_u32(a[5] + 92)?, m.arg_u32(a[5] + 96)?))
                 } else if a[4] & 0x8000 != 0 {
                     // Like Wine, a source-keyed blit needs a source key.
                     let Some(&key) = self.color_keys.get(&(src, 8)) else {
@@ -1748,7 +1754,7 @@ impl DirectDraw {
                 }
                 0
             }
-            _ => return Err(format!("unknown DirectDraw API {id}")),
+            _ => return Err(format!("unknown DirectDraw API {id}").into()),
         })
     }
 }

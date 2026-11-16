@@ -13,6 +13,7 @@ pub mod shader;
 pub mod wmvcore;
 pub mod xaudio2;
 
+pub mod argument;
 pub mod interop;
 mod refcounts;
 

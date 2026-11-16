@@ -3,6 +3,7 @@
 //! registration never decodes an opaque descriptor or uses a hand-written arity.
 #![allow(clippy::too_many_arguments)] // SDK COM signatures.
 use super::*;
+use crate::argument::CallError;
 use crate::interop::{DcSurface, MemoryDc};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
 use adv_cpu::backend::{Backend, Guest, Prot};
@@ -168,7 +169,7 @@ pub fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Ou
     publish_counters(env);
     match result {
         Ok(hr) => Outcome::Return(hr),
-        Err(error) => Outcome::Fail(format!("DirectDraw activation: {error}")),
+        Err(error) => error.outcome(env),
     }
 }
 fn publish_counters(env: &mut Env<'_>) {
@@ -318,7 +319,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     }
     match result {
         Ok(value) => Outcome::Return(value),
-        Err(error) => Outcome::Fail(format!("DirectDraw: {error}")),
+        Err(error) => error.outcome(env),
     }
 }
 // Static descriptors are verified by the ABI macro against generated SDK data.
@@ -978,7 +979,7 @@ fn get_dc(env: &mut Env<'_>, object: u32, output: u32) -> Outcome {
     }
     let provider = state.provider;
     if let Err(error) = (provider.memory)(env.cpu).writable(output, 4) {
-        return Outcome::Fail(format!("DirectDraw: {error}"));
+        return CallError::Argument(error).outcome(env);
     }
     let surface = dc_surface(env, sid);
     (provider.dc.create)(
@@ -999,7 +1000,7 @@ fn get_dc(env: &mut Env<'_>, object: u32, output: u32) -> Outcome {
                 return (provider.dc.release)(
                     env,
                     dc,
-                    Box::new(move |_, _| Outcome::Fail(format!("DirectDraw: {error}"))),
+                    Box::new(move |env, _| CallError::Argument(error).outcome(env)),
                 );
             }
             env.ext.get_mut::<State>().draw.surface_dcs.insert(dc, sid);
