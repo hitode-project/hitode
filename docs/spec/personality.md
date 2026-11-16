@@ -41,6 +41,12 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: API front ends MUST preserve explicit ACP and charset selection and MUST NOT silently truncate conversion sources.
 **Verification**: Review — charset tests cover selected APIs, but no test checks source completeness across all conversion front ends.
 
+### PERS-SCOPE-12 DirectX argument validation
+
+**Rule**: DirectDraw, DirectSound and their class factories MUST answer a caller pointer argument that does not reach accessible guest memory with `E_INVALIDARG`. Such an argument MUST NOT end the run. Each answer MUST be reported through `adv_abi::warn_unavailable`.
+**Verification**: Test
+**Basis**: Windows DirectX runtimes return `DDERR_INVALIDPARAMS` and `DSERR_INVALIDPARAM` for null caps, descriptor and output pointers.
+
 ## Exports and diagnostics
 
 ### PERS-EXPORT-1 Fixed export structure

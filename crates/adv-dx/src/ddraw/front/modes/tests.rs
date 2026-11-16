@@ -1382,3 +1382,36 @@ fn surfaces_beyond_the_first_store_mapping_grow_the_store() {
         usage.capacity
     );
 }
+
+#[test]
+// spec: PERS-SCOPE-12
+fn inaccessible_argument_pointers_answer_invalid_params() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    for (id, args) in [
+        (api::CREATE_SURFACE, [device, 0, DATA, 0]),
+        (api::CREATE_SURFACE, [device, DATA + 64, 0x10, 0]),
+        (api::GET_CAPS, [device, 0x10, 0, 0]),
+    ] {
+        if id == api::CREATE_SURFACE && args[1] != 0 {
+            let mut desc = [0u8; 124];
+            desc[..4].copy_from_slice(&124u32.to_le_bytes());
+            desc[4..8].copy_from_slice(&7u32.to_le_bytes());
+            desc[8..12].copy_from_slice(&8u32.to_le_bytes());
+            desc[12..16].copy_from_slice(&8u32.to_le_bytes());
+            desc[104..108].copy_from_slice(&0x840u32.to_le_bytes());
+            m.cpu.write(DATA + 64, &desc).unwrap();
+        }
+        let arity = if id == api::GET_CAPS { 3 } else { 4 };
+        assert!(matches!(
+            front::call(&mut env(&mut m), id, &args[..arity]),
+            Outcome::Return(0x80070057)
+        ));
+    }
+    let diagnostics = m.ext.get::<adv_abi::ApiDiagnostics>();
+    assert!(
+        diagnostics
+            .warnings
+            .keys()
+            .any(|(_, reason)| reason.contains("E_INVALIDARG"))
+    );
+}

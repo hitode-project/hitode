@@ -93,7 +93,7 @@ fn get_surface_from_dc(
         {
             Ok(Some(pointer)) => pointer,
             Ok(None) => return Outcome::Return(0x8007000e),
-            Err(error) => return Outcome::Fail(format!("DirectDraw: {error}")),
+            Err(error) => return error.outcome(env),
         };
     match output.write(env.cpu, pointer) {
         Ok(()) => Outcome::Return(0),

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use adv_abi::{Conv, Registry};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
+use adv_dx::argument::CallError;
 use adv_machine::layout::PAGE;
 use adv_machine::{Env, Machine, Outcome};
 
@@ -73,7 +74,8 @@ pub(super) fn register(registry: &mut Registry) {
     );
     registry.add(MODULE, METHODS[0].0, Conv::Stdcall { argc: 3 }, |env| {
         let (this, iid, out) = (env.arg(0), env.arg(1), env.arg(2));
-        hresult(factory_interface(env, this, iid, out))
+        let result = factory_interface(env, this, iid, out);
+        hresult(env, result)
     });
     // The factories are static: their references never end them.
     for (name, argc) in [METHODS[1], METHODS[2]] {
@@ -83,7 +85,7 @@ pub(super) fn register(registry: &mut Registry) {
         let (this, outer, iid, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
         let iid = match read_guid(env, iid) {
             Ok(iid) => iid,
-            Err(error) => return Outcome::Fail(error),
+            Err(error) => return error.outcome(env),
         };
         match env.ext.get::<Factories>().objects.get(&this).copied() {
             Some(Activation::DirectDraw) => adv_dx::ddraw::front::activate(env, iid, outer, out),
@@ -136,18 +138,19 @@ pub(super) fn get_class_object(
     activation: impl FnOnce([u8; 16]) -> Option<Activation>,
 ) -> Outcome {
     let (class, iid, out) = (env.arg(0), env.arg(1), env.arg(2));
-    hresult((|| {
+    let result = (|| {
         let Some(activation) = activation(read_guid(env, class)?) else {
             write(env, out, 0)?;
             return Ok(CLASS_E_CLASSNOTAVAILABLE);
         };
         let factory = factory(env, activation)?;
         factory_interface(env, factory, iid, out)
-    })())
+    })();
+    hresult(env, result)
 }
 
 /// The factory object for `activation`, made on first use.
-fn factory(env: &mut Env<'_>, activation: Activation) -> Result<u32, String> {
+fn factory(env: &mut Env<'_>, activation: Activation) -> Result<u32, CallError> {
     let factories = env.ext.get::<Factories>();
     let same = |a: &Activation| match (a, &activation) {
         (Activation::DirectDraw, Activation::DirectDraw) => true,
@@ -159,10 +162,12 @@ fn factory(env: &mut Env<'_>, activation: Activation) -> Result<u32, String> {
     }
     let object = factories.page + 4 * (METHODS.len() + factories.objects.len()) as u32;
     if object + 4 > factories.page + PAGE {
-        return Err(format!("{MODULE}: too many class factories"));
+        return Err(format!("{MODULE}: too many class factories").into());
     }
     let vtable = factories.page;
-    write(env, object, vtable)?;
+    env.cpu
+        .write_u32(object, vtable)
+        .map_err(|e| format!("{MODULE}: {e}"))?;
     env.ext
         .get_mut::<Factories>()
         .objects
@@ -171,7 +176,12 @@ fn factory(env: &mut Env<'_>, activation: Activation) -> Result<u32, String> {
 }
 
 /// Hand out `factory` as `iid` through `out`.
-fn factory_interface(env: &mut Env<'_>, factory: u32, iid: u32, out: u32) -> Result<u32, String> {
+fn factory_interface(
+    env: &mut Env<'_>,
+    factory: u32,
+    iid: u32,
+    out: u32,
+) -> Result<u32, CallError> {
     let iid = read_guid(env, iid)?;
     if iid != IUNKNOWN && iid != ICLASSFACTORY {
         write(env, out, 0)?;
@@ -181,23 +191,21 @@ fn factory_interface(env: &mut Env<'_>, factory: u32, iid: u32, out: u32) -> Res
     Ok(0)
 }
 
-fn hresult(result: Result<u32, String>) -> Outcome {
+fn hresult(env: &mut Env<'_>, result: Result<u32, CallError>) -> Outcome {
     match result {
         Ok(hr) => Outcome::Return(hr),
-        Err(error) => Outcome::Fail(error),
+        Err(error) => error.outcome(env),
     }
 }
 
-fn read_guid(env: &Env<'_>, at: u32) -> Result<[u8; 16], String> {
+/// Caller-supplied GUID.
+fn read_guid(env: &Env<'_>, at: u32) -> Result<[u8; 16], CallError> {
     let mut guid = [0; 16];
-    env.cpu
-        .read(at, &mut guid)
-        .map_err(|e| format!("{MODULE}: {e}"))?;
+    env.cpu.read(at, &mut guid)?;
     Ok(guid)
 }
 
-fn write(env: &mut Env<'_>, at: u32, value: u32) -> Result<(), String> {
-    env.cpu
-        .write_u32(at, value)
-        .map_err(|e| format!("{MODULE}: {e}"))
+/// Caller-supplied output pointer.
+fn write(env: &mut Env<'_>, at: u32, value: u32) -> Result<(), CallError> {
+    Ok(env.cpu.write_u32(at, value)?)
 }
