@@ -58,6 +58,7 @@ fn voice(control: &AudioControl) {
                 view,
                 channels: 1,
                 bits: 16,
+                float: false,
                 frequency: 48_000,
                 output_rate: 44_100,
                 notifications: vec![],

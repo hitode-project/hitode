@@ -18,6 +18,7 @@ fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() 
         rate: 1000,
         channels: 1,
         bits: 8,
+        ..Format::default()
     };
     m.cpu.write(DATA + 64, &format.bytes()).unwrap();
     for (flags, expected) in [
