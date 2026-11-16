@@ -220,6 +220,24 @@ pub fn set_protections(memory: &mut Memory, base: u32, protections: &[u32]) {
     }
 }
 
+pub(crate) const SECTION_PROTECTION: Status = 0xc000_004e;
+const CAP_READ: u8 = 1;
+const CAP_WRITE: u8 = 2;
+const CAP_EXEC: u8 = 4;
+
+/// Access capabilities granted by a Win32 `PAGE_*` protection constant.
+pub(crate) fn protection_caps(protection: u32) -> Result<u8, Status> {
+    match protection & !(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE) {
+        PAGE_NOACCESS => Ok(0),
+        PAGE_READONLY | PAGE_WRITECOPY => Ok(CAP_READ),
+        PAGE_READWRITE => Ok(CAP_READ | CAP_WRITE),
+        PAGE_EXECUTE => Ok(CAP_EXEC),
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_WRITECOPY => Ok(CAP_READ | CAP_EXEC),
+        PAGE_EXECUTE_READWRITE => Ok(CAP_READ | CAP_WRITE | CAP_EXEC),
+        _ => Err(status::INVALID_PAGE_PROTECTION),
+    }
+}
+
 /// Maps `bytes`, zero-filled to `size`, as a view of a data section with
 /// `protection`, and returns its base.
 pub fn map_view(
@@ -231,6 +249,7 @@ pub fn map_view(
     protection: u32,
     base: u32,
 ) -> Result<u32, Status> {
+    let caps = protection_caps(protection)?;
     let prot = memory.prot(protection)?;
     let size = align_up(size, PAGE);
     let placeholder = replaced_placeholder(memory, base);
@@ -248,8 +267,10 @@ pub fn map_view(
         protection,
         vec![Some(protection); (size / PAGE) as usize],
     );
+    let region = memory.regions.get_mut(&base).unwrap();
+    region.maximum_protection = Some(u32::from(caps));
     if placeholder {
-        memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
+        region.placeholder = Placeholder::Replaced;
     }
     Ok(base)
 }
@@ -286,8 +307,13 @@ pub(crate) fn map_shared_view_at(
     protection: u32,
     (base, size): (u32, u32),
 ) -> Result<u32, Status> {
-    // Data views never execute, whatever the image's DEP choice.
-    let prot = Prot(memory.prot(protection)?.0 & !Prot::EXEC.0);
+    let caps = protection_caps(protection)?;
+    // Non-executable data views never execute, even when execute_readable is set.
+    let prot = if caps & CAP_EXEC != 0 {
+        memory.prot(protection)?
+    } else {
+        Prot(memory.prot(protection)?.0 & !Prot::EXEC.0)
+    };
     let size = align_up(size, PAGE);
     let placeholder = replaced_placeholder(memory, base);
     if cpu.map_shared_file(base, size, fd, offset, prot).is_err() {
@@ -301,8 +327,10 @@ pub(crate) fn map_shared_view_at(
         protection,
         vec![Some(protection); (size / PAGE) as usize],
     );
+    let region = memory.regions.get_mut(&base).unwrap();
+    region.maximum_protection = Some(u32::from(caps));
     if placeholder {
-        memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
+        region.placeholder = Placeholder::Replaced;
     }
     Ok(base)
 }
@@ -341,15 +369,8 @@ pub(crate) fn map_source_view(
         protection,
         vec![Some(protection); (size / PAGE) as usize],
     );
-    memory.regions.get_mut(&base).unwrap().maximum_protection = Some(
-        PAGE_NOACCESS
-            | PAGE_READONLY
-            | if copy {
-                PAGE_READWRITE | PAGE_WRITECOPY
-            } else {
-                0
-            },
-    );
+    let caps = protection_caps(protection)?;
+    memory.regions.get_mut(&base).unwrap().maximum_protection = Some(u32::from(caps));
     if placeholder {
         memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
     }
@@ -469,6 +490,23 @@ pub fn allocate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
+fn check_maximum_protection(
+    region: &Region,
+    protection: u32,
+    prot: &mut Prot,
+) -> Result<(), Status> {
+    if let Some(maximum) = region.maximum_protection {
+        let requested = u32::from(protection_caps(protection)?);
+        if requested & !maximum != 0 {
+            return Err(SECTION_PROTECTION);
+        }
+        if maximum & u32::from(CAP_EXEC) == 0 {
+            prot.0 &= !Prot::EXEC.0;
+        }
+    }
+    Ok(())
+}
+
 fn allocate_in(
     env: &mut Env<'_>,
     args: &[u32],
@@ -493,7 +531,7 @@ fn allocate_in(
     if size == 0 {
         return Err(status::INVALID_PARAMETER);
     }
-    let prot = memory(env).prot(protection)?;
+    let mut prot = memory(env).prot(protection)?;
     if kind & MEM_RESET != 0 {
         // Contents may be discarded; keeping them is allowed.
         return Ok(());
@@ -548,9 +586,12 @@ fn allocate_in(
         let (start, length) = pages(address, size)?;
         match memory(env).region_of(start) {
             Some((base, region))
-                if region.kind == Kind::Private
+                if matches!(region.kind, Kind::Private | Kind::Mapped)
                     && region.placeholder != Placeholder::Free
-                    && start + length <= region.end(base) => {}
+                    && start + length <= region.end(base) =>
+            {
+                check_maximum_protection(region, protection, &mut prot)?;
+            }
             _ => return Err(status::CONFLICTING_ADDRESSES),
         }
         (start, length)
@@ -723,12 +764,7 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
     if start + length > region.end(base) {
         return Err(status::NOT_MAPPED_VIEW);
     }
-    if let Some(maximum) = region.maximum_protection {
-        if protection & 0xff & !maximum != 0 {
-            return Err(0xc000_004e);
-        }
-        prot.0 &= !Prot::EXEC.0;
-    }
+    check_maximum_protection(region, protection, &mut prot)?;
     let first = ((start - base) / PAGE) as usize;
     let range = first..first + (length / PAGE) as usize;
     let Some(old) = region.pages[first] else {
@@ -1835,5 +1871,64 @@ mod volume_tests {
         cpu.read(first + 31 * PAGE, &mut byte).unwrap();
         assert_eq!(byte, [32]);
         assert_eq!(loads.get(), 2);
+    }
+
+    #[test]
+    fn mapped_view_protection_ceilings_follow_windows_capabilities() {
+        let mut memory = Memory {
+            execute_readable: true,
+            ..Default::default()
+        };
+        let cpu_ro = Cpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        let mut cpu = cpu_ro;
+        let mut vm = Vm::new();
+        let base_ro = vm.reserve(PAGE).unwrap();
+        map_view(
+            &mut cpu,
+            &mut vm,
+            &mut memory,
+            &[],
+            PAGE,
+            PAGE_READONLY,
+            base_ro,
+        )
+        .unwrap();
+        let mut prot = memory.prot(PAGE_WRITECOPY).unwrap();
+        let mut prot_rw = memory.prot(PAGE_READWRITE).unwrap();
+        let mut prot_x = memory.prot(PAGE_EXECUTE_READ).unwrap();
+        let (_, region_ro) = memory.region_of(base_ro).unwrap();
+
+        assert_eq!(
+            check_maximum_protection(region_ro, PAGE_WRITECOPY, &mut prot),
+            Ok(())
+        );
+        assert!(!prot.contains(Prot::EXEC));
+        assert_eq!(
+            check_maximum_protection(region_ro, PAGE_READWRITE, &mut prot_rw),
+            Err(SECTION_PROTECTION)
+        );
+        assert_eq!(
+            check_maximum_protection(region_ro, PAGE_EXECUTE_READ, &mut prot_x),
+            Err(SECTION_PROTECTION)
+        );
+
+        let base_rwx = vm.reserve(PAGE).unwrap();
+        map_view(
+            &mut cpu,
+            &mut vm,
+            &mut memory,
+            &[],
+            PAGE,
+            PAGE_EXECUTE_READWRITE,
+            base_rwx,
+        )
+        .unwrap();
+        let mut prot_rx = memory.prot(PAGE_EXECUTE_READ).unwrap();
+        let (_, region_rwx) = memory.region_of(base_rwx).unwrap();
+        assert_eq!(
+            check_maximum_protection(region_rwx, PAGE_EXECUTE_READ, &mut prot_rx),
+            Ok(())
+        );
+        assert!(prot_rx.contains(Prot::EXEC));
     }
 }

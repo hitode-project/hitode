@@ -1281,7 +1281,7 @@ impl Memory {
     ) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         if self.reservation.is_none()
-            || perms & !(READ | WRITE) != 0
+            || perms & !(READ | WRITE | EXEC) != 0
             || perms & READ == 0
             || self.mapped[pages.clone()].iter().any(|&mapped| mapped)
         {
@@ -1333,6 +1333,9 @@ impl Memory {
             return;
         };
         let perms = self.perms[linear.start];
+        if perms & EXEC != 0 {
+            return;
+        }
         let Some(source) = storage.host_pages(*offset, end - first, host) else {
             return;
         };

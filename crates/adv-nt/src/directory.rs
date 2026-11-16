@@ -26,6 +26,9 @@ const FILE_BOTH_DIRECTORY_INFORMATION: u32 = 3;
 const FD_TYPE_DIR: i32 = 2;
 const BUFFER_OVERFLOW: Status = 0x8000_0005;
 const NO_MORE_FILES: Status = 0x8000_0006;
+const FILE_ID_BOTH_DIRECTORY_INFORMATION: u32 = 37;
+const FILE_ID_FULL_DIRECTORY_INFORMATION: u32 = 38;
+const FILE_ID_EXTD_DIRECTORY_INFORMATION: u32 = 60;
 const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION: u32 = 63;
 
 pub(crate) const FIND_QUERY: &str = "find_first_directory_query";
@@ -107,20 +110,30 @@ pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
     let (io, buffer, length, class, mask, restart) =
         (args[4], args[5], args[6], args[7], args[9], args[10]);
     Outcome::call(target, args, move |env, result| {
-        if result.value() != status::SUCCESS
-            || class != FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION
-            || restart as u8 == 0
-            || env.cpu.read_u32(io + 4).ok() != Some(0)
-            || !read_unicode_string(env, mask).is_ok_and(|name| {
+        if class != FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION {
+            return Outcome::Return(result.value());
+        }
+        let legacy_hook_error = matches!(
+            result.value(),
+            status::INVALID_HANDLE | status::INVALID_INFO_CLASS
+        );
+        let empty_exact_lookup = result.value() == status::SUCCESS
+            && restart as u8 != 0
+            && env.cpu.read_u32(io + 4).ok() == Some(0)
+            && read_unicode_string(env, mask).is_ok_and(|name| {
                 !name.is_empty()
                     && !name
                         .iter()
                         .any(|&unit| [42, 63, 60, 62, 34].contains(&unit))
-            })
-        {
+            });
+        if !legacy_hook_error && !empty_exact_lookup {
             return Outcome::Return(result.value());
         }
         args[7] = FILE_BOTH_DIRECTORY_INFORMATION;
+        if legacy_hook_error {
+            // Translate one entry so a legacy hook's multi-entry wildcard reply still converts cleanly.
+            args[8] = 1;
+        }
         Outcome::call(target, args, move |env, legacy| {
             if legacy.value() == status::SUCCESS
                 && let Some(bytes) = legacy_find_record(env, io, buffer, length)
@@ -129,6 +142,9 @@ pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
                 return status::finish(
                     write_u32(env, io + 4, bytes.len() as u32).map_err(Error::Status),
                 );
+            }
+            if legacy_hook_error {
+                return Outcome::Return(legacy.value());
             }
             // Leave the result of the original empty query intact.
             status::finish(
@@ -200,17 +216,14 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 "NtQueryDirectoryFile with an event or APC routine".into(),
             ));
         }
-        let fixed = match class {
-            FILE_DIRECTORY_INFORMATION => 64,
-            FILE_FULL_DIRECTORY_INFORMATION => 68,
-            FILE_BOTH_DIRECTORY_INFORMATION => 94,
-            FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION => 114,
-            10 | 12 | 37 | 38 | 50 | 60 => {
+        let fixed = match fixed_record_size(class) {
+            Some(fixed) => fixed,
+            None if matches!(class, 10 | 12 | 50) => {
                 return Err(Error::Unsupported(format!(
                     "directory information class {class}"
                 )));
             }
-            _ => return Err(status::INVALID_INFO_CLASS.into()),
+            None => return Err(status::INVALID_INFO_CLASS.into()),
         };
         if length < align(fixed) {
             return Err(status::INFO_LENGTH_MISMATCH.into());
@@ -297,24 +310,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             );
             entry[56..60].copy_from_slice(&basic[32..36]);
             entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
-            if class == 63 {
-                entry[72..80].copy_from_slice(&metadata.ino().to_le_bytes());
-            }
-            if class == 3 || class == 63 {
-                let units: Vec<u16> = name
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| u16::from_le_bytes(*pair))
-                    .collect();
-                let short = crate::path::short_name(&units);
-                let offset = if class == 3 { 68 } else { 88 };
-                entry[offset] = (short.len() * 2) as u8;
-                for (index, unit) in short.iter().enumerate() {
-                    entry[offset + 2 + index * 2..offset + 4 + index * 2]
-                        .copy_from_slice(&unit.to_le_bytes());
-                }
-            }
+            write_record_ids_and_short_name(entry, class, metadata.ino(), &name);
             bytes.extend_from_slice(&name[..shown]);
             if let Some(previous) = last {
                 bytes[previous as usize..previous as usize + 4]
@@ -341,6 +337,57 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             result => Err(result.into()),
         }
     })())
+}
+
+fn fixed_record_size(class: u32) -> Option<u32> {
+    match class {
+        FILE_DIRECTORY_INFORMATION => Some(64),
+        FILE_FULL_DIRECTORY_INFORMATION => Some(68),
+        FILE_BOTH_DIRECTORY_INFORMATION => Some(94),
+        FILE_ID_BOTH_DIRECTORY_INFORMATION => Some(104),
+        FILE_ID_FULL_DIRECTORY_INFORMATION => Some(80),
+        FILE_ID_EXTD_DIRECTORY_INFORMATION => Some(88),
+        FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION => Some(114),
+        _ => None,
+    }
+}
+
+fn write_record_ids_and_short_name(entry: &mut [u8], class: u32, ino: u64, name: &[u8]) {
+    match class {
+        FILE_ID_BOTH_DIRECTORY_INFORMATION => {
+            entry[96..104].copy_from_slice(&ino.to_le_bytes());
+        }
+        FILE_ID_FULL_DIRECTORY_INFORMATION
+        | FILE_ID_EXTD_DIRECTORY_INFORMATION
+        | FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION => {
+            entry[72..80].copy_from_slice(&ino.to_le_bytes());
+        }
+        _ => {}
+    }
+    if matches!(
+        class,
+        FILE_BOTH_DIRECTORY_INFORMATION
+            | FILE_ID_BOTH_DIRECTORY_INFORMATION
+            | FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION
+    ) {
+        let units: Vec<u16> = name
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        let short = crate::path::short_name(&units);
+        let offset = if class == FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION {
+            88
+        } else {
+            68
+        };
+        entry[offset] = (short.len() * 2) as u8;
+        for (index, unit) in short.iter().enumerate() {
+            entry[offset + 2 + index * 2..offset + 4 + index * 2]
+                .copy_from_slice(&unit.to_le_bytes());
+        }
+    }
 }
 
 fn align(size: u32) -> u32 {
@@ -420,7 +467,7 @@ const DOS_DOT: u16 = b'"' as u16;
 
 #[cfg(test)]
 mod tests {
-    use super::matches;
+    use super::{fixed_record_size, matches, write_record_ids_and_short_name};
 
     fn utf16(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
@@ -455,5 +502,34 @@ mod tests {
                 "{mask}, {name}"
             );
         }
+    }
+
+    // spec: WINE-SYS-5
+    #[test]
+    fn directory_id_classes_match_windows_offsets() {
+        assert_eq!(fixed_record_size(3), Some(94));
+        assert_eq!(fixed_record_size(37), Some(104));
+        assert_eq!(fixed_record_size(38), Some(80));
+        assert_eq!(fixed_record_size(60), Some(88));
+        assert_eq!(fixed_record_size(63), Some(114));
+
+        let name: Vec<u8> = utf16("longfilename_test.txt")
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let ino = 0x0018_0000_0005_b376u64;
+
+        let mut e37 = vec![0u8; 104];
+        write_record_ids_and_short_name(&mut e37, 37, ino, &name);
+        assert_eq!(e37[68], 24);
+        assert_eq!(&e37[96..104], &ino.to_le_bytes());
+
+        let mut e38 = vec![0u8; 80];
+        write_record_ids_and_short_name(&mut e38, 38, ino, &name);
+        assert_eq!(&e38[72..80], &ino.to_le_bytes());
+
+        let mut e60 = vec![0u8; 88];
+        write_record_ids_and_short_name(&mut e60, 60, ino, &name);
+        assert_eq!(&e60[72..80], &ino.to_le_bytes());
     }
 }

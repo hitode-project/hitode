@@ -126,6 +126,7 @@ impl Attributes {
 /// NtClose(handle)
 pub fn close(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     crate::directory::forget(env, args[0]);
+    crate::section::forget(env, args[0]);
     status::finish(crate::server::close(env, args[0]))
 }
 
@@ -325,6 +326,15 @@ pub fn duplicate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
         let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
         if destination != 0 {
             write_u32(env, destination, reply.handle)?;
+        }
+        if reply.header.error == 0 {
+            crate::section::duplicate_handle(
+                env,
+                src_process,
+                src_handle,
+                dst_process,
+                reply.handle,
+            );
         }
         status::check(reply.header.error)
     })())
