@@ -3,7 +3,9 @@
 //! The first query on a handle lists the directory: `.` and `..`, then
 //! the entries that match the mask in name order. Each query goes on from
 //! where the last stopped, until a restart. Entries include Wine's hashed
-//! 8.3 aliases for names that need them.
+//! 8.3 aliases for names that need them. A mask without wildcards names
+//! one entry, which the path index finds without listing the directory
+//! again, as Wine finds it by name.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -121,10 +123,7 @@ pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
             && restart as u8 != 0
             && env.cpu.read_u32(io + 4).ok() == Some(0)
             && read_unicode_string(env, mask).is_ok_and(|name| {
-                !name.is_empty()
-                    && !name
-                        .iter()
-                        .any(|&unit| [42, 63, 60, 62, 34].contains(&unit))
+                !name.is_empty() && !name.iter().any(|unit| WILDCARDS.contains(unit))
             });
         if !legacy_hook_error && !empty_exact_lookup {
             return Outcome::Return(result.value());
@@ -395,7 +394,26 @@ fn align(size: u32) -> u32 {
 }
 
 /// `.`, `..` and the entries of `directory` that match `mask`, in order.
+/// A mask without wildcards names one entry, found through the path index
+/// as Wine finds it by name; other masks list the directory, checking only
+/// matching names.
 fn list(directory: &std::path::Path, mask: Option<&[u16]>) -> Result<Vec<OsString>, Status> {
+    let listed = |path: &std::path::Path| {
+        path.metadata()
+            .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
+    };
+    if let Some(mask) = mask
+        && !mask.iter().any(|unit| WILDCARDS.contains(unit))
+        && let Ok(name) = String::from_utf16(mask)
+        && name != "."
+        && name != ".."
+    {
+        let found = crate::path::entry(directory, &name);
+        return Ok(found
+            .into_iter()
+            .filter(|name| listed(&directory.join(name)))
+            .collect());
+    }
     let wanted = |name: &OsString| {
         let name: Vec<u16> = name.to_string_lossy().encode_utf16().collect();
         mask.is_none_or(|mask| {
@@ -405,14 +423,12 @@ fn list(directory: &std::path::Path, mask: Option<&[u16]>) -> Result<Vec<OsStrin
     let entries = std::fs::read_dir(directory).map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
     let mut names: Vec<OsString> = entries
         .flatten()
-        .filter(|entry| {
-            entry
-                .path()
-                .metadata()
-                .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
+        .filter(|entry| wanted(&entry.file_name()))
+        .filter(|entry| match entry.file_type() {
+            Ok(kind) if !kind.is_symlink() => kind.is_file() || kind.is_dir(),
+            _ => listed(&entry.path()),
         })
         .map(|entry| entry.file_name())
-        .filter(&wanted)
         .collect();
     names.sort();
     let dots = [".", ".."].map(OsString::from);
@@ -464,10 +480,12 @@ const DOT: u16 = b'.' as u16;
 const DOS_STAR: u16 = b'<' as u16;
 const DOS_QM: u16 = b'>' as u16;
 const DOS_DOT: u16 = b'"' as u16;
+const WILDCARDS: [u16; 5] = [STAR, QUESTION, DOS_STAR, DOS_QM, DOS_DOT];
 
 #[cfg(test)]
 mod tests {
-    use super::{fixed_record_size, matches, write_record_ids_and_short_name};
+    use super::{fixed_record_size, list, matches, write_record_ids_and_short_name};
+    use std::ffi::OsString;
 
     fn utf16(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
@@ -531,5 +549,44 @@ mod tests {
         let mut e60 = vec![0u8; 88];
         write_record_ids_and_short_name(&mut e60, 60, ino, &name);
         assert_eq!(&e60[72..80], &ino.to_le_bytes());
+    }
+
+    // spec: WINE-SYS-5
+    #[test]
+    fn exact_masks_name_one_entry_and_wildcards_list_files_and_directories() {
+        let root = std::env::temp_dir().join(format!("adv-nt-directory-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Sub")).unwrap();
+        std::fs::write(root.join("Present.G00"), b"").unwrap();
+        std::fs::write(root.join("LongFileName.txt"), b"").unwrap();
+        std::os::unix::fs::symlink("Present.G00", root.join("link.g00")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join("broken.g00")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("pipe.g00").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let names = |mask: &str| -> Vec<String> {
+            list(&root, Some(&utf16(mask)))
+                .unwrap()
+                .into_iter()
+                .map(|name: OsString| name.into_string().unwrap())
+                .collect()
+        };
+        let alias =
+            String::from_utf16(&crate::path::short_name(&utf16("LongFileName.txt"))).unwrap();
+        assert_eq!(names("present.g00"), ["Present.G00"]);
+        assert_eq!(names(&alias), ["LongFileName.txt"]);
+        assert_eq!(names("SUB"), ["Sub"]);
+        assert_eq!(names("link.g00"), ["link.g00"]);
+        for absent in ["missing.g00", "broken.g00", "pipe.g00"] {
+            assert!(names(absent).is_empty(), "{absent}");
+        }
+        assert_eq!(names("*.g00"), ["Present.G00", "link.g00"]);
+        assert_eq!(names("."), ["."]);
+        // A name the host adds later changes the directory and is found.
+        std::fs::write(root.join("Later.g00"), b"").unwrap();
+        assert_eq!(names("later.G00"), ["Later.g00"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

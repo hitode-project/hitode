@@ -25,19 +25,50 @@ thread_local! {
 
 pub(super) fn find(directory: &Path, name: &str) -> Option<PathBuf> {
     let metadata = directory.metadata().ok()?;
-    CACHE.with_borrow_mut(|cache| {
-        let units: Vec<_> = name.encode_utf16().collect();
-        let alias = units.len() >= 8 && units[4] == 126 && super::short_name(&units).is_empty();
-        if !alias && !cache.case_sensitive(directory, metadata.dev()) {
-            return None;
-        }
+    CACHE
+        .with_borrow_mut(|cache| {
+            let units: Vec<_> = name.encode_utf16().collect();
+            let alias = units.len() >= 8 && units[4] == 126 && super::short_name(&units).is_empty();
+            if !alias && !cache.case_sensitive(directory, metadata.dev()) {
+                return None;
+            }
+            cache.entry(directory, &metadata, name)
+        })
+        .map(|entry| directory.join(entry))
+}
+
+/// The host name of the entry of `directory` that `name` names without
+/// regard to case or as its hashed alias, on any volume.
+pub(super) fn entry(directory: &Path, name: &str) -> Option<OsString> {
+    let metadata = directory.metadata().ok()?;
+    CACHE.with_borrow_mut(|cache| cache.entry(directory, &metadata, name))
+}
+
+/// Drop the index of a file's containing directory for an NT mutation.
+pub(crate) fn invalidate(file: &Path) {
+    if let Some(metadata) = file.parent().and_then(|parent| parent.metadata().ok()) {
+        CACHE.with_borrow_mut(|cache| {
+            cache
+                .directories
+                .retain(|entry| entry.identity != (metadata.dev(), metadata.ino()));
+        });
+    }
+}
+
+impl Cache {
+    fn entry(
+        &mut self,
+        directory: &Path,
+        metadata: &std::fs::Metadata,
+        name: &str,
+    ) -> Option<OsString> {
         let identity = (metadata.dev(), metadata.ino());
         let modified = (metadata.mtime(), metadata.mtime_nsec());
-        let position = cache
+        let position = self
             .directories
             .iter()
             .position(|entry| entry.identity == identity);
-        let mut entry = position.and_then(|position| cache.directories.remove(position));
+        let mut entry = position.and_then(|position| self.directories.remove(position));
         if entry
             .as_ref()
             .is_none_or(|entry| entry.modified != modified)
@@ -64,30 +95,14 @@ pub(super) fn find(directory: &Path, name: &str) -> Option<PathBuf> {
             });
         }
         let entry = entry?;
-        let result = entry
-            .names
-            .get(&name.to_lowercase())
-            .map(|name| directory.join(name));
-        cache.directories.push_back(entry);
-        if cache.directories.len() > 256 {
-            cache.directories.pop_front();
+        let result = entry.names.get(&name.to_lowercase()).cloned();
+        self.directories.push_back(entry);
+        if self.directories.len() > 256 {
+            self.directories.pop_front();
         }
         result
-    })
-}
-
-/// Drop the index of a file's containing directory for an NT mutation.
-pub(crate) fn invalidate(file: &Path) {
-    if let Some(metadata) = file.parent().and_then(|parent| parent.metadata().ok()) {
-        CACHE.with_borrow_mut(|cache| {
-            cache
-                .directories
-                .retain(|entry| entry.identity != (metadata.dev(), metadata.ino()));
-        });
     }
-}
 
-impl Cache {
     fn case_sensitive(&mut self, directory: &Path, _device: u64) -> bool {
         #[cfg(target_vendor = "apple")]
         return *self
