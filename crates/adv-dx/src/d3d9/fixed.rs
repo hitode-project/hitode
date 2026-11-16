@@ -481,8 +481,10 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
-    if !valid_fvf(fvf) {
-        return UNAVAILABLE;
+    // Any FVF is state; draws reject one without a fixed-function layout.
+    // Zero is accepted and leaves the current binding unchanged.
+    if fvf == 0 {
+        return 0;
     }
     let previous = f.fvf;
     if previous == fvf

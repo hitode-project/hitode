@@ -363,6 +363,12 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 | Unsupported divisors | MUST return D3DERR_NOTAVAILABLE. |
 | Reset | MUST restore every stream frequency to one. |
 
+### GFX-INPUT-8 FVF state and implicit declarations
+
+**Rule**: SetFVF MUST store any nonzero FVF as state, replacing a bound declaration, and zero MUST succeed without change. After SetFVF, GetVertexDeclaration MUST return one device-retained declaration per FVF, built by the D3D9 FVF element mapping. Draws MUST reject an FVF without a supported layout.
+**Verification**: Test
+**Basis**: Wine d3d9 `test_fvf_decl_conversion` and `test_fvf_decl_management`, which pass on Windows.
+
 ## Samplers
 
 ### GFX-SAMPLER-1 Addressing
@@ -477,6 +483,12 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 
 **Rule**: UpdateSurface MUST upload matching-format SYSTEMMEM surfaces or texture levels into DEFAULT destinations, honoring optional source rectangles and destination points. Invalid pools, formats, locked surfaces, depth/stencil, multisampling, and out-of-bounds rectangles MUST return D3DERR_INVALIDCALL. Uploads MUST preserve pixels outside the destination rectangle and track resource-level writes.
 **Verification**: Test
+
+### GFX-COPY-4 Plain-surface formats and color fills
+
+**Rule**: DEFAULT offscreen plain surfaces MUST accept every format CheckDeviceFormat advertises for plain surfaces. ColorFill MUST store the D3DCOLOR truncated to the surface format, as a locked write of that texel would. Lock readback MUST return exactly those packed texels.
+**Verification**: Test
+**Basis**: Wine d3d9 `colorfill_test`, which passes on Windows.
 
 ### GFX-STATE-1 Neutral fixed state
 

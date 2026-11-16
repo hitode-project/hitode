@@ -162,7 +162,93 @@ fn binding_replaces_the_fvf_and_set_fvf_releases_the_declaration() {
     assert_eq!(fvf(&mut env, this), 0x142);
     assert!(com(&env).get_identity(&env.sys.objects, decl).is_none());
     assert_eq!(get(&mut env, this, output), 0);
-    assert_eq!(output.read(env.cpu).unwrap(), 0);
+    let implicit = output.read(env.cpu).unwrap();
+    assert_ne!(implicit, declaration);
+    assert_eq!(
+        super::declaration(&env, implicit).unwrap().elements,
+        fvf_elements(0x142)
+    );
+    assert_eq!(release(&mut env, implicit), 0);
+}
+
+/// (offset, type, usage, usage index) records on stream zero.
+type Records<'a> = &'a [(u16, u8, u8, u8)];
+fn records(list: Records<'_>) -> Vec<[u8; 8]> {
+    let mut records: Vec<[u8; 8]> = list
+        .iter()
+        .map(|&(offset, kind, usage, index)| {
+            let [low, high] = offset.to_le_bytes();
+            [0, 0, low, high, kind, 0, usage, index]
+        })
+        .collect();
+    records.push([0xff, 0, 0, 0, 17, 0, 0, 0]);
+    records
+}
+
+// spec: GFX-INPUT-8
+#[test]
+fn fvf_declarations_follow_the_d3d9_element_mapping() {
+    // (offset, type, usage, usage index); usages 0 POSITION, 1 BLENDWEIGHT,
+    // 2 BLENDINDICES, 3 NORMAL, 5 TEXCOORD, 9 POSITIONT, 10 COLOR.
+    let cases: &[(u32, Records<'_>)] = &[
+        (0x0e, &[(0, 2, 0, 0), (12, 3, 1, 0), (28, 0, 2, 0)]),
+        (0x100e, &[(0, 2, 0, 0), (12, 3, 1, 0), (28, 5, 2, 0)]),
+        (0x8008, &[(0, 2, 0, 0), (12, 4, 1, 0), (16, 5, 2, 0)]),
+        (0x800a, &[(0, 2, 0, 0), (12, 1, 1, 0), (20, 4, 2, 0)]),
+        (0x1006, &[(0, 2, 0, 0), (12, 5, 2, 0)]),
+        (0x4012, &[(0, 3, 0, 0), (16, 2, 3, 0)]),
+        (0x10, &[(0, 2, 3, 0)]),
+        (
+            0x100c4 | 0x200,
+            &[
+                (0, 3, 9, 0),
+                (16, 4, 10, 0),
+                (20, 4, 10, 1),
+                (24, 2, 5, 0),
+                (36, 1, 5, 1),
+            ],
+        ),
+    ];
+    for &(fvf, expected) in cases {
+        assert_eq!(fvf_elements(fvf), records(expected), "{fvf:#x}");
+    }
+}
+
+// spec: GFX-INPUT-8
+#[test]
+fn set_fvf_keeps_any_fvf_and_serves_one_implicit_declaration_per_fvf() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (device, _) = setup(&mut env);
+    let this = GuestPtr::new(device);
+    let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+    // A positionless FVF is state; zero leaves the binding unchanged.
+    assert_eq!(fixed::set_fvf(&mut env, this, 0x10), 0);
+    assert_eq!(fixed::set_fvf(&mut env, this, 0), 0);
+    assert_eq!(fvf(&mut env, this), 0x10);
+    // The test machine allows one public reference beside the device's own.
+    let implicit = |env: &mut Env<'_>, fvf: u32| {
+        assert_eq!(fixed::set_fvf(env, this, fvf), 0);
+        assert_eq!(get(env, this, output), 0);
+        let pointer = output.read(env.cpu).unwrap();
+        assert_eq!(release(env, pointer), 0);
+        pointer
+    };
+    let first = implicit(&mut env, 4);
+    // The device keeps the declaration after the application releases it.
+    assert_eq!(implicit(&mut env, 4), first);
+    assert_ne!(implicit(&mut env, 0x10), first);
+    assert_eq!(implicit(&mut env, 4), first);
+    assert_eq!(
+        super::declaration(&env, first).unwrap().elements,
+        records(&[(0, 3, 9, 0)])
+    );
 }
 
 #[test]

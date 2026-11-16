@@ -332,8 +332,133 @@ pub(super) fn set(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) 
     };
     bind(env, device, new)
 }
-/// Reports only declarations bound by SetVertexDeclaration; after SetFVF it
-/// returns null where native D3D9 would return an implicit FVF declaration.
+/// D3DVERTEXELEMENT9 records equivalent to `fvf`, terminator included, in the
+/// order and types of the D3D9 FVF-to-declaration mapping.
+pub(super) fn fvf_elements(fvf: u32) -> Vec<[u8; 8]> {
+    const POSITION: u8 = 0;
+    const BLENDWEIGHT: u8 = 1;
+    const BLENDINDICES: u8 = 2;
+    const NORMAL: u8 = 3;
+    const PSIZE: u8 = 4;
+    const TEXCOORD: u8 = 5;
+    const POSITIONT: u8 = 9;
+    const COLOR: u8 = 10;
+    const FLOAT1: u8 = 0;
+    const FLOAT3: u8 = 2;
+    const FLOAT4: u8 = 3;
+    const D3DCOLOR: u8 = 4;
+    const UBYTE4: u8 = 5;
+    const LASTBETA_UBYTE4: u32 = 0x1000;
+    const LASTBETA_D3DCOLOR: u32 = 0x8000;
+    let mut elements = Vec::new();
+    let mut offset = 0u16;
+    let mut push = |kind: u8, usage: u8, index: u8| {
+        let [low, high] = offset.to_le_bytes();
+        elements.push([0, 0, low, high, kind, 0, usage, index]);
+        offset += match kind {
+            0..=3 => 4 * (u16::from(kind) + 1),
+            _ => 4,
+        };
+    };
+    let position = fvf & 0x0e;
+    let blend = position > 4;
+    if fvf & 0x400e != 0 {
+        match position {
+            4 => push(FLOAT4, POSITIONT, 0),
+            _ if !blend && fvf & 0x4002 == 0x4002 => push(FLOAT4, POSITION, 0),
+            _ => push(FLOAT3, POSITION, 0),
+        }
+    }
+    if blend {
+        // XYZB1..XYZB5 carry one to five betas; the last may be the indices.
+        let two_with_color = position == 8 && fvf & LASTBETA_D3DCOLOR != 0;
+        let indices = position == 0x0e || fvf & (LASTBETA_D3DCOLOR | LASTBETA_UBYTE4) != 0;
+        let weights = (position - 4) / 2 - u32::from(indices);
+        if weights > 0 {
+            let kind = if two_with_color {
+                D3DCOLOR
+            } else {
+                weights as u8 - 1
+            };
+            push(kind, BLENDWEIGHT, 0);
+        }
+        if indices {
+            let kind = if fvf & LASTBETA_UBYTE4 != 0 || two_with_color {
+                UBYTE4
+            } else if fvf & LASTBETA_D3DCOLOR != 0 {
+                D3DCOLOR
+            } else {
+                FLOAT1
+            };
+            push(kind, BLENDINDICES, 0);
+        }
+    }
+    if fvf & 0x10 != 0 {
+        push(FLOAT3, NORMAL, 0);
+    }
+    if fvf & 0x20 != 0 {
+        push(FLOAT1, PSIZE, 0);
+    }
+    if fvf & 0x40 != 0 {
+        push(D3DCOLOR, COLOR, 0);
+    }
+    if fvf & 0x80 != 0 {
+        push(D3DCOLOR, COLOR, 1);
+    }
+    for index in 0..((fvf >> 8) & 15).min(8) {
+        // D3DFVF_TEXTUREFORMAT2, 3, 4 and 1 are FLOAT2, FLOAT3, FLOAT4 and FLOAT1.
+        let kind = (((fvf >> (16 + 2 * index)) & 3) as u8 + 1) & 3;
+        push(kind, TEXCOORD, index as u8);
+    }
+    elements.push([0xff, 0, 0, 0, 17, 0, 0, 0]);
+    elements
+}
+/// The device's declaration for `fvf`, made on first request and then kept
+/// with an internal reference, so repeated requests return one object.
+fn implicit(env: &mut Env<'_>, device: Id, fvf: u32) -> Option<u32> {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device) else {
+        return None;
+    };
+    if let Some(&id) = d.implicit_declarations.get(&fvf) {
+        let Some(Payload::Declaration(declaration)) = com(env).get_identity(&env.sys.objects, id)
+        else {
+            return None;
+        };
+        return Some(declaration.pointer);
+    }
+    let payload = Declaration {
+        pointer: 0,
+        device,
+        elements: fvf_elements(fvf),
+    };
+    let (pointer, id) = object(
+        env,
+        "IDirect3DVertexDeclaration9",
+        IID_DECLARATION,
+        Payload::Declaration(payload),
+    )?;
+    // The creation reference becomes the device's internal one; the object
+    // holds its device only while the application holds the object.
+    if !com(env).retain_internal(&mut env.sys.objects, id) {
+        if let Some(dead) = com(env)
+            .release::<Payload>(&mut env.sys.objects, pointer)
+            .and_then(|released| released.destroyed)
+        {
+            super::destroy(env, dead);
+        }
+        return None;
+    }
+    let _ = com(env).release::<Payload>(&mut env.sys.objects, pointer);
+    let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
+        return None;
+    };
+    d.implicit_declarations.insert(fvf, id);
+    if let Some(Payload::Declaration(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
+        d.pointer = pointer;
+    }
+    Some(pointer)
+}
+/// The bound declaration, or after SetFVF the device's declaration for it.
 #[win32(d3d9,name="IDirect3DDevice9::GetVertexDeclaration",level=implement)]
 pub(super) fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
@@ -342,14 +467,27 @@ pub(super) fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) 
     let Some(d) = super::device(env, this.addr()) else {
         return INVALID;
     };
-    let Some(id) = d.buffers.declaration else {
-        return 0;
+    let (bound, fvf) = (d.buffers.declaration, d.fixed.fvf);
+    let pointer = match bound {
+        Some(id) => {
+            let Some(Payload::Declaration(declaration)) =
+                com(env).get_identity(&env.sys.objects, id)
+            else {
+                return INVALID;
+            };
+            declaration.pointer
+        }
+        None if fvf == 0 => return 0,
+        None => {
+            let Some(device) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) else {
+                return INVALID;
+            };
+            let Some(pointer) = implicit(env, device, fvf) else {
+                return OUT_OF_MEMORY;
+            };
+            pointer
+        }
     };
-    let Some(Payload::Declaration(declaration)) = com(env).get_identity(&env.sys.objects, id)
-    else {
-        return INVALID;
-    };
-    let pointer = declaration.pointer;
     if add_ref(env, pointer).is_none() {
         return OUT_OF_MEMORY;
     }

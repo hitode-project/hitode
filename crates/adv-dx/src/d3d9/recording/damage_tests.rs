@@ -1453,7 +1453,15 @@ fn repeated_full_upload_keeps_cursor_damage_local() {
             &mut state.upload_scratch,
             (21, address, 64 * 4),
             (64, 48),
-            true,
+            (
+                &target.image,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 48,
+                },
+            ),
         )
         .unwrap();
         let result = record(

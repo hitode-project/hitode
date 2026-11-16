@@ -217,7 +217,7 @@ fn prepare(
             &mut state.upload_scratch,
             (s.desc.Format, source, pitch),
             (rectangle.w, rectangle.h),
-            format::covers(rectangle, &target.image),
+            (&target.image, rectangle),
         )
         .ok_or(INVALID)?;
         let level = index as u32;

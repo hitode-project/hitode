@@ -868,6 +868,27 @@ fn color_fill_writes_default_pool_rectangles_and_rejects_other_pools() {
     }
 }
 
+// spec: GFX-COPY-4
+#[test]
+fn color_fill_packs_the_color_into_each_plain_surface_format() {
+    let mut f = Fixture::new();
+    for (format, packed) in [(23, [0xfd, 0xad]), (26, [0xbe, 0xda])] {
+        let surface = f.surface(2, 1, format, 0);
+        let image = f.image(surface);
+        f.okay(
+            "IDirect3DDevice9::ColorFill",
+            &[f.device, surface, 0, 0xdeadbeef],
+        );
+        let expected = format::upload(format, packed.repeat(2), 4, 2, 1).unwrap().0;
+        assert_eq!(f.pixels(&image), expected, "format {format}");
+        assert_eq!(
+            format::readback(format, expected).unwrap(),
+            packed.repeat(2)
+        );
+        assert_eq!(release(&mut env(&mut f.m), surface), 0);
+    }
+}
+
 // spec: GFX-COPY-3
 #[test]
 fn d3d9_package_d_update_surface_full_and_rect_pixels() {

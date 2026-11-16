@@ -133,6 +133,8 @@ struct Device {
     /// Borrowed surface identity; its controlling resource has one internal ref.
     render_target: Option<Id>,
     buffers: buffers::Bindings,
+    /// Declarations GetVertexDeclaration made for FVFs, internally retained.
+    implicit_declarations: BTreeMap<u32, Id>,
     fixed: fixed::CachedFixed,
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
@@ -647,6 +649,11 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         targets::release_binding(env, device.render_target);
         depth::release_binding(env, device.depth_stencil);
         buffers::release_bindings(env, device.buffers);
+        for id in device.implicit_declarations.into_values() {
+            if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
+                destroy(env, dead);
+            }
+        }
         shaders::release_bindings(env, device.shaders);
         if let Some(recording) = device.recording {
             shaders::stateblocks::release_snapshot(env, recording);
@@ -1177,6 +1184,7 @@ fn create_device(
         texture: None,
         render_target: None,
         buffers: buffers::Bindings::default(),
+        implicit_declarations: BTreeMap::new(),
         fixed,
         shaders: shaders::Bindings::default(),
         recording: None,
