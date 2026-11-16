@@ -69,14 +69,8 @@ fn locked(
 pub(super) fn raster_status(env: &mut Env<'_>, output: GuestPtr<[u32; 2]>) -> u32 {
     let provider = env.ext.get::<State>().provider;
     let (_, height, hz) = (provider.display)(env.ext);
-    let phase = if let Some((since, period)) = (provider.vsync)(env.ext) {
-        since.as_secs_f64() / period.as_secs_f64()
-    } else {
-        env.sys.clock.now_us() as f64 * f64::from(hz) / 1_000_000.0
-    };
-    // Model a scan with one blanking line after the visible display rows.
-    let line = (phase.fract() * f64::from(height + 1)) as u32;
-    let blank = line >= height;
+    let vsync = (provider.vsync)(env.ext);
+    let (blank, line) = crate::pacing::scanline(height, hz, env.sys.clock.now_us(), vsync);
     output
         .write(env.cpu, [u32::from(blank), if blank { 0 } else { line }])
         .map_or(INVALID, |()| 0)

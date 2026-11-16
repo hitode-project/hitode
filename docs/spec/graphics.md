@@ -68,6 +68,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Microsoft `IDirectDraw7::SetCooperativeLevel` permits a null window in normal mode.
 
+### GFX-DDRAW-12 Device timing, memory and status queries
+
+**Rule**: `GetVerticalBlankStatus`, `GetMonitorFrequency` and `GetAvailableVidMem` MUST validate the device and output pointers and agree with the virtual scan and video-memory caps. `Compact`, `TestCooperativeLevel` and `RestoreAllSurfaces` MUST reflect exclusive-mode ownership and restore lost surfaces owned by the device. `GetCaps` MUST report `DDCAPS_READSCANLINE`.
+**Verification**: Test
+**Basis**: Measured on Windows 11 DirectDraw 7.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
