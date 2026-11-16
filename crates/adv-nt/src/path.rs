@@ -165,6 +165,12 @@ fn find(directory: &Path, name: &str) -> Option<PathBuf> {
     index::find(directory, name)
 }
 
+/// The host name of the entry of `directory`, an existing directory, that
+/// `name` names without regard to case or as its hashed alias.
+pub(crate) fn entry(directory: &Path, name: &str) -> Option<std::ffi::OsString> {
+    index::entry(directory, name)
+}
+
 /// Wine's hash_short_file_name, used when a host name needs a DOS alias.
 pub(crate) fn short_name(name: &[u16]) -> Vec<u16> {
     let invalid = |unit: u16| unit > 0x7f || b"*?<>|\"+=,;[] \xe5:/\\".contains(&(unit as u8));
