@@ -11,6 +11,7 @@ pub struct RingConfig {
     pub bytes: u32,
     pub channels: u16,
     pub bits: u16,
+    pub float: bool,
     pub frequency: u32,
     pub output_rate: u32,
     pub notifications: Vec<(u32, u32)>,
@@ -63,6 +64,7 @@ pub struct RingVoice {
     pub bytes: u32,
     channels: u16,
     bits: u16,
+    float: bool,
     frequency: u32,
     converter: Converter,
     phase: u64,
@@ -98,8 +100,10 @@ impl RingVoice {
     }
     pub(crate) fn with_staging(config: RingConfig, stage_lead: bool) -> Result<Box<Self>, String> {
         let align = u32::from(config.channels) * u32::from(config.bits) / 8;
-        if !matches!(config.channels, 1 | 2)
-            || !matches!(config.bits, 8 | 16)
+        let valid_sample = (!config.float && matches!(config.bits, 8 | 16 | 24 | 32))
+            || (config.float && config.bits == 32);
+        if !(1..=8).contains(&config.channels)
+            || !valid_sample
             || config.bytes == 0
             || config.bytes as usize > config.view.len()
             || !config.bytes.is_multiple_of(align)
@@ -129,6 +133,7 @@ impl RingVoice {
             bytes: config.bytes,
             channels: config.channels,
             bits: config.bits,
+            float: config.float,
             frequency: config.frequency,
             converter: Converter::new(config.frequency, config.output_rate)?,
             phase: 0,
@@ -236,6 +241,7 @@ impl RingVoice {
             self.bytes,
             self.channels,
             self.bits,
+            self.float,
             self.looping,
             self.streaming,
             self.generation,
@@ -613,6 +619,7 @@ impl RingVoice {
         bytes: u32,
         channels: u16,
         bits: u16,
+        float: bool,
         looping: bool,
         streaming: bool,
         generation: u64,
@@ -636,15 +643,59 @@ impl RingVoice {
             return ([0.0; 2], true);
         }
         let at = position as usize * align as usize;
+        let bytes_per_sample = usize::from(bits) / 8;
         let sample = |channel: usize| {
-            let at = at + channel.min(usize::from(channels) - 1) * usize::from(bits) / 8;
-            if bits == 8 {
-                (f32::from(view.load_u8(at)) - 128.0) / 128.0
-            } else {
-                f32::from(i16::from_le_bytes([view.load_u8(at), view.load_u8(at + 1)])) / 32768.0
+            let at = at + channel.min(usize::from(channels) - 1) * bytes_per_sample;
+            match (float, bits) {
+                (true, 32) => {
+                    let value = f32::from_le_bytes([
+                        view.load_u8(at),
+                        view.load_u8(at + 1),
+                        view.load_u8(at + 2),
+                        view.load_u8(at + 3),
+                    ]);
+                    if value.is_finite() { value } else { 0.0 }
+                }
+                (_, 8) => (f32::from(view.load_u8(at)) - 128.0) / 128.0,
+                (_, 16) => {
+                    f32::from(i16::from_le_bytes([view.load_u8(at), view.load_u8(at + 1)]))
+                        / 32768.0
+                }
+                (_, 24) => {
+                    let raw = (i32::from(view.load_u8(at)) << 8)
+                        | (i32::from(view.load_u8(at + 1)) << 16)
+                        | (i32::from(view.load_u8(at + 2)) << 24);
+                    (raw as f32) / 2147483648.0
+                }
+                _ => {
+                    i32::from_le_bytes([
+                        view.load_u8(at),
+                        view.load_u8(at + 1),
+                        view.load_u8(at + 2),
+                        view.load_u8(at + 3),
+                    ]) as f32
+                        / 2147483648.0
+                }
             }
         };
-        ([sample(0), sample(1)], false)
+        let stereo = if channels <= 2 {
+            [sample(0), sample(1)]
+        } else {
+            let center = if channels >= 3 {
+                sample(2) * 0.707_106_77
+            } else {
+                0.0
+            };
+            let back_l = if channels >= 5 { sample(4) * 0.5 } else { 0.0 };
+            let back_r = if channels >= 6 { sample(5) * 0.5 } else { 0.0 };
+            let side_l = if channels >= 7 { sample(6) * 0.5 } else { 0.0 };
+            let side_r = if channels >= 8 { sample(7) * 0.5 } else { 0.0 };
+            [
+                sample(0) + center + back_l + side_l,
+                sample(1) + center + back_r + side_r,
+            ]
+        };
+        (stereo, false)
     }
     pub fn render(
         &mut self,
@@ -720,6 +771,7 @@ impl RingVoice {
                         self.bytes,
                         self.channels,
                         self.bits,
+                        self.float,
                         self.looping,
                         self.streaming,
                         self.generation,
@@ -808,6 +860,7 @@ mod tests {
             bytes: 131,
             channels: 1,
             bits: 8,
+            float: false,
             frequency: 1000,
             output_rate: 1000,
             notifications: vec![(0, 1), (64, 2), (130, 3)],
@@ -840,6 +893,7 @@ mod tests {
             bytes: 131,
             channels: 1,
             bits: 8,
+            float: false,
             frequency: 1000,
             output_rate: 1000,
             notifications: vec![],
@@ -896,5 +950,80 @@ mod tests {
         assert_eq!(voice.lead_us(), Some(0.0));
         voice.playing = false;
         assert_eq!(voice.lead_us(), None);
+    }
+
+    struct BytesView(Vec<u8>);
+    impl SharedReadView for BytesView {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn load_u8(&self, offset: usize) -> u8 {
+            self.0[offset]
+        }
+    }
+
+    #[test]
+    fn extended_pcm_float_and_multichannel_rings_render_expected_stereo_levels() {
+        // 24-bit stereo: [+0.5, -0.25]
+        let mut pcm24 = Vec::new();
+        pcm24.extend_from_slice(&0x400000i32.to_le_bytes()[0..3]);
+        pcm24.extend_from_slice(&(-0x200000i32).to_le_bytes()[0..3]);
+        pcm24.extend_from_slice(&[0; 6]);
+        let mut v24 = RingVoice::new(RingConfig {
+            view: Arc::new(BytesView(pcm24)),
+            bytes: 12,
+            channels: 2,
+            bits: 24,
+            float: false,
+            frequency: 1000,
+            output_rate: 1000,
+            notifications: vec![],
+        })
+        .unwrap();
+        v24.written(0, 12);
+        v24.play(false);
+        let mut out = [0.0; 2];
+        v24.render(&mut out, 2, 1000, &mut [0]);
+        assert!((out[0] - 0.5).abs() < 1e-5);
+        assert!((out[1] + 0.25).abs() < 1e-5);
+
+        // 32-bit float 6-channel (FL=0.25, FR=-0.25, FC=0.5, LFE=0.9, BL=0.2, BR=-0.2), +NaN guard
+        let mut flt6 = Vec::new();
+        for s in [
+            0.25f32,
+            -0.25,
+            0.5,
+            0.9,
+            0.2,
+            -0.2,
+            f32::NAN,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ] {
+            flt6.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut v6 = RingVoice::new(RingConfig {
+            view: Arc::new(BytesView(flt6)),
+            bytes: 48,
+            channels: 6,
+            bits: 32,
+            float: true,
+            frequency: 1000,
+            output_rate: 1000,
+            notifications: vec![],
+        })
+        .unwrap();
+        v6.written(0, 48);
+        v6.play(false);
+        let mut out6 = [0.0; 4];
+        v6.render(&mut out6, 2, 1000, &mut [0]);
+        let expected_l = 0.25 + 0.5 * 0.707_106_77 + 0.2 * 0.5;
+        let expected_r = -0.25 + 0.5 * 0.707_106_77 - 0.2 * 0.5;
+        assert!((out6[0] - expected_l).abs() < 1e-5);
+        assert!((out6[1] - expected_r).abs() < 1e-5);
+        assert_eq!(out6[2], 0.0);
     }
 }
