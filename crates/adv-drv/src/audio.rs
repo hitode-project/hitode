@@ -351,6 +351,7 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
                     bytes: frames * fmt.mixer_align(),
                     channels: fmt.channels,
                     bits: fmt.mixer_bits(),
+                    float: false,
                     frequency: fmt.rate,
                     output_rate: 44100,
                     notifications: Vec::new(),

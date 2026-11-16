@@ -925,6 +925,7 @@ impl Session {
                             }
                             self.retired_boundaries
                                 .merge(&adv_nt::counters::Boundaries::of(&machine.ext));
+                            debug::merge_api_diagnostics(machine, &mut self.stub_gaps.borrow_mut());
                         }
                         self.shared.driver.borrow_mut().parked.clear();
                         self.finished = Some(code);
@@ -949,6 +950,7 @@ impl Session {
                         }
                         self.retired_boundaries
                             .merge(&adv_nt::counters::Boundaries::of(&retired.ext));
+                        debug::merge_api_diagnostics(&retired, &mut self.stub_gaps.borrow_mut());
                         self.idle.remove(&id);
                     } else {
                         self.finished = Some(code);

@@ -17,6 +17,7 @@ use iced_x86::{
 };
 
 use crate::integer::{AF, Address, CF, OF, Operand, PF, Reg, SF, ZF, condition_true, mask, signed};
+use crate::memory::SHARED;
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
@@ -719,10 +720,11 @@ impl Page {
             version: index.map_or(0, |p| memory.versions[p]),
         }
     }
-    /// Nothing about the page changed since it was stamped. Another view
-    /// writes shared pages without bumping versions: compare their bytes.
+    /// Nothing about tracked code changed since it was stamped. External
+    /// writers of non-coherent shared pages require byte comparisons.
     fn current(self, memory: &Memory) -> bool {
-        self.permissions & crate::memory::SHARED == 0 && self == Self::at(memory, self.address)
+        (self.permissions & SHARED == 0 || memory.code_tracked(self.address))
+            && self == Self::at(memory, self.address)
     }
     fn matches(self, memory: &Memory) -> bool {
         let current = Self::at(memory, self.address);
@@ -792,11 +794,12 @@ fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Optio
         // Preserve the existing bytewise reads of concurrently shared code.
         // Ordinary ranges require only one mapping/host-protection check per
         // page, including execute-only pages (data READ is not required here).
-        let mut len = if BULK && page.permissions & crate::memory::SHARED == 0 {
-            (15 - offset).min(PAGE_SIZE - address as usize % PAGE_SIZE)
-        } else {
-            1
-        };
+        let mut len =
+            if BULK && (page.permissions & SHARED == 0 || memory.code_tracked(page.address)) {
+                (15 - offset).min(PAGE_SIZE - address as usize % PAGE_SIZE)
+            } else {
+                1
+            };
         if memory
             .read_into(address, &mut entry.bytes[offset..offset + len])
             .is_err()
@@ -976,7 +979,7 @@ struct DecodedBlock {
     bytes: Vec<u8>,
     pages: Vec<Page>,
     revision: Option<u64>,
-    /// SHARED dependencies never qualify for the owner-generation shortcut.
+    /// Externally writable dependencies cannot use the generation shortcut.
     generation: Option<u64>,
     successor: Option<BlockLink>,
 }
@@ -1007,7 +1010,7 @@ impl DecodedBlock {
         self.generation = self
             .pages
             .iter()
-            .all(|page| page.permissions & crate::memory::SHARED == 0)
+            .all(|page| page.permissions & SHARED == 0 || memory.code_tracked(page.address))
             .then_some(memory.code_generation);
     }
 
@@ -1050,7 +1053,7 @@ impl DecodedBlock {
                 .pages
                 .iter()
                 .flatten()
-                .any(|p| p.permissions & crate::memory::SHARED != 0);
+                .any(|p| p.permissions & SHARED != 0 && !memory.code_tracked(p.address));
             // Another view may change shared code without an owner epoch. Keep
             // its original transfer boundaries; never cache it in a local loop.
             if shared && block.local_branches && !block.instructions.is_empty() {

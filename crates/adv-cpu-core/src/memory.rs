@@ -1,9 +1,9 @@
 use crate::backend::{HostAccess, Pinned};
-use crate::shared_memory::SharedAllocation;
+use crate::shared_memory::{FileIdentity, FilePageIdentity, SharedAllocation};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -190,6 +190,8 @@ pub struct Memory {
     pub dirty_ranges: Option<Vec<(u32, usize)>>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: page_map::PageMap<SharedPage>,
+    coherent: BTreeSet<usize>,
+    aliases: BTreeMap<FilePageIdentity, BTreeSet<usize>>,
     /// Owned snapshots have no external alias. SHARED is only their first-store
     /// barrier, retired by the same transactional store preparation as COPY.
     private_copy_pages: Vec<Option<bool>>,
@@ -403,6 +405,17 @@ impl Memory {
             }
             if !self.watched[page] {
                 self.watched[page] = true;
+                #[cfg(unix)]
+                if self.coherent.contains(&page)
+                    && let Some(key) = self.file_page_key(page)
+                    && let Some(aliases) = self.aliases.get(&key)
+                {
+                    let aliases = aliases.iter().copied().collect::<Vec<_>>();
+                    for alias in aliases {
+                        self.unlinearize(alias..alias + 1)
+                            .expect("remove linear aliases of observed code");
+                    }
+                }
                 fresh = Some(fresh.map_or(page..page + 1, |old: std::ops::Range<usize>| {
                     old.start..page + 1
                 }));
@@ -447,8 +460,11 @@ impl Memory {
 
     /// Whether a store of `len` bytes at `addr` would change observed code.
     pub fn stores_code(&self, addr: u32, len: usize) -> bool {
-        self.range(addr, len)
-            .is_ok_and(|range| self.writes_code(&range))
+        self.range(addr, len).is_ok_and(|range| {
+            self.writes_code(&range)
+                || page_spans(range)
+                    .any(|(page, bytes)| self.observed_aliases(page, bytes).next().is_some())
+        })
     }
 
     /// Search the existing page table in one bounded metadata slice pass. This
@@ -500,6 +516,8 @@ impl Memory {
             dirty_ranges: Some(Vec::new()),
             reservation: None,
             shared_pages: Default::default(),
+            coherent: Default::default(),
+            aliases: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
@@ -545,6 +563,8 @@ impl Memory {
             dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
             shared_pages: Default::default(),
+            coherent: Default::default(),
+            aliases: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
@@ -844,7 +864,7 @@ impl Memory {
             start = end;
         }
         for page in pages.clone() {
-            self.shared_pages.remove(&page);
+            self.remove_shared_page(page);
             if self.private_copy_pages[page].take().is_some() {
                 self.private_copy_epoch += 1;
             }
@@ -979,9 +999,9 @@ impl Memory {
             };
             return bytes == expected;
         }
-        let mut buffer = [0; PAGE_SIZE];
+        let mut buffer = [0; 64];
         let mut at = addr;
-        expected.chunks(PAGE_SIZE).all(|chunk| {
+        expected.chunks(64).all(|chunk| {
             let bytes = &mut buffer[..chunk.len()];
             let same = self.read_into(at, bytes).is_ok() && bytes == chunk;
             at = at.wrapping_add(chunk.len() as u32);
@@ -1263,9 +1283,9 @@ impl Memory {
         Ok(storage)
     }
 
-    /// Maps `storage`, a shared file view, at `addr` with `perms` (READ,
-    /// and WRITE when the view is writable). Every guest access goes through
-    /// the view, so it sees the file's other mappings at once.
+    /// Maps shared file `storage` with guest `perms`. `coherent` promises
+    /// every writer of the backing file goes through this memory. Every
+    /// guest access sees the file's other mappings at once.
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -1278,6 +1298,7 @@ impl Memory {
         len: usize,
         storage: Arc<SharedAllocation>,
         perms: u8,
+        coherent: bool,
     ) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         if self.reservation.is_none()
@@ -1288,6 +1309,10 @@ impl Memory {
             return Err("invalid or overlapping shared file mapping".into());
         }
         for (index, page) in pages.clone().enumerate() {
+            if coherent && let Some(key) = storage.file_page(index * PAGE_SIZE) {
+                self.aliases.entry(key).or_default().insert(page);
+                self.coherent.insert(page);
+            }
             self.shared_pages.insert(
                 page,
                 SharedPage::Storage {
@@ -1300,9 +1325,108 @@ impl Memory {
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
+        for page in pages.clone() {
+            if self.coherent.contains(&page)
+                && self.watched[page]
+                && let Some(aliases) = self
+                    .file_page_key(page)
+                    .and_then(|key| self.aliases.get(&key))
+            {
+                let aliases: Vec<_> = aliases.iter().copied().collect();
+                for alias in aliases {
+                    self.unlinearize(alias..alias + 1)?;
+                }
+            }
+        }
         self.linearize(pages);
         self.touch(addr, len);
         Ok(())
+    }
+
+    /// Code whose writers are all tracked by this memory owner.
+    pub fn code_tracked(&self, address: u32) -> bool {
+        self.range(address, 1).is_ok_and(|range| {
+            let page = range.start / PAGE_SIZE;
+            self.linear(page) || self.coherent.contains(&page)
+        })
+    }
+
+    fn file_page_key(&self, page: usize) -> Option<FilePageIdentity> {
+        match self.shared_pages.get(&page)? {
+            SharedPage::Storage { storage, offset } => storage.file_page(*offset),
+            _ => None,
+        }
+    }
+
+    fn remove_shared_page(&mut self, page: usize) {
+        self.coherent.remove(&page);
+        if let Some(key) = self.file_page_key(page)
+            && let Some(aliases) = self.aliases.get_mut(&key)
+        {
+            aliases.remove(&page);
+            if aliases.is_empty() {
+                self.aliases.remove(&key);
+            }
+        }
+        self.shared_pages.remove(&page);
+    }
+
+    /// External writers permanently revoke tracking for all views of this file.
+    pub fn revoke_shared_file_coherence(&mut self, file: FileIdentity) {
+        let keys: Vec<_> = self
+            .aliases
+            .range((file, 0)..=(file, u64::MAX))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in keys {
+            for page in self.aliases.remove(&key).into_iter().flatten() {
+                self.coherent.remove(&page);
+                if self.watched[page] {
+                    self.touch(self.base + (page * PAGE_SIZE) as u32, PAGE_SIZE);
+                }
+            }
+        }
+    }
+
+    fn alias_watched(&self, page: usize) -> bool {
+        self.file_page_key(page)
+            .and_then(|key| self.aliases.get(&key))
+            .is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|&alias| self.coherent.contains(&alias) && self.watched[alias])
+            })
+    }
+
+    fn observed_aliases(
+        &self,
+        page: usize,
+        bytes: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = usize> + '_ {
+        self.file_page_key(page)
+            .and_then(|key| self.aliases.get(&key))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |&alias| {
+                alias != page
+                    && self.coherent.contains(&alias)
+                    && self.writes_code(
+                        &(alias * PAGE_SIZE + bytes.start..alias * PAGE_SIZE + bytes.end),
+                    )
+            })
+    }
+
+    fn touch_aliases(&mut self, range: std::ops::Range<usize>) {
+        for (page, bytes) in page_spans(range) {
+            let aliases: Vec<_> = self.observed_aliases(page, bytes.clone()).collect();
+            for alias in aliases {
+                self.touch(
+                    self.base + (alias * PAGE_SIZE + bytes.start) as u32,
+                    bytes.len(),
+                );
+            }
+        }
     }
 
     /// Shows the host pages of the window that storage pages `pages`, just
@@ -1333,7 +1457,7 @@ impl Memory {
             return;
         };
         let perms = self.perms[linear.start];
-        if perms & EXEC != 0 {
+        if perms & EXEC != 0 || linear.clone().any(|page| self.alias_watched(page)) {
             return;
         }
         let Some(source) = storage.host_pages(*offset, end - first, host) else {
@@ -1521,7 +1645,7 @@ impl Memory {
             return;
         }
         self.map_generation += 1;
-        self.shared_pages.remove(&page);
+        self.remove_shared_page(page);
         self.resident.insert(page, storage);
         self.resident_pages[page] = true;
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
@@ -1717,6 +1841,9 @@ impl Memory {
         }
 
         if overlays {
+            if !self.coherent.is_empty() {
+                self.touch_aliases(range.clone());
+            }
             if let Some((storage, offset)) = self.storage_run(&range, info) {
                 if !storage.writable() {
                     return Err("write to a read-only shared file view".into());

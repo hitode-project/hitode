@@ -280,8 +280,8 @@ pub trait Guest {
         Err(MemFault { addr, len })
     }
     /// Map `len` bytes of host file `fd` from `offset` at `addr`, shared with
-    /// every other mapping of the file. Data only: `prot` is READ, with WRITE
-    /// for a writable descriptor.
+    /// every other mapping of the file. `coherent` promises that every writer
+    /// goes through this owner; EXEC views can then cache translated code.
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -295,9 +295,13 @@ pub trait Guest {
         _fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
         _prot: Prot,
+        _coherent: bool,
     ) -> Result<(), MemFault> {
         Err(MemFault { addr, len })
     }
+    /// Revoke tracked code in every view of a section exposed to another process.
+    fn revoke_shared_file_coherence(&mut self, _file: crate::shared_memory::FileIdentity) {}
+
     /// Alias worker-confined file data pages. COPY views share reads until the
     /// first write to each page, then retain a private page. No executable views.
     fn map_file_pages(

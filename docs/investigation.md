@@ -112,7 +112,7 @@ Wine sessions use the same debugger in headless and windowed runs. `info` names
 which stack is running. `modules` and `threads` list the session's processes;
 `mem`, `dis`, `stack`, `calls` and `slow` inspect the presented process. `calls`
 records NT/Unix and host-module boundaries, not calls between Wine PE modules.
-`gaps` reports that the built-in stack's API diagnostics are unavailable.
+`gaps` reports Wine stub raises, host syscall stubs, and host-module capability gaps recorded across the session's processes.
 Addresses in the distribution's modules are named `module!function+offset`
 from the code identity tables when the mapped image's headers match them.
 Timeline execution counters cover the process family, including exited children.
