@@ -179,11 +179,14 @@ impl Context {
         Ok(())
     }
     fn result<T>(&self, result: std::result::Result<T, vk::Result>) -> Result<T> {
+        self.result_in(result, "")
+    }
+    fn result_in<T>(&self, result: std::result::Result<T, vk::Result>, op: &str) -> Result<T> {
         result.map_err(|error| {
             if error == vk::Result::ERROR_DEVICE_LOST {
                 self.lost.store(true, Ordering::Relaxed);
             }
-            vk_error(error)
+            vk_error_at(error, op)
         })
     }
     pub(super) fn retire(&self, item: Retired) {
@@ -372,12 +375,17 @@ impl Context {
 }
 
 fn vk_error(error: vk::Result) -> Error {
+    vk_error_at(error, "")
+}
+
+fn vk_error_at(error: vk::Result, op: &str) -> Error {
     match error {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
             Error::OutOfMemory
         }
         vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost(LOST.into()),
-        _ => Error::Unavailable(format!("Vulkan: {error:?}")),
+        _ if op.is_empty() => Error::Unavailable(format!("Vulkan: {error:?}")),
+        _ => Error::Unavailable(format!("Vulkan ({op}): {error:?}")),
     }
 }
 

@@ -85,6 +85,14 @@ impl Device {
         f()
     }
 
+    pub(crate) fn open_with<T>(
+        options: &DeviceOptions,
+        init: &mut dyn FnMut(crate::Device, crate::Queue) -> Result<T>,
+    ) -> Result<T> {
+        let (device, queue) = Self::open(options)?;
+        init(device, queue)
+    }
+
     pub(crate) fn caps(&self) -> &Caps {
         &self.0.caps
     }

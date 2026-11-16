@@ -291,7 +291,11 @@ impl Display {
             .features
             .contains(adv_gpu::Features::TIMESTAMPS)
         {
-            Some(device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2)?)
+            match device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2) {
+                Ok(queries) => Some(queries),
+                Err(adv_gpu::Error::OutOfMemory) => return Err(adv_gpu::Error::OutOfMemory),
+                Err(_) => None,
+            }
         } else {
             None
         };

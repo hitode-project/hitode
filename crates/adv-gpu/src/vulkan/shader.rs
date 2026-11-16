@@ -102,12 +102,15 @@ impl Shader {
                 combine_video_sampler(&mut words, video_set.unwrap());
             }
             (
-                self.0.context.result(unsafe {
-                    self.0.context.device.create_shader_module(
-                        &vk::ShaderModuleCreateInfo::default().code(&words),
-                        None,
-                    )
-                })?,
+                self.0.context.result_in(
+                    unsafe {
+                        self.0.context.device.create_shader_module(
+                            &vk::ShaderModuleCreateInfo::default().code(&words),
+                            None,
+                        )
+                    },
+                    "shader module",
+                )?,
                 true,
             )
         } else {

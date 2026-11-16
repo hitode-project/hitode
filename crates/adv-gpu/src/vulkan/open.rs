@@ -1,7 +1,7 @@
 use super::*;
 use crate::health::{
-    DevicePlan, Mask, Optional, ProbeStep, QueriedSupport, load_health, next_fallback,
-    run_probe_step, save_verified, select_device_plan,
+    DevicePlan, Mask, Optional, ProbeStep, QueriedSupport, invalidate_health, load_health,
+    next_fallback, run_probe_step, save_verified, select_device_plan,
 };
 
 unsafe extern "system" fn debug_message(
@@ -94,6 +94,21 @@ struct SelectedAdapter {
 
 impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
+        Self::open_inner(options, false, &mut |device, queue| Ok((device, queue)))
+    }
+
+    pub(crate) fn open_with<T>(
+        options: &DeviceOptions,
+        init: &mut dyn FnMut(crate::Device, crate::Queue) -> Result<T>,
+    ) -> Result<T> {
+        Self::open_inner(options, true, init)
+    }
+
+    fn open_inner<T>(
+        options: &DeviceOptions,
+        run_startup_init: bool,
+        init: &mut dyn FnMut(crate::Device, crate::Queue) -> Result<T>,
+    ) -> Result<T> {
         let cache_dir = options.cache_dir.as_deref();
         // SAFETY: All creation structures and extension names live through their calls.
         let mut current = Some(unsafe { Self::prepare_adapter(options)? });
@@ -101,6 +116,7 @@ impl Device {
         let health = load_health(cache_dir, &prefix, options.disable);
         let mut disabled = health.degraded;
         let crashed = health.crashed;
+        let mut verified_cached = health.verified;
 
         loop {
             let (inst, adapter) = match current.take() {
@@ -134,116 +150,149 @@ impl Device {
                 },
             };
 
-            if health.verified && disabled == health.degraded {
-                return Ok((device, queue));
-            }
-
-            let ok_4444 = run_probe_step(
-                cache_dir,
-                &prefix,
-                ProbeStep::CanaryPack4444,
-                active,
-                disabled,
-                || clears_pack_4444(&device, &mut queue),
-            );
-            match ok_4444 {
-                Ok(true) => {}
-                Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
-                Ok(false) | Err(_) => {
-                    drop((device, queue));
-                    if let Some(next) = next_fallback(ProbeStep::CanaryPack4444, active, disabled) {
-                        disabled = next;
-                        continue;
-                    }
-                    return Err(Error::Unavailable("4444 clear canary failed".into()));
-                }
-            }
-
-            let ok_render = run_probe_step(
-                cache_dir,
-                &prefix,
-                ProbeStep::CanaryRender,
-                active,
-                disabled,
-                || canary_render(&device, &mut queue),
-            );
-            match ok_render {
-                Ok(true) => {}
-                Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
-                Ok(false) | Err(_) => {
-                    drop((device, queue));
-                    if let Some(next) = next_fallback(ProbeStep::CanaryRender, active, disabled) {
-                        disabled = next;
-                        continue;
-                    }
-                    return Err(Error::Unavailable("graphics canary failed".into()));
-                }
-            }
-
-            let ok_compute = run_probe_step(
-                cache_dir,
-                &prefix,
-                ProbeStep::CanaryCompute,
-                active,
-                disabled,
-                || canary_compute(&device, &mut queue),
-            );
-            match ok_compute {
-                Ok(true) => {}
-                Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
-                Ok(false) | Err(_) => {
-                    drop((device, queue));
-                    if let Some(next) = next_fallback(ProbeStep::CanaryCompute, active, disabled) {
-                        disabled = next;
-                        continue;
-                    }
-                    return Err(Error::Unavailable("compute canary failed".into()));
-                }
-            }
-
-            #[cfg(target_os = "android")]
-            {
-                let ok_present = run_probe_step(
+            let need_canaries = !verified_cached || disabled != health.degraded;
+            if need_canaries {
+                let ok_4444 = run_probe_step(
                     cache_dir,
                     &prefix,
-                    ProbeStep::CanaryPresent,
+                    ProbeStep::CanaryPack4444,
                     active,
                     disabled,
-                    || canary_present(&device, &mut queue),
+                    || clears_pack_4444(&device, &mut queue),
                 );
-                match ok_present {
+                match ok_4444 {
                     Ok(true) => {}
                     Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
                     Ok(false) | Err(_) => {
                         drop((device, queue));
                         if let Some(next) =
-                            next_fallback(ProbeStep::CanaryPresent, active, disabled)
+                            next_fallback(ProbeStep::CanaryPack4444, active, disabled)
                         {
                             disabled = next;
                             continue;
                         }
-                        return Err(Error::Unavailable(
-                            "presentable buffer canary failed".into(),
-                        ));
+                        return Err(Error::Unavailable("4444 clear canary failed".into()));
                     }
+                }
+
+                let ok_render = run_probe_step(
+                    cache_dir,
+                    &prefix,
+                    ProbeStep::CanaryRender,
+                    active,
+                    disabled,
+                    || canary_render(&device, &mut queue),
+                );
+                match ok_render {
+                    Ok(true) => {}
+                    Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
+                    Ok(false) | Err(_) => {
+                        drop((device, queue));
+                        if let Some(next) = next_fallback(ProbeStep::CanaryRender, active, disabled)
+                        {
+                            disabled = next;
+                            continue;
+                        }
+                        return Err(Error::Unavailable("graphics canary failed".into()));
+                    }
+                }
+
+                let ok_compute = run_probe_step(
+                    cache_dir,
+                    &prefix,
+                    ProbeStep::CanaryCompute,
+                    active,
+                    disabled,
+                    || canary_compute(&device, &mut queue),
+                );
+                match ok_compute {
+                    Ok(true) => {}
+                    Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
+                    Ok(false) | Err(_) => {
+                        drop((device, queue));
+                        if let Some(next) =
+                            next_fallback(ProbeStep::CanaryCompute, active, disabled)
+                        {
+                            disabled = next;
+                            continue;
+                        }
+                        return Err(Error::Unavailable("compute canary failed".into()));
+                    }
+                }
+
+                #[cfg(target_os = "android")]
+                {
+                    let ok_present = run_probe_step(
+                        cache_dir,
+                        &prefix,
+                        ProbeStep::CanaryPresent,
+                        active,
+                        disabled,
+                        || canary_present(&device, &mut queue),
+                    );
+                    match ok_present {
+                        Ok(true) => {}
+                        Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
+                        Ok(false) | Err(_) => {
+                            drop((device, queue));
+                            if let Some(next) =
+                                next_fallback(ProbeStep::CanaryPresent, active, disabled)
+                            {
+                                disabled = next;
+                                continue;
+                            }
+                            return Err(Error::Unavailable(
+                                "presentable buffer canary failed".into(),
+                            ));
+                        }
+                    }
+                }
+
+                // Reap temporary buffers, views, samplers and bindless heap slots
+                // dropped at the end of each canary before handing the device back.
+                queue.poll()?;
+                if let Some(heap) = &device.inner.0.heap {
+                    heap.reset_free_order();
                 }
             }
 
-            // Reap temporary buffers, views, samplers and bindless heap slots
-            // dropped at the end of each canary before handing the device back.
-            queue.poll()?;
-            if let Some(heap) = &device.inner.0.heap {
-                heap.reset_free_order();
+            let degraded = device.inner.0.degraded;
+            if !run_startup_init {
+                if need_canaries {
+                    save_verified(cache_dir, &prefix, options.disable, degraded, crashed);
+                }
+                return init(device, queue);
             }
 
-            save_verified(
+            let result = run_probe_step(
                 cache_dir,
                 &prefix,
-                options.disable,
-                device.inner.0.degraded,
-                crashed,
+                ProbeStep::StartupInit,
+                active,
+                disabled,
+                || init(device, queue),
             );
-            return Ok((device, queue));
+            match result {
+                Ok(value) => {
+                    if need_canaries {
+                        save_verified(cache_dir, &prefix, options.disable, degraded, crashed);
+                    }
+                    return Ok(value);
+                }
+                Err(Error::OutOfMemory) => return Err(Error::OutOfMemory),
+                Err(error @ Error::Invalid(_)) => return Err(error),
+                Err(error) => {
+                    verified_cached = false;
+                    if let Some(next) = next_fallback(ProbeStep::StartupInit, active, disabled) {
+                        disabled = next;
+                        continue;
+                    }
+                    if health.verified {
+                        invalidate_health(cache_dir, &prefix, options.disable);
+                    }
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -1307,11 +1356,14 @@ struct Tint { color: vec4<f32> }
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(2) @binding(0) var samp: sampler;
 @group(3) @binding(0) var<storage, read> verts: array<vec4<f32>>;
+@group(3) @binding(1) var<storage, read> bits: array<u32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return verts[i];
 }
 @fragment fn fs() -> @location(0) vec4<f32> {
-    return textureSampleLevel(tex, samp, vec2<f32>(0.5, 0.5), 0.0) * tint.color;
+    if tint.color.a < 0.0 { discard; }
+    let mask = unpack4x8unorm((bits[0] >> 0u) & bits[1]);
+    return textureSampleLevel(tex, samp, vec2<f32>(0.5, 0.5), 0.0) * tint.color * mask;
 }
 ";
     let size = Extent {
@@ -1371,6 +1423,12 @@ struct Tint { color: vec4<f32> }
         memory: Memory::Upload,
         label: "canary vertices",
     })?;
+    let frag_bits = device.create_buffer(&BufferDesc {
+        size: storage_size,
+        usage: BufferUsage::STORAGE,
+        memory: Memory::Upload,
+        label: "canary fragment bits",
+    })?;
     // SAFETY: newly allocated Upload buffers have no GPU readers yet.
     unsafe {
         let tint_bytes: Vec<u8> = [1.0f32, 1.0, 0.0, 1.0]
@@ -1385,6 +1443,7 @@ struct Tint { color: vec4<f32> }
         .flat_map(f32::to_ne_bytes)
         .collect();
         (&mut *vertices.mapped().unwrap().as_ptr())[..48].copy_from_slice(&vert_bytes);
+        (&mut *frag_bits.mapped().unwrap().as_ptr())[..8].copy_from_slice(&[0xffu8; 8]);
     }
     let readback = device.create_buffer(&BufferDesc {
         size: 16,
@@ -1425,6 +1484,11 @@ struct Tint { color: vec4<f32> }
                     slot: 0,
                     kind: BindingKind::StorageBuffer { writable: false },
                     stages: Stages::VERTEX,
+                },
+                Binding {
+                    slot: 1,
+                    kind: BindingKind::StorageBuffer { writable: false },
+                    stages: Stages::FRAGMENT,
                 },
             ],
             primitive: Primitive {
@@ -1486,6 +1550,7 @@ struct Tint { color: vec4<f32> }
         pass.bind(0, Bind::Sampled(sampled.view()));
         pass.bind(0, Bind::Sampler(&sampler));
         pass.bind(0, Bind::StorageBuffer(vertices.slice(0..48)));
+        pass.bind(1, Bind::StorageBuffer(frag_bits.slice(0..16)));
         pass.draw(0..3, 0..1);
     }
     encoder.copy_image_to_buffer(
