@@ -74,8 +74,11 @@ pub(crate) struct Context {
     eds: Option<Eds>,
     cache_prefix: [u8; 28],
     health_dir: Option<std::path::PathBuf>,
+    caller_disable: Modern,
+    active_mask: crate::health::Mask,
     degraded: crate::health::Mask,
     crashed: bool,
+    demoted: AtomicBool,
     #[cfg(target_os = "android")]
     ahb: ash::android::external_memory_android_hardware_buffer::Device,
     #[cfg(target_os = "android")]
@@ -434,6 +437,17 @@ impl Device {
     }
     pub(crate) fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         crate::health::guard_compile(self.0.health_dir.as_deref(), &self.0.cache_prefix, probe, f)
+    }
+    pub(crate) fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::health::guard_guest_pipeline(
+            self.0.health_dir.as_deref(),
+            &self.0.cache_prefix,
+            self.0.caller_disable,
+            self.0.active_mask,
+            self.0.degraded,
+            &self.0.demoted,
+            f,
+        )
     }
 }
 

@@ -78,7 +78,7 @@ impl VideoFormat {
                 None,
             )
         }
-        .map_err(vk_error)
+        .map_err(|e| vk_error_at(e, "ycbcr conversion"))
     }
     fn filter(self) -> vk::Filter {
         if self
@@ -129,7 +129,7 @@ impl VideoPool {
                         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
                     None,
                 )
-                .map_err(vk_error)?;
+                .map_err(|e| vk_error_at(e, "ycbcr sampler"))?;
             let samplers = [resources.sampler];
             let bindings = [vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -143,7 +143,7 @@ impl VideoPool {
                     &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                     None,
                 )
-                .map_err(vk_error)?;
+                .map_err(|e| vk_error_at(e, "video set layout"))?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -171,7 +171,7 @@ impl VideoPool {
                 None,
             )
         }
-        .map_err(vk_error)?;
+        .map_err(|e| vk_error_at(e, "video descriptor pool"))?;
         let layouts = [self.resources.layout];
         let handle = match unsafe {
             self.device.allocate_descriptor_sets(
@@ -185,7 +185,7 @@ impl VideoPool {
                 unsafe {
                     self.device.destroy_descriptor_pool(descriptors, None);
                 }
-                return Err(vk_error(error));
+                return Err(vk_error_at(error, "video descriptor set"));
             }
         };
         let images = [vk::DescriptorImageInfo::default()

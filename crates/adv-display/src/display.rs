@@ -199,11 +199,33 @@ impl Upscaled {
 impl Pipelines {
     fn new(device: &Device, format: Format) -> adv_gpu::Result<Self> {
         let (video, sampler) = video::resources(device, format)?;
+        let software_video = video::software_resources(device, format)?.0;
+        let ingest = ingest::pipeline(device, format)?;
+        let output = output::pipeline(device, format, false)?;
+        let software = output::pipeline(device, format, true)?;
+        #[cfg(target_os = "android")]
+        if device
+            .caps()
+            .format(Format::Nv21)
+            .contains(adv_gpu::FormatCaps::PRESENTABLE)
+        {
+            let check_pool = device.create_present_pool(&adv_gpu::present::PoolDesc {
+                color: Some(adv_gpu::present::YuvColor::Bt601Limited),
+                width: 2,
+                height: 2,
+                format: Format::Nv21,
+                count: 1,
+                storage: false,
+                label: "video pipeline check",
+            })?;
+            let _ = video::converted_resources(device, format, &check_pool)?;
+            let _ = video::converted_software_resources(device, format, &check_pool)?;
+        }
         Ok(Self {
-            software_video: video::software_resources(device, format)?.0,
-            ingest: ingest::pipeline(device, format)?,
-            output: output::pipeline(device, format, false)?,
-            software: output::pipeline(device, format, true)?,
+            software_video,
+            ingest,
+            output,
+            software,
             video,
             sampler,
         })
