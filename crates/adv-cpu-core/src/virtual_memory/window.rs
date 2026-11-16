@@ -272,12 +272,12 @@ impl GuestWindow {
                     .next_multiple_of(SPAN)
                     .max(base + SPAN)
             };
-            // The kernel would not hand out the lower guard. When nothing is
-            // mapped there either, it stays inaccessible and serves as one;
-            // on iOS this is the end of the dyld shared region.
+            // The kernel would not hand out the lower guard. When nothing
+            // there can become accessible either, it serves as one; on iOS
+            // this is the padding that ends the dyld shared region.
             // SAFETY: as above.
             let raw = unsafe { reserve(base as *mut u8, SPAN + GUARD, 0) };
-            if raw as usize == base && unmapped(low, GUARD) {
+            if raw as usize == base && inaccessible(low, GUARD) {
                 return Ok(Self::found(base, SPAN + GUARD, base));
             }
             release(raw, SPAN + GUARD);
@@ -346,7 +346,22 @@ fn release(raw: *mut libc::c_void, len: usize) {
     }
 }
 
+/// Whether no page of `[address, address + len)` is accessible or can be
+/// made so. On Darwin the dyld shared region ends in padding that never
+/// opens, which `msync` counts as mapped.
+fn inaccessible(address: usize, len: usize) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        darwin::sealed(address as u64, (address + len) as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        unmapped(address, len)
+    }
+}
+
 /// Whether no page of `[address, address + len)` is mapped.
+#[cfg(any(test, not(target_vendor = "apple")))]
 fn unmapped(address: usize, len: usize) -> bool {
     let Ok(page) = super::os::page_size() else {
         return false;
@@ -380,7 +395,25 @@ mod darwin {
             count: *mut u32,
             object_name: *mut libc::mach_port_t,
         ) -> libc::c_int;
+        fn mach_vm_region_recurse(
+            task: libc::mach_port_t,
+            address: *mut u64,
+            size: *mut u64,
+            depth: *mut u32,
+            info: *mut i32,
+            count: *mut u32,
+        ) -> libc::c_int;
     }
+
+    /// `vm_region_submap_info_64` in 32-bit words, and the words of its
+    /// `max_protection` and `is_submap`.
+    const SUBMAP_INFO_WORDS: usize = 19;
+    const MAX_PROTECTION: usize = 1;
+    const IS_SUBMAP: usize = 12;
+    /// Deeper than Darwin nests submaps.
+    const SUBMAP_DEPTH: u32 = 8;
+    /// `mach_vm_region_recurse` found no mapping at or above the address.
+    const KERN_INVALID_ADDRESS: libc::c_int = 1;
 
     /// `TASK_VM_INFO` up to revision 2's `max_address`, in 64-bit words.
     const VM_INFO_WORDS: usize = 21;
@@ -404,6 +437,59 @@ mod darwin {
         } else {
             0
         }
+    }
+
+    /// Whether no mapping in `[from, to)` can ever be accessed: each one
+    /// there, looked up through submaps such as the dyld shared region, has
+    /// no maximum protection. A failed lookup answers no.
+    pub fn sealed(from: u64, to: u64) -> bool {
+        let mut address = from;
+        while address < to {
+            match innermost(address) {
+                Ok(Some((start, end, max_protection))) if start < to => {
+                    if max_protection != 0 {
+                        return false;
+                    }
+                    address = end;
+                }
+                Ok(_) => return true,
+                Err(()) => return false,
+            }
+        }
+        true
+    }
+
+    /// The innermost mapping holding or following `address`: its start, end
+    /// and maximum protection, or `None` when no mapping follows. Fails when
+    /// the kernel refuses the lookup or submaps nest past `SUBMAP_DEPTH`.
+    fn innermost(address: u64) -> Result<Option<(u64, u64, i32)>, ()> {
+        let mut depth = 0;
+        while depth < SUBMAP_DEPTH {
+            let (mut start, mut size) = (address, 0);
+            let mut info = [0i32; SUBMAP_INFO_WORDS];
+            let mut count = SUBMAP_INFO_WORDS as u32;
+            // SAFETY: out-parameters for the mapping at or above `address`.
+            let result = unsafe {
+                mach_vm_region_recurse(
+                    mach_task_self_,
+                    &mut start,
+                    &mut size,
+                    &mut depth,
+                    info.as_mut_ptr(),
+                    &mut count,
+                )
+            };
+            match result {
+                0 => {}
+                KERN_INVALID_ADDRESS => return Ok(None),
+                _ => return Err(()),
+            }
+            if info[IS_SUBMAP] == 0 {
+                return Ok(Some((start, start + size, info[MAX_PROTECTION])));
+            }
+            depth += 1;
+        }
+        Err(())
     }
 
     /// Mapped ranges in `[from, to)`, merged where they touch, at most
@@ -587,5 +673,53 @@ mod tests {
             libc::munmap(raw as *mut _, page);
             libc::munmap((raw + 2 * page) as *mut _, page);
         }
+    }
+
+    // spec: IOS-MEM-1
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_mapping_that_can_never_open_serves_as_a_guard() {
+        unsafe extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+            fn mach_vm_protect(
+                task: libc::mach_port_t,
+                address: u64,
+                size: u64,
+                set_maximum: libc::boolean_t,
+                protection: libc::c_int,
+            ) -> libc::c_int;
+        }
+        let page = crate::virtual_memory::os::page_size().unwrap();
+        // SAFETY: a fresh reservation whose middle page then loses even its
+        // maximum protection, as the dyld shared region's padding has.
+        let raw = unsafe { reserve(std::ptr::null_mut(), 3 * page, 0) } as usize;
+        let sealed =
+            unsafe { mach_vm_protect(mach_task_self_, (raw + page) as u64, page as u64, 1, 0) };
+        assert_eq!(sealed, 0);
+        assert!(inaccessible(raw + page, page));
+        // An inaccessible reservation can still be opened.
+        assert!(!inaccessible(raw, 2 * page));
+        unsafe { libc::munmap(raw as *mut _, 3 * page) };
+    }
+
+    // spec: IOS-MEM-1
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    #[test]
+    fn the_dyld_shared_region_padding_serves_as_a_guard() {
+        unsafe extern "C" {
+            fn _dyld_get_shared_cache_range(length: *mut usize) -> *const libc::c_void;
+        }
+        /// Where arm64 Darwin nests the dyld shared region.
+        const SHARED_REGION: usize = 0x1_8000_0000;
+        let page = crate::virtual_memory::os::page_size().unwrap();
+        let mut len = 0;
+        // SAFETY: an out-parameter for the cache's length.
+        let cache = unsafe { _dyld_get_shared_cache_range(&mut len) } as usize;
+        // The cache slides inside the region, and padding fills the slide.
+        if cache < SHARED_REGION + page {
+            return;
+        }
+        assert!(inaccessible(SHARED_REGION, cache - SHARED_REGION));
+        assert!(!inaccessible(cache, page));
     }
 }
