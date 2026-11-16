@@ -164,6 +164,12 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: Primary buffers MUST expose the 3D listener and secondary buffers created with 3D control a 3D buffer interface. Defaults, parameter ranges, orientation normalization, creation rules and deferred settings MUST match Windows. Sources MUST pan by bearing, fade with distance and cones, and shift pitch with relative velocity.
 **Verification**: Test
 
+### DEV-AUDIO-7 DirectSound buffer sizes
+
+**Rule**: `CreateSoundBuffer` MUST accept nonempty secondary buffers up to `DSBSIZE_MAX` (0x0FFFFFFF) bytes that are whole blocks of their format, and MUST reject other sizes with `DSERR_INVALIDPARAM`.
+**Verification**: Test
+**Basis**: Windows DirectSound limits; games create static buffers holding whole tracks.
+
 ### DEV-AUDIO-5 Owned PCM timing
 
 **Rule**: Owned PCM clock conversion MUST use guest and device readings from the same synchronization point. Decode duration MUST NOT shift a continuous audio stream's presentation timestamps. Queue-depth metrics MUST measure total queued duration per stream.

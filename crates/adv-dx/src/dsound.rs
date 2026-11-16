@@ -14,6 +14,8 @@ mod spatial;
 use spatial::{Deferred, Listener, Source, Vector};
 
 const INVALID: u32 = 0x80070057;
+/// The largest secondary buffer Windows accepts.
+const DSBSIZE_MAX: u32 = 0x0fff_ffff;
 const UNSUPPORTED: u32 = 0x80004001;
 const NO_INTERFACE: u32 = 0x80004002;
 const OUT_OF_MEMORY: u32 = 0x8007000e;
@@ -1241,7 +1243,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     return Ok(INVALID);
                 }
                 if (!primary
-                    && (len == 0 || len > 32 * 1024 * 1024 || !len.is_multiple_of(format.align())))
+                    && (len == 0 || len > DSBSIZE_MAX || !len.is_multiple_of(format.align())))
                     || (primary && len != 0)
                 {
                     return Ok(INVALID);
@@ -2770,6 +2772,29 @@ mod tests {
             0
         );
         m.cpu.read_u32(DATA + 128).unwrap()
+    }
+    // spec: DEV-AUDIO-7
+    #[test]
+    fn secondary_buffer_sizes_follow_windows_limits() {
+        let mut m = machine();
+        let d = device(&mut m);
+        m.cpu.write(DATA + 64, &Format::default().bytes()).unwrap();
+        // A static buffer holding a whole track: 48 MiB is above the old cap.
+        for (bytes, expected) in [(0, INVALID), (48 << 20, 0), (DSBSIZE_MAX + 1, INVALID)] {
+            for (i, value) in [20, 0x8002, bytes, 0, DATA + 64].into_iter().enumerate() {
+                m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+            }
+            m.cpu.write_u32(DATA + 128, 0xdeadbeef).unwrap();
+            let hr = invoke(
+                &mut m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[d, DATA, DATA + 128, 0],
+            );
+            assert_eq!(hr, expected, "{bytes} bytes");
+            if expected == 0 {
+                assert_ne!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            }
+        }
     }
     // spec: DEV-AUDIO-6
     #[test]
