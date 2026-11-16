@@ -291,13 +291,14 @@ pub fn map_shared_view(
     if !vm.reserve_at(base, size) {
         return Err(status::NO_MEMORY);
     }
-    map_shared_view_at(cpu, vm, memory, fd, offset, protection, (base, size))
+    map_shared_view_at(cpu, vm, memory, fd, offset, protection, (base, size), false)
 }
 
 /// Maps `size` bytes of the file `fd` from `offset` as a view of a data
 /// section with `protection`, read-only or read-write, and returns its
 /// base. The view shares the file's pages with every other mapping of it,
 /// such as the server's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn map_shared_view_at(
     cpu: &mut dyn Guest,
     vm: &mut Vm,
@@ -306,6 +307,7 @@ pub(crate) fn map_shared_view_at(
     offset: u64,
     protection: u32,
     (base, size): (u32, u32),
+    coherent: bool,
 ) -> Result<u32, Status> {
     let caps = protection_caps(protection)?;
     // Non-executable data views never execute, even when execute_readable is set.
@@ -316,7 +318,10 @@ pub(crate) fn map_shared_view_at(
     };
     let size = align_up(size, PAGE);
     let placeholder = replaced_placeholder(memory, base);
-    if cpu.map_shared_file(base, size, fd, offset, prot).is_err() {
+    if cpu
+        .map_shared_file(base, size, fd, offset, prot, coherent)
+        .is_err()
+    {
         memory.regions.remove(&base);
         let _ = vm.free(cpu, base);
         return Err(status::NO_MEMORY);

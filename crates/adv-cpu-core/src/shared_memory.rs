@@ -75,11 +75,28 @@ pub(crate) unsafe fn atomic_store(mut destination: *mut u8, mut input: &[u8]) {
     }
 }
 
+pub type FileIdentity = (libc::dev_t, libc::ino_t);
+pub(crate) type FilePageIdentity = (FileIdentity, u64);
+
+#[cfg(unix)]
+pub fn file_identity(fd: std::os::fd::BorrowedFd<'_>) -> Result<FileIdentity, String> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes stat on success and does not retain its pointer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: fstat succeeded above.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
 pub struct SharedAllocation {
     mapping: os::Mapping,
     len: usize,
     /// Host stores are allowed; a read-only file view refuses them.
     writable: bool,
+    file: Option<(FileIdentity, u64)>,
 }
 
 /// A retained read-only file range for serial host libraries. Its mapping
@@ -127,6 +144,7 @@ impl SharedAllocation {
             mapping: os::Mapping::new(len)?,
             len,
             writable: true,
+            file: None,
         }))
     }
 
@@ -152,7 +170,12 @@ impl SharedAllocation {
             mapping: os::Mapping::file(fd, offset, len, writable)?,
             len,
             writable,
+            file: Some((file_identity(fd)?, offset)),
         }))
+    }
+
+    pub(crate) fn file_page(&self, offset: usize) -> Option<FilePageIdentity> {
+        self.file.map(|(file, base)| (file, base + offset as u64))
     }
 
     pub(crate) fn read_only_view(

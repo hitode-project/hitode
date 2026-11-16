@@ -7,6 +7,23 @@ static void check(const char *name, BOOL ok) {
     printf("%s=%s\n",name,ok?"ok":"FAIL"); fflush(stdout);
     if(!ok){printf("error=%lu\n",GetLastError());ExitProcess(1);}
 }
+/* spec: A64-MEM-13 */
+static HANDLE executable_section(void *address, BOOL inherit)
+{
+    SECURITY_ATTRIBUTES attributes={sizeof(attributes),NULL,TRUE};
+    HANDLE section=CreateFileMappingW(INVALID_HANDLE_VALUE,&attributes,PAGE_EXECUTE_READWRITE,0,65536,NULL);
+    if(!section) return NULL;
+    BYTE *rw=MapViewOfFile(section,FILE_MAP_WRITE,0,0,65536);
+    void *rx=MapViewOfFileEx(section,FILE_MAP_READ|FILE_MAP_EXECUTE,0,0,65536,address);
+    if(!rw || rx!=address) return NULL;
+    const BYTE code[]={0xb8,7,0,0,0,0xc3}; /* mov eax, 7; ret */
+    memcpy(rw,code,sizeof(code));
+    if(((int (__cdecl *)(void))rx)()!=7) return NULL;
+    UnmapViewOfFile(rw);
+    if(!SetHandleInformation(section,HANDLE_FLAG_INHERIT,inherit?HANDLE_FLAG_INHERIT:0)) return NULL;
+    return section;
+}
+
 int main(void) {
     char exe[MAX_PATH], command[MAX_PATH+32];
     STARTUPINFOA startup={sizeof(startup)};
@@ -15,7 +32,7 @@ int main(void) {
     SIZE_T transferred;
     void *remote;
     char bytes[16]={0};
-    HANDLE remote_thread, pipe_read, pipe_write;
+    HANDLE remote_thread, pipe_read, pipe_write, sections[4];
     SECURITY_ATTRIBUTES security={sizeof(security),NULL,TRUE};
     CONTEXT context={0};
     MEMORY_BASIC_INFORMATION memory;
@@ -25,13 +42,20 @@ int main(void) {
         return 42;
     }
     if(strstr(GetCommandLineA(),"--child")) return 37;
+    sections[0]=executable_section((void *)0x33000000,TRUE);
+    sections[1]=executable_section((void *)0x33010000,FALSE);
+    sections[2]=executable_section((void *)0x33020000,TRUE);
+    sections[3]=executable_section((void *)0x33030000,FALSE);
+    check("coherent_sections",sections[0]&&sections[1]&&sections[2]&&sections[3]);
     GetModuleFileNameA(NULL,exe,sizeof(exe));
     snprintf(command,sizeof(command),"\"%s\" --child",exe);
-    check("create_process",CreateProcessA(NULL,command,NULL,NULL,TRUE,0,NULL,NULL,&startup,&child));
+    check("create_process",CreateProcessA(NULL,command,NULL,NULL,FALSE,0,NULL,NULL,&startup,&child));
     check("wait_child",WaitForSingleObject(child.hProcess,30000)==WAIT_OBJECT_0);
     check("child_exit",GetExitCodeProcess(child.hProcess,&code)&&code==37);
     CloseHandle(child.hThread);CloseHandle(child.hProcess);
+    CloseHandle(sections[0]);CloseHandle(sections[1]);
     check("create_suspended",CreateProcessA(NULL,command,NULL,NULL,TRUE,CREATE_SUSPENDED,NULL,NULL,&startup,&child));
+    CloseHandle(sections[2]);CloseHandle(sections[3]);
     context.ContextFlags=CONTEXT_INTEGER|CONTEXT_CONTROL;
     check("get_context",GetThreadContext(child.hThread,&context)&&context.Eax!=0);
     check("set_context",SetThreadContext(child.hThread,&context));

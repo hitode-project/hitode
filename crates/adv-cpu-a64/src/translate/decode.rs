@@ -871,11 +871,11 @@ pub struct Helper {
 /// Decodes guest instructions a page at a time, over the page and, when it
 /// is executable too, the start of the next one; iced only sees a page
 /// when `quick` declines an instruction on it.
-pub struct Fetcher<'m> {
-    memory: &'m Memory,
+pub struct Fetcher {
     page: Option<u32>,
-    bytes: &'m [u8],
-    decoder: Option<Decoder<'m>>,
+    buffer: Option<Box<[u8; 0x1000 + 15]>>,
+    len: usize,
+    copied: bool,
     /// Why the last fetch failed: 1 not executable, 2 unreadable, 3 not
     /// handled.
     pub failure: u8,
@@ -885,52 +885,80 @@ pub struct Fetcher<'m> {
     pub locked: Option<(Mem, u8, u8)>,
 }
 
-impl<'m> Fetcher<'m> {
-    pub fn new(memory: &'m Memory) -> Self {
+impl Default for Fetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fetcher {
+    pub fn new() -> Self {
         Self {
-            memory,
             page: None,
-            bytes: &[],
-            decoder: None,
+            buffer: None,
+            len: 0,
+            copied: false,
             failure: 0,
             helpers: None,
             locked: None,
         }
     }
 
+    /// Permission/page lookup shared with native entry selection.
+    pub fn fetchable(memory: &Memory, pc: u32) -> bool {
+        let page = pc & !0xfff;
+        memory.executable(page, 0x1000)
+            && memory.code_tracked(page)
+            && memory.committed(page, 0x1000).is_ok()
+            && page
+                .checked_add(0x1000)
+                .is_none_or(|next| !memory.executable(next, 15) || memory.code_tracked(next))
+    }
+
     /// The `Op` and length of the instruction at `pc`, if it is entirely in
     /// executable memory and handled.
-    pub fn fetch(&mut self, pc: u32) -> Option<(Op, u32)> {
+    pub fn fetch(&mut self, memory: &mut Memory, pc: u32) -> Option<(Op, u32)> {
         self.locked = None;
         const PAGE: u32 = 0x1000;
         let page = pc & !(PAGE - 1);
         if self.page != Some(page) {
             self.page = None;
-            self.decoder = None;
-            if !self.memory.executable(page, PAGE as usize) {
+            if !memory.executable(page, PAGE as usize) {
                 self.failure = 1;
                 return None;
             }
             // An instruction may run up to 14 bytes into the next page.
             let more = page
                 .checked_add(PAGE)
-                .is_some_and(|next| self.memory.executable(next, 15));
+                .is_some_and(|next| memory.executable(next, 15));
             let len = PAGE as usize + if more { 15 } else { 0 };
             self.failure = 2;
-            self.bytes = self.memory.read_linear(page, len).ok()?;
+            if !Self::fetchable(memory, pc) {
+                return None;
+            }
+            self.copied = memory.read_linear(page, len).is_err();
+            if self.copied {
+                let buffer = self
+                    .buffer
+                    .get_or_insert_with(|| Box::new([0; 0x1000 + 15]));
+                memory.read_into(page, &mut buffer[..len]).ok()?;
+            }
+            self.len = len;
             self.page = Some(page);
         }
         self.failure = 3;
         let at = (pc - page) as usize;
-        if let Some(quick) = quick(&self.bytes[at..], pc) {
+        let bytes = if self.copied {
+            &self.buffer.as_ref().unwrap()[..self.len]
+        } else {
+            memory.read_linear(page, self.len).ok()?
+        };
+        if let Some(quick) = quick(&bytes[at..], pc) {
             return Some(quick);
         }
-        if self.decoder.is_none() {
-            let decoder =
-                Decoder::try_with_ip(32, self.bytes, u64::from(page), DecoderOptions::NONE).ok()?;
-            self.decoder = Some(decoder);
-        }
-        let decoder = self.decoder.as_mut()?;
+        // The decoder borrows only for this instruction, including owned copies.
+        let mut decoder =
+            Decoder::try_with_ip(32, bytes, u64::from(page), DecoderOptions::NONE).ok()?;
         decoder.set_position(at).ok()?;
         decoder.set_ip(u64::from(pc));
         let instruction = decoder.decode();
@@ -954,7 +982,7 @@ impl<'m> Fetcher<'m> {
         helpers.push(Helper {
             pc,
             next: instruction.next_ip32(),
-            prepared: Prepared::new(&instruction, self.bytes.get(at..at + len)?)?,
+            prepared: Prepared::new(&instruction, bytes.get(at..at + len)?)?,
         });
         // SIMD instructions keep their helper for when they are checked.
         let index = (helpers.len() - 1) as u8;

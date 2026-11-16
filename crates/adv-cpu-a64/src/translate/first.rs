@@ -33,18 +33,18 @@ pub struct Visit {
 
 /// Runs from `cpu.eip` until a control transfer, `stop`, `fuel`
 /// instructions, or an instruction it declines.
-pub fn run(cpu: &mut CpuState, memory: &Memory, stop: u32, fuel: u64) -> Visit {
+pub fn run(cpu: &mut CpuState, memory: &mut Memory, stop: u32, fuel: u64) -> Visit {
     run_until(cpu, memory, stop, fuel, &[])
 }
 
 pub(crate) fn run_until(
     cpu: &mut CpuState,
-    memory: &Memory,
+    memory: &mut Memory,
     stop: u32,
     fuel: u64,
     candidates: &[u32],
 ) -> Visit {
-    let mut fetcher = Fetcher::new(memory);
+    let mut fetcher = Fetcher::new();
     let mut retired = 0u32;
     loop {
         if u64::from(retired) == fuel
@@ -55,7 +55,7 @@ pub(crate) fn run_until(
                 declined: false,
             };
         }
-        let Some((op, len)) = fetcher.fetch(cpu.eip) else {
+        let Some((op, len)) = fetcher.fetch(memory, cpu.eip) else {
             return Visit {
                 retired,
                 declined: true,
@@ -526,8 +526,8 @@ mod tests {
                 };
             }
             let mut ours = state.clone();
-            let mine = memory(&code, &data);
-            let visit = run(&mut ours, &mine, 0, 1);
+            let mut mine = memory(&code, &data);
+            let visit = run(&mut ours, &mut mine, 0, 1);
             if visit.declined {
                 assert_eq!(ours, state, "{code:02x?}: a decline changes nothing");
                 continue;

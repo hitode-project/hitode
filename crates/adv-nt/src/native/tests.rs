@@ -472,7 +472,7 @@ fn native_memo_tracks_pinned_storage_and_type() {
     let address = 0x400000;
     machine
         .cpu
-        .map_shared_file(address, PAGE as u32, file.as_fd(), 0, Prot::READ)
+        .map_shared_file(address, PAGE as u32, file.as_fd(), 0, Prot::READ, false)
         .unwrap();
     let derived = Cell::new(0);
     let mut env = Env {
@@ -508,7 +508,7 @@ fn native_memo_tracks_pinned_storage_and_type() {
     std::fs::remove_file(&path).unwrap();
     other.write_all(&[0x72; PAGE]).unwrap();
     env.cpu
-        .map_shared_file(address, PAGE as u32, other.as_fd(), 0, Prot::READ)
+        .map_shared_file(address, PAGE as u32, other.as_fd(), 0, Prot::READ, false)
         .unwrap();
     assert_eq!(
         *memo(&mut env, address, 16, |bytes| {

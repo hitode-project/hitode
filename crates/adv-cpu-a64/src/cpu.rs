@@ -258,14 +258,18 @@ impl Guest for View<'_> {
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         prot: Prot,
+        coherent: bool,
     ) -> Result<(), MemFault> {
         let writable = prot.contains(Prot::WRITE);
         adv_cpu_core::shared_memory::SharedAllocation::map_file(fd, offset, len as usize, writable)
             .and_then(|storage| {
                 self.memory
-                    .map_shared_file(addr, len as usize, storage, prot.0)
+                    .map_shared_file(addr, len as usize, storage, prot.0, coherent)
             })
             .map_err(|_| fault(addr, len as usize))
+    }
+    fn revoke_shared_file_coherence(&mut self, file: adv_cpu_core::shared_memory::FileIdentity) {
+        self.memory.revoke_shared_file_coherence(file);
     }
     fn map_file_pages(
         &mut self,
@@ -425,8 +429,9 @@ impl Guest for Cpu {
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         prot: Prot,
+        coherent: bool,
     ) -> Result<(), MemFault> {
-        self.view(|guest| guest.map_shared_file(addr, len, fd, offset, prot))
+        self.view(|guest| guest.map_shared_file(addr, len, fd, offset, prot, coherent))
     }
     forward! {
         fn register_code_image(&mut self, image: adv_cpu_core::AotImage) -> ();
@@ -441,6 +446,7 @@ impl Guest for Cpu {
         fn map_private_copy_pages(&mut self, addr: u32, bytes: &[u8], prot: Prot)
             -> Result<(), MemFault>;
         fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault>;
+        fn revoke_shared_file_coherence(&mut self, file: adv_cpu_core::shared_memory::FileIdentity) -> ();
         fn map_file_pages(
             &mut self,
             addr: u32,

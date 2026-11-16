@@ -338,7 +338,7 @@ mod tests {
         memory.write(0x10000, &bytes).unwrap();
         let mut trace = Trace::default();
         trace.build(
-            &memory,
+            &mut memory,
             0x10000,
             &[0x10000 + bytes.len() as u32],
             &|_, _| None,
@@ -402,7 +402,7 @@ mod tests {
         memory.write(0x10000, &bytes).unwrap();
         let mut trace = Trace::default();
         trace.build(
-            &memory,
+            &mut memory,
             0x10000,
             &[0x10000 + bytes.len() as u32],
             &|_, _| None,
