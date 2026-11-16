@@ -100,6 +100,8 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })
 }
 
+const PROCESS_CREATE_FLAGS_INHERIT_HANDLES: u32 = 4;
+
 type Created = (u32, u32, u32, u32, u32, [u8; 48]);
 
 fn prepare(env: &mut Env<'_>, args: &[u32]) -> Result<Created, Error> {
@@ -190,6 +192,9 @@ fn prepare(env: &mut Env<'_>, args: &[u32]) -> Result<Created, Error> {
         info_size: startup.len() as u32,
         ..Default::default()
     };
+    if flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES != 0 {
+        section::revoke_inherited_coherence(env);
+    }
     let (process, _) = server::request(
         env,
         &mut request,

@@ -172,7 +172,7 @@ fn slot(pc: u32, frame: u16) -> usize {
 /// Resolve forwarding entries whose register and stack effects cancel before
 /// their tail transfer. Every instruction and pointer slot is a code dependency.
 fn forwarded_body(
-    memory: &Memory,
+    memory: &mut Memory,
     mut pc: u32,
     redirect: &dyn Fn(u32) -> Option<Redirect>,
     stops: &Stops<'_>,
@@ -193,7 +193,7 @@ fn forwarded_body(
     let mut stack = Vec::new();
     let mut seen = Vec::new();
     let mut watched = Vec::new();
-    let mut fetcher = Fetcher::new(memory);
+    let mut fetcher = Fetcher::new();
     while !seen.contains(&pc) {
         if stops.contains(pc) {
             return None;
@@ -225,7 +225,7 @@ fn forwarded_body(
                 ));
             }
         }
-        let (op, size) = fetcher.fetch(pc)?;
+        let (op, size) = fetcher.fetch(memory, pc)?;
         watched.push((pc, size));
         let next = pc.wrapping_add(size);
         pc = match op {
@@ -301,7 +301,7 @@ impl Trace {
     /// path of at most `MAX_INSTRUCTIONS`.
     pub fn build(
         &mut self,
-        memory: &Memory,
+        memory: &mut Memory,
         entry: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
@@ -404,7 +404,7 @@ impl Trace {
     /// Returns the stop for a rebuild when the primary path ran past its latch.
     fn build_paths(
         &mut self,
-        memory: &Memory,
+        memory: &mut Memory,
         entry: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
@@ -424,7 +424,7 @@ impl Trace {
         });
         self.slots.clear();
         self.slots.resize(SLOTS, 0);
-        let mut fetcher = Fetcher::new(memory);
+        let mut fetcher = Fetcher::new();
         self.helpers.clear();
         fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
@@ -433,7 +433,7 @@ impl Trace {
         self.path(
             (entry, 0),
             &mut weight,
-            (memory, &mut fetcher),
+            (&mut *memory, &mut fetcher),
             bounds,
             host,
             redirect,
@@ -466,7 +466,7 @@ impl Trace {
                     if !self.path(
                         (target, inst.frame),
                         &mut weight,
-                        (memory, &mut fetcher),
+                        (&mut *memory, &mut fetcher),
                         bounds,
                         host,
                         redirect,
@@ -503,7 +503,7 @@ impl Trace {
         &mut self,
         (mut pc, mut frame): (u32, u16),
         weight: &mut usize,
-        (memory, fetcher): (&Memory, &mut Fetcher<'_>),
+        (memory, fetcher): (&mut Memory, &mut Fetcher),
         (limit, stops, stop): (usize, &Stops<'_>, Option<(u32, u16)>),
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
@@ -558,7 +558,7 @@ impl Trace {
                         _ => Some((Op::Jmp(redirect.target), 0)),
                     }
                 }
-                None => fetcher.fetch(pc),
+                None => fetcher.fetch(memory, pc),
             };
             let Some((op, size)) = fetched else {
                 if start == 0 {

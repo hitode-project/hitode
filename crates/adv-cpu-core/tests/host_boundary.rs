@@ -44,7 +44,7 @@ fn host_boundary_generation_mutations() {
     changed!(memory.unmap(at, PAGE_SIZE).unwrap());
     changed!(
         memory
-            .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ)
+            .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ, false)
             .unwrap()
     );
     changed!(memory.unmap(at, 2 * PAGE_SIZE).unwrap());
@@ -122,7 +122,13 @@ fn host_boundary_word_copies_all_alignments_and_lengths() {
     let storage = SharedAllocation::new(PAGE_SIZE).unwrap();
     let mut memory = Memory::reserve(0, 4 * PAGE_SIZE).unwrap();
     memory
-        .map_shared_file(PAGE_SIZE as u32, PAGE_SIZE, storage.clone(), READ | WRITE)
+        .map_shared_file(
+            PAGE_SIZE as u32,
+            PAGE_SIZE,
+            storage.clone(),
+            READ | WRITE,
+            false,
+        )
         .unwrap();
     for offset in 0..8 {
         for len in 0..=17 {
@@ -161,7 +167,7 @@ fn host_boundary_pinned_identity_revalidates() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
     let at = PAGE_SIZE as u32;
     memory
-        .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ)
+        .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ, false)
         .unwrap();
     let pinned = memory.pinned(at + 3, PAGE_SIZE + 7).unwrap();
     let misses = memory.host_access().tlb_misses;
@@ -185,7 +191,7 @@ fn host_boundary_pinned_identity_revalidates() {
     memory.unmap(at, 2 * PAGE_SIZE).unwrap();
     assert!(!memory.still_pinned(&pinned));
     memory
-        .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ)
+        .map_shared_file(at, 2 * PAGE_SIZE, read_only_storage(), READ, false)
         .unwrap();
     assert!(!memory.still_pinned(&pinned));
     let other = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
@@ -220,6 +226,7 @@ fn host_boundary_counters_distinguish_contiguous_and_page_copies() {
             2 * PAGE_SIZE,
             read_only_storage(),
             READ,
+            false,
         )
         .unwrap();
     let before = memory.host_access();
@@ -286,4 +293,72 @@ fn host_boundary_tlb_keeps_alternating_pages_and_replaces_collisions() {
     memory.unmap(alias, PAGE_SIZE).unwrap();
     memory.map(alias, PAGE_SIZE, READ | WRITE).unwrap();
     assert!(memory.writable_bytes(alias, 16).is_some());
+}
+
+// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13
+#[test]
+fn coherent_file_aliases_track_only_observed_bytes() {
+    use adv_cpu_core::EXEC;
+    use adv_cpu_core::memory::LINEAR;
+    let path = std::env::temp_dir().join(format!("adv-coherent-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.set_len(0x8000).unwrap();
+    for coherent in [false, true] {
+        let mut memory = Memory::window(0, 0x40000).unwrap();
+        let rw = SharedAllocation::map_file(file.as_fd(), 0, 0x8000, true).unwrap();
+        let rx = SharedAllocation::map_file(file.as_fd(), 0x4000, 0x4000, false).unwrap();
+        memory
+            .map_shared_file(0x10000, 0x8000, rw, READ | WRITE, coherent)
+            .unwrap();
+        memory
+            .map_shared_file(0x20000, 0x4000, rx.clone(), READ | EXEC, coherent)
+            .unwrap();
+        assert_ne!(memory.perms[0x14] & LINEAR, 0);
+        memory.watch_code(0x20008, 4);
+        assert_eq!(memory.code_tracked(0x20008), coherent);
+        assert_eq!(memory.perms[0x14] & LINEAR == 0, coherent);
+        let version = memory.versions[0x20];
+        memory.dirty_pages.clear();
+        assert!(!memory.stores_code(0x14018, 4));
+        assert_eq!(memory.stores_code(0x14008, 4), coherent);
+        memory.write(0x14018, b"data").unwrap();
+        assert_eq!(memory.versions[0x20], version);
+        assert!(memory.dirty_pages.is_empty());
+        memory.write(0x14008, b"code").unwrap();
+        assert!(memory.matches(0x20008, b"code"));
+        assert_eq!(memory.versions[0x20] != version, coherent);
+        assert_eq!(memory.dirty_pages.contains_key(&0x20000), coherent);
+        // A new alias and a remapped watched address preserve the barrier.
+        let alias = SharedAllocation::map_file(file.as_fd(), 0x4000, 0x4000, true).unwrap();
+        memory
+            .map_shared_file(0x30000, 0x4000, alias, READ | WRITE, coherent)
+            .unwrap();
+        assert_eq!(memory.perms[0x30] & LINEAR == 0, coherent);
+        memory.unmap(0x20000, 0x4000).unwrap();
+        memory.map(0x20000, 0x4000, READ | WRITE).unwrap();
+        let version = memory.versions[0x20];
+        memory.write(0x14008, b"away").unwrap();
+        assert_eq!(memory.versions[0x20], version);
+        memory.unmap(0x20000, 0x4000).unwrap();
+        memory
+            .map_shared_file(0x20000, 0x4000, rx, READ | EXEC, coherent)
+            .unwrap();
+        let version = memory.versions[0x20];
+        memory.revoke_shared_file_coherence(
+            adv_cpu_core::shared_memory::file_identity(file.as_fd()).unwrap(),
+        );
+        assert!(!memory.code_tracked(0x20008));
+        assert_eq!(memory.versions[0x20] > version, coherent);
+        let version = memory.versions[0x20];
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(b"else", 0x4008).unwrap();
+        assert_eq!(memory.versions[0x20], version);
+        assert!(!memory.matches(0x20008, b"away"));
+    }
 }

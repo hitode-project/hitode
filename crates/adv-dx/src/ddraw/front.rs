@@ -27,6 +27,7 @@ pub struct Provider {
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
     /// The DirectDraw object is gone: its windows present their own surfaces.
     pub released: fn(&Ext, u32),
+    pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,
 }
 pub struct State {
     draw: DirectDraw,
@@ -66,6 +67,9 @@ pub fn register(registry: &mut Registry) {
     registry.register(get_fourcc_codes_ABI);
     registry.register(wait_for_vertical_blank_ABI);
     registry.register(get_scan_line_ABI);
+    registry.register(get_vertical_blank_status_ABI);
+    registry.register(get_monitor_frequency_ABI);
+    registry.register(get_available_vid_mem_ABI);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
@@ -310,6 +314,9 @@ pub const BINDINGS: &[(u32, adv_abi::Api)] = &[
     (api::GET_PIXEL_FORMAT, get_pixel_format_ABI),
     (api::SET_COLOR_KEY, set_color_key_ABI),
     (api::GET_COLOR_KEY, get_color_key_ABI),
+    (api::COMPACT, compact_ABI),
+    (api::RESTORE_ALL_SURFACES, restore_all_surfaces_ABI),
+    (api::TEST_COOPERATIVE_LEVEL, test_cooperative_level_ABI),
 ];
 #[win32(ddraw, name = "IDirectDraw7::CreateClipper", level = implement)]
 fn create_clipper(
@@ -436,39 +443,124 @@ fn create_surface(
 fn cooperative(env: &mut Env<'_>, this: GuestPtr<()>, arg1: Handle, arg2: u32) -> Outcome {
     call(env, api::COOPERATIVE, &[this.addr(), arg1.0, arg2])
 }
-/// The virtual 60 Hz adapter scans the visible rows and one blanking row.
-/// Querying the guest clock also advances virtual-time polling loops.
-#[win32(ddraw, name = "IDirectDraw7::GetScanLine", level = state)]
-fn get_scan_line(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome {
+fn validate_device(env: &Env<'_>, this: u32) -> Result<(), u32> {
     let state = env.ext.get::<State>();
     let Some(object) = state
         .draw
         .com
         .as_ref()
-        .and_then(|com| com.get::<ComState>(&env.sys.objects, this.addr()))
+        .and_then(|com| com.get::<ComState>(&env.sys.objects, this))
         .filter(|object| matches!(object.kind, Kind::Device))
     else {
-        return Outcome::Return(0x88760082); // DDERR_INVALIDOBJECT
+        return Err(0x88760082); // DDERR_INVALIDOBJECT
     };
     if !object.initialized {
-        return Outcome::Return(0x800401f0); // DDERR_NOTINITIALIZED
+        return Err(0x800401f0); // DDERR_NOTINITIALIZED
     }
+    Ok(())
+}
+fn writable_u32(env: &Env<'_>, output: GuestPtr<u32>) -> Result<(), u32> {
     if output.is_null()
         || adv_abi::guest::check_range(env.cpu, output.addr(), 4, adv_cpu::backend::Prot::WRITE)
             .is_err()
     {
-        return Outcome::Return(INVALID);
+        return Err(INVALID);
     }
+    Ok(())
+}
+fn device_scanline(
+    env: &mut Env<'_>,
+    this: u32,
+    output: GuestPtr<u32>,
+) -> Result<(bool, u32), u32> {
+    validate_device(env, this)?;
+    writable_u32(env, output)?;
+    let vsync = (env.ext.get::<State>().provider.vsync)(env.ext);
     let height = env.ext.get::<SurfaceStore>().height;
     let now = env.sys.clock.guest_now_us();
-    // Integer phase avoids drift and overflow at long runtimes. Match the
-    // 60 Hz profile advertised by DirectDraw display-mode enumeration.
-    let phase = (now % 1_000_000) * 60 % 1_000_000;
-    let line = (phase * (u64::from(height) + 1) / 1_000_000) as u32;
-    if line >= height {
+    Ok(crate::pacing::scanline(height, 60, now, vsync))
+}
+/// The virtual 60 Hz adapter scans the visible rows and one blanking row.
+/// Querying the guest clock also advances virtual-time polling loops.
+#[win32(ddraw, name = "IDirectDraw7::GetScanLine", level = state)]
+fn get_scan_line(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome {
+    let (blank, line) = match device_scanline(env, this.addr(), output) {
+        Ok(result) => result,
+        Err(hr) => return Outcome::Return(hr),
+    };
+    if blank {
         return Outcome::Return(0x88760219); // DDERR_VERTICALBLANKINPROGRESS
     }
     Outcome::Return(output.write(env.cpu, line).map_or(INVALID, |()| 0))
+}
+#[win32(ddraw, name = "IDirectDraw7::GetVerticalBlankStatus", level = state)]
+fn get_vertical_blank_status(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    output: GuestPtr<u32>,
+) -> Outcome {
+    let (blank, _) = match device_scanline(env, this.addr(), output) {
+        Ok(result) => result,
+        Err(hr) => return Outcome::Return(hr),
+    };
+    Outcome::Return(
+        output
+            .write(env.cpu, u32::from(blank))
+            .map_or(INVALID, |()| 0),
+    )
+}
+#[win32(ddraw, name = "IDirectDraw7::GetMonitorFrequency", level = state)]
+fn get_monitor_frequency(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome {
+    if let Err(hr) = validate_device(env, this.addr()).and_then(|()| writable_u32(env, output)) {
+        return Outcome::Return(hr);
+    }
+    Outcome::Return(output.write(env.cpu, 60).map_or(INVALID, |()| 0))
+}
+#[win32(ddraw, name = "IDirectDraw7::GetAvailableVidMem", level = state)]
+fn get_available_vid_mem(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    caps: GuestPtr<u32>,
+    total: GuestPtr<u32>,
+    free: GuestPtr<u32>,
+) -> Outcome {
+    const DDSCAPS_SYSTEMMEMORY: u32 = 0x800;
+    if let Err(hr) = validate_device(env, this.addr()) {
+        return Outcome::Return(hr);
+    }
+    if caps.is_null() || (total.is_null() && free.is_null()) {
+        return Outcome::Return(INVALID);
+    }
+    let Ok(dw_caps) = caps.read(env.cpu) else {
+        return Outcome::Return(INVALID);
+    };
+    if dw_caps & DDSCAPS_SYSTEMMEMORY != 0 {
+        return Outcome::Return(INVALID);
+    }
+    if (!total.is_null() && writable_u32(env, total).is_err())
+        || (!free.is_null() && writable_u32(env, free).is_err())
+    {
+        return Outcome::Return(INVALID);
+    }
+    if !total.is_null() && total.write(env.cpu, 64 * 1024 * 1024).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    if !free.is_null() && free.write(env.cpu, 32 * 1024 * 1024).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    Outcome::Return(0)
+}
+#[win32(ddraw, name = "IDirectDraw7::Compact", level = implement)]
+fn compact(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    call(env, api::COMPACT, &[this.addr()])
+}
+#[win32(ddraw, name = "IDirectDraw7::RestoreAllSurfaces", level = implement)]
+fn restore_all_surfaces(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    call(env, api::RESTORE_ALL_SURFACES, &[this.addr()])
+}
+#[win32(ddraw, name = "IDirectDraw7::TestCooperativeLevel", level = implement)]
+fn test_cooperative_level(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    call(env, api::TEST_COOPERATIVE_LEVEL, &[this.addr()])
 }
 #[win32(ddraw, name = "IDirectDraw7::WaitForVerticalBlank", level = state)]
 fn wait_for_vertical_blank(

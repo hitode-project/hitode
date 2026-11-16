@@ -155,11 +155,19 @@ const IID_BUFFER_3D: [u8; 16] = [
     0x86, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Extensible {
+    valid_bits: u16,
+    channel_mask: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Format {
     rate: u32,
     channels: u16,
     bits: u16,
+    float: bool,
+    extensible: Option<Extensible>,
 }
 impl Default for Format {
     fn default() -> Self {
@@ -167,6 +175,8 @@ impl Default for Format {
             rate: 44100,
             channels: 2,
             bits: 16,
+            float: false,
+            extensible: None,
         }
     }
 }
@@ -175,31 +185,80 @@ impl Format {
         u32::from(self.channels) * u32::from(self.bits) / 8
     }
     fn read(cpu: &dyn Guest, ptr: u32) -> Result<Self, String> {
+        const SUBTYPE_TAIL: [u8; 12] = [0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71];
         let mut b = [0; 16];
         cpu.read(ptr, &mut b).map_err(|e| e.to_string())?;
-        let f = Self {
-            channels: u16::from_le_bytes(b[2..4].try_into().unwrap()),
-            rate: u32::from_le_bytes(b[4..8].try_into().unwrap()),
-            bits: u16::from_le_bytes(b[14..16].try_into().unwrap()),
+        let tag = u16::from_le_bytes(b[..2].try_into().unwrap());
+        let channels = u16::from_le_bytes(b[2..4].try_into().unwrap());
+        let rate = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let block_align = u16::from_le_bytes(b[12..14].try_into().unwrap());
+        let bits = u16::from_le_bytes(b[14..16].try_into().unwrap());
+        let (float, extensible) = if tag == 0xfffe {
+            let mut ext = [0; 40];
+            cpu.read(ptr, &mut ext).map_err(|e| e.to_string())?;
+            let cb_size = u16::from_le_bytes(ext[16..18].try_into().unwrap());
+            let valid_bits = u16::from_le_bytes(ext[18..20].try_into().unwrap());
+            let channel_mask = u32::from_le_bytes(ext[20..24].try_into().unwrap());
+            let sub_tag = u32::from_le_bytes(ext[24..28].try_into().unwrap());
+            if cb_size < 22 || ext[28..40] != SUBTYPE_TAIL || !matches!(sub_tag, 1 | 3) {
+                return Err("unsupported extensible PCM subformat".into());
+            }
+            if valid_bits > bits || (sub_tag == 3 && !matches!(valid_bits, 0 | 32)) {
+                return Err("unsupported extensible sample width".into());
+            }
+            (
+                sub_tag == 3,
+                Some(Extensible {
+                    valid_bits: if valid_bits == 0 { bits } else { valid_bits },
+                    channel_mask,
+                }),
+            )
+        } else if matches!(tag, 1 | 3) {
+            (tag == 3, None)
+        } else {
+            return Err("unsupported PCM format".into());
         };
-        if u16::from_le_bytes(b[..2].try_into().unwrap()) != 1
-            || !matches!(f.channels, 1 | 2)
-            || !matches!(f.bits, 8 | 16)
+        let f = Self {
+            rate,
+            channels,
+            bits,
+            float,
+            extensible,
+        };
+        let valid_bits =
+            (!f.float && matches!(f.bits, 8 | 16 | 24 | 32)) || (f.float && f.bits == 32);
+        if !(1..=8).contains(&f.channels)
+            || !valid_bits
             || !(100..=200000).contains(&f.rate)
-            || u16::from_le_bytes(b[12..14].try_into().unwrap()) != f.align() as u16
+            || u32::from(block_align) != f.align()
         {
             return Err("unsupported PCM format".into());
         }
         Ok(f)
     }
-    fn bytes(self) -> [u8; 18] {
-        let mut b = [0; 18];
-        b[..2].copy_from_slice(&1u16.to_le_bytes());
+    fn bytes(self) -> Vec<u8> {
+        const SUBTYPE_TAIL: [u8; 12] = [0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71];
+        let mut b = vec![0; if self.extensible.is_some() { 40 } else { 18 }];
+        let tag: u16 = if self.extensible.is_some() {
+            0xfffe
+        } else if self.float {
+            3
+        } else {
+            1
+        };
+        b[..2].copy_from_slice(&tag.to_le_bytes());
         b[2..4].copy_from_slice(&self.channels.to_le_bytes());
         b[4..8].copy_from_slice(&self.rate.to_le_bytes());
         b[8..12].copy_from_slice(&(self.rate * self.align()).to_le_bytes());
         b[12..14].copy_from_slice(&(self.align() as u16).to_le_bytes());
         b[14..16].copy_from_slice(&self.bits.to_le_bytes());
+        if let Some(ext) = self.extensible {
+            b[16..18].copy_from_slice(&22u16.to_le_bytes());
+            b[18..20].copy_from_slice(&ext.valid_bits.to_le_bytes());
+            b[20..24].copy_from_slice(&ext.channel_mask.to_le_bytes());
+            b[24..28].copy_from_slice(&(if self.float { 3u32 } else { 1u32 }).to_le_bytes());
+            b[28..40].copy_from_slice(&SUBTYPE_TAIL);
+        }
         b
     }
 }
@@ -1193,7 +1252,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                     {
                         return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
                     }
-                    if format.bits != 16 {
+                    if format.bits != 16 || format.float {
                         adv_abi::warn_unavailable(
                             e,
                             &format!("dsound.dll!{full}"),
@@ -1264,6 +1323,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                                 bytes: len,
                                 channels: format.channels,
                                 bits: format.bits,
+                                float: format.float,
                                 frequency: format.rate,
                                 output_rate: 44100,
                                 notifications: Vec::new(),
@@ -1413,6 +1473,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
                         bytes: orig_len,
                         channels: orig_format.channels,
                         bits: orig_format.bits,
+                        float: orig_format.float,
                         frequency: orig_format.rate,
                         output_rate: 44100,
                         notifications: Vec::new(),
@@ -1633,16 +1694,18 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
             0
         }
         "GetFormat" => {
+            let bytes = buf.format.bytes();
+            let needed = bytes.len() as u32;
             if args[3] != 0 {
-                e.cpu.write_u32(args[3], 18).map_err(|e| e.to_string())?;
+                e.cpu
+                    .write_u32(args[3], needed)
+                    .map_err(|e| e.to_string())?;
             }
             if b != 0 {
-                if c < 18 {
+                if c < needed {
                     return Ok(INVALID);
                 }
-                e.cpu
-                    .write(b, &buf.format.bytes())
-                    .map_err(|e| e.to_string())?;
+                e.cpu.write(b, &bytes).map_err(|e| e.to_string())?;
             }
             0
         }
@@ -2509,6 +2572,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let parent_buffer = buffer(&mut parent, format, 1000);
         let child_buffer = buffer(&mut child, format, 1000);
@@ -2554,6 +2618,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             1000,
         );
@@ -2718,6 +2783,7 @@ mod tests {
                 rate: 22050,
                 channels,
                 bits: 16,
+                ..Format::default()
             };
             m.cpu.write(DATA + 64, &format.bytes()).unwrap();
             let (bytes, at) = if flags & 1 != 0 {
@@ -3074,6 +3140,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3134,6 +3201,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3188,6 +3256,7 @@ mod tests {
                 rate: 1000,
                 channels: 2,
                 bits: 16,
+                ..Format::default()
             },
             400,
         );
@@ -3234,6 +3303,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             64,
         );
@@ -3332,11 +3402,13 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             Format {
                 rate: 1000,
                 channels: 2,
                 bits: 16,
+                ..Format::default()
             },
         ] {
             let mut m = machine();
@@ -3401,6 +3473,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3467,6 +3540,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let voice = buffer(&mut m, format, 1000);
         let music = buffer(&mut m, format, 1000);
@@ -3528,6 +3602,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let voice = buffer(&mut m, format, 30);
         let storage = m
@@ -3560,6 +3635,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             1000,
         );
@@ -3599,6 +3675,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let voice = buffer(&mut m, format, 1000);
         let music = buffer(&mut m, format, 1000);
@@ -3645,6 +3722,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             1000,
         );
@@ -3695,6 +3773,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             1000,
         );
@@ -3787,6 +3866,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             1000,
         );
@@ -3825,6 +3905,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3889,6 +3970,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3919,6 +4001,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -3959,6 +4042,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let orig = buffer(&mut m, format, 100);
         let orig_storage = m
@@ -4093,6 +4177,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
         let orig = buffer(&mut m, format, 100);
         let storage = m
@@ -4300,6 +4385,7 @@ mod tests {
                 rate: 1000,
                 channels: 2,
                 bits: 16,
+                ..Format::default()
             },
             400,
         );
@@ -4385,6 +4471,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             200,
         );
@@ -4445,6 +4532,7 @@ mod tests {
             rate: 1000,
             channels: 1,
             bits: 8,
+            ..Format::default()
         };
 
         // Without live output: a 40-ms (40-byte) ring caps lead at 20 bytes (half the buffer)
@@ -4543,6 +4631,7 @@ mod tests {
                 rate: 1000,
                 channels: 1,
                 bits: 8,
+                ..Format::default()
             },
             100,
         );
@@ -4588,5 +4677,150 @@ mod tests {
             next_30ms, [0.5; 60],
             "sub-30ms streaming packet unlocked inside write lead must not hit pre-staged silence"
         );
+    }
+
+    // spec: WINE-AUD-7
+    #[test]
+    fn extended_pcm_float_and_extensible_formats_create_query_and_mix() {
+        let audio = AudioControl::new(true);
+        let mut m = machine_for_process(
+            adv_machine::ObjectLimits::default(),
+            0x1000,
+            Some(audio.clone()),
+        );
+        let dev = device(&mut m);
+        let mut reader = audio.stream().device_reader(1000, 2).unwrap();
+        reader.read(&mut [0.0; 4000], 0);
+
+        // Reject unsupported tag/cbSize/subformat before object creation.
+        m.cpu.write(DATA + 64, &[0u8; 40]).unwrap();
+        m.cpu.write_u32(DATA + 64, (2 << 16) | 0xfffe).unwrap();
+        m.cpu.write_u32(DATA + 68, 44100).unwrap();
+        m.cpu.write_u32(DATA + 72, 44100 * 8).unwrap();
+        m.cpu.write_u32(DATA + 76, (32 << 16) | 8).unwrap();
+        m.cpu.write_u32(DATA + 80, 10).unwrap(); // cbSize < 22
+        for (i, v) in [20u32, 0x80, 800, 0, DATA + 64].into_iter().enumerate() {
+            m.cpu.write_u32(DATA + i as u32 * 4, v).unwrap();
+        }
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[dev, DATA, DATA + 128, 0]
+            ),
+            0x88780064
+        );
+
+        let formats = [
+            Format {
+                rate: 1000,
+                channels: 2,
+                bits: 24,
+                float: false,
+                extensible: None,
+            },
+            Format {
+                rate: 1000,
+                channels: 2,
+                bits: 32,
+                float: false,
+                extensible: None,
+            },
+            Format {
+                rate: 1000,
+                channels: 2,
+                bits: 32,
+                float: true,
+                extensible: None,
+            },
+            Format {
+                rate: 1000,
+                channels: 6,
+                bits: 32,
+                float: true,
+                extensible: Some(Extensible {
+                    valid_bits: 32,
+                    channel_mask: 0x3f,
+                }),
+            },
+            Format {
+                rate: 1000,
+                channels: 2,
+                bits: 32,
+                float: false,
+                extensible: Some(Extensible {
+                    valid_bits: 24,
+                    channel_mask: 3,
+                }),
+            },
+        ];
+        for fmt in formats {
+            let expected_bytes = fmt.bytes();
+            let buf = buffer(&mut m, fmt, fmt.align() * 100);
+            m.cpu.write_u32(DATA + 300, 0).unwrap();
+            assert_eq!(
+                invoke(
+                    &mut m,
+                    "IDirectSoundBuffer8::GetFormat",
+                    &[buf, 0, 0, DATA + 300]
+                ),
+                0
+            );
+            assert_eq!(
+                m.cpu.read_u32(DATA + 300).unwrap(),
+                expected_bytes.len() as u32
+            );
+            if expected_bytes.len() > 18 {
+                assert_eq!(
+                    invoke(
+                        &mut m,
+                        "IDirectSoundBuffer8::GetFormat",
+                        &[buf, DATA + 304, 18, DATA + 300]
+                    ),
+                    INVALID
+                );
+            }
+            assert_eq!(
+                invoke(
+                    &mut m,
+                    "IDirectSoundBuffer8::GetFormat",
+                    &[buf, DATA + 304, expected_bytes.len() as u32, DATA + 300]
+                ),
+                0
+            );
+            let mut got = vec![0u8; expected_bytes.len()];
+            m.cpu.read(DATA + 304, &mut got).unwrap();
+            assert_eq!(got, expected_bytes);
+            assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[buf]), 0);
+        }
+
+        // Verify 32-bit IEEE float stereo playback through shared mixer ring.
+        let float_fmt = formats[2];
+        let buf = buffer(&mut m, float_fmt, float_fmt.align() * 100);
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Lock",
+                &[buf, 0, 16, DATA + 128, DATA + 132, 0, 0, 0]
+            ),
+            0
+        );
+        let p1 = m.cpu.read_u32(DATA + 128).unwrap();
+        let mut samples = Vec::new();
+        for s in [0.5f32, -0.25, 0.5, -0.25] {
+            samples.extend_from_slice(&s.to_le_bytes());
+        }
+        m.cpu.write(p1, &samples).unwrap();
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[buf, p1, 16, 0, 0]),
+            0
+        );
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundBuffer8::Play", &[buf, 0, 0, 0]),
+            0
+        );
+        let mut out = [0.0; 4];
+        reader.read(&mut out, 1_000_000);
+        assert_eq!(out, [0.5, -0.25, 0.5, -0.25]);
     }
 }

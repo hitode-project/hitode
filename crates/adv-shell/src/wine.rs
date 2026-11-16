@@ -504,6 +504,7 @@ impl DebugTarget for DebugSession<'_> {
         self.session.contexts_report()
     }
     fn api_gaps_report(&self) -> String {
+        self.session.sync_api_diagnostics();
         let gaps = self.session.stub_gaps.borrow();
         if gaps.called.is_empty() {
             "no called API gaps".into()
@@ -880,6 +881,7 @@ fn drive(
     } else {
         outcome.exit_code.unwrap_or(0) as u8
     };
+    session.sync_api_diagnostics();
     let process = session.failed_process.unwrap_or(session.machine.sys.pid);
     let mut failure = None;
     session.debug_processes(|machine| {

@@ -2852,3 +2852,102 @@ fn first_divergence() {
     }
     println!("no divergence");
 }
+
+// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13, A64-CTL-10
+#[cfg(native)]
+#[test]
+fn shared_code_executes_rewrites_and_non_fetchable_entries_use_blocks() {
+    use adv_cpu_core::shared_memory::SharedAllocation;
+    use std::os::fd::AsFd;
+    let path = std::env::temp_dir().join(format!("adv-shared-code-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.set_len(0x4000).unwrap();
+    for coherent in [false, true] {
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        let memory = executor.memory_mut();
+        for at in [CODE, DATA] {
+            memory.unmap(at, 0x4000).unwrap();
+        }
+        let rx = SharedAllocation::map_file(file.as_fd(), 0, 0x4000, false).unwrap();
+        let rw = SharedAllocation::map_file(file.as_fd(), 0, 0x4000, true).unwrap();
+        memory
+            .map_shared_file(CODE, 0x4000, rx, 5, coherent)
+            .unwrap();
+        memory
+            .map_shared_file(DATA, 0x4000, rw, 3, coherent)
+            .unwrap();
+        let entry = CODE + 0xffd;
+        // MOV crosses a page; MOVZX takes the full decoder; the other forms take quick decoding.
+        memory
+            .write(DATA + 0xffd, &[0xb8, 1, 0, 0, 0, 0x0f, 0xb6, 0xc8, 0x90])
+            .unwrap();
+        let patch = CODE + 0x8000;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(dword_ptr(DATA as i32 + 0xffe), edx).unwrap();
+        a.nop().unwrap();
+        let bytes = a.assemble(u64::from(patch)).unwrap();
+        memory.protect(patch, 0x4000, 7).unwrap();
+        memory.write(patch, &bytes).unwrap();
+        let mut interpreted = 0;
+        let rounds = crate::native::CHECK_AFTER + 3;
+        for value in 1..=rounds {
+            executor.state.eip = entry;
+            let entries = executor.stats.interpreter_entries;
+            let native_entries = executor.stats.native_entries;
+            assert_eq!(
+                executor.run(entry + 8, 100).unwrap(),
+                RunOutcome::ReachedStop
+            );
+            assert_eq!(executor.state.regs[0], value);
+            assert_eq!(executor.state.regs[1], value);
+            assert_eq!(executor.stats.native_entries > native_entries, coherent);
+            if !coherent {
+                assert_eq!(
+                    executor.stats.interpreter_entries - entries,
+                    1,
+                    "whole block"
+                );
+                interpreted += 1;
+            }
+            if value < rounds {
+                executor.state.regs[2] = value + 1;
+                executor.state.eip = patch;
+                assert_eq!(
+                    executor.run(patch + bytes.len() as u32 - 1, 100).unwrap(),
+                    RunOutcome::ReachedStop
+                );
+            }
+        }
+        let native = executor.native.as_ref().unwrap();
+        assert_eq!(&native.diagnostics.empty_units[1..3], &[0, 0]);
+        assert_eq!(native.diagnostics.empty, 0);
+        if coherent {
+            assert!(
+                native.diagnostics.refused > 0,
+                "checked alias stores leave before invalidation"
+            );
+        }
+        assert_eq!(interpreted, if coherent { 0 } else { rounds });
+        assert!(
+            executor.stats.native_entries > 0,
+            "translated code or patch"
+        );
+        executor.memory_mut().protect(CODE, 0x4000, 1).unwrap();
+        executor.state.eip = entry;
+        assert!(matches!(
+            executor.run(entry + 8, 100).unwrap(),
+            RunOutcome::FetchFault { .. }
+        ));
+        assert_eq!(
+            &executor.native.as_ref().unwrap().diagnostics.empty_units[1..3],
+            &[0, 0]
+        );
+    }
+}

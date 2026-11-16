@@ -300,7 +300,7 @@ fn k_security() {
     assert_eq!(lines, expected.map(|name| format!("{name} ok")), "{text}");
 }
 
-// spec: NT-SYS-1, NT-SYS-2, NT-SYS-3, NT-SYS-4, WINE-SYS-3, WINE-SRC-4, WINE-SRC-5
+// spec: NT-SYS-1, NT-SYS-2, NT-SYS-3, NT-SYS-4, WINE-SYS-3, WINE-SRC-4, WINE-SRC-5, A64-MEM-13
 #[test]
 fn m_system() {
     let Some((stop, text)) = probe("m_system", "nt_m_system.exe", |_, _| {}) else {
@@ -314,6 +314,7 @@ fn m_system() {
             "displaced-image-base",
             "restore-unprotected-thunk",
             "hook-five-bytes",
+            "shared-executable-views",
             "create-section-ex",
             "map-view-ex-shared",
             "map-view-ex-alignment",
@@ -352,10 +353,31 @@ fn m_system() {
     );
 }
 
-// spec: WINE-SYS-4, PROC-ISO-1, PROC-HANDLE-1, PROC-CREATE-2, PROC-MEM-1, SRV-SYNC-3
+// spec: WINE-SYS-4, PROC-ISO-1, PROC-HANDLE-1, PROC-CREATE-2, PROC-MEM-1, SRV-SYNC-3, A64-MEM-13
 #[test]
 fn children() {
-    let Some((stop, text)) = probe("children", "nt_children.exe", |_, _| {}) else {
+    let Some((stop, text)) = probe_inspect(
+        "children",
+        "nt_children.exe",
+        |_, _| {},
+        |session| {
+            let memory = session.machine.cpu.executor().memory();
+            for address in [0x33000000, 0x33010000, 0x33020000, 0x33030000] {
+                assert!(
+                    memory.executable(address, 1),
+                    "{address:#x} retains its view"
+                );
+            }
+            // The first child inherits nothing. Its sections then retain only views.
+            for address in [0x33000000, 0x33010000, 0x33030000] {
+                assert!(memory.code_tracked(address), "{address:#x} stays coherent");
+            }
+            assert!(
+                !memory.code_tracked(0x33020000),
+                "inherited section loses coherence"
+            );
+        },
+    ) else {
         return;
     };
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
@@ -363,6 +385,7 @@ fn children() {
         &text,
         "=ok",
         &[
+            "coherent_sections",
             "create_process",
             "wait_child",
             "child_exit",

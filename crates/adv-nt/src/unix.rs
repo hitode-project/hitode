@@ -4,7 +4,7 @@
 use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
-use crate::protocol::FIXED_SIZE;
+use crate::protocol::{CloseHandleRequest, DupHandleRequest, FIXED_SIZE, Request};
 use crate::server::Link;
 
 const WINE_DBG_WRITE: u32 = 2;
@@ -112,6 +112,10 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
     let fault = |error: adv_cpu::backend::MemFault| error.to_string();
     let mut fixed = [0u8; FIXED_SIZE];
     env.cpu.read(request, &mut fixed).map_err(fault)?;
+    let word = |offset| u32::from_le_bytes(fixed[offset..offset + 4].try_into().unwrap());
+    let duplicate = (word(0) as i32 == DupHandleRequest::NUMBER)
+        .then(|| [word(12), word(16), word(20), word(32)]);
+    let close = (word(0) as i32 == CloseHandleRequest::NUMBER).then(|| word(12));
     let count = env.cpu.read_u32(request + DATA_COUNT).map_err(fault)?;
     if count > MAX_DATA {
         return Err(format!("server request with {count} data vectors"));
@@ -140,6 +144,15 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
     let size = link
         .call_raw(context, env.cpu, &mut fixed, &parts, &mut reply)
         .map_err(|error| format!("server call failed: {error}"))?;
+    if u32::from_le_bytes(fixed[..4].try_into().unwrap()) == 0 {
+        if let Some([source, handle, destination, options]) = duplicate {
+            let result = u32::from_le_bytes(fixed[8..12].try_into().unwrap());
+            crate::section::duplicate_handle(env, source, handle, destination, result, options);
+        }
+        if let Some(handle) = close {
+            crate::section::forget(env, handle);
+        }
+    }
     crate::server::deliver(env);
     env.cpu.write(request, &fixed).map_err(fault)?;
     // As ntdll.so: a request that takes no reply data leaves the pointer

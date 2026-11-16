@@ -42,7 +42,7 @@ Exact retirement is enabled by `--profile`, `--frame-budget`, or the live debugg
 
 ### EXEC-CORE-6 Tier 0 decode cache validity
 
-**Rule**: Tier 0 MAY skip private page validation only when the block's last validated owner generation matches. Page-version, mapping and permission changes MUST advance that generation, and generations MUST distinguish memory owners. Changed generations and SHARED code MUST trigger validation on each entry, retaining decoded blocks only when permissions, mappings and bytes match.
+**Rule**: Tier 0 MAY skip private and coherent shared view validation only when the block's last validated owner generation matches. Page-version, mapping and permission changes MUST advance that generation, and generations MUST distinguish memory owners. Changed generations and non-coherent SHARED code MUST trigger validation on each entry, retaining decoded blocks only when permissions, mappings and bytes match.
 **Verification**: Test
 
 Cached successors MUST match entry EIP and block-cache generation. They MUST pass the same memory and native-publication revision checks as a lookup. Clearing either decode cache MUST advance the cache generation before any entry is reused. Successor hits MUST preserve entry stops, budgets and observation boundaries.

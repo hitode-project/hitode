@@ -65,7 +65,7 @@ The title block holds the library match’s VNDB ID and name, plus the player’
 **Rule**: Each Wine stub raise MUST enter one session-owned set, shared by every process and the debugger. Reports MUST derive `called` and terminal API failures from this state, with `imported` empty on Wine. Lists MUST contain at most 256 sorted, distinct, printable ASCII `module!function` names.
 **Verification**: Test
 
-Both guest `EXCEPTION_WINE_STUB` records and host syscall stubs feed the same set. Report construction lowercases module names and drops invalid entries; report validation rejects invalid names. Legacy ABI stubs retain their existing text classification while they still produce that diagnostic.
+Both guest `EXCEPTION_WINE_STUB` records and host syscall stubs feed the same set. Host-module ABI stubs and capability rejections also normalize into `called` across live and retired processes without mutating `failure`. Report construction lowercases module names and drops invalid entries; report validation rejects invalid names. Legacy ABI stubs retain their existing text classification while they still produce that diagnostic.
 
 ### REPORT-PERF-1 Frame time percentiles
 
