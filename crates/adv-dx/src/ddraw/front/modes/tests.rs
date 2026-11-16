@@ -1165,3 +1165,175 @@ fn cooperative_status_compact_and_restore_all_surfaces_follow_exclusive_ownershi
     assert_eq!(call(&mut m, api::RESTORE_ALL_SURFACES, &[first]), 0);
     assert_eq!(call(&mut m, api::IS_LOST, &[first_primary]), 0);
 }
+
+#[test]
+// spec: GFX-DDRAW-13
+fn clipper_dc_gdi_and_surface_metadata_queries_work_across_guest_vtables() {
+    let mut registry = Registry::default();
+    registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+        Outcome::ExitThread(0)
+    });
+    let (mut m, dd) = setup(false, false, registry);
+    {
+        let provider = &mut m.ext.get_mut::<front::State>().provider;
+        provider.window = |_, _, hwnd| {
+            (hwnd == 7).then_some(front::WindowGeometry {
+                hwnd,
+                width: 16,
+                height: 12,
+                origin: (0, 0),
+            })
+        };
+        provider.dc.create = |env, _, then| then(env, Ok(0x7001));
+        provider.dc.flush = |env, _, _, then| then(env, Ok(()));
+        provider.dc.release = |env, _, then| then(env, Ok(()));
+    }
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
+    {
+        Outcome::Return(hr) => hr,
+        _ => panic!("synchronous authored call"),
+    };
+
+    // Standalone DirectDrawCreateClipper returns a usable clipper; flags != 0 fails.
+    assert_eq!(call(&mut m, api::DD_CREATE_CLIPPER, &[1, DATA, 0]), INVALID);
+    assert_eq!(call(&mut m, api::DD_CREATE_CLIPPER, &[0, DATA, 0]), 0);
+    let clipper = m.cpu.read_u32(DATA).unwrap();
+    assert_ne!(clipper, 0);
+
+    // Unconfigured clipper has no clip list (DDERR_NOCLIPLIST); GetClipList measures and fills after SetHWnd.
+    let get_clip_list = m
+        .cpu
+        .read_u32(m.cpu.read_u32(clipper).unwrap() + 3 * 4)
+        .unwrap();
+    let is_changed = m
+        .cpu
+        .read_u32(m.cpu.read_u32(clipper).unwrap() + 6 * 4)
+        .unwrap();
+    let done = m.resolve_import("test", "done").unwrap();
+    let run_guest = |m: &mut Machine<JitCpu>, build: &dyn Fn(&mut Asm)| {
+        let mut code = Asm::new(CODE);
+        build(&mut code);
+        code.call(done).hlt();
+        m.cpu.write(CODE, &code.bytes).unwrap();
+        m.spawn("ddraw query", CODE, &[], 65536).unwrap();
+        assert!(matches!(m.run(), RunResult::Exited(_)));
+    };
+    m.cpu.write_u32(DATA + 20, 0).unwrap();
+    run_guest(&mut m, &|c| {
+        c.push_imm(DATA + 20)
+            .push_imm(0)
+            .push_imm(0)
+            .push_imm(clipper)
+            .call(get_clip_list)
+            .mov_mem_eax(DATA + 24)
+            .push_imm(DATA + 28)
+            .push_imm(clipper)
+            .call(is_changed)
+            .mov_mem_eax(DATA + 32);
+    });
+    assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), 0x887600cd);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 0);
+
+    // Bind window HWND to clipper: GetClipList reports size 48, REGIONTOOSMALL when <48, then populates RGNDATA.
+    assert_eq!(call(&mut m, api::CLIPPER_SET_HWND, &[clipper, 0, 7]), 0);
+    m.cpu.write_u32(DATA + 20, 16).unwrap();
+    run_guest(&mut m, &|c| {
+        c.push_imm(DATA + 20)
+            .push_imm(DATA + 128)
+            .push_imm(0)
+            .push_imm(clipper)
+            .call(get_clip_list)
+            .mov_mem_eax(DATA + 24);
+    });
+    assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), 0x88760236);
+    assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 48);
+    run_guest(&mut m, &|c| {
+        c.push_imm(DATA + 20)
+            .push_imm(DATA + 128)
+            .push_imm(0)
+            .push_imm(clipper)
+            .call(get_clip_list)
+            .mov_mem_eax(DATA + 24);
+    });
+    assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 128 + 8).unwrap(), 1);
+    assert_eq!(m.cpu.read_u32(DATA + 128 + 40).unwrap(), 16);
+    assert_eq!(m.cpu.read_u32(DATA + 128 + 44).unwrap(), 12);
+
+    // GetGDISurface rejects before primary, returns primary after CreateSurface.
+    assert_eq!(call(&mut m, api::GET_GDI_SURFACE, &[dd, DATA]), 0x887600ff);
+    assert_eq!(call(&mut m, api::DISPLAY_MODE, &[dd, 8, 8, 32, 0, 0]), 0);
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x200u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    assert_eq!(
+        call(&mut m, api::CREATE_SURFACE, &[dd, DATA + 64, DATA, 0]),
+        0
+    );
+    let primary = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(call(&mut m, api::GET_GDI_SURFACE, &[dd, DATA + 4]), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), primary);
+
+    // Surface metadata/uniqueness/lock helpers & GetSurfaceFromDC.
+    assert_eq!(call(&mut m, api::GET_DD_INTERFACE, &[primary, DATA + 8]), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), dd);
+    assert_eq!(call(&mut m, api::PAGE_LOCK, &[primary, 0]), 0);
+    assert_eq!(call(&mut m, api::PAGE_UNLOCK, &[primary, 0]), 0);
+    assert_eq!(call(&mut m, api::PAGE_UNLOCK, &[primary, 0]), 0x88760248);
+    assert_eq!(call(&mut m, api::GET_UNIQUENESS, &[primary, DATA + 12]), 0);
+    let u0 = m.cpu.read_u32(DATA + 12).unwrap();
+    assert_eq!(call(&mut m, api::CHANGE_UNIQUENESS, &[primary]), 0);
+    assert_eq!(call(&mut m, api::GET_UNIQUENESS, &[primary, DATA + 12]), 0);
+    assert_ne!(m.cpu.read_u32(DATA + 12).unwrap(), u0);
+    assert_eq!(call(&mut m, api::SURFACE_CAPS, &[primary, DATA + 200]), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 200).unwrap(), 0x200);
+    assert_eq!(
+        call(&mut m, api::SURFACE_INITIALIZE, &[primary, dd, DATA + 64]),
+        0x88760005
+    );
+
+    let get_dc = m
+        .cpu
+        .read_u32(m.cpu.read_u32(primary).unwrap() + 17 * 4)
+        .unwrap();
+    let release_dc = m
+        .cpu
+        .read_u32(m.cpu.read_u32(primary).unwrap() + 26 * 4)
+        .unwrap();
+    let get_from_dc = m
+        .cpu
+        .read_u32(m.cpu.read_u32(dd).unwrap() + 24 * 4)
+        .unwrap();
+    run_guest(&mut m, &|c| {
+        c.push_imm(DATA + 16)
+            .push_imm(primary)
+            .call(get_dc)
+            .mov_mem_eax(DATA + 36);
+    });
+    assert_eq!(m.cpu.read_u32(DATA + 36).unwrap(), 0);
+    let hdc = m.cpu.read_u32(DATA + 16).unwrap();
+    assert_ne!(hdc, 0);
+    run_guest(&mut m, &|c| {
+        c.push_imm(DATA + 20)
+            .push_imm(hdc)
+            .push_imm(dd)
+            .call(get_from_dc)
+            .mov_mem_eax(DATA + 24)
+            .push_imm(DATA + 28)
+            .push_imm(0x1234)
+            .push_imm(dd)
+            .call(get_from_dc)
+            .mov_mem_eax(DATA + 32)
+            .push_imm(hdc)
+            .push_imm(primary)
+            .call(release_dc)
+            .mov_mem_eax(DATA + 40);
+    });
+    assert_eq!(m.cpu.read_u32(DATA + 24).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), primary);
+    assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0x887600ff);
+    assert_eq!(m.cpu.read_u32(DATA + 40).unwrap(), 0);
+}

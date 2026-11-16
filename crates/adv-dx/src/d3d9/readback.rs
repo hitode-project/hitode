@@ -518,10 +518,15 @@ fn read_target(
     {
         return Outcome::Return(INVALID);
     }
+    let format = dst.desc.Format;
+    let detach = dst.container.is_none();
+    let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(storage) = resources::storage(env, dst) else {
+        return Outcome::Return(INVALID);
+    };
     let state = env.ext.get::<State>();
-    if state.sender.is_none() || state.wake.is_none() {
-        return Outcome::Return(UNAVAILABLE);
-    }
     let Some(image) = src
         .surface
         .and_then(|id| (state.provider.target)(env.ext, id))
@@ -529,14 +534,33 @@ fn read_target(
     else {
         return Outcome::Return(INVALID);
     };
-    let Some(storage) = resources::storage(env, dst) else {
-        return Outcome::Return(INVALID);
-    };
-    let format = dst.desc.Format;
-    let detach = dst.container.is_none();
-    let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
-        return Outcome::Return(INVALID);
-    };
+    enqueue_readback(
+        env,
+        owner,
+        image,
+        destination,
+        storage,
+        length,
+        format,
+        detach,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_readback(
+    env: &mut Env<'_>,
+    owner: Id,
+    image: adv_device::gpu::Image,
+    destination: GuestPtr<()>,
+    storage: u32,
+    length: u32,
+    format: u32,
+    detach: bool,
+) -> Outcome {
+    let state = env.ext.get::<State>();
+    if state.sender.is_none() || state.wake.is_none() {
+        return Outcome::Return(UNAVAILABLE);
+    }
     if adv_abi::guest::check_range(env.cpu, storage, length, Prot::WRITE).is_err() {
         return Outcome::Return(INVALID);
     }
@@ -840,32 +864,91 @@ fn advance(env: &mut Env<'_>, transfer: &mut PendingTransfer) -> bool {
 #[cfg(test)]
 mod tests;
 
-// Front-buffer capture remains unsupported and terminates through its existing
-// failure contract. Flush accepted work before that boundary, without inventing
-// successful capture or pixels for an API that has no implementation.
-#[win32(d3d9,name="IDirect3DDevice9::GetFrontBufferData",level=safe_fail)]
+#[win32(d3d9, name = "IDirect3DDevice9::GetFrontBufferData", level = implement)]
 pub(super) fn front(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
-    _chain: u32,
-    _destination: GuestPtr<()>,
+    chain: u32,
+    destination: GuestPtr<()>,
 ) -> Outcome {
-    let failed = |env: &mut Env<'_>| {
-        adv_abi::warn_unavailable(
-            env,
-            "IDirect3DDevice9::GetFrontBufferData",
-            "front-buffer capture is unsupported",
-        );
-        Outcome::Fail("unimplemented: d3d9.dll!IDirect3DDevice9::GetFrontBufferData".into())
-    };
-    if let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) {
-        recording::barrier(
-            env,
-            recording::owner(env, owner),
-            recording::Reason::Readback,
-            failed,
-        )
-    } else {
-        failed(env)
+    if let Some(outcome) = settle(env, destination.addr(), move |env| {
+        front(env, this, chain, destination)
+    }) {
+        return outcome;
     }
+    if let Some(owner) = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .filter(|_| device(env, this.addr()).is_some())
+    {
+        return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
+            read_front(env, this, chain, destination)
+        });
+    }
+    Outcome::Return(INVALID)
+}
+
+fn read_front(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    chain: u32,
+    destination: GuestPtr<()>,
+) -> Outcome {
+    if chain != 0 {
+        return Outcome::Return(INVALID);
+    }
+    let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(d) = device(env, this.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    let front_surface = d.front.unwrap_or(d.surface);
+    if let Some(back) = d.back_buffer {
+        recording::trace::readback(env, back);
+    }
+    let Some(dst) = resources::resource(env, destination.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    if dst.device != owner
+        || dst.kind != Kind::Surface
+        || dst.desc.Pool != 2
+        || dst.desc.Format != 21
+        || resources::locked(env, dst)
+    {
+        return Outcome::Return(INVALID);
+    }
+    let format = dst.desc.Format;
+    let detach = dst.container.is_none();
+    let (dst_width, dst_height) = (dst.desc.Width, dst.desc.Height);
+    let Some(length) = format::length(format, dst_width, dst_height) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(storage) = resources::storage(env, dst) else {
+        return Outcome::Return(INVALID);
+    };
+    let state = env.ext.get::<State>();
+    let Some(image) = (state.provider.target)(env.ext, front_surface).map(|t| t.image) else {
+        return Outcome::Return(INVALID);
+    };
+    if (dst_width, dst_height) != (image.width(), image.height()) {
+        let (display_w, display_h, _) = (state.provider.display)(env.ext);
+        if (dst_width, dst_height) == (display_w, display_h) {
+            adv_abi::warn_unavailable(
+                env,
+                "IDirect3DDevice9::GetFrontBufferData",
+                "desktop-sized front-buffer capture outside the device surface is unavailable",
+            );
+        }
+        return Outcome::Return(INVALID);
+    }
+    enqueue_readback(
+        env,
+        owner,
+        image,
+        destination,
+        storage,
+        length,
+        format,
+        detach,
+    )
 }

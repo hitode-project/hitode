@@ -56,6 +56,15 @@ pub mod api {
     pub const COMPACT: u32 = 239;
     pub const RESTORE_ALL_SURFACES: u32 = 240;
     pub const TEST_COOPERATIVE_LEVEL: u32 = 241;
+    pub const DD_CREATE_CLIPPER: u32 = 242;
+    pub const GET_GDI_SURFACE: u32 = 243;
+    pub const GET_DD_INTERFACE: u32 = 244;
+    pub const PAGE_LOCK: u32 = 245;
+    pub const PAGE_UNLOCK: u32 = 246;
+    pub const GET_UNIQUENESS: u32 = 247;
+    pub const CHANGE_UNIQUENESS: u32 = 248;
+    pub const SURFACE_CAPS: u32 = 249;
+    pub const SURFACE_INITIALIZE: u32 = 250;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -187,6 +196,9 @@ const INVALID_CLIP_LIST: u32 = 0x8876006e;
 const CLIPPER_IS_USING_HWND: u32 = 0x88760237;
 const BLT_FAST_CANT_CLIP: u32 = 0x8876023e;
 const NO_COLOR_KEY: u32 = 0x887600d7;
+const NO_CLIP_LIST: u32 = 0x887600cd;
+const REGION_TOO_SMALL: u32 = 0x88760236;
+const ALREADY_INITIALIZED: u32 = 0x88760005;
 /// DDCKEY_DESTBLT, DDCKEY_DESTOVERLAY, DDCKEY_SRCBLT and DDCKEY_SRCOVERLAY.
 const KEY_KINDS: [u32; 4] = [2, 4, 8, 0x10];
 const NOT_LOCKED: u32 = 0x88760248;
@@ -198,6 +210,12 @@ pub struct DirectDraw {
     pending_guest: Vec<ComIdentity<ComState>>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
     surface_objects: BTreeMap<u32, ComIdentity<ComState>>,
+    /// Non-owning index from device_id to live device identity for GetDDInterface.
+    device_objects: BTreeMap<u64, ComIdentity<ComState>>,
+    /// Leased GDI memory DC -> surface id for IDirectDraw7::GetSurfaceFromDC.
+    pub(super) surface_dcs: BTreeMap<u32, u32>,
+    /// Active PageLock counts per surface id.
+    page_locks: BTreeMap<u32, u32>,
     dd_vtable: Option<u32>,
     old_dd_vtable: Option<u32>,
     surface_vtable: Option<u32>,
@@ -240,6 +258,9 @@ impl DirectDraw {
             com: None,
             pending_guest: Vec::new(),
             surface_objects: BTreeMap::new(),
+            device_objects: BTreeMap::new(),
+            surface_dcs: BTreeMap::new(),
+            page_locks: BTreeMap::new(),
             dd_vtable: None,
             old_dd_vtable: None,
             surface_vtable: None,
@@ -367,10 +388,12 @@ impl DirectDraw {
                 (11, api::FLIP),
                 (12, api::GET_ATTACHED),
                 (13, api::GET_BLT_STATUS),
+                (14, api::SURFACE_CAPS),
                 (17, api::SURFACE_DC),
                 (18, api::GET_FLIP_STATUS),
                 (21, api::GET_PIXEL_FORMAT),
                 (22, api::GET_DESC),
+                (23, api::SURFACE_INITIALIZE),
                 (24, api::IS_LOST),
                 (25, api::LOCK),
                 (26, api::SURFACE_RELEASE_DC),
@@ -380,6 +403,11 @@ impl DirectDraw {
                 (28, api::SET_CLIPPER),
                 (29, api::SET_COLOR_KEY),
                 (32, api::UNLOCK),
+                (36, api::GET_DD_INTERFACE),
+                (37, api::PAGE_LOCK),
+                (38, api::PAGE_UNLOCK),
+                (43, api::GET_UNIQUENESS),
+                (44, api::CHANGE_UNIQUENESS),
             ]);
         } else {
             methods.extend([
@@ -390,6 +418,7 @@ impl DirectDraw {
                 (10, api::FLIP_TO_GDI),
                 (11, api::GET_CAPS),
                 (12, api::GET_DISPLAY_MODE),
+                (14, api::GET_GDI_SURFACE),
                 (18, api::INITIALIZE),
                 (19, api::RESTORE_MODE),
                 (20, api::COOPERATIVE),
@@ -553,8 +582,14 @@ impl DirectDraw {
             }
             return Ok(None);
         }
-        if let Kind::Surface(sid) = kind {
-            self.surface_objects.insert(sid, identity);
+        match kind {
+            Kind::Device => {
+                self.device_objects.insert(device_id, identity);
+            }
+            Kind::Surface(sid) => {
+                self.surface_objects.insert(sid, identity);
+            }
+            Kind::Clipper => (),
         }
         self.pending_guest.push(identity);
         Ok(Some(canonical))
@@ -606,6 +641,18 @@ impl DirectDraw {
             .and_then(|clipper| self.clip_lists.get(clipper))
             .cloned()
     }
+    /// AddRef and return a surface interface pointer for an existing surface id.
+    fn surface_interface<P: Presenter>(
+        &mut self,
+        objects: &mut Objects,
+        surfaces: &mut Surfaces<P>,
+        sid: u32,
+        legacy: bool,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<Option<u32>, String> {
+        self.com_version(objects, surfaces, Kind::Surface(sid), legacy, m)
+    }
+
     fn surface_id(&self, objects: &Objects, object: u32) -> Option<u32> {
         match self.com?.get::<ComState>(objects, object)?.kind {
             Kind::Surface(id) => Some(id),
@@ -633,6 +680,7 @@ impl DirectDraw {
                 self.clip_lists.remove(&pointer);
             }
             if matches!(destroyed.value.kind, Kind::Device) {
+                self.device_objects.remove(&destroyed.value.device_id);
                 if self.primary_owner == Some(destroyed.value.modern) {
                     self.primary_owner = None;
                 }
@@ -644,6 +692,8 @@ impl DirectDraw {
                 self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
                 self.surface_owners.remove(&sid);
+                self.page_locks.remove(&sid);
+                self.surface_dcs.retain(|_, &mut owner| owner != sid);
                 self.attached.remove(&sid);
                 self.flipped.remove(&sid);
                 if let Some(back) = self.attached_refs.remove(&sid) {
@@ -783,6 +833,22 @@ impl DirectDraw {
     ) -> Result<u32, String> {
         if id == api::UNIMPLEMENTED_COM {
             return Err("unimplemented DirectDraw COM method".into());
+        }
+        if id == api::DD_CREATE_CLIPPER {
+            if a[1] == 0 {
+                return Ok(INVALID);
+            }
+            m.put_u32(a[1], 0)?;
+            if a[0] != 0 || a[2] != 0 {
+                return Ok(INVALID);
+            }
+            let Some(clipper) = self.com_version(objects, surfaces, Kind::Clipper, false, m)?
+            else {
+                return Ok(0x8007000e);
+            };
+            self.clipper_windows.insert(clipper, 0);
+            m.put_u32(a[1], clipper)?;
+            return Ok(0);
         }
         if id == api::DD_CREATE || id == api::DD_CREATE_OLD {
             m.put_u32(a[1], 0)?;
@@ -1306,6 +1372,129 @@ impl DirectDraw {
                 self.lost
                     .retain(|sid| self.surface_owners.get(sid) != Some(&owner_id));
                 0
+            }
+            api::GET_GDI_SURFACE => {
+                if a[1] == 0 {
+                    return Ok(INVALID);
+                }
+                m.put_u32(a[1], 0)?;
+                let Some(primary) = surfaces
+                    .primary_id()
+                    .filter(|_| matches!(kind, Kind::Device))
+                    .filter(|_| self.primary_owner == Some(object.modern))
+                else {
+                    return Ok(NOT_FOUND);
+                };
+                let sid = match self.attached.get(&primary) {
+                    Some(&back) if self.flipped.contains(&primary) => back,
+                    _ => primary,
+                };
+                let Some(pointer) = self.surface_interface(objects, surfaces, sid, legacy, m)?
+                else {
+                    return Ok(0x8007000e);
+                };
+                m.put_u32(a[1], pointer)?;
+                0
+            }
+            api::GET_DD_INTERFACE => {
+                if a[1] == 0 {
+                    return Ok(INVALID);
+                }
+                m.put_u32(a[1], 0)?;
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                let Some(&device_id) = self.surface_owners.get(&sid) else {
+                    return Ok(NOT_FOUND);
+                };
+                let Some(&device) = self.device_objects.get(&device_id) else {
+                    return Ok(NOT_FOUND);
+                };
+                let Some(canonical) = com.canonical::<ComState>(objects, device) else {
+                    return Ok(NOT_FOUND);
+                };
+                let iid = if legacy { IID_DDRAW } else { IID_DDRAW7 };
+                match com.query::<ComState>(objects, canonical, iid) {
+                    Ok(pointer) => {
+                        m.put_u32(a[1], pointer)?;
+                        0
+                    }
+                    Err(QueryError::ReferenceLimit) => 0x8007000e,
+                    Err(_) => NOT_FOUND,
+                }
+            }
+            api::PAGE_LOCK => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] != 0 {
+                    return Ok(INVALID);
+                }
+                let count = self.page_locks.entry(sid).or_insert(0);
+                let Some(next) = count.checked_add(1) else {
+                    return Ok(0x8007000e);
+                };
+                *count = next;
+                0
+            }
+            api::PAGE_UNLOCK => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] != 0 {
+                    return Ok(INVALID);
+                }
+                match self.page_locks.get_mut(&sid) {
+                    Some(count) if *count > 0 => {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.page_locks.remove(&sid);
+                        }
+                        0
+                    }
+                    _ => NOT_LOCKED,
+                }
+            }
+            api::GET_UNIQUENESS => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] == 0 {
+                    return Ok(INVALID);
+                }
+                m.put_u32(a[1], surfaces[sid].version as u32)?;
+                0
+            }
+            api::CHANGE_UNIQUENESS => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                let s = surfaces.get_mut(sid).unwrap();
+                s.version = s.version.wrapping_add(1);
+                0
+            }
+            api::SURFACE_CAPS => {
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] == 0 {
+                    return Ok(INVALID);
+                }
+                let caps = u32::from_le_bytes(desc(surfaces, sid, 0)[104..108].try_into().unwrap());
+                m.put_u32(a[1], caps)?;
+                if !legacy {
+                    for offset in [4u32, 8, 12] {
+                        m.put_u32(a[1] + offset, 0)?;
+                    }
+                }
+                0
+            }
+            api::SURFACE_INITIALIZE => {
+                if self.surface_id(objects, a[0]).is_none() {
+                    INVALID
+                } else {
+                    ALREADY_INITIALIZED
+                }
             }
             api::IS_LOST | api::RESTORE => match kind {
                 Kind::Surface(sid) if id == api::IS_LOST && self.lost.contains(&sid) => {

@@ -74,6 +74,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Measured on Windows 11 DirectDraw 7.
 
+### GFX-DDRAW-13 Clipper, DC and surface metadata queries
+
+**Rule**: `DirectDrawCreateClipper` and `DirectDrawEnumerateExA`/`W` MUST construct clippers and enumerate the virtual display. `IDirectDraw7::{GetGDISurface, GetSurfaceFromDC}` and `IDirectDrawClipper::{GetClipList, IsClipListChanged}` MUST query live surfaces, leased DCs and clip regions. `IDirectDrawSurface7::{GetDDInterface, PageLock, PageUnlock, GetUniquenessValue, ChangeUniquenessValue, GetCaps}` MUST maintain surface links and counters.
+**Verification**: Test
+**Basis**: Measured on Windows 11 DirectDraw 7.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
@@ -116,7 +122,7 @@ Clipped clears MUST retain depth/stencil deferral independently of their color w
 
 Recorded programmable draws capture guest streams and neutral geometry once, before the guest can mutate or release their sources. Immutable vertices and register snapshots are shared with bounds and sampling analysis. Backend byte packing and point expansion occur only when surviving commands execute. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
 
-Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback boundaries include GetRenderTargetData, GetFrontBufferData, GPU LockRect and GetDC; unsupported capture retains its ABI failure.
+Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback boundaries include GetRenderTargetData, GetFrontBufferData, GPU LockRect and GetDC; GetFrontBufferData captures the presented front surface or rejects invalid destinations.
 
 ### GFX-REC-2 Complete content identities and repeated frames
 

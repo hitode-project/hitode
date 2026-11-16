@@ -151,7 +151,7 @@ fn null_or_non_executable_callbacks_and_short_stack_reject() {
             thunk: 0,
         };
         assert!(matches!(
-            enumerate(&mut e, callback, 0, false),
+            enumerate(&mut e, callback, 0, false, false),
             Outcome::Return(INVALID)
         ));
     }
@@ -164,7 +164,72 @@ fn null_or_non_executable_callbacks_and_short_stack_reject() {
         thunk: 0,
     };
     assert!(matches!(
-        enumerate(&mut e, PARK_ADDR, 0, false),
+        enumerate(&mut e, PARK_ADDR, 0, false, false),
         Outcome::Return(INVALID)
     ));
+}
+
+#[test]
+// spec: GFX-DDRAW-13
+fn extended_enumeration_passes_five_arguments_and_validates_flags() {
+    for wide in [false, true] {
+        let mut registry = Registry::default();
+        register(&mut registry);
+        registry.add("test", "probe_ex", Conv::Stdcall { argc: 5 }, |e| {
+            assert_eq!(e.arg(0), 0);
+            assert_eq!(e.arg(3), DATA);
+            assert_eq!(e.arg(4), 0);
+            e.cpu
+                .write_u32(DATA + 28, e.cpu.read_u32(DATA + 28).unwrap() + 1)
+                .unwrap();
+            Outcome::Return(1)
+        });
+        registry.add("test", "done", Conv::Stdcall { argc: 0 }, |_| {
+            Outcome::ExitThread(0)
+        });
+        assert!(registry.signature_conflicts().is_empty());
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            registry,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        m.cpu.map(CODE, 4096, Prot::EXEC | Prot::READ).unwrap();
+        m.cpu.map(DATA, 4096, Prot::RW).unwrap();
+        let probe = m.resolve_import("test", "probe_ex").unwrap();
+        let done = m.resolve_import("test", "done").unwrap();
+        let name = if wide {
+            "DirectDrawEnumerateExW"
+        } else {
+            "DirectDrawEnumerateExA"
+        };
+        let entry = m.resolve_import("ddraw.dll", name).unwrap();
+        let callback = CODE + 256;
+        let mut cb = Asm::new(callback);
+        for _ in 0..5 {
+            cb.mov_eax_esp(20).push_eax();
+        }
+        cb.call(probe);
+        cb.bytes.extend_from_slice(&[0xc2, 20, 0]);
+        m.cpu.write(callback, &cb.bytes).unwrap();
+        let mut main = Asm::new(CODE);
+        main.push_imm(0)
+            .push_imm(DATA)
+            .push_imm(callback)
+            .call(entry)
+            .mov_mem_eax(DATA)
+            .push_imm(0x8000)
+            .push_imm(DATA)
+            .push_imm(callback)
+            .call(entry)
+            .mov_mem_eax(DATA + 4)
+            .call(done)
+            .hlt();
+        m.cpu.write(CODE, &main.bytes).unwrap();
+        m.spawn("enumex", CODE, &[], 65536).unwrap();
+        assert!(matches!(m.run(), RunResult::Exited(_)));
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), INVALID);
+        assert_eq!(m.cpu.read_u32(DATA + 28).unwrap(), 1);
+    }
 }
