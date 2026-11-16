@@ -225,6 +225,11 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
         Outcome::Return(0)
     ));
     let this = m.cpu.read_u32(DATA).unwrap();
+    // Windows creates surfaces only after a cooperative level is set.
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::COOPERATIVE, &[this, 0, 8]),
+        Outcome::Return(0)
+    ));
     let table = m.cpu.read_u32(this).unwrap();
     let thunk = m
         .resolve_import("ddraw.dll", "IDirectDraw7::EnumDisplayModes")
@@ -530,7 +535,8 @@ fn exclusive_mode_of_a_new_device_loses_a_primary_left_by_a_released_one() {
         0
     );
     let leaked = m.cpu.read_u32(DATA).unwrap();
-    assert_eq!(call(&mut m, api::RELEASE, &[first]), 0);
+    // The surface keeps the DirectDraw7 interface that created it alive.
+    assert_eq!(call(&mut m, api::RELEASE, &[first]), 1);
     assert_eq!(call(&mut m, api::IS_LOST, &[leaked]), 0);
 
     m.cpu.write(DATA + 256, &IID_DDRAW7).unwrap();
@@ -1289,7 +1295,8 @@ fn clipper_dc_gdi_and_surface_metadata_queries_work_across_guest_vtables() {
     assert_eq!(call(&mut m, api::GET_UNIQUENESS, &[primary, DATA + 12]), 0);
     assert_ne!(m.cpu.read_u32(DATA + 12).unwrap(), u0);
     assert_eq!(call(&mut m, api::SURFACE_CAPS, &[primary, DATA + 200]), 0);
-    assert_eq!(m.cpu.read_u32(DATA + 200).unwrap(), 0x200);
+    // DDSCAPS_PRIMARYSURFACE | VISIBLE | VIDEOMEMORY | LOCALVIDMEM, as on Windows.
+    assert_eq!(m.cpu.read_u32(DATA + 200).unwrap(), 0x1000_c200);
     assert_eq!(
         call(&mut m, api::SURFACE_INITIALIZE, &[primary, dd, DATA + 64]),
         0x88760005

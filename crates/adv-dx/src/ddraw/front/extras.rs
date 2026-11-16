@@ -81,7 +81,7 @@ fn get_surface_from_dc(
     if !object.initialized {
         return Outcome::Return(0x800401f0);
     }
-    let legacy = object.legacy_descriptors.contains(&this.addr());
+    let version = surface_version(object.version(this.addr()));
     let Some(&sid) = state.draw.surface_dcs.get(&hdc.0) else {
         return Outcome::Return(NOT_FOUND);
     };
@@ -89,7 +89,7 @@ fn get_surface_from_dc(
     let pointer =
         match state
             .draw
-            .surface_interface(&mut env.sys.objects, store, sid, legacy, &mut mem)
+            .surface_interface(&mut env.sys.objects, store, sid, version, &mut mem)
         {
             Ok(Some(pointer)) => pointer,
             Ok(None) => return Outcome::Return(0x8007000e),
