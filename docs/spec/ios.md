@@ -41,7 +41,7 @@ The check uses Security's `SecTaskCopyValueForEntitlement` for the current proce
 **Applies to**: AArch64
 **Verification**: Test
 
-2 GiB is the user space of 32-bit Windows. Without extended virtual addressing an iOS app has about 7 GiB of address space, so a window and a separate alias do not fit. The lower guard is then the end of the dyld shared region.
+2 GiB is the user space of 32-bit Windows. The dyld shared region ends at `0x3_0000_0000`, and its unmapped end serves as the lower guard. Without the kernel's jumbo map (IOS-MEM-4), an app on a device with more than 3 GiB maps only up to `0x4_5800_0000`. Those 5.4 GiB hold one window but not a window and a separate alias.
 
 ### IOS-MEM-2 Shared compact window
 
@@ -57,7 +57,7 @@ The family runs one process at a time. Every window starts at guest address 0, s
 **Applies to**: iOS
 **Verification**: Test
 
-The app's address space ends a few GiB past the dyld shared region. WebKit reserves its 2 GiB JavaScript heap at the start of that range once a webview loads, after which no 4 GiB-aligned window fits. Reserved first, the window leaves WebKit to run without that heap.
+Without the jumbo map, the app's address space ends 5.4 GiB past the dyld shared region. WebKit reserves its 2 GiB JavaScript heap at the start of that range once a webview loads, after which no 4 GiB-aligned window fits. Reserved first, the window leaves WebKit to run without that heap.
 
 ### IOS-MEM-4 Memory extension
 
@@ -65,7 +65,7 @@ The app's address space ends a few GiB past the dyld shared region. WebKit reser
 **Applies to**: iOS
 **Verification**: Review — signed entitlement queries require a sideloaded device, including the host process inside LiveContainer.
 
-The extension raises the memory limit and widens the address space. That decides whether IOS-MEM-3's 4 GiB-aligned window fits once the process has mapped its libraries. Inside LiveContainer the host process is LiveContainer's, so LiveContainer's own signature carries the extension. Installers that re-sign the app read its declared entitlements and enable the capability on the user's App ID. iloader 2.4.1 enables it for every app it installs, and free development teams may use it. Installations made before this rule lack it, so the dialog reaches upgrading users. The check uses the same `SecTaskCopyValueForEntitlement` query as IOS-JIT-3. The TrollStore package also declares extended virtual addressing, which grants the jumbo map on every device; sideload installers drop it.
+The extension raises the memory limit. Where the device tree sets an entitled memory limit or app swap, it also grants the jumbo map, which ends at `0xf_c000_0000`; elsewhere the kernel ignores the extension. The jumbo map leaves room for the window and everything mapped after it. Inside LiveContainer the host process is LiveContainer's, so LiveContainer's own signature carries the extension. Installers that re-sign the app read its declared entitlements and enable the capability on the user's App ID. iloader 2.4.1 enables it for every app it installs, and free development teams may use it. Installations made before this rule lack it, so the dialog reaches upgrading users. The check uses the same `SecTaskCopyValueForEntitlement` query as IOS-JIT-3. The TrollStore package also declares extended virtual addressing, which grants the jumbo map on every device; sideload installers drop it.
 
 ### IOS-MEM-5 Address space record
 
@@ -73,7 +73,7 @@ The extension raises the memory limit and widens the address space. That decides
 **Applies to**: iOS
 **Verification**: Test
 
-The record tells apart a device whose kernel withholds the jumbo map from one where something else holds the candidate ranges. The kernel grants the jumbo map for the memory extension only on devices that configure an entitled memory limit; without it, the map of a device with more than 3 GiB ends at `0x4_5800_0000`. The layout at launch is the only useful one: once WebKit loads, its heap fills the free range. A restart repeats the same launch, so it cannot help.
+The record tells apart a device whose kernel withholds the jumbo map (IOS-MEM-4) from one where something else holds the candidate ranges. Only the layout at launch shows this, before WebKit and the game map more. A restart repeats the same launch, so it cannot help.
 
 ### IOS-APP-1 Game folder access
 
