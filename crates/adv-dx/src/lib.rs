@@ -8,6 +8,7 @@ pub mod d3d9;
 pub mod ddraw;
 pub mod dshow;
 pub mod dsound;
+pub(crate) mod pacing;
 pub mod shader;
 pub mod wmvcore;
 pub mod xaudio2;

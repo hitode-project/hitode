@@ -103,6 +103,10 @@ pub fn install<B: Backend>(
             completed: frame_completed,
             submitted: adv_drv::user::input::shared_front_frame,
             released: adv_drv::user::input::front_released,
+            vsync: |ext| {
+                ext.try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()
+                    .and_then(|vsync| vsync.phase(std::time::Instant::now()))
+            },
         },
     )?;
     class::install(machine)?;

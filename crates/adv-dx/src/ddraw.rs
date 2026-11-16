@@ -53,6 +53,9 @@ pub mod api {
     pub const GET_BLT_STATUS: u32 = 236;
     pub const GET_FLIP_STATUS: u32 = 237;
     pub const FLIP_TO_GDI: u32 = 238;
+    pub const COMPACT: u32 = 239;
+    pub const RESTORE_ALL_SURFACES: u32 = 240;
+    pub const TEST_COOPERATIVE_LEVEL: u32 = 241;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -176,6 +179,8 @@ const INVALID: u32 = 0x80070057;
 const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
 const NOT_FOUND: u32 = 0x887600ff;
+const NO_EXCLUSIVE_MODE: u32 = 0x887600e1;
+const EXCLUSIVE_MODE_ALREADY_SET: u32 = 0x88760245;
 const SURFACE_LOST: u32 = 0x887601c2;
 const NO_CLIPPER_ATTACHED: u32 = 0x88760238;
 const INVALID_CLIP_LIST: u32 = 0x8876006e;
@@ -213,6 +218,11 @@ pub struct DirectDraw {
     /// The live DirectDraw object (its modern interface) that created the
     /// primary surface; none once that object is gone.
     primary_owner: Option<u32>,
+    /// Monotonic id of the live device holding exclusive fullscreen mode.
+    exclusive_owner: Option<u64>,
+    next_device_id: u64,
+    /// Owning device id for each surface sid at creation time.
+    surface_owners: BTreeMap<u32, u64>,
     /// Current screen origin of the window-backed primary for this operation.
     primary_origin: Option<(i32, i32)>,
     /// Surfaces lost to another DirectDraw object's exclusive mode.
@@ -243,6 +253,9 @@ impl DirectDraw {
             attached: BTreeMap::new(),
             attached_refs: BTreeMap::new(),
             primary_owner: None,
+            exclusive_owner: None,
+            next_device_id: 1,
+            surface_owners: BTreeMap::new(),
             primary_origin: None,
             lost: BTreeSet::new(),
             flipped: BTreeSet::new(),
@@ -300,6 +313,8 @@ enum Kind {
 struct ComState {
     kind: Kind,
     initialized: bool,
+    device_id: u64,
+    was_exclusive: bool,
     focus_window: u32,
     windowed: bool,
     old: u32,
@@ -368,6 +383,7 @@ impl DirectDraw {
             ]);
         } else {
             methods.extend([
+                (3, api::COMPACT),
                 (4, api::CREATE_CLIPPER),
                 (6, api::CREATE_SURFACE),
                 (8, api::ENUM_MODES),
@@ -385,6 +401,8 @@ impl DirectDraw {
                         api::DISPLAY_MODE
                     },
                 ),
+                (25, api::RESTORE_ALL_SURFACES),
+                (26, api::TEST_COOPERATIVE_LEVEL),
             ]);
         }
         for (slot, id) in methods {
@@ -488,9 +506,18 @@ impl DirectDraw {
         let modern = *pointers.last().unwrap();
         let canonical = if legacy { old } else { modern };
         let initial_iid = layouts.iter().find(|(_, p)| *p == canonical).unwrap().0;
+        let device_id = if matches!(kind, Kind::Device) {
+            let id = self.next_device_id;
+            self.next_device_id += 1;
+            id
+        } else {
+            0
+        };
         let value = ComState {
             kind,
             initialized: true,
+            device_id,
+            was_exclusive: false,
             focus_window: 0,
             windowed: false,
             old,
@@ -605,14 +632,18 @@ impl DirectDraw {
                 self.clipper_origins.remove(&pointer);
                 self.clip_lists.remove(&pointer);
             }
-            if matches!(destroyed.value.kind, Kind::Device)
-                && self.primary_owner == Some(destroyed.value.modern)
-            {
-                self.primary_owner = None;
+            if matches!(destroyed.value.kind, Kind::Device) {
+                if self.primary_owner == Some(destroyed.value.modern) {
+                    self.primary_owner = None;
+                }
+                if self.exclusive_owner == Some(destroyed.value.device_id) {
+                    self.exclusive_owner = None;
+                }
             }
             if let Kind::Surface(sid) = destroyed.value.kind {
                 self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
+                self.surface_owners.remove(&sid);
                 self.attached.remove(&sid);
                 self.flipped.remove(&sid);
                 if let Some(back) = self.attached_refs.remove(&sid) {
@@ -827,15 +858,26 @@ impl DirectDraw {
                     com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
                     0
                 } else if a[2] == 8 || a[2] & 0x11 == 0x11 {
-                    let device = com.get_mut::<ComState>(objects, a[0]).unwrap();
-                    device.focus_window = a[1];
-                    device.windowed = a[2] == 8;
-                    let device = device.modern;
+                    let exclusive = a[2] & 0x11 == 0x11;
+                    let device_state = com.get_mut::<ComState>(objects, a[0]).unwrap();
+                    device_state.focus_window = a[1];
+                    device_state.windowed = !exclusive;
+                    let device_id = device_state.device_id;
+                    let device = device_state.modern;
+                    if exclusive {
+                        device_state.was_exclusive = true;
+                        self.exclusive_owner = Some(device_id);
+                    } else {
+                        device_state.was_exclusive = false;
+                        if self.exclusive_owner == Some(device_id) {
+                            self.exclusive_owner = None;
+                        }
+                    }
                     // Exclusive mode loses the surfaces of every other
                     // DirectDraw object, so a primary another object made, or
                     // one left behind by a released object, stops being the
                     // display.
-                    if a[2] & 0x11 == 0x11
+                    if exclusive
                         && self.primary_owner != Some(device)
                         && let Some(sid) = surfaces.detach_primary()
                     {
@@ -1065,7 +1107,7 @@ impl DirectDraw {
                         // dwCaps2 and ddsCaps report the surfaces CreateSurface
                         // makes, local and nonlocal (AGP) video memory alike.
                         for (offset, value) in [
-                            (4usize, 0x00400040u32),
+                            (4usize, 0x00420040u32), // DDCAPS_BLT | DDCAPS_READSCANLINE | DDCAPS_GDI
                             (8, 0x200),
                             (60, 64 * 1024 * 1024), // dwVidMemTotal
                             (64, 32 * 1024 * 1024), // dwVidMemFree
@@ -1094,9 +1136,11 @@ impl DirectDraw {
                 {
                     return Ok(UNSUPPORTED);
                 }
+                let owner_device_id = object.device_id;
+                let owner_modern = object.modern;
                 let sid = if caps & 0x200 != 0 {
                     let primary = surfaces.primary(m)?;
-                    self.primary_owner = com.get::<ComState>(objects, a[0]).map(|d| d.modern);
+                    self.primary_owner = Some(owner_modern);
                     if caps & 0x18 == 0x18 && flags & 0x20 != 0 && m.u32(a[1] + 20)? > 0 {
                         if self.attached.contains_key(&primary) {
                             return Ok(BUSY);
@@ -1114,6 +1158,7 @@ impl DirectDraw {
                             surfaces.delete(back);
                             return Ok(0x8007000e);
                         };
+                        self.surface_owners.insert(back, owner_device_id);
                         self.attached.insert(primary, back);
                         self.attached_refs.insert(primary, back_ref);
                         self.flipped.remove(&primary);
@@ -1156,6 +1201,7 @@ impl DirectDraw {
                     return Ok(0x8007000e);
                 };
                 m.put_u32(a[2], p)?;
+                self.surface_owners.insert(sid, owner_device_id);
                 0
             }
             api::LOCK => {
@@ -1221,11 +1267,60 @@ impl DirectDraw {
                 m.write(a[1], &desc[..len as usize])?;
                 0
             }
+            api::COMPACT => {
+                if !matches!(kind, Kind::Device) {
+                    return Ok(INVALID);
+                }
+                if self.exclusive_owner == Some(object.device_id) {
+                    0
+                } else {
+                    NO_EXCLUSIVE_MODE
+                }
+            }
+            api::TEST_COOPERATIVE_LEVEL => {
+                if !matches!(kind, Kind::Device) {
+                    return Ok(INVALID);
+                }
+                if object.was_exclusive && self.exclusive_owner != Some(object.device_id) {
+                    NO_EXCLUSIVE_MODE
+                } else if self
+                    .exclusive_owner
+                    .is_some_and(|owner| owner != object.device_id)
+                {
+                    EXCLUSIVE_MODE_ALREADY_SET
+                } else {
+                    0
+                }
+            }
+            api::RESTORE_ALL_SURFACES => {
+                if !matches!(kind, Kind::Device) {
+                    return Ok(INVALID);
+                }
+                if self
+                    .exclusive_owner
+                    .is_some_and(|owner| owner != object.device_id)
+                {
+                    return Ok(EXCLUSIVE_MODE_ALREADY_SET);
+                }
+                let owner_id = object.device_id;
+                self.lost
+                    .retain(|sid| self.surface_owners.get(sid) != Some(&owner_id));
+                0
+            }
             api::IS_LOST | api::RESTORE => match kind {
                 Kind::Surface(sid) if id == api::IS_LOST && self.lost.contains(&sid) => {
                     SURFACE_LOST
                 }
-                Kind::Surface(_) => 0,
+                Kind::Surface(sid) => {
+                    if surfaces.primary_id() == Some(sid)
+                        || self
+                            .exclusive_owner
+                            .is_none_or(|owner| self.surface_owners.get(&sid) == Some(&owner))
+                    {
+                        self.lost.remove(&sid);
+                    }
+                    0
+                }
                 _ => INVALID,
             },
             api::GET_PIXEL_FORMAT => {
