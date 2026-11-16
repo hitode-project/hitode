@@ -53,22 +53,34 @@ impl Com {
         {
             return false;
         }
-        let Some(counter) = env.sys.guest_words.allocate(env.cpu, &mut env.sys.vm) else {
-            return false;
-        };
-        counter.store(1);
-        counter.set_limit(
-            u32::MAX
-                - self.object(&env.sys.objects, id).unwrap().aliases.len() as u32
-                - self.object(&env.sys.objects, id).unwrap().internal,
-        );
+        let limit = u32::MAX - pointers.len() as u32 - object.internal;
+        let separate: Vec<_> = object.separate.keys().copied().collect();
+        let mut counters = Vec::new();
+        for _ in 0..=separate.len() {
+            let Some(counter) = env.sys.guest_words.allocate(env.cpu, &mut env.sys.vm) else {
+                return false;
+            };
+            counter.set_limit(limit);
+            counters.push(counter);
+        }
+        let shared = counters.pop().unwrap();
+        shared.store(self.shared(&env.sys.objects, id).unwrap());
         for pointer in pointers {
+            let address = separate
+                .iter()
+                .position(|&p| p == pointer)
+                .map_or(shared.address, |at| counters[at].address);
             // All complete ranges were checked before any publication.
             env.cpu
-                .write_u32(pointer + 4, counter.address)
+                .write_u32(pointer + 4, address)
                 .expect("validated COM header");
         }
-        env.sys.objects.owned_mut(id).unwrap().guest = Some(counter);
+        let object = env.sys.objects.owned_mut(id).unwrap();
+        for (count, counter) in object.separate.values_mut().zip(counters) {
+            counter.store(count.host);
+            count.guest = Some(counter);
+        }
+        object.guest = Some(shared);
         true
     }
 }
