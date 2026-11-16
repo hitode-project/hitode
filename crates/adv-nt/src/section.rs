@@ -252,6 +252,43 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
+/// Initial page capability ceilings for data section handles created here.
+#[derive(Default)]
+struct SectionProtections(std::collections::HashMap<u32, u8>);
+
+/// Forgets tracked section protection state when `handle` closes.
+pub fn forget(env: &mut Env<'_>, handle: u32) {
+    if let Some(sections) = env.ext.try_get_mut::<SectionProtections>() {
+        sections.0.remove(&handle);
+    }
+}
+
+/// Copies a data section's protection ceiling across in-process handle duplication.
+pub(crate) fn duplicate_handle(
+    env: &mut Env<'_>,
+    src_process: u32,
+    src_handle: u32,
+    dst_process: u32,
+    dst_handle: u32,
+) {
+    if dst_handle == 0
+        || crate::information::current_process(env, src_process).is_err()
+        || crate::information::current_process(env, dst_process).is_err()
+    {
+        return;
+    }
+    if let Some(caps) = env
+        .ext
+        .try_get::<SectionProtections>()
+        .and_then(|sections| sections.0.get(&src_handle).copied())
+    {
+        env.ext
+            .get_or_default::<SectionProtections>()
+            .0
+            .insert(dst_handle, caps);
+    }
+}
+
 /// Creates a section in the server and returns its handle, with
 /// OBJECT_NAME_EXISTS when a named section was opened instead.
 pub fn create_mapping(
@@ -264,6 +301,7 @@ pub fn create_mapping(
     file: u32,
 ) -> Result<(u32, Status), Error> {
     use crate::memory::*;
+    let caps = protection_caps(protection)?;
     let file_access = match protection & 0xff {
         PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY => {
             FILE_READ_DATA
@@ -284,9 +322,32 @@ pub fn create_mapping(
     };
     let (reply, _) = server::request(env, &mut request, &[&objattr], &mut [])?;
     match reply.header.error {
-        status::SUCCESS | status::OBJECT_NAME_EXISTS => Ok((reply.handle, reply.header.error)),
+        status::SUCCESS | status::OBJECT_NAME_EXISTS => {
+            if flags & SEC_IMAGE == 0 && reply.header.error == status::SUCCESS {
+                env.ext
+                    .get_or_default::<SectionProtections>()
+                    .0
+                    .insert(reply.handle, caps);
+            }
+            Ok((reply.handle, reply.header.error))
+        }
         error => Err(error.into()),
     }
+}
+
+fn validate_view_alignment(address: &mut u32, offset: u64, alloc_type: u32) -> Result<(), Status> {
+    if alloc_type & 0x800_0000 != 0 {
+        *address &= !(PAGE - 1);
+    }
+    let mask = if alloc_type & (0x4000 | 0x800_0000) != 0 {
+        PAGE - 1
+    } else {
+        ALLOCATION_GRANULARITY - 1
+    };
+    if (offset as u32) & mask != 0 || *address & mask != 0 {
+        return Err(MAPPED_ALIGNMENT);
+    }
+    Ok(())
 }
 
 /// NtMapViewOfSection(handle, process, *base, zero_bits, commit_size,
@@ -304,12 +365,12 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         handle,
         process,
         base_out,
-        _,
-        _,
+        _zero_bits,
+        _commit_size,
         offset,
         size_out,
-        _,
-        _,
+        _inherit,
+        alloc_type,
         protection,
     ] = args
     else {
@@ -317,11 +378,7 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     };
     status::finish((|| {
         crate::information::current_process(env, process)?;
-        if read_u32(env, base_out)? != 0 {
-            return Err(Error::Unsupported(
-                "mapping a view at a given address".into(),
-            ));
-        }
+        let mut requested_base = read_u32(env, base_out)?;
         let offset = match offset {
             0 => 0,
             offset => {
@@ -336,6 +393,7 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
         if reply.flags & SEC_IMAGE == 0 {
+            validate_view_alignment(&mut requested_base, offset, alloc_type)?;
             let requested = read_u32(env, size_out)?;
             let (base, size) = map_data(
                 env,
@@ -344,7 +402,7 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 offset,
                 requested,
                 protection,
-                (0, 0, 0, 0),
+                (requested_base, alloc_type, 0, 0),
             )?;
             write_u32(env, base_out, base)?;
             write_u32(env, size_out, size)?;
@@ -355,7 +413,7 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 "mapping an image view at an offset".into(),
             ));
         }
-        let view = map_image(env, handle)?;
+        let view = map_image_at(env, handle, requested_base)?;
         write_u32(env, base_out, view.base)?;
         write_u32(env, size_out, view.size)?;
         if view.relocated {
@@ -397,6 +455,15 @@ fn map_data(
     (address, kind, low, high): (u32, u32, u32, u32),
 ) -> Result<(u32, u32), Error> {
     use crate::memory::*;
+    let view_caps = protection_caps(protection)?;
+    if let Some(sec_caps) = env
+        .ext
+        .try_get::<SectionProtections>()
+        .and_then(|sections| sections.0.get(&mapping).copied())
+        && view_caps & !sec_caps != 0
+    {
+        return Err(SECTION_PROTECTION.into());
+    }
     let alignment = if kind & 0x4000 != 0 || kind & 0x800_0000 != 0 {
         PAGE
     } else {
@@ -416,14 +483,9 @@ fn map_data(
         }
         requested => requested,
     };
-    if protection == PAGE_EXECUTE_READWRITE {
-        return Err(Error::Unsupported(
-            "mapping a writable executable view of a data section".into(),
-        ));
-    }
-    let fd = server::handle_fd(env, mapping)?;
     let rounded = u32::try_from(u64::from(size).next_multiple_of(u64::from(PAGE)))
         .map_err(|_| status::INVALID_PARAMETER)?;
+    let fd = server::handle_fd(env, mapping)?;
     let base = memory::reserve_section(env, address, rounded, kind, low, high)?;
     let source = crate::file::volume::mounts(env)
         .reader(fd.fd)
@@ -442,7 +504,7 @@ fn map_data(
         )?
     } else {
         match protection & 0xff {
-            PAGE_READONLY | PAGE_READWRITE => {
+            PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE => {
                 // SAFETY: the server's descriptor stays open while fd lives.
                 let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
                 let memory = env.ext.get_or_default::<Memory>();
@@ -557,7 +619,23 @@ pub fn are_same(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
+fn range_is_free(vm: &adv_machine::vm::Vm, start: u32, size: u32) -> bool {
+    start >= ALLOCATION_GRANULARITY
+        && start.checked_add(size).is_some()
+        && vm.containing(start).is_none()
+        && vm
+            .next_region(start)
+            .is_none_or(|next| next - start >= size)
+}
+
 pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
+    map_image_at(env, mapping, 0)
+}
+
+fn map_image_at(env: &mut Env<'_>, mapping: u32, requested_base: u32) -> Result<View, Error> {
+    if requested_base != 0 && !requested_base.is_multiple_of(ALLOCATION_GRANULARITY) {
+        return Err(MAPPED_ALIGNMENT.into());
+    }
     let mut request = GetMappingInfoRequest {
         handle: mapping,
         access: SECTION_MAP_READ,
@@ -601,13 +679,12 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
         pe.image_base
     };
     let size = align_up(pe.size_of_image, PAGE);
-    let base = if env.sys.vm.containing(preferred).is_none()
-        && env
-            .sys
-            .vm
-            .next_region(preferred)
-            .is_none_or(|next| next - preferred >= size)
-    {
+    let base = if requested_base != 0 {
+        if !range_is_free(&env.sys.vm, requested_base, size) {
+            return Err(status::CONFLICTING_ADDRESSES.into());
+        }
+        requested_base
+    } else if range_is_free(&env.sys.vm, preferred, size) {
         preferred
     } else {
         memory::find_free(&env.sys.vm, size, false).ok_or(status::NO_MEMORY)?
@@ -800,17 +877,9 @@ pub fn map_view_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if address != 0 && (low != 0 || high != 0) {
             return Err(status::INVALID_PARAMETER.into());
         }
+        validate_view_alignment(&mut address, offset, args[5])?;
         if args[5] & 0x800_0000 != 0 {
-            address &= !(PAGE - 1);
             write_u32(env, args[2], address)?;
-        }
-        let mask = if args[5] & (0x4000 | 0x800_0000) != 0 {
-            PAGE - 1
-        } else {
-            ALLOCATION_GRANULARITY - 1
-        };
-        if offset as u32 & mask != 0 || address & mask != 0 {
-            return Err(MAPPED_ALIGNMENT.into());
         }
         crate::information::current_process(env, args[1])?;
         let mut request = GetMappingInfoRequest {

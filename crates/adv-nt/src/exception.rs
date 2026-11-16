@@ -81,6 +81,9 @@ const DISPATCH_CLEARED_FLAGS: u32 = 0x100 | 0x400 | 0x4_0000;
 
 /// The machine's exception handler for NT processes.
 pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) -> Outcome {
+    if matches!(event, Exception::Trap { vector: 41, .. }) {
+        return fastfail(env);
+    }
     if matches!(event, Exception::Trap { vector: 45, .. })
         && matches!(checkpoint.state.regs[0], 1 | 3 | 4 | 5)
     {
@@ -108,6 +111,20 @@ pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) 
     }
     mapping::normalize_context(&record, &mut checkpoint.state);
     enter_dispatcher(env, checkpoint, &record, &[])
+}
+
+const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xc000_0409;
+
+/// `__fastfail` (`int 0x29`) bypasses user handlers and ends the process.
+fn fastfail(env: &mut Env<'_>) -> Outcome {
+    if env.ext.try_get::<crate::server::Link>().is_some() {
+        let _ = crate::process::terminate(env, &[0, STATUS_STACK_BUFFER_OVERRUN]);
+        return crate::process::terminate(
+            env,
+            &[crate::memory::CURRENT_PROCESS, STATUS_STACK_BUFFER_OVERRUN],
+        );
+    }
+    Outcome::ExitProcess(STATUS_STACK_BUFFER_OVERRUN)
 }
 
 /// Resumes the thread in the dispatcher with `record` and the CONTEXT of
@@ -345,4 +362,36 @@ pub fn syscall_stub(env: &mut Env<'_>, _: &[u32]) -> Outcome {
         information,
     };
     enter_dispatcher(env, checkpoint, &record, &tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::Cpu;
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+    #[test]
+    fn fastfail_trap_bypasses_dispatcher_and_exits_with_stack_buffer_overrun() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let main = machine.spawn("main", PARK_ADDR, &[], 0x1_0000).unwrap();
+        let outcome = machine
+            .visit_context(Some(main), |env| {
+                let checkpoint = env.checkpoint().unwrap();
+                deliver(
+                    env,
+                    Exception::Trap {
+                        pc: 0x1000,
+                        vector: 41,
+                    },
+                    checkpoint,
+                )
+            })
+            .unwrap();
+        assert!(matches!(outcome, Outcome::ExitProcess(0xc000_0409)));
+    }
 }

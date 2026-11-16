@@ -257,18 +257,26 @@ pub(crate) fn child_block(
         .enumerate()
     {
         let len = get(64 + 4 * index) as usize;
-        if field == 0x30 && len == 0 {
+        if (field == 0x30 || field == 0x88) && len == 0 {
             continue;
         }
         let mut text = &bytes[source..source + len];
         if field == 0x38 && text.starts_with(&[92, 0, 63, 0, 63, 0, 92, 0]) {
             text = &text[8..];
         }
-        let max = if index == 0 { 520 } else { text.len() + 2 };
+        let max = match field {
+            CURRENT_DIRECTORY => 520,
+            0x88 => text.len(),
+            _ => text.len() + 2,
+        };
         put(&mut block, field, text.len() as u32 | ((max as u32) << 16));
         put(&mut block, field + 4, base + target as u32);
         block[target..target + text.len()].copy_from_slice(text);
-        target += max;
+        target += if field == 0x88 {
+            max.next_multiple_of(2)
+        } else {
+            max
+        };
         source += len;
     }
     let environment = &bytes[info_size as usize..];
@@ -276,4 +284,40 @@ pub(crate) fn child_block(
     put(&mut block, ENVIRONMENT_SIZE, environment.len() as u32);
     block[target..target + environment.len()].copy_from_slice(environment);
     Ok(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_block_leaves_empty_runtime_data_zero_and_preserves_nonempty_length() {
+        let mut info = vec![0u8; 96];
+        // imagepath_len = 2 ("a" without NUL for a minimal fixture)
+        put(&mut info, 64 + 4 * 2, 2);
+        info.extend_from_slice(&[b'a', 0]);
+        let info_size = info.len() as u32;
+        info.extend_from_slice(&[0, 0, 0, 0]); // empty environment block
+
+        let block = child_block(&info, info_size, 0x1000).unwrap();
+        let read = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        assert_eq!(read(0x88), 0);
+        assert_eq!(read(0x8c), 0);
+
+        // Now populate RuntimeData with an odd binary byte count (cbReserved2 = 5).
+        let mut non_empty = vec![0u8; 96];
+        put(&mut non_empty, 64 + 4 * 2, 2);
+        put(&mut non_empty, 64 + 4 * 7, 5);
+        non_empty.extend_from_slice(&[b'a', 0, 1, 2, 3, 4, 5, 0]);
+        let info_size = non_empty.len() as u32;
+        non_empty.extend_from_slice(&[b'X', 0, 0, 0, 0, 0]);
+
+        let block = child_block(&non_empty, info_size, 0x2000).unwrap();
+        let read = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        // Both Length and MaximumLength must equal 5 (cbReserved2) without +2 string padding.
+        assert_eq!(read(0x88), 5 | (5 << 16));
+        let runtime_ptr = read(0x8c) as usize - 0x2000;
+        assert_eq!(&block[runtime_ptr..runtime_ptr + 5], &[1, 2, 3, 4, 5]);
+        assert_eq!(read(ENVIRONMENT) % 2, 0);
+    }
 }
