@@ -18,6 +18,7 @@
         android:label="@string/app_name"
         android:theme="@style/Theme.adv_launcher"
         android:usesCleartextTraffic="${usesCleartextTraffic}"
+        android:requestLegacyExternalStorage="true"
         android:hasFragileUserData="true">
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|density|fontScale|layoutDirection|navigation|touchscreen|colorMode"

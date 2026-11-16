@@ -134,6 +134,42 @@ class ImportFilesTest {
     }
 
     // spec: AND-APP-9
+    @Test fun legacySecondaryVolumeDiscoveryMarksRemovableVolumesReadOnly() {
+        val temp = Files.createTempDirectory("legacy-storage-test").toFile()
+        try {
+            val storageDir = File(temp, "storage").apply { mkdir() }
+            val primaryAppDir = File(storageDir, "emulated/0/Android/data/org.hitode.launcher/files")
+            val sdAppDir = File(storageDir, "9C33-6BBD/Android/data/org.hitode.launcher/files")
+            val selfAppDir = File(storageDir, "self/primary/Android/data/org.hitode.launcher/files")
+
+            assertNull(legacyExternalVolumeRoot(primaryAppDir, storageDir))
+            assertNull(legacyExternalVolumeRoot(selfAppDir, storageDir))
+            val sdRoot = legacyExternalVolumeRoot(sdAppDir, storageDir)
+            assertNotNull(sdRoot)
+            assertEquals("9C33-6BBD", sdRoot!!.id)
+            assertEquals(File(storageDir, "9C33-6BBD"), sdRoot.directory)
+            assertFalse(sdRoot.writable)
+
+            val api29Roots = listOf(
+                StorageRoot("primary", File(storageDir, "emulated/0"), writable = true),
+                sdRoot,
+            )
+            assertFalse(
+                canGrantDirectAccess(
+                    "com.android.externalstorage.documents",
+                    "9C33-6BBD:Games/Novel",
+                    granted = true,
+                    supported = true,
+                    api29Roots,
+                )
+            )
+            assertNull(writableFolderPath("9C33-6BBD:Games/Novel", true, api29Roots))
+        } finally {
+            temp.deleteRecursively()
+        }
+    }
+
+    // spec: AND-APP-9
     @Test fun failedCopyLeavesNeitherPartialDestinationNorStaging() {
         val parent = Files.createTempDirectory("import-test").toFile()
         try {

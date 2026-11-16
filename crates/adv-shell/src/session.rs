@@ -128,7 +128,11 @@ impl Session {
         #[cfg(target_os = "macos")]
         let damage_hud;
         {
-            let (startup, display) = view.create_display(options.gpu_software, ui.wake())?;
+            let (startup, display) = view.create_display(
+                options.gpu_software,
+                ui.wake(),
+                Some(options.gpu_cache_dir()),
+            )?;
             #[cfg(target_os = "macos")]
             {
                 damage_hud = startup.debug_settings().damage_hud.clone();

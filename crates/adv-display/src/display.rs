@@ -199,21 +199,44 @@ impl Upscaled {
 impl Pipelines {
     fn new(device: &Device, format: Format) -> adv_gpu::Result<Self> {
         let (video, sampler) = video::resources(device, format)?;
+        let software_video = video::software_resources(device, format)?.0;
+        let ingest = ingest::pipeline(device, format)?;
+        let output = output::pipeline(device, format, false)?;
+        let software = output::pipeline(device, format, true)?;
+        #[cfg(target_os = "android")]
+        if device
+            .caps()
+            .format(Format::Nv21)
+            .contains(adv_gpu::FormatCaps::PRESENTABLE)
+        {
+            let check_pool = device.create_present_pool(&adv_gpu::present::PoolDesc {
+                color: Some(adv_gpu::present::YuvColor::Bt601Limited),
+                width: 2,
+                height: 2,
+                format: Format::Nv21,
+                count: 1,
+                storage: false,
+                label: "video pipeline check",
+            })?;
+            let _ = video::converted_resources(device, format, &check_pool)?;
+            let _ = video::converted_software_resources(device, format, &check_pool)?;
+        }
         Ok(Self {
-            software_video: video::software_resources(device, format)?.0,
-            ingest: ingest::pipeline(device, format)?,
-            output: output::pipeline(device, format, false)?,
-            software: output::pipeline(device, format, true)?,
+            software_video,
+            ingest,
+            output,
+            software,
             video,
             sampler,
         })
     }
 }
-/// A model build: its choice and canvas, the result once sent, then its
-/// half-precision check until the GPU ran it. A failed build stays here, so
-/// the view stays unscaled instead of retrying.
+/// A model build: its choice, canvas and precision, the result once sent, then
+/// its half-precision check until the GPU ran it. A failed single-precision
+/// build stays here, so the view stays unscaled instead of retrying.
 struct Building {
     key: (Upscaler, (u32, u32)),
+    half: bool,
     result: std::sync::mpsc::Receiver<adv_gpu::Result<(Upscaled, Option<upscale::Check>)>>,
     checking: Option<(Upscaled, upscale::Check, Token)>,
     failed: bool,
@@ -290,7 +313,11 @@ impl Display {
             .features
             .contains(adv_gpu::Features::TIMESTAMPS)
         {
-            Some(device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2)?)
+            match device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2) {
+                Ok(queries) => Some(queries),
+                Err(adv_gpu::Error::OutOfMemory) => return Err(adv_gpu::Error::OutOfMemory),
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -363,6 +390,25 @@ impl Display {
     #[cfg(test)]
     pub(crate) fn upscaler_ready(&mut self, queue: &mut Queue) -> bool {
         self.install(queue).unwrap() || self.upscaled.is_some()
+    }
+    #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+    pub(crate) fn inject_failed_build(&mut self, choice: Upscaler, canvas: (u32, u32), half: bool) {
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        send.send(Err(adv_gpu::Error::Compile(
+            "blocked after driver crash: upscale:f16".into(),
+        )))
+        .unwrap();
+        self.building = Some(Building {
+            key: (choice, canvas),
+            half,
+            result,
+            checking: None,
+            failed: false,
+        });
+    }
+    #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+    pub(crate) fn single_precision_forced(&self) -> bool {
+        self.single
     }
     /// The base image the compositor shows last.
     #[cfg(test)]
@@ -1046,13 +1092,17 @@ impl Display {
             let spawned = std::thread::Builder::new()
                 .name("adv-upscale-build".into())
                 .spawn(move || {
-                    let _ = send.send(Upscaled::new(&device, choice, canvas, half));
+                    let probe = format!("upscale:{choice:?}:{}", if half { "f16" } else { "f32" });
+                    let built = device
+                        .guard_compile(&probe, || Upscaled::new(&device, choice, canvas, half));
+                    let _ = send.send(built);
                     if let Some(wake) = wake {
                         wake();
                     }
                 });
             self.building = Some(Building {
                 key,
+                half,
                 result,
                 checking: None,
                 failed: spawned.is_err(),
@@ -1093,8 +1143,16 @@ impl Display {
                     return Ok(false);
                 }
                 Ok(Err(error)) => {
-                    eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
-                    building.failed = true;
+                    if building.half {
+                        eprintln!(
+                            "[display] {choice:?} half precision failed ({error:?}); using single"
+                        );
+                        self.single = true;
+                        self.building = None;
+                    } else {
+                        eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
+                        building.failed = true;
+                    }
                     return Ok(false);
                 }
                 Err(_) => return Ok(false),

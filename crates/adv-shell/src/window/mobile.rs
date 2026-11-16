@@ -538,22 +538,33 @@ impl GameView {
         &self,
         software: bool,
         wake: adv_sync::WakeEvent,
+        cache_dir: Option<std::path::PathBuf>,
     ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
-        let (device, queue) = crate::display::open(software)?;
         #[cfg(target_os = "android")]
         {
-            let caps = crate::display::platform_caps(Some(&device));
-            let compositor = unsafe {
-                adv_display::compositor::android::SurfaceCompositor::new(
-                    self.window.get().ok_or("the Android view has no surface")?,
-                    caps,
+            let window = self.window.get().ok_or("the Android view has no surface")?;
+            let view_size = self.client.get();
+            crate::display::open_with(software, cache_dir, |device, queue| {
+                let caps = crate::display::platform_caps(Some(&device));
+                let compositor = match unsafe {
+                    adv_display::compositor::android::SurfaceCompositor::new(window, caps)
+                } {
+                    Ok(compositor) => compositor,
+                    Err(e) => return Ok(Err(format!("SurfaceControl: {e:?}"))),
+                };
+                crate::display::channel(
+                    device,
+                    queue,
+                    Box::new(compositor),
+                    view_size,
+                    wake.clone(),
                 )
-            }
-            .map_err(|e| format!("SurfaceControl: {e:?}"))?;
-            crate::display::channel(device, queue, Box::new(compositor), self.client.get(), wake)
+                .map(Ok)
+            })
         }
         #[cfg(target_os = "ios")]
         {
+            let (device, queue) = crate::display::open(software, cache_dir)?;
             let host = self.host.borrow();
             let host = host.as_ref().ok_or("the iOS view is gone")?;
             crate::display::apple_channel(

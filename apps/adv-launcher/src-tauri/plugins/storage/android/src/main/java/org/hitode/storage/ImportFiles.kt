@@ -61,6 +61,26 @@ internal fun canGrantDirectAccess(
     authority == "com.android.externalstorage.documents" &&
     storagePath(documentId, granted = true, roots, requireWritable = true) != null
 
+internal fun legacyExternalVolumeRoot(
+    appFilesDir: File,
+    storageDir: File = File("/storage"),
+): StorageRoot? {
+    val storageRoot = storageDir.toPath().normalize()
+    var current: File? = appFilesDir.toPath().normalize().toFile()
+    while (current != null) {
+        val parent = current.parentFile
+        if (parent != null && parent.toPath().normalize() == storageRoot) {
+            val name = current.name
+            if (name != "emulated" && name != "self" && name.isNotEmpty()) {
+                return StorageRoot(name, current, writable = false)
+            }
+            return null
+        }
+        current = parent
+    }
+    return null
+}
+
 /** Publish a complete same-parent copy; exceptions leave no partial destination. */
 internal fun publishFolder(dest: File, copy: (File) -> Unit) {
     if (dest.exists()) throw IOException("Import destination already exists")

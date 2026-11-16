@@ -8,6 +8,7 @@ import { fetchStorageStatus, invokeRequestStorage } from "./storage";
 class AndroidStorage {
   granted = $state(true);
   supported = $state(false);
+  legacy = $state(false);
   checked = $state(false);
   busy = $state(false);
   #refreshing: Promise<void> | null = null;
@@ -44,6 +45,7 @@ class AndroidStorage {
         const changed = this.checked && this.granted !== status.granted;
         this.granted = status.granted;
         this.supported = status.supported;
+        this.legacy = Boolean(status.legacy);
         this.checked = true;
         if (changed) await library.refresh();
       } catch (error) {
@@ -63,6 +65,7 @@ class AndroidStorage {
       const changed = !this.checked || this.granted !== status.granted;
       this.granted = status.granted;
       this.supported = status.supported;
+      this.legacy = Boolean(status.legacy);
       this.checked = true;
       if (changed) await library.refresh();
       return status.granted;

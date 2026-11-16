@@ -1,9 +1,11 @@
 package org.hitode.storage
 
+import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.CancellationSignal
@@ -15,10 +17,14 @@ import android.provider.DocumentsContract.Document
 import android.provider.Settings
 import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import app.tauri.PermissionState
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.Permission
+import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
@@ -83,7 +89,19 @@ private class CopyJob(val id: String) {
 
 private data class Entry(val id: String, val name: String, val directory: Boolean, val size: Long?)
 
-@TauriPlugin
+private const val LEGACY_STORAGE_ALIAS = "legacyStorage"
+
+@TauriPlugin(
+    permissions = [
+        Permission(
+            strings = [
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            ],
+            alias = LEGACY_STORAGE_ALIAS,
+        )
+    ]
+)
 class StoragePlugin(private val activity: Activity) : Plugin(activity) {
     private val resolver = activity.contentResolver
     @Volatile private var copying: CopyJob? = null
@@ -109,30 +127,69 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun supported() = Build.VERSION.SDK_INT >= 30
+    private fun supported() = Build.VERSION.SDK_INT >= 29
 
-    private fun granted() = supported() && Environment.isExternalStorageManager()
+    private fun isLegacyStorage() = supported() && Build.VERSION.SDK_INT < 30
+
+    private fun hasLegacyStoragePermissions(): Boolean =
+        ContextCompat.checkSelfPermission(activity, Manifest.permission.READ_EXTERNAL_STORAGE) ==
+            PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(activity, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun granted() = when {
+        !supported() -> false
+        Build.VERSION.SDK_INT >= 30 -> Environment.isExternalStorageManager()
+        else -> hasLegacyStoragePermissions()
+    }
 
     private fun storageRoots(): List<StorageRoot> {
         if (!supported()) return emptyList()
-        val roots = activity.getSystemService(StorageManager::class.java)
-            ?.storageVolumes
-            ?.mapNotNull { volume ->
-                val mounted = volume.state == Environment.MEDIA_MOUNTED ||
-                    volume.state == Environment.MEDIA_MOUNTED_READ_ONLY
-                if (!mounted) return@mapNotNull null
-                val dir = volume.directory ?: return@mapNotNull null
-                val id = if (volume.isPrimary) "primary" else volume.uuid ?: return@mapNotNull null
-                StorageRoot(id, dir, writable = volume.state == Environment.MEDIA_MOUNTED)
+        if (Build.VERSION.SDK_INT >= 30) {
+            val roots = activity.getSystemService(StorageManager::class.java)
+                ?.storageVolumes
+                ?.mapNotNull { volume ->
+                    val mounted = volume.state == Environment.MEDIA_MOUNTED ||
+                        volume.state == Environment.MEDIA_MOUNTED_READ_ONLY
+                    if (!mounted) return@mapNotNull null
+                    val dir = volume.directory ?: return@mapNotNull null
+                    val id = if (volume.isPrimary) "primary" else volume.uuid ?: return@mapNotNull null
+                    StorageRoot(id, dir, writable = volume.state == Environment.MEDIA_MOUNTED)
+                }
+                .orEmpty()
+            return if (roots.any { it.id == "primary" }) roots
+            else {
+                @Suppress("DEPRECATION")
+                roots + StorageRoot("primary", Environment.getExternalStorageDirectory())
             }
-            .orEmpty()
-        return if (roots.any { it.id == "primary" }) roots
-        else roots + StorageRoot("primary", Environment.getExternalStorageDirectory())
+        }
+        val roots = mutableListOf<StorageRoot>()
+        @Suppress("DEPRECATION")
+        val primary = Environment.getExternalStorageDirectory()
+        val primaryState = Environment.getExternalStorageState(primary)
+        if (primaryState == Environment.MEDIA_MOUNTED || primaryState == Environment.MEDIA_MOUNTED_READ_ONLY) {
+            roots.add(StorageRoot("primary", primary, writable = primaryState == Environment.MEDIA_MOUNTED))
+        }
+        for (appDir in activity.getExternalFilesDirs(null).orEmpty()) {
+            if (appDir == null) continue
+            val state = Environment.getExternalStorageState(appDir)
+            if (state != Environment.MEDIA_MOUNTED && state != Environment.MEDIA_MOUNTED_READ_ONLY) continue
+            val root = legacyExternalVolumeRoot(appDir) ?: continue
+            if (roots.none { it.id.equals(root.id, ignoreCase = true) }) {
+                roots.add(root)
+            }
+        }
+        return roots
     }
 
     @Command
     fun storageStatus(invoke: Invoke) {
-        invoke.resolve(JSObject().put("granted", granted()).put("supported", supported()))
+        invoke.resolve(
+            JSObject()
+                .put("granted", granted())
+                .put("supported", supported())
+                .put("legacy", isLegacyStorage())
+        )
     }
 
     @Command
@@ -142,23 +199,48 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
             storageStatus(invoke)
             return
         }
-        val appIntent = Intent(
-            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-            Uri.parse("package:${activity.packageName}")
-        )
-        try {
+        if (Build.VERSION.SDK_INT >= 30) {
+            val appIntent = Intent(
+                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:${activity.packageName}")
+            )
             try {
-                startActivityForResult(invoke, appIntent, "storageResult")
-            } catch (_: ActivityNotFoundException) {
-                startActivityForResult(
-                    invoke,
-                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-                    "storageResult"
-                )
+                try {
+                    startActivityForResult(invoke, appIntent, "storageResult")
+                } catch (_: ActivityNotFoundException) {
+                    startActivityForResult(
+                        invoke,
+                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                        "storageResult"
+                    )
+                }
+            } catch (error: Exception) {
+                invoke.reject(error.message)
             }
+            return
+        }
+        if (open || getPermissionState(LEGACY_STORAGE_ALIAS) == PermissionState.DENIED) {
+            openAppSettings(invoke)
+            return
+        }
+        requestPermissionForAlias(LEGACY_STORAGE_ALIAS, invoke, "legacyStorageResult")
+    }
+
+    private fun openAppSettings(invoke: Invoke) {
+        try {
+            val intent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:${activity.packageName}")
+            )
+            startActivityForResult(invoke, intent, "storageResult")
         } catch (error: Exception) {
             invoke.reject(error.message)
         }
+    }
+
+    @PermissionCallback
+    fun legacyStorageResult(invoke: Invoke) {
+        storageStatus(invoke)
     }
 
     @ActivityCallback

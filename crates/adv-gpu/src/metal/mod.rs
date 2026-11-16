@@ -73,8 +73,28 @@ impl Device {
             vendor: vendor.into(),
             device: caps.adapter.clone(),
             driver: caps.driver.clone(),
-            tier: "metal",
+            tier: "metal".into(),
         }
+    }
+
+    pub(crate) fn guard_compile<T>(
+        &self,
+        _probe: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        f()
+    }
+
+    pub(crate) fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        f()
+    }
+
+    pub(crate) fn open_with<T>(
+        options: &DeviceOptions,
+        init: &mut dyn FnMut(crate::Device, crate::Queue) -> Result<T>,
+    ) -> Result<T> {
+        let (device, queue) = Self::open(options)?;
+        init(device, queue)
     }
 
     pub(crate) fn caps(&self) -> &Caps {

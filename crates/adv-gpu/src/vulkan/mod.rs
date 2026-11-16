@@ -73,12 +73,18 @@ pub(crate) struct Context {
     /// Set when extended dynamic state is in use.
     eds: Option<Eds>,
     cache_prefix: [u8; 28],
+    health_dir: Option<std::path::PathBuf>,
+    caller_disable: Modern,
+    active_mask: crate::health::Mask,
+    degraded: crate::health::Mask,
+    crashed: bool,
+    demoted: AtomicBool,
     #[cfg(target_os = "android")]
     ahb: ash::android::external_memory_android_hardware_buffer::Device,
     #[cfg(target_os = "android")]
-    semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    ahb_ubwc: bool,
     #[cfg(target_os = "android")]
-    vendor: u32,
+    semaphore_fd: ash::khr::external_semaphore_fd::Device,
     #[cfg(target_os = "android")]
     video_format: Option<video::VideoFormat>,
 }
@@ -176,11 +182,14 @@ impl Context {
         Ok(())
     }
     fn result<T>(&self, result: std::result::Result<T, vk::Result>) -> Result<T> {
+        self.result_in(result, "")
+    }
+    fn result_in<T>(&self, result: std::result::Result<T, vk::Result>, op: &str) -> Result<T> {
         result.map_err(|error| {
             if error == vk::Result::ERROR_DEVICE_LOST {
                 self.lost.store(true, Ordering::Relaxed);
             }
-            vk_error(error)
+            vk_error_at(error, op)
         })
     }
     pub(super) fn retire(&self, item: Retired) {
@@ -369,12 +378,17 @@ impl Context {
 }
 
 fn vk_error(error: vk::Result) -> Error {
+    vk_error_at(error, "")
+}
+
+fn vk_error_at(error: vk::Result, op: &str) -> Error {
     match error {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
             Error::OutOfMemory
         }
         vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost(LOST.into()),
-        _ => Error::Unavailable(format!("Vulkan: {error:?}")),
+        _ if op.is_empty() => Error::Unavailable(format!("Vulkan: {error:?}")),
+        _ => Error::Unavailable(format!("Vulkan ({op}): {error:?}")),
     }
 }
 
@@ -412,13 +426,7 @@ impl Device {
             vendor: format!("0x{:04x}", id(16)),
             device: format!("0x{:04x}", id(20)),
             driver: caps.driver.clone(),
-            tier: if caps.modern.contains(Modern::BINDLESS) {
-                "bindless"
-            } else if caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
-                "push_descriptors"
-            } else {
-                "descriptor_sets"
-            },
+            tier: crate::health::format_tier(caps.modern, self.0.degraded, self.0.crashed),
         }
     }
     pub(crate) fn caps(&self) -> &Caps {
@@ -426,6 +434,20 @@ impl Device {
     }
     pub(crate) fn lost(&self) -> Option<String> {
         self.0.lost.load(Ordering::Relaxed).then(|| LOST.into())
+    }
+    pub(crate) fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::health::guard_compile(self.0.health_dir.as_deref(), &self.0.cache_prefix, probe, f)
+    }
+    pub(crate) fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::health::guard_guest_pipeline(
+            self.0.health_dir.as_deref(),
+            &self.0.cache_prefix,
+            self.0.caller_disable,
+            self.0.active_mask,
+            self.0.degraded,
+            &self.0.demoted,
+            f,
+        )
     }
 }
 

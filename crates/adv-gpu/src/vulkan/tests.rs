@@ -1680,3 +1680,169 @@ fn precompiled_workgroup_atomic_arrays_start_zero_after_round_trip() {
         assert!(bytes(&result).iter().all(|&byte| byte == 0));
     }
 }
+
+// spec: GFX-CACHE-4
+#[test]
+fn startup_canaries_and_health_cache_round_trip() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-health-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for disable in [Modern::empty(), Modern::all()] {
+        let (device, mut queue) = test_device!(DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            disable,
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        });
+        assert!(device.inner.0.retired.lock().unwrap().is_empty());
+        if let Some(heap) = &device.inner.0.heap {
+            for kind in 0..4 {
+                assert_eq!(heap.used(kind), 0);
+            }
+            let first = device
+                .create_buffer(&BufferDesc {
+                    size: 16,
+                    usage: BufferUsage::STORAGE,
+                    memory: Memory::Device,
+                    label: "first storage slot",
+                })
+                .unwrap();
+            assert_eq!(first.inner.0.storage, Some(0));
+            drop(first);
+            queue.poll().unwrap();
+        }
+        assert!(open::canary_render(&device, &mut queue).unwrap());
+        assert!(open::canary_compute(&device, &mut queue).unwrap());
+        assert_eq!(device.guard_compile("canary:test", || Ok(7)).unwrap(), 7);
+    }
+    assert!(dir.join("vulkan-health.bin").exists());
+    assert!(!dir.join("vulkan-probe.bin").exists());
+    // Warm reopen reuses the verified profile without leaving a probe sentinel.
+    let (_warm_device, _warm_queue) = test_device!(DeviceOptions {
+        software: !cfg!(target_os = "android"),
+        validation: !cfg!(target_os = "android"),
+        cache_dir: Some(dir.clone()),
+        ..DeviceOptions::default()
+    });
+    assert!(!dir.join("vulkan-probe.bin").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// spec: GFX-CACHE-4
+#[test]
+fn open_with_post_open_failure_steps_down_and_persists_health() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-post-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let probe = crate::Device::open(&DeviceOptions {
+        software: !cfg!(target_os = "android"),
+        validation: !cfg!(target_os = "android"),
+        ..DeviceOptions::default()
+    });
+    let Ok((probe_dev, _)) = probe else {
+        return;
+    };
+    let had_bindless = probe_dev.caps().modern.contains(Modern::BINDLESS);
+    drop(probe_dev);
+    if !had_bindless {
+        return;
+    }
+
+    let mut seen = Vec::new();
+    let recovered = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| {
+            let bindless = device.caps().modern.contains(Modern::BINDLESS);
+            seen.push(bindless);
+            if bindless {
+                return Err(Error::Unavailable(
+                    "Vulkan (graphics pipeline: synthetic): ERROR_UNKNOWN".into(),
+                ));
+            }
+            Ok(device)
+        },
+    )
+    .unwrap();
+    assert_eq!(seen, vec![true, false]);
+    assert!(!recovered.caps().modern.contains(Modern::BINDLESS));
+    assert!(
+        recovered
+            .adapter_identity()
+            .tier
+            .contains("masked: bindless")
+    );
+    drop(recovered);
+
+    // Warm reopen directly starts without bindless on the persisted profile.
+    let mut warm_seen = Vec::new();
+    let warm = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| {
+            warm_seen.push(device.caps().modern.contains(Modern::BINDLESS));
+            Ok(device)
+        },
+    )
+    .unwrap();
+    assert_eq!(warm_seen, vec![false]);
+    assert!(!warm.caps().modern.contains(Modern::BINDLESS));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// spec: GFX-CACHE-4
+#[test]
+fn guest_pipeline_failure_demotes_tier_for_next_open() {
+    let dir = std::env::temp_dir().join(format!("adv-vk-guest-demote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let initial = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| Ok(device),
+    );
+    let Ok(device) = initial else {
+        return;
+    };
+    if !device.caps().modern.contains(Modern::BINDLESS) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let failed: Result<()> = device.guard_guest_pipeline(|| {
+        Err(Error::Unavailable(
+            "Vulkan (graphics pipeline: native executor): ERROR_UNKNOWN".into(),
+        ))
+    });
+    assert!(matches!(failed, Err(Error::Unavailable(_))));
+    assert!(!dir.join("vulkan-guest-probe.bin").exists());
+    drop(device);
+
+    let reopened = crate::Device::open_with(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            cache_dir: Some(dir.clone()),
+            ..DeviceOptions::default()
+        },
+        |device, _queue| Ok(device),
+    )
+    .unwrap();
+    assert!(!reopened.caps().modern.contains(Modern::BINDLESS));
+    assert!(
+        reopened
+            .adapter_identity()
+            .tier
+            .contains("masked: bindless")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

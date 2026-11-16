@@ -80,6 +80,12 @@ fn pipeline(
     pool: Option<&PresentPool>,
 ) -> Result<RenderPipeline> {
     let converted = pool.is_some() && cfg!(target_os = "android");
+    let label = match (converted, software) {
+        (true, true) => "video_converted_software",
+        (true, false) => "video_converted",
+        (false, true) => "video_software",
+        (false, false) => "video",
+    };
     let shader = device.create_shader(ShaderDesc {
         source: if converted {
             Source::Precompiled {
@@ -99,7 +105,7 @@ fn pipeline(
         } else {
             include!(concat!(env!("OUT_DIR"), "/video.identity.rs"))
         },
-        label: "video",
+        label,
     })?;
     let mut desc = RenderPipelineDesc {
         vertex: shader.entry(if software { "vs_software" } else { "vs" }, Stage::Vertex)?,
@@ -131,7 +137,7 @@ fn pipeline(
         depth_stencil: None,
         samples: 1,
         alpha_to_coverage: false,
-        label: "video",
+        label,
     };
     if let Some(pool) = pool {
         desc.bindings.retain(|b| {

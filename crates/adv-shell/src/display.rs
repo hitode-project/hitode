@@ -215,13 +215,39 @@ pub(crate) fn platform_caps(device: Option<&Device>) -> plan::CompositorCaps {
         tile: device.map_or((0, 0), |d| d.caps().limits.tile),
     }
 }
-pub(crate) fn open(software: bool) -> Result<(Device, Queue), String> {
+#[allow(dead_code)]
+pub(crate) fn open(
+    software: bool,
+    cache_dir: Option<std::path::PathBuf>,
+) -> Result<(Device, Queue), String> {
     Device::open(&adv_gpu::queue::DeviceOptions {
         software,
         label: "session display",
+        cache_dir,
         ..Default::default()
     })
     .map_err(|e| e.to_string())
+}
+#[cfg(any(
+    target_os = "android",
+    target_os = "macos",
+    all(test, feature = "media")
+))]
+pub(crate) fn open_with<T>(
+    software: bool,
+    cache_dir: Option<std::path::PathBuf>,
+    init: impl FnMut(Device, Queue) -> adv_gpu::Result<Result<T, String>>,
+) -> Result<T, String> {
+    Device::open_with(
+        &adv_gpu::queue::DeviceOptions {
+            software,
+            label: "session display",
+            cache_dir,
+            ..Default::default()
+        },
+        init,
+    )
+    .map_err(|e| e.to_string())?
 }
 pub(crate) fn channel(
     device: Device,
@@ -229,7 +255,7 @@ pub(crate) fn channel(
     compositor: Box<dyn Compositor>,
     view: (u32, u32),
     wake: WakeEvent,
-) -> Result<(Startup, Ui), String> {
+) -> adv_gpu::Result<(Startup, Ui)> {
     let settings = plan::Settings {
         view,
         rotation: plan::Rotation::None,
@@ -241,8 +267,7 @@ pub(crate) fn channel(
     };
     #[cfg(target_os = "android")]
     let caps = compositor.caps();
-    let display =
-        Display::new(device.clone(), compositor, settings.clone()).map_err(|e| e.to_string())?;
+    let display = Display::new(device.clone(), compositor, settings.clone())?;
     let shared = Arc::new(Shared {
         #[cfg(target_os = "macos")]
         damage_hud: display.damage_hud(),
@@ -280,12 +305,14 @@ pub(crate) fn headless(
     software: bool,
     view: (u32, u32),
     wake: WakeEvent,
+    cache_dir: Option<std::path::PathBuf>,
 ) -> Result<Startup, String> {
-    let (device, queue) = open(software)?;
-    let c = Box::new(adv_display::compositor::HeadlessCompositor::new(
-        platform_caps(Some(&device)),
-    ));
-    Ok(channel(device, queue, c, view, wake)?.0)
+    open_with(software, cache_dir, |device, queue| {
+        let c = Box::new(adv_display::compositor::HeadlessCompositor::new(
+            platform_caps(Some(&device)),
+        ));
+        Ok(Ok(channel(device, queue, c, view, wake.clone())?.0))
+    })
 }
 #[cfg(target_vendor = "apple")]
 pub(crate) fn apple_channel(
@@ -303,7 +330,8 @@ pub(crate) fn apple_channel(
         platform_caps(Some(&device)),
         objc2::MainThreadMarker::new().unwrap(),
     );
-    let (startup, mut ui) = channel(device, queue, Box::new(c), view, wake)?;
+    let (startup, mut ui) =
+        channel(device, queue, Box::new(c), view, wake).map_err(|e| e.to_string())?;
     ui.update(view, scale);
     Ok((startup, ui))
 }
@@ -721,7 +749,7 @@ mod tests {
         assert_eq!(s.view, (800, 600));
         assert_eq!(s.placement, crate::Scaling::Integer);
         assert_eq!(s.upscaler, Upscaler::Artcnn);
-        let (device, mut queue) = open(false).unwrap();
+        let (device, mut queue) = open(false, None).unwrap();
         let (mut startup, _) = channel(
             device,
             queue,
@@ -783,7 +811,7 @@ mod tests {
     // spec: HOST-VIEW-3
     #[test]
     fn presenter_maps_every_software_encoding_and_both_swap_kinds() {
-        let (device, mut queue) = open(false).unwrap();
+        let (device, mut queue) = open(false, None).unwrap();
         for f in [
             frame::PixelFormat::Bgra32,
             frame::PixelFormat::Bgr24,
@@ -864,7 +892,7 @@ mod tests {
     #[cfg(feature = "media")]
     #[test]
     fn presenter_maps_changed_and_retained_video_planes_and_cursor_regions() {
-        let gpu = headless(false, (64, 48), WakeEvent::new().unwrap())
+        let gpu = headless(false, (64, 48), WakeEvent::new().unwrap(), None)
             .unwrap()
             .start()
             .unwrap();
@@ -966,7 +994,7 @@ mod tests {
                 send: send.clone(),
             }) as Box<dyn Compositor>
         };
-        let (device, queue) = open(false).unwrap();
+        let (device, queue) = open(false, None).unwrap();
         let (startup, mut ui) =
             channel(device, queue, make(), (64, 48), WakeEvent::new().unwrap()).unwrap();
         let gpu = startup.start().unwrap();

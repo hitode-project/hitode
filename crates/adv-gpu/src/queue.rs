@@ -22,6 +22,9 @@ pub struct DeviceOptions {
     pub disable: crate::caps::Modern,
     pub ring_size: u64,
     pub label: &'static str,
+    /// Host cache directory for persistent driver health profiles and crash
+    /// sentinels (GFX-CACHE-4); `None` keeps probe results in process memory.
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 /// Shared handle to one GPU device. Creation calls are allowed from any
@@ -39,13 +42,22 @@ pub struct AdapterIdentity {
     pub vendor: String,
     pub device: String,
     pub driver: String,
-    pub tier: &'static str,
+    pub tier: String,
 }
 
 impl Device {
     /// Open the platform's device and its queue.
     pub fn open(options: &DeviceOptions) -> Result<(Device, Queue)> {
         imp::Device::open(options)
+    }
+
+    /// Open the platform's device and queue, then run caller startup `init`
+    /// under crash sentinels and progressive Vulkan fallback.
+    pub fn open_with<T>(
+        options: &DeviceOptions,
+        mut init: impl FnMut(Device, Queue) -> Result<T>,
+    ) -> Result<T> {
+        imp::Device::open_with(options, &mut init)
     }
     pub fn adapter_identity(&self) -> AdapterIdentity {
         self.inner.adapter_identity()
@@ -114,6 +126,18 @@ impl Device {
     /// Set once the device is lost; see [`crate::Error::DeviceLost`].
     pub fn lost(&self) -> Option<String> {
         self.inner.lost()
+    }
+    /// Guards a background shader or pipeline build with a persistent crash
+    /// sentinel when `cache_dir` is configured, blocking repeats after a
+    /// driver compiler crash on this adapter and driver version.
+    pub fn guard_compile<T>(&self, probe: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.inner.guard_compile(probe, f)
+    }
+    /// Guards a guest shader or render-pipeline build: arms a crash sentinel
+    /// and demotes one Vulkan tier step for the next launch if the driver
+    /// crashes or rejects valid lowered SPIR-V.
+    pub fn guard_guest_pipeline<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.inner.guard_guest_pipeline(f)
     }
 }
 
