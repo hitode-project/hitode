@@ -101,7 +101,7 @@ pub fn install<B: Backend>(
                 geometry(ext, objects, hwnd)
             },
             completed: frame_completed,
-            submitted: adv_drv::user::input::front_frame,
+            submitted: adv_drv::user::input::shared_front_frame,
             released: adv_drv::user::input::front_released,
         },
     )?;

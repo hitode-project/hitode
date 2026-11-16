@@ -30,6 +30,7 @@ pub(super) struct Presentation {
     candidate: Cell<Option<(u32, (i32, i32))>>,
     last: Cell<Option<(u32, (i32, i32))>>,
     front: Cell<Option<(u32, u32)>>,
+    shared_with_gdi: Cell<bool>,
 }
 
 /// Associate the next presentation with this window and its screen origin.
@@ -46,9 +47,23 @@ pub fn front_frame(ext: &Ext, hwnd: u32, source: u32) {
         return;
     };
     prepare(ext, hwnd, window.origin);
+    ext.get::<Presentation>().shared_with_gdi.set(false);
     ext.get::<Presentation>()
         .front
         .set(Some((top_level(ext, hwnd), source)));
+}
+
+/// DirectDraw and GDI share screen content: a fresh window draw may replace it.
+pub fn shared_front_frame(ext: &Ext, hwnd: u32, source: u32) {
+    front_frame(ext, hwnd, source);
+    let presentation = ext.get::<Presentation>();
+    if presentation.front.get().is_some_and(|(_, id)| id == source) {
+        presentation.shared_with_gdi.set(true);
+    }
+}
+
+pub(super) fn front_shares_gdi(ext: &Ext) -> bool {
+    ext.get::<Presentation>().shared_with_gdi.get()
 }
 
 /// Release the association for this source, without affecting another front.
@@ -56,6 +71,7 @@ pub fn front_released(ext: &Ext, source: u32) {
     let front = &ext.get::<Presentation>().front;
     if front.get().is_some_and(|(_, id)| id == source) {
         front.set(None);
+        ext.get::<Presentation>().shared_with_gdi.set(false);
     }
 }
 
