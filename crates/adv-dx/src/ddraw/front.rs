@@ -5,7 +5,7 @@
 use super::*;
 use crate::interop::{DcSurface, MemoryDc};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
-use adv_cpu::backend::{Backend, Guest};
+use adv_cpu::backend::{Backend, Guest, Prot};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
 mod enumeration;
@@ -180,6 +180,46 @@ fn publish_counters(env: &mut Env<'_>) {
         }
     }
 }
+/// Map more guest address space into the store before a surface it cannot
+/// place: as on Windows, system-memory surfaces are bounded by the address
+/// space, not by the store's first mapping. A primary may bring a back buffer.
+fn reserve_surface(env: &mut Env<'_>, desc: u32) -> Result<(), u32> {
+    const OUT_OF_MEMORY: u32 = 0x8007000e;
+    let provider = env.ext.get::<State>().provider;
+    let read = |env: &mut Env<'_>, offset| (provider.memory)(env.cpu).u32(desc + offset).ok();
+    let (caps, width, height) = (read(env, 104), read(env, 12), read(env, 8));
+    let store = env.ext.get::<SurfaceStore>();
+    let pixels = match (caps, width, height) {
+        (Some(caps), _, _) if caps & 0x200 != 0 => {
+            2 * surface::size(store.width, store.height).unwrap_or(0)
+        }
+        (Some(_), Some(width), Some(height)) => surface::size(width, height).unwrap_or(0),
+        _ => 0,
+    };
+    // Front objects for the new interfaces come from the same store.
+    let Some(growth) = store
+        .arena_growth(pixels + 4096)
+        .filter(|&growth| growth != 0)
+    else {
+        return Ok(());
+    };
+    let address = env
+        .sys
+        .vm
+        .alloc(env.cpu, growth, Prot::RW)
+        .map_err(|_| OUT_OF_MEMORY)?;
+    let length = env.sys.vm.region(address).unwrap();
+    let store = env.ext.get_mut::<SurfaceStore>();
+    if store.extend_arena(address, length).is_err() {
+        let _ = env.sys.vm.free(env.cpu, address);
+        return Err(OUT_OF_MEMORY);
+    }
+    log::info!(
+        "DirectDraw surface storage grew by {length} bytes: {:?}",
+        store.arena_usage()
+    );
+    Ok(())
+}
 fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let provider = env.ext.get::<State>().provider;
     if id == api::COOPERATIVE
@@ -187,6 +227,11 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
         && (provider.window)(env.ext, &env.sys.objects, words[1]).is_none()
     {
         return Outcome::Return(INVALID);
+    }
+    if id == api::CREATE_SURFACE
+        && let Err(hr) = reserve_surface(env, words[1])
+    {
+        return Outcome::Return(hr);
     }
     let binding = match id {
         api::COOPERATIVE if words[2] == 8 => Some((words[1], None)),

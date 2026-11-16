@@ -80,6 +80,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Measured on Windows 11 DirectDraw 7.
 
+### GFX-DDRAW-14 Surface storage
+
+**Rule**: `CreateSurface` MUST map more guest storage when no free block of the surface store holds the surface. It MUST return `E_OUTOFMEMORY` only when no mapping is possible. Released storage MUST be reused before the store maps more.
+**Verification**: Test
+**Basis**: Windows places system-memory surfaces in the process address space without a fixed pool.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
