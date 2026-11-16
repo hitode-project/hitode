@@ -1337,3 +1337,48 @@ fn clipper_dc_gdi_and_surface_metadata_queries_work_across_guest_vtables() {
     assert_eq!(m.cpu.read_u32(DATA + 32).unwrap(), 0x887600ff);
     assert_eq!(m.cpu.read_u32(DATA + 40).unwrap(), 0);
 }
+
+#[test]
+// spec: GFX-DDRAW-14
+fn surfaces_beyond_the_first_store_mapping_grow_the_store() {
+    let (mut m, device) = setup(false, false, Registry::default());
+    let capacity = m.ext.get::<SurfaceStore>().arena_usage().capacity;
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&7u32.to_le_bytes());
+    desc[8..12].copy_from_slice(&64u32.to_le_bytes());
+    desc[12..16].copy_from_slice(&64u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&0x40u32.to_le_bytes());
+    m.cpu.write(DATA + 64, &desc).unwrap();
+    // Eight 16 KiB surfaces do not fit the 64 KiB first mapping.
+    let mut surfaces = Vec::new();
+    for _ in 0..8 {
+        let result = front::call(
+            &mut env(&mut m),
+            api::CREATE_SURFACE,
+            &[device, DATA + 64, DATA, 0],
+        );
+        assert!(matches!(result, Outcome::Return(0)));
+        surfaces.push(m.cpu.read_u32(DATA).unwrap());
+    }
+    let usage = m.ext.get::<SurfaceStore>().arena_usage();
+    assert!(usage.capacity > capacity);
+    assert_eq!(usage.pixel_bytes, 8 * 64 * 64 * 4);
+    // Released storage is reused before the store maps more.
+    for surface in surfaces {
+        assert!(matches!(
+            front::call(&mut env(&mut m), api::RELEASE, &[surface]),
+            Outcome::Return(0)
+        ));
+    }
+    let result = front::call(
+        &mut env(&mut m),
+        api::CREATE_SURFACE,
+        &[device, DATA + 64, DATA, 0],
+    );
+    assert!(matches!(result, Outcome::Return(0)));
+    assert_eq!(
+        m.ext.get::<SurfaceStore>().arena_usage().capacity,
+        usage.capacity
+    );
+}
