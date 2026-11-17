@@ -37,6 +37,7 @@ const fn wm(d1: u32) -> Iid {
 const IID_IWMPROFILE: Iid = wm(0x9640_6bdb);
 const IID_IWMHEADERINFO: Iid = wm(0x9640_6bda);
 const IID_IWMSTREAMCONFIG: Iid = wm(0x9640_6bdc);
+const IID_IWMOUTPUTMEDIAPROPS: Iid = wm(0x9640_6bd7);
 const IID_IWMMEDIAPROPS: Iid = wm(0x9640_6bce);
 const IID_INSSBUFFER: Iid = guid(
     0xe1cd_3524,
@@ -45,17 +46,75 @@ const IID_INSSBUFFER: Iid = guid(
     [0x9e, 0xed, 0x00, 0x60, 0x97, 0xd2, 0xd7, 0xcf],
 );
 
+const IID_IWMPROFILE2: Iid = guid(
+    0x07e72d33,
+    0xd94e,
+    0x4be7,
+    [0x88, 0x43, 0x60, 0xae, 0x5f, 0xf7, 0xe5, 0xf5],
+);
+const IID_IWMPROFILE3: Iid = guid(
+    0x00ef96cc,
+    0xa461,
+    0x4546,
+    [0x8b, 0xcd, 0xc9, 0xa2, 0x8f, 0x0e, 0x06, 0xf5],
+);
+const IID_IWMHEADERINFO2: Iid = guid(
+    0x15cf9781,
+    0x454e,
+    0x482e,
+    [0xb3, 0x93, 0x85, 0xfa, 0xe4, 0x87, 0xa8, 0x10],
+);
+const IID_IWMHEADERINFO3: Iid = guid(
+    0x15cc68e3,
+    0x27cc,
+    0x4ecd,
+    [0xb2, 0x22, 0x3f, 0x5d, 0x02, 0xd8, 0x0b, 0xd5],
+);
+const IID_IWMLANGUAGELIST: Iid = guid(
+    0xdf683f00,
+    0x2d49,
+    0x4d8e,
+    [0x92, 0xb7, 0xfb, 0x19, 0xf6, 0xa0, 0xdc, 0x57],
+);
+const IID_IWMPACKETSIZE: Iid = guid(
+    0xcdfb97ab,
+    0x188f,
+    0x40b3,
+    [0xb6, 0x43, 0x5b, 0x79, 0x03, 0x97, 0x5c, 0x59],
+);
+const IID_IWMPACKETSIZE2: Iid = guid(
+    0x8bfc2b9e,
+    0xb646,
+    0x4233,
+    [0xa8, 0x77, 0x1c, 0x6a, 0x07, 0x96, 0x69, 0xdc],
+);
+const IID_IWMREADERPLAYLISTBURN: Iid = guid(
+    0xf28c0300,
+    0x9baa,
+    0x4477,
+    [0xa8, 0x46, 0x17, 0x44, 0xd9, 0xcb, 0xf5, 0x33],
+);
+const IID_IWMREADERTIMECODE: Iid = guid(
+    0xf369e2f0,
+    0xe081,
+    0x4fe6,
+    [0x84, 0x50, 0xb8, 0x10, 0xb2, 0xf4, 0x10, 0xd1],
+);
+
 const NS_E_NO_MORE_SAMPLES: u32 = 0xc00d_0bcf;
 const NS_E_INVALID_REQUEST: u32 = 0xc00d_002b;
-const NS_E_INVALID_INPUT_FORMAT: u32 = 0xc00d_0bbb;
+const NS_E_INVALID_INPUT_FORMAT: u32 = 0xc00d_0bb8;
+const NS_E_INVALID_OUTPUT_FORMAT: u32 = 0xc00d_0bbb;
+const NS_E_NO_STREAM: u32 = 0xc00d_0033;
+const NS_E_AUDIO_CODEC_NOT_INSTALLED: u32 = 0xc00d_0bc2;
+const NS_E_INCOMPATIBLE_FORMAT: u32 = 0xc00d_0041;
+const ASF_E_BADMEDIATYPE: u32 = 0xc00d_0807;
 const ASF_E_NOTFOUND: u32 = 0xc00d_07f0;
-const ASF_E_BUFFERTOOSMALL: u32 = 0xc00d_07f1;
+const ASF_E_BUFFERTOOSMALL: u32 = 0xc00d_07d1;
 const NS_E_INVALID_STREAM: u32 = 0xc00d_0b9d;
 
 const WM_SF_CLEANPOINT: u32 = 1;
 const WM_SF_DISCONTINUITY: u32 = 2;
-const WM_SFEX_NOTASYNCPOINT: u32 = 2;
-const WM_SFEX_DISCONTINUITY: u32 = 4;
 const WMT_TYPE_DWORD: u32 = 0;
 const WMT_TYPE_BOOL: u32 = 3;
 const WMT_TYPE_QWORD: u32 = 4;
@@ -72,29 +131,48 @@ enum Face {
     StreamConfig,
     MediaProps,
     Buffer,
+    OutputProps,
+    ReaderAux,
 }
 
-const FACES: [(Face, &str); 6] = [
+const FACES: [(Face, &str); 8] = [
     (Face::SyncReader, "IWMSyncReader2"),
     (Face::Profile, "IWMProfile"),
     (Face::HeaderInfo, "IWMHeaderInfo"),
     (Face::StreamConfig, "IWMStreamConfig"),
     (Face::MediaProps, "IWMMediaProps"),
     (Face::Buffer, "INSSBuffer"),
+    (Face::OutputProps, "IWMOutputMediaProps"),
+    (Face::ReaderAux, "IUnknown"),
 ];
 
 impl Face {
     fn interface(self) -> &'static str {
         FACES[self as usize].1
     }
+    fn signatures(self) -> &'static str {
+        if self == Face::OutputProps {
+            "IWMMediaProps"
+        } else {
+            self.interface()
+        }
+    }
     fn iids(self) -> &'static [Iid] {
         match self {
             Face::SyncReader => &[IID_IWMSYNCREADER, IID_IWMSYNCREADER2],
-            Face::Profile => &[IID_IWMPROFILE],
-            Face::HeaderInfo => &[IID_IWMHEADERINFO],
+            Face::Profile => &[IID_IWMPROFILE, IID_IWMPROFILE2, IID_IWMPROFILE3],
+            Face::HeaderInfo => &[IID_IWMHEADERINFO, IID_IWMHEADERINFO2, IID_IWMHEADERINFO3],
             Face::StreamConfig => &[IID_IWMSTREAMCONFIG],
             Face::MediaProps => &[IID_IWMMEDIAPROPS],
             Face::Buffer => &[IID_INSSBUFFER],
+            Face::ReaderAux => &[
+                IID_IWMLANGUAGELIST,
+                IID_IWMPACKETSIZE,
+                IID_IWMPACKETSIZE2,
+                IID_IWMREADERPLAYLISTBURN,
+                IID_IWMREADERTIMECODE,
+            ],
+            Face::OutputProps => &[IID_IWMOUTPUTMEDIAPROPS, IID_IWMMEDIAPROPS],
         }
     }
 }
@@ -119,6 +197,10 @@ struct Stream {
     discontinuity: bool,
     /// Guest IWMReaderAllocatorEx with one reference held, or 0.
     allocator: u32,
+    output_allocator: u32,
+    allocator_used: bool,
+    output_type: MediaType,
+    settings: BTreeMap<String, u32>,
     epoch: u64,
     decoded: Option<DecodedStream>,
 }
@@ -150,6 +232,10 @@ impl Reader {
                 end_100ns: u64::MAX,
                 discontinuity: true,
                 allocator: 0,
+                output_allocator: 0,
+                allocator_used: false,
+                output_type: output_type(&s.format),
+                settings: BTreeMap::new(),
                 epoch: 0,
                 decoded: None,
             })
@@ -167,6 +253,7 @@ enum Obj {
         bit_rate: u32,
         media_type: MediaType,
     },
+    Output(MediaType),
     Buffer {
         data: u32,
         length: u32,
@@ -188,7 +275,7 @@ pub fn register(registry: &mut Registry) {
     for (face, interface) in FACES {
         for signature in adv_abi::signature::com_signatures()
             .iter()
-            .filter(|signature| signature.module == interface)
+            .filter(|signature| signature.module == face.signatures())
         {
             let (Some(conv), Some(slot)) = (signature.conv, signature.com_slot) else {
                 continue;
@@ -212,7 +299,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
     for (face, interface) in FACES {
         let methods: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
-            .filter(|signature| signature.module == interface)
+            .filter(|signature| signature.module == face.signatures())
             .collect();
         let table =
             dshow::alloc(env, methods.len() as u32 * 4).ok_or("Windows Media vtable allocation")?;
@@ -295,7 +382,7 @@ fn release(env: &mut Env<'_>, pointer: u32) -> (u32, Vec<u32>) {
                 held = close(env, *reader);
             }
             Obj::Buffer { data, .. } => dshow::free(env, data),
-            Obj::Config { .. } => {}
+            Obj::Config { .. } | Obj::Output(_) => {}
         }
         if let Some(&first) = destroyed.interfaces.iter().min() {
             dshow::free(env, first);
@@ -312,7 +399,11 @@ fn close(env: &mut Env<'_>, reader: Reader) -> Vec<u32> {
     if reader.scratch != 0 {
         dshow::free(env, reader.scratch);
     }
-    let mut held: Vec<u32> = reader.streams.iter().map(|s| s.allocator).collect();
+    let mut held: Vec<u32> = reader
+        .streams
+        .iter()
+        .flat_map(|s| [s.allocator, s.output_allocator])
+        .collect();
     held.push(reader.source);
     held.retain(|&p| p != 0);
     held
@@ -358,7 +449,12 @@ fn create_sync_reader(
     };
     match create(
         env,
-        &[Face::SyncReader, Face::Profile, Face::HeaderInfo],
+        &[
+            Face::SyncReader,
+            Face::Profile,
+            Face::HeaderInfo,
+            Face::ReaderAux,
+        ],
         Obj::Reader(Box::new(reader)),
     ) {
         Ok(pointer) => {
@@ -405,7 +501,10 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         Face::SyncReader => reader_method(env, this, &method),
         Face::Profile => profile_method(env, this, &method),
         Face::HeaderInfo => header_method(env, this, &method),
-        Face::StreamConfig | Face::MediaProps => config_method(env, this, &method),
+        Face::StreamConfig | Face::MediaProps | Face::OutputProps => {
+            config_method(env, this, &method)
+        }
+        Face::ReaderAux => None,
         Face::Buffer => buffer_method(env, this, &method),
     };
     outcome.unwrap_or_else(|| {
@@ -515,13 +614,16 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let held: Vec<u32> = reader
                 .streams
                 .drain(..)
-                .map(|s| s.allocator)
+                .flat_map(|s| [s.allocator, s.output_allocator])
                 .chain([std::mem::take(&mut reader.source)])
                 .filter(|&p| p != 0)
                 .collect();
             reader.media = None;
             reader.can_decode = false;
             Some(release_guests(env, held, S_OK))
+        }
+        "GetOutputSetting" | "SetOutputSetting" => {
+            Some(output_setting(env, this, method == "SetOutputSetting"))
         }
         _ if !opened => r(NS_E_INVALID_REQUEST),
         "SetRange" => {
@@ -544,7 +646,7 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                     return r(E_POINTER);
                 };
                 let Some(index) = stream_index(env, this, number) else {
-                    return r(NS_E_INVALID_STREAM);
+                    return r(NS_E_INVALID_REQUEST);
                 };
                 chosen.push((index, selection != 0));
             }
@@ -556,18 +658,18 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
         }
         "GetStreamSelected" => {
             let Some(index) = stream_index(env, this, a1 as u16) else {
-                return r(NS_E_INVALID_STREAM);
+                return r(E_INVALIDARG);
             };
             let selected = reader(env, this)?.streams[index].selected;
             r(if write_u32(env, a2, if selected { 2 } else { 0 }) {
                 S_OK
             } else {
-                E_POINTER
+                E_INVALIDARG
             })
         }
         "SetReadStreamSamples" => {
             let Some(index) = stream_index(env, this, a1 as u16) else {
-                return r(NS_E_INVALID_STREAM);
+                return r(E_INVALIDARG);
             };
             let stream = &mut reader(env, this)?.streams[index];
             let compressed = a2 != 0;
@@ -582,16 +684,79 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
         }
         "GetReadStreamSamples" => {
             let Some(index) = stream_index(env, this, a1 as u16) else {
-                return r(NS_E_INVALID_STREAM);
+                return r(E_INVALIDARG);
             };
             let compressed = reader(env, this)?.streams[index].compressed;
             r(if write_u32(env, a2, u32::from(compressed)) {
                 S_OK
             } else {
-                E_POINTER
+                E_INVALIDARG
             })
         }
-        // Outputs are numbered by stream position; only stream samples exist.
+        "GetOutputProps" | "GetOutputFormat" | "GetOutputFormatCount" | "SetOutputProps" => {
+            let Some(index) = output_index(reader(env, this)?, a1) else {
+                return r(E_INVALIDARG);
+            };
+            if method == "GetOutputFormatCount" {
+                return r(if write_u32(env, a2, 1) {
+                    S_OK
+                } else {
+                    E_INVALIDARG
+                });
+            }
+            if method == "SetOutputProps" {
+                let Some(Obj::Output(mt)) = payload(env, a2) else {
+                    return r(E_POINTER);
+                };
+                let mt = mt.clone();
+                let source = &reader(env, this)?.media.as_ref()?.streams[index].format;
+                match source {
+                    CodecFormat::Audio { channels, .. } => {
+                        if mt.major != dshow::MEDIATYPE_AUDIO {
+                            return r(ASF_E_BADMEDIATYPE);
+                        }
+                        if mt.format.len() >= 4
+                            && u16::from_le_bytes(mt.format[2..4].try_into().unwrap()) > *channels
+                        {
+                            return r(NS_E_AUDIO_CODEC_NOT_INSTALLED);
+                        }
+                    }
+                    CodecFormat::Video { width, height, .. } => {
+                        if mt.major != dshow::MEDIATYPE_VIDEO {
+                            return r(NS_E_INCOMPATIBLE_FORMAT);
+                        }
+                        if ![dshow::MEDIASUBTYPE_RGB24, dshow::MEDIASUBTYPE_RGB32].contains(&mt.sub)
+                            || mt.format.len() < 60
+                            || u32::from_le_bytes(mt.format[52..56].try_into().unwrap()) != *width
+                            || u32::from_le_bytes(mt.format[56..60].try_into().unwrap()) != *height
+                        {
+                            return r(NS_E_INVALID_OUTPUT_FORMAT);
+                        }
+                    }
+                }
+                reader(env, this)?.streams[index].output_type = mt;
+                return r(S_OK);
+            }
+            if method == "GetOutputFormat" && a2 != 0 {
+                return r(NS_E_INVALID_OUTPUT_FORMAT);
+            }
+            let output = if method == "GetOutputProps" { a2 } else { a3 };
+            let mt = if method == "GetOutputProps" {
+                reader(env, this)?.streams[index].output_type.clone()
+            } else {
+                output_type(&reader(env, this)?.media.as_ref()?.streams[index].format)
+            };
+            r(match create(env, &[Face::OutputProps], Obj::Output(mt)) {
+                Ok(pointer) => {
+                    if write_u32(env, output, pointer) {
+                        S_OK
+                    } else {
+                        E_POINTER
+                    }
+                }
+                Err(hr) => hr,
+            })
+        }
         "GetOutputCount" => {
             let count = reader(env, this)?.streams.len() as u32;
             r(if write_u32(env, a1, count) {
@@ -604,24 +769,38 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let Some(index) = stream_index(env, this, a1 as u16) else {
                 return r(NS_E_INVALID_STREAM);
             };
-            r(if write_u32(env, a2, index as u32) {
+            let output = output_number(reader(env, this)?, index);
+            r(if write_u32(env, a2, output) {
                 S_OK
             } else {
                 E_POINTER
             })
         }
         "GetStreamNumberForOutput" => {
-            let Some(number) = reader(env, this)?
-                .streams
-                .get(a1 as usize)
-                .map(|s| s.number)
-            else {
+            let index = output_index(reader(env, this)?, a1).unwrap_or(usize::MAX);
+            let Some(number) = reader(env, this)?.streams.get(index).map(|s| s.number) else {
                 return r(E_INVALIDARG);
             };
             r(if write_u16(env, a2, number) {
                 S_OK
             } else {
                 E_POINTER
+            })
+        }
+        "GetMaxOutputSampleSize" => {
+            let Some(index) = output_index(reader(env, this)?, a1) else {
+                return r(E_INVALIDARG);
+            };
+            let mt = &reader(env, this)?.streams[index].output_type;
+            let size = if mt.major == dshow::MEDIATYPE_VIDEO {
+                mt.sample_size
+            } else {
+                u32::from_le_bytes(mt.format[8..12].try_into().unwrap())
+            };
+            r(if write_u32(env, a2, size) {
+                S_OK
+            } else {
+                E_INVALIDARG
             })
         }
         "GetMaxStreamSampleSize" => {
@@ -639,12 +818,21 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let index = if method == "SetAllocateForStream" {
                 stream_index(env, this, a1 as u16)
             } else {
-                Some(a1 as usize).filter(|&i| i < reader(env, this).map_or(0, |r| r.streams.len()))
+                output_index(reader(env, this)?, a1)
             };
             let Some(index) = index else {
-                return r(NS_E_INVALID_STREAM);
+                return r(E_INVALIDARG);
             };
-            let old = std::mem::replace(&mut reader(env, this)?.streams[index].allocator, a2);
+            let stream = &mut reader(env, this)?.streams[index];
+            if stream.allocator_used {
+                return r(NS_E_INVALID_REQUEST);
+            }
+            let allocator = if method == "SetAllocateForStream" {
+                &mut stream.allocator
+            } else {
+                &mut stream.output_allocator
+            };
+            let old = std::mem::replace(allocator, a2);
             let mut calls = Vec::new();
             if a2 != 0 {
                 calls.push((a2, 1));
@@ -658,14 +846,19 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let index = if method == "GetAllocateForStream" {
                 stream_index(env, this, a1 as u16)
             } else {
-                Some(a1 as usize).filter(|&i| i < reader(env, this).map_or(0, |r| r.streams.len()))
+                output_index(reader(env, this)?, a1)
             };
             let Some(index) = index else {
-                return r(NS_E_INVALID_STREAM);
+                return r(E_INVALIDARG);
             };
-            let allocator = reader(env, this)?.streams[index].allocator;
+            let stream = &reader(env, this)?.streams[index];
+            let allocator = if method == "GetAllocateForStream" {
+                stream.allocator
+            } else {
+                stream.output_allocator
+            };
             if !write_u32(env, a2, allocator) {
-                return r(E_POINTER);
+                return r(E_INVALIDARG);
             }
             Some(guest_calls(
                 env,
@@ -678,6 +871,73 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
         }
         _ => None,
     }
+}
+
+fn output_setting(env: &mut Env<'_>, this: u32, set: bool) -> Outcome {
+    let [output, name, kind, value, size] = std::array::from_fn(|i| env.arg(i as u32 + 1));
+    let Some(index) = reader(env, this).and_then(|r| output_index(r, output)) else {
+        return Outcome::Return(if reader(env, this).unwrap().media.is_none() {
+            E_UNEXPECTED
+        } else {
+            E_INVALIDARG
+        });
+    };
+    let name = String::from_utf16_lossy(&read_wide(env, name, 256));
+    let audio =
+        reader(env, this).unwrap().streams[index].output_type.major == dshow::MEDIATYPE_AUDIO;
+    let (expected_kind, default) = match name.as_str() {
+        "DedicatedDeliveryThread" | "JustInTimeDecode" | "SingleOutputBuffer" => {
+            return Outcome::Return(NS_E_INVALID_REQUEST);
+        }
+        "StreamLanguage" if !set => return Outcome::Return(NS_E_INVALID_REQUEST),
+        "NeedsPreviousSample" if !audio && !set => return Outcome::Return(NS_E_INVALID_REQUEST),
+        "DeliverOnReceive" => (WMT_TYPE_BOOL, 0),
+        "EnableDiscreteOutput" if audio => (WMT_TYPE_BOOL, 0),
+        "EnableWMAProSPDIFOutput" if audio && set => (WMT_TYPE_BOOL, 0),
+        "AllowInterlacedOutput" | "EnableFrameInterpolation" | "VideoSampleDurations" if !audio => {
+            (WMT_TYPE_BOOL, 0)
+        }
+        "SoftwareScaling" if !audio => (WMT_TYPE_BOOL, 1),
+        "DynamicRangeControl" | "SpeakerConfig" if audio => (WMT_TYPE_DWORD, u32::MAX),
+        "EarlyDataDelivery" => (WMT_TYPE_DWORD, 0),
+        "StreamLanguage" => (5, 0),
+        _ => return Outcome::Return(E_INVALIDARG),
+    };
+    let length = if expected_kind == 5 { 2 } else { 4 };
+    if set {
+        if kind != expected_kind || size != length {
+            return Outcome::Return(E_INVALIDARG);
+        }
+        let data = if length == 2 {
+            env.cpu.read_u16(value).map(u32::from)
+        } else {
+            env.cpu.read_u32(value)
+        };
+        let Ok(data) = data else {
+            return Outcome::Return(E_INVALIDARG);
+        };
+        reader(env, this).unwrap().streams[index]
+            .settings
+            .insert(name, data);
+    } else {
+        let capacity = env.cpu.read_u16(size).unwrap_or(0);
+        write_u16(env, size, length as u16);
+        if u32::from(capacity) < length {
+            return Outcome::Return(ASF_E_BUFFERTOOSMALL);
+        }
+        let data = reader(env, this).unwrap().streams[index]
+            .settings
+            .get(&name)
+            .copied()
+            .unwrap_or(default);
+        write_u32(env, kind, expected_kind);
+        if length == 2 {
+            write_u16(env, value, data as u16);
+        } else {
+            write_u32(env, value, data);
+        }
+    }
+    Outcome::Return(S_OK)
 }
 
 /// Call slot `.1` (AddRef or Release) of each pointer in order, then return `value`.
@@ -766,7 +1026,7 @@ fn finish_open(env: &mut Env<'_>, this: u32, stream: u32, bytes: Vec<u8>) -> Out
         );
     }
     let size = bytes.len();
-    let demuxed = match media::demux(bytes) {
+    let demuxed = match demux(bytes) {
         Ok(demuxed) => demuxed,
         Err(error) => {
             log::warn!("IWMSyncReader::OpenStream: {size} bytes: {error}");
@@ -829,11 +1089,50 @@ pub struct NativeSamples {
     pub samples: u64,
 }
 
+fn demux(bytes: Vec<u8>) -> Result<Demuxed, media::Error> {
+    let file_properties = guid(
+        0x8cab_dca1,
+        0xa947,
+        0x11cf,
+        [0x8e, 0xe4, 0, 0xc0, 0x0c, 0x20, 0x53, 0x65],
+    );
+    let mut duration = None;
+    if bytes.starts_with(&guid(
+        0x75b2_2630,
+        0x668e,
+        0x11cf,
+        [0xa6, 0xd9, 0, 0xaa, 0, 0x62, 0xce, 0x6c],
+    )) {
+        let mut offset = 30;
+        while let Some(header) = bytes.get(offset..offset + 24) {
+            let size = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+            if size < 24 {
+                break;
+            }
+            let Some(object) = bytes.get(offset..).and_then(|tail| tail.get(..size)) else {
+                break;
+            };
+            if object[..16] == file_properties && object.len() >= 88 {
+                let play = u64::from_le_bytes(object[64..72].try_into().unwrap());
+                let preroll = u64::from_le_bytes(object[80..88].try_into().unwrap());
+                duration = Some(play.saturating_sub(preroll.saturating_mul(10_000)));
+                break;
+            }
+            offset += size;
+        }
+    }
+    let mut media = media::demux(bytes)?;
+    if let Some(duration) = duration {
+        media.duration_100ns = duration;
+    }
+    Ok(media)
+}
+
 fn prepare_native(env: &mut Env<'_>, this: u32, bytes: Vec<u8>) -> Outcome {
     let size = bytes.len();
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = media::demux(bytes).map_err(|error| {
+        let result = demux(bytes).map_err(|error| {
             log::warn!("IWMSyncReader::Open: {size} bytes: {error}");
             NS_E_INVALID_INPUT_FORMAT
         });
@@ -950,10 +1249,16 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
     let number = env.arg(1) as u16;
     let outputs: [u32; 6] = std::array::from_fn(|i| env.arg(2 + i as u32));
     let [sample_out, time_out, duration_out, flags_out, _, _] = outputs;
+    if number == 0 && outputs[4] == 0 && outputs[5] == 0 {
+        return Outcome::Return(E_INVALIDARG);
+    }
     if sample_out == 0 || time_out == 0 || duration_out == 0 || flags_out == 0 {
         return Outcome::Return(E_INVALIDARG);
     }
     let _ = env.cpu.write_u32(sample_out, 0);
+    if number != 0 && outputs[5] != 0 {
+        write_u16(env, outputs[5], number);
+    }
     poll_next_sample(env, this, number, outputs)
 }
 
@@ -1004,7 +1309,11 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
         }
     }
     if !any {
-        return Outcome::Return(NS_E_INVALID_REQUEST);
+        return Outcome::Return(if number == 0 {
+            NS_E_NO_MORE_SAMPLES
+        } else {
+            NS_E_INVALID_REQUEST
+        });
     }
     if waiting {
         return Outcome::block(
@@ -1053,7 +1362,11 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
         stream.cursor,
         stream.epoch,
         stream.decoded.as_ref().map_or(0, |d| d.delivered),
-        stream.allocator,
+        if stream.compressed {
+            stream.allocator
+        } else {
+            stream.output_allocator
+        },
         stream.discontinuity,
         stream.number,
     );
@@ -1072,9 +1385,21 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
     };
     let (time, duration, key, data) = (
         packet.time_100ns,
-        packet.duration_100ns,
+        if compressed
+            && media.container == "asf"
+            && matches!(media.streams[index].format, CodecFormat::Video { .. })
+        {
+            10_000
+        } else {
+            packet.duration_100ns
+        },
         packet.key,
-        packet.data.clone(),
+        if !compressed && let CodecFormat::Video { width, height, .. } = media.streams[index].format
+        {
+            dshow::convert_bgra(width, height, &packet.data, &stream.output_type)
+        } else {
+            packet.data.clone()
+        },
     );
     let flags = if key { WM_SF_CLEANPOINT } else { 0 }
         | if discontinuity {
@@ -1107,7 +1432,8 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
         write_u64(env, duration_out, duration);
         write_u32(env, flags_out, flags);
         if output_out != 0 {
-            write_u32(env, output_out, index as u32);
+            let output = output_number(reader(env, this).unwrap(), index);
+            write_u32(env, output_out, output);
         }
         if number_out != 0 {
             write_u16(env, number_out, stream_number);
@@ -1139,64 +1465,119 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
             }
         };
     }
-    let flags_ex = if key { 0 } else { WM_SFEX_NOTASYNCPOINT }
-        | if discontinuity {
-            WM_SFEX_DISCONTINUITY
-        } else {
-            0
-        };
+    let output = output_number(reader(env, this).unwrap(), index);
+    let stream = &mut reader(env, this).unwrap().streams[index];
+    stream.allocator_used = true;
     let _ = env.cpu.write_u32(scratch, 0);
     let args = vec![
-        u32::from(stream_number),
+        if compressed {
+            u32::from(stream_number)
+        } else {
+            output
+        },
         length,
         scratch,
-        flags_ex,
-        time as u32,
-        (time >> 32) as u32,
-        duration as u32,
-        (duration >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        0,
         0,
     ];
     // IWMReaderAllocatorEx::AllocateForStreamEx, then INSSBuffer::GetBuffer and SetLength.
-    guest_call(env, allocator, 3, args, move |env, hr| {
-        let buffer = env.cpu.read_u32(scratch).unwrap_or(0);
-        if hr & 0x8000_0000 != 0 || buffer == 0 {
-            return Outcome::Return(if hr & 0x8000_0000 != 0 {
-                hr
-            } else {
-                E_OUTOFMEMORY
-            });
-        }
-        guest_call(env, buffer, 5, vec![scratch], move |env, hr| {
-            let max = env.cpu.read_u32(scratch).unwrap_or(0);
-            if hr & 0x8000_0000 != 0 || max < length {
-                log::warn!(
-                    "IWMSyncReader: allocator buffer of {max} bytes for a {length}-byte sample"
-                );
-                return guest_call(env, buffer, 2, vec![], move |_, _| {
-                    Outcome::Return(if hr & 0x8000_0000 != 0 {
-                        hr
-                    } else {
-                        E_OUTOFMEMORY
-                    })
+    guest_call(
+        env,
+        allocator,
+        if compressed { 3 } else { 4 },
+        args,
+        move |env, hr| {
+            let buffer = env.cpu.read_u32(scratch).unwrap_or(0);
+            if hr & 0x8000_0000 != 0 || buffer == 0 {
+                return Outcome::Return(if hr & 0x8000_0000 != 0 {
+                    NS_E_NO_MORE_SAMPLES
+                } else {
+                    E_OUTOFMEMORY
                 });
             }
-            guest_call(env, buffer, 6, vec![scratch], move |env, hr| {
-                let pointer = env.cpu.read_u32(scratch).unwrap_or(0);
-                if hr & 0x8000_0000 != 0 || pointer == 0 || env.cpu.write(pointer, &data).is_err() {
+            guest_call(env, buffer, 5, vec![scratch], move |env, hr| {
+                let max = env.cpu.read_u32(scratch).unwrap_or(0);
+                if hr & 0x8000_0000 != 0 || max < length {
+                    log::warn!(
+                        "IWMSyncReader: allocator buffer of {max} bytes for a {length}-byte sample"
+                    );
                     return guest_call(env, buffer, 2, vec![], move |_, _| {
-                        Outcome::Return(E_POINTER)
+                        Outcome::Return(if hr & 0x8000_0000 != 0 {
+                            hr
+                        } else {
+                            E_OUTOFMEMORY
+                        })
                     });
                 }
-                guest_call(env, buffer, 4, vec![length], move |env, hr| {
-                    if hr & 0x8000_0000 != 0 {
-                        return guest_call(env, buffer, 2, vec![], move |_, _| Outcome::Return(hr));
+                guest_call(env, buffer, 6, vec![scratch], move |env, hr| {
+                    let pointer = env.cpu.read_u32(scratch).unwrap_or(0);
+                    if hr & 0x8000_0000 != 0
+                        || pointer == 0
+                        || env.cpu.write(pointer, &data).is_err()
+                    {
+                        return guest_call(env, buffer, 2, vec![], move |_, _| {
+                            Outcome::Return(E_POINTER)
+                        });
                     }
-                    finish(env, buffer)
+                    guest_call(env, buffer, 4, vec![length], move |env, hr| {
+                        if hr & 0x8000_0000 != 0 {
+                            return guest_call(env, buffer, 2, vec![], move |_, _| {
+                                Outcome::Return(hr)
+                            });
+                        }
+                        finish(env, buffer)
+                    })
                 })
             })
-        })
-    })
+        },
+    )
+}
+
+fn output_type(format: &CodecFormat) -> MediaType {
+    match *format {
+        CodecFormat::Audio { rate, channels, .. } => MediaType::audio_pcm(rate, channels),
+        CodecFormat::Video {
+            width,
+            height,
+            frame_100ns,
+            ..
+        } => {
+            let mut mt =
+                MediaType::video_rgb(dshow::MEDIASUBTYPE_RGB24, width, height, frame_100ns as i64);
+            for (at, value) in [(8, width), (12, height), (24, width), (28, height), (32, 0)] {
+                mt.format[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            mt
+        }
+    }
+}
+
+fn output_index(reader: &Reader, output: u32) -> Option<usize> {
+    let media = reader.media.as_ref()?;
+    media
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s.format, CodecFormat::Audio { .. }))
+        .chain(
+            media
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s.format, CodecFormat::Video { .. })),
+        )
+        .nth(output as usize)
+        .map(|(i, _)| i)
+}
+
+fn output_number(reader: &Reader, index: usize) -> u32 {
+    (0..reader.streams.len() as u32)
+        .find(|&n| output_index(reader, n) == Some(index))
+        .unwrap()
 }
 
 fn config(env: &mut Env<'_>, this: u32, index: usize) -> Result<u32, u32> {
@@ -1207,7 +1588,14 @@ fn config(env: &mut Env<'_>, this: u32, index: usize) -> Result<u32, u32> {
     let value = Obj::Config {
         number: stream.number,
         bit_rate: stream.bit_rate,
-        media_type: MediaType::compressed(&stream.format, stream.bit_rate),
+        media_type: {
+            let mut mt = MediaType::compressed(&stream.format, stream.bit_rate);
+            if mt.major == dshow::MEDIATYPE_VIDEO {
+                mt.format[40..48].fill(0);
+                mt.format[68..72].fill(0);
+            }
+            mt
+        },
     };
     create(env, &[Face::StreamConfig, Face::MediaProps], value)
 }
@@ -1224,7 +1612,7 @@ fn profile_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome>
             r(if write_u32(env, a1, count as u32) {
                 S_OK
             } else {
-                E_POINTER
+                E_INVALIDARG
             })
         }
         "GetStream" | "GetStreamByNumber" => {
@@ -1238,7 +1626,7 @@ fn profile_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome>
                 stream_index(env, this, a1 as u16)
             };
             let Some(index) = index else {
-                return r(NS_E_INVALID_STREAM);
+                return r(NS_E_NO_STREAM);
             };
             match config(env, this, index) {
                 Ok(pointer) => {
@@ -1260,12 +1648,7 @@ enum Attribute {
 
 fn attribute(media: &Demuxed, name: &str) -> Option<Attribute> {
     let video = media.streams.iter().find_map(|s| match s.format {
-        CodecFormat::Video {
-            width,
-            height,
-            frame_100ns,
-            ..
-        } => Some((width, height, frame_100ns, s.packets.len())),
+        CodecFormat::Video { width, height, .. } => Some((width, height, s.packets.len())),
         CodecFormat::Audio { .. } => None,
     });
     match name {
@@ -1273,10 +1656,8 @@ fn attribute(media: &Demuxed, name: &str) -> Option<Attribute> {
         "Seekable" => Some(Attribute::Bool(true)),
         "WM/VideoWidth" => video.map(|v| Attribute::Dword(v.0)),
         "WM/VideoHeight" => video.map(|v| Attribute::Dword(v.1)),
-        "WM/VideoFrameRate" => video
-            .filter(|v| v.2 > 0)
-            .map(|v| Attribute::Dword((10_000_000 / v.2) as u32)),
-        "NumberOfFrames" => video.map(|v| Attribute::Qword(v.3 as u64)),
+
+        "NumberOfFrames" => video.map(|v| Attribute::Qword(v.2 as u64)),
         _ => None,
     }
 }
@@ -1311,14 +1692,15 @@ fn header_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let Ok(capacity) = env.cpu.read_u16(length) else {
                 return r(E_POINTER);
             };
-            if !write_u32(env, kind, type_id) || !write_u16(env, length, bytes.len() as u16) {
+            if !write_u16(env, length, bytes.len() as u16) {
                 return r(E_POINTER);
             }
+            if value != 0 && usize::from(capacity) < bytes.len() {
+                return r(ASF_E_BUFFERTOOSMALL);
+            }
+            write_u32(env, kind, type_id);
             if value == 0 {
                 return r(S_OK);
-            }
-            if usize::from(capacity) < bytes.len() {
-                return r(ASF_E_BUFFERTOOSMALL);
             }
             r(if env.cpu.write(value, &bytes).is_ok() {
                 S_OK
@@ -1333,15 +1715,15 @@ fn header_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
 fn config_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
     let (a1, a2) = (env.arg(1), env.arg(2));
-    let Some(Obj::Config {
-        number,
-        bit_rate,
-        media_type,
-    }) = payload(env, this)
-    else {
-        return r(E_UNEXPECTED);
+    let (number, bit_rate, media_type) = match payload(env, this)? {
+        Obj::Config {
+            number,
+            bit_rate,
+            media_type,
+        } => (*number, *bit_rate, media_type.clone()),
+        Obj::Output(mt) => (0, 0, mt.clone()),
+        _ => return r(E_UNEXPECTED),
     };
-    let (number, bit_rate, media_type) = (*number, *bit_rate, media_type.clone());
     match method {
         "GetStreamType" | "GetType" => {
             r(if dshow::write_guid(env, a1, &media_type.major).is_ok() {
@@ -1360,6 +1742,21 @@ fn config_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
         } else {
             E_POINTER
         }),
+        "SetMediaType" if matches!(payload(env, this), Some(Obj::Output(_))) => {
+            if a1 == 0 {
+                return r(E_POINTER);
+            }
+            let Ok(mt) = MediaType::read(env, a1) else {
+                return r(E_POINTER);
+            };
+            if mt.major != dshow::MEDIATYPE_AUDIO && mt.major != dshow::MEDIATYPE_VIDEO {
+                return r(0x8000_4005);
+            }
+            if let Some(Obj::Output(current)) = payload(env, this) {
+                *current = mt;
+            }
+            r(S_OK)
+        }
         "GetMediaType" => {
             // WM_MEDIA_TYPE with its format block placed directly after it.
             let size = MEDIA_TYPE_SIZE + media_type.format.len() as u32;
@@ -1380,6 +1777,7 @@ fn config_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                 write_u32(env, a2, size);
                 return r(ASF_E_BUFFERTOOSMALL);
             }
+            write_u32(env, a2, size);
             r(match write_media_type(env, a1, &media_type) {
                 Ok(()) => S_OK,
                 Err(error) => error,

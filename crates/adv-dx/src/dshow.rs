@@ -25,6 +25,7 @@ pub(crate) mod host;
 pub use host::{Host, MediaEntry, MediaTypes, Opened, Ranges, ReadFile, Sampled, WINE_QUARTZ};
 mod sample;
 mod stream;
+pub(crate) use stream::convert_bgra;
 mod video;
 mod vmr;
 pub use video::{VideoProvider, VideoWindowGeometry, pump_video, set_video_provider};
