@@ -24,6 +24,10 @@ const OUT_OF_MEMORY: u32 = 0x8007000e;
 const INVALID_CALL: u32 = 0x88780032;
 const NO_DRIVER: u32 = 0x88780078;
 const CONTROL_UNAVAILABLE: u32 = 0x8878001e;
+const PRIORITY_NEEDED: u32 = 0x8878_0046;
+const ALLOCATED: u32 = 0x8878_000a;
+/// DSSCL_NORMAL, the level below which formats and memory stay fixed.
+const NORMAL: u32 = 1;
 const OBJECT_NOT_FOUND: u32 = 0x88781161;
 const CLASS_NOT_REGISTERED: u32 = 0x80040154;
 const CTRL_3D: u32 = 0x10;
@@ -206,6 +210,72 @@ impl Default for Format {
         }
     }
 }
+/// The WAVEFORMATEX at `pointer` as Windows keeps it: PCM-style formats
+/// without their extra bytes, WAVEFORMATEXTENSIBLE with them.
+fn described(cpu: &dyn Guest, pointer: u32) -> Result<Vec<u8>, CallError> {
+    check_range(cpu, pointer, 18, Prot::READ)?;
+    let mut b = vec![0; 18];
+    cpu.read(pointer, &mut b)?;
+    if b[..2] == [0xfe, 0xff] {
+        let extra = u32::from(u16::from_le_bytes([b[16], b[17]]));
+        check_range(cpu, pointer, 18 + extra, Prot::READ)?;
+        b.resize(18 + extra as usize, 0);
+        cpu.read(pointer, &mut b)?;
+    } else {
+        b[16..].fill(0);
+    }
+    Ok(b)
+}
+
+/// Whether the WAVEFORMATEX header in `b` is self-consistent, as both
+/// buffer creation and primary SetFormat require.
+fn consistent(b: &[u8]) -> bool {
+    let half = |at: usize| u32::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    let (channels, align, bits) = (half(2), half(12), half(14));
+    bits >= 8
+        && bits % 8 == 0
+        && channels != 0
+        && b[4..8] != [0; 4]
+        && b[8..12] != [0; 4]
+        && align == channels * bits / 8
+}
+
+/// Check a secondary buffer's format as Windows does: an inconsistent
+/// description is invalid, and only a consistent one Windows cannot mix is a
+/// bad format.
+fn secondary_format(cpu: &dyn Guest, pointer: u32) -> Result<Result<Format, u32>, CallError> {
+    const PCM_SUBTYPE_TAIL: [u8; 12] = [0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71];
+    if pointer == 0 {
+        return Ok(Err(INVALID));
+    }
+    check_range(cpu, pointer, 18, Prot::READ)?;
+    let mut b = [0; 18];
+    cpu.read(pointer, &mut b)?;
+    let half = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    let (tag, channels, bits, extra) = (half(0), half(2), half(14), half(16));
+    if !matches!(tag, 1 | 3 | 0xfffe) {
+        return Ok(Err(UNSUPPORTED));
+    }
+    if !consistent(&b) || (channels > 2 && tag != 0xfffe) {
+        return Ok(Err(INVALID));
+    }
+    if tag == 0xfffe {
+        if extra < 22 {
+            return Ok(Err(INVALID));
+        }
+        check_range(cpu, pointer, 40, Prot::READ)?;
+        let mut x = [0; 40];
+        cpu.read(pointer, &mut x)?;
+        let known = x[28..40] == PCM_SUBTYPE_TAIL && matches!(x[24..28], [1 | 3, 0, 0, 0]);
+        if extra > 22 && !(known && extra == 40) {
+            return Ok(Err(CONTROL_UNAVAILABLE));
+        }
+        if !known || u16::from_le_bytes([x[18], x[19]]) > bits {
+            return Ok(Err(INVALID));
+        }
+    }
+    Ok(Format::read(cpu, pointer).map_err(|_| 0x88780064))
+}
 impl Format {
     fn align(self) -> u32 {
         u32::from(self.channels) * u32::from(self.bits) / 8
@@ -307,6 +377,10 @@ enum Kind {
 struct Object {
     kind: Kind,
     pointer: u32,
+    /// A device's primary buffer, which it keeps alive at zero references.
+    primary: u32,
+    /// A device's cooperative level, DSSCL_NORMAL until set.
+    level: u32,
     notify: u32,
     spatial: u32,
     properties: u32,
@@ -348,6 +422,10 @@ struct Buffer {
     len: u32,
     flags: u32,
     format: Format,
+    /// The format as the caller described it, which GetFormat returns.
+    described: Vec<u8>,
+    /// A primary buffer's device cooperative level.
+    level: u32,
     /// The playback rate, which a 3D source's Doppler shift may change.
     frequency: u32,
     volume: i32,
@@ -784,7 +862,7 @@ fn create_com_device(
 }
 /// Publish a new `kind` object at `output` through the interface `iid`.
 fn activate_object(e: &mut Env<'_>, kind: Kind, iid: [u8; 16], output: u32) -> Outcome {
-    let ptr = match object(e, kind, false, None) {
+    let ptr = match object(e, kind, false, None, false) {
         Ok(Some(ptr)) => ptr,
         Ok(None) => return Outcome::Return(OUT_OF_MEMORY),
         Err(error) => return Outcome::Fail(error),
@@ -841,6 +919,21 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     let Some(destroyed) = released.destroyed else {
         return released.references;
     };
+    retire(e, destroyed);
+    0
+}
+/// Free what a destroyed object held. A device ends its primary buffer.
+fn retire(e: &mut Env<'_>, destroyed: adv_abi::com::Destroyed<Object>) {
+    let primary = destroyed.value.primary;
+    if primary != 0 {
+        let com = e.ext.get::<Sound>().com;
+        if let Some(id) = com.identity::<Object>(&e.sys.objects, primary)
+            && let Some(Some(ended)) = com.release_internal(&mut e.sys.objects, id)
+        {
+            retire(e, ended);
+        }
+    }
+    let s = e.ext.get_mut::<Sound>();
     if let Some(buffer) = destroyed.value.buffer {
         s.buffer_ids.remove(&buffer.audio_id);
         if let Some(storage) = buffer.storage {
@@ -859,7 +952,6 @@ fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     for pointer in interfaces {
         free(e, pointer);
     }
-    0
 }
 /// An interface pointer whose method table is `INTERFACES[table]`.
 fn interface(e: &mut Env<'_>, table: usize) -> Result<Option<u32>, String> {
@@ -884,11 +976,13 @@ fn spatial_interface(flags: u32) -> Option<(usize, [u8; 16])> {
         None
     }
 }
+/// `primary` buffers have no IDirectSoundBuffer8, as on Windows.
 fn object(
     e: &mut Env<'_>,
     kind: Kind,
     with_notify: bool,
     spatial: Option<(usize, [u8; 16])>,
+    primary: bool,
 ) -> Result<Option<u32>, String> {
     let i = match kind {
         Kind::Device { .. } => 0,
@@ -941,7 +1035,7 @@ fn object(
     let com = e.ext.get::<Sound>().com;
     let (iid, iid8) = match kind {
         Kind::Device { version8, .. } => (IID_DEVICE, version8.then_some(IID_DEVICE8)),
-        Kind::Buffer => (IID_BUFFER, Some(IID_BUFFER8)),
+        Kind::Buffer => (IID_BUFFER, (!primary).then_some(IID_BUFFER8)),
         _ => (capture::primary(kind), None),
     };
     let Some(id) = com.create(
@@ -951,6 +1045,8 @@ fn object(
         Object {
             kind,
             pointer: ptr,
+            primary: 0,
+            level: NORMAL,
             notify,
             spatial,
             properties,
@@ -1156,6 +1252,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             },
             false,
             None,
+            false,
         )?
         else {
             return Ok(OUT_OF_MEMORY);
@@ -1288,14 +1385,40 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 if fx {
                     check_range(e.cpu, fp, 16, Prot::READ)?;
                 }
-                let format = if primary && fp == 0 {
+                let format = if primary {
+                    if fp != 0 {
+                        return Ok(INVALID);
+                    }
+                    // Each device has one primary buffer, and later requests
+                    // return it whatever they describe.
+                    let existing = com
+                        .get::<Object>(&e.sys.objects, a)
+                        .map_or(0, |o| o.primary);
+                    if existing != 0 {
+                        if com
+                            .add_ref::<Object>(&mut e.sys.objects, existing)
+                            .is_none()
+                        {
+                            return Ok(OUT_OF_MEMORY);
+                        }
+                        e.cpu.write_u32(c, existing)?;
+                        return Ok(0);
+                    }
                     Format::default()
                 } else {
-                    match Format::read(e.cpu, fp) {
+                    match secondary_format(e.cpu, fp)? {
                         Ok(f) => f,
-                        Err(_) => return Ok(0x88780064),
+                        Err(hr) => return Ok(hr),
                     }
                 };
+                let format_bytes = if primary {
+                    format.bytes()
+                } else {
+                    described(e.cpu, fp)?
+                };
+                let level = com
+                    .get::<Object>(&e.sys.objects, a)
+                    .map_or(NORMAL, |o| o.level);
                 // DirectSound 8 takes 3D sources in mono and without pan
                 // control; earlier versions take either.
                 if version8
@@ -1305,12 +1428,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 {
                     return Ok(INVALID);
                 }
-                if (!primary
-                    && (len == 0 || len > DSBSIZE_MAX || !len.is_multiple_of(format.align())))
-                    || (primary && len != 0)
-                {
+                if (!primary && (len == 0 || len > DSBSIZE_MAX)) || (primary && len != 0) {
                     return Ok(INVALID);
                 }
+                // Like Windows, a length between whole frames rounds up to one.
+                let len = len.next_multiple_of(format.align().max(1));
                 if fx {
                     if e.cpu.read_u32(fp + 8)? != format.rate * format.align() {
                         return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
@@ -1342,6 +1464,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     Kind::Buffer,
                     flags & 0x100 != 0,
                     spatial_interface(flags),
+                    primary,
                 )?
                 else {
                     return Ok(OUT_OF_MEMORY);
@@ -1441,6 +1564,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     len,
                     flags,
                     format,
+                    described: format_bytes,
+                    level,
                     frequency: format.rate,
                     volume: 0,
                     pan: 0,
@@ -1469,6 +1594,16 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                         .set_stereo_gain(audio_id, mix(&s.listener.applied, buffer).0);
                 }
                 s.buffer_ids.insert(audio_id, id);
+                if primary {
+                    // The device keeps its primary buffer at zero references.
+                    if !com.retain_internal(&mut e.sys.objects, id) {
+                        release(e, ptr);
+                        return Ok(OUT_OF_MEMORY);
+                    }
+                    com.get_mut::<Object>(&mut e.sys.objects, a)
+                        .unwrap()
+                        .primary = ptr;
+                }
                 e.cpu.write_u32(c, ptr)?;
                 Ok(0)
             }
@@ -1524,6 +1659,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     Kind::Buffer,
                     orig_flags & 0x100 != 0,
                     spatial_interface(orig_flags),
+                    false,
                 )?
                 else {
                     return Ok(OUT_OF_MEMORY);
@@ -1556,6 +1692,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     record.live_buffers += 1;
                 }
                 let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
+                let orig_described = com
+                    .get_identity(&e.sys.objects, orig_id)
+                    .and_then(|o| o.buffer.as_ref())
+                    .map_or_else(|| orig_format.bytes(), |b| b.described.clone());
                 let dup_buffer = Buffer {
                     audio_id,
                     voice: Some(voice),
@@ -1565,6 +1705,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     len: orig_len,
                     flags: orig_flags,
                     format: orig_format,
+                    described: orig_described,
+                    level: NORMAL,
                     frequency: orig_freq,
                     volume: orig_vol,
                     pan: orig_pan,
@@ -1604,13 +1746,33 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 e.cpu.write(b, &caps)?;
                 Ok(0)
             }
-            "SetCooperativeLevel" => Ok(if (1..=4).contains(&c) { 0 } else { INVALID }),
+            "SetCooperativeLevel" => {
+                if !(1..=4).contains(&c) {
+                    return Ok(INVALID);
+                }
+                let device = com.get_mut::<Object>(&mut e.sys.objects, a).unwrap();
+                device.level = c;
+                let primary = device.primary;
+                if let Some(buffer) = com
+                    .get_mut::<Object>(&mut e.sys.objects, primary)
+                    .and_then(|o| o.buffer.as_mut())
+                {
+                    buffer.level = c;
+                }
+                Ok(0)
+            }
             "GetSpeakerConfig" => {
                 e.cpu.write_u32(b, 4)?;
                 Ok(0)
             }
             "SetSpeakerConfig" => Ok(if b & 0xff == 4 { 0 } else { UNSUPPORTED }),
-            "Compact" => Ok(0),
+            "Compact" => Ok(
+                if com.get::<Object>(&e.sys.objects, a).unwrap().level == NORMAL {
+                    PRIORITY_NEEDED
+                } else {
+                    0
+                },
+            ),
             "VerifyCertification" => {
                 e.cpu.write_u32(b, 1)?;
                 Ok(0)
@@ -1759,7 +1921,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             0
         }
         "GetFormat" => {
-            let bytes = buf.format.bytes();
+            let bytes = buf.described.clone();
             let needed = bytes.len() as u32;
             if args[3] != 0 {
                 e.cpu.write_u32(args[3], needed)?;
@@ -1830,11 +1992,32 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             if buf.flags & 1 == 0 {
                 return Ok(INVALID_CALL);
             }
-            let Ok(format) = Format::read(e.cpu, b) else {
-                return Ok(0x88780064);
-            };
-            buf.format = format;
-            buf.frequency = format.rate;
+            if buf.level == NORMAL {
+                return Ok(PRIORITY_NEEDED);
+            }
+            if b == 0 {
+                return Ok(INVALID);
+            }
+            // Like Windows, the primary keeps any consistent format as given;
+            // the mixer's output does not depend on it.
+            let bytes = described(e.cpu, b)?;
+            let channels = u16::from_le_bytes([bytes[2], bytes[3]]);
+            let extensible = bytes[..2] == [0xfe, 0xff];
+            let overwide = extensible
+                && bytes.len() >= 20
+                && u16::from_le_bytes([bytes[18], bytes[19]])
+                    > u16::from_le_bytes([bytes[14], bytes[15]]);
+            if !consistent(&bytes) || overwide {
+                return Ok(INVALID);
+            }
+            if channels > 2 && !extensible {
+                return Ok(ALLOCATED);
+            }
+            if let Ok(format) = Format::read(e.cpu, b) {
+                buf.format = format;
+                buf.frequency = format.rate;
+            }
+            buf.described = bytes;
             0
         }
         "SetCurrentPosition" => {
@@ -3050,6 +3233,105 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(m.sys.objects.object_count(), owners);
+    }
+    // spec: DEV-AUDIO-10
+    #[test]
+    fn each_device_has_one_primary_buffer_that_outlives_its_references() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        let device = device(&mut m);
+        let call = |m: &mut Machine<JitCpu>, name: &str, args: &[u32]| invoke(m, name, args);
+        let create = |m: &mut Machine<JitCpu>, format: u32| {
+            m.cpu.write(DATA, &[0; 20]).unwrap();
+            for (at, value) in [(0, 20), (4, 0x81), (16, format)] {
+                m.cpu.write_u32(DATA + at, value).unwrap();
+            }
+            let hr = invoke(
+                m,
+                "IDirectSound::CreateSoundBuffer",
+                &[device, DATA, DATA + 128, 0],
+            );
+            (hr, m.cpu.read_u32(DATA + 128).unwrap())
+        };
+        // A primary buffer takes no format.
+        assert_eq!(create(&mut m, DATA + 64).0, INVALID);
+        let (hr, primary) = create(&mut m, 0);
+        assert_eq!(hr, 0);
+        assert_eq!(create(&mut m, 0), (0, primary));
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::Release", &[primary]), 1);
+        m.cpu.write(DATA + 256, &IID_BUFFER8).unwrap();
+        let args = [primary, DATA + 256, DATA + 128];
+        assert_eq!(
+            call(&mut m, "IDirectSoundBuffer8::QueryInterface", &args),
+            NO_INTERFACE
+        );
+        // At zero references the device still owns it.
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::Release", &[primary]), 0);
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::AddRef", &[primary]), 1);
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::Release", &[primary]), 0);
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::Release", &[primary]), 0);
+        assert_eq!(create(&mut m, 0), (0, primary));
+        // Formats and memory stay fixed below DSSCL_PRIORITY.
+        let format = DATA + 64;
+        m.cpu.write(format, &[0; 18]).unwrap();
+        for (at, value) in [
+            (0, (2 << 16) | 1),
+            (4, 44100),
+            (8, 44100 * 4 + 1),
+            (12, (16 << 16) | 4),
+        ] {
+            m.cpu.write_u32(format + at, value).unwrap();
+        }
+        let set = [primary, format];
+        assert_eq!(
+            call(&mut m, "IDirectSound::Compact", &[device]),
+            PRIORITY_NEEDED
+        );
+        assert_eq!(
+            call(&mut m, "IDirectSoundBuffer8::SetFormat", &set),
+            PRIORITY_NEEDED
+        );
+        assert_eq!(
+            call(&mut m, "IDirectSound::SetCooperativeLevel", &[device, 0, 2]),
+            0
+        );
+        assert_eq!(call(&mut m, "IDirectSound::Compact", &[device]), 0);
+        // The primary keeps a consistent format exactly as given.
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::SetFormat", &set), 0);
+        let get = [primary, DATA + 300, 18, 0];
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::GetFormat", &get), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 308).unwrap(), 44100 * 4 + 1);
+        m.cpu.write_u32(format, (4 << 16) | 1).unwrap();
+        m.cpu.write_u32(format + 12, (16 << 16) | 8).unwrap();
+        assert_eq!(
+            call(&mut m, "IDirectSoundBuffer8::SetFormat", &set),
+            ALLOCATED
+        );
+        m.cpu.write_u32(format + 12, (16 << 16) | 7).unwrap();
+        assert_eq!(
+            call(&mut m, "IDirectSoundBuffer8::SetFormat", &set),
+            INVALID
+        );
+        // A secondary length between whole frames rounds up to one.
+        m.cpu.write_u32(format, (2 << 16) | 1).unwrap();
+        m.cpu.write_u32(format + 12, (16 << 16) | 4).unwrap();
+        for (at, value) in [(4, 0), (8, 4097), (16, format)] {
+            m.cpu.write_u32(DATA + at, value).unwrap();
+        }
+        let args = [device, DATA, DATA + 128, 0];
+        assert_eq!(call(&mut m, "IDirectSound::CreateSoundBuffer", &args), 0);
+        let secondary = m.cpu.read_u32(DATA + 128).unwrap();
+        m.cpu.write_u32(DATA + 200, 20).unwrap();
+        let caps = [secondary, DATA + 200];
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::GetCaps", &caps), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 208).unwrap(), 4100);
+        assert_eq!(
+            call(&mut m, "IDirectSoundBuffer8::Release", &[secondary]),
+            0
+        );
+        assert_eq!(call(&mut m, "IDirectSoundBuffer8::Release", &[primary]), 0);
+        assert_eq!(call(&mut m, "IDirectSound::Release", &[device]), 0);
         assert_eq!(m.sys.objects.object_count(), owners);
     }
     // spec: DEV-AUDIO-6
@@ -4976,7 +5258,9 @@ mod tests {
         let mut reader = audio.stream().device_reader(1000, 2).unwrap();
         reader.read(&mut [0.0; 4000], 0);
 
-        // Reject unsupported tag/cbSize/subformat before object creation.
+        // Like Windows, an inconsistent description is invalid before any
+        // object exists; only a consistent one that cannot mix is a bad format.
+        // spec: DEV-AUDIO-10
         m.cpu.write(DATA + 64, &[0u8; 40]).unwrap();
         m.cpu.write_u32(DATA + 64, (2 << 16) | 0xfffe).unwrap();
         m.cpu.write_u32(DATA + 68, 44100).unwrap();
@@ -4992,8 +5276,26 @@ mod tests {
                 "IDirectSound8::CreateSoundBuffer",
                 &[dev, DATA, DATA + 128, 0]
             ),
-            0x88780064
+            INVALID
         );
+        // An unknown tag cannot be mixed at all, and a missing format is invalid.
+        m.cpu.write_u32(DATA + 64, (2 << 16) | 2).unwrap();
+        let create = |m: &mut Machine<JitCpu>| {
+            invoke(
+                m,
+                "IDirectSound8::CreateSoundBuffer",
+                &[dev, DATA, DATA + 128, 0],
+            )
+        };
+        assert_eq!(create(&mut m), UNSUPPORTED);
+        m.cpu.write_u32(DATA + 16, 0).unwrap();
+        assert_eq!(create(&mut m), INVALID);
+        // A consistent PCM format outside the mixer's rates is a bad format.
+        m.cpu.write_u32(DATA + 16, DATA + 64).unwrap();
+        m.cpu.write_u32(DATA + 64, (2 << 16) | 1).unwrap();
+        m.cpu.write_u32(DATA + 68, 50).unwrap();
+        m.cpu.write_u32(DATA + 72, 50 * 8).unwrap();
+        assert_eq!(create(&mut m), 0x88780064);
 
         let formats = [
             Format {

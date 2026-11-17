@@ -182,6 +182,12 @@ Unmatched libraries MUST execute their guest implementations.
 **Verification**: Test
 **Basis**: Wine dsound `dsound` and `dsound8` tests, which pass on Windows.
 
+### DEV-AUDIO-10 DirectSound buffer descriptions
+
+**Rule**: `CreateSoundBuffer` MUST reject inconsistent descriptions with `DSERR_INVALIDPARAM` in Windows's order, keeping `DSERR_BADFORMAT` for consistent unmixable formats. Lengths MUST round up to whole frames, and `GetFormat` MUST return formats as given, set on primaries only from DSSCL_PRIORITY. Each device MUST keep one primary buffer, without `IDirectSoundBuffer8`, alive at zero references until the device ends.
+**Verification**: Test
+**Basis**: Wine dsound `dsound` and `dsound8` tests, which pass on Windows.
+
 ### DEV-AUDIO-5 Owned PCM timing
 
 **Rule**: Owned PCM clock conversion MUST use guest and device readings from the same synchronization point. Decode duration MUST NOT shift a continuous audio stream's presentation timestamps. Queue-depth metrics MUST measure total queued duration per stream.
