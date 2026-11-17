@@ -785,9 +785,7 @@ pub(crate) fn transition_result(env: &mut Env<'_>, filter: u32) -> u32 {
 
 /// Current IBaseFilter::GetState result, without waiting.
 pub(crate) fn state_result(env: &mut Env<'_>, filter: u32) -> u32 {
-    if state(env).filters[&filter].state == graph::PAUSED
-        && transition_result(env, filter) == S_FALSE
-    {
+    if transition_result(env, filter) == S_FALSE {
         0x0004_0237
     } else {
         S_OK
@@ -2736,5 +2734,28 @@ mod tests {
         let sample = captured.borrow_mut().take().unwrap().unwrap();
         assert_eq!(sample.bytes.len(), 16);
         assert_eq!(sample.start_100ns, Some(5_000_000));
+    }
+
+    // spec: MEDIA-VIDEO-9
+    #[test]
+    fn running_connected_vmr_reports_intermediate_state_before_first_sample() {
+        let (mut m, _graph, _control, _windowless, input_pin, _config) = setup_windowless();
+        assert_eq!(
+            method(&mut m, "IPin::QueryPinInfo", &[input_pin, DATA]),
+            S_OK
+        );
+        let vmr = m.cpu.read_u32(DATA).unwrap();
+        assert_eq!(method(&mut m, "IBaseFilter::Run", &[vmr, 0, 0]), S_FALSE);
+        assert_eq!(
+            method(&mut m, "IBaseFilter::GetState", &[vmr, 0, DATA + 4]),
+            0x0004_0237
+        );
+        assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), graph::RUNNING);
+        assert_eq!(method(&mut m, "IBaseFilter::Stop", &[vmr]), S_OK);
+        assert_eq!(
+            method(&mut m, "IBaseFilter::GetState", &[vmr, 0, DATA + 4]),
+            S_OK
+        );
+        assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), graph::STOPPED);
     }
 }
