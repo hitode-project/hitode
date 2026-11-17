@@ -1243,8 +1243,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     e.cpu.write_u32(c, 0)?;
                 }
                 // Software PCM supports 3D and an empty FX chain, without
-                // hardware voices or effect-DSP constructors.
+                // hardware voices or effect-DSP constructors. Like Windows,
+                // a primary buffer ignores DSBCAPS_LOCHARDWARE.
+                let ignored = if flags & 1 != 0 { 0x4 } else { 0 };
                 let unsupported = flags
+                    & !ignored
                     & !(0x1
                         | 0x2
                         | 0x8
@@ -4597,9 +4600,10 @@ mod tests {
         assert_eq!(m.sys.objects.object_count(), objects);
         assert_eq!(heap_next(&mut m), header);
         assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
-        // Create primary buffer
+        // A primary buffer ignores DSBCAPS_LOCHARDWARE, as on Windows.
+        // spec: DEV-AUDIO-9
         m.cpu.write_u32(DATA, 20).unwrap();
-        m.cpu.write_u32(DATA + 4, 1).unwrap(); // DSBCAPS_PRIMARYBUFFER
+        m.cpu.write_u32(DATA + 4, 5).unwrap(); // PRIMARYBUFFER | LOCHARDWARE
         m.cpu.write_u32(DATA + 8, 0).unwrap();
         m.cpu.write_u32(DATA + 12, 0).unwrap();
         m.cpu.write_u32(DATA + 16, 0).unwrap();

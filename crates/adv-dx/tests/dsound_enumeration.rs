@@ -215,19 +215,30 @@ fn enumeration(jit: bool, wide: bool, keep_going: u32) {
     code.ret();
     let (result, marker, objects) = run(&mut m, code);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
-    assert_eq!(m.cpu.read_u32(COUNT).unwrap(), 1);
-    assert_eq!(m.cpu.read_u32(INNER_COUNT).unwrap(), 1);
-    assert_eq!(m.cpu.read_u32(GUID).unwrap(), 0);
+    // Like Windows, the primary driver entry comes first, then the device;
+    // the inner callback stops after the primary entry each time.
+    let entries = if keep_going == 0 { 1 } else { 2 };
+    assert_eq!(m.cpu.read_u32(COUNT).unwrap(), entries);
+    assert_eq!(m.cpu.read_u32(INNER_COUNT).unwrap(), entries);
+    assert_eq!(m.cpu.read_u32(GUID).unwrap() != 0, keep_going != 0);
     assert_eq!(m.cpu.read_u32(CONTEXT).unwrap(), 0xfedc_ba98);
     assert_eq!(m.cpu.read_u32(INNER_CONTEXT).unwrap(), 0x1122_3344);
     for output in [HRESULT, NESTED_HRESULT, CREATE_HRESULT] {
         assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
     }
     assert_eq!(m.cpu.read_u32(RELEASE_COUNT).unwrap(), 0);
-    assert_eq!(text(&m, TEXT, wide), "Primary Sound Driver");
-    assert_eq!(text(&m, MODULE_TEXT, wide), "dsound.dll");
+    let (description, module) = if keep_going == 0 {
+        ("Primary Sound Driver", "")
+    } else {
+        (
+            "Speakers",
+            "{0.0.0.00000000}.{2270eaf5-ed98-4c2d-ae2b-97007ff345c1}",
+        )
+    };
+    assert_eq!(text(&m, TEXT, wide), description);
+    assert_eq!(text(&m, MODULE_TEXT, wide), module);
     assert_eq!(text(&m, INNER_TEXT, true), "Primary Sound Driver");
-    assert_eq!(text(&m, INNER_MODULE_TEXT, true), "dsound.dll");
+    assert_eq!(text(&m, INNER_MODULE_TEXT, true), "");
     assert_ne!(
         m.cpu.read_u32(DESCRIPTION).unwrap(),
         m.cpu.read_u32(INNER_DESCRIPTION).unwrap()
@@ -296,6 +307,7 @@ fn empty_or_invalid(jit: bool, installed: bool, enabled: bool) {
     );
 }
 
+// spec: DEV-AUDIO-9
 #[test]
 fn default_enumeration_is_synchronous_reentrant_and_creatable_for_ansi_and_utf16() {
     for jit in [false, true] {

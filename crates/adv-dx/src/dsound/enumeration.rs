@@ -1,13 +1,14 @@
-//! Enumerate only the installed emulated default that DirectSoundCreate(NULL)
-//! can open. Its one fixed identity is what GetDeviceID gives the default
-//! playback aliases; the front never queries host hardware.
+//! Enumerate the installed emulated playback device as Windows does: first
+//! the primary driver entry, then the device under its fixed identity, which
+//! is what GetDeviceID gives the default playback aliases. The front never
+//! queries host hardware.
 use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{Prot, Reg};
 use adv_machine::{Env, Outcome};
 
 use super::{INVALID, NO_DRIVER, OUT_OF_MEMORY, Sound};
 
-const SCRATCH: u32 = 64;
+const SCRATCH: u32 = 160;
 const CALLBACK_STACK: u32 = 20; // Four arguments plus return address.
 
 struct Enumeration {
@@ -15,7 +16,8 @@ struct Enumeration {
     context: u32,
     scratch: u32,
     wide: bool,
-    delivered: bool,
+    /// Entries already handed to the callback.
+    delivered: usize,
 }
 
 fn start(env: &mut Env<'_>, callback: u32, context: u32, wide: bool, installed: bool) -> Outcome {
@@ -64,7 +66,7 @@ fn start(env: &mut Env<'_>, callback: u32, context: u32, wide: bool, installed: 
             context,
             scratch,
             wide,
-            delivered: false,
+            delivered: 0,
         },
         1,
     )
@@ -77,7 +79,7 @@ fn string(text: &str, wide: bool) -> Vec<u8> {
             .flat_map(u16::to_le_bytes)
             .collect()
     } else {
-        // The two fixed labels are ASCII, represented identically in every
+        // The fixed labels are ASCII, represented identically in every
         // supported guest ACP (including CP932, CP936 and UTF-8).
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(0);
@@ -85,23 +87,34 @@ fn string(text: &str, wide: bool) -> Vec<u8> {
     }
 }
 
+/// The device entry's module: Windows names an endpoint by its id.
+const MODULE: &str = "{0.0.0.00000000}.{2270eaf5-ed98-4c2d-ae2b-97007ff345c1}";
+
 fn next(env: &mut Env<'_>, mut enumeration: Enumeration, keep_going: u32) -> Outcome {
-    if keep_going == 0 || enumeration.delivered {
+    if keep_going == 0 || enumeration.delivered == 2 {
         return Outcome::Return(0); // Callback FALSE and exhaustion both return DS_OK.
     }
-    enumeration.delivered = true;
-    let mut bytes = string("Primary Sound Driver", enumeration.wide);
-    let module = enumeration.scratch + bytes.len() as u32;
-    bytes.extend(string("dsound.dll", enumeration.wide));
+    // The primary driver entry has no GUID and an empty module.
+    let (guid, description, module) = match enumeration.delivered {
+        0 => (None, "Primary Sound Driver", ""),
+        _ => (Some(PLAYBACK_DEVICE), "Speakers", MODULE),
+    };
+    enumeration.delivered += 1;
+    let mut bytes = guid.map_or_else(Vec::new, |guid| guid.to_vec());
+    let at = |bytes: &Vec<u8>| enumeration.scratch + bytes.len() as u32;
+    let text = at(&bytes);
+    bytes.extend(string(description, enumeration.wide));
+    let module_at = at(&bytes);
+    bytes.extend(string(module, enumeration.wide));
     if env.cpu.write(enumeration.scratch, &bytes).is_err() {
         return Outcome::Return(OUT_OF_MEMORY);
     }
-    // Only the default device has a supported identity: Create rejects any
-    // non-NULL GUID. Pointers are valid throughout the synchronous callback,
-    // including a wait or a nested API call, but are not retained afterward.
+    let guid = guid.map_or(0, |_| enumeration.scratch);
+    // Pointers are valid throughout the synchronous callback, including a
+    // wait or a nested API call, but are not retained afterward.
     Outcome::call_on_stack(
         enumeration.callback,
-        [0, enumeration.scratch, module, enumeration.context],
+        [guid, text, module_at, enumeration.context],
         enumeration.scratch,
         move |env, resume| next(env, enumeration, resume.value()),
     )
