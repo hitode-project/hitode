@@ -1118,10 +1118,7 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
     }
     let filter = state(env).pins[&pin].filter;
     if state(env).filters[&filter].state != graph::STOPPED {
-        return Outcome::Return(0x8004_0224);
-    }
-    if state(env).filters[&filter].role == Role::VideoRenderer && !super::vmr::connects_input(&mt) {
-        return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
+        return Outcome::Return(VFW_E_NOT_STOPPED);
     }
     if state(env).filters[&filter].role == Role::DmoDecoder
         && !super::dmo::connect_input(env, pin, &mt)

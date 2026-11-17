@@ -13,6 +13,8 @@ const E_FAIL: u32 = 0x8000_4005;
 const VFW_E_NOT_PAUSED: u32 = 0x8004_0225;
 const VFW_E_NO_PALETTE_AVAILABLE: u32 = 0x8004_0220;
 const WS_VISIBLE: u32 = 0x1000_0000;
+const WM_SIZE: u32 = 0x0005;
+const WM_CLOSE: u32 = 0x0010;
 const WS_FORBIDDEN: u32 = 0x0800_0000 | 0x2000_0000 | 0x0100_0000 | 0x0020_0000 | 0x0010_0000;
 // Parent/clip/visibility and conventional nonclient style metadata. Scroll,
 // disabled and iconic/maximized windows are excluded by IVideoWindow's contract.
@@ -431,12 +433,14 @@ pub(crate) fn vmr_window_proc(env: &mut Env<'_>) -> Outcome {
         let f = &state(env).filters[&filter];
         let graph = f.graph;
         let drain = f.vmr.as_ref().unwrap().drain;
+        // WM_MOUSEACTIVATE, non-client mouse, WM_KEYDOWN/UP and client mouse
+        // messages go to the drain window, as IVideoWindow::put_MessageDrain says.
         if drain != 0 && matches!(message, 0x21 | 0xa1..=0xa9 | 0x100 | 0x101 | 0x200..=0x209) {
             let mut forwarded = args.clone();
             forwarded[0] = drain;
             return user(env, "PostMessageW", forwarded, |_, _| Outcome::Return(0));
         }
-        if message == 0x10 {
+        if message == WM_CLOSE {
             let v = state(env)
                 .filters
                 .get_mut(&filter)
@@ -448,7 +452,7 @@ pub(crate) fn vmr_window_proc(env: &mut Env<'_>) -> Outcome {
             let wake = v.wake;
             env.sys.set_event(wake);
             if state(env).graphs.contains_key(&graph) {
-                graph::notify(env, graph, 2, 0, 0);
+                graph::notify(env, graph, graph::EC_USERABORT, 0, 0);
                 state(env)
                     .graphs
                     .get_mut(&graph)
@@ -461,7 +465,7 @@ pub(crate) fn vmr_window_proc(env: &mut Env<'_>) -> Outcome {
                 graph::flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
             });
         }
-        if message == 5 && state(env).graphs.contains_key(&graph) {
+        if message == WM_SIZE && state(env).graphs.contains_key(&graph) {
             let size = args[3];
             let w = &mut state(env).graphs.get_mut(&graph).unwrap().video;
             w.position = Some(Rect {

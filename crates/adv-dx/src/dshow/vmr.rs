@@ -664,7 +664,9 @@ pub(crate) fn allocated(env: &mut Env<'_>, allocator: u32) -> Option<Outcome> {
         word(24).wrapping_sub(word(16)),
         word(28).wrapping_sub(word(20)),
     );
-    let count = env.cpu.read_u32(env.arg(1)).unwrap();
+    let Ok(count) = env.cpu.read_u32(env.arg(1)) else {
+        return Some(Outcome::Return(E_POINTER));
+    };
     let raw: Vec<u8> = [
         0x14,
         scratch + 40,
