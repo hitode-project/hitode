@@ -112,7 +112,7 @@ mod disabled_stage_tests {
         let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
         let this = GuestPtr::new(pointer);
         let second =
-            |env: &Env<'_>| second_stage(current(env, pointer).unwrap()).map_err(|e| e.code);
+            |env: &Env<'_>| second_stage(&current(env, pointer).unwrap()).map_err(|e| e.code);
         assert_eq!(second(&env), Ok(None));
         for op in [2, 3, 4, 7, 10] {
             assert_eq!(set_stage(&mut env, this, 1, 1, op), 0);

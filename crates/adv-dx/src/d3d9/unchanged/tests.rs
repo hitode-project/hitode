@@ -36,7 +36,11 @@ fn create(f: &mut Fixture, name: &str, mut args: Vec<u32>) -> u32 {
     f.m.cpu.read_u32(output).unwrap()
 }
 fn versions(f: &mut Fixture) -> [u64; 15] {
-    device(&env(&mut f.m, 0), f.device).unwrap().versions
+    device(&env(&mut f.m, 0), f.device)
+        .unwrap()
+        .hot
+        .borrow()
+        .versions
 }
 
 #[test]
@@ -148,14 +152,20 @@ fn rebinding_changes_nothing_and_switches_run_the_setter() {
     let block = f.m.cpu.read_u32(output).unwrap();
     f.okay("IDirect3DDevice9::SetFVF", &[d, 0x104]);
     f.okay("IDirect3DStateBlock9::Apply", &[block]);
-    assert_eq!(device(&env(&mut f.m, 0), d).unwrap().fixed.fvf, 0x44);
+    assert_eq!(
+        device(&env(&mut f.m, 0), d).unwrap().hot.borrow().fixed.fvf,
+        0x44
+    );
 }
 
 #[test]
 fn redundant_zero_fvf_keeps_the_unavailable_result() {
     let mut f = Fixture::new();
     let d = f.device;
-    assert_eq!(device(&env(&mut f.m, 0), d).unwrap().fixed.fvf, 0);
+    assert_eq!(
+        device(&env(&mut f.m, 0), d).unwrap().hot.borrow().fixed.fvf,
+        0
+    );
     assert!(!unchanged(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0]));
 }
 
@@ -199,7 +209,12 @@ fn state_blocks_equal_to_the_device_transfer_nothing() {
     f.okay("IDirect3DDevice9::SetVertexShader", &[d, b]);
     assert!(!unchanged(&mut f, "IDirect3DStateBlock9::Apply", &[block]));
     f.okay("IDirect3DStateBlock9::Apply", &[block]);
-    let bound = device(&env(&mut f.m, 0), d).unwrap().shaders.vertex;
+    let bound = device(&env(&mut f.m, 0), d)
+        .unwrap()
+        .hot
+        .borrow()
+        .shaders
+        .vertex;
     let a = com(&env(&mut f.m, 0)).identity::<Payload>(&f.m.sys.objects, a);
     assert_eq!(bound, a);
 }

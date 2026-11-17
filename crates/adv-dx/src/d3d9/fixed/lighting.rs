@@ -1,4 +1,4 @@
-use super::super::shaders::stateblocks::{FixedKey, mark_fixed};
+use super::super::shaders::stateblocks::FixedKey;
 use super::*;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -52,14 +52,15 @@ pub(super) fn set_light(
     {
         return INVALID;
     }
-    let Some(f) = mutable(env, this.addr()) else {
+    if !super::mutate_fixed_raw(env, this.addr(), FixedKey::Light(index), |f| {
+        let created = !f.lights.contains_key(&index);
+        let light = f.lights.entry(index).or_default();
+        let changed = created || light.value != value;
+        light.value = value;
+        changed
+    }) {
         return INVALID;
-    };
-    let created = !f.lights.contains_key(&index);
-    let light = f.lights.entry(index).or_default();
-    let changed = created || light.value != value;
-    light.value = value;
-    mark_fixed(env, this.addr(), FixedKey::Light(index), changed);
+    }
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetLight",level=implement)]
@@ -69,22 +70,23 @@ pub(super) fn get_light(
     index: u32,
     output: GuestPtr<[u32; 26]>,
 ) -> u32 {
-    let Some(light) = current(env, this.addr()).and_then(|f| f.lights.get(&index)) else {
+    let Some(value) = current(env, this.addr()).and_then(|f| f.lights.get(&index).map(|l| l.value))
+    else {
         return INVALID;
     };
-    let value = light.value;
     output.write(env.cpu, value).map_or(INVALID, |()| 0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::LightEnable",level=implement)]
 pub(super) fn light_enable(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, enable: i32) -> u32 {
-    let Some(f) = mutable(env, this.addr()) else {
+    if !super::mutate_fixed_raw(env, this.addr(), FixedKey::LightEnable(index), |f| {
+        let created = !f.lights.contains_key(&index);
+        let light = f.lights.entry(index).or_default();
+        let changed = created || light.enabled != (enable != 0);
+        light.enabled = enable != 0;
+        changed
+    }) {
         return INVALID;
-    };
-    let created = !f.lights.contains_key(&index);
-    let light = f.lights.entry(index).or_default();
-    let changed = created || light.enabled != (enable != 0);
-    light.enabled = enable != 0;
-    mark_fixed(env, this.addr(), FixedKey::LightEnable(index), changed);
+    }
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetLightEnable",level=implement)]
@@ -94,11 +96,13 @@ pub(super) fn get_light_enable(
     index: u32,
     output: GuestPtr<i32>,
 ) -> u32 {
-    let Some(light) = current(env, this.addr()).and_then(|f| f.lights.get(&index)) else {
+    let Some(enabled) =
+        current(env, this.addr()).and_then(|f| f.lights.get(&index).map(|l| l.enabled))
+    else {
         return INVALID;
     };
     // Native D3D9 returns 128 for an enabled light.
-    let value = if light.enabled { 128 } else { 0 };
+    let value = if enabled { 128 } else { 0 };
     output.write(env.cpu, value).map_or(INVALID, |()| 0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetMaterial",level=implement)]
@@ -110,12 +114,13 @@ pub(super) fn set_material(
     let Ok(value) = material.read(env.cpu) else {
         return INVALID;
     };
-    let Some(f) = mutable(env, this.addr()) else {
+    if !super::mutate_fixed_raw(env, this.addr(), FixedKey::Material, |f| {
+        let changed = f.material.map(f32::to_bits) != value.map(f32::to_bits);
+        f.material = value;
+        changed
+    }) {
         return INVALID;
-    };
-    let changed = f.material.map(f32::to_bits) != value.map(f32::to_bits);
-    f.material = value;
-    mark_fixed(env, this.addr(), FixedKey::Material, changed);
+    }
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetMaterial",level=implement)]
@@ -124,10 +129,9 @@ pub(super) fn get_material(
     this: GuestPtr<()>,
     output: GuestPtr<[f32; 17]>,
 ) -> u32 {
-    let Some(f) = current(env, this.addr()) else {
+    let Some(value) = current(env, this.addr()).map(|f| f.material) else {
         return INVALID;
     };
-    let value = f.material;
     output.write(env.cpu, value).map_or(INVALID, |()| 0)
 }
 pub(super) fn active(f: &Fixed) -> Result<[Option<[f32; 26]>; 8], Rejected> {

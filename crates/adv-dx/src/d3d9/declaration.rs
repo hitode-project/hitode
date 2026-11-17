@@ -293,19 +293,33 @@ pub(super) fn bind(env: &mut Env<'_>, device: Id, new: Option<Id>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device) else {
         return INVALID;
     };
-    let old = d.buffers.declaration;
-    if old == new && d.fixed.fvf == 0 {
+    let (old, fvf) = {
+        let hot = d.hot.borrow();
+        (hot.buffers.declaration, hot.fixed.fvf)
+    };
+    if old == new && fvf == 0 {
         return 0;
     }
+    let new_ptr = new.and_then(|id| {
+        if let Some(Payload::Declaration(decl)) = com(env).get_identity(&env.sys.objects, id) {
+            Some(decl.pointer)
+        } else {
+            None
+        }
+    });
     if new != old && new.is_some_and(|id| !com(env).retain_internal(&mut env.sys.objects, id)) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.buffers.declaration = new;
-    d.fixed.clear_fvf();
-    d.touch(7);
+    {
+        let mut hot = d.hot.borrow_mut();
+        hot.buffers.declaration = new;
+        hot.declaration_ptr = new_ptr.unwrap_or(0);
+        hot.fixed.clear_fvf();
+        hot.touch(7);
+    }
     if new != old
         && let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -467,7 +481,10 @@ pub(super) fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) 
     let Some(d) = super::device(env, this.addr()) else {
         return INVALID;
     };
-    let (bound, fvf) = (d.buffers.declaration, d.fixed.fvf);
+    let (bound, fvf) = {
+        let hot = d.hot.borrow();
+        (hot.buffers.declaration, hot.fixed.fvf)
+    };
     let pointer = match bound {
         Some(id) => {
             let Some(Payload::Declaration(declaration)) =

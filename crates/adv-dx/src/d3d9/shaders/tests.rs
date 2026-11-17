@@ -277,16 +277,29 @@ fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() 
     assert_eq!(set_vertex(&mut env, this, GuestPtr::new(pointer)), 0);
     assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);
     assert_eq!(fixed::set_fvf(&mut env, this, 0x42), 0);
-    assert_eq!(current_device(&env, device).unwrap().shaders.vertex, None);
     assert_eq!(
         current_device(&env, device)
             .unwrap()
+            .hot
+            .borrow()
+            .shaders
+            .vertex,
+        None
+    );
+    assert_eq!(
+        current_device(&env, device)
+            .unwrap()
+            .hot
+            .borrow()
             .shaders
             .vertex_constants
             .floats[7],
         [0.; 4]
     );
-    assert_eq!(current_device(&env, device).unwrap().fixed.fvf, 0);
+    assert_eq!(
+        current_device(&env, device).unwrap().hot.borrow().fixed.fvf,
+        0
+    );
     assert_eq!(stateblocks::end(&mut env, this, output), 0);
     let block = output.read(env.cpu).unwrap();
     assert_eq!(release(&mut env, pointer), 0);
@@ -297,10 +310,12 @@ fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() 
     assert_eq!(set_vertex_f(&mut env, this, 8, input.cast(), 1), 0);
     assert_eq!(stateblocks::apply(&mut env, GuestPtr::new(block)), 0);
     let d = current_device(&env, device).unwrap();
-    assert_eq!(d.shaders.vertex, Some(shader_id));
-    assert_eq!(d.shaders.vertex_constants.floats[7], [1., 2., 3., 4.]);
-    assert_eq!(d.shaders.vertex_constants.floats[8], [9.; 4]);
-    assert_eq!(d.fixed.fvf, 0x42);
+    let hot = d.hot.borrow();
+    assert_eq!(hot.shaders.vertex, Some(shader_id));
+    assert_eq!(hot.shaders.vertex_constants.floats[7], [1., 2., 3., 4.]);
+    assert_eq!(hot.shaders.vertex_constants.floats[8], [9.; 4]);
+    assert_eq!(hot.fixed.fvf, 0x42);
+    drop(hot);
     assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);
     assert_eq!(stateblocks::capture(&mut env, GuestPtr::new(block)), 0);
     GuestPtr::<[f32; 4]>::new(input.addr())
@@ -312,6 +327,8 @@ fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() 
     assert_eq!(
         current_device(&env, device)
             .unwrap()
+            .hot
+            .borrow()
             .shaders
             .vertex_constants
             .floats[7],
@@ -320,6 +337,8 @@ fn custom_stateblock_records_without_mutating_device_and_capture_keeps_subset() 
     assert_eq!(
         current_device(&env, device)
             .unwrap()
+            .hot
+            .borrow()
             .shaders
             .vertex_constants
             .floats[8],
@@ -353,8 +372,10 @@ fn reset_clears_shader_bindings_constants_and_recording_but_keeps_public_program
     assert!(bound(&env, shader_id).is_some());
     let d = current_device(&env, device).unwrap();
     assert!(d.recording.is_none());
-    assert!(d.shaders.vertex.is_none());
-    assert_eq!(d.shaders.vertex_constants.floats[1], [0.; 4]);
+    let hot = d.hot.borrow();
+    assert!(hot.shaders.vertex.is_none());
+    assert_eq!(hot.shaders.vertex_constants.floats[1], [0.; 4]);
+    drop(hot);
     assert_eq!(set_vertex(&mut env, this, GuestPtr::new(pointer)), 0);
     assert_eq!(release(&mut env, pointer), 0);
     assert_eq!(set_vertex(&mut env, this, GuestPtr::new(0)), 0);
@@ -376,10 +397,11 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
         let before = [2, 0, 1, 3, 0, 1];
         let after = [1, 1, 0, 1, 1, 2];
         if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
+            let mut hot = d.hot.borrow_mut();
             for (&state, &value) in states.iter().zip(&before) {
-                d.fixed.render.insert(state, value);
+                hot.fixed.render.insert(state, value);
             }
-            d.touch(0);
+            hot.touch(0);
         }
         input.write(env.cpu, [1.; 4]).unwrap();
         assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);
@@ -388,10 +410,11 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
         assert_eq!(stateblocks::create(&mut env, this, kind, output), 0);
         let block = output.read(env.cpu).unwrap();
         if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
+            let mut hot = d.hot.borrow_mut();
             for (&state, &value) in states.iter().zip(&after) {
-                d.fixed.render.insert(state, value);
+                hot.fixed.render.insert(state, value);
             }
-            d.touch(0);
+            hot.touch(0);
         }
         input.write(env.cpu, [3.; 4]).unwrap();
         assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);
@@ -399,15 +422,17 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
         assert_eq!(set_pixel_f(&mut env, this, 7, input.cast(), 1), 0);
         assert_eq!(stateblocks::apply(&mut env, GuestPtr::new(block)), 0);
         let d = current_device(&env, device).unwrap();
-        assert_eq!(states.map(|state| d.fixed.render[&state]), expected);
+        let hot = d.hot.borrow();
+        assert_eq!(states.map(|state| hot.fixed.render[&state]), expected);
         assert_eq!(
-            d.shaders.vertex_constants.floats[7],
+            hot.shaders.vertex_constants.floats[7],
             if kind == 3 { [1.; 4] } else { [3.; 4] }
         );
         assert_eq!(
-            d.shaders.pixel_constants.floats[7],
+            hot.shaders.pixel_constants.floats[7],
             if kind == 2 { [2.; 4] } else { [4.; 4] }
         );
+        drop(hot);
         assert_eq!(release(&mut env, block), 0);
     }
 }
@@ -477,46 +502,42 @@ fn typed_recording_keeps_buffers_alive_and_restores_fixed_sampler_and_bump_state
     ] {
         assert_eq!(typed_call(&mut env, &registry, name, &args), 0);
     }
-    assert_eq!(current_device(&env, device).unwrap().fixed.render[&137], 1);
-    assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&1], 1);
-    assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&3], 1);
-    assert_eq!(current_device(&env, device).unwrap().fixed.sampler[&4], 0);
-    assert_eq!(
-        current_device(&env, device).unwrap().fixed.sampler_slots[2][&9],
-        0
-    );
-    assert_eq!(
-        current_device(&env, device).unwrap().fixed.stage_slots[0][&7],
-        0
-    );
-    assert!(
-        current_device(&env, device).unwrap().buffers.streams[1]
-            .buffer
-            .is_none()
-    );
+    {
+        let d = current_device(&env, device).unwrap();
+        let hot = d.hot.borrow();
+        assert_eq!(hot.fixed.render[&137], 1);
+        assert_eq!(hot.fixed.sampler[&1], 1);
+        assert_eq!(hot.fixed.sampler[&3], 1);
+        assert_eq!(hot.fixed.sampler[&4], 0);
+        assert_eq!(hot.fixed.sampler_slots[2][&9], 0);
+        assert_eq!(hot.fixed.stage_slots[0][&7], 0);
+        assert!(hot.buffers.streams[1].buffer.is_none());
+    }
     assert_eq!(stateblocks::end(&mut env, GuestPtr::new(device), output), 0);
     let block = output.read(env.cpu).unwrap();
     assert_eq!(release(&mut env, buffer), 0);
     assert_eq!(stateblocks::apply(&mut env, GuestPtr::new(block)), 0);
     let d = current_device(&env, device).unwrap();
-    assert_eq!(d.fixed.render[&137], 0);
-    assert_eq!(d.fixed.sampler_slots[2][&9], 5);
-    assert_eq!(d.fixed.sampler[&1], 4);
-    assert_eq!(d.fixed.sampler[&4], 0x8010_2040);
-    assert_eq!(d.fixed.sampler[&3], 3);
-    assert_eq!(d.fixed.sampler_slots[2][&3], 2);
-    assert_eq!(d.fixed.sampler_slots[2][&4], 0xffab_cdef);
-    assert_eq!(d.fixed.sampler_slots[16][&4], 0xff12_3456);
+    let hot = d.hot.borrow();
+    assert_eq!(hot.fixed.render[&137], 0);
+    assert_eq!(hot.fixed.sampler_slots[2][&9], 5);
+    assert_eq!(hot.fixed.sampler[&1], 4);
+    assert_eq!(hot.fixed.sampler[&4], 0x8010_2040);
+    assert_eq!(hot.fixed.sampler[&3], 3);
+    assert_eq!(hot.fixed.sampler_slots[2][&3], 2);
+    assert_eq!(hot.fixed.sampler_slots[2][&4], 0xffab_cdef);
+    assert_eq!(hot.fixed.sampler_slots[16][&4], 0xff12_3456);
     assert_eq!(
-        d.fixed.program_sampler(0).unwrap().border_color,
+        hot.fixed.program_sampler(0).unwrap().border_color,
         0x8040_2010
     );
-    assert_eq!(d.fixed.stage_slots[0][&7], 1f32.to_bits());
-    assert_eq!(d.buffers.streams[1].buffer, Some(buffer_id));
+    assert_eq!(hot.fixed.stage_slots[0][&7], 1f32.to_bits());
+    assert_eq!(hot.buffers.streams[1].buffer, Some(buffer_id));
     assert_eq!(
-        (d.buffers.streams[1].offset, d.buffers.streams[1].stride),
+        (hot.buffers.streams[1].offset, hot.buffers.streams[1].stride),
         (4, 12)
     );
+    drop(hot);
     assert_eq!(release(&mut env, block), 0);
     buffers::reset_bindings(&mut env, id);
     assert!(
@@ -774,15 +795,16 @@ fn repeated_capture_preserves_signed_zero_nan_and_uncaptured_constants() {
     assert_eq!(set_vertex_f(&mut env, this, 7, input, 1), 0);
     assert_eq!(set_vertex_f(&mut env, this, 8, input, 1), 0);
     assert_eq!(stateblocks::apply(&mut env, block), 0);
-    let c = &current_device(&env, device)
-        .unwrap()
-        .shaders
-        .vertex_constants;
-    assert_eq!(
-        c.floats[7].map(f32::to_bits),
-        [0x8000_0000, 0x7fc0_0123, 0, 0]
-    );
-    assert_eq!(c.floats[8][0], 1.);
+    {
+        let d = current_device(&env, device).unwrap();
+        let hot = d.hot.borrow();
+        let c = &hot.shaders.vertex_constants;
+        assert_eq!(
+            c.floats[7].map(f32::to_bits),
+            [0x8000_0000, 0x7fc0_0123, 0, 0]
+        );
+        assert_eq!(c.floats[8][0], 1.);
+    }
 }
 
 // spec: GFX-REC-7
@@ -793,13 +815,14 @@ fn unused_constant_uploads_retain_the_used_register_capture() {
     let (device, _, _, _) = super::super::tests::setup(&mut env);
     let mut usage = adv_device::constants::ConstantUsage::default();
     usage.set(0);
-    let constants = &super::device(&env, device)
-        .unwrap()
-        .shaders
-        .vertex_constants;
-    let before = constants.snapshot(usage, &[]);
-    let address = before.ranges(usage).next().unwrap().1.as_ptr();
-    let key = constants.key(usage);
+    let (address, key, before) = {
+        let d = super::device(&env, device).unwrap();
+        let hot = d.hot.borrow();
+        let constants = &hot.shaders.vertex_constants;
+        let before = constants.snapshot(usage, &[]);
+        let address = before.ranges(usage).next().unwrap().1.as_ptr();
+        (address, constants.key(usage), before)
+    };
     let data = bytemuck::bytes_of(&[0x8000_0000u32, 0x7fc0_1234, 7, 9]);
     let input = alloc(&mut env, 16).unwrap();
     env.cpu.write(input, data).unwrap();
@@ -816,22 +839,22 @@ fn unused_constant_uploads_retain_the_used_register_capture() {
         )
     };
     assert_eq!(upload(&mut env, 255), 0);
-    let constants = &super::device(&env, device)
-        .unwrap()
-        .shaders
-        .vertex_constants;
-    let unchanged = constants.snapshot(usage, &[]);
-    assert_eq!(unchanged.ranges(usage).next().unwrap().1.as_ptr(), address);
-    assert_eq!(constants.key(usage), key);
-    assert_eq!(
-        constants.floats[255].map(f32::to_bits),
-        [0x8000_0000, 0x7fc0_1234, 7, 9]
-    );
+    {
+        let d = super::device(&env, device).unwrap();
+        let hot = d.hot.borrow();
+        let constants = &hot.shaders.vertex_constants;
+        let unchanged = constants.snapshot(usage, &[]);
+        assert_eq!(unchanged.ranges(usage).next().unwrap().1.as_ptr(), address);
+        assert_eq!(constants.key(usage), key);
+        assert_eq!(
+            constants.floats[255].map(f32::to_bits),
+            [0x8000_0000, 0x7fc0_1234, 7, 9]
+        );
+    }
     assert_eq!(upload(&mut env, 0), 0);
-    let constants = &super::device(&env, device)
-        .unwrap()
-        .shaders
-        .vertex_constants;
+    let d = super::device(&env, device).unwrap();
+    let hot = d.hot.borrow();
+    let constants = &hot.shaders.vertex_constants;
     assert_ne!(constants.key(usage), key);
     assert_eq!(
         constants.snapshot(usage, &[]).register(0),

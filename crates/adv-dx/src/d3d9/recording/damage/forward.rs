@@ -6,6 +6,12 @@ use super::*;
 
 type Changes<'a> = [Option<Progress<'a>>];
 
+#[derive(Default)]
+pub(super) struct Scratch {
+    pub(super) results: Vec<Option<Region>>,
+    inputs: [Region; 3],
+}
+
 pub(super) struct Progress<'a> {
     len: usize,
     cursor: usize,
@@ -18,7 +24,19 @@ pub(super) struct Progress<'a> {
     written: Option<Region>,
 }
 impl<'a> Progress<'a> {
+    #[cfg(test)]
     pub(super) fn new(h: &'a History, generation: usize, force: bool, append_final: bool) -> Self {
+        let mut pool = Vec::new();
+        Self::with_pool(h, generation, force, append_final, &mut pool)
+    }
+
+    pub(super) fn with_pool(
+        h: &'a History,
+        generation: usize,
+        force: bool,
+        append_final: bool,
+        pool: &mut Vec<Region>,
+    ) -> Self {
         let next = &h.next[generation];
         let extent = size(next.full);
         let old = h.matched[generation]
@@ -35,12 +53,9 @@ impl<'a> Progress<'a> {
             next,
             append_final,
             same_start,
-            region: if old.is_some() {
-                Region::empty(extent)
-            } else {
-                Region::whole(extent)
-            },
-            written: (generation == 0 && !next.independent).then(|| Region::empty(extent)),
+            region: take_region(pool, extent, old.is_none()),
+            written: (generation == 0 && !next.independent)
+                .then(|| take_region(pool, extent, false)),
         }
     }
 
@@ -150,10 +165,13 @@ fn project_inputs(
                 }
                 continue;
             }
-            for r in rects(region)
-                .into_iter()
-                .chain(old_writes.iter().map(|&(_, r)| r))
-            {
+            region.for_each_rect(|r| {
+                let r: Rect = r.into();
+                for mapping in mappings {
+                    out.add(mapping.map(r, bounds).into());
+                }
+            });
+            for &(_, r) in old_writes {
                 for mapping in mappings {
                     out.add(mapping.map(r, bounds).into());
                 }
@@ -169,8 +187,10 @@ pub(super) fn changes(
     count: usize,
     epoch: u64,
     force: bool,
-) -> Vec<Option<Region>> {
-    let mut changes: Vec<_> = (0..count).map(|_| None).collect();
+    scratch: &mut Scratch,
+    pool: &mut Vec<Region>,
+) {
+    let mut changes: Vec<Option<Progress<'_>>> = (0..count).map(|_| None).collect();
     for h in histories.values() {
         for (g, next) in h.next.iter().enumerate() {
             let missed = h.seen + 1 != epoch;
@@ -178,33 +198,37 @@ pub(super) fn changes(
                 && (!missed || h.retains_start())
                 && h.previous.len() == 1
                 && h.previous[0].shape == next.shape;
-            changes[next.forward] = Some(Progress::new(h, g, force || missed, append_final));
+            changes[next.forward] = Some(Progress::with_pool(
+                h,
+                g,
+                force || missed,
+                append_final,
+                pool,
+            ));
         }
     }
     let diagnose = trace::capturing();
-    let mut scratch: [Region; 3] = std::array::from_fn(|_| Region::default());
     for (at, node) in nodes.iter().enumerate() {
         let writes = node.record.writes.iter().zip(&node.generations);
         // All aspects observe the inputs before this command's first write.
         let mut proven = [false; 3];
-        for ((_, g), (proven, region)) in writes.clone().zip(proven.iter_mut().zip(&mut scratch)) {
+        for ((_, g), (proven, region)) in writes
+            .clone()
+            .zip(proven.iter_mut().zip(&mut scratch.inputs))
+        {
             let Some(change) = &changes[g.forward] else {
                 continue;
             };
             if let Some(old) = change.old
                 && let Some(entry) = change.next.matches[change.len].filter(|entry| entry.inputs)
             {
-                if region.size() == change.region.size() {
-                    region.clear();
-                } else {
-                    *region = Region::empty(change.region.size());
-                }
+                region.reset(change.region.size(), false);
                 *proven =
                     project_inputs(&changes, change.next, change.len, old, entry.index, region)
                         .is_some();
             }
         }
-        for ((w, g), (proven, region)) in writes.zip(proven.into_iter().zip(&scratch)) {
+        for ((w, g), (proven, region)) in writes.zip(proven.into_iter().zip(&scratch.inputs)) {
             let Some(change) = &mut changes[g.forward] else {
                 continue;
             };
@@ -240,13 +264,14 @@ pub(super) fn changes(
             }
         }
     }
-    changes
-        .into_iter()
-        .map(|change| {
-            change.map(|mut c| {
-                c.finish();
-                c.region
-            })
+    scratch.results.clear();
+    scratch.results.extend(changes.into_iter().map(|change| {
+        change.map(|mut c| {
+            c.finish();
+            if let Some(written) = c.written.take() {
+                recycle_region(pool, written);
+            }
+            c.region
         })
-        .collect()
+    }));
 }

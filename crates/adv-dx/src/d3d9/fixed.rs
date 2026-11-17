@@ -65,6 +65,12 @@ impl CachedFixed {
     pub(super) fn finish_inputs(&self) {
         self.inputs.borrow_mut().finish();
     }
+    pub(super) fn state_mut(&mut self) -> &mut Fixed {
+        &mut self.state
+    }
+    pub(super) fn invalidate_key(&self) {
+        self.key.set(None);
+    }
 }
 impl std::ops::Deref for CachedFixed {
     type Target = Fixed;
@@ -454,18 +460,63 @@ pub(super) fn register(registry: &mut Registry) {
         registry.register(api);
     }
 }
-fn mutable<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a mut Fixed> {
-    match com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)? {
-        Payload::Device(d) => Some(if let Some(recording) = &mut d.recording {
-            &mut recording.fixed
-        } else {
-            &mut d.fixed
-        }),
-        _ => None,
+fn update_fixed(
+    env: &mut Env<'_>,
+    pointer: u32,
+    apply: impl FnOnce(&mut Fixed) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32>,
+) -> u32 {
+    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
+    else {
+        return INVALID;
+    };
+    if let Some(recording) = &mut d.recording {
+        return match apply(&mut recording.fixed) {
+            Ok((key, _)) => {
+                super::shaders::stateblocks::record_fixed_key(recording, key);
+                0
+            }
+            Err(code) => code,
+        };
+    }
+    let mut hot = d.hot.borrow_mut();
+    match apply(hot.fixed.state_mut()) {
+        Ok((key, changed)) => {
+            if changed {
+                hot.fixed.invalidate_key();
+                hot.touch(key.class());
+            }
+            0
+        }
+        Err(code) => code,
     }
 }
-fn current<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Fixed> {
-    Some(&device(env, pointer)?.fixed)
+pub(super) fn mutate_fixed_raw(
+    env: &mut Env<'_>,
+    pointer: u32,
+    key: super::shaders::stateblocks::FixedKey,
+    mutate: impl FnOnce(&mut Fixed) -> bool,
+) -> bool {
+    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
+    else {
+        return false;
+    };
+    if let Some(recording) = &mut d.recording {
+        let _ = mutate(&mut recording.fixed);
+        super::shaders::stateblocks::record_fixed_key(recording, key);
+        return true;
+    }
+    let mut hot = d.hot.borrow_mut();
+    if mutate(hot.fixed.state_mut()) {
+        hot.fixed.invalidate_key();
+        hot.touch(key.class());
+    }
+    true
+}
+fn current<'a>(env: &'a Env<'_>, pointer: u32) -> Option<std::cell::Ref<'a, Fixed>> {
+    Some(std::cell::Ref::map(
+        device(env, pointer)?.hot.borrow(),
+        |h| &*h.fixed,
+    ))
 }
 fn valid_fvf(fvf: u32) -> bool {
     let count = (fvf >> 8) & 15;
@@ -478,7 +529,7 @@ fn valid_fvf(fvf: u32) -> bool {
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetFVF",level=state)]
 pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
-    let Some(f) = mutable(env, this.addr()) else {
+    let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
     // Any FVF is state; draws reject one without a fixed-function layout.
@@ -486,71 +537,61 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     if fvf == 0 {
         return 0;
     }
-    let previous = f.fvf;
-    if previous == fvf
-        && device(env, this.addr())
-            .is_some_and(|d| d.recording.is_none() && d.buffers.declaration.is_none())
-    {
-        return 0;
-    }
-    let changed = previous != fvf;
-    mutable(env, this.addr()).unwrap().fvf = fvf;
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Fvf,
-        changed,
-    );
+    let needs_unbind = {
+        let hot = d.hot.borrow();
+        if d.recording.is_none() && hot.buffers.declaration.is_none() && hot.fixed.fvf == fvf {
+            return 0;
+        }
+        hot.buffers.declaration.is_some()
+    };
+    let set_raw = |env: &mut Env<'_>, force: bool| {
+        mutate_fixed_raw(
+            env,
+            this.addr(),
+            super::shaders::stateblocks::FixedKey::Fvf,
+            |f| {
+                let changed = force || f.fvf != fvf;
+                f.fvf = fvf;
+                changed
+            },
+        );
+    };
+    set_raw(env, false);
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
     if let Some(code) = super::shaders::stateblocks::record_declaration(env, device, None) {
         if code == 0 {
-            mutable(env, this.addr()).unwrap().fvf = fvf;
-            super::shaders::stateblocks::mark_fixed(
-                env,
-                this.addr(),
-                super::shaders::stateblocks::FixedKey::Fvf,
-                true,
-            );
+            set_raw(env, true);
         }
         return code;
     }
-    if device_declaration(env, this.addr()).is_some() {
+    if needs_unbind {
         // Unbinding a declaration clears the FVF it replaced; restore ours.
         let code = super::declaration::bind(env, device, None);
         if code != 0 {
             return code;
         }
-        mutable(env, this.addr()).unwrap().fvf = fvf;
-        super::shaders::stateblocks::mark_fixed(
-            env,
-            this.addr(),
-            super::shaders::stateblocks::FixedKey::Fvf,
-            true,
-        );
+        set_raw(env, true);
     }
     0
 }
-fn device_declaration(env: &Env<'_>, pointer: u32) -> Option<Id> {
-    device(env, pointer)?.buffers.declaration
-}
 pub(super) fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
     let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
-    match d.buffers.declaration {
+    let hot = d.hot.borrow();
+    match hot.buffers.declaration {
         Some(id) => {
             super::declaration::layout(env, id).map_err(|reason| rejected(UNAVAILABLE, reason))
         }
-        None => Layout::from_fvf(d.fixed.fvf)
+        None => Layout::from_fvf(hot.fixed.fvf)
             .ok_or_else(|| rejected(INVALID, "no supported FVF is set")),
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement)]
 pub(super) fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    let Some(f) = current(env, this.addr()) else {
+    let Some(fvf) = current(env, this.addr()).map(|f| f.fvf) else {
         return INVALID;
     };
-    let fvf = f.fvf;
     if output.write(env.cpu, fvf).is_ok() {
         0
     } else {
@@ -613,27 +654,23 @@ fn stencil_op(value: u32) -> Option<StencilOp> {
         _ => return None,
     })
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
-pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
+pub(super) fn apply_render_raw(f: &mut Fixed, state: i32, value: u32) -> Result<bool, u32> {
     let valid = match state {
         8 => match value {
             3 => true,
-            1 | 2 => return UNAVAILABLE,
+            1 | 2 => return Err(UNAVAILABLE),
             _ => false,
         },
         9 => match value {
             1 | 2 => true,
-            3 => return UNAVAILABLE,
+            3 => return Err(UNAVAILABLE),
             _ => false,
         },
         7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 141 | 142 | 143 | 48 | 157 | 161 | 174 | 176
         | 194 | 185 | 206 => value <= 1,
         26 => match value {
             0 => true,
-            1 => return UNAVAILABLE,
+            1 => return Err(UNAVAILABLE),
             _ => false,
         },
         28 | 156 => value <= 1,
@@ -648,14 +685,14 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
         154 | 155 | 166 => f32::from_bits(value).is_finite() && f32::from_bits(value) > 0.0,
         167 => match value {
             0 => true,
-            1 => return UNAVAILABLE,
+            1 => return Err(UNAVAILABLE),
             _ => false,
         },
         136 => value <= 1,
         145..=148 => value <= 2,
         151 => match value {
             0 => true,
-            1..=3 | 255 | 256 => return UNAVAILABLE,
+            1..=3 | 255 | 256 => return Err(UNAVAILABLE),
             _ => false,
         },
         152 => value & !63 == 0,
@@ -667,27 +704,36 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
         168 => value <= 15,
         128..=135 | 198..=205 => match value {
             0 => true,
-            1..=15 => return UNAVAILABLE,
+            1..=15 => return Err(UNAVAILABLE),
             _ => false,
         },
         171 | 209 => operation(value).is_some(),
-        _ => return UNAVAILABLE,
+        _ => return Err(UNAVAILABLE),
     };
     if !valid {
-        return INVALID;
+        return Err(INVALID);
     }
-    let changed = f.render.insert(state, value) != Some(value);
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Render(state),
-        changed,
-    );
-    0
+    Ok(f.render.insert(state, value) != Some(value))
+}
+pub(super) fn apply_render(f: &mut CachedFixed, state: i32, value: u32) -> Result<bool, u32> {
+    let changed = apply_render_raw(f.state_mut(), state, value)?;
+    if changed {
+        f.invalidate_key();
+    }
+    Ok(changed)
+}
+#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
+pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
+    update_fixed(env, this.addr(), |f| {
+        Ok((
+            super::shaders::stateblocks::FixedKey::Render(state),
+            apply_render_raw(f, state, value)?,
+        ))
+    })
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement)]
 fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPtr<u32>) -> u32 {
-    let Some(&value) = current(env, this.addr()).and_then(|f| f.render.get(&state)) else {
+    let Some(value) = current(env, this.addr()).and_then(|f| f.render.get(&state).copied()) else {
         return INVALID;
     };
     if output.write(env.cpu, value).is_ok() {
@@ -696,29 +742,21 @@ fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPt
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state)]
-pub(super) fn set_stage(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
+pub(super) fn apply_stage_raw(
+    f: &mut Fixed,
     stage: u32,
     kind: i32,
     value: u32,
-) -> u32 {
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
+) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32> {
     if stage >= 8 {
-        return INVALID;
+        return Err(INVALID);
     }
     if matches!(kind, 7..=10 | 22 | 23) {
         let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
-        super::shaders::stateblocks::mark_fixed(
-            env,
-            this.addr(),
+        return Ok((
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
             changed,
-        );
-        return 0;
+        ));
     }
     if stage != 0 {
         // Stage one combines like stage zero; later stages stay disabled.
@@ -727,28 +765,25 @@ pub(super) fn set_stage(
             1 | 4 => match value {
                 1 => true,
                 2 | 3 | 4 | 7 | 10 if stage == 1 => true,
-                2..=26 => return UNAVAILABLE,
+                2..=26 => return Err(UNAVAILABLE),
                 _ => false,
             },
             2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 6,
             11 => match (value & 0xffff, value >> 16) {
                 (0..=7, 0) => true,
-                (0..=7, 1..=4) => return UNAVAILABLE,
+                (0..=7, 1..=4) => return Err(UNAVAILABLE),
                 _ => false,
             },
-            _ => return UNAVAILABLE,
+            _ => return Err(UNAVAILABLE),
         };
         if !valid {
-            return INVALID;
+            return Err(INVALID);
         }
         let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
-        super::shaders::stateblocks::mark_fixed(
-            env,
-            this.addr(),
+        return Ok((
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
             changed,
-        );
-        return 0;
+        ));
     }
     let valid = match kind {
         1 | 4 => matches!(value, 1 | 2 | 3 | 4 | 7 | 10),
@@ -759,29 +794,56 @@ pub(super) fn set_stage(
             if value & 0xffff > 7 || value >> 16 > 4 {
                 false
             } else if value != 0 {
-                return UNAVAILABLE;
+                return Err(UNAVAILABLE);
             } else {
                 true
             }
         }
         24 => match value {
             0 => true,
-            1..=4 | 256..=260 => return UNAVAILABLE,
+            1..=4 | 256..=260 => return Err(UNAVAILABLE),
             _ => false,
         },
-        _ => return UNAVAILABLE,
+        _ => return Err(UNAVAILABLE),
     };
     if !valid {
-        return INVALID;
+        return Err(INVALID);
     }
     let changed = f.stage.insert(kind, value) != Some(value);
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Stage(kind),
-        changed,
-    );
-    0
+    Ok((super::shaders::stateblocks::FixedKey::Stage(kind), changed))
+}
+pub(super) fn apply_stage(
+    f: &mut CachedFixed,
+    stage: u32,
+    kind: i32,
+    value: u32,
+) -> Result<bool, u32> {
+    let (_, changed) = apply_stage_raw(f.state_mut(), stage, kind, value)?;
+    if changed {
+        f.invalidate_key();
+    }
+    Ok(changed)
+}
+pub(super) fn stage_value(f: &Fixed, stage: u32, kind: i32) -> Option<u32> {
+    if stage >= 8 {
+        return None;
+    }
+    let states = if stage != 0 || matches!(kind, 7..=10 | 22 | 23) {
+        &f.stage_slots[stage as usize]
+    } else {
+        &f.stage
+    };
+    states.get(&kind).copied()
+}
+#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state)]
+pub(super) fn set_stage(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stage: u32,
+    kind: i32,
+    value: u32,
+) -> u32 {
+    update_fixed(env, this.addr(), |f| apply_stage_raw(f, stage, kind, value))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement)]
 fn get_stage(
@@ -791,18 +853,7 @@ fn get_stage(
     kind: i32,
     output: GuestPtr<u32>,
 ) -> u32 {
-    let Some(f) = current(env, this.addr()) else {
-        return INVALID;
-    };
-    if stage >= 8 {
-        return INVALID;
-    }
-    let states = if stage != 0 || matches!(kind, 7..=10 | 22 | 23) {
-        &f.stage_slots[stage as usize]
-    } else {
-        &f.stage
-    };
-    let Some(&value) = states.get(&kind) else {
+    let Some(value) = current(env, this.addr()).and_then(|f| stage_value(&f, stage, kind)) else {
         return INVALID;
     };
     if output.write(env.cpu, value).is_ok() {
@@ -824,19 +875,14 @@ fn address(value: u32) -> Option<Address> {
 fn rgba(argb: u32) -> u32 {
     (argb & 0xff00_ff00) | ((argb >> 16) & 0xff) | ((argb & 0xff) << 16)
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state)]
-pub(super) fn set_sampler(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
+pub(super) fn apply_sampler_raw(
+    f: &mut Fixed,
     sampler: u32,
     kind: i32,
     value: u32,
-) -> u32 {
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
+) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32> {
     let Some(slot) = super::programmable::sampler_slot(sampler) else {
-        return INVALID;
+        return Err(INVALID);
     };
     let valid = match kind {
         1..=3 => address(value).is_some(),
@@ -848,27 +894,55 @@ pub(super) fn set_sampler(
         8 if f32::from_bits(value) == 0. => true,
         10 if value == 1 => true,
         11..=13 if value == 0 => true,
-        _ => return UNAVAILABLE,
+        _ => return Err(UNAVAILABLE),
     };
     if !valid {
-        return INVALID;
+        return Err(INVALID);
     }
     let changed = if slot == 0 {
         f.sampler.insert(kind, value)
     } else {
         f.sampler_slots[slot].insert(kind, value)
     } != Some(value);
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        if slot == 0 {
-            super::shaders::stateblocks::FixedKey::Sampler(kind)
-        } else {
-            super::shaders::stateblocks::FixedKey::SamplerSlot(slot, kind)
-        },
-        changed,
-    );
-    0
+    let key = if slot == 0 {
+        super::shaders::stateblocks::FixedKey::Sampler(kind)
+    } else {
+        super::shaders::stateblocks::FixedKey::SamplerSlot(slot, kind)
+    };
+    Ok((key, changed))
+}
+pub(super) fn apply_sampler(
+    f: &mut CachedFixed,
+    sampler: u32,
+    kind: i32,
+    value: u32,
+) -> Result<bool, u32> {
+    let (_, changed) = apply_sampler_raw(f.state_mut(), sampler, kind, value)?;
+    if changed {
+        f.invalidate_key();
+    }
+    Ok(changed)
+}
+pub(super) fn sampler_value(f: &Fixed, sampler: u32, kind: i32) -> Option<u32> {
+    let slot = super::programmable::sampler_slot(sampler)?;
+    if slot == 0 {
+        f.sampler.get(&kind)
+    } else {
+        f.sampler_slots[slot].get(&kind)
+    }
+    .copied()
+}
+#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state)]
+pub(super) fn set_sampler(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    sampler: u32,
+    kind: i32,
+    value: u32,
+) -> u32 {
+    update_fixed(env, this.addr(), |f| {
+        apply_sampler_raw(f, sampler, kind, value)
+    })
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement)]
 fn get_sampler(
@@ -878,16 +952,8 @@ fn get_sampler(
     kind: i32,
     output: GuestPtr<u32>,
 ) -> u32 {
-    let Some(slot) = super::programmable::sampler_slot(sampler) else {
-        return INVALID;
-    };
-    let Some(&value) = current(env, this.addr()).and_then(|f| {
-        if slot == 0 {
-            f.sampler.get(&kind)
-        } else {
-            f.sampler_slots[slot].get(&kind)
-        }
-    }) else {
+    let Some(value) = current(env, this.addr()).and_then(|f| sampler_value(&f, sampler, kind))
+    else {
         return INVALID;
     };
     if output.write(env.cpu, value).is_ok() {
@@ -896,31 +962,23 @@ fn get_sampler(
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state)]
-fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIEWPORT9>) -> u32 {
-    let Ok(v) = viewport.read(env.cpu) else {
-        return INVALID;
-    };
-    let Ok(target) = super::targets::draw_target(env, this.addr()) else {
-        return INVALID;
-    };
+pub(super) fn apply_viewport_raw(
+    f: &mut Fixed,
+    v: D3DVIEWPORT9,
+    target: (u32, u32),
+) -> Result<bool, u32> {
     if v.Width == 0
         || v.Height == 0
-        || v.X
-            .checked_add(v.Width)
-            .is_none_or(|x| x > target.image.width())
-        || v.Y
-            .checked_add(v.Height)
-            .is_none_or(|y| y > target.image.height())
+        || v.X.checked_add(v.Width).is_none_or(|x| x > target.0)
+        || v.Y.checked_add(v.Height).is_none_or(|y| y > target.1)
         || !v.MinZ.is_finite()
         || !v.MaxZ.is_finite()
         || v.MinZ < 0.
         || v.MaxZ > 1.
         || v.MinZ > v.MaxZ
     {
-        return INVALID;
+        return Err(INVALID);
     }
-    let f = mutable(env, this.addr()).unwrap();
     let old = f.viewport;
     let changed = (
         old.X,
@@ -938,68 +996,127 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
         v.MaxZ.to_bits(),
     );
     f.viewport = v;
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Viewport,
-        changed,
-    );
-    0
+    Ok(changed)
+}
+pub(super) fn apply_viewport(
+    f: &mut CachedFixed,
+    v: D3DVIEWPORT9,
+    target: (u32, u32),
+) -> Result<bool, u32> {
+    let changed = apply_viewport_raw(f.state_mut(), v, target)?;
+    if changed {
+        f.invalidate_key();
+    }
+    Ok(changed)
+}
+#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state)]
+fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIEWPORT9>) -> u32 {
+    let Ok(v) = viewport.read(env.cpu) else {
+        return INVALID;
+    };
+    let Ok(target) = super::targets::draw_target(env, this.addr()) else {
+        return INVALID;
+    };
+    let size = (target.image.width(), target.image.height());
+    update_fixed(env, this.addr(), |f| {
+        Ok((
+            super::shaders::stateblocks::FixedKey::Viewport,
+            apply_viewport_raw(f, v, size)?,
+        ))
+    })
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement)]
 fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWPORT9>) -> u32 {
-    let Some(f) = current(env, this.addr()) else {
+    let Some(v) = current(env, this.addr()).map(|f| f.viewport) else {
         return INVALID;
     };
-    let v = f.viewport;
     if output.write(env.cpu, v).is_ok() {
         0
     } else {
         INVALID
     }
+}
+pub(super) fn apply_scissor_raw(f: &mut Fixed, rect: RECT) -> Result<bool, u32> {
+    if rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return Err(INVALID);
+    }
+    let old = f.scissor;
+    let changed = (old.left, old.top, old.right, old.bottom)
+        != (rect.left, rect.top, rect.right, rect.bottom);
+    f.scissor = rect;
+    Ok(changed)
+}
+pub(super) fn apply_scissor(f: &mut CachedFixed, rect: RECT) -> Result<bool, u32> {
+    let changed = apply_scissor_raw(f.state_mut(), rect)?;
+    if changed {
+        f.invalidate_key();
+    }
+    Ok(changed)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state)]
 fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u32 {
     let Ok(rect) = rect.read(env.cpu) else {
         return INVALID;
     };
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
-    if rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top {
-        return INVALID;
-    }
-    let old = f.scissor;
-    let changed = (old.left, old.top, old.right, old.bottom)
-        != (rect.left, rect.top, rect.right, rect.bottom);
-    f.scissor = rect;
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Scissor,
-        changed,
-    );
-    0
+    update_fixed(env, this.addr(), |f| {
+        Ok((
+            super::shaders::stateblocks::FixedKey::Scissor,
+            apply_scissor_raw(f, rect)?,
+        ))
+    })
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement)]
 fn get_scissor(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<RECT>) -> u32 {
-    let Some(f) = current(env, this.addr()) else {
+    let Some(v) = current(env, this.addr()).map(|f| f.scissor) else {
         return INVALID;
     };
-    let v = f.scissor;
     if output.write(env.cpu, v).is_ok() {
         0
     } else {
         INVALID
     }
 }
-fn transform_slot(kind: i32) -> Option<usize> {
+pub(super) fn transform_slot(kind: i32) -> Option<usize> {
     Some(match kind {
         256 => 0,
         2 => 1,
         3 => 2,
         _ => return None,
     })
+}
+pub(super) fn apply_transform_raw(f: &mut Fixed, slot: usize, matrix: [f32; 16]) -> bool {
+    let changed = f.transforms[slot].map(f32::to_bits) != matrix.map(f32::to_bits);
+    f.transforms[slot] = matrix;
+    changed
+}
+pub(super) fn apply_transform(f: &mut CachedFixed, slot: usize, matrix: [f32; 16]) -> bool {
+    let changed = apply_transform_raw(f.state_mut(), slot, matrix);
+    if changed {
+        f.invalidate_key();
+    }
+    changed
+}
+pub(super) fn multiply_transform_raw(f: &mut Fixed, slot: usize, matrix: [f32; 16]) -> bool {
+    let result = std::array::from_fn(|n| {
+        row(
+            matrix[n / 4 * 4..n / 4 * 4 + 4].try_into().unwrap(),
+            &f.transforms[slot],
+        )[n % 4]
+    });
+    let changed = f.transforms[slot].map(f32::to_bits) != result.map(f32::to_bits);
+    f.transforms[slot] = result;
+    changed
+}
+pub(super) fn multiply_transform_cached(
+    f: &mut CachedFixed,
+    slot: usize,
+    matrix: [f32; 16],
+) -> bool {
+    let changed = multiply_transform_raw(f.state_mut(), slot, matrix);
+    if changed {
+        f.invalidate_key();
+    }
+    changed
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state)]
 fn set_transform(
@@ -1017,18 +1134,12 @@ fn set_transform(
     if matrix.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
-    let changed = f.transforms[slot].map(f32::to_bits) != matrix.map(f32::to_bits);
-    f.transforms[slot] = matrix;
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Transform(slot),
-        changed,
-    );
-    0
+    update_fixed(env, this.addr(), |f| {
+        Ok((
+            super::shaders::stateblocks::FixedKey::Transform(slot),
+            apply_transform_raw(f, slot, matrix),
+        ))
+    })
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement)]
 fn get_transform(
@@ -1040,10 +1151,9 @@ fn get_transform(
     let Some(slot) = transform_slot(kind) else {
         return INVALID;
     };
-    let Some(f) = current(env, this.addr()) else {
+    let Some(matrix) = current(env, this.addr()).map(|f| f.transforms[slot]) else {
         return INVALID;
     };
-    let matrix = f.transforms[slot];
     if output.write(env.cpu, matrix).is_ok() {
         0
     } else {
@@ -1071,24 +1181,12 @@ fn multiply_transform(
     if matrix.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    let Some(f) = mutable(env, this.addr()) else {
-        return INVALID;
-    };
-    let result = std::array::from_fn(|n| {
-        row(
-            matrix[n / 4 * 4..n / 4 * 4 + 4].try_into().unwrap(),
-            &f.transforms[slot],
-        )[n % 4]
-    });
-    let changed = f.transforms[slot].map(f32::to_bits) != result.map(f32::to_bits);
-    f.transforms[slot] = result;
-    super::shaders::stateblocks::mark_fixed(
-        env,
-        this.addr(),
-        super::shaders::stateblocks::FixedKey::Transform(slot),
-        changed,
-    );
-    0
+    update_fixed(env, this.addr(), |f| {
+        Ok((
+            super::shaders::stateblocks::FixedKey::Transform(slot),
+            multiply_transform_raw(f, slot, matrix),
+        ))
+    })
 }
 /// The enabled second stage as `[color op, color arguments, alpha op and
 /// arguments, coordinate set]`, each argument a byte; `None` when the first
@@ -1148,7 +1246,7 @@ pub(super) fn prepare_bound(
     indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
     if log::log_enabled!(log::Level::Debug)
-        && let Some(id) = device(env, pointer).and_then(|d| d.buffers.declaration)
+        && let Some(id) = device(env, pointer).and_then(|d| d.hot.borrow().buffers.declaration)
     {
         log::debug!(
             target: "adv_dx::d3d9::fixed::input",
@@ -1200,7 +1298,7 @@ pub(super) fn primitive_length(kind: i32, count: u32) -> Result<u32, u32> {
 }
 pub(super) fn empty_draw(env: &Env<'_>, pointer: u32, kind: i32) -> Result<(), u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
-    if !d.scene || d.needs_reset || !matches!(kind, 1..=6) {
+    if !d.hot.borrow().scene || d.needs_reset || !matches!(kind, 1..=6) {
         return Err(INVALID);
     }
     // Zero batches do not dereference data, transform vertices or enqueue GPU
@@ -1268,18 +1366,19 @@ fn prepare_input_checked(
     indices: Option<&[u32]>,
 ) -> Result<Draw, Rejected> {
     let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
-    let f = &d.fixed;
-    if !d.scene {
+    let hot = d.hot.borrow();
+    let f = &hot.fixed;
+    if !hot.scene {
         return Err(rejected(INVALID, "draw outside BeginScene/EndScene"));
     }
-    if d.shaders.vertex.is_none() && d.shaders.pixel.is_none() && f.render[&152] != 0 {
+    if hot.shaders.vertex.is_none() && hot.shaders.pixel.is_none() && f.render[&152] != 0 {
         return Err(rejected(
             UNAVAILABLE,
             "clip planes require the programmable draw path",
         ));
     }
     let mut layout = layout(env, pointer)?;
-    if d.buffers.declaration.is_none()
+    if hot.buffers.declaration.is_none()
         && let input::Input::Up { stride, .. } = source
     {
         // UP uploads one stride of bytes per vertex. Trailing FVF texture
@@ -1311,7 +1410,7 @@ fn prepare_input_checked(
     let base_key = super::recording::draw_key(env, pointer);
     let captured = input.captured_key(indices, length);
     let geometry_key = captured.map(|key| super::recording::hash((base_key, kind, count, key)));
-    if let Some(geometry) = geometry_key.and_then(|key| d.fixed.inputs.borrow_mut().get(key)) {
+    if let Some(geometry) = geometry_key.and_then(|key| hot.fixed.inputs.borrow_mut().get(key)) {
         let (target, image, state) = prepare_state(env, pointer, kind)?;
         return Ok(Draw {
             target,
@@ -1487,7 +1586,7 @@ fn prepare_input_checked(
         texcoords: texcoords.map(|values| (coordinate_count, values.into())),
     };
     if let Some(key) = geometry_key {
-        d.fixed.inputs.borrow_mut().insert(key, geometry.clone());
+        hot.fixed.inputs.borrow_mut().insert(key, geometry.clone());
     }
     Ok(Draw {
         target,
@@ -1511,7 +1610,8 @@ pub(super) fn prepare_state(
     kind: i32,
 ) -> Result<(Target, Option<Image>, DrawState), Rejected> {
     let d = device(env, pointer).ok_or(INVALID)?;
-    let f = &d.fixed;
+    let hot = d.hot.borrow();
+    let f = &hot.fixed;
     let topology = match kind {
         1 => Topology::Points,
         2 => Topology::Lines,
@@ -1529,9 +1629,9 @@ pub(super) fn prepare_state(
     } else {
         target
     };
-    let (image, lod) = if d.shaders.pixel.is_some() {
+    let (image, lod) = if hot.shaders.pixel.is_some() {
         (None, 0)
-    } else if let Some(id) = d.texture {
+    } else if let Some(id) = hot.texture {
         let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
             return Err(rejected(
                 INVALID,
@@ -1687,7 +1787,7 @@ pub(super) fn prepare_state(
         lod.max(f.sampler[&9])
     };
     state.sampler.first_level = first.min(image.as_ref().map_or(1, Image::mip_levels) - 1);
-    if image.is_some() && d.shaders.pixel.is_none() {
+    if image.is_some() && hot.shaders.pixel.is_none() {
         state.texture_op = combine(f.stage[&1], f.stage[&2], f.stage[&3]).ok_or(UNAVAILABLE)?;
         state.alpha_texture_op =
             combine(f.stage[&4], f.stage[&5], f.stage[&6]).ok_or(UNAVAILABLE)?;
@@ -1778,15 +1878,16 @@ fn warn_rejected(
     let state = device(env, pointer).map_or_else(
         || "device unavailable".to_owned(),
         |d| {
-            let v = d.fixed.viewport;
-            let declaration = d
+            let hot = d.hot.borrow();
+            let v = hot.fixed.viewport;
+            let declaration = hot
                 .buffers
                 .declaration
                 .map_or_else(|| "none".into(), |id| super::declaration::describe(env, id));
             format!(
                 "FVF={:#x}, declaration={declaration}, scene={}, viewport=({},{} {}x{},{}..{}), z_enable={}, stencil_enable={}, stencil_attachment={}",
-                d.fixed.fvf, d.scene, v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ,
-                d.fixed.render[&7], d.fixed.render[&52], super::depth::has_stencil(env, pointer),
+                hot.fixed.fvf, hot.scene, v.X, v.Y, v.Width, v.Height, v.MinZ, v.MaxZ,
+                hot.fixed.render[&7], hot.fixed.render[&52], super::depth::has_stencil(env, pointer),
             )
         },
     );
@@ -1826,7 +1927,7 @@ mod tests {
         else {
             panic!("test device");
         };
-        d.scene = true;
+        d.hot.borrow_mut().scene = true;
         let original = current(&env, device).unwrap().render[&152];
         assert_eq!(set_render(&mut env, this, 152, 1), 0);
         // Rejection happens before vertex access or queued GPU work.

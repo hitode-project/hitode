@@ -283,8 +283,9 @@ fn benchmark_input_bodies(tid: u32) {
         )
         .unwrap();
         machine.ext.insert(Thread(tid));
-        machine.sys.body_services =
-            Some(|_, ext, services| services.thread = ext.get::<Thread>().0);
+        machine
+            .sys
+            .add_body_services(|_, ext, services| services.thread = ext.get::<Thread>().0);
         machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
         machine.cpu.map(ENTRY, 4096, Prot::RX).unwrap();
         machine.cpu.map(0x420000, 4096, Prot::RW).unwrap();

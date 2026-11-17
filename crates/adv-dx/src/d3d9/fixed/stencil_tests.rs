@@ -177,7 +177,7 @@ fn depth_only_stencil_never_is_ignored_but_real_stencil_and_depth_tests_still_re
             id
         });
         if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
-            d.scene = true;
+            d.hot.borrow_mut().scene = true;
             d.render_target = Some(back);
             d.depth_stencil = depth;
         }
@@ -288,7 +288,7 @@ fn untransformed_vertices_cover_d3d9_pixel_centres() {
         r.desc.Height = 12;
     }
     if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
-        d.scene = true;
+        d.hot.borrow_mut().scene = true;
         d.render_target = Some(back);
     }
     env.ext.get_mut::<State>().provider.target =

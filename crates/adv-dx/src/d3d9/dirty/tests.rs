@@ -491,7 +491,7 @@ fn attach_target(m: &mut Machine<JitCpu>, device_pointer: u32) -> Image {
         if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
             d.surface = target_surface;
             d.back_buffer = Some(back);
-            d.fixed.target_changed(4, 4);
+            d.hot.borrow_mut().fixed.target_changed(4, 4);
         }
     }
     target.image
@@ -984,7 +984,7 @@ fn a8_bytes_mip_aliases_identity_sampling_and_managed_restoration_match_native()
         if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
             d.surface = target_surface;
             d.back_buffer = Some(back);
-            d.fixed.target_changed(4, 4);
+            d.hot.borrow_mut().fixed.target_changed(4, 4);
         }
     }
     okay(call(&mut m, "IDirect3DDevice9::SetFVF", &[device, 0x144]));

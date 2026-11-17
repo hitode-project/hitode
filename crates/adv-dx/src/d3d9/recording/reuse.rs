@@ -82,29 +82,30 @@ fn prefix(
         d.depth_stencil,
         key::target_key(target),
     );
+    let hot = d.hot.borrow();
     if let Some(p) = &d.frame.reuse.prefix
         && p.request.0 == request.0
         && p.request.1 == request.1
         && p.request.2 == request.2
-        && p.fingerprints == d.fingerprints
-        && p.streams == d.buffers.streams
-        && p.indices == d.buffers.indices
+        && p.fingerprints == hot.fingerprints
+        && p.streams == hot.buffers.streams
+        && p.indices == hot.buffers.indices
         && p.target == target
     {
         return Ok((p.hash.clone(), None));
     }
     let mut h = xxhash_rust::xxh3::Xxh3::new();
-    (request, d.fingerprints).hash(&mut h);
+    (request, hot.fingerprints).hash(&mut h);
     // Presentation rotates back-buffer images; commands depend only on the
     // target's shape, and a reused command is rebased onto the current one.
     target.hash(&mut h);
-    d.buffers
+    hot.buffers
         .streams
         .iter()
         .filter(|s| s.buffer.is_some())
         .count()
         .hash(&mut h);
-    for (slot, stream) in d.buffers.streams.iter().enumerate() {
+    for (slot, stream) in hot.buffers.streams.iter().enumerate() {
         if let Some(id) = stream.buffer {
             (slot, id, stream.offset, stream.stride).hash(&mut h);
             let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, id) else {
@@ -115,12 +116,12 @@ fn prefix(
             }
         }
     }
-    d.buffers.indices.hash(&mut h);
+    hot.buffers.indices.hash(&mut h);
     let prefix = Prefix {
         request: (request.0, request.1, request.2.to_vec()),
-        fingerprints: d.fingerprints,
-        streams: d.buffers.streams,
-        indices: d.buffers.indices,
+        fingerprints: hot.fingerprints,
+        streams: hot.buffers.streams,
+        indices: hot.buffers.indices,
         target,
         hash: h.clone(),
     };
@@ -136,7 +137,8 @@ fn signature(
         .ok_or(INVALID)?;
     key::bind(env, owner)?;
     let d = device(env, pointer).ok_or(INVALID)?;
-    if !d.scene
+    let hot = d.hot.borrow();
+    if !hot.scene
         || d.needs_reset
         || d.frame.reuse.disabled
         || d.frame.partial
@@ -146,18 +148,18 @@ fn signature(
     }
     #[cfg(any(test, feature = "d3d9-counters"))]
     debug_assert_eq!(
-        d.fingerprints,
-        std::array::from_fn(|class| d.class_key(class))
+        hot.fingerprints,
+        std::array::from_fn(|class| hot.class_key(class))
     );
     let target = targets::draw_target(env, pointer)?;
     let (mut h, prefix) = prefix(env, d, request, &target)?;
-    std::iter::once(d.texture)
-        .chain(d.shaders.textures)
+    std::iter::once(hot.texture)
+        .chain(hot.shaders.textures)
         .flatten()
         .count()
         .hash(&mut h);
-    for (slot, id) in std::iter::once(d.texture)
-        .chain(d.shaders.textures)
+    for (slot, id) in std::iter::once(hot.texture)
+        .chain(hot.shaders.textures)
         .enumerate()
     {
         if let Some(id) = id {
@@ -196,6 +198,7 @@ fn signature(
             .hash(&mut h);
     }
     if let Some(prefix) = prefix {
+        drop(hot);
         frame(env, owner).reuse.prefix = Some(prefix);
     }
     Ok((h.digest128(), target))
@@ -296,10 +299,12 @@ pub(in crate::d3d9) fn indexed(
             _ => entry,
         }
     } else {
-        *d.fixed.captures.borrow_mut() = Some(Vec::new());
+        *d.hot.borrow().fixed.captures.borrow_mut() = Some(Vec::new());
         let draw = build(env);
         let spans = device(env, pointer)
             .unwrap()
+            .hot
+            .borrow()
             .fixed
             .captures
             .borrow_mut()

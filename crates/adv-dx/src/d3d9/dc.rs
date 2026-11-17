@@ -106,6 +106,7 @@ fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> Outcome 
         dc: 0,
         phase: Phase::Acquiring,
     });
+    super::targets::refresh_hot_id(env, device);
     acquired(env, owner, outcome)
 }
 fn acquired(env: &mut Env<'_>, owner: Id, outcome: Outcome) -> Outcome {
@@ -372,6 +373,7 @@ fn retire(env: &mut Env<'_>, owner: Id) {
         let provider = env.ext.get::<State>().provider;
         (provider.dc.discard)(env, lease.dc);
     }
+    super::targets::refresh_hot_id(env, lease.device);
     free(env, lease.scratch);
     drop_ref(env, lease.owner);
     drop_ref(env, lease.device);

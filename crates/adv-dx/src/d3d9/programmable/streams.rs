@@ -11,6 +11,7 @@ pub(super) fn capture(
     instanced: bool,
 ) -> Result<Vec<VertexStream>, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
+    let hot = d.hot.borrow();
     let mut streams = Vec::new();
     let mut total = 0u32;
     for n in 0..16 {
@@ -29,7 +30,7 @@ pub(super) fn capture(
             }
             (data.addr(), stride, u32::MAX)
         } else {
-            let stream = d.buffers.streams[n];
+            let stream = hot.buffers.streams[n];
             let Some(Payload::Buffer(buffer)) = stream
                 .buffer
                 .and_then(|id| com(env).get_identity(&env.sys.objects, id))
@@ -48,9 +49,9 @@ pub(super) fn capture(
         if stride > 2048 || !stride.is_multiple_of(4) || (stride != 0 && stride < minimum) {
             return Err(INVALID);
         }
-        let instance = instanced && d.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0;
+        let instance = instanced && hot.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0;
         let (start, first, last) = if instance {
-            (0, 0, buffers::instances(&d.buffers) - 1)
+            (0, 0, buffers::instances(&hot.buffers) - 1)
         } else {
             (start, first, last)
         };
@@ -71,7 +72,7 @@ pub(super) fn capture(
             .ok_or(INVALID)?;
         let at = data.checked_add(offset).ok_or(INVALID)?;
         adv_abi::guest::check_range(env.cpu, at, bytes, Prot::READ).map_err(|_| INVALID)?;
-        let mut raw = d.fixed.capture_stream(env, at, bytes)?;
+        let mut raw = hot.fixed.capture_stream(env, at, bytes)?;
         if instanced && stride != 0 && !bytes.is_multiple_of(stride) {
             // Metal bounds vertex fetches by complete strides, including the
             // final record whose unused trailing bytes need no guest storage.

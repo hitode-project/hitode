@@ -686,7 +686,7 @@ pub(crate) fn bind_relocated(
     base: u32,
     relocations: &[u32],
 ) {
-    sys.body_services = Some(|sys, ext, services| {
+    sys.add_body_services(|sys, ext, services| {
         #[cfg(any(target_vendor = "apple", target_os = "android"))]
         if let Some(user) = ext.try_get::<UserServices>() {
             services.user_state = std::rc::Rc::as_ptr(&user.0).cast();

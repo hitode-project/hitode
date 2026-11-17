@@ -149,7 +149,7 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Whole-image upload snapshots are identified by their texels and replace previous pixel dependencies. Partial uploads receive fresh identities and preserve earlier writes. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
-Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
+Fixed-state draw keys may be cached between changes; unchanged setters preserve the key, and mutations invalidate it. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
 Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
 Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
 Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
@@ -191,6 +191,8 @@ COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse ov
 |---|---|
 | SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF | The incoming object identity, and any offset, stride or FVF, equal the bound state. |
 | StateBlock Capture, Apply | Every captured value equals the device state. |
+
+Hot state setters, getters, scene boundaries, and unchanged bindings or state blocks may run as direct bodies over shared state. Recording, invalid objects, binding changes, and managed-texture flushes fall back to the full handler.
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 

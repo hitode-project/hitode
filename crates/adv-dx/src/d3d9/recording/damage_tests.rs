@@ -84,21 +84,22 @@ fn check_sparse_constants(verify: bool) {
             else {
                 unreachable!()
             };
-            d.shaders
+            let mut hot = d.hot.borrow_mut();
+            hot.shaders
                 .vertex_constants
                 .floats
                 .fill([f32::from_bits(0x7fc00000 | frame_index as u32); 4]);
-            d.shaders
+            hot.shaders
                 .pixel_constants
                 .floats
                 .fill([f32::from_bits(0x7f800000 | ((frame_index as u32 & 1) << 31)); 4]);
-            d.shaders.vertex_constants.integers.fill([frame_index; 4]);
-            d.shaders.pixel_constants.integers.fill([frame_index; 4]);
-            d.shaders.vertex_constants.booleans.fill(frame_index);
-            d.shaders.pixel_constants.booleans.fill(frame_index);
-            d.shaders.vertex_constants.floats[3] =
+            hot.shaders.vertex_constants.integers.fill([frame_index; 4]);
+            hot.shaders.pixel_constants.integers.fill([frame_index; 4]);
+            hot.shaders.vertex_constants.booleans.fill(frame_index);
+            hot.shaders.pixel_constants.booleans.fill(frame_index);
+            hot.shaders.vertex_constants.floats[3] =
                 [if frame_index == 2 { 0.25 } else { 0. }, 0., 0., 0.];
-            d.shaders.pixel_constants.floats[7] = if frame_index == 2 {
+            hot.shaders.pixel_constants.floats[7] = if frame_index == 2 {
                 [0., 1., 0., 1.]
             } else {
                 [1., 0., 0., 1.]
@@ -118,6 +119,7 @@ fn check_sparse_constants(verify: bool) {
         let (mut full, state) = {
             let e = env(&mut f);
             let device = device(&e, pointer).unwrap();
+            let hot = device.hot.borrow();
             let Operation::Draw(d) = device.frame.commands.last().unwrap() else {
                 unreachable!()
             };
@@ -129,23 +131,16 @@ fn check_sparse_constants(verify: bool) {
             assert_eq!(p.vertex_constants.floats[255], [0.; 4]);
             assert_eq!(p.pixel_constants.floats[255], [0.; 4]);
             let mut full = p.clone();
-            Arc::make_mut(&mut full).vertex_constants.floats =
-                device.shaders.vertex_constants.floats;
+            Arc::make_mut(&mut full).vertex_constants.floats = hot.shaders.vertex_constants.floats;
             Arc::make_mut(&mut full).vertex_constants.integers =
-                device.shaders.vertex_constants.integers;
-            Arc::make_mut(&mut full).vertex_constants.booleans = device
-                .shaders
-                .vertex_constants
-                .booleans
-                .map(|b| [b, 0, 0, 0]);
-            Arc::make_mut(&mut full).pixel_constants.floats = device.shaders.pixel_constants.floats;
+                hot.shaders.vertex_constants.integers;
+            Arc::make_mut(&mut full).vertex_constants.booleans =
+                hot.shaders.vertex_constants.booleans.map(|b| [b, 0, 0, 0]);
+            Arc::make_mut(&mut full).pixel_constants.floats = hot.shaders.pixel_constants.floats;
             Arc::make_mut(&mut full).pixel_constants.integers =
-                device.shaders.pixel_constants.integers;
-            Arc::make_mut(&mut full).pixel_constants.booleans = device
-                .shaders
-                .pixel_constants
-                .booleans
-                .map(|b| [b, 0, 0, 0]);
+                hot.shaders.pixel_constants.integers;
+            Arc::make_mut(&mut full).pixel_constants.booleans =
+                hot.shaders.pixel_constants.booleans.map(|b| [b, 0, 0, 0]);
             let full_bounds = damage::bounds(
                 &e,
                 device,
@@ -923,7 +918,7 @@ fn sampled_target_changes_damage_the_consuming_draw_and_copy_clips_keep_offsets(
         if let Some(Payload::Device(d)) =
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {
-            d.texture = Some(resource);
+            d.hot.borrow_mut().texture = Some(resource);
         }
         let mut d = quad(&mut f, 2., [1.; 4]);
         d.image = Some(target.image.clone());
@@ -1978,8 +1973,9 @@ fn sample_binding(f: &mut Fixture, surface: Option<u32>) {
     let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) else {
         unreachable!()
     };
-    d.texture = resource;
-    d.versions[12] += 1;
+    let mut hot = d.hot.borrow_mut();
+    hot.texture = resource;
+    hot.versions[12] += 1;
 }
 
 // spec: GFX-REC-4 GFX-REC-5

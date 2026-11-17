@@ -77,7 +77,9 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         shader_cache: None,
         frames: FrameCounters::default(),
         verify_frames: false,
+        shared: Rc::new(RefCell::new(SharedD3D9::default())),
     });
+    m.sys.add_body_services(direct::body_services);
     m
 }
 
@@ -125,6 +127,9 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     com(env)
         .add_ref_identity(&mut env.sys.objects, factory)
         .unwrap();
+    let hot = Rc::new(RefCell::new(HotDevice::new(fixed::CachedFixed::new(
+        16, 12,
+    ))));
     let (device, device_id) = object(
         env,
         "IDirect3DDevice9",
@@ -139,21 +144,15 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             creator: 0,
             preserve_fpu: true,
             creation: creation::State::new(0, 1, 0, 0x22).unwrap(),
-            scene: false,
             needs_reset: false,
             back_buffer: None,
             swap_chain: None,
             queries: queries::DeviceState::default(),
             depth_stencil: None,
-            texture: None,
             render_target: None,
-            buffers: buffers::Bindings::default(),
             implicit_declarations: BTreeMap::new(),
-            fixed: fixed::CachedFixed::new(16, 12),
-            shaders: shaders::Bindings::default(),
+            hot: Rc::clone(&hot),
             recording: None,
-            versions: [0; 15],
-            fingerprints: [0; 15],
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,
@@ -163,8 +162,14 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     .unwrap();
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.pointer = device;
+        d.hot.borrow_mut().pointer = device;
         d.refresh_all();
     }
+    env.ext
+        .get::<State>()
+        .shared
+        .borrow_mut()
+        .register_device(device, hot);
     let (resource, id) = resources::make(
         env,
         Resource {

@@ -181,10 +181,11 @@ pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Err(INVALID);
     };
+    let hot = d.hot.borrow();
     let signature = (
         d.render_target.or(d.back_buffer),
         d.depth_stencil,
-        d.versions[12],
+        hot.versions[12],
     );
     if d.frame
         .binding_cache
@@ -194,8 +195,8 @@ pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
         return Ok(());
     }
     let mut samples = Vec::new();
-    for id in std::iter::once(d.texture)
-        .chain(d.shaders.textures)
+    for id in std::iter::once(hot.texture)
+        .chain(hot.shaders.textures)
         .flatten()
     {
         sample(env, id, &mut samples);
@@ -206,6 +207,7 @@ pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
         depth.as_ref().map(|r| r.content(None, 1)),
         depth.as_ref().map(|r| r.content(None, 2)),
     ];
+    drop(hot);
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
     frame(env, owner).binding_cache = Some(Bindings {

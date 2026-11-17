@@ -15,11 +15,14 @@ fn disabling_npatches_succeeds_without_supporting_tessellation() {
     };
     let (pointer, _, _, _) = super::super::tests::setup(&mut env);
     let this = GuestPtr::new(pointer);
-    let versions = device(&env, pointer).unwrap().versions;
+    let versions = device(&env, pointer).unwrap().hot.borrow().versions;
     assert_eq!(set_npatch(&mut env, this, 0.0), 0);
     assert_eq!(set_npatch(&mut env, this, 1.0), UNAVAILABLE);
     assert_eq!(set_npatch(&mut env, this, -0.0), 0);
-    assert_eq!(device(&env, pointer).unwrap().versions, versions);
+    assert_eq!(
+        device(&env, pointer).unwrap().hot.borrow().versions,
+        versions
+    );
 }
 
 #[test]
@@ -59,13 +62,13 @@ fn dialog_box_mode_is_inert_outside_scene_and_fullscreen_requires_a_gdi_back_buf
         assert_eq!(set_dialogs(&mut env, this, enabled), 0);
     }
     if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
-        d.scene = true;
+        d.hot.borrow_mut().scene = true;
     }
     for enabled in [0, 1] {
         assert_eq!(set_dialogs(&mut env, this, enabled), INVALID);
     }
     if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, owner) {
-        d.scene = false;
+        d.hot.borrow_mut().scene = false;
         d.parameters.Windowed = 0;
     }
     // A fullscreen ARGB back buffer is not GDI-compatible; X8R8G8B8 is.
@@ -274,7 +277,7 @@ fn rejected_reset_keeps_mixed_mode_and_does_not_replace_creation_identity() {
     let (pointer, id, _, _) = super::super::tests::setup(&mut env);
     if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
         d.creation = State::new(0, 1, 0x778899, 0x86).unwrap();
-        d.scene = true;
+        d.hot.borrow_mut().scene = true;
     }
     assert_eq!(set_software(&mut env, GuestPtr::new(pointer), 1), 0);
     assert!(matches!(
