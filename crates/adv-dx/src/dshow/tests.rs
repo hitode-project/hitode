@@ -522,6 +522,32 @@ fn graph_names_members_counts_changes_and_hands_out_its_clock() {
     assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
 }
 
+// spec: MEDIA-GRAPH-17
+#[test]
+fn graph_controls_without_a_renderer_report_what_windows_reports() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let audio = query(&mut m, graph, IID_IBASICAUDIO);
+    let video = query(&mut m, graph, IID_IBASICVIDEO2);
+    let window = query(&mut m, graph, IID_IVIDEOWINDOW);
+    assert_eq!(
+        method(&mut m, "IBasicAudio::put_Volume", &[audio, -10i32 as u32]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicAudio::get_Balance", &[audio, DATA]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicVideo2::get_BitRate", &[video, DATA]),
+        E_NOINTERFACE
+    );
+    assert_eq!(
+        method(&mut m, "IVideoWindow::SetWindowForeground", &[window, 0]),
+        E_NOINTERFACE
+    );
+}
+
 // spec: MEDIA-GRAPH-10
 #[test]
 fn aggregated_graph_keeps_its_inner_count_and_forwards_other_faces_to_the_outer() {

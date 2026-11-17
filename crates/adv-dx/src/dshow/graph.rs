@@ -10,6 +10,7 @@ use super::*;
 
 mod autoplug;
 mod clock;
+mod delegate;
 pub(super) mod mapper;
 mod render;
 mod seeking;
@@ -617,9 +618,12 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         }
         (Face::MediaSeeking, method) => seeking::call(env, graph, method),
         (Face::MediaPosition, method) => seeking::position(env, graph, method),
-        (Face::BasicAudio, method) => audio_method(env, graph, method),
-        (Face::BasicVideo | Face::VideoWindow, method) => {
+        (Face::BasicAudio, method) if host_audio(env, graph) => audio_method(env, graph, method),
+        (Face::BasicVideo | Face::VideoWindow, method) if video::available(env, graph) => {
             video::window::call(env, graph, face, method)
+        }
+        (Face::BasicAudio | Face::BasicVideo | Face::VideoWindow, method) => {
+            Some(delegate::call(env, graph, face, method))
         }
         _ => None,
     }
@@ -1365,6 +1369,16 @@ fn resolve_position(current: i64, value: i64, flags: u32) -> Option<i64> {
         2 | 3 => Some(current + value),
         _ => None,
     }
+}
+
+/// Whether a host audio renderer in the graph answers IBasicAudio.
+fn host_audio(env: &Env<'_>, graph: u32) -> bool {
+    let state = env.ext.get::<State>();
+    state.graphs[&graph]
+        .members
+        .iter()
+        .filter_map(|m| m.host)
+        .any(|id| state.filters[&id].role == filter::Role::AudioRenderer)
 }
 
 fn audio_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> {
