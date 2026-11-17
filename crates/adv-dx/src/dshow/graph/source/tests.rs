@@ -528,7 +528,7 @@ fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_w
         } else {
             Role::AudioRenderer
         };
-        let renderer = filter::new_filter(&mut env(&mut m), role, class).unwrap();
+        let renderer = filter::new_filter(&mut env(&mut m), role, class, 0).unwrap();
         assert_eq!(
             invoke(&mut m, graph, "IFilterGraph2", "AddFilter", &[renderer, 0]),
             S_OK

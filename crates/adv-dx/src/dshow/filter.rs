@@ -49,6 +49,10 @@ pub(crate) struct Filter {
     pub source_path: Vec<u16>,
     pub dmo: Option<super::dmo::Dmo>,
     pub vmr: Option<super::vmr::Vmr>,
+    /// The controlling outer object of an aggregated filter, and the filter's
+    /// own non-delegating IUnknown; both zero otherwise.
+    pub outer: u32,
+    pub inner: u32,
 }
 
 pub(crate) struct Pin {
@@ -145,7 +149,9 @@ pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, outpu
     )
 }
 
-fn create_filter(
+/// CoCreateInstance of a host filter. Like Windows, an aggregated filter hands
+/// out only its inner IUnknown.
+pub(super) fn create_filter(
     env: &mut Env<'_>,
     iid: Iid,
     outer: u32,
@@ -153,10 +159,11 @@ fn create_filter(
     role: Role,
     clsid: Iid,
 ) -> Outcome {
-    if outer != 0 {
-        return Outcome::Return(CLASS_E_NOAGGREGATION);
+    if outer != 0 && iid != adv_os::com::IUNKNOWN {
+        let _ = env.cpu.write_u32(output, 0);
+        return Outcome::Return(E_NOINTERFACE);
     }
-    let base = match new_filter(env, role, clsid) {
+    let base = match new_filter(env, role, clsid, outer) {
         Ok(base) => base,
         Err(error) => return Outcome::Return(error),
     };
@@ -172,7 +179,12 @@ fn create_filter(
     Outcome::Return(result)
 }
 
-pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u32, u32> {
+pub(super) fn new_filter(
+    env: &mut Env<'_>,
+    role: Role,
+    clsid: Iid,
+    outer: u32,
+) -> Result<u32, u32> {
     let is_vmr = role == Role::VideoRenderer && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER;
     let faces: &[Face] = match role {
         Role::FileSource => &[Face::BaseFilter, Face::FileSource],
@@ -184,7 +196,21 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
         ],
         _ => &[Face::BaseFilter],
     };
-    let base = super::create(env, faces, Obj::Filter)?[0];
+    let faces = if outer == 0 {
+        super::create(env, faces, Obj::Filter)?
+    } else {
+        let mut faces = faces.to_vec();
+        faces.push(Face::Inner);
+        super::create_aggregated(env, &faces, Obj::Filter)?
+    };
+    let (base, inner) = (
+        faces[0],
+        if outer == 0 {
+            0
+        } else {
+            *faces.last().unwrap()
+        },
+    );
     let vmr = (role == Role::VideoRenderer).then(|| super::vmr::Vmr::new(env));
     state(env).filters.insert(
         base,
@@ -199,6 +225,8 @@ pub(super) fn new_filter(env: &mut Env<'_>, role: Role, clsid: Iid) -> Result<u3
             source_path: Vec::new(),
             dmo: None,
             vmr,
+            outer,
+            inner,
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {

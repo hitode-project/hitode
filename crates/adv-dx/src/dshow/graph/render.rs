@@ -8,7 +8,7 @@ const VFW_E_RENDERER_NOT_FOUND: u32 = 0x8004_0266;
 const VFW_S_PARTIAL_RENDER: u32 = 0x0004_0242;
 
 fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> Result<u32, u32> {
-    let filter = filter::new_filter(env, role, clsid)?;
+    let filter = filter::new_filter(env, role, clsid, 0)?;
     let name: Vec<u16> = name.encode_utf16().collect();
     let f = state(env).filters.get_mut(&filter).unwrap();
     f.graph = graph;

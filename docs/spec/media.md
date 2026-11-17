@@ -93,7 +93,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-10 Aggregation
 
-**Rule**: An aggregated filter graph MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
+**Rule**: An aggregated filter graph or host filter MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
 **Verification**: Test
 
 ### MEDIA-GRAPH-11 Member names

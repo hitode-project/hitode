@@ -65,23 +65,7 @@ pub(crate) struct Dmo {
 
 /// CoCreateInstance(CLSID_DMOWrapperFilter): pins appear at IDMOWrapperFilter::Init.
 pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    if outer != 0 {
-        return Outcome::Return(CLASS_E_NOAGGREGATION);
-    }
-    let base = match filter::new_filter(env, Role::DmoDecoder, CLSID_DMO_WRAPPER) {
-        Ok(base) => base,
-        Err(error) => return Outcome::Return(error),
-    };
-    let com = state(env).com;
-    let result = match com.query::<Obj>(&mut env.sys.objects, base, iid) {
-        Ok(pointer) => {
-            let _ = env.cpu.write_u32(output, pointer);
-            S_OK
-        }
-        Err(_) => E_NOINTERFACE,
-    };
-    release(env, base);
-    Outcome::Return(result)
+    filter::create_filter(env, iid, outer, output, Role::DmoDecoder, CLSID_DMO_WRAPPER)
 }
 
 fn dmo<'a>(env: &'a mut Env<'_>, filter: u32) -> Option<&'a mut Dmo> {

@@ -43,8 +43,8 @@ pub(crate) struct Graph {
     pub faces: Vec<u32>,
     /// The controlling outer object of an aggregated graph, and the graph's
     /// own non-delegating IUnknown; both zero otherwise.
-    outer: u32,
-    inner: u32,
+    pub outer: u32,
+    pub inner: u32,
     /// The aggregated FilterMapper2's inner IUnknown, once created.
     mapper: u32,
     pub members: Vec<Member>,
@@ -257,14 +257,6 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
     Outcome::Return(outcome)
 }
 
-/// The outer object every face of an aggregated graph but its inner IUnknown
-/// forwards QueryInterface, AddRef and Release to.
-pub(crate) fn outer(env: &Env<'_>, this: u32) -> Option<u32> {
-    let key = canonical(env, this)?;
-    let graph = env.ext.get::<State>().graphs.get(&key)?;
-    (graph.outer != 0 && this != graph.inner).then_some(graph.outer)
-}
-
 /// The inner IUnknown's QueryInterface: IUnknown is itself, and any other
 /// interface is retained through the outer object, as COM aggregation needs.
 pub(crate) fn inner_query(env: &mut Env<'_>, this: u32, iid: u32, output: u32) -> Outcome {
@@ -285,8 +277,7 @@ pub(crate) fn inner_query(env: &mut Env<'_>, this: u32, iid: u32, output: u32) -
     let Ok(pointer) = com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested) else {
         return Outcome::Return(E_NOINTERFACE);
     };
-    let key = canonical(env, this).unwrap();
-    let outer = state(env).graphs[&key].outer;
+    let (outer, _) = super::aggregate(env, this).unwrap();
     guest_call(env, outer, 1, vec![], move |env, _| {
         let _ = env.cpu.write_u32(output, pointer);
         Outcome::Return(S_OK)

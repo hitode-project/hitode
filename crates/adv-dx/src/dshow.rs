@@ -46,7 +46,6 @@ pub(crate) const E_POINTER: u32 = 0x8000_4003;
 pub(crate) const E_UNEXPECTED: u32 = 0x8000_ffff;
 pub(crate) const E_OUTOFMEMORY: u32 = 0x8007_000e;
 pub(crate) const E_INVALIDARG: u32 = 0x8007_0057;
-pub(crate) const CLASS_E_NOAGGREGATION: u32 = 0x8004_0110;
 pub(crate) const VFW_E_NOT_CONNECTED: u32 = 0x8004_0209;
 pub(crate) const VFW_E_NO_ALLOCATOR: u32 = 0x8004_020a;
 pub(crate) const VFW_E_ALREADY_CONNECTED: u32 = 0x8004_0204;
@@ -711,7 +710,8 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(E_POINTER);
     }
     if slot <= 2
-        && let Some(outer) = graph::outer(env, this)
+        && let Some((outer, inner)) = aggregate(env, this)
+        && this != inner
     {
         let args = if slot == 0 {
             vec![env.arg(1), env.arg(2)]
@@ -770,6 +770,19 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         log::debug!("DirectShow {}::{method}: not implemented", face.interface());
         Outcome::Return(E_NOTIMPL)
     })
+}
+
+/// The controlling outer object and the inner IUnknown of the aggregated graph
+/// or filter owning `this`. Every face but the inner IUnknown forwards
+/// QueryInterface, AddRef and Release to the outer object.
+pub(crate) fn aggregate(env: &Env<'_>, this: u32) -> Option<(u32, u32)> {
+    let key = canonical(env, this)?;
+    let state = env.ext.get::<State>();
+    let (outer, inner) = match state.graphs.get(&key) {
+        Some(graph) => (graph.outer, graph.inner),
+        None => state.filters.get(&key).map(|f| (f.outer, f.inner))?,
+    };
+    (outer != 0).then_some((outer, inner))
 }
 
 pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u32) -> u32 {
