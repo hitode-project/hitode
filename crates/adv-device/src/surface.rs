@@ -1986,6 +1986,43 @@ impl<P: Presenter> Surfaces<P> {
         self.arena.release(old.pixels, old.pitch * old.height);
         Ok(())
     }
+    /// Point surface `id` at existing writable guest pixels with a new layout,
+    /// returning its store-owned storage. The caller keeps that memory alive
+    /// until it deletes or rebinds the surface again.
+    pub fn rebind(
+        &mut self,
+        id: u32,
+        pixels: u32,
+        (width, height, pitch): (u32, u32, u32),
+        format: PixelFormat,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        size(width, height)?;
+        let bytes = pitch.checked_mul(height).ok_or("surface overflow")?;
+        let end = pixels.checked_add(bytes).ok_or("surface overflow")?;
+        if pixels == 0
+            || pitch < format.row_bytes(width)
+            || self
+                .arena
+                .regions
+                .iter()
+                .any(|&(base, len)| pixels < base + len && base < end)
+        {
+            return Err("invalid external surface storage".into());
+        }
+        m.writable(pixels, bytes as usize)?;
+        let s = self.surfaces.get_mut(&id).ok_or("unknown surface")?;
+        if s.locked.is_some() {
+            return Err("surface is locked".into());
+        }
+        let old = (s.pixels, s.pitch * s.height);
+        (s.pixels, s.width, s.height, s.pitch, s.format) = (pixels, width, height, pitch, format);
+        s.version += 1;
+        if self.arena.contains(old.0, old.1) {
+            self.arena.release(old.0, old.1);
+        }
+        Ok(())
+    }
     /// Register existing writable guest pixels without copying or clearing them.
     /// The caller keeps that memory alive until it deletes the surface. Imported
     /// memory must lie outside the arena, so deletion never transfers it there.

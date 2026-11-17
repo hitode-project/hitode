@@ -3,13 +3,13 @@
 use super::*;
 
 pub(super) const DDSD_CAPS: u32 = 1;
-const DDSD_HEIGHT: u32 = 2;
-const DDSD_WIDTH: u32 = 4;
+pub(super) const DDSD_HEIGHT: u32 = 2;
+pub(super) const DDSD_WIDTH: u32 = 4;
 pub(super) const DDSD_PITCH: u32 = 8;
 pub(super) const DDSD_BACKBUFFERCOUNT: u32 = 0x20;
 const DDSD_ZBUFFERBITDEPTH: u32 = 0x40;
 pub(super) const DDSD_LPSURFACE: u32 = 0x800;
-const DDSD_PIXELFORMAT: u32 = 0x1000;
+pub(super) const DDSD_PIXELFORMAT: u32 = 0x1000;
 pub(super) const DDSD_MIPMAPCOUNT: u32 = 0x20000;
 /// DDSD_CKDESTOVERLAY, DDSD_CKDESTBLT, DDSD_CKSRCOVERLAY and DDSD_CKSRCBLT,
 /// in descriptor order, with the DDCKEY kind each one carries.
@@ -19,9 +19,9 @@ pub(super) const BACKBUFFER: u32 = 4;
 pub(super) const COMPLEX: u32 = 8;
 pub(super) const FLIP: u32 = 0x10;
 pub(super) const FRONTBUFFER: u32 = 0x20;
-const OVERLAY: u32 = 0x80;
+pub(super) const OVERLAY: u32 = 0x80;
 pub(super) const PRIMARY: u32 = 0x200;
-const SYSTEM_MEMORY: u32 = 0x800;
+pub(super) const SYSTEM_MEMORY: u32 = 0x800;
 pub(super) const TEXTURE: u32 = 0x1000;
 const VIDEO_MEMORY: u32 = 0x4000;
 pub(super) const VISIBLE: u32 = 0x8000;
@@ -30,9 +30,9 @@ pub(super) const ZBUFFER: u32 = 0x20000;
 pub(super) const MIPMAP: u32 = 0x40_0000;
 const ALLOC_ON_LOAD: u32 = 0x400_0000;
 const LOCAL_VIDEO_MEMORY: u32 = 0x1000_0000;
-const CUBEMAP: u32 = 0x200;
+pub(super) const CUBEMAP: u32 = 0x200;
 const CUBEMAP_ALL_FACES: u32 = 0xfc00;
-const MANAGED: u32 = 0x10 | 0x2_0000;
+pub(super) const MANAGED: u32 = 0x10 | 0x2_0000;
 
 const DDPF_PALETTEINDEXED8: u32 = 0x20;
 const DDPF_RGB: u32 = 0x40;
@@ -40,6 +40,15 @@ const DDPF_ZBUFFER: u32 = 0x400;
 
 pub(super) const INVALID_CAPS: u32 = 0x8876_0064;
 pub(super) const NO_COOPERATIVE_LEVEL: u32 = 0x8876_00d4;
+pub(super) const CANNOT_ATTACH: u32 = 0x8876_000a;
+pub(super) const CANNOT_DETACH: u32 = 0x8876_0014;
+pub(super) const ALREADY_ATTACHED: u32 = 0x8876_019a;
+pub(super) const NOT_ATTACHED: u32 = 0x8876_01cc;
+pub(super) const NOT_FLIPPABLE: u32 = 0x8876_0246;
+pub(super) const INVALID_SURFACE_TYPE: u32 = 0x8876_0250;
+pub(super) const OFFSCREEN_PLAIN: u32 = 0x40;
+pub(super) const THREE_D_DEVICE: u32 = 0x2000;
+pub(super) const MIPMAP_SUBLEVEL: u32 = 0x1_0000;
 const NO_OVERLAY_HW: u32 = 0x8876_0104;
 const NO_COLOR_KEY_HW: u32 = 0x8876_00dc;
 const INVALID_PIXEL_FORMAT: u32 = 0x8876_0091;
@@ -53,6 +62,9 @@ pub(super) struct Described {
     pub height: u32,
     pub backbuffers: u32,
     pub mipmaps: u32,
+    /// lPitch and lpSurface as given; reports take both from the store.
+    pub pitch: u32,
+    pub memory: u32,
     /// Low and high values of each key in [`KEYS`] order.
     pub keys: [(u32, u32); 4],
     /// DDPIXELFORMAT.
@@ -77,8 +89,10 @@ impl Described {
             flags,
             height: word(raw, 8),
             width: word(raw, 12),
+            pitch: word(raw, 16),
             backbuffers: word(raw, 20),
             mipmaps: word(raw, 24),
+            memory: word(raw, 36),
             keys: std::array::from_fn(|i| (word(raw, 40 + i * 8), word(raw, 44 + i * 8))),
             format: raw[72..104].try_into().unwrap(),
             caps: [word(raw, 104), 0, 0, 0],
@@ -97,12 +111,10 @@ impl Described {
     }
 
     /// Write the descriptor as `len` bytes (108 or 124) for a surface whose
-    /// pixels are at `pixels` with `pitch`, or with no address when zero.
+    /// pixels are at `pitch` and `pixels`, zero outside a lock. Like Windows,
+    /// a locked descriptor carries the address without DDSD_LPSURFACE.
     pub fn bytes(&self, len: u32, pitch: u32, pixels: u32) -> Vec<u8> {
         let mut flags = self.flags | DDSD_PITCH;
-        if pixels != 0 {
-            flags |= DDSD_LPSURFACE;
-        }
         let mut depth = self.mipmaps;
         if len == 108 && self.caps[0] & ZBUFFER != 0 && flags & DDSD_PIXELFORMAT != 0 {
             flags = flags & !DDSD_PIXELFORMAT | DDSD_ZBUFFERBITDEPTH;
@@ -216,11 +228,9 @@ pub(super) fn validate(
         if d.flags & DDSD_BACKBUFFERCOUNT == 0 || d.backbuffers == 0 || !has(COMPLEX) {
             return Err(INVALID_CAPS);
         }
+        // Unlike Wine, 32-bit Windows also makes flippable textures.
         if cube {
             return Err(INVALID);
-        }
-        if has(TEXTURE) {
-            return Err(INVALID_CAPS);
         }
     } else if d.flags & DDSD_BACKBUFFERCOUNT != 0 {
         return Err(if cube { INVALID } else { INVALID_CAPS });
@@ -302,7 +312,7 @@ pub(super) fn validate(
         if caps & SYSTEM_MEMORY == 0 {
             return Err(INVALID_CAPS);
         }
-        if version < 4 || d.flags & DDSD_PITCH == 0 {
+        if version < 4 || d.memory == 0 || d.flags & DDSD_PITCH == 0 {
             return Err(INVALID);
         }
     }
