@@ -40,7 +40,7 @@ pub(crate) struct Source {
 
 pub(crate) struct Filter {
     pub role: Role,
-    clsid: Iid,
+    pub(super) clsid: Iid,
     pub pins: Vec<u32>,
     pub graph: u32,
     pub name: Vec<u16>,
@@ -139,14 +139,22 @@ pub(crate) fn create_audio_renderer(
 }
 
 pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    create_filter(
+    let outcome = create_filter(
         env,
         iid,
         outer,
         output,
         Role::VideoRenderer,
         super::vmr::CLSID_VIDEO_MIXING_RENDERER,
-    )
+    );
+    match outcome {
+        Outcome::Return(S_OK) => {
+            let pointer = env.cpu.read_u32(output).unwrap();
+            let filter = canonical(env, pointer).unwrap();
+            super::video::window::create_vmr_window(env, filter)
+        }
+        outcome => outcome,
+    }
 }
 
 /// CoCreateInstance of a host filter. Like Windows, an aggregated filter hands
@@ -168,7 +176,11 @@ pub(super) fn create_filter(
         Err(error) => return Outcome::Return(error),
     };
     let com = state(env).com;
-    let result = match com.query::<Obj>(&mut env.sys.objects, base, iid) {
+    let result = match if super::vmr::supports(env, base, iid) {
+        com.query::<Obj>(&mut env.sys.objects, base, iid)
+    } else {
+        Err(adv_os::com::QueryError::NoInterface)
+    } {
         Ok(pointer) => {
             let _ = env.cpu.write_u32(output, pointer);
             S_OK
@@ -193,6 +205,21 @@ pub(super) fn new_filter(
             Face::BaseFilter,
             Face::VmrFilterConfig,
             Face::VmrWindowlessControl,
+            Face::BasicVideo,
+            Face::VideoWindow,
+            Face::MediaSeeking,
+            Face::MediaPosition,
+            Face::VmrProtection,
+            Face::VmrMisc,
+            Face::VmrProperties,
+            Face::VmrQuality,
+            Face::VmrStatistics,
+            Face::VmrAspect,
+            Face::VmrDeinterlace,
+            Face::VmrBitmap,
+            Face::VmrMixer,
+            Face::VmrMonitor,
+            Face::VmrNotify,
         ],
         _ => &[Face::BaseFilter],
     };
@@ -255,7 +282,7 @@ pub(super) fn new_filter(
     Ok(base)
 }
 
-/// A pin lives as long as the process: its filter holds an internal reference.
+/// The filter retains each pin internally; VMR pin references count on the filter.
 pub(super) fn new_pin(
     env: &mut Env<'_>,
     filter: u32,
@@ -264,7 +291,17 @@ pub(super) fn new_pin(
     major: Iid,
     mt: Option<MediaType>,
 ) -> Result<u32, u32> {
-    let faces: &[Face] = if dir == INPUT {
+    let faces: &[Face] = if dir == INPUT
+        && state(env).filters[&filter].clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER
+    {
+        &[
+            Face::Pin,
+            Face::MemInputPin,
+            Face::VmrAccelerator,
+            Face::VmrOverlay,
+            Face::VmrQuality,
+        ]
+    } else if dir == INPUT {
         &[Face::Pin, Face::MemInputPin]
     } else {
         &[Face::Pin]
@@ -283,11 +320,19 @@ pub(super) fn new_pin(
             reader: 0,
             mem: 0,
             allocator: 0,
-            faces,
+            faces: faces.clone(),
         },
     );
     retain_internal(env, pin);
-    release(env, pin);
+    let com = state(env).com;
+    let _ = com.release::<Obj>(&mut env.sys.objects, pin);
+    if state(env).filters[&filter].clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER {
+        // Guest AddRef/Release use the same counter as the owning VMR filter.
+        let counter = env.cpu.read_u32(filter + 4).unwrap_or(0);
+        for &face in &faces {
+            let _ = env.cpu.write_u32(face + 4, counter);
+        }
+    }
     state(env).filters.get_mut(&filter).unwrap().pins.push(pin);
     Ok(pin)
 }
@@ -355,13 +400,30 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 _ => graph::RUNNING,
             };
             set_state(env, filter, value);
-            r(S_OK)
+            if state(env).filters[&filter].vmr.is_some() {
+                let result = super::vmr::transition_result(env, filter);
+                let graph = state(env).filters[&filter].graph;
+                if value != graph::STOPPED && graph != 0 {
+                    return Some(super::vmr::show_windows(
+                        env,
+                        graph,
+                        Box::new(move |_, _| Outcome::Return(result)),
+                    ));
+                }
+                r(result)
+            } else {
+                r(S_OK)
+            }
         }
         "GetState" => {
             let value = state(env).filters[&filter].state;
             let output = env.arg(2);
             r(if env.cpu.write_u32(output, value).is_ok() {
-                S_OK
+                if state(env).filters[&filter].vmr.is_some() {
+                    super::vmr::state_result(env, filter)
+                } else {
+                    S_OK
+                }
             } else {
                 E_POINTER
             })
@@ -375,12 +437,14 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
             if a1 == 0 {
                 return r(E_POINTER);
             }
+            let count = state(env).filters[&filter].pins.len();
             match super::create(
                 env,
                 &[Face::EnumPins],
                 Obj::EnumPins {
                     filter,
                     position: 0,
+                    count,
                 },
             ) {
                 Ok(faces) => {
@@ -445,11 +509,13 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
 }
 
 pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
+    let previous;
     let outputs: Vec<u32> = {
         let s = state(env);
         let Some(f) = s.filters.get_mut(&filter) else {
             return;
         };
+        previous = f.state;
         f.state = value;
         f.pins
             .iter()
@@ -467,7 +533,7 @@ pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
         }
     }
     super::dmo::state_changed(env, filter, value);
-    super::vmr::state_changed(env, filter, value);
+    super::vmr::state_changed(env, filter, value, previous);
 }
 
 fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
@@ -970,7 +1036,7 @@ pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
     };
     disconnect_host(env, pin);
     state(env).pins.get_mut(&pin).unwrap().reader = 0;
-    let mut calls = VecDeque::new();
+    let mut calls = super::vmr::disconnect_calls(env, pin);
     for pointer in [mem, reader, seeking] {
         if pointer != 0 {
             calls.push_back(Call(pointer, 2, vec![]));
@@ -1043,10 +1109,20 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
     let Ok(mt) = MediaType::read(env, pmt) else {
         return Outcome::Return(E_POINTER);
     };
-    if !accepts(env, pin, &mt) {
+    if !(if role_of(env, pin) == Role::VideoRenderer {
+        super::vmr::connects_input(&mt)
+    } else {
+        accepts(env, pin, &mt)
+    }) {
         return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
     }
     let filter = state(env).pins[&pin].filter;
+    if state(env).filters[&filter].state != graph::STOPPED {
+        return Outcome::Return(0x8004_0224);
+    }
+    if state(env).filters[&filter].role == Role::VideoRenderer && !super::vmr::connects_input(&mt) {
+        return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
+    }
     if state(env).filters[&filter].role == Role::DmoDecoder
         && !super::dmo::connect_input(env, pin, &mt)
     {
@@ -1060,6 +1136,8 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
         return guest_call(env, connector, 1, vec![], move |env, _| {
             if dmo {
                 super::dmo::learn_upstream(env, pin, connector)
+            } else if state(env).filters[&filter].role == Role::VideoRenderer {
+                super::video::window::connect_vmr_window(env, filter)
             } else {
                 Outcome::Return(S_OK)
             }
@@ -1225,8 +1303,15 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
     match method {
         "Next" => {
             let (count, output, fetched) = (env.arg(1), env.arg(2), env.arg(3));
-            if output == 0 || (count > 1 && fetched == 0) {
+            if output == 0 {
                 return r(E_POINTER);
+            }
+            if count > 1 && fetched == 0 {
+                return r(if face == Face::EnumPins {
+                    E_INVALIDARG
+                } else {
+                    E_POINTER
+                });
             }
             if out_of_sync(env, this) {
                 return r(VFW_E_ENUM_OUT_OF_SYNC);
@@ -1264,11 +1349,26 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             {
                 return r(E_INVALIDARG);
             }
+            if let Some(Obj::EnumPins {
+                count: length,
+                position,
+                ..
+            }) = payload(env, this)
+                && count > length.saturating_sub(*position)
+            {
+                return r(S_FALSE);
+            }
             let skipped = advance(env, this, count);
             r(if skipped == count { S_OK } else { S_FALSE })
         }
         "Reset" => {
             let current = filter_list(env, this);
+            let pin_count = match payload(env, this) {
+                Some(Obj::EnumPins { filter, .. }) => {
+                    Some(env.ext.get::<State>().filters[filter].pins.len())
+                }
+                _ => None,
+            };
             match payload_mut(env, this) {
                 Some(Obj::EnumFilters { list, position, .. }) => {
                     if let Some(current) = current {
@@ -1276,9 +1376,13 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
                     }
                     *position = 0;
                 }
-                Some(Obj::EnumPins { position, .. }) | Some(Obj::EnumTypes { position, .. }) => {
-                    *position = 0
+                Some(Obj::EnumPins {
+                    position, count, ..
+                }) => {
+                    *position = 0;
+                    *count = pin_count.unwrap();
                 }
+                Some(Obj::EnumTypes { position, .. }) => *position = 0,
                 _ => {}
             }
             r(S_OK)
@@ -1286,9 +1390,14 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
         "Clone" => {
             let output = env.arg(1);
             let copy = match payload(env, this) {
-                Some(Obj::EnumPins { filter, position }) => Obj::EnumPins {
+                Some(Obj::EnumPins {
+                    filter,
+                    position,
+                    count,
+                }) => Obj::EnumPins {
                     filter: *filter,
                     position: *position,
+                    count: *count,
                 },
                 Some(Obj::EnumTypes { types, position }) => Obj::EnumTypes {
                     types: types.clone(),
@@ -1334,12 +1443,7 @@ fn out_of_sync(env: &Env<'_>, this: u32) -> bool {
 
 fn advance(env: &mut Env<'_>, this: u32, count: usize) -> usize {
     let length = match payload(env, this) {
-        Some(Obj::EnumPins { filter, .. }) => env
-            .ext
-            .get::<State>()
-            .filters
-            .get(filter)
-            .map_or(0, |f| f.pins.len()),
+        Some(Obj::EnumPins { count, .. }) => *count,
         Some(Obj::EnumTypes { types, .. }) => types.len(),
         Some(Obj::EnumFilters { list, .. }) => list.len(),
         _ => 0,
@@ -1360,14 +1464,18 @@ fn advance(env: &mut Env<'_>, this: u32, count: usize) -> usize {
 /// (unreferenced) filter pointers.
 fn next_items(env: &mut Env<'_>, this: u32, count: usize) -> Vec<u32> {
     let (start, items): (usize, Vec<Item>) = match payload(env, this) {
-        Some(Obj::EnumPins { filter, position }) => (
+        Some(Obj::EnumPins {
+            filter,
+            position,
+            count,
+        }) => (
             *position,
             env.ext
                 .get::<State>()
                 .filters
                 .get(filter)
                 .map_or(Vec::new(), |f| {
-                    f.pins.iter().map(|&p| Item::Pin(p)).collect()
+                    f.pins.iter().take(*count).map(|&p| Item::Pin(p)).collect()
                 }),
         ),
         Some(Obj::EnumTypes { types, position }) => {

@@ -210,10 +210,45 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-VIDEO-6 Window limits
 
-**Rule**: Standalone host video windows, fullscreen activation, and input-message forwarding MUST fail explicitly without altering embedded geometry.
+**Rule**: Host video windows other than VMR windows, fullscreen activation, and unsupported input-message forwarding MUST fail explicitly without altering embedded geometry.
 **Verification**: Test
 
 ### MEDIA-VIDEO-7 Native video planes
 
 **Rule**: With GPU rendering, decoded host pictures MUST use four reusable presentable buffers per stream: NV12 on Apple, NV21 on Android. Display MUST transfer each picture's presentable lease at most once. Guest pixel requests MUST convert on demand using the stream matrix and range.
+**Verification**: Test
+
+### MEDIA-VIDEO-8 VMR configuration and interfaces
+
+**Rule**: VMR rendering mode MUST default to windowed and lock after its first explicit setting. Interfaces MUST follow the selected mode, and stream-count queries MUST fail before mixing is enabled.
+**Verification**: Test
+
+### MEDIA-VIDEO-9 VMR pins and enumeration
+
+**Rule**: Mixing MUST publish the requested numbered input pins. VMR pins MUST share their filter's reference count, and pin enumerators MUST retain their filter. Enumerators MUST observe added pins after Reset.
+**Verification**: Test
+
+### MEDIA-VIDEO-10 VMR bitmap negotiation
+
+**Rule**: VMR connection MUST interpret supported bitmap depths independently of subtype labels, while rejecting paletted RGB subtypes. QueryAccept MUST accept a null subtype with a video information format. A sample without a stop time MUST retain its start timestamp.
+**Verification**: Test
+
+### MEDIA-VIDEO-11 VMR readiness and paused samples
+
+**Rule**: Connected VMR transitions MUST return S_FALSE before receiving a sample, and paused GetState MUST report an intermediate state. Paused Receive MUST publish and hold the first sample until Run, Stop, or flushing, including samples marked preroll. Flush completion MUST require a new sample, while end of stream MUST complete readiness.
+**Verification**: Test
+
+### MEDIA-VIDEO-12 VMR guest windows
+
+**Rule**: Windowed VMR MUST own a guest USER window and honor its caption, styles, owner, geometry, visibility, and message forwarding. Graph startup MUST show windowed VMR windows only when AutoShow is enabled. Windowed and windowless rendering MUST use the existing video provider.
+**Verification**: Test
+
+### MEDIA-VIDEO-13 VMR video outputs
+
+**Rule**: VMR basic-video getters MUST validate required outputs before checking connection. VMR snapshots MUST retain the last RGB32 image across playback states and preserve a supplied size when copying pixels.
+**Verification**: Test
+
+### MEDIA-VIDEO-14 Renderless VMR ownership
+
+**Rule**: Renderless VMR MUST retain the guest allocator-presenter and DirectDraw device and allocate surfaces during allocator configuration. Samples MUST populate those surfaces and invoke PrepareSurface followed by PresentImage with their timestamps. Renderless VMR MUST NOT publish frames through the host video provider.
 **Verification**: Test

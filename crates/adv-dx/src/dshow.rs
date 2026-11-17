@@ -264,11 +264,24 @@ pub(crate) enum Face {
     DmoWrapper,
     VmrFilterConfig,
     VmrWindowlessControl,
+    VmrProtection,
+    VmrMisc,
+    VmrProperties,
+    VmrQuality,
+    VmrStatistics,
+    VmrAspect,
+    VmrDeinterlace,
+    VmrBitmap,
+    VmrMixer,
+    VmrMonitor,
+    VmrNotify,
+    VmrAccelerator,
+    VmrOverlay,
     /// An aggregated object's own, non-delegating IUnknown.
     Inner,
 }
 
-const FACES: [(Face, &str); 27] = [
+const FACES: [(Face, &str); 40] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -295,6 +308,19 @@ const FACES: [(Face, &str); 27] = [
     (Face::DmoWrapper, "IDMOWrapperFilter"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
+    (Face::VmrProtection, "IAMCertifiedOutputProtection"),
+    (Face::VmrMisc, "IAMFilterMiscFlags"),
+    (Face::VmrProperties, "IKsPropertySet"),
+    (Face::VmrQuality, "IQualityControl"),
+    (Face::VmrStatistics, "IQualProp"),
+    (Face::VmrAspect, "IVMRAspectRatioControl"),
+    (Face::VmrDeinterlace, "IVMRDeinterlaceControl"),
+    (Face::VmrBitmap, "IVMRMixerBitmap"),
+    (Face::VmrMixer, "IVMRMixerControl"),
+    (Face::VmrMonitor, "IVMRMonitorConfig"),
+    (Face::VmrNotify, "IVMRSurfaceAllocatorNotify"),
+    (Face::VmrAccelerator, "IAMVideoAccelerator"),
+    (Face::VmrOverlay, "IOverlay"),
     (Face::Inner, "IUnknown"),
 ];
 
@@ -331,6 +357,19 @@ impl Face {
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
+            Face::VmrProtection => &[vmr::IID_IAMCERTIFIEDOUTPUTPROTECTION],
+            Face::VmrMisc => &[vmr::IID_IAMFILTERMISCFLAGS],
+            Face::VmrProperties => &[vmr::IID_IKSPROPERTYSET],
+            Face::VmrQuality => &[vmr::IID_IQUALITYCONTROL],
+            Face::VmrStatistics => &[vmr::IID_IQUALPROP],
+            Face::VmrAspect => &[vmr::IID_IVMRASPECTRATIOCONTROL],
+            Face::VmrDeinterlace => &[vmr::IID_IVMRDEINTERLACECONTROL],
+            Face::VmrBitmap => &[vmr::IID_IVMRMIXERBITMAP],
+            Face::VmrMixer => &[vmr::IID_IVMRMIXERCONTROL],
+            Face::VmrMonitor => &[vmr::IID_IVMRMONITORCONFIG],
+            Face::VmrNotify => &[vmr::IID_IVMRSURFACEALLOCATORNOTIFY],
+            Face::VmrAccelerator => &[vmr::IID_IAMVIDEOACCELERATOR],
+            Face::VmrOverlay => &[vmr::IID_IOVERLAY],
             Face::Inner => &[],
         }
     }
@@ -351,6 +390,7 @@ pub(crate) enum Obj {
     EnumPins {
         filter: u32,
         position: usize,
+        count: usize,
     },
     EnumTypes {
         types: Vec<MediaType>,
@@ -426,6 +466,12 @@ pub fn register(registry: &mut Registry) {
         stream::THREAD_ENTRY,
         Conv::Stdcall { argc: 1 },
         stream::thread_entry,
+    );
+    registry.add(
+        "quartz.dll",
+        "VMRWindowProc",
+        Conv::Stdcall { argc: 4 },
+        video::window::vmr_window_proc,
     );
     crate::refcounts::install(registry, "quartz.dll");
 }
@@ -558,6 +604,14 @@ fn create_counted(
         log::warn!("DirectShow: {error}");
         E_OUTOFMEMORY
     })?;
+    if let Obj::EnumPins { filter, .. } = &value
+        && state(env)
+            .filters
+            .get(filter)
+            .is_some_and(|f| f.clsid == vmr::CLSID_VIDEO_MIXING_RENDERER)
+    {
+        add_ref(env, *filter);
+    }
     let block = alloc(env, faces.len() as u32 * 8).ok_or(E_OUTOFMEMORY)?;
     let pointers: Vec<u32> = (0..faces.len() as u32).map(|i| block + i * 8).collect();
     for (&face, &pointer) in faces.iter().zip(&pointers) {
@@ -610,6 +664,9 @@ pub(crate) fn payload_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a 
 }
 
 pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
+    if let Some(owner) = vmr::pin_owner(env, pointer) {
+        return add_ref(env, owner);
+    }
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
@@ -621,6 +678,9 @@ pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
 
 /// Host-side Release; samples return to their allocator instead of being destroyed.
 pub(crate) fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
+    if let Some(owner) = vmr::pin_owner(env, pointer) {
+        return release(env, owner);
+    }
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
@@ -666,6 +726,20 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             if let Some(vmr) = filter.vmr {
                 vmr::destroyed(env, vmr);
             }
+            if filter.clsid == vmr::CLSID_VIDEO_MIXING_RENDERER {
+                for pin in filter.pins {
+                    let com = self::state(env).com;
+                    if let Some(id) = com.identity::<Obj>(&env.sys.objects, pin)
+                        && let Some(Some(destroyed)) =
+                            com.release_internal::<Obj>(&mut env.sys.objects, id)
+                    {
+                        destroyed_object(env, pin, &destroyed.value);
+                        if let Some(&first) = destroyed.interfaces.iter().min() {
+                            free(env, first);
+                        }
+                    }
+                }
+            }
         }
         Obj::Pin => {
             state.pins.remove(&canonical);
@@ -679,7 +753,16 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
         Obj::Sample => {
             state.samples.remove(&canonical);
         }
-        Obj::EnumFilters { .. } | Obj::EnumPins { .. } | Obj::EnumTypes { .. } => {}
+        Obj::EnumPins { filter, .. } => {
+            if state
+                .filters
+                .get(filter)
+                .is_some_and(|f| f.clsid == vmr::CLSID_VIDEO_MIXING_RENDERER)
+            {
+                release(env, *filter);
+            }
+        }
+        Obj::EnumFilters { .. } | Obj::EnumTypes { .. } => {}
     }
 }
 
@@ -730,6 +813,11 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     {
         return graph::mapper::query(env, graph, env.arg(1), env.arg(2));
     }
+    if slot == 2
+        && let Some(outcome) = vmr::release_window(env, this)
+    {
+        return outcome;
+    }
     match slot {
         0 => return Outcome::Return(query_interface(env, this, env.arg(1), env.arg(2))),
         1 => return Outcome::Return(add_ref(env, this)),
@@ -747,13 +835,14 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::MediaSeeking
         | Face::MediaPosition
         | Face::BasicAudio
-        | Face::BasicVideo
-        | Face::VideoWindow
         | Face::MediaFilter
         | Face::ObjectWithSite
         | Face::GraphConfig
         | Face::GraphVersion
         | Face::VideoFrameStep => graph::call(env, face, &method, this),
+        Face::BasicVideo | Face::VideoWindow => {
+            vmr::call(env, face, &method, this).or_else(|| graph::call(env, face, &method, this))
+        }
         Face::BaseFilter
         | Face::FileSource
         | Face::EnumFilters
@@ -764,6 +853,19 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::DmoWrapper => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
+        Face::VmrProtection
+        | Face::VmrMisc
+        | Face::VmrProperties
+        | Face::VmrQuality
+        | Face::VmrStatistics
+        | Face::VmrAspect
+        | Face::VmrDeinterlace
+        | Face::VmrBitmap
+        | Face::VmrMixer
+        | Face::VmrMonitor
+        | Face::VmrNotify
+        | Face::VmrAccelerator
+        | Face::VmrOverlay => vmr::call(env, face, &method, this),
         Face::Inner => None,
     };
     outcome.unwrap_or_else(|| {
@@ -793,7 +895,22 @@ pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u3
     let Ok(requested) = read_guid(env, iid) else {
         return E_POINTER;
     };
+    if let Some(filter) = canonical(env, this)
+        && !vmr::supports(env, filter, requested)
+    {
+        return E_NOINTERFACE;
+    }
     let com = state(env).com;
+    if vmr::pin_owner(env, this).is_some() {
+        return match com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested) {
+            Ok(pointer) => {
+                add_ref(env, pointer);
+                let _ = env.cpu.write_u32(output, pointer);
+                S_OK
+            }
+            Err(_) => E_NOINTERFACE,
+        };
+    }
     match com.query::<Obj>(&mut env.sys.objects, this, requested) {
         Ok(pointer) => {
             let _ = env.cpu.write_u32(output, pointer);

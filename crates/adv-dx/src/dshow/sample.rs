@@ -168,7 +168,16 @@ pub(crate) fn decommit(env: &mut Env<'_>, allocator: u32) -> bool {
 pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<Outcome> {
     let this = canonical(env, this)?;
     match face {
-        Face::MemAllocator => allocator_method(env, this, method),
+        Face::MemAllocator => {
+            let outcome = allocator_method(env, this, method);
+            if method == "SetProperties"
+                && matches!(outcome, Some(Outcome::Return(S_OK)))
+                && let Some(outcome) = super::vmr::allocated(env, this)
+            {
+                return Some(outcome);
+            }
+            outcome
+        }
         Face::MediaSample => sample_method(env, this, method),
         _ => None,
     }
@@ -179,10 +188,15 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
     let a1 = env.arg(1);
     let properties = |env: &mut Env<'_>, output: u32| {
         let a = &state(env).allocators[&this];
-        let raw: Vec<u8> = [a.samples.len() as u32, a.size, 1, 0]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
+        let raw: Vec<u8> = [
+            a.samples.len() as u32,
+            a.size,
+            u32::from(!a.samples.is_empty()),
+            0,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
         env.cpu.write(output, &raw).is_ok()
     };
     match method {

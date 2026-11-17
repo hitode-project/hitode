@@ -40,6 +40,221 @@ pub(crate) const FORMAT_VIDEOINFO2: Iid = guid(
     [0xac, 0xe4, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba],
 );
 
+pub(crate) const IID_IAMCERTIFIEDOUTPUTPROTECTION: Iid = guid(
+    0x6feded3e,
+    0x0ff1,
+    0x4901,
+    [0xa2, 0xf1, 0x43, 0xf7, 0x01, 0x2c, 0x85, 0x15],
+);
+pub(crate) const IID_IAMFILTERMISCFLAGS: Iid = guid(
+    0x2dd74950,
+    0xa890,
+    0x11d1,
+    [0xab, 0xe8, 0x00, 0xa0, 0xc9, 0x05, 0xf3, 0x75],
+);
+pub(crate) const IID_IKSPROPERTYSET: Iid = guid(
+    0x31efac30,
+    0x515c,
+    0x11d0,
+    [0xa9, 0xaa, 0x00, 0xaa, 0x00, 0x61, 0xbe, 0x93],
+);
+pub(crate) const IID_IQUALITYCONTROL: Iid = guid(
+    0x56a868a5,
+    0x0ad4,
+    0x11ce,
+    [0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70],
+);
+pub(crate) const IID_IQUALPROP: Iid = guid(
+    0x1bd0ecb0,
+    0xf8e2,
+    0x11ce,
+    [0xaa, 0xc6, 0x00, 0x20, 0xaf, 0x0b, 0x99, 0xa3],
+);
+pub(crate) const IID_IVMRASPECTRATIOCONTROL: Iid = guid(
+    0xede80b5c,
+    0xbad6,
+    0x4623,
+    [0xb5, 0x37, 0x65, 0x58, 0x6c, 0x9f, 0x8d, 0xfd],
+);
+pub(crate) const IID_IVMRDEINTERLACECONTROL: Iid = guid(
+    0xbb057577,
+    0x0db8,
+    0x4e6a,
+    [0x87, 0xa7, 0x1a, 0x8c, 0x9a, 0x50, 0x5a, 0x0f],
+);
+pub(crate) const IID_IVMRMIXERBITMAP: Iid = guid(
+    0x1e673275,
+    0x0257,
+    0x40aa,
+    [0xaf, 0x20, 0x7c, 0x60, 0x8d, 0x4a, 0x04, 0x28],
+);
+pub(crate) const IID_IVMRMIXERCONTROL: Iid = guid(
+    0x1c1a17b0,
+    0xbed0,
+    0x415d,
+    [0x97, 0x4b, 0xdc, 0x66, 0x96, 0x13, 0x15, 0x99],
+);
+pub(crate) const IID_IVMRMONITORCONFIG: Iid = guid(
+    0x9cf0b1b6,
+    0xfbaa,
+    0x4b7f,
+    [0x88, 0xcf, 0xcf, 0x1f, 0x13, 0x0a, 0x0d, 0xce],
+);
+pub(crate) const IID_IVMRSURFACEALLOCATORNOTIFY: Iid = guid(
+    0xaada05a8,
+    0x5a4e,
+    0x4729,
+    [0xaf, 0x0b, 0xce, 0xa2, 0x7a, 0xed, 0x51, 0xe2],
+);
+pub(crate) const IID_IAMVIDEOACCELERATOR: Iid = guid(
+    0x256a6a22,
+    0xfbad,
+    0x11d1,
+    [0x82, 0xbf, 0x00, 0xa0, 0xc9, 0x69, 0x6c, 0x8f],
+);
+pub(crate) const IID_IOVERLAY: Iid = guid(
+    0x56a868a1,
+    0x0ad4,
+    0x11ce,
+    [0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70],
+);
+
+const VMRPROTECTION_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("KeyExchange", Conv::Stdcall { argc: 4 }, 3),
+    ("SessionSequenceStart", Conv::Stdcall { argc: 2 }, 4),
+    ("ProtectionCommand", Conv::Stdcall { argc: 2 }, 5),
+    ("ProtectionStatus", Conv::Stdcall { argc: 3 }, 6),
+];
+const VMRMISC_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("GetMiscFlags", Conv::Stdcall { argc: 1 }, 3),
+];
+const VMRPROPERTIES_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("Set", Conv::Stdcall { argc: 7 }, 3),
+    ("Get", Conv::Stdcall { argc: 8 }, 4),
+    ("QuerySupported", Conv::Stdcall { argc: 4 }, 5),
+];
+const VMRQUALITY_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("Notify", Conv::Stdcall { argc: 8 }, 3),
+    ("SetSink", Conv::Stdcall { argc: 2 }, 4),
+];
+const VMRSTATISTICS_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("FramesDroppedInRenderer", Conv::Stdcall { argc: 2 }, 3),
+    ("FramesDrawn", Conv::Stdcall { argc: 2 }, 4),
+    ("AvgFrameRate", Conv::Stdcall { argc: 2 }, 5),
+    ("Jitter", Conv::Stdcall { argc: 2 }, 6),
+    ("AvgSyncOffset", Conv::Stdcall { argc: 2 }, 7),
+    ("DevSyncOffset", Conv::Stdcall { argc: 2 }, 8),
+];
+const VMRASPECT_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("GetAspectRatioMode", Conv::Stdcall { argc: 2 }, 3),
+    ("SetAspectRatioMode", Conv::Stdcall { argc: 2 }, 4),
+];
+const VMRDEINTERLACE_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("GetNumberOfDeinterlaceModes", Conv::Stdcall { argc: 4 }, 3),
+    ("GetDeinterlaceModeCaps", Conv::Stdcall { argc: 4 }, 4),
+    ("GetDeinterlaceMode", Conv::Stdcall { argc: 3 }, 5),
+    ("SetDeinterlaceMode", Conv::Stdcall { argc: 3 }, 6),
+    ("GetDeinterlacePrefs", Conv::Stdcall { argc: 2 }, 7),
+    ("SetDeinterlacePrefs", Conv::Stdcall { argc: 2 }, 8),
+    ("GetActualDeinterlaceMode", Conv::Stdcall { argc: 3 }, 9),
+];
+const VMRBITMAP_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("SetAlphaBitmap", Conv::Stdcall { argc: 2 }, 3),
+    ("UpdateAlphaBitmapParameters", Conv::Stdcall { argc: 2 }, 4),
+    ("GetAlphaBitmapParameters", Conv::Stdcall { argc: 2 }, 5),
+];
+const VMRMIXER_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("SetAlpha", Conv::Stdcall { argc: 3 }, 3),
+    ("GetAlpha", Conv::Stdcall { argc: 3 }, 4),
+    ("SetZOrder", Conv::Stdcall { argc: 3 }, 5),
+    ("GetZOrder", Conv::Stdcall { argc: 3 }, 6),
+    ("SetOutputRect", Conv::Stdcall { argc: 3 }, 7),
+    ("SetBackgroundClr", Conv::Stdcall { argc: 2 }, 8),
+    ("GetBackgroundClr", Conv::Stdcall { argc: 2 }, 9),
+    ("SetMixingPrefs", Conv::Stdcall { argc: 2 }, 10),
+    ("GetMixingPrefs", Conv::Stdcall { argc: 2 }, 11),
+];
+const VMRMONITOR_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("SetMonitor", Conv::Stdcall { argc: 2 }, 3),
+    ("GetMonitor", Conv::Stdcall { argc: 2 }, 4),
+    ("SetDefaultMonitor", Conv::Stdcall { argc: 2 }, 5),
+    ("GetDefaultMonitor", Conv::Stdcall { argc: 2 }, 6),
+    ("GetAvailableMonitors", Conv::Stdcall { argc: 4 }, 7),
+];
+const VMRNOTIFY_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("AdviseSurfaceAllocator", Conv::Stdcall { argc: 3 }, 3),
+    ("SetDDrawDevice", Conv::Stdcall { argc: 3 }, 4),
+    ("ChangeDDrawDevice", Conv::Stdcall { argc: 3 }, 5),
+    ("RestoreDDrawSurfaces", Conv::Stdcall { argc: 1 }, 6),
+    ("NotifyEvent", Conv::Stdcall { argc: 4 }, 7),
+    ("SetBorderColor", Conv::Stdcall { argc: 2 }, 8),
+];
+const VMRACCELERATOR_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("GetVideoAcceleratorGUIDs", Conv::Stdcall { argc: 3 }, 3),
+    ("GetUncompFormatsSupported", Conv::Stdcall { argc: 4 }, 4),
+    ("GetInternalMemInfo", Conv::Stdcall { argc: 4 }, 5),
+    ("GetCompBufferInfo", Conv::Stdcall { argc: 5 }, 6),
+    ("GetInternalCompBufferInfo", Conv::Stdcall { argc: 3 }, 7),
+    ("BeginFrame", Conv::Stdcall { argc: 2 }, 8),
+    ("EndFrame", Conv::Stdcall { argc: 2 }, 9),
+    ("GetBuffer", Conv::Stdcall { argc: 6 }, 10),
+    ("ReleaseBuffer", Conv::Stdcall { argc: 3 }, 11),
+    ("Execute", Conv::Stdcall { argc: 8 }, 12),
+    ("QueryRenderStatus", Conv::Stdcall { argc: 4 }, 13),
+    ("DisplayFrame", Conv::Stdcall { argc: 3 }, 14),
+];
+const VMROVERLAY_METHODS: &[(&str, Conv, u16)] = &[
+    ("QueryInterface", Conv::Stdcall { argc: 3 }, 0),
+    ("AddRef", Conv::Stdcall { argc: 1 }, 1),
+    ("Release", Conv::Stdcall { argc: 1 }, 2),
+    ("GetPalette", Conv::Stdcall { argc: 3 }, 3),
+    ("SetPalette", Conv::Stdcall { argc: 3 }, 4),
+    ("GetDefaultColorKey", Conv::Stdcall { argc: 2 }, 5),
+    ("GetColorKey", Conv::Stdcall { argc: 2 }, 6),
+    ("SetColorKey", Conv::Stdcall { argc: 2 }, 7),
+    ("GetWindowHandle", Conv::Stdcall { argc: 2 }, 8),
+    ("GetClipList", Conv::Stdcall { argc: 4 }, 9),
+    ("GetVideoPosition", Conv::Stdcall { argc: 3 }, 10),
+    ("Advise", Conv::Stdcall { argc: 3 }, 11),
+    ("Unadvise", Conv::Stdcall { argc: 1 }, 12),
+];
+
 const VMR_MODE_WINDOWED: u32 = 1;
 const VMR_MODE_WINDOWLESS: u32 = 2;
 const VMR_MODE_RENDERLESS: u32 = 4;
@@ -57,6 +272,15 @@ const POLL_US: u64 = 10_000;
 const MAX_VIDEO_DIMENSION: u32 = 8192;
 
 pub(crate) struct Vmr {
+    pub device: u32,
+    pub surface_allocator: u32,
+    pub presenter: u32,
+    pub cookie: u32,
+    pub surfaces: Vec<u32>,
+    pub surface_next: usize,
+    pub hwnd: u32,
+    pub drain: u32,
+    pub closed: bool,
     pub mode: u32,
     pub streams: u32,
     pub prefs: u32,
@@ -79,8 +303,17 @@ impl Vmr {
             signaled: false,
         });
         Self {
-            mode: VMR_MODE_WINDOWED,
-            streams: 1,
+            device: 0,
+            surface_allocator: 0,
+            presenter: 0,
+            cookie: 0,
+            surfaces: Vec::new(),
+            surface_next: 0,
+            hwnd: 0,
+            drain: 0,
+            closed: false,
+            mode: 0,
+            streams: 0,
             prefs: 0,
             aspect_mode: VMR_ARMODE_NONE,
             color_key: 0,
@@ -132,6 +365,19 @@ pub(super) const WINDOWLESS_METHODS: &[(&str, Conv, u16)] = &[
 
 pub(super) fn interface_methods(interface: &str) -> Option<&'static [(&'static str, Conv, u16)]> {
     match interface {
+        "IAMCertifiedOutputProtection" => Some(VMRPROTECTION_METHODS),
+        "IAMFilterMiscFlags" => Some(VMRMISC_METHODS),
+        "IKsPropertySet" => Some(VMRPROPERTIES_METHODS),
+        "IQualityControl" => Some(VMRQUALITY_METHODS),
+        "IQualProp" => Some(VMRSTATISTICS_METHODS),
+        "IVMRAspectRatioControl" => Some(VMRASPECT_METHODS),
+        "IVMRDeinterlaceControl" => Some(VMRDEINTERLACE_METHODS),
+        "IVMRMixerBitmap" => Some(VMRBITMAP_METHODS),
+        "IVMRMixerControl" => Some(VMRMIXER_METHODS),
+        "IVMRMonitorConfig" => Some(VMRMONITOR_METHODS),
+        "IVMRSurfaceAllocatorNotify" => Some(VMRNOTIFY_METHODS),
+        "IAMVideoAccelerator" => Some(VMRACCELERATOR_METHODS),
+        "IOverlay" => Some(VMROVERLAY_METHODS),
         "IVMRFilterConfig" => Some(FILTER_CONFIG_METHODS),
         "IVMRWindowlessControl" => Some(WINDOWLESS_METHODS),
         _ => None,
@@ -148,18 +394,7 @@ struct PixelFormat {
 }
 
 fn parse_video_format(mt: &MediaType) -> Option<PixelFormat> {
-    if mt.major != MEDIATYPE_VIDEO {
-        return None;
-    }
-    if ![
-        MEDIASUBTYPE_RGB32,
-        MEDIASUBTYPE_ARGB32,
-        MEDIASUBTYPE_RGB24,
-        MEDIASUBTYPE_RGB565,
-        MEDIASUBTYPE_RGB555,
-    ]
-    .contains(&mt.sub)
-    {
+    if mt.major != MEDIATYPE_VIDEO || mt.sub == amovie(0xe436_eb7a) {
         return None;
     }
     let header_offset = if mt.format_type == FORMAT_VIDEOINFO && mt.format.len() >= 88 {
@@ -184,8 +419,22 @@ fn parse_video_format(mt: &MediaType) -> Option<PixelFormat> {
         return None;
     }
     let frame_100ns = i64::from_le_bytes(mt.format[40..48].try_into().unwrap());
+    let depth = (word(header_offset + 12) >> 16) as u16;
+    let sub = match depth {
+        32 => {
+            if mt.sub == MEDIASUBTYPE_ARGB32 {
+                MEDIASUBTYPE_ARGB32
+            } else {
+                MEDIASUBTYPE_RGB32
+            }
+        }
+        24 => MEDIASUBTYPE_RGB24,
+        16 if mt.sub == MEDIASUBTYPE_RGB565 => MEDIASUBTYPE_RGB565,
+        16 if mt.sub == MEDIASUBTYPE_RGB555 => MEDIASUBTYPE_RGB555,
+        _ => return None,
+    };
     Some(PixelFormat {
-        sub: mt.sub,
+        sub,
         width: width as u32,
         height,
         top_down: raw_height < 0,
@@ -194,6 +443,20 @@ fn parse_video_format(mt: &MediaType) -> Option<PixelFormat> {
 }
 
 pub(crate) fn accepts_input(mt: &MediaType) -> bool {
+    mt.major == MEDIATYPE_VIDEO
+        && matches!(mt.format_type, FORMAT_VIDEOINFO | FORMAT_VIDEOINFO2)
+        && [
+            GUID_NULL,
+            MEDIASUBTYPE_RGB32,
+            MEDIASUBTYPE_ARGB32,
+            MEDIASUBTYPE_RGB24,
+            MEDIASUBTYPE_RGB565,
+            MEDIASUBTYPE_RGB555,
+        ]
+        .contains(&mt.sub)
+}
+
+pub(crate) fn connects_input(mt: &MediaType) -> bool {
     parse_video_format(mt).is_some()
 }
 
@@ -210,6 +473,328 @@ pub(crate) fn video_info_from_media_type(mt: &MediaType) -> Option<VideoInfo> {
         height: fmt.height,
         frame_rate,
     })
+}
+
+/// Show the windowed renderer through USER before graph startup.
+pub(crate) fn show_windows(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
+    let hwnd = state(env).filters.values().find_map(|f| {
+        let v = f.vmr.as_ref()?;
+        (f.graph == graph && v.mode <= VMR_MODE_WINDOWED && v.hwnd != 0).then_some(v.hwnd)
+    });
+    if let Some(hwnd) = hwnd
+        && state(env).graphs[&graph].video.auto_show
+    {
+        state(env)
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .set_visible(true);
+        video::window::user(env, "ShowWindow", vec![hwnd, 5], move |env, _| {
+            then(env, Vec::new())
+        })
+    } else {
+        then(env, Vec::new())
+    }
+}
+
+pub(crate) fn pin_owner(env: &Env<'_>, pointer: u32) -> Option<u32> {
+    let object = canonical(env, pointer)?;
+    let state = env.ext.get::<State>();
+    let pin = state.pins.get(&object)?;
+    (state.filters[&pin.filter].clsid == CLSID_VIDEO_MIXING_RENDERER).then_some(pin.filter)
+}
+
+pub(crate) fn release_window(env: &mut Env<'_>, this: u32) -> Option<Outcome> {
+    let filter = pin_owner(env, this).or_else(|| canonical(env, this))?;
+    let f = state(env).filters.get(&filter)?;
+    let hwnd = f.vmr.as_ref()?.hwnd;
+    if hwnd == 0 {
+        return None;
+    }
+    let com = state(env).com;
+    let id = com.identity::<Obj>(&env.sys.objects, filter)?;
+    if com.references(&env.sys.objects, id) != Some(1) {
+        return None;
+    }
+    Some(video::window::user(
+        env,
+        "DestroyWindow",
+        vec![hwnd],
+        move |env, _| {
+            state(env)
+                .filters
+                .get_mut(&filter)
+                .unwrap()
+                .vmr
+                .as_mut()
+                .unwrap()
+                .hwnd = 0;
+            let v = state(env)
+                .filters
+                .get_mut(&filter)
+                .unwrap()
+                .vmr
+                .as_mut()
+                .unwrap();
+            let calls = [v.device, v.surface_allocator, v.presenter]
+                .into_iter()
+                .filter(|&p| p != 0)
+                .map(|p| Call(p, 2, vec![]))
+                .collect();
+            v.device = 0;
+            v.surface_allocator = 0;
+            v.presenter = 0;
+            chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(move |env, _| Outcome::Return(release(env, this))),
+            )
+        },
+    ))
+}
+
+fn notify_call(env: &mut Env<'_>, filter: u32, method: &str) -> Outcome {
+    let a1 = env.arg(1);
+    match method {
+        "SetDDrawDevice" | "ChangeDDrawDevice" => {
+            let v = filter_vmr(env, filter).unwrap();
+            let old = std::mem::replace(&mut v.device, a1);
+            let mut calls = VecDeque::new();
+            if a1 != 0 {
+                calls.push_back(Call(a1, 1, vec![]));
+            }
+            if old != 0 {
+                calls.push_back(Call(old, 2, vec![]));
+            }
+            chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(|_, _| Outcome::Return(S_OK)),
+            )
+        }
+        "AdviseSurfaceAllocator" => {
+            let allocator = env.arg(2);
+            if !filter_vmr(env, filter).unwrap().surfaces.is_empty() {
+                return Outcome::Return(VFW_E_WRONG_STATE);
+            }
+            let Some(scratch) = alloc(env, 20) else {
+                return Outcome::Return(E_OUTOFMEMORY);
+            };
+            let iid = guid(
+                0xce70_4fe7,
+                0xe71e,
+                0x41fb,
+                [0xba, 0xa2, 0xc4, 0x40, 0x3e, 0x11, 0x82, 0xf5],
+            );
+            let _ = env.cpu.write(scratch, &iid);
+            guest_call(
+                env,
+                allocator,
+                0,
+                vec![scratch, scratch + 16],
+                move |env, hr| {
+                    let presenter = env.cpu.read_u32(scratch + 16).unwrap_or(0);
+                    free(env, scratch);
+                    if hr != S_OK {
+                        return Outcome::Return(hr);
+                    }
+                    let v = filter_vmr(env, filter).unwrap();
+                    let old_allocator = std::mem::replace(&mut v.surface_allocator, allocator);
+                    let old_presenter = std::mem::replace(&mut v.presenter, presenter);
+                    v.cookie = a1;
+                    let mut calls = VecDeque::from([Call(allocator, 1, vec![])]);
+                    for p in [old_allocator, old_presenter] {
+                        if p != 0 {
+                            calls.push_back(Call(p, 2, vec![]));
+                        }
+                    }
+                    chain(
+                        env,
+                        calls,
+                        Vec::new(),
+                        Box::new(|_, _| Outcome::Return(S_OK)),
+                    )
+                },
+            )
+        }
+        "RestoreDDrawSurfaces" => Outcome::Return(S_OK),
+        "NotifyEvent" => {
+            let graph = state(env).filters[&filter].graph;
+            graph::notify(env, graph, a1, env.arg(2), env.arg(3));
+            graph::flush_posts(env, Box::new(|_, _| Outcome::Return(S_OK)))
+        }
+        _ => Outcome::Return(E_NOTIMPL),
+    }
+}
+
+/// Allocate renderless surfaces only when the upstream allocator is configured.
+pub(crate) fn allocated(env: &mut Env<'_>, allocator: u32) -> Option<Outcome> {
+    let filter = state(env).filters.iter().find_map(|(&id, f)| {
+        f.vmr
+            .as_ref()
+            .filter(|v| v.allocator == allocator && v.mode == VMR_MODE_RENDERLESS)
+            .map(|_| id)
+    })?;
+    let (owner, cookie) = {
+        let v = filter_vmr(env, filter)?;
+        (v.surface_allocator, v.cookie)
+    };
+    let mt = {
+        let s = state(env);
+        s.filters[&filter]
+            .pins
+            .iter()
+            .find_map(|p| s.pins[p].mt.clone())?
+    };
+    let Some(scratch) = alloc(env, 112) else {
+        return Some(Outcome::Return(E_OUTOFMEMORY));
+    };
+    let bitmap = if mt.format_type == FORMAT_VIDEOINFO2 {
+        72
+    } else {
+        48
+    };
+    let word = |at: usize| u32::from_le_bytes(mt.format[at..at + 4].try_into().unwrap());
+    let width = word(bitmap + 4);
+    let height = word(bitmap + 8);
+    let aspect = (
+        word(24).wrapping_sub(word(16)),
+        word(28).wrapping_sub(word(20)),
+    );
+    let count = env.cpu.read_u32(env.arg(1)).unwrap();
+    let raw: Vec<u8> = [
+        0x14,
+        scratch + 40,
+        0,
+        aspect.0,
+        aspect.1,
+        count,
+        count,
+        0,
+        width,
+        height,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let _ = env.cpu.write(scratch, &raw);
+    let _ = env.cpu.write(scratch + 40, &mt.format[bitmap..bitmap + 40]);
+    let _ = env.cpu.write_u32(scratch + 80, count);
+    Some(guest_call(
+        env,
+        owner,
+        3,
+        vec![cookie, scratch, scratch + 80, scratch + 84],
+        move |env, hr| {
+            if hr != S_OK {
+                free(env, scratch);
+                return Outcome::Return(hr);
+            }
+            let surface = env.cpu.read_u32(scratch + 84).unwrap();
+            let count = env.cpu.read_u32(scratch + 80).unwrap();
+            let v = filter_vmr(env, filter).unwrap();
+            v.surfaces = vec![surface];
+            v.surface_next = count as usize - 1;
+            guest_call(env, surface, 1, vec![], move |env, _| {
+                collect_surfaces(env, filter, scratch, count)
+            })
+        },
+    ))
+}
+
+fn collect_surfaces(env: &mut Env<'_>, filter: u32, scratch: u32, count: u32) -> Outcome {
+    let v = filter_vmr(env, filter).unwrap();
+    if v.surfaces.len() == count as usize {
+        free(env, scratch);
+        return Outcome::Return(S_OK);
+    }
+    let previous = *v.surfaces.last().unwrap();
+    let _ = env.cpu.write(scratch + 88, &[0; 16]);
+    let _ = env.cpu.write_u32(scratch + 88, 0x10);
+    guest_call(
+        env,
+        previous,
+        12,
+        vec![scratch + 88, scratch + 84],
+        move |env, hr| {
+            if hr != S_OK {
+                free(env, scratch);
+                return Outcome::Return(hr);
+            }
+            let surface = env.cpu.read_u32(scratch + 84).unwrap();
+            filter_vmr(env, filter).unwrap().surfaces.push(surface);
+            collect_surfaces(env, filter, scratch, count)
+        },
+    )
+}
+
+pub(crate) fn disconnect_calls(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
+    let filter = state(env).pins[&pin].filter;
+    let Some(v) = filter_vmr(env, filter) else {
+        return VecDeque::new();
+    };
+    if v.surfaces.is_empty() {
+        return VecDeque::new();
+    }
+    let mut calls: VecDeque<_> = std::mem::take(&mut v.surfaces)
+        .into_iter()
+        .rev()
+        .map(|p| Call(p, 2, vec![]))
+        .collect();
+    calls.push_back(Call(v.surface_allocator, 4, vec![v.cookie]));
+    calls
+}
+
+pub(crate) fn supports(env: &Env<'_>, filter: u32, iid: Iid) -> bool {
+    let Some(vmr) = env
+        .ext
+        .get::<State>()
+        .filters
+        .get(&filter)
+        .and_then(|f| f.vmr.as_ref())
+    else {
+        return true;
+    };
+    match iid {
+        IID_IBASICVIDEO | IID_IBASICVIDEO2 | IID_IVIDEOWINDOW => vmr.mode <= VMR_MODE_WINDOWED,
+        IID_IVMRWINDOWLESSCONTROL => vmr.mode == VMR_MODE_WINDOWLESS,
+        IID_IVMRSURFACEALLOCATORNOTIFY => vmr.mode == VMR_MODE_RENDERLESS,
+        IID_IVMRMONITORCONFIG => vmr.mode != VMR_MODE_RENDERLESS,
+        IID_IVMRMIXERCONTROL => vmr.streams != 0,
+        _ => true,
+    }
+}
+
+/// Result of the renderer's latest Pause/Run transition.
+pub(crate) fn transition_result(env: &mut Env<'_>, filter: u32) -> u32 {
+    let state = env.ext.get::<State>();
+    let f = &state.filters[&filter];
+    let connected = f.pins.iter().any(|pin| state.pins[pin].peer != 0);
+    let v = f.vmr.as_ref().unwrap();
+    if connected
+        && f.state != graph::STOPPED
+        && !v.prerolled
+        && !v.eos
+        && !(f.state == graph::RUNNING && v.closed)
+    {
+        S_FALSE
+    } else {
+        S_OK
+    }
+}
+
+/// Current IBaseFilter::GetState result, without waiting.
+pub(crate) fn state_result(env: &mut Env<'_>, filter: u32) -> u32 {
+    if state(env).filters[&filter].state == graph::PAUSED
+        && transition_result(env, filter) == S_FALSE
+    {
+        0x0004_0237
+    } else {
+        S_OK
+    }
 }
 
 fn filter_vmr<'a>(env: &'a mut Env<'_>, filter: u32) -> Option<&'a mut Vmr> {
@@ -269,13 +854,21 @@ fn write_rect(env: &mut Env<'_>, pointer: u32, rect: Rect) -> u32 {
 }
 
 pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<Outcome> {
-    let filter = canonical(env, this)?;
+    let object = canonical(env, this)?;
+    let filter = state(env).pins.get(&object).map_or(object, |p| p.filter);
     if !state(env).filters.contains_key(&filter) {
         return None;
     }
     let result = match face {
+        Face::VmrNotify => return Some(notify_call(env, filter, method)),
         Face::VmrFilterConfig => config_call(env, filter, method),
         Face::VmrWindowlessControl => windowless_call(env, filter, method),
+        Face::VmrOverlay if method == "GetWindowHandle" => {
+            let hwnd = filter_vmr(env, filter)?.hwnd;
+            write_word(env, env.arg(1), hwnd)
+        }
+        Face::BasicVideo => return Some(video::window::vmr_basic_call(env, filter, method)),
+        Face::VideoWindow => return Some(video::window::vmr_window_call(env, filter, method)),
         _ => return None,
     };
     Some(Outcome::Return(result))
@@ -298,23 +891,43 @@ fn config_call(env: &mut Env<'_>, filter: u32, method: &str) -> u32 {
             }
         }
         "SetNumberOfStreams" => {
-            if a1 == 1 {
-                filter_vmr(env, filter).unwrap().streams = 1;
-                S_OK
-            } else if (2..=VMR_MAX_STREAMS).contains(&a1) {
-                adv_abi::warn_unavailable(
-                    env,
-                    "IVMRFilterConfig::SetNumberOfStreams",
-                    "multiple VMR input streams are not supported",
-                );
-                E_NOTIMPL
-            } else {
-                E_INVALIDARG
+            if !(1..=VMR_MAX_STREAMS).contains(&a1) {
+                return E_INVALIDARG;
             }
+            const NAMES: [&str; 16] = [
+                "VMR Input0",
+                "VMR Input1",
+                "VMR Input2",
+                "VMR Input3",
+                "VMR Input4",
+                "VMR Input5",
+                "VMR Input6",
+                "VMR Input7",
+                "VMR Input8",
+                "VMR Input9",
+                "VMR Input10",
+                "VMR Input11",
+                "VMR Input12",
+                "VMR Input13",
+                "VMR Input14",
+                "VMR Input15",
+            ];
+            let count = state(env).filters[&filter].pins.len();
+            for &name in NAMES.iter().take(a1 as usize).skip(count) {
+                if let Err(hr) = filter::new_pin(env, filter, INPUT, name, MEDIATYPE_VIDEO, None) {
+                    return hr;
+                }
+            }
+            filter_vmr(env, filter).unwrap().streams = a1;
+            S_OK
         }
         "GetNumberOfStreams" => {
             let value = filter_vmr(env, filter).unwrap().streams;
-            write_word(env, a1, value)
+            if value == 0 {
+                0x8004_0296
+            } else {
+                write_word(env, a1, value)
+            }
         }
         "SetRenderingPrefs" => {
             filter_vmr(env, filter).unwrap().prefs = a1;
@@ -324,32 +937,27 @@ fn config_call(env: &mut Env<'_>, filter: u32, method: &str) -> u32 {
             let value = filter_vmr(env, filter).unwrap().prefs;
             write_word(env, a1, value)
         }
-        "SetRenderingMode" => match a1 {
-            VMR_MODE_WINDOWED => {
-                filter_vmr(env, filter).unwrap().mode = a1;
-                S_OK
+        "SetRenderingMode" => {
+            if !matches!(
+                a1,
+                VMR_MODE_WINDOWED | VMR_MODE_WINDOWLESS | VMR_MODE_RENDERLESS
+            ) {
+                return E_INVALIDARG;
             }
-            VMR_MODE_WINDOWLESS => {
-                filter_vmr(env, filter).unwrap().mode = a1;
-                // Windowless VMR renders directly onto the clipping HWND
-                // instead of auto-showing a standalone renderer window.
-                if let Some(g) = state(env).graphs.get_mut(&graph) {
-                    g.video.auto_show = false;
-                }
-                S_OK
+            let vmr = filter_vmr(env, filter).unwrap();
+            if vmr.mode != 0 {
+                return VFW_E_WRONG_STATE;
             }
-            VMR_MODE_RENDERLESS => {
-                adv_abi::warn_unavailable(
-                    env,
-                    "IVMRFilterConfig::SetRenderingMode",
-                    "VMRMode_Renderless is not supported",
-                );
-                E_NOTIMPL
+            vmr.mode = a1;
+            if a1 != VMR_MODE_WINDOWED
+                && let Some(g) = state(env).graphs.get_mut(&graph)
+            {
+                g.video.auto_show = false;
             }
-            _ => E_INVALIDARG,
-        },
+            S_OK
+        }
         "GetRenderingMode" => {
-            let value = filter_vmr(env, filter).unwrap().mode;
+            let value = filter_vmr(env, filter).unwrap().mode.max(VMR_MODE_WINDOWED);
             write_word(env, a1, value)
         }
         _ => E_NOTIMPL,
@@ -397,6 +1005,9 @@ fn windowless_call(env: &mut Env<'_>, filter: u32, method: &str) -> u32 {
     match method {
         "GetNativeVideoSize" => {
             let (lp_w, lp_h, lp_ar_w, lp_ar_h) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+            if lp_w == 0 || lp_h == 0 {
+                return E_POINTER;
+            }
             let (w, h) = info.map_or((0, 0), |i| (i.width, i.height));
             for &(ptr, val) in &[(lp_w, w), (lp_h, h), (lp_ar_w, w), (lp_ar_h, h)] {
                 if ptr != 0 && write_word(env, ptr, val) != S_OK {
@@ -611,7 +1222,11 @@ fn windowless_call(env: &mut Env<'_>, filter: u32, method: &str) -> u32 {
     }
 }
 
-pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32) {
+pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32, previous: u32) {
+    let connected = {
+        let s = state(env);
+        s.filters[&filter].pins.iter().any(|p| s.pins[p].peer != 0)
+    };
     let Some(v) = filter_vmr(env, filter) else {
         return;
     };
@@ -623,18 +1238,20 @@ pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32) {
         v.flushing = false;
         v.eos = false;
         v.complete_sent = false;
+        v.closed = false;
+    } else if value == graph::PAUSED && previous != graph::PAUSED {
+        v.prerolled = false;
     } else if value == graph::RUNNING && v.eos && !v.complete_sent && !v.flushing {
         v.complete_sent = true;
         deliver_eos = true;
     }
-    if allocator != 0 {
-        if value == graph::STOPPED {
-            sample::decommit(env, allocator);
-        } else {
-            sample::commit(env, allocator);
-        }
+    if allocator != 0 && value == graph::STOPPED {
+        sample::decommit(env, allocator);
     }
     env.sys.set_event(wake);
+    if value == graph::RUNNING && !connected {
+        deliver_eos = true;
+    }
     if deliver_eos {
         let graph = state(env).filters[&filter].graph;
         if graph != 0 && state(env).graphs.contains_key(&graph) {
@@ -680,7 +1297,7 @@ pub(crate) fn renderers(env: &Env<'_>, graph: u32) -> u32 {
         .filter(|f| {
             f.pins.iter().any(|p| {
                 let pin = &state.pins[p];
-                pin.dir == INPUT && pin.peer != 0 && !state.pins.contains_key(&pin.peer)
+                pin.dir == INPUT && (pin.peer == 0 || !state.pins.contains_key(&pin.peer))
             })
         })
         .count() as u32
@@ -794,7 +1411,14 @@ pub(crate) fn input_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<
                 E_POINTER
             })
         }
-        "NotifyAllocator" => r(S_OK),
+        "NotifyAllocator" => {
+            let allocator = filter_vmr(env, filter)?.allocator;
+            r(if env.arg(1) != 0 && env.arg(1) == allocator {
+                S_OK
+            } else {
+                E_FAIL
+            })
+        }
         "GetAllocatorRequirements" => r(E_NOTIMPL),
         "ReceiveCanBlock" => r(S_OK),
         "Receive" => Some(receive(env, pin, env.arg(1))),
@@ -848,7 +1472,7 @@ fn receive(env: &mut Env<'_>, pin: u32, sample: u32) -> Outcome {
 struct ReadSample {
     bytes: Vec<u8>,
     start_100ns: Option<i64>,
-    preroll: bool,
+    end_100ns: Option<i64>,
 }
 
 fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome {
@@ -875,6 +1499,9 @@ fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome
     if v.flushing || v.stopping {
         return done(env, S_FALSE);
     }
+    if v.closed {
+        return done(env, E_UNEXPECTED);
+    }
     if filter_state == graph::STOPPED {
         return done(env, VFW_E_WRONG_STATE);
     }
@@ -892,7 +1519,7 @@ fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome
             ReadSample {
                 bytes,
                 start_100ns: s.time.map(|(start, _)| start),
-                preroll: s.preroll,
+                end_100ns: s.time.map(|(_, end)| end),
             },
             done,
         );
@@ -933,17 +1560,18 @@ fn read_guest_sample(
                     let start_100ns = matches!(time_hr, S_OK | VFW_S_NO_STOP_TIME)
                         .then(|| read_i64(env, scratch + 8))
                         .flatten();
-                    guest_call(env, sample, 9, vec![], move |env, preroll_hr| {
-                        free(env, scratch);
-                        then(
-                            env,
-                            Ok(ReadSample {
-                                bytes,
-                                start_100ns,
-                                preroll: preroll_hr == S_OK,
-                            }),
-                        )
-                    })
+                    let end_100ns = (time_hr == S_OK)
+                        .then(|| read_i64(env, scratch + 16))
+                        .flatten();
+                    free(env, scratch);
+                    then(
+                        env,
+                        Ok(ReadSample {
+                            bytes,
+                            start_100ns,
+                            end_100ns,
+                        }),
+                    )
                 },
             )
         })
@@ -958,9 +1586,6 @@ fn present_sample(
     sample: ReadSample,
     done: Done,
 ) -> Outcome {
-    if sample.preroll {
-        return done(env, S_OK);
-    }
     let bgra = match to_bgra(&sample.bytes, fmt) {
         Ok(bgra) => bgra,
         Err(hr) => return done(env, hr),
@@ -968,6 +1593,17 @@ fn present_sample(
     wait_due(env, filter, graph, sample.start_100ns, move |env, hr| {
         if hr != S_OK {
             return done(env, hr);
+        }
+        if filter_vmr(env, filter).unwrap().mode == VMR_MODE_RENDERLESS {
+            return present_renderless(
+                env,
+                filter,
+                fmt,
+                sample.start_100ns,
+                sample.end_100ns,
+                bgra,
+                done,
+            );
         }
         let pts_us = (sample.start_100ns.unwrap_or(0).max(0) / 10) as u64;
         publish_frame(env, filter, graph, fmt, pts_us, bgra, done)
@@ -1064,8 +1700,12 @@ fn publish_frame(
         Ok(outcome) => {
             env.ext.get_or_default::<Playback>().video_frames += 1;
             match outcome {
-                Some(outcome) => after(env, outcome, Box::new(move |env, _| done(env, S_OK))),
-                None => done(env, S_OK),
+                Some(outcome) => after(
+                    env,
+                    outcome,
+                    Box::new(move |env, _| hold_sample(env, filter, done)),
+                ),
+                None => hold_sample(env, filter, done),
             }
         }
         Err(hr) => {
@@ -1076,6 +1716,97 @@ fn publish_frame(
             done(env, hr)
         }
     }
+}
+
+fn present_renderless(
+    env: &mut Env<'_>,
+    filter: u32,
+    fmt: PixelFormat,
+    start: Option<i64>,
+    end: Option<i64>,
+    bgra: Vec<u8>,
+    done: Done,
+) -> Outcome {
+    let v = filter_vmr(env, filter).unwrap();
+    let (owner, presenter, cookie) = (v.surface_allocator, v.presenter, v.cookie);
+    let surface = v.surfaces[v.surface_next];
+    v.surface_next = if v.surface_next == 0 {
+        v.surfaces.len() - 1
+    } else {
+        v.surface_next - 1
+    };
+    let Some(scratch) = alloc(env, 124) else {
+        return done(env, E_OUTOFMEMORY);
+    };
+    let _ = env.cpu.write_u32(scratch, 124);
+    guest_call(env, surface, 25, vec![0, scratch, 1, 0], move |env, hr| {
+        if hr != S_OK {
+            free(env, scratch);
+            return done(env, hr);
+        }
+        let pitch = env.cpu.read_u32(scratch + 16).unwrap();
+        let pixels = env.cpu.read_u32(scratch + 36).unwrap();
+        for y in 0..fmt.height {
+            let row = y as usize * fmt.width as usize * 4;
+            let _ = env
+                .cpu
+                .write(pixels + y * pitch, &bgra[row..row + fmt.width as usize * 4]);
+        }
+        guest_call(env, surface, 32, vec![0], move |env, _| {
+            guest_call(env, owner, 5, vec![cookie, surface, 0], move |env, hr| {
+                if hr != S_OK {
+                    free(env, scratch);
+                    return done(env, hr);
+                }
+                let mt = {
+                    let s = state(env);
+                    s.filters[&filter]
+                        .pins
+                        .iter()
+                        .find_map(|p| s.pins[p].mt.as_ref())
+                        .unwrap()
+                };
+                let word =
+                    |at: usize| u32::from_le_bytes(mt.format[at..at + 4].try_into().unwrap());
+                let mut info = [0u8; 72];
+                info[0..4].copy_from_slice(&(if start.is_some() { 8u32 } else { 0 }).to_le_bytes());
+                info[4..8].copy_from_slice(&surface.to_le_bytes());
+                info[8..16].copy_from_slice(&start.unwrap_or(0).to_le_bytes());
+                info[16..24].copy_from_slice(&end.unwrap_or(0).to_le_bytes());
+                info[24..28].copy_from_slice(&word(24).wrapping_sub(word(16)).to_le_bytes());
+                info[28..32].copy_from_slice(&word(28).wrapping_sub(word(20)).to_le_bytes());
+                let _ = env.cpu.write(scratch, &info);
+                guest_call(env, presenter, 5, vec![cookie, scratch], move |env, hr| {
+                    free(env, scratch);
+                    filter_vmr(env, filter).unwrap().prerolled = true;
+                    if hr != S_OK {
+                        return done(env, hr);
+                    }
+                    hold_sample(env, filter, done)
+                })
+            })
+        })
+    })
+}
+
+fn hold_sample(env: &mut Env<'_>, filter: u32, done: Done) -> Outcome {
+    let f = &state(env).filters[&filter];
+    let v = f.vmr.as_ref().unwrap();
+    if v.closed {
+        return done(env, E_UNEXPECTED);
+    }
+    if f.state != graph::PAUSED || v.flushing || v.stopping {
+        return done(env, S_OK);
+    }
+    let wake = v.wake;
+    env.sys.reset_event(wake);
+    Outcome::block(
+        Wait::Object {
+            handle: wake,
+            deadline: None,
+        },
+        move |env, _| hold_sample(env, filter, done),
+    )
 }
 
 fn to_bgra(src: &[u8], fmt: PixelFormat) -> Result<Vec<u8>, u32> {
@@ -1297,14 +2028,380 @@ mod tests {
         (m, graph, control, windowless, input_pin, config)
     }
 
+    // spec: MEDIA-VIDEO-8, MEDIA-VIDEO-9
+    #[test]
+    fn rendering_mode_locks_and_mixing_adds_pins_without_changing_mode() {
+        let mut m = machine();
+        let filter = activate(&mut m, CLSID_VIDEO_MIXING_RENDERER, IID_IBASEFILTER);
+        let config = query(&mut m, filter, IID_IVMRFILTERCONFIG);
+        assert_eq!(
+            method(
+                &mut m,
+                "IVMRFilterConfig::GetNumberOfStreams",
+                &[config, DATA]
+            ),
+            0x8004_0296
+        );
+        assert_eq!(
+            method(&mut m, "IVMRFilterConfig::SetNumberOfStreams", &[config, 3]),
+            S_OK
+        );
+        assert_eq!(
+            method(
+                &mut m,
+                "IVMRFilterConfig::GetNumberOfStreams",
+                &[config, DATA]
+            ),
+            S_OK
+        );
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), 3);
+        assert_eq!(m.ext.get::<State>().filters[&filter].pins.len(), 3);
+        assert_eq!(
+            method(&mut m, "IBaseFilter::EnumPins", &[filter, DATA]),
+            S_OK
+        );
+        let pins = m.cpu.read_u32(DATA).unwrap();
+        assert_eq!(method(&mut m, "IBaseFilter::AddRef", &[filter]), 4);
+        assert_eq!(method(&mut m, "IBaseFilter::Release", &[filter]), 3);
+        assert_eq!(method(&mut m, "IEnumPins::Next", &[pins, 1, DATA, 0]), S_OK);
+        let pin = m.cpu.read_u32(DATA).unwrap();
+        assert_eq!(method(&mut m, "IPin::AddRef", &[pin]), 5);
+        assert_eq!(method(&mut m, "IPin::Release", &[pin]), 4);
+        assert_eq!(method(&mut m, "IPin::Release", &[pin]), 3);
+        assert_eq!(method(&mut m, "IEnumPins::Release", &[pins]), 0);
+        assert_eq!(
+            method(&mut m, "IVMRFilterConfig::SetRenderingMode", &[config, 4]),
+            S_OK
+        );
+        assert_eq!(
+            method(&mut m, "IVMRFilterConfig::SetRenderingMode", &[config, 2]),
+            VFW_E_WRONG_STATE
+        );
+        m.cpu.write(DATA, &IID_IVMRWINDOWLESSCONTROL).unwrap();
+        assert_eq!(
+            method(
+                &mut m,
+                "IBaseFilter::QueryInterface",
+                &[filter, DATA, DATA + 16]
+            ),
+            E_NOINTERFACE
+        );
+        assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 0);
+    }
+
+    // spec: MEDIA-VIDEO-10, MEDIA-VIDEO-13
+    #[test]
+    fn bitmap_depth_decides_connection_and_basic_video_checks_outputs_first() {
+        let mut mt = MediaType::video_rgb(MEDIASUBTYPE_RGB32, 32, 16, 200_000);
+        mt.sub = GUID_NULL;
+        assert!(accepts_input(&mt));
+        mt.sub = amovie(0xe436_eb7a);
+        assert!(!connects_input(&mt));
+        mt.sub = guid(
+            0x4556_4157,
+            0,
+            0x10,
+            [0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71],
+        );
+        assert!(connects_input(&mt));
+        mt.format[62..64].copy_from_slice(&16u16.to_le_bytes());
+        assert!(!connects_input(&mt));
+        let mut m = machine();
+        let video = activate(&mut m, CLSID_VIDEO_MIXING_RENDERER, IID_IBASICVIDEO);
+        assert_eq!(
+            method(&mut m, "IBasicVideo2::get_VideoWidth", &[video, 0]),
+            E_POINTER
+        );
+        assert_eq!(
+            method(&mut m, "IBasicVideo2::get_VideoWidth", &[video, DATA]),
+            VFW_E_NOT_CONNECTED
+        );
+    }
+
+    // spec: MEDIA-VIDEO-11
+    #[test]
+    fn renderer_readiness_tracks_samples_eos_flush_and_stop() {
+        let (mut m, _graph, _, _, pin, _) = setup_windowless();
+        let filter = m.ext.get::<State>().pins[&pin].filter;
+        assert_eq!(method(&mut m, "IBaseFilter::Pause", &[filter]), S_FALSE);
+        assert_eq!(
+            method(&mut m, "IBaseFilter::GetState", &[filter, 0, DATA]),
+            0x0004_0237
+        );
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), graph::PAUSED);
+        m.ext
+            .get_mut::<State>()
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap()
+            .prerolled = true;
+        assert_eq!(
+            transition_result(&mut crate::dshow::tests::env(&mut m), filter),
+            S_OK
+        );
+        assert_eq!(
+            state_result(&mut crate::dshow::tests::env(&mut m), filter),
+            S_OK
+        );
+        assert_eq!(method(&mut m, "IPin::EndFlush", &[pin]), S_OK);
+        assert_eq!(
+            state_result(&mut crate::dshow::tests::env(&mut m), filter),
+            0x0004_0237
+        );
+        assert_eq!(method(&mut m, "IPin::EndOfStream", &[pin]), S_OK);
+        assert_eq!(
+            state_result(&mut crate::dshow::tests::env(&mut m), filter),
+            S_OK
+        );
+        assert_eq!(method(&mut m, "IBaseFilter::Stop", &[filter]), S_OK);
+        assert_eq!(
+            state_result(&mut crate::dshow::tests::env(&mut m), filter),
+            S_OK
+        );
+    }
+
+    // spec: MEDIA-VIDEO-12
+    #[test]
+    fn graph_startup_shows_only_windowed_auto_show_windows() {
+        let (mut m, graph, _, _, pin, _) = setup_windowless();
+        let filter = m.ext.get::<State>().pins[&pin].filter;
+        m.ext.insert(host::Host {
+            allocator: crate::interop::GuestAllocator {
+                allocate: |_, _| unreachable!(),
+                free: |_, _| unreachable!(),
+            },
+            open: |_, _, _| unreachable!(),
+            read: |_, _, _| unreachable!(),
+            close: |_, _| unreachable!(),
+            thread: |_, _| unreachable!(),
+            event: |_| unreachable!(),
+            signal: |_, _, _| unreachable!(),
+            post: |_, _| unreachable!(),
+            media_types: |_, _| unreachable!(),
+            sample: |_, _, _, _| unreachable!(),
+            export: |_, module, name| {
+                assert_eq!((module, name), ("user32.dll", "ShowWindow"));
+                Some(DATA + 2000)
+            },
+        });
+        let v = m
+            .ext
+            .get_mut::<State>()
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap();
+        v.hwnd = 0x200;
+        v.mode = VMR_MODE_WINDOWED;
+        m.ext
+            .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .auto_show = true;
+        let Outcome::Call {
+            target, args, then, ..
+        } = show_windows(
+            &mut crate::dshow::tests::env(&mut m),
+            graph,
+            Box::new(|_, _| Outcome::Return(123)),
+        )
+        else {
+            panic!("ShowWindow must be called");
+        };
+        assert_eq!(target, DATA + 2000);
+        assert_eq!(args, vec![0x200, 5]);
+        assert!(matches!(
+            then(
+                &mut crate::dshow::tests::env(&mut m),
+                adv_machine::Resume::Returned(0)
+            ),
+            Outcome::Return(123)
+        ));
+        m.ext
+            .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .auto_show = false;
+        assert!(matches!(
+            show_windows(
+                &mut crate::dshow::tests::env(&mut m),
+                graph,
+                Box::new(|_, _| Outcome::Return(123))
+            ),
+            Outcome::Return(123)
+        ));
+        m.ext
+            .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .auto_show = true;
+        m.ext
+            .get_mut::<State>()
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap()
+            .mode = VMR_MODE_WINDOWLESS;
+        assert!(matches!(
+            show_windows(
+                &mut crate::dshow::tests::env(&mut m),
+                graph,
+                Box::new(|_, _| Outcome::Return(123))
+            ),
+            Outcome::Return(123)
+        ));
+    }
+
+    // spec: MEDIA-VIDEO-14
+    #[test]
+    fn renderless_surfaces_are_allocated_on_properties_and_presented_by_the_guest() {
+        let (mut m, _graph, _, _, pin, _) = setup_windowless();
+        let filter = m.ext.get::<State>().pins[&pin].filter;
+        let owner = DATA + 1800;
+        let presenter = DATA + 1816;
+        let owner_vt = DATA + 1900;
+        let presenter_vt = DATA + 1940;
+        let surface_vt = DATA + 2048;
+        m.cpu.write_u32(owner, owner_vt).unwrap();
+        m.cpu.write_u32(presenter, presenter_vt).unwrap();
+        m.cpu.write_u32(owner_vt + 12, 0x71000003).unwrap();
+        m.cpu.write_u32(owner_vt + 20, 0x71000005).unwrap();
+        m.cpu.write_u32(presenter_vt + 20, 0x73000005).unwrap();
+        for slot in [1, 12, 25, 32] {
+            m.cpu
+                .write_u32(surface_vt + slot * 4, 0x72000000 + slot)
+                .unwrap();
+        }
+        let surfaces: Vec<u32> = (0..6).map(|i| DATA + 2304 + i * 8).collect();
+        for &surface in &surfaces {
+            m.cpu.write_u32(surface, surface_vt).unwrap();
+        }
+        let mut env = crate::dshow::tests::env(&mut m);
+        let v = filter_vmr(&mut env, filter).unwrap();
+        v.mode = VMR_MODE_RENDERLESS;
+        v.allocator = DATA + 1850;
+        v.surface_allocator = owner;
+        v.presenter = presenter;
+        v.cookie = 0xabacab;
+        m.cpu.write_u32(DATA + 128, 5).unwrap();
+        m.cpu.write_u32(STACK + 8, DATA + 128).unwrap();
+        let mut outcome = allocated(&mut crate::dshow::tests::env(&mut m), DATA + 1850).unwrap();
+        let mut attached = 0;
+        loop {
+            match outcome {
+                Outcome::Call {
+                    target, args, then, ..
+                } => {
+                    if target == 0x71000003 {
+                        assert_eq!(args[1], 0xabacab);
+                        assert_eq!(m.cpu.read_u32(args[2]).unwrap(), 0x14);
+                        assert_eq!(m.cpu.read_u32(args[2] + 20).unwrap(), 5);
+                        assert_eq!(m.cpu.read_u32(args[3]).unwrap(), 5);
+                        m.cpu.write_u32(args[3], 6).unwrap();
+                        m.cpu.write_u32(args[4], surfaces[0]).unwrap();
+                    } else if target == 0x7200000c {
+                        attached += 1;
+                        m.cpu.write_u32(args[2], surfaces[attached]).unwrap();
+                    } else {
+                        assert_eq!(target, 0x72000001);
+                    }
+                    outcome = then(
+                        &mut crate::dshow::tests::env(&mut m),
+                        adv_machine::Resume::Returned(S_OK),
+                    );
+                }
+                Outcome::Return(S_OK) => break,
+                _ => panic!("unexpected allocation outcome"),
+            }
+        }
+        let fmt =
+            parse_video_format(&MediaType::video_rgb(MEDIASUBTYPE_RGB32, 2, 2, 333_333)).unwrap();
+        filter::set_state(&mut crate::dshow::tests::env(&mut m), filter, graph::PAUSED);
+        let updates = m.ext.get_or_default::<Vec<Option<VideoLayer>>>().len();
+        outcome = present_renderless(
+            &mut crate::dshow::tests::env(&mut m),
+            filter,
+            fmt,
+            Some(0),
+            Some(333_333),
+            vec![0x55; 16],
+            Box::new(|_, hr| Outcome::Return(hr)),
+        );
+        let mut callbacks = 0;
+        loop {
+            match outcome {
+                Outcome::Call {
+                    target, args, then, ..
+                } => {
+                    match target {
+                        0x72000019 => {
+                            assert_eq!(args[0], surfaces[5]);
+                            m.cpu.write_u32(args[2] + 16, 8).unwrap();
+                            m.cpu.write_u32(args[2] + 36, DATA + 2600).unwrap();
+                        }
+                        0x72000020 => {}
+                        0x71000005 => {
+                            assert_eq!(args, vec![owner, 0xabacab, surfaces[5], 0]);
+                            callbacks += 1;
+                        }
+                        0x73000005 => {
+                            assert_eq!(m.cpu.read_u32(args[2]).unwrap(), 8);
+                            assert_eq!(m.cpu.read_u32(args[2] + 4).unwrap(), surfaces[5]);
+                            assert_eq!(
+                                read_i64(&crate::dshow::tests::env(&mut m), args[2] + 16),
+                                Some(333_333)
+                            );
+                            callbacks += 1;
+                        }
+                        _ => panic!("unexpected presenter call"),
+                    }
+                    outcome = then(
+                        &mut crate::dshow::tests::env(&mut m),
+                        adv_machine::Resume::Returned(S_OK),
+                    );
+                }
+                Outcome::Block { then, .. } => {
+                    assert_eq!(callbacks, 2);
+                    assert_eq!(m.ext.get::<Vec<Option<VideoLayer>>>().len(), updates);
+                    let mut pixels = [0; 16];
+                    m.cpu.read(DATA + 2600, &mut pixels).unwrap();
+                    assert_eq!(pixels, [0x55; 16]);
+                    filter::set_state(
+                        &mut crate::dshow::tests::env(&mut m),
+                        filter,
+                        graph::RUNNING,
+                    );
+                    assert!(matches!(
+                        then(
+                            &mut crate::dshow::tests::env(&mut m),
+                            adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled)
+                        ),
+                        Outcome::Return(S_OK)
+                    ));
+                    break;
+                }
+                _ => panic!("unexpected presentation outcome"),
+            }
+        }
+    }
+
+    // spec: MEDIA-VIDEO-2, MEDIA-VIDEO-8
     #[test]
     fn windowless_vmr_connects_before_clipping_window_and_maps_rects() {
         let (mut m, _graph, _control, windowless, _input, config) = setup_windowless();
-        // Multi-stream requests are rejected instead of succeeding silently.
-        assert_eq!(
-            method(&mut m, "IVMRFilterConfig::SetNumberOfStreams", &[config, 2]),
-            E_NOTIMPL
-        );
         assert_eq!(
             method(&mut m, "IVMRFilterConfig::SetNumberOfStreams", &[config, 0]),
             E_INVALIDARG
@@ -1381,6 +2478,7 @@ mod tests {
     }
 
     #[cfg(any(not(feature = "gpu"), feature = "media"))]
+    // spec: MEDIA-VIDEO-11, MEDIA-VIDEO-13
     #[test]
     fn pushed_rgb32_flips_rows_paces_pause_and_completes_on_eos() {
         let (mut m, graph, control, windowless, input_pin, _config) = setup_windowless();
@@ -1389,6 +2487,19 @@ mod tests {
                 &mut m,
                 "IVMRWindowlessControl::SetVideoClippingWindow",
                 &[windowless, 0x200]
+            ),
+            S_OK
+        );
+        let destination: Vec<u8> = [0i32, 0, 2, 2]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        m.cpu.write(DATA + 32, &destination).unwrap();
+        assert_eq!(
+            method(
+                &mut m,
+                "IVMRWindowlessControl::SetVideoPosition",
+                &[windowless, 0, DATA + 32]
             ),
             S_OK
         );
@@ -1453,9 +2564,14 @@ mod tests {
             S_OK
         );
         assert_eq!(
-            method(&mut m, "IMemInputPin::Receive", &[mem_input, sample]),
+            method(&mut m, "IMediaSample::SetPreroll", &[sample, 1]),
             S_OK
         );
+        let Outcome::Block { then: received, .. } =
+            receive(&mut crate::dshow::tests::env(&mut m), input_pin, sample)
+        else {
+            panic!("paused Receive must hold the sample after presenting it");
+        };
 
         #[cfg(not(feature = "gpu"))]
         {
@@ -1483,6 +2599,13 @@ mod tests {
 
         // Flush cancels delivery while Run + EndOfStream completes the graph.
         assert_eq!(method(&mut m, "IPin::BeginFlush", &[input_pin]), S_OK);
+        assert!(matches!(
+            received(
+                &mut crate::dshow::tests::env(&mut m),
+                adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled)
+            ),
+            Outcome::Return(S_OK)
+        ));
         assert_eq!(
             method(&mut m, "IMemInputPin::Receive", &[mem_input, sample]),
             S_FALSE
@@ -1523,6 +2646,7 @@ mod tests {
         assert_ne!(m.cpu.read_u32(DATA + 104).unwrap(), 0);
     }
 
+    // spec: MEDIA-FAIL-3
     #[test]
     fn paused_eos_defers_ec_complete_until_run_once() {
         const E_ABORT: u32 = 0x8000_4004;
@@ -1564,6 +2688,7 @@ mod tests {
         );
     }
 
+    // spec: MEDIA-VIDEO-10
     #[test]
     fn guest_sample_with_no_stop_time_preserves_start_timestamp() {
         let mut m = machine();
@@ -1571,12 +2696,7 @@ mod tests {
         let sample_obj = DATA + 2120;
         let buf = DATA + 2200;
         m.cpu.write(buf, &[0u8; 16]).unwrap();
-        let slots = [
-            (3u32, DATA + 2300),
-            (11, DATA + 2310),
-            (5, DATA + 2320),
-            (9, DATA + 2330),
-        ];
+        let slots = [(3u32, DATA + 2300), (11, DATA + 2310), (5, DATA + 2320)];
         m.cpu.write_u32(sample_obj, sample_vt).unwrap();
         for (slot, addr) in slots {
             m.cpu.write_u32(sample_vt + slot * 4, addr).unwrap();
@@ -1608,8 +2728,7 @@ mod tests {
                         env.cpu.write(args[1], &5_000_000i64.to_le_bytes()).unwrap();
                         VFW_S_NO_STOP_TIME
                     } else {
-                        assert_eq!(target, slots[3].1);
-                        S_FALSE
+                        panic!("unexpected sample method");
                     };
                     outcome = then(&mut env, adv_machine::Resume::Returned(hr));
                 }
@@ -1620,6 +2739,5 @@ mod tests {
         let sample = captured.borrow_mut().take().unwrap().unwrap();
         assert_eq!(sample.bytes.len(), 16);
         assert_eq!(sample.start_100ns, Some(5_000_000));
-        assert!(!sample.preroll);
     }
 }
