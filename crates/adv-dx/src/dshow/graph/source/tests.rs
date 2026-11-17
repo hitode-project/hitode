@@ -616,9 +616,10 @@ fn asf_reader_is_a_native_file_source_until_loaded() {
 
 #[cfg(feature = "media")]
 #[test]
-// spec: MEDIA-GRAPH-2
-fn asf_reader_load_probes_windows_media_video_and_audio() {
+// spec: MEDIA-GRAPH-19
+fn asf_reader_load_defers_streams_until_graph_join() {
     let mut m = machine();
+    crate::dshow::tests::install_media_host(&mut m);
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
         .unwrap();
     let guest_path = authored(
@@ -639,14 +640,37 @@ fn asf_reader_load_probes_windows_media_video_and_audio() {
         ),
         S_OK
     );
-    let info = m.ext.get::<State>().filters[&reader]
-        .source
-        .as_ref()
-        .and_then(|s| s.info.clone())
-        .unwrap();
-    let video = info.video.unwrap();
-    assert_eq!((video.width, video.height), (32, 16));
-    assert_eq!(info.audio.unwrap().sample_rate, 22050);
+    assert!(m.ext.get::<State>().filters[&reader].pins.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    assert_eq!(
+        invoke(
+            &mut m,
+            reader,
+            "IBaseFilter",
+            "JoinFilterGraph",
+            &[graph, 0]
+        ),
+        S_OK
+    );
+    let pins = m.ext.get::<State>().filters[&reader].pins.clone();
+    let video = crate::dshow::asf::types(&env(&mut m), pins[0]);
+    assert_eq!(
+        video[1].video_geometry().map(|(w, h, _)| (w, h)),
+        Some((32, 16))
+    );
+    let audio = crate::dshow::asf::types(&env(&mut m), pins[1]);
+    assert!(matches!(
+        audio[0].codec_format(),
+        Some(CodecFormat::Audio { rate: 22050, .. })
+    ));
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_some());
+    for transition in ["Run", "Pause", "Stop"] {
+        assert_eq!(
+            invoke(&mut m, reader, "IBaseFilter", transition, &[0, 0]),
+            S_OK
+        );
+    }
     method(&mut m, "IFileSourceFilter::Release", &[file_face]);
     assert_eq!(method(&mut m, "IBaseFilter::Release", &[reader]), 0);
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());

@@ -12,6 +12,9 @@ use super::filter::{INPUT, OUTPUT, Role};
 use super::*;
 use crate::dsound::Sound;
 
+mod object;
+pub(super) use object::IID_IMEDIABUFFER;
+
 pub(crate) const CLSID_DMO_WRAPPER: Iid = guid(
     0x9429_7043,
     0xbd82,
@@ -43,6 +46,9 @@ const E_FAIL: u32 = 0x8000_4005;
 const POLL_US: u64 = 10_000;
 
 pub(crate) struct Dmo {
+    object: u32,
+    eos: bool,
+    receiving: bool,
     decoder: Option<PacketDecoder>,
     /// Host allocator handed to the upstream output; one internal reference.
     input_allocator: u32,
@@ -65,7 +71,11 @@ pub(crate) struct Dmo {
 
 /// CoCreateInstance(CLSID_DMOWrapperFilter): pins appear at IDMOWrapperFilter::Init.
 pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    filter::create_filter(env, iid, outer, output, Role::DmoDecoder, CLSID_DMO_WRAPPER)
+    if outer != 0 && iid != adv_os::com::IUNKNOWN {
+        let _ = env.cpu.write_u32(output, 0);
+        return Outcome::Return(E_NOINTERFACE);
+    }
+    filter::create_filter(env, iid, 0, output, Role::DmoDecoder, CLSID_DMO_WRAPPER)
 }
 
 fn dmo<'a>(env: &'a mut Env<'_>, filter: u32) -> Option<&'a mut Dmo> {
@@ -85,7 +95,7 @@ fn pin_of(env: &Env<'_>, filter: u32, dir: u32) -> Option<u32> {
         .find(|p| state.pins[p].dir == dir)
 }
 
-/// IDMOWrapperFilter::Init: only the Windows Media decoders are provided.
+/// IDMOWrapperFilter::Init selects a built-in decoder or aggregates a guest DMO.
 pub(crate) fn wrapper_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome> {
     if method != "Init" {
         return None;
@@ -99,39 +109,119 @@ pub(crate) fn wrapper_method(env: &mut Env<'_>, filter: u32, method: &str) -> Op
     let major = match clsid {
         c if c == CLSID_WMV_DECODER => MEDIATYPE_VIDEO,
         c if c == CLSID_WMA_DECODER => MEDIATYPE_AUDIO,
-        _ => {
-            adv_abi::warn_unavailable(
-                env,
-                "IDMOWrapperFilter::Init",
-                "only the Windows Media audio and video decoder DMOs are provided",
-            );
-            return Some(Outcome::Return(REGDB_E_CLASSNOTREG));
-        }
+        _ => return Some(object::init(env, filter, clsid)),
     };
-    let wake = env.sys.objects.insert(Object::Event {
-        manual_reset: false,
-        signaled: false,
-    });
     for (dir, name) in [(INPUT, "in0"), (OUTPUT, "out0")] {
         if let Err(error) = filter::new_pin(env, filter, dir, name, major, None) {
-            env.sys.objects.close(wake);
             return Some(Outcome::Return(error));
         }
     }
-    state(env).filters.get_mut(&filter).unwrap().dmo = Some(Dmo {
-        decoder: None,
-        input_allocator: 0,
-        audio: None,
-        wake,
-        flushing: false,
-        stopping: false,
-        prerolled: false,
-        discontinuity: true,
-        segment: 0,
-        upstream_seeking: 0,
-        upstream_filter: 0,
-    });
+    let dmo = Dmo::new(env, 0);
+    state(env).filters.get_mut(&filter).unwrap().dmo = Some(dmo);
     Some(Outcome::Return(S_OK))
+}
+
+impl Dmo {
+    pub(super) fn new(env: &mut Env<'_>, object: u32) -> Self {
+        let wake = env.sys.objects.insert(Object::Event {
+            manual_reset: object != 0,
+            signaled: false,
+        });
+        Self {
+            object,
+            eos: false,
+            receiving: false,
+            decoder: None,
+            input_allocator: 0,
+            audio: None,
+            wake,
+            flushing: false,
+            stopping: false,
+            prerolled: false,
+            discontinuity: true,
+            segment: 0,
+            upstream_seeking: 0,
+            upstream_filter: 0,
+        }
+    }
+}
+
+pub(super) fn is_object(env: &Env<'_>, filter: u32) -> bool {
+    env.ext.get::<State>().filters[&filter]
+        .dmo
+        .as_ref()
+        .is_some_and(|d| d.object != 0)
+}
+
+pub(super) fn inner(env: &Env<'_>, filter: u32) -> u32 {
+    env.ext.get::<State>().filters[&filter]
+        .dmo
+        .as_ref()
+        .map_or(0, |d| d.object)
+}
+
+pub(super) fn transition(env: &mut Env<'_>, filter: u32, value: u32, then: Done) -> Outcome {
+    if state(env).filters[&filter].dmo.is_none() {
+        return then(env, E_FAIL);
+    }
+    if is_object(env, filter) {
+        return object::transition(env, filter, value, then);
+    }
+    filter::set_state(env, filter, value);
+    then(env, S_OK)
+}
+
+pub(super) fn connect(env: &mut Env<'_>, pin: u32, peer: u32, mt: u32) -> Outcome {
+    object::connect(env, pin, peer, mt)
+}
+
+pub(super) fn clear_type(env: &mut Env<'_>, pin: u32) -> Outcome {
+    object::set_type(env, pin, 0, 2)
+}
+
+pub(super) fn object_pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
+    let filter = filter_of(env, pin);
+    if !is_object(env, filter) {
+        return None;
+    }
+    match method {
+        "Connect" => Some(object::connect(env, pin, env.arg(1), env.arg(2))),
+        "ReceiveConnection" => {
+            if state(env).pins[&pin].dir == OUTPUT {
+                return Some(Outcome::Return(E_UNEXPECTED));
+            }
+            Some(object::receive_connection(env, pin, env.arg(1), env.arg(2)))
+        }
+        "QueryAccept" => {
+            let outcome = object::set_type(env, pin, env.arg(1), 1);
+            Some(after(
+                env,
+                outcome,
+                Box::new(|_, hr| Outcome::Return(if hr[0] == S_OK { S_OK } else { S_FALSE })),
+            ))
+        }
+        "EnumMediaTypes" => {
+            let output = env.arg(1);
+            Some(object::types(
+                env,
+                pin,
+                Box::new(move |env, types| {
+                    match super::create(
+                        env,
+                        &[Face::EnumMediaTypes],
+                        Obj::EnumTypes { types, position: 0 },
+                    ) {
+                        Ok(faces) => {
+                            let _ = env.cpu.write_u32(output, faces[0]);
+                            Outcome::Return(S_OK)
+                        }
+                        Err(hr) => Outcome::Return(hr),
+                    }
+                }),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Whether the input pin can decode `mt`.
@@ -311,6 +401,9 @@ pub(crate) fn output_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
 /// Drop decoding state when the input disconnects.
 pub(crate) fn disconnected(env: &mut Env<'_>, pin: u32) {
     let filter = filter_of(env, pin);
+    if is_object(env, filter) {
+        return;
+    }
     if state(env).pins[&pin].dir != INPUT {
         return;
     }
@@ -428,6 +521,11 @@ pub(crate) fn renderers(env: &Env<'_>, graph: u32) -> u32 {
 pub(crate) fn input_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));
     let filter = filter_of(env, pin);
+    if is_object(env, filter)
+        && let Some(outcome) = object::input_method(env, filter, method)
+    {
+        return Some(outcome);
+    }
     match method {
         "GetAllocator" => {
             let output = env.arg(1);
@@ -497,9 +595,12 @@ fn receive(env: &mut Env<'_>, filter: u32, sample: u32) -> Outcome {
     receive_then(env, filter, sample, Box::new(|_, hr| Outcome::Return(hr)))
 }
 
-type Done = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
+pub(super) type Done = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
 
 fn receive_then(env: &mut Env<'_>, filter: u32, sample: u32, done: Done) -> Outcome {
+    if is_object(env, filter) {
+        return object::receive(env, filter, sample, done);
+    }
     let filter_state = state(env).filters[&filter].state;
     let Some(d) = dmo(env, filter) else {
         return done(env, E_UNEXPECTED);
@@ -771,6 +872,9 @@ fn push_audio(
 /// IPin streaming calls on DMO pins.
 pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let filter = filter_of(env, pin);
+    if is_object(env, filter) {
+        return object::pin_method(env, pin, method);
+    }
     if state(env).pins[&pin].dir != INPUT {
         return None;
     }
@@ -866,4 +970,102 @@ fn finish_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Out
         return graph::flush_posts(env, Box::new(|_, _| Outcome::Return(S_OK)));
     }
     Outcome::Return(S_OK)
+}
+
+pub(super) fn interface_methods(interface: &str) -> Option<Vec<(&'static str, Conv, u16)>> {
+    let methods: &[(&str, u8)] = match interface {
+        "IMediaBuffer" => &[
+            ("QueryInterface", 3),
+            ("AddRef", 1),
+            ("Release", 1),
+            ("SetLength", 2),
+            ("GetMaxLength", 2),
+            ("GetBufferAndLength", 3),
+        ],
+        "IQualityControl" => &[
+            ("QueryInterface", 3),
+            ("AddRef", 1),
+            ("Release", 1),
+            ("Notify", 8),
+            ("SetSink", 2),
+        ],
+        "IPersistStream" => &[
+            ("QueryInterface", 3),
+            ("AddRef", 1),
+            ("Release", 1),
+            ("GetClassID", 2),
+            ("IsDirty", 1),
+            ("Load", 2),
+            ("Save", 3),
+            ("GetSizeMax", 2),
+        ],
+        _ => return None,
+    };
+    Some(
+        methods
+            .iter()
+            .enumerate()
+            .map(|(slot, &(name, argc))| (name, Conv::Stdcall { argc }, slot as u16))
+            .collect(),
+    )
+}
+
+pub(super) fn release_method(env: &mut Env<'_>, this: u32) -> Option<Outcome> {
+    let key = canonical(env, this)?;
+    let owner = filter::pin_parent(env, this).unwrap_or(key);
+    let com = state(env).com;
+    let id = com.identity::<Obj>(&env.sys.objects, owner)?;
+    if com.references(&env.sys.objects, id) != Some(1) {
+        return None;
+    }
+    let mut calls = VecDeque::new();
+    match payload(env, owner)? {
+        Obj::DmoBuffer { sample, .. } => calls.push_back(Call(*sample, 2, vec![])),
+        Obj::Filter => {
+            let d = state(env).filters[&owner].dmo.as_ref()?;
+            if d.object == 0 {
+                return None;
+            }
+            calls.push_back(Call(d.object, 2, vec![]));
+            if d.input_allocator != 0 {
+                calls.push_back(Call(d.input_allocator, 2, vec![]));
+            }
+        }
+        _ => return None,
+    }
+    Some(chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |env, _| Outcome::Return(release(env, this))),
+    ))
+}
+
+pub(super) fn buffer_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> {
+    let (sample, length) = match payload(env, this)? {
+        Obj::DmoBuffer { sample, length } => (*sample, *length),
+        _ => return None,
+    };
+    let a1 = env.arg(1);
+    Some(match method {
+        "SetLength" => {
+            if let Some(Obj::DmoBuffer { length, .. }) = payload_mut(env, this) {
+                *length = a1;
+            }
+            Outcome::Return(S_OK)
+        }
+        "GetMaxLength" => guest_call(env, sample, 4, vec![], move |env, size| {
+            let _ = env.cpu.write_u32(a1, size);
+            Outcome::Return(S_OK)
+        }),
+        "GetBufferAndLength" => {
+            let _ = env.cpu.write_u32(env.arg(2), length);
+            if a1 == 0 {
+                Outcome::Return(S_OK)
+            } else {
+                guest_call(env, sample, 3, vec![a1], |_, hr| Outcome::Return(hr))
+            }
+        }
+        _ => return None,
+    })
 }

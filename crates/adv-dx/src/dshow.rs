@@ -15,6 +15,7 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use adv_os::com::{Com, Iid, QueryError};
 
+mod asf;
 mod automation;
 mod dmo;
 #[cfg(test)]
@@ -213,8 +214,7 @@ const CLSID_MPEG_AUDIO_CODEC: Iid = guid(
     0x11ce,
     [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
 );
-/// qasf's WM ASF Reader: a file source whose Load hands the file to the
-/// common decoder, so Windows Media streams render natively.
+/// qasf's WM ASF Reader publishes compressed streams when it joins a graph.
 pub(crate) const CLSID_WMASF_READER: Iid = guid(
     0x1874_63a0,
     0x5bb7,
@@ -233,6 +233,9 @@ const CLSID_AUDIO_RENDER: Iid = guid(
     0x11ce,
     [0x87, 0x5d, 0x00, 0x60, 0x8c, 0xb7, 0x80, 0x66],
 );
+
+const IID_IQUALITYCONTROL: Iid = quartz(0x56a8_68a5);
+const IID_IPERSISTSTREAM: Iid = guid(0x0000_0109, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
 
 /// One guest-visible vtable layout. The generated COM table supplies slots and
 /// stack widths; a face may answer for every IID its vtable is a superset of.
@@ -262,13 +265,19 @@ pub(crate) enum Face {
     MemAllocator,
     MediaSample,
     DmoWrapper,
+    MediaBuffer,
+    QualityControl,
+    PersistStream,
+    ServiceProvider,
+    WmHeaderInfo,
+    WmReaderAdvanced,
     VmrFilterConfig,
     VmrWindowlessControl,
     /// An aggregated object's own, non-delegating IUnknown.
     Inner,
 }
 
-const FACES: [(Face, &str); 27] = [
+const FACES: [(Face, &str); 33] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -293,6 +302,12 @@ const FACES: [(Face, &str); 27] = [
     (Face::MemAllocator, "IMemAllocator"),
     (Face::MediaSample, "IMediaSample"),
     (Face::DmoWrapper, "IDMOWrapperFilter"),
+    (Face::MediaBuffer, "IMediaBuffer"),
+    (Face::QualityControl, "IQualityControl"),
+    (Face::PersistStream, "IPersistStream"),
+    (Face::ServiceProvider, "IServiceProvider"),
+    (Face::WmHeaderInfo, "IWMHeaderInfo"),
+    (Face::WmReaderAdvanced, "IWMReaderAdvanced2"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
     (Face::Inner, "IUnknown"),
@@ -329,6 +344,12 @@ impl Face {
             Face::MemAllocator => &[IID_IMEMALLOCATOR],
             Face::MediaSample => &[IID_IMEDIASAMPLE],
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
+            Face::MediaBuffer => &[dmo::IID_IMEDIABUFFER],
+            Face::QualityControl => &[IID_IQUALITYCONTROL],
+            Face::PersistStream => &[IID_IPERSISTSTREAM],
+            Face::ServiceProvider => &[asf::IID_ISERVICEPROVIDER],
+            Face::WmHeaderInfo => &[asf::IID_IWMHEADERINFO],
+            Face::WmReaderAdvanced => &[asf::IID_IWMREADERADVANCED, asf::IID_IWMREADERADVANCED2],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
             Face::Inner => &[],
@@ -358,6 +379,10 @@ pub(crate) enum Obj {
     },
     Allocator,
     Sample,
+    DmoBuffer {
+        sample: u32,
+        length: u32,
+    },
 }
 
 pub(crate) struct State {
@@ -369,6 +394,7 @@ pub(crate) struct State {
     pub(crate) allocators: BTreeMap<u32, sample::Allocator>,
     pub(crate) samples: BTreeMap<u32, sample::Sample>,
     pub(crate) sessions: BTreeMap<u32, stream::Session>,
+    asf_threads: BTreeMap<u32, (u32, Vec<(u32, usize)>)>,
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
@@ -402,6 +428,10 @@ fn interface_methods(interface: &str) -> Vec<(&'static str, Conv, u16)> {
         .collect();
     if !from_abi.is_empty() {
         return from_abi;
+    }
+    let extra = dmo::interface_methods(interface).or_else(|| asf::interface_methods(interface));
+    if let Some(methods) = extra {
+        return methods;
     }
     vmr::interface_methods(interface)
         .map(|methods| methods.to_vec())
@@ -500,6 +530,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         allocators: BTreeMap::new(),
         samples: BTreeMap::new(),
         sessions: BTreeMap::new(),
+        asf_threads: BTreeMap::new(),
         next_session: 1,
         pending_threads: Vec::new(),
         pending_posts: Vec::new(),
@@ -610,6 +641,9 @@ pub(crate) fn payload_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a 
 }
 
 pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
+    if let Some(parent) = filter::pin_parent(env, pointer) {
+        return add_ref(env, parent);
+    }
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
@@ -621,6 +655,9 @@ pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
 
 /// Host-side Release; samples return to their allocator instead of being destroyed.
 pub(crate) fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
+    if let Some(parent) = filter::pin_parent(env, pointer) {
+        return release(env, parent);
+    }
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
@@ -660,6 +697,9 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             if let Some(handle) = filter.source.and_then(|s| s.file_handle) {
                 host::close(env, handle);
             }
+            if let Some(asf) = filter.asf {
+                asf::destroyed(env, asf);
+            }
             if let Some(dmo) = filter.dmo {
                 dmo::destroyed(env, dmo);
             }
@@ -679,7 +719,10 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
         Obj::Sample => {
             state.samples.remove(&canonical);
         }
-        Obj::EnumFilters { .. } | Obj::EnumPins { .. } | Obj::EnumTypes { .. } => {}
+        Obj::EnumPins { filter, .. } => {
+            release(env, *filter);
+        }
+        Obj::DmoBuffer { .. } | Obj::EnumFilters { .. } | Obj::EnumTypes { .. } => {}
     }
 }
 
@@ -730,11 +773,32 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     {
         return graph::mapper::query(env, graph, env.arg(1), env.arg(2));
     }
+    if slot == 0 && matches!(payload(env, this), Some(Obj::Filter)) {
+        let hr = query_interface(env, this, env.arg(1), env.arg(2));
+        let filter = canonical(env, this).unwrap();
+        let inner = dmo::inner(env, filter);
+        if hr == E_NOINTERFACE && inner != 0 {
+            return guest_call(env, inner, 0, vec![env.arg(1), env.arg(2)], |_, hr| {
+                Outcome::Return(hr)
+            });
+        }
+        return Outcome::Return(hr);
+    }
+    if slot == 2
+        && let Some(outcome) = dmo::release_method(env, this)
+    {
+        return outcome;
+    }
     match slot {
         0 => return Outcome::Return(query_interface(env, this, env.arg(1), env.arg(2))),
         1 => return Outcome::Return(add_ref(env, this)),
         2 => return graph::release_method(env, this),
         _ => {}
+    }
+    if matches!(payload(env, this), Some(Obj::Pin))
+        && matches!(face, Face::MediaSeeking | Face::MediaPosition)
+    {
+        return Outcome::Return(E_NOTIMPL);
     }
     if let Some(outcome) = automation::call(env, face, &method, this) {
         return outcome;
@@ -764,6 +828,12 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::DmoWrapper => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
+        Face::MediaBuffer => dmo::buffer_method(env, this, &method),
+        Face::QualityControl
+        | Face::ServiceProvider
+        | Face::WmHeaderInfo
+        | Face::WmReaderAdvanced => None,
+        Face::PersistStream => filter::call(env, Face::BaseFilter, &method, this),
         Face::Inner => None,
     };
     outcome.unwrap_or_else(|| {
@@ -794,8 +864,12 @@ pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u3
         return E_POINTER;
     };
     let com = state(env).com;
-    match com.query::<Obj>(&mut env.sys.objects, this, requested) {
+    let resolved = com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested);
+    match resolved {
         Ok(pointer) => {
+            if add_ref(env, pointer) == 0 {
+                return E_OUTOFMEMORY;
+            }
             let _ = env.cpu.write_u32(output, pointer);
             S_OK
         }

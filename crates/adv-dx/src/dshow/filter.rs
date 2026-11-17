@@ -49,6 +49,7 @@ pub(crate) struct Filter {
     pub source_path: Vec<u16>,
     pub dmo: Option<super::dmo::Dmo>,
     pub vmr: Option<super::vmr::Vmr>,
+    pub asf: Option<super::asf::Asf>,
     /// The controlling outer object of an aggregated filter, and the filter's
     /// own non-delegating IUnknown; both zero otherwise.
     pub outer: u32,
@@ -58,7 +59,7 @@ pub(crate) struct Filter {
 pub(crate) struct Pin {
     pub filter: u32,
     pub dir: u32,
-    name: &'static str,
+    name: String,
     pub major: Iid,
     /// Connected IPin (host canonical or guest pointer); 0 when unconnected.
     pub peer: u32,
@@ -187,8 +188,15 @@ pub(super) fn new_filter(
 ) -> Result<u32, u32> {
     let is_vmr = role == Role::VideoRenderer && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER;
     let faces: &[Face] = match role {
+        Role::FileSource if clsid == CLSID_WMASF_READER => &[
+            Face::BaseFilter,
+            Face::FileSource,
+            Face::ServiceProvider,
+            Face::WmHeaderInfo,
+            Face::WmReaderAdvanced,
+        ],
         Role::FileSource => &[Face::BaseFilter, Face::FileSource],
-        Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper],
+        Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper, Face::PersistStream],
         Role::VideoRenderer if is_vmr => &[
             Face::BaseFilter,
             Face::VmrFilterConfig,
@@ -211,6 +219,7 @@ pub(super) fn new_filter(
             *faces.last().unwrap()
         },
     );
+    let asf = (clsid == CLSID_WMASF_READER).then(|| super::asf::Asf::new(env));
     let vmr = (role == Role::VideoRenderer).then(|| super::vmr::Vmr::new(env));
     state(env).filters.insert(
         base,
@@ -225,11 +234,13 @@ pub(super) fn new_filter(
             source_path: Vec::new(),
             dmo: None,
             vmr,
+            asf,
             outer,
             inner,
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
+        Role::FileSource if clsid == CLSID_WMASF_READER => &[],
         Role::FileSource => &[(OUTPUT, "Output", MEDIATYPE_STREAM)],
         Role::Splitter => &[(INPUT, "Input", MEDIATYPE_STREAM)],
         Role::VideoDecoder => &[
@@ -260,23 +271,33 @@ pub(super) fn new_pin(
     env: &mut Env<'_>,
     filter: u32,
     dir: u32,
-    name: &'static str,
+    name: &str,
     major: Iid,
     mt: Option<MediaType>,
 ) -> Result<u32, u32> {
-    let faces: &[Face] = if dir == INPUT {
-        &[Face::Pin, Face::MemInputPin]
-    } else {
-        &[Face::Pin]
-    };
-    let faces = super::create(env, faces, Obj::Pin)?;
+    let f = &state(env).filters[&filter];
+    let owned = f.asf.is_some() || f.role == Role::DmoDecoder;
+    let mut faces = vec![Face::Pin];
+    if dir == INPUT {
+        faces.push(Face::MemInputPin);
+    }
+    if owned {
+        faces.push(Face::QualityControl);
+        if dir == OUTPUT {
+            faces.push(Face::MediaSeeking);
+            if f.role == Role::DmoDecoder {
+                faces.push(Face::MediaPosition);
+            }
+        }
+    }
+    let faces = super::create(env, &faces, Obj::Pin)?;
     let pin = faces[0];
     state(env).pins.insert(
         pin,
         Pin {
             filter,
             dir,
-            name,
+            name: name.into(),
             major,
             peer: 0,
             mt,
@@ -287,9 +308,22 @@ pub(super) fn new_pin(
         },
     );
     retain_internal(env, pin);
-    release(env, pin);
+    let com = state(env).com;
+    com.release::<Obj>(&mut env.sys.objects, pin);
+    if owned {
+        for &face in &state(env).pins[&pin].faces.clone() {
+            let _ = env.cpu.write_u32(face + 4, 0);
+        }
+    }
     state(env).filters.get_mut(&filter).unwrap().pins.push(pin);
     Ok(pin)
+}
+
+pub(super) fn pin_parent(env: &Env<'_>, pointer: u32) -> Option<u32> {
+    let state = env.ext.try_get::<State>()?;
+    let pin = state.pins.get(&canonical(env, pointer)?)?;
+    let f = &state.filters[&pin.filter];
+    (f.asf.is_some() || f.role == Role::DmoDecoder).then_some(pin.filter)
 }
 
 fn role_of(env: &Env<'_>, pin: u32) -> Role {
@@ -317,11 +351,14 @@ fn host_filter(env: &Env<'_>, pointer: u32) -> Option<u32> {
 
 pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<Outcome> {
     match face {
-        Face::FileSource => Some(super::graph::source::file_method(
-            env,
-            host_filter(env, this)?,
-            method,
-        )),
+        Face::FileSource => {
+            let filter = host_filter(env, this)?;
+            Some(if state(env).filters[&filter].asf.is_some() {
+                super::asf::file_method(env, filter, method)
+            } else {
+                super::graph::source::file_method(env, filter, method)
+            })
+        }
         Face::BaseFilter => filter_method(env, host_filter(env, this)?, method),
         Face::Pin => pin_method(env, host_pin(env, this)?, method),
         Face::MemInputPin => {
@@ -354,8 +391,14 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 "Pause" => graph::PAUSED,
                 _ => graph::RUNNING,
             };
-            set_state(env, filter, value);
-            r(S_OK)
+            let start = if method == "Run" { arg_i64(env, 1) } else { 0 };
+            Some(transition(
+                env,
+                filter,
+                value,
+                start,
+                Box::new(|_, hr| Outcome::Return(hr)),
+            ))
         }
         "GetState" => {
             let value = state(env).filters[&filter].state;
@@ -384,6 +427,7 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
                 },
             ) {
                 Ok(faces) => {
+                    add_ref(env, filter);
                     let _ = env.cpu.write_u32(a1, faces[0]);
                     r(S_OK)
                 }
@@ -434,14 +478,63 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
         "JoinFilterGraph" => {
             let graph = canonical(env, a1).unwrap_or(0);
             let name = read_wide(env, env.arg(2), 127);
-            let f = state(env).filters.get_mut(&filter).unwrap();
-            f.graph = graph;
-            f.name = name;
-            r(S_OK)
+            Some(join_graph(
+                env,
+                filter,
+                graph,
+                name,
+                Box::new(|_, hr| Outcome::Return(hr)),
+            ))
         }
         "QueryVendorInfo" => r(E_NOTIMPL),
         _ => None,
     }
+}
+
+pub(crate) fn join_graph(
+    env: &mut Env<'_>,
+    filter: u32,
+    graph: u32,
+    name: Vec<u16>,
+    then: super::dmo::Done,
+) -> Outcome {
+    if state(env).filters[&filter].asf.is_some() {
+        return super::asf::join(
+            env,
+            filter,
+            graph,
+            Box::new(move |env, hr| {
+                if hr == S_OK {
+                    let f = state(env).filters.get_mut(&filter).unwrap();
+                    f.graph = graph;
+                    f.name = name;
+                }
+                then(env, hr)
+            }),
+        );
+    }
+    let f = state(env).filters.get_mut(&filter).unwrap();
+    f.graph = graph;
+    f.name = name;
+    then(env, S_OK)
+}
+
+pub(crate) fn transition(
+    env: &mut Env<'_>,
+    filter: u32,
+    value: u32,
+    _start: i64,
+    then: super::dmo::Done,
+) -> Outcome {
+    let f = &state(env).filters[&filter];
+    if f.asf.is_some() {
+        return super::asf::transition(env, filter, value, then);
+    }
+    if f.role == Role::DmoDecoder {
+        return super::dmo::transition(env, filter, value, then);
+    }
+    set_state(env, filter, value);
+    then(env, S_OK)
 }
 
 pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
@@ -489,6 +582,9 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
             }
             _ => {}
         }
+    }
+    if let Some(outcome) = super::dmo::object_pin_method(env, pin, method) {
+        return Some(outcome);
     }
     let a1 = env.arg(1);
     match method {
@@ -659,6 +755,9 @@ fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
 fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
     let state = env.ext.get::<State>();
     let p = &state.pins[&pin];
+    if state.filters[&p.filter].asf.is_some() {
+        return super::asf::types(env, pin);
+    }
     let role = state.filters.get(&p.filter).map(|f| f.role);
     match (role, p.dir) {
         (Some(Role::Splitter), INPUT) => vec![MediaType {
@@ -734,6 +833,11 @@ pub(crate) fn connect(env: &mut Env<'_>, out: u32, input: u32, pmt: u32) -> Outc
     if out == 0 || input == 0 {
         return Outcome::Return(E_POINTER);
     }
+    if let Some(pin) = host_pin(env, out)
+        && super::dmo::is_object(env, env.ext.get::<State>().pins[&pin].filter)
+    {
+        return super::dmo::connect(env, pin, input, pmt);
+    }
     match (host_pin(env, out), host_pin(env, input)) {
         (Some(out), Some(input)) => Outcome::Return(connect_hosts(env, out, input)),
         (Some(out), None) => connect_to_guest(env, out, input, pmt),
@@ -803,6 +907,7 @@ fn connect_to_guest(env: &mut Env<'_>, out: u32, input: u32, pmt: u32) -> Outcom
             candidates.retain(|c| {
                 (wanted.major == GUID_NULL || c.major == wanted.major)
                     && (wanted.sub == GUID_NULL || c.sub == wanted.sub)
+                    && (wanted.format_type == GUID_NULL || c.format_type == wanted.format_type)
             });
         }
     }
@@ -840,7 +945,7 @@ fn try_types(
     })
 }
 
-fn free_type_block(env: &mut Env<'_>, block: u32) {
+pub(super) fn free_type_block(env: &mut Env<'_>, block: u32) {
     if let Ok(data) = env.cpu.read_u32(block + 68)
         && data != 0
     {
@@ -874,7 +979,10 @@ fn finish_guest_connection(
                 return abort_guest_connection(env, out, input, VFW_E_NO_TRANSPORT);
             }
             state(env).pins.get_mut(&out).unwrap().mem = mem;
-            let size = if mt.major == MEDIATYPE_AUDIO {
+            let filter = state(env).pins[&out].filter;
+            let size = if state(env).filters[&filter].asf.is_some() {
+                super::asf::sample_size(env, out)
+            } else if mt.major == MEDIATYPE_AUDIO {
                 // Keep a second of PCM, as the DirectSound renderer does.
                 u32::from_le_bytes(mt.format[8..12].try_into().unwrap())
             } else {
@@ -904,7 +1012,12 @@ fn finish_guest_connection(
     )
 }
 
-fn abort_guest_connection(env: &mut Env<'_>, out: u32, input: u32, error: u32) -> Outcome {
+pub(super) fn abort_guest_connection(
+    env: &mut Env<'_>,
+    out: u32,
+    input: u32,
+    error: u32,
+) -> Outcome {
     let mem = state(env).pins[&out].mem;
     disconnect_host(env, out);
     let mut calls = VecDeque::new();
@@ -939,21 +1052,37 @@ fn describe(mt: &MediaType) -> String {
 pub(crate) fn disconnect(env: &mut Env<'_>, pin: u32) -> Outcome {
     match host_pin(env, pin) {
         Some(pin) => {
-            let hr = if state(env).pins[&pin].peer == 0 {
-                S_FALSE
-            } else {
-                S_OK
-            };
-            let calls = disconnect_owned(env, pin);
-            chain(
-                env,
-                calls,
-                Vec::new(),
-                Box::new(move |_, _| Outcome::Return(hr)),
-            )
+            let filter = state(env).pins[&pin].filter;
+            if super::dmo::is_object(env, filter) {
+                if state(env).filters[&filter].state != graph::STOPPED {
+                    return Outcome::Return(0x8004_0224);
+                }
+                let outcome = super::dmo::clear_type(env, pin);
+                return after(
+                    env,
+                    outcome,
+                    Box::new(move |env, _| disconnect_pin(env, pin)),
+                );
+            }
+            disconnect_pin(env, pin)
         }
         None => guest_call(env, pin, 5, vec![], |_, hr| Outcome::Return(hr)),
     }
+}
+
+fn disconnect_pin(env: &mut Env<'_>, pin: u32) -> Outcome {
+    let hr = if state(env).pins[&pin].peer == 0 {
+        S_FALSE
+    } else {
+        S_OK
+    };
+    let calls = disconnect_owned(env, pin);
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |_, _| Outcome::Return(hr)),
+    )
 }
 
 /// Detach a host pin and return the guest releases owned by its connection.
@@ -961,7 +1090,9 @@ pub(crate) fn disconnect(env: &mut Env<'_>, pin: u32) -> Outcome {
 /// and memory input interfaces each hold a separate COM reference.
 pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
     let p = &state(env).pins[&pin];
-    let (peer, mem, reader) = (p.peer, p.mem, p.reader);
+    let (peer, mem, reader, allocator) = (p.peer, p.mem, p.reader, p.allocator);
+    let guest_allocator =
+        (allocator != 0 && canonical(env, allocator).is_none()).then_some(allocator);
     let guest_peer = peer != 0 && host_pin(env, peer).is_none();
     let seeking = if role_of(env, pin) == Role::DmoDecoder {
         super::dmo::take_upstream(env, pin)
@@ -971,7 +1102,7 @@ pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
     disconnect_host(env, pin);
     state(env).pins.get_mut(&pin).unwrap().reader = 0;
     let mut calls = VecDeque::new();
-    for pointer in [mem, reader, seeking] {
+    for pointer in [mem, reader, seeking].into_iter().chain(guest_allocator) {
         if pointer != 0 {
             calls.push_back(Call(pointer, 2, vec![]));
         }
@@ -1225,8 +1356,11 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
     match method {
         "Next" => {
             let (count, output, fetched) = (env.arg(1), env.arg(2), env.arg(3));
-            if output == 0 || (count > 1 && fetched == 0) {
+            if output == 0 {
                 return r(E_POINTER);
+            }
+            if count > 1 && fetched == 0 {
+                return r(E_INVALIDARG);
             }
             if out_of_sync(env, this) {
                 return r(VFW_E_ENUM_OUT_OF_SYNC);
@@ -1263,6 +1397,15 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
                 && count > list.len().saturating_sub(*position)
             {
                 return r(E_INVALIDARG);
+            }
+            if let Some(Obj::EnumPins { filter, position }) = payload(env, this)
+                && count
+                    > env.ext.get::<State>().filters[filter]
+                        .pins
+                        .len()
+                        .saturating_sub(*position)
+            {
+                return r(S_FALSE);
             }
             let skipped = advance(env, this, count);
             r(if skipped == count { S_OK } else { S_FALSE })
@@ -1305,8 +1448,15 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
                 },
                 _ => return r(E_UNEXPECTED),
             };
+            let parent = match &copy {
+                Obj::EnumPins { filter, .. } => Some(*filter),
+                _ => None,
+            };
             match super::create(env, &[face], copy) {
                 Ok(faces) => {
+                    if let Some(parent) = parent {
+                        add_ref(env, parent);
+                    }
                     let _ = env.cpu.write_u32(output, faces[0]);
                     r(S_OK)
                 }
