@@ -12,6 +12,33 @@ pub(crate) fn machine() -> Machine<JitCpu> {
     let mut reg = Registry::default();
     crate::test_support::register(&mut reg);
     register(&mut reg);
+    for (slot, argc) in [
+        (0, 3),
+        (1, 1),
+        (2, 1),
+        (8, 4),
+        (9, 4),
+        (12, 5),
+        (16, 1),
+        (17, 2),
+        (18, 1),
+        (19, 1),
+        (21, 8),
+        (22, 5),
+        (100, 2),
+        (114, 1),
+        (115, 1),
+        (116, 1),
+        (117, 7),
+    ] {
+        reg.add_with_data(
+            "authored.dmo",
+            &format!("slot{slot}"),
+            Conv::Stdcall { argc },
+            fixture_dmo,
+            slot as u64,
+        );
+    }
     crate::wmvcore::register(&mut reg);
     let mut m = Machine::new(
         JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
@@ -666,7 +693,6 @@ fn aggregated_host_filters_hand_out_their_inner_unknown_and_forward_to_the_outer
         CLSID_MPEG_VIDEO_CODEC,
         CLSID_MPEG_AUDIO_CODEC,
         CLSID_WMASF_READER,
-        dmo::CLSID_DMO_WRAPPER,
         vmr::CLSID_VIDEO_MIXING_RENDERER,
     ] {
         let create = |m: &mut Machine<JitCpu>, iid| {
@@ -1317,6 +1343,362 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         ),
         0x8000_4004
     );
+}
+
+#[derive(Default)]
+struct DmoFixture {
+    calls: Vec<u32>,
+    allocate: u32,
+    output: u32,
+    incomplete: bool,
+    received: Vec<sample::Sample>,
+    input_flags: u32,
+}
+
+fn fixture_dmo(env: &mut Env<'_>) -> Outcome {
+    let slot = env.sys.thunks.get(env.thunk).f.data as u32;
+    env.ext.get_or_default::<DmoFixture>().calls.push(slot);
+    match slot {
+        0 => {
+            let _ = env.cpu.write_u32(env.arg(2), DATA + 2048);
+        }
+        8 | 9 => return Outcome::Return(if env.arg(3) == 1 { S_FALSE } else { S_OK }),
+        12 => {
+            for (arg, value) in [(2, 321), (3, 0), (4, 64)] {
+                let _ = env.cpu.write_u32(env.arg(arg), value);
+            }
+        }
+        18 => return Outcome::Return(env.ext.get::<DmoFixture>().allocate),
+        21 => {
+            env.ext.get_mut::<DmoFixture>().input_flags = env.arg(3);
+            let buffer = env.arg(2);
+            return guest_call(
+                env,
+                buffer,
+                5,
+                vec![DATA + 2400, DATA + 2404],
+                move |env, hr| {
+                    assert_eq!(hr, S_OK);
+                    assert_eq!(env.cpu.read_u32(DATA + 2404).unwrap(), 200);
+                    let data = env.cpu.read_u32(DATA + 2400).unwrap();
+                    assert_eq!(env.cpu.read_u8(data + 199).unwrap(), 199);
+                    guest_call(env, buffer, 4, vec![DATA + 2404], |env, hr| {
+                        assert_eq!(hr, S_OK);
+                        assert_eq!(env.cpu.read_u32(DATA + 2404).unwrap(), 256);
+                        Outcome::Return(S_OK)
+                    })
+                },
+            );
+        }
+        22 => {
+            assert_eq!(env.arg(1), 1);
+            assert_eq!(env.arg(2), 2);
+            let buffers = env.arg(3);
+            let output = env.ext.get::<DmoFixture>().output;
+            let incomplete = std::mem::take(&mut env.ext.get_mut::<DmoFixture>().incomplete);
+            let flags = 7 | if incomplete { 0x0100_0000 } else { 0 };
+            let mut calls = VecDeque::new();
+            for index in 0..2 {
+                let at = buffers + index * 24;
+                let buffer = env.cpu.read_u32(at).unwrap();
+                if buffer != 0 {
+                    let _ = env.cpu.write_u32(at + 4, flags);
+                    write_i64(env, at + 8, 5000);
+                    write_i64(env, at + 16, 1000);
+                    calls.push_back(Call(buffer, 3, vec![300]));
+                }
+            }
+            return chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(move |_, _| Outcome::Return(output)),
+            );
+        }
+        100 => {
+            let sample = canonical(env, env.arg(1)).unwrap();
+            let s = state(env).samples[&sample].clone();
+            env.ext.get_mut::<DmoFixture>().received.push(s);
+        }
+        _ => {}
+    }
+    Outcome::Return(S_OK)
+}
+
+fn fixture_dmo_filter(m: &mut Machine<JitCpu>) -> u32 {
+    let filter = activate(m, dmo::CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+    let object = DATA + 2048;
+    let table = DATA + 2080;
+    m.cpu.write_u32(object, table).unwrap();
+    for slot in [0, 1, 2, 8, 9, 12, 16, 17, 18, 19, 21, 22] {
+        let target = m
+            .resolve_import("authored.dmo", &format!("slot{slot}"))
+            .unwrap();
+        m.cpu.write_u32(table + slot * 4, target).unwrap();
+    }
+    let dmo = dmo::Dmo::new(&mut env(m), object);
+    m.ext
+        .get_mut::<State>()
+        .filters
+        .get_mut(&filter)
+        .unwrap()
+        .dmo = Some(dmo);
+    for (dir, name) in [
+        (filter::INPUT, "in0"),
+        (filter::OUTPUT, "out0"),
+        (filter::OUTPUT, "out1"),
+    ] {
+        filter::new_pin(&mut env(m), filter, dir, name, GUID_NULL, None).unwrap();
+    }
+    m.ext.insert(DmoFixture::default());
+    filter
+}
+
+// spec: MEDIA-DMO-5
+#[test]
+fn dmo_transitions_propagate_allocation_failure_and_clean_up_resources() {
+    let mut m = machine();
+    let filter = fixture_dmo_filter(&mut m);
+    m.ext.get_mut::<DmoFixture>().allocate = 0xdead_beef;
+    let outcome = start_method(&mut m, "IBaseFilter::Pause", &[filter]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), 0xdead_beef);
+    assert_eq!(m.ext.get::<State>().filters[&filter].state, graph::STOPPED);
+    m.ext.get_mut::<DmoFixture>().allocate = 0xbeef;
+    let outcome = start_method(&mut m, "IBaseFilter::Run", &[filter, 0, 0]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+    assert_eq!(m.ext.get::<State>().filters[&filter].state, graph::RUNNING);
+    let output = m.ext.get::<State>().filters[&filter].pins[1];
+    let outcome = filter::connect(&mut env(&mut m), output, DATA + 3000, 0);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), 0x8004_0224);
+    let outcome = filter::disconnect(&mut env(&mut m), output);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), 0x8004_0224);
+    let outcome = start_method(&mut m, "IBaseFilter::Stop", &[filter]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+    assert!(m.ext.get::<DmoFixture>().calls.ends_with(&[0, 16, 19, 2]));
+}
+
+// spec: MEDIA-DMO-6
+#[test]
+fn dmo_wraps_samples_drains_incomplete_outputs_and_forwards_stream_events() {
+    let mut m = machine();
+    let filter = fixture_dmo_filter(&mut m);
+    let pins = m.ext.get::<State>().filters[&filter].pins.clone();
+    let allocator = sample::create_allocator(&mut env(&mut m), 1, 16384).unwrap();
+    let sink = DATA + 2600;
+    let table = DATA + 2640;
+    m.cpu.write_u32(sink, table).unwrap();
+    for (slot, fixture) in [(6, 100), (14, 114), (15, 115), (16, 116), (17, 117)] {
+        let target = m
+            .resolve_import("authored.dmo", &format!("slot{fixture}"))
+            .unwrap();
+        m.cpu.write_u32(table + slot * 4, target).unwrap();
+    }
+    let out = m.ext.get_mut::<State>().pins.get_mut(&pins[1]).unwrap();
+    out.allocator = allocator;
+    out.mem = sink;
+    out.peer = sink;
+    let input_allocator = sample::create_allocator(&mut env(&mut m), 1, 256).unwrap();
+    let sample = sample::take(&mut env(&mut m), input_allocator).unwrap();
+    let buffer = m.ext.get::<State>().samples[&sample].buffer;
+    m.cpu
+        .write(buffer, &(0..=255).collect::<Vec<u8>>())
+        .unwrap();
+    method(&mut m, "IMediaSample::SetActualDataLength", &[sample, 200]);
+    method(&mut m, "IMediaSample::SetSyncPoint", &[sample, 0]);
+    write_i64(&mut env(&mut m), DATA + 16, 20000);
+    method(&mut m, "IMediaSample::SetTime", &[sample, DATA + 16, 0]);
+    let outcome = start_method(&mut m, "IBaseFilter::Pause", &[filter]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+    m.ext.get_mut::<DmoFixture>().incomplete = true;
+    let input = m.ext.get::<State>().pins[&pins[0]].faces[1];
+    let outcome = start_method(&mut m, "IMemInputPin::Receive", &[input, sample]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+    assert_eq!(m.ext.get::<DmoFixture>().input_flags, 6);
+    let received = &m.ext.get::<DmoFixture>().received;
+    assert_eq!(received.len(), 2);
+    for sample in received {
+        assert_eq!(
+            (sample.actual, sample.time, sample.sync_point),
+            (300, Some((5000, 6000)), true)
+        );
+    }
+    for (event, expected) in [
+        ("NewSegment", 117),
+        ("EndOfStream", 114),
+        ("BeginFlush", 115),
+        ("EndFlush", 116),
+    ] {
+        let outcome = start_method(
+            &mut m,
+            &format!("IPin::{event}"),
+            &[pins[0], 10000, 0, 20000, 0, 0, 0x3ff0_0000],
+        );
+        assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+        assert!(m.ext.get::<DmoFixture>().calls.contains(&expected));
+        if event == "EndOfStream" {
+            assert_eq!(
+                method(&mut m, "IMemInputPin::Receive", &[input, sample]),
+                0x8004_022c
+            );
+        }
+    }
+    let outcome = start_method(&mut m, "IBaseFilter::Stop", &[filter]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), S_OK);
+}
+
+// spec: MEDIA-DMO-5
+#[test]
+fn dmo_wrapper_validates_aggregation_but_keeps_its_own_identity() {
+    let mut m = machine();
+    let outcome = crate::test_support::activate(
+        &mut env(&mut m),
+        dmo::CLSID_DMO_WRAPPER,
+        adv_os::com::IUNKNOWN,
+        DATA + 512,
+        DATA,
+    );
+    assert!(matches!(outcome, Outcome::Return(S_OK)));
+    let unknown = m.cpu.read_u32(DATA).unwrap();
+    let filter = query(&mut m, unknown, IID_IBASEFILTER);
+    assert_eq!(filter, unknown);
+    assert_eq!(method(&mut m, "IUnknown::Release", &[unknown]), 1);
+    assert_eq!(method(&mut m, "IBaseFilter::Pause", &[filter]), 0x8000_4005);
+    assert_eq!(method(&mut m, "IBaseFilter::Stop", &[filter]), 0x8000_4005);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[filter]), 0);
+}
+
+pub(crate) fn install_media_host(m: &mut Machine<JitCpu>) {
+    m.ext.insert(Host {
+        allocator: crate::interop::GuestAllocator {
+            allocate: |env, size| {
+                let heaps = env.ext.get_mut::<Heaps>();
+                heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, size, true)
+            },
+            free: |env, pointer| {
+                let heaps = env.ext.get_mut::<Heaps>();
+                heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+            },
+        },
+        read: |env, filename, then| {
+            let create = env
+                .sys
+                .thunks
+                .publish(env.cpu, "kernel32.dll", "CreateFileW")
+                .unwrap();
+            Outcome::call(
+                create,
+                vec![filename, 0x8000_0000, 1, 0, 3, 0x80, 0],
+                move |env, result| {
+                    use std::io::Read;
+                    let handle = result.value();
+                    if handle == u32::MAX {
+                        return then(env, Err(0x8007_0002));
+                    }
+                    let file = env
+                        .sys
+                        .objects
+                        .host::<adv_os::vfs::FileObj>(handle)
+                        .unwrap();
+                    let mut file = file.file.host().unwrap().try_clone().unwrap();
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).unwrap();
+                    then(env, Ok((bytes, Some(handle))))
+                },
+            )
+        },
+        close: |env, handle| {
+            env.sys.objects.close(handle);
+        },
+        open: |_, _, _| unreachable!(),
+        thread: |_, _| unreachable!(),
+        event: |env| {
+            Ok(env.sys.objects.insert(adv_machine::Object::Event {
+                manual_reset: true,
+                signaled: false,
+            }))
+        },
+        signal: |env, handle, set| {
+            if set {
+                env.sys.set_event(handle);
+            } else {
+                env.sys.reset_event(handle);
+            }
+        },
+        post: |_, _| unreachable!(),
+        media_types: |_, _| MediaTypes::default(),
+        sample: |_, _, _, _| unreachable!(),
+        export: |_, _, _| None,
+    });
+}
+
+// spec: MEDIA-GRAPH-19
+#[test]
+fn asf_load_defers_io_preserves_filename_and_selectively_clears_media_type() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    install_media_host(&mut m);
+    let filter = activate(&mut m, CLSID_WMASF_READER, IID_IBASEFILTER);
+    let file = query(&mut m, filter, IID_IFILESOURCEFILTER);
+    assert_eq!(
+        method(&mut m, "IFileSourceFilter::Load", &[file, 0, 0]),
+        E_POINTER
+    );
+    m.cpu
+        .write(DATA + 512, &vec![0x22; MEDIA_TYPE_SIZE as usize])
+        .unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IFileSourceFilter::GetCurFile",
+            &[file, DATA, DATA + 512]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA + 512 + 32).unwrap(), 0x2222_2222);
+    assert_eq!(m.cpu.read_u32(DATA + 512 + 44).unwrap(), 0x2222_2222);
+    assert_eq!(m.cpu.read_u32(DATA + 512 + 64).unwrap(), 0);
+    m.cpu
+        .write(
+            DATA + 768,
+            &"missing.wmv"
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IFileSourceFilter::Load",
+            &[file, DATA + 768, DATA + 512]
+        ),
+        S_OK
+    );
+    assert!(m.ext.get::<State>().filters[&filter].pins.is_empty());
+    assert_eq!(
+        method(&mut m, "IFileSourceFilter::Load", &[file, DATA + 768, 0]),
+        0x8000_4005
+    );
+    for method_name in ["Run", "Pause", "Stop"] {
+        assert_eq!(
+            method(
+                &mut m,
+                &format!("IBaseFilter::{method_name}"),
+                &[filter, 0, 0]
+            ),
+            0x8000_4005
+        );
+        assert_eq!(m.ext.get::<State>().filters[&filter].state, graph::STOPPED);
+    }
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let outcome = start_method(&mut m, "IBaseFilter::JoinFilterGraph", &[filter, graph, 0]);
+    assert_eq!(graph::source::tests::finish(&mut m, outcome), 0x8007_0002);
+    assert!(m.ext.get::<State>().filters[&filter].pins.is_empty());
+    method(&mut m, "IFileSourceFilter::Release", &[file]);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[filter]), 0);
 }
 
 // spec: MEDIA-STREAM-6

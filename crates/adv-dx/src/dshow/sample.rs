@@ -13,6 +13,8 @@ pub(crate) struct Allocator {
     samples: Vec<u32>,
     pub free: Vec<u32>,
     size: u32,
+    alignment: u32,
+    prefix: u32,
     pub committed: bool,
     pub wake: Handle,
 }
@@ -24,6 +26,8 @@ pub(crate) struct Sample {
     pub size: u32,
     pub actual: u32,
     pub time: Option<(i64, i64)>,
+    stop_time: bool,
+    media_type: Option<MediaType>,
     media_time: Option<(i64, i64)>,
     pub sync_point: bool,
     pub preroll: bool,
@@ -51,7 +55,9 @@ pub(crate) fn create_allocator(env: &mut Env<'_>, count: u32, size: u32) -> Resu
             samples: Vec::new(),
             free: Vec::new(),
             size,
-            committed: true,
+            alignment: u32::from(count != 0),
+            prefix: 0,
+            committed: count != 0,
             wake,
         },
     );
@@ -74,6 +80,8 @@ fn add_samples(env: &mut Env<'_>, allocator: u32, count: u32, size: u32) -> Resu
                 size,
                 actual: 0,
                 time: None,
+                stop_time: true,
+                media_type: None,
                 media_time: None,
                 sync_point: true,
                 preroll: false,
@@ -111,6 +119,8 @@ pub(crate) fn take(env: &mut Env<'_>, allocator: u32) -> Option<u32> {
     let s = state(env).samples.get_mut(&sample).unwrap();
     s.actual = 0;
     s.time = None;
+    s.stop_time = true;
+    s.media_type = None;
     s.media_time = None;
     s.sync_point = true;
     s.preroll = false;
@@ -188,15 +198,10 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
     let a1 = env.arg(1);
     let properties = |env: &mut Env<'_>, output: u32| {
         let a = &state(env).allocators[&this];
-        let raw: Vec<u8> = [
-            a.samples.len() as u32,
-            a.size,
-            u32::from(!a.samples.is_empty()),
-            0,
-        ]
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect();
+        let raw: Vec<u8> = [a.samples.len() as u32, a.size, a.alignment, a.prefix]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
         env.cpu.write(output, &raw).is_ok()
     };
     match method {
@@ -217,6 +222,9 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
                 {
                     return r(E_INVALIDARG);
                 }
+                let a = state(env).allocators.get_mut(&this).unwrap();
+                a.alignment = word(8);
+                a.prefix = word(12);
                 if let Err(error) = add_samples(env, this, count as u32, size as u32) {
                     return r(error);
                 }
@@ -302,11 +310,19 @@ fn sample_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                 s.media_time
             };
             let Some((start, stop)) = value else {
-                return r(0x8004_0249); // VFW_E_SAMPLE_TIME_NOT_SET
+                return r(if method == "GetTime" {
+                    0x8004_0249
+                } else {
+                    0x8004_0251
+                });
             };
             write_i64(env, a1, start);
             write_i64(env, a2, stop);
-            r(S_OK)
+            r(if method == "GetTime" && !s.stop_time {
+                0x0004_0270
+            } else {
+                S_OK
+            })
         }
         "SetTime" | "SetMediaTime" => {
             let value = (a1 != 0)
@@ -315,6 +331,7 @@ fn sample_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             let s = state(env).samples.get_mut(&this)?;
             if method == "SetTime" {
                 s.time = value;
+                s.stop_time = a2 != 0;
             } else {
                 s.media_time = value;
             }
@@ -343,12 +360,29 @@ fn sample_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             state(env).samples.get_mut(&this)?.actual = a1;
             r(S_OK)
         }
-        // The connection type never changes mid-stream.
         "GetMediaType" => {
-            let _ = env.cpu.write_u32(a1, 0);
-            r(S_FALSE)
+            let pointer = match s.media_type {
+                Some(mt) => match mt.create(env) {
+                    Ok(pointer) => pointer,
+                    Err(hr) => return r(hr),
+                },
+                None => 0,
+            };
+            let _ = env.cpu.write_u32(a1, pointer);
+            r(if pointer == 0 { S_FALSE } else { S_OK })
         }
-        "SetMediaType" => r(S_OK),
+        "SetMediaType" => {
+            let mt = if a1 == 0 {
+                None
+            } else {
+                match MediaType::read(env, a1) {
+                    Ok(mt) => Some(mt),
+                    Err(_) => return r(E_POINTER),
+                }
+            };
+            state(env).samples.get_mut(&this)?.media_type = mt;
+            r(S_OK)
+        }
         _ => None,
     }
 }

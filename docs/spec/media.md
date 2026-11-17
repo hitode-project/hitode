@@ -53,7 +53,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-2 File sources
 
-**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing files or invalid arguments without publishing a source or touching its output. Its async reader MUST load undecodable contents, which rendering then rejects with `VFW_E_UNSUPPORTED_STREAM`. The WM ASF Reader MUST be this source, loaded through IFileSourceFilter and rejecting undecodable files, and its filter MUST keep the file sharing lock.
+**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing files or invalid arguments without publishing a source or touching its output. Its async reader MUST load undecodable contents, which rendering then rejects with `VFW_E_UNSUPPORTED_STREAM`. File-source filters MUST keep their file sharing locks.
 **Verification**: Test
 
 ### MEDIA-GRAPH-3 Render negotiation
@@ -93,7 +93,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-10 Aggregation
 
-**Rule**: An aggregated filter graph or host filter MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
+**Rule**: An aggregated filter graph or host filter MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Except for DMO wrappers, every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
 **Verification**: Test
 
 ### MEDIA-GRAPH-11 Member names
@@ -134,6 +134,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 ### MEDIA-GRAPH-18 Graph state
 
 **Rule**: Graph transitions MUST return the first member result that is not S_OK, and Stop from Running MUST pause every member first. GetState MUST poll every member and report VFW_S_STATE_INTERMEDIATE until all reach the graph state or the timeout passes. Stop MUST return only after every host stream thread has left the downstream filters.
+**Verification**: Test
+
+### MEDIA-GRAPH-19 ASF reader lifecycle
+
+**Rule**: ASF Load MUST retain the first filename without opening it, ignore supplied media types, and reject subsequent loads with E_FAIL. Graph join MUST open the file and publish named compressed stream pins, and state transitions before successful opening MUST fail without changing state. GetCurFile MUST preserve unspecified media-type fields, and compressed delivery MUST use ReceiveMultiple with separate stream threads when downstream reception can block.
 **Verification**: Test
 
 ### MEDIA-STREAM-1 Pull delivery
@@ -185,14 +190,14 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-DMO-1 Decoder admission
 
-**Rule**: DMO wrappers MUST accept only supported WMV/WMA decoder identities and publish input/output pins only after Init.
+**Rule**: DMO wrappers MUST publish input/output pins only after Init, using a built-in Windows Media decoder or an aggregated registered media object.
 Wine decoder capability probes MUST succeed for available codecs before stream sequence headers are supplied; decoder opening MUST wait for the first sample.
 **Verification**: Test
 
 ### MEDIA-DMO-2 Push ownership and preroll
 
-**Rule**: The DMO wrapper MUST accept only host samples from its allocator. Decoded video MUST follow graph time with one paused preroll frame, while decoded audio MUST use the shared mixer.
-**Verification**: Review — DMO tests cover identity and pin publication but not pushed sample ownership, scheduling, and paused preroll.
+**Rule**: Built-in DMO decoders MUST accept only host samples, while registered media objects MUST receive buffers wrapping upstream samples. Decoded video MUST follow graph time with one paused preroll frame, while decoded audio MUST use the shared mixer.
+**Verification**: Review — unit tests do not exercise built-in decoder scheduling, audio mixing, and paused video preroll.
 
 ### MEDIA-DMO-3 End-of-stream ordering
 
@@ -202,6 +207,16 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 ### MEDIA-DMO-4 Upstream seeking and control
 
 **Rule**: Connected DMO graphs MUST derive duration from upstream IMediaSeeking and forward seeks to that source. Pause and Run MUST invoke the upstream source last, and Stop MUST invoke it first.
+**Verification**: Test
+
+### MEDIA-DMO-5 Wrapper identity and state
+
+**Rule**: DMO wrappers MUST validate aggregation requests but retain their own controlling identity, exposing additional interfaces through the aggregated media object. Leaving Stopped MUST allocate streaming resources and commit connected output allocators, preserving Stopped when allocation fails. Stop MUST wait for active reception, decommit outputs, flush the media object, and free streaming resources.
+**Verification**: Test
+
+### MEDIA-DMO-6 Media object streaming
+
+**Rule**: Registered DMOs MUST negotiate types through IMediaObject, including allocator sizes, alignment, and dynamic output types. Reception MUST translate timestamps and flags, drain incomplete connected outputs, and propagate downstream failures. EOS MUST drain once before flushing and forwarding, and flushing MUST reject samples until EndFlush resets EOS and flushes the media object.
 **Verification**: Test
 
 ## Synchronous Windows Media reader

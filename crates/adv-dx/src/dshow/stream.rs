@@ -244,6 +244,9 @@ pub(crate) fn apply_volume(env: &mut Env<'_>, graph: u32) {
 
 pub(crate) fn thread_entry(env: &mut Env<'_>) -> Outcome {
     let id = env.arg(0);
+    if state(env).asf_threads.contains_key(&id) {
+        return super::asf::thread(env, id);
+    }
     pump(env, id)
 }
 

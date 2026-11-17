@@ -52,6 +52,7 @@ pub(crate) struct Filter {
     pub source_path: Vec<u16>,
     pub dmo: Option<super::dmo::Dmo>,
     pub vmr: Option<super::vmr::Vmr>,
+    pub asf: Option<super::asf::Asf>,
     /// The controlling outer object of an aggregated filter, and the filter's
     /// own non-delegating IUnknown; both zero otherwise.
     pub outer: u32,
@@ -69,7 +70,7 @@ pub(crate) struct Filter {
 pub(crate) struct Pin {
     pub filter: u32,
     pub dir: u32,
-    name: &'static str,
+    name: String,
     pub major: Iid,
     /// Connected IPin (host canonical or guest pointer); 0 when unconnected.
     pub peer: u32,
@@ -212,8 +213,15 @@ pub(super) fn new_filter(
 ) -> Result<u32, u32> {
     let is_vmr = role == Role::VideoRenderer && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER;
     let faces: &[Face] = match role {
+        Role::FileSource if clsid == CLSID_WMASF_READER => &[
+            Face::BaseFilter,
+            Face::FileSource,
+            Face::ServiceProvider,
+            Face::WmHeaderInfo,
+            Face::WmReaderAdvanced,
+        ],
         Role::FileSource => &[Face::BaseFilter, Face::FileSource],
-        Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper],
+        Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper, Face::PersistStream],
         Role::AudioDecoder => &[Face::BaseFilter, Face::MpegAudioDecoder],
         Role::Splitter => &[Face::BaseFilter, Face::StreamSelect],
         Role::VideoRenderer if is_vmr => &[
@@ -253,6 +261,7 @@ pub(super) fn new_filter(
             *faces.last().unwrap()
         },
     );
+    let asf = (clsid == CLSID_WMASF_READER).then(|| super::asf::Asf::new(env));
     let vmr = (role == Role::VideoRenderer).then(|| super::vmr::Vmr::new(env));
     state(env).filters.insert(
         base,
@@ -267,6 +276,7 @@ pub(super) fn new_filter(
             source_path: Vec::new(),
             dmo: None,
             vmr,
+            asf,
             outer,
             inner,
             position: 0,
@@ -280,6 +290,7 @@ pub(super) fn new_filter(
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
+        Role::FileSource if clsid == CLSID_WMASF_READER => &[],
         Role::FileSource => &[(OUTPUT, "Output", MEDIATYPE_STREAM)],
         Role::Splitter => &[(INPUT, "Input", MEDIATYPE_STREAM)],
         Role::VideoDecoder => &[
@@ -305,51 +316,49 @@ pub(super) fn new_filter(
     Ok(base)
 }
 
-/// The filter retains each pin internally; VMR pin references count on the filter.
+/// The filter retains each pin internally; pin references count on the filter.
 pub(super) fn new_pin(
     env: &mut Env<'_>,
     filter: u32,
     dir: u32,
-    name: &'static str,
+    name: &str,
     major: Iid,
     mt: Option<MediaType>,
 ) -> Result<u32, u32> {
-    let clsid = state(env).filters[&filter].clsid;
-    let role = state(env).filters[&filter].role;
+    let f = &state(env).filters[&filter];
+    let clsid = f.clsid;
+    let role = f.role;
+    let owned = f.asf.is_some() || role == Role::DmoDecoder;
     let mpeg = matches!(
         role,
         Role::Splitter | Role::VideoDecoder | Role::AudioDecoder
     );
-    let faces: &[Face] = if dir == INPUT && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER {
-        &[
-            Face::Pin,
-            Face::MemInputPin,
-            Face::VmrAccelerator,
-            Face::VmrOverlay,
-            Face::VmrQuality,
-        ]
+    let mut faces = vec![Face::Pin];
+    if dir == INPUT {
+        faces.push(Face::MemInputPin);
+    }
+    if dir == INPUT && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER {
+        faces.extend([Face::VmrAccelerator, Face::VmrOverlay, Face::VmrQuality]);
     } else {
-        match (mpeg, dir) {
-            (true, INPUT) => &[Face::Pin, Face::MemInputPin, Face::QualityControl],
-            (true, OUTPUT) if role != Role::Splitter => &[
-                Face::Pin,
-                Face::QualityControl,
-                Face::MediaSeeking,
-                Face::MediaPosition,
-            ],
-            (true, OUTPUT) => &[Face::Pin, Face::QualityControl, Face::MediaSeeking],
-            (false, INPUT) => &[Face::Pin, Face::MemInputPin],
-            _ => &[Face::Pin],
+        if mpeg || owned {
+            faces.push(Face::QualityControl);
         }
-    };
-    let faces = super::create(env, faces, Obj::Pin)?;
+        if dir == OUTPUT && (mpeg || owned) {
+            faces.push(Face::MediaSeeking);
+            if role == Role::VideoDecoder || role == Role::AudioDecoder || role == Role::DmoDecoder
+            {
+                faces.push(Face::MediaPosition);
+            }
+        }
+    }
+    let faces = super::create(env, &faces, Obj::Pin)?;
     let pin = faces[0];
     state(env).pins.insert(
         pin,
         Pin {
             filter,
             dir,
-            name,
+            name: name.into(),
             major,
             peer: 0,
             types: mt.iter().cloned().collect(),
@@ -401,11 +410,14 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         Face::StreamSelect => Some(stream_select(env, host_filter(env, this)?, method)),
         Face::QualityControl => Some(quality_control(env, host_pin(env, this)?, method)),
         Face::MpegAudioDecoder => Some(Outcome::Return(E_NOTIMPL)),
-        Face::FileSource => Some(super::graph::source::file_method(
-            env,
-            host_filter(env, this)?,
-            method,
-        )),
+        Face::FileSource => {
+            let filter = host_filter(env, this)?;
+            Some(if state(env).filters[&filter].asf.is_some() {
+                super::asf::file_method(env, filter, method)
+            } else {
+                super::graph::source::file_method(env, filter, method)
+            })
+        }
         Face::BaseFilter => filter_method(env, host_filter(env, this)?, method),
         Face::Pin => pin_method(env, host_pin(env, this)?, method),
         Face::MemInputPin => {
@@ -561,6 +573,9 @@ fn quality_control(env: &mut Env<'_>, pin: u32, method: &str) -> Outcome {
 pub(super) fn seeking(env: &mut Env<'_>, pin: u32, method: &str) -> Outcome {
     let filter = state(env).pins[&pin].filter;
     let f = &state(env).filters[&filter];
+    if f.asf.is_some() || f.role == Role::DmoDecoder {
+        return Outcome::Return(E_NOTIMPL);
+    }
     let duration = f.source.as_ref().map_or(0, |s| s.duration_us as i64 * 10);
     let (position, stop, rate) = (f.position, f.stop.unwrap_or(duration), f.rate);
     let (a1, a2) = (env.arg(1), env.arg(2));
@@ -802,14 +817,45 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
         "JoinFilterGraph" => {
             let graph = canonical(env, a1).unwrap_or(0);
             let name = read_wide(env, env.arg(2), 127);
-            let f = state(env).filters.get_mut(&filter).unwrap();
-            f.graph = graph;
-            f.name = name;
-            r(S_OK)
+            Some(join_graph(
+                env,
+                filter,
+                graph,
+                name,
+                Box::new(|_, hr| Outcome::Return(hr)),
+            ))
         }
         "QueryVendorInfo" => r(E_NOTIMPL),
         _ => None,
     }
+}
+
+pub(crate) fn join_graph(
+    env: &mut Env<'_>,
+    filter: u32,
+    graph: u32,
+    name: Vec<u16>,
+    then: Done,
+) -> Outcome {
+    if state(env).filters[&filter].asf.is_some() {
+        return super::asf::join(
+            env,
+            filter,
+            graph,
+            Box::new(move |env, hr| {
+                if hr == S_OK {
+                    let f = state(env).filters.get_mut(&filter).unwrap();
+                    f.graph = graph;
+                    f.name = name;
+                }
+                then(env, hr)
+            }),
+        );
+    }
+    let f = state(env).filters.get_mut(&filter).unwrap();
+    f.graph = graph;
+    f.name = name;
+    then(env, S_OK)
 }
 
 /// Move host filter `filter` to `state` (State_Stopped/Paused/Running; `start` is the Run time, 0 otherwise),
@@ -821,6 +867,13 @@ pub(crate) fn transition(
     _start: i64,
     then: Done,
 ) -> Outcome {
+    let f = &self::state(env).filters[&filter];
+    if f.asf.is_some() {
+        return super::asf::transition(env, filter, state, then);
+    }
+    if f.role == Role::DmoDecoder {
+        return super::dmo::transition(env, filter, state, then);
+    }
     set_state(env, filter, state);
     if self::state(env).filters[&filter].vmr.is_some() {
         let result = super::vmr::transition_result(env, filter);
@@ -913,6 +966,9 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
             _ => {}
         }
     }
+    if let Some(outcome) = super::dmo::object_pin_method(env, pin, method) {
+        return Some(outcome);
+    }
     if matches!(role_of(env, pin), Role::VideoDecoder | Role::AudioDecoder)
         && state(env).pins[&pin].dir == INPUT
         && matches!(
@@ -965,7 +1021,7 @@ fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
                     "XForm Out"
                 }
             } else {
-                state(env).pins[&pin].name
+                &state(env).pins[&pin].name
             };
             let name: Vec<u16> = name.encode_utf16().take(127).collect();
             let mut raw = vec![0u8; 8 + 256];
@@ -1538,6 +1594,9 @@ fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
 fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
     let state = env.ext.get::<State>();
     let p = &state.pins[&pin];
+    if state.filters[&p.filter].asf.is_some() {
+        return super::asf::types(env, pin);
+    }
     let role = state.filters.get(&p.filter).map(|f| f.role);
     match (role, p.dir) {
         (Some(Role::Splitter), INPUT) => [
@@ -1727,6 +1786,11 @@ pub(crate) fn connect(env: &mut Env<'_>, out: u32, input: u32, pmt: u32) -> Outc
     if out == 0 || input == 0 {
         return Outcome::Return(E_POINTER);
     }
+    if let Some(pin) = host_pin(env, out)
+        && super::dmo::is_object(env, env.ext.get::<State>().pins[&pin].filter)
+    {
+        return super::dmo::connect(env, pin, input, pmt);
+    }
     match (host_pin(env, out), host_pin(env, input)) {
         (Some(out), Some(input)) => Outcome::Return(connect_hosts(env, out, input)),
         (Some(out), None) => connect_to_guest(env, out, input, pmt),
@@ -1902,7 +1966,7 @@ fn try_types(
     })
 }
 
-fn free_type_block(env: &mut Env<'_>, block: u32) {
+pub(super) fn free_type_block(env: &mut Env<'_>, block: u32) {
     if let Ok(data) = env.cpu.read_u32(block + 68)
         && data != 0
     {
@@ -1941,8 +2005,10 @@ fn finish_guest_connection(
             {
                 return decoder_allocator(env, out, input, mem, mt);
             }
-            let size = if role_of(env, out) == Role::Splitter {
-                let filter = state(env).pins[&out].filter;
+            let filter = state(env).pins[&out].filter;
+            let size = if state(env).filters[&filter].asf.is_some() {
+                super::asf::sample_size(env, out)
+            } else if role_of(env, out) == Role::Splitter {
                 state(env).filters[&filter]
                     .packets
                     .as_ref()
@@ -2055,7 +2121,12 @@ fn notify_decoder_allocator(
     })
 }
 
-fn abort_guest_connection(env: &mut Env<'_>, out: u32, input: u32, error: u32) -> Outcome {
+pub(super) fn abort_guest_connection(
+    env: &mut Env<'_>,
+    out: u32,
+    input: u32,
+    error: u32,
+) -> Outcome {
     let mem = state(env).pins[&out].mem;
     let allocator = state(env).pins[&out].allocator;
     let foreign_allocator = allocator != 0 && canonical(env, allocator).is_none();
@@ -2099,21 +2170,33 @@ pub(crate) fn disconnect(env: &mut Env<'_>, pin: u32) -> Outcome {
             if state(env).filters[&filter].state != graph::STOPPED {
                 return Outcome::Return(0x8004_0224);
             }
-            let hr = if state(env).pins[&pin].peer == 0 {
-                S_FALSE
-            } else {
-                S_OK
-            };
-            let calls = disconnect_owned(env, pin);
-            chain(
-                env,
-                calls,
-                Vec::new(),
-                Box::new(move |_, _| Outcome::Return(hr)),
-            )
+            if super::dmo::is_object(env, filter) {
+                let outcome = super::dmo::clear_type(env, pin);
+                return after(
+                    env,
+                    outcome,
+                    Box::new(move |env, _| disconnect_pin(env, pin)),
+                );
+            }
+            disconnect_pin(env, pin)
         }
         None => guest_call(env, pin, 5, vec![], |_, hr| Outcome::Return(hr)),
     }
+}
+
+fn disconnect_pin(env: &mut Env<'_>, pin: u32) -> Outcome {
+    let hr = if state(env).pins[&pin].peer == 0 {
+        S_FALSE
+    } else {
+        S_OK
+    };
+    let calls = disconnect_owned(env, pin);
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |_, _| Outcome::Return(hr)),
+    )
 }
 
 /// Detach a host pin and return the guest releases owned by its connection.
