@@ -15,6 +15,8 @@ use crate::dsound::Sound;
 pub(crate) const THREAD_ENTRY: &str = "<DirectShowStreamThread>";
 const POLL_US: u64 = 10_000;
 const EC_COMPLETE: u32 = 1;
+/// Below the decoder's one-second seek threshold.
+const FREE_END_STEP_US: u64 = 500_000;
 const EC_ERRORABORT: u32 = 3;
 const E_FAIL: u32 = 0x8000_4005;
 
@@ -48,6 +50,8 @@ pub(crate) struct Session {
     updates: VecDeque<Result<adv_device::media::Update, adv_device::media::Error>>,
     decoded_end: bool,
     compressed: Option<VecDeque<(u32, adv_device::media::Packet)>>,
+    /// Media time a video-only stream has reached without a reference clock.
+    free_us: Option<u64>,
 }
 
 enum End {
@@ -163,6 +167,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             updates: VecDeque::new(),
             decoded_end: false,
             compressed: None,
+            free_us: None,
         },
     );
     apply_volume(env, graph);
@@ -182,6 +187,17 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
     }
     log::info!("DirectShow: streaming splitter {filter:#x} (video={video:?}, audio={audio:?})");
     host_renderers(video, audio_renderer)
+}
+
+/// Deliver one more picture after a running graph pauses.
+pub(crate) fn repreroll(env: &mut Env<'_>, id: u32) {
+    if let Some(s) = state(env).sessions.get_mut(&id)
+        && !s.ended
+    {
+        s.prerolled = false;
+        s.video_rendered = false;
+    }
+    wake(env, id);
 }
 
 pub(crate) fn wake(env: &mut Env<'_>, id: u32) {
@@ -326,10 +342,19 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     if ended || (paused && prerolled) {
         return wait(env, id, None);
     }
-    let position = graph::stream_position(env, graph);
+    let s = session(env, id);
+    // Without a clock, renderers take pictures as soon as they come: a
+    // video-only stream decodes picture after picture instead of following time.
+    let unclocked =
+        s.audio.is_none() && s.audio_guest.is_none() && state(env).graphs[&graph].free_running();
+    let free = unclocked && !paused;
+    let position = match session(env, id).free_us {
+        Some(us) if unclocked => (us * 10) as i64,
+        _ => graph::stream_position(env, graph),
+    };
     let media_us = (position.max(0) / 10) as u64;
     let native = env.ext.try_get::<Host>().is_some();
-    let preroll = paused && !prerolled && !video_rendered;
+    let preroll = free || paused && !prerolled && !video_rendered;
     let update = if native && !session(env, id).host {
         match session(env, id).updates.pop_front() {
             Some(update) => Some(update),
@@ -353,12 +378,22 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
                     decoder.frame_at(media_us).map(Some)
                 }
             });
-        match update {
+        let update = match update {
             Some(Ok(None)) => return wait(env, id, Some(env.sys.clock.now_us() + 1000)),
             Some(Ok(Some(update))) => Some(Ok(update)),
             Some(Err(error)) => Some(Err(error)),
             None => None,
+        };
+        if free && let Some(Ok(update)) = &update {
+            // Past the last picture, step on to the decoder's end time.
+            session(env, id).free_us = Some(
+                update
+                    .video
+                    .as_ref()
+                    .map_or(media_us + FREE_END_STEP_US, |frame| frame.pts_us + 1),
+            );
         }
+        update
     };
     process_update(env, id, update, position, paused)
 }
@@ -624,6 +659,7 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.pending_audio.clear();
     s.updates.clear();
     s.decoded_end = false;
+    s.free_us = None;
     s.audio_end = 0;
     if flush {
         s.audio_paused = false;
@@ -1146,6 +1182,7 @@ mod tests {
                 updates: VecDeque::new(),
                 decoded_end: false,
                 compressed: None,
+                free_us: None,
             },
         );
         (m, graph, events, wake)

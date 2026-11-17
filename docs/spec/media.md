@@ -183,7 +183,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-3 Audio lead and pause
 
-**Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time. A paused stream that has shown no picture since its segment began MUST present the first picture at or after the position.
+**Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time. Pausing from Stopped or Running MUST present the first picture at or after the position, which the stream then holds.
 **Verification**: Test
 
 ### MEDIA-STREAM-4 Decoding off the execution thread
@@ -214,6 +214,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 ### MEDIA-STREAM-8 MPEG splitter streams
 
 **Rule**: Direct MPEG splitter outputs MUST deliver compressed packets and end-of-stream while paused, using the selected segment positions. Splitter output seeking MUST expose media time, capability mask `0x37`, duration, positions, and a positive playback rate. IAMStreamSelect MUST describe each output's type, group, name, and pin identity.
+**Verification**: Test
+
+### MEDIA-STREAM-9 Streams without a clock
+
+**Rule**: After SetSyncSource(NULL), a running video-only stream MUST present each picture without waiting for its time. GetCurrentPosition MUST report 0 while such a graph runs and the stop once it completes.
 **Verification**: Test
 
 ## Windows Media decoder wrappers
@@ -351,4 +356,9 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 ### MEDIA-VIDEO-14 Renderless VMR ownership
 
 **Rule**: Renderless VMR MUST retain the guest allocator-presenter and DirectDraw device and allocate surfaces during allocator configuration. Samples MUST populate those surfaces and invoke PrepareSurface followed by PresentImage with their timestamps. Renderless VMR MUST NOT publish frames through the host video provider.
+**Verification**: Test
+
+### MEDIA-VIDEO-15 Video Renderer window
+
+**Rule**: Render MUST give the Video Renderer its own guest window sized to the video, as windowed VMR has. The graph's IVideoWindow MUST forward to a renderer that owns a window, except full-screen mode, which the graph keeps.
 **Verification**: Test

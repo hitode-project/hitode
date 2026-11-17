@@ -534,12 +534,18 @@ fn next_filter(
         free(env, scratch);
         let owner = state(env).pins[&out].filter;
         let graph = state(env).filters[&owner].graph;
-        let hr = if state(env).pins[&out].major == MEDIATYPE_AUDIO {
-            system_audio(env, graph, out, existing_only).map_or_else(|hr| hr, |_| S_OK)
-        } else {
-            system_video(env, graph, out, existing_only)
-        };
-        return then(env, vec![hr]);
+        if state(env).pins[&out].major == MEDIATYPE_AUDIO {
+            let hr = system_audio(env, graph, out, existing_only).map_or_else(|hr| hr, |_| S_OK);
+            return then(env, vec![hr]);
+        }
+        let hr = system_video(env, graph, out, existing_only);
+        if hr != S_OK {
+            return then(env, vec![hr]);
+        }
+        let input = state(env).pins[&out].peer;
+        let renderer = state(env).pins[&input].filter;
+        let outcome = crate::dshow::video::window::renderer_window(env, renderer);
+        return after(env, outcome, then);
     };
     let _ = env.cpu.write_u32(scratch, 0);
     guest_call(env, filter, 10, vec![scratch], move |env, hr| {
