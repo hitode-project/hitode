@@ -10,6 +10,7 @@ use iced_x86::Mnemonic as M;
 
 use super::ir::{
     Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
+    VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -231,6 +232,7 @@ fn step(
             }
         }
         Op::Vec(op, a, b) => vector(op, get(a), get(b), fpsr),
+        Op::VecUnary(op, a) => vector_unary(op, get(a)),
         Op::Load { width, addr, .. } => {
             let mut bytes = [0u8; 16];
             memory
@@ -482,24 +484,199 @@ fn arithmetic(op: FpOp, a: f64, b: f64, fpsr: &mut u32) -> f64 {
     r
 }
 
+fn vec_signed(value: u64, bits: usize) -> i64 {
+    ((value << (64 - bits)) as i64) >> (64 - bits)
+}
+
+fn vec_shift(op: crate::encode::ShiftImm, log2: u8, full: bool, a: u128, count: u64) -> u128 {
+    use crate::encode::ShiftImm as S;
+    let bits = 8usize << log2;
+    let mask = u64::MAX >> (64 - bits);
+    let lanes = if full { 128 } else { 64 } / bits;
+    let mut out = 0u128;
+    for i in 0..lanes {
+        let shift = i * bits;
+        let lane = ((a >> shift) as u64) & mask;
+        let val = match op {
+            S::Shl => {
+                if count >= bits as u64 {
+                    0
+                } else {
+                    (lane << count) & mask
+                }
+            }
+            S::Ushr => {
+                if count >= bits as u64 {
+                    0
+                } else {
+                    lane >> count
+                }
+            }
+            S::Sshr => {
+                let s = vec_signed(lane, bits);
+                (s >> count.min(bits as u64 - 1)) as u64 & mask
+            }
+        };
+        out |= u128::from(val) << shift;
+    }
+    out
+}
+
+fn vector_unary(op: VecUnary, a: u128) -> u128 {
+    match op {
+        VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
+        VecUnary::Low64 => a & u128::from(u64::MAX),
+    }
+}
+
 fn vector(op: VecOp, a: u128, b: u128, fpsr: &mut u32) -> u128 {
+    use crate::encode::{Narrowing, Permute, Same};
     let lanes64 = |f: &mut dyn FnMut(u64, u64) -> u64| {
         let lo = f(a as u64, b as u64);
         let hi = f((a >> 64) as u64, (b >> 64) as u64);
         u128::from(lo) | u128::from(hi) << 64
     };
-    let count = b as u64;
+    let mask_full = |v: u128, full: bool| {
+        if full { v } else { v & u128::from(u64::MAX) }
+    };
     match op {
-        VecOp::And => a & b,
-        VecOp::AndNot => !a & b,
-        VecOp::Or => a | b,
-        VecOp::Xor => a ^ b,
-        VecOp::SubI32 => (0..4).fold(0, |acc, i| {
-            let lane = ((a >> (32 * i)) as u32).wrapping_sub((b >> (32 * i)) as u32);
-            acc | u128::from(lane) << (32 * i)
-        }),
-        VecOp::ShlI64 => lanes64(&mut |x, _| if count > 63 { 0 } else { x << count }),
-        VecOp::ShrI64 => lanes64(&mut |x, _| if count > 63 { 0 } else { x >> count }),
+        VecOp::And(full) => mask_full(a & b, full),
+        VecOp::AndNot(full) => mask_full(!a & b, full),
+        VecOp::Or(full) => mask_full(a | b, full),
+        VecOp::Xor(full) => mask_full(a ^ b, full),
+        VecOp::Same(op, log2, full) => {
+            let bits = 8usize << log2;
+            let mask = u64::MAX >> (64 - bits);
+            let lanes = if full { 128 } else { 64 } / bits;
+            let mut out = 0u128;
+            for i in 0..lanes {
+                let shift = i * bits;
+                let x = ((a >> shift) as u64) & mask;
+                let y = ((b >> shift) as u64) & mask;
+                let val = match op {
+                    Same::Add => x.wrapping_add(y) & mask,
+                    Same::Sub => x.wrapping_sub(y) & mask,
+                    Same::Sqadd => {
+                        let lo = -(1i64 << (bits - 1));
+                        let hi = (1i64 << (bits - 1)) - 1;
+                        (vec_signed(x, bits) + vec_signed(y, bits)).clamp(lo, hi) as u64 & mask
+                    }
+                    Same::Uqadd => (x + y).min(mask),
+                    Same::Sqsub => {
+                        let lo = -(1i64 << (bits - 1));
+                        let hi = (1i64 << (bits - 1)) - 1;
+                        (vec_signed(x, bits) - vec_signed(y, bits)).clamp(lo, hi) as u64 & mask
+                    }
+                    Same::Uqsub => x.saturating_sub(y),
+                    Same::Cmeq => {
+                        if x == y {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    Same::Cmgt => {
+                        if vec_signed(x, bits) > vec_signed(y, bits) {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    Same::Mul => x.wrapping_mul(y) & mask,
+                    Same::Umin => x.min(y),
+                    Same::Umax => x.max(y),
+                    Same::Smin => {
+                        if vec_signed(x, bits) < vec_signed(y, bits) {
+                            x
+                        } else {
+                            y
+                        }
+                    }
+                    Same::Smax => {
+                        if vec_signed(x, bits) > vec_signed(y, bits) {
+                            x
+                        } else {
+                            y
+                        }
+                    }
+                    Same::Urhadd => ((x + y + 1) >> 1) & mask,
+                    _ => unreachable!("unsupported Same op"),
+                };
+                out |= u128::from(val) << shift;
+            }
+            out
+        }
+        VecOp::Unpack(perm, log2, full) => {
+            let width = 1usize << log2;
+            let total = if full { 16 } else { 8 };
+            let base = if perm == Permute::Zip2 { total / 2 } else { 0 };
+            let left = a.to_le_bytes();
+            let right = b.to_le_bytes();
+            let mut out = [0u8; 16];
+            for n in 0..total / (2 * width) {
+                let dst = n * 2 * width;
+                let src = base + n * width;
+                out[dst..dst + width].copy_from_slice(&left[src..src + width]);
+                out[dst + width..dst + 2 * width].copy_from_slice(&right[src..src + width]);
+            }
+            u128::from_le_bytes(out)
+        }
+        VecOp::Pack(narrow, log2, full) => {
+            let out_w = 1usize << log2;
+            let in_w = out_w * 2;
+            let total = if full { 16 } else { 8 };
+            let left = a.to_le_bytes();
+            let right = b.to_le_bytes();
+            let mut out = [0u8; 16];
+            for (n, chunk) in left[..total]
+                .chunks_exact(in_w)
+                .chain(right[..total].chunks_exact(in_w))
+                .enumerate()
+            {
+                let mut val = 0u64;
+                for (k, &byte) in chunk.iter().enumerate() {
+                    val |= u64::from(byte) << (k * 8);
+                }
+                let s = vec_signed(val, in_w * 8);
+                let clamped = match narrow {
+                    Narrowing::Sqxtun => s.clamp(0, 255),
+                    Narrowing::Sqxtn if out_w == 1 => s.clamp(-128, 127),
+                    Narrowing::Sqxtn => s.clamp(-32768, 32767),
+                    Narrowing::Xtn => unreachable!(),
+                };
+                out[n * out_w..(n + 1) * out_w].copy_from_slice(&clamped.to_le_bytes()[..out_w]);
+            }
+            u128::from_le_bytes(out)
+        }
+        VecOp::MulHigh(signed, full) => {
+            let lanes = if full { 8 } else { 4 };
+            let mut out = 0u128;
+            for i in 0..lanes {
+                let x = (a >> (i * 16)) as u16;
+                let y = (b >> (i * 16)) as u16;
+                let hi = if signed {
+                    ((i32::from(x as i16) * i32::from(y as i16)) >> 16) as u16
+                } else {
+                    ((u32::from(x) * u32::from(y)) >> 16) as u16
+                };
+                out |= u128::from(hi) << (i * 16);
+            }
+            out
+        }
+        VecOp::MulAdd(full) => {
+            let pairs = if full { 4 } else { 2 };
+            let mut out = 0u128;
+            for i in 0..pairs {
+                let x0 = i32::from((a >> (i * 32)) as i16);
+                let y0 = i32::from((b >> (i * 32)) as i16);
+                let x1 = i32::from((a >> (i * 32 + 16)) as i16);
+                let y1 = i32::from((b >> (i * 32 + 16)) as i16);
+                let sum = (x0 * y0).wrapping_add(x1 * y1) as u32;
+                out |= u128::from(sum) << (i * 32);
+            }
+            out
+        }
+        VecOp::Shift(op, log2, full) => vec_shift(op, log2, full, a, b as u64),
         VecOp::LessF64 => lanes64(&mut |x, y| {
             let (p, q) = (
                 input(f64::from_bits(x), fpsr),

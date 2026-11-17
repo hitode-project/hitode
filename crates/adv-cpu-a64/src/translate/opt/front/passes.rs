@@ -59,6 +59,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }
         | Op::FpUnary(_, a)
+        | Op::VecUnary(_, a)
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
         | Op::Load { addr: a, .. }
@@ -557,6 +558,7 @@ fn identity(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<Value> {
             Some(b)
         }
         Op::Int(IntOp::And | IntOp::Or, a, b) if a == b => Some(a),
+        Op::Vec(VecOp::And(true) | VecOp::Or(true), a, b) if a == b => Some(a),
         Op::Int(IntOp::Mul, a, b) if constant(defs, b) == Some(1) => Some(a),
         Op::Int(IntOp::Mul, a, b) if constant(defs, a) == Some(1) => Some(b),
         Op::Select { cond, a, b } => {
@@ -671,6 +673,12 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
                 ty,
             )
         }
+        Op::Vec(
+            VecOp::Xor(_) | VecOp::AndNot(_) | VecOp::Same(crate::encode::Same::Sub, _, _),
+            a,
+            b,
+        ) if a == b => 0,
+        Op::VecUnary(VecUnary::Low64, a) => c(a)? & u128::from(u64::MAX),
         Op::Test { flags, cond } => {
             let bits = if let Some(bits) = c(flags) {
                 bits as u32

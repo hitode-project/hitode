@@ -1858,3 +1858,210 @@ fn mmx_rejects_and_denies_admission_when_x87_exception_pending() {
         .is_some()
     );
 }
+
+// spec: A64-OPT-1, A64-OPT-6
+#[test]
+fn mmx_and_xmm_packed_integer_ops_lower_and_match_interpreter() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            // MMX packed-integer suite (width 8 / 4).
+            a.movd(mm0, dword_ptr(esi)).unwrap();
+            a.movd(eax, mm0).unwrap();
+            a.movq(mm1, qword_ptr(esi)).unwrap();
+            a.movq(mm2, qword_ptr(edi)).unwrap();
+            a.punpcklbw(mm0, mm2).unwrap();
+            a.punpckhbw(mm1, mm2).unwrap();
+            a.punpcklwd(mm0, mm2).unwrap();
+            a.punpckhwd(mm1, mm2).unwrap();
+            a.punpckldq(mm0, mm2).unwrap();
+            a.punpckhdq(mm1, mm2).unwrap();
+            a.paddb(mm0, mm1).unwrap();
+            a.paddw(mm0, mm2).unwrap();
+            a.paddd(mm0, mm1).unwrap();
+            a.paddq(mm0, mm2).unwrap();
+            a.psubb(mm0, mm2).unwrap();
+            a.psubw(mm0, mm1).unwrap();
+            a.psubd(mm0, mm2).unwrap();
+            a.psubq(mm0, mm1).unwrap();
+            a.paddsb(mm0, mm2).unwrap();
+            a.paddsw(mm0, mm1).unwrap();
+            a.paddusb(mm0, mm2).unwrap();
+            a.paddusw(mm0, mm1).unwrap();
+            a.psubsb(mm0, mm2).unwrap();
+            a.psubsw(mm0, mm1).unwrap();
+            a.psubusb(mm0, mm2).unwrap();
+            a.psubusw(mm0, mm1).unwrap();
+            a.pmullw(mm0, mm2).unwrap();
+            a.pmulhw(mm0, mm2).unwrap();
+            a.pmulhuw(mm0, mm1).unwrap();
+            a.pmaddwd(mm0, mm2).unwrap();
+            a.pminsw(mm0, mm1).unwrap();
+            a.pmaxsw(mm0, mm2).unwrap();
+            a.pminub(mm0, mm1).unwrap();
+            a.pmaxub(mm0, mm2).unwrap();
+            a.pavgb(mm0, mm2).unwrap();
+            a.pavgw(mm0, mm1).unwrap();
+            a.psllw(mm0, 3).unwrap();
+            a.pslld(mm0, 5).unwrap();
+            a.psllq(mm0, 9).unwrap();
+            a.psrlw(mm0, 2).unwrap();
+            a.psrld(mm0, 4).unwrap();
+            a.psrlq(mm0, 7).unwrap();
+            a.psraw(mm0, 1).unwrap();
+            a.psrad(mm0, 3).unwrap();
+            a.psllw(mm0, mm3).unwrap();
+            a.pslld(mm0, mm3).unwrap();
+            a.psllq(mm0, mm3).unwrap();
+            a.psrlw(mm0, mm3).unwrap();
+            a.psrld(mm0, mm3).unwrap();
+            a.psrlq(mm0, mm3).unwrap();
+            a.psraw(mm0, mm3).unwrap();
+            a.psrad(mm0, mm3).unwrap();
+            a.pand(mm0, mm2).unwrap();
+            a.por(mm0, mm1).unwrap();
+            a.pxor(mm0, mm3).unwrap();
+            a.pandn(mm0, mm2).unwrap();
+            a.pcmpeqb(mm1, mm2).unwrap();
+            a.pcmpeqw(mm0, mm1).unwrap();
+            a.pcmpeqd(mm0, mm2).unwrap();
+            a.pcmpgtb(mm1, mm2).unwrap();
+            a.pcmpgtw(mm0, mm1).unwrap();
+            a.pcmpgtd(mm0, mm2).unwrap();
+            a.packsswb(mm0, mm1).unwrap();
+            a.packssdw(mm0, mm2).unwrap();
+            a.packuswb(mm0, mm1).unwrap();
+            a.movd(dword_ptr(edi), mm0).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+
+            // XMM packed-integer suite (128-bit lanes).
+            a.movd(xmm0, eax).unwrap();
+            a.movq(xmm1, qword_ptr(esi)).unwrap();
+            a.movdqu(xmm2, xmmword_ptr(edi)).unwrap();
+            a.punpcklbw(xmm0, xmm2).unwrap();
+            a.punpckhbw(xmm1, xmm2).unwrap();
+            a.punpcklwd(xmm0, xmm2).unwrap();
+            a.punpckhwd(xmm1, xmm2).unwrap();
+            a.punpckldq(xmm0, xmm2).unwrap();
+            a.punpckhdq(xmm1, xmm2).unwrap();
+            a.punpcklqdq(xmm0, xmm2).unwrap();
+            a.punpckhqdq(xmm1, xmm2).unwrap();
+            a.paddb(xmm0, xmm1).unwrap();
+            a.paddw(xmm0, xmm2).unwrap();
+            a.paddd(xmm0, xmm1).unwrap();
+            a.paddq(xmm0, xmm2).unwrap();
+            a.psubusb(xmm0, xmm2).unwrap();
+            a.psubusw(xmm0, xmm1).unwrap();
+            a.pmullw(xmm0, xmm2).unwrap();
+            a.pmulhw(xmm0, xmm2).unwrap();
+            a.pmulhuw(xmm0, xmm1).unwrap();
+            a.pmaddwd(xmm0, xmm2).unwrap();
+            a.pminsw(xmm0, xmm1).unwrap();
+            a.pmaxub(xmm0, xmm2).unwrap();
+            a.pavgb(xmm0, xmm2).unwrap();
+            a.pavgw(xmm0, xmm1).unwrap();
+            a.psllw(xmm0, 3).unwrap();
+            a.psrlq(xmm0, 17).unwrap();
+            a.psrad(xmm0, 5).unwrap();
+            a.psllw(xmm0, xmm3).unwrap();
+            a.psrlq(xmm0, xmm3).unwrap();
+            a.psrad(xmm0, xmm3).unwrap();
+            a.pand(xmm0, xmm2).unwrap();
+            a.pandn(xmm0, xmm2).unwrap();
+            a.pcmpeqb(xmm1, xmm2).unwrap();
+            a.pcmpgtw(xmm0, xmm1).unwrap();
+            a.packsswb(xmm0, xmm1).unwrap();
+            a.packssdw(xmm0, xmm2).unwrap();
+            a.packuswb(xmm0, xmm1).unwrap();
+            a.movdqu(xmmword_ptr(edi + 16), xmm0).unwrap();
+            a.emms().unwrap();
+        });
+    });
+    let mut at = initial();
+    at.regs[1] = 4;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    at.x87.regs[3] = adv_cpu_core::X87Register::from_parts(33, 0xffff);
+    at.refresh_mmx();
+    at.xmm[3] = 5u128.to_le_bytes();
+    let built = differential(&code, &at, |mem| {
+        for i in 0..64u32 {
+            let v = i.wrapping_mul(0x1357_2469).wrapping_add(0x80ff_7f01);
+            mem.write(DATA + 0x100 + i * 4, &v.to_le_bytes()).unwrap();
+            mem.write(DATA + 0x200 + i * 4, &(!v).to_le_bytes())
+                .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
+}
+
+// spec: A64-OPT-1, A64-OPT-3, A64-OPT-6
+#[test]
+fn mmx_pixel_blend_loop_builds_and_recovers_every_fault() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(mm1, dword_ptr(edi)).unwrap();
+        a.punpcklbw(mm0, mm7).unwrap();
+        a.punpcklbw(mm1, mm7).unwrap();
+        a.pmullw(mm0, mm6).unwrap();
+        a.psrlw(mm0, 8).unwrap();
+        a.paddw(mm0, mm1).unwrap();
+        a.packuswb(mm0, mm7).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.emms().unwrap();
+    });
+    let mut at = initial();
+    at.x87.status = 5 << 11;
+    at.x87.tag = 0x1234;
+    at.x87.regs = std::array::from_fn(|n| {
+        adv_cpu_core::X87Register::from_parts(
+            if n == 7 { 0 } else { 0x0040_0040_0040_0040 },
+            0x3fff,
+        )
+    });
+    at.refresh_mmx();
+    at.regs[1] = 8;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    at.mmx[6] = 0x0040_0040_0040_0040;
+    at.mmx[7] = 0;
+    let built = differential(&code, &at, |mem| {
+        for i in 0..8u32 {
+            mem.write(DATA + 0x100 + i * 4, &(i * 0x1122_3344).to_le_bytes())
+                .unwrap();
+            mem.write(
+                DATA + 0x200 + i * 4,
+                &(i * 0x0102_0304 + 0x1020_3040).to_le_bytes(),
+            )
+            .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
+    // Fault on iteration 1 (before any MMX op) and on iteration 3 (after MMX ops).
+    for unmapped_iter in [0u32, 2] {
+        at.regs[1] = 4;
+        at.regs[6] = DATA + 0x20000 - unmapped_iter * 4;
+        at.regs[7] = DATA + 0x200;
+        compare(
+            &code,
+            &at,
+            |mem| {
+                for i in 0..unmapped_iter {
+                    mem.write(
+                        DATA + 0x20000 - (unmapped_iter - i) * 4,
+                        &0x4080_c0ffu32.to_le_bytes(),
+                    )
+                    .unwrap();
+                    mem.write(DATA + 0x200 + i * 4, &0x1020_3040u32.to_le_bytes())
+                        .unwrap();
+                }
+            },
+            true,
+        );
+    }
+}

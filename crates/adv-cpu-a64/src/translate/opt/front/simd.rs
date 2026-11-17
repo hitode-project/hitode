@@ -1,5 +1,5 @@
 use super::*;
-use crate::encode::{Float, Logic, ShiftImm};
+use crate::encode::{Float, Logic};
 use crate::translate::simd::{Kind, Loc, Simd};
 
 impl Front<'_> {
@@ -24,9 +24,7 @@ impl Front<'_> {
             let value = self.imm(self.assumed.mxcsr);
             return self.write(s.mem, 4, value);
         }
-        if s.mmx() && s.kind != Kind::Move {
-            return Err(Reject::Mmx(self.index));
-        }
+        let full = matches!(s.dst, Loc::Xmm(_));
         let src = match s.src {
             Loc::Xmm(r) => self.state.xmm[r as usize],
             Loc::Mmx(r) => self.state.mmx[r as usize],
@@ -41,10 +39,13 @@ impl Front<'_> {
         };
         let value = match s.kind {
             Kind::Move => {
-                if s.width < 16 {
+                if s.width == 8 && matches!(s.dst, Loc::Mmx(_) | Loc::Xmm(_)) {
+                    let src = self.bits(Type::V128, src);
+                    self.value(Op::VecUnary(VecUnary::Low64, src))
+                } else if s.width < 16 && matches!(s.dst, Loc::Mmx(_) | Loc::Xmm(_)) {
                     let mask = self.constant(Type::V128, (1u128 << (s.width * 8)) - 1);
                     let src = self.bits(Type::V128, src);
-                    self.value(Op::Vec(VecOp::And, src, mask))
+                    self.value(Op::Vec(VecOp::And(full), src, mask))
                 } else {
                     src
                 }
@@ -52,23 +53,23 @@ impl Front<'_> {
             Kind::MoveLow(3) => self.low(dst, src),
             Kind::Logic(op) => {
                 let op = match op {
-                    Logic::And => VecOp::And,
-                    Logic::Orr => VecOp::Or,
-                    Logic::Eor => VecOp::Xor,
+                    Logic::And => VecOp::And(full),
+                    Logic::Orr => VecOp::Or(full),
+                    Logic::Eor => VecOp::Xor(full),
                     _ => return Err(Reject::Unsupported(self.index)),
                 };
                 self.value(Op::Vec(op, dst, src))
             }
-            Kind::AndNot => self.value(Op::Vec(VecOp::AndNot, dst, src)),
-            Kind::Same(crate::encode::Same::Sub, 2) => self.value(Op::Vec(VecOp::SubI32, dst, src)),
-            Kind::ShiftImm(op, 3) | Kind::ShiftBy(op, 3) => {
-                let op = match op {
-                    ShiftImm::Shl => VecOp::ShlI64,
-                    ShiftImm::Ushr => VecOp::ShrI64,
-                    _ => return Err(Reject::Unsupported(self.index)),
-                };
-                self.value(Op::Vec(op, dst, src))
+            Kind::AndNot => self.value(Op::Vec(VecOp::AndNot(full), dst, src)),
+            Kind::Same(op, log2) => self.value(Op::Vec(VecOp::Same(op, log2, full), dst, src)),
+            Kind::Unpack(op, log2) => self.value(Op::Vec(VecOp::Unpack(op, log2, full), dst, src)),
+            Kind::Pack(op, log2) => self.value(Op::Vec(VecOp::Pack(op, log2, full), dst, src)),
+            Kind::MulHigh(signed) => self.value(Op::Vec(VecOp::MulHigh(signed, full), dst, src)),
+            Kind::MulAdd => self.value(Op::Vec(VecOp::MulAdd(full), dst, src)),
+            Kind::ShiftImm(op, log2) => {
+                self.value(Op::VecUnary(VecUnary::ShiftImm(op, log2, s.imm, full), dst))
             }
+            Kind::ShiftBy(op, log2) => self.value(Op::Vec(VecOp::Shift(op, log2, full), dst, src)),
             Kind::Compare(false, true) if s.imm == 1 => {
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
@@ -110,7 +111,13 @@ impl Front<'_> {
                 });
                 return Ok(());
             }
-            _ => return Err(Reject::Unsupported(self.index)),
+            _ => {
+                return Err(if s.mmx() {
+                    Reject::Mmx(self.index)
+                } else {
+                    Reject::Unsupported(self.index)
+                });
+            }
         };
         match s.dst {
             Loc::Xmm(r) => self.state.xmm[r as usize] = self.bits(Type::V128, value),
@@ -156,9 +163,9 @@ impl Front<'_> {
     }
     fn low(&mut self, dst: Value, src: Value) -> Value {
         let mask = self.constant(Type::V128, u128::MAX << 64);
-        let hi = self.value(Op::Vec(VecOp::And, dst, mask));
+        let hi = self.value(Op::Vec(VecOp::And(true), dst, mask));
         let lo = self.bits(Type::I64, src);
         let lo = self.bits(Type::V128, lo);
-        self.value(Op::Vec(VecOp::Or, hi, lo))
+        self.value(Op::Vec(VecOp::Or(true), hi, lo))
     }
 }

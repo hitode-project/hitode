@@ -76,19 +76,30 @@ pub(crate) enum FpUnary {
     Abs,
 }
 
-/// SSE2 operations on 128-bit values. Shifts take their count from the low
-/// 64 bits of the second operand; counts above 63 give zero.
+/// MMX/SSE packed-integer and comparison operations. `full` selects 128-bit
+/// XMM vs 64-bit MMX (upper 64 bits zeroed). Shifts take their count from
+/// the low 64 bits of the second operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecOp {
-    And,
-    AndNot,
-    Or,
-    Xor,
-    SubI32,
-    ShlI64,
-    ShrI64,
+    And(bool),
+    AndNot(bool),
+    Or(bool),
+    Xor(bool),
+    Same(crate::encode::Same, u8, bool),
+    Unpack(crate::encode::Permute, u8, bool),
+    Pack(crate::encode::Narrowing, u8, bool),
+    MulHigh(bool, bool),
+    MulAdd(bool),
+    Shift(crate::encode::ShiftImm, u8, bool),
     /// `cmpltpd`: all ones in each lane where the first is less.
     LessF64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VecUnary {
+    ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
+    /// Zeroes bits 64..128 of a V128 value.
+    Low64,
 }
 
 /// The guest operation whose EFLAGS a `Flags` value holds.
@@ -185,6 +196,7 @@ pub(crate) enum Op {
         wide: bool,
     },
     Vec(VecOp, Value, Value),
+    VecUnary(VecUnary, Value),
     /// A load of `width` bytes outside the frame, zero-extended to `ty`.
     Load {
         ty: Type,
@@ -237,6 +249,7 @@ impl Op {
             Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
+            | Op::VecUnary(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::Load { addr: a, .. }
@@ -473,7 +486,7 @@ impl Func {
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) => Type::V128,
+            Op::Vec(..) | Op::VecUnary(..) => Type::V128,
             Op::Store { .. } | Op::FrameStore { .. } | Op::Validate => return None,
         })
     }

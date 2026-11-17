@@ -2340,13 +2340,13 @@ mod opt_back {
             }
         }
         for op in [
-            VecOp::And,
-            VecOp::AndNot,
-            VecOp::Or,
-            VecOp::Xor,
-            VecOp::SubI32,
-            VecOp::ShlI64,
-            VecOp::ShrI64,
+            VecOp::And(true),
+            VecOp::AndNot(true),
+            VecOp::Or(true),
+            VecOp::Xor(true),
+            VecOp::Same(crate::encode::Same::Sub, 2, true),
+            VecOp::Shift(crate::encode::ShiftImm::Shl, 3, true),
+            VecOp::Shift(crate::encode::ShiftImm::Ushr, 3, true),
             VecOp::LessF64,
         ] {
             let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
@@ -2387,6 +2387,157 @@ mod opt_back {
             finish(&mut f, b, v);
             for cond in [0, 1] {
                 compare(&f, &[cond, 123, 456], &mut h);
+            }
+        }
+    }
+
+    // spec: A64-OPT-6
+    #[test]
+    fn opt_back_packed_integer_vector_ops_match_reference() {
+        use crate::encode::{Narrowing, Permute, Same, ShiftImm};
+        let mut h = harness();
+        let pairs = [
+            (
+                0x80ff_7fff_0001_fe10_7f80_0100_ffff_0081u128,
+                0x0001_7fff_8000_01ff_7f80_ff01_0002_807fu128,
+            ),
+            (
+                0xffff_8000_0000_1234_abcd_ef01_8000_7fffu128,
+                0xffff_8000_7fff_fedc_0000_8000_0001_0002u128,
+            ),
+        ];
+        for full in [false, true] {
+            let (mut f, b, p, _) = start(&[Type::V128]);
+            let v = f.push(b, Op::VecUnary(VecUnary::Low64, p[0])).unwrap();
+            finish(&mut f, b, v);
+            for &(a, _) in &pairs {
+                compare(&f, &[a], &mut h);
+            }
+            for op in [
+                VecOp::And(full),
+                VecOp::AndNot(full),
+                VecOp::Or(full),
+                VecOp::Xor(full),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f.push(b, Op::Vec(op, p[0], p[1])).unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                }
+            }
+            for (op, log2) in [
+                (Same::Add, 0),
+                (Same::Add, 1),
+                (Same::Add, 2),
+                (Same::Add, 3),
+                (Same::Sub, 0),
+                (Same::Sub, 1),
+                (Same::Sub, 2),
+                (Same::Sub, 3),
+                (Same::Sqadd, 0),
+                (Same::Sqadd, 1),
+                (Same::Uqadd, 0),
+                (Same::Uqadd, 1),
+                (Same::Sqsub, 0),
+                (Same::Sqsub, 1),
+                (Same::Uqsub, 0),
+                (Same::Uqsub, 1),
+                (Same::Cmeq, 0),
+                (Same::Cmeq, 1),
+                (Same::Cmeq, 2),
+                (Same::Cmgt, 0),
+                (Same::Cmgt, 1),
+                (Same::Cmgt, 2),
+                (Same::Mul, 1),
+                (Same::Smax, 1),
+                (Same::Smin, 1),
+                (Same::Umax, 0),
+                (Same::Umin, 0),
+                (Same::Urhadd, 0),
+                (Same::Urhadd, 1),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f
+                    .push(b, Op::Vec(VecOp::Same(op, log2, full), p[0], p[1]))
+                    .unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                }
+            }
+            for (op, log2) in [
+                (Permute::Zip1, 0),
+                (Permute::Zip1, 1),
+                (Permute::Zip1, 2),
+                (Permute::Zip2, 0),
+                (Permute::Zip2, 1),
+                (Permute::Zip2, 2),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f
+                    .push(b, Op::Vec(VecOp::Unpack(op, log2, full), p[0], p[1]))
+                    .unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                }
+            }
+            for (op, log2) in [
+                (Narrowing::Sqxtn, 0),
+                (Narrowing::Sqxtn, 1),
+                (Narrowing::Sqxtun, 0),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f
+                    .push(b, Op::Vec(VecOp::Pack(op, log2, full), p[0], p[1]))
+                    .unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                }
+            }
+            for op in [
+                VecOp::MulHigh(true, full),
+                VecOp::MulHigh(false, full),
+                VecOp::MulAdd(full),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f.push(b, Op::Vec(op, p[0], p[1])).unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                }
+            }
+            for (op, log2) in [
+                (ShiftImm::Shl, 1),
+                (ShiftImm::Shl, 2),
+                (ShiftImm::Shl, 3),
+                (ShiftImm::Ushr, 1),
+                (ShiftImm::Ushr, 2),
+                (ShiftImm::Ushr, 3),
+                (ShiftImm::Sshr, 1),
+                (ShiftImm::Sshr, 2),
+            ] {
+                for count in [0u8, 1, 7, 15, 16, 31, 32, 63, 64] {
+                    let (mut f, b, p, _) = start(&[Type::V128]);
+                    let v = f
+                        .push(
+                            b,
+                            Op::VecUnary(VecUnary::ShiftImm(op, log2, count, full), p[0]),
+                        )
+                        .unwrap();
+                    finish(&mut f, b, v);
+                    compare(&f, &[pairs[0].0], &mut h);
+                }
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f
+                    .push(b, Op::Vec(VecOp::Shift(op, log2, full), p[0], p[1]))
+                    .unwrap();
+                finish(&mut f, b, v);
+                for count in [0u64, 1, 7, 15, 16, 31, 32, 63, 64, u64::MAX] {
+                    compare(&f, &[pairs[0].0, u128::from(count)], &mut h);
+                }
             }
         }
     }

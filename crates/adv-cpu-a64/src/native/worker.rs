@@ -1622,6 +1622,491 @@ mod tests {
         assert_eq!(cpu.x87.tag, 0xffff);
     }
 
+    // spec: A64-OPT-1 A64-TR-9 A64F-FP-4
+    #[test]
+    fn an_admitted_mmx_pixel_loop_splits_and_matches_serial() {
+        let _pool = exclusive_pool();
+        if Pool::get().is_none_or(|pool| pool.limit < 2) {
+            return;
+        }
+        // head: dst[i] = ((src[i] * alpha) >> 8) + dst[i] per 8-bit channel.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(mm1, dword_ptr(edi)).unwrap();
+        a.punpcklbw(mm0, mm7).unwrap();
+        a.punpcklbw(mm1, mm7).unwrap();
+        a.pmullw(mm0, mm6).unwrap();
+        a.psrlw(mm0, 8).unwrap();
+        a.paddw(mm0, mm1).unwrap();
+        a.packuswb(mm0, mm7).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 4;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        let src: Vec<u8> = (0..N)
+            .flat_map(|i| (i.wrapping_mul(0x1357_2461)).to_le_bytes())
+            .collect();
+        let dst: Vec<u8> = (0..N)
+            .flat_map(|i| (i ^ 0x2468_1357).to_le_bytes())
+            .collect();
+        memory.write(SRC, &src).unwrap();
+        let expected: Vec<u8> = src
+            .iter()
+            .zip(&dst)
+            .map(|(&s, &d)| {
+                ((u16::from(s) * 0x40) >> 8)
+                    .saturating_add(u16::from(d))
+                    .min(255) as u8
+            })
+            .collect();
+        executor.state.eip = CODE;
+        executor.state.regs[1] = N;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        executor.state.x87.control = 0x27f;
+        executor.state.x87.status = 5 << 11;
+        executor.state.x87.tag = 0x5555;
+        executor.state.x87.regs = std::array::from_fn(|n| {
+            adv_cpu_core::X87Register::from_parts(
+                if n == 7 { 0 } else { 0x0040_0040_0040_0040 },
+                0x3fff,
+            )
+        });
+        executor.state.refresh_mmx();
+        let start = Some(executor.save_context().unwrap());
+        let reset = |memory: &mut Memory| memory.write(DST, &dst).unwrap();
+        let (retired, final_context) = whole_then_split(
+            &mut executor,
+            &mut native,
+            &start,
+            stop,
+            reset,
+            &[(DST, len)],
+        );
+        assert_eq!(retired, u64::from(N) * 13);
+        assert_eq!(executor.memory().read(DST, len).unwrap(), expected);
+        let cpu = final_context.cpu();
+        assert_eq!(cpu.x87.top(), 0);
+        assert_eq!(cpu.x87.tag, 0);
+        assert_eq!(cpu.x87.regs[0].sign_exponent(), 0xffff);
+        assert_eq!(cpu.x87.regs[1].sign_exponent(), 0xffff);
+        assert_eq!(cpu.x87.regs[6].sign_exponent(), 0x3fff);
+        assert_eq!(cpu.x87.regs[7].sign_exponent(), 0x3fff);
+    }
+
+    // spec: A64-OPT-1 A64-TR-9 A64F-FP-4
+    #[test]
+    fn an_mmx_accumulator_loop_refuses_split_and_runs_serially() {
+        const COUNT: u32 = 4096;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.paddw(mm0, qword_ptr(esi)).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = COUNT as usize * 8;
+        let memory = executor.memory_mut();
+        memory.map(SRC, len, READ | WRITE).unwrap();
+        memory.map(DST, len, READ | WRITE).unwrap();
+        let mut acc = [1u16, 2, 3, 4];
+        let mut src = Vec::with_capacity(len);
+        let mut expected_dst = Vec::with_capacity(len);
+        for i in 0..COUNT {
+            for (lane, acc_lane) in acc.iter_mut().enumerate() {
+                let w = ((i * 5 + lane as u32) as u16).wrapping_mul(17);
+                *acc_lane = acc_lane.wrapping_add(w);
+                src.extend_from_slice(&w.to_le_bytes());
+                expected_dst.extend_from_slice(&acc_lane.to_le_bytes());
+            }
+        }
+        memory.write(SRC, &src).unwrap();
+        let expected_mm0 = u64::from_le_bytes(
+            acc.iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        );
+        let seed_mm0 = u64::from_le_bytes(
+            [1u16, 2, 3, 4]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        );
+        executor.state.eip = CODE;
+        executor.state.regs[1] = COUNT;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        executor.state.x87.control = 0x27f;
+        executor.state.x87.regs[0] = adv_cpu_core::X87Register::from_parts(seed_mm0, 0x3fff);
+        executor.state.refresh_mmx();
+        let start = Some(executor.save_context().unwrap());
+        native.candidates.push(CODE);
+        native.set_computation_offer(true, None);
+        let mut cpu = start.as_ref().unwrap().cpu().clone();
+        let offer = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.exit, Exit::Computation);
+        assert!(!native.computation[&CODE].proof.splits());
+        let mut retired = 0;
+        let mut done = None;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |scope| done = scope.run_local(1, &start),
+        );
+        let done = done.expect("admitted serial loop");
+        assert_eq!(done.retired, u64::from(COUNT) * 6);
+        assert_eq!(done.optimized, done.retired);
+        assert_eq!(executor.memory().read(DST, len).unwrap(), expected_dst);
+        let cpu = done.context.as_ref().unwrap().cpu();
+        assert_eq!(cpu.mmx[0], expected_mm0);
+        assert_eq!(cpu.x87.regs[0].sign_exponent(), 0xffff);
+    }
+
+    // spec: A64-OPT-1 A64F-FP-4
+    #[test]
+    fn pending_x87_exception_denies_mmx_computation_admission() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.paddw(mm0, qword_ptr(esi)).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        executor.memory_mut().map(SRC, 4096, READ | WRITE).unwrap();
+        executor.memory_mut().map(DST, 4096, READ | WRITE).unwrap();
+        executor.state.eip = CODE;
+        executor.state.regs[1] = 4;
+        executor.state.regs[6] = SRC;
+        executor.state.regs[7] = DST;
+        executor.state.mxcsr = 0x1f80;
+        executor.state.x87.control = 0x27f;
+        executor.state.x87.status = 0;
+        executor.state.refresh_mmx();
+        let clean = Some(executor.save_context().unwrap());
+        executor.state.x87.control = 0x27e;
+        executor.state.x87.status = 0x81;
+        let pending = Some(executor.save_context().unwrap());
+        native.candidates.push(CODE);
+        native.set_computation_offer(true, None);
+        let mut cpu = clean.as_ref().unwrap().cpu().clone();
+        let offer = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.exit, Exit::Computation);
+        // Install the optimized form first, then enter with a pending x87 exception.
+        let mut retired = 0;
+        let mut clean_done = None;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |scope| clean_done = scope.run_local(1, &clean),
+        );
+        assert!(clean_done.unwrap().optimized > 0);
+        assert!(native.computation[&CODE].code.optimized.is_some());
+        let mut pending_done = None;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |scope| pending_done = scope.run_local(2, &pending),
+        );
+        let done = pending_done.unwrap();
+        assert_eq!(done.optimized, 0);
+        assert_eq!(done.retired, 0);
+        assert!(done.requires_owner);
+        assert_eq!(done.context.unwrap().cpu().eip, CODE);
+    }
+
+    // spec: A64-OPT-1 A64-OPT-6 A64F-FP-4 A64-VER-1 A64-VER-2
+    #[test]
+    fn mmx_optimized_matches_interpreter_across_flagm_cuts_and_faults() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(mm1, dword_ptr(edi)).unwrap();
+        a.punpcklbw(mm0, mm7).unwrap();
+        a.punpcklbw(mm1, mm7).unwrap();
+        a.pmullw(mm0, mm6).unwrap();
+        a.psrlw(mm0, 8).unwrap();
+        a.paddw(mm0, mm1).unwrap();
+        a.packuswb(mm0, mm7).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let words = a.assemble(u64::from(CODE)).unwrap();
+        let stop = CODE + words.len() as u32 - 1;
+        let host = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(0x4000);
+        for flagm in [false, true] {
+            for emms_before in [false, true] {
+                // Case 1: budget cut (deadline recall) + full resume vs interpreter.
+                const COUNT: u32 = 8192;
+                let len = (COUNT as usize * 4).max(host);
+                let mut a_prog = CodeAssembler::new(32).unwrap();
+                let mut h = a_prog.create_label();
+                a_prog.set_label(&mut h).unwrap();
+                a_prog.movd(mm0, dword_ptr(esi)).unwrap();
+                a_prog.movd(mm1, dword_ptr(edi)).unwrap();
+                a_prog.punpcklbw(mm0, mm7).unwrap();
+                a_prog.punpcklbw(mm1, mm7).unwrap();
+                a_prog.pmullw(mm0, mm6).unwrap();
+                a_prog.psrlw(mm0, 8).unwrap();
+                a_prog.paddw(mm0, mm1).unwrap();
+                a_prog.packuswb(mm0, mm7).unwrap();
+                a_prog.movd(dword_ptr(edi), mm0).unwrap();
+                a_prog.add(esi, 4).unwrap();
+                a_prog.add(edi, 4).unwrap();
+                a_prog.dec(ecx).unwrap();
+                a_prog.jne(h).unwrap();
+                a_prog.int3().unwrap();
+                let src: Vec<u8> = (0..COUNT)
+                    .flat_map(|i| i.wrapping_mul(0x1357_2461).to_le_bytes())
+                    .collect();
+                let dst: Vec<u8> = (0..COUNT)
+                    .flat_map(|i| (i ^ 0x2468_1357).to_le_bytes())
+                    .collect();
+                let init = |exec: &mut Executor, count: u32, start_src: u32| {
+                    exec.memory_mut().write(SRC, &src).unwrap();
+                    exec.memory_mut().write(DST, &dst).unwrap();
+                    exec.state.eip = CODE;
+                    exec.state.eflags = 0x202;
+                    exec.state.regs = [0; 8];
+                    exec.state.regs[1] = count;
+                    exec.state.regs[6] = start_src;
+                    exec.state.regs[7] = DST;
+                    exec.state.mxcsr = 0x1f80;
+                    exec.state.x87.control = 0x27f;
+                    if emms_before {
+                        exec.state.x87.status = 0;
+                        exec.state.x87.tag = 0xffff;
+                    } else {
+                        exec.state.x87.status = 5 << 11;
+                        exec.state.x87.tag = 0x5555;
+                    }
+                    exec.state.x87.regs = std::array::from_fn(|n| {
+                        adv_cpu_core::X87Register::from_parts(
+                            if n == 7 { 0 } else { 0x0040_0040_0040_0040 },
+                            0x3fff,
+                        )
+                    });
+                    exec.state.refresh_mmx();
+                };
+                let (mut executor, mut native) = fixture(&mut a_prog);
+                native.features.flagm = flagm;
+                executor.memory_mut().map(SRC, len, READ | WRITE).unwrap();
+                executor.memory_mut().map(DST, len, READ | WRITE).unwrap();
+                init(&mut executor, COUNT, SRC);
+                let mut interp = Executor::interpreted_address_space().unwrap();
+                interp.interpreter_only = true;
+                interp.memory_mut().map(CODE, 0x4000, READ | WRITE).unwrap();
+                interp.memory_mut().write(CODE, &words).unwrap();
+                interp
+                    .memory_mut()
+                    .protect(CODE, 0x4000, READ | EXEC)
+                    .unwrap();
+                interp.memory_mut().map(SRC, len, READ | WRITE).unwrap();
+                interp.memory_mut().map(DST, len, READ | WRITE).unwrap();
+                init(&mut interp, COUNT, SRC);
+
+                let start = Some(executor.save_context().unwrap());
+                native.candidates.push(CODE);
+                native.set_computation_offer(true, None);
+                let mut cpu = start.as_ref().unwrap().cpu().clone();
+                let offer = native
+                    .run(
+                        &mut cpu,
+                        executor.memory_mut(),
+                        stop,
+                        1 << 16,
+                        std::ptr::null_mut(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(offer.exit, Exit::Computation);
+                native.install_optimized(true);
+                let prepared = &native.computation[&CODE];
+                assert!(prepared.code.optimized.is_some());
+                let entry = Entry {
+                    enter: native.enter,
+                    window: native.runtime.window,
+                    alias: super::super::alias_base(executor.memory()),
+                    fault: native.stubs.fault,
+                };
+                let signals = Signals {
+                    recall: Arc::new(AtomicU32::new(0)),
+                    pending: (
+                        Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)),
+                        adv_sync::pending::DEADLINE,
+                    ),
+                };
+                let mut retired = 0;
+                let cut = run(
+                    &mut Runtime::new(std::ptr::null_mut(), 0),
+                    1,
+                    start.clone().unwrap(),
+                    entry,
+                    (&prepared.code, 0),
+                    &signals,
+                    LOCAL,
+                )
+                .completion;
+                assert!(cut.optimized > 0 && cut.retired < u64::from(COUNT) * 13);
+                assert_eq!(
+                    interp.run(stop, cut.retired).unwrap(),
+                    adv_cpu_core::RunOutcome::Budget
+                );
+                interp.state.refresh_mmx();
+                let mid = cut.context.as_ref().unwrap().cpu();
+                assert_eq!(
+                    (mid.eip, mid.regs, mid.eflags),
+                    (interp.state.eip, interp.state.regs, interp.state.eflags)
+                );
+                assert_eq!(
+                    (mid.x87.top(), mid.x87.tag),
+                    (interp.state.x87.top(), interp.state.x87.tag)
+                );
+                assert_eq!(mid.mmx[2..], interp.state.mmx[2..]);
+                assert_eq!(mid.x87.regs[2..], interp.state.x87.regs[2..]);
+                assert_eq!(
+                    executor.memory().read(DST, COUNT as usize * 4).unwrap(),
+                    interp.memory().read(DST, COUNT as usize * 4).unwrap()
+                );
+                let mut rest = None;
+                native.with_computation(
+                    executor.memory_mut(),
+                    &mut retired,
+                    (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+                    None,
+                    &mut |scope| rest = scope.run_local(2, &cut.context),
+                );
+                let rest = rest.expect("resumed mmx job");
+                assert_eq!(rest.optimized, rest.retired);
+                assert_eq!(cut.retired + rest.retired, u64::from(COUNT) * 13);
+                assert_eq!(
+                    interp.run(stop, 200_000).unwrap(),
+                    adv_cpu_core::RunOutcome::ReachedStop
+                );
+                interp.state.refresh_mmx();
+                interp.state.fuel = 0;
+                assert_eq!(rest.context.as_ref().unwrap().cpu(), &interp.state);
+                assert_eq!(
+                    executor.memory().read(DST, COUNT as usize * 4).unwrap(),
+                    interp.memory().read(DST, COUNT as usize * 4).unwrap()
+                );
+
+                // Case 2: unmapped page-crossing fault on iter 1 vs iter 2+.
+                for iter1 in [true, false] {
+                    let start_src = if iter1 {
+                        SRC + len as u32 - 2
+                    } else {
+                        SRC + len as u32 - 6
+                    };
+                    init(&mut executor, 8, start_src);
+                    init(&mut interp, 8, start_src);
+                    let f_start = executor.save_context().unwrap();
+                    let clean_signals = Signals {
+                        recall: Arc::new(AtomicU32::new(0)),
+                        pending: (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+                    };
+                    let fault_entry = Entry {
+                        alias: native.runtime.window,
+                        ..entry
+                    };
+                    let done = run(
+                        &mut Runtime::new(std::ptr::null_mut(), 0),
+                        3,
+                        f_start,
+                        fault_entry,
+                        (&native.computation[&CODE].code, 0),
+                        &clean_signals,
+                        LOCAL,
+                    );
+                    assert_eq!(done.admitted, Some(true));
+                    let faulted = done.completion;
+                    assert!(!faulted.requires_owner);
+                    assert_eq!(faulted.retired, if iter1 { 0 } else { 13 });
+                    let outcome = interp.run(stop, 10_000).unwrap();
+                    assert!(matches!(
+                        outcome,
+                        adv_cpu_core::RunOutcome::ReadFault { .. }
+                    ));
+                    interp.state.refresh_mmx();
+                    let fault_cpu = faulted.context.as_ref().unwrap().cpu();
+                    assert_eq!(
+                        (fault_cpu.eip, fault_cpu.regs, fault_cpu.eflags),
+                        (interp.state.eip, interp.state.regs, interp.state.eflags)
+                    );
+                    assert_eq!(
+                        (fault_cpu.x87.top(), fault_cpu.x87.tag),
+                        (interp.state.x87.top(), interp.state.x87.tag)
+                    );
+                    if iter1 {
+                        interp.state.fuel = 0;
+                        interp.state.fault_addr = 0;
+                        assert_eq!(fault_cpu, &interp.state);
+                    } else {
+                        assert_eq!(fault_cpu.mmx[2..], interp.state.mmx[2..]);
+                        assert_eq!(fault_cpu.x87.regs[2..], interp.state.x87.regs[2..]);
+                    }
+                    assert_eq!(
+                        executor.memory().read(DST, 32).unwrap(),
+                        interp.memory().read(DST, 32).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
     // spec: A64-TR-9
     #[test]
     fn blocks_run_frame_writing_iterations_on_private_frames() {
