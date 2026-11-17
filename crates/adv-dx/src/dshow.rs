@@ -50,6 +50,7 @@ pub(crate) const E_INVALIDARG: u32 = 0x8007_0057;
 pub(crate) const VFW_E_NOT_CONNECTED: u32 = 0x8004_0209;
 pub(crate) const VFW_E_NO_ALLOCATOR: u32 = 0x8004_020a;
 pub(crate) const VFW_E_ALREADY_CONNECTED: u32 = 0x8004_0204;
+pub(crate) const VFW_E_NOT_STOPPED: u32 = 0x8004_0224;
 pub(crate) const VFW_E_NO_ACCEPTABLE_TYPES: u32 = 0x8004_0207;
 pub(crate) const VFW_E_INVALID_DIRECTION: u32 = 0x8004_0208;
 pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;
@@ -278,6 +279,19 @@ pub(crate) enum Face {
     DmoWrapper,
     VmrFilterConfig,
     VmrWindowlessControl,
+    VmrProtection,
+    VmrMisc,
+    VmrProperties,
+    VmrQuality,
+    VmrStatistics,
+    VmrAspect,
+    VmrDeinterlace,
+    VmrBitmap,
+    VmrMixer,
+    VmrMonitor,
+    VmrNotify,
+    VmrAccelerator,
+    VmrOverlay,
     QualityControl,
     MpegAudioDecoder,
     StreamSelect,
@@ -285,7 +299,7 @@ pub(crate) enum Face {
     Inner,
 }
 
-const FACES: [(Face, &str); 30] = [
+const FACES: [(Face, &str); 43] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -312,6 +326,19 @@ const FACES: [(Face, &str); 30] = [
     (Face::DmoWrapper, "IDMOWrapperFilter"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
+    (Face::VmrProtection, "IAMCertifiedOutputProtection"),
+    (Face::VmrMisc, "IAMFilterMiscFlags"),
+    (Face::VmrProperties, "IKsPropertySet"),
+    (Face::VmrQuality, "IQualityControl"),
+    (Face::VmrStatistics, "IQualProp"),
+    (Face::VmrAspect, "IVMRAspectRatioControl"),
+    (Face::VmrDeinterlace, "IVMRDeinterlaceControl"),
+    (Face::VmrBitmap, "IVMRMixerBitmap"),
+    (Face::VmrMixer, "IVMRMixerControl"),
+    (Face::VmrMonitor, "IVMRMonitorConfig"),
+    (Face::VmrNotify, "IVMRSurfaceAllocatorNotify"),
+    (Face::VmrAccelerator, "IAMVideoAccelerator"),
+    (Face::VmrOverlay, "IOverlay"),
     (Face::QualityControl, "IQualityControl"),
     (Face::MpegAudioDecoder, "IMpegAudioDecoder"),
     (Face::StreamSelect, "IAMStreamSelect"),
@@ -351,6 +378,19 @@ impl Face {
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
+            Face::VmrProtection => &[vmr::IID_IAMCERTIFIEDOUTPUTPROTECTION],
+            Face::VmrMisc => &[vmr::IID_IAMFILTERMISCFLAGS],
+            Face::VmrProperties => &[vmr::IID_IKSPROPERTYSET],
+            Face::VmrQuality => &[vmr::IID_IQUALITYCONTROL],
+            Face::VmrStatistics => &[vmr::IID_IQUALPROP],
+            Face::VmrAspect => &[vmr::IID_IVMRASPECTRATIOCONTROL],
+            Face::VmrDeinterlace => &[vmr::IID_IVMRDEINTERLACECONTROL],
+            Face::VmrBitmap => &[vmr::IID_IVMRMIXERBITMAP],
+            Face::VmrMixer => &[vmr::IID_IVMRMIXERCONTROL],
+            Face::VmrMonitor => &[vmr::IID_IVMRMONITORCONFIG],
+            Face::VmrNotify => &[vmr::IID_IVMRSURFACEALLOCATORNOTIFY],
+            Face::VmrAccelerator => &[vmr::IID_IAMVIDEOACCELERATOR],
+            Face::VmrOverlay => &[vmr::IID_IOVERLAY],
             Face::QualityControl => &[IID_IQUALITYCONTROL],
             Face::MpegAudioDecoder => &[IID_IMPEGAUDIODECODER],
             Face::StreamSelect => &[IID_IAMSTREAMSELECT],
@@ -451,6 +491,12 @@ pub fn register(registry: &mut Registry) {
         stream::THREAD_ENTRY,
         Conv::Stdcall { argc: 1 },
         stream::thread_entry,
+    );
+    registry.add(
+        "quartz.dll",
+        "VMRWindowProc",
+        Conv::Stdcall { argc: 4 },
+        video::window::vmr_window_proc,
     );
     crate::refcounts::install(registry, "quartz.dll");
 }
@@ -703,6 +749,18 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             if let Some(vmr) = filter.vmr {
                 vmr::destroyed(env, vmr);
             }
+            for pin in filter.pins {
+                let com = self::state(env).com;
+                if let Some(id) = com.identity::<Obj>(&env.sys.objects, pin)
+                    && let Some(Some(destroyed)) =
+                        com.release_internal::<Obj>(&mut env.sys.objects, id)
+                {
+                    destroyed_object(env, pin, &destroyed.value);
+                    if let Some(&first) = destroyed.interfaces.iter().min() {
+                        free(env, first);
+                    }
+                }
+            }
         }
         Obj::Pin => {
             state.pins.remove(&canonical);
@@ -770,6 +828,11 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     {
         return graph::mapper::query(env, graph, env.arg(1), env.arg(2));
     }
+    if slot == 2
+        && let Some(outcome) = vmr::release_window(env, this)
+    {
+        return outcome;
+    }
     match slot {
         0 => return Outcome::Return(query_interface(env, this, env.arg(1), env.arg(2))),
         1 => return Outcome::Return(add_ref(env, this)),
@@ -792,13 +855,14 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::MediaSeeking
         | Face::MediaPosition
         | Face::BasicAudio
-        | Face::BasicVideo
-        | Face::VideoWindow
         | Face::MediaFilter
         | Face::ObjectWithSite
         | Face::GraphConfig
         | Face::GraphVersion
         | Face::VideoFrameStep => graph::call(env, face, &method, this),
+        Face::BasicVideo | Face::VideoWindow => {
+            vmr::call(env, face, &method, this).or_else(|| graph::call(env, face, &method, this))
+        }
         Face::BaseFilter
         | Face::FileSource
         | Face::EnumFilters
@@ -812,6 +876,19 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::StreamSelect => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
+        Face::VmrProtection
+        | Face::VmrMisc
+        | Face::VmrProperties
+        | Face::VmrQuality
+        | Face::VmrStatistics
+        | Face::VmrAspect
+        | Face::VmrDeinterlace
+        | Face::VmrBitmap
+        | Face::VmrMixer
+        | Face::VmrMonitor
+        | Face::VmrNotify
+        | Face::VmrAccelerator
+        | Face::VmrOverlay => vmr::call(env, face, &method, this),
         Face::Inner => None,
     };
     outcome.unwrap_or_else(|| {
@@ -841,6 +918,11 @@ pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u3
     let Ok(requested) = read_guid(env, iid) else {
         return E_POINTER;
     };
+    if let Some(filter) = canonical(env, this)
+        && !vmr::supports(env, filter, requested)
+    {
+        return E_NOINTERFACE;
+    }
     let com = state(env).com;
     if filter::host_pin(env, this).is_some() {
         return match com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested) {

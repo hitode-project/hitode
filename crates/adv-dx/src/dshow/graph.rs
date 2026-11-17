@@ -23,7 +23,7 @@ pub(crate) const RUNNING: u32 = 2;
 
 const EC_COMPLETE: u32 = 1;
 const AM_MEDIAEVENT_NONOTIFY: u32 = 1;
-const EC_USERABORT: u32 = 2;
+pub(crate) const EC_USERABORT: u32 = 2;
 const EC_ERRORABORT: u32 = 3;
 const E_ABORT: u32 = 0x8000_4004;
 const E_FAIL: u32 = 0x8000_4005;

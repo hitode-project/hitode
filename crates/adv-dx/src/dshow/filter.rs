@@ -43,7 +43,7 @@ pub(crate) struct Source {
 
 pub(crate) struct Filter {
     pub role: Role,
-    clsid: Iid,
+    pub(super) clsid: Iid,
     pub pins: Vec<u32>,
     pub graph: u32,
     pub name: Vec<u16>,
@@ -152,14 +152,22 @@ pub(crate) fn create_audio_renderer(
 }
 
 pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    create_filter(
+    let outcome = create_filter(
         env,
         iid,
         outer,
         output,
         Role::VideoRenderer,
         super::vmr::CLSID_VIDEO_MIXING_RENDERER,
-    )
+    );
+    match outcome {
+        Outcome::Return(S_OK) => {
+            let pointer = env.cpu.read_u32(output).unwrap();
+            let filter = canonical(env, pointer).unwrap();
+            super::video::window::create_vmr_window(env, filter)
+        }
+        outcome => outcome,
+    }
 }
 
 /// CoCreateInstance of a host filter. Like Windows, an aggregated filter hands
@@ -181,7 +189,11 @@ pub(super) fn create_filter(
         Err(error) => return Outcome::Return(error),
     };
     let com = state(env).com;
-    let result = match com.query::<Obj>(&mut env.sys.objects, base, iid) {
+    let result = match if super::vmr::supports(env, base, iid) {
+        com.query::<Obj>(&mut env.sys.objects, base, iid)
+    } else {
+        Err(adv_os::com::QueryError::NoInterface)
+    } {
         Ok(pointer) => {
             let _ = env.cpu.write_u32(output, pointer);
             S_OK
@@ -208,6 +220,21 @@ pub(super) fn new_filter(
             Face::BaseFilter,
             Face::VmrFilterConfig,
             Face::VmrWindowlessControl,
+            Face::BasicVideo,
+            Face::VideoWindow,
+            Face::MediaSeeking,
+            Face::MediaPosition,
+            Face::VmrProtection,
+            Face::VmrMisc,
+            Face::VmrProperties,
+            Face::VmrQuality,
+            Face::VmrStatistics,
+            Face::VmrAspect,
+            Face::VmrDeinterlace,
+            Face::VmrBitmap,
+            Face::VmrMixer,
+            Face::VmrMonitor,
+            Face::VmrNotify,
         ],
         _ => &[Face::BaseFilter],
     };
@@ -278,7 +305,7 @@ pub(super) fn new_filter(
     Ok(base)
 }
 
-/// A pin lives as long as the process: its filter holds an internal reference.
+/// The filter retains each pin internally; VMR pin references count on the filter.
 pub(super) fn new_pin(
     env: &mut Env<'_>,
     filter: u32,
@@ -287,30 +314,36 @@ pub(super) fn new_pin(
     major: Iid,
     mt: Option<MediaType>,
 ) -> Result<u32, u32> {
+    let clsid = state(env).filters[&filter].clsid;
     let role = state(env).filters[&filter].role;
     let mpeg = matches!(
         role,
         Role::Splitter | Role::VideoDecoder | Role::AudioDecoder
     );
-    let faces: &[Face] = match (mpeg, dir) {
-        (true, INPUT) => &[Face::Pin, Face::MemInputPin, Face::QualityControl],
-        (true, OUTPUT) if role != Role::Splitter => &[
+    let faces: &[Face] = if dir == INPUT && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER {
+        &[
             Face::Pin,
-            Face::QualityControl,
-            Face::MediaSeeking,
-            Face::MediaPosition,
-        ],
-        (true, OUTPUT) => &[Face::Pin, Face::QualityControl, Face::MediaSeeking],
-        (false, INPUT) => &[Face::Pin, Face::MemInputPin],
-        _ => &[Face::Pin],
+            Face::MemInputPin,
+            Face::VmrAccelerator,
+            Face::VmrOverlay,
+            Face::VmrQuality,
+        ]
+    } else {
+        match (mpeg, dir) {
+            (true, INPUT) => &[Face::Pin, Face::MemInputPin, Face::QualityControl],
+            (true, OUTPUT) if role != Role::Splitter => &[
+                Face::Pin,
+                Face::QualityControl,
+                Face::MediaSeeking,
+                Face::MediaPosition,
+            ],
+            (true, OUTPUT) => &[Face::Pin, Face::QualityControl, Face::MediaSeeking],
+            (false, INPUT) => &[Face::Pin, Face::MemInputPin],
+            _ => &[Face::Pin],
+        }
     };
     let faces = super::create(env, faces, Obj::Pin)?;
     let pin = faces[0];
-    retain_internal(env, pin);
-    release(env, pin);
-    for &face in &faces {
-        let _ = env.cpu.write_u32(face + 4, 0);
-    }
     state(env).pins.insert(
         pin,
         Pin {
@@ -324,10 +357,18 @@ pub(super) fn new_pin(
             reader: 0,
             mem: 0,
             allocator: 0,
-            faces,
+            faces: faces.clone(),
             quality_sink: 0,
         },
     );
+    retain_internal(env, pin);
+    let com = state(env).com;
+    let _ = com.release::<Obj>(&mut env.sys.objects, pin);
+    // Guest AddRef/Release use the same counter as the owning filter.
+    let counter = env.cpu.read_u32(filter + 4).unwrap_or(0);
+    for &face in &faces {
+        let _ = env.cpu.write_u32(face + 4, counter);
+    }
     state(env).filters.get_mut(&filter).unwrap().pins.push(pin);
     Ok(pin)
 }
@@ -681,7 +722,11 @@ fn filter_method(env: &mut Env<'_>, filter: u32, method: &str) -> Option<Outcome
             let value = state(env).filters[&filter].state;
             let output = env.arg(2);
             r(if env.cpu.write_u32(output, value).is_ok() {
-                S_OK
+                if state(env).filters[&filter].vmr.is_some() {
+                    super::vmr::state_result(env, filter)
+                } else {
+                    S_OK
+                }
             } else {
                 E_POINTER
             })
@@ -777,6 +822,14 @@ pub(crate) fn transition(
     then: Done,
 ) -> Outcome {
     set_state(env, filter, state);
+    if self::state(env).filters[&filter].vmr.is_some() {
+        let result = super::vmr::transition_result(env, filter);
+        let graph = self::state(env).filters[&filter].graph;
+        if state != graph::STOPPED && graph != 0 {
+            return super::vmr::show_windows(env, graph, Box::new(move |env, _| then(env, result)));
+        }
+        return then(env, result);
+    }
     let calls = env.ext.get::<State>().filters[&filter]
         .pins
         .iter()
@@ -807,11 +860,13 @@ pub(crate) fn transition(
 }
 
 pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
+    let previous;
     let outputs: Vec<u32> = {
         let s = state(env);
         let Some(f) = s.filters.get_mut(&filter) else {
             return;
         };
+        previous = f.state;
         f.state = value;
         if value == graph::STOPPED {
             f.decoder = None;
@@ -835,7 +890,7 @@ pub(crate) fn set_state(env: &mut Env<'_>, filter: u32, value: u32) {
         }
     }
     super::dmo::state_changed(env, filter, value);
-    super::vmr::state_changed(env, filter, value);
+    super::vmr::state_changed(env, filter, value, previous);
 }
 
 fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
@@ -2076,7 +2131,7 @@ pub(super) fn disconnect_owned(env: &mut Env<'_>, pin: u32) -> VecDeque<Call> {
     };
     disconnect_host(env, pin);
     state(env).pins.get_mut(&pin).unwrap().reader = 0;
-    let mut calls = VecDeque::new();
+    let mut calls = super::vmr::disconnect_calls(env, pin);
     for pointer in [
         mem,
         reader,
@@ -2158,10 +2213,17 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
     let Ok(mt) = MediaType::read(env, pmt) else {
         return Outcome::Return(E_POINTER);
     };
-    if !accepts(env, pin, &mt) {
+    if !(if role_of(env, pin) == Role::VideoRenderer {
+        super::vmr::connects_input(&mt)
+    } else {
+        accepts(env, pin, &mt)
+    }) {
         return Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED);
     }
     let filter = state(env).pins[&pin].filter;
+    if state(env).filters[&filter].state != graph::STOPPED {
+        return Outcome::Return(VFW_E_NOT_STOPPED);
+    }
     if state(env).filters[&filter].role == Role::DmoDecoder
         && !super::dmo::connect_input(env, pin, &mt)
     {
@@ -2175,6 +2237,8 @@ fn receive_connection(env: &mut Env<'_>, pin: u32, connector: u32, pmt: u32) -> 
         return guest_call(env, connector, 1, vec![], move |env, _| {
             if dmo {
                 super::dmo::learn_upstream(env, pin, connector)
+            } else if state(env).filters[&filter].role == Role::VideoRenderer {
+                super::video::window::connect_vmr_window(env, filter)
             } else {
                 Outcome::Return(S_OK)
             }

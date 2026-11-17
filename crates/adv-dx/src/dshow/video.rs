@@ -234,7 +234,7 @@ pub(crate) fn publish(
 }
 
 pub(crate) fn auto_show(env: &mut Env<'_>, graph: u32) -> u32 {
-    if !available(env, graph) {
+    if !available(env, graph) || !connected(env, graph) {
         return S_OK;
     }
     let window = &mut state(env).graphs.get_mut(&graph).unwrap().video;
