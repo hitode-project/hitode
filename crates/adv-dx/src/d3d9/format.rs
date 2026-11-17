@@ -70,6 +70,17 @@ pub(super) fn snapshot(
     let mut hash = whole.then(Xxh3::new);
     if destination.0.texel_format() == texel(format)? {
         let row_bytes = self::pitch(format, width)?;
+        if pitch == row_bytes
+            && let Some(total) = row_bytes.checked_mul(height)
+            && let Some(all) = cpu.shared_bytes(address, total as usize)
+        {
+            if let Some(hash) = &mut hash {
+                hash.update(all);
+            }
+            let staged = gpu.stage_bytes(row_bytes, height, all).ok()?;
+            let pitch = staged.pitch();
+            return Some((super::Pixels::Staged(staged, key(hash)), pitch));
+        }
         let staged = gpu
             .stage(row_bytes, height, |write| {
                 for y in 0..height {

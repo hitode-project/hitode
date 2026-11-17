@@ -429,6 +429,33 @@ impl Gpu {
     pub fn stores(&self, texel: TexelFormat) -> bool {
         stores(&self.device, texel)
     }
+    fn take_stage(
+        &mut self,
+        row_bytes: u32,
+        rows: u32,
+    ) -> Result<(Arc<adv_gpu::Buffer>, u32), Error> {
+        self.check()?;
+        let size = row_bytes
+            .checked_mul(rows)
+            .filter(|_| row_bytes != 0 && rows != 0)
+            .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
+        Ok((self.staging.take(&self.device, u64::from(size))?, size))
+    }
+    /// Copy a tightly packed pixel slice into a mapped staging buffer.
+    pub fn stage_bytes(&mut self, row_bytes: u32, rows: u32, src: &[u8]) -> Result<Staged, Error> {
+        let (buffer, size) = self.take_stage(row_bytes, rows)?;
+        if src.len() != size as usize {
+            return Err(Error::Invalid("staged byte slice length".into()));
+        }
+        // SAFETY: `take_stage` returns an exclusive staging buffer.
+        let bytes = unsafe { &mut buffer.mapped().unwrap().as_mut()[..size as usize] };
+        bytes.copy_from_slice(src);
+        Ok(Staged {
+            buffer,
+            pitch: row_bytes,
+            len: size,
+        })
+    }
     /// Write rows directly into a mapped staging buffer, without clearing it.
     pub fn stage<E>(
         &mut self,
@@ -436,13 +463,8 @@ impl Gpu {
         rows: u32,
         fill: impl FnOnce(&mut dyn FnMut(u32, &[u8])) -> Result<(), E>,
     ) -> Result<Result<Staged, E>, Error> {
-        self.check()?;
-        let size = row_bytes
-            .checked_mul(rows)
-            .filter(|_| row_bytes != 0 && rows != 0)
-            .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
-        let buffer = self.staging.take(&self.device, u64::from(size))?;
-        // SAFETY: `take` returns a buffer no other handle shares, so neither the
+        let (buffer, size) = self.take_stage(row_bytes, rows)?;
+        // SAFETY: `take_stage` returns a buffer no other handle shares, so neither the
         // GPU nor another writer touches it until the returned `Staged` is used.
         let bytes = unsafe { &mut buffer.mapped().unwrap().as_mut()[..size as usize] };
         let result = fill(&mut |y, row| {

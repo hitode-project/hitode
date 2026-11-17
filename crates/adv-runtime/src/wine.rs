@@ -210,16 +210,104 @@ fn install_image<B: Backend>(
 /// The heap of guest storage that the old stack's fronts allocate.
 struct Heap(u32);
 
+/// Large-block threshold matching `adv_os::heap::LARGE`.
+const LARGE_POOL_MIN: u32 = 0x8_0000;
+const LARGE_POOL_BYTES: usize = 32 * 1024 * 1024;
+const LARGE_POOL_COUNT: usize = 16;
+
+/// Bounded host-only pool of freed large blocks on [`Heap`] so texture churn
+/// avoids unmapping and remapping guest VM pages every frame.
+#[derive(Default)]
+struct LargePool {
+    live: HashMap<u32, u32>,
+    free: Vec<(u32, u32)>,
+    free_bytes: usize,
+}
+
+fn zero_guest(cpu: &mut dyn adv_cpu::backend::Guest, addr: u32, len: u32) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if let Some(bytes) = cpu.writable_bytes(addr, len as usize) {
+        bytes.fill(0);
+        return true;
+    }
+    let zeros = [0u8; 4096];
+    let mut offset = 0;
+    while offset < len {
+        let chunk = (len - offset).min(zeros.len() as u32);
+        if cpu.write(addr + offset, &zeros[..chunk as usize]).is_err() {
+            return false;
+        }
+        offset += chunk;
+    }
+    true
+}
+
 /// Allocation from [`Heap`], as the fronts' Win32 heap.
 fn allocator() -> adv_dx::interop::GuestAllocator {
     adv_dx::interop::GuestAllocator {
         allocate: |env, length| {
             let heap = env.ext.get::<Heap>().0;
+            if length >= LARGE_POOL_MIN {
+                let max_cap = length.saturating_add(length / 4).max(length + 0x1_0000);
+                let pool = env.ext.get_or_default::<LargePool>();
+                if let Some((index, _)) = pool
+                    .free
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, cap))| *cap >= length && *cap <= max_cap)
+                    .min_by_key(|(_, (_, cap))| *cap)
+                {
+                    let (addr, cap) = pool.free.remove(index);
+                    pool.free_bytes -= cap as usize;
+                    if zero_guest(env.cpu, addr, length) {
+                        pool.live.insert(addr, cap);
+                        return Some(addr);
+                    }
+                    let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                    heaps.free(env.cpu, &mut env.sys.vm, heap, addr);
+                }
+            }
             let heaps = env.ext.get_mut::<adv_os::Heaps>();
-            heaps.alloc(env.cpu, &mut env.sys.vm, heap, length, true)
+            let addr = heaps.alloc(env.cpu, &mut env.sys.vm, heap, length, true)?;
+            if length >= LARGE_POOL_MIN {
+                env.ext
+                    .get_or_default::<LargePool>()
+                    .live
+                    .insert(addr, length);
+            }
+            Some(addr)
         },
         free: |env, pointer| {
             let heap = env.ext.get::<Heap>().0;
+            if let Some(cap) = env.ext.get_or_default::<LargePool>().live.remove(&pointer) {
+                let mut evicted = Vec::new();
+                {
+                    let pool = env.ext.get_mut::<LargePool>();
+                    if cap as usize <= LARGE_POOL_BYTES {
+                        while (pool.free.len() >= LARGE_POOL_COUNT
+                            || pool.free_bytes + cap as usize > LARGE_POOL_BYTES)
+                            && !pool.free.is_empty()
+                        {
+                            let (old_addr, old_cap) = pool.free.remove(0);
+                            pool.free_bytes -= old_cap as usize;
+                            evicted.push(old_addr);
+                        }
+                        pool.free.push((pointer, cap));
+                        pool.free_bytes += cap as usize;
+                    } else {
+                        evicted.push(pointer);
+                    }
+                }
+                if !evicted.is_empty() {
+                    let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                    for addr in evicted {
+                        heaps.free(env.cpu, &mut env.sys.vm, heap, addr);
+                    }
+                }
+                return;
+            }
             let heaps = env.ext.get_mut::<adv_os::Heaps>();
             heaps.free(env.cpu, &mut env.sys.vm, heap, pointer);
         },
@@ -443,4 +531,56 @@ fn release<const IMAGE: usize>(env: &mut Env<'_>, dc: u32, then: DcFinished) -> 
             status => then(env, Err(format!("D3DKMTDestroyDCFromMemory: {status:#x}"))),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::Cpu;
+    use adv_machine::{Clock, layout::PARK_ADDR};
+
+    #[test]
+    fn large_pool_reuses_zeroed_blocks_and_evicts_past_cap() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, false).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let heap = machine
+            .ext
+            .get_or_default::<adv_os::Heaps>()
+            .create(&mut machine.cpu, &mut machine.sys.vm)
+            .unwrap();
+        machine.ext.insert(Heap(heap));
+        let alloc = allocator();
+        let size = 6 * 1024 * 1024;
+        let mut env = Env {
+            context: machine.sys.current,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        let first = (alloc.allocate)(&mut env, size).unwrap();
+        env.cpu.write(first, &[0x5a; 4096]).unwrap();
+        (alloc.free)(&mut env, first);
+        let reused = (alloc.allocate)(&mut env, size).unwrap();
+        assert_eq!(reused, first, "freed large block should be reused in place");
+        let mut head = [0u8; 4096];
+        env.cpu.read(reused, &mut head).unwrap();
+        assert!(head.iter().all(|&b| b == 0), "reused block must be zeroed");
+        (alloc.free)(&mut env, reused);
+        // Exceed the 32 MiB pool cap with distinct live allocations, then free all.
+        let mut blocks = Vec::new();
+        for _ in 0..7 {
+            blocks.push((alloc.allocate)(&mut env, size).unwrap());
+        }
+        for b in blocks {
+            (alloc.free)(&mut env, b);
+        }
+        let pool = env.ext.get::<LargePool>();
+        assert!(pool.free_bytes <= LARGE_POOL_BYTES);
+        assert!(pool.live.is_empty());
+    }
 }
