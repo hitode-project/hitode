@@ -30,6 +30,8 @@ struct PullSource {
     disconnects: u32,
     graph: u32,
     controls: Vec<u32>,
+    /// For each state change, whether the host filters downstream already had it.
+    hosts_ahead: Vec<bool>,
     enum_next: bool,
 }
 
@@ -170,7 +172,24 @@ fn callback(env: &mut Env<'_>) -> Outcome {
                 12 => PAUSED,
                 _ => RUNNING,
             };
-            env.ext.get_mut::<PullSource>().controls.push(state);
+            let hosts_ahead = crate::dshow::state(env)
+                .filters
+                .values()
+                .all(|filter| filter.state == state);
+            let source = env.ext.get_mut::<PullSource>();
+            source.controls.push(state);
+            source.hosts_ahead.push(hosts_ahead);
+            r(S_OK)
+        }
+        16 => {
+            let state = env
+                .ext
+                .get::<PullSource>()
+                .controls
+                .last()
+                .copied()
+                .unwrap_or(STOPPED);
+            env.cpu.write_u32(env.arg(2), state).unwrap();
             r(S_OK)
         }
         14 => {
@@ -199,6 +218,8 @@ fn callback(env: &mut Env<'_>) -> Outcome {
             }
             r(if available { S_OK } else { S_FALSE })
         }
+        // IMediaFilter::SetSyncSource.
+        17 => r(S_OK),
         _ => unreachable!(),
     }
 }
@@ -225,6 +246,8 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
         (13, 3),
         (14, 2),
         (15, 4),
+        (16, 3),
+        (17, 2),
     ] {
         registry.add_with_data(
             "authored-pull-source.dll",
@@ -266,10 +289,11 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
         disconnects: 0,
         graph: 0,
         controls: Vec::new(),
+        hosts_ahead: Vec::new(),
         enum_next: false,
     });
     let mut methods = BTreeMap::new();
-    for op in 0..=15 {
+    for op in 0..=17 {
         methods.insert(
             op,
             m.resolve_import("authored-pull-source.dll", &format!("method{op}"))
@@ -286,6 +310,8 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
                 (4, 11),
                 (5, 12),
                 (6, 13),
+                (7, 16),
+                (8, 17),
                 (10, 14),
                 (13, 10),
             ],
@@ -538,6 +564,117 @@ fn movie() -> Vec<u8> {
     include_bytes!("fixtures/guest_movie.mpg").to_vec()
 }
 
+#[cfg(feature = "media")]
+#[test]
+// spec: MEDIA-STREAM-9
+fn unclocked_video_presents_every_picture_at_once_and_completes_at_the_stop() {
+    use crate::dshow::{tests::query, video};
+    use adv_machine::{Resume, WakeReason};
+
+    // ffmpeg -f lavfi -i color=c=blue:s=16x16:r=25:d=0.24 -c:v mpeg1video
+    // -g 1 -b:v 200k -packetsize 512 -f mpeg guest_video.mpg
+    let (mut m, graph) = fixture(include_bytes!("fixtures/guest_video.mpg").to_vec());
+    video::set_video_provider(
+        &mut m.ext,
+        VideoProvider {
+            window: |_, _, owner| {
+                (owner == 42).then_some(video::VideoWindowGeometry {
+                    width: 16,
+                    height: 16,
+                    origin: (0, 0),
+                    canvas: (16, 16),
+                    visible: true,
+                })
+            },
+            update: |_, _, _, _| Ok(1),
+            completed: |_, _| None,
+        },
+    );
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "Render", &[OUTPUT_PIN]),
+        S_OK
+    );
+    let window = query(&mut m, graph, IID_IVIDEOWINDOW);
+    assert_eq!(
+        invoke(&mut m, window, "IVideoWindow", "put_Owner", &[42]),
+        S_OK
+    );
+    let media = query(&mut m, graph, IID_IMEDIAFILTER);
+    assert_eq!(
+        invoke(&mut m, media, "IMediaFilter", "SetSyncSource", &[0]),
+        S_OK
+    );
+    let control = query(&mut m, graph, IID_IMEDIACONTROL);
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Run", &[]), 1);
+    let session = *m.ext.get::<State>().sessions.keys().next().unwrap();
+    m.cpu.write_u32(STACK + 4, session).unwrap();
+    let Outcome::Block { mut then, .. } = stream::thread_entry(&mut env(&mut m)) else {
+        panic!("stream must wait after its preroll picture");
+    };
+    let worker = *m.ext.get::<State>().async_runs.keys().next().unwrap();
+    m.cpu.write_u32(STACK + 4, worker).unwrap();
+    let outcome = stream::thread_entry(&mut env(&mut m));
+    assert_eq!(finish(&mut m, outcome), 0);
+    // spec: MEDIA-GRAPH-25
+    // The host splitter, decoder and renderer pause and run before the guest
+    // source feeding them.
+    let source = m.ext.get::<PullSource>();
+    assert_eq!(source.controls, [PAUSED, RUNNING]);
+    assert_eq!(source.hosts_ahead, [true, true]);
+    // The clock never moves: each wake takes the next picture regardless.
+    for _ in 0..16 {
+        if m.ext.get::<State>().graphs[&graph].completion.is_some() {
+            break;
+        }
+        let Outcome::Block { then: next, .. } =
+            then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout))
+        else {
+            panic!("stream must keep waiting between pictures");
+        };
+        then = next;
+    }
+    let splitter = *m
+        .ext
+        .get::<State>()
+        .filters
+        .iter()
+        .find(|(_, filter)| filter.role == Role::Splitter)
+        .unwrap()
+        .0;
+    let source = m.ext.get::<State>().filters[&splitter]
+        .source
+        .as_ref()
+        .unwrap();
+    assert_eq!(source.decoder.as_ref().unwrap().stats().converted_frames, 6);
+    let stop = source.duration_us as i64 * 10;
+    assert_eq!(
+        m.ext.get::<State>().graphs[&graph].completion,
+        Some(EC_COMPLETE)
+    );
+    assert_eq!(crate::dshow::graph::current(&env(&mut m), graph), stop);
+    drop(then);
+}
+
+#[cfg(feature = "media")]
+#[test]
+// spec: MEDIA-GRAPH-26
+fn file_splitter_outputs_take_the_types_their_headers_give() {
+    let bytes = movie();
+    let video = filter::output_type(MEDIATYPE_VIDEO, &bytes);
+    assert_eq!(video.sub, MEDIASUBTYPE_MPEG1PAYLOAD);
+    // MPEG1VIDEOINFO ends with the sequence header the stream begins with.
+    assert_eq!(video.format.len(), 112);
+    assert_eq!(&video.format[96..100], &[0, 0, 1, 0xb3]);
+    let audio = filter::output_type(MEDIATYPE_AUDIO, &bytes);
+    assert_eq!(audio.format_type, FORMAT_WAVEFORMATEX);
+    // Without a readable header the output keeps the bare payload type.
+    let bare = filter::output_type(MEDIATYPE_VIDEO, &[]);
+    assert_eq!(
+        (bare.sub, bare.format_type, bare.format.len()),
+        (MEDIASUBTYPE_MPEG1PAYLOAD, GUID_NULL, 0)
+    );
+}
+
 fn invoke(
     m: &mut Machine<JitCpu>,
     pointer: u32,
@@ -564,6 +701,8 @@ fn invoke(
 #[cfg(feature = "media")]
 #[test]
 // spec: MEDIA-STREAM-1
+// spec: MEDIA-STREAM-3
+// spec: MEDIA-GRAPH-20
 fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_releases_source_refs() {
     use crate::dshow::{tests::query, video};
     use adv_machine::{Resume, WakeReason};
@@ -729,28 +868,29 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
         .as_mut()
         .unwrap()
         .duration_us = 20_000;
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Run", &[]), S_OK);
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Run", &[]), 1);
     assert_eq!(m.ext.get::<State>().graphs[&graph].state, RUNNING);
     assert_eq!(m.ext.get::<State>().graphs[&graph].expected, 2);
     let session = *m.ext.get::<State>().sessions.keys().next().unwrap();
     // Drive the authored stream handler directly: no host window, device or
     // real guest program runs while exercising decode -> publish/mixer delivery.
     m.cpu.write_u32(STACK + 4, session).unwrap();
+    // The renderer is still pausing: the stream prerolls its first picture.
     let outcome = stream::thread_entry(&mut env(&mut m));
     let Outcome::Block { then, .. } = outcome else {
-        panic!("stream must wait for media time");
-    };
-    // MPEG audio establishes the common origin slightly before the first
-    // video picture. Advance to the first due picture rather than show it early.
-    m.sys.clock.advance_to(m.sys.clock.now_us() + 20_000);
-    let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout));
-    let Outcome::Block { then, .. } = outcome else {
-        panic!("stream must wait after its first frame");
+        panic!("stream must wait after its preroll picture");
     };
     let frame = video::latest(&env(&mut m), graph).unwrap();
+    // Every member has paused now; the run's worker starts the graph.
+    let worker = *m.ext.get::<State>().async_runs.keys().next().unwrap();
+    m.cpu.write_u32(STACK + 4, worker).unwrap();
+    let outcome = stream::thread_entry(&mut env(&mut m));
+    assert_eq!(finish(&mut m, outcome), 0);
+    assert!(!m.ext.get::<State>().graphs[&graph].members_paused());
     let pixels = frame.bgra();
     assert!(pixels[0] < 20 && pixels[1] < 20 && pixels[2] > 220);
-    m.sys.clock.advance_to(m.sys.clock.now_us() + 40_000);
+    // Stream time starts with the run; the second picture follows the first.
+    m.sys.clock.advance_to(m.sys.clock.now_us() + 60_000);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout));
     let Outcome::Block { then, .. } = outcome else {
         panic!("stream must wait after its second frame");
@@ -797,19 +937,27 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
             > 0
     );
 
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Pause", &[]), S_OK);
+    assert_eq!(
+        invoke(&mut m, control, "IMediaControl", "GetState", &[0, DATA]),
+        S_OK
+    );
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Pause", &[]), 1);
     assert_eq!(m.ext.get::<State>().graphs[&graph].state, PAUSED);
     let updates = m.ext.get::<Presentation>().updates.len();
     m.sys.clock.advance_to(m.sys.clock.now_us() + 400_000);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Signaled));
     let Outcome::Block { then, .. } = outcome else {
-        panic!("paused stream must retain its frame and wait");
+        panic!("paused stream must hold its picture and wait");
     };
     assert_eq!(
         video::latest(&env(&mut m), graph).unwrap().bgra(),
         frame.bgra()
     );
-    assert_eq!(m.ext.get::<Presentation>().updates.len(), updates);
+    // spec: MEDIA-STREAM-3
+    // Pausing a running graph delivers one more picture for the renderer to
+    // hold, as a push stream does, and then the stream waits.
+    assert_eq!(m.ext.get::<Presentation>().updates.len(), updates + 1);
+    let updates = updates + 1;
     // Owner visibility can change while the paused decoder emits no frames.
     // The existing service boundary must retract that retained movie layer.
     video::pump_video(&mut m).unwrap();

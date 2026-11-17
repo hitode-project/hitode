@@ -88,7 +88,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-9 Event timeouts
 
-**Rule**: GetEvent MUST zero the event code before it waits, so a timeout returns `E_ABORT` with code zero.
+**Rule**: GetEvent MUST zero the event code before it waits, so a timeout returns `E_ABORT` with code zero. GetEvent finding no queued event MUST reset the event handle.
 **Verification**: Test
 
 ### MEDIA-GRAPH-10 Aggregation
@@ -103,7 +103,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-12 Reference clock
 
-**Rule**: The graph MUST hold one reference to its reference clock and give it to every member, including later ones. Removal and final release MUST clear a member's clock. Until a clock is set explicitly, leaving Stopped MUST choose the newest member's own clock, otherwise a system clock.
+**Rule**: The graph MUST hold one reference to its reference clock and give it to every member, including later ones. Removal and final release MUST clear a member's clock. Until a clock is set explicitly, leaving Stopped MUST choose the earliest added member's own clock, otherwise a system clock.
 **Verification**: Test
 
 ### MEDIA-GRAPH-13 Automation and filter mapper
@@ -141,6 +141,41 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: ASF Load MUST retain the first filename without opening it, ignore supplied media types, and reject subsequent loads with E_FAIL. Graph join MUST open the file and publish named compressed stream pins, and state transitions before successful opening MUST fail without changing state. GetCurFile MUST preserve unspecified media-type fields, and compressed delivery MUST use ReceiveMultiple with separate stream threads when downstream reception can block.
 **Verification**: Test
 
+### MEDIA-GRAPH-20 Asynchronous run
+
+**Rule**: When the pause of IMediaControl::Run from Stopped returns S_FALSE, Run MUST return S_FALSE and report Running unless a member's GetState(0) gives VFW_S_CANT_CUE. A worker MUST then run the members once all have paused unless Pause or Stop comes first, and streams MUST stay paused until then. Otherwise, and for IMediaFilter::Run from any state, the graph MUST run every member at once.
+**Verification**: Test
+
+### MEDIA-GRAPH-21 Event notification
+
+**Rule**: Default handling MUST consume only EC_COMPLETE and EC_REPAINT, and every other event MUST be queued. While AM_MEDIAEVENT_NONOTIFY is set, events MUST be dropped, and setting it MUST discard the queue and reset the event handle.
+**Verification**: Test
+
+### MEDIA-GRAPH-22 Completion
+
+**Rule**: When every renderer has completed, the graph MUST queue EC_COMPLETE, or set only the event handle while notification is disabled. Completion MUST end WaitForCompletion and leave the position at the stop members reported when the run started. Starting a run MUST remove queued EC_COMPLETE events.
+**Verification**: Test
+
+### MEDIA-GRAPH-23 Member removal
+
+**Rule**: RemoveFilter MUST disconnect each connected pin's peer and then the pin before the filter leaves the graph. The first failing Disconnect MUST be returned, and the filter MUST stay a member.
+**Verification**: Test
+
+### MEDIA-GRAPH-24 Direct connection
+
+**Rule**: Connect and ConnectDirect MUST call Connect on the first pin as given, without reordering the pair. ConnectDirect MUST fail with VFW_E_CIRCULAR_GRAPH when the connection would close a loop.
+**Verification**: Test
+
+### MEDIA-GRAPH-25 Transition order
+
+**Rule**: Each Stop, Pause and Run MUST first sort all members by their pins' connections, downstream before upstream, starting from the newest member. Host members MUST take their places by their own pins. Members MUST then change state in that order.
+**Verification**: Test
+
+### MEDIA-GRAPH-26 Rendered file splitters
+
+**Rule**: RenderFile's splitter outputs MUST carry the media types their stream headers give, as IAsyncReader splitters' do. Each output MUST try the graph's members before a host decoder. A guest input MUST receive the file's demuxed packets.
+**Verification**: Test — header types; members-first rendering and packet delivery also require review.
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
@@ -153,7 +188,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-3 Audio lead and pause
 
-**Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time.
+**Rule**: Audio-only streams MUST decode about one second ahead, matching the quartz DirectSound renderer's buffer. A paused graph MUST pause its queued PCM, and resuming MUST shift that PCM by the paused time. Pausing from Stopped or Running MUST present the first picture at or after the position, which the stream then holds.
 **Verification**: Test
 
 ### MEDIA-STREAM-4 Decoding off the execution thread
@@ -184,6 +219,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 ### MEDIA-STREAM-8 MPEG splitter streams
 
 **Rule**: Direct MPEG splitter outputs MUST deliver compressed packets and end-of-stream while paused, using the selected segment positions. Splitter output seeking MUST expose media time, capability mask `0x37`, duration, positions, and a positive playback rate. IAMStreamSelect MUST describe each output's type, group, name, and pin identity.
+**Verification**: Test
+
+### MEDIA-STREAM-9 Streams without a clock
+
+**Rule**: After SetSyncSource(NULL), a running video-only stream MUST present each picture without waiting for its time. GetCurrentPosition MUST report 0 while such a graph runs and the stop once it completes.
 **Verification**: Test
 
 ## Windows Media decoder wrappers
@@ -321,4 +361,9 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 ### MEDIA-VIDEO-14 Renderless VMR ownership
 
 **Rule**: Renderless VMR MUST retain the guest allocator-presenter and DirectDraw device and allocate surfaces during allocator configuration. Samples MUST populate those surfaces and invoke PrepareSurface followed by PresentImage with their timestamps. Renderless VMR MUST NOT publish frames through the host video provider.
+**Verification**: Test
+
+### MEDIA-VIDEO-15 Video Renderer window
+
+**Rule**: Render MUST give the Video Renderer its own guest window sized to the video, as windowed VMR has. The graph's IVideoWindow MUST forward to a renderer that owns a window, except full-screen mode, which the graph keeps.
 **Verification**: Test

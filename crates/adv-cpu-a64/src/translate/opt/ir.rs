@@ -76,19 +76,51 @@ pub(crate) enum FpUnary {
     Abs,
 }
 
-/// SSE2 operations on 128-bit values. Shifts take their count from the low
-/// 64 bits of the second operand; counts above 63 give zero.
+/// MMX/SSE packed-integer and comparison operations. `full` selects 128-bit
+/// XMM vs 64-bit MMX (upper 64 bits zeroed). Shifts take their count from
+/// the low 64 bits of the second operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecOp {
-    And,
-    AndNot,
-    Or,
-    Xor,
-    SubI32,
-    ShlI64,
-    ShrI64,
+    And(bool),
+    AndNot(bool),
+    Or(bool),
+    Xor(bool),
+    Same(crate::encode::Same, u8, bool),
+    Unpack(crate::encode::Permute, u8, bool),
+    Pack(crate::encode::Narrowing, u8, bool),
+    MulHigh(bool, bool),
+    MulAdd(bool),
+    Shift(crate::encode::ShiftImm, u8, bool),
+    Shufps(u8),
+    Shufpd(u8),
+    MulDwords(bool),
+    SadBytes(bool),
+    MoveLow32,
+    Insert64(bool, bool),
+    InsertWord(u8, bool),
     /// `cmpltpd`: all ones in each lane where the first is less.
     LessF64,
+}
+
+/// Unary vector lane shifts, half extracts, and immediate shuffles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VecUnary {
+    ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
+    /// Zeroes bits 64..128 of a V128 value.
+    Low64,
+    /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
+    High64,
+    Shuffle(u8, u8, bool),
+    ShuffleWords(bool, u8),
+    ShiftBytes(bool, u8),
+}
+
+/// Vector-to-I32 extractions and sign/byte masks (`pextrw`, `pmovmskb`, `movmskps`/`pd`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VecToInt {
+    ExtractWord(u8),
+    ByteMask(bool),
+    SignMask(bool),
 }
 
 /// The guest operation whose EFLAGS a `Flags` value holds.
@@ -185,6 +217,8 @@ pub(crate) enum Op {
         wide: bool,
     },
     Vec(VecOp, Value, Value),
+    VecUnary(VecUnary, Value),
+    VecToInt(VecToInt, Value),
     /// A load of `width` bytes outside the frame, zero-extended to `ty`.
     Load {
         ty: Type,
@@ -237,6 +271,8 @@ impl Op {
             Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
+            | Op::VecUnary(_, a)
+            | Op::VecToInt(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::Load { addr: a, .. }
@@ -367,6 +403,8 @@ pub(crate) enum Source {
     Eflags,
     /// An XMM register, V128.
     Xmm(u8),
+    /// An MMX register, V128 with upper 64 bits zero.
+    Mmx(u8),
     /// A valid x87 physical register as binary64, F64.
     X87(u8),
     /// The x87 last instruction pointer and opcode, I32.
@@ -387,7 +425,7 @@ impl Source {
             Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,
-            Source::Xmm(_) => Type::V128,
+            Source::Xmm(_) | Source::Mmx(_) => Type::V128,
             Source::X87(_) => Type::F64,
         }
     }
@@ -404,9 +442,10 @@ pub(crate) struct Func {
     /// edges to it also check the head-exit word. Block 0 may be an entry
     /// prologue that jumps there.
     pub head_exit: Option<Block>,
-    /// Registers (bits 0–7) and XMM registers (bits 8–15) the form never
-    /// writes: records leave them at their entry values.
-    pub kept: u16,
+    /// Registers (bits 0–7), XMM registers (bits 8–15) and MMX registers
+    /// (bits 16–23) the form never writes: records leave them at their entry
+    /// values.
+    pub kept: u32,
 }
 
 impl Func {
@@ -466,11 +505,12 @@ impl Func {
             Op::Div { .. }
             | Op::Remainder { .. }
             | Op::Test { .. }
-            | Op::ToInt { wide: false, .. } => Type::I32,
+            | Op::ToInt { wide: false, .. }
+            | Op::VecToInt(..) => Type::I32,
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) => Type::V128,
+            Op::Vec(..) | Op::VecUnary(..) => Type::V128,
             Op::Store { .. } | Op::FrameStore { .. } | Op::Validate => return None,
         })
     }

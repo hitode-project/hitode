@@ -54,6 +54,15 @@ fn host_timeline(env: &Env<'_>, graph: u32) -> bool {
     connected || !crate::dshow::dmo::upstream_seekers(env, graph).is_empty()
 }
 
+/// Populate cached `IMediaSeeking` pointers on guest members supporting media time.
+pub(super) fn probe_seekers(
+    env: &mut Env<'_>,
+    graph: u32,
+    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
+) -> Outcome {
+    seekers(env, graph, Box::new(move |env, _| then(env)))
+}
+
 /// Members' cached IMediaSeeking, newest first. A guest member is asked for
 /// one until it gives one that supports media time, as quartz caches it.
 fn seekers(env: &mut Env<'_>, graph: u32, then: Seekers) -> Outcome {
@@ -185,6 +194,24 @@ fn host(env: &mut Env<'_>, graph: u32, slot: u32, args: &[u32], then: Done) -> O
         }
         _ => then(env, E_NOTIMPL),
     }
+}
+
+/// Keep the stop position the members report as a run starts; completion
+/// leaves the graph's position there.
+pub(super) fn keep_stop(env: &mut Env<'_>, graph: u32, then: Finish) -> Outcome {
+    longest(
+        env,
+        graph,
+        GET_STOP_POSITION,
+        Box::new(move |env, hr, stop| {
+            if let Some(graph_state) = state(env).graphs.get_mut(&graph)
+                && !failed(hr)
+            {
+                graph_state.stream_stop = Some(stop);
+            }
+            then(env)
+        }),
+    )
 }
 
 fn stop_position(env: &Env<'_>, graph: u32) -> i64 {
@@ -379,7 +406,8 @@ fn set_positions(
             if seekers.is_empty() {
                 return then(env, E_NOTIMPL, current_value, stop_value);
             }
-            if g(env, graph).state != RUNNING {
+            // A run still waiting for its members to pause is not paused again.
+            if g(env, graph).state != RUNNING || g(env, graph).pending_run.is_some() {
                 return position_all(
                     env,
                     graph,

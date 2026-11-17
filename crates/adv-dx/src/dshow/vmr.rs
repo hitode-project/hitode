@@ -2124,6 +2124,13 @@ mod tests {
             0x0004_0237
         );
         assert_eq!(m.cpu.read_u32(DATA).unwrap(), graph::PAUSED);
+        assert_eq!(method(&mut m, "IBaseFilter::Run", &[filter, 0, 0]), S_FALSE);
+        assert_eq!(
+            method(&mut m, "IBaseFilter::GetState", &[filter, 0, DATA]),
+            0x0004_0237
+        );
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), graph::RUNNING);
+        assert_eq!(method(&mut m, "IBaseFilter::Pause", &[filter]), S_FALSE);
         m.ext
             .get_mut::<State>()
             .filters
@@ -2518,7 +2525,7 @@ mod tests {
             S_OK
         );
         assert_eq!(method(&mut m, "IMemAllocator::Commit", &[alloc_ptr]), S_OK);
-        assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+        assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), 1);
 
         // First buffer: bottom-up 2x2 RGB32 with zero alpha bytes; row 0 in buffer is image bottom.
         assert_eq!(
@@ -2607,7 +2614,7 @@ mod tests {
         );
         assert_eq!(method(&mut m, "IPin::EndFlush", &[input_pin]), S_OK);
 
-        assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+        assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), 1);
         // VMR GetCurrentImage succeeds in RUNNING and STOPPED states as well as PAUSED.
         assert_eq!(
             method(
@@ -2647,7 +2654,7 @@ mod tests {
         const E_ABORT: u32 = 0x8000_4004;
         let (mut m, _graph, control, _windowless, input_pin, _config) = setup_windowless();
         let events = query(&mut m, _graph, IID_IMEDIAEVENTEX);
-        assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+        assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), 1);
         assert_eq!(method(&mut m, "IPin::EndOfStream", &[input_pin]), S_OK);
         assert_eq!(
             method(

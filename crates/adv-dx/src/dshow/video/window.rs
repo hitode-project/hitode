@@ -268,6 +268,18 @@ pub(crate) fn call(env: &mut Env<'_>, graph: u32, face: Face, method: &str) -> O
     {
         return Some(Outcome::Return(S_FALSE));
     }
+    // The graph forwards IVideoWindow to a renderer that owns a real window,
+    // keeping full-screen mode, which renderers leave unimplemented.
+    if face == Face::VideoWindow
+        && !method.ends_with("FullScreenMode")
+        && let Some(renderer) = super::renderer(env, graph)
+        && env.ext.get::<State>().filters[&renderer]
+            .vmr
+            .as_ref()
+            .is_some_and(|v| v.hwnd != 0)
+    {
+        return Some(vmr_window_call(env, renderer, method));
+    }
     let result = match face {
         Face::VideoWindow => window_call(env, graph, method, &info),
         Face::BasicVideo => basic_call(env, graph, method, &info),
@@ -292,13 +304,17 @@ pub(crate) fn user(
     }
 }
 
-pub(crate) fn create_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {
+pub(crate) fn create_vmr_window(
+    env: &mut Env<'_>,
+    filter: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     use crate::dshow::{alloc, free};
     if env.ext.try_get::<crate::dshow::host::Host>().is_none() {
-        return Outcome::Return(S_OK);
+        return then(env, S_OK);
     }
     let Some(text) = alloc(env, 64) else {
-        return Outcome::Return(E_OUTOFMEMORY);
+        return then(env, E_OUTOFMEMORY);
     };
     let bytes: Vec<u8> = "static\0ActiveMovie Window\0"
         .encode_utf16()
@@ -312,7 +328,7 @@ pub(crate) fn create_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {
         move |env, hwnd| {
             free(env, text);
             if hwnd == 0 {
-                return Outcome::Return(E_FAIL);
+                return then(env, E_FAIL);
             }
             state(env)
                 .filters
@@ -331,10 +347,28 @@ pub(crate) fn create_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {
                 env,
                 "SetWindowLongW",
                 vec![hwnd, (-4i32) as u32, proc],
-                |_, _| Outcome::Return(S_OK),
+                move |env, _| then(env, S_OK),
             )
         },
     )
+}
+
+/// The Video Renderer's own top-level window, created the first time it is
+/// connected and sized to the video as the VMR's is.
+pub(crate) fn renderer_window(env: &mut Env<'_>, filter: u32) -> Outcome {
+    let hwnd = state(env).filters[&filter]
+        .vmr
+        .as_ref()
+        .map_or(0, |v| v.hwnd);
+    if hwnd != 0 {
+        return connect_vmr_window(env, filter);
+    }
+    create_vmr_window(env, filter, move |env, hr| {
+        if hr != S_OK {
+            return Outcome::Return(hr);
+        }
+        connect_vmr_window(env, filter)
+    })
 }
 
 pub(crate) fn connect_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {

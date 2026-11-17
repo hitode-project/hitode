@@ -148,7 +148,6 @@ impl Front<'_> {
                 });
             }
             D::Helper(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
-            D::Simd(s) if s.mmx() => return Err(Reject::Mmx(self.index)),
             D::Simd(s) => self.simd(s)?,
             _ => return Err(Reject::Unsupported(self.index)),
         }

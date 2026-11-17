@@ -73,6 +73,7 @@ fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
             Source::X87Ip => u128::from(at.x87.ip),
             Source::X87Opcode => u128::from(at.x87.opcode),
             Source::Xmm(i) => u128::from_le_bytes(at.xmm[i as usize]),
+            Source::Mmx(i) => u128::from(at.mmx[i as usize]),
             Source::X87(i) => {
                 let x = at.x87.regs[i as usize];
                 let value = if x.significand() == 0 {
@@ -162,6 +163,32 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
             None => {}
         }
     }
+    let meta = record
+        .mmx_meta
+        .as_ref()
+        .map_or(0, |loc| eval::locate(loc, &run.values) as u32);
+    for (i, loc) in record.mmx.iter().enumerate() {
+        match loc {
+            Some(loc) => {
+                let value = eval::locate(loc, &run.values) as u64;
+                assert_eq!(value, cpu.mmx[i], "mmx {i}");
+                if meta >> i & 1 != 0 {
+                    assert_eq!(
+                        adv_cpu_core::X87Register::from_parts(value, 0xffff),
+                        cpu.x87.regs[i],
+                        "mmx alias {i}"
+                    );
+                } else if exit {
+                    assert_eq!(at.x87.regs[i], cpu.x87.regs[i], "unwritten mmx alias {i}");
+                }
+            }
+            None if exit && record.x87.is_none() => {
+                assert_eq!(at.mmx[i], cpu.mmx[i], "kept mmx {i}");
+                assert_eq!(at.x87.regs[i], cpu.x87.regs[i], "kept mmx alias {i}");
+            }
+            None => {}
+        }
+    }
     match &record.x87 {
         Some(x87) => {
             assert_eq!(x87.top, cpu.x87.top() as u8);
@@ -200,6 +227,22 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
                 }
             }
         }
+        None if record.mmx_meta.is_some() => {
+            let expected_top = if meta >> 10 & 1 != 0 { 0 } else { at.x87.top() };
+            let expected_tag = match meta >> 8 & 3 {
+                1 => 0,
+                2 => 0xffff,
+                _ => at.x87.tag,
+            };
+            assert_eq!(expected_top, cpu.x87.top(), "mmx TOP");
+            assert_eq!(expected_tag, cpu.x87.tag, "mmx tag");
+            assert_eq!(at.x87.control, cpu.x87.control, "mmx x87 control");
+            assert_eq!(
+                at.x87.status & !0x3800,
+                cpu.x87.status & !0x3800,
+                "mmx x87 status"
+            );
+        }
         None => assert_eq!(
             (at.x87.control, at.x87.status, at.x87.tag),
             (cpu.x87.control, cpu.x87.status, cpu.x87.tag),
@@ -234,6 +277,21 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
             resumed.xmm[i] = record.xmm[i].map_or(at.xmm[i], |loc| {
                 eval::locate(&loc, &run.values).to_le_bytes()
             });
+            if let Some(loc) = record.mmx[i] {
+                let value = eval::locate(&loc, &run.values) as u64;
+                resumed.mmx[i] = value;
+                if meta >> i & 1 != 0 {
+                    resumed.x87.regs[i] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
+                }
+            }
+        }
+        if meta >> 10 & 1 != 0 {
+            resumed.x87.set_top(0);
+        }
+        match meta >> 8 & 3 {
+            1 => resumed.x87.tag = 0,
+            2 => resumed.x87.tag = 0xffff,
+            _ => {}
         }
         resumed.eflags = record
             .eflags
@@ -1676,4 +1734,401 @@ fn rows_whose_loop_branches_back_to_the_pixel_loop_head() {
                 .unwrap();
         }
     });
+}
+
+// spec: A64-OPT-1, A64-OPT-6, A64F-FP-4
+#[test]
+fn mmx_moves_emms_and_alias_exponents_recover_at_every_boundary() {
+    let seeded = || {
+        let mut at = initial();
+        at.x87.status = 5 << 11;
+        at.x87.tag = 0x5555;
+        at.x87.regs = std::array::from_fn(|n| {
+            adv_cpu_core::X87Register::from_parts(0x11223344_55667788 ^ n as u64, 0x3fff)
+        });
+        at.refresh_mmx();
+        at
+    };
+
+    // Straight-line and loop with movd/movq/movq2dq/movdq2q/emms: mm2 is read-only
+    // (must keep 0x3fff exponent), mm0 is written (must get 0xffff), and emms
+    // sets tags to 0xffff while keeping TOP = 0.
+    let loop_code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.movq2dq(xmm0, mm2).unwrap();
+        a.movdq2q(mm1, xmm0).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.emms().unwrap();
+    });
+    let mut at = seeded();
+    at.regs[1] = 4;
+    differential(&loop_code, &at, |m| {
+        for i in 0..8u32 {
+            m.write(
+                DATA + i * 8,
+                &(0x01020304_05060708u64 + u64::from(i)).to_le_bytes(),
+            )
+            .unwrap();
+        }
+    });
+
+    // Fault on iteration 1 before any MMX write (load fault): TOP=5, tag=0x5555,
+    // and mm0's exponent must remain 0x3fff. Fault on iteration 2 after iter 1
+    // wrote mm0/mm1: mm0/mm1 must have exponent 0xffff, TOP=0, tag=0, while mm2 keeps 0x3fff.
+    let fault_loop = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.movq(mm1, mm2).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.emms().unwrap();
+    });
+    at.regs[1] = 3;
+    at.regs[6] = DATA + 0x20000;
+    compare(&fault_loop, &at, |_| {}, true);
+
+    at.regs[1] = 3;
+    at.regs[6] = DATA + 0x20000 - 8;
+    compare(&fault_loop, &at, |_| {}, true);
+
+    // Conditional MMX write inside a loop: only taken iterations mark mm3 written.
+    let cond_code = assemble(|a| {
+        let (mut head, mut skip) = (a.create_label(), a.create_label());
+        a.set_label(&mut head).unwrap();
+        a.test(ecx, 1).unwrap();
+        a.jnz(skip).unwrap();
+        a.movd(mm3, dword_ptr(esi)).unwrap();
+        a.movd(dword_ptr(edi), mm3).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    for count in [1u32, 2, 3] {
+        let mut at = seeded();
+        at.regs[1] = count;
+        differential(&cond_code, &at, |m| {
+            m.write(DATA, &[0xaa; 64]).unwrap();
+        });
+    }
+}
+
+// spec: A64-OPT-1, A64F-FP-4
+#[test]
+fn mmx_rejects_and_denies_admission_when_x87_exception_pending() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+        });
+    });
+    let mut pending = initial();
+    pending.x87.status = 0x80;
+    assert!(matches!(rejected(&code, &pending), Reject::Mode(_)));
+
+    let clean = initial();
+    let (_, _, built) = built(&code, &clean);
+    assert!(built.assumed.mmx);
+    let mem = memory(&code);
+    assert!(
+        super::super::admit(&built.func.entry, &built.assumed, &pending, |addr, w| {
+            let mut b = [0u8; 8];
+            mem.read_into(addr, &mut b[..w as usize]).unwrap();
+            u64::from_le_bytes(b)
+        })
+        .is_none()
+    );
+    assert!(
+        super::super::admit(&built.func.entry, &built.assumed, &clean, |addr, w| {
+            let mut b = [0u8; 8];
+            mem.read_into(addr, &mut b[..w as usize]).unwrap();
+            u64::from_le_bytes(b)
+        })
+        .is_some()
+    );
+}
+
+// spec: A64-OPT-1, A64-OPT-6
+#[test]
+fn mmx_and_xmm_packed_integer_ops_lower_and_match_interpreter() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            // MMX packed-integer suite (width 8 / 4).
+            a.movd(mm0, dword_ptr(esi)).unwrap();
+            a.movd(eax, mm0).unwrap();
+            a.movq(mm1, qword_ptr(esi)).unwrap();
+            a.movq(mm2, qword_ptr(edi)).unwrap();
+            a.punpcklbw(mm0, mm2).unwrap();
+            a.punpckhbw(mm1, mm2).unwrap();
+            a.punpcklwd(mm0, mm2).unwrap();
+            a.punpckhwd(mm1, mm2).unwrap();
+            a.punpckldq(mm0, mm2).unwrap();
+            a.punpckhdq(mm1, mm2).unwrap();
+            a.paddb(mm0, mm1).unwrap();
+            a.paddw(mm0, mm2).unwrap();
+            a.paddd(mm0, mm1).unwrap();
+            a.paddq(mm0, mm2).unwrap();
+            a.psubb(mm0, mm2).unwrap();
+            a.psubw(mm0, mm1).unwrap();
+            a.psubd(mm0, mm2).unwrap();
+            a.psubq(mm0, mm1).unwrap();
+            a.paddsb(mm0, mm2).unwrap();
+            a.paddsw(mm0, mm1).unwrap();
+            a.paddusb(mm0, mm2).unwrap();
+            a.paddusw(mm0, mm1).unwrap();
+            a.psubsb(mm0, mm2).unwrap();
+            a.psubsw(mm0, mm1).unwrap();
+            a.psubusb(mm0, mm2).unwrap();
+            a.psubusw(mm0, mm1).unwrap();
+            a.pmullw(mm0, mm2).unwrap();
+            a.pmulhw(mm0, mm2).unwrap();
+            a.pmulhuw(mm0, mm1).unwrap();
+            a.pmaddwd(mm0, mm2).unwrap();
+            a.pminsw(mm0, mm1).unwrap();
+            a.pmaxsw(mm0, mm2).unwrap();
+            a.pminub(mm0, mm1).unwrap();
+            a.pmaxub(mm0, mm2).unwrap();
+            a.pavgb(mm0, mm2).unwrap();
+            a.pavgw(mm0, mm1).unwrap();
+            a.psllw(mm0, 3).unwrap();
+            a.pslld(mm0, 5).unwrap();
+            a.psllq(mm0, 9).unwrap();
+            a.psrlw(mm0, 2).unwrap();
+            a.psrld(mm0, 4).unwrap();
+            a.psrlq(mm0, 7).unwrap();
+            a.psraw(mm0, 1).unwrap();
+            a.psrad(mm0, 3).unwrap();
+            a.psllw(mm0, mm3).unwrap();
+            a.pslld(mm0, mm3).unwrap();
+            a.psllq(mm0, mm3).unwrap();
+            a.psrlw(mm0, mm3).unwrap();
+            a.psrld(mm0, mm3).unwrap();
+            a.psrlq(mm0, mm3).unwrap();
+            a.psraw(mm0, mm3).unwrap();
+            a.psrad(mm0, mm3).unwrap();
+            a.pand(mm0, mm2).unwrap();
+            a.por(mm0, mm1).unwrap();
+            a.pxor(mm0, mm3).unwrap();
+            a.pandn(mm0, mm2).unwrap();
+            a.pcmpeqb(mm1, mm2).unwrap();
+            a.pcmpeqw(mm0, mm1).unwrap();
+            a.pcmpeqd(mm0, mm2).unwrap();
+            a.pcmpgtb(mm1, mm2).unwrap();
+            a.pcmpgtw(mm0, mm1).unwrap();
+            a.pcmpgtd(mm0, mm2).unwrap();
+            a.packsswb(mm0, mm1).unwrap();
+            a.packssdw(mm0, mm2).unwrap();
+            a.packuswb(mm0, mm1).unwrap();
+            a.movd(dword_ptr(edi), mm0).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+
+            // XMM packed-integer suite (128-bit lanes).
+            a.movd(xmm0, eax).unwrap();
+            a.movq(xmm1, qword_ptr(esi)).unwrap();
+            a.movdqu(xmm2, xmmword_ptr(edi)).unwrap();
+            a.punpcklbw(xmm0, xmm2).unwrap();
+            a.punpckhbw(xmm1, xmm2).unwrap();
+            a.punpcklwd(xmm0, xmm2).unwrap();
+            a.punpckhwd(xmm1, xmm2).unwrap();
+            a.punpckldq(xmm0, xmm2).unwrap();
+            a.punpckhdq(xmm1, xmm2).unwrap();
+            a.punpcklqdq(xmm0, xmm2).unwrap();
+            a.punpckhqdq(xmm1, xmm2).unwrap();
+            a.paddb(xmm0, xmm1).unwrap();
+            a.paddw(xmm0, xmm2).unwrap();
+            a.paddd(xmm0, xmm1).unwrap();
+            a.paddq(xmm0, xmm2).unwrap();
+            a.psubusb(xmm0, xmm2).unwrap();
+            a.psubusw(xmm0, xmm1).unwrap();
+            a.pmullw(xmm0, xmm2).unwrap();
+            a.pmulhw(xmm0, xmm2).unwrap();
+            a.pmulhuw(xmm0, xmm1).unwrap();
+            a.pmaddwd(xmm0, xmm2).unwrap();
+            a.pminsw(xmm0, xmm1).unwrap();
+            a.pmaxub(xmm0, xmm2).unwrap();
+            a.pavgb(xmm0, xmm2).unwrap();
+            a.pavgw(xmm0, xmm1).unwrap();
+            a.psllw(xmm0, 3).unwrap();
+            a.psrlq(xmm0, 17).unwrap();
+            a.psrad(xmm0, 5).unwrap();
+            a.psllw(xmm0, xmm3).unwrap();
+            a.psrlq(xmm0, xmm3).unwrap();
+            a.psrad(xmm0, xmm3).unwrap();
+            a.pand(xmm0, xmm2).unwrap();
+            a.pandn(xmm0, xmm2).unwrap();
+            a.pcmpeqb(xmm1, xmm2).unwrap();
+            a.pcmpgtw(xmm0, xmm1).unwrap();
+            a.packsswb(xmm0, xmm1).unwrap();
+            a.packssdw(xmm0, xmm2).unwrap();
+            a.packuswb(xmm0, xmm1).unwrap();
+            a.movdqu(xmmword_ptr(edi + 16), xmm0).unwrap();
+            a.emms().unwrap();
+        });
+    });
+    let mut at = initial();
+    at.regs[1] = 4;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    at.x87.regs[3] = adv_cpu_core::X87Register::from_parts(33, 0xffff);
+    at.refresh_mmx();
+    at.xmm[3] = 5u128.to_le_bytes();
+    let built = differential(&code, &at, |mem| {
+        for i in 0..64u32 {
+            let v = i.wrapping_mul(0x1357_2469).wrapping_add(0x80ff_7f01);
+            mem.write(DATA + 0x100 + i * 4, &v.to_le_bytes()).unwrap();
+            mem.write(DATA + 0x200 + i * 4, &(!v).to_le_bytes())
+                .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
+}
+
+// spec: A64-OPT-1, A64-OPT-3, A64-OPT-6
+#[test]
+fn mmx_pixel_blend_loop_builds_and_recovers_every_fault() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(esi)).unwrap();
+        a.movd(mm1, dword_ptr(edi)).unwrap();
+        a.punpcklbw(mm0, mm7).unwrap();
+        a.punpcklbw(mm1, mm7).unwrap();
+        a.pmullw(mm0, mm6).unwrap();
+        a.psrlw(mm0, 8).unwrap();
+        a.paddw(mm0, mm1).unwrap();
+        a.packuswb(mm0, mm7).unwrap();
+        a.movd(dword_ptr(edi), mm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.emms().unwrap();
+    });
+    let mut at = initial();
+    at.x87.status = 5 << 11;
+    at.x87.tag = 0x1234;
+    at.x87.regs = std::array::from_fn(|n| {
+        adv_cpu_core::X87Register::from_parts(
+            if n == 7 { 0 } else { 0x0040_0040_0040_0040 },
+            0x3fff,
+        )
+    });
+    at.refresh_mmx();
+    at.regs[1] = 8;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    at.mmx[6] = 0x0040_0040_0040_0040;
+    at.mmx[7] = 0;
+    let built = differential(&code, &at, |mem| {
+        for i in 0..8u32 {
+            mem.write(DATA + 0x100 + i * 4, &(i * 0x1122_3344).to_le_bytes())
+                .unwrap();
+            mem.write(
+                DATA + 0x200 + i * 4,
+                &(i * 0x0102_0304 + 0x1020_3040).to_le_bytes(),
+            )
+            .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
+    // Fault on iteration 1 (before any MMX op) and on iteration 3 (after MMX ops).
+    for unmapped_iter in [0u32, 2] {
+        at.regs[1] = 4;
+        at.regs[6] = DATA + 0x20000 - unmapped_iter * 4;
+        at.regs[7] = DATA + 0x200;
+        compare(
+            &code,
+            &at,
+            |mem| {
+                for i in 0..unmapped_iter {
+                    mem.write(
+                        DATA + 0x20000 - (unmapped_iter - i) * 4,
+                        &0x4080_c0ffu32.to_le_bytes(),
+                    )
+                    .unwrap();
+                    mem.write(DATA + 0x200 + i * 4, &0x1020_3040u32.to_le_bytes())
+                        .unwrap();
+                }
+            },
+            true,
+        );
+    }
+}
+
+// spec: A64-OPT-1, A64-OPT-6
+#[test]
+fn mmx_and_xmm_shuffles_extract_insert_masks_match_interpreter() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.movq(mm1, qword_ptr(edi)).unwrap();
+            a.pshufw(mm2, mm0, 0x1b).unwrap();
+            a.pshufw(mm3, mm1, 0xaa).unwrap();
+            a.pinsrw(mm2, eax, 2).unwrap();
+            a.pinsrw(mm3, word_ptr(esi + 2), 3).unwrap();
+            a.pextrw(eax, mm2, 1).unwrap();
+            a.pmuludq(mm2, mm3).unwrap();
+            a.psadbw(mm2, mm1).unwrap();
+            a.pmovmskb(ebx, mm3).unwrap();
+            a.add(eax, ebx).unwrap();
+            a.movq(qword_ptr(edi), mm2).unwrap();
+
+            a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+            a.movdqu(xmm1, xmmword_ptr(edi)).unwrap();
+            a.pshufd(xmm2, xmm0, 0x4e).unwrap();
+            a.pshuflw(xmm2, xmm2, 0xd8).unwrap();
+            a.pshufhw(xmm2, xmm2, 0x93).unwrap();
+            a.shufps(xmm2, xmm1, 0xe4).unwrap();
+            a.shufpd(xmm2, xmm0, 2).unwrap();
+            a.pinsrw(xmm2, eax, 5).unwrap();
+            a.pinsrw(xmm3, word_ptr(esi + 4), 6).unwrap();
+            a.pextrw(edx, xmm2, 5).unwrap();
+            a.pmuludq(xmm2, xmm3).unwrap();
+            a.psadbw(xmm2, xmm1).unwrap();
+            a.pslldq(xmm2, 3).unwrap();
+            a.psrldq(xmm2, 1).unwrap();
+            a.movss(xmm2, xmm0).unwrap();
+            a.movsd_2(xmm2, xmm1).unwrap();
+            a.movlps(xmm2, qword_ptr(esi)).unwrap();
+            a.movhps(xmm2, qword_ptr(edi)).unwrap();
+            a.movlps(qword_ptr(edi + 16), xmm2).unwrap();
+            a.movhps(qword_ptr(edi + 24), xmm2).unwrap();
+            a.movlhps(xmm2, xmm0).unwrap();
+            a.movhlps(xmm2, xmm1).unwrap();
+            a.pmovmskb(ebp, xmm2).unwrap();
+            a.movmskps(ebx, xmm2).unwrap();
+            a.xor(ebp, ebx).unwrap();
+            a.movmskpd(ebx, xmm0).unwrap();
+            a.add(edx, ebp).unwrap();
+            a.add(edx, ebx).unwrap();
+            a.mov(dword_ptr(edi + 32), edx).unwrap();
+            a.movdqu(xmmword_ptr(edi + 48), xmm2).unwrap();
+            a.emms().unwrap();
+        });
+    });
+    let mut at = initial();
+    at.regs[0] = 0x1234_5678;
+    at.regs[1] = 4;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    let built = differential(&code, &at, |mem| {
+        for i in 0..64u32 {
+            let v = i.wrapping_mul(0x2468_1357).wrapping_add(0x80ff_7f81);
+            mem.write(DATA + 0x100 + i * 4, &v.to_le_bytes()).unwrap();
+            mem.write(DATA + 0x200 + i * 4, &(!v).to_le_bytes())
+                .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
 }

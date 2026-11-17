@@ -42,6 +42,8 @@ pub(crate) struct Assumed {
     pub denormal: bool,
     /// Whether the form runs x87 instructions, so that the x87 facts hold.
     pub x87: bool,
+    /// Whether the form runs MMX or EMMS instructions, requiring no pending x87 exception.
+    pub mmx: bool,
     /// The MXCSR bits the form assumes: all of them when it runs SSE
     /// floating-point or control instructions, else the control bits.
     pub mxcsr_mask: u32,
@@ -87,6 +89,9 @@ struct State {
     regs: [Value; 8],
     flags: Value,
     xmm: [Value; 8],
+    mmx: [Value; 8],
+    mmx_meta: Value,
+    mmx_meta_bits: (u32, u32),
     x87: [Option<Value>; 8],
     top: u8,
     control: u16,
@@ -177,9 +182,29 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         return Err(Reject::Empty);
     }
     let insts = &unit.trace.insts;
+    let primary_mmx = insts[..unit.trace.primary]
+        .iter()
+        .any(|i| matches!(i.op, decode::Op::Simd(s) if s.mmx()));
+    if primary_mmx
+        && let Some(i) = insts[unit.trace.primary..]
+            .iter()
+            .position(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)))
+    {
+        return Err(Reject::Unsupported(unit.trace.primary + i));
+    }
     let x87 = insts
         .iter()
         .any(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)));
+    let mmx_index = insts
+        .iter()
+        .position(|i| matches!(i.op, decode::Op::Simd(s) if s.mmx()));
+    if !x87
+        && let Some(i) = mmx_index
+        && at.x87.status & 0x80 != 0
+    {
+        return Err(Reject::Mode(i));
+    }
+    let mmx = !x87 && mmx_index.is_some();
     let simd = |pick: fn(&crate::translate::simd::Simd) -> bool| {
         insts
             .iter()
@@ -220,6 +245,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
             .then_some((at.regs[ESP as usize] & 15) as u8),
         denormal: at.x87.status & 2 != 0,
         x87,
+        mmx,
         mxcsr_mask: if floating || control {
             u32::MAX
         } else {
@@ -263,6 +289,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         .map(Source::Reg)
         .chain([Source::Eflags])
         .chain((0..8).map(Source::Xmm))
+        .chain((0..8).map(Source::Mmx))
         .collect();
     // Registers and EFLAGS, live ones as parameters of `block`.
     let registers = |func: &mut Func, block: Block, live: &live::Set| -> Vec<Value> {
@@ -271,6 +298,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
             .map(|s| match *s {
                 Source::Reg(r) if !live.reg(usize::from(r)) => unused[0],
                 Source::Xmm(r) if !live.reg(8 + usize::from(r)) => unused[1],
+                Source::Mmx(r) if !live.reg(16 + usize::from(r)) => unused[1],
                 _ => func.param(block, s.ty()),
             })
             .collect()
@@ -282,6 +310,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         .filter(|s| match *s {
             Source::Reg(r) => live.entry[0].reg(usize::from(r)),
             Source::Xmm(r) => live.entry[0].reg(8 + usize::from(r)),
+            Source::Mmx(r) => live.entry[0].reg(16 + usize::from(r)),
             _ => true,
         })
         .collect();
@@ -330,6 +359,9 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
         regs: params[..8].try_into().unwrap(),
         flags: params[8],
         xmm: params[9..17].try_into().unwrap(),
+        mmx: params[17..25].try_into().unwrap(),
+        mmx_meta: unused[0],
+        mmx_meta_bits: (0, u32::MAX),
         x87,
         top: assumed.top,
         control: assumed.control,
@@ -389,10 +421,21 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                 })),
                 model::C1::Unknown => None,
             };
+            let mmx_meta = if !assumed.mmx {
+                unused[0]
+            } else if model.mmx_meta.1 == u32::MAX {
+                func.push(block, Op::Constant(Type::I32, u128::from(model.mmx_meta.0)))
+                    .unwrap()
+            } else {
+                func.param(block, Type::I32)
+            };
             Ok(State {
                 regs: params[..8].try_into().unwrap(),
                 flags: params[8],
                 xmm: params[9..17].try_into().unwrap(),
+                mmx: params[17..25].try_into().unwrap(),
+                mmx_meta,
+                mmx_meta_bits: model.mmx_meta,
                 x87,
                 frame,
                 floats,
@@ -706,6 +749,14 @@ impl Front<'_> {
             regs: std::array::from_fn(|r| held(r, self.state.regs[r])),
             eflags: Some(Location::Recipe(Recipe::Eflags(self.state.flags))),
             xmm: std::array::from_fn(|r| held(8 + r, self.state.xmm[r])),
+            mmx: std::array::from_fn(|r| held(16 + r, self.state.mmx[r])),
+            mmx_meta: self.assumed.mmx.then(|| {
+                if self.state.mmx_meta_bits.1 == u32::MAX {
+                    Location::Constant(u64::from(self.state.mmx_meta_bits.0))
+                } else {
+                    Location::At(self.state.mmx_meta)
+                }
+            }),
             x87: self.assumed.x87.then(|| X87 {
                 top: self.state.top,
                 valid: self

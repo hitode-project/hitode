@@ -25,6 +25,9 @@ pub(super) struct Model {
     pub dirty: Rc<BTreeSet<i32>>,
     regs: [(u32, u32); 8],
     mxcsr: u32,
+    /// Known-bit lattice `(bits, known)` for MMX alias metadata (bits 0–7
+    /// written mask, 8–9 tag state, 10 TOP=0).
+    pub mmx_meta: (u32, u32),
     bytes: Rc<BTreeMap<i32, u8>>,
     flags: Option<u32>,
 }
@@ -69,6 +72,7 @@ pub(super) fn analyze(
         dirty: Default::default(),
         regs: [(0, 0); 8],
         mxcsr: at.mxcsr,
+        mmx_meta: (0, u32::MAX),
         bytes: Default::default(),
         flags: None,
     };
@@ -136,6 +140,8 @@ pub(super) fn analyze(
                     a.1 &= b.1 & !(a.0 ^ b.0);
                     a.0 &= a.1;
                 }
+                old.mmx_meta.1 &= m.mmx_meta.1 & !(old.mmx_meta.0 ^ m.mmx_meta.0);
+                old.mmx_meta.0 &= old.mmx_meta.1;
                 retain(&mut old.floats, |p| m.floats.contains(p));
                 extend(&mut old.stored, &m.stored);
                 extend(&mut old.dirty, &m.dirty);
@@ -360,6 +366,18 @@ impl Model {
                 self.write(Part::Mem(s.mem), 4, Some(self.mxcsr), offsets);
             }
             D::Simd(s) => {
+                if s.kind == crate::translate::simd::Kind::Emms {
+                    self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x200;
+                    self.mmx_meta.1 |= 0x300;
+                } else if s.mmx() {
+                    let write_bit = if let crate::translate::simd::Loc::Mmx(n) = s.dst {
+                        1u32 << n
+                    } else {
+                        0
+                    };
+                    self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x500 | write_bit;
+                    self.mmx_meta.1 |= 0x700 | write_bit;
+                }
                 if s.dst == crate::translate::simd::Loc::Mem {
                     self.write(Part::Mem(s.mem), s.width, None, offsets);
                 }

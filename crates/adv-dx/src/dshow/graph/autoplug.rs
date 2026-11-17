@@ -34,13 +34,15 @@ type Direction = Box<dyn FnOnce(&mut Env<'_>, u32, u32) -> Outcome>;
 /// The next candidate (`None`) or the final HRESULT.
 type Step = Box<dyn FnOnce(&mut Env<'_>, Option<u32>) -> Outcome>;
 
-/// One autoplug request: the target input (0 when rendering) and whether
-/// only filters with outputs may be added, as Connect and RenderEx ask.
+/// One autoplug request: the target input (0 when rendering), whether
+/// only filters with outputs may be added, as Connect and RenderEx ask, and
+/// whether this level stops after the graph's members.
 #[derive(Clone, Copy)]
 struct Plug {
     graph: u32,
     sink: u32,
     existing: bool,
+    members_only: bool,
 }
 
 fn failed(hr: u32) -> bool {
@@ -61,39 +63,46 @@ fn export(env: &Env<'_>, module: &str, name: &str) -> Option<u32> {
         .and_then(|host| (host.export)(env, module, name))
 }
 
-/// IGraphBuilder::Connect; an input given first is swapped with the output.
+/// IGraphBuilder::Connect: the pins as given, directly first, then through
+/// intermediate filters unless that would close a loop.
 pub(super) fn connect(env: &mut Env<'_>, graph: u32, source: u32, sink: u32) -> Outcome {
     if source == 0 || sink == 0 {
         return Outcome::Return(E_POINTER);
     }
-    direction(
+    let plug = Plug {
+        graph,
+        sink,
+        existing: true,
+        members_only: false,
+    };
+    closes_loop(
         env,
         source,
-        Box::new(move |env, hr, dir| {
-            if failed(hr) {
-                return Outcome::Return(hr);
+        sink,
+        Box::new(move |env, looped| {
+            if looped {
+                return Outcome::Return(VFW_E_CANNOT_CONNECT);
             }
-            let (source, sink) = if dir == INPUT {
-                (sink, source)
-            } else {
-                (source, sink)
-            };
-            let plug = Plug {
-                graph,
-                sink,
-                existing: true,
-            };
-            closes_loop(
-                env,
-                source,
-                sink,
-                Box::new(move |env, looped| {
-                    if looped {
-                        return Outcome::Return(VFW_E_CANNOT_CONNECT);
-                    }
-                    autoplug(env, plug, source, 0, Box::new(|_, hr| Outcome::Return(hr)))
-                }),
-            )
+            autoplug(env, plug, source, 0, Box::new(|_, hr| Outcome::Return(hr)))
+        }),
+    )
+}
+
+/// IFilterGraph::ConnectDirect: `source` connects to `sink` as given, unless
+/// that would close a loop.
+pub(super) fn connect_direct(env: &mut Env<'_>, source: u32, sink: u32, mt: u32) -> Outcome {
+    if source == 0 || sink == 0 {
+        return Outcome::Return(E_POINTER);
+    }
+    closes_loop(
+        env,
+        source,
+        sink,
+        Box::new(move |env, looped| {
+            if looped {
+                return Outcome::Return(VFW_E_CIRCULAR_GRAPH);
+            }
+            filter::connect(env, source, sink, mt)
         }),
     )
 }
@@ -289,6 +298,7 @@ pub(super) fn render(env: &mut Env<'_>, graph: u32, source: u32, existing: bool)
         graph,
         sink: 0,
         existing,
+        members_only: false,
     };
     autoplug(
         env,
@@ -303,6 +313,24 @@ pub(super) fn render(env: &mut Env<'_>, graph: u32, source: u32, existing: bool)
             })
         }),
     )
+}
+
+/// Render a host stream through the graph's members only; the caller decodes
+/// it on the host when none accepts, standing in for the mapper.
+pub(super) fn into_members(
+    env: &mut Env<'_>,
+    graph: u32,
+    source: u32,
+    existing: bool,
+    then: Hr,
+) -> Outcome {
+    let plug = Plug {
+        graph,
+        sink: 0,
+        existing,
+        members_only: true,
+    };
+    members(env, plug, source, 0, then)
 }
 
 fn autoplug(env: &mut Env<'_>, plug: Plug, source: u32, depth: u32, then: Hr) -> Outcome {
@@ -345,6 +373,9 @@ fn try_members(
     then: Hr,
 ) -> Outcome {
     let Some(filter) = list.pop_front() else {
+        if plug.members_only {
+            return then(env, VFW_E_CANNOT_CONNECT);
+        }
         return stand_in(env, plug, source, depth, then);
     };
     through_filter(
@@ -537,9 +568,13 @@ fn plug_outputs(env: &mut Env<'_>, state: Onward, mut outputs: VecDeque<u32>, th
         }
         return undo(env, state.source, state.middle, then);
     };
+    let plug = Plug {
+        members_only: false,
+        ..state.plug
+    };
     autoplug(
         env,
-        state.plug,
+        plug,
         output,
         state.depth + 1,
         Box::new(move |env, hr| {
@@ -946,7 +981,7 @@ fn free_media_type(env: &mut Env<'_>, mt: u32, then: Finish) -> Outcome {
 }
 
 /// Every pin of `filter`, each holding a reference.
-fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
+pub(super) fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
     let Some(scratch) = alloc(env, 8) else {
         return then(env, Vec::new());
     };

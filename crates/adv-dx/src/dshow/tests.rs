@@ -288,6 +288,83 @@ fn event_timeouts_leave_no_event_code() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
+#[test]
+// spec: MEDIA-GRAPH-21, MEDIA-GRAPH-22
+fn completion_and_disabled_notification_follow_quartz() {
+    const EC_COMPLETE: u32 = 1;
+    const EC_STATUS: u32 = 0x8000;
+    const E_ABORT: u32 = 0x8000_4004;
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let events = query(&mut m, graph, IID_IMEDIAEVENTEX);
+    let sink = query(&mut m, graph, IID_IMEDIAEVENTSINK);
+    let control = query(&mut m, graph, IID_IMEDIACONTROL);
+    let get_event = |m: &mut Machine<JitCpu>| {
+        method(
+            m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0],
+        )
+    };
+    let notify = |m: &mut Machine<JitCpu>, code: u32| {
+        assert_eq!(
+            method(m, "IMediaEventSink::Notify", &[sink, code, 0, 0]),
+            S_OK
+        );
+    };
+    let wait =
+        |m: &mut Machine<JitCpu>| method(m, "IMediaEventEx::WaitForCompletion", &[events, 0, DATA]);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    m.ext
+        .get_mut::<State>()
+        .graphs
+        .get_mut(&graph)
+        .unwrap()
+        .expected = 1;
+
+    // Disabling notification discards the queue and drops later events, but
+    // completion still ends WaitForCompletion.
+    notify(&mut m, EC_STATUS);
+    assert_eq!(
+        method(&mut m, "IMediaEventEx::SetNotifyFlags", &[events, 1]),
+        S_OK
+    );
+    assert_eq!(get_event(&mut m), E_ABORT);
+    notify(&mut m, EC_STATUS);
+    assert_eq!(wait(&mut m), E_ABORT);
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(get_event(&mut m), E_ABORT);
+    assert_eq!(wait(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_COMPLETE);
+
+    // With notification, completion is queued and stays queued for GetEvent;
+    // a new run removes it and the completion.
+    assert_eq!(
+        method(&mut m, "IMediaEventEx::SetNotifyFlags", &[events, 0]),
+        S_OK
+    );
+    assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    assert_eq!(wait(&mut m), E_ABORT);
+    m.ext
+        .get_mut::<State>()
+        .graphs
+        .get_mut(&graph)
+        .unwrap()
+        .expected = 1;
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(wait(&mut m), S_OK);
+    assert_eq!(get_event(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_COMPLETE);
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+    notify(&mut m, EC_STATUS);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    assert_eq!(get_event(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_STATUS);
+    assert_eq!(get_event(&mut m), E_ABORT);
+}
+
 /// An expected guest-call argument that matches any value, such as a pointer
 /// the host allocated.
 const ANY: u32 = u32::MAX;
@@ -764,12 +841,77 @@ fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
         method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
         VFW_E_ENUM_OUT_OF_SYNC
     );
-    // Reset takes the live list, which now holds only the decoder.
+    // Reset takes the live list, which now holds only the decoder; skipping
+    // from its end is refused.
     assert_eq!(method(&mut m, "IEnumFilters::Reset", &[filters]), S_OK);
-    assert_eq!(method(&mut m, "IEnumFilters::Skip", &[filters, 1]), S_OK);
+    assert_eq!(method(&mut m, "IEnumFilters::Skip", &[filters, 2]), S_FALSE);
     assert_eq!(
         method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
         E_INVALIDARG
+    );
+}
+
+#[test]
+// spec: MEDIA-GRAPH-23
+fn removal_disconnects_guest_pins_and_keeps_a_filter_that_refuses() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    // Guest filter, pin enumerator, pin and connected peer.
+    let objects = [DATA + 0x400, DATA + 0x500, DATA + 0x600, DATA + 0x700];
+    for (i, obj) in objects.into_iter().enumerate() {
+        m.cpu.write_u32(obj, obj + 4).unwrap();
+        for slot in 0..18u32 {
+            m.cpu
+                .write_u32(obj + 4 + slot * 4, 0x7200_0000 + (i as u32) * 0x100 + slot)
+                .unwrap();
+        }
+    }
+    let [filter, pins, pin, peer] = objects;
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, filter, 0],
+            &[
+                (0x7200_0001, &[filter], 2),
+                (0x7200_000d, &[filter, graph, ANY], S_OK),
+                (0x7200_0008, &[filter, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    // EnumPins, Next and ConnectedTo hand out the objects; the peer refuses
+    // Disconnect, so every reference is returned and the filter stays.
+    let mut outcome = start_method(&mut m, "IFilterGraph2::RemoveFilter", &[graph, filter]);
+    for (target, output, value) in [
+        (0x7200_000a, Some((1, pins)), S_OK),
+        (0x7200_0103, Some((2, pin)), S_OK),
+        (0x7200_0206, Some((1, peer)), S_OK),
+        (0x7200_0305, None, VFW_E_NOT_STOPPED),
+        (0x7200_0302, None, 0),
+        (0x7200_0202, None, 0),
+        (0x7200_0102, None, 0),
+    ] {
+        let Outcome::Call {
+            target: called,
+            args,
+            then,
+            ..
+        } = outcome
+        else {
+            panic!("RemoveFilter must call {target:#x}");
+        };
+        assert_eq!(called, target);
+        if let Some((index, object)) = output {
+            m.cpu.write_u32(args[index], object).unwrap();
+        }
+        outcome = then(&mut env(&mut m), adv_machine::Resume::Returned(value));
+    }
+    assert!(matches!(outcome, Outcome::Return(VFW_E_NOT_STOPPED)));
+    assert_eq!(
+        m.ext.get::<State>().graphs[&graph].members.len(),
+        1,
+        "a refused removal keeps the member"
     );
 }
 
@@ -806,6 +948,14 @@ fn system_filters_expose_pins_and_join_the_graph() {
         S_OK
     );
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), filter::OUTPUT);
+    // spec: MEDIA-GRAPH-24
+    // Feeding a filter's output back into its own input closes a loop.
+    let outcome = start_method(
+        &mut m,
+        "IFilterGraph2::ConnectDirect",
+        &[graph, output, input, 0],
+    );
+    assert_eq!(finish_calls(&mut m, outcome), VFW_E_CIRCULAR_GRAPH);
     // A decoder offers no output types until its input is connected.
     assert_eq!(
         method(&mut m, "IPin::EnumMediaTypes", &[output, DATA]),
@@ -1231,9 +1381,14 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Pause",
             &[control],
             &[
-                // No member has a clock and no system clock exists here.
-                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                // spec: MEDIA-GRAPH-12
+                // No member has a clock and no system clock exists here;
+                // the first member added is asked first.
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                // Members are sorted by their connections before each change.
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
             ],
@@ -1246,8 +1401,21 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Run",
             &[control],
             &[
+                // ensure_default probes IReferenceClock, the stop position probes
+                // IMediaSeeking, then count_guest_renderers probes IMediaSeeking,
+                // IAMFilterMiscFlags, and IMediaPosition on each guest member.
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0106, &[renderer, 0, 0], S_OK),
                 (0x7100_0006, &[source, 0, 0], S_OK),
             ],
@@ -1315,8 +1483,12 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Stop",
             &[control],
             &[
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
                 // Stopped, the graph re-seeks its streams to the kept position.
@@ -1885,8 +2057,8 @@ fn splitter_output_seeking_keeps_positions_and_reports_stream_identity() {
     assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 0);
 }
 
-#[cfg(feature = "media")]
-fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
+/// Follow a quartz method's calls into host thunks until it returns.
+fn finish_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
     loop {
         outcome = match outcome {
             Outcome::Return(hr) => return hr,
@@ -1912,7 +2084,7 @@ fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
                     ext: &mut m.ext,
                     thunk,
                 });
-                let hr = finish_mpeg_calls(m, call);
+                let hr = finish_calls(m, call);
                 then(&mut env(m), adv_machine::Resume::Returned(hr))
             }
             Outcome::Block { then, .. } => {
@@ -1922,7 +2094,7 @@ fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
                     adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
                 )
             }
-            _ => panic!("unexpected MPEG continuation"),
+            _ => panic!("unexpected continuation"),
         };
     }
 }
@@ -2010,11 +2182,11 @@ fn pushed_mpeg_video_delivers_a_timed_sample_after_a_direct_pause() {
     let outcome = Outcome::call(receive, vec![input, source], |_, resume| {
         Outcome::Return(resume.value())
     });
-    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    assert_eq!(finish_calls(&mut m, outcome), S_OK);
     let eos = m.resolve_import("quartz.dll", "IPin::EndOfStream").unwrap();
     let outcome = Outcome::call(eos, vec![pins[0]], |_, resume| {
         Outcome::Return(resume.value())
     });
-    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    assert_eq!(finish_calls(&mut m, outcome), S_OK);
     assert!(m.ext.get::<Received>().0 > 0);
 }

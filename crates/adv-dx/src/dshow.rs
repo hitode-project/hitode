@@ -52,6 +52,7 @@ pub(crate) const VFW_E_NOT_CONNECTED: u32 = 0x8004_0209;
 pub(crate) const VFW_E_NO_ALLOCATOR: u32 = 0x8004_020a;
 pub(crate) const VFW_E_ALREADY_CONNECTED: u32 = 0x8004_0204;
 pub(crate) const VFW_E_NOT_STOPPED: u32 = 0x8004_0224;
+pub(crate) const VFW_E_CIRCULAR_GRAPH: u32 = 0x8004_0231;
 pub(crate) const VFW_E_NO_ACCEPTABLE_TYPES: u32 = 0x8004_0207;
 pub(crate) const VFW_E_INVALID_DIRECTION: u32 = 0x8004_0208;
 pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;
@@ -458,6 +459,8 @@ pub(crate) struct State {
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
+    /// Worker threads (by thread id) finishing an asynchronous graph Run.
+    pub(crate) async_runs: BTreeMap<u32, u32>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
     /// The quartz type library and the ITypeInfo of each automation
     /// interface, loaded on first use and kept for the process, as strmbase does.
@@ -597,6 +600,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         asf_threads: BTreeMap::new(),
         next_session: 1,
         pending_threads: Vec::new(),
+        async_runs: BTreeMap::new(),
         pending_posts: Vec::new(),
         type_library: 0,
         type_infos: BTreeMap::new(),

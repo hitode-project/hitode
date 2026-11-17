@@ -1163,7 +1163,7 @@ impl Builder<'_> {
                 let addr = self.address(state, mem)?;
                 self.read(state, addr, 8, record);
             }
-            Op::Simd(s) if !s.mmx() && s.kind != Kind::MaskMove => {
+            Op::Simd(s) if s.kind != Kind::MaskMove => {
                 if s.memory() {
                     let addr = self.address(state, s.mem)?;
                     if s.dst == Loc::Mem {
@@ -1673,6 +1673,14 @@ impl Builder<'_> {
 
 impl Builder<'_> {
     fn frame_cache(&self) -> Option<FrameCache> {
+        if self
+            .trace
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::Simd(s) if s.mmx()))
+        {
+            return None;
+        }
         let n = self.trace.len();
         let mut reads = vec![None; n];
         let mut writes = Vec::new();
