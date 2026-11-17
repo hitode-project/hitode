@@ -8,6 +8,7 @@ use adv_os::com::Iid;
 
 use super::*;
 
+mod autoplug;
 mod clock;
 pub(super) mod mapper;
 mod render;

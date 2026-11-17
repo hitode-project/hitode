@@ -372,20 +372,14 @@ fn guest_render_validates_direction_connection_and_graph_owner_before_connecting
 }
 
 #[test]
-// spec: MEDIA-GRAPH-6
+// spec: MEDIA-GRAPH-6, MEDIA-GRAPH-16
 fn guest_render_failed_pull_and_probe_release_reader_and_remove_temporary_filters() {
     for fail_reads in [true, false] {
         let (mut m, graph) = fixture(vec![0x55; 32]);
         m.ext.get_mut::<PullSource>().fail_reads = fail_reads;
         let outcome = pin(&mut env(&mut m), graph, OUTPUT_PIN);
-        assert_eq!(
-            finish(&mut m, outcome),
-            if fail_reads {
-                VFW_E_TYPE_NOT_ACCEPTED
-            } else {
-                VFW_E_UNSUPPORTED_STREAM
-            }
-        );
+        // Host decoding refused the stream and no mapper candidate remains.
+        assert_eq!(finish(&mut m, outcome), VFW_E_CANNOT_RENDER);
         let source = m.ext.get::<PullSource>();
         assert_eq!((source.connects, source.queries, source.reads), (1, 1, 1));
         assert_eq!(source.disconnects, 1);

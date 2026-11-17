@@ -121,6 +121,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: The graph's IMediaSeeking MUST ask every member exposing IMediaSeeking in media time, newest first, with host playback answering as one more member. Durations and stops MUST take the largest answer, capabilities their intersection, and SetPositions MUST pause a running graph around the seek. Stop MUST re-seek every member to the kept position.
 **Verification**: Test
 
+### MEDIA-GRAPH-16 Intelligent connect
+
+**Rule**: Connect and Render of a guest pin MUST try a direct connection, then graph members newest first, then the mapper's matching filters, added on demand. Recursion MUST stop at depth five, and a connection closing a loop MUST fail with VFW_E_CANNOT_CONNECT. A filter added for a failed attempt MUST be removed again.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
