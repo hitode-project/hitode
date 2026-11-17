@@ -37,7 +37,7 @@ fn feed(h: &mut History, mut next: Sequence) {
     h.start(key, bounds, false);
     *h.next.last_mut().unwrap() = next;
     for (key, bounds) in entries {
-        h.record(key, bounds, Arc::default(), Vec::new());
+        h.record(key, bounds, Arc::default(), SmallVec::new());
     }
 }
 /// One generation's change, settled as the final version.

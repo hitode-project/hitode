@@ -157,6 +157,7 @@ dependencies = [
  "naga",
  "rustc-hash 2.1.3",
  "sha2 0.10.9",
+ "smallvec",
  "xxhash-rust",
 ]
 

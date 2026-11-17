@@ -2,12 +2,25 @@
 use super::*;
 use adv_device::{
     gpu::{AttributeFormat, Image},
-    surface::{Rect, Region, rects},
+    surface::{Rect, Region},
 };
 use rustc_hash::FxHashSet as HashSet;
+use smallvec::SmallVec;
 mod forward;
 pub(super) mod sampling;
 mod schedule;
+
+fn take_region(pool: &mut Vec<Region>, extent: (u32, u32), whole: bool) -> Region {
+    let mut region = pool.pop().unwrap_or_default();
+    region.reset(extent, whole);
+    region
+}
+
+fn recycle_region(pool: &mut Vec<Region>, region: Region) {
+    if pool.len() < 128 {
+        pool.push(region);
+    }
+}
 
 pub(super) fn image(operation: &Operation) -> Option<&Image> {
     match operation {
@@ -177,11 +190,11 @@ pub(in crate::d3d9) fn vertex_input(
 #[derive(Default)]
 struct Samples {
     base: u128,
-    reads: Vec<Sample>,
+    reads: SmallVec<[Sample; 2]>,
 }
 struct Sample {
     source: Content,
-    mappings: Vec<sampling::Mapping>,
+    mappings: SmallVec<[sampling::Mapping; 2]>,
     version: u128,
 }
 /// The generation and number of writes visible to a read.
@@ -205,7 +218,7 @@ struct Generation {
 
 struct Observed {
     samples: Arc<Samples>,
-    prefixes: Vec<Option<Prefix>>,
+    prefixes: SmallVec<[Option<Prefix>; 4]>,
 }
 
 /// One generation of a content: its writes from a proven overwrite (or the
@@ -215,8 +228,8 @@ struct Sequence {
     entries: Vec<(u128, Rect)>,
     observed: Vec<Option<Observed>>,
     forward: usize,
-    index: HashMap<u128, Vec<usize>>,
-    sampled_index: HashMap<u128, Vec<usize>>,
+    index: HashMap<u128, SmallVec<[usize; 2]>>,
+    sampled_index: HashMap<u128, SmallVec<[usize; 2]>>,
     cursor: usize,
     matches: Vec<Option<Match>>,
     different: bool,
@@ -227,12 +240,32 @@ struct Sequence {
     independent: bool,
     initial: u128,
 }
+impl Sequence {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.observed.clear();
+        self.forward = 0;
+        self.index.clear();
+        self.sampled_index.clear();
+        self.cursor = 0;
+        self.matches.clear();
+        self.different = false;
+        self.full = Rect::default();
+        self.view = Rect::default();
+        self.shape = 0;
+        self.slot = 0;
+        self.independent = false;
+        self.initial = 0;
+    }
+}
 static EMPTY: std::sync::LazyLock<Sequence> = std::sync::LazyLock::new(Sequence::default);
 #[derive(Default)]
 struct History {
     /// The previous frame's generations and this frame's.
     previous: Vec<Sequence>,
     next: Vec<Sequence>,
+    /// Cleared sequences retained to reuse their buffers across frames.
+    spare: Vec<Sequence>,
     /// The previous generation each of this frame's compares with.
     matched: Vec<Option<usize>>,
     /// Per slot, the cells whose pixels differ from this content's current
@@ -246,6 +279,18 @@ struct History {
 impl History {
     fn current(&self) -> Option<&Sequence> {
         self.next.last()
+    }
+    fn recycle_previous(&mut self) {
+        for mut seq in self.previous.drain(..) {
+            seq.clear();
+            self.spare.push(seq);
+        }
+    }
+    fn recycle_next(&mut self) {
+        for mut seq in self.next.drain(..) {
+            seq.clear();
+            self.spare.push(seq);
+        }
     }
     /// Starts a generation at a write keyed `key`. One continuing the frame
     /// start compares with the previous frame's first; one from an overwrite
@@ -265,14 +310,14 @@ impl History {
             (!self.previous.is_empty()).then_some(0)
         };
         self.matched.push(found);
-        self.next.push(Sequence::default());
+        self.next.push(self.spare.pop().unwrap_or_default());
     }
     fn record(
         &mut self,
         key: u128,
         bounds: Rect,
         samples: Arc<Samples>,
-        prefixes: Vec<Option<Prefix>>,
+        prefixes: SmallVec<[Option<Prefix>; 4]>,
     ) {
         let previous = self
             .matched
@@ -282,7 +327,7 @@ impl History {
             .map_or(&*EMPTY, |m| &self.previous[m]);
         let s = self.next.last_mut().unwrap();
         let at = s.entries.len();
-        let candidate = |positions: &Vec<usize>| {
+        let candidate = |positions: &SmallVec<[usize; 2]>| {
             let first = positions.partition_point(|&n| n < s.cursor);
             positions[first..]
                 .iter()
@@ -324,23 +369,43 @@ impl History {
     }
     /// After every generation's change: what the final version changed since
     /// the previous frame's, and what its slot must redraw.
+    #[cfg(test)]
     fn settle(&mut self, force: bool, last: Region) -> (Region, Region) {
+        let mut pool = Vec::new();
+        self.settle_with_pool(force, last, &mut pool)
+    }
+    fn settle_with_pool(
+        &mut self,
+        force: bool,
+        last: Region,
+        pool: &mut Vec<Region>,
+    ) -> (Region, Region) {
         let next = self.next.last().unwrap();
         let size = size(next.full);
         let compared = !force
             && !self.previous.is_empty()
             && self.matched.last() == Some(&Some(self.previous.len() - 1));
-        let changed = if compared { last } else { Region::whole(size) };
+        let changed = if compared {
+            last
+        } else {
+            recycle_region(pool, last);
+            take_region(pool, size, true)
+        };
         self.serial += 1;
         for stale in self.stale.values_mut() {
             stale.union(&changed);
         }
         self.stale.retain(|_, stale| !stale.is_whole());
-        let redraw = self
-            .stale
-            .insert(next.slot, Region::empty(size))
-            .unwrap_or_else(|| Region::whole(size));
-        self.previous = std::mem::take(&mut self.next);
+        let empty = take_region(pool, size, false);
+        let redraw = match self.stale.get_mut(&next.slot) {
+            Some(existing) => std::mem::replace(existing, empty),
+            None => {
+                self.stale.insert(next.slot, empty);
+                take_region(pool, size, true)
+            }
+        };
+        self.recycle_previous();
+        std::mem::swap(&mut self.previous, &mut self.next);
         self.matched.clear();
         (changed, redraw)
     }
@@ -358,10 +423,10 @@ impl History {
 }
 type Write = (Content, u128, Rect, Rect, u128, bool, Arc<Samples>);
 pub(super) struct Record {
-    writes: Vec<Write>,
+    writes: SmallVec<[Write; 3]>,
     /// What the write's pixels read from each source: a proven mapping, or
     /// the whole source.
-    demands: Vec<(Content, Option<sampling::Mapping>)>,
+    demands: SmallVec<[(Content, Option<sampling::Mapping>); 4]>,
     bounds: Rect,
     view: Rect,
     upload: bool,
@@ -371,10 +436,7 @@ pub(super) struct Record {
 /// once per scissor it meets; past this many, coarser cells merge them.
 const PARTS: usize = 8;
 pub(super) fn area(region: &Region) -> u64 {
-    rects(region)
-        .iter()
-        .map(|r| u64::from(r.w) * u64::from(r.h))
-        .sum()
+    region.area()
 }
 #[derive(Default)]
 pub(super) struct Work {
@@ -412,6 +474,10 @@ pub(super) struct Analysis {
     pub planned: bool,
     epoch: u64,
     forward_len: usize,
+    region_pool: Vec<Region>,
+    forward_scratch: forward::Scratch,
+    stale_scratch: HashMap<Content, Region>,
+    schedule_scratch: schedule::Scratch,
 }
 impl Analysis {
     pub fn written(&self, content: &Content) -> bool {
@@ -429,7 +495,7 @@ impl Analysis {
     ) -> Arc<Record> {
         let image = image(&p.operation).unwrap();
         let slot = slot.unwrap_or_else(|| hash(image.id()));
-        let mut demands = Vec::new();
+        let mut demands = SmallVec::new();
         for &k in &p.reads {
             let mut proven = p.samples.iter().filter(|r| r.source == k).peekable();
             if proven.peek().is_none() {
@@ -454,7 +520,7 @@ impl Analysis {
             demands.extend(proven.map(|r| (k, Some(r.mapping))));
         }
         let mut record = Record {
-            writes: Vec::new(),
+            writes: SmallVec::new(),
             demands,
             bounds: p.bounds.clipped(full(image)),
             view: full(image),
@@ -550,12 +616,13 @@ impl Analysis {
             record: record.clone(),
             producers,
             previous,
-            generations: Vec::new(),
+            generations: SmallVec::new(),
             submissions: 0,
         });
         // Reads of all aspects precede this command's writes, including a
         // color write that also updates the depth or stencil it tests.
-        let mut prefixes = [const { Vec::new() }; 3];
+        let mut prefixes: [SmallVec<[Option<Prefix>; 4]>; 3] =
+            [SmallVec::new(), SmallVec::new(), SmallVec::new()];
         for (write, prefixes) in record.writes.iter().zip(&mut prefixes) {
             *prefixes = write
                 .6
@@ -616,12 +683,14 @@ impl Analysis {
             return [0; 2];
         }
         self.epoch += 1;
-        let mut changes = forward::changes(
+        forward::changes(
             &self.histories,
             &self.nodes,
             self.forward_len,
             self.epoch,
             force,
+            &mut self.forward_scratch,
+            &mut self.region_pool,
         );
         for ((content, generation, _), work) in &mut self.work {
             if let Some(s) = self
@@ -629,10 +698,13 @@ impl Analysis {
                 .get(content)
                 .and_then(|h| h.next.get(*generation))
             {
-                work.changed = changes[s.forward].as_ref().unwrap().clone();
+                work.changed = self.forward_scratch.results[s.forward]
+                    .as_ref()
+                    .unwrap()
+                    .clone();
             }
         }
-        let mut stale = HashMap::default();
+        self.stale_scratch.clear();
         for (content, h) in &mut self.histories {
             if h.next.is_empty() {
                 continue;
@@ -640,18 +712,40 @@ impl Analysis {
             let last = h.next.len() - 1;
             let force = force || (h.seen + 1 != self.epoch && !h.retains_start());
             let slot = h.next[last].slot;
-            let (changed, redraw) = h.settle(force, changes[h.next[last].forward].take().unwrap());
+            let last_change = self.forward_scratch.results[h.next[last].forward]
+                .take()
+                .unwrap();
+            let (changed, redraw) = h.settle_with_pool(force, last_change, &mut self.region_pool);
             h.seen = self.epoch;
             if content.2 == 0 {
-                self.changed
-                    .entry(slot)
-                    .and_modify(|r| r.union(&changed))
-                    .or_insert(changed);
+                match self.changed.entry(slot) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().union(&changed);
+                        recycle_region(&mut self.region_pool, changed);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(changed);
+                    }
+                }
+            } else {
+                recycle_region(&mut self.region_pool, changed);
             }
-            stale.insert(*content, redraw);
+            self.stale_scratch.insert(*content, redraw);
         }
-        let (clips, promotions) = schedule::schedule(&self.nodes, &self.done, &stale);
-        self.clips = clips;
+        for region in self.forward_scratch.results.drain(..).flatten() {
+            recycle_region(&mut self.region_pool, region);
+        }
+        let promotions = schedule::schedule(
+            &self.nodes,
+            &self.done,
+            &self.stale_scratch,
+            &mut self.clips,
+            &mut self.schedule_scratch,
+            &mut self.region_pool,
+        );
+        for (_, region) in self.stale_scratch.drain() {
+            recycle_region(&mut self.region_pool, region);
+        }
         let diagnose = trace::capturing();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.slot != output && !diagnose {
@@ -661,7 +755,7 @@ impl Analysis {
             let r = self
                 .execution
                 .entry(node.slot)
-                .or_insert_with(|| Region::empty(size(view)));
+                .or_insert_with(|| take_region(&mut self.region_pool, size(view), false));
             let early = node
                 .record
                 .writes
@@ -674,7 +768,7 @@ impl Analysis {
                     }
                 }
                 _ if node.record.upload => r.add(node.record.bounds.into()),
-                _ => *r = Region::whole(r.size()),
+                _ => r.reset(r.size(), true),
             }
         }
         self.planned = true;
@@ -809,18 +903,24 @@ impl Analysis {
     pub fn finish(&mut self) {
         for h in self.histories.values_mut() {
             if !self.planned && !h.next.is_empty() {
-                h.previous = std::mem::take(&mut h.next);
+                h.recycle_previous();
+                std::mem::swap(&mut h.previous, &mut h.next);
+            } else {
+                h.recycle_next();
             }
-            h.next.clear();
             h.matched.clear();
         }
         self.forward_len = 0;
         self.clips.clear();
-        self.changed.clear();
+        for (_, region) in self.changed.drain() {
+            recycle_region(&mut self.region_pool, region);
+        }
         self.nodes.clear();
         self.last_writer.clear();
         self.done.clear();
-        self.execution.clear();
+        for (_, region) in self.execution.drain() {
+            recycle_region(&mut self.region_pool, region);
+        }
         self.work.clear();
         self.planned = false;
     }

@@ -20,25 +20,35 @@ pub struct Region {
 impl Region {
     /// Nothing changed in an image of `size` pixels.
     pub fn empty(size: (u32, u32)) -> Self {
-        let (columns, rows) = cells(size);
-        let stride = columns.div_ceil(64) as usize;
-        Self {
-            size,
-            stride,
-            bits: vec![0; stride * rows as usize],
-        }
+        let mut region = Self::default();
+        region.reset(size, false);
+        region
     }
 
     /// Everything changed.
     pub fn whole(size: (u32, u32)) -> Self {
-        let mut region = Self::empty(size);
-        region.add(Rect {
-            x: 0,
-            y: 0,
-            w: size.0,
-            h: size.1,
-        });
+        let mut region = Self::default();
+        region.reset(size, true);
         region
+    }
+
+    /// Reuses this region's backing storage for `size`, cleared or filled whole.
+    pub fn reset(&mut self, size: (u32, u32), whole: bool) {
+        let (columns, rows) = cells(size);
+        let stride = columns.div_ceil(64) as usize;
+        let len = stride * rows as usize;
+        self.size = size;
+        self.stride = stride;
+        self.bits.clear();
+        self.bits.resize(len, 0);
+        if whole {
+            self.add(Rect {
+                x: 0,
+                y: 0,
+                w: size.0,
+                h: size.1,
+            });
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -194,54 +204,87 @@ impl Region {
         Some(self.pixels(lo, hi, top?, bottom))
     }
 
-    /// Disjoint rectangles covering exactly the marked cells, clipped to the
-    /// image: runs of cells in each row, merged with identical runs below.
-    pub fn rects(&self) -> Vec<Rect> {
+    /// Pixel area covered by all marked cells, without allocating rectangles.
+    pub fn area(&self) -> u64 {
         let (columns, rows) = cells(self.size);
-        let mut out = Vec::new();
+        if columns == 0 || rows == 0 {
+            return 0;
+        }
+        let last_w = self.size.0 - (columns - 1) * CELL;
+        let last_h = self.size.1 - (rows - 1) * CELL;
+        let last_word = (columns as usize - 1) / 64;
+        let last_bit = 1u64 << ((columns as usize - 1) % 64);
+        let mut total = 0u64;
+        for y in 0..rows {
+            let row = self.row(y);
+            let ones: u32 = row.iter().map(|w| w.count_ones()).sum();
+            let last = u32::from(row[last_word] & last_bit != 0);
+            let row_w = (ones - last) * CELL + last * last_w;
+            let row_h = if y + 1 == rows { last_h } else { CELL };
+            total += u64::from(row_w) * u64::from(row_h);
+        }
+        total
+    }
+
+    /// Visits disjoint rectangles covering exactly the marked cells, clipped
+    /// to the image, in [`rects`](Self::rects) order.
+    pub fn for_each_rect(&self, mut emit: impl FnMut(Rect)) {
+        let (columns, rows) = cells(self.size);
         // Open runs as (first column, end column, first row), sorted by column.
-        let mut open: Vec<(u32, u32, u32)> = Vec::new();
-        let mut next = Vec::new();
+        let mut open = RunBuffer::default();
+        let mut next = RunBuffer::default();
         for y in 0..rows {
             let mut i = 0;
             for (a, b) in runs(self.row(y), columns) {
                 let mut extended = None;
-                while i < open.len() && open[i].0 <= a {
-                    let (oa, ob, top) = open[i];
+                let current = open.as_slice();
+                while i < current.len() && current[i].0 <= a {
+                    let (oa, ob, top) = current[i];
                     if (oa, ob) == (a, b) {
                         extended = Some(top);
                     } else {
-                        out.push(self.pixels(oa, ob, top, y));
+                        emit(self.pixels(oa, ob, top, y));
                     }
                     i += 1;
                 }
                 next.push((a, b, extended.unwrap_or(y)));
             }
-            for &(a, b, top) in &open[i..] {
-                out.push(self.pixels(a, b, top, y));
+            for &(a, b, top) in &open.as_slice()[i..] {
+                emit(self.pixels(a, b, top, y));
             }
             std::mem::swap(&mut open, &mut next);
             next.clear();
         }
-        for (a, b, top) in open {
-            out.push(self.pixels(a, b, top, rows));
+        for &(a, b, top) in open.as_slice() {
+            emit(self.pixels(a, b, top, rows));
         }
+    }
+
+    /// Disjoint rectangles covering exactly the marked cells, clipped to the
+    /// image: runs of cells in each row, merged with identical runs below.
+    pub fn rects(&self) -> Vec<Rect> {
+        let mut out = Vec::new();
+        self.for_each_rect(|r| out.push(r));
         out
     }
 
-    /// At most `max` (at least one) disjoint rectangles covering every marked
-    /// cell: the [`rects`](Self::rects) of the finest grid of `CELL << k`
-    /// squares that needs no more of them.
-    pub fn parts(&self, max: usize) -> Vec<Rect> {
-        let mut out = self.rects();
+    /// Reuses `out` to store at most `max` (at least one) disjoint rectangles
+    /// covering every marked cell.
+    pub fn parts_into(&self, max: usize, out: &mut Vec<Rect>) {
+        out.clear();
+        self.for_each_rect(|r| out.push(r));
         let (columns, rows) = cells(self.size);
         let mut k = 0;
+        let mut coarse = Region::default();
         while out.len() > max.max(1) {
             k += 1;
-            let mut coarse = Self::empty((
-                columns.div_ceil(1 << k) * CELL,
-                rows.div_ceil(1 << k) * CELL,
-            ));
+            coarse.reset(
+                (
+                    columns.div_ceil(1 << k) * CELL,
+                    rows.div_ceil(1 << k) * CELL,
+                ),
+                false,
+            );
             for y in 0..rows {
                 for (a, b) in runs(self.row(y), columns) {
                     let (a, b) = (a >> k, (b - 1) >> k);
@@ -253,20 +296,25 @@ impl Region {
                     });
                 }
             }
-            out = coarse
-                .rects()
-                .into_iter()
-                .map(|r| {
-                    let (x, y) = (r.x << k, r.y << k);
-                    Rect {
-                        x,
-                        y,
-                        w: ((r.x + r.w) << k).min(self.size.0) - x,
-                        h: ((r.y + r.h) << k).min(self.size.1) - y,
-                    }
-                })
-                .collect();
+            out.clear();
+            coarse.for_each_rect(|r| {
+                let (x, y) = (r.x << k, r.y << k);
+                out.push(Rect {
+                    x,
+                    y,
+                    w: ((r.x + r.w) << k).min(self.size.0) - x,
+                    h: ((r.y + r.h) << k).min(self.size.1) - y,
+                });
+            });
         }
+    }
+
+    /// At most `max` (at least one) disjoint rectangles covering every marked
+    /// cell: the [`rects`](Self::rects) of the finest grid of `CELL << k`
+    /// squares that needs no more of them.
+    pub fn parts(&self, max: usize) -> Vec<Rect> {
+        let mut out = Vec::new();
+        self.parts_into(max, &mut out);
         out
     }
 
@@ -295,6 +343,57 @@ impl Region {
             y,
             w: (x1 * CELL).min(self.size.0) - x,
             h: (y1 * CELL).min(self.size.1) - y,
+        }
+    }
+}
+
+const INLINE_RUNS: usize = 16;
+
+enum RunBuffer {
+    Inline {
+        items: [(u32, u32, u32); INLINE_RUNS],
+        len: usize,
+    },
+    Heap(Vec<(u32, u32, u32)>),
+}
+
+impl Default for RunBuffer {
+    fn default() -> Self {
+        Self::Inline {
+            items: [(0, 0, 0); INLINE_RUNS],
+            len: 0,
+        }
+    }
+}
+
+impl RunBuffer {
+    fn push(&mut self, item: (u32, u32, u32)) {
+        match self {
+            Self::Inline { items, len } if *len < INLINE_RUNS => {
+                items[*len] = item;
+                *len += 1;
+            }
+            Self::Inline { items, len } => {
+                let mut vec = Vec::with_capacity(INLINE_RUNS * 2);
+                vec.extend_from_slice(&items[..*len]);
+                vec.push(item);
+                *self = Self::Heap(vec);
+            }
+            Self::Heap(vec) => vec.push(item),
+        }
+    }
+
+    fn as_slice(&self) -> &[(u32, u32, u32)] {
+        match self {
+            Self::Inline { items, len } => &items[..*len],
+            Self::Heap(vec) => vec,
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Heap(vec) => vec.clear(),
         }
     }
 }
@@ -463,5 +562,40 @@ mod tests {
         assert_eq!(a.rects(), [rect(40, 40, 60, 10)]);
         a.union(&Region::empty((101, 50)));
         assert!(a.is_whole());
+    }
+
+    #[test]
+    fn area_and_reused_buffers_match_rects_on_irregular_and_wide_shapes() {
+        let size = (8 * 70 + 3, 8 * 9 + 5);
+        let mut region = Region::empty(size);
+        let shape = |x: u32, y: u32| (x * 7 + y * 3) % 5 < 2 || (62..66).contains(&x) || y == 9;
+        for y in 0..10 {
+            for x in 0..71 {
+                if shape(x, y) {
+                    region.add(rect(x * CELL + 1, y * CELL + 1, 1, 1));
+                }
+            }
+        }
+        let expected_area: u64 = region
+            .rects()
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h))
+            .sum();
+        assert_eq!(region.area(), expected_area);
+        assert_eq!(Region::empty((0, 0)).area(), 0);
+        assert_eq!(Region::empty(size).area(), 0);
+        assert_eq!(
+            Region::whole(size).area(),
+            u64::from(size.0) * u64::from(size.1)
+        );
+        let mut buf = vec![rect(1, 2, 3, 4)];
+        region.parts_into(8, &mut buf);
+        assert_eq!(buf, region.parts(8));
+        region.reset((32, 24), true);
+        assert!(region.is_whole());
+        assert_eq!(region.area(), 32 * 24);
+        region.reset((32, 24), false);
+        assert!(region.is_empty());
+        assert_eq!(region.area(), 0);
     }
 }

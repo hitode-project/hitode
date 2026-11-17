@@ -1176,12 +1176,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         };
         let executed = f.damage.execution.get(&slot).filter(|r| !r.is_whole());
         let clipped = executed.is_some();
-        let area = executed.map_or(u64::from(full.w) * u64::from(full.h), |r| {
-            adv_device::surface::rects(r)
-                .iter()
-                .map(|r| u64::from(r.w) * u64::from(r.h))
-                .sum()
-        });
+        let area = executed.map_or(u64::from(full.w) * u64::from(full.h), |r| r.area());
         let fraction = area as f64 / (f64::from(full.w) * f64::from(full.h));
         let counters = &mut env.ext.get_mut::<State>().frames;
         #[cfg(feature = "d3d9-counters")]

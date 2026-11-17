@@ -442,9 +442,33 @@ impl From<adv_gpu::Rect> for Rect {
         }
     }
 }
+/// Reusable buffer for [`for_each_part`].
+#[derive(Default)]
+pub struct PartsScratch(Vec<adv_gpu::Rect>);
+
+/// Visits at most `max` (at least one) disjoint rectangles covering `region`
+/// without allocating into `scratch`.
+pub fn for_each_part(
+    region: &Region,
+    max: usize,
+    scratch: &mut PartsScratch,
+    mut f: impl FnMut(Rect),
+) {
+    region.parts_into(max, &mut scratch.0);
+    for &r in &scratch.0 {
+        f(r.into());
+    }
+}
+
+/// Visits the disjoint rectangles of `region` without allocating.
+pub fn for_each_rect(region: &Region, mut f: impl FnMut(Rect)) {
+    region.for_each_rect(|r| f(r.into()));
+}
 /// The disjoint rectangles of `region`.
 pub fn rects(region: &Region) -> Vec<Rect> {
-    region.rects().into_iter().map(Into::into).collect()
+    let mut out = Vec::new();
+    for_each_rect(region, |r| out.push(r));
+    out
 }
 fn region(size: (u32, u32), rect: Rect) -> Region {
     let mut region = Region::empty(size);
@@ -452,11 +476,7 @@ fn region(size: (u32, u32), rect: Rect) -> Region {
     region
 }
 fn area(region: &Region) -> u64 {
-    region
-        .rects()
-        .iter()
-        .map(|r| u64::from(r.w) * u64::from(r.h))
-        .sum()
+    region.area()
 }
 #[derive(Clone, Default)]
 struct DamageHistory {
