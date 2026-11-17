@@ -259,7 +259,7 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) ->
                     }
                     // Hold the caller's pin across nested source/renderer calls.
                     guest_call(env, output, 1, vec![], move |env, _| {
-                        let outcome = guest_source(env, graph, output, existing_only);
+                        let outcome = super::autoplug::render(env, graph, output, existing_only);
                         after(
                             env,
                             outcome,
@@ -275,7 +275,12 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) ->
     })
 }
 
-fn guest_source(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) -> Outcome {
+pub(super) fn guest_source(
+    env: &mut Env<'_>,
+    graph: u32,
+    output: u32,
+    existing_only: bool,
+) -> Outcome {
     let mut build = match Build::new(env, graph, existing_only) {
         Ok(build) => build,
         Err(error) => return Outcome::Return(error),
@@ -312,7 +317,7 @@ pub(super) fn connect_pins(env: &mut Env<'_>, graph: u32, output: u32, input: u3
     });
     match source {
         Some(source) => file(env, graph, source, output, false, Some(input)),
-        None => filter::connect(env, output, input, 0),
+        None => super::autoplug::connect(env, graph, output, input),
     }
 }
 
