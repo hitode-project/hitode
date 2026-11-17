@@ -463,17 +463,14 @@ fn wave() -> Vec<u8> {
 #[test]
 // spec: MEDIA-GRAPH-3
 fn guest_render_builds_the_common_audio_pipeline_and_disconnect_returns_source_references() {
-    let media = adv_device::media::demux(movie()).unwrap();
-    let audio = media
-        .streams
-        .into_iter()
-        .find(|stream| matches!(stream.format, CodecFormat::Audio { .. }))
-        .unwrap();
-    let bytes = audio
-        .packets
-        .into_iter()
-        .flat_map(|packet| packet.data)
-        .collect();
+    // Strip the video PES packet to padding (0xbe) while keeping MPEG-1 PS framing
+    // so FFmpeg's mpegps demuxer handles audio-only input without an MP3 demuxer.
+    let mut bytes = movie();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i..i + 4] == [0x00, 0x00, 0x01, 0xe0] {
+            bytes[i + 3] = 0xbe;
+        }
+    }
     let (mut m, graph) = fixture(bytes);
     let outcome = pin(&mut env(&mut m), graph, OUTPUT_PIN);
     assert_eq!(finish(&mut m, outcome), S_OK);
