@@ -157,6 +157,19 @@ pub(crate) const IID_IENUMMEDIATYPES: Iid = guid(
     0x11ce,
     [0x97, 0xd3, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a],
 );
+const IID_IQUALITYCONTROL: Iid = quartz(0x56a8_68a5);
+const IID_IMPEGAUDIODECODER: Iid = guid(
+    0xb45d_d570,
+    0x3c77,
+    0x11d1,
+    [0xab, 0xe1, 0, 0xa0, 0xc9, 5, 0xf3, 0x75],
+);
+const IID_IAMSTREAMSELECT: Iid = guid(
+    0xc196_0960,
+    0x17f5,
+    0x11d1,
+    [0xab, 0xe1, 0, 0xa0, 0xc9, 5, 0xf3, 0x75],
+);
 pub(crate) const IID_IMEMINPUTPIN: Iid = quartz(0x56a8_689d);
 pub(crate) const IID_IMEMALLOCATOR: Iid = quartz(0x56a8_689c);
 pub(crate) const IID_IMEDIASAMPLE: Iid = quartz(0x56a8_689a);
@@ -265,11 +278,14 @@ pub(crate) enum Face {
     DmoWrapper,
     VmrFilterConfig,
     VmrWindowlessControl,
+    QualityControl,
+    MpegAudioDecoder,
+    StreamSelect,
     /// An aggregated object's own, non-delegating IUnknown.
     Inner,
 }
 
-const FACES: [(Face, &str); 27] = [
+const FACES: [(Face, &str); 30] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -296,6 +312,9 @@ const FACES: [(Face, &str); 27] = [
     (Face::DmoWrapper, "IDMOWrapperFilter"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
+    (Face::QualityControl, "IQualityControl"),
+    (Face::MpegAudioDecoder, "IMpegAudioDecoder"),
+    (Face::StreamSelect, "IAMStreamSelect"),
     (Face::Inner, "IUnknown"),
 ];
 
@@ -332,6 +351,9 @@ impl Face {
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
+            Face::QualityControl => &[IID_IQUALITYCONTROL],
+            Face::MpegAudioDecoder => &[IID_IMPEGAUDIODECODER],
+            Face::StreamSelect => &[IID_IAMSTREAMSELECT],
             Face::Inner => &[],
         }
     }
@@ -351,6 +373,7 @@ pub(crate) enum Obj {
     },
     EnumPins {
         filter: u32,
+        list: Vec<u32>,
         position: usize,
     },
     EnumTypes {
@@ -404,7 +427,8 @@ fn interface_methods(interface: &str) -> Vec<(&'static str, Conv, u16)> {
     if !from_abi.is_empty() {
         return from_abi;
     }
-    vmr::interface_methods(interface)
+    filter::interface_methods(interface)
+        .or_else(|| vmr::interface_methods(interface))
         .map(|methods| methods.to_vec())
         .unwrap_or_default()
 }
@@ -614,9 +638,14 @@ pub(crate) fn add_ref(env: &mut Env<'_>, pointer: u32) -> u32 {
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
+    let owner = state
+        .pins
+        .get(&canonical(env, pointer).unwrap_or(0))
+        .map(|p| p.filter)
+        .unwrap_or(pointer);
     state
         .com
-        .add_ref::<Obj>(&mut env.sys.objects, pointer)
+        .add_ref::<Obj>(&mut env.sys.objects, owner)
         .unwrap_or(0)
 }
 
@@ -625,6 +654,13 @@ pub(crate) fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     let Some(state) = env.ext.try_get::<State>() else {
         return 0;
     };
+    let owner = state
+        .pins
+        .get(&canonical(env, pointer).unwrap_or(0))
+        .map(|p| p.filter);
+    if let Some(owner) = owner {
+        return release(env, owner);
+    }
     let com = state.com;
     let canonical = canonical(env, pointer);
     let Some(released) = com.release::<Obj>(&mut env.sys.objects, pointer) else {
@@ -680,7 +716,10 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
         Obj::Sample => {
             state.samples.remove(&canonical);
         }
-        Obj::EnumFilters { .. } | Obj::EnumPins { .. } | Obj::EnumTypes { .. } => {}
+        Obj::EnumPins { filter, .. } => {
+            release(env, *filter);
+        }
+        Obj::EnumFilters { .. } | Obj::EnumTypes { .. } => {}
     }
 }
 
@@ -740,6 +779,11 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     if let Some(outcome) = automation::call(env, face, &method, this) {
         return outcome;
     }
+    if matches!(face, Face::MediaSeeking | Face::MediaPosition)
+        && let Some(pin) = filter::host_pin(env, this)
+    {
+        return filter::seeking(env, pin, &method);
+    }
     let outcome = match face {
         Face::FilterGraph
         | Face::MediaControl
@@ -762,7 +806,10 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::Pin
         | Face::MemInputPin
         | Face::EnumMediaTypes
-        | Face::DmoWrapper => filter::call(env, face, &method, this),
+        | Face::DmoWrapper
+        | Face::QualityControl
+        | Face::MpegAudioDecoder
+        | Face::StreamSelect => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
         Face::Inner => None,
@@ -795,6 +842,16 @@ pub(crate) fn query_interface(env: &mut Env<'_>, this: u32, iid: u32, output: u3
         return E_POINTER;
     };
     let com = state(env).com;
+    if filter::host_pin(env, this).is_some() {
+        return match com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested) {
+            Ok(pointer) => {
+                add_ref(env, pointer);
+                let _ = env.cpu.write_u32(output, pointer);
+                S_OK
+            }
+            Err(_) => E_NOINTERFACE,
+        };
+    }
     match com.query::<Obj>(&mut env.sys.objects, this, requested) {
         Ok(pointer) => {
             let _ = env.cpu.write_u32(output, pointer);

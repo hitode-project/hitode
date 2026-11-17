@@ -179,10 +179,15 @@ fn allocator_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcom
     let a1 = env.arg(1);
     let properties = |env: &mut Env<'_>, output: u32| {
         let a = &state(env).allocators[&this];
-        let raw: Vec<u8> = [a.samples.len() as u32, a.size, 1, 0]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
+        let raw: Vec<u8> = [
+            a.samples.len() as u32,
+            a.size,
+            u32::from(!a.samples.is_empty()),
+            0,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
         env.cpu.write(output, &raw).is_ok()
     };
     match method {

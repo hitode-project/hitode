@@ -1,6 +1,6 @@
-//! Streaming: one guest thread per running splitter. It decodes at the graph's
-//! media position, pushes video samples into the downstream (usually guest)
-//! renderer. Audio feeds either a guest renderer or the DirectSound mixer.
+//! Streaming: one guest thread per running splitter. Direct guest sinks receive
+//! compressed MPEG packets; decoder paths deliver video at the graph position.
+//! Audio feeds either a guest renderer or the DirectSound mixer.
 //! Receive may block while the graph is paused, so delivery has its own thread.
 use std::collections::VecDeque;
 
@@ -20,7 +20,7 @@ const E_FAIL: u32 = 0x8000_4005;
 
 pub(crate) struct Session {
     pub graph: u32,
-    splitter: u32,
+    pub(super) splitter: u32,
     /// Host output pin connected to a guest input.
     video: Option<VideoTarget>,
     /// Mixer stream of a host audio renderer.
@@ -45,6 +45,7 @@ pub(crate) struct Session {
     audio_end: u64,
     updates: VecDeque<Result<adv_device::media::Update, adv_device::media::Error>>,
     decoded_end: bool,
+    compressed: Option<VecDeque<(u32, adv_device::media::Packet)>>,
 }
 
 enum End {
@@ -151,6 +152,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             audio_end: 0,
             updates: VecDeque::new(),
             decoded_end: false,
+            compressed: None,
         },
     );
     apply_volume(env, graph);
@@ -272,6 +274,12 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     if ending {
         return end_of_stream(env, id);
+    }
+    if session(env, id).compressed.is_some() {
+        if ended {
+            return wait(env, id, None);
+        }
+        return deliver_compressed(env, id);
     }
     let paused = graph_state == Some(graph::PAUSED);
     if !sync_audio_pause(env, id, paused) {
@@ -483,10 +491,56 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
         let deadline = env.sys.clock.now_us() + POLL_US;
         return wait(env, id, Some(deadline));
     }
-    let position = graph::stream_position(env, graph).max(0);
-    let stop = state(env).graphs[&graph]
-        .stop
-        .unwrap_or_else(|| graph::duration(env, graph));
+    let direct: Vec<_> = match video {
+        Some(VideoTarget::Guest(pin)) => Some(pin),
+        _ => None,
+    }
+    .into_iter()
+    .chain(audio_guest)
+    .filter(|pin| env.ext.get::<State>().pins[pin].filter == splitter)
+    .collect();
+    let raw = !direct.is_empty();
+    let position = if raw {
+        state(env).filters[&splitter].position
+    } else {
+        graph::stream_position(env, graph).max(0)
+    };
+    let stop = if raw {
+        let f = &state(env).filters[&splitter];
+        f.stop
+            .unwrap_or_else(|| f.source.as_ref().map_or(0, |s| s.duration_us as i64 * 10))
+    } else {
+        state(env).graphs[&graph]
+            .stop
+            .unwrap_or_else(|| graph::duration(env, graph))
+    };
+    if raw {
+        let state = state(env);
+        let mut packets = Vec::new();
+        if let Some(media) = &state.filters[&splitter].packets {
+            for stream in &media.streams {
+                let major = match stream.format {
+                    adv_device::media::CodecFormat::Audio { .. } => MEDIATYPE_AUDIO,
+                    _ => MEDIATYPE_VIDEO,
+                };
+                if let Some(&pin) = direct.iter().find(|p| state.pins[p].major == major) {
+                    packets.extend(
+                        stream
+                            .packets
+                            .iter()
+                            .filter(|p| {
+                                p.time_100ns >= position.max(0) as u64
+                                    && p.time_100ns < stop.max(0) as u64
+                            })
+                            .cloned()
+                            .map(|p| (pin, p)),
+                    );
+                }
+            }
+        }
+        packets.sort_by_key(|(_, p)| p.time_100ns);
+        session(env, id).compressed = Some(packets.into());
+    }
     let native = env.ext.try_get::<Host>().is_some();
     if let Some(decoder) = state(env)
         .filters
@@ -656,6 +710,37 @@ fn push_audio(env: &mut Env<'_>, id: u32) {
         }
         session(env, id).audio_end = session(env, id).audio_end.max(end);
     }
+}
+
+fn deliver_compressed(env: &mut Env<'_>, id: u32) -> Outcome {
+    let Some((pin, packet)) = session(env, id).compressed.as_mut().unwrap().pop_front() else {
+        return end_of_stream(env, id);
+    };
+    let p = &state(env).pins[&pin];
+    let (mem, allocator) = (p.mem, p.allocator);
+    let Some(sample) = sample::take(env, allocator) else {
+        session(env, id)
+            .compressed
+            .as_mut()
+            .unwrap()
+            .push_front((pin, packet));
+        return wait(env, id, Some(env.sys.clock.now_us() + POLL_US));
+    };
+    let s = &state(env).samples[&sample];
+    let (buffer, capacity) = (s.buffer, s.size as usize);
+    let size = packet.data.len().min(capacity);
+    let _ = env.cpu.write(buffer, &packet.data[..size]);
+    let start = packet.time_100ns as i64 - session(env, id).segment;
+    let s = state(env).samples.get_mut(&sample).unwrap();
+    s.actual = size as u32;
+    s.time = Some((start, start + packet.duration_100ns as i64));
+    guest_call(env, mem, 6, vec![sample], move |env, hr| {
+        release(env, sample);
+        if hr & 0x8000_0000 != 0 {
+            return abort_stream(env, id, hr, "compressed Receive failed");
+        }
+        pump(env, id)
+    })
 }
 
 fn deliver_audio(
@@ -975,6 +1060,7 @@ mod tests {
                 audio_end: 0,
                 updates: VecDeque::new(),
                 decoded_end: false,
+                compressed: None,
             },
         );
         (m, graph, events, wake)
