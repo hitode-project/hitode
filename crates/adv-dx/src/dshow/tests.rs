@@ -617,6 +617,66 @@ fn aggregated_graph_keeps_its_inner_count_and_forwards_other_faces_to_the_outer(
     assert!(m.ext.get::<State>().graphs.is_empty());
 }
 
+// spec: MEDIA-GRAPH-10
+#[test]
+fn aggregated_host_filters_hand_out_their_inner_unknown_and_forward_to_the_outer() {
+    let mut m = machine();
+    let (outer, output, iid) = (DATA + 512, DATA + 128, DATA + 256);
+    m.cpu.write_u32(outer, outer + 4).unwrap();
+    for slot in 0..3 {
+        m.cpu
+            .write_u32(outer + 4 + slot * 4, 0x7100_0000 + slot)
+            .unwrap();
+    }
+    let (outer_add, outer_release) = (0x7100_0001, 0x7100_0002);
+    let outer_only: &[u32] = &[outer];
+    for class in [
+        CLSID_MPEG1_SPLITTER,
+        CLSID_MPEG_VIDEO_CODEC,
+        CLSID_MPEG_AUDIO_CODEC,
+        CLSID_WMASF_READER,
+        dmo::CLSID_DMO_WRAPPER,
+        vmr::CLSID_VIDEO_MIXING_RENDERER,
+    ] {
+        let create = |m: &mut Machine<JitCpu>, iid| {
+            m.cpu.write_u32(output, 0xdead).unwrap();
+            let outcome = crate::test_support::activate(&mut env(m), class, iid, outer, output);
+            let Outcome::Return(hr) = outcome else {
+                panic!("activation needed a guest call")
+            };
+            (hr, m.cpu.read_u32(output).unwrap())
+        };
+        assert_eq!(create(&mut m, IID_IBASEFILTER), (E_NOINTERFACE, 0));
+        let (hr, inner) = create(&mut m, adv_os::com::IUNKNOWN);
+        assert_eq!(hr, S_OK);
+        assert_eq!(method(&mut m, "IUnknown::AddRef", &[inner]), 2);
+        assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 1);
+        m.cpu.write(iid, &IID_IBASEFILTER).unwrap();
+        assert_eq!(
+            method_calls(
+                &mut m,
+                "IUnknown::QueryInterface",
+                &[inner, iid, output],
+                &[(outer_add, outer_only, 2)],
+            ),
+            S_OK
+        );
+        let filter = m.cpu.read_u32(output).unwrap();
+        assert_ne!(filter, inner);
+        assert_eq!(
+            method_calls(
+                &mut m,
+                "IBaseFilter::Release",
+                &[filter],
+                &[(outer_release, outer_only, 1)],
+            ),
+            1
+        );
+        assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 0);
+    }
+    assert!(m.ext.get::<State>().filters.is_empty());
+}
+
 #[test]
 // spec: MEDIA-GRAPH-1
 fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
