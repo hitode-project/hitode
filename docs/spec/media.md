@@ -126,6 +126,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Connect and Render of a guest pin MUST try a direct connection, then graph members newest first, then the mapper's matching filters, added on demand. Recursion MUST stop at depth five, and a connection closing a loop MUST fail with VFW_E_CANNOT_CONNECT. A filter added for a failed attempt MUST be removed again.
 **Verification**: Test
 
+### MEDIA-GRAPH-17 Control delegation
+
+**Rule**: Without a host renderer, the graph's IBasicAudio, IBasicVideo2 and IVideoWindow MUST forward each call to the newest guest member exposing that interface. With no such member, IBasicAudio MUST return E_NOTIMPL and the video interfaces E_NOINTERFACE.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
