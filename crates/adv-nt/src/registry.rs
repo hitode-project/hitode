@@ -371,6 +371,49 @@ pub fn value(
     Ok(Some((reply.r#type as u32, data)))
 }
 
+/// One enumerated registry value.
+pub struct NamedValue {
+    pub name: Vec<u16>,
+    pub kind: u32,
+    pub data: Vec<u8>,
+}
+
+/// Value `index` of `key`, or `None` past the last one. Data beyond `limit`
+/// bytes is cut off.
+pub fn value_at(
+    env: &mut Env<'_>,
+    key: u32,
+    index: u32,
+    limit: usize,
+) -> Result<Option<NamedValue>, Error> {
+    let mut request = EnumKeyValueRequest {
+        hkey: key,
+        index: index as i32,
+        info_class: KEY_VALUE_FULL as i32,
+        ..Default::default()
+    };
+    let mut data = vec![0u8; MAX_KEY_NAME + limit];
+    let (reply, size) = server::request(env, &mut request, &[], &mut data)?;
+    match reply.header.error {
+        NO_MORE_ENTRIES => return Ok(None),
+        BUFFER_OVERFLOW => {}
+        error => status::check(error)?,
+    }
+    let name_length = (reply.namelen as usize).min(size);
+    let name = data[..name_length]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
+        .collect();
+    data.truncate(size);
+    Ok(Some(NamedValue {
+        name,
+        kind: reply.r#type as u32,
+        data: data.split_off(name_length),
+    }))
+}
+
 /// NtCreateKey(*key, access, *attributes, index, *class, options, *disposition)
 pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[key, access, attributes, _, class, options, disposition] = args else {

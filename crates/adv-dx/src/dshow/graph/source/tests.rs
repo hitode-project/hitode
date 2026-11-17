@@ -66,7 +66,7 @@ fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
             VFW_E_UNSUPPORTED_STREAM
         }
     );
-    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), u32::MAX);
     assert!(m.ext.get::<State>().filters.is_empty());
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
     let directory = Path::new("./target/dshow-source-tests");
@@ -79,10 +79,19 @@ fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
         &format!("target/dshow-source-tests/{filename}"),
     );
     let outcome = add(&mut env(&mut m), graph, DATA + 256, 0, DATA);
-    assert_eq!(finish(&mut m, outcome), VFW_E_UNSUPPORTED_STREAM);
-    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
-    assert!(m.ext.get::<State>().filters.is_empty());
-    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+    if !Decoder::available() {
+        assert_eq!(finish(&mut m, outcome), VFW_E_UNSUPPORTED_STREAM);
+        assert_eq!(m.cpu.read_u32(DATA).unwrap(), u32::MAX);
+        assert!(m.ext.get::<State>().filters.is_empty());
+        return;
+    }
+    // Undecodable contents load, as into the async reader, and fail to render.
+    assert_eq!(finish(&mut m, outcome), S_OK);
+    let source = m.cpu.read_u32(DATA).unwrap();
+    let pin = m.ext.get::<State>().filters[&source].pins[0];
+    let rendered = invoke(&mut m, graph, "IFilterGraph2", "Render", &[pin]);
+    assert_eq!(rendered, VFW_E_UNSUPPORTED_STREAM);
+    assert_eq!(m.ext.get::<State>().graphs[&graph].members.len(), 1);
 }
 
 #[cfg(feature = "media")]
@@ -253,7 +262,6 @@ fn automatic_audio_graph_owns_the_file_and_negotiates_pcm_without_a_video_render
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
 }
 
-#[cfg(feature = "media")]
 fn invoke(
     m: &mut Machine<adv_cpu::JitCpu>,
     pointer: u32,

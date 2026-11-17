@@ -625,16 +625,27 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
 }
 
 fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome {
+    add_filter_then(env, graph, filter, name, |_, hr| Outcome::Return(hr))
+}
+
+/// IFilterGraph::AddFilter, then `then` with its HRESULT.
+fn add_filter_then(
+    env: &mut Env<'_>,
+    graph: u32,
+    filter: u32,
+    name: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     if filter == 0 {
-        return Outcome::Return(E_POINTER);
+        return then(env, E_POINTER);
     }
     let requested = (name != 0).then(|| read_wide(env, name, 127));
     if g(env, graph).members.iter().any(|m| m.filter == filter) {
-        return Outcome::Return(E_INVALIDARG);
+        return then(env, E_INVALIDARG);
     }
     let duplicate = requested.as_ref().is_some_and(|n| g(env, graph).named(n));
     let Some(name_text) = g(env, graph).unique_name(requested) else {
-        return Outcome::Return(VFW_E_DUPLICATE_NAME);
+        return then(env, VFW_E_DUPLICATE_NAME);
     };
     let added = if duplicate {
         VFW_S_DUPLICATE_NAME
@@ -653,7 +664,7 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
             name: name_text,
             host: Some(host),
         });
-        return Outcome::Return(added);
+        return then(env, added);
     }
     // The filter receives the final name; filters copy it in JoinFilterGraph.
     let bytes: Vec<u8> = name_text
@@ -662,7 +673,7 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
         .flat_map(|c| c.to_le_bytes())
         .collect();
     let Some(name) = alloc(env, bytes.len() as u32) else {
-        return Outcome::Return(E_OUTOFMEMORY);
+        return then(env, E_OUTOFMEMORY);
     };
     let _ = env.cpu.write(name, &bytes);
     let calls = VecDeque::from([
@@ -677,10 +688,10 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
             free(env, name);
             let joined = results[1];
             if joined & 0x8000_0000 != 0 {
-                return guest_call(env, filter, 2, vec![], move |_, _| Outcome::Return(joined));
+                return guest_call(env, filter, 2, vec![], move |env, _| then(env, joined));
             }
             let Some(graph) = state(env).graphs.get_mut(&graph) else {
-                return Outcome::Return(added);
+                return then(env, added);
             };
             graph.join(Member {
                 filter,
@@ -688,9 +699,7 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
                 host: None,
             });
             let clock = graph.clock;
-            guest_call(env, filter, 8, vec![clock], move |_, _| {
-                Outcome::Return(added)
-            })
+            guest_call(env, filter, 8, vec![clock], move |env, _| then(env, added))
         }),
     )
 }
