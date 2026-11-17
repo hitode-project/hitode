@@ -333,6 +333,19 @@ impl Decoder {
         }
     }
 
+    /// Submit or collect the first frame at or after `media_us` for paused preroll.
+    pub fn poll_preroll(&mut self, media_us: u64) -> Result<Option<Update>, Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.poll_preroll(media_us)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = media_us;
+            Err(Error::Unavailable)
+        }
+    }
+
     /// Queue a seek before the next asynchronous frame request.
     pub fn request_seek(&mut self, media_us: u64) -> Result<(), Error> {
         #[cfg(feature = "media")]
@@ -350,6 +363,19 @@ impl Decoder {
         #[cfg(feature = "media")]
         {
             self.inner.frame_at(media_us)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = media_us;
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Return the frame at `media_us`, or the first subsequent frame if none is due yet.
+    pub fn preroll_at(&mut self, media_us: u64) -> Result<Update, Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.preroll_at(media_us)
         }
         #[cfg(not(feature = "media"))]
         {

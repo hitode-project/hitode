@@ -13,8 +13,8 @@ pub(super) fn set(env: &mut Env<'_>, graph: u32, clock: u32) -> Outcome {
     assign(env, graph, clock, Box::new(|_, hr| Outcome::Return(hr[0])))
 }
 
-/// Hand `clock` to every guest member and keep it. If one refuses, every
-/// member gets the old clock back and the graph keeps it.
+/// Hand `clock` to every guest member and keep it, queuing EC_CLOCK_CHANGED.
+/// If one refuses, every member gets the old clock back and the graph keeps it.
 pub(super) fn assign(env: &mut Env<'_>, graph: u32, clock: u32, then: Then) -> Outcome {
     let guests: Vec<u32> = g(env, graph)
         .members
@@ -46,6 +46,8 @@ pub(super) fn assign(env: &mut Env<'_>, graph: u32, clock: u32, then: Then) -> O
             if old != 0 {
                 calls.push_back(Call(old, 2, vec![]));
             }
+            // quartz reports every clock it sets to the application.
+            super::notify(env, graph, super::EC_CLOCK_CHANGED, 0, 0);
             chain(
                 env,
                 calls,
@@ -56,16 +58,16 @@ pub(super) fn assign(env: &mut Env<'_>, graph: u32, clock: u32, then: Then) -> O
     )
 }
 
-/// IFilterGraph::SetDefaultSyncSource.
+/// IFilterGraph::SetDefaultSyncSource: the first member added that exposes a
+/// clock, as Windows chooses (not quartz's newest first).
 pub(super) fn set_default(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    let newest_first = g(env, graph)
+    let oldest_first = g(env, graph)
         .members
         .iter()
-        .rev()
         .filter(|m| m.host.is_none())
         .map(|m| m.filter)
         .collect();
-    member_clock(env, graph, newest_first, then)
+    member_clock(env, graph, oldest_first, then)
 }
 
 /// Before `next`, choose the default clock if the graph still has none.

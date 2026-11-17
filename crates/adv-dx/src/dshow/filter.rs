@@ -2643,18 +2643,18 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             if out_of_sync(env, this) {
                 return r(VFW_E_ENUM_OUT_OF_SYNC);
             }
-            // quartz's filter enumerator refuses to skip past its end; the
-            // pin and media type enumerators skip what remains.
-            if let Some(
-                Obj::EnumFilters { list, position, .. } | Obj::EnumPins { list, position, .. },
-            ) = payload(env, this)
-                && count > list.len().saturating_sub(*position)
-            {
-                return r(if face == Face::EnumPins {
-                    S_FALSE
-                } else {
-                    E_INVALIDARG
-                });
+            // quartz's filter enumerator refuses to skip from its end and stops
+            // at the end otherwise; the pin enumerator skips nothing past its end.
+            match payload(env, this) {
+                Some(Obj::EnumFilters { list, position, .. }) if *position >= list.len() => {
+                    return r(E_INVALIDARG);
+                }
+                Some(Obj::EnumPins { list, position, .. })
+                    if count > list.len().saturating_sub(*position) =>
+                {
+                    return r(S_FALSE);
+                }
+                _ => {}
             }
             let skipped = advance(env, this, count);
             r(if skipped == count { S_OK } else { S_FALSE })
@@ -2685,6 +2685,9 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
         }
         "Clone" => {
             let output = env.arg(1);
+            if output == 0 {
+                return r(E_POINTER);
+            }
             let copy = match payload(env, this) {
                 Some(Obj::EnumPins {
                     filter,
@@ -2735,7 +2738,7 @@ fn filter_list(env: &Env<'_>, this: u32) -> Option<Vec<u32>> {
         return None;
     };
     let graph = env.ext.get::<State>().graphs.get(graph)?;
-    Some(graph.members.iter().map(|m| m.filter).collect())
+    Some(graph.members.iter().rev().map(|m| m.filter).collect())
 }
 fn out_of_sync(env: &Env<'_>, this: u32) -> bool {
     match (payload(env, this), filter_list(env, this)) {

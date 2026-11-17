@@ -173,6 +173,17 @@ fn callback(env: &mut Env<'_>) -> Outcome {
             env.ext.get_mut::<PullSource>().controls.push(state);
             r(S_OK)
         }
+        16 => {
+            let state = env
+                .ext
+                .get::<PullSource>()
+                .controls
+                .last()
+                .copied()
+                .unwrap_or(STOPPED);
+            env.cpu.write_u32(env.arg(2), state).unwrap();
+            r(S_OK)
+        }
         14 => {
             let output = env.arg(1);
             let source = env.ext.get_mut::<PullSource>();
@@ -225,6 +236,7 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
         (13, 3),
         (14, 2),
         (15, 4),
+        (16, 3),
     ] {
         registry.add_with_data(
             "authored-pull-source.dll",
@@ -269,7 +281,7 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
         enum_next: false,
     });
     let mut methods = BTreeMap::new();
-    for op in 0..=15 {
+    for op in 0..=16 {
         methods.insert(
             op,
             m.resolve_import("authored-pull-source.dll", &format!("method{op}"))
@@ -286,6 +298,7 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
                 (4, 11),
                 (5, 12),
                 (6, 13),
+                (7, 16),
                 (10, 14),
                 (13, 10),
             ],
@@ -564,6 +577,8 @@ fn invoke(
 #[cfg(feature = "media")]
 #[test]
 // spec: MEDIA-STREAM-1
+// spec: MEDIA-STREAM-3
+// spec: MEDIA-GRAPH-20
 fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_releases_source_refs() {
     use crate::dshow::{tests::query, video};
     use adv_machine::{Resume, WakeReason};
@@ -729,28 +744,29 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
         .as_mut()
         .unwrap()
         .duration_us = 20_000;
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Run", &[]), S_OK);
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Run", &[]), 1);
     assert_eq!(m.ext.get::<State>().graphs[&graph].state, RUNNING);
     assert_eq!(m.ext.get::<State>().graphs[&graph].expected, 2);
     let session = *m.ext.get::<State>().sessions.keys().next().unwrap();
     // Drive the authored stream handler directly: no host window, device or
     // real guest program runs while exercising decode -> publish/mixer delivery.
     m.cpu.write_u32(STACK + 4, session).unwrap();
+    // The renderer is still pausing: the stream prerolls its first picture.
     let outcome = stream::thread_entry(&mut env(&mut m));
     let Outcome::Block { then, .. } = outcome else {
-        panic!("stream must wait for media time");
-    };
-    // MPEG audio establishes the common origin slightly before the first
-    // video picture. Advance to the first due picture rather than show it early.
-    m.sys.clock.advance_to(m.sys.clock.now_us() + 20_000);
-    let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout));
-    let Outcome::Block { then, .. } = outcome else {
-        panic!("stream must wait after its first frame");
+        panic!("stream must wait after its preroll picture");
     };
     let frame = video::latest(&env(&mut m), graph).unwrap();
+    // Every member has paused now; the run's worker starts the graph.
+    let worker = *m.ext.get::<State>().async_runs.keys().next().unwrap();
+    m.cpu.write_u32(STACK + 4, worker).unwrap();
+    let outcome = stream::thread_entry(&mut env(&mut m));
+    assert_eq!(finish(&mut m, outcome), 0);
+    assert!(!m.ext.get::<State>().graphs[&graph].members_paused());
     let pixels = frame.bgra();
     assert!(pixels[0] < 20 && pixels[1] < 20 && pixels[2] > 220);
-    m.sys.clock.advance_to(m.sys.clock.now_us() + 40_000);
+    // Stream time starts with the run; the second picture follows the first.
+    m.sys.clock.advance_to(m.sys.clock.now_us() + 60_000);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout));
     let Outcome::Block { then, .. } = outcome else {
         panic!("stream must wait after its second frame");
@@ -797,7 +813,11 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
             > 0
     );
 
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Pause", &[]), S_OK);
+    assert_eq!(
+        invoke(&mut m, control, "IMediaControl", "GetState", &[0, DATA]),
+        S_OK
+    );
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Pause", &[]), 1);
     assert_eq!(m.ext.get::<State>().graphs[&graph].state, PAUSED);
     let updates = m.ext.get::<Presentation>().updates.len();
     m.sys.clock.advance_to(m.sys.clock.now_us() + 400_000);

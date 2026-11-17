@@ -61,39 +61,45 @@ fn export(env: &Env<'_>, module: &str, name: &str) -> Option<u32> {
         .and_then(|host| (host.export)(env, module, name))
 }
 
-/// IGraphBuilder::Connect; an input given first is swapped with the output.
+/// IGraphBuilder::Connect: the pins as given, directly first, then through
+/// intermediate filters unless that would close a loop.
 pub(super) fn connect(env: &mut Env<'_>, graph: u32, source: u32, sink: u32) -> Outcome {
     if source == 0 || sink == 0 {
         return Outcome::Return(E_POINTER);
     }
-    direction(
+    let plug = Plug {
+        graph,
+        sink,
+        existing: true,
+    };
+    closes_loop(
         env,
         source,
-        Box::new(move |env, hr, dir| {
-            if failed(hr) {
-                return Outcome::Return(hr);
+        sink,
+        Box::new(move |env, looped| {
+            if looped {
+                return Outcome::Return(VFW_E_CANNOT_CONNECT);
             }
-            let (source, sink) = if dir == INPUT {
-                (sink, source)
-            } else {
-                (source, sink)
-            };
-            let plug = Plug {
-                graph,
-                sink,
-                existing: true,
-            };
-            closes_loop(
-                env,
-                source,
-                sink,
-                Box::new(move |env, looped| {
-                    if looped {
-                        return Outcome::Return(VFW_E_CANNOT_CONNECT);
-                    }
-                    autoplug(env, plug, source, 0, Box::new(|_, hr| Outcome::Return(hr)))
-                }),
-            )
+            autoplug(env, plug, source, 0, Box::new(|_, hr| Outcome::Return(hr)))
+        }),
+    )
+}
+
+/// IFilterGraph::ConnectDirect: `source` connects to `sink` as given, unless
+/// that would close a loop.
+pub(super) fn connect_direct(env: &mut Env<'_>, source: u32, sink: u32, mt: u32) -> Outcome {
+    if source == 0 || sink == 0 {
+        return Outcome::Return(E_POINTER);
+    }
+    closes_loop(
+        env,
+        source,
+        sink,
+        Box::new(move |env, looped| {
+            if looped {
+                return Outcome::Return(VFW_E_CIRCULAR_GRAPH);
+            }
+            filter::connect(env, source, sink, mt)
         }),
     )
 }
@@ -946,7 +952,7 @@ fn free_media_type(env: &mut Env<'_>, mt: u32, then: Finish) -> Outcome {
 }
 
 /// Every pin of `filter`, each holding a reference.
-fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
+pub(super) fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
     let Some(scratch) = alloc(env, 8) else {
         return then(env, Vec::new());
     };
