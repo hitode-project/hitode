@@ -212,39 +212,111 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             calls.extend(filter::disconnect_filter(env, host));
         }
     }
-    for &(filter, host) in &members {
-        if host.is_none() {
-            calls.push_back(Call(filter, 13, vec![0, 0]));
-            calls.push_back(Call(filter, 2, vec![]));
-        }
+    let guests: Vec<u32> = members
+        .iter()
+        .filter(|m| m.1.is_none())
+        .map(|m| m.0)
+        .collect();
+    let mut leave = VecDeque::new();
+    for &filter in &guests {
+        leave.push_back(Call(filter, 13, vec![0, 0]));
+        leave.push_back(Call(filter, 2, vec![]));
     }
     let site = std::mem::take(&mut g(env, graph).site);
     if site != 0 {
-        calls.push_back(Call(site, 2, vec![]));
+        leave.push_back(Call(site, 2, vec![]));
     }
     state(env).graphs.get_mut(&graph).unwrap().members.clear();
     let event = state(env).graphs[&graph].event;
     let public_event = state(env).graphs[&graph].public_event;
+    let finish: Then = Box::new(move |env, results| {
+        for (_, host) in members {
+            if let Some(host) = host {
+                if let Some(filter) = state(env).filters.get_mut(&host) {
+                    filter.graph = 0;
+                }
+                release(env, host);
+            }
+        }
+        env.sys.objects.close(event);
+        if let Some(event) = public_event {
+            host::close(env, event);
+        }
+        then(env, results)
+    });
     chain(
         env,
         calls,
         Vec::new(),
-        Box::new(move |env, results| {
-            for (_, host) in members {
-                if let Some(host) = host {
-                    if let Some(filter) = state(env).filters.get_mut(&host) {
-                        filter.graph = 0;
-                    }
-                    release(env, host);
-                }
-            }
-            env.sys.objects.close(event);
-            if let Some(event) = public_event {
-                host::close(env, event);
-            }
-            then(env, results)
+        Box::new(move |env, _| {
+            disconnect_guests(
+                env,
+                guests.into(),
+                Box::new(move |env| chain(env, leave, Vec::new(), finish)),
+            )
         }),
     )
+}
+
+/// Like quartz's RemoveFilter, disconnect every connected pin of each guest
+/// filter, peer first, so pin references no longer hold either filter.
+fn disconnect_guests(
+    env: &mut Env<'_>,
+    mut filters: VecDeque<u32>,
+    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
+) -> Outcome {
+    let Some(filter) = filters.pop_front() else {
+        return then(env);
+    };
+    let Some(scratch) = alloc(env, 12) else {
+        return then(env);
+    };
+    let _ = env.cpu.write_u32(scratch, 0);
+    guest_call(env, filter, 10, vec![scratch], move |env, hr| {
+        let pins = env.cpu.read_u32(scratch).unwrap_or(0);
+        let rest: Box<dyn FnOnce(&mut Env<'_>) -> Outcome> = Box::new(move |env| {
+            free(env, scratch);
+            disconnect_guests(env, filters, then)
+        });
+        if hr != S_OK || pins == 0 {
+            return rest(env);
+        }
+        disconnect_pins(env, pins, scratch, rest)
+    })
+}
+
+fn disconnect_pins(
+    env: &mut Env<'_>,
+    pins: u32,
+    scratch: u32,
+    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
+) -> Outcome {
+    let _ = env.cpu.write_u32(scratch + 4, 0);
+    guest_call(env, pins, 3, vec![1, scratch + 4, 0], move |env, hr| {
+        let pin = env.cpu.read_u32(scratch + 4).unwrap_or(0);
+        if hr != S_OK || pin == 0 {
+            return guest_call(env, pins, 2, vec![], move |env, _| then(env));
+        }
+        let _ = env.cpu.write_u32(scratch + 8, 0);
+        guest_call(env, pin, 6, vec![scratch + 8], move |env, _| {
+            let peer = env.cpu.read_u32(scratch + 8).unwrap_or(0);
+            let mut calls = VecDeque::new();
+            if peer != 0 {
+                calls.extend([
+                    Call(peer, 5, vec![]),
+                    Call(peer, 2, vec![]),
+                    Call(pin, 5, vec![]),
+                ]);
+            }
+            calls.push_back(Call(pin, 2, vec![]));
+            chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(move |env, _| disconnect_pins(env, pins, scratch, then)),
+            )
+        })
+    })
 }
 
 /// Quartz keeps one reference to the site and answers GetSite by querying it;
@@ -475,11 +547,17 @@ fn remove_filter(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
         );
     }
     let calls = VecDeque::from([Call(filter, 13, vec![0, 0]), Call(filter, 2, vec![])]);
-    chain(
+    disconnect_guests(
         env,
-        calls,
-        Vec::new(),
-        Box::new(|_, _| Outcome::Return(S_OK)),
+        VecDeque::from([filter]),
+        Box::new(move |env| {
+            chain(
+                env,
+                calls,
+                Vec::new(),
+                Box::new(|_, _| Outcome::Return(S_OK)),
+            )
+        }),
     )
 }
 
