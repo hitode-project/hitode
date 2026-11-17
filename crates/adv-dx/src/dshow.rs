@@ -458,6 +458,8 @@ pub(crate) struct State {
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
+    /// Worker threads (by thread id) finishing an asynchronous graph Run.
+    pub(crate) async_runs: BTreeMap<u32, u32>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
     /// The quartz type library and the ITypeInfo of each automation
     /// interface, loaded on first use and kept for the process, as strmbase does.
@@ -597,6 +599,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         asf_threads: BTreeMap::new(),
         next_session: 1,
         pending_threads: Vec::new(),
+        async_runs: BTreeMap::new(),
         pending_posts: Vec::new(),
         type_library: 0,
         type_infos: BTreeMap::new(),

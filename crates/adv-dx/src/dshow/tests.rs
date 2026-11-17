@@ -288,6 +288,83 @@ fn event_timeouts_leave_no_event_code() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
+#[test]
+// spec: MEDIA-GRAPH-21, MEDIA-GRAPH-22
+fn completion_and_disabled_notification_follow_quartz() {
+    const EC_COMPLETE: u32 = 1;
+    const EC_STATUS: u32 = 0x8000;
+    const E_ABORT: u32 = 0x8000_4004;
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let events = query(&mut m, graph, IID_IMEDIAEVENTEX);
+    let sink = query(&mut m, graph, IID_IMEDIAEVENTSINK);
+    let control = query(&mut m, graph, IID_IMEDIACONTROL);
+    let get_event = |m: &mut Machine<JitCpu>| {
+        method(
+            m,
+            "IMediaEventEx::GetEvent",
+            &[events, DATA, DATA + 4, DATA + 8, 0],
+        )
+    };
+    let notify = |m: &mut Machine<JitCpu>, code: u32| {
+        assert_eq!(
+            method(m, "IMediaEventSink::Notify", &[sink, code, 0, 0]),
+            S_OK
+        );
+    };
+    let wait =
+        |m: &mut Machine<JitCpu>| method(m, "IMediaEventEx::WaitForCompletion", &[events, 0, DATA]);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    m.ext
+        .get_mut::<State>()
+        .graphs
+        .get_mut(&graph)
+        .unwrap()
+        .expected = 1;
+
+    // Disabling notification discards the queue and drops later events, but
+    // completion still ends WaitForCompletion.
+    notify(&mut m, EC_STATUS);
+    assert_eq!(
+        method(&mut m, "IMediaEventEx::SetNotifyFlags", &[events, 1]),
+        S_OK
+    );
+    assert_eq!(get_event(&mut m), E_ABORT);
+    notify(&mut m, EC_STATUS);
+    assert_eq!(wait(&mut m), E_ABORT);
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(get_event(&mut m), E_ABORT);
+    assert_eq!(wait(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_COMPLETE);
+
+    // With notification, completion is queued and stays queued for GetEvent;
+    // a new run removes it and the completion.
+    assert_eq!(
+        method(&mut m, "IMediaEventEx::SetNotifyFlags", &[events, 0]),
+        S_OK
+    );
+    assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    assert_eq!(wait(&mut m), E_ABORT);
+    m.ext
+        .get_mut::<State>()
+        .graphs
+        .get_mut(&graph)
+        .unwrap()
+        .expected = 1;
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(wait(&mut m), S_OK);
+    assert_eq!(get_event(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_COMPLETE);
+    notify(&mut m, EC_COMPLETE);
+    assert_eq!(method(&mut m, "IMediaControl::Pause", &[control]), S_OK);
+    notify(&mut m, EC_STATUS);
+    assert_eq!(method(&mut m, "IMediaControl::Run", &[control]), S_OK);
+    assert_eq!(get_event(&mut m), S_OK);
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), EC_STATUS);
+    assert_eq!(get_event(&mut m), E_ABORT);
+}
+
 /// An expected guest-call argument that matches any value, such as a pointer
 /// the host allocated.
 const ANY: u32 = u32::MAX;
@@ -764,9 +841,10 @@ fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
         method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
         VFW_E_ENUM_OUT_OF_SYNC
     );
-    // Reset takes the live list, which now holds only the decoder.
+    // Reset takes the live list, which now holds only the decoder; skipping
+    // from its end is refused.
     assert_eq!(method(&mut m, "IEnumFilters::Reset", &[filters]), S_OK);
-    assert_eq!(method(&mut m, "IEnumFilters::Skip", &[filters, 1]), S_OK);
+    assert_eq!(method(&mut m, "IEnumFilters::Skip", &[filters, 2]), S_FALSE);
     assert_eq!(
         method(&mut m, "IEnumFilters::Skip", &[filters, 1]),
         E_INVALIDARG
@@ -1231,9 +1309,11 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Pause",
             &[control],
             &[
-                // No member has a clock and no system clock exists here.
-                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                // spec: MEDIA-GRAPH-12
+                // No member has a clock and no system clock exists here;
+                // the first member added is asked first.
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
             ],
@@ -1246,8 +1326,19 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Run",
             &[control],
             &[
+                // ensure_default probes IReferenceClock, the stop position probes
+                // IMediaSeeking, then count_guest_renderers probes IMediaSeeking,
+                // IAMFilterMiscFlags, and IMediaPosition on each guest member.
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0106, &[renderer, 0, 0], S_OK),
                 (0x7100_0006, &[source, 0, 0], S_OK),
             ],

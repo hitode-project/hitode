@@ -9,7 +9,7 @@ use super::native::Native;
 use super::{Error, ReadSeek, Stats, StreamInfo, Update};
 
 enum Request {
-    At(u64),
+    At { media_us: u64, preroll: bool },
     Seek(u64),
 }
 
@@ -58,6 +58,14 @@ impl Worker {
     }
 
     pub fn poll_frame(&mut self, media_us: u64) -> Result<Option<Update>, Error> {
+        self.poll_inner(media_us, false)
+    }
+
+    pub fn poll_preroll(&mut self, media_us: u64) -> Result<Option<Update>, Error> {
+        self.poll_inner(media_us, true)
+    }
+
+    fn poll_inner(&mut self, media_us: u64, preroll: bool) -> Result<Option<Update>, Error> {
         let lost = || Error::Decode("decoder thread ended".into());
         while self.seeks != 0 {
             match self.replies.try_recv() {
@@ -75,7 +83,7 @@ impl Worker {
         }
         if !self.pending {
             self.requests
-                .send(Request::At(media_us))
+                .send(Request::At { media_us, preroll })
                 .map_err(|_| lost())?;
             self.pending = true;
         }
@@ -100,7 +108,21 @@ impl Worker {
     }
 
     pub fn frame_at(&mut self, media_us: u64) -> Result<Update, Error> {
-        Ok(self.call(Request::At(media_us))?.unwrap_or_default())
+        Ok(self
+            .call(Request::At {
+                media_us,
+                preroll: false,
+            })?
+            .unwrap_or_default())
+    }
+
+    pub fn preroll_at(&mut self, media_us: u64) -> Result<Update, Error> {
+        Ok(self
+            .call(Request::At {
+                media_us,
+                preroll: true,
+            })?
+            .unwrap_or_default())
     }
 
     pub fn seek(&mut self, media_us: u64) -> Result<(), Error> {
@@ -113,7 +135,12 @@ fn serve(owned: Owned, inbox: &Receiver<Request>, outbox: &Sender<Reply>) {
     // Ends when the `Worker` is dropped.
     while let Ok(request) = inbox.recv() {
         let result = match request {
-            Request::At(media_us) => native.frame_at(media_us).map(Some),
+            Request::At { media_us, preroll } => if preroll {
+                native.preroll_at(media_us)
+            } else {
+                native.frame_at(media_us)
+            }
+            .map(Some),
             Request::Seek(media_us) => native.seek(media_us).map(|()| None),
         };
         let failed = result.is_err();

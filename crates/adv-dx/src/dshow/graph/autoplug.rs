@@ -946,7 +946,7 @@ fn free_media_type(env: &mut Env<'_>, mt: u32, then: Finish) -> Outcome {
 }
 
 /// Every pin of `filter`, each holding a reference.
-fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
+pub(super) fn pins(env: &mut Env<'_>, filter: u32, then: Pins) -> Outcome {
     let Some(scratch) = alloc(env, 8) else {
         return then(env, Vec::new());
     };

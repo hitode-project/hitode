@@ -80,7 +80,12 @@ pub(super) fn render_file(env: &mut Env<'_>, graph: u32, filename: u32) -> Outco
                 Box::new(move |env, result| {
                     // Drop the AddSourceFilter caller reference; the graph keeps its own.
                     release(env, source);
-                    Outcome::Return(result[0])
+                    let hr = result[0];
+                    if hr & 0x8000_0000 != 0 {
+                        let removed = super::remove_filter(env, graph, source);
+                        return after(env, removed, Box::new(move |_, _| Outcome::Return(hr)));
+                    }
+                    Outcome::Return(hr)
                 }),
             )
         }),

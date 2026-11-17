@@ -32,6 +32,8 @@ pub(crate) struct Session {
     seen_generation: u32,
     stopping: bool,
     prerolled: bool,
+    /// At least one video picture has been output in the current segment.
+    video_rendered: bool,
     ending: bool,
     ended: bool,
     discontinuity: bool,
@@ -140,6 +142,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             seen_generation: 0,
             stopping: false,
             prerolled: false,
+            video_rendered: false,
             ending: false,
             ended: false,
             discontinuity: true,
@@ -166,17 +169,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             + u32::from(audio_renderer)
             + u32::from(audio_guest.is_some());
     }
-    let spawned = env
-        .sys
-        .thunks
-        .publish(env.cpu, "quartz.dll", THREAD_ENTRY)
-        .map_err(|e| e.to_string())
-        .and_then(|entry| {
-            env.sys
-                .spawn(env.cpu, "dshow-stream", entry, &[id], 0x10000)
-                .map_err(|e| format!("{e:?}"))
-        });
-    if let Err(error) = spawned {
+    if let Err(error) = spawn(env, "dshow-stream", id) {
         log::warn!("DirectShow: stream thread: {error}");
         state(env).sessions.remove(&id);
         env.sys.objects.close(wake);
@@ -242,8 +235,40 @@ pub(crate) fn apply_volume(env: &mut Env<'_>, graph: u32) {
     }
 }
 
+/// Start the guest thread `id` at [`thread_entry`]; with a host, at its next
+/// call boundary.
+fn spawn(env: &mut Env<'_>, name: &str, id: u32) -> Result<(), String> {
+    if env.ext.try_get::<Host>().is_some() {
+        state(env).pending_threads.push(id);
+        return Ok(());
+    }
+    let entry = env
+        .sys
+        .thunks
+        .publish(env.cpu, "quartz.dll", THREAD_ENTRY)
+        .map_err(|e| e.to_string())?;
+    env.sys
+        .spawn(env.cpu, name, entry, &[id], 0x10000)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A worker for `graph`'s asynchronous Run, as quartz's thread pool work.
+pub(crate) fn spawn_async_run(env: &mut Env<'_>, graph: u32) {
+    let id = state(env).next_session;
+    state(env).next_session += 1;
+    state(env).async_runs.insert(id, graph);
+    if let Err(error) = spawn(env, "dshow-run", id) {
+        log::warn!("DirectShow: graph run thread: {error}");
+        state(env).async_runs.remove(&id);
+    }
+}
+
 pub(crate) fn thread_entry(env: &mut Env<'_>) -> Outcome {
     let id = env.arg(0);
+    if let Some(graph) = state(env).async_runs.remove(&id) {
+        return graph::async_run(env, graph);
+    }
     if state(env).asf_threads.contains_key(&id) {
         return super::asf::thread(env, id);
     }
@@ -258,7 +283,7 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     let Some(s) = state(env).sessions.get(&id) else {
         return Outcome::Return(0);
     };
-    let (graph, stopping, generation, seen, ending, ended, prerolled, splitter) = (
+    let (graph, stopping, generation, seen, ending, ended, prerolled, video_rendered, splitter) = (
         s.graph,
         s.stopping,
         s.generation,
@@ -266,10 +291,14 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
         s.ending,
         s.ended,
         s.prerolled,
+        s.video_rendered,
         s.splitter,
     );
-    let graph_state = state(env).graphs.get(&graph).map(|g| g.state);
-    if stopping || graph_state.is_none_or(|g| g == graph::STOPPED) {
+    let graph_state = state(env)
+        .graphs
+        .get(&graph)
+        .map(|g| (g.state, g.members_paused()));
+    if stopping || graph_state.is_none_or(|(g, _)| g == graph::STOPPED) {
         return finish(env, id);
     }
     if generation != seen {
@@ -284,7 +313,7 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
         }
         return deliver_compressed(env, id);
     }
-    let paused = graph_state == Some(graph::PAUSED);
+    let paused = graph_state.is_some_and(|(_, paused)| paused);
     if !sync_audio_pause(env, id, paused) {
         let deadline = env.sys.clock.now_us() + POLL_US;
         return wait(env, id, Some(deadline));
@@ -295,6 +324,7 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     let position = graph::stream_position(env, graph);
     let media_us = (position.max(0) / 10) as u64;
     let native = env.ext.try_get::<Host>().is_some();
+    let preroll = paused && !prerolled && !video_rendered;
     let update = if native && !session(env, id).host {
         match session(env, id).updates.pop_front() {
             Some(update) => Some(update),
@@ -307,7 +337,13 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
             .and_then(|f| f.source.as_mut()?.decoder.as_mut())
             .map(|decoder| {
                 if native {
-                    decoder.poll_frame(media_us)
+                    if preroll {
+                        decoder.poll_preroll(media_us)
+                    } else {
+                        decoder.poll_frame(media_us)
+                    }
+                } else if preroll {
+                    decoder.preroll_at(media_us).map(Some)
                 } else {
                     decoder.frame_at(media_us).map(Some)
                 }
@@ -387,7 +423,10 @@ fn process_update(
             .is_some_and(|stop| position >= stop);
         let ended = update.ended || past_stop;
         let s = session(env, id);
-        if paused {
+        if update.video.is_some() {
+            s.video_rendered = true;
+        }
+        if paused && (s.video.is_none() || s.video_rendered || ended) {
             s.prerolled = true;
         }
         let video = s.video;
@@ -415,12 +454,23 @@ fn process_update(
                     );
                 }
                 match video::publish(env, graph, frame) {
-                    Ok(Some(outcome)) => outcome,
-                    Ok(None) if ended => end_of_stream(env, id),
-                    Ok(None) if session(env, id).host => {
-                        wait(env, id, Some(env.sys.clock.now_us() + 1000))
+                    Ok(outcome) => {
+                        if let Some(v) = state(env)
+                            .filters
+                            .get_mut(&renderer)
+                            .and_then(|f| f.vmr.as_mut())
+                        {
+                            v.prerolled = true;
+                        }
+                        match outcome {
+                            Some(outcome) => outcome,
+                            None if ended => end_of_stream(env, id),
+                            None if session(env, id).host => {
+                                wait(env, id, Some(env.sys.clock.now_us() + 1000))
+                            }
+                            None => pump(env, id),
+                        }
                     }
-                    Ok(None) => pump(env, id),
                     Err(hr) => abort_stream(env, id, hr, "video presentation failed"),
                 }
             }
@@ -563,6 +613,7 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.ending = false;
     s.ended = false;
     s.prerolled = false;
+    s.video_rendered = false;
     s.discontinuity = true;
     s.audio_discontinuity = true;
     s.pending_audio.clear();
@@ -573,6 +624,15 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
         s.audio_paused = false;
     }
     s.segment = position;
+    if let Some(VideoTarget::Host(renderer)) = video
+        && let Some(v) = state(env)
+            .filters
+            .get_mut(&renderer)
+            .and_then(|f| f.vmr.as_mut())
+    {
+        v.eos = false;
+        v.prerolled = false;
+    }
     let mut calls = VecDeque::new();
     let video_guest = match video {
         Some(VideoTarget::Guest(pin)) => Some(pin),
@@ -653,7 +713,16 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
         Some(VideoTarget::Guest(pin)) => {
             calls.push_back(Call(state(env).pins[&pin].peer, 14, vec![]));
         }
-        Some(VideoTarget::Host(_)) => graph::notify(env, graph, EC_COMPLETE, 0, 0),
+        Some(VideoTarget::Host(renderer)) => {
+            if let Some(v) = state(env)
+                .filters
+                .get_mut(&renderer)
+                .and_then(|f| f.vmr.as_mut())
+            {
+                v.eos = true;
+            }
+            graph::notify(env, graph, EC_COMPLETE, 0, 0);
+        }
         None => {}
     }
     chain(
@@ -926,7 +995,7 @@ fn produce(env: &mut Env<'_>, id: u32) {
     if graph_state.state == graph::STOPPED {
         return;
     }
-    let paused = graph_state.state == graph::PAUSED;
+    let paused = graph_state.members_paused();
     if paused && (session(env, id).prerolled || !session(env, id).updates.is_empty()) {
         return;
     }
@@ -934,11 +1003,18 @@ fn produce(env: &mut Env<'_>, id: u32) {
         return;
     }
     let position = graph::stream_position(env, graph).max(0) as u64 / 10;
+    let preroll = paused && !session(env, id).prerolled;
     let update = state(env)
         .filters
         .get_mut(&splitter)
         .and_then(|f| f.source.as_mut()?.decoder.as_mut())
-        .map(|decoder| decoder.poll_frame(position));
+        .map(|decoder| {
+            if preroll {
+                decoder.poll_preroll(position)
+            } else {
+                decoder.poll_frame(position)
+            }
+        });
     let result = match update {
         Some(Ok(None)) | None => None,
         Some(Ok(Some(update))) => Some(Ok(update)),
@@ -1051,6 +1127,7 @@ mod tests {
                 seen_generation: 1,
                 stopping: false,
                 prerolled: false,
+                video_rendered: false,
                 ending: false,
                 ended: false,
                 discontinuity: true,
