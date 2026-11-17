@@ -22,6 +22,23 @@ pub(super) fn bodies() -> Vec<super::Body> {
     .collect();
     bodies.extend(
         [
+            "cabinet.dll",
+            "dbghelp.dll",
+            "opcservices.dll",
+            "user32.dll",
+            "wininet.dll",
+            "windowscodecs.dll",
+        ]
+        .map(|module| super::Body {
+            name: format!("{module}!zmemcpy").into(),
+            conv: Conv::Cdecl { argc: 3 },
+            body: None,
+            handler: super::resume_original,
+            direct: Some(ZMEMCPY),
+        }),
+    );
+    bodies.extend(
+        [
             "dbghelp.dll",
             "user32.dll",
             "wininet.dll",
@@ -125,7 +142,41 @@ pub(super) fn adler32<M: Mem, const SIMD: bool>(
 
 const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
 adv_cpu::body!(ADLER32 = adler32::<_, true>, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(ZMEMCPY = zmemcpy, inputs: ARGS, outputs: 0, pop: 0);
 adv_cpu::body!(INFLATE_FAST = inflate_fast, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 0);
+
+// spec: NAT-BODY-1, NAT-BODY-17
+fn zmemcpy<M: Mem>(mem: &mut M, [dst, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    if len != 0 {
+        let [from, to] = mem.spans([(src, len, false), (dst, len, true)])?;
+        if dst != src {
+            let forward_overlap =
+                u64::from(dst) > u64::from(src) && u64::from(dst) - u64::from(src) < u64::from(len);
+            // SAFETY: both spans were checked; forward overlap repeats the
+            // leading `dst - src` bytes just as Wine's `movsb` loop does.
+            unsafe {
+                if !forward_overlap {
+                    std::ptr::copy(from, to, len as usize);
+                } else {
+                    let period = (dst - src) as usize;
+                    if period == 1 {
+                        std::ptr::write_bytes(to, from.read(), len as usize);
+                    } else {
+                        std::ptr::copy_nonoverlapping(from, to, period);
+                        let mut done = period;
+                        while done < len as usize {
+                            let chunk = done.min(len as usize - done);
+                            std::ptr::copy_nonoverlapping(to, to.add(done), chunk);
+                            done += chunk;
+                        }
+                    }
+                }
+            }
+        }
+        mem.commit()?;
+    }
+    Ok(0u32.into())
+}
 
 // Error pointers belong to this module, including after relocation. Resolve
 // them once when binding, then pass them as fixed direct-body inputs.
@@ -182,6 +233,14 @@ unsafe fn set(bytes: *mut u8, offset: usize, value: u32) {
             .cast::<u32>()
             .write_unaligned(value.to_le())
     };
+}
+
+#[inline]
+fn overlaps(a: u32, alen: u32, b: u32, blen: u32) -> bool {
+    alen != 0
+        && blen != 0
+        && u64::from(a) < u64::from(b) + u64::from(blen)
+        && u64::from(b) < u64::from(a) + u64::from(alen)
 }
 
 // spec: NAT-BODY-11
@@ -243,6 +302,20 @@ fn inflate_fast<M: Mem>(
     let (mut mode, mut message) = (None, 0);
     let lmask = (1u32 << lbits) - 1;
     let dmask = (1u32 << dbits) - 1;
+    let dest_aliases = overlaps(output, avail_out, input, avail_in)
+        || overlaps(output, avail_out, lcode, 852 * 4)
+        || overlaps(output, avail_out, dcode, 592 * 4)
+        || overlaps(output, avail_out, window, wsize)
+        || overlaps(
+            output,
+            avail_out,
+            output.wrapping_sub(prefix_len),
+            prefix_len,
+        )
+        || overlaps(output, avail_out, stream, 32)
+        || overlaps(output, avail_out, state, 96)
+        || overlaps(output, avail_out, state.wrapping_add(7108), 4);
+    let fast_copy = !dest_aliases && wnext < wsize && avail_in >= 6;
     // Raw pointers deliberately retain live aliasing: output may overwrite
     // later input, table entries or sliding-window bytes, exactly as zlib does.
     // SAFETY: each accepted stream supplies the complete spans checked above;
@@ -250,12 +323,22 @@ fn inflate_fast<M: Mem>(
     unsafe {
         'decode: loop {
             if bits < 15 {
-                hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
-                read += 1;
-                bits += 8;
-                hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
-                read += 1;
-                bits += 8;
+                if avail_in - read >= 2 {
+                    hold = hold.wrapping_add(
+                        u32::from(u16::from_le(
+                            source.add(read as usize).cast::<u16>().read_unaligned(),
+                        )) << bits,
+                    );
+                    read += 2;
+                    bits += 16;
+                } else {
+                    hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                    read += 1;
+                    bits += 8;
+                    hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                    read += 1;
+                    bits += 8;
+                }
             }
             let mut here = literals.add((hold & lmask) as usize * 4);
             let mut op;
@@ -282,14 +365,24 @@ fn inflate_fast<M: Mem>(
                     hold >>= op;
                     bits -= op;
                     if bits < 15 {
-                        hold =
-                            hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
-                        read += 1;
-                        bits += 8;
-                        hold =
-                            hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
-                        read += 1;
-                        bits += 8;
+                        if avail_in - read >= 2 {
+                            hold = hold.wrapping_add(
+                                u32::from(u16::from_le(
+                                    source.add(read as usize).cast::<u16>().read_unaligned(),
+                                )) << bits,
+                            );
+                            read += 2;
+                            bits += 16;
+                        } else {
+                            hold = hold
+                                .wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                            read += 1;
+                            bits += 8;
+                            hold = hold
+                                .wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                            read += 1;
+                            bits += 8;
+                        }
                     }
                     here = distances.add((hold & dmask) as usize * 4);
                     let mut dist;
@@ -327,23 +420,90 @@ fn inflate_fast<M: Mem>(
                         message = too_far;
                         break 'decode;
                     }
-                    while len != 0 {
-                        let byte = if back != 0 {
+                    if fast_copy && back <= wsize {
+                        while back != 0 && len != 0 {
                             let at = if wnext >= back {
                                 wnext - back
                             } else {
-                                wsize.wrapping_add(wnext).wrapping_sub(back)
+                                wsize + wnext - back
                             };
-                            back -= 1;
-                            history.add(at as usize).read()
-                        } else if dist > written {
-                            prefix.add((prefix_len + written - dist) as usize).read()
-                        } else {
-                            dest.add((written - dist) as usize).read()
-                        };
-                        dest.add(written as usize).write(byte);
-                        written += 1;
-                        len -= 1;
+                            let chunk = len.min(back).min(wsize - at);
+                            std::ptr::copy_nonoverlapping(
+                                history.add(at as usize),
+                                dest.add(written as usize),
+                                chunk as usize,
+                            );
+                            back -= chunk;
+                            written += chunk;
+                            len -= chunk;
+                        }
+                        if len != 0 && dist > written {
+                            let chunk = len.min(dist - written);
+                            std::ptr::copy_nonoverlapping(
+                                prefix.add((prefix_len + written - dist) as usize),
+                                dest.add(written as usize),
+                                chunk as usize,
+                            );
+                            written += chunk;
+                            len -= chunk;
+                        }
+                        if len != 0 {
+                            if dist >= len {
+                                std::ptr::copy_nonoverlapping(
+                                    dest.add((written - dist) as usize),
+                                    dest.add(written as usize),
+                                    len as usize,
+                                );
+                                written += len;
+                            } else if dist == 1 {
+                                let byte = dest.add((written - 1) as usize).read();
+                                std::ptr::write_bytes(
+                                    dest.add(written as usize),
+                                    byte,
+                                    len as usize,
+                                );
+                                written += len;
+                            } else {
+                                let mut step = dist;
+                                std::ptr::copy_nonoverlapping(
+                                    dest.add((written - dist) as usize),
+                                    dest.add(written as usize),
+                                    step as usize,
+                                );
+                                written += step;
+                                len -= step;
+                                while len != 0 {
+                                    let chunk = len.min(step);
+                                    std::ptr::copy_nonoverlapping(
+                                        dest.add((written - step) as usize),
+                                        dest.add(written as usize),
+                                        chunk as usize,
+                                    );
+                                    written += chunk;
+                                    len -= chunk;
+                                    step *= 2;
+                                }
+                            }
+                        }
+                    } else {
+                        while len != 0 {
+                            let byte = if back != 0 {
+                                let at = if wnext >= back {
+                                    wnext - back
+                                } else {
+                                    wsize.wrapping_add(wnext).wrapping_sub(back)
+                                };
+                                back -= 1;
+                                history.add(at as usize).read()
+                            } else if dist > written {
+                                prefix.add((prefix_len + written - dist) as usize).read()
+                            } else {
+                                dest.add((written - dist) as usize).read()
+                            };
+                            dest.add(written as usize).write(byte);
+                            written += 1;
+                            len -= 1;
+                        }
                     }
                     break;
                 } else if op & 64 == 0 {

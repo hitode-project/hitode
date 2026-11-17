@@ -626,15 +626,18 @@ fn allocate_in(
         for page in &mut region.pages[first..first + (length / PAGE) as usize] {
             *page = Some(protection);
         }
+        let all_new = reserved.len() == 1 && reserved[0] == (start, length);
         for (address, size) in reserved {
             if env.cpu.map(address, size, prot).is_err() {
                 return Err(status::NO_MEMORY);
             }
         }
         // Committing again keeps the contents and applies the protection.
-        env.cpu
-            .protect(start, length, prot)
-            .map_err(|_| status::NO_MEMORY)?;
+        if !all_new {
+            env.cpu
+                .protect(start, length, prot)
+                .map_err(|_| status::NO_MEMORY)?;
+        }
     }
     apply_write_watch(env, start, length)?;
     write(env, base_out, start)?;
@@ -656,6 +659,22 @@ pub fn free(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         return free(env, &args);
     }
     finish(free_in(env, args))
+}
+
+fn unmap_committed(cpu: &mut dyn Guest, pages: &mut [Page], start: u32) {
+    let mut index = 0;
+    while index < pages.len() {
+        if pages[index].is_none() {
+            index += 1;
+            continue;
+        }
+        let begin = index;
+        while index < pages.len() && pages[index].is_some() {
+            pages[index] = None;
+            index += 1;
+        }
+        let _ = cpu.unmap(start + begin as u32 * PAGE, (index - begin) as u32 * PAGE);
+    }
 }
 
 fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
@@ -692,10 +711,11 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
             }
             region.placeholder = Placeholder::Free;
             region.protection = PAGE_NOACCESS;
-            region.pages.fill(None);
-            for page in (base..end).step_by(PAGE as usize) {
-                let _ = env.cpu.unmap(page, PAGE);
-            }
+            let mut committed = Vec::new();
+            std::mem::swap(&mut region.pages, &mut committed);
+            unmap_committed(env.cpu, &mut committed, base);
+            let (_, region) = memory(env).region_of(base).unwrap();
+            region.pages = committed;
             write(env, base_out, start)?;
             write(env, size_out, length)
         }
@@ -722,12 +742,10 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
             }
             let (_, region) = memory(env).region_of(start).expect("region");
             let first = ((start - base) / PAGE) as usize;
-            for page in &mut region.pages[first..first + (length / PAGE) as usize] {
-                *page = None;
-            }
-            for page in (start..start + length).step_by(PAGE as usize) {
-                let _ = env.cpu.unmap(page, PAGE);
-            }
+            let count = (length / PAGE) as usize;
+            let mut slice = region.pages[first..first + count].to_vec();
+            region.pages[first..first + count].fill(None);
+            unmap_committed(env.cpu, &mut slice, start);
             write(env, base_out, start)?;
             write(env, size_out, if size == 0 { 0 } else { length })
         }

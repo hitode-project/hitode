@@ -11,14 +11,16 @@ enum PngFilter {
 }
 
 const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+const BGR_ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1)];
 adv_cpu::body!(SUB = sub, inputs: ARGS, outputs: 0, pop: 0);
 adv_cpu::body!(UP = up, inputs: ARGS, outputs: 0, pop: 0);
 adv_cpu::body!(AVERAGE = average, inputs: ARGS, outputs: 0, pop: 0);
 adv_cpu::body!(PAETH_ONE = paeth_one, inputs: ARGS, outputs: 0, pop: 0);
 adv_cpu::body!(PAETH = paeth, inputs: ARGS, outputs: 0, pop: 0);
+adv_cpu::body!(DO_BGR = do_bgr::<_, true>, inputs: BGR_ARGS, outputs: 0, pop: 0);
 
 pub(super) fn bodies() -> Vec<super::Body> {
-    [
+    let mut bodies: Vec<_> = [
         ("png_read_filter_row_sub", SUB),
         ("png_read_filter_row_up", UP),
         ("png_read_filter_row_avg", AVERAGE),
@@ -33,7 +35,15 @@ pub(super) fn bodies() -> Vec<super::Body> {
         handler: super::resume_original,
         direct: Some(direct),
     })
-    .collect()
+    .collect();
+    bodies.push(super::Body {
+        name: "windowscodecs.dll!png_do_bgr".into(),
+        conv: Conv::Cdecl { argc: 2 },
+        body: None,
+        handler: super::resume_original,
+        direct: Some(DO_BGR),
+    });
+    bodies
 }
 fn sub<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
     filter(mem, args, PngFilter::Sub, false)
@@ -49,6 +59,93 @@ fn paeth_one<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
 }
 fn paeth<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
     filter(mem, args, PngFilter::Paeth, false)
+}
+
+// spec: NAT-BODY-1, NAT-BODY-9, NAT-BODY-17, NAT-BODY-19
+pub(super) fn do_bgr<M: Mem, const SIMD: bool>(
+    mem: &mut M,
+    [info, row, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    // Wine's i386 png_row_info: width at 0, color_type at 8, bit_depth at 9.
+    let color_type = unsafe { *mem.input(info.wrapping_add(8), 1)? };
+    if color_type & 2 == 0 {
+        return Ok(0u32.into());
+    }
+    let width = mem.u32(info)?;
+    let bit_depth = unsafe { *mem.input(info.wrapping_add(9), 1)? };
+    let bpp = match (bit_depth, color_type) {
+        (8, 2) => 3u32,
+        (8, 6) => 4,
+        (16, 2) => 6,
+        (16, 6) => 8,
+        _ => return Ok(0u32.into()),
+    };
+    if width == 0 {
+        return Ok(0u32.into());
+    }
+    let len = width.checked_mul(bpp).ok_or(Stop::Slow)?;
+    let out = mem.output(row, len)?;
+    let count = width as usize;
+    // SAFETY: `out` covers `count * bpp` writable guest bytes.
+    unsafe {
+        match (bit_depth, color_type) {
+            (8, 6) => {
+                let mut i = 0;
+                #[cfg(target_arch = "aarch64")]
+                if SIMD {
+                    use std::arch::aarch64::*;
+                    let perm =
+                        vld1q_u8([2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15].as_ptr());
+                    while i + 4 <= count {
+                        let p = out.add(i * 4);
+                        vst1q_u8(p, vqtbl1q_u8(vld1q_u8(p), perm));
+                        i += 4;
+                    }
+                }
+                while i < count {
+                    let p = out.add(i * 4);
+                    let r = p.read();
+                    p.write(p.add(2).read());
+                    p.add(2).write(r);
+                    i += 1;
+                }
+            }
+            (8, 2) => {
+                let mut i = 0;
+                #[cfg(target_arch = "aarch64")]
+                if SIMD {
+                    use std::arch::aarch64::*;
+                    while i + 16 <= count {
+                        let p = out.add(i * 3);
+                        let mut v = vld3q_u8(p);
+                        std::mem::swap(&mut v.0, &mut v.2);
+                        vst3q_u8(p, v);
+                        i += 16;
+                    }
+                }
+                while i < count {
+                    let p = out.add(i * 3);
+                    let r = p.read();
+                    p.write(p.add(2).read());
+                    p.add(2).write(r);
+                    i += 1;
+                }
+            }
+            (16, 2 | 6) => {
+                let step = bpp as usize;
+                for i in 0..count {
+                    let p = out.add(i * step);
+                    let hi = p.cast::<u16>().read_unaligned();
+                    p.cast::<u16>()
+                        .write_unaligned(p.add(4).cast::<u16>().read_unaligned());
+                    p.add(4).cast::<u16>().write_unaligned(hi);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    mem.commit()?;
+    Ok(0u32.into())
 }
 // spec: NAT-BODY-9
 #[inline(always)]
