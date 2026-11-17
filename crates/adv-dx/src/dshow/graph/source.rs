@@ -278,6 +278,7 @@ fn reader(
                 filter,
                 name: name_text,
                 host: Some(filter),
+                seeking: 0,
             });
             Outcome::Return(S_OK)
         }),

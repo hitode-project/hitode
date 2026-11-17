@@ -11,6 +11,7 @@ use super::*;
 mod clock;
 pub(super) mod mapper;
 mod render;
+mod seeking;
 pub(super) mod source;
 
 pub(crate) const STOPPED: u32 = 0;
@@ -36,6 +37,8 @@ pub(crate) struct Member {
     pub name: Vec<u16>,
     /// The host filter's canonical pointer; guest filters are called through vtables.
     pub host: Option<u32>,
+    /// A guest member's IMediaSeeking once it answered in media time; 0 until then.
+    pub seeking: u32,
 }
 
 pub(crate) struct Graph {
@@ -325,6 +328,12 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         .iter()
         .map(|m| (m.filter, m.host))
         .collect();
+    let cached: Vec<u32> = state(env).graphs[&graph]
+        .members
+        .iter()
+        .map(|m| m.seeking)
+        .filter(|&s| s != 0)
+        .collect();
     let mut calls = VecDeque::new();
     for &(filter, host) in &members {
         if host.is_none() {
@@ -341,7 +350,7 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         .filter(|m| m.1.is_none())
         .map(|m| m.0)
         .collect();
-    let mut leave = VecDeque::new();
+    let mut leave: VecDeque<Call> = cached.into_iter().map(|s| Call(s, 2, vec![])).collect();
     for &filter in &guests {
         leave.push_back(Call(filter, 13, vec![0, 0]));
         leave.push_back(Call(filter, 8, vec![0]));
@@ -614,8 +623,8 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             notify(env, graph, env.arg(1), env.arg(2), env.arg(3));
             Some(with_posts(env, S_OK))
         }
-        (Face::MediaSeeking, method) => seeking(env, graph, method),
-        (Face::MediaPosition, method) => position_method(env, graph, method),
+        (Face::MediaSeeking, method) => seeking::call(env, graph, method),
+        (Face::MediaPosition, method) => seeking::position(env, graph, method),
         (Face::BasicAudio, method) => audio_method(env, graph, method),
         (Face::BasicVideo | Face::VideoWindow, method) => {
             video::window::call(env, graph, face, method)
@@ -663,6 +672,7 @@ fn add_filter_then(
             filter,
             name: name_text,
             host: Some(host),
+            seeking: 0,
         });
         return then(env, added);
     }
@@ -697,6 +707,7 @@ fn add_filter_then(
                 filter,
                 name: name_text,
                 host: None,
+                seeking: 0,
             });
             let clock = graph.clock;
             guest_call(env, filter, 8, vec![clock], move |env, _| then(env, added))
@@ -747,11 +758,14 @@ fn detach(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
             }),
         );
     }
-    let calls = VecDeque::from([
+    let mut calls = VecDeque::from([
         Call(filter, 13, vec![0, 0]),
         Call(filter, 8, vec![0]),
         Call(filter, 2, vec![]),
     ]);
+    if member.seeking != 0 {
+        calls.push_front(Call(member.seeking, 2, vec![]));
+    }
     disconnect_guests(
         env,
         VecDeque::from([filter]),
@@ -854,7 +868,6 @@ pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
 }
 
 fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    let now = env.sys.clock.now_us();
     let previous = g(env, graph).state;
     if previous == STOPPED {
         let hr = video::auto_show(env, graph);
@@ -871,6 +884,7 @@ fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         5,
         vec![],
         Box::new(move |env, _| {
+            let now = env.sys.clock.now_us();
             let graph_state = g(env, graph);
             graph_state.position = graph_state.position(now);
             graph_state.origin = None;
@@ -919,11 +933,11 @@ fn ran(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
 }
 
 pub(crate) fn stop(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    let now = env.sys.clock.now_us();
     if g(env, graph).state == STOPPED {
         return then(env, Vec::new());
     }
     {
+        let now = env.sys.clock.now_us();
         let graph_state = g(env, graph);
         graph_state.position = graph_state.position(now);
         graph_state.origin = None;
@@ -965,11 +979,13 @@ pub(crate) fn stop(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                 downstream_calls,
                 Vec::new(),
                 Box::new(move |env, more| {
-                    if let Some(graph_state) = state(env).graphs.get_mut(&graph) {
-                        graph_state.stopping = false;
-                    }
                     results.extend(more);
-                    then(env, results)
+                    let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
+                        return then(env, results);
+                    };
+                    graph_state.stopping = false;
+                    // Quartz re-seeks every stream to the kept position.
+                    seeking::rewind(env, graph, Box::new(move |env| then(env, results)))
                 }),
             )
         }),
@@ -1258,7 +1274,20 @@ pub(crate) fn duration(env: &Env<'_>, graph: u32) -> i64 {
         .max(state.graphs[&graph].guest_duration)
 }
 
+/// IMediaSeeking::GetCurrentPosition: the position the graph keeps, advanced
+/// by the clock while running and bounded by the stop. Without a clock a
+/// running graph reports 0, as quartz does.
 pub(crate) fn current(env: &Env<'_>, graph: u32) -> i64 {
+    let graph_state = &env.ext.get::<State>().graphs[&graph];
+    match graph_state.state {
+        RUNNING if graph_state.clock == 0 => 0,
+        RUNNING => reached(env, graph),
+        _ => graph_state.position,
+    }
+}
+
+/// The running position, bounded by the stop or the host media's end.
+fn reached(env: &Env<'_>, graph: u32) -> i64 {
     let now = env.sys.clock.now_us();
     let length = duration(env, graph);
     let graph_state = &env.ext.get::<State>().graphs[&graph];
@@ -1342,221 +1371,6 @@ fn resolve_position(current: i64, value: i64, flags: u32) -> Option<i64> {
         0 => None,
         1 => Some(value),
         2 | 3 => Some(current + value),
-        _ => None,
-    }
-}
-
-fn seeking(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> {
-    let r = |value: u32| Some(Outcome::Return(value));
-    let a1 = env.arg(1);
-    match method {
-        "GetCapabilities" | "CheckCapabilities" => {
-            if method == "CheckCapabilities" {
-                let wanted = env.cpu.read_u32(a1).unwrap_or(0);
-                let _ = env.cpu.write_u32(a1, wanted & 0x3f);
-                return r(if wanted & !0x3f == 0 { S_OK } else { S_FALSE });
-            }
-            let _ = env.cpu.write_u32(a1, 0x3f);
-            r(S_OK)
-        }
-        "IsFormatSupported" => {
-            let format = read_guid(env, a1).unwrap_or(GUID_NULL);
-            r(if format == TIME_FORMAT_MEDIA_TIME {
-                S_OK
-            } else {
-                S_FALSE
-            })
-        }
-        "QueryPreferredFormat" => {
-            let _ = write_guid(env, a1, &TIME_FORMAT_MEDIA_TIME);
-            r(S_OK)
-        }
-        "GetTimeFormat" => {
-            let format = g(env, graph).time_format;
-            let _ = write_guid(env, a1, &format);
-            r(S_OK)
-        }
-        "IsUsingTimeFormat" => {
-            let format = read_guid(env, a1).unwrap_or(GUID_NULL);
-            r(if format == g(env, graph).time_format {
-                S_OK
-            } else {
-                S_FALSE
-            })
-        }
-        "SetTimeFormat" => {
-            let format = read_guid(env, a1).unwrap_or(GUID_NULL);
-            if format != TIME_FORMAT_MEDIA_TIME && format != TIME_FORMAT_NONE {
-                return r(E_INVALIDARG);
-            }
-            g(env, graph).time_format = TIME_FORMAT_MEDIA_TIME;
-            r(S_OK)
-        }
-        "GetDuration" => {
-            let value = duration(env, graph);
-            r(if write_i64(env, a1, value) {
-                S_OK
-            } else {
-                E_POINTER
-            })
-        }
-        "GetStopPosition" => {
-            let value = g(env, graph).stop.unwrap_or(duration(env, graph));
-            r(if write_i64(env, a1, value) {
-                S_OK
-            } else {
-                E_POINTER
-            })
-        }
-        "GetCurrentPosition" => {
-            let value = current(env, graph);
-            r(if write_i64(env, a1, value) {
-                S_OK
-            } else {
-                E_POINTER
-            })
-        }
-        "ConvertTimeFormat" => {
-            let value = arg_i64(env, 3);
-            r(if write_i64(env, a1, value) {
-                S_OK
-            } else {
-                E_POINTER
-            })
-        }
-        "SetPositions" => {
-            let (current_flags, stop_pointer, stop_flags) = (env.arg(2), env.arg(3), env.arg(4));
-            let now_position = current(env, graph);
-            let stop_now = g(env, graph).stop.unwrap_or(duration(env, graph));
-            let position = read_i64(env, a1)
-                .and_then(|value| resolve_position(now_position, value, current_flags));
-            let stop_position = read_i64(env, stop_pointer)
-                .and_then(|value| resolve_position(stop_now, value, stop_flags));
-            seek(env, graph, position, stop_position);
-            Some(seek_guests(
-                env,
-                graph,
-                position,
-                stop_position,
-                Box::new(move |env, _| {
-                    if current_flags & 8 != 0 {
-                        let value = current(env, graph);
-                        write_i64(env, a1, value);
-                    }
-                    if stop_flags & 8 != 0 {
-                        let value = g(env, graph).stop.unwrap_or(duration(env, graph));
-                        write_i64(env, stop_pointer, value);
-                    }
-                    Outcome::Return(S_OK)
-                }),
-            ))
-        }
-        "GetPositions" => {
-            let value = current(env, graph);
-            write_i64(env, a1, value);
-            let value = g(env, graph).stop.unwrap_or(duration(env, graph));
-            write_i64(env, env.arg(2), value);
-            r(S_OK)
-        }
-        "GetAvailable" => {
-            write_i64(env, a1, 0);
-            let value = duration(env, graph);
-            write_i64(env, env.arg(2), value);
-            r(S_OK)
-        }
-        "SetRate" => {
-            let rate = arg_f64(env, 1);
-            if rate.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-                return r(E_INVALIDARG);
-            }
-            let now = env.sys.clock.now_us();
-            let graph_state = g(env, graph);
-            graph_state.position = graph_state.position(now);
-            if graph_state.origin.is_some() {
-                graph_state.origin = Some(now);
-            }
-            graph_state.rate = rate;
-            r(S_OK)
-        }
-        "GetRate" => {
-            let rate = g(env, graph).rate;
-            let _ = env.cpu.write(a1, &rate.to_le_bytes());
-            r(S_OK)
-        }
-        "GetPreroll" => {
-            write_i64(env, a1, 0);
-            r(S_OK)
-        }
-        _ => None,
-    }
-}
-
-/// IMediaPosition: REFTIME seconds as doubles, by value or through pointers.
-fn position_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> {
-    let r = |value: u32| Some(Outcome::Return(value));
-    let seconds = |value: i64| value as f64 / 10_000_000.0;
-    let write = |env: &mut Env<'_>, value: f64| {
-        let _ = env.cpu.write(env.arg(1), &value.to_le_bytes());
-    };
-    match method {
-        "get_Duration" => {
-            let value = seconds(duration(env, graph));
-            write(env, value);
-            r(S_OK)
-        }
-        "get_CurrentPosition" => {
-            let value = seconds(current(env, graph));
-            write(env, value);
-            r(S_OK)
-        }
-        "put_CurrentPosition" => {
-            let value = (arg_f64(env, 1) * 10_000_000.0) as i64;
-            seek(env, graph, Some(value), None);
-            Some(seek_guests(
-                env,
-                graph,
-                Some(value),
-                None,
-                Box::new(|_, _| Outcome::Return(S_OK)),
-            ))
-        }
-        "get_StopTime" => {
-            let value = seconds(g(env, graph).stop.unwrap_or(duration(env, graph)));
-            write(env, value);
-            r(S_OK)
-        }
-        "put_StopTime" => {
-            let value = (arg_f64(env, 1) * 10_000_000.0) as i64;
-            seek(env, graph, None, Some(value));
-            Some(seek_guests(
-                env,
-                graph,
-                None,
-                Some(value),
-                Box::new(|_, _| Outcome::Return(S_OK)),
-            ))
-        }
-        "get_PrerollTime" => {
-            write(env, 0.0);
-            r(S_OK)
-        }
-        "put_PrerollTime" => r(S_OK),
-        "put_Rate" => {
-            let rate = arg_f64(env, 1);
-            if rate > 0.0 {
-                g(env, graph).rate = rate;
-            }
-            r(S_OK)
-        }
-        "get_Rate" => {
-            let value = g(env, graph).rate;
-            write(env, value);
-            r(S_OK)
-        }
-        "CanSeekForward" | "CanSeekBackward" => {
-            let _ = env.cpu.write_u32(env.arg(1), u32::MAX);
-            r(S_OK)
-        }
         _ => None,
     }
 }

@@ -116,6 +116,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: AddSourceFilter MUST take the media type from `HKCR\Media Type\Extensions` when the file extension is registered. Otherwise the first `Media Type` entry whose byte patterns all match MUST decide the type and the source filter. A registered source other than the async reader MUST be created, loaded and added.
 **Verification**: Test
 
+### MEDIA-GRAPH-15 Graph seeking
+
+**Rule**: The graph's IMediaSeeking MUST ask every member exposing IMediaSeeking in media time, newest first, with host playback answering as one more member. Durations and stops MUST take the largest answer, capabilities their intersection, and SetPositions MUST pause a running graph around the seek. Stop MUST re-seek every member to the kept position.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.

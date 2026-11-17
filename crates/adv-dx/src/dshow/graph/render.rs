@@ -18,6 +18,7 @@ fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> 
         filter,
         name,
         host: Some(filter),
+        seeking: 0,
     });
     Ok(filter)
 }
