@@ -367,6 +367,8 @@ pub(crate) enum Source {
     Eflags,
     /// An XMM register, V128.
     Xmm(u8),
+    /// An MMX register, V128 with upper 64 bits zero.
+    Mmx(u8),
     /// A valid x87 physical register as binary64, F64.
     X87(u8),
     /// The x87 last instruction pointer and opcode, I32.
@@ -387,7 +389,7 @@ impl Source {
             Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,
-            Source::Xmm(_) => Type::V128,
+            Source::Xmm(_) | Source::Mmx(_) => Type::V128,
             Source::X87(_) => Type::F64,
         }
     }
@@ -404,9 +406,10 @@ pub(crate) struct Func {
     /// edges to it also check the head-exit word. Block 0 may be an entry
     /// prologue that jumps there.
     pub head_exit: Option<Block>,
-    /// Registers (bits 0–7) and XMM registers (bits 8–15) the form never
-    /// writes: records leave them at their entry values.
-    pub kept: u16,
+    /// Registers (bits 0–7), XMM registers (bits 8–15) and MMX registers
+    /// (bits 16–23) the form never writes: records leave them at their entry
+    /// values.
+    pub kept: u32,
 }
 
 impl Func {

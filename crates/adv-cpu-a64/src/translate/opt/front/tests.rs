@@ -73,6 +73,7 @@ fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
             Source::X87Ip => u128::from(at.x87.ip),
             Source::X87Opcode => u128::from(at.x87.opcode),
             Source::Xmm(i) => u128::from_le_bytes(at.xmm[i as usize]),
+            Source::Mmx(i) => u128::from(at.mmx[i as usize]),
             Source::X87(i) => {
                 let x = at.x87.regs[i as usize];
                 let value = if x.significand() == 0 {
@@ -162,6 +163,32 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
             None => {}
         }
     }
+    let meta = record
+        .mmx_meta
+        .as_ref()
+        .map_or(0, |loc| eval::locate(loc, &run.values) as u32);
+    for (i, loc) in record.mmx.iter().enumerate() {
+        match loc {
+            Some(loc) => {
+                let value = eval::locate(loc, &run.values) as u64;
+                assert_eq!(value, cpu.mmx[i], "mmx {i}");
+                if meta >> i & 1 != 0 {
+                    assert_eq!(
+                        adv_cpu_core::X87Register::from_parts(value, 0xffff),
+                        cpu.x87.regs[i],
+                        "mmx alias {i}"
+                    );
+                } else if exit {
+                    assert_eq!(at.x87.regs[i], cpu.x87.regs[i], "unwritten mmx alias {i}");
+                }
+            }
+            None if exit && record.x87.is_none() => {
+                assert_eq!(at.mmx[i], cpu.mmx[i], "kept mmx {i}");
+                assert_eq!(at.x87.regs[i], cpu.x87.regs[i], "kept mmx alias {i}");
+            }
+            None => {}
+        }
+    }
     match &record.x87 {
         Some(x87) => {
             assert_eq!(x87.top, cpu.x87.top() as u8);
@@ -200,6 +227,22 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
                 }
             }
         }
+        None if record.mmx_meta.is_some() => {
+            let expected_top = if meta >> 10 & 1 != 0 { 0 } else { at.x87.top() };
+            let expected_tag = match meta >> 8 & 3 {
+                1 => 0,
+                2 => 0xffff,
+                _ => at.x87.tag,
+            };
+            assert_eq!(expected_top, cpu.x87.top(), "mmx TOP");
+            assert_eq!(expected_tag, cpu.x87.tag, "mmx tag");
+            assert_eq!(at.x87.control, cpu.x87.control, "mmx x87 control");
+            assert_eq!(
+                at.x87.status & !0x3800,
+                cpu.x87.status & !0x3800,
+                "mmx x87 status"
+            );
+        }
         None => assert_eq!(
             (at.x87.control, at.x87.status, at.x87.tag),
             (cpu.x87.control, cpu.x87.status, cpu.x87.tag),
@@ -234,6 +277,21 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
             resumed.xmm[i] = record.xmm[i].map_or(at.xmm[i], |loc| {
                 eval::locate(&loc, &run.values).to_le_bytes()
             });
+            if let Some(loc) = record.mmx[i] {
+                let value = eval::locate(&loc, &run.values) as u64;
+                resumed.mmx[i] = value;
+                if meta >> i & 1 != 0 {
+                    resumed.x87.regs[i] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
+                }
+            }
+        }
+        if meta >> 10 & 1 != 0 {
+            resumed.x87.set_top(0);
+        }
+        match meta >> 8 & 3 {
+            1 => resumed.x87.tag = 0,
+            2 => resumed.x87.tag = 0xffff,
+            _ => {}
         }
         resumed.eflags = record
             .eflags
@@ -1676,4 +1734,127 @@ fn rows_whose_loop_branches_back_to_the_pixel_loop_head() {
                 .unwrap();
         }
     });
+}
+
+// spec: A64-OPT-1, A64-OPT-6, A64F-FP-4
+#[test]
+fn mmx_moves_emms_and_alias_exponents_recover_at_every_boundary() {
+    let seeded = || {
+        let mut at = initial();
+        at.x87.status = 5 << 11;
+        at.x87.tag = 0x5555;
+        at.x87.regs = std::array::from_fn(|n| {
+            adv_cpu_core::X87Register::from_parts(0x11223344_55667788 ^ n as u64, 0x3fff)
+        });
+        at.refresh_mmx();
+        at
+    };
+
+    // Straight-line and loop with movd/movq/movq2dq/movdq2q/emms: mm2 is read-only
+    // (must keep 0x3fff exponent), mm0 is written (must get 0xffff), and emms
+    // sets tags to 0xffff while keeping TOP = 0.
+    let loop_code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.movq2dq(xmm0, mm2).unwrap();
+        a.movdq2q(mm1, xmm0).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.emms().unwrap();
+    });
+    let mut at = seeded();
+    at.regs[1] = 4;
+    differential(&loop_code, &at, |m| {
+        for i in 0..8u32 {
+            m.write(
+                DATA + i * 8,
+                &(0x01020304_05060708u64 + u64::from(i)).to_le_bytes(),
+            )
+            .unwrap();
+        }
+    });
+
+    // Fault on iteration 1 before any MMX write (load fault): TOP=5, tag=0x5555,
+    // and mm0's exponent must remain 0x3fff. Fault on iteration 2 after iter 1
+    // wrote mm0/mm1: mm0/mm1 must have exponent 0xffff, TOP=0, tag=0, while mm2 keeps 0x3fff.
+    let fault_loop = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.movq(mm1, mm2).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+        a.emms().unwrap();
+    });
+    at.regs[1] = 3;
+    at.regs[6] = DATA + 0x20000;
+    compare(&fault_loop, &at, |_| {}, true);
+
+    at.regs[1] = 3;
+    at.regs[6] = DATA + 0x20000 - 8;
+    compare(&fault_loop, &at, |_| {}, true);
+
+    // Conditional MMX write inside a loop: only taken iterations mark mm3 written.
+    let cond_code = assemble(|a| {
+        let (mut head, mut skip) = (a.create_label(), a.create_label());
+        a.set_label(&mut head).unwrap();
+        a.test(ecx, 1).unwrap();
+        a.jnz(skip).unwrap();
+        a.movd(mm3, dword_ptr(esi)).unwrap();
+        a.movd(dword_ptr(edi), mm3).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    for count in [1u32, 2, 3] {
+        let mut at = seeded();
+        at.regs[1] = count;
+        differential(&cond_code, &at, |m| {
+            m.write(DATA, &[0xaa; 64]).unwrap();
+        });
+    }
+}
+
+// spec: A64-OPT-1, A64F-FP-4
+#[test]
+fn mmx_rejects_and_denies_admission_when_x87_exception_pending() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+        });
+    });
+    let mut pending = initial();
+    pending.x87.status = 0x80;
+    assert!(matches!(rejected(&code, &pending), Reject::Mode(_)));
+
+    let clean = initial();
+    let (_, _, built) = built(&code, &clean);
+    assert!(built.assumed.mmx);
+    let mem = memory(&code);
+    assert!(
+        super::super::admit(&built.func.entry, &built.assumed, &pending, |addr, w| {
+            let mut b = [0u8; 8];
+            mem.read_into(addr, &mut b[..w as usize]).unwrap();
+            u64::from_le_bytes(b)
+        })
+        .is_none()
+    );
+    assert!(
+        super::super::admit(&built.func.entry, &built.assumed, &clean, |addr, w| {
+            let mut b = [0u8; 8];
+            mem.read_into(addr, &mut b[..w as usize]).unwrap();
+            u64::from_le_bytes(b)
+        })
+        .is_some()
+    );
 }

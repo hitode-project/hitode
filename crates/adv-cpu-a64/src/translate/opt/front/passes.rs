@@ -112,8 +112,9 @@ fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
     for loc in record
         .regs
         .iter_mut()
-        .chain([&mut record.eflags])
+        .chain([&mut record.eflags, &mut record.mmx_meta])
         .chain(record.xmm.iter_mut())
+        .chain(record.mmx.iter_mut())
         .chain(record.x87.iter_mut().flat_map(|x| {
             x.stack
                 .iter_mut()

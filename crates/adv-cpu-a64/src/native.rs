@@ -1081,7 +1081,9 @@ impl Native {
             .get(&cpu.eip)
             .is_some_and(worker::Prepared::wants_form)
         {
-            self.request_optimized(cpu.eip, cpu.clone());
+            let mut at = cpu.clone();
+            at.refresh_mmx();
+            self.request_optimized(cpu.eip, at);
         }
         // Reaching the computation tells peers it is here, offered or not,
         // and takes the frame's pace for a split.
@@ -1225,6 +1227,7 @@ impl Native {
         if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
             return None;
         }
+        cpu.refresh_mmx();
         let alias = alias_base(memory);
         let optimized = worker::admit(&prepared.code, cpu, alias);
         prepared.admitted(optimized.is_some());

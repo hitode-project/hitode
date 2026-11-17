@@ -4,6 +4,13 @@ use crate::translate::simd::{Kind, Loc, Simd};
 
 impl Front<'_> {
     pub(super) fn simd(&mut self, s: Simd) -> Result<(), Reject> {
+        if self.assumed.x87 && s.mmx() {
+            return Err(Reject::Mmx(self.index));
+        }
+        if s.kind == Kind::Emms {
+            self.update_mmx_meta(true, None);
+            return Ok(());
+        }
         // Frame cells are at most eight bytes, and an aligned access must
         // not fault where the guest's would: its address is a constant.
         let constant =
@@ -17,15 +24,19 @@ impl Front<'_> {
             let value = self.imm(self.assumed.mxcsr);
             return self.write(s.mem, 4, value);
         }
+        if s.mmx() && s.kind != Kind::Move {
+            return Err(Reject::Mmx(self.index));
+        }
         let src = match s.src {
             Loc::Xmm(r) => self.state.xmm[r as usize],
+            Loc::Mmx(r) => self.state.mmx[r as usize],
             Loc::Gpr(r) => self.state.regs[r as usize],
             Loc::Mem => self.read(s.mem, s.width, Type::V128)?,
             Loc::Imm => self.constant(Type::V128, u128::from(s.imm)),
-            Loc::Mmx(_) => return Err(Reject::Mmx(self.index)),
         };
         let dst = match s.dst {
             Loc::Xmm(r) => self.state.xmm[r as usize],
+            Loc::Mmx(r) => self.state.mmx[r as usize],
             _ => src,
         };
         let value = match s.kind {
@@ -103,11 +114,45 @@ impl Front<'_> {
         };
         match s.dst {
             Loc::Xmm(r) => self.state.xmm[r as usize] = self.bits(Type::V128, value),
+            Loc::Mmx(r) => self.state.mmx[r as usize] = self.bits(Type::V128, value),
             Loc::Gpr(r) => self.state.regs[r as usize] = self.bits(Type::I32, value),
             Loc::Mem => self.write(s.mem, s.width, value)?,
             _ => return Err(Reject::Unsupported(self.index)),
         }
+        if s.mmx() {
+            let dst_mmx = match s.dst {
+                Loc::Mmx(r) => Some(r),
+                _ => None,
+            };
+            self.update_mmx_meta(false, dst_mmx);
+        }
         Ok(())
+    }
+    fn update_mmx_meta(&mut self, emms: bool, dst_mmx: Option<u8>) {
+        if emms {
+            self.state.mmx_meta_bits.0 = (self.state.mmx_meta_bits.0 & !0x300) | 0x200;
+            self.state.mmx_meta_bits.1 |= 0x300;
+            if self.state.mmx_meta_bits.1 == u32::MAX {
+                self.state.mmx_meta = self.imm(self.state.mmx_meta_bits.0);
+            } else {
+                let clear = self.imm(!0x300);
+                let set = self.imm(0x200);
+                let masked = self.int(IntOp::And, self.state.mmx_meta, clear);
+                self.state.mmx_meta = self.int(IntOp::Or, masked, set);
+            }
+        } else {
+            let write_bit = dst_mmx.map_or(0, |n| 1u32 << n);
+            self.state.mmx_meta_bits.0 = (self.state.mmx_meta_bits.0 & !0x300) | 0x500 | write_bit;
+            self.state.mmx_meta_bits.1 |= 0x700 | write_bit;
+            if self.state.mmx_meta_bits.1 == u32::MAX {
+                self.state.mmx_meta = self.imm(self.state.mmx_meta_bits.0);
+            } else {
+                let clear = self.imm(!0x300);
+                let set = self.imm(0x500 | write_bit);
+                let masked = self.int(IntOp::And, self.state.mmx_meta, clear);
+                self.state.mmx_meta = self.int(IntOp::Or, masked, set);
+            }
+        }
     }
     fn low(&mut self, dst: Value, src: Value) -> Value {
         let mask = self.constant(Type::V128, u128::MAX << 64);

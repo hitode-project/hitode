@@ -563,6 +563,8 @@ mod tests {
             eflags: None,
             x87: None,
             xmm: [None; 8],
+            mmx: [None; 8],
+            mmx_meta: None,
             frame: Vec::new(),
         }
     }
@@ -689,6 +691,7 @@ mod tests {
         full.regs = [Some(Location::Constant(0)); 8];
         full.eflags = Some(Location::Constant(0));
         full.xmm = [Some(Location::Constant(0)); 8];
+        full.mmx = [Some(Location::Constant(0)); 8];
         let entry = f.record(IrRecord {
             refund: 3,
             ..full.clone()

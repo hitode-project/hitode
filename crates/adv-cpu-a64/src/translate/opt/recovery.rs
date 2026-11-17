@@ -58,6 +58,11 @@ pub(crate) struct Record<L> {
     /// registers stand.
     pub x87: Option<X87<L>>,
     pub xmm: [Option<Location<L>>; 8],
+    pub mmx: [Option<Location<L>>; 8],
+    /// MMX alias metadata for units with MMX/EMMS: bits 0–7 mark written MMX
+    /// registers whose x87 exponent is `0xffff`; bits 8–9 encode tag state
+    /// (0 untouched, 1 zero, 2 `0xffff`); bit 10 clears x87 TOP when set.
+    pub mmx_meta: Option<Location<L>>,
     /// Frame bytes whose values differ from memory: offset from entry ESP,
     /// width in bytes and value.
     pub frame: Vec<(i32, u8, Location<L>)>,
@@ -70,8 +75,13 @@ impl<L: Copy> Record<L> {
             .x87
             .iter()
             .flat_map(|x| x.stack.iter().chain([&x.c1, &x.ip, &x.opcode]));
-        let held = self.regs.iter().chain([&self.eflags]).chain(x87);
+        let held = self
+            .regs
+            .iter()
+            .chain([&self.eflags, &self.mmx_meta])
+            .chain(x87);
         held.chain(&self.xmm)
+            .chain(&self.mmx)
             .flatten()
             .chain(self.frame.iter().map(|(_, _, location)| location))
             .flat_map(|location| match *location {
@@ -83,11 +93,16 @@ impl<L: Copy> Record<L> {
     }
 
     /// Whether every component is present but the registers in `kept`
-    /// (bits 0–7, XMM registers at 8–15), as exits require (A64-OPT-6).
-    pub(crate) fn complete(&self, kept: u16) -> bool {
+    /// (bits 0–7, XMM at 8–15, MMX at 16–23), as exits require (A64-OPT-6).
+    pub(crate) fn complete(&self, kept: u32) -> bool {
         let held = |bit: usize, loc: &Option<Location<L>>| loc.is_some() || kept >> bit & 1 != 0;
         self.regs.iter().enumerate().all(|(r, loc)| held(r, loc))
             && self.xmm.iter().enumerate().all(|(r, loc)| held(8 + r, loc))
+            && self
+                .mmx
+                .iter()
+                .enumerate()
+                .all(|(r, loc)| held(16 + r, loc))
             && self.eflags.is_some()
             && self.x87.as_ref().is_none_or(|x| {
                 x.c1.is_some()
@@ -280,6 +295,24 @@ pub(crate) fn materialize(
             *reg = values.locate(location).to_le_bytes();
         }
     }
+    let meta = record.mmx_meta.map_or(0, |l| values.locate(l) as u32);
+    for (n, location) in record.mmx.iter().enumerate() {
+        if let Some(location) = location {
+            let value = values.locate(*location) as u64;
+            cpu.mmx[n] = value;
+            if meta >> n & 1 != 0 {
+                cpu.x87.regs[n] = adv_cpu_core::state::X87Register::from_parts(value, 0xffff);
+            }
+        }
+    }
+    if meta >> 10 & 1 != 0 {
+        cpu.x87.set_top(0);
+    }
+    match meta >> 8 & 3 {
+        1 => cpu.x87.tag = 0,
+        2 => cpu.x87.tag = 0xffff,
+        _ => {}
+    }
     for &(offset, width, location) in &record.frame {
         frame(
             offset,
@@ -381,6 +414,8 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
             opcode: x.opcode.map(loc),
         }),
         xmm: record.xmm.map(|l| l.map(loc)),
+        mmx: record.mmx.map(|l| l.map(loc)),
+        mmx_meta: record.mmx_meta.map(loc),
         frame: record
             .frame
             .iter()

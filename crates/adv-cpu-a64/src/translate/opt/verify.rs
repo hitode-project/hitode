@@ -337,6 +337,8 @@ mod tests {
                 opcode: Some(Location::Constant(0)),
             }),
             xmm: [Some(Location::Constant(0)); 8],
+            mmx: [Some(Location::Constant(0)); 8],
+            mmx_meta: None,
             frame: Vec::new(),
         }
     }
