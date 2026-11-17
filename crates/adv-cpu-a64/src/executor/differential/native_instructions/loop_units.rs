@@ -408,3 +408,56 @@ fn budget_exits_promote_a_hot_loop_and_its_enclosing_entry() {
         assert_eq!(engine.diagnostics.promotions, promotions, "fuel {fuel}");
     }
 }
+
+// spec: A64-CTL-7, A64-TR-3, A64-VER-1
+#[test]
+fn forward_internal_jcc_inlines_without_cold_jumps_and_matches_oracle() {
+    let mut stop = 0;
+    let mut branch_pc = 0u32;
+    let mut p = fixture(|a| {
+        let (mut top, mut skip) = (a.create_label(), a.create_label());
+        a.set_label(&mut top).unwrap();
+        a.test(ecx, 1).unwrap();
+        branch_pc = a.instructions().len() as u32;
+        a.jz(skip).unwrap();
+        a.add(eax, 3).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(ebx, 1).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        stop = a.instructions().len();
+        a.nop().unwrap();
+    });
+    let branch_pc = pc(&p, branch_pc as usize);
+    p.stop = pc(&p, stop);
+    p.state.regs[1] = 16;
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    for config in pixel_loops::configs() {
+        for budget in [1, 2, 3, 4, 5, 6, 7, 15, 200] {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            assert_eq!(
+                compare(&mut native, &mut oracle, &p, budget),
+                if budget >= 200 {
+                    RunOutcome::ReachedStop
+                } else {
+                    RunOutcome::Budget
+                }
+            );
+            if budget == 200 && !config.1 {
+                let engine = native.native.as_ref().unwrap();
+                let base = engine.unit_address(CODE).unwrap();
+                let (_, marks) = units_of(CODE)
+                    .into_iter()
+                    .rfind(|&(at, _)| at == base)
+                    .unwrap();
+                assert!(
+                    !marks
+                        .iter()
+                        .any(|m| m.part == Part::Cold && m.eip == branch_pc)
+                );
+            }
+        }
+    }
+}

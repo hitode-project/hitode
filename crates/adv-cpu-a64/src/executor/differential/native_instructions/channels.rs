@@ -145,7 +145,7 @@ fn channel_batches_leave_the_exact_prefix_at_later_read_and_write_faults() {
 // spec: A64-TR-6, A64-MEM-4, A64-MEM-8, A64-VER-1
 #[test]
 fn channel_aliases_bound_writes_page_crossings_and_code_barriers_use_scalar_semantics() {
-    for case in 0..8 {
+    for case in 0..9 {
         let mut p = program(4, 0);
         match case {
             0 => p.state.regs[6] = p.state.regs[3],
@@ -153,6 +153,7 @@ fn channel_aliases_bound_writes_page_crossings_and_code_barriers_use_scalar_sema
             2 => p.state.regs[6] = p.state.regs[3] - 1,
             3 => p.state.regs[6] = p.state.regs[5] - 4,
             4 => p.state.regs[3] = DATA + 0x1000 - 33,
+            5 => p.state.regs[3] = DATA + 0x1000 - 33,
             _ => {}
         }
         let (mut native, mut oracle) = pair(
@@ -163,23 +164,21 @@ fn channel_aliases_bound_writes_page_crossings_and_code_barriers_use_scalar_sema
         );
         for cpu in [&mut native, &mut oracle] {
             match case {
-                5 => cpu.protect(DATA + 0x2000, 0x1000, 7).unwrap(),
-                6 => cpu.memory_mut().watch_code(DATA + 0x2000, 4),
-                7 => cpu.protect(DATA + 0x3000, 0x1000, 1).unwrap(),
+                4 => cpu.protect(DATA + 0x1000, 0x1000, 0).unwrap(),
+                6 => cpu.protect(DATA + 0x2000, 0x1000, 7).unwrap(),
+                7 => cpu.memory_mut().watch_code(DATA + 0x2000, 4),
+                8 => cpu.protect(DATA + 0x3000, 0x1000, 1).unwrap(),
                 _ => {}
             }
         }
-        assert_eq!(
-            native.run(p.stop, 975).unwrap(),
-            oracle.run(p.stop, 975).unwrap()
-        );
+        let outcome = native.run(p.stop, 975).unwrap();
+        assert_eq!(outcome, oracle.run(p.stop, 975).unwrap());
         same(&native, &oracle);
-        if case <= 6 && case != 5 {
-            assert_eq!(
-                native.native.as_ref().unwrap().channel_batches(),
-                0,
-                "case {case}"
-            );
+        let batches = native.native.as_ref().unwrap().channel_batches();
+        if case == 5 {
+            assert!(batches > 0, "accessible cross-page batch should run NEON");
+        } else if matches!(case, 0 | 1 | 2 | 3 | 4 | 7) {
+            assert_eq!(batches, 0, "case {case}");
         }
     }
 }

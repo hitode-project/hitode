@@ -52,7 +52,11 @@ pub(super) struct Entry {
 
 /// The SIMD registers an instruction reads and writes, as `Vector::dirty`
 /// numbers them, or `None` when it may drop the cache.
-fn footprint(trace: &Trace, index: usize, _checked: &dyn Fn(u32) -> bool) -> Option<(u16, u16)> {
+pub(super) fn footprint(
+    trace: &Trace,
+    index: usize,
+    _checked: &dyn Fn(u32) -> bool,
+) -> Option<(u16, u16)> {
     let inst = trace.insts[index];
     if inst.call.is_some() || inst.locked.is_some() || inst.mode == Mode::Real {
         return None;
@@ -155,12 +159,11 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             None => 0,
         };
     }
-    // The primary path's loop heads also hold what their bodies write, and
-    // merges inside a body hold what its head does: their arrivals already
-    // hold it. A join from an appended path does not enclose a body in
-    // emission order.
+    // Single-path loop heads also hold what their bodies write, and merges
+    // inside a body hold what its head does: their arrivals already hold it.
+    // A primary-to-appended edge does not enclose a body in emission order.
     let mut bodies = Vec::new();
-    for (index, inst) in trace.insts[..trace.primary].iter().enumerate() {
+    for (index, inst) in trace.insts.iter().enumerate() {
         let jump = match inst.next {
             Next::Edge(edge) => Some(edge),
             _ => None,
@@ -168,6 +171,8 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
         for edge in [inst.taken, jump] {
             if let Some(Edge::Internal(head)) = edge
                 && head <= index
+                && !(head < trace.primary && index >= trace.primary)
+                && (head..index).all(|n| trace.insts[n].next == Next::Fall)
                 && let Some(writes) =
                     (head..=index).try_fold(0, |writes, n| footprints[n].map(|(_, w)| writes | w))
             {
