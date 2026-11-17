@@ -502,21 +502,6 @@ pub(crate) fn audio_streams(env: &Env<'_>, graph: u32) -> Vec<u64> {
         .collect()
 }
 
-/// Connected outputs whose renderer will report completion.
-pub(crate) fn renderers(env: &Env<'_>, graph: u32) -> u32 {
-    let state = env.ext.get::<State>();
-    state
-        .filters
-        .values()
-        .filter(|f| f.graph == graph && f.dmo.is_some())
-        .filter(|f| {
-            f.pins
-                .iter()
-                .any(|p| state.pins[p].dir == OUTPUT && state.pins[p].peer != 0)
-        })
-        .count() as u32
-}
-
 /// IMemInputPin on a DMO input.
 pub(crate) fn input_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Outcome> {
     let r = |value: u32| Some(Outcome::Return(value));

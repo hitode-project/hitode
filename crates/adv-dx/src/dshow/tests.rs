@@ -955,7 +955,7 @@ fn system_filters_expose_pins_and_join_the_graph() {
         "IFilterGraph2::ConnectDirect",
         &[graph, output, input, 0],
     );
-    assert_eq!(finish_mpeg_calls(&mut m, outcome), VFW_E_CIRCULAR_GRAPH);
+    assert_eq!(finish_calls(&mut m, outcome), VFW_E_CIRCULAR_GRAPH);
     // A decoder offers no output types until its input is connected.
     assert_eq!(
         method(&mut m, "IPin::EnumMediaTypes", &[output, DATA]),
@@ -2057,8 +2057,8 @@ fn splitter_output_seeking_keeps_positions_and_reports_stream_identity() {
     assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 0);
 }
 
-#[cfg(feature = "media")]
-fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
+/// Follow a quartz method's calls into host thunks until it returns.
+fn finish_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
     loop {
         outcome = match outcome {
             Outcome::Return(hr) => return hr,
@@ -2084,7 +2084,7 @@ fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
                     ext: &mut m.ext,
                     thunk,
                 });
-                let hr = finish_mpeg_calls(m, call);
+                let hr = finish_calls(m, call);
                 then(&mut env(m), adv_machine::Resume::Returned(hr))
             }
             Outcome::Block { then, .. } => {
@@ -2094,7 +2094,7 @@ fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
                     adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
                 )
             }
-            _ => panic!("unexpected MPEG continuation"),
+            _ => panic!("unexpected continuation"),
         };
     }
 }
@@ -2182,11 +2182,11 @@ fn pushed_mpeg_video_delivers_a_timed_sample_after_a_direct_pause() {
     let outcome = Outcome::call(receive, vec![input, source], |_, resume| {
         Outcome::Return(resume.value())
     });
-    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    assert_eq!(finish_calls(&mut m, outcome), S_OK);
     let eos = m.resolve_import("quartz.dll", "IPin::EndOfStream").unwrap();
     let outcome = Outcome::call(eos, vec![pins[0]], |_, resume| {
         Outcome::Return(resume.value())
     });
-    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    assert_eq!(finish_calls(&mut m, outcome), S_OK);
     assert!(m.ext.get::<Received>().0 > 0);
 }

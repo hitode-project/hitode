@@ -86,7 +86,14 @@ fn follow(env: &Env<'_>, mut out: u32) -> Option<End> {
     None
 }
 
-/// Start streaming a splitter; returns how many renderers will report completion.
+/// Host renderers a session feeds. Guest renderers downstream of it are
+/// counted with the graph's guest members.
+fn host_renderers(video: Option<VideoTarget>, audio: bool) -> u32 {
+    u32::from(matches!(video, Some(VideoTarget::Host(_)))) + u32::from(audio)
+}
+
+/// Start streaming a splitter; returns how many host renderers will report
+/// completion.
 pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
     let state_ref = state(env);
     let Some(f) = state_ref.filters.get(&filter) else {
@@ -165,9 +172,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
         if !native {
             state(env).pending_threads.push(id);
         }
-        return u32::from(video.is_some())
-            + u32::from(audio_renderer)
-            + u32::from(audio_guest.is_some());
+        return host_renderers(video, audio_renderer);
     }
     if let Err(error) = spawn(env, "dshow-stream", id) {
         log::warn!("DirectShow: stream thread: {error}");
@@ -176,7 +181,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
         return 0;
     }
     log::info!("DirectShow: streaming splitter {filter:#x} (video={video:?}, audio={audio:?})");
-    u32::from(video.is_some()) + u32::from(audio_renderer) + u32::from(audio_guest.is_some())
+    host_renderers(video, audio_renderer)
 }
 
 pub(crate) fn wake(env: &mut Env<'_>, id: u32) {

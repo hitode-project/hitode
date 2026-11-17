@@ -1499,7 +1499,6 @@ fn start_sessions(env: &mut Env<'_>, graph: u32) {
     for host in hosts {
         expected += stream::start(env, graph, host);
     }
-    expected += super::dmo::renderers(env, graph);
     expected += super::vmr::renderers(env, graph);
     if stream::threads_running(env, graph) {
         let idle = g(env, graph).idle;
