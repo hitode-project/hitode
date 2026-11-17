@@ -1081,9 +1081,7 @@ impl Native {
             .get(&cpu.eip)
             .is_some_and(worker::Prepared::wants_form)
         {
-            let mut at = cpu.clone();
-            at.refresh_mmx();
-            self.request_optimized(cpu.eip, at);
+            self.request_optimized(cpu.eip, cpu.clone());
         }
         // Reaching the computation tells peers it is here, offered or not,
         // and takes the frame's pace for a split.
@@ -1841,7 +1839,8 @@ impl Native {
 
     /// Asks for an optimized form of the computation prepared at `eip`,
     /// taking its facts from `at`, the state at an entry.
-    fn request_optimized(&mut self, eip: u32, at: CpuState) {
+    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
+        at.refresh_mmx();
         let prepared = &self.computation[&eip];
         prepared.requested();
         crate::jit_map::optimized(eip, format_args!("requested\t-\t-"));

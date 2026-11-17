@@ -1807,10 +1807,17 @@ mod tests {
         a.dec(ecx).unwrap();
         a.jne(head).unwrap();
         a.int3().unwrap();
-        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let words = a.assemble(u64::from(CODE)).unwrap();
+        let stop = CODE + words.len() as u32 - 1;
         let (mut executor, mut native) = fixture(&mut a);
-        executor.memory_mut().map(SRC, 4096, READ | WRITE).unwrap();
-        executor.memory_mut().map(DST, 4096, READ | WRITE).unwrap();
+        executor
+            .memory_mut()
+            .map(SRC, 0x4000, READ | WRITE)
+            .unwrap();
+        executor
+            .memory_mut()
+            .map(DST, 0x4000, READ | WRITE)
+            .unwrap();
         executor.state.eip = CODE;
         executor.state.regs[1] = 4;
         executor.state.regs[6] = SRC;
@@ -1861,10 +1868,53 @@ mod tests {
         assert_eq!(done.optimized, 0);
         assert_eq!(done.retired, 0);
         assert!(done.requires_owner);
-        assert_eq!(done.context.unwrap().cpu().eip, CODE);
+        let mut owner_cpu = done.context.unwrap().cpu().clone();
+        assert_eq!(owner_cpu.eip, CODE);
+        // Owner fallback runs the ordinary path and leaves to raise #MF at CODE.
+        native.set_computation_offer(false, None);
+        let fallback = native
+            .run(
+                &mut owner_cpu,
+                executor.memory_mut(),
+                stop,
+                1000,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (fallback.exit, fallback.retired, owner_cpu.eip),
+            (Exit::Interpret, 0, CODE)
+        );
+        let mut native_exec = Executor::address_space().unwrap();
+        let mut interp_exec = Executor::interpreted_address_space().unwrap();
+        interp_exec.interpreter_only = true;
+        for exec in [&mut native_exec, &mut interp_exec] {
+            exec.memory_mut().map(CODE, 0x4000, READ | WRITE).unwrap();
+            exec.memory_mut().write(CODE, &words).unwrap();
+            exec.memory_mut()
+                .protect(CODE, 0x4000, READ | EXEC)
+                .unwrap();
+            exec.memory_mut().map(SRC, 0x4000, READ | WRITE).unwrap();
+            exec.memory_mut().map(DST, 0x4000, READ | WRITE).unwrap();
+            exec.state = owner_cpu.clone();
+        }
+        let native_out = native_exec.run(stop, 1000).unwrap();
+        let interp_out = interp_exec.run(stop, 1000).unwrap();
+        assert_eq!(
+            native_out,
+            adv_cpu_core::RunOutcome::Trap {
+                pc: CODE,
+                vector: 16
+            }
+        );
+        assert_eq!(native_out, interp_out);
+        native_exec.state.fuel = 0;
+        interp_exec.state.fuel = 0;
+        assert_eq!(native_exec.state, interp_exec.state);
     }
 
-    // spec: A64-OPT-1 A64-OPT-6 A64F-FP-4 A64-VER-1 A64-VER-2
+    // spec: A64-OPT-1 A64-OPT-6 A64F-FP-4 A64-VER-1
     #[test]
     fn mmx_optimized_matches_interpreter_across_flagm_cuts_and_faults() {
         let mut a = CodeAssembler::new(32).unwrap();
