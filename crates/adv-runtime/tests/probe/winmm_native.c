@@ -11,6 +11,9 @@ static unsigned opened, closed, done;
 static HANDLE completed;
 static DWORD main_thread, callback_thread;
 static short samples[3][4410 * 2];
+#ifndef DRVM_MAPPER_PREFERRED_GET
+#define DRVM_MAPPER_PREFERRED_GET 0x2015
+#endif
 static void check(const char *name, BOOL ok)
 {
     printf("%s=%s\n", name, ok ? "ok" : "FAIL");
@@ -67,6 +70,7 @@ static void callback_kinds(void)
     HWAVEOUT output;
     MSG msg;
     unsigned i, j;
+    DWORD preferred = 0xdead, status = 0xdead;
     WNDCLASSW cls = {0};
     HWND window;
     cls.lpfnWndProc = window_proc;
@@ -75,6 +79,10 @@ static void callback_kinds(void)
     check("class", RegisterClassW(&cls));
     window = CreateWindowW(cls.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, cls.hInstance, NULL);
     check("message-window", window != NULL);
+    check("mapper-preferred", !waveOutMessage((HWAVEOUT)WAVE_MAPPER, DRVM_MAPPER_PREFERRED_GET,
+          (DWORD_PTR)&preferred, (DWORD_PTR)&status) && preferred < waveOutGetNumDevs() && !status);
+    check("mapper-preferred-args", waveOutMessage((HWAVEOUT)WAVE_MAPPER, DRVM_MAPPER_PREFERRED_GET,
+          (DWORD_PTR)&preferred, 0) == MMSYSERR_INVALPARAM);
     for (i = 0; i < 3; ++i)
         for (j = 0; j < 4410; ++j)
             samples[i][2*j] = samples[i][2*j+1] = (j % 100 < 50 ? 1 : -1) * (4096 * (i+1));

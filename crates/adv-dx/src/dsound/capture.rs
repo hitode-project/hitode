@@ -109,6 +109,9 @@ fn activate(
     if outer != 0 {
         return Outcome::Return(NO_AGGREGATION);
     }
+    if let Some(refused) = clear_output(e, output) {
+        return refused;
+    }
     if iid != adv_os::com::IUNKNOWN && iid != primary {
         return Outcome::Return(NO_INTERFACE);
     }

@@ -691,7 +691,7 @@ Every presenter's frames carry only that content, while the host shows caption, 
 
 ### WINE-AUD-5 MIDI output messages
 
-**Rule**: MIDI output MUST support capability queries, open/close, prepared long messages, short messages, reset and stereo volume. Successful open, close and long-message submission MUST deliver the corresponding WinMM callbacks. Failed requests MUST NOT create an output handle or deliver a completion callback.
+**Rule**: MIDI output MUST support capability queries, open/close, prepared long messages, short messages, reset and stereo volume. Successful open, close and long-message submission MUST deliver the corresponding WinMM callbacks. Failed requests MUST NOT create an output handle or deliver a completion callback, and unpreparing an unprepared header MUST succeed.
 **Verification**: Test
 
 ### WINE-AUD-6 MIDI synthesis
@@ -866,7 +866,7 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 
 ### WINE-AUD-8 Native wave output
 
-**Rule**: Native PCM and float wave output MUST consume queued headers on device time through the session mixer. Pausing, restarting, resetting and breaking loops MUST preserve Wine 11's header flags, ordering and positions.
+**Rule**: Native PCM and float wave output MUST consume queued headers on device time through the session mixer. Pausing, restarting, resetting and breaking loops MUST preserve Wine 11's header flags, ordering and positions. The wave mapper's preferred device MUST be the one device counted.
 **Verification**: Test
 **Basis**: Wine 11 `dlls/winmm/waveform.c`.
 
@@ -891,9 +891,9 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 
 ### WINE-AUD-12 Native MIDI streams
 
-**Rule**: MIDI streams MUST sequence short, long, tempo and callback events on host time through the Wine stack's synthesizer. Pause, restart, stop, properties and position MUST retain Wine 11's results. Session idle deadlines MUST include native audio work.
+**Rule**: MIDI streams MUST sequence short, long, tempo and callback events on host time through the Wine stack's synthesizer. Pause, restart, stop and properties MUST retain Wine 11's results, and position MUST report SMPTE time under an SMPTE division. Session idle deadlines MUST include native audio work.
 **Verification**: Test
-**Basis**: Wine 11 `dlls/winmm/winmm.c`.
+**Basis**: Wine 11 `dlls/winmm/winmm.c`; Wine winmm `midi` test, which passes on Windows.
 
 ## Native XAudio2
 
