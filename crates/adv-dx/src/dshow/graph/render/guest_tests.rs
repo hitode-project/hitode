@@ -463,7 +463,18 @@ fn wave() -> Vec<u8> {
 #[test]
 // spec: MEDIA-GRAPH-3
 fn guest_render_builds_the_common_audio_pipeline_and_disconnect_returns_source_references() {
-    let (mut m, graph) = fixture(wave());
+    let media = adv_device::media::demux(movie()).unwrap();
+    let audio = media
+        .streams
+        .into_iter()
+        .find(|stream| matches!(stream.format, CodecFormat::Audio { .. }))
+        .unwrap();
+    let bytes = audio
+        .packets
+        .into_iter()
+        .flat_map(|packet| packet.data)
+        .collect();
+    let (mut m, graph) = fixture(bytes);
     let outcome = pin(&mut env(&mut m), graph, OUTPUT_PIN);
     assert_eq!(finish(&mut m, outcome), S_OK);
     let state = m.ext.get::<State>();
