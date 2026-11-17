@@ -67,6 +67,9 @@ pub mod api {
     pub const CHANGE_UNIQUENESS: u32 = 248;
     pub const SURFACE_CAPS: u32 = 249;
     pub const SURFACE_INITIALIZE: u32 = 250;
+    pub const ADD_ATTACHED: u32 = 251;
+    pub const DELETE_ATTACHED: u32 = 252;
+    pub const SET_SURFACE_DESC: u32 = 253;
 }
 
 pub const DEVICE_METHODS: &[&str] = &[
@@ -237,9 +240,14 @@ pub struct DirectDraw {
     /// Call id -> guest entry; 400 + slot and 500 + slot are the device and surface
     /// vtables' diagnostic entries.
     entries: BTreeMap<u32, u32>,
-    attached: BTreeMap<u32, u32>,
-    /// Each parent attachment retains one reference in the common COM table.
-    attached_refs: BTreeMap<u32, u32>,
+    /// Each surface's implicit chain successors: the next flip buffer or
+    /// mipmap level, created with the chain's root.
+    complex: BTreeMap<u32, Vec<u32>>,
+    /// Chain member -> its root and the interface the root holds a reference on.
+    members: BTreeMap<u32, (u32, u32)>,
+    /// Explicit attachments: each surface and the interface it was attached
+    /// through, which the parent holds a reference on.
+    attachments: BTreeMap<u32, Vec<(u32, u32)>>,
     /// The live DirectDraw object (its modern interface) that created the
     /// primary surface; none once that object is gone.
     primary_owner: Option<u32>,
@@ -252,9 +260,9 @@ pub struct DirectDraw {
     primary_origin: Option<(i32, i32)>,
     /// Surfaces lost to another DirectDraw object's exclusive mode.
     lost: BTreeSet<u32>,
-    /// Primaries whose chain has flipped an odd number of times, so the
-    /// front shows the back buffer's memory instead of GDI's.
-    flipped: BTreeSet<u32>,
+    /// Primary flip chains -> the member holding GDI's memory, which flips
+    /// move along the chain.
+    gdi: BTreeMap<u32, u32>,
 }
 
 impl DirectDraw {
@@ -280,15 +288,16 @@ impl DirectDraw {
             clipper_origins: BTreeMap::new(),
             clip_lists: BTreeMap::new(),
             entries,
-            attached: BTreeMap::new(),
-            attached_refs: BTreeMap::new(),
+            complex: BTreeMap::new(),
+            members: BTreeMap::new(),
+            attachments: BTreeMap::new(),
             primary_owner: None,
             exclusive_owner: None,
             next_device_id: 1,
             surface_owners: BTreeMap::new(),
             primary_origin: None,
             lost: BTreeSet::new(),
-            flipped: BTreeSet::new(),
+            gdi: BTreeMap::new(),
         }
     }
 
@@ -306,26 +315,122 @@ impl DirectDraw {
         Ok(())
     }
 
-    /// Exchanges the memory of `dst` and `src` and presents `dst`.
-    fn flip<P: Presenter>(
+    /// Move the memory of each flip `chain` surface to the one before it and
+    /// the front's memory to the last, then present the front.
+    fn rotate<P: Presenter>(
         &mut self,
         surfaces: &mut Surfaces<P>,
         m: &mut dyn SurfaceMemory,
-        dst: u32,
-        src: u32,
+        chain: &[u32],
     ) -> Result<u32, CallError> {
-        if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
+        if chain.iter().any(|&sid| surfaces[sid].locked.is_some()) {
             return Ok(BUSY);
         }
         surfaces.flush(m, surface::FlushReason::Immediate)?;
-        let front = surfaces[dst].pixels;
-        surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
-        surfaces.get_mut(src).unwrap().pixels = front;
-        if self.attached.get(&dst) == Some(&src) && !self.flipped.remove(&dst) {
-            self.flipped.insert(dst);
+        let front = surfaces[chain[0]].pixels;
+        for pair in chain.windows(2) {
+            surfaces.get_mut(pair[0]).unwrap().pixels = surfaces[pair[1]].pixels;
         }
-        self.present(surfaces, dst, m, surfaces[dst].rect())?;
+        surfaces.get_mut(*chain.last().unwrap()).unwrap().pixels = front;
+        if let Some(at) = self.gdi.get_mut(&chain[0])
+            && let Some(i) = chain.iter().position(|sid| sid == at)
+        {
+            *at = chain[(i + chain.len() - 1) % chain.len()];
+        }
+        self.present(surfaces, chain[0], m, surfaces[chain[0]].rect())?;
         Ok(0)
+    }
+
+    /// Create the chain `root` was described with: back buffers leading back
+    /// to the root, or smaller mipmap levels. False when an object could not
+    /// be made; the root's release then ends what was built.
+    #[allow(clippy::too_many_arguments)]
+    fn build_chain<P: Presenter>(
+        &mut self,
+        objects: &mut Objects,
+        surfaces: &mut Surfaces<P>,
+        m: &mut dyn SurfaceMemory,
+        root: u32,
+        d: creation::Described,
+        version: u8,
+        owner: u64,
+    ) -> Result<bool, CallError> {
+        use creation::*;
+        let (width, height, format) = {
+            let s = &surfaces[root];
+            (s.width, s.height, s.format)
+        };
+        let flip = d.caps[0] & FLIP != 0;
+        let mut levels = Vec::new();
+        if flip {
+            for i in 0..d.backbuffers {
+                let mut member = d;
+                member.caps[0] &= !(VISIBLE | PRIMARY | FRONTBUFFER | BACKBUFFER);
+                if i == 0 {
+                    member.caps[0] |= BACKBUFFER;
+                }
+                member.backbuffers = 0;
+                levels.push((width, height, member));
+            }
+        } else if d.caps[0] & MIPMAP != 0 {
+            for j in 1..d.mipmaps {
+                let mut member = d;
+                (member.width, member.height) = ((width >> j).max(1), (height >> j).max(1));
+                member.mipmaps = d.mipmaps - j;
+                member.caps[1] |= MIPMAP_SUBLEVEL;
+                levels.push((member.width, member.height, member));
+            }
+        }
+        let mut parent = root;
+        for (w, h, member) in levels {
+            let sid = surfaces.create(w, h, false, format, m)?;
+            let Some(p) = self.com_version(objects, surfaces, Kind::Surface(sid), version, m)?
+            else {
+                surfaces.delete(sid);
+                return Ok(false);
+            };
+            self.described.insert(sid, member);
+            self.surface_owners.insert(sid, owner);
+            self.members.insert(sid, (root, p));
+            self.complex.entry(parent).or_default().push(sid);
+            parent = sid;
+        }
+        if flip {
+            self.complex.entry(parent).or_default().push(root);
+        }
+        Ok(true)
+    }
+
+    /// The capabilities surface `sid` reports.
+    fn caps(&self, sid: u32) -> [u32; 4] {
+        self.described
+            .get(&sid)
+            .map_or([creation::OFFSCREEN_PLAIN, 0, 0, 0], |d| d.caps)
+    }
+
+    /// `front` and the surfaces its flip chain reaches before coming back.
+    fn flip_chain(&self, front: u32) -> Vec<u32> {
+        let mut chain = vec![front];
+        loop {
+            let at = *chain.last().unwrap();
+            let next = self.complex.get(&at).and_then(|next| {
+                next.iter()
+                    .copied()
+                    .find(|&sid| self.caps(sid)[0] & creation::FLIP != 0)
+            });
+            match next {
+                Some(next) if next == front => return chain,
+                Some(next) if !chain.contains(&next) => chain.push(next),
+                _ => return vec![front],
+            }
+        }
+    }
+
+    /// Surfaces attached to `sid`: its chain successors, then explicit ones.
+    fn attached(&self, sid: u32) -> Vec<u32> {
+        let implicit = self.complex.get(&sid).into_iter().flatten().copied();
+        let explicit = self.attachments.get(&sid).into_iter().flatten();
+        implicit.chain(explicit.map(|&(sid, _)| sid)).collect()
     }
 
     /// Surface `sid`'s descriptor as `len` bytes, with its pixels at `pixels`
@@ -775,10 +880,29 @@ impl DirectDraw {
                 self.surface_owners.remove(&sid);
                 self.page_locks.remove(&sid);
                 self.surface_dcs.retain(|_, &mut owner| owner != sid);
-                self.attached.remove(&sid);
-                self.flipped.remove(&sid);
-                if let Some(back) = self.attached_refs.remove(&sid) {
-                    self.release_com(objects, surfaces, back);
+                // A primary chain hands GDI's memory back to the primary.
+                if let Some(at) = self.gdi.remove(&sid)
+                    && at != sid
+                    && surfaces.get_mut(at).is_some()
+                {
+                    let front = surfaces[sid].pixels;
+                    surfaces.get_mut(sid).unwrap().pixels = surfaces[at].pixels;
+                    surfaces.get_mut(at).unwrap().pixels = front;
+                }
+                // The root ends its chain; explicit attachments are released.
+                self.complex.remove(&sid);
+                let held: Vec<u32> = self
+                    .members
+                    .iter()
+                    .filter(|&(_, &(root, _))| root == sid)
+                    .map(|(_, &(_, pointer))| pointer)
+                    .collect();
+                self.members.retain(|_, &mut (root, _)| root != sid);
+                for pointer in held {
+                    self.release_com(objects, surfaces, pointer);
+                }
+                for (_, pointer) in self.attachments.remove(&sid).unwrap_or_default() {
+                    self.release_com(objects, surfaces, pointer);
                 }
                 if let Some(clipper) = self.surface_clippers.remove(&sid) {
                     self.release_com(objects, surfaces, clipper);
@@ -788,9 +912,7 @@ impl DirectDraw {
                 if let Some(creator) = self.creators.remove(&sid) {
                     self.release_com(objects, surfaces, creator);
                 }
-                if surfaces.primary_id() != Some(sid)
-                    && !self.attached.values().any(|&other| other == sid)
-                {
+                if surfaces.primary_id() != Some(sid) && !self.members.contains_key(&sid) {
                     surfaces.delete(sid);
                 }
             }
@@ -799,17 +921,17 @@ impl DirectDraw {
     }
 }
 
-fn desc<P: Presenter>(surfaces: &Surfaces<P>, id: u32, pixels: u32) -> [u8; 124] {
+/// The display mode as the primary's descriptor, for GetDisplayMode.
+fn desc<P: Presenter>(surfaces: &Surfaces<P>, id: u32) -> [u8; 124] {
     let s = &surfaces[id];
     let mut d = [0u8; 124];
     let (r, g, b) = s.format.masks();
     for (offset, v) in [
         (0, 124),
-        (4, if pixels == 0 { 0x100f } else { 0x180f }),
+        (4, 0x100f),
         (8, s.height),
         (12, s.width),
         (16, s.pitch),
-        (36, pixels),
         (72, 32),
         (76, 0x40),
         (84, s.format.bytes() * 8),
@@ -1016,9 +1138,10 @@ impl DirectDraw {
                     com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
                     0
                 } else if a[2] & 0x11 == 0x11
-                    // DDSCL_NORMAL, alone or with DDSCL_ALLOWREBOOT,
+                    // DDSCL_NORMAL, alone or with DDSCL_FULLSCREEN, ALLOWREBOOT,
                     // NOWINDOWCHANGES, MULTITHREADED, FPUSETUP or FPUPRESERVE.
-                    || (a[2] & 8 != 0 && a[2] & !(8 | 2 | 4 | 0x400 | 0x800 | 0x1000) == 0)
+                    || (a[2] & 8 != 0
+                        && a[2] & !(8 | 1 | 2 | 4 | 0x400 | 0x800 | 0x1000) == 0)
                 {
                     let exclusive = a[2] & 0x11 == 0x11;
                     let device_state = com.get_mut::<ComState>(objects, a[0]).unwrap();
@@ -1045,7 +1168,7 @@ impl DirectDraw {
                         && let Some(sid) = surfaces.detach_primary()
                     {
                         if self.surface_objects.contains_key(&sid)
-                            || self.attached.values().any(|&other| other == sid)
+                            || self.members.contains_key(&sid)
                         {
                             self.lost.insert(sid);
                         } else {
@@ -1254,7 +1377,7 @@ impl DirectDraw {
                     return Ok(INVALID);
                 }
                 let sid = surfaces.primary(m)?;
-                let mut desc = desc(surfaces, sid, 0);
+                let mut desc = desc(surfaces, sid);
                 desc[..4].copy_from_slice(&len.to_le_bytes());
                 m.arg_write(a[1], &desc[..len as usize])?;
                 0
@@ -1313,65 +1436,45 @@ impl DirectDraw {
                 }
                 let primary = d.caps[0] & PRIMARY != 0;
                 let flip = d.caps[0] & FLIP != 0;
-                // Client memory, mipmap and cube chains, longer flip chains
-                // and offscreen flip chains are not built yet.
-                if d.flags & DDSD_LPSURFACE != 0
-                    || d.mipmaps > 1
-                    || d.caps[1] != 0
-                    || (flip && (!primary || d.backbuffers > 1))
-                {
+                // Cube maps belong to Direct3D textures, which are not built yet.
+                if d.caps[1] & CUBEMAP != 0 {
                     return Ok(UNSUPPORTED);
                 }
                 let owner_device_id = object.device_id;
                 let owner_modern = object.modern;
                 let surface_version = surface_version(version);
+                let format = storage(&d.format).expect("validated format");
                 let sid = if primary {
                     let primary = surfaces.primary(m)?;
-                    self.primary_owner = Some(owner_modern);
-                    if flip {
-                        if self.attached.contains_key(&primary) {
-                            return Ok(BUSY);
-                        }
-                        let back = surfaces.create(
-                            surfaces.width,
-                            surfaces.height,
-                            false,
-                            surfaces.display_format,
-                            m,
-                        )?;
-                        let Some(back_ref) = self.com_version(
-                            objects,
-                            surfaces,
-                            Kind::Surface(back),
-                            surface_version,
-                            m,
-                        )?
-                        else {
-                            surfaces.delete(back);
-                            return Ok(0x8007000e);
-                        };
-                        let mut back_desc = d;
-                        back_desc.caps[0] =
-                            d.caps[0] & !(VISIBLE | PRIMARY | FRONTBUFFER) | BACKBUFFER;
-                        back_desc.backbuffers = 0;
-                        self.described.insert(back, back_desc);
-                        self.surface_owners.insert(back, owner_device_id);
-                        self.attached.insert(primary, back);
-                        self.attached_refs.insert(primary, back_ref);
-                        self.flipped.remove(&primary);
+                    if flip && self.complex.contains_key(&primary) {
+                        return Ok(BUSY);
                     }
+                    self.primary_owner = Some(owner_modern);
                     primary
+                } else if d.flags & DDSD_LPSURFACE != 0 {
+                    let memory = adv_device::surface::Surface {
+                        pixels: d.memory,
+                        width: d.width,
+                        height: d.height,
+                        pitch: d.pitch,
+                        bottom_up: false,
+                        locked: None,
+                        version: 0,
+                        format,
+                        palette: None,
+                    };
+                    match surfaces.import_guest(memory, m) {
+                        Ok(sid) => sid,
+                        Err(_) => return Ok(INVALID),
+                    }
                 } else {
-                    let format = storage(&d.format).expect("validated format");
                     surfaces.create(d.width, d.height, false, format, m)?
                 };
+                // Like Windows, the kept descriptor has no client address.
+                d.flags &= !DDSD_LPSURFACE;
                 let Some(p) =
                     self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m)?
                 else {
-                    self.attached.remove(&sid);
-                    if let Some(back) = self.attached_refs.remove(&sid) {
-                        self.release_com(objects, surfaces, back);
-                    }
                     if surfaces.primary_id() != Some(sid) {
                         surfaces.delete(sid);
                     }
@@ -1391,6 +1494,23 @@ impl DirectDraw {
                         return Ok(0x8007000e);
                     }
                     self.creators.insert(sid, a[0]);
+                }
+                let built = self.build_chain(
+                    objects,
+                    surfaces,
+                    m,
+                    sid,
+                    d,
+                    surface_version,
+                    owner_device_id,
+                );
+                if !matches!(built, Ok(true)) {
+                    self.release_com(objects, surfaces, p);
+                    built?;
+                    return Ok(0x8007000e);
+                }
+                if primary && flip {
+                    self.gdi.insert(sid, sid);
                 }
                 m.arg_put_u32(a[2], p)?;
                 0
@@ -1506,10 +1626,7 @@ impl DirectDraw {
                 else {
                     return Ok(NOT_FOUND);
                 };
-                let sid = match self.attached.get(&primary) {
-                    Some(&back) if self.flipped.contains(&primary) => back,
-                    _ => primary,
-                };
+                let sid = self.gdi.get(&primary).copied().unwrap_or(primary);
                 let Some(pointer) =
                     self.surface_interface(objects, surfaces, sid, surface_version(version), m)?
                 else {
@@ -1646,11 +1763,25 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                let Some(&back) = self.attached.get(&sid) else {
+                if self.lost.contains(&sid) {
+                    return Ok(SURFACE_LOST);
+                }
+                // DirectDraw7 also matches DDSCAPS2; earlier versions pass junk there.
+                let want = m.arg_u32(a[1])?;
+                let want2 = if version == 7 {
+                    m.arg_u32(a[1] + 4)?
+                } else {
+                    0
+                };
+                let found = self.attached(sid).into_iter().find(|&other| {
+                    let caps = self.caps(other);
+                    caps[0] & want == want && caps[1] & want2 == want2
+                });
+                let Some(found) = found else {
                     return Ok(NOT_FOUND);
                 };
                 let Some(p) =
-                    self.com_version(objects, surfaces, Kind::Surface(back), version, m)?
+                    self.com_version(objects, surfaces, Kind::Surface(found), version, m)?
                 else {
                     return Ok(0x8007000e);
                 };
@@ -1658,16 +1789,169 @@ impl DirectDraw {
                 0
             }
             api::FLIP => {
+                use creation::*;
                 let Some(dst) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                let src = if a[1] != 0 {
-                    self.surface_id(objects, a[1])
-                } else {
-                    self.attached.get(&dst).copied()
+                let target = match a[1] {
+                    0 => None,
+                    p => match self.surface_id(objects, p) {
+                        Some(target) => Some(target),
+                        None => return Ok(INVALID),
+                    },
                 };
-                let Some(src) = src else { return Ok(INVALID) };
-                self.flip(surfaces, m, dst, src)?
+                let caps = self.caps(dst)[0];
+                if a[1] == a[0] || caps & (FRONTBUFFER | OVERLAY) == 0 {
+                    return Ok(NOT_FLIPPABLE);
+                }
+                if self.lost.contains(&dst) {
+                    return Ok(SURFACE_LOST);
+                }
+                if caps & PRIMARY != 0
+                    && self.exclusive_owner != self.surface_owners.get(&dst).copied()
+                {
+                    return Ok(NO_EXCLUSIVE_MODE);
+                }
+                let chain = self.flip_chain(dst);
+                match target {
+                    Some(target) if !chain[1..].contains(&target) => NOT_FLIPPABLE,
+                    Some(target) => self.rotate(surfaces, m, &[dst, target])?,
+                    None if chain.len() < 2 => NOT_FLIPPABLE,
+                    None => self.rotate(surfaces, m, &chain)?,
+                }
+            }
+            api::ADD_ATTACHED => {
+                use creation::*;
+                let (Some(sid), Some(child)) = (
+                    self.surface_id(objects, a[0]),
+                    self.surface_id(objects, a[1]),
+                ) else {
+                    return Ok(INVALID);
+                };
+                let (parent_caps, child_caps) = (self.caps(sid)[0], self.caps(child)[0]);
+                let z = child_caps & ZBUFFER != 0;
+                let plain = PRIMARY | OFFSCREEN_PLAIN;
+                // DirectDraw7 attaches only Z buffers; earlier versions also
+                // attach plain surfaces to each other, all of the same size.
+                let allowed = if version == 7 {
+                    z
+                } else {
+                    (parent_caps & plain != 0 && child_caps & plain != 0)
+                        || (parent_caps & (PRIMARY | THREE_D_DEVICE) != 0 && z)
+                };
+                let same_size = (surfaces[sid].width, surfaces[sid].height)
+                    == (surfaces[child].width, surfaces[child].height);
+                if sid == child || !allowed || !same_size {
+                    return Ok(CANNOT_ATTACH);
+                }
+                if let Some(&(_, through)) = self
+                    .attachments
+                    .get(&sid)
+                    .into_iter()
+                    .flatten()
+                    .find(|&&(other, _)| other == child)
+                {
+                    return Ok(if through == a[1] {
+                        ALREADY_ATTACHED
+                    } else {
+                        CANNOT_ATTACH
+                    });
+                }
+                if com.add_ref::<ComState>(objects, a[1]).is_none() {
+                    return Ok(0x8007000e);
+                }
+                self.attachments.entry(sid).or_default().push((child, a[1]));
+                0
+            }
+            api::DELETE_ATTACHED => {
+                use creation::*;
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                let child = (a[2] != 0)
+                    .then(|| self.surface_id(objects, a[2]))
+                    .flatten();
+                let list = self.attachments.entry(sid).or_default();
+                let Some(i) = list.iter().position(|&(other, _)| Some(other) == child) else {
+                    return Ok(CANNOT_DETACH);
+                };
+                if list[i].1 != a[2] {
+                    return Ok(NOT_ATTACHED);
+                }
+                let (_, through) = list.remove(i);
+                if list.is_empty() {
+                    self.attachments.remove(&sid);
+                }
+                self.release_com(objects, surfaces, through);
+                0
+            }
+            api::SET_SURFACE_DESC => {
+                use creation::*;
+                let Some(sid) = self.surface_id(objects, a[0]) else {
+                    return Ok(INVALID);
+                };
+                if a[1] == 0 || a[2] != 0 {
+                    return Ok(INVALID);
+                }
+                let caps = self.caps(sid);
+                if caps[0] & SYSTEM_MEMORY == 0 || caps[0] & PRIMARY != 0 || caps[1] & MANAGED != 0
+                {
+                    return Ok(INVALID_SURFACE_TYPE);
+                }
+                let r = Described::read(m, a[1], if legacy { 108 } else { 124 })?;
+                let allowed = DDSD_LPSURFACE
+                    | DDSD_PIXELFORMAT
+                    | DDSD_WIDTH
+                    | DDSD_HEIGHT
+                    | DDSD_PITCH
+                    | DDSD_CAPS;
+                if r.flags & !allowed != 0 || r.flags & DDSD_LPSURFACE == 0 || r.memory == 0 {
+                    return Ok(INVALID);
+                }
+                if r.flags & DDSD_CAPS != 0 && r.caps[0] != 0 {
+                    return Ok(INVALID_CAPS);
+                }
+                let s = &surfaces[sid];
+                let (mut width, mut height, mut pitch, mut format) =
+                    (s.width, s.height, s.pitch, s.format);
+                if r.flags & DDSD_WIDTH != 0 {
+                    if r.flags & DDSD_PITCH == 0
+                        || r.width == 0
+                        || r.pitch as i32 <= 0
+                        || r.pitch & 3 != 0
+                    {
+                        return Ok(INVALID);
+                    }
+                    (width, pitch) = (r.width, r.pitch);
+                } else if r.flags & DDSD_PITCH != 0 {
+                    return Ok(INVALID);
+                }
+                if r.flags & DDSD_HEIGHT != 0 {
+                    if r.height == 0 {
+                        return Ok(INVALID);
+                    }
+                    height = r.height;
+                }
+                if r.flags & DDSD_PIXELFORMAT != 0 {
+                    match storage(&r.format) {
+                        Some(new) => format = new,
+                        None => return Ok(INVALID),
+                    }
+                }
+                surfaces.flush(m, surface::FlushReason::Immediate)?;
+                if surfaces
+                    .rebind(sid, r.memory, (width, height, pitch), format, m)
+                    .is_err()
+                {
+                    return Ok(INVALID);
+                }
+                if let Some(d) = self.described.get_mut(&sid) {
+                    (d.width, d.height) = (width, height);
+                    if r.flags & DDSD_PIXELFORMAT != 0 {
+                        d.format = r.format;
+                    }
+                }
+                0
             }
             api::FLIP_TO_GDI => {
                 // The GDI surface is the front buffer the primary was created
@@ -1679,10 +1963,8 @@ impl DirectDraw {
                 else {
                     return Ok(NOT_FOUND);
                 };
-                match self.attached.get(&primary) {
-                    Some(&back) if self.flipped.contains(&primary) => {
-                        self.flip(surfaces, m, primary, back)?
-                    }
+                match self.gdi.get(&primary) {
+                    Some(&at) if at != primary => self.rotate(surfaces, m, &[primary, at])?,
                     _ => 0,
                 }
             }

@@ -92,6 +92,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Wine ddraw `ddraw1`–`ddraw7` and `dsurface` tests, which pass on Windows.
 
+### GFX-DDRAW-16 Attached surfaces
+
+**Rule**: Complex surfaces MUST build Windows's flip rings and halving mipmap chains, owned by the root and found by capability. `Flip` MUST rotate memory along the ring or swap with a reachable target. Attaching, detaching, enumeration and guest-memory surfaces, including `SetSurfaceDesc`, MUST follow Windows's checks and references.
+**Verification**: Test
+**Basis**: Wine ddraw `ddraw1`–`ddraw7` tests, which pass on Windows.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

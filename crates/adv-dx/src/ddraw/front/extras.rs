@@ -337,14 +337,8 @@ fn evaluate_mode(
 }
 
 #[win32(ddraw, name = "IDirectDrawSurface7::AddAttachedSurface", level = implement)]
-fn add_attached_surface(env: &mut Env<'_>, this: GuestPtr<()>, _attached: GuestPtr<()>) -> Outcome {
-    unavailable_surface(
-        env,
-        this,
-        "IDirectDrawSurface7::AddAttachedSurface",
-        "attaching arbitrary DirectDraw surfaces is unsupported",
-        None,
-    )
+fn add_attached_surface(env: &mut Env<'_>, this: GuestPtr<()>, attached: GuestPtr<()>) -> Outcome {
+    call(env, api::ADD_ATTACHED, &[this.addr(), attached.addr()])
 }
 
 #[win32(ddraw, name = "IDirectDrawSurface7::AddOverlayDirtyRect", level = implement)]
@@ -379,31 +373,97 @@ fn blt_batch(
 fn delete_attached_surface(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
-    _flags: u32,
-    _attached: GuestPtr<()>,
+    flags: u32,
+    attached: GuestPtr<()>,
 ) -> Outcome {
-    unavailable_surface(
+    call(
         env,
-        this,
-        "IDirectDrawSurface7::DeleteAttachedSurface",
-        "detaching DirectDraw surfaces is unsupported",
-        None,
+        api::DELETE_ATTACHED,
+        &[this.addr(), flags, attached.addr()],
     )
 }
 
-#[win32(ddraw, name = "IDirectDrawSurface7::EnumAttachedSurfaces", level = implement)]
+#[win32(ddraw, name = "IDirectDrawSurface7::EnumAttachedSurfaces", level = state)]
 fn enum_attached_surfaces(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
-    _context: GuestPtr<()>,
-    _callback: GuestPtr<()>,
+    context: GuestPtr<()>,
+    callback: GuestPtr<()>,
 ) -> Outcome {
-    unavailable_surface(
+    let draw = &env.ext.get::<State>().draw;
+    let Some(com) = draw.com else {
+        return Outcome::Return(INVALID);
+    };
+    let (Some(sid), Some(object)) = (
+        draw.surface_id(&env.sys.objects, this.addr()),
+        com.get::<ComState>(&env.sys.objects, this.addr()),
+    ) else {
+        return Outcome::Return(INVALID);
+    };
+    if callback.is_null() {
+        return Outcome::Return(INVALID);
+    }
+    let version = object.version(this.addr());
+    let length = if version < 4 { 108 } else { 124 };
+    let attached = draw.attached(sid);
+    let Some(scratch) = env
+        .cpu
+        .reg(adv_cpu::backend::Reg::Esp)
+        .checked_sub(length)
+        .map(|p| p & !3)
+    else {
+        return Outcome::Return(INVALID);
+    };
+    next_attached(
         env,
-        this,
-        "IDirectDrawSurface7::EnumAttachedSurfaces",
-        "DirectDraw attached surface enumeration is unsupported",
-        None,
+        attached.into_iter(),
+        (version, length),
+        callback.addr(),
+        context.addr(),
+        scratch,
+    )
+}
+
+/// Hand the next attached surface to the guest callback, which owns the
+/// reference it receives; a zero return ends the enumeration.
+fn next_attached(
+    env: &mut Env<'_>,
+    mut attached: std::vec::IntoIter<u32>,
+    (version, length): (u8, u32),
+    callback: u32,
+    context: u32,
+    scratch: u32,
+) -> Outcome {
+    let Some(sid) = attached.next() else {
+        return Outcome::Return(0);
+    };
+    let provider = env.ext.get::<State>().provider;
+    let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
+    let desc = state.draw.describe(store, sid, length, 0);
+    let mut mem = (provider.memory)(env.cpu);
+    let pointer =
+        match state
+            .draw
+            .surface_interface(&mut env.sys.objects, store, sid, version, &mut mem)
+        {
+            Ok(Some(pointer)) => pointer,
+            Ok(None) => return Outcome::Return(0x8007000e),
+            Err(error) => return error.outcome(env),
+        };
+    if env.cpu.write(scratch, &desc).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    Outcome::call_on_stack(
+        callback,
+        [pointer, scratch, context],
+        scratch,
+        move |env, returned| {
+            if returned.value() == 0 {
+                Outcome::Return(0)
+            } else {
+                next_attached(env, attached, (version, length), callback, context, scratch)
+            }
+        },
     )
 }
 
@@ -523,15 +583,13 @@ fn update_overlay_z_order(
 fn set_surface_desc(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
-    _desc: GuestPtr<()>,
-    _flags: u32,
+    desc: GuestPtr<()>,
+    flags: u32,
 ) -> Outcome {
-    unavailable_surface(
+    call(
         env,
-        this,
-        "IDirectDrawSurface7::SetSurfaceDesc",
-        "mutating surface backing memory via SetSurfaceDesc is unsupported",
-        None,
+        api::SET_SURFACE_DESC,
+        &[this.addr(), desc.addr(), flags],
     )
 }
 

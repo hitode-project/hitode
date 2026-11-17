@@ -81,7 +81,8 @@ impl Fixture {
             #[cfg(feature = "gpu")]
             capture,
             objects,
-            memory: Memory(vec![0; 65536]),
+            // Past the surface arena's end, 0x10000.. is client memory.
+            memory: Memory(vec![0; 0x20000]),
             surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
             ddraw: DirectDraw::new(
                 adv_dx::ddraw::front::BINDINGS
@@ -259,6 +260,131 @@ fn attached_surface_has_stable_identity_and_parent_retains_it_until_release() {
     assert_eq!(f.dd(dd::RELEASE, &[parent]), 0);
     assert_eq!(f.objects.object_count(), 1);
     assert_eq!(f.dd(dd::ADDREF, &[first]), 0x80070057);
+}
+
+impl Fixture {
+    /// Create a surface from (offset, value) descriptor words.
+    fn create(&mut self, words: &[(usize, u32)]) -> u32 {
+        let mut desc = [0u8; 124];
+        desc[..4].copy_from_slice(&124u32.to_le_bytes());
+        for &(at, value) in words {
+            desc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        self.memory.write(64, &desc).unwrap();
+        assert_eq!(self.dd(dd::CREATE_SURFACE, &[self.device, 64, 32, 0]), 0);
+        self.memory.u32(32).unwrap()
+    }
+    /// The surface attached to `surface` with capabilities `caps`.
+    fn attached(&mut self, surface: u32, caps: u32) -> u32 {
+        self.memory.write(256, &[0; 16]).unwrap();
+        self.memory.put_u32(256, caps).unwrap();
+        assert_eq!(self.dd(dd::GET_ATTACHED, &[surface, 256, 32]), 0);
+        self.memory.u32(32).unwrap()
+    }
+    /// Lock `surface` and return its descriptor's flags, width and address.
+    fn locked(&mut self, surface: u32) -> (u32, u32, u32) {
+        self.memory.put_u32(512, 124).unwrap();
+        assert_eq!(self.dd(dd::LOCK, &[surface, 0, 512, 0, 0]), 0);
+        assert_eq!(self.dd(dd::UNLOCK, &[surface, 0]), 0);
+        let word = |f: &Self, at: u32| f.memory.u32(512 + at).unwrap();
+        (word(self, 4), word(self, 12), word(self, 36))
+    }
+}
+
+// spec: GFX-DDRAW-16
+#[test]
+fn flip_chains_rotate_memory_and_mipmap_levels_halve() {
+    let mut f = Fixture::new();
+    assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 7, 0x11]), 0);
+    // A primary with two back buffers forms a ring back to the front.
+    let front = f.create(&[(4, 0x21), (20, 2), (104, 0x218)]);
+    let first = f.attached(front, 4);
+    let second = f.attached(first, 0x10);
+    assert_eq!(f.attached(second, 0x10), front);
+    assert_eq!(f.dd(dd::RELEASE, &[front]), 1);
+    let memory = [front, first, second].map(|s| f.locked(s).2);
+    assert_eq!(f.dd(dd::FLIP, &[front, 0, 1]), 0);
+    let flipped = [front, first, second].map(|s| f.locked(s).2);
+    assert_eq!(flipped, [memory[1], memory[2], memory[0]]);
+    assert_eq!(f.dd(dd::FLIP, &[front, second, 1]), 0);
+    assert_eq!(f.locked(front).2, memory[0]);
+    assert_eq!(f.locked(second).2, memory[1]);
+    assert_eq!(f.dd(dd::FLIP, &[front, front, 1]), 0x8876_0246);
+    assert_eq!(f.dd(dd::FLIP, &[first, 0, 1]), 0x8876_0246);
+    for surface in [first, second] {
+        assert_eq!(f.dd(dd::RELEASE, &[surface]), 1);
+    }
+    assert_eq!(f.dd(dd::RELEASE, &[front]), 0);
+    assert_eq!(f.objects.object_count(), 1);
+
+    // Three mipmap levels, each half the last and owned by the top level.
+    let top = f.create(&[(4, 0x2_0007), (8, 8), (12, 8), (104, 0x40_1808), (24, 3)]);
+    let level = f.attached(top, 0x40_0000);
+    assert_eq!(f.locked(level).1, 4);
+    let last = f.attached(level, 0x40_0000);
+    assert_eq!(f.locked(last).1, 2);
+    f.memory.write(256, &[0; 16]).unwrap();
+    f.memory.put_u32(256, 0x40_0000).unwrap();
+    assert_eq!(f.dd(dd::GET_ATTACHED, &[last, 256, 32]), 0x8876_00ff);
+    assert_eq!(f.memory.u32(32).unwrap(), 0);
+    for surface in [level, last] {
+        assert_eq!(f.dd(dd::RELEASE, &[surface]), 1);
+    }
+    assert_eq!(f.dd(dd::RELEASE, &[top]), 0);
+    assert_eq!(f.objects.object_count(), 1);
+}
+
+// spec: GFX-DDRAW-16
+#[test]
+fn attachments_and_client_memory_follow_windows_rules() {
+    let mut f = Fixture::new();
+    let (plain, _, _) = f.surface(4, 4, PixelFormat::Bgra32, false);
+    let (other, _, _) = f.surface(4, 4, PixelFormat::Bgra32, false);
+    // DirectDraw7 attaches only Z buffers of the parent's size.
+    assert_eq!(f.dd(dd::ADD_ATTACHED, &[plain, other]), 0x8876_000a);
+    let small = f.create(&[(4, 7), (8, 2), (12, 2), (104, 0x2_0000)]);
+    assert_eq!(f.dd(dd::ADD_ATTACHED, &[plain, small]), 0x8876_000a);
+    let z = f.create(&[(4, 7), (8, 4), (12, 4), (104, 0x2_0000)]);
+    assert_eq!(f.dd(dd::ADD_ATTACHED, &[plain, z]), 0);
+    assert_eq!(f.dd(dd::ADD_ATTACHED, &[plain, z]), 0x8876_019a);
+    assert_eq!(f.attached(plain, 0x2_0000), z);
+    assert_eq!(f.dd(dd::RELEASE, &[z]), 2);
+    assert_eq!(f.dd(dd::DELETE_ATTACHED, &[plain, 0, 0]), 0x8876_0014);
+    assert_eq!(f.dd(dd::DELETE_ATTACHED, &[plain, 0, small]), 0x8876_0014);
+    assert_eq!(f.dd(dd::RELEASE, &[z]), 1);
+    assert_eq!(f.dd(dd::DELETE_ATTACHED, &[plain, 0, z]), 0);
+    assert_eq!(f.dd(dd::ADDREF, &[z]), 0x8007_0057);
+
+    // A client-memory surface locks at that memory but never reports it.
+    let client = f.create(&[
+        (4, 0x180f),
+        (8, 2),
+        (12, 2),
+        (16, 8),
+        (36, 0x1_0000),
+        (76, 0x40),
+        (84, 32),
+        (88, 0xff_0000),
+        (92, 0xff00),
+        (96, 0xff),
+        (104, 0x840),
+    ]);
+    let (flags, _, address) = f.locked(client);
+    assert_eq!((flags & 0x800, address), (0, 0x1_0000));
+    // SetSurfaceDesc moves it to other client memory and layout.
+    f.memory.write(64, &[0; 124]).unwrap();
+    for (at, value) in [(0, 124), (4, 0x80c), (12, 3), (16, 16), (36, 0x1_8000)] {
+        f.memory.put_u32(64 + at, value).unwrap();
+    }
+    assert_eq!(f.dd(dd::SET_SURFACE_DESC, &[client, 64, 1]), 0x8007_0057);
+    assert_eq!(f.dd(dd::SET_SURFACE_DESC, &[client, 64, 0]), 0);
+    assert_eq!(f.locked(client), (0x100f, 3, 0x1_8000));
+    // Video-memory surfaces keep their storage.
+    assert_eq!(f.dd(dd::SET_SURFACE_DESC, &[plain, 64, 0]), 0x8876_0250);
+    for surface in [client, small, other, plain] {
+        assert_eq!(f.dd(dd::RELEASE, &[surface]), 0);
+    }
+    assert_eq!(f.objects.object_count(), 1);
 }
 
 #[test]
