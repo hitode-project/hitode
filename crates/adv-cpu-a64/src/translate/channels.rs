@@ -233,24 +233,23 @@ impl Translator<'_> {
         }
     }
 
-    /// The entire range, including the scalar tail, must stay in one directly
-    /// accessible guest page. The snapshot includes host-page intersections.
+    /// Both bounding pages must stay within 4 GiB and allow ordinary access.
+    /// The snapshot includes host-page intersections.
     fn channel_range(&mut self, address: Reg, bytes: u32, store: bool, scalar: Label) {
+        let perm = if store { WRITE } else { READ }.trailing_zeros();
         self.emit_all(&[
             add_imm(X, X3, address, bytes - 1, false),
-            eor(X, X4, X3, address, Lsl, 0),
+            lsr_imm(W, X4, address, 12),
         ]);
-        self.asm.tbz(true, X4, 12, scalar);
+        self.asm.tbz(true, X3, 32, scalar);
         self.emit_all(&[
-            lsr_imm(W, X3, address, 12),
-            ldr_narrow(Narrow::Byte, X4, X5, X3),
+            ldr_narrow(Narrow::Byte, X4, X5, X4),
+            lsr_imm(W, X3, X3, 12),
+            ldr_narrow(Narrow::Byte, X3, X5, X3),
+            and(W, X17, X4, X3, Lsl, 0),
+            orr(W, X4, X4, X3, Lsl, 0),
         ]);
-        self.asm.tbz(
-            false,
-            X4,
-            if store { WRITE } else { READ }.trailing_zeros(),
-            scalar,
-        );
+        self.asm.tbz(false, X17, perm, scalar);
         for bit in [SHARED].into_iter().chain(store.then_some(EXEC)) {
             self.asm.tbz(true, X4, bit.trailing_zeros(), scalar);
         }

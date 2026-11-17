@@ -1513,6 +1513,74 @@ fn j1_sse_reuses_mxcsr_and_pe_checks_until_a_control_write() {
     }
 }
 
+// spec: A64-CTL-7, A64-TR-5, A64-REG-5, A64F-FP-4
+#[test]
+fn j1_forward_internal_jcc_inlines_and_peeled_mmx_loop_minimizes_guards() {
+    let branch_pc = CODE + bytes(|a| a.test(ecx, 1).unwrap()).len() as u32;
+    let branching_loop = bytes(|a| {
+        let (mut top, mut skip) = (a.create_label(), a.create_label());
+        a.set_label(&mut top).unwrap();
+        a.test(ecx, 1).unwrap();
+        a.jz(skip).unwrap();
+        a.add(eax, 3).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.add(ebx, 1).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let work = j1_unit(&branching_loop);
+    assert!(
+        !work
+            .marks()
+            .iter()
+            .any(|mark| mark.part == Part::Cold && mark.eip == branch_pc),
+        "forward internal jcc should inline instead of hopping through Cold::Edge"
+    );
+
+    let mmx_loop = bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.paddw(mm0, qword_ptr(edi)).unwrap();
+        a.movq(qword_ptr(ebx), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.add(ebx, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.mov(eax, eax).unwrap();
+    });
+    let work = j1_unit(&mmx_loop);
+    let marks = work.marks();
+    let hot = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
+    let warm_head_offset = hot
+        .iter()
+        .rfind(|m| m.part == Part::Body && m.eip == CODE)
+        .expect("peeled loop should emit a steady-state warm copy of the head")
+        .offset;
+    assert!(
+        !hot.iter().any(|m| m.part == Part::SimdLoad),
+        "peeled write-first loop must eliminate SimdLoad from entry and backedge"
+    );
+    assert_eq!(
+        hot.iter().filter(|m| m.part == Part::SimdGuard).count(),
+        2,
+        "peeled entry emits one SimdGuard pre-check and one TOP/tag clear"
+    );
+    assert!(
+        !hot.iter()
+            .any(|m| m.part == Part::SimdGuard && m.offset >= warm_head_offset),
+        "steady-state warm loop must not re-check x87/mmx guard; warm_head_offset={warm_head_offset} hot={hot:?}"
+    );
+    let warm_end_pc = hot.last().unwrap().eip;
+    assert!(
+        !hot.iter().any(|m| m.part == Part::SimdPublish
+            && m.offset >= warm_head_offset
+            && m.eip != warm_end_pc),
+        "peeled steady-state backedge must keep MMX resident until loop exit"
+    );
+}
+
 // spec: A64-TR-9 A64-CTL-8
 #[test]
 #[cfg(native)]

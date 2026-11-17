@@ -128,8 +128,23 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
+    let whole = format::covers(rectangle, &target.image);
     let state = env.ext.get_mut::<State>();
-    let Some((pixels, pitch)) = format::snapshot(
+    let probe = if whole {
+        format::sample_probe(
+            env.cpu,
+            &mut state.upload_scratch,
+            (format, address, pitch),
+            (rectangle.w, rectangle.h),
+        )
+    } else {
+        None
+    };
+    let hash_whole = match (selected.upload_probe, probe) {
+        (Some(prev), Some(now)) => prev == now,
+        _ => true,
+    };
+    let Some((pixels, pitch)) = format::snapshot_with_hash(
         env.cpu,
         state.gpu.as_mut().unwrap(),
         &mut state.upload_admission,
@@ -137,6 +152,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
         (format, address, pitch),
         (rectangle.w, rectangle.h),
         (&target.image, rectangle),
+        hash_whole,
     ) else {
         return Outcome::Return(INVALID);
     };
@@ -144,6 +160,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
         // Clear before submission so a later AddDirtyRect cannot be erased by
         // this upload's completion. Its original bytes already belong to the op.
         r.levels[index as usize].dirty = None;
+        r.levels[index as usize].upload_probe = if whole { probe } else { None };
         r.levels[index as usize].lock = Some(Lock {
             rectangle,
             flags: 0,
@@ -172,6 +189,7 @@ fn uploaded(env: &mut Env<'_>, id: Id, index: u32, rectangle: Rect, outcome: Out
             if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id)
             {
                 r.levels[index as usize].mark(rectangle);
+                r.levels[index as usize].upload_probe = None;
                 r.levels[index as usize].lock = None;
             }
             Outcome::Return(error)

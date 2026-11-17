@@ -739,6 +739,14 @@ impl Vector {
             ..Self::default()
         }
     }
+
+    pub(super) fn entry(self) -> Entry {
+        Entry {
+            regs: u16::from(self.mmx) | u16::from(self.xmm) << 8,
+            dirty: self.dirty,
+            guards: self.guards,
+        }
+    }
 }
 
 fn vmem(bytes: u8) -> VMem {

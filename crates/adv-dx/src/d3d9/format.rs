@@ -45,6 +45,38 @@ pub(super) fn covers(rectangle: Rect, image: &Image) -> bool {
         && rectangle.h == image.height()
 }
 
+/// Sparse content probe over whole uploads larger than 4 KiB; matching probes
+/// gate the full `xxh3` pass in `dirty::next` without risking false matches.
+pub(super) fn sample_probe(
+    cpu: &dyn adv_cpu::backend::Guest,
+    scratch: &mut Vec<u8>,
+    (format, address, pitch): (u32, u32, u32),
+    (width, height): (u32, u32),
+) -> Option<u128> {
+    let row_bytes = self::pitch(format, width)?;
+    if row_bytes.checked_mul(height)? <= 4096 || height == 0 {
+        return None;
+    }
+    let slice_len = row_bytes.min(32);
+    let mut hash = Xxh3::new();
+    use std::hash::Hash;
+    (format, row_bytes, height).hash(&mut hash);
+    for k in 0..8u32 {
+        let y = if height > 1 { k * (height - 1) / 7 } else { 0 };
+        let x = k * row_bytes.saturating_sub(slice_len) / 7;
+        let at = address + y * pitch + x;
+        let slice = if let Some(slice) = cpu.shared_bytes(at, slice_len as usize) {
+            slice
+        } else {
+            scratch.resize(slice_len as usize, 0);
+            cpu.read(at, scratch).ok()?;
+            scratch.as_slice()
+        };
+        hash.update(slice);
+    }
+    Some(hash.digest128())
+}
+
 /// Snapshot admitted guest rows for `destination`, staging them unconverted
 /// when its image stores the guest format and expanding to BGRA8 otherwise.
 /// The caller has checked that the complete source rectangle is readable.
@@ -57,9 +89,31 @@ pub(super) fn snapshot(
     size: (u32, u32),
     destination: (&Image, Rect),
 ) -> Option<(super::Pixels, u32)> {
+    snapshot_with_hash(
+        cpu,
+        gpu,
+        admission,
+        scratch,
+        source,
+        size,
+        destination,
+        true,
+    )
+}
+
+pub(super) fn snapshot_with_hash(
+    cpu: &dyn adv_cpu::backend::Guest,
+    gpu: &mut adv_device::gpu::Gpu,
+    admission: &mut u64,
+    scratch: &mut Vec<u8>,
+    source: (u32, u32, u32),
+    size: (u32, u32),
+    destination: (&Image, Rect),
+    hash_whole: bool,
+) -> Option<(super::Pixels, u32)> {
     let (format, address, pitch) = source;
     let (width, height) = size;
-    let whole = covers(destination.1, destination.0);
+    let whole = hash_whole && covers(destination.1, destination.0);
     let mut key = |hash: Option<Xxh3>| match hash {
         Some(hash) => UploadKey::Content(hash.digest128()),
         None => {
@@ -74,10 +128,12 @@ pub(super) fn snapshot(
             && let Some(total) = row_bytes.checked_mul(height)
             && let Some(all) = cpu.shared_bytes(address, total as usize)
         {
-            if let Some(hash) = &mut hash {
-                hash.update(all);
-            }
-            let staged = gpu.stage_bytes(row_bytes, height, all).ok()?;
+            let staged = if let Some(hash) = &mut hash {
+                gpu.stage_bytes_with(row_bytes, height, all, |chunk| hash.update(chunk))
+                    .ok()?
+            } else {
+                gpu.stage_bytes(row_bytes, height, all).ok()?
+            };
             let pitch = staged.pitch();
             return Some((super::Pixels::Staged(staged, key(hash)), pitch));
         }

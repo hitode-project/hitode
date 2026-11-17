@@ -320,6 +320,10 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
 #[test]
 fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
     let mut f = fixture();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
     let d = f.device;
     let shader = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, 0xa0e40000, 0xffff]);
     let output = f.packet(0u32);
@@ -1922,4 +1926,131 @@ fn d3d9_package_b_query_rejects_invalid_issue_and_data_arguments() {
     }
     assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0xa5a5a5a5);
     f.okay("IDirect3DQuery9::GetData", &[q, 0, 0, 0]);
+}
+
+// spec: GFX-REC-7, GFX-REC-2
+#[test]
+fn large_texture_probe_gates_full_hashing_and_preserves_frame_elimination() {
+    use adv_abi::types::D3DLOCKED_RECT;
+    use adv_device::surface::Rect;
+
+    let mut f = fixture();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    let d = f.device;
+    let owner = id(&mut f);
+    let out = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateTexture",
+        &[d, 4, 4, 1, 0, 21, 1, out, 0],
+    );
+    let small = f.m.cpu.read_u32(out).unwrap();
+    let lock_out = f.packet(D3DLOCKED_RECT::default());
+    f.okay("IDirect3DTexture9::LockRect", &[small, 0, lock_out, 0, 0]);
+    let locked: D3DLOCKED_RECT = GuestPtr::new(lock_out).read(&f.m.cpu).unwrap();
+    f.m.cpu.write(locked.pBits, &[0x55u8; 64]).unwrap();
+    f.okay("IDirect3DTexture9::UnlockRect", &[small, 0]);
+    let small_key = frame(&mut env(&mut f), owner)
+        .commands
+        .iter()
+        .find_map(|op| match op {
+            Operation::Upload { pixels, .. } => Some(pixels.key()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(small_key, UploadKey::Content(_)));
+
+    f.okay(
+        "IDirect3DDevice9::CreateTexture",
+        &[d, 64, 64, 1, 0, 21, 1, out, 0],
+    );
+    let large = f.m.cpu.read_u32(out).unwrap();
+    let mut vertices = [0u32; 28];
+    for (index, (x, y, u, v)) in [
+        (-0.5f32, -0.5f32, 0f32, 0f32),
+        (15.5, -0.5, 1., 0.),
+        (-0.5, 11.5, 0., 1.),
+        (15.5, 11.5, 1., 1.),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        vertices[index * 7..index * 7 + 7].copy_from_slice(&[
+            x.to_bits(),
+            y.to_bits(),
+            0,
+            1f32.to_bits(),
+            u32::MAX,
+            u.to_bits(),
+            v.to_bits(),
+        ]);
+    }
+    let vertices = f.packet(vertices);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x144]);
+    f.okay("IDirect3DDevice9::SetTexture", &[d, 0, large]);
+
+    let upload_and_present = |f: &mut Fixture, bytes: &[u8]| -> Result<u128, u64> {
+        f.okay("IDirect3DTexture9::LockRect", &[large, 0, lock_out, 0, 0]);
+        let locked: D3DLOCKED_RECT = GuestPtr::new(lock_out).read(&f.m.cpu).unwrap();
+        assert_eq!(locked.Pitch, 256);
+        f.m.cpu.write(locked.pBits, bytes).unwrap();
+        f.okay("IDirect3DTexture9::UnlockRect", &[large, 0]);
+        let key = frame(&mut env(f), owner)
+            .commands
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                Operation::Upload {
+                    pixels, rectangle, ..
+                } if *rectangle
+                    == Rect {
+                        x: 0,
+                        y: 0,
+                        w: 64,
+                        h: 64,
+                    } =>
+                {
+                    Some(match pixels.key() {
+                        UploadKey::Content(h) => Ok(h),
+                        UploadKey::Admission(id) => Err(id),
+                    })
+                }
+                _ => None,
+            })
+            .unwrap();
+        clear(f, 0);
+        f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[d, 5, 2, vertices, 28],
+        );
+        f.okay("IDirect3DDevice9::EndScene", &[d]);
+        present(f);
+        key
+    };
+
+    let pat1 = vec![0x11u8; 64 * 64 * 4];
+    let mut pat2 = vec![0x22u8; 64 * 64 * 4];
+    let key1 = upload_and_present(&mut f, &pat1);
+    assert!(key1.is_err());
+    let key2 = upload_and_present(&mut f, &pat2);
+    assert!(key2.is_err());
+    let hash2 = upload_and_present(&mut f, &pat2).unwrap();
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 0);
+    let hash3 = upload_and_present(&mut f, &pat2).unwrap();
+    assert_eq!(hash3, hash2);
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
+
+    // Modify bytes outside all 8 sampled probe windows while matching pat2's probe.
+    pat2[48..52].copy_from_slice(&[0xff, 0x00, 0x80, 0xff]);
+    let hash4 = upload_and_present(&mut f, &pat2).unwrap();
+    assert_ne!(hash4, hash2);
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
+    assert_eq!(f.m.ext.get::<Presents>().published, [1, 2, 3, 5]);
+
+    f.okay("IDirect3DDevice9::SetTexture", &[d, 0, 0]);
+    assert_eq!(release(&mut env(&mut f), small), 0);
+    assert_eq!(release(&mut env(&mut f), large), 0);
 }

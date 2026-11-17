@@ -265,3 +265,96 @@ fn checked_simd_accesses_complete_and_refuse_without_instruction_helpers() {
         }
     }
 }
+
+// spec: A64F-FP-4, A64-TR-5, A64-REG-5, A64-VER-1
+#[test]
+fn write_first_and_appended_mmx_loops_avoid_interpret_and_recover_cuts_and_faults() {
+    for appended in [false, true] {
+        for fault in [false, true] {
+            if fault && appended {
+                continue;
+            }
+            for accumulator in [false, true] {
+                if accumulator && (appended || fault) {
+                    continue;
+                }
+                let mut p = fixture(|a| {
+                    let mut top = a.create_label();
+                    if appended {
+                        a.cmp(edx, 0).unwrap();
+                        a.jne(top).unwrap();
+                        a.add(eax, 1).unwrap();
+                        a.ret().unwrap();
+                    }
+                    a.set_label(&mut top).unwrap();
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
+                    a.paddw(mm0, qword_ptr(edi)).unwrap();
+                    if accumulator {
+                        a.paddw(mm1, mm0).unwrap();
+                        a.movq(qword_ptr(ebx), mm1).unwrap();
+                    } else {
+                        a.movq(qword_ptr(ebx), mm0).unwrap();
+                    }
+                    a.add(esi, 8).unwrap();
+                    a.add(edi, 8).unwrap();
+                    a.add(ebx, 8).unwrap();
+                    a.dec(ecx).unwrap();
+                    a.jnz(top).unwrap();
+                });
+                // Stale non-MMX exponent on write-first mm0 after prior FP/emms use;
+                // read-first accumulator mm1 already carries a valid MMX tag/exponent.
+                p.state.x87.regs = std::array::from_fn(|n| {
+                    adv_cpu_core::X87Register::from_parts(
+                        0x1122334455667788 ^ n as u64,
+                        if accumulator && n == 1 {
+                            0xffff
+                        } else {
+                            0x3fff
+                        },
+                    )
+                });
+                p.state.mmx = std::array::from_fn(|n| 0x0102030405060708 * (n as u64 + 1));
+                p.state.x87.status = 0;
+                p.state.mmx_mode = 0;
+                for (n, chunk) in p.data.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    chunk.copy_from_slice(
+                        &(0x0001000200030004u64.wrapping_mul(n as u64 + 1)).to_le_bytes(),
+                    );
+                }
+                p.state.regs[1] = 8; // ecx
+                p.state.regs[2] = 1; // edx (take appended path)
+                p.state.regs[6] = DATA; // esi
+                p.state.regs[7] = DATA + 256; // edi
+                p.state.regs[3] = if fault { DATA + 4096 - 16 } else { DATA + 512 }; // ebx
+
+                for config in configs() {
+                    for budget in [1, 2, 4, 8, 9, 10, 17, 18, 25, 200] {
+                        let mut native = executor(&p, config, false);
+                        let mut oracle = executor(&p, config, true);
+                        let got = native.run(p.stop, budget).unwrap();
+                        let expected = oracle.run(p.stop, budget).unwrap();
+                        assert_eq!(
+                            got, expected,
+                            "appended={appended} fault={fault} acc={accumulator} budget={budget}"
+                        );
+                        same(&native, &oracle);
+                        if matches!(got, RunOutcome::Budget) {
+                            assert_eq!(
+                                native.run(p.stop, 300).unwrap(),
+                                oracle.run(p.stop, 300).unwrap()
+                            );
+                            same(&native, &oracle);
+                        }
+                        assert_eq!(
+                            native.native.as_ref().unwrap().diagnostics.interprets,
+                            0,
+                            "appended={appended} fault={fault} acc={accumulator} config={config:?} budget={budget} histogram={:?} eip={:#x}",
+                            native.histogram,
+                            native.state.eip
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

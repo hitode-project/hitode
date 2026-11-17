@@ -349,6 +349,20 @@ enum Test {
     Count(Option<Cond>),
 }
 
+impl Test {
+    fn inverse(self) -> Option<Self> {
+        Some(match self {
+            Self::Cond(cond) => Self::Cond(cond.invert()),
+            Self::Zero(reg, nonzero) => Self::Zero(reg, !nonzero),
+            Self::Parity(set) => Self::Parity(!set),
+            Self::EcxZero => Self::Zero(host(1), true),
+            Self::CxZero => Self::Zero(X16, true),
+            Self::Count(None) => Self::EcxZero,
+            Self::Count(Some(_)) => return None,
+        })
+    }
+}
+
 /// Code emitted after the unit body.
 enum Cold {
     InlineBody {
@@ -687,8 +701,15 @@ impl Jit<'_> {
             t.exit(Exit::Interpret, eip);
             *retired = 0;
         } else {
-            for index in 0..trace.len() {
-                t.instruction(index);
+            let mut index = 0;
+            while index < trace.len() {
+                if let Some((end, peel_entry)) = t.mmx_peel_plan(index) {
+                    t.lower_peeled_mmx_loop(index, end, peel_entry);
+                    index = end + 1;
+                } else {
+                    t.instruction(index);
+                    index += 1;
+                }
             }
             *retired = trace.prepaid(0);
         }
@@ -821,6 +842,12 @@ impl Translator<'_> {
     }
 
     fn instruction(&mut self, index: usize) {
+        self.instruction_prologue(index);
+        self.asm.bind(self.labels[index]);
+        self.instruction_body(index, true);
+    }
+
+    fn instruction_prologue(&mut self, index: usize) {
         let trace = self.trace;
         let inst = trace.insts[index];
         self.index = index;
@@ -893,8 +920,11 @@ impl Translator<'_> {
         {
             self.load_frame_cache(&cache.offsets);
         }
-        self.asm.bind(self.labels[index]);
-        if !self.computation {
+    }
+
+    fn instruction_body(&mut self, index: usize, batch: bool) {
+        let inst = self.trace.insts[index];
+        if batch && !self.computation {
             self.native_batch(index);
             self.channel_batch(index);
         }
@@ -910,6 +940,124 @@ impl Translator<'_> {
             self.follow(edge);
         }
         self.x87_end_integer();
+    }
+
+    /// Detects a short straight-line MMX loop whose peeled first iteration
+    /// avoids per-iteration x87 guards, dead pre-loads, or backedge flushes.
+    fn mmx_peel_plan(&self, head: usize) -> Option<(usize, residency::Entry)> {
+        if self.computation || self.x87.active || !self.trace.merge[head] {
+            return None;
+        }
+        let insts = &self.trace.insts;
+        let end = (head + 1..insts.len())
+            .take(64)
+            .find(|&i| insts[i].taken == Some(Edge::Internal(head)))?;
+        let has_next = match insts[end].next {
+            Next::Fall => end + 1 < insts.len(),
+            Next::Edge(Edge::Internal(to)) => !(head..=end).contains(&to),
+            Next::Edge(_) => true,
+            Next::Dynamic => false,
+        };
+        if !has_next {
+            return None;
+        }
+        let mut written = 0u16;
+        let mut read_before_write = 0u16;
+        let mut has_mmx = false;
+        let mut body_guards = simd::Guards::default();
+        for i in head..=end {
+            if i != head && (self.trace.head(i) || self.trace.merge[i]) {
+                return None;
+            }
+            if i != end
+                && (insts[i].next != Next::Fall
+                    || matches!(insts[i].taken, Some(Edge::Internal(_))))
+            {
+                return None;
+            }
+            if self.regions.iter().any(|&(at, _)| at == i) {
+                return None;
+            }
+            let (reads, writes) = residency::footprint(self.trace, i, self.checked)?;
+            read_before_write |= reads & !written;
+            written |= writes;
+            if let decode::Op::Simd(s) = insts[i].op {
+                if s.kind == simd::Kind::Emms {
+                    return None;
+                }
+                has_mmx |= s.mmx();
+                body_guards = s.guarding(body_guards);
+            }
+        }
+        if !has_mmx {
+            return None;
+        }
+        let write_first = written & !read_before_write;
+        let orig = self.entry[head];
+        let peel_entry = residency::Entry {
+            regs: orig.regs & !write_first,
+            dirty: orig.dirty & !write_first,
+            guards: orig.guards,
+        };
+        let removes_guard = !orig.guards.ready && body_guards.ready;
+        let removes_dead_loads = (orig.regs & write_first) != 0;
+        let removes_publish = (!orig.dirty & written) != 0;
+        (removes_guard || removes_dead_loads || removes_publish).then_some((end, peel_entry))
+    }
+
+    fn lower_peeled_mmx_loop(&mut self, head: usize, end: usize, peel_entry: residency::Entry) {
+        let orig_entry = self.entry[head];
+        self.entry[head] = peel_entry;
+        for i in head..end {
+            self.instruction(i);
+        }
+        self.instruction_prologue(end);
+        self.asm.bind(self.labels[end]);
+        let warm_entry = self.vector.entry();
+        let warm_head = self.asm.label();
+        let orig_head_label = self.labels[head];
+        self.labels[head] = warm_head;
+        self.entry[head] = warm_entry;
+        self.instruction_body(end, true);
+        if self.trace.insts[end].next == Next::Fall {
+            self.asm.b(self.labels[end + 1]);
+        }
+        let (peel_fall_state, peel_fall_vector) = (self.state, self.vector);
+
+        let saved_labels: Vec<_> = (head + 1..=end)
+            .map(|i| {
+                let prev = self.labels[i];
+                self.labels[i] = self.asm.label();
+                prev
+            })
+            .collect();
+
+        self.asm.bind(warm_head);
+        let head_inst = self.trace.insts[head];
+        self.index = head;
+        self.mark(head_inst.pc, Part::Body);
+        self.checking = (self.checked)(head_inst.pc);
+        self.out = self.trace.observe_out[head];
+        self.keep = self.out.minus(head_inst.effects.writes);
+        self.state = State::CANONICAL;
+        self.vector = simd::Vector::at(warm_entry);
+        self.instruction_body(head, false);
+
+        for i in head + 1..=end {
+            self.instruction(i);
+        }
+        debug_assert_eq!(self.state, peel_fall_state);
+        debug_assert_eq!(self.vector.dirty, peel_fall_vector.dirty);
+        debug_assert_eq!(self.vector.guards, peel_fall_vector.guards);
+        let _ = (peel_fall_state, peel_fall_vector);
+
+        self.labels[head] = orig_head_label;
+        for (i, label) in (head + 1..=end).zip(saved_labels) {
+            self.labels[i] = label;
+        }
+        // Any later arrival targeting `head` enters the peeled pass.
+        self.entry[head] = peel_entry;
+        let _ = orig_entry;
     }
 
     fn budget_exit(&self) -> Exit {
@@ -1173,25 +1321,36 @@ impl Translator<'_> {
             Edge::Internal(to) => {
                 let test = self.test(cc);
                 let x87 = self.x87_arriving(to);
-                if self.trace.net(from, to) == 0
+                let net = self.trace.net(from, to);
+                if (net == 0 || (net < 0 && -net < 4096))
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
                     && self.vector.dirty & !self.entry[to].dirty == 0
                     && self.holds(self.entry[to])
                 {
-                    self.jump_if(test, self.labels[to]);
-                } else {
-                    let label = self.asm.label();
-                    self.jump_if(test, label);
-                    self.push_cold(Cold::Edge {
-                        label,
-                        state: self.state,
-                        vector: self.vector,
-                        from,
-                        to,
-                        x87,
-                    });
+                    if net == 0 {
+                        self.jump_if(test, self.labels[to]);
+                        return;
+                    }
+                    if let Some(inverse) = test.inverse() {
+                        let skip = self.asm.label();
+                        self.jump_if(inverse, skip);
+                        self.emit(add_imm(X, X9, X9, (-net) as u32, false));
+                        self.asm.b(self.labels[to]);
+                        self.asm.bind(skip);
+                        return;
+                    }
                 }
+                let label = self.asm.label();
+                self.jump_if(test, label);
+                self.push_cold(Cold::Edge {
+                    label,
+                    state: self.state,
+                    vector: self.vector,
+                    from,
+                    to,
+                    x87,
+                });
             }
             Edge::Exit(eip) => {
                 let test = self.test(cc);

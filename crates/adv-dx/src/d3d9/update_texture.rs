@@ -327,6 +327,7 @@ fn uploaded(env: &mut Env<'_>, destination: Id, outcome: Outcome) -> Outcome {
                 com(env).get_identity_mut(&mut env.sys.objects, destination)
             {
                 r.levels[level as usize].dirty = None;
+                r.levels[level as usize].upload_probe = None;
             }
             let commit = env.ext.get_mut::<Transfers>().active[index]
                 .current
