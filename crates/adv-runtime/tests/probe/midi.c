@@ -80,6 +80,9 @@ int main(void)
     check("done", WaitForSingleObject(completed, 2000) == WAIT_OBJECT_0 && done == 1 &&
           (header.dwFlags & MHDR_DONE) && !(header.dwFlags & MHDR_INQUEUE));
     check("unprepare", midiOutUnprepareHeader(midi, &header, sizeof(header)) == 0 && !(header.dwFlags & MHDR_PREPARED));
+    header.dwFlags |= MHDR_INQUEUE;
+    check("unprepare-unprepared", midiOutUnprepareHeader(midi, &header, sizeof(header)) == 0 && (header.dwFlags & MHDR_INQUEUE));
+    header.dwFlags &= ~MHDR_INQUEUE;
     check("reset", midiOutReset(midi) == 0);
     check("close", midiOutClose(midi) == 0 && closes == 1);
 
@@ -112,6 +115,11 @@ int main(void)
     check("stream-resume", midiStreamRestart(stream) == 0);
     check("stream-done", WaitForSingleObject(completed, 3000) == WAIT_OBJECT_0 && done == 2 && positions == 2);
     check("stream-stop", midiStreamStop(stream) == 0);
+    division.dwTimeDiv = 0xe204; /* 30 fps, 4 ticks per frame */
+    check("stream-smpte-division", midiStreamProperty(stream, (BYTE *)&division, MIDIPROP_SET | MIDIPROP_TIMEDIV) == 0);
+    after.wType = TIME_SMPTE;
+    check("stream-smpte-position", midiStreamPosition(stream, &after, sizeof(after)) == 0 &&
+          after.wType == TIME_SMPTE && after.u.smpte.fps == 30 && !after.u.smpte.frame);
     check("stream-unprepare", midiOutUnprepareHeader((HMIDIOUT)stream, &header, sizeof(header)) == 0);
     check("stream-close", midiStreamClose(stream) == 0);
 

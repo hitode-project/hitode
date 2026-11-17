@@ -239,19 +239,41 @@ fn result(env: &mut Env<'_>, name: &str, a: &[u32]) -> Result<u32, String> {
                         0
                     };
                 let kind = read(env, a[1])?;
-                let value = match kind {
-                    32 => pulses,
+                let mut value = [0; 8];
+                match kind {
+                    32 => value[..4].copy_from_slice(&(pulses as u32).to_le_bytes()),
                     16 if s.division <= 0x8000 => {
                         let div = u64::from(s.division.max(24));
                         let pos = (pulses + div / 8) / (div / 4);
-                        if pulses != 0 { pos.max(1) } else { 0 }
+                        let pos = if pulses != 0 { pos.max(1) } else { 0 };
+                        value[..4].copy_from_slice(&(pos as u32).to_le_bytes());
+                    }
+                    // An SMPTE division reports SMPTE time, as on Windows.
+                    8 if s.division > 0x8000 => {
+                        let fps = u64::from((-(s.division as u16 as i16 >> 8)) as u8).max(1);
+                        let frames = pulses / u64::from(s.division & 255).max(1);
+                        let seconds = frames / fps;
+                        value[..5].copy_from_slice(&[
+                            (seconds / 3600) as u8,
+                            (seconds / 60 % 60) as u8,
+                            (seconds % 60) as u8,
+                            (frames % fps) as u8,
+                            fps as u8,
+                        ]);
                     }
                     _ => {
                         write(env, a[1], 1)?;
-                        elapsed / 1000
+                        value[..4].copy_from_slice(&((elapsed / 1000) as u32).to_le_bytes());
                     }
+                }
+                let len = if kind == 8 && s.division > 0x8000 {
+                    8
+                } else {
+                    4
                 };
-                write(env, a[1] + 4, value as u32)?;
+                env.cpu
+                    .write(a[1] + 4, &value[..len])
+                    .map_err(|e| e.to_string())?;
                 0
             }
         }

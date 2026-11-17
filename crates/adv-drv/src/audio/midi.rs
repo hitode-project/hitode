@@ -175,6 +175,10 @@ fn message(
                 if data == 0 {
                     return Ok((11, None));
                 }
+                // Like Windows, an unprepared header is done whatever its flags.
+                if flags & PREPARED == 0 {
+                    return Ok((0, None));
+                }
                 if flags & INQUEUE != 0 {
                     return Ok((65, None));
                 }

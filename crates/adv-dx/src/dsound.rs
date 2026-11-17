@@ -851,6 +851,9 @@ fn create_com_device(
     if outer != 0 {
         return Outcome::Return(0x8004_0110);
     }
+    if let Some(refused) = clear_output(e, output) {
+        return refused;
+    }
     if iid != adv_os::com::IUNKNOWN && iid != IID_DEVICE && !(version8 && iid == IID_DEVICE8) {
         return Outcome::Return(NO_INTERFACE);
     }
@@ -859,6 +862,17 @@ fn create_com_device(
         version8,
     };
     activate_object(e, kind, iid, output)
+}
+/// Like Windows, a class factory refuses a missing output and clears a given
+/// one before checking the interface.
+fn clear_output(e: &mut Env<'_>, output: u32) -> Option<Outcome> {
+    if output == 0 {
+        return Some(Outcome::Return(INVALID));
+    }
+    e.cpu
+        .write_u32(output, 0)
+        .err()
+        .map(|error| Outcome::Fail(error.to_string()))
 }
 /// Publish a new `kind` object at `output` through the interface `iid`.
 fn activate_object(e: &mut Env<'_>, kind: Kind, iid: [u8; 16], output: u32) -> Outcome {
@@ -3026,22 +3040,30 @@ mod tests {
         );
         assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[direct]), 0);
     }
+    // spec: DEV-AUDIO-9
     #[test]
     fn class_constructor_failures_do_not_allocate_or_leak() {
         let mut m = machine();
         let owners = m.sys.objects.object_count();
-        for (class, iid, outer, expected) in [
-            (CLSID_DEVICE, [0xff; 16], 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE8, 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE, DATA, 0x80040110),
+        // Like Windows, aggregation is refused first and the output is
+        // cleared before the interface is checked.
+        for (class, iid, outer, expected, left) in [
+            (CLSID_DEVICE, [0xff; 16], 0, NO_INTERFACE, 0),
+            (CLSID_DEVICE, IID_DEVICE8, 0, NO_INTERFACE, 0),
+            (capture::CLSID_CAPTURE, IID_DEVICE, 0, NO_INTERFACE, 0),
+            (CLSID_DEVICE, IID_DEVICE, DATA, 0x80040110, 0xdeadbeef),
         ] {
             m.cpu.write_u32(DATA + 128, 0xdeadbeef).unwrap();
             assert!(
                 matches!(activate(&mut m, class, iid, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
             );
-            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0xdeadbeef);
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), left);
             assert_eq!(m.sys.objects.object_count(), owners);
         }
+        assert!(matches!(
+            activate(&mut m, CLSID_DEVICE, IID_PROPERTIES, 0, 0),
+            Outcome::Return(INVALID)
+        ));
         assert!(matches!(
             activate(&mut m, CLSID_DEVICE, IID_DEVICE, 0, 0x700000),
             Outcome::Fail(_)

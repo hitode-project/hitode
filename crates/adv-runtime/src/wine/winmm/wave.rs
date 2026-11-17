@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 
+const DRVM_MAPPER_PREFERRED_GET: u32 = 0x2015;
+
 #[derive(Clone, Copy)]
 pub(super) struct Format {
     pub channels: u16,
@@ -102,6 +104,16 @@ pub(super) fn call(env: &mut Env<'_>, name: &str, args: Vec<u32>) -> Outcome {
     }
     if name == "waveOutGetNumDevs" {
         return Outcome::Return(1);
+    }
+    // The mapper's preferred device is the one device counted above.
+    if name == "waveOutMessage" && args[0] == u32::MAX && args[1] == DRVM_MAPPER_PREFERRED_GET {
+        if args[2] == 0 || args[3] == 0 {
+            return Outcome::Return(11); // MMSYSERR_INVALPARAM
+        }
+        return match write(env, args[2], 0).and_then(|()| write(env, args[3], 0)) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error),
+        };
     }
     if name.contains("Pitch") || name.contains("PlaybackRate") {
         return Outcome::Return(8);
