@@ -37,11 +37,11 @@ The check uses Security's `SecTaskCopyValueForEntitlement` for the current proce
 
 ### IOS-MEM-1 Compact window
 
-**Rule**: iOS, and other hosts with `ADV_A64_COMPACT_WINDOW=1`, MUST give the guest only `[0, 2 GiB)` of a 4 GiB-aligned window and map its `Memory::ptr` alias at `x27 + 2 GiB`. The lower guard MAY be an unmapped range the kernel will not allocate. A window search MUST try aligned bases upward from where the kernel places one, never reserving more than one window at a time.
+**Rule**: iOS, and other hosts with `ADV_A64_COMPACT_WINDOW=1`, MUST give the guest only `[0, 2 GiB)` of a 4 GiB-aligned window and map its `Memory::ptr` alias at `x27 + 2 GiB`. The lower guard MAY be a range the kernel will not allocate where no mapping's maximum protection allows access. A window search MUST try aligned bases upward from where the kernel places one, never reserving more than one window at a time.
 **Applies to**: AArch64
 **Verification**: Test
 
-2 GiB is the user space of 32-bit Windows. The dyld shared region ends at `0x3_0000_0000`, and its unmapped end serves as the lower guard. Without the kernel's jumbo map (IOS-MEM-4), an app on a device with more than 3 GiB maps only up to `0x4_5800_0000`. Those 5.4 GiB hold one window but not a window and a separate alias.
+2 GiB is the user space of 32-bit Windows. The dyld shared region ends at `0x3_0000_0000` in padding whose maximum protection is none, and that padding serves as the lower guard. Without the kernel's jumbo map (IOS-MEM-4), an app on a device with more than 3 GiB maps only up to `0x4_5800_0000`. Those 5.4 GiB hold one window but not a window and a separate alias.
 
 ### IOS-MEM-2 Shared compact window
 
