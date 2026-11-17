@@ -121,6 +121,8 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
         thread,
         post,
         export: |env, module, name| export(env, module, name).ok(),
+        media_types,
+        sample,
         event: |env| {
             let mut request = adv_nt::protocol::CreateEventRequest {
                 access: 0x1f0003,
@@ -237,7 +239,14 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
         move |env, result| {
             let handle = result.value();
             if handle == u32::MAX {
-                return then(env, Err(0x8004_0216));
+                // HRESULT_FROM_WIN32 of the thread's last error, as quartz returns.
+                let error = env.cpu.read_u32(env.ctx().teb + 0x34).unwrap_or(0);
+                let hr = if error == 0 {
+                    0x8000_4005
+                } else {
+                    0x8007_0000 | (error & 0xffff)
+                };
+                return then(env, Err(hr));
             }
             if adv_nt::identity::reads_hooked(env.cpu, env.ext) {
                 return guest_contents(env, handle, then);
@@ -319,7 +328,7 @@ fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcom
             };
             let (send, receive) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = send.send(Decoder::open_reader(file).map_err(|_| 0x8004_0265));
+                let _ = send.send(Decoder::open_reader(file).ok());
             });
             opened(env, handle, receive, then)
         }),
@@ -328,15 +337,12 @@ fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcom
 fn opened(
     env: &mut Env<'_>,
     handle: Option<u32>,
-    receive: Receiver<Result<Decoder, u32>>,
+    receive: Receiver<Option<Decoder>>,
     then: adv_dx::dshow::Opened,
 ) -> Outcome {
     match receive.try_recv() {
-        Ok(Ok(decoder)) => then(env, Ok((decoder, handle))),
-        Ok(Err(hr)) => {
-            release(env, handle);
-            then(env, Err(hr))
-        }
+        // Undecodable contents still make a source, as the async reader does.
+        Ok(decoder) => then(env, Ok((decoder, handle))),
         Err(TryRecvError::Empty) => {
             Outcome::block(Wait::Until(env.sys.clock.now_us() + 1000), move |env, _| {
                 opened(env, handle, receive, then)
@@ -348,6 +354,119 @@ fn opened(
         }
     }
 }
+const MEDIA_TYPES: &str = "\\Registry\\Machine\\Software\\Classes\\Media Type";
+/// Registry strings longer than this are no GUID or pattern quartz reads.
+const MEDIA_VALUE: usize = 4096;
+
+fn registry_text(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn registry_guid(env: &mut Env<'_>, key: u32, name: &str) -> Option<adv_os::com::Iid> {
+    let (_, data) = adv_nt::registry::value(env, key, name, MEDIA_VALUE).ok()??;
+    adv_os::com::parse_guid(&registry_text(&data))
+}
+
+fn subkeys(env: &mut Env<'_>, key: u32) -> Vec<String> {
+    (0..)
+        .map_while(|index| adv_nt::registry::subkey(env, key, index).ok().flatten())
+        .map(|name| String::from_utf16_lossy(&name))
+        .collect()
+}
+
+/// `HKCR\Media Type`, read as quartz's async reader reads it.
+fn media_types(env: &mut Env<'_>, extension: Option<&str>) -> adv_dx::dshow::MediaTypes {
+    use adv_dx::dshow::{MediaEntry, MediaTypes};
+    let mut types = MediaTypes::default();
+    let Ok(root) = adv_nt::registry::open_for_reading(env, 0, MEDIA_TYPES) else {
+        return types;
+    };
+    let path = extension.map(|extension| format!("Extensions\\{extension}"));
+    if let Some(key) =
+        path.and_then(|path| adv_nt::registry::open_for_reading(env, root, &path).ok())
+    {
+        types.extension = Some(MediaEntry {
+            major: registry_guid(env, key, "Media Type"),
+            sub: registry_guid(env, key, "Subtype"),
+            source: registry_guid(env, key, "Source Filter"),
+            patterns: Vec::new(),
+        });
+        let _ = adv_nt::server::close(env, key);
+        let _ = adv_nt::server::close(env, root);
+        return types;
+    }
+    for major_name in subkeys(env, root) {
+        if major_name == "Extensions" {
+            continue;
+        }
+        let Ok(major) = adv_nt::registry::open_for_reading(env, root, &major_name) else {
+            continue;
+        };
+        for sub_name in subkeys(env, major) {
+            let Ok(sub) = adv_nt::registry::open_for_reading(env, major, &sub_name) else {
+                continue;
+            };
+            let patterns = (0..)
+                .map_while(|index| {
+                    adv_nt::registry::value_at(env, sub, index, MEDIA_VALUE)
+                        .ok()
+                        .flatten()
+                })
+                .filter(|value| String::from_utf16_lossy(&value.name) != "Source Filter")
+                .map(|value| registry_text(&value.data))
+                .collect();
+            types.entries.push(MediaEntry {
+                major: adv_os::com::parse_guid(&major_name),
+                sub: adv_os::com::parse_guid(&sub_name),
+                source: registry_guid(env, sub, "Source Filter"),
+                patterns,
+            });
+            let _ = adv_nt::server::close(env, sub);
+        }
+        let _ = adv_nt::server::close(env, major);
+    }
+    let _ = adv_nt::server::close(env, root);
+    types
+}
+
+/// The requested byte ranges of a file opened through the guest.
+fn sample(
+    env: &mut Env<'_>,
+    filename: u32,
+    ranges: adv_dx::dshow::Ranges,
+    then: adv_dx::dshow::Sampled,
+) -> Outcome {
+    use std::io::{Seek, SeekFrom};
+    file(
+        env,
+        filename,
+        Box::new(move |env, result| {
+            let (mut file, handle) = match result {
+                Ok(value) => value,
+                Err(hr) => return then(env, Err(hr)),
+            };
+            let sampled = ranges
+                .iter()
+                .map(|&(offset, length)| {
+                    let mut bytes = vec![0; length];
+                    file.seek(SeekFrom::Start(offset)).ok()?;
+                    file.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                })
+                .collect();
+            release(env, handle);
+            then(env, Ok(sampled))
+        }),
+    )
+}
+
 fn read_file(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::ReadFile) -> Outcome {
     file(
         env,

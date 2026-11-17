@@ -53,7 +53,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-2 File sources
 
-**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing, unsupported, or invalid inputs without publishing a source. The WM ASF Reader class MUST be this file source, loaded through IFileSourceFilter. The decoder-owning filter MUST retain the file sharing lock until release.
+**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing files or invalid arguments without publishing a source or touching its output. Its async reader MUST load undecodable contents, which rendering then rejects with `VFW_E_UNSUPPORTED_STREAM`. The WM ASF Reader MUST be this source, loaded through IFileSourceFilter and rejecting undecodable files, and its filter MUST keep the file sharing lock.
 **Verification**: Test
 
 ### MEDIA-GRAPH-3 Render negotiation
@@ -110,6 +110,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 **Rule**: Automation interfaces MUST answer IDispatch through the quartz type library. IFilterMapper, IFilterMapper2 and IFilterMapper3 MUST come from an aggregated system filter mapper.
 **Verification**: Review — unit tests cover GetTypeInfoCount only; the type library and the mapper come from Wine's quartz, which unit tests do not load.
+
+### MEDIA-GRAPH-14 Source filter choice
+
+**Rule**: AddSourceFilter MUST take the media type from `HKCR\Media Type\Extensions` when the file extension is registered. Otherwise the first `Media Type` entry whose byte patterns all match MUST decide the type and the source filter. A registered source other than the async reader MUST be created, loaded and added.
+**Verification**: Test
 
 ### MEDIA-STREAM-1 Pull delivery
 

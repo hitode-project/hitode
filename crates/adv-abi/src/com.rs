@@ -22,6 +22,27 @@ pub use guest::GuestReferences;
 pub type Iid = [u8; 16];
 pub const IUNKNOWN: Iid = [0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 
+/// A GUID in registry form, `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`, as
+/// CLSIDFromString reads it.
+pub fn parse_guid(text: &str) -> Option<Iid> {
+    let inner = text.strip_prefix('{')?.strip_suffix('}')?;
+    let parts: Vec<&str> = inner.split('-').collect();
+    if parts.iter().map(|p| p.len()).ne([8, 4, 4, 4, 12])
+        || !inner.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut guid = [0; 16];
+    guid[..4].copy_from_slice(&u32::from_str_radix(parts[0], 16).ok()?.to_le_bytes());
+    guid[4..6].copy_from_slice(&u16::from_str_radix(parts[1], 16).ok()?.to_le_bytes());
+    guid[6..8].copy_from_slice(&u16::from_str_radix(parts[2], 16).ok()?.to_le_bytes());
+    let tail = [parts[3], parts[4]].concat();
+    for (i, byte) in guid[8..].iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(guid)
+}
+
 pub type ComIdentity<T> = Identity<ComObject<T>>;
 
 /// Typed payload and interface metadata stored in `adv_machine::Objects`.
@@ -493,5 +514,24 @@ impl Com {
             value: object.value,
             interfaces: pointers,
         })
+    }
+}
+
+#[cfg(test)]
+mod guid_tests {
+    use super::*;
+
+    #[test]
+    fn registry_guids_parse_in_memory_order() {
+        let guid = parse_guid("{56A868B0-0AD4-11CE-B03A-0020AF0BA770}").unwrap();
+        assert_eq!(
+            guid,
+            [
+                0xb0, 0x68, 0xa8, 0x56, 0xd4, 0x0a, 0xce, 0x11, 0xb0, 0x3a, 0x00, 0x20, 0xaf, 0x0b,
+                0xa7, 0x70
+            ]
+        );
+        assert_eq!(parse_guid("56a868b0-0ad4-11ce-b03a-0020af0ba770"), None);
+        assert_eq!(parse_guid("{56a868b0-0ad4-11ce-b03a-0020af0ba77g}"), None);
     }
 }

@@ -1,13 +1,39 @@
 //! Assembly seams for Wine's files, notifications and guest allocation.
 use super::*;
 
-/// A source opened by file name, with the handle that keeps its sharing lock.
-/// Contents read out through the guest come without one: their handle was
-/// closed through the guest as it was opened.
+/// A source opened by file name, with the handle that keeps its sharing lock,
+/// and its decoder unless the contents do not decode. Contents read out
+/// through the guest come without a handle: theirs was closed as it opened.
 pub type Opened = Box<
-    dyn FnOnce(&mut Env<'_>, Result<(adv_device::media::Decoder, Option<u32>), u32>) -> Outcome,
+    dyn FnOnce(
+        &mut Env<'_>,
+        Result<(Option<adv_device::media::Decoder>, Option<u32>), u32>,
+    ) -> Outcome,
 >;
 pub type ReadFile = Box<dyn FnOnce(&mut Env<'_>, Result<(Vec<u8>, Option<u32>), u32>) -> Outcome>;
+/// Byte ranges of a file: `(offset, length)`.
+pub type Ranges = Vec<(u64, usize)>;
+/// The bytes of each requested range, `None` where the file is shorter.
+pub type Sampled = Box<dyn FnOnce(&mut Env<'_>, Result<Vec<Option<Vec<u8>>>, u32>) -> Outcome>;
+
+/// One registered media type, with its source filter and byte patterns.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaEntry {
+    pub major: Option<adv_os::com::Iid>,
+    pub sub: Option<adv_os::com::Iid>,
+    pub source: Option<adv_os::com::Iid>,
+    /// Pattern strings: "offset, size, mask, value" tuples, all of which match.
+    pub patterns: Vec<String>,
+}
+
+/// The registry's answer for one file.
+#[derive(Debug, Default)]
+pub struct MediaTypes {
+    /// `Media Type\Extensions\<extension>`, when registered.
+    pub extension: Option<MediaEntry>,
+    /// Every `Media Type\{major}\{subtype}` entry, read only without one.
+    pub entries: Vec<MediaEntry>,
+}
 
 /// The file Wine's own quartz keeps once the native front takes `quartz.dll`.
 pub const WINE_QUARTZ: &str = "winequartz.dll";
@@ -22,6 +48,11 @@ pub struct Host {
     pub event: fn(&mut Env<'_>) -> Result<u32, String>,
     pub signal: fn(&mut Env<'_>, u32, bool),
     pub post: fn(&mut Env<'_>, [u32; 4]),
+    /// `HKCR\Media Type` for a file with this extension, dot included.
+    pub media_types: fn(&mut Env<'_>, Option<&str>) -> MediaTypes,
+    /// Read each `(offset, length)` range of the named file through the
+    /// guest, then close it.
+    pub sample: fn(&mut Env<'_>, u32, Ranges, Sampled) -> Outcome,
     /// The address of a loaded module's export; Wine's own quartz is
     /// [`WINE_QUARTZ`].
     pub export: fn(&Env<'_>, &str, &str) -> Option<u32>,
