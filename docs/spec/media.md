@@ -131,6 +131,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Without a host renderer, the graph's IBasicAudio, IBasicVideo2 and IVideoWindow MUST forward each call to the newest guest member exposing that interface. With no such member, IBasicAudio MUST return E_NOTIMPL and the video interfaces E_NOINTERFACE.
 **Verification**: Test
 
+### MEDIA-GRAPH-18 Graph state
+
+**Rule**: Graph transitions MUST return the first member result that is not S_OK, and Stop from Running MUST pause every member first. GetState MUST poll every member and report VFW_S_STATE_INTERMEDIATE until all reach the graph state or the timeout passes. Stop MUST return only after every host stream thread has left the downstream filters.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.

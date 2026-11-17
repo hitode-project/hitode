@@ -265,14 +265,8 @@ fn event_timeouts_leave_no_event_code() {
 /// the host allocated.
 const ANY: u32 = u32::MAX;
 
-/// Run a quartz method that calls back into the guest exactly once per item
-/// of `expected`, checking each call's target and arguments.
-fn method_calls(
-    m: &mut Machine<JitCpu>,
-    name: &str,
-    args: &[u32],
-    expected: &[(u32, &[u32], u32)],
-) -> u32 {
+/// Enter a quartz method and return its first outcome without resuming it.
+pub(crate) fn start_method(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> Outcome {
     m.resolve_import("quartz.dll", name).unwrap();
     let thunk = m
         .sys
@@ -286,13 +280,24 @@ fn method_calls(
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
     }
-    let mut outcome = handler(&mut Env {
+    handler(&mut Env {
         context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
         thunk,
-    });
+    })
+}
+
+/// Run a quartz method that calls back into the guest exactly once per item
+/// of `expected`, checking each call's target and arguments.
+fn method_calls(
+    m: &mut Machine<JitCpu>,
+    name: &str,
+    args: &[u32],
+    expected: &[(u32, &[u32], u32)],
+) -> u32 {
+    let mut outcome = start_method(m, name, args);
     for &(target, args, value) in expected {
         let Outcome::Call {
             target: called,
@@ -1275,7 +1280,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
     );
     assert_eq!(method(&mut m, "IMemAllocator::Commit", &[in_alloc]), S_OK);
 
-    // Stop invokes upstream source FIRST and downstream renderer LAST, and
+    // A running graph pauses its members first, as quartz does. Stop then
+    // invokes upstream source FIRST and downstream renderer LAST, and
     // ignores any VFW_E_NOT_COMMITTED abort raised while stopping.
     assert_eq!(
         method_calls(
@@ -1283,6 +1289,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Stop",
             &[control],
             &[
+                (0x7100_0105, &[renderer], S_OK),
+                (0x7100_0005, &[source], S_OK),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
                 // Stopped, the graph re-seeks its streams to the kept position.
