@@ -10,7 +10,7 @@ use iced_x86::Mnemonic as M;
 
 use super::ir::{
     Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
-    VecUnary,
+    VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -233,6 +233,7 @@ fn step(
         }
         Op::Vec(op, a, b) => vector(op, get(a), get(b), fpsr),
         Op::VecUnary(op, a) => vector_unary(op, get(a)),
+        Op::VecToInt(op, a) => u128::from(vector_to_int(op, get(a))),
         Op::Load { width, addr, .. } => {
             let mut bytes = [0u8; 16];
             memory
@@ -526,6 +527,68 @@ fn vector_unary(op: VecUnary, a: u128) -> u128 {
     match op {
         VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
         VecUnary::Low64 => a & u128::from(u64::MAX),
+        VecUnary::High64 => a >> 64,
+        VecUnary::Shuffle(log2, imm, full) => {
+            let bits = 8usize << log2;
+            let mask = u128::MAX >> (128 - bits);
+            let mut out = 0u128;
+            for lane in 0..4 {
+                let from = usize::from((imm >> (2 * lane)) & 3);
+                let val = (a >> (from * bits)) & mask;
+                out |= val << (lane * bits);
+            }
+            if full {
+                out
+            } else {
+                out & u128::from(u64::MAX)
+            }
+        }
+        VecUnary::ShuffleWords(high, imm) => {
+            let base = if high { 4 } else { 0 };
+            let mut out = a & !(u128::from(u64::MAX) << (base * 16));
+            for lane in 0..4 {
+                let from = usize::from((imm >> (2 * lane)) & 3);
+                let val = (a >> ((base + from) * 16)) & 0xffff;
+                out |= val << ((base + lane) * 16);
+            }
+            out
+        }
+        VecUnary::ShiftBytes(left, count) => {
+            if count >= 16 {
+                0
+            } else if left {
+                a << (usize::from(count) * 8)
+            } else {
+                a >> (usize::from(count) * 8)
+            }
+        }
+    }
+}
+
+fn vector_to_int(op: VecToInt, a: u128) -> u32 {
+    match op {
+        VecToInt::ExtractWord(lane) => ((a >> (usize::from(lane) * 16)) & 0xffff) as u32,
+        VecToInt::ByteMask(full) => {
+            let bytes = if full { 16 } else { 8 };
+            let mut out = 0u32;
+            for i in 0..bytes {
+                if (a >> (i * 8 + 7)) & 1 != 0 {
+                    out |= 1 << i;
+                }
+            }
+            out
+        }
+        VecToInt::SignMask(double) => {
+            let (lanes, shift) = if double { (2, 63) } else { (4, 31) };
+            let mut out = 0u32;
+            for i in 0..lanes {
+                let width = if double { 64 } else { 32 };
+                if (a >> (i * width + shift)) & 1 != 0 {
+                    out |= 1 << i;
+                }
+            }
+            out
+        }
     }
 }
 
@@ -677,6 +740,58 @@ fn vector(op: VecOp, a: u128, b: u128, fpsr: &mut u32) -> u128 {
             out
         }
         VecOp::Shift(op, log2, full) => vec_shift(op, log2, full, a, b as u64),
+        VecOp::Shufps(imm) => {
+            let mut out = 0u128;
+            for lane in 0..4 {
+                let src = if lane < 2 { a } else { b };
+                let from = usize::from((imm >> (2 * lane)) & 3);
+                out |= ((src >> (from * 32)) & u128::from(u32::MAX)) << (lane * 32);
+            }
+            out
+        }
+        VecOp::Shufpd(imm) => {
+            let lo = (a >> (usize::from(imm & 1) * 64)) as u64;
+            let hi = (b >> (usize::from((imm >> 1) & 1) * 64)) as u64;
+            u128::from(lo) | u128::from(hi) << 64
+        }
+        VecOp::MulDwords(full) => {
+            let lo = u64::from(a as u32) * u64::from(b as u32);
+            if full {
+                let hi = u64::from((a >> 64) as u32) * u64::from((b >> 64) as u32);
+                u128::from(lo) | u128::from(hi) << 64
+            } else {
+                u128::from(lo)
+            }
+        }
+        VecOp::SadBytes(full) => {
+            let sum = |offset: usize| -> u64 {
+                (0..8)
+                    .map(|i| {
+                        let x = (a >> ((offset + i) * 8)) as u8;
+                        let y = (b >> ((offset + i) * 8)) as u8;
+                        u64::from(x.abs_diff(y))
+                    })
+                    .sum()
+            };
+            let lo = sum(0);
+            if full {
+                u128::from(lo) | u128::from(sum(8)) << 64
+            } else {
+                u128::from(lo)
+            }
+        }
+        VecOp::MoveLow32 => (a & !u128::from(u32::MAX)) | (b & u128::from(u32::MAX)),
+        VecOp::Insert64(dst_lane, src_lane) => {
+            let val = u128::from((b >> (if src_lane { 64 } else { 0 })) as u64);
+            let shift = if dst_lane { 64 } else { 0 };
+            (a & !(u128::from(u64::MAX) << shift)) | (val << shift)
+        }
+        VecOp::InsertWord(lane, full) => {
+            let word = b & 0xffff;
+            let shift = usize::from(lane) * 16;
+            let out = (a & !(0xffffu128 << shift)) | (word << shift);
+            mask_full(out, full)
+        }
         VecOp::LessF64 => lanes64(&mut |x, y| {
             let (p, q) = (
                 input(f64::from_bits(x), fpsr),

@@ -2065,3 +2065,70 @@ fn mmx_pixel_blend_loop_builds_and_recovers_every_fault() {
         );
     }
 }
+
+// spec: A64-OPT-1, A64-OPT-6
+#[test]
+fn mmx_and_xmm_shuffles_extract_insert_masks_match_interpreter() {
+    let code = assemble(|a| {
+        row(a, |a| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.movq(mm1, qword_ptr(edi)).unwrap();
+            a.pshufw(mm2, mm0, 0x1b).unwrap();
+            a.pshufw(mm3, mm1, 0xaa).unwrap();
+            a.pinsrw(mm2, eax, 2).unwrap();
+            a.pinsrw(mm3, word_ptr(esi + 2), 3).unwrap();
+            a.pextrw(eax, mm2, 1).unwrap();
+            a.pmuludq(mm2, mm3).unwrap();
+            a.psadbw(mm2, mm1).unwrap();
+            a.pmovmskb(ebx, mm3).unwrap();
+            a.add(eax, ebx).unwrap();
+            a.movq(qword_ptr(edi), mm2).unwrap();
+
+            a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+            a.movdqu(xmm1, xmmword_ptr(edi)).unwrap();
+            a.pshufd(xmm2, xmm0, 0x4e).unwrap();
+            a.pshuflw(xmm2, xmm2, 0xd8).unwrap();
+            a.pshufhw(xmm2, xmm2, 0x93).unwrap();
+            a.shufps(xmm2, xmm1, 0xe4).unwrap();
+            a.shufpd(xmm2, xmm0, 2).unwrap();
+            a.pinsrw(xmm2, eax, 5).unwrap();
+            a.pinsrw(xmm3, word_ptr(esi + 4), 6).unwrap();
+            a.pextrw(edx, xmm2, 5).unwrap();
+            a.pmuludq(xmm2, xmm3).unwrap();
+            a.psadbw(xmm2, xmm1).unwrap();
+            a.pslldq(xmm2, 3).unwrap();
+            a.psrldq(xmm2, 1).unwrap();
+            a.movss(xmm2, xmm0).unwrap();
+            a.movsd_2(xmm2, xmm1).unwrap();
+            a.movlps(xmm2, qword_ptr(esi)).unwrap();
+            a.movhps(xmm2, qword_ptr(edi)).unwrap();
+            a.movlps(qword_ptr(edi + 16), xmm2).unwrap();
+            a.movhps(qword_ptr(edi + 24), xmm2).unwrap();
+            a.movlhps(xmm2, xmm0).unwrap();
+            a.movhlps(xmm2, xmm1).unwrap();
+            a.pmovmskb(ebp, xmm2).unwrap();
+            a.movmskps(ebx, xmm2).unwrap();
+            a.xor(ebp, ebx).unwrap();
+            a.movmskpd(ebx, xmm0).unwrap();
+            a.add(edx, ebp).unwrap();
+            a.add(edx, ebx).unwrap();
+            a.mov(dword_ptr(edi + 32), edx).unwrap();
+            a.movdqu(xmmword_ptr(edi + 48), xmm2).unwrap();
+            a.emms().unwrap();
+        });
+    });
+    let mut at = initial();
+    at.regs[0] = 0x1234_5678;
+    at.regs[1] = 4;
+    at.regs[6] = DATA + 0x100;
+    at.regs[7] = DATA + 0x200;
+    let built = differential(&code, &at, |mem| {
+        for i in 0..64u32 {
+            let v = i.wrapping_mul(0x2468_1357).wrapping_add(0x80ff_7f81);
+            mem.write(DATA + 0x100 + i * 4, &v.to_le_bytes()).unwrap();
+            mem.write(DATA + 0x200 + i * 4, &(!v).to_le_bytes())
+                .unwrap();
+        }
+    });
+    assert!(built.assumed.mmx);
+}

@@ -60,6 +60,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::Bits { value: a, .. }
         | Op::FpUnary(_, a)
         | Op::VecUnary(_, a)
+        | Op::VecToInt(_, a)
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
         | Op::Load { addr: a, .. }

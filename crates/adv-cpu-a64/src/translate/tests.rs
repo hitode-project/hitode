@@ -2539,6 +2539,61 @@ mod opt_back {
                     compare(&f, &[pairs[0].0, u128::from(count)], &mut h);
                 }
             }
+            for op in [
+                VecUnary::High64,
+                VecUnary::Shuffle(if full { 2 } else { 1 }, 0x1b, full),
+                VecUnary::Shuffle(if full { 2 } else { 1 }, 0xaa, full),
+                VecUnary::ShuffleWords(false, 0xd8),
+                VecUnary::ShuffleWords(true, 0x39),
+                VecUnary::ShiftBytes(true, 0),
+                VecUnary::ShiftBytes(true, 5),
+                VecUnary::ShiftBytes(true, 16),
+                VecUnary::ShiftBytes(false, 3),
+                VecUnary::ShiftBytes(false, 20),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128]);
+                let v = f.push(b, Op::VecUnary(op, p[0])).unwrap();
+                finish(&mut f, b, v);
+                for &(a, _) in &pairs {
+                    compare(&f, &[a], &mut h);
+                }
+            }
+            for op in [
+                VecOp::Shufps(0x93),
+                VecOp::Shufpd(2),
+                VecOp::MulDwords(full),
+                VecOp::SadBytes(full),
+                VecOp::MoveLow32,
+                VecOp::Insert64(false, false),
+                VecOp::Insert64(true, false),
+                VecOp::Insert64(false, true),
+                VecOp::InsertWord(if full { 6 } else { 2 }, full),
+            ] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f.push(b, Op::Vec(op, p[0], p[1])).unwrap();
+                finish(&mut f, b, v);
+                for &(a, x) in &pairs {
+                    compare(&f, &[a, x], &mut h);
+                    compare(&f, &[a, a], &mut h);
+                }
+            }
+        }
+        for op in [
+            VecToInt::ExtractWord(0),
+            VecToInt::ExtractWord(3),
+            VecToInt::ExtractWord(7),
+            VecToInt::ByteMask(false),
+            VecToInt::ByteMask(true),
+            VecToInt::SignMask(false),
+            VecToInt::SignMask(true),
+        ] {
+            let (mut f, b, p, _) = start(&[Type::V128]);
+            let v = f.push(b, Op::VecToInt(op, p[0])).unwrap();
+            finish(&mut f, b, v);
+            for &(a, x) in &pairs {
+                compare(&f, &[a], &mut h);
+                compare(&f, &[x], &mut h);
+            }
         }
     }
 

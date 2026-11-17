@@ -91,15 +91,36 @@ pub(crate) enum VecOp {
     MulHigh(bool, bool),
     MulAdd(bool),
     Shift(crate::encode::ShiftImm, u8, bool),
+    Shufps(u8),
+    Shufpd(u8),
+    MulDwords(bool),
+    SadBytes(bool),
+    MoveLow32,
+    Insert64(bool, bool),
+    InsertWord(u8, bool),
     /// `cmpltpd`: all ones in each lane where the first is less.
     LessF64,
 }
 
+/// Unary vector lane shifts, half extracts, and immediate shuffles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecUnary {
     ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
     /// Zeroes bits 64..128 of a V128 value.
     Low64,
+    /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
+    High64,
+    Shuffle(u8, u8, bool),
+    ShuffleWords(bool, u8),
+    ShiftBytes(bool, u8),
+}
+
+/// Vector-to-I32 extractions and sign/byte masks (`pextrw`, `pmovmskb`, `movmskps`/`pd`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VecToInt {
+    ExtractWord(u8),
+    ByteMask(bool),
+    SignMask(bool),
 }
 
 /// The guest operation whose EFLAGS a `Flags` value holds.
@@ -197,6 +218,7 @@ pub(crate) enum Op {
     },
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
+    VecToInt(VecToInt, Value),
     /// A load of `width` bytes outside the frame, zero-extended to `ty`.
     Load {
         ty: Type,
@@ -250,6 +272,7 @@ impl Op {
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
             | Op::VecUnary(_, a)
+            | Op::VecToInt(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::Load { addr: a, .. }
@@ -482,7 +505,8 @@ impl Func {
             Op::Div { .. }
             | Op::Remainder { .. }
             | Op::Test { .. }
-            | Op::ToInt { wide: false, .. } => Type::I32,
+            | Op::ToInt { wide: false, .. }
+            | Op::VecToInt(..) => Type::I32,
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
