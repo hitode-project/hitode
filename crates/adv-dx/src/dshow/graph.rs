@@ -428,69 +428,71 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             disconnect_guests(
                 env,
                 guests.into(),
-                Box::new(move |env| chain(env, leave, Vec::new(), finish)),
+                Box::new(move |env, _| chain(env, leave, Vec::new(), finish)),
             )
         }),
     )
 }
 
 /// Like quartz's RemoveFilter, disconnect every connected pin of each guest
-/// filter, peer first, so pin references no longer hold either filter.
-fn disconnect_guests(
-    env: &mut Env<'_>,
-    mut filters: VecDeque<u32>,
-    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
-) -> Outcome {
+/// filter, peer first, so pin references no longer hold either filter. The
+/// first Disconnect that fails ends the walk with its result.
+fn disconnect_guests(env: &mut Env<'_>, mut filters: VecDeque<u32>, then: dmo::Done) -> Outcome {
     let Some(filter) = filters.pop_front() else {
-        return then(env);
+        return then(env, S_OK);
     };
     let Some(scratch) = alloc(env, 12) else {
-        return then(env);
+        return then(env, E_OUTOFMEMORY);
     };
     let _ = env.cpu.write_u32(scratch, 0);
     guest_call(env, filter, 10, vec![scratch], move |env, hr| {
         let pins = env.cpu.read_u32(scratch).unwrap_or(0);
-        let rest: Box<dyn FnOnce(&mut Env<'_>) -> Outcome> = Box::new(move |env| {
+        let rest: dmo::Done = Box::new(move |env, hr| {
             free(env, scratch);
+            if hr & 0x8000_0000 != 0 {
+                return then(env, hr);
+            }
             disconnect_guests(env, filters, then)
         });
         if hr != S_OK || pins == 0 {
-            return rest(env);
+            return rest(env, S_OK);
         }
         disconnect_pins(env, pins, scratch, rest)
     })
 }
 
-fn disconnect_pins(
-    env: &mut Env<'_>,
-    pins: u32,
-    scratch: u32,
-    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
-) -> Outcome {
+fn disconnect_pins(env: &mut Env<'_>, pins: u32, scratch: u32, then: dmo::Done) -> Outcome {
     let _ = env.cpu.write_u32(scratch + 4, 0);
     guest_call(env, pins, 3, vec![1, scratch + 4, 0], move |env, hr| {
         let pin = env.cpu.read_u32(scratch + 4).unwrap_or(0);
         if hr != S_OK || pin == 0 {
-            return guest_call(env, pins, 2, vec![], move |env, _| then(env));
+            return guest_call(env, pins, 2, vec![], move |env, _| then(env, S_OK));
         }
+        // Release the pin; a failure also ends the enumeration.
+        let done: dmo::Done = Box::new(move |env, hr| {
+            guest_call(env, pin, 2, vec![], move |env, _| {
+                if hr & 0x8000_0000 != 0 {
+                    return guest_call(env, pins, 2, vec![], move |env, _| then(env, hr));
+                }
+                disconnect_pins(env, pins, scratch, then)
+            })
+        });
         let _ = env.cpu.write_u32(scratch + 8, 0);
         guest_call(env, pin, 6, vec![scratch + 8], move |env, _| {
             let peer = env.cpu.read_u32(scratch + 8).unwrap_or(0);
-            let mut calls = VecDeque::new();
-            if peer != 0 {
-                calls.extend([
-                    Call(peer, 5, vec![]),
-                    Call(peer, 2, vec![]),
-                    Call(pin, 5, vec![]),
-                ]);
+            if peer == 0 {
+                return done(env, S_OK);
             }
-            calls.push_back(Call(pin, 2, vec![]));
-            chain(
-                env,
-                calls,
-                Vec::new(),
-                Box::new(move |env, _| disconnect_pins(env, pins, scratch, then)),
-            )
+            guest_call(env, peer, 5, vec![], move |env, hr| {
+                guest_call(env, peer, 2, vec![], move |env, _| {
+                    if hr & 0x8000_0000 != 0 {
+                        return done(env, hr);
+                    }
+                    guest_call(env, pin, 5, vec![], move |env, hr| {
+                        done(env, if hr & 0x8000_0000 != 0 { hr } else { S_OK })
+                    })
+                })
+            })
         })
     })
 }
@@ -790,8 +792,8 @@ fn detach(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
     else {
         return Outcome::Return(VFW_E_NOT_FOUND);
     };
-    let member = g(env, graph).leave(index);
-    if let Some(host) = member.host {
+    if let Some(host) = g(env, graph).members[index].host {
+        g(env, graph).leave(index);
         if state(env)
             .filters
             .get(&host)
@@ -813,18 +815,30 @@ fn detach(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
             }),
         );
     }
-    let mut calls = VecDeque::from([
-        Call(filter, 13, vec![0, 0]),
-        Call(filter, 8, vec![0]),
-        Call(filter, 2, vec![]),
-    ]);
-    if member.seeking != 0 {
-        calls.push_front(Call(member.seeking, 2, vec![]));
-    }
+    // A pin that refuses to disconnect keeps the filter in the graph.
     disconnect_guests(
         env,
         VecDeque::from([filter]),
-        Box::new(move |env| {
+        Box::new(move |env, hr| {
+            if hr & 0x8000_0000 != 0 {
+                return Outcome::Return(hr);
+            }
+            let Some(index) = g(env, graph)
+                .members
+                .iter()
+                .position(|m| m.filter == filter)
+            else {
+                return Outcome::Return(VFW_E_NOT_FOUND);
+            };
+            let member = g(env, graph).leave(index);
+            let mut calls = VecDeque::from([
+                Call(filter, 13, vec![0, 0]),
+                Call(filter, 8, vec![0]),
+                Call(filter, 2, vec![]),
+            ]);
+            if member.seeking != 0 {
+                calls.push_front(Call(member.seeking, 2, vec![]));
+            }
             chain(
                 env,
                 calls,

@@ -156,6 +156,11 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: When every renderer has completed, the graph MUST queue EC_COMPLETE, or set only the event handle while notification is disabled. Completion MUST end WaitForCompletion and leave the position at the stop members reported when the run started. Starting a run MUST remove queued EC_COMPLETE events.
 **Verification**: Test
 
+### MEDIA-GRAPH-23 Member removal
+
+**Rule**: RemoveFilter MUST disconnect each connected pin's peer and then the pin before the filter leaves the graph. The first failing Disconnect MUST be returned, and the filter MUST stay a member.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.

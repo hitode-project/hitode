@@ -852,6 +852,70 @@ fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
 }
 
 #[test]
+// spec: MEDIA-GRAPH-23
+fn removal_disconnects_guest_pins_and_keeps_a_filter_that_refuses() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    // Guest filter, pin enumerator, pin and connected peer.
+    let objects = [DATA + 0x400, DATA + 0x500, DATA + 0x600, DATA + 0x700];
+    for (i, obj) in objects.into_iter().enumerate() {
+        m.cpu.write_u32(obj, obj + 4).unwrap();
+        for slot in 0..18u32 {
+            m.cpu
+                .write_u32(obj + 4 + slot * 4, 0x7200_0000 + (i as u32) * 0x100 + slot)
+                .unwrap();
+        }
+    }
+    let [filter, pins, pin, peer] = objects;
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, filter, 0],
+            &[
+                (0x7200_0001, &[filter], 2),
+                (0x7200_000d, &[filter, graph, ANY], S_OK),
+                (0x7200_0008, &[filter, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    // EnumPins, Next and ConnectedTo hand out the objects; the peer refuses
+    // Disconnect, so every reference is returned and the filter stays.
+    let mut outcome = start_method(&mut m, "IFilterGraph2::RemoveFilter", &[graph, filter]);
+    for (target, output, value) in [
+        (0x7200_000a, Some((1, pins)), S_OK),
+        (0x7200_0103, Some((2, pin)), S_OK),
+        (0x7200_0206, Some((1, peer)), S_OK),
+        (0x7200_0305, None, VFW_E_NOT_STOPPED),
+        (0x7200_0302, None, 0),
+        (0x7200_0202, None, 0),
+        (0x7200_0102, None, 0),
+    ] {
+        let Outcome::Call {
+            target: called,
+            args,
+            then,
+            ..
+        } = outcome
+        else {
+            panic!("RemoveFilter must call {target:#x}");
+        };
+        assert_eq!(called, target);
+        if let Some((index, object)) = output {
+            m.cpu.write_u32(args[index], object).unwrap();
+        }
+        outcome = then(&mut env(&mut m), adv_machine::Resume::Returned(value));
+    }
+    assert!(matches!(outcome, Outcome::Return(VFW_E_NOT_STOPPED)));
+    assert_eq!(
+        m.ext.get::<State>().graphs[&graph].members.len(),
+        1,
+        "a refused removal keeps the member"
+    );
+}
+
+#[test]
 fn system_filters_expose_pins_and_join_the_graph() {
     let mut m = machine();
     let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
