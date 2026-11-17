@@ -52,6 +52,7 @@ pub(crate) const VFW_E_NOT_CONNECTED: u32 = 0x8004_0209;
 pub(crate) const VFW_E_NO_ALLOCATOR: u32 = 0x8004_020a;
 pub(crate) const VFW_E_ALREADY_CONNECTED: u32 = 0x8004_0204;
 pub(crate) const VFW_E_NOT_STOPPED: u32 = 0x8004_0224;
+pub(crate) const VFW_E_CIRCULAR_GRAPH: u32 = 0x8004_0231;
 pub(crate) const VFW_E_NO_ACCEPTABLE_TYPES: u32 = 0x8004_0207;
 pub(crate) const VFW_E_INVALID_DIRECTION: u32 = 0x8004_0208;
 pub(crate) const VFW_E_TYPE_NOT_ACCEPTED: u32 = 0x8004_022a;

@@ -161,6 +161,16 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: RemoveFilter MUST disconnect each connected pin's peer and then the pin before the filter leaves the graph. The first failing Disconnect MUST be returned, and the filter MUST stay a member.
 **Verification**: Test
 
+### MEDIA-GRAPH-24 Direct connection
+
+**Rule**: Connect and ConnectDirect MUST call Connect on the first pin as given, without reordering the pair. ConnectDirect MUST fail with VFW_E_CIRCULAR_GRAPH when the connection would close a loop.
+**Verification**: Test
+
+### MEDIA-GRAPH-25 Transition order
+
+**Rule**: Each Stop, Pause and Run MUST first sort guest members by their pins' connections, downstream before upstream, starting from the newest member. Members MUST then change state in that order.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.

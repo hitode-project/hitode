@@ -948,6 +948,14 @@ fn system_filters_expose_pins_and_join_the_graph() {
         S_OK
     );
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), filter::OUTPUT);
+    // spec: MEDIA-GRAPH-24
+    // Feeding a filter's output back into its own input closes a loop.
+    let outcome = start_method(
+        &mut m,
+        "IFilterGraph2::ConnectDirect",
+        &[graph, output, input, 0],
+    );
+    assert_eq!(finish_mpeg_calls(&mut m, outcome), VFW_E_CIRCULAR_GRAPH);
     // A decoder offers no output types until its input is connected.
     assert_eq!(
         method(&mut m, "IPin::EnumMediaTypes", &[output, DATA]),
@@ -1378,6 +1386,9 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
                 // the first member added is asked first.
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                // Members are sorted by their connections before each change.
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
             ],
@@ -1403,6 +1414,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0106, &[renderer, 0, 0], S_OK),
                 (0x7100_0006, &[source, 0, 0], S_OK),
             ],
@@ -1470,8 +1483,12 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Stop",
             &[control],
             &[
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
+                (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
+                (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
                 // Stopped, the graph re-seeks its streams to the kept position.
