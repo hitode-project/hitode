@@ -93,7 +93,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-10 Aggregation
 
-**Rule**: An aggregated filter graph MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
+**Rule**: An aggregated filter graph or host filter MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
 **Verification**: Test
 
 ### MEDIA-GRAPH-11 Member names
@@ -114,6 +114,26 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 ### MEDIA-GRAPH-14 Source filter choice
 
 **Rule**: AddSourceFilter MUST take the media type from `HKCR\Media Type\Extensions` when the file extension is registered. Otherwise the first `Media Type` entry whose byte patterns all match MUST decide the type and the source filter. A registered source other than the async reader MUST be created, loaded and added.
+**Verification**: Test
+
+### MEDIA-GRAPH-15 Graph seeking
+
+**Rule**: The graph's IMediaSeeking MUST ask every member exposing IMediaSeeking in media time, newest first, with host playback answering as one more member. Durations and stops MUST take the largest answer, capabilities their intersection, and SetPositions MUST pause a running graph around the seek. Stop MUST re-seek every member to the kept position.
+**Verification**: Test
+
+### MEDIA-GRAPH-16 Intelligent connect
+
+**Rule**: Connect and Render of a guest pin MUST try a direct connection, then graph members newest first, then the mapper's matching filters, added on demand. Recursion MUST stop at depth five, and a connection closing a loop MUST fail with VFW_E_CANNOT_CONNECT. A filter added for a failed attempt MUST be removed again.
+**Verification**: Test
+
+### MEDIA-GRAPH-17 Control delegation
+
+**Rule**: Without a host renderer, the graph's IBasicAudio, IBasicVideo2 and IVideoWindow MUST forward each call to the newest guest member exposing that interface. With no such member, IBasicAudio MUST return E_NOTIMPL and the video interfaces E_NOINTERFACE.
+**Verification**: Test
+
+### MEDIA-GRAPH-18 Graph state
+
+**Rule**: Graph transitions MUST return the first member result that is not S_OK, and Stop from Running MUST pause every member first. GetState MUST poll every member and report VFW_S_STATE_INTERMEDIATE until all reach the graph state or the timeout passes. Stop MUST return only after every host stream thread has left the downstream filters.
 **Verification**: Test
 
 ### MEDIA-STREAM-1 Pull delivery

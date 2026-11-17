@@ -8,7 +8,7 @@ const VFW_E_RENDERER_NOT_FOUND: u32 = 0x8004_0266;
 const VFW_S_PARTIAL_RENDER: u32 = 0x0004_0242;
 
 fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> Result<u32, u32> {
-    let filter = filter::new_filter(env, role, clsid)?;
+    let filter = filter::new_filter(env, role, clsid, 0)?;
     let name: Vec<u16> = name.encode_utf16().collect();
     let f = state(env).filters.get_mut(&filter).unwrap();
     f.graph = graph;
@@ -18,6 +18,7 @@ fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> 
         filter,
         name,
         host: Some(filter),
+        seeking: 0,
     });
     Ok(filter)
 }
@@ -258,7 +259,7 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) ->
                     }
                     // Hold the caller's pin across nested source/renderer calls.
                     guest_call(env, output, 1, vec![], move |env, _| {
-                        let outcome = guest_source(env, graph, output, existing_only);
+                        let outcome = super::autoplug::render(env, graph, output, existing_only);
                         after(
                             env,
                             outcome,
@@ -274,7 +275,12 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) ->
     })
 }
 
-fn guest_source(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) -> Outcome {
+pub(super) fn guest_source(
+    env: &mut Env<'_>,
+    graph: u32,
+    output: u32,
+    existing_only: bool,
+) -> Outcome {
     let mut build = match Build::new(env, graph, existing_only) {
         Ok(build) => build,
         Err(error) => return Outcome::Return(error),
@@ -311,7 +317,7 @@ pub(super) fn connect_pins(env: &mut Env<'_>, graph: u32, output: u32, input: u3
     });
     match source {
         Some(source) => file(env, graph, source, output, false, Some(input)),
-        None => filter::connect(env, output, input, 0),
+        None => super::autoplug::connect(env, graph, output, input),
     }
 }
 

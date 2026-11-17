@@ -372,20 +372,14 @@ fn guest_render_validates_direction_connection_and_graph_owner_before_connecting
 }
 
 #[test]
-// spec: MEDIA-GRAPH-6
+// spec: MEDIA-GRAPH-6, MEDIA-GRAPH-16
 fn guest_render_failed_pull_and_probe_release_reader_and_remove_temporary_filters() {
     for fail_reads in [true, false] {
         let (mut m, graph) = fixture(vec![0x55; 32]);
         m.ext.get_mut::<PullSource>().fail_reads = fail_reads;
         let outcome = pin(&mut env(&mut m), graph, OUTPUT_PIN);
-        assert_eq!(
-            finish(&mut m, outcome),
-            if fail_reads {
-                VFW_E_TYPE_NOT_ACCEPTED
-            } else {
-                VFW_E_UNSUPPORTED_STREAM
-            }
-        );
+        // Host decoding refused the stream and no mapper candidate remains.
+        assert_eq!(finish(&mut m, outcome), VFW_E_CANNOT_RENDER);
         let source = m.ext.get::<PullSource>();
         assert_eq!((source.connects, source.queries, source.reads), (1, 1, 1));
         assert_eq!(source.disconnects, 1);
@@ -825,11 +819,14 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
     assert_eq!(m.ext.get::<Presentation>().updates.len(), updates + 1);
     video::pump_video(&mut m).unwrap();
     assert_eq!(m.ext.get::<Presentation>().updates.len(), updates + 1);
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Stop", &[]), S_OK);
-    assert_eq!(m.ext.get::<State>().graphs[&graph].state, STOPPED);
+    // The stream thread leaves once stopping; Stop then has no thread to join.
+    let session = *m.ext.get::<State>().sessions.keys().next().unwrap();
+    stream::stop(&mut env(&mut m), session);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Signaled));
     assert_eq!(finish(&mut m, outcome), 0);
     assert!(m.ext.get::<State>().sessions.is_empty());
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Stop", &[]), S_OK);
+    assert_eq!(m.ext.get::<State>().graphs[&graph].state, STOPPED);
 
     assert_eq!(invoke(&mut m, basic, "IBasicVideo", "Release", &[]), 3);
     assert_eq!(invoke(&mut m, control, "IMediaControl", "Release", &[]), 2);

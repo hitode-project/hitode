@@ -199,6 +199,14 @@ pub(crate) fn stop(env: &mut Env<'_>, id: u32) {
     wake(env, id);
 }
 
+/// Whether a stream thread of `graph` (not a host-serviced session) is live.
+pub(super) fn threads_running(env: &mut Env<'_>, graph: u32) -> bool {
+    state(env)
+        .sessions
+        .values()
+        .any(|s| s.graph == graph && !s.host)
+}
+
 pub(crate) fn seek(env: &mut Env<'_>, id: u32, _position: i64) {
     if let Some(session) = state(env).sessions.get_mut(&id) {
         session.generation += 1;
@@ -438,6 +446,12 @@ fn finish(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     if let Some(s) = state(env).sessions.remove(&id) {
         env.sys.objects.close(s.wake);
+        if !threads_running(env, s.graph)
+            && let Some(graph) = state(env).graphs.get(&s.graph)
+        {
+            let idle = graph.idle;
+            env.sys.set_event(idle);
+        }
     }
     Outcome::Return(0)
 }
@@ -661,7 +675,12 @@ fn deliver_audio(
                 handle: session(env, id).wake,
                 deadline: Some(env.sys.clock.now_us() + POLL_US),
             },
-            move |env, _| deliver_audio(env, id, pin, then),
+            move |env, _| {
+                if session(env, id).stopping {
+                    return then(env);
+                }
+                deliver_audio(env, id, pin, then)
+            },
         );
     };
     let frame = session(env, id).pending_audio.pop_front().unwrap();
@@ -959,6 +978,41 @@ mod tests {
             },
         );
         (m, graph, events, wake)
+    }
+
+    // spec: MEDIA-GRAPH-18
+    #[test]
+    fn stop_returns_only_after_the_stream_thread_leaves() {
+        let (mut m, graph, _, _) = failure_session();
+        let control = query(&mut m, graph, IID_IMEDIACONTROL);
+        let idle = m.ext.get::<State>().graphs[&graph].idle;
+        m.sys.reset_event(idle);
+        m.ext
+            .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .state = graph::PAUSED;
+        let stop = crate::dshow::tests::start_method(&mut m, "IMediaControl::Stop", &[control]);
+        let Outcome::Block {
+            wait: Wait::Object { handle, .. },
+            then,
+            ..
+        } = stop
+        else {
+            panic!("Stop must wait for the stream thread");
+        };
+        assert_eq!(handle, idle);
+        assert!(matches!(pump(&mut env(&mut m), 1), Outcome::Return(0)));
+        assert!(matches!(
+            m.sys.objects.get(idle),
+            Some(Object::Event { signaled: true, .. })
+        ));
+        let resumed = then(
+            &mut env(&mut m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+        );
+        assert!(matches!(resumed, Outcome::Return(S_OK)));
     }
 
     // spec: MEDIA-STREAM-1

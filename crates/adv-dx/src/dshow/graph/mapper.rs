@@ -4,7 +4,7 @@ use super::*;
 use crate::dshow::host::create_wine;
 
 const IID_IFILTERMAPPER: Iid = quartz(0x56a8_68a3);
-const IID_IFILTERMAPPER2: Iid = guid(
+pub(super) const IID_IFILTERMAPPER2: Iid = guid(
     0xb79b_b0b0,
     0x33c1,
     0x11d1,

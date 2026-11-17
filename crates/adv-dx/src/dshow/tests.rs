@@ -235,11 +235,12 @@ fn graph_faces_share_identity_and_report_state() {
         S_OK
     );
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), graph::STOPPED);
+    // spec: MEDIA-GRAPH-15
+    // Nothing in an empty graph seeks.
     assert_eq!(
         method(&mut m, "IMediaSeeking::GetDuration", &[seeking, DATA]),
-        S_OK
+        E_NOTIMPL
     );
-    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
 #[test]
@@ -264,14 +265,8 @@ fn event_timeouts_leave_no_event_code() {
 /// the host allocated.
 const ANY: u32 = u32::MAX;
 
-/// Run a quartz method that calls back into the guest exactly once per item
-/// of `expected`, checking each call's target and arguments.
-fn method_calls(
-    m: &mut Machine<JitCpu>,
-    name: &str,
-    args: &[u32],
-    expected: &[(u32, &[u32], u32)],
-) -> u32 {
+/// Enter a quartz method and return its first outcome without resuming it.
+pub(crate) fn start_method(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> Outcome {
     m.resolve_import("quartz.dll", name).unwrap();
     let thunk = m
         .sys
@@ -285,13 +280,24 @@ fn method_calls(
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
     }
-    let mut outcome = handler(&mut Env {
+    handler(&mut Env {
         context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
         thunk,
-    });
+    })
+}
+
+/// Run a quartz method that calls back into the guest exactly once per item
+/// of `expected`, checking each call's target and arguments.
+fn method_calls(
+    m: &mut Machine<JitCpu>,
+    name: &str,
+    args: &[u32],
+    expected: &[(u32, &[u32], u32)],
+) -> u32 {
+    let mut outcome = start_method(m, name, args);
     for &(target, args, value) in expected {
         let Outcome::Call {
             target: called,
@@ -521,6 +527,32 @@ fn graph_names_members_counts_changes_and_hands_out_its_clock() {
     assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
 }
 
+// spec: MEDIA-GRAPH-17
+#[test]
+fn graph_controls_without_a_renderer_report_what_windows_reports() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let audio = query(&mut m, graph, IID_IBASICAUDIO);
+    let video = query(&mut m, graph, IID_IBASICVIDEO2);
+    let window = query(&mut m, graph, IID_IVIDEOWINDOW);
+    assert_eq!(
+        method(&mut m, "IBasicAudio::put_Volume", &[audio, -10i32 as u32]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicAudio::get_Balance", &[audio, DATA]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicVideo2::get_BitRate", &[video, DATA]),
+        E_NOINTERFACE
+    );
+    assert_eq!(
+        method(&mut m, "IVideoWindow::SetWindowForeground", &[window, 0]),
+        E_NOINTERFACE
+    );
+}
+
 // spec: MEDIA-GRAPH-10
 #[test]
 fn aggregated_graph_keeps_its_inner_count_and_forwards_other_faces_to_the_outer() {
@@ -614,6 +646,66 @@ fn aggregated_graph_keeps_its_inner_count_and_forwards_other_faces_to_the_outer(
     );
     assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 0);
     assert!(m.ext.get::<State>().graphs.is_empty());
+}
+
+// spec: MEDIA-GRAPH-10
+#[test]
+fn aggregated_host_filters_hand_out_their_inner_unknown_and_forward_to_the_outer() {
+    let mut m = machine();
+    let (outer, output, iid) = (DATA + 512, DATA + 128, DATA + 256);
+    m.cpu.write_u32(outer, outer + 4).unwrap();
+    for slot in 0..3 {
+        m.cpu
+            .write_u32(outer + 4 + slot * 4, 0x7100_0000 + slot)
+            .unwrap();
+    }
+    let (outer_add, outer_release) = (0x7100_0001, 0x7100_0002);
+    let outer_only: &[u32] = &[outer];
+    for class in [
+        CLSID_MPEG1_SPLITTER,
+        CLSID_MPEG_VIDEO_CODEC,
+        CLSID_MPEG_AUDIO_CODEC,
+        CLSID_WMASF_READER,
+        dmo::CLSID_DMO_WRAPPER,
+        vmr::CLSID_VIDEO_MIXING_RENDERER,
+    ] {
+        let create = |m: &mut Machine<JitCpu>, iid| {
+            m.cpu.write_u32(output, 0xdead).unwrap();
+            let outcome = crate::test_support::activate(&mut env(m), class, iid, outer, output);
+            let Outcome::Return(hr) = outcome else {
+                panic!("activation needed a guest call")
+            };
+            (hr, m.cpu.read_u32(output).unwrap())
+        };
+        assert_eq!(create(&mut m, IID_IBASEFILTER), (E_NOINTERFACE, 0));
+        let (hr, inner) = create(&mut m, adv_os::com::IUNKNOWN);
+        assert_eq!(hr, S_OK);
+        assert_eq!(method(&mut m, "IUnknown::AddRef", &[inner]), 2);
+        assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 1);
+        m.cpu.write(iid, &IID_IBASEFILTER).unwrap();
+        assert_eq!(
+            method_calls(
+                &mut m,
+                "IUnknown::QueryInterface",
+                &[inner, iid, output],
+                &[(outer_add, outer_only, 2)],
+            ),
+            S_OK
+        );
+        let filter = m.cpu.read_u32(output).unwrap();
+        assert_ne!(filter, inner);
+        assert_eq!(
+            method_calls(
+                &mut m,
+                "IBaseFilter::Release",
+                &[filter],
+                &[(outer_release, outer_only, 1)],
+            ),
+            1
+        );
+        assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 0);
+    }
+    assert!(m.ext.get::<State>().filters.is_empty());
 }
 
 #[test]
@@ -1024,8 +1116,19 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         Outcome::Return(S_OK)
     ));
 
+    // The graph asks its guest members for IMediaSeeking, newest first; the
+    // host timeline answers for the DMO stage and its upstream.
+    let refused: &[(u32, &[u32], u32)] = &[
+        (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+        (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+    ];
     assert_eq!(
-        method(&mut m, "IMediaSeeking::GetDuration", &[seeking, DATA]),
+        method_calls(
+            &mut m,
+            "IMediaSeeking::GetDuration",
+            &[seeking, DATA],
+            refused
+        ),
         S_OK
     );
     let mut dur = [0u8; 8];
@@ -1057,13 +1160,26 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
     }
     let handler = m.sys.thunks.get(seek_thunk).f.handler;
-    let outcome = handler(&mut Env {
+    let mut outcome = handler(&mut Env {
         context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
         thunk: seek_thunk,
     });
+    for &(target, args, value) in refused {
+        let Outcome::Call {
+            target: called,
+            args: passed,
+            then,
+            ..
+        } = outcome
+        else {
+            panic!("SetPositions must ask {target:#x} for IMediaSeeking");
+        };
+        assert_eq!((called, passed[0]), (target, args[0]));
+        outcome = then(&mut env(&mut m), adv_machine::Resume::Returned(value));
+    }
     let Outcome::Call {
         target, args, then, ..
     } = outcome
@@ -1164,7 +1280,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
     );
     assert_eq!(method(&mut m, "IMemAllocator::Commit", &[in_alloc]), S_OK);
 
-    // Stop invokes upstream source FIRST and downstream renderer LAST, and
+    // A running graph pauses its members first, as quartz does. Stop then
+    // invokes upstream source FIRST and downstream renderer LAST, and
     // ignores any VFW_E_NOT_COMMITTED abort raised while stopping.
     assert_eq!(
         method_calls(
@@ -1172,8 +1289,14 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Stop",
             &[control],
             &[
+                (0x7100_0105, &[renderer], S_OK),
+                (0x7100_0005, &[source], S_OK),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
+                // Stopped, the graph re-seeks its streams to the kept position.
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_030e, &[upstream_seek, ANY, 1, ANY, 0], S_OK),
             ],
         ),
         S_OK

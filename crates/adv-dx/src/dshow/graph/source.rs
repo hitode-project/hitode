@@ -257,7 +257,7 @@ fn reader(
                 close(env);
                 return Outcome::Return(VFW_E_DUPLICATE_NAME);
             };
-            let filter = match filter::new_filter(env, Role::FileSource, CLSID_ASYNC_READER) {
+            let filter = match filter::new_filter(env, Role::FileSource, CLSID_ASYNC_READER, 0) {
                 Ok(filter) => filter,
                 Err(error) => {
                     close(env);
@@ -278,6 +278,7 @@ fn reader(
                 filter,
                 name: name_text,
                 host: Some(filter),
+                seeking: 0,
             });
             Outcome::Return(S_OK)
         }),
