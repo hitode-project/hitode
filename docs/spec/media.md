@@ -73,7 +73,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-6 Failed connection ownership
 
-**Rule**: Total Render failure MUST roll back new connections, members, and references, restoring the source decoder for retry. Removal or termination MUST disconnect guest peers and release readers.
+**Rule**: Total Render failure MUST roll back new connections, members, and references, restoring the source decoder for retry. Removal or termination MUST disconnect every connected pin of each member and its peer, then release readers.
 **Verification**: Test
 
 ### MEDIA-GRAPH-7 Partial graphs and unsupported automation

@@ -193,7 +193,10 @@ fn callback(env: &mut Env<'_>) -> Outcome {
             env.cpu
                 .write_u32(output, if available { OUTPUT_PIN } else { 0 })
                 .unwrap();
-            env.cpu.write_u32(fetched, u32::from(available)).unwrap();
+            // COM allows a null count when one element is requested.
+            if fetched != 0 {
+                env.cpu.write_u32(fetched, u32::from(available)).unwrap();
+            }
             r(if available { S_OK } else { S_FALSE })
         }
         _ => unreachable!(),
@@ -314,6 +317,32 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
     let outcome = add_filter(&mut env(&mut m), graph, SOURCE, 0);
     assert_eq!(finish(&mut m, outcome), S_OK);
     (m, graph)
+}
+
+#[test]
+// spec: MEDIA-GRAPH-6
+fn removal_and_final_release_disconnect_pins_between_guest_filters() {
+    for remove in [true, false] {
+        let (mut m, graph) = fixture(vec![0x55; 32]);
+        // FOREIGN stands for another guest filter's pin, connected to ours.
+        let disconnect = m.cpu.read_u32(DATA + 0xa00 + 5 * 4).unwrap();
+        m.cpu.write_u32(DATA + 0xc00 + 5 * 4, disconnect).unwrap();
+        m.ext.get_mut::<PullSource>().peer = FOREIGN;
+        if remove {
+            let outcome = remove_filter(&mut env(&mut m), graph, SOURCE);
+            assert_eq!(finish(&mut m, outcome), S_OK);
+        } else {
+            assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
+        }
+        let source = m.ext.get::<PullSource>();
+        assert_eq!(source.disconnects, 2, "peer and pin");
+        assert_eq!(source.peer, 0);
+        assert_eq!(source.graph, 0);
+        for object in [SOURCE, OUTPUT_PIN, FOREIGN] {
+            assert_eq!(source.refs[&object], 1);
+        }
+        assert_eq!(source.refs[&ENUMERATOR], 0);
+    }
 }
 
 #[test]
