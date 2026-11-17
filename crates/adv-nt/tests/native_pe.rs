@@ -366,6 +366,103 @@ fn png_row_family_matches_wine() {
     }
 }
 
+// spec: NAT-BODY-1, NAT-BODY-9
+#[test]
+fn png_do_bgr_matches_wine() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
+    let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let entry = pe.image_base + table.named("png_do_bgr").unwrap().rva;
+    assert!(native.sys.redirects.contains_key(&entry));
+    for m in [&mut native, &mut reference] {
+        prepare(m, entry, 2, false);
+    }
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    let mut data = vec![0; LEN as usize];
+    for color_type in [0u8, 2, 3, 4, 6] {
+        for bit_depth in [1u8, 4, 8, 16] {
+            for width in [0u32, 1, 3, 4, 15, 16, 19, 63, 129] {
+                for b in &mut data {
+                    *b = rng.next() as u8;
+                }
+                put(&mut data, DATA, 4, width);
+                put(&mut data, DATA + 8, 1, u32::from(color_type));
+                put(&mut data, DATA + 9, 1, u32::from(bit_depth));
+                let args = [DATA, DATA + 0x1000];
+                let before = adv_nt::native::declines(&native.ext);
+                let mut actual = call(&mut native, &data, &args);
+                let mut expected = call(&mut reference, &data, &args);
+                actual.0.as_mut().unwrap()[0] = 0;
+                expected.0.as_mut().unwrap()[0] = 0;
+                assert_eq!(
+                    actual, expected,
+                    "png_do_bgr color_type={color_type} bit_depth={bit_depth} width={width}"
+                );
+                assert_eq!(
+                    adv_nt::native::declines(&native.ext),
+                    before,
+                    "png_do_bgr was not accelerated"
+                );
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-11
+#[test]
+fn embedded_zmemcpy_matches_wine() {
+    let Some(dist) = dist() else { return };
+    for module in [
+        "cabinet.dll",
+        "dbghelp.dll",
+        "opcservices.dll",
+        "user32.dll",
+        "wininet.dll",
+        "windowscodecs.dll",
+    ] {
+        let (mut native, pe) = machine(&dist, module, true);
+        let (mut reference, _) = machine(&dist, module, false);
+        let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+            .table()
+            .unwrap();
+        let entry = pe.image_base + table.named("zmemcpy").unwrap().rva;
+        assert!(native.sys.redirects.contains_key(&entry));
+        for m in [&mut native, &mut reference] {
+            prepare(m, entry, 3, false);
+        }
+        let mut rng = Rng(0x517cc1b727220a95);
+        let mut data = vec![0; LEN as usize];
+        for (dst, src, len) in [
+            (DATA + 0x1000, DATA + 0x2000, 0u32),
+            (DATA + 0x1000, DATA + 0x2000, 17),
+            (DATA + 0x1003, DATA + 0x2001, 259),
+            (DATA + 0x1000, DATA + 0x1000, 64),
+            (DATA + 0x1000, DATA + 0x1005, 64),
+            (DATA + 0x1001, DATA + 0x1000, 64),
+            (DATA + 0x1003, DATA + 0x1000, 128),
+            (DATA + 0x1000, DATA + 0x2000, 4096),
+        ] {
+            for b in &mut data {
+                *b = rng.next() as u8;
+            }
+            let before = adv_nt::native::declines(&native.ext);
+            let mut actual = call(&mut native, &data, &[dst, src, len]);
+            let mut expected = call(&mut reference, &data, &[dst, src, len]);
+            // zmemcpy returns void; EAX is not part of its ABI.
+            actual.0.as_mut().unwrap()[0] = 0;
+            expected.0.as_mut().unwrap()[0] = 0;
+            assert_eq!(
+                actual, expected,
+                "{module} zmemcpy dst={dst:#x} src={src:#x} len={len}"
+            );
+            assert_eq!(adv_nt::native::declines(&native.ext), before);
+        }
+    }
+}
+
 // spec: NAT-BODY-1, NAT-BODY-8
 #[test]
 fn d3dx_versions_share_integer_pixels() {

@@ -569,6 +569,24 @@ fn crt_and_adler_neon_match_scalar() {
             zlib::adler32::<_, true>(&mut mem, args),
             zlib::adler32::<_, false>(&mut mem, args)
         );
+        for (color_type, bit_depth, width) in
+            [(2u8, 8u8, 35u32), (6, 8, 19), (2, 16, 9), (6, 16, 7)]
+        {
+            cpu.bytes[0x1000..0x1004].copy_from_slice(&width.to_le_bytes());
+            cpu.bytes[0x1008] = color_type;
+            cpu.bytes[0x1009] = bit_depth;
+            let mut cpu_scalar = guest();
+            cpu_scalar.bytes = cpu.bytes.clone();
+            let args = [0x1000, 2 * PAGE as u32, 0, 0, 0, 0, 0];
+            let mut mem_neon = GuestMem::new(&mut cpu, &mut scratch);
+            let mut scratch_scalar = Scratch::default();
+            let mut mem_scalar = GuestMem::new(&mut cpu_scalar, &mut scratch_scalar);
+            assert_eq!(
+                png::do_bgr::<_, true>(&mut mem_neon, args),
+                png::do_bgr::<_, false>(&mut mem_scalar, args),
+            );
+            assert_eq!(cpu.bytes, cpu_scalar.bytes);
+        }
     }
 }
 
