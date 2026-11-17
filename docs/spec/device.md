@@ -176,6 +176,12 @@ Unmatched libraries MUST execute their guest implementations.
 **Verification**: Test
 **Basis**: Wine dsound `capture` and `duplex` tests, which pass on Windows; the built-in stack has no capture devices.
 
+### DEV-AUDIO-9 DirectSound playback devices
+
+**Rule**: `DirectSoundEnumerate` MUST list the primary driver entry with a null GUID and empty module first, then the playback device under its fixed GUID. That GUID MUST open the same device as the default aliases. A primary buffer MUST ignore `DSBCAPS_LOCHARDWARE`.
+**Verification**: Test
+**Basis**: Wine dsound `dsound` and `dsound8` tests, which pass on Windows.
+
 ### DEV-AUDIO-5 Owned PCM timing
 
 **Rule**: Owned PCM clock conversion MUST use guest and device readings from the same synchronization point. Decode duration MUST NOT shift a continuous audio stream's presentation timestamps. Queue-depth metrics MUST measure total queued duration per stream.
