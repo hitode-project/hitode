@@ -536,7 +536,6 @@ fn movie() -> Vec<u8> {
     include_bytes!("fixtures/guest_movie.mpg").to_vec()
 }
 
-#[cfg(feature = "media")]
 fn invoke(
     m: &mut Machine<JitCpu>,
     pointer: u32,
