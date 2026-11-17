@@ -8,6 +8,8 @@ use adv_os::com::Iid;
 
 use super::*;
 
+mod clock;
+pub(super) mod mapper;
 mod render;
 pub(super) mod source;
 
@@ -37,13 +39,28 @@ pub(crate) struct Member {
 }
 
 pub(crate) struct Graph {
-    /// IFilterGraph2, IMediaControl, IMediaEventEx, IMediaSeeking, IMediaPosition,
-    /// IBasicAudio, IMediaEventSink, IMediaFilter, IBasicVideo, IVideoWindow,
-    /// IObjectWithSite.
+    /// [`GRAPH_FACES`], then the inner IUnknown of an aggregated graph.
     pub faces: Vec<u32>,
+    /// The controlling outer object of an aggregated graph, and the graph's
+    /// own non-delegating IUnknown; both zero otherwise.
+    outer: u32,
+    inner: u32,
+    /// The aggregated FilterMapper2's inner IUnknown, once created.
+    mapper: u32,
     pub members: Vec<Member>,
+    /// IGraphVersion's count, advanced on each membership change.
+    version: u32,
+    /// The counter that generated filter names take, from 1 modulo 10000.
+    name_index: u32,
     /// The guest site set through IObjectWithSite, holding one reference.
     site: u32,
+    /// The reference clock set through IMediaFilter, holding one reference;
+    /// every guest member receives it.
+    clock: u32,
+    /// Whether the graph still chooses its clock, and the member whose own
+    /// clock it chose.
+    default_clock: bool,
+    clock_provider: u32,
     pub state: u32,
     stopping: bool,
     events: VecDeque<(u32, u32, u32)>,
@@ -73,6 +90,52 @@ pub(crate) struct Graph {
 }
 
 impl Graph {
+    /// The IUnknown that aggregated objects, such as the mapper, delegate to.
+    fn controlling(&self) -> u32 {
+        if self.outer != 0 {
+            self.outer
+        } else {
+            self.faces[0]
+        }
+    }
+
+    fn named(&self, name: &[u16]) -> bool {
+        self.members.iter().any(|m| m.name == name)
+    }
+
+    /// A filter's name in the graph: `requested` when free, otherwise the
+    /// first free "NNNN" or "requested NNNN" from the graph's counter.
+    fn unique_name(&mut self, requested: Option<Vec<u16>>) -> Option<Vec<u16>> {
+        if let Some(name) = requested.as_ref().filter(|n| !self.named(n)) {
+            return Some(name.clone());
+        }
+        for _ in 0..10_000 {
+            let suffix = format!("{:04}", self.name_index);
+            self.name_index = (self.name_index + 1) % 10_000;
+            let mut name = requested.clone().map_or_else(Vec::new, |mut n| {
+                n.push(u16::from(b' '));
+                n
+            });
+            name.extend(suffix.encode_utf16());
+            if !self.named(&name) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn join(&mut self, member: Member) {
+        self.members.push(member);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    pub(crate) fn leave(&mut self, index: usize) -> Member {
+        self.version = self.version.wrapping_add(1);
+        self.members.remove(index)
+    }
+}
+
+impl Graph {
     pub fn position(&self, now_us: u64) -> i64 {
         match self.origin {
             Some(origin) if self.state == RUNNING => {
@@ -90,7 +153,7 @@ impl Graph {
     }
 }
 
-const GRAPH_FACES: [Face; 11] = [
+const GRAPH_FACES: [Face; 14] = [
     Face::FilterGraph,
     Face::MediaControl,
     Face::MediaEvent,
@@ -102,13 +165,25 @@ const GRAPH_FACES: [Face; 11] = [
     Face::BasicVideo,
     Face::VideoWindow,
     Face::ObjectWithSite,
+    Face::GraphConfig,
+    Face::GraphVersion,
+    Face::VideoFrameStep,
 ];
 
 pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
-    if outer != 0 {
-        return Outcome::Return(CLASS_E_NOAGGREGATION);
+    // Like Windows, an aggregated graph hands out only its inner IUnknown.
+    if outer != 0 && iid != adv_os::com::IUNKNOWN {
+        let _ = env.cpu.write_u32(output, 0);
+        return Outcome::Return(E_NOINTERFACE);
     }
-    let faces = match super::create(env, &GRAPH_FACES, Obj::Graph) {
+    let created = if outer == 0 {
+        super::create(env, &GRAPH_FACES, Obj::Graph)
+    } else {
+        let mut faces = GRAPH_FACES.to_vec();
+        faces.push(Face::Inner);
+        super::create_aggregated(env, &faces, Obj::Graph)
+    };
+    let faces = match created {
         Ok(faces) => faces,
         Err(error) => return Outcome::Return(error),
     };
@@ -125,10 +200,23 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
         None
     };
     let canonical = faces[0];
+    let inner = if outer == 0 {
+        0
+    } else {
+        *faces.last().unwrap()
+    };
     state(env).graphs.insert(
         canonical,
         Graph {
             faces,
+            outer,
+            inner,
+            mapper: 0,
+            version: 0,
+            name_index: 1,
+            clock: 0,
+            default_clock: true,
+            clock_provider: 0,
             members: Vec::new(),
             site: 0,
             state: STOPPED,
@@ -167,6 +255,42 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
     release(env, canonical);
     log::info!("DirectShow: filter graph {canonical:#x} created");
     Outcome::Return(outcome)
+}
+
+/// The outer object every face of an aggregated graph but its inner IUnknown
+/// forwards QueryInterface, AddRef and Release to.
+pub(crate) fn outer(env: &Env<'_>, this: u32) -> Option<u32> {
+    let key = canonical(env, this)?;
+    let graph = env.ext.get::<State>().graphs.get(&key)?;
+    (graph.outer != 0 && this != graph.inner).then_some(graph.outer)
+}
+
+/// The inner IUnknown's QueryInterface: IUnknown is itself, and any other
+/// interface is retained through the outer object, as COM aggregation needs.
+pub(crate) fn inner_query(env: &mut Env<'_>, this: u32, iid: u32, output: u32) -> Outcome {
+    if output == 0 || iid == 0 {
+        return Outcome::Return(E_POINTER);
+    }
+    let _ = env.cpu.write_u32(output, 0);
+    let Ok(requested) = read_guid(env, iid) else {
+        return Outcome::Return(E_POINTER);
+    };
+    if requested == adv_os::com::IUNKNOWN {
+        return Outcome::Return(super::query_interface(env, this, iid, output));
+    }
+    if let Some(graph) = mapper::target(env, this, iid) {
+        return mapper::query(env, graph, iid, output);
+    }
+    let com = state(env).com;
+    let Ok(pointer) = com.resolve_interface::<Obj>(&mut env.sys.objects, this, requested) else {
+        return Outcome::Return(E_NOINTERFACE);
+    };
+    let key = canonical(env, this).unwrap();
+    let outer = state(env).graphs[&key].outer;
+    guest_call(env, outer, 1, vec![], move |env, _| {
+        let _ = env.cpu.write_u32(output, pointer);
+        Outcome::Return(S_OK)
+    })
 }
 
 /// Release for every DirectShow face. The last graph reference first stops and
@@ -220,11 +344,20 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     let mut leave = VecDeque::new();
     for &filter in &guests {
         leave.push_back(Call(filter, 13, vec![0, 0]));
+        leave.push_back(Call(filter, 8, vec![0]));
         leave.push_back(Call(filter, 2, vec![]));
+    }
+    let clock = std::mem::take(&mut g(env, graph).clock);
+    if clock != 0 {
+        leave.push_back(Call(clock, 2, vec![]));
     }
     let site = std::mem::take(&mut g(env, graph).site);
     if site != 0 {
         leave.push_back(Call(site, 2, vec![]));
+    }
+    let mapper = std::mem::take(&mut g(env, graph).mapper);
+    if mapper != 0 {
+        leave.push_back(Call(mapper, 2, vec![]));
     }
     state(env).graphs.get_mut(&graph).unwrap().members.clear();
     let event = state(env).graphs[&graph].event;
@@ -381,7 +514,11 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         }
         (Face::FilterGraph, "Disconnect") => Some(filter::disconnect(env, env.arg(1))),
         (Face::FilterGraph, "Reconnect" | "ReconnectEx") => r(E_NOTIMPL),
-        (Face::FilterGraph, "SetDefaultSyncSource") => r(S_OK),
+        (Face::FilterGraph, "SetDefaultSyncSource") => Some(clock::set_default(
+            env,
+            graph,
+            Box::new(|_, hr| Outcome::Return(hr[0])),
+        )),
         (Face::FilterGraph, "AddSourceFilter") => {
             Some(source::add(env, graph, env.arg(1), env.arg(2), env.arg(3)))
         }
@@ -394,6 +531,15 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             env.arg(2),
             env.arg(3),
         )),
+        (Face::GraphVersion, "QueryVersion") => {
+            let output = env.arg(1);
+            if output == 0 {
+                return r(E_POINTER);
+            }
+            let version = g(env, graph).version;
+            let _ = env.cpu.write_u32(output, version);
+            r(S_OK)
+        }
         (Face::FilterGraph, "SetLogFile") => r(S_OK),
         (Face::FilterGraph, "Abort") => r(S_OK),
         (Face::FilterGraph, "ShouldOperationContinue") => r(S_OK),
@@ -445,12 +591,22 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             let _ = env.cpu.write_u32(env.arg(2), value);
             r(S_OK)
         }
-        (Face::MediaFilter, "SetSyncSource") => r(S_OK),
+        (Face::MediaFilter, "SetSyncSource") => Some(clock::set(env, graph, env.arg(1))),
         (Face::ObjectWithSite, "SetSite") => Some(set_site(env, graph, env.arg(1))),
         (Face::ObjectWithSite, "GetSite") => Some(get_site(env, graph, env.arg(1), env.arg(2))),
         (Face::MediaFilter, "GetSyncSource") => {
-            let _ = env.cpu.write_u32(env.arg(1), 0);
-            r(S_FALSE)
+            let output = env.arg(1);
+            if output == 0 {
+                return r(E_POINTER);
+            }
+            let clock = g(env, graph).clock;
+            let _ = env.cpu.write_u32(output, clock);
+            if clock == 0 {
+                return r(S_FALSE);
+            }
+            Some(guest_call(env, clock, 1, vec![], |_, _| {
+                Outcome::Return(S_OK)
+            }))
         }
 
         (Face::MediaEvent, method) => event_method(env, graph, method),
@@ -472,10 +628,19 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
     if filter == 0 {
         return Outcome::Return(E_POINTER);
     }
-    let name_text = read_wide(env, name, 127);
+    let requested = (name != 0).then(|| read_wide(env, name, 127));
     if g(env, graph).members.iter().any(|m| m.filter == filter) {
         return Outcome::Return(E_INVALIDARG);
     }
+    let duplicate = requested.as_ref().is_some_and(|n| g(env, graph).named(n));
+    let Some(name_text) = g(env, graph).unique_name(requested) else {
+        return Outcome::Return(VFW_E_DUPLICATE_NAME);
+    };
+    let added = if duplicate {
+        VFW_S_DUPLICATE_NAME
+    } else {
+        S_OK
+    };
     let host = canonical(env, filter).filter(|c| state(env).filters.contains_key(c));
     let graph_face = g(env, graph).faces[0];
     if let Some(host) = host {
@@ -483,13 +648,23 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
         let f = state(env).filters.get_mut(&host).unwrap();
         f.graph = graph;
         f.name = name_text.clone();
-        g(env, graph).members.push(Member {
+        g(env, graph).join(Member {
             filter,
             name: name_text,
             host: Some(host),
         });
-        return Outcome::Return(S_OK);
+        return Outcome::Return(added);
     }
+    // The filter receives the final name; filters copy it in JoinFilterGraph.
+    let bytes: Vec<u8> = name_text
+        .iter()
+        .chain(&[0])
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let Some(name) = alloc(env, bytes.len() as u32) else {
+        return Outcome::Return(E_OUTOFMEMORY);
+    };
+    let _ = env.cpu.write(name, &bytes);
     let calls = VecDeque::from([
         Call(filter, 1, vec![]),
         Call(filter, 13, vec![graph_face, name]),
@@ -499,23 +674,40 @@ fn add_filter(env: &mut Env<'_>, graph: u32, filter: u32, name: u32) -> Outcome 
         calls,
         Vec::new(),
         Box::new(move |env, results| {
+            free(env, name);
             let joined = results[1];
             if joined & 0x8000_0000 != 0 {
                 return guest_call(env, filter, 2, vec![], move |_, _| Outcome::Return(joined));
             }
-            if let Some(graph) = state(env).graphs.get_mut(&graph) {
-                graph.members.push(Member {
-                    filter,
-                    name: name_text,
-                    host: None,
-                });
-            }
-            Outcome::Return(S_OK)
+            let Some(graph) = state(env).graphs.get_mut(&graph) else {
+                return Outcome::Return(added);
+            };
+            graph.join(Member {
+                filter,
+                name: name_text,
+                host: None,
+            });
+            let clock = graph.clock;
+            guest_call(env, filter, 8, vec![clock], move |_, _| {
+                Outcome::Return(added)
+            })
         }),
     )
 }
 
 fn remove_filter(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
+    if !g(env, graph).members.iter().any(|m| m.filter == filter) {
+        return Outcome::Return(VFW_E_NOT_FOUND);
+    }
+    clock::leave(
+        env,
+        graph,
+        filter,
+        Box::new(move |env, _| detach(env, graph, filter)),
+    )
+}
+
+fn detach(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
     let Some(index) = g(env, graph)
         .members
         .iter()
@@ -523,7 +715,7 @@ fn remove_filter(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
     else {
         return Outcome::Return(VFW_E_NOT_FOUND);
     };
-    let member = g(env, graph).members.remove(index);
+    let member = g(env, graph).leave(index);
     if let Some(host) = member.host {
         if state(env)
             .filters
@@ -546,7 +738,11 @@ fn remove_filter(env: &mut Env<'_>, graph: u32, filter: u32) -> Outcome {
             }),
         );
     }
-    let calls = VecDeque::from([Call(filter, 13, vec![0, 0]), Call(filter, 2, vec![])]);
+    let calls = VecDeque::from([
+        Call(filter, 13, vec![0, 0]),
+        Call(filter, 8, vec![0]),
+        Call(filter, 2, vec![]),
+    ]);
     disconnect_guests(
         env,
         VecDeque::from([filter]),
@@ -639,11 +835,18 @@ fn set_host_states(env: &mut Env<'_>, graph: u32, value: u32) {
 }
 
 pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
+    match g(env, graph).state {
+        PAUSED => then(env, Vec::new()),
+        STOPPED => {
+            clock::ensure_default(env, graph, Box::new(move |env, _| paused(env, graph, then)))
+        }
+        _ => paused(env, graph, then),
+    }
+}
+
+fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     let now = env.sys.clock.now_us();
     let previous = g(env, graph).state;
-    if previous == PAUSED {
-        return then(env, Vec::new());
-    }
     if previous == STOPPED {
         let hr = video::auto_show(env, graph);
         if hr != S_OK {
@@ -681,6 +884,13 @@ pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     if previous == STOPPED {
         return pause(env, graph, Box::new(move |env, _| run(env, graph, then)));
     }
+    if g(env, graph).default_clock && g(env, graph).clock == 0 {
+        return clock::ensure_default(env, graph, Box::new(move |env, _| ran(env, graph, then)));
+    }
+    ran(env, graph, then)
+}
+
+fn ran(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     // Without a reference clock tStart only orders samples; stream time starts at 0.
     each_guest_filter(
         env,

@@ -98,3 +98,50 @@ fn dll_round_trips_sections_exports_imports_and_relocations() {
     assert_eq!(pe.cstr_at(pe.u32_at(names).unwrap()).unwrap(), b"Alpha");
     assert_eq!(pe.cstr_at(pe.u32_at(names + 4).unwrap()).unwrap(), b"Zed");
 }
+
+// A one-leaf resource tree (type 16, name 1, language 0x409) at `rva`.
+fn resource_section(rva: u32) -> Vec<u8> {
+    let mut bytes = vec![0; 96];
+    let directory = |bytes: &mut Vec<u8>, at: usize, id: u32, target: u32| {
+        bytes[at + 14..at + 16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[at + 16..at + 20].copy_from_slice(&id.to_le_bytes());
+        bytes[at + 20..at + 24].copy_from_slice(&target.to_le_bytes());
+    };
+    directory(&mut bytes, 0, 16, 0x8000_0000 | 24);
+    directory(&mut bytes, 24, 1, 0x8000_0000 | 48);
+    directory(&mut bytes, 48, 0x409, 72);
+    bytes[72..76].copy_from_slice(&(rva + 88).to_le_bytes());
+    bytes[76..80].copy_from_slice(&5u32.to_le_bytes());
+    bytes[88..93].copy_from_slice(b"hello");
+    bytes
+}
+
+// spec: WINE-DLL-4
+#[test]
+fn replacement_dll_carries_the_original_resources() {
+    let mut original = DllWriter::new("original.dll", 0x1000_0000);
+    let rva = original.next_rva();
+    let section = resource_section(rva);
+    let len = section.len() as u32;
+    original
+        .section(".rsrc", section, len, scn::MEM_READ | 0x40)
+        .unwrap();
+    let mut bytes = original.finish().unwrap();
+    // The resource data directory of the PE32 optional header.
+    bytes[0x108..0x10c].copy_from_slice(&rva.to_le_bytes());
+    bytes[0x10c..0x110].copy_from_slice(&88u32.to_le_bytes());
+    let original = Pe::parse(&bytes).unwrap();
+
+    let mut writer = DllWriter::new("replacement.dll", 0x1000_0000);
+    writer
+        .section(".text", vec![0xc3], 0x2000, scn::CNT_CODE | scn::MEM_READ)
+        .unwrap();
+    writer.resources(&original).unwrap();
+    let pe = Pe::parse(&writer.finish().unwrap()).unwrap();
+    assert_ne!(pe.dir(dir::RESOURCE).rva, rva);
+    let leaves = pe.resources().unwrap().unwrap().leaves();
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(leaves[0].lang, 0x409);
+    let data = leaves[0].data;
+    assert_eq!(pe.slice(data.rva, data.size).unwrap(), b"hello");
+}

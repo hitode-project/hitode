@@ -530,6 +530,11 @@ D3DX checks an admitted CRT entry against the exact relocated bytes saved at bin
 **Rule**: Installed host DLL exports MUST point inside an i386 PE32 image that Wine's loader maps. Entries MUST use their registered calling conventions and machine bindings without storing host addresses, at any load base.
 **Verification**: Test
 
+### WINE-DLL-4 Replaced module resources
+
+**Rule**: A host DLL that takes the place of a Wine module's file MUST carry that module's resources, such as type libraries and version information, unchanged.
+**Verification**: Test
+
 ### WINE-DLL-2 Ordinary import calls
 
 **Rule**: Host DLL import calls MUST read the image's IAT slot at call time and enter its target through `Outcome::call` and a continuation. Guest changes to the slot or target entry MUST intercept the call. Host code that a COM method or another path outside the image's entries enters MUST bind imports with the loader's image base.

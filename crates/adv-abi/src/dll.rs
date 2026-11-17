@@ -125,6 +125,30 @@ impl ModuleImage {
         exports: &[Export<'_>],
         imports: &[ImportModule],
     ) -> Result<Self, String> {
+        Self::assemble(machine, module, entry, exports, imports, None)
+    }
+
+    /// [`Self::build`] for an image that takes the place of `original`'s file,
+    /// keeping its resources, such as type libraries and version information.
+    pub fn build_replacing<B: Backend>(
+        machine: &mut Machine<B>,
+        module: &str,
+        exports: &[Export<'_>],
+        imports: &[ImportModule],
+        original: &[u8],
+    ) -> Result<Self, String> {
+        let original = adv_pe::Pe::parse(original).map_err(|e| e.to_string())?;
+        Self::assemble(machine, module, None, exports, imports, Some(&original))
+    }
+
+    fn assemble<B: Backend>(
+        machine: &mut Machine<B>,
+        module: &str,
+        entry: Option<&str>,
+        exports: &[Export<'_>],
+        imports: &[ImportModule],
+        original: Option<&adv_pe::Pe>,
+    ) -> Result<Self, String> {
         let name = module.to_ascii_lowercase();
         if !(name.ends_with(".dll") || name.ends_with(".drv")) || name.contains(['/', '\\', ':']) {
             return Err("a host module needs a DLL file name".into());
@@ -164,6 +188,9 @@ impl ModuleImage {
             writer.exports(&pe_exports)?;
             let imports = writer.imports(imports)?;
             writer.relocations(&relocations)?;
+            if let Some(original) = original {
+                writer.resources(original)?;
+            }
             Ok((writer.finish()?, Arc::new(imports)))
         })()
         .map_err(|e| e.to_string())?;

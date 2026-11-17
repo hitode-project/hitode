@@ -234,6 +234,35 @@ impl DllWriter {
         Ok(())
     }
 
+    /// Carry `source`'s resource tree, with its data, unchanged. The span is
+    /// copied whole, so directory offsets hold and only data RVAs move.
+    pub fn resources(&mut self, source: &crate::Pe) -> Result<()> {
+        let Some(tree) = source.resources()? else {
+            return Ok(());
+        };
+        let directory = source.dir(dir::RESOURCE);
+        let leaves = tree.leaves();
+        let mut start = directory.rva;
+        let mut end = crate::add(directory.rva, directory.size)?;
+        for leaf in &leaves {
+            start = start.min(leaf.data.rva);
+            end = end.max(crate::add(leaf.data.rva, leaf.data.size)?);
+        }
+        let mut bytes = source.slice(start, end - start)?.to_vec();
+        let rva = self.next;
+        for leaf in &leaves {
+            let at = (leaf.data.entry_rva - start) as usize;
+            put32(&mut bytes, at, leaf.data.rva - start + rva);
+        }
+        let len = size(bytes.len())?;
+        self.section(".rsrc", bytes, len, scn::MEM_READ | 0x40)?;
+        self.dirs[dir::RESOURCE] = DataDir {
+            rva: rva + (directory.rva - start),
+            size: directory.size,
+        };
+        Ok(())
+    }
+
     fn directory(&mut self, index: usize, name: &str, bytes: Vec<u8>, flags: u32) -> Result<()> {
         let len = size(bytes.len())?;
         self.dirs[index] = DataDir {

@@ -176,7 +176,7 @@ pub(super) fn add(env: &mut Env<'_>, graph: u32, filename: u32, name: u32, outpu
             let source = state(env).filters.get_mut(&filter).unwrap();
             source.graph = graph;
             source.name = name_text.clone();
-            g(env, graph).members.push(Member {
+            g(env, graph).join(Member {
                 filter,
                 name: name_text,
                 host: Some(filter),

@@ -437,7 +437,7 @@ fn basic_call(env: &mut Env<'_>, graph: u32, method: &str, info: &VideoInfo) -> 
     match method {
         "get_VideoWidth" => write_word(env, info.width),
         "get_VideoHeight" => write_word(env, info.height),
-        "GetVideoSize" => write_size(env, info.width, info.height),
+        "GetVideoSize" | "GetPreferredAspectRatio" => write_size(env, info.width, info.height),
         "get_AvgTimePerFrame" => {
             let output = env.arg(1);
             if !writable(env, output, 8) {

@@ -15,13 +15,14 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use adv_os::com::{Com, Iid, QueryError};
 
+mod automation;
 mod dmo;
 #[cfg(test)]
 mod error_text_tests;
 mod filter;
 mod graph;
 pub(crate) mod host;
-pub use host::{Host, Opened, ReadFile};
+pub use host::{Host, Opened, ReadFile, WINE_QUARTZ};
 mod sample;
 mod stream;
 mod video;
@@ -56,6 +57,8 @@ pub(crate) const VFW_E_NOT_COMMITTED: u32 = 0x8004_0211;
 pub(crate) const VFW_E_WRONG_STATE: u32 = 0x8004_0227;
 pub(crate) const VFW_E_TIMEOUT: u32 = 0x8004_022e;
 pub(crate) const VFW_E_NOT_FOUND: u32 = 0x8004_0216;
+pub(crate) const VFW_S_DUPLICATE_NAME: u32 = 0x0004_022d;
+pub(crate) const VFW_E_DUPLICATE_NAME: u32 = 0x8004_022d;
 pub(crate) const VFW_E_ENUM_OUT_OF_SYNC: u32 = 0x8004_0203;
 pub(crate) const VFW_E_UNSUPPORTED_STREAM: u32 = 0x8004_0265;
 
@@ -117,6 +120,25 @@ pub(crate) const IID_IMEDIAPOSITION: Iid = quartz(0x56a8_68b2);
 pub(crate) const IID_IBASICAUDIO: Iid = quartz(0x56a8_68b3);
 pub(crate) const IID_IVIDEOWINDOW: Iid = quartz(0x56a8_68b4);
 pub(crate) const IID_IBASICVIDEO: Iid = quartz(0x56a8_68b5);
+pub(crate) const IID_IBASICVIDEO2: Iid = guid(
+    0x329b_b360,
+    0xf6ea,
+    0x11d1,
+    [0x90, 0x38, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x98],
+);
+pub(crate) const IID_IGRAPHCONFIG: Iid = guid(
+    0x03a1_eb8e,
+    0x32bf,
+    0x4245,
+    [0x85, 0x02, 0x11, 0x4d, 0x08, 0xa9, 0xcb, 0x88],
+);
+pub(crate) const IID_IGRAPHVERSION: Iid = quartz(0x56a8_68ab);
+pub(crate) const IID_IVIDEOFRAMESTEP: Iid = guid(
+    0xe46a_9787,
+    0x2b71,
+    0x444d,
+    [0xa4, 0xb5, 0x1f, 0xab, 0x7b, 0x70, 0x8d, 0x6a],
+);
 pub(crate) const IID_IOBJECTWITHSITE: Iid = guid(
     0xfc48_01a3,
     0x2ba9,
@@ -227,6 +249,9 @@ pub(crate) enum Face {
     VideoWindow,
     MediaFilter,
     ObjectWithSite,
+    GraphConfig,
+    GraphVersion,
+    VideoFrameStep,
     BaseFilter,
     FileSource,
     EnumFilters,
@@ -239,9 +264,11 @@ pub(crate) enum Face {
     DmoWrapper,
     VmrFilterConfig,
     VmrWindowlessControl,
+    /// An aggregated object's own, non-delegating IUnknown.
+    Inner,
 }
 
-const FACES: [(Face, &str); 23] = [
+const FACES: [(Face, &str); 27] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -249,10 +276,13 @@ const FACES: [(Face, &str); 23] = [
     (Face::MediaSeeking, "IMediaSeeking"),
     (Face::MediaPosition, "IMediaPosition"),
     (Face::BasicAudio, "IBasicAudio"),
-    (Face::BasicVideo, "IBasicVideo"),
+    (Face::BasicVideo, "IBasicVideo2"),
     (Face::VideoWindow, "IVideoWindow"),
     (Face::MediaFilter, "IMediaFilter"),
     (Face::ObjectWithSite, "IObjectWithSite"),
+    (Face::GraphConfig, "IGraphConfig"),
+    (Face::GraphVersion, "IGraphVersion"),
+    (Face::VideoFrameStep, "IVideoFrameStep"),
     (Face::BaseFilter, "IBaseFilter"),
     (Face::FileSource, "IFileSourceFilter"),
     (Face::EnumFilters, "IEnumFilters"),
@@ -265,6 +295,7 @@ const FACES: [(Face, &str); 23] = [
     (Face::DmoWrapper, "IDMOWrapperFilter"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
+    (Face::Inner, "IUnknown"),
 ];
 
 impl Face {
@@ -281,10 +312,13 @@ impl Face {
             Face::MediaSeeking => &[IID_IMEDIASEEKING],
             Face::MediaPosition => &[IID_IMEDIAPOSITION],
             Face::BasicAudio => &[IID_IBASICAUDIO],
-            Face::BasicVideo => &[IID_IBASICVIDEO],
+            Face::BasicVideo => &[IID_IBASICVIDEO, IID_IBASICVIDEO2],
             Face::VideoWindow => &[IID_IVIDEOWINDOW],
             Face::MediaFilter => &[IID_IMEDIAFILTER, IID_IPERSIST],
             Face::ObjectWithSite => &[IID_IOBJECTWITHSITE],
+            Face::GraphConfig => &[IID_IGRAPHCONFIG],
+            Face::GraphVersion => &[IID_IGRAPHVERSION],
+            Face::VideoFrameStep => &[IID_IVIDEOFRAMESTEP],
             Face::BaseFilter => &[IID_IBASEFILTER, IID_IMEDIAFILTER, IID_IPERSIST],
             Face::FileSource => &[IID_IFILESOURCEFILTER],
             Face::EnumFilters => &[IID_IENUMFILTERS],
@@ -297,6 +331,7 @@ impl Face {
             Face::DmoWrapper => &[dmo::IID_IDMOWRAPPERFILTER],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
+            Face::Inner => &[],
         }
     }
 }
@@ -338,6 +373,10 @@ pub(crate) struct State {
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
+    /// The quartz type library and the ITypeInfo of each automation
+    /// interface, loaded on first use and kept for the process, as strmbase does.
+    type_library: u32,
+    type_infos: BTreeMap<Iid, u32>,
 }
 
 /// Dispatch data: face index and slot, bound once per thunk.
@@ -464,6 +503,8 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         next_session: 1,
         pending_threads: Vec::new(),
         pending_posts: Vec::new(),
+        type_library: 0,
+        type_infos: BTreeMap::new(),
     });
     Ok(())
 }
@@ -493,6 +534,26 @@ pub(crate) fn free(env: &mut Env<'_>, pointer: u32) {
 /// pointers in order; the first is canonical. The caller stores its own state
 /// under that pointer before handing any of them to the guest.
 pub(crate) fn create(env: &mut Env<'_>, faces: &[Face], value: Obj) -> Result<Vec<u32>, u32> {
+    create_counted(env, faces, value, false)
+}
+
+/// [`create`] for an aggregated object: IUnknown moves to the last face, which
+/// keeps its own count. Host dispatch counts every face, because the others
+/// forward their references to the controlling outer object.
+pub(crate) fn create_aggregated(
+    env: &mut Env<'_>,
+    faces: &[Face],
+    value: Obj,
+) -> Result<Vec<u32>, u32> {
+    create_counted(env, faces, value, true)
+}
+
+fn create_counted(
+    env: &mut Env<'_>,
+    faces: &[Face],
+    value: Obj,
+    aggregated: bool,
+) -> Result<Vec<u32>, u32> {
     initialize(env).map_err(|error| {
         log::warn!("DirectShow: {error}");
         E_OUTOFMEMORY
@@ -519,7 +580,15 @@ pub(crate) fn create(env: &mut Env<'_>, faces: &[Face], value: Obj) -> Result<Ve
             }
         }
     }
-    com.enable_guest(env, id);
+    if aggregated {
+        let inner = *pointers.last().unwrap();
+        if !com.register_separate(&mut env.sys.objects, id, adv_os::com::IUNKNOWN, inner) {
+            release(env, block);
+            return Err(E_OUTOFMEMORY);
+        }
+    } else {
+        com.enable_guest(env, id);
+    }
     Ok(pointers)
 }
 
@@ -640,11 +709,34 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         );
         return Outcome::Return(E_POINTER);
     }
+    if slot <= 2
+        && let Some(outer) = graph::outer(env, this)
+    {
+        let args = if slot == 0 {
+            vec![env.arg(1), env.arg(2)]
+        } else {
+            vec![]
+        };
+        return guest_call(env, outer, slot.into(), args, |_, value| {
+            Outcome::Return(value)
+        });
+    }
+    if slot == 0 && face == Face::Inner {
+        return graph::inner_query(env, this, env.arg(1), env.arg(2));
+    }
+    if slot == 0
+        && let Some(graph) = graph::mapper::target(env, this, env.arg(1))
+    {
+        return graph::mapper::query(env, graph, env.arg(1), env.arg(2));
+    }
     match slot {
         0 => return Outcome::Return(query_interface(env, this, env.arg(1), env.arg(2))),
         1 => return Outcome::Return(add_ref(env, this)),
         2 => return graph::release_method(env, this),
         _ => {}
+    }
+    if let Some(outcome) = automation::call(env, face, &method, this) {
+        return outcome;
     }
     let outcome = match face {
         Face::FilterGraph
@@ -657,7 +749,10 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::BasicVideo
         | Face::VideoWindow
         | Face::MediaFilter
-        | Face::ObjectWithSite => graph::call(env, face, &method, this),
+        | Face::ObjectWithSite
+        | Face::GraphConfig
+        | Face::GraphVersion
+        | Face::VideoFrameStep => graph::call(env, face, &method, this),
         Face::BaseFilter
         | Face::FileSource
         | Face::EnumFilters
@@ -668,6 +763,7 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::DmoWrapper => filter::call(env, face, &method, this),
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
+        Face::Inner => None,
     };
     outcome.unwrap_or_else(|| {
         log::debug!("DirectShow {}::{method}: not implemented", face.interface());

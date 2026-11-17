@@ -14,7 +14,7 @@ fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> 
     f.graph = graph;
     f.name = name.clone();
     // Transfer the newly created reference to the graph.
-    g(env, graph).members.push(Member {
+    g(env, graph).join(Member {
         filter,
         name,
         host: Some(filter),
@@ -646,7 +646,10 @@ fn system_video(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) ->
     };
     let input = endpoint(env, renderer, INPUT);
     if let Err(hr) = connect(env, out, input) {
-        g(env, graph).members.retain(|m| m.host != Some(renderer));
+        let entry = g(env, graph);
+        if let Some(index) = entry.members.iter().position(|m| m.host == Some(renderer)) {
+            entry.leave(index);
+        }
         state(env).filters.get_mut(&renderer).unwrap().graph = 0;
         release(env, renderer);
         return hr;

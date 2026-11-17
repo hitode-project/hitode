@@ -18,7 +18,7 @@ use adv_pe::{ImportModule, ImportName};
 const QUARTZ: &str = "quartz.dll";
 const WMVCORE: &str = "wmvcore.dll";
 const QASF: &str = "qasf.dll";
-const ORIGINAL_QUARTZ: &str = "winequartz.dll";
+const ORIGINAL_QUARTZ: &str = adv_dx::dshow::WINE_QUARTZ;
 const ORIGINAL_WMVCORE: &str = "winewmvcore.dll";
 const ORIGINAL_QASF: &str = "wineqasf.dll";
 // Wine 11.0's spec files, including the explicitly assigned wmvcore ordinals.
@@ -120,6 +120,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
         close,
         thread,
         post,
+        export: |env, module, name| export(env, module, name).ok(),
         event: |env| {
             let mut request = adv_nt::protocol::CreateEventRequest {
                 access: 0x1f0003,
@@ -171,7 +172,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
         let directory = drive.join("windows/system32");
         let retained = directory.join(original);
         if !retained.exists() {
-            std::fs::copy(directory.join(module), retained).map_err(|e| e.to_string())?;
+            std::fs::copy(directory.join(module), &retained).map_err(|e| e.to_string())?;
         }
         let imports = [ImportModule {
             dll: original.into(),
@@ -191,7 +192,8 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
             .iter()
             .map(|&(name, ordinal, _)| Export { name, ordinal })
             .collect();
-        let image = ModuleImage::build(machine, module, &exports, &imports)?;
+        let wine = std::fs::read(&retained).map_err(|e| e.to_string())?;
+        let image = ModuleImage::build_replacing(machine, module, &exports, &imports, &wine)?;
         adv_unix::builtin::install(drive, &image).map_err(|e| e.to_string())?;
     }
     Ok(())
