@@ -165,7 +165,7 @@ pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, outpu
         Outcome::Return(S_OK) => {
             let pointer = env.cpu.read_u32(output).unwrap();
             let filter = canonical(env, pointer).unwrap();
-            super::video::window::create_vmr_window(env, filter)
+            super::video::window::create_vmr_window(env, filter, |_, hr| Outcome::Return(hr))
         }
         outcome => outcome,
     }

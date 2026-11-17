@@ -172,6 +172,12 @@ impl Graph {
         self.state == PAUSED || self.pending_run.is_some()
     }
 
+    /// SetSyncSource(NULL) leaves no reference clock: renderers present each
+    /// sample as soon as it arrives.
+    pub(crate) fn free_running(&self) -> bool {
+        self.clock == 0 && !self.default_clock
+    }
+
     fn set_position(&mut self, position: i64, now_us: u64) {
         self.position = position.max(0);
         self.ended = false;
@@ -1062,7 +1068,11 @@ fn pause_members(env: &mut Env<'_>, graph: u32, previous: u32, then: Then) -> Ou
                     if previous == STOPPED {
                         start_sessions(env, graph);
                     } else {
-                        wake_sessions(env, graph);
+                        // A push stream keeps going until its renderers hold
+                        // the next sample, which completes their pause.
+                        for id in sessions_of(env, graph) {
+                            stream::repreroll(env, id);
+                        }
                     }
                     host_results.extend(results);
                     flush_posts(env, Box::new(move |env, _| then(env, host_results)))
@@ -1803,11 +1813,11 @@ pub(crate) fn duration(env: &Env<'_>, graph: u32) -> i64 {
 
 /// IMediaSeeking::GetCurrentPosition: the position the graph keeps, advanced
 /// by the clock while running and bounded by the stop. Without a clock a
-/// running graph reports 0, as quartz does.
+/// running graph reports 0 until it completes at the stop.
 pub(crate) fn current(env: &Env<'_>, graph: u32) -> i64 {
     let graph_state = &env.ext.get::<State>().graphs[&graph];
     match graph_state.state {
-        RUNNING if graph_state.clock == 0 => 0,
+        RUNNING if graph_state.clock == 0 && !graph_state.ended => 0,
         RUNNING => reached(env, graph),
         _ => graph_state.position,
     }
