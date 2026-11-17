@@ -165,7 +165,7 @@ pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, outpu
         Outcome::Return(S_OK) => {
             let pointer = env.cpu.read_u32(output).unwrap();
             let filter = canonical(env, pointer).unwrap();
-            super::video::window::create_vmr_window(env, filter)
+            super::video::window::create_vmr_window(env, filter, |_, hr| Outcome::Return(hr))
         }
         outcome => outcome,
     }
@@ -1587,7 +1587,38 @@ fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
     if p.dir == INPUT && state.filters[&p.filter].role == Role::VideoRenderer {
         return super::vmr::accepts_input(mt);
     }
+    if p.dir == INPUT && state.filters[&p.filter].role == Role::AudioRenderer {
+        return playable(mt);
+    }
     true
+}
+
+/// Formats a DirectSound buffer can be created with: integer PCM and 32-bit
+/// float, plain or extensible.
+fn playable(mt: &MediaType) -> bool {
+    let field = |at: usize| {
+        mt.format
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    if mt.format_type != FORMAT_WAVEFORMATEX {
+        return false;
+    }
+    let (Some(mut tag), Some(bits)) = (field(0), field(14)) else {
+        return false;
+    };
+    if tag == 0xfffe {
+        // The subformat GUID's first word is the plain format tag.
+        let Some(sub) = field(24) else {
+            return false;
+        };
+        tag = sub;
+    }
+    match tag {
+        1 => matches!(bits, 8 | 16 | 24 | 32),
+        3 => bits == 32,
+        _ => false,
+    }
 }
 
 /// Types a pin proposes. Decoder outputs depend on their connected input.
@@ -1808,17 +1839,27 @@ fn connect_hosts(env: &mut Env<'_>, out: u32, input: u32) -> u32 {
     if o.peer != 0 || i.peer != 0 {
         return VFW_E_ALREADY_CONNECTED;
     }
-    let mt =
-        o.mt.clone()
-            .or_else(|| offered_types(env, out).into_iter().next());
-    let state = self::state(env);
-    let Some(mt) = mt else {
-        return VFW_E_NO_ACCEPTABLE_TYPES;
+    let candidates = match o.mt.clone() {
+        Some(mt) => vec![mt],
+        None => offered_types(env, out),
     };
-    let i = &state.pins[&input];
-    if i.major != GUID_NULL && i.major != mt.major {
-        return VFW_E_TYPE_NOT_ACCEPTED;
+    if candidates.is_empty() {
+        return VFW_E_NO_ACCEPTABLE_TYPES;
     }
+    // Links into splitters and decoders are typed by construction; renderers
+    // refuse what they cannot present, so compressed streams get a decoder.
+    let renderer = matches!(
+        role_of(env, input),
+        Role::AudioRenderer | Role::VideoRenderer
+    );
+    let Some(mt) = candidates
+        .into_iter()
+        .find(|mt| !renderer || accepts(env, input, mt))
+    else {
+        return VFW_E_TYPE_NOT_ACCEPTED;
+    };
+    let state = self::state(env);
+    let i = &state.pins[&input];
     let (out_role, in_role) = (
         state.filters[&state.pins[&out].filter].role,
         state.filters[&i.filter].role,
@@ -2006,53 +2047,66 @@ fn finish_guest_connection(
                 return decoder_allocator(env, out, input, mem, mt);
             }
             let filter = state(env).pins[&out].filter;
-            let size = if state(env).filters[&filter].asf.is_some() {
-                super::asf::sample_size(env, out)
-            } else if role_of(env, out) == Role::Splitter {
-                state(env).filters[&filter]
-                    .packets
-                    .as_ref()
-                    .map_or(1, |media| {
-                        media
-                            .streams
-                            .iter()
-                            .filter(|s| {
-                                matches!(s.format, adv_device::media::CodecFormat::Audio { .. })
-                                    == (mt.major == MEDIATYPE_AUDIO)
-                            })
-                            .map(|s| s.max_packet)
-                            .max()
-                            .unwrap_or(1)
-                    })
-                    .max(1)
-            } else if mt.major == MEDIATYPE_AUDIO {
-                // Keep a second of PCM, as the DirectSound renderer does.
-                u32::from_le_bytes(mt.format[8..12].try_into().unwrap())
-            } else {
-                mt.sample_size.max(1)
-            };
-            let allocator = match sample::create_allocator(env, 3, size) {
-                Ok(allocator) => allocator,
-                Err(error) => return abort_guest_connection(env, out, input, error),
-            };
-            let p = state(env).pins.get_mut(&out).unwrap();
-            p.mem = mem;
-            p.allocator = allocator;
-            let face = state(env).allocators[&allocator].face;
-            guest_call(env, mem, 4, vec![face, 0], move |env, hr| {
-                if hr & 0x8000_0000 != 0 {
-                    log::warn!("DirectShow: NotifyAllocator refused ({hr:#x})");
-                    return abort_guest_connection(env, out, input, hr);
-                }
-                log::info!(
-                    "DirectShow: host pin {out:#x} connected to guest pin {input:#x} ({})",
-                    describe(&mt)
+            if role_of(env, out) == Role::Splitter {
+                return load_packets(
+                    env,
+                    filter,
+                    Box::new(move |env| output_allocator(env, out, input, mem, mt)),
                 );
-                let _ = env;
-                Outcome::Return(S_OK)
-            })
+            }
+            output_allocator(env, out, input, mem, mt)
         }),
     )
+}
+
+/// A host output's own allocator, sized for its samples, offered to the guest input.
+fn output_allocator(env: &mut Env<'_>, out: u32, input: u32, mem: u32, mt: MediaType) -> Outcome {
+    let filter = state(env).pins[&out].filter;
+    let size = if state(env).filters[&filter].asf.is_some() {
+        super::asf::sample_size(env, out)
+    } else if role_of(env, out) == Role::Splitter {
+        state(env).filters[&filter]
+            .packets
+            .as_ref()
+            .map_or(1, |media| {
+                media
+                    .streams
+                    .iter()
+                    .filter(|s| {
+                        matches!(s.format, adv_device::media::CodecFormat::Audio { .. })
+                            == (mt.major == MEDIATYPE_AUDIO)
+                    })
+                    .map(|s| s.max_packet)
+                    .max()
+                    .unwrap_or(1)
+            })
+            .max(1)
+    } else if mt.major == MEDIATYPE_AUDIO {
+        // Keep a second of PCM, as the DirectSound renderer does.
+        u32::from_le_bytes(mt.format[8..12].try_into().unwrap())
+    } else {
+        mt.sample_size.max(1)
+    };
+    let allocator = match sample::create_allocator(env, 3, size) {
+        Ok(allocator) => allocator,
+        Err(error) => return abort_guest_connection(env, out, input, error),
+    };
+    let p = state(env).pins.get_mut(&out).unwrap();
+    p.mem = mem;
+    p.allocator = allocator;
+    let face = state(env).allocators[&allocator].face;
+    guest_call(env, mem, 4, vec![face, 0], move |env, hr| {
+        if hr & 0x8000_0000 != 0 {
+            log::warn!("DirectShow: NotifyAllocator refused ({hr:#x})");
+            return abort_guest_connection(env, out, input, hr);
+        }
+        log::info!(
+            "DirectShow: host pin {out:#x} connected to guest pin {input:#x} ({})",
+            describe(&mt)
+        );
+        let _ = env;
+        Outcome::Return(S_OK)
+    })
 }
 
 fn decoder_allocator(env: &mut Env<'_>, out: u32, input: u32, mem: u32, mt: MediaType) -> Outcome {
@@ -2497,6 +2551,120 @@ pub(super) fn mpeg_audio_type(bytes: &[u8]) -> Option<MediaType> {
 }
 
 /// Probe the stream and expose one output pin per elementary stream.
+/// A splitter output's type: the one its stream header gives, else the bare
+/// MPEG-1 payload type.
+pub(super) fn output_type(major: Iid, bytes: &[u8]) -> MediaType {
+    let audio = major == MEDIATYPE_AUDIO;
+    let probed = if audio {
+        mpeg_audio_type(bytes)
+    } else {
+        mpeg_video_type(bytes)
+    };
+    probed.unwrap_or(MediaType {
+        major,
+        sub: if audio {
+            MEDIASUBTYPE_MPEG1AUDIOPAYLOAD
+        } else {
+            MEDIASUBTYPE_MPEG1PAYLOAD
+        },
+        fixed_size: false,
+        temporal: true,
+        sample_size: 0,
+        format_type: GUID_NULL,
+        format: Vec::new(),
+    })
+}
+
+/// The guest copy of a file name, NUL-terminated.
+fn guest_name(env: &mut Env<'_>, path: &[u16]) -> Option<u32> {
+    let bytes: Vec<u8> = path
+        .iter()
+        .chain(&[0])
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let name = alloc(env, bytes.len() as u32)?;
+    env.cpu.write(name, &bytes).ok()?;
+    Some(name)
+}
+
+/// A continuation taking a file's leading bytes.
+pub(super) type Header = Box<dyn FnOnce(&mut Env<'_>, Vec<u8>) -> Outcome>;
+
+/// The leading bytes of a file, enough for its stream headers; empty when
+/// they cannot be read.
+pub(super) fn file_header(env: &mut Env<'_>, path: &[u16], then: Header) -> Outcome {
+    const CHUNK: usize = 2048;
+    let Some(host) = env.ext.try_get::<super::host::Host>().copied() else {
+        return then(env, Vec::new());
+    };
+    let Some(name) = guest_name(env, path) else {
+        return then(env, Vec::new());
+    };
+    let ranges = (0..32).map(|at| (at * CHUNK as u64, CHUNK)).collect();
+    (host.sample)(
+        env,
+        name,
+        ranges,
+        Box::new(move |env, sampled| {
+            free(env, name);
+            let header = sampled
+                .unwrap_or_default()
+                .into_iter()
+                .map_while(|chunk| chunk)
+                .flatten()
+                .collect();
+            then(env, header)
+        }),
+    )
+}
+
+/// The file a splitter pulls through a host file source.
+fn upstream_file(env: &Env<'_>, splitter: u32) -> Option<Vec<u16>> {
+    let state = env.ext.get::<State>();
+    let input = state.filters[&splitter]
+        .pins
+        .iter()
+        .find(|p| state.pins[p].dir == INPUT)?;
+    let source = &state.filters[&state.pins.get(&state.pins[input].peer)?.filter];
+    (source.role == Role::FileSource && !source.source_path.is_empty())
+        .then(|| source.source_path.clone())
+}
+
+/// A file splitter demuxes its packets only once a guest pin takes one of its
+/// compressed outputs; host decoding never needs them.
+fn load_packets(
+    env: &mut Env<'_>,
+    splitter: u32,
+    then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
+) -> Outcome {
+    let path = upstream_file(env, splitter);
+    let host = env.ext.try_get::<super::host::Host>().copied();
+    let (Some(path), Some(host)) = (path, host) else {
+        return then(env);
+    };
+    if state(env).filters[&splitter].packets.is_some() {
+        return then(env);
+    }
+    let Some(name) = guest_name(env, &path) else {
+        return then(env);
+    };
+    (host.read)(
+        env,
+        name,
+        Box::new(move |env, result| {
+            free(env, name);
+            if let Ok((bytes, handle)) = result {
+                if let Some(handle) = handle {
+                    super::host::close(env, handle);
+                }
+                state(env).filters.get_mut(&splitter).unwrap().packets =
+                    adv_device::media::demux(bytes).ok();
+            }
+            then(env)
+        }),
+    )
+}
+
 pub(super) fn attach_source(
     env: &mut Env<'_>,
     pin: u32,
@@ -2506,8 +2674,8 @@ pub(super) fn attach_source(
     bytes: Vec<u8>,
 ) -> Outcome {
     let length = bytes.len();
-    let audio_type = mpeg_audio_type(&bytes);
-    let video_type = mpeg_video_type(&bytes);
+    let audio_type = output_type(MEDIATYPE_AUDIO, &bytes);
+    let video_type = output_type(MEDIATYPE_VIDEO, &bytes);
     let packets = adv_device::media::demux(bytes.clone()).ok();
     let (decoder, info) = match Decoder::open_memory(bytes) {
         Ok(decoder) => {
@@ -2553,40 +2721,11 @@ pub(super) fn attach_source(
         decoder,
         info,
     });
-    let streams = [
-        (video, "Video", MEDIATYPE_VIDEO, MEDIASUBTYPE_MPEG1PAYLOAD),
-        (
-            audio,
-            "Audio",
-            MEDIATYPE_AUDIO,
-            MEDIASUBTYPE_MPEG1AUDIOPAYLOAD,
-        ),
-    ];
-    for (present, name, major, sub) in streams {
+    for (present, name, mt) in [(video, "Video", video_type), (audio, "Audio", audio_type)] {
         if !present {
             continue;
         }
-        let mt = if major == MEDIATYPE_AUDIO {
-            audio_type.clone().unwrap_or(MediaType {
-                major,
-                sub,
-                fixed_size: false,
-                temporal: true,
-                sample_size: 0,
-                format_type: GUID_NULL,
-                format: Vec::new(),
-            })
-        } else {
-            video_type.clone().unwrap_or(MediaType {
-                major,
-                sub,
-                fixed_size: false,
-                temporal: true,
-                sample_size: 0,
-                format_type: GUID_NULL,
-                format: Vec::new(),
-            })
-        };
+        let major = mt.major;
         if let Err(error) = new_pin(env, filter, OUTPUT, name, major, Some(mt)) {
             state(env).filters.get_mut(&filter).unwrap().source = None;
             return guest_call(env, reader, 2, vec![], move |_, _| Outcome::Return(error));
@@ -2643,18 +2782,18 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
             if out_of_sync(env, this) {
                 return r(VFW_E_ENUM_OUT_OF_SYNC);
             }
-            // quartz's filter enumerator refuses to skip past its end; the
-            // pin and media type enumerators skip what remains.
-            if let Some(
-                Obj::EnumFilters { list, position, .. } | Obj::EnumPins { list, position, .. },
-            ) = payload(env, this)
-                && count > list.len().saturating_sub(*position)
-            {
-                return r(if face == Face::EnumPins {
-                    S_FALSE
-                } else {
-                    E_INVALIDARG
-                });
+            // quartz's filter enumerator refuses to skip from its end and stops
+            // at the end otherwise; the pin enumerator skips nothing past its end.
+            match payload(env, this) {
+                Some(Obj::EnumFilters { list, position, .. }) if *position >= list.len() => {
+                    return r(E_INVALIDARG);
+                }
+                Some(Obj::EnumPins { list, position, .. })
+                    if count > list.len().saturating_sub(*position) =>
+                {
+                    return r(S_FALSE);
+                }
+                _ => {}
             }
             let skipped = advance(env, this, count);
             r(if skipped == count { S_OK } else { S_FALSE })
@@ -2685,6 +2824,9 @@ fn enumerator(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Option<
         }
         "Clone" => {
             let output = env.arg(1);
+            if output == 0 {
+                return r(E_POINTER);
+            }
             let copy = match payload(env, this) {
                 Some(Obj::EnumPins {
                     filter,
@@ -2735,7 +2877,7 @@ fn filter_list(env: &Env<'_>, this: u32) -> Option<Vec<u32>> {
         return None;
     };
     let graph = env.ext.get::<State>().graphs.get(graph)?;
-    Some(graph.members.iter().map(|m| m.filter).collect())
+    Some(graph.members.iter().rev().map(|m| m.filter).collect())
 }
 fn out_of_sync(env: &Env<'_>, this: u32) -> bool {
     match (payload(env, this), filter_list(env, this)) {

@@ -869,6 +869,14 @@ impl Native {
     }
 
     pub fn frame_at(&mut self, media_us: u64) -> Result<Update, Error> {
+        self.decode_at(media_us, false)
+    }
+
+    pub fn preroll_at(&mut self, media_us: u64) -> Result<Update, Error> {
+        self.decode_at(media_us, true)
+    }
+
+    fn decode_at(&mut self, media_us: u64, preroll: bool) -> Result<Update, Error> {
         if self.last_request.is_some_and(|t| media_us < t)
             || media_us.saturating_sub(self.last_request.unwrap_or(0)) > 1_000_000
         {
@@ -894,7 +902,7 @@ impl Native {
                 match self.next_video() {
                     Ok(next) => self.next.extend(next),
                     Err(_) if self.seek_pending && media_us > 0 => {
-                        return self.restart_at(media_us);
+                        return self.restart_at(media_us, preroll);
                     }
                     Err(e) => return Err(e),
                 };
@@ -912,7 +920,18 @@ impl Native {
         // Some MPEG-PS inputs have no usable index and report a successful seek to a
         // future keyframe. Decode from the beginning rather than show it early.
         if self.seek_pending && media_us > 0 && due.is_none() {
-            return self.restart_at(media_us);
+            return self.restart_at(media_us, preroll);
+        }
+        if preroll && due.is_none() {
+            if self.next.is_empty() && !self.eof {
+                if let Some(error) = self.deferred.take() {
+                    return Err(error);
+                }
+                let next = self.next_video()?;
+                self.next.extend(next);
+            }
+            due = self.next.pop_front();
+            ready = self.converted.take();
         }
         self.seek_pending = false;
         self.read_ahead_audio(media_us)?;
@@ -966,11 +985,11 @@ impl Native {
         }
     }
 
-    fn restart_at(&mut self, media_us: u64) -> Result<Update, Error> {
+    fn restart_at(&mut self, media_us: u64, preroll: bool) -> Result<Update, Error> {
         self.seek(0)?;
         self.seek_pending = false;
         self.discard_audio_before = media_us;
         self.last_request = Some(media_us);
-        self.frame_at(media_us)
+        self.decode_at(media_us, preroll)
     }
 }

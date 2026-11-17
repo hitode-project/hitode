@@ -80,7 +80,12 @@ pub(super) fn render_file(env: &mut Env<'_>, graph: u32, filename: u32) -> Outco
                 Box::new(move |env, result| {
                     // Drop the AddSourceFilter caller reference; the graph keeps its own.
                     release(env, source);
-                    Outcome::Return(result[0])
+                    let hr = result[0];
+                    if hr & 0x8000_0000 != 0 {
+                        let removed = super::remove_filter(env, graph, source);
+                        return after(env, removed, Box::new(move |_, _| Outcome::Return(hr)));
+                    }
+                    Outcome::Return(hr)
                 }),
             )
         }),
@@ -348,123 +353,162 @@ fn file(
     }
     let media = state(env).filters.get_mut(&source).unwrap().source.take();
     state(env).filters.get_mut(&build.splitter).unwrap().source = media;
-    for (present, major, sub, name) in [
-        (
-            info.video.is_some(),
-            MEDIATYPE_VIDEO,
-            MEDIASUBTYPE_MPEG1PAYLOAD,
-            "Video",
-        ),
-        (
-            info.audio.is_some(),
-            MEDIATYPE_AUDIO,
-            MEDIASUBTYPE_MPEG1AUDIOPAYLOAD,
-            "Audio",
-        ),
-    ] {
-        if !present {
-            continue;
-        }
-        let mt = MediaType {
-            major,
-            sub,
-            fixed_size: false,
-            temporal: true,
-            sample_size: 0,
-            format_type: GUID_NULL,
-            format: Vec::new(),
-        };
-        if let Err(error) = filter::new_pin(env, build.splitter, OUTPUT, name, major, Some(mt)) {
-            return build.finish(env, error);
-        }
-    }
-    streams(env, build)
+    // Outputs carry the types their stream headers give, as the guest
+    // IAsyncReader path's do.
+    let path = state(env).filters[&source].source_path.clone();
+    filter::file_header(
+        env,
+        &path,
+        Box::new(move |env, header| {
+            for (present, major, name) in [
+                (info.video.is_some(), MEDIATYPE_VIDEO, "Video"),
+                (info.audio.is_some(), MEDIATYPE_AUDIO, "Audio"),
+            ] {
+                if !present {
+                    continue;
+                }
+                let mt = filter::output_type(major, &header);
+                if let Err(error) =
+                    filter::new_pin(env, build.splitter, OUTPUT, name, major, Some(mt))
+                {
+                    return build.finish(env, error);
+                }
+            }
+            streams(env, build)
+        }),
+    )
 }
 
 /// Both file sources and guest IAsyncReader sources arrive here with the same
 /// probed splitter outputs and use identical decoder/renderer negotiation.
-fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
-    let graph = build.graph;
-    let existing_only = build.existing_only;
-    let target = build.target;
-    let mut video_output = None;
-    let mut audio_output = None;
+fn streams(env: &mut Env<'_>, build: Build) -> Outcome {
     let state = env.ext.get::<State>();
-    let outputs: Vec<(u32, Iid)> = state.filters[&build.splitter]
+    let outputs: VecDeque<(u32, Iid)> = state.filters[&build.splitter]
         .pins
         .iter()
         .filter_map(|&pin| {
             let p = &state.pins[&pin];
             (p.dir == OUTPUT).then_some((pin, p.major))
         })
+        .filter(|&(_, major)| {
+            major == MEDIATYPE_VIDEO || (build.target.is_none() && major == MEDIATYPE_AUDIO)
+        })
         .collect();
-    for (pin, major) in outputs {
-        if target.is_some() && major != MEDIATYPE_VIDEO {
-            continue;
-        }
+    plug_streams(env, build, outputs, [None; 2])
+}
+
+/// A splitter output either rendered by the graph's members or decoded on the
+/// host, leaving the decoder's output to render.
+#[derive(Clone, Copy)]
+enum Stream {
+    Rendered(u32),
+    Decoded(u32),
+}
+
+/// Each output first tries the graph's members, as quartz does before the
+/// mapper; a host decoder stands in for the mapper's decoders.
+fn plug_streams(
+    env: &mut Env<'_>,
+    build: Build,
+    mut outputs: VecDeque<(u32, Iid)>,
+    done: [Option<Stream>; 2],
+) -> Outcome {
+    let Some((pin, major)) = outputs.pop_front() else {
+        return render_streams(env, build, done);
+    };
+    let slot = usize::from(major == MEDIATYPE_AUDIO);
+    let decode = move |env: &mut Env<'_>,
+                       mut build: Build,
+                       outputs: VecDeque<(u32, Iid)>,
+                       mut done: [Option<Stream>; 2]| {
         let (role, clsid, name) = if major == MEDIATYPE_VIDEO {
             (Role::VideoDecoder, CLSID_MPEG_VIDEO_CODEC, "Video decoder")
-        } else if major == MEDIATYPE_AUDIO {
-            (Role::AudioDecoder, CLSID_MPEG_AUDIO_CODEC, "Audio decoder")
         } else {
-            continue;
+            (Role::AudioDecoder, CLSID_MPEG_AUDIO_CODEC, "Audio decoder")
         };
-        let decoder = match member(env, graph, role, clsid, name) {
+        let decoder = match member(env, build.graph, role, clsid, name) {
             Ok(filter) => filter,
             Err(error) => return build.finish(env, error),
         };
         build.added.push(decoder);
-        let input = endpoint(env, decoder, INPUT);
-        if let Err(error) = connect(env, pin, input) {
+        if let Err(error) = connect(env, pin, endpoint(env, decoder, INPUT)) {
             return build.finish(env, error);
         }
-        let out = endpoint(env, decoder, OUTPUT);
-        if major == MEDIATYPE_VIDEO {
-            video_output = Some(out);
-        } else {
-            audio_output = Some(out);
-        }
+        done[slot] = Some(Stream::Decoded(endpoint(env, decoder, OUTPUT)));
+        plug_streams(env, build, outputs, done)
+    };
+    if build.target.is_some() {
+        return decode(env, build, outputs, done);
     }
-    let finish: Then = Box::new(move |env, results| {
-        let video_result = results.first().copied();
-        let finish: Then = Box::new(move |env, results| {
-            let audio_result = results.first().copied();
-            let video_ok = video_result == Some(S_OK);
-            let audio_ok = audio_result == Some(S_OK);
-            let failed = video_result.is_some_and(|hr| hr != S_OK)
-                || audio_result.is_some_and(|hr| hr != S_OK);
-            let hr = if failed && (video_ok || audio_ok) {
-                adv_abi::warn_unavailable(
-                    env,
-                    "IGraphBuilder::Render",
-                    "only part of the source's streams could be rendered",
-                );
-                VFW_S_PARTIAL_RENDER
-            } else if failed {
-                video_result
-                    .filter(|hr| *hr != S_OK)
-                    .or(audio_result)
-                    .unwrap_or(VFW_E_CANNOT_RENDER)
-            } else if video_ok || audio_ok {
-                S_OK
-            } else {
-                VFW_E_CANNOT_RENDER
-            };
-            build.finish(env, hr)
-        });
-        match audio_output {
-            Some(out) => renderer(env, graph, out, existing_only, finish),
-            None => finish(env, Vec::new()),
-        }
-    });
-    match video_output {
-        Some(out) if target.is_some() => {
-            let outcome = filter::connect(env, out, target.unwrap(), 0);
-            after(env, outcome, finish)
-        }
-        Some(out) => renderer(env, graph, out, existing_only, finish),
-        None => finish(env, Vec::new()),
-    }
+    let (graph, existing_only) = (build.graph, build.existing_only);
+    super::autoplug::into_members(
+        env,
+        graph,
+        pin,
+        existing_only,
+        Box::new(move |env, hr| {
+            if hr & 0x8000_0000 != 0 {
+                return decode(env, build, outputs, done);
+            }
+            let mut done = done;
+            done[slot] = Some(Stream::Rendered(hr));
+            plug_streams(env, build, outputs, done)
+        }),
+    )
+}
+
+fn render_streams(env: &mut Env<'_>, build: Build, done: [Option<Stream>; 2]) -> Outcome {
+    let graph = build.graph;
+    let existing_only = build.existing_only;
+    let target = build.target;
+    let render = move |env: &mut Env<'_>, stream: Option<Stream>, then: Then| match stream {
+        None => then(env, Vec::new()),
+        Some(Stream::Rendered(hr)) => then(env, vec![hr]),
+        Some(Stream::Decoded(out)) => match target {
+            Some(target) => {
+                let outcome = filter::connect(env, out, target, 0);
+                after(env, outcome, then)
+            }
+            None => renderer(env, graph, out, existing_only, then),
+        },
+    };
+    let [video, audio] = done;
+    render(
+        env,
+        video,
+        Box::new(move |env, results| {
+            let video_result = results.first().copied();
+            render(
+                env,
+                audio,
+                Box::new(move |env, results| {
+                    let audio_result = results.first().copied();
+                    let video_ok = video_result == Some(S_OK);
+                    let audio_ok = audio_result == Some(S_OK);
+                    let failed = video_result.is_some_and(|hr| hr != S_OK)
+                        || audio_result.is_some_and(|hr| hr != S_OK);
+                    let hr = if failed && (video_ok || audio_ok) {
+                        adv_abi::warn_unavailable(
+                            env,
+                            "IGraphBuilder::Render",
+                            "only part of the source's streams could be rendered",
+                        );
+                        VFW_S_PARTIAL_RENDER
+                    } else if failed {
+                        video_result
+                            .filter(|hr| *hr != S_OK)
+                            .or(audio_result)
+                            .unwrap_or(VFW_E_CANNOT_RENDER)
+                    } else if video_ok || audio_ok {
+                        S_OK
+                    } else {
+                        VFW_E_CANNOT_RENDER
+                    };
+                    build.finish(env, hr)
+                }),
+            )
+        }),
+    )
 }
 
 fn available_renderer(env: &mut Env<'_>, graph: u32, role: Role) -> Option<u32> {
@@ -529,12 +573,18 @@ fn next_filter(
         free(env, scratch);
         let owner = state(env).pins[&out].filter;
         let graph = state(env).filters[&owner].graph;
-        let hr = if state(env).pins[&out].major == MEDIATYPE_AUDIO {
-            system_audio(env, graph, out, existing_only).map_or_else(|hr| hr, |_| S_OK)
-        } else {
-            system_video(env, graph, out, existing_only)
-        };
-        return then(env, vec![hr]);
+        if state(env).pins[&out].major == MEDIATYPE_AUDIO {
+            let hr = system_audio(env, graph, out, existing_only).map_or_else(|hr| hr, |_| S_OK);
+            return then(env, vec![hr]);
+        }
+        let hr = system_video(env, graph, out, existing_only);
+        if hr != S_OK {
+            return then(env, vec![hr]);
+        }
+        let input = state(env).pins[&out].peer;
+        let renderer = state(env).pins[&input].filter;
+        let outcome = crate::dshow::video::window::renderer_window(env, renderer);
+        return after(env, outcome, then);
     };
     let _ = env.cpu.write_u32(scratch, 0);
     guest_call(env, filter, 10, vec![scratch], move |env, hr| {
