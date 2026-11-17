@@ -26,6 +26,7 @@ fn surfaces(env: &mut Env<'_>, id: Id, views: &[Option<u32>], dirty: bool) {
         let mut aliases = Vec::new();
         for (level, &surface) in r.levels.iter_mut().zip(views) {
             level.surface = surface;
+            level.upload_probe = None;
             if dirty {
                 level.mark_all();
             }

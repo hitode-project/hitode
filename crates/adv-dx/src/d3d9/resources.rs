@@ -50,6 +50,8 @@ pub(super) struct Level {
     pub lock: Option<Lock>,
     /// Pending CPU-to-GPU synchronization: the bounds of the changed texels.
     pub dirty: Option<Rect>,
+    /// Sampled fingerprint of the previous whole-level upload, for gating full hashes.
+    pub upload_probe: Option<u128>,
 }
 impl Level {
     pub(super) fn whole(&self) -> Rect {
@@ -718,6 +720,7 @@ fn level_layout(desc: D3DSURFACE_DESC, count: u32) -> Option<(Vec<Level>, u32)> 
                 w: level_desc.Width,
                 h: level_desc.Height,
             }),
+            upload_probe: None,
         });
     }
     Some((levels, length))

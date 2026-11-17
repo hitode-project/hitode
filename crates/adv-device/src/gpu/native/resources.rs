@@ -443,13 +443,28 @@ impl Gpu {
     }
     /// Copy a tightly packed pixel slice into a mapped staging buffer.
     pub fn stage_bytes(&mut self, row_bytes: u32, rows: u32, src: &[u8]) -> Result<Staged, Error> {
+        self.stage_bytes_with(row_bytes, rows, src, |_| {})
+    }
+    /// Copy a tightly packed pixel slice into a mapped staging buffer while inspecting
+    /// each L1-sized chunk in the same pass.
+    pub fn stage_bytes_with(
+        &mut self,
+        row_bytes: u32,
+        rows: u32,
+        src: &[u8],
+        mut inspect: impl FnMut(&[u8]),
+    ) -> Result<Staged, Error> {
         let (buffer, size) = self.take_stage(row_bytes, rows)?;
         if src.len() != size as usize {
             return Err(Error::Invalid("staged byte slice length".into()));
         }
         // SAFETY: `take_stage` returns an exclusive staging buffer.
         let bytes = unsafe { &mut buffer.mapped().unwrap().as_mut()[..size as usize] };
-        bytes.copy_from_slice(src);
+        const CHUNK: usize = 32 * 1024;
+        for (dst, chunk) in bytes.chunks_mut(CHUNK).zip(src.chunks(CHUNK)) {
+            dst.copy_from_slice(chunk);
+            inspect(chunk);
+        }
         Ok(Staged {
             buffer,
             pitch: row_bytes,

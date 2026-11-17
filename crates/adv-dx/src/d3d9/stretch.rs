@@ -371,6 +371,7 @@ fn surface_uploaded(
                         com(env).get_identity_mut(&mut env.sys.objects, resource)
                 {
                     r.levels[level as usize].dirty = None;
+                    r.levels[level as usize].upload_probe = None;
                 }
             }
             Outcome::Return(0)

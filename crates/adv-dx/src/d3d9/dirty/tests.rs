@@ -1096,3 +1096,77 @@ fn a8_bytes_mip_aliases_identity_sampling_and_managed_restoration_match_native()
     assert_eq!(release(&mut env(&mut m), device), 0);
     assert!(m.ext.get::<Surfaces>().targets.is_empty());
 }
+
+// spec: GFX-REC-7
+#[test]
+fn large_whole_texture_probe_tracks_changes_and_resets_on_partial_upload() {
+    let (mut m, device) = machine(true);
+    let small = texture(&mut m, device, 1, 1);
+    let locked_small = lock(&mut m, small, 0, 0, 0);
+    assert_eq!(locked_small.Pitch, 16);
+    m.cpu.write(locked_small.pBits, &[0x33u8; 64]).unwrap();
+    okay(unlock(&mut m, small, 0));
+    assert_eq!(
+        resources::resource(&env(&mut m), small).unwrap().levels[0].upload_probe,
+        None
+    );
+
+    let output = packet(&mut m, 0u32);
+    okay(call(
+        &mut m,
+        "IDirect3DDevice9::CreateTexture",
+        &[device, 64, 64, 1, 0, 21, 1, output, 0],
+    ));
+    let large = m.cpu.read_u32(output).unwrap();
+    assert_eq!(
+        resources::resource(&env(&mut m), large).unwrap().levels[0].upload_probe,
+        None
+    );
+
+    let mut pattern = vec![0x11u8; 64 * 64 * 4];
+    let locked = lock(&mut m, large, 0, 0, 0);
+    assert_eq!(locked.Pitch, 256);
+    m.cpu.write(locked.pBits, &pattern).unwrap();
+    okay(unlock(&mut m, large, 0));
+    let probe1 = resources::resource(&env(&mut m), large).unwrap().levels[0].upload_probe;
+    assert!(probe1.is_some());
+
+    pattern.fill(0x22);
+    let locked = lock(&mut m, large, 0, 0, 0);
+    m.cpu.write(locked.pBits, &pattern).unwrap();
+    okay(unlock(&mut m, large, 0));
+    let probe2 = resources::resource(&env(&mut m), large).unwrap().levels[0].upload_probe;
+    assert!(probe2.is_some() && probe2 != probe1);
+
+    // Byte offset 48 lies between sample probe windows 0 and 1.
+    pattern[48..52].copy_from_slice(&[0xee, 0xdd, 0xcc, 0xbb]);
+    let locked = lock(&mut m, large, 0, 0, 0);
+    m.cpu.write(locked.pBits, &pattern).unwrap();
+    okay(unlock(&mut m, large, 0));
+    assert_eq!(
+        resources::resource(&env(&mut m), large).unwrap().levels[0].upload_probe,
+        probe2
+    );
+    let img = image(&mut m, large, 0);
+    assert_eq!(&pixels(&mut m, &img)[48..52], &[0xee, 0xdd, 0xcc, 0xbb]);
+
+    let partial = packet(
+        &mut m,
+        RECT {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 32,
+        },
+    );
+    let locked = lock(&mut m, large, 0, partial, 0);
+    m.cpu.write(locked.pBits, &[0x44u8; 32 * 4]).unwrap();
+    okay(unlock(&mut m, large, 0));
+    assert_eq!(
+        resources::resource(&env(&mut m), large).unwrap().levels[0].upload_probe,
+        None
+    );
+
+    assert_eq!(release(&mut env(&mut m), small), 0);
+    assert_eq!(release(&mut env(&mut m), large), 0);
+}
