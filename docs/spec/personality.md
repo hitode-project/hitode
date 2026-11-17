@@ -47,6 +47,12 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Verification**: Test
 **Basis**: Windows DirectX runtimes return `DDERR_INVALIDPARAMS` and `DSERR_INVALIDPARAM` for null caps, descriptor and output pointers.
 
+### PERS-SCOPE-13 Per-interface reference counts
+
+**Rule**: A separately counted interface MUST keep its own AddRef, Release and QueryInterface count, and the object MUST outlive every count and internal reference. DirectSound MUST count a device's IUnknown and each buffer interface separately. DirectDraw MUST count each device and surface interface version separately.
+**Verification**: Test
+**Basis**: Wine dsound `dsound8`, `ds3d` and ddraw `refcount` tests, which pass on Windows.
+
 ## Exports and diagnostics
 
 ### PERS-EXPORT-1 Fixed export structure

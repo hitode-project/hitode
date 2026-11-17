@@ -6,6 +6,9 @@
 //! ownership; interface aliases carry internal references until the last Release.
 //! Guest-counted objects retain one table owner and share their public count
 //! with authored vtable code through execution-owner-only counter storage.
+//! Interfaces registered as separately counted keep their own public count,
+//! as some Windows runtimes do per interface; the object lives while any
+//! count or internal reference remains.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +35,38 @@ pub struct ComObject<T: Any> {
     /// Once queried, the observable interface set must remain static.
     sealed: bool,
     guest: Option<GuestReferences>,
+    /// Separately counted interface pointers. Every other alias shares the
+    /// object's count.
+    separate: BTreeMap<u32, Count>,
+}
+
+/// One separately counted interface: a host count until guest counting.
+#[derive(Default)]
+struct Count {
+    host: u32,
+    guest: Option<GuestReferences>,
+}
+
+impl Count {
+    fn load(&self) -> u32 {
+        self.guest.as_ref().map_or(self.host, GuestReferences::load)
+    }
+}
+
+impl<T: Any> ComObject<T> {
+    fn counters(&self) -> impl Iterator<Item = &GuestReferences> {
+        self.guest
+            .iter()
+            .chain(self.separate.values().filter_map(|c| c.guest.as_ref()))
+    }
+    fn at_limit(&self) -> bool {
+        self.counters().any(|c| c.load() >= c.limit())
+    }
+    fn adjust_limits(&self, by: i64) {
+        for counter in self.counters() {
+            counter.set_limit((i64::from(counter.limit()) + by) as u32);
+        }
+    }
 }
 
 /// The last Release returns the payload and interface allocations for cleanup.
@@ -93,6 +128,7 @@ impl Com {
             internal: 0,
             sealed: false,
             guest: None,
+            separate: BTreeMap::new(),
         })?;
         if !objects.bind_alias(self.namespace, pointer, id) {
             // The initial owner was never published and must not be leaked.
@@ -150,7 +186,8 @@ impl Com {
     }
 
     /// Declare an additional initialized interface, without acquiring a client
-    /// reference. Multiple IIDs may share one pointer. IUnknown is always canonical.
+    /// reference. Multiple IIDs may share one pointer. IUnknown is canonical
+    /// unless [`Self::register_separate`] moves it.
     pub fn register_interface<T: Any>(
         &self,
         objects: &mut Objects,
@@ -171,7 +208,7 @@ impl Com {
             return false;
         }
         let needs_alias = !object.aliases.contains(&pointer);
-        if needs_alias && object.guest.as_ref().is_some_and(|c| c.load() >= c.limit()) {
+        if needs_alias && object.at_limit() {
             return false;
         }
         if needs_alias && !objects.bind_alias(self.namespace, pointer, id) {
@@ -180,9 +217,52 @@ impl Com {
         let object = objects.owned_mut(id).unwrap();
         object.interfaces.insert(iid, pointer);
         object.aliases.insert(pointer);
-        if needs_alias && let Some(counter) = &object.guest {
-            counter.set_limit(counter.limit() - 1);
+        if needs_alias {
+            object.adjust_limits(-1);
         }
+        true
+    }
+
+    /// Declare an interface whose pointer keeps its own public count, starting
+    /// at zero. IIDs later registered on the same pointer share that count.
+    /// IUnknown may move off the canonical pointer this way. Call before
+    /// guest counting and before the pointer is published.
+    pub fn register_separate<T: Any>(
+        &self,
+        objects: &mut Objects,
+        id: ComIdentity<T>,
+        iid: Iid,
+        pointer: u32,
+    ) -> bool {
+        let Some(object) = self.object(objects, id) else {
+            return false;
+        };
+        let canonical = object.canonical;
+        if pointer == canonical || object.guest.is_some() {
+            return false;
+        }
+        let moved = iid == IUNKNOWN
+            && !object.sealed
+            && object.interfaces.get(&IUNKNOWN) == Some(&canonical);
+        if moved {
+            objects.owned_mut(id).unwrap().interfaces.remove(&IUNKNOWN);
+        }
+        if !self.register_interface(objects, id, iid, pointer) {
+            if moved {
+                objects
+                    .owned_mut(id)
+                    .unwrap()
+                    .interfaces
+                    .insert(IUNKNOWN, canonical);
+            }
+            return false;
+        }
+        objects
+            .owned_mut(id)
+            .unwrap()
+            .separate
+            .entry(pointer)
+            .or_default();
         true
     }
 
@@ -196,12 +276,29 @@ impl Com {
             return None;
         }
         if let Some(counter) = &object.guest {
-            return Some(counter.load());
+            return object
+                .separate
+                .values()
+                .try_fold(counter.load(), |sum, c| sum.checked_add(c.load()));
         }
         objects
             .strong_count(id)?
             .checked_sub(object.aliases.len().try_into().ok()?)?
             .checked_sub(object.internal)
+    }
+
+    /// The count shared by every interface not counted separately.
+    pub(crate) fn shared<T: Any>(&self, objects: &Objects, id: ComIdentity<T>) -> Option<u32> {
+        let object = self.object(objects, id)?;
+        if let Some(counter) = &object.guest {
+            return Some(counter.load());
+        }
+        object
+            .separate
+            .values()
+            .try_fold(self.references(objects, id)?, |rest, c| {
+                rest.checked_sub(c.host)
+            })
     }
 
     /// A device/state binding owns the payload, but is not an AddRef visible to
@@ -214,20 +311,14 @@ impl Com {
         else {
             return false;
         };
-        if self
-            .object(objects, id)
-            .and_then(|o| o.guest.as_ref())
-            .is_some_and(|c| c.load() >= c.limit())
-        {
+        if self.object(objects, id).is_some_and(ComObject::at_limit) {
             return false;
         }
         if !objects.retain(id) {
             return false;
         }
         objects.owned_mut(id).unwrap().internal = internal;
-        if let Some(counter) = &self.object(objects, id).unwrap().guest {
-            counter.set_limit(counter.limit() - 1);
-        }
+        self.object(objects, id).unwrap().adjust_limits(-1);
         true
     }
 
@@ -248,9 +339,7 @@ impl Com {
             return Some(Some(self.destroy(objects, id)?));
         }
         objects.owned_mut(id)?.internal = internal;
-        if let Some(counter) = &self.object(objects, id)?.guest {
-            counter.set_limit(counter.limit() + 1);
-        }
+        self.object(objects, id)?.adjust_limits(1);
         objects.release(id)?;
         Some(None)
     }
@@ -288,17 +377,31 @@ impl Com {
         pointer: u32,
         iid: Iid,
     ) -> Result<u32, QueryError> {
-        let id = self
-            .identity::<T>(objects, pointer)
-            .ok_or(QueryError::InvalidObject)?;
         let target = self.resolve_interface::<T>(objects, pointer, iid)?;
-        self.add_ref_identity(objects, id)
+        self.add_ref::<T>(objects, target)
             .ok_or(QueryError::ReferenceLimit)?;
         Ok(target)
     }
 
+    /// Retain the count `pointer` belongs to and return that count.
     pub fn add_ref<T: Any>(&self, objects: &mut Objects, pointer: u32) -> Option<u32> {
-        self.add_ref_identity(objects, self.identity::<T>(objects, pointer)?)
+        let id = self.identity::<T>(objects, pointer)?;
+        let Some(count) = self.object(objects, id)?.separate.get(&pointer) else {
+            return self.add_ref_identity(objects, id);
+        };
+        let references = count.load().checked_add(1)?;
+        if let Some(counter) = &count.guest {
+            if references > counter.limit() {
+                return None;
+            }
+            counter.store(references);
+            return Some(references);
+        }
+        if !objects.retain(id) {
+            return None;
+        }
+        objects.owned_mut(id)?.separate.get_mut(&pointer)?.host = references;
+        Some(references)
     }
 
     pub fn add_ref_identity<T: Any>(
@@ -306,7 +409,7 @@ impl Com {
         objects: &mut Objects,
         id: ComIdentity<T>,
     ) -> Option<u32> {
-        let references = self.references(objects, id)?.checked_add(1)?;
+        let references = self.shared(objects, id)?.checked_add(1)?;
         if let Some(counter) = &self.object(objects, id)?.guest {
             if references > counter.limit() {
                 return None;
@@ -317,8 +420,20 @@ impl Com {
         objects.retain(id).then_some(references)
     }
 
+    /// Release the count `pointer` belongs to. `references` is that count.
     pub fn release<T: Any>(&self, objects: &mut Objects, pointer: u32) -> Option<Released<T>> {
-        self.release_identity(objects, self.identity::<T>(objects, pointer)?)
+        let id = self.identity::<T>(objects, pointer)?;
+        let total = self.references(objects, id)?;
+        let Some(count) = self.object(objects, id)?.separate.get(&pointer) else {
+            return self.release_identity(objects, id);
+        };
+        let references = count.load().checked_sub(1)?;
+        let guest = count.guest.is_some();
+        match &count.guest {
+            Some(counter) => counter.store(references),
+            None => objects.owned_mut(id)?.separate.get_mut(&pointer)?.host = references,
+        }
+        self.released(objects, id, total - 1, references, guest)
     }
 
     pub fn release_identity<T: Any>(
@@ -326,13 +441,27 @@ impl Com {
         objects: &mut Objects,
         id: ComIdentity<T>,
     ) -> Option<Released<T>> {
-        let references = self.references(objects, id)?.checked_sub(1)?;
+        let total = self.references(objects, id)?;
+        let references = self.shared(objects, id)?.checked_sub(1)?;
         let guest = self.object(objects, id)?.guest.as_ref();
         if let Some(counter) = guest {
             counter.store(references);
         }
-        if references != 0 || self.object(objects, id)?.internal != 0 {
-            if guest.is_none() {
+        let guest = guest.is_some();
+        self.released(objects, id, total - 1, references, guest)
+    }
+
+    /// Finish a public release: `remaining` counts every interface.
+    fn released<T: Any>(
+        &self,
+        objects: &mut Objects,
+        id: ComIdentity<T>,
+        remaining: u32,
+        references: u32,
+        guest: bool,
+    ) -> Option<Released<T>> {
+        if remaining != 0 || self.object(objects, id)?.internal != 0 {
+            if !guest {
                 objects.release(id)?;
             }
             return Some(Released {

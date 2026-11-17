@@ -330,3 +330,36 @@ fn process_exit_drops_live_com_payloads_once_with_outstanding_references() {
     }
     assert_eq!(drops.get(), 1);
 }
+
+// spec: PERS-SCOPE-13
+#[test]
+fn separately_counted_interfaces_keep_their_own_counts_and_share_one_lifetime() {
+    let mut objects = Objects::default();
+    let com = Com::new(&mut objects).unwrap();
+    let id = com.create(&mut objects, 0x1000, A, 7_u32).unwrap();
+    assert!(com.register_interface(&mut objects, id, B, 0x1000));
+    assert!(com.register_separate(&mut objects, id, IUNKNOWN, 0x2000));
+    assert!(com.register_separate(&mut objects, id, C, 0x3000));
+    assert!(!com.register_separate(&mut objects, id, C, 0x1000));
+    // IUnknown now names its own pointer, counted apart from A and B.
+    assert_eq!(com.query::<u32>(&mut objects, 0x1000, IUNKNOWN), Ok(0x2000));
+    assert_eq!(com.add_ref::<u32>(&mut objects, 0x2000), Some(2));
+    assert_eq!(com.add_ref::<u32>(&mut objects, 0x1000), Some(2));
+    assert_eq!(com.query::<u32>(&mut objects, 0x2000, C), Ok(0x3000));
+    assert_eq!(com.query::<u32>(&mut objects, 0x3000, B), Ok(0x1000));
+    assert_eq!(com.references(&objects, id), Some(6));
+    for (pointer, counts) in [(0x1000, &[2, 1, 0][..]), (0x2000, &[1, 0])] {
+        for &expected in counts {
+            let released = com.release::<u32>(&mut objects, pointer).unwrap();
+            assert_eq!(released.references, expected);
+            assert!(released.destroyed.is_none());
+        }
+    }
+    // A count at zero does not release another interface's references.
+    assert!(com.release::<u32>(&mut objects, 0x1000).is_none());
+    let last = com.release::<u32>(&mut objects, 0x3000).unwrap();
+    assert_eq!(last.references, 0);
+    let destroyed = last.destroyed.unwrap();
+    assert_eq!(destroyed.interfaces, vec![0x1000, 0x2000, 0x3000]);
+    assert_eq!(objects.object_count(), 0);
+}

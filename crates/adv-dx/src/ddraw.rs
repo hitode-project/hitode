@@ -11,6 +11,7 @@ use adv_device::surface::{
 };
 use adv_machine::Objects;
 
+mod creation;
 pub mod front;
 pub use front::{Provider, WindowGeometry, install, register};
 
@@ -225,6 +226,11 @@ pub struct DirectDraw {
     surface_clippers: BTreeMap<u32, u32>,
     /// (surface, DDCKEY kind) -> inclusive raw pixel range.
     color_keys: BTreeMap<(u32, u32), (u32, u32)>,
+    /// The completed descriptor each surface was created with.
+    described: BTreeMap<u32, creation::Described>,
+    /// The DirectDraw4/7 interface each surface created through it holds a
+    /// reference on until it is destroyed.
+    creators: BTreeMap<u32, u32>,
     clipper_origins: BTreeMap<u32, (i32, i32)>,
     /// Explicit clip lists by clipper; Blt writes only inside these rectangles.
     clip_lists: BTreeMap<u32, Vec<Rect>>,
@@ -269,6 +275,8 @@ impl DirectDraw {
             clipper_windows: BTreeMap::new(),
             surface_clippers: BTreeMap::new(),
             color_keys: BTreeMap::new(),
+            described: BTreeMap::new(),
+            creators: BTreeMap::new(),
             clipper_origins: BTreeMap::new(),
             clip_lists: BTreeMap::new(),
             entries,
@@ -320,6 +328,42 @@ impl DirectDraw {
         Ok(0)
     }
 
+    /// Surface `sid`'s descriptor as `len` bytes, with its pixels at `pixels`
+    /// when locked and its current color keys.
+    fn describe<P: Presenter>(
+        &self,
+        surfaces: &Surfaces<P>,
+        sid: u32,
+        len: u32,
+        pixels: u32,
+    ) -> Vec<u8> {
+        let s = &surfaces[sid];
+        let mut d = self
+            .described
+            .get(&sid)
+            .copied()
+            .unwrap_or_else(|| creation::Described {
+                flags: creation::DDSD_CAPS | 0x1006,
+                caps: [0x40, 0, 0, 0],
+                format: creation::pixel_format(s.format),
+                ..Default::default()
+            });
+        (d.width, d.height) = (s.width, s.height);
+        for (i, &(flag, key)) in creation::KEYS.iter().enumerate() {
+            match self.color_keys.get(&(sid, key)) {
+                Some(&value) => {
+                    d.flags |= flag;
+                    d.keys[i] = value;
+                }
+                None => {
+                    d.flags &= !flag;
+                    d.keys[i] = (0, 0);
+                }
+            }
+        }
+        d.bytes(len, s.pitch, pixels)
+    }
+
     /// Screen origin of the window a clipper names; primary-surface blits are relative to it.
     pub fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {
         self.clipper_origins.insert(clipper, origin);
@@ -339,9 +383,39 @@ struct ComState {
     was_exclusive: bool,
     focus_window: u32,
     windowed: bool,
+    /// SetCooperativeLevel has set a normal or exclusive level.
+    cooperative: bool,
     old: u32,
     modern: u32,
-    legacy_descriptors: Vec<u32>,
+    /// Each interface version's pointer, oldest first.
+    versions: Vec<(u8, u32)>,
+}
+
+impl ComState {
+    /// The interface version `pointer` names.
+    fn version(&self, pointer: u32) -> u8 {
+        self.versions
+            .iter()
+            .find(|&&(_, p)| p == pointer)
+            .map_or(7, |&(version, _)| version)
+    }
+    /// The pointer of interface `version`, or of the newest older one.
+    fn pointer(&self, version: u8) -> u32 {
+        self.versions
+            .iter()
+            .rev()
+            .find(|&&(v, _)| v <= version)
+            .map_or(self.old, |&(_, p)| p)
+    }
+}
+
+/// The surface version a DirectDraw interface version creates and returns.
+fn surface_version(device: u8) -> u8 {
+    match device {
+        1 | 2 => 1,
+        4 => 4,
+        _ => 7,
+    }
 }
 
 impl DirectDraw {
@@ -455,9 +529,10 @@ impl DirectDraw {
         objects: &mut Objects,
         surfaces: &mut Surfaces<P>,
         kind: Kind,
-        legacy: bool,
+        version: u8,
         m: &mut dyn SurfaceMemory,
     ) -> Result<Option<u32>, CallError> {
+        let legacy = version < 4;
         if self.com.is_none() {
             self.com = CommonCom::new(objects);
         }
@@ -468,8 +543,8 @@ impl DirectDraw {
             && let Some(&identity) = self.surface_objects.get(&sid)
             && let Some(value) = com.get_identity(objects, identity)
         {
-            let pointer = if legacy { value.old } else { value.modern };
-            return Ok(com.add_ref_identity(objects, identity).map(|_| pointer));
+            let pointer = value.pointer(version);
+            return Ok(com.add_ref::<ComState>(objects, pointer).map(|_| pointer));
         }
         let vtable = if matches!(kind, Kind::Clipper) {
             if let Some(table) = self.clipper_vtable {
@@ -503,19 +578,29 @@ impl DirectDraw {
         } else {
             self.table(surfaces, matches!(kind, Kind::Surface(_)), legacy, m)?
         };
-        // Distinct layouts may expose different interface pointers, but all
-        // versions share the same canonical IUnknown and reference ownership.
+        // Like Windows, every interface version has its own pointer and
+        // reference count; all share the canonical IUnknown and the object.
         let mut layouts = match kind {
-            Kind::Clipper => vec![(IID_CLIPPER, vtable)],
-            Kind::Surface(_) => vec![(IID_SURFACE, vtable), (IID_SURFACE7, vtable)],
-            Kind::Device => vec![
-                (IID_DDRAW, self.table(surfaces, false, true, m)?),
-                (IID_DDRAW2, self.table(surfaces, false, false, m)?),
-                (IID_DDRAW7, self.table(surfaces, false, false, m)?),
+            Kind::Clipper => vec![(1, IID_CLIPPER, vtable)],
+            Kind::Surface(_) => vec![
+                (1, IID_SURFACE, vtable),
+                (2, IID_SURFACE2, vtable),
+                (3, IID_SURFACE3, vtable),
+                (4, IID_SURFACE4, vtable),
+                (7, IID_SURFACE7, vtable),
             ],
+            Kind::Device => {
+                let modern = self.table(surfaces, false, false, m)?;
+                vec![
+                    (1, IID_DDRAW, self.table(surfaces, false, true, m)?),
+                    (2, IID_DDRAW2, modern),
+                    (4, IID_DDRAW4, modern),
+                    (7, IID_DDRAW7, modern),
+                ]
+            }
         };
         let mut pointers = Vec::new();
-        for (_, table) in &mut layouts {
+        for (_, _, table) in &mut layouts {
             let result = surfaces.alloc(16, m).and_then(|p| {
                 pointers.push(p);
                 m.put_u32(p, *table)?;
@@ -534,8 +619,11 @@ impl DirectDraw {
         }
         let old = pointers[0];
         let modern = *pointers.last().unwrap();
-        let canonical = if legacy { old } else { modern };
-        let initial_iid = layouts.iter().find(|(_, p)| *p == canonical).unwrap().0;
+        let &(_, initial_iid, canonical) = layouts
+            .iter()
+            .rev()
+            .find(|&&(v, _, _)| v <= version)
+            .unwrap_or(&layouts[0]);
         let device_id = if matches!(kind, Kind::Device) {
             let id = self.next_device_id;
             self.next_device_id += 1;
@@ -550,13 +638,10 @@ impl DirectDraw {
             was_exclusive: false,
             focus_window: 0,
             windowed: false,
+            cooperative: false,
             old,
             modern,
-            legacy_descriptors: if matches!(kind, Kind::Clipper) {
-                Vec::new()
-            } else {
-                pointers[..pointers.len() - 1].to_vec()
-            },
+            versions: layouts.iter().map(|&(v, _, p)| (v, p)).collect(),
         };
         let Some(identity) = com.create(objects, canonical, initial_iid, value) else {
             for p in pointers {
@@ -564,18 +649,10 @@ impl DirectDraw {
             }
             return Ok(None);
         };
-        match kind {
-            Kind::Device => layouts.push((IID_DDRAW4, modern)),
-            Kind::Surface(_) => layouts.extend([
-                (IID_SURFACE2, old),
-                (IID_SURFACE3, old),
-                (IID_SURFACE4, modern),
-            ]),
-            Kind::Clipper => (),
-        }
         if !layouts
             .into_iter()
-            .all(|(iid, p)| com.register_interface(objects, identity, iid, p))
+            .filter(|&(_, _, p)| p != canonical)
+            .all(|(_, iid, p)| com.register_separate(objects, identity, iid, p))
         {
             com.release_identity(objects, identity);
             for p in pointers {
@@ -619,18 +696,21 @@ impl DirectDraw {
         {
             return Ok(0x80004002);
         }
-        let Some(pointer) = self.com_version(objects, surfaces, Kind::Device, false, m)? else {
+        let Some(pointer) = self.com_version(objects, surfaces, Kind::Device, 7, m)? else {
             return Ok(0x8007000e);
         };
         let com = self.com.unwrap();
         com.get_mut::<ComState>(objects, pointer)
             .unwrap()
             .initialized = false;
-        let target = com
-            .resolve_interface::<ComState>(objects, pointer, iid)
-            .unwrap();
+        // The requested version takes the creation reference.
+        let target = com.query::<ComState>(objects, pointer, iid);
+        self.release_com(objects, surfaces, pointer);
+        let Ok(target) = target else {
+            return Ok(0x8007000e);
+        };
         if let Err(error) = m.arg_put_u32(output, target) {
-            self.release_com(objects, surfaces, pointer);
+            self.release_com(objects, surfaces, target);
             return Err(error);
         }
         Ok(0)
@@ -648,10 +728,10 @@ impl DirectDraw {
         objects: &mut Objects,
         surfaces: &mut Surfaces<P>,
         sid: u32,
-        legacy: bool,
+        version: u8,
         m: &mut dyn SurfaceMemory,
     ) -> Result<Option<u32>, CallError> {
-        self.com_version(objects, surfaces, Kind::Surface(sid), legacy, m)
+        self.com_version(objects, surfaces, Kind::Surface(sid), version, m)
     }
 
     fn surface_id(&self, objects: &Objects, object: u32) -> Option<u32> {
@@ -704,6 +784,10 @@ impl DirectDraw {
                     self.release_com(objects, surfaces, clipper);
                 }
                 self.color_keys.retain(|&(owner, _), _| owner != sid);
+                self.described.remove(&sid);
+                if let Some(creator) = self.creators.remove(&sid) {
+                    self.release_com(objects, surfaces, creator);
+                }
                 if surfaces.primary_id() != Some(sid)
                     && !self.attached.values().any(|&other| other == sid)
                 {
@@ -843,8 +927,7 @@ impl DirectDraw {
             if a[0] != 0 || a[2] != 0 {
                 return Ok(INVALID);
             }
-            let Some(clipper) = self.com_version(objects, surfaces, Kind::Clipper, false, m)?
-            else {
+            let Some(clipper) = self.com_version(objects, surfaces, Kind::Clipper, 1, m)? else {
                 return Ok(0x8007000e);
             };
             self.clipper_windows.insert(clipper, 0);
@@ -860,8 +943,13 @@ impl DirectDraw {
             {
                 return Ok(INVALID);
             }
-            let Some(p) =
-                self.com_version(objects, surfaces, Kind::Device, id == api::DD_CREATE_OLD, m)?
+            let Some(p) = self.com_version(
+                objects,
+                surfaces,
+                Kind::Device,
+                if id == api::DD_CREATE_OLD { 1 } else { 7 },
+                m,
+            )?
             else {
                 return Ok(0x8007000e);
             };
@@ -875,7 +963,9 @@ impl DirectDraw {
             return Ok(INVALID);
         };
         let kind = object.kind;
-        let legacy = object.legacy_descriptors.contains(&a[0]);
+        let version = object.version(a[0]);
+        // Versions before DirectDraw4 exchange DDSURFACEDESC.
+        let legacy = version < 4;
         if matches!(kind, Kind::Device)
             && !object.initialized
             && !matches!(
@@ -925,11 +1015,16 @@ impl DirectDraw {
                     }
                     com.get_mut::<ComState>(objects, a[0]).unwrap().focus_window = a[1];
                     0
-                } else if a[2] == 8 || a[2] & 0x11 == 0x11 {
+                } else if a[2] & 0x11 == 0x11
+                    // DDSCL_NORMAL, alone or with DDSCL_ALLOWREBOOT,
+                    // NOWINDOWCHANGES, MULTITHREADED, FPUSETUP or FPUPRESERVE.
+                    || (a[2] & 8 != 0 && a[2] & !(8 | 2 | 4 | 0x400 | 0x800 | 0x1000) == 0)
+                {
                     let exclusive = a[2] & 0x11 == 0x11;
                     let device_state = com.get_mut::<ComState>(objects, a[0]).unwrap();
                     device_state.focus_window = a[1];
                     device_state.windowed = !exclusive;
+                    device_state.cooperative = true;
                     let device_id = device_state.device_id;
                     let device = device_state.modern;
                     if exclusive {
@@ -967,7 +1062,7 @@ impl DirectDraw {
                 if !matches!(kind, Kind::Device) || a[1] != 0 || a[3] != 0 {
                     return Ok(INVALID);
                 }
-                let Some(clipper) = self.com_version(objects, surfaces, Kind::Clipper, false, m)?
+                let Some(clipper) = self.com_version(objects, surfaces, Kind::Clipper, 1, m)?
                 else {
                     return Ok(0x8007000e);
                 };
@@ -1195,25 +1290,45 @@ impl DirectDraw {
                 0
             }
             api::CREATE_SURFACE => {
-                m.arg_put_u32(a[2], 0)?;
-                let desc_len = m.arg_u32(a[1])?;
-                if !matches!(kind, Kind::Device) || a[3] != 0 || !matches!(desc_len, 108 | 124) {
+                use creation::*;
+                if !matches!(kind, Kind::Device) {
                     return Ok(INVALID);
                 }
-                let flags = m.arg_u32(a[1] + 4)?;
-                let caps = m.arg_u32(a[1] + 104)?;
-                if flags & 1 == 0
-                    || flags & !0x1027 != 0
-                    || (desc_len == 124 && m.arg_read(a[1] + 108, 12)?.iter().any(|&b| b != 0))
+                if !object.cooperative {
+                    return Ok(NO_COOPERATIVE_LEVEL);
+                }
+                let len = if legacy { 108 } else { 124 };
+                if a[1] == 0 || m.arg_u32(a[1])? != len {
+                    return Ok(INVALID);
+                }
+                m.arg_put_u32(a[2], 0)?;
+                let mut d = Described::read(m, a[1], len)?;
+                if d.caps[0] & (FRONTBUFFER | BACKBUFFER) != 0 {
+                    return Ok(INVALID_CAPS);
+                }
+                let exclusive = self.exclusive_owner == Some(object.device_id);
+                let mode = (surfaces.width, surfaces.height, surfaces.display_format);
+                if let Err(hr) = validate(&mut d, a[3], version, exclusive, mode) {
+                    return Ok(hr);
+                }
+                let primary = d.caps[0] & PRIMARY != 0;
+                let flip = d.caps[0] & FLIP != 0;
+                // Client memory, mipmap and cube chains, longer flip chains
+                // and offscreen flip chains are not built yet.
+                if d.flags & DDSD_LPSURFACE != 0
+                    || d.mipmaps > 1
+                    || d.caps[1] != 0
+                    || (flip && (!primary || d.backbuffers > 1))
                 {
                     return Ok(UNSUPPORTED);
                 }
                 let owner_device_id = object.device_id;
                 let owner_modern = object.modern;
-                let sid = if caps & 0x200 != 0 {
+                let surface_version = surface_version(version);
+                let sid = if primary {
                     let primary = surfaces.primary(m)?;
                     self.primary_owner = Some(owner_modern);
-                    if caps & 0x18 == 0x18 && flags & 0x20 != 0 && m.arg_u32(a[1] + 20)? > 0 {
+                    if flip {
                         if self.attached.contains_key(&primary) {
                             return Ok(BUSY);
                         }
@@ -1224,12 +1339,22 @@ impl DirectDraw {
                             surfaces.display_format,
                             m,
                         )?;
-                        let Some(back_ref) =
-                            self.com_version(objects, surfaces, Kind::Surface(back), legacy, m)?
+                        let Some(back_ref) = self.com_version(
+                            objects,
+                            surfaces,
+                            Kind::Surface(back),
+                            surface_version,
+                            m,
+                        )?
                         else {
                             surfaces.delete(back);
                             return Ok(0x8007000e);
                         };
+                        let mut back_desc = d;
+                        back_desc.caps[0] =
+                            d.caps[0] & !(VISIBLE | PRIMARY | FRONTBUFFER) | BACKBUFFER;
+                        back_desc.backbuffers = 0;
+                        self.described.insert(back, back_desc);
                         self.surface_owners.insert(back, owner_device_id);
                         self.attached.insert(primary, back);
                         self.attached_refs.insert(primary, back_ref);
@@ -1237,31 +1362,11 @@ impl DirectDraw {
                     }
                     primary
                 } else {
-                    if caps & !SURFACE_CAPS != 0 || flags & 7 != 7 {
-                        return Ok(UNSUPPORTED);
-                    }
-                    let format = if flags & 0x1000 == 0 {
-                        surfaces.display_format
-                    } else {
-                        match (
-                            m.arg_u32(a[1] + 84)?,
-                            m.arg_u32(a[1] + 88)?,
-                            m.arg_u32(a[1] + 92)?,
-                            m.arg_u32(a[1] + 96)?,
-                        ) {
-                            (32, 0xff0000, 0xff00, 0xff) => PixelFormat::Bgra32,
-                            (16, 0xf800, 0x7e0, 0x1f) => PixelFormat::Rgb565,
-                            (16, 0x7c00, 0x3e0, 0x1f) => PixelFormat::Rgb555,
-                            _ => return Ok(UNSUPPORTED),
-                        }
-                    };
-                    let (w, h) = (m.arg_u32(a[1] + 12)?, m.arg_u32(a[1] + 8)?);
-                    if surface::size(w, h).is_err() {
-                        return Ok(INVALID);
-                    }
-                    surfaces.create(w, h, false, format, m)?
+                    let format = storage(&d.format).expect("validated format");
+                    surfaces.create(d.width, d.height, false, format, m)?
                 };
-                let Some(p) = self.com_version(objects, surfaces, Kind::Surface(sid), legacy, m)?
+                let Some(p) =
+                    self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m)?
                 else {
                     self.attached.remove(&sid);
                     if let Some(back) = self.attached_refs.remove(&sid) {
@@ -1272,8 +1377,22 @@ impl DirectDraw {
                     }
                     return Ok(0x8007000e);
                 };
-                m.arg_put_u32(a[2], p)?;
+                for (i, &(flag, key)) in KEYS.iter().enumerate() {
+                    if d.flags & flag != 0 {
+                        self.color_keys.insert((sid, key), d.keys[i]);
+                    }
+                }
+                self.described.insert(sid, d);
                 self.surface_owners.insert(sid, owner_device_id);
+                // Surfaces from DirectDraw4 and 7 keep their creator alive.
+                if version >= 4 {
+                    if com.add_ref::<ComState>(objects, a[0]).is_none() {
+                        self.release_com(objects, surfaces, p);
+                        return Ok(0x8007000e);
+                    }
+                    self.creators.insert(sid, a[0]);
+                }
+                m.arg_put_u32(a[2], p)?;
                 0
             }
             api::LOCK => {
@@ -1295,9 +1414,7 @@ impl DirectDraw {
                     return Ok(INVALID);
                 };
                 let p = surfaces[sid].row(rect.x, rect.y);
-                let mut desc = desc(surfaces, sid, p);
-                desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.arg_write(a[2], &desc[..len as usize])?;
+                m.arg_write(a[2], &self.describe(surfaces, sid, len, p))?;
                 surfaces.get_mut(sid).unwrap().locked = Some((rect, a[3] & 0x10 != 0));
                 surfaces.stats.locks += 1;
                 0
@@ -1334,9 +1451,7 @@ impl DirectDraw {
                 if !matches!(len, 108 | 124) {
                     return Ok(INVALID);
                 }
-                let mut desc = desc(surfaces, sid, 0);
-                desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.arg_write(a[1], &desc[..len as usize])?;
+                m.arg_write(a[1], &self.describe(surfaces, sid, len, 0))?;
                 0
             }
             api::COMPACT => {
@@ -1395,7 +1510,8 @@ impl DirectDraw {
                     Some(&back) if self.flipped.contains(&primary) => back,
                     _ => primary,
                 };
-                let Some(pointer) = self.surface_interface(objects, surfaces, sid, legacy, m)?
+                let Some(pointer) =
+                    self.surface_interface(objects, surfaces, sid, surface_version(version), m)?
                 else {
                     return Ok(0x8007000e);
                 };
@@ -1419,7 +1535,11 @@ impl DirectDraw {
                 let Some(canonical) = com.canonical::<ComState>(objects, device) else {
                     return Ok(NOT_FOUND);
                 };
-                let iid = if legacy { IID_DDRAW } else { IID_DDRAW7 };
+                let iid = match version {
+                    7 => IID_DDRAW7,
+                    4 => IID_DDRAW4,
+                    _ => IID_DDRAW,
+                };
                 match com.query::<ComState>(objects, canonical, iid) {
                     Ok(pointer) => {
                         m.arg_put_u32(a[1], pointer)?;
@@ -1486,13 +1606,9 @@ impl DirectDraw {
                 if a[1] == 0 {
                     return Ok(INVALID);
                 }
-                let caps = u32::from_le_bytes(desc(surfaces, sid, 0)[104..108].try_into().unwrap());
-                m.arg_put_u32(a[1], caps)?;
-                if !legacy {
-                    for offset in [4u32, 8, 12] {
-                        m.arg_put_u32(a[1] + offset, 0)?;
-                    }
-                }
+                let desc = self.describe(surfaces, sid, 124, 0);
+                let caps = if legacy { 4 } else { 16 };
+                m.arg_write(a[1], &desc[104..104 + caps])?;
                 0
             }
             api::SURFACE_INITIALIZE => {
@@ -1522,7 +1638,7 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                m.arg_write(a[1], &desc(surfaces, sid, 0)[72..104])?;
+                m.arg_write(a[1], &self.describe(surfaces, sid, 124, 0)[72..104])?;
                 0
             }
             api::GET_ATTACHED => {
@@ -1534,7 +1650,7 @@ impl DirectDraw {
                     return Ok(NOT_FOUND);
                 };
                 let Some(p) =
-                    self.com_version(objects, surfaces, Kind::Surface(back), legacy, m)?
+                    self.com_version(objects, surfaces, Kind::Surface(back), version, m)?
                 else {
                     return Ok(0x8007000e);
                 };

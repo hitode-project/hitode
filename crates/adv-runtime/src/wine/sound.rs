@@ -5,11 +5,10 @@ use std::path::Path;
 
 use adv_abi::dll::{Export, ModuleImage};
 use adv_abi::{Conv, Registry};
-use adv_cpu::backend::{Backend, GuestExt};
+use adv_cpu::backend::Backend;
 use adv_machine::{Machine, Outcome};
 
 pub(super) const MODULE: &str = "dsound.dll";
-const DSERR_NODRIVER: u32 = 0x8878_0078;
 
 /// Wine's dsound.spec exports at their ordinals; games import some by ordinal.
 const EXPORTS: [(&str, u16); 12] = [
@@ -29,13 +28,7 @@ const EXPORTS: [(&str, u16); 12] = [
 
 pub(super) fn register(registry: &mut Registry) {
     adv_dx::dsound::register(registry);
-    // The built-in stack has no capture devices: creation finds no driver
-    // and enumeration lists nothing.
-    for name in ["DirectSoundCaptureCreate", "DirectSoundCaptureCreate8"] {
-        registry.add(MODULE, name, Conv::Stdcall { argc: 3 }, |env| {
-            no_driver(env, env.arg(1))
-        });
-    }
+    // The built-in stack has no capture devices: enumeration lists nothing.
     for name in [
         "DirectSoundCaptureEnumerateA",
         "DirectSoundCaptureEnumerateW",
@@ -44,26 +37,6 @@ pub(super) fn register(registry: &mut Registry) {
             Outcome::Return(0)
         });
     }
-    registry.add(
-        MODULE,
-        "DirectSoundFullDuplexCreate",
-        Conv::Stdcall { argc: 10 },
-        |env| {
-            for at in [env.arg(6), env.arg(7), env.arg(8)] {
-                if at != 0 && env.cpu.write_u32(at, 0).is_err() {
-                    return Outcome::Return(DSERR_NODRIVER);
-                }
-            }
-            no_driver(env, env.arg(9))
-        },
-    );
-}
-
-fn no_driver(env: &mut adv_machine::Env<'_>, out: u32) -> Outcome {
-    if out != 0 {
-        let _ = env.cpu.write_u32(out, 0);
-    }
-    Outcome::Return(DSERR_NODRIVER)
 }
 
 /// Install the front over the session's audio stream and put its image in

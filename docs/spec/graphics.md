@@ -86,6 +86,12 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Verification**: Test
 **Basis**: Windows places system-memory surfaces in the process address space without a fixed pool.
 
+### GFX-DDRAW-15 Surface descriptors
+
+**Rule**: `CreateSurface` MUST check a descriptor's capabilities, counts, size and format in the order Windows does and fail with the same error. Missing caps, size and format MUST come from the display mode, and memory placement MUST be reported as on a hardware adapter. `GetSurfaceDesc`, `GetCaps` and `GetPixelFormat` MUST report the completed descriptor.
+**Verification**: Test
+**Basis**: Wine ddraw `ddraw1`–`ddraw7` and `dsurface` tests, which pass on Windows.
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

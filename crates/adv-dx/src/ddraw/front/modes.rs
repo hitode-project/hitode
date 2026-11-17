@@ -52,10 +52,7 @@ fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
             let (red, green, blue) = format.masks();
             for (offset, value) in [
                 (0, if legacy { 108 } else { 124 }),
-                (
-                    4,
-                    HEIGHT | WIDTH | 8 | PIXEL_FORMAT | if legacy { 0 } else { REFRESH },
-                ),
+                (4, HEIGHT | WIDTH | 8 | PIXEL_FORMAT | REFRESH),
                 (8, height),
                 (12, width),
                 (16, (width * format.bytes() + 3) & !3),
@@ -128,7 +125,7 @@ pub(super) fn enum_modes(
     if !object.initialized {
         return Outcome::Return(0x800401f0);
     }
-    let legacy = object.legacy_descriptors.contains(&this.addr());
+    let legacy = object.version(this.addr()) < 4;
     let length = if legacy { 108 } else { 124 };
     // Standard VGA requests are accepted, but this device exposes no 8-bit
     // display modes. REFRESHRATES exposes the single supported 60 Hz profile.

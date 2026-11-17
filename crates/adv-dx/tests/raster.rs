@@ -70,6 +70,8 @@ impl Fixture {
         f.memory.write(16, &IID_DDRAW7).unwrap();
         assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0);
         f.device = f.memory.u32(32).unwrap();
+        // Windows creates surfaces only after a cooperative level is set.
+        assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 0, 8]), 0);
         f
     }
     fn empty(objects: adv_machine::Objects) -> Self {
@@ -107,10 +109,10 @@ impl Fixture {
         result
     }
     fn surface(&mut self, w: u32, h: u32, format: PixelFormat, primary: bool) -> (u32, u32, u32) {
-        let mut desc = [0u8; 108];
+        let mut desc = [0u8; 124];
         let (r, g, b) = format.masks();
         for (offset, value) in [
-            (0, 108),
+            (0, 124),
             (4, if primary { 1 } else { 0x1007 }),
             (8, h),
             (12, w),
@@ -126,6 +128,7 @@ impl Fixture {
         self.memory.write(64, &desc).unwrap();
         assert_eq!(self.dd(dd::CREATE_SURFACE, &[self.device, 64, 32, 0]), 0);
         let object = self.memory.u32(32).unwrap();
+        self.memory.put_u32(64, 124).unwrap();
         assert_eq!(self.dd(dd::LOCK, &[object, 0, 64, 0, 0]), 0);
         let pixels = self.memory.u32(64 + 36).unwrap();
         let pitch = self.memory.u32(64 + 16).unwrap();
@@ -171,8 +174,9 @@ fn failed_com_publication_reclaims_all_unpublished_interface_allocations() {
     }
 }
 
+// spec: PERS-SCOPE-13
 #[test]
-fn directdraw_versions_share_canonical_unknown_and_one_reference_lifetime() {
+fn directdraw_versions_share_canonical_unknown_and_count_apart() {
     let mut f = Fixture::new();
     let device = f.device;
     let old_iid = [
@@ -185,17 +189,57 @@ fn directdraw_versions_share_canonical_unknown_and_one_reference_lifetime() {
     assert_eq!((from_old, from_new), (device, device));
     assert_eq!(f.objects.object_count(), 1);
     assert!(f.objects.close(old).is_none());
-    assert_eq!(f.dd(dd::RELEASE, &[from_old]), 3);
-    assert_eq!(f.dd(dd::RELEASE, &[from_new]), 2);
-    assert_eq!(f.dd(dd::RELEASE, &[device]), 1);
+    // Each version keeps its own count; the object lives while any does.
+    assert_eq!(f.dd(dd::RELEASE, &[from_old]), 2);
+    assert_eq!(f.dd(dd::RELEASE, &[from_new]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[device]), 0);
+    assert_eq!(f.objects.object_count(), 1);
     assert_eq!(f.dd(dd::RELEASE, &[old]), 0);
     assert_eq!(f.objects.object_count(), 0);
     assert_eq!(f.dd(dd::ADDREF, &[device]), 0x80070057);
 }
 
+// spec: GFX-DDRAW-15
+#[test]
+fn surfaces_need_a_cooperative_level_and_report_their_completed_descriptor() {
+    let mut f = Fixture::new();
+    let owners = f.objects.object_count();
+    f.memory.write(16, &IID_DDRAW7).unwrap();
+    assert_eq!(f.dd(dd::DD_CREATE, &[0, 32, 16, 0]), 0);
+    let device = f.memory.u32(32).unwrap();
+    // An offscreen surface without DDSD_CAPS, which Windows completes.
+    let mut desc = [0u8; 124];
+    for (at, value) in [(0, 124_u32), (4, 6), (8, 2), (12, 3), (104, 0x40)] {
+        desc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    f.memory.write(64, &desc).unwrap();
+    let create = |f: &mut Fixture| f.dd(dd::CREATE_SURFACE, &[device, 64, 32, 0]);
+    assert_eq!(create(&mut f), 0x887600d4); // DDERR_NOCOOPERATIVELEVELSET
+    // DDSCL_NORMAL | DDSCL_MULTITHREADED.
+    assert_eq!(f.dd(dd::COOPERATIVE, &[device, 0, 0x408]), 0);
+    // DirectDraw7 takes DDSURFACEDESC2 only.
+    f.memory.put_u32(64, 108).unwrap();
+    assert_eq!(create(&mut f), 0x80070057);
+    f.memory.put_u32(64, 124).unwrap();
+    assert_eq!(create(&mut f), 0);
+    let surface = f.memory.u32(32).unwrap();
+    f.memory.write(128, &[0; 124]).unwrap();
+    f.memory.put_u32(128, 124).unwrap();
+    assert_eq!(f.dd(dd::GET_DESC, &[surface, 128]), 0);
+    // DDSD_CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT; local video memory.
+    assert_eq!(f.memory.u32(128 + 4).unwrap(), 0x100f);
+    assert_eq!(f.memory.u32(128 + 104).unwrap(), 0x1000_4040);
+    // The surface keeps its DirectDraw7 creator alive.
+    assert_eq!(f.dd(dd::RELEASE, &[device]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[surface]), 0);
+    assert_eq!(f.objects.object_count(), owners);
+}
+
 #[test]
 fn attached_surface_has_stable_identity_and_parent_retains_it_until_release() {
     let mut f = Fixture::new();
+    // Flipping primaries need exclusive mode.
+    assert_eq!(f.dd(dd::COOPERATIVE, &[f.device, 7, 0x11]), 0);
     let mut desc = [0u8; 124];
     for (at, value) in [(0, 124_u32), (4, 0x21), (20, 1), (104, 0x218)] {
         desc[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -227,8 +271,8 @@ fn surface_versions_and_clipper_replacement_release_their_retained_objects() {
     let old = f.query(surface, old_iid);
     let unknown = f.query(old, adv_os::com::IUNKNOWN);
     assert_eq!(unknown, surface);
-    assert_eq!(f.dd(dd::RELEASE, &[unknown]), 2);
-    assert_eq!(f.dd(dd::RELEASE, &[old]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[unknown]), 1);
+    assert_eq!(f.dd(dd::RELEASE, &[old]), 0);
     assert_eq!(f.dd(dd::CREATE_CLIPPER, &[f.device, 0, 32, 0]), 0);
     let clipper = f.memory.u32(32).unwrap();
     assert_eq!(f.dd(dd::SET_CLIPPER, &[surface, clipper]), 0);

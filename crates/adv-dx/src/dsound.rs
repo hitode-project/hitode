@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 
+mod capture;
 mod enumeration;
 mod spatial;
 use spatial::{Deferred, Listener, Source, Vector};
@@ -120,13 +121,24 @@ const BUFFER_3D: &[(&str, u8)] = &[
     ("SetPosition", 5),
     ("SetVelocity", 5),
 ];
+const PROPERTIES: &[(&str, u8)] = &[
+    ("QueryInterface", 3),
+    ("AddRef", 1),
+    ("Release", 1),
+    ("Get", 8),
+    ("Set", 7),
+    ("QuerySupport", 4),
+];
 /// The interfaces whose method tables the front allocates, by table index.
-const INTERFACES: [(&str, &[(&str, u8)]); 5] = [
+const INTERFACES: [(&str, &[(&str, u8)]); 8] = [
     ("IDirectSound8", DEVICE),
     ("IDirectSoundBuffer8", BUFFER),
     ("IDirectSoundNotify", NOTIFY),
     ("IDirectSound3DListener", LISTENER),
     ("IDirectSound3DBuffer", BUFFER_3D),
+    ("IKsPropertySet", PROPERTIES),
+    ("IDirectSoundCapture", capture::CAPTURE),
+    ("IDirectSoundFullDuplex", capture::DUPLEX),
 ];
 const IID_DEVICE: [u8; 16] = [
     0x83, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
@@ -141,7 +153,13 @@ const CLSID_DEVICE8: [u8; 16] = [
     0x3f, 0xcc, 0x01, 0x39, 0xb5, 0x84, 0xa4, 0x4f, 0xba, 0x35, 0xaa, 0x81, 0x72, 0xb8, 0xa0, 0x9b,
 ];
 /// The classes `CoCreateInstance` activates through this front.
-pub const CLASSES: [[u8; 16]; 2] = [CLSID_DEVICE, CLSID_DEVICE8];
+pub const CLASSES: [[u8; 16]; 5] = [
+    CLSID_DEVICE,
+    CLSID_DEVICE8,
+    capture::CLSID_CAPTURE,
+    capture::CLSID_CAPTURE8,
+    capture::CLSID_DUPLEX,
+];
 const IID_BUFFER: [u8; 16] = [
     0x85, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -157,6 +175,11 @@ const IID_LISTENER: [u8; 16] = [
 const IID_BUFFER_3D: [u8; 16] = [
     0x86, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
+const IID_PROPERTIES: [u8; 16] = [
+    0x30, 0xac, 0xef, 0x31, 0x5c, 0x51, 0xd0, 0x11, 0xa9, 0xaa, 0, 0xaa, 0, 0x61, 0xbe, 0x93,
+];
+/// E_PROP_ID_UNSUPPORTED: no driver property set is available.
+const PROPERTY_UNSUPPORTED: u32 = 0x8007_0490;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Extensible {
@@ -275,12 +298,18 @@ enum Kind {
     Notify(u32),
     /// The listener of a primary buffer, or the 3D control of a secondary one.
     Spatial(u32),
+    /// A buffer's IKsPropertySet, which supports no property set.
+    Properties,
+    /// An uninitialized DirectSoundCapture or DirectSoundFullDuplex object.
+    Capture,
+    Duplex,
 }
 struct Object {
     kind: Kind,
     pointer: u32,
     notify: u32,
     spatial: u32,
+    properties: u32,
     buffer: Option<Buffer>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,7 +492,7 @@ pub struct AudioSourceStatus {
 
 pub struct Sound {
     pub enabled: bool,
-    tables: [u32; 5],
+    tables: [u32; INTERFACES.len()],
     listener: Deferred<Listener>,
     com: Com,
     /// Non-owning iteration index; payload and all references live in Objects.
@@ -556,6 +585,9 @@ pub fn register(reg: &mut Registry) {
                 call,
             );
         }
+    }
+    for (name, argc) in capture::CREATORS {
+        reg.add("dsound.dll", name, Conv::Stdcall { argc }, call);
     }
     crate::refcounts::install(reg, "dsound.dll");
 }
@@ -659,7 +691,7 @@ fn install_audio<B: Backend>(
     } else {
         None
     };
-    let mut tables = [0; 5];
+    let mut tables = [0; INTERFACES.len()];
     for (i, (prefix, methods)) in INTERFACES.into_iter().enumerate() {
         let table = m
             .sys
@@ -705,6 +737,9 @@ fn install_audio<B: Backend>(
     let classes = m.ext.get_or_default::<adv_os::com::ClassFactories>();
     classes.register(CLSID_DEVICE, create_class);
     classes.register(CLSID_DEVICE8, create_class8);
+    classes.register(capture::CLSID_CAPTURE, capture::create_class);
+    classes.register(capture::CLSID_CAPTURE8, capture::create_class);
+    classes.register(capture::CLSID_DUPLEX, capture::create_duplex_class);
     Ok(())
 }
 
@@ -741,21 +776,29 @@ fn create_com_device(
     if iid != adv_os::com::IUNKNOWN && iid != IID_DEVICE && !(version8 && iid == IID_DEVICE8) {
         return Outcome::Return(NO_INTERFACE);
     }
-    let ptr = match object(
-        e,
-        Kind::Device {
-            initialized: false,
-            version8,
-        },
-        false,
-        None,
-    ) {
+    let kind = Kind::Device {
+        initialized: false,
+        version8,
+    };
+    activate_object(e, kind, iid, output)
+}
+/// Publish a new `kind` object at `output` through the interface `iid`.
+fn activate_object(e: &mut Env<'_>, kind: Kind, iid: [u8; 16], output: u32) -> Outcome {
+    let ptr = match object(e, kind, false, None) {
         Ok(Some(ptr)) => ptr,
         Ok(None) => return Outcome::Return(OUT_OF_MEMORY),
         Err(error) => return Outcome::Fail(error),
     };
-    if let Err(error) = e.cpu.write_u32(output, ptr) {
-        release(e, ptr);
+    // The requested interface takes the creation reference, so IUnknown
+    // starts with its own count of one.
+    let com = e.ext.get::<Sound>().com;
+    let target = com.query::<Object>(&mut e.sys.objects, ptr, iid);
+    release(e, ptr);
+    let Ok(target) = target else {
+        return Outcome::Return(OUT_OF_MEMORY);
+    };
+    if let Err(error) = e.cpu.write_u32(output, target) {
+        release(e, target);
         return Outcome::Fail(error.to_string());
     }
     Outcome::Return(0)
@@ -850,16 +893,29 @@ fn object(
     let i = match kind {
         Kind::Device { .. } => 0,
         Kind::Buffer => 1,
-        Kind::Notify(_) | Kind::Spatial(_) => unreachable!("aliases belong to the buffer"),
+        Kind::Capture => 6,
+        Kind::Duplex => 7,
+        Kind::Notify(_) | Kind::Spatial(_) | Kind::Properties => {
+            unreachable!("aliases belong to the buffer")
+        }
     };
     let Some(ptr) = interface(e, i)? else {
         return Ok(None);
     };
+    // Like Windows, the IUnknown of every non-buffer object and every buffer
+    // alias keep their own reference counts. IUnknown reuses its object's
+    // method table.
+    let separate = if i != 1 {
+        [Some((i, adv_os::com::IUNKNOWN)), None, None]
+    } else {
+        [
+            Some((5, IID_PROPERTIES)),
+            with_notify.then_some((2, IID_NOTIFY)),
+            spatial,
+        ]
+    };
     let mut aliases = Vec::new();
-    for (table, iid) in [with_notify.then_some((2, IID_NOTIFY)), spatial]
-        .into_iter()
-        .flatten()
-    {
+    for (table, iid) in separate.into_iter().flatten() {
         match interface(e, table) {
             Ok(Some(alias)) => aliases.push((alias, iid)),
             failed => {
@@ -877,15 +933,16 @@ fn object(
             .find(|&&(_, known)| known == iid)
             .map_or(0, |&(alias, _)| alias)
     };
-    let (notify, spatial) = (
+    let (notify, spatial, properties) = (
         alias_of(IID_NOTIFY),
         spatial.map_or(0, |(_, iid)| alias_of(iid)),
+        alias_of(IID_PROPERTIES),
     );
     let com = e.ext.get::<Sound>().com;
-    let (iid, iid8) = if matches!(kind, Kind::Device { .. }) {
-        (IID_DEVICE, IID_DEVICE8)
-    } else {
-        (IID_BUFFER, IID_BUFFER8)
+    let (iid, iid8) = match kind {
+        Kind::Device { version8, .. } => (IID_DEVICE, version8.then_some(IID_DEVICE8)),
+        Kind::Buffer => (IID_BUFFER, Some(IID_BUFFER8)),
+        _ => (capture::primary(kind), None),
     };
     let Some(id) = com.create(
         &mut e.sys.objects,
@@ -896,6 +953,7 @@ fn object(
             pointer: ptr,
             notify,
             spatial,
+            properties,
             buffer: None,
         },
     ) else {
@@ -905,14 +963,9 @@ fn object(
         free(e, ptr);
         return Ok(None);
     };
-    let supports8 = !matches!(
-        kind,
-        Kind::Device {
-            version8: false,
-            ..
-        }
-    );
-    if supports8 && !com.register_interface(&mut e.sys.objects, id, iid8, ptr) {
+    if let Some(iid8) = iid8
+        && !com.register_interface(&mut e.sys.objects, id, iid8, ptr)
+    {
         for &(alias, _) in &aliases {
             free(e, alias);
         }
@@ -920,7 +973,7 @@ fn object(
         return Ok(None);
     }
     for (at, &(alias, iid)) in aliases.iter().enumerate() {
-        if !com.register_interface(&mut e.sys.objects, id, iid, alias) {
+        if !com.register_separate(&mut e.sys.objects, id, iid, alias) {
             // Registered aliases are released with the owner. A failed
             // registration leaves the remaining allocations outside the table
             // and the unpublished owner holds one ref.
@@ -1110,6 +1163,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
         e.cpu.write_u32(b, obj)?;
         return Ok(0);
     }
+    if let Some(hr) = capture::create(e, name)? {
+        return Ok(hr);
+    }
     let com = e.ext.get::<Sound>().com;
     let Some(obj) = com.get::<Object>(&e.sys.objects, a) else {
         return Ok(INVALID);
@@ -1118,6 +1174,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
         Kind::Notify(obj.pointer)
     } else if a == obj.spatial {
         Kind::Spatial(obj.pointer)
+    } else if a == obj.properties {
+        Kind::Properties
     } else {
         obj.kind
     };
@@ -1139,6 +1197,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
         };
         e.cpu.write_u32(c, ptr)?;
         return Ok(0);
+    }
+    match kind {
+        Kind::Properties => return Ok(PROPERTY_UNSUPPORTED),
+        Kind::Capture | Kind::Duplex => return capture::method(e, kind, name),
+        _ => {}
     }
     if let Kind::Device {
         initialized,
@@ -2707,8 +2770,9 @@ mod tests {
                 invoke(&mut m, "IDirectSound8::Initialize", &[ptr, 0]),
                 0x88780082
             );
-            assert_eq!(query(&mut m, ptr, &adv_os::com::IUNKNOWN), ptr);
-            assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 1);
+            let unknown = query(&mut m, ptr, &adv_os::com::IUNKNOWN);
+            assert_ne!(unknown, ptr);
+            assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[unknown]), 0);
             m.cpu.write_u32(DATA, 96).unwrap();
             assert_eq!(invoke(&mut m, "IDirectSound8::GetCaps", &[ptr, DATA]), 0);
             assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 0);
@@ -2818,6 +2882,172 @@ mod tests {
             "inaccessible argument (guest memory fault at 0x00000000 (+4)); returning E_INVALIDARG"
                 .to_owned()
         )));
+    }
+    // spec: PERS-SCOPE-13
+    #[test]
+    fn interfaces_keep_windows_reference_counts() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        let add = |m: &mut Machine<JitCpu>, p: u32| invoke(m, "IDirectSound8::AddRef", &[p]);
+        let release = |m: &mut Machine<JitCpu>, p: u32| invoke(m, "IDirectSound8::Release", &[p]);
+        assert_eq!(invoke(&mut m, "DirectSoundCreate8", &[0, DATA + 128, 0]), 0);
+        let ds8 = m.cpu.read_u32(DATA + 128).unwrap();
+        // IDirectSound and IDirectSound8 share a count; IUnknown has its own.
+        assert_eq!(add(&mut m, ds8), 2);
+        assert_eq!(query(&mut m, ds8, &IID_DEVICE), ds8);
+        assert_eq!(add(&mut m, ds8), 4);
+        let unknown = query(&mut m, ds8, &adv_os::com::IUNKNOWN);
+        assert_ne!(unknown, ds8);
+        assert_eq!(add(&mut m, unknown), 2);
+        for expected in (0..4).rev() {
+            assert_eq!(release(&mut m, ds8), expected);
+        }
+        assert_eq!(m.sys.objects.object_count(), owners + 1);
+        assert_eq!(release(&mut m, unknown), 1);
+        assert_eq!(release(&mut m, unknown), 0);
+        assert_eq!(m.sys.objects.object_count(), owners);
+
+        // The listener and IKsPropertySet count apart from their buffer.
+        let device = device(&mut m);
+        for (i, value) in [20, 0x11, 0, 0, 0].into_iter().enumerate() {
+            m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
+        }
+        let args = [device, DATA, DATA + 128, 0];
+        assert_eq!(invoke(&mut m, "IDirectSound8::CreateSoundBuffer", &args), 0);
+        let primary = m.cpu.read_u32(DATA + 128).unwrap();
+        let listener = query(&mut m, primary, &IID_LISTENER);
+        assert_eq!(query(&mut m, listener, &IID_BUFFER), primary);
+        assert_eq!(release(&mut m, primary), 1);
+        let properties = query(&mut m, listener, &IID_PROPERTIES);
+        let get = [properties, DATA, 0, 0, 0, DATA + 64, 4, DATA + 128];
+        assert_eq!(
+            invoke(&mut m, "IKsPropertySet::Get", &get),
+            PROPERTY_UNSUPPORTED
+        );
+        for pointer in [properties, listener, primary] {
+            assert_eq!(release(&mut m, pointer), 0);
+        }
+        assert_eq!(release(&mut m, device), 0);
+        assert_eq!(m.sys.objects.object_count(), owners);
+    }
+    // spec: DEV-AUDIO-8
+    #[test]
+    fn capture_and_full_duplex_find_no_driver_as_windows_does() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        let mark = |m: &mut Machine<JitCpu>| m.cpu.write_u32(DATA + 128, 0xdead_beef).unwrap();
+        let out = |m: &mut Machine<JitCpu>| m.cpu.read_u32(DATA + 128).unwrap();
+        for name in ["DirectSoundCaptureCreate", "DirectSoundCaptureCreate8"] {
+            assert_eq!(invoke(&mut m, name, &[0, 0, 0]), INVALID);
+            mark(&mut m);
+            assert_eq!(invoke(&mut m, name, &[0, DATA + 128, DATA]), 0x8004_0110);
+            assert_eq!(out(&mut m), 0xdead_beef);
+            assert_eq!(invoke(&mut m, name, &[0, DATA + 128, 0]), NO_DRIVER);
+            assert_eq!(out(&mut m), 0);
+        }
+        let duplex = |m: &mut Machine<JitCpu>, outputs: [u32; 3], outer: u32| {
+            let [fd, cb, b] = outputs;
+            let args = [0, 0, DATA, DATA, 0, 1, fd, cb, b, outer];
+            invoke(m, "DirectSoundFullDuplexCreate", &args)
+        };
+        assert_eq!(duplex(&mut m, [0, DATA + 132, DATA + 136], 0), INVALID);
+        mark(&mut m);
+        assert_eq!(
+            duplex(&mut m, [DATA + 128, DATA + 132, DATA + 136], DATA),
+            0x8004_0110
+        );
+        assert_eq!(out(&mut m), 0);
+        assert_eq!(duplex(&mut m, [DATA + 128, 0, 0], 0), INVALID);
+        assert_eq!(
+            duplex(&mut m, [DATA + 128, DATA + 132, DATA + 136], 0),
+            NO_DRIVER
+        );
+
+        // The classes make real, uninitialized objects with Windows counts.
+        let activate = |m: &mut Machine<JitCpu>, class, iid, outer, output| match activate(
+            m, class, iid, outer, output,
+        ) {
+            Outcome::Return(hr) => hr,
+            _ => panic!("class activation did not return"),
+        };
+        let clsid_capture = capture::CLSID_CAPTURE;
+        let iid_capture = capture::primary(Kind::Capture);
+        let unknown = adv_os::com::IUNKNOWN;
+        assert_eq!(
+            activate(&mut m, clsid_capture, iid_capture, DATA, DATA + 128),
+            0x8004_0110
+        );
+        assert_eq!(
+            activate(&mut m, clsid_capture, IID_DEVICE, 0, DATA + 128),
+            NO_INTERFACE
+        );
+        assert_eq!(
+            activate(&mut m, clsid_capture, iid_capture, 0, DATA + 128),
+            0
+        );
+        let dsc = out(&mut m);
+        let release =
+            |m: &mut Machine<JitCpu>, p: u32| invoke(m, "IDirectSoundCapture::Release", &[p]);
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundCapture::GetCaps", &[dsc, DATA]),
+            0x8878_00aa
+        );
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundCapture::Initialize", &[dsc, 0]),
+            NO_DRIVER
+        );
+        let args = [dsc, DATA, DATA + 128, 0];
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundCapture::CreateCaptureBuffer", &args),
+            0x8878_00aa
+        );
+        let dsc_unknown = query(&mut m, dsc, &unknown);
+        assert_ne!(dsc_unknown, dsc);
+        assert_eq!(release(&mut m, dsc), 0);
+        assert_eq!(release(&mut m, dsc_unknown), 0);
+        assert_eq!(m.sys.objects.object_count(), owners);
+
+        let clsid_duplex = capture::CLSID_DUPLEX;
+        assert_eq!(
+            activate(&mut m, clsid_duplex, unknown, DATA, DATA + 128),
+            0x8004_0110
+        );
+        assert_eq!(
+            activate(&mut m, clsid_duplex, IID_DEVICE8, 0, DATA + 128),
+            NO_INTERFACE
+        );
+        let iid_duplex = capture::primary(Kind::Duplex);
+        assert_eq!(activate(&mut m, clsid_duplex, iid_duplex, 0, DATA + 128), 0);
+        let dsfd = out(&mut m);
+        let add =
+            |m: &mut Machine<JitCpu>, p: u32| invoke(m, "IDirectSoundFullDuplex::AddRef", &[p]);
+        assert_eq!(add(&mut m, dsfd), 2);
+        let dsfd_unknown = query(&mut m, dsfd, &unknown);
+        assert_eq!(add(&mut m, dsfd_unknown), 2);
+        // Uninitialized, it exposes neither the render nor the capture device.
+        m.cpu.write(DATA + 256, &IID_DEVICE8).unwrap();
+        let args = [dsfd, DATA + 256, DATA + 128];
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundFullDuplex::QueryInterface", &args),
+            NO_INTERFACE
+        );
+        let init = [dsfd, 0, 0, DATA, DATA, 0, 1, 0, 0];
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundFullDuplex::Initialize", &init),
+            INVALID
+        );
+        let init = [dsfd, 0, 0, DATA, DATA, 0, 1, DATA + 132, DATA + 136];
+        assert_eq!(
+            invoke(&mut m, "IDirectSoundFullDuplex::Initialize", &init),
+            NO_DRIVER
+        );
+        for (pointer, expected) in [(dsfd, 1), (dsfd, 0), (dsfd_unknown, 1), (dsfd_unknown, 0)] {
+            assert_eq!(
+                invoke(&mut m, "IDirectSoundFullDuplex::Release", &[pointer]),
+                expected
+            );
+        }
+        assert_eq!(m.sys.objects.object_count(), owners);
     }
     // spec: DEV-AUDIO-6
     #[test]
@@ -3020,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_and_buffer_interfaces_share_identity_and_last_release() {
+    fn notification_and_buffer_interfaces_share_identity_and_count_apart() {
         let mut m = machine();
         let b = buffer(&mut m, Format::default(), 400);
         let before = m.sys.objects.object_count();
@@ -3031,7 +3261,7 @@ mod tests {
         assert_eq!(query(&mut m, b, &IID_BUFFER8), b);
         assert_eq!(m.sys.objects.object_count(), before);
         assert!(m.sys.objects.close(notify).is_none());
-        for (pointer, remaining) in [(b, 4), (notify, 3), (b, 2), (b, 1), (notify, 0)] {
+        for (pointer, remaining) in [(b, 2), (notify, 1), (b, 1), (b, 0), (notify, 0)] {
             assert_eq!(
                 invoke(&mut m, "IDirectSoundBuffer8::Release", &[pointer]),
                 remaining
@@ -3093,12 +3323,13 @@ mod tests {
                 objects: 1,
                 ..ObjectLimits::default()
             },
+            // A device holds two aliases; a notifying buffer needs three.
             ObjectLimits {
-                aliases: 2,
+                aliases: 3,
                 ..ObjectLimits::default()
             },
             ObjectLimits {
-                references: 2,
+                references: 3,
                 ..ObjectLimits::default()
             },
         ] {
@@ -4005,7 +4236,8 @@ mod tests {
                 .unwrap()
                 .playing
         );
-        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[b]), 1);
+        assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Release", &[b]), 0);
+        assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, b).is_some());
         assert_eq!(invoke(&mut m, "IDirectSoundNotify::Release", &[notify]), 0);
         assert!(m.ext.get::<Sound>().buffer(&m.sys.objects, b).is_none());
     }
