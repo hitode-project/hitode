@@ -10,7 +10,7 @@ fn status(m: &mut Machine<JitCpu>, buffer: u32) -> u32 {
 }
 
 #[test]
-// spec: MEDIA-AUDIO-3
+// spec: MEDIA-AUDIO-3, DEV-AUDIO-12
 fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() {
     let mut m = machine();
     let dev = device(&mut m);
@@ -46,6 +46,9 @@ fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() 
         0
     );
     assert_eq!(m.cpu.read_u32(DATA + 204).unwrap(), LOC_DEFER | 0x1e2);
+    // Like Windows, a deferred buffer reports DSBSTATUS_LOCSOFTWARE only
+    // once its voice is acquired.
+    assert_eq!(status(&mut m, b), 0);
     for (flags, count, expected) in [
         (0, 0, 0),
         (4, 0, 0),
@@ -63,7 +66,7 @@ fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() 
         );
         assert_eq!(
             status(&mut m, b),
-            0,
+            0x10,
             "acquiring does not start PCM playback"
         );
     }
@@ -93,7 +96,7 @@ fn deferred_buffers_preserve_caps_and_use_the_shared_software_voice_lifecycle() 
             advance(&mut m, 25_000);
             assert_eq!(position(&mut m, b), 25);
             assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Stop", &[b]), 0);
-            assert_eq!(status(&mut m, b), 0);
+            assert_eq!(status(&mut m, b), 0x10);
             assert_eq!(
                 invoke(&mut m, "IDirectSoundBuffer8::SetCurrentPosition", &[b, 0]),
                 0

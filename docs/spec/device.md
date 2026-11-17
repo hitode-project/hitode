@@ -188,6 +188,18 @@ Unmatched libraries MUST execute their guest implementations.
 **Verification**: Test
 **Basis**: Wine dsound `dsound` and `dsound8` tests, which pass on Windows.
 
+### DEV-AUDIO-11 DirectSound locks
+
+**Rule**: A buffer MUST hold any number of disjoint locks, refusing an overlapping one after clearing every output given. `DSBLOCK_ENTIREBUFFER` MUST lock the whole length from the offset, wrapping to the start. `Unlock` MUST end the locks starting at each address in turn, ignoring sizes and stopping at the first that matches none.
+**Verification**: Test
+**Basis**: Wine dsound `dsound` test `test_lock`, which passes on Windows.
+
+### DEV-AUDIO-12 DirectSound buffer controls
+
+**Rule**: Volume, pan and frequency methods MUST fail with `DSERR_CONTROLUNAVAIL` when the buffer lacks the control, in Windows's order of checks. A primary buffer's frequency MUST be unavailable, and a deferred buffer MUST report `DSBSTATUS_LOCSOFTWARE` once its voice is acquired. A listener MUST reject front and top vectors at no angle to each other.
+**Verification**: Test
+**Basis**: Wine dsound `dsound`, `ds3d` and `ds3d8` tests, which pass on Windows.
+
 ### DEV-AUDIO-5 Owned PCM timing
 
 **Rule**: Owned PCM clock conversion MUST use guest and device readings from the same synchronization point. Decode duration MUST NOT shift a continuous audio stream's presentation timestamps. Queue-depth metrics MUST measure total queued duration per stream.
