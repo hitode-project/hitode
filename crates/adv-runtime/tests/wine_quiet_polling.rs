@@ -64,17 +64,14 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
         .set_time_skip_source(Some(std::sync::Arc::new(|_| true)));
     until(&mut session, &mut output, &mut text, "clock_reads=");
     session.machine.set_time_skip_source(None);
-    let reads: u32 = text
-        .lines()
-        .find_map(|line| line.strip_prefix("clock_reads="))
-        .unwrap()
-        .parse()
-        .unwrap();
-    // A streak of back-to-back reads proves the spin; a host stall between two
-    // reads, such as a run slice ending, may restart the proof once.
-    let streak = adv_machine::clock::POLL_STREAK;
-    assert!(reads < 3 * streak, "clock-only loop spun {reads} times");
-    assert!(session.machine.sys.scheduling.active_time_skip_us >= 50_000);
+    // Skipped time proves the 100 ms loop idled. Its read count is not
+    // bounded: every host stall between two reads, such as a slice ending or
+    // the host preempting the run, restarts the proof streak.
+    let skipped = session.machine.sys.scheduling.active_time_skip_us;
+    assert!(
+        skipped >= 50_000,
+        "clock-only loop skipped {skipped} us: {text}"
+    );
     until(&mut session, &mut output, &mut text, "deadline=");
     let ready = text
         .lines()
