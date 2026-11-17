@@ -178,8 +178,8 @@ fn failed_task_memory_outputs_leave_the_shared_allocation_ledger_unchanged() {
 // spec: MEDIA-STREAM-2
 fn pushed_samples_are_rejected_and_processed_output_is_checked_and_cleared() {
     let mut m = machine();
-    let decoder = activate(&mut m, CLSID_MPEG_VIDEO_CODEC, IID_IBASEFILTER);
-    let pin = m.ext.get::<State>().filters[&decoder].pins[0];
+    let splitter = activate(&mut m, CLSID_MPEG1_SPLITTER, IID_IBASEFILTER);
+    let pin = m.ext.get::<State>().filters[&splitter].pins[0];
     let input = query(&mut m, pin, IID_IMEMINPUTPIN);
     assert_eq!(
         method(&mut m, "IMemInputPin::Receive", &[input, 0xdead_beef]),
@@ -265,14 +265,8 @@ fn event_timeouts_leave_no_event_code() {
 /// the host allocated.
 const ANY: u32 = u32::MAX;
 
-/// Run a quartz method that calls back into the guest exactly once per item
-/// of `expected`, checking each call's target and arguments.
-fn method_calls(
-    m: &mut Machine<JitCpu>,
-    name: &str,
-    args: &[u32],
-    expected: &[(u32, &[u32], u32)],
-) -> u32 {
+/// Enter a quartz method and return its first outcome without resuming it.
+pub(crate) fn start_method(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> Outcome {
     m.resolve_import("quartz.dll", name).unwrap();
     let thunk = m
         .sys
@@ -286,13 +280,24 @@ fn method_calls(
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
     }
-    let mut outcome = handler(&mut Env {
+    handler(&mut Env {
         context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
         thunk,
-    });
+    })
+}
+
+/// Run a quartz method that calls back into the guest exactly once per item
+/// of `expected`, checking each call's target and arguments.
+fn method_calls(
+    m: &mut Machine<JitCpu>,
+    name: &str,
+    args: &[u32],
+    expected: &[(u32, &[u32], u32)],
+) -> u32 {
+    let mut outcome = start_method(m, name, args);
     for &(target, args, value) in expected {
         let Outcome::Call {
             target: called,
@@ -520,6 +525,32 @@ fn graph_names_members_counts_changes_and_hands_out_its_clock() {
         S_OK
     );
     assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
+}
+
+// spec: MEDIA-GRAPH-17
+#[test]
+fn graph_controls_without_a_renderer_report_what_windows_reports() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let audio = query(&mut m, graph, IID_IBASICAUDIO);
+    let video = query(&mut m, graph, IID_IBASICVIDEO2);
+    let window = query(&mut m, graph, IID_IVIDEOWINDOW);
+    assert_eq!(
+        method(&mut m, "IBasicAudio::put_Volume", &[audio, -10i32 as u32]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicAudio::get_Balance", &[audio, DATA]),
+        E_NOTIMPL
+    );
+    assert_eq!(
+        method(&mut m, "IBasicVideo2::get_BitRate", &[video, DATA]),
+        E_NOINTERFACE
+    );
+    assert_eq!(
+        method(&mut m, "IVideoWindow::SetWindowForeground", &[window, 0]),
+        E_NOINTERFACE
+    );
 }
 
 // spec: MEDIA-GRAPH-10
@@ -1249,7 +1280,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
     );
     assert_eq!(method(&mut m, "IMemAllocator::Commit", &[in_alloc]), S_OK);
 
-    // Stop invokes upstream source FIRST and downstream renderer LAST, and
+    // A running graph pauses its members first, as quartz does. Stop then
+    // invokes upstream source FIRST and downstream renderer LAST, and
     // ignores any VFW_E_NOT_COMMITTED abort raised while stopping.
     assert_eq!(
         method_calls(
@@ -1257,6 +1289,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Stop",
             &[control],
             &[
+                (0x7100_0105, &[renderer], S_OK),
+                (0x7100_0005, &[source], S_OK),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
                 // Stopped, the graph re-seeks its streams to the kept position.
@@ -1283,4 +1317,322 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         ),
         0x8000_4004
     );
+}
+
+// spec: MEDIA-STREAM-6
+#[test]
+fn mpeg_pin_counts_and_enumeration_follow_the_filter() {
+    let mut m = machine();
+    let splitter = activate(&mut m, CLSID_MPEG1_SPLITTER, IID_IBASEFILTER);
+    assert_eq!(
+        method(&mut m, "IBaseFilter::EnumPins", &[splitter, DATA]),
+        S_OK
+    );
+    let enumerator = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(method(&mut m, "IBaseFilter::AddRef", &[splitter]), 3);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[splitter]), 2);
+    assert_eq!(
+        method(&mut m, "IEnumPins::Next", &[enumerator, 2, DATA, 0]),
+        E_INVALIDARG
+    );
+    assert_eq!(method(&mut m, "IEnumPins::Skip", &[enumerator, 2]), S_FALSE);
+    assert_eq!(
+        method(&mut m, "IEnumPins::Next", &[enumerator, 1, DATA, 0]),
+        S_OK
+    );
+    let pin = m.cpu.read_u32(DATA).unwrap();
+    assert_eq!(method(&mut m, "IPin::AddRef", &[pin]), 4);
+    assert_eq!(method(&mut m, "IPin::Release", &[pin]), 3);
+    filter::new_pin(
+        &mut env(&mut m),
+        splitter,
+        filter::OUTPUT,
+        "Audio",
+        MEDIATYPE_AUDIO,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        method(&mut m, "IEnumPins::Next", &[enumerator, 1, DATA, 0]),
+        S_FALSE
+    );
+    assert_eq!(method(&mut m, "IPin::Release", &[pin]), 2);
+    assert_eq!(method(&mut m, "IEnumPins::Reset", &[enumerator]), S_OK);
+    assert_eq!(
+        method(&mut m, "IEnumPins::Next", &[enumerator, 2, DATA, DATA + 8]),
+        S_OK
+    );
+    for at in [0, 4] {
+        let pin = m.cpu.read_u32(DATA + at).unwrap();
+        method(&mut m, "IPin::Release", &[pin]);
+    }
+    assert_eq!(method(&mut m, "IEnumPins::Release", &[enumerator]), 0);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[splitter]), 0);
+}
+
+// spec: MEDIA-STREAM-5
+#[test]
+fn mpeg_audio_headers_and_type_admission_match_windows() {
+    let mut m = machine();
+    let mt = filter::mpeg_audio_type(&[0xff, 0xfb, 0x14, 0xc4]).unwrap();
+    let expected: Vec<u8> = [0x50u16, 1]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .chain([48000u32, 4000].into_iter().flat_map(u32::to_le_bytes))
+        .chain([96u16, 0, 22, 4].into_iter().flat_map(u16::to_le_bytes))
+        .chain(32000u32.to_le_bytes())
+        .chain([8u16, 0, 1, 28].into_iter().flat_map(u16::to_le_bytes))
+        .chain([0; 8])
+        .collect();
+    assert_eq!(mt.format, expected);
+    let decoder = activate(&mut m, CLSID_MPEG_AUDIO_CODEC, IID_IBASEFILTER);
+    let pin = m.ext.get::<State>().filters[&decoder].pins[0];
+    mt.write(&mut env(&mut m), DATA).unwrap();
+    assert_eq!(method(&mut m, "IPin::QueryAccept", &[pin, DATA]), S_FALSE);
+    let mut layer2 = mt.clone();
+    layer2.format[18..20].copy_from_slice(&2u16.to_le_bytes());
+    layer2.write(&mut env(&mut m), DATA).unwrap();
+    assert_eq!(method(&mut m, "IPin::QueryAccept", &[pin, DATA]), S_OK);
+    layer2.sub = MEDIASUBTYPE_PCM;
+    layer2.write(&mut env(&mut m), DATA).unwrap();
+    assert_eq!(method(&mut m, "IPin::QueryAccept", &[pin, DATA]), S_FALSE);
+}
+
+// spec: MEDIA-STREAM-7
+#[test]
+fn direct_mpeg_filter_transitions_call_guest_allocators() {
+    let mut m = machine();
+    let decoder = activate(&mut m, CLSID_MPEG_VIDEO_CODEC, IID_IBASEFILTER);
+    let output = m.ext.get::<State>().filters[&decoder].pins[1];
+    let allocator = DATA + 512;
+    let table = DATA + 544;
+    m.cpu.write_u32(allocator, table).unwrap();
+    m.cpu.write_u32(table + 20, 0x71000005).unwrap();
+    m.cpu.write_u32(table + 24, 0x71000006).unwrap();
+    m.ext
+        .get_mut::<State>()
+        .pins
+        .get_mut(&output)
+        .unwrap()
+        .allocator = allocator;
+    for (name, target, state) in [
+        ("Pause", 0x71000005, graph::PAUSED),
+        ("Run", 0x71000005, graph::RUNNING),
+        ("Stop", 0x71000006, graph::STOPPED),
+    ] {
+        assert_eq!(
+            method_calls(
+                &mut m,
+                &format!("IBaseFilter::{name}"),
+                &[decoder, 0, 0],
+                &[(target, &[allocator], S_OK)]
+            ),
+            S_OK
+        );
+        assert_eq!(m.ext.get::<State>().filters[&decoder].state, state);
+    }
+}
+
+// spec: MEDIA-STREAM-8
+#[test]
+fn splitter_output_seeking_keeps_positions_and_reports_stream_identity() {
+    let mut m = machine();
+    let splitter = activate(&mut m, CLSID_MPEG1_SPLITTER, IID_IBASEFILTER);
+    let mt = filter::mpeg_audio_type(&[0xff, 0xfb, 0x14, 0xc4]).unwrap();
+    let pin = filter::new_pin(
+        &mut env(&mut m),
+        splitter,
+        filter::OUTPUT,
+        "Audio",
+        MEDIATYPE_AUDIO,
+        Some(mt),
+    )
+    .unwrap();
+    let seeking = query(&mut m, pin, IID_IMEDIASEEKING);
+    assert_eq!(
+        method(&mut m, "IMediaSeeking::GetCapabilities", &[seeking, DATA]),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0x37);
+    write_i64(&mut env(&mut m), DATA, 1_000_000);
+    write_i64(&mut env(&mut m), DATA + 8, 3_000_000);
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaSeeking::SetPositions",
+            &[seeking, DATA, 1, DATA + 8, 1]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(
+            &mut m,
+            "IMediaSeeking::GetPositions",
+            &[seeking, DATA + 16, DATA + 24]
+        ),
+        S_OK
+    );
+    assert_eq!(read_i64(&env(&mut m), DATA + 16), Some(1_000_000));
+    assert_eq!(read_i64(&env(&mut m), DATA + 24), Some(3_000_000));
+    let select = query(&mut m, splitter, IID_IAMSTREAMSELECT);
+    assert_eq!(
+        method(&mut m, "IAMStreamSelect::Count", &[select, DATA]),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
+    assert_eq!(
+        method(
+            &mut m,
+            "IAMStreamSelect::Info",
+            &[
+                select,
+                0,
+                0,
+                DATA,
+                DATA + 4,
+                DATA + 8,
+                DATA + 12,
+                DATA + 16,
+                DATA + 20
+            ]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
+    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), pin);
+    assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 0);
+}
+
+#[cfg(feature = "media")]
+fn finish_mpeg_calls(m: &mut Machine<JitCpu>, mut outcome: Outcome) -> u32 {
+    loop {
+        outcome = match outcome {
+            Outcome::Return(hr) => return hr,
+            Outcome::Call {
+                target, args, then, ..
+            } => {
+                let thunk = m
+                    .sys
+                    .thunks
+                    .iter()
+                    .find(|(index, _)| adv_machine::layout::thunk_addr(*index) == target)
+                    .unwrap()
+                    .0;
+                let handler = m.sys.thunks.get(thunk).f.handler;
+                m.cpu.set_reg(Reg::Esp, STACK);
+                for (i, arg) in args.iter().enumerate() {
+                    m.cpu.write_u32(STACK + 4 + i as u32 * 4, *arg).unwrap();
+                }
+                let call = handler(&mut Env {
+                    context: m.sys.current,
+                    cpu: &mut m.cpu,
+                    sys: &mut m.sys,
+                    ext: &mut m.ext,
+                    thunk,
+                });
+                let hr = finish_mpeg_calls(m, call);
+                then(&mut env(m), adv_machine::Resume::Returned(hr))
+            }
+            Outcome::Block { then, .. } => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                then(
+                    &mut env(m),
+                    adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+                )
+            }
+            _ => panic!("unexpected MPEG continuation"),
+        };
+    }
+}
+
+// spec: MEDIA-STREAM-7
+#[test]
+#[cfg(feature = "media")]
+fn pushed_mpeg_video_delivers_a_timed_sample_after_a_direct_pause() {
+    #[derive(Default)]
+    struct Received(u32);
+    let mut m = machine();
+    m.ext.insert(Received::default());
+    m.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+        "authored-mpeg.dll",
+        "Receive",
+        Conv::Stdcall { argc: 2 },
+        |env| {
+            let sample = &env.ext.get::<State>().samples[&env.arg(1)];
+            assert_eq!(sample.size, 16 * 16 * 4);
+            assert_eq!(sample.actual, sample.size);
+            assert_eq!(sample.time, Some((22222, 22222)));
+            env.ext.get_mut::<Received>().0 += 1;
+            Outcome::Return(S_OK)
+        },
+    );
+    m.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+        "authored-mpeg.dll",
+        "EndOfStream",
+        Conv::Stdcall { argc: 1 },
+        |_| Outcome::Return(S_OK),
+    );
+    let receive = m.resolve_import("authored-mpeg.dll", "Receive").unwrap();
+    let eos = m
+        .resolve_import("authored-mpeg.dll", "EndOfStream")
+        .unwrap();
+    let peer = DATA + 512;
+    let mem = DATA + 516;
+    let table = DATA + 544;
+    m.cpu.write_u32(peer, table).unwrap();
+    m.cpu.write_u32(mem, table).unwrap();
+    m.cpu.write_u32(table + 24, receive).unwrap();
+    m.cpu.write_u32(table + 56, eos).unwrap();
+    let bytes = include_bytes!("graph/render/fixtures/guest_movie.mpg");
+    let input_mt = filter::mpeg_video_type(bytes).unwrap();
+    let media = adv_device::media::demux(bytes.to_vec()).unwrap();
+    let packets = media
+        .streams
+        .iter()
+        .find(|s| matches!(s.format, CodecFormat::Video { .. }))
+        .unwrap();
+    let decoder = activate(&mut m, CLSID_MPEG_VIDEO_CODEC, IID_IBASEFILTER);
+    let pins = m.ext.get::<State>().filters[&decoder].pins.clone();
+    let output_mt = MediaType::video_rgb(MEDIASUBTYPE_RGB32, 16, 16, 400000);
+    let allocator = sample::create_allocator(&mut env(&mut m), 1, output_mt.sample_size).unwrap();
+    sample::decommit(&mut env(&mut m), allocator);
+    {
+        let state = m.ext.get_mut::<State>();
+        let input = state.pins.get_mut(&pins[0]).unwrap();
+        input.mt = Some(input_mt);
+        input.peer = peer;
+        let output = state.pins.get_mut(&pins[1]).unwrap();
+        output.mt = Some(output_mt);
+        output.peer = peer;
+        output.mem = mem;
+        output.allocator = allocator;
+    }
+    assert_eq!(method(&mut m, "IBaseFilter::Pause", &[decoder]), S_OK);
+    let input = query(&mut m, pins[0], IID_IMEMINPUTPIN);
+    let size = packets.packets.iter().map(|p| p.data.len()).sum::<usize>();
+    let source_allocator = sample::create_allocator(&mut env(&mut m), 1, size as u32).unwrap();
+    let source = sample::take(&mut env(&mut m), source_allocator).unwrap();
+    let bytes: Vec<_> = packets
+        .packets
+        .iter()
+        .flat_map(|p| p.data.iter().copied())
+        .collect();
+    let buffer = m.ext.get::<State>().samples[&source].buffer;
+    m.cpu.write(buffer, &bytes).unwrap();
+    let sample = m.ext.get_mut::<State>().samples.get_mut(&source).unwrap();
+    sample.actual = bytes.len() as u32;
+    sample.time = Some((22222, 33333));
+    let receive = m
+        .resolve_import("quartz.dll", "IMemInputPin::Receive")
+        .unwrap();
+    let outcome = Outcome::call(receive, vec![input, source], |_, resume| {
+        Outcome::Return(resume.value())
+    });
+    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    let eos = m.resolve_import("quartz.dll", "IPin::EndOfStream").unwrap();
+    let outcome = Outcome::call(eos, vec![pins[0]], |_, resume| {
+        Outcome::Return(resume.value())
+    });
+    assert_eq!(finish_mpeg_calls(&mut m, outcome), S_OK);
+    assert!(m.ext.get::<Received>().0 > 0);
 }

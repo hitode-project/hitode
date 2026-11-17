@@ -498,15 +498,10 @@ pub(crate) fn show_windows(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome
     }
 }
 
-pub(crate) fn pin_owner(env: &Env<'_>, pointer: u32) -> Option<u32> {
-    let object = canonical(env, pointer)?;
-    let state = env.ext.get::<State>();
-    let pin = state.pins.get(&object)?;
-    (state.filters[&pin.filter].clsid == CLSID_VIDEO_MIXING_RENDERER).then_some(pin.filter)
-}
-
 pub(crate) fn release_window(env: &mut Env<'_>, this: u32) -> Option<Outcome> {
-    let filter = pin_owner(env, this).or_else(|| canonical(env, this))?;
+    let filter = filter::host_pin(env, this)
+        .map(|pin| env.ext.get::<State>().pins[&pin].filter)
+        .or_else(|| canonical(env, this))?;
     let f = state(env).filters.get(&filter)?;
     let hwnd = f.vmr.as_ref()?.hwnd;
     if hwnd == 0 {

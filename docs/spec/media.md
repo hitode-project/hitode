@@ -126,6 +126,16 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Connect and Render of a guest pin MUST try a direct connection, then graph members newest first, then the mapper's matching filters, added on demand. Recursion MUST stop at depth five, and a connection closing a loop MUST fail with VFW_E_CANNOT_CONNECT. A filter added for a failed attempt MUST be removed again.
 **Verification**: Test
 
+### MEDIA-GRAPH-17 Control delegation
+
+**Rule**: Without a host renderer, the graph's IBasicAudio, IBasicVideo2 and IVideoWindow MUST forward each call to the newest guest member exposing that interface. With no such member, IBasicAudio MUST return E_NOTIMPL and the video interfaces E_NOINTERFACE.
+**Verification**: Test
+
+### MEDIA-GRAPH-18 Graph state
+
+**Rule**: Graph transitions MUST return the first member result that is not S_OK, and Stop from Running MUST pause every member first. GetState MUST poll every member and report VFW_S_STATE_INTERMEDIATE until all reach the graph state or the timeout passes. Stop MUST return only after every host stream thread has left the downstream filters.
+**Verification**: Test
+
 ### MEDIA-STREAM-1 Pull delivery
 
 **Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
@@ -133,7 +143,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-2 Rejected push
 
-**Rule**: System splitter and decoder input pins MUST reject Receive and ReceiveMultiple with `E_NOTIMPL` and a capability warning. ReceiveMultiple MUST zero a valid processed output and return `E_POINTER` for an invalid output.
+**Rule**: System splitter input pins MUST reject Receive and ReceiveMultiple with `E_NOTIMPL` and a capability warning. ReceiveMultiple MUST zero a valid processed output and return `E_POINTER` for an invalid output.
 **Verification**: Test
 
 ### MEDIA-STREAM-3 Audio lead and pause
@@ -146,6 +156,31 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Each movie source MUST decode on a host thread of its own and answer every request exactly as decoding on the caller's thread would. Between requests it MAY decode and convert the next frames ahead.
 **Verification**: Test
 
+### MEDIA-STREAM-5 MPEG media types
+
+**Rule**: MPEG filters MUST enumerate and validate the MPEG stream formats and decoded output formats exposed by Windows. Splitter audio types MUST preserve MPEG frame header fields and offer payload, elementary payload, and MP3 formats when applicable. Media negotiation MUST validate explicit output formats and prioritize downstream types for wildcard requests.
+**Verification**: Test
+
+### MEDIA-STREAM-6 Filter pin ownership
+
+**Rule**: MPEG pins MUST count public references on their owning filter while retaining their own IUnknown identity. Pin enumerators MUST retain their filter and snapshot its pins until Reset. Pin enumerators MUST use the argument and cursor results below.
+**Verification**: Test
+
+| Operation | Result |
+|---|---|
+| Next of multiple pins with valid output and no fetched count | `E_INVALIDARG`, unchanged position |
+| Skip beyond the remaining pins | `S_FALSE`, unchanged position |
+
+### MEDIA-STREAM-7 MPEG decoder delivery
+
+**Rule**: MPEG decoders MUST retain notified input allocators and negotiate output allocators with the downstream input. Output allocators MUST commit during Pause or Run and decommit during Stop. Decoder inputs MUST decode pushed samples, forward stream events, reject stopped delivery, and return `S_FALSE` during flushing.
+**Verification**: Test
+
+### MEDIA-STREAM-8 MPEG splitter streams
+
+**Rule**: Direct MPEG splitter outputs MUST deliver compressed packets and end-of-stream while paused, using the selected segment positions. Splitter output seeking MUST expose media time, capability mask `0x37`, duration, positions, and a positive playback rate. IAMStreamSelect MUST describe each output's type, group, name, and pin identity.
+**Verification**: Test
+
 ## Windows Media decoder wrappers
 
 ### MEDIA-DMO-1 Decoder admission
@@ -156,7 +191,7 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-DMO-2 Push ownership and preroll
 
-**Rule**: The DMO wrapper MUST be the only push-accepting host filter and accept only host samples from its allocator. Decoded video MUST follow graph time with one paused preroll frame, while decoded audio MUST use the shared mixer.
+**Rule**: The DMO wrapper MUST accept only host samples from its allocator. Decoded video MUST follow graph time with one paused preroll frame, while decoded audio MUST use the shared mixer.
 **Verification**: Review — DMO tests cover identity and pin publication but not pushed sample ownership, scheduling, and paused preroll.
 
 ### MEDIA-DMO-3 End-of-stream ordering
