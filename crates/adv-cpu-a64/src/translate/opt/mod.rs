@@ -2,7 +2,7 @@
 //!
 //! An optimized form lowers the same `Unit` as the ordinary computation form,
 //! but through an SSA IR ([`ir`]) whose values hold the whole guest state:
-//! registers, EFLAGS, the x87 stack, XMM registers and frame bytes. Only
+//! registers, EFLAGS, the x87 stack, XMM and MMX registers, and frame bytes. Only
 //! memory outside the frame stays memory. The IR is checked by [`verify`]
 //! before emission, and every point that can fail names a recovery record
 //! ([`recovery`]) from which the owner continues on the ordinary path.
@@ -91,6 +91,7 @@ pub(crate) fn admit(
             && x87.status & !0x3800 == assumed.status
             && x87.top() as u8 == assumed.top
             && x87.tag == assumed.tags)
+        && (!assumed.mmx || x87.status & 0x80 == 0)
         && (cpu.mxcsr ^ assumed.mxcsr) & assumed.mxcsr_mask == 0
         && assumed.esp_low.is_none_or(|low| (esp & 15) as u8 == low);
     if !holds {
@@ -103,6 +104,7 @@ pub(crate) fn admit(
                 Source::Reg(i) => u128::from(cpu.regs[usize::from(i)]),
                 Source::Eflags => u128::from(cpu.eflags),
                 Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
+                Source::Mmx(i) => u128::from(cpu.mmx[usize::from(i)]),
                 Source::X87(i) => u128::from(recovery::binary64(x87.regs[usize::from(i)])?),
                 Source::X87Ip => u128::from(x87.ip),
                 Source::X87Opcode => u128::from(x87.opcode),

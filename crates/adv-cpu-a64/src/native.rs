@@ -1225,6 +1225,7 @@ impl Native {
         if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
             return None;
         }
+        cpu.refresh_mmx();
         let alias = alias_base(memory);
         let optimized = worker::admit(&prepared.code, cpu, alias);
         prepared.admitted(optimized.is_some());
@@ -1838,7 +1839,8 @@ impl Native {
 
     /// Asks for an optimized form of the computation prepared at `eip`,
     /// taking its facts from `at`, the state at an entry.
-    fn request_optimized(&mut self, eip: u32, at: CpuState) {
+    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
+        at.refresh_mmx();
         let prepared = &self.computation[&eip];
         prepared.requested();
         crate::jit_map::optimized(eip, format_args!("requested\t-\t-"));

@@ -812,34 +812,285 @@ impl<'a> Emitter<'a> {
                 self.asm
                     .emit(fcvt_int(if wide { X } else { W }, true, d, a));
             }
+            Op::VecUnary(op, a) => {
+                let a = self.vr(a, A);
+                match op {
+                    VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
+                    VecUnary::High64 => {
+                        self.asm.emit_all(&[vins(3, q, 0, a, 1), vmov(false, q, q)])
+                    }
+                    VecUnary::ShiftImm(shift_op, log2, count, full) => {
+                        let arr = Arr::new(u32::from(log2), full);
+                        let bits = arr.bits();
+                        let count = u32::from(count);
+                        if count == 0 {
+                            self.asm.emit(vmov(full, q, a));
+                        } else if shift_op == ShiftImm::Sshr {
+                            self.asm.emit(vshift(shift_op, arr, q, a, count.min(bits)));
+                        } else if count >= bits {
+                            self.asm.emit(vzero(full, q));
+                        } else {
+                            self.asm.emit(vshift(shift_op, arr, q, a, count));
+                            if !full && log2 == 3 {
+                                self.asm.emit(vmov(false, q, q));
+                            }
+                        }
+                    }
+                    VecUnary::Shuffle(log2, imm, full) => {
+                        let log2 = u32::from(log2);
+                        let lane = u32::from(imm & 3);
+                        if u32::from(imm) == lane * 0x55 {
+                            self.asm.emit(vdup_lane(Arr::new(log2, full), q, a, lane));
+                        } else {
+                            for i in 0..4 {
+                                let from = u32::from(imm) >> (2 * i) & 3;
+                                self.asm.emit(vins(log2, C, i, a, from));
+                            }
+                            self.asm.emit(vmov(full, q, C));
+                        }
+                    }
+                    VecUnary::ShuffleWords(high, imm) => {
+                        self.asm.emit(vmov(true, C, a));
+                        let base = if high { 4 } else { 0 };
+                        for i in 0..4 {
+                            let from = u32::from(imm) >> (i * 2) & 3;
+                            self.asm.emit(vins(1, C, base + i, a, base + from));
+                        }
+                        self.asm.emit(vmov(true, q, C));
+                    }
+                    VecUnary::ShiftBytes(left, count) => {
+                        let count = u32::from(count);
+                        if count >= 16 {
+                            self.asm.emit(vzero(true, q));
+                        } else if count == 0 {
+                            if q != a {
+                                self.asm.emit(vmov(true, q, a));
+                            }
+                        } else {
+                            self.asm.emit(vzero(true, C));
+                            self.asm.emit(if left {
+                                vext(q, C, a, 16 - count)
+                            } else {
+                                vext(q, a, C, count)
+                            });
+                        }
+                    }
+                }
+            }
+            Op::VecToInt(op, a) => {
+                let a = self.vr(a, A);
+                match op {
+                    VecToInt::ExtractWord(lane) => {
+                        self.asm.emit(vumov(1, d, a, u32::from(lane)));
+                    }
+                    VecToInt::ByteMask(full) => {
+                        self.asm.emit_all(&[
+                            movz(X, U, 0x4081, 0),
+                            movk(X, U, 0x1020, 16),
+                            movk(X, U, 0x0408, 32),
+                            movk(X, U, 0x0002, 48),
+                            vumov(3, T, a, 0),
+                            and_imm(X, T, T, 0x8080_8080_8080_8080),
+                            mul(X, T, T, U),
+                            lsr_imm(X, d, T, 56),
+                        ]);
+                        if full {
+                            self.asm.emit_all(&[
+                                vumov(3, T, a, 1),
+                                and_imm(X, T, T, 0x8080_8080_8080_8080),
+                                mul(X, T, T, U),
+                                lsr_imm(X, T, T, 56),
+                                orr(W, d, d, T, Lsl, 8),
+                            ]);
+                        }
+                    }
+                    VecToInt::SignMask(double) => {
+                        self.asm.emit_all(&[
+                            vshift(
+                                ShiftImm::Ushr,
+                                if double { Arr::D2 } else { Arr::S4 },
+                                C,
+                                a,
+                                if double { 63 } else { 31 },
+                            ),
+                            vumov(3, T, C, 0),
+                            vumov(3, U, C, 1),
+                        ]);
+                        if double {
+                            self.asm.emit(orr(W, d, T, U, Lsl, 1));
+                        } else {
+                            self.asm.emit_all(&[
+                                orr(X, T, T, T, Lsr, 31),
+                                orr(X, U, U, U, Lsr, 31),
+                                and_imm(W, T, T, 3),
+                                and_imm(W, U, U, 3),
+                                orr(W, d, T, U, Lsl, 2),
+                            ]);
+                        }
+                    }
+                }
+            }
             Op::Vec(op, a, b) => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 match op {
-                    VecOp::SubI32 => self.asm.emit(vsame(Same::Sub, Arr::S4, q, a, b)),
-                    VecOp::LessF64 => self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a)),
-                    VecOp::ShlI64 | VecOp::ShrI64 => {
+                    VecOp::And(full) => self.asm.emit(vlogic(Logic::And, full, q, a, b)),
+                    VecOp::AndNot(full) => self.asm.emit(vlogic(Logic::Bic, full, q, b, a)),
+                    VecOp::Or(full) => self.asm.emit(vlogic(Logic::Orr, full, q, a, b)),
+                    VecOp::Xor(full) => self.asm.emit(vlogic(Logic::Eor, full, q, a, b)),
+                    VecOp::Same(same_op, log2, full) => {
                         self.asm
-                            .emit_all(&[fmov_from_v(X, T, b), cmp_imm(X, T, 63, false)]);
-                        let zero = self.asm.label();
-                        let done = self.asm.label();
-                        self.asm.b_cond(Cond::Hi, zero);
-                        if op == VecOp::ShrI64 {
+                            .emit(vsame(same_op, Arr::new(u32::from(log2), full), q, a, b));
+                        if !full && log2 == 3 {
+                            self.asm.emit(vmov(false, q, q));
+                        }
+                    }
+                    VecOp::Unpack(perm, log2, full) => {
+                        self.asm
+                            .emit(vpermute(perm, Arr::new(u32::from(log2), full), q, a, b));
+                    }
+                    VecOp::Pack(narrow, log2, full) => {
+                        let log2 = u32::from(log2);
+                        if full {
+                            self.asm.emit_all(&[
+                                vnarrow(narrow, Arr::new(log2, false), C, a),
+                                vnarrow(narrow, Arr::new(log2, true), C, b),
+                                vmov(true, q, C),
+                            ]);
+                        } else {
+                            self.asm.emit_all(&[
+                                vmov(false, C, a),
+                                vins(3, C, 1, b, 0),
+                                vnarrow(narrow, Arr::new(log2, false), q, C),
+                            ]);
+                        }
+                    }
+                    VecOp::MulHigh(signed, full) => {
+                        self.asm.emit(vmull(signed, Arr::H4, C, a, b));
+                        if full {
+                            self.asm.emit_all(&[
+                                vshrn(Arr::H4, C, C, 16),
+                                vmull(signed, Arr::H8, q, a, b),
+                                vshrn(Arr::H8, C, q, 16),
+                                vmov(true, q, C),
+                            ]);
+                        } else {
+                            self.asm.emit(vshrn(Arr::H4, q, C, 16));
+                        }
+                    }
+                    VecOp::MulAdd(full) => {
+                        self.asm.emit(vmull(true, Arr::H4, C, a, b));
+                        if full {
+                            self.asm.emit_all(&[
+                                vmull(true, Arr::H8, q, a, b),
+                                vsame(Same::Addp, Arr::S4, q, C, q),
+                            ]);
+                        } else {
+                            self.asm.emit_all(&[
+                                vsame(Same::Addp, Arr::S4, q, C, C),
+                                vmov(false, q, q),
+                            ]);
+                        }
+                    }
+                    VecOp::Shift(shift_op, log2, full) => {
+                        let arr = Arr::new(u32::from(log2), full);
+                        self.asm.emit_all(&[
+                            fmov_from_v(X, T, b),
+                            movz(X, U, arr.bits() as u16, 0),
+                            cmp(X, T, U, Lsl, 0),
+                            csel(X, T, T, U, Cond::Lo),
+                        ]);
+                        if shift_op != ShiftImm::Shl {
                             self.asm.emit(sub(X, T, Reg::ZR, T, Lsl, 0));
                         }
+                        let same = if shift_op == ShiftImm::Sshr {
+                            Same::Sshl
+                        } else {
+                            Same::Ushl
+                        };
                         self.asm
-                            .emit_all(&[vdup(Arr::D2, C, T), vsame(Same::Ushl, Arr::D2, q, a, C)]);
-                        self.asm.b(done);
-                        self.asm.bind(zero);
-                        self.asm.emit(vzero(true, q));
-                        self.asm.bind(done);
+                            .emit_all(&[vdup(arr, C, T), vsame(same, arr, q, a, C)]);
+                        if !full && log2 == 3 {
+                            self.asm.emit(vmov(false, q, q));
+                        }
                     }
-                    _ => self.asm.emit(match op {
-                        VecOp::And => vlogic(Logic::And, true, q, a, b),
-                        VecOp::AndNot => vlogic(Logic::Bic, true, q, b, a),
-                        VecOp::Or => vlogic(Logic::Orr, true, q, a, b),
-                        _ => vlogic(Logic::Eor, true, q, a, b),
-                    }),
+                    VecOp::Shufps(imm) => {
+                        for lane in 0..4 {
+                            let from = u32::from(imm) >> (2 * lane) & 3;
+                            self.asm
+                                .emit(vins(2, C, lane, if lane < 2 { a } else { b }, from));
+                        }
+                        self.asm.emit(vmov(true, q, C));
+                    }
+                    VecOp::Shufpd(imm) => {
+                        self.asm.emit_all(&[
+                            vins(3, C, 0, a, u32::from(imm & 1)),
+                            vins(3, C, 1, b, u32::from(imm >> 1 & 1)),
+                            vmov(true, q, C),
+                        ]);
+                    }
+                    VecOp::MulDwords(full) => {
+                        if full {
+                            self.asm.emit_all(&[
+                                vpermute(Permute::Uzp1, Arr::S4, C, b, b),
+                                vpermute(Permute::Uzp1, Arr::S4, q, a, a),
+                                vmull(false, Arr::S2, q, q, C),
+                            ]);
+                        } else {
+                            self.asm
+                                .emit_all(&[vmull(false, Arr::S2, C, a, b), vmov(false, q, C)]);
+                        }
+                    }
+                    VecOp::SadBytes(full) => {
+                        self.asm.emit_all(&[
+                            vsame(Same::Uabd, Arr::new(0, full), C, a, b),
+                            vaddlp(Arr::new(0, full), C, C),
+                            vaddlp(Arr::new(1, full), C, C),
+                            vaddlp(Arr::new(2, full), C, C),
+                            vmov(full, q, C),
+                        ]);
+                    }
+                    VecOp::MoveLow32 => {
+                        if q == a {
+                            self.asm.emit(vins(2, q, 0, b, 0));
+                        } else if q != b {
+                            self.asm.emit_all(&[vmov(true, q, a), vins(2, q, 0, b, 0)]);
+                        } else {
+                            self.asm.emit_all(&[
+                                vmov(true, C, a),
+                                vins(2, C, 0, b, 0),
+                                vmov(true, q, C),
+                            ]);
+                        }
+                    }
+                    VecOp::Insert64(dst_lane, src_lane) => {
+                        let (dl, sl) = (u32::from(dst_lane), u32::from(src_lane));
+                        if q == a {
+                            if q != b || dl != sl {
+                                self.asm.emit(vins(3, q, dl, b, sl));
+                            }
+                        } else if q != b {
+                            self.asm
+                                .emit_all(&[vmov(true, q, a), vins(3, q, dl, b, sl)]);
+                        } else {
+                            self.asm.emit_all(&[
+                                vmov(true, C, a),
+                                vins(3, C, dl, b, sl),
+                                vmov(true, q, C),
+                            ]);
+                        }
+                    }
+                    VecOp::InsertWord(lane, full) => {
+                        self.asm.emit(vumov(1, T, b, 0));
+                        if q != a {
+                            self.asm.emit(vmov(true, q, a));
+                        }
+                        self.asm.emit(vins_general(1, q, u32::from(lane), T));
+                        if !full {
+                            self.asm.emit(vmov(false, q, q));
+                        }
+                    }
+                    VecOp::LessF64 => self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a)),
                 }
             }
             Op::Load { ty, width, addr } => {

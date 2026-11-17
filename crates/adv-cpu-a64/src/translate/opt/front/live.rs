@@ -1,5 +1,5 @@
-//! The guest registers, XMM registers and frame bytes that execution from
-//! each trace position may read (A64-OPT-6). Exits read everything, and so
+//! The guest registers, XMM and MMX registers, and frame bytes that execution
+//! from each trace position may read (A64-OPT-6). Exits read everything, and so
 //! does an instruction that may raise an exception. A block takes a
 //! parameter, and a record a location, only for a live component.
 
@@ -12,11 +12,11 @@ use crate::translate::decode::{self, ESP, Mem};
 use crate::translate::integer::Integer;
 use crate::translate::trace::{Edge, Next};
 
-/// Registers 0–7 as bits 0–7 and XMM registers as bits 8–15, and frame
-/// bytes by their index in the layout's frame.
+/// Registers 0–7 as bits 0–7, XMM registers as bits 8–15, MMX registers as
+/// bits 16–23, and frame bytes by their index in the layout's frame.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Set {
-    pub regs: u16,
+    pub regs: u32,
     frame: Vec<u64>,
 }
 
@@ -29,7 +29,7 @@ impl Set {
     }
     fn all(bytes: usize) -> Self {
         Set {
-            regs: u16::MAX,
+            regs: u32::MAX,
             frame: vec![u64::MAX; bytes.div_ceil(64)],
         }
     }
@@ -72,7 +72,7 @@ pub(super) struct Live {
     pub all: Set,
     /// Registers no instruction writes: records leave them at their entry
     /// values.
-    pub kept: u16,
+    pub kept: u32,
 }
 
 pub(super) fn analyze(
@@ -89,7 +89,7 @@ pub(super) fn analyze(
     let mut defines = Vec::with_capacity(n);
     let mut raising = Vec::with_capacity(n);
     let mut touched = Vec::with_capacity(n);
-    let mut written = 0u16;
+    let mut written = 0u32;
     for (i, inst) in unit.trace.insts.iter().enumerate() {
         let mut read = Set::empty(frame.len());
         let mut define = Set::empty(frame.len());
@@ -114,7 +114,7 @@ pub(super) fn analyze(
             defines.push(define);
             raising.push(false);
             touched.push(all.clone());
-            written = u16::MAX;
+            written = u32::MAX;
             continue;
         };
         let mut touch = Set::empty(frame.len());
@@ -125,10 +125,12 @@ pub(super) fn analyze(
                 (reg.full_register32().number(), reg.size() == 4)
             } else if reg.is_xmm() {
                 (8 + reg.number(), true)
+            } else if reg.is_mm() {
+                (16 + reg.number(), true)
             } else {
                 continue;
             };
-            let bit = 1u16 << bit;
+            let bit = 1u32 << bit;
             match used.access() {
                 OpAccess::Read | OpAccess::CondRead => read.regs |= bit,
                 OpAccess::Write if full => {
@@ -177,7 +179,7 @@ pub(super) fn analyze(
         touched.push(touch);
     }
     let registers = Set {
-        regs: u16::MAX,
+        regs: u32::MAX,
         frame: vec![0; all.frame.len()],
     };
     let (guest, _) = solve(unit, &reads, &defines, &raising, &registers);

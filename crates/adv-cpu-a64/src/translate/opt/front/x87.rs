@@ -14,6 +14,11 @@ impl Front<'_> {
                     .filter(|&r| live.reg(8 + r))
                     .map(|r| self.state.xmm[r]),
             )
+            .chain(
+                (0..8)
+                    .filter(|&r| live.reg(16 + r))
+                    .map(|r| self.state.mmx[r]),
+            )
             .chain(self.state.x87.into_iter().flatten())
             .collect();
         for start in self.held[to].clone() {
@@ -60,6 +65,9 @@ impl Front<'_> {
                 _ => return Err(Reject::StaticX87(to)),
             };
             args.extend(pair);
+        }
+        if self.assumed.mmx && self.models[to].mmx_meta.1 != u32::MAX {
+            args.push(self.state.mmx_meta);
         }
         Ok(args)
     }
