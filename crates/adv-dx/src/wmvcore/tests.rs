@@ -82,7 +82,12 @@ fn reader_mode(m: &mut Machine<JitCpu>, media: Option<Demuxed>, can_decode: bool
     }
     create(
         &mut env,
-        &[Face::SyncReader, Face::Profile, Face::HeaderInfo],
+        &[
+            Face::SyncReader,
+            Face::Profile,
+            Face::HeaderInfo,
+            Face::ReaderAux,
+        ],
         Obj::Reader(Box::new(reader)),
     )
     .unwrap()
@@ -198,6 +203,9 @@ fn stream_samples_arrive_in_time_order_with_clean_point_flags() {
     loop {
         match next(&mut m, reader, 0) {
             Ok(sample) => {
+                if sample.number == VIDEO {
+                    assert_eq!(m.cpu.read_u32(DATA + 16).unwrap(), 10_000);
+                }
                 let index = usize::from(sample.number - 1);
                 assert_eq!(sample.output, index as u32);
                 assert_eq!(sample.data[0], [0xa0, 0xb0][index]);
@@ -316,15 +324,15 @@ fn header_and_profile_describe_the_opened_streams() {
         ASF_E_BUFFERTOOSMALL
     );
     assert_eq!(m.cpu.read_u16(DATA + 216).unwrap(), 8);
-    for (name, expected) in [
-        ("WM/VideoWidth", 640),
-        ("WM/VideoHeight", 480),
-        ("WM/VideoFrameRate", 2),
-    ] {
+    for (name, expected) in [("WM/VideoWidth", 640), ("WM/VideoHeight", 480)] {
         assert_eq!(attribute_of(&mut m, header, name, 4), S_OK, "{name}");
         assert_eq!(m.cpu.read_u32(DATA + 200).unwrap(), WMT_TYPE_DWORD);
         assert_eq!(m.cpu.read_u32(DATA + 208).unwrap(), expected, "{name}");
     }
+    assert_eq!(
+        attribute_of(&mut m, header, "WM/VideoFrameRate", 4),
+        ASF_E_NOTFOUND
+    );
     assert_eq!(attribute_of(&mut m, header, "NumberOfFrames", 8), S_OK);
     assert_eq!(m.cpu.read_u32(DATA + 208).unwrap(), 4);
     assert_eq!(attribute_of(&mut m, header, "Title", 64), ASF_E_NOTFOUND);
@@ -399,7 +407,7 @@ fn header_and_profile_describe_the_opened_streams() {
             "IWMProfile::GetStreamByNumber",
             &[reader, 9, DATA + 48]
         ),
-        NS_E_INVALID_STREAM
+        NS_E_NO_STREAM
     );
 }
 
@@ -545,4 +553,305 @@ fn native_reader_decodes_uncompressed_streams_on_demand_and_drops_on_mode_switch
             .decoded
             .is_none()
     );
+}
+
+#[test]
+// spec: MEDIA-WMV-3
+fn output_properties_are_independent_snapshots_in_audio_first_order() {
+    let mut m = machine();
+    let mut input = media();
+    input.streams.reverse();
+    let reader = reader_with(&mut m, Some(input));
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputNumberForStream",
+            &[reader, u32::from(VIDEO), DATA]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 1);
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetStreamNumberForOutput",
+            &[reader, 0, DATA]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u16(DATA).unwrap(), AUDIO);
+    let mut snapshots = Vec::new();
+    for _ in 0..2 {
+        assert_eq!(
+            call(&mut m, "IWMSyncReader2::GetOutputProps", &[reader, 1, DATA]),
+            S_OK
+        );
+        snapshots.push(m.cpu.read_u32(DATA).unwrap());
+    }
+    assert_ne!(snapshots[0], snapshots[1]);
+    let props = snapshots[0];
+    m.cpu.write_u32(DATA + 4, 2000).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMOutputMediaProps::GetMediaType",
+            &[props, DATA + 128, DATA + 4]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA + 4).unwrap(), MEDIA_TYPE_SIZE + 88);
+    let mut mt = MediaType::read(&env(&mut m), DATA + 128).unwrap();
+    assert_eq!(mt.sub, dshow::MEDIASUBTYPE_RGB24);
+    assert_eq!(
+        u32::from_le_bytes(mt.format[24..28].try_into().unwrap()),
+        640
+    );
+    assert_eq!(u32::from_le_bytes(mt.format[32..36].try_into().unwrap()), 0);
+    mt.sub = dshow::MEDIASUBTYPE_RGB32;
+    mt.format[62..64].copy_from_slice(&32u16.to_le_bytes());
+    write_media_type(&mut env(&mut m), DATA + 128, &mt).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMOutputMediaProps::SetMediaType",
+            &[props, DATA + 128]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetOutputProps",
+            &[reader, 1, props]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetOutputProps",
+            &[reader, 0, props]
+        ),
+        ASF_E_BADMEDIATYPE
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMOutputMediaProps::GetMediaType",
+            &[snapshots[1], DATA + 128, DATA + 4]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        MediaType::read(&env(&mut m), DATA + 128).unwrap().sub,
+        dshow::MEDIASUBTYPE_RGB24
+    );
+    m.cpu.write_u32(DATA, 0xdeadbeef).unwrap();
+    assert_eq!(
+        call(&mut m, "IWMSyncReader2::GetOutputProps", &[reader, 2, DATA]),
+        E_INVALIDARG
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xdeadbeef);
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputFormat",
+            &[reader, 1, 1, DATA]
+        ),
+        NS_E_INVALID_OUTPUT_FORMAT
+    );
+    for props in snapshots {
+        assert_eq!(call(&mut m, "IWMOutputMediaProps::Release", &[props]), 0);
+    }
+}
+
+#[test]
+// spec: MEDIA-WMV-4, MEDIA-WMV-5
+fn reader_errors_preserve_outputs_and_header_size_reports_keep_the_type() {
+    let mut m = machine();
+    let reader = reader_with(&mut m, Some(media()));
+    m.cpu.write_u32(DATA, 0xdeadbeef).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetStreamSelected",
+            &[reader, 0, DATA]
+        ),
+        E_INVALIDARG
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0xdeadbeef);
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetReadStreamSamples",
+            &[reader, 0, 1]
+        ),
+        E_INVALIDARG
+    );
+    assert_eq!(
+        call(&mut m, "IWMProfile::GetStreamCount", &[reader, 0]),
+        E_INVALIDARG
+    );
+    assert_eq!(
+        call(&mut m, "IWMProfile::GetStreamByNumber", &[reader, 0, DATA]),
+        NS_E_NO_STREAM
+    );
+    m.cpu.write_u32(DATA + 200, 0xdeadbeef).unwrap();
+    assert_eq!(attribute_of(&mut m, reader, "Duration", 7), 0xc00d_07d1);
+    assert_eq!(m.cpu.read_u32(DATA + 200).unwrap(), 0xdeadbeef);
+    assert_eq!(m.cpu.read_u16(DATA + 216).unwrap(), 8);
+    assert_eq!(
+        attribute_of(&mut m, reader, "WM/VideoFrameRate", 4),
+        ASF_E_NOTFOUND
+    );
+}
+
+#[test]
+// spec: MEDIA-WMV-2
+fn allocator_slots_are_separate_and_freeze_after_use() {
+    let mut m = machine();
+    let reader = reader_with(&mut m, Some(media()));
+    {
+        let mut e = env(&mut m);
+        let stream = &mut super::reader(&mut e, reader).unwrap().streams[0];
+        stream.allocator = 0x1234;
+        stream.allocator_used = true;
+    }
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetAllocateForOutput",
+            &[reader, 0, DATA]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetAllocateForOutput",
+            &[reader, 0, 0]
+        ),
+        NS_E_INVALID_REQUEST
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetAllocateForStream",
+            &[reader, 1, 0]
+        ),
+        NS_E_INVALID_REQUEST
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetAllocateForStream",
+            &[reader, 1, 0]
+        ),
+        E_INVALIDARG
+    );
+}
+
+#[test]
+// spec: MEDIA-WMV-6
+fn output_settings_use_the_output_kind_and_retain_values() {
+    let mut m = machine();
+    let reader = reader_with(&mut m, None);
+    let wide: Vec<_> = "SoftwareScaling"
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    m.cpu.write(DATA + 64, &wide).unwrap();
+    m.cpu.write(DATA + 4, &4u16.to_le_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputSetting",
+            &[reader, 1, DATA + 64, DATA, DATA + 8, DATA + 4]
+        ),
+        E_UNEXPECTED
+    );
+    super::reader(&mut env(&mut m), reader)
+        .unwrap()
+        .open(media(), false);
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputSetting",
+            &[reader, 0, DATA + 64, DATA, DATA + 8, DATA + 4]
+        ),
+        E_INVALIDARG
+    );
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputSetting",
+            &[reader, 1, DATA + 64, DATA, DATA + 8, DATA + 4]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 1);
+    m.cpu.write_u32(DATA + 8, 0).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::SetOutputSetting",
+            &[reader, 1, DATA + 64, WMT_TYPE_BOOL, DATA + 8, 4]
+        ),
+        S_OK
+    );
+    m.cpu.write_u32(DATA + 8, 1).unwrap();
+    assert_eq!(
+        call(
+            &mut m,
+            "IWMSyncReader2::GetOutputSetting",
+            &[reader, 1, DATA + 64, DATA, DATA + 8, DATA + 4]
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(DATA + 8).unwrap(), 0);
+}
+
+#[cfg(feature = "media")]
+#[test]
+// spec: MEDIA-WMV-5
+fn asf_header_duration_excludes_preroll_and_packet_tail() {
+    let media =
+        demux(include_bytes!("../../../adv-device/tests/fixtures/asf_movie.wmv").to_vec()).unwrap();
+    assert_eq!(media.duration_100ns, 10_460_000);
+}
+
+#[test]
+// spec: MEDIA-WMV-6
+fn reader_interface_aliases_share_identity_and_references() {
+    let mut m = machine();
+    let reader = reader_with(&mut m, None);
+    for face in [Face::Profile, Face::HeaderInfo, Face::ReaderAux] {
+        for iid in face.iids() {
+            m.cpu.write(DATA + 128, iid).unwrap();
+            assert_eq!(
+                call(
+                    &mut m,
+                    "IWMSyncReader2::QueryInterface",
+                    &[reader, DATA + 128, DATA]
+                ),
+                S_OK
+            );
+            let pointer = m.cpu.read_u32(DATA).unwrap();
+            m.cpu.write(DATA + 128, &adv_os::com::IUNKNOWN).unwrap();
+            assert_eq!(
+                call(
+                    &mut m,
+                    "IWMSyncReader2::QueryInterface",
+                    &[pointer, DATA + 128, DATA]
+                ),
+                S_OK
+            );
+            assert_eq!(m.cpu.read_u32(DATA).unwrap(), reader);
+            assert_eq!(call(&mut m, "IWMSyncReader2::Release", &[reader]), 2);
+            assert_eq!(call(&mut m, "IWMSyncReader2::Release", &[pointer]), 1);
+        }
+    }
+    assert_eq!(call(&mut m, "IWMSyncReader2::Release", &[reader]), 0);
 }

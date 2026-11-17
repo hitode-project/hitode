@@ -1,4 +1,4 @@
-//! The graph's video-window distributor. Geometry is in video-window client
+//! Video-window distribution and the VMR guest USER window. Geometry is in video-window client
 //! coordinates; presentation owns the conversion to the owner's canvas.
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::{media::VideoInfo, surface::VideoFrame};
@@ -13,6 +13,8 @@ const E_FAIL: u32 = 0x8000_4005;
 const VFW_E_NOT_PAUSED: u32 = 0x8004_0225;
 const VFW_E_NO_PALETTE_AVAILABLE: u32 = 0x8004_0220;
 const WS_VISIBLE: u32 = 0x1000_0000;
+const WM_SIZE: u32 = 0x0005;
+const WM_CLOSE: u32 = 0x0010;
 const WS_FORBIDDEN: u32 = 0x0800_0000 | 0x2000_0000 | 0x0100_0000 | 0x0020_0000 | 0x0010_0000;
 // Parent/clip/visibility and conventional nonclient style metadata. Scroll,
 // disabled and iconic/maximized windows are excluded by IVideoWindow's contract.
@@ -256,12 +258,486 @@ pub(crate) fn call(env: &mut Env<'_>, graph: u32, face: Face, method: &str) -> O
     {
         return Some(Outcome::Return(E_INVALIDARG));
     }
+    if face == Face::VideoWindow
+        && method == "put_FullScreenMode"
+        && env.arg(1) == 0
+        && super::renderer(env, graph).is_some_and(|f| {
+            env.ext.get::<State>().filters[&f].clsid
+                == crate::dshow::vmr::CLSID_VIDEO_MIXING_RENDERER
+        })
+    {
+        return Some(Outcome::Return(S_FALSE));
+    }
     let result = match face {
         Face::VideoWindow => window_call(env, graph, method, &info),
         Face::BasicVideo => basic_call(env, graph, method, &info),
         _ => return None,
     };
     Some(Outcome::Return(result))
+}
+
+pub(crate) fn user(
+    env: &mut Env<'_>,
+    name: &str,
+    args: Vec<u32>,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let entry = env
+        .ext
+        .try_get::<crate::dshow::host::Host>()
+        .and_then(|host| (host.export)(env, "user32.dll", name));
+    match entry {
+        Some(entry) => Outcome::call(entry, args, move |env, result| then(env, result.value())),
+        None => Outcome::Return(E_NOTIMPL),
+    }
+}
+
+pub(crate) fn create_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {
+    use crate::dshow::{alloc, free};
+    if env.ext.try_get::<crate::dshow::host::Host>().is_none() {
+        return Outcome::Return(S_OK);
+    }
+    let Some(text) = alloc(env, 64) else {
+        return Outcome::Return(E_OUTOFMEMORY);
+    };
+    let bytes: Vec<u8> = "static\0ActiveMovie Window\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let _ = env.cpu.write(text, &bytes);
+    user(
+        env,
+        "CreateWindowExW",
+        vec![0, text, text + 14, 0x06cf_0000, 0, 0, 0, 0, 0, 0, 0, 0],
+        move |env, hwnd| {
+            free(env, text);
+            if hwnd == 0 {
+                return Outcome::Return(E_FAIL);
+            }
+            state(env)
+                .filters
+                .get_mut(&filter)
+                .unwrap()
+                .vmr
+                .as_mut()
+                .unwrap()
+                .hwnd = hwnd;
+            let proc = env
+                .sys
+                .thunks
+                .publish(env.cpu, "quartz.dll", "VMRWindowProc")
+                .unwrap();
+            user(
+                env,
+                "SetWindowLongW",
+                vec![hwnd, (-4i32) as u32, proc],
+                |_, _| Outcome::Return(S_OK),
+            )
+        },
+    )
+}
+
+pub(crate) fn connect_vmr_window(env: &mut Env<'_>, filter: u32) -> Outcome {
+    use crate::dshow::{alloc, free};
+    let f = &state(env).filters[&filter];
+    let (graph, hwnd, mode) = (
+        f.graph,
+        f.vmr.as_ref().unwrap().hwnd,
+        f.vmr.as_ref().unwrap().mode,
+    );
+    if graph == 0 {
+        return Outcome::Return(S_OK);
+    }
+    let windowless = mode == 2;
+    if windowless {
+        let window = &mut state(env).graphs.get_mut(&graph).unwrap().video;
+        window.auto_show = false;
+        window.position = Some(Rect {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+        return Outcome::Return(S_OK);
+    }
+    let info = super::info(env, graph).unwrap();
+    let window = &mut state(env).graphs.get_mut(&graph).unwrap().video;
+    window.source = None;
+    window.destination = None;
+    if hwnd == 0 {
+        return Outcome::Return(S_OK);
+    }
+    window.owner = hwnd;
+    let Some(rect) = alloc(env, 16) else {
+        return Outcome::Return(E_OUTOFMEMORY);
+    };
+    let bytes: Vec<u8> = [0, 0, info.width, info.height]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let _ = env.cpu.write(rect, &bytes);
+    user(
+        env,
+        "AdjustWindowRectEx",
+        vec![rect, 0x06cf_0000, 0, 0],
+        move |env, _| {
+            let width = env
+                .cpu
+                .read_u32(rect + 8)
+                .unwrap()
+                .wrapping_sub(env.cpu.read_u32(rect).unwrap());
+            let height = env
+                .cpu
+                .read_u32(rect + 12)
+                .unwrap()
+                .wrapping_sub(env.cpu.read_u32(rect + 4).unwrap());
+            user(
+                env,
+                "SetWindowPos",
+                vec![hwnd, 0, 0, 0, width, height, 0x14],
+                move |env, _| {
+                    user(env, "GetClientRect", vec![hwnd, rect], move |env, _| {
+                        let width = env.cpu.read_u32(rect + 8).unwrap() as i32;
+                        let height = env.cpu.read_u32(rect + 12).unwrap() as i32;
+                        free(env, rect);
+                        state(env).graphs.get_mut(&graph).unwrap().video.position = Some(Rect {
+                            left: 0,
+                            top: 0,
+                            width,
+                            height,
+                        });
+                        state(env)
+                            .filters
+                            .get_mut(&filter)
+                            .unwrap()
+                            .vmr
+                            .as_mut()
+                            .unwrap()
+                            .closed = false;
+                        Outcome::Return(S_OK)
+                    })
+                },
+            )
+        },
+    )
+}
+
+pub(crate) fn vmr_window_proc(env: &mut Env<'_>) -> Outcome {
+    let args: Vec<u32> = (0..4).map(|i| env.arg(i)).collect();
+    let (hwnd, message) = (args[0], args[1]);
+    let filter = state(env)
+        .filters
+        .iter()
+        .find_map(|(&id, f)| f.vmr.as_ref().filter(|v| v.hwnd == hwnd).map(|_| id));
+    if let Some(filter) = filter {
+        let f = &state(env).filters[&filter];
+        let graph = f.graph;
+        let drain = f.vmr.as_ref().unwrap().drain;
+        // WM_MOUSEACTIVATE, non-client mouse, WM_KEYDOWN/UP and client mouse
+        // messages go to the drain window, as IVideoWindow::put_MessageDrain says.
+        if drain != 0 && matches!(message, 0x21 | 0xa1..=0xa9 | 0x100 | 0x101 | 0x200..=0x209) {
+            let mut forwarded = args.clone();
+            forwarded[0] = drain;
+            return user(env, "PostMessageW", forwarded, |_, _| Outcome::Return(0));
+        }
+        if message == WM_CLOSE {
+            let v = state(env)
+                .filters
+                .get_mut(&filter)
+                .unwrap()
+                .vmr
+                .as_mut()
+                .unwrap();
+            v.closed = true;
+            let wake = v.wake;
+            env.sys.set_event(wake);
+            if state(env).graphs.contains_key(&graph) {
+                graph::notify(env, graph, graph::EC_USERABORT, 0, 0);
+                state(env)
+                    .graphs
+                    .get_mut(&graph)
+                    .unwrap()
+                    .video
+                    .set_visible(false);
+                let _ = super::refresh(env, graph);
+            }
+            return user(env, "ShowWindow", vec![hwnd, 0], move |env, _| {
+                graph::flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
+            });
+        }
+        if message == WM_SIZE && state(env).graphs.contains_key(&graph) {
+            let size = args[3];
+            let w = &mut state(env).graphs.get_mut(&graph).unwrap().video;
+            w.position = Some(Rect {
+                left: 0,
+                top: 0,
+                width: (size & 0xffff) as i32,
+                height: (size >> 16) as i32,
+            });
+            let _ = super::refresh(env, graph);
+        }
+    }
+    user(env, "DefWindowProcW", args, |_, result| {
+        Outcome::Return(result)
+    })
+}
+
+pub(crate) fn vmr_window_call(env: &mut Env<'_>, filter: u32, method: &str) -> Outcome {
+    use crate::dshow::{alloc, free};
+    let f = &state(env).filters[&filter];
+    let (graph, hwnd) = (f.graph, f.vmr.as_ref().unwrap().hwnd);
+    if !super::connected(env, graph) {
+        return Outcome::Return(VFW_E_NOT_CONNECTED);
+    }
+    let (value, a2, a3, a4) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let finish = |_: &mut Env<'_>, _: u32| Outcome::Return(S_OK);
+    match method {
+        "get_Caption" => {
+            let Some(text) = alloc(env, 1024) else {
+                return Outcome::Return(E_OUTOFMEMORY);
+            };
+            user(
+                env,
+                "GetWindowTextW",
+                vec![hwnd, text, 512],
+                move |env, length| {
+                    let mut bytes = vec![0; length as usize * 2];
+                    let _ = env.cpu.read(text, &mut bytes);
+                    free(env, text);
+                    let wide: Vec<u16> = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect();
+                    let bstr = adv_os::com::alloc_bstr(env, &wide);
+                    Outcome::Return(if env.cpu.write_u32(value, bstr).is_ok() {
+                        S_OK
+                    } else {
+                        E_POINTER
+                    })
+                },
+            )
+        }
+        "put_Caption" => user(env, "SetWindowTextW", vec![hwnd, value], finish),
+        "get_WindowStyle" | "get_WindowStyleEx" => {
+            let index = if method.ends_with("Ex") { -20i32 } else { -16 };
+            user(
+                env,
+                "GetWindowLongW",
+                vec![hwnd, index as u32],
+                move |env, style| Outcome::Return(write_word(env, style)),
+            )
+        }
+        "put_WindowStyle" => {
+            if value & WS_FORBIDDEN != 0 {
+                return Outcome::Return(E_INVALIDARG);
+            }
+            user(env, "IsWindowVisible", vec![hwnd], move |env, visible| {
+                user(
+                    env,
+                    "GetWindowLongW",
+                    vec![hwnd, (-16i32) as u32],
+                    move |env, old| {
+                        let style = (value & !WS_VISIBLE)
+                            | (old & 0x2100_0000)
+                            | if visible != 0 {
+                                WS_VISIBLE | 0x0400_0000
+                            } else {
+                                0
+                            };
+                        user(
+                            env,
+                            "SetWindowLongW",
+                            vec![hwnd, (-16i32) as u32, style],
+                            finish,
+                        )
+                    },
+                )
+            })
+        }
+        "put_WindowStyleEx" => user(
+            env,
+            "SetWindowLongW",
+            vec![hwnd, (-20i32) as u32, value],
+            finish,
+        ),
+        "get_AutoShow" => Outcome::Return(write_word(env, bool_word(window(env, graph).auto_show))),
+        "put_AutoShow" => {
+            state(env).graphs.get_mut(&graph).unwrap().video.auto_show = value != 0;
+            Outcome::Return(S_OK)
+        }
+        "get_Visible" => user(env, "IsWindowVisible", vec![hwnd], move |env, visible| {
+            Outcome::Return(write_word(env, bool_word(visible != 0)))
+        }),
+        "put_Visible" | "put_WindowState" => {
+            let show = if method == "put_Visible" {
+                if value == 0 { 0 } else { 5 }
+            } else {
+                value
+            };
+            state(env)
+                .graphs
+                .get_mut(&graph)
+                .unwrap()
+                .video
+                .set_visible(show != 0);
+            user(env, "ShowWindow", vec![hwnd, show], move |env, _| {
+                Outcome::Return(super::refresh(env, graph))
+            })
+        }
+        "get_WindowState" => user(
+            env,
+            "GetWindowLongW",
+            vec![hwnd, (-16i32) as u32],
+            move |env, style| {
+                let show = if style & WS_VISIBLE == 0 {
+                    0
+                } else if style & 0x2000_0000 != 0 {
+                    6
+                } else if style & 0x0100_0000 != 0 {
+                    3
+                } else {
+                    5
+                };
+                Outcome::Return(write_word(env, show))
+            },
+        ),
+        "get_MessageDrain" => {
+            let drain = state(env).filters[&filter].vmr.as_ref().unwrap().drain;
+            Outcome::Return(write_word(env, drain))
+        }
+        "put_MessageDrain" => {
+            state(env)
+                .filters
+                .get_mut(&filter)
+                .unwrap()
+                .vmr
+                .as_mut()
+                .unwrap()
+                .drain = value;
+            Outcome::Return(S_OK)
+        }
+        "get_Owner" => user(
+            env,
+            "GetWindowLongW",
+            vec![hwnd, (-16i32) as u32],
+            move |env, style| {
+                if style & 0x4000_0000 == 0 {
+                    return Outcome::Return(write_word(env, 0));
+                }
+                user(env, "GetParent", vec![hwnd], move |env, parent| {
+                    Outcome::Return(write_word(env, parent))
+                })
+            },
+        ),
+        "put_Owner" => user(
+            env,
+            "GetWindowLongW",
+            vec![hwnd, (-16i32) as u32],
+            move |env, style| {
+                let style = if value == 0 {
+                    (style & !0x4000_0000) | 0x0400_0000
+                } else {
+                    style | 0x4000_0000
+                };
+                user(
+                    env,
+                    "SetWindowLongW",
+                    vec![hwnd, (-16i32) as u32, style],
+                    move |env, _| user(env, "SetParent", vec![hwnd, value], finish),
+                )
+            },
+        ),
+        "NotifyOwnerMessage" => {
+            if a2 == 0x15 {
+                user(env, "SendMessageW", vec![hwnd, a2, a3, a4], finish)
+            } else {
+                Outcome::Return(S_OK)
+            }
+        }
+        "SetWindowForeground" => {
+            if !matches!(value, 0 | u32::MAX) {
+                return Outcome::Return(E_INVALIDARG);
+            }
+            if value == 0 {
+                return user(env, "SetWindowPos", vec![hwnd, 0, 0, 0, 0, 0, 0x13], finish);
+            }
+            user(
+                env,
+                "SetWindowPos",
+                vec![hwnd, 0, 0, 0, 0, 0, 3],
+                move |env, _| {
+                    user(env, "SetForegroundWindow", vec![hwnd], move |env, _| {
+                        user(env, "SetFocus", vec![hwnd], finish)
+                    })
+                },
+            )
+        }
+        "get_FullScreenMode" | "put_FullScreenMode" => Outcome::Return(E_NOTIMPL),
+        "GetMinIdealImageSize" | "GetMaxIdealImageSize" => {
+            Outcome::Return(crate::dshow::VFW_E_WRONG_STATE)
+        }
+        "GetWindowPosition" | "get_Left" | "get_Top" | "get_Width" | "get_Height"
+        | "SetWindowPosition" | "put_Left" | "put_Top" | "put_Width" | "put_Height" => {
+            let Some(rect) = alloc(env, 16) else {
+                return Outcome::Return(E_OUTOFMEMORY);
+            };
+            let method = method.to_owned();
+            let outputs = [value, a2, a3, a4];
+            user(env, "GetWindowRect", vec![hwnd, rect], move |env, _| {
+                let left = env.cpu.read_u32(rect).unwrap() as i32;
+                let top = env.cpu.read_u32(rect + 4).unwrap() as i32;
+                let width = (env.cpu.read_u32(rect + 8).unwrap() as i32) - left;
+                let height = (env.cpu.read_u32(rect + 12).unwrap() as i32) - top;
+                free(env, rect);
+                let position = Rect {
+                    left,
+                    top,
+                    width,
+                    height,
+                };
+                if method == "GetWindowPosition" {
+                    return Outcome::Return(write_words(
+                        env,
+                        &outputs,
+                        &[left as u32, top as u32, width as u32, height as u32],
+                    ));
+                }
+                if method.starts_with("get_") {
+                    return Outcome::Return(write_word(env, rect_property(position, &method)));
+                }
+                let position = if method == "SetWindowPosition" {
+                    Rect {
+                        left: value as i32,
+                        top: a2 as i32,
+                        width: a3 as i32,
+                        height: a4 as i32,
+                    }
+                } else {
+                    property_rect(position, &method, value as i32)
+                };
+                user(
+                    env,
+                    "SetWindowPos",
+                    vec![
+                        hwnd,
+                        0,
+                        position.left as u32,
+                        position.top as u32,
+                        position.width as u32,
+                        position.height as u32,
+                        0x14,
+                    ],
+                    finish,
+                )
+            })
+        }
+        _ => {
+            let info = super::info(env, graph).unwrap();
+            Outcome::Return(window_call(env, graph, method, &info))
+        }
+    }
 }
 
 fn window_call(env: &mut Env<'_>, graph: u32, method: &str, info: &VideoInfo) -> u32 {
@@ -431,6 +907,61 @@ fn window_call(env: &mut Env<'_>, graph: u32, method: &str, info: &VideoInfo) ->
             "standalone video windows, activation and owner messages are not supported",
         ),
     }
+}
+
+pub(crate) fn vmr_basic_call(env: &mut Env<'_>, filter: u32, method: &str) -> Outcome {
+    let (a1, a2, a3, a4) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
+    let outputs: &[u32] = match method {
+        "GetSourcePosition" | "GetDestinationPosition" => &[a1, a2, a3, a4],
+        "GetVideoSize" | "GetPreferredAspectRatio" => &[a1, a2],
+        "GetVideoPaletteEntries" => &[a3],
+        "GetCurrentImage" => &[a1],
+        method if method.starts_with("get_") => &[a1],
+        _ => &[],
+    };
+    if outputs.iter().any(|&p| !writable(env, p, 4)) {
+        return Outcome::Return(E_POINTER);
+    }
+    let f = &env.ext.get::<State>().filters[&filter];
+    let graph = f.graph;
+    let Some(info) = super::info(env, graph) else {
+        return Outcome::Return(VFW_E_NOT_CONNECTED);
+    };
+    let result = match method {
+        "get_BitRate" | "get_BitErrorRate" => {
+            let mt = f
+                .pins
+                .iter()
+                .find_map(|pin| env.ext.get::<State>().pins[pin].mt.as_ref())
+                .unwrap();
+            let offset = if method == "get_BitRate" { 32 } else { 36 };
+            let value = u32::from_le_bytes(mt.format[offset..offset + 4].try_into().unwrap());
+            write_word(env, value)
+        }
+        "GetVideoPaletteEntries" => VFW_E_NO_PALETTE_AVAILABLE,
+        "IsUsingDefaultSource" => {
+            if window(env, graph).effective_source(&info) == Rect::image(&info) {
+                S_OK
+            } else {
+                S_FALSE
+            }
+        }
+        "GetCurrentImage" => {
+            let bytes = match current_image_dib(env, graph, &info) {
+                Ok(bytes) => bytes,
+                Err(hr) => return Outcome::Return(hr),
+            };
+            if a2 == 0 {
+                write_word(env, bytes.len() as u32)
+            } else if env.cpu.write(a2, &bytes).is_ok() {
+                S_OK
+            } else {
+                E_POINTER
+            }
+        }
+        _ => basic_call(env, graph, method, &info),
+    };
+    Outcome::Return(result)
 }
 
 fn basic_call(env: &mut Env<'_>, graph: u32, method: &str, info: &VideoInfo) -> u32 {

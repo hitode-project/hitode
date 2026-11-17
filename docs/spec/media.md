@@ -148,7 +148,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-2 Rejected push
 
-**Rule**: System splitter and decoder input pins MUST reject Receive and ReceiveMultiple with `E_NOTIMPL` and a capability warning. ReceiveMultiple MUST zero a valid processed output and return `E_POINTER` for an invalid output.
+**Rule**: System splitter input pins MUST reject Receive and ReceiveMultiple with `E_NOTIMPL` and a capability warning. ReceiveMultiple MUST zero a valid processed output and return `E_POINTER` for an invalid output.
 **Verification**: Test
 
 ### MEDIA-STREAM-3 Audio lead and pause
@@ -159,6 +159,31 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 ### MEDIA-STREAM-4 Decoding off the execution thread
 
 **Rule**: Each movie source MUST decode on a host thread of its own and answer every request exactly as decoding on the caller's thread would. Between requests it MAY decode and convert the next frames ahead.
+**Verification**: Test
+
+### MEDIA-STREAM-5 MPEG media types
+
+**Rule**: MPEG filters MUST enumerate and validate the MPEG stream formats and decoded output formats exposed by Windows. Splitter audio types MUST preserve MPEG frame header fields and offer payload, elementary payload, and MP3 formats when applicable. Media negotiation MUST validate explicit output formats and prioritize downstream types for wildcard requests.
+**Verification**: Test
+
+### MEDIA-STREAM-6 Filter pin ownership
+
+**Rule**: MPEG pins MUST count public references on their owning filter while retaining their own IUnknown identity. Pin enumerators MUST retain their filter and snapshot its pins until Reset. Pin enumerators MUST use the argument and cursor results below.
+**Verification**: Test
+
+| Operation | Result |
+|---|---|
+| Next of multiple pins with valid output and no fetched count | `E_INVALIDARG`, unchanged position |
+| Skip beyond the remaining pins | `S_FALSE`, unchanged position |
+
+### MEDIA-STREAM-7 MPEG decoder delivery
+
+**Rule**: MPEG decoders MUST retain notified input allocators and negotiate output allocators with the downstream input. Output allocators MUST commit during Pause or Run and decommit during Stop. Decoder inputs MUST decode pushed samples, forward stream events, reject stopped delivery, and return `S_FALSE` during flushing.
+**Verification**: Test
+
+### MEDIA-STREAM-8 MPEG splitter streams
+
+**Rule**: Direct MPEG splitter outputs MUST deliver compressed packets and end-of-stream while paused, using the selected segment positions. Splitter output seeking MUST expose media time, capability mask `0x37`, duration, positions, and a positive playback rate. IAMStreamSelect MUST describe each output's type, group, name, and pin identity.
 **Verification**: Test
 
 ## Windows Media decoder wrappers
@@ -203,8 +228,28 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-WMV-2 Input and allocation
 
-**Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. When supplied, guest IWMReaderAllocatorEx MUST own the buffer receiving each delivered sample.
-**Verification**: Review — packet tests use prepared demuxed data and do not exercise full IStream admission or guest sample allocation.
+**Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. Stream and output allocators MUST remain separate, receive zero flags and timestamps, and own compressed and decoded buffers respectively. Once used, both allocator slots for that stream MUST reject changes, and allocation failure MUST return `NS_E_NO_MORE_SAMPLES`.
+**Verification**: Test
+
+### MEDIA-WMV-3 Output properties
+
+**Rule**: Synchronous readers MUST number audio outputs before video and return independent output-property snapshots. Output formats MUST default to PCM audio and RGB24 video, with full source and target rectangles. Format negotiation MUST reject incompatible major types, unsupported video layouts, changed video dimensions, and audio channel expansion with Windows HRESULTs.
+**Verification**: Test
+
+### MEDIA-WMV-4 Reader arguments
+
+**Rule**: `GetStreamSelected` and compressed-sample mode methods MUST return `E_INVALIDARG` for invalid stream numbers, and nonexistent profile stream numbers MUST return `NS_E_NO_STREAM`. Invalid selections MUST preserve the previous selection, and end-of-stream MUST preserve timestamps while reporting an explicitly requested stream number. Reading any stream MUST require an output number or stream number destination.
+**Verification**: Test
+
+### MEDIA-WMV-5 Header metadata
+
+**Rule**: ASF duration MUST come from the header's play duration minus preroll, and compressed ASF video samples MUST report one-millisecond durations. Missing attributes MUST leave destinations unchanged, and `WM/VideoFrameRate` MUST return `ASF_E_NOTFOUND` when absent. Insufficient attribute buffers MUST update the required size without changing the attribute type or value.
+**Verification**: Test
+
+### MEDIA-WMV-6 Reader settings and identities
+
+**Rule**: Synchronous readers MUST expose profile, header, language-list, packet-size, playlist-burn, and timecode interface identities. Output settings MUST follow Windows defaults and applicability for audio and video, retain assigned values, and return `E_UNEXPECTED` before opening.
+**Verification**: Test
 
 ## Embedded video
 
@@ -235,10 +280,45 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-VIDEO-6 Window limits
 
-**Rule**: Standalone host video windows, fullscreen activation, and input-message forwarding MUST fail explicitly without altering embedded geometry.
+**Rule**: Host video windows other than VMR windows, fullscreen activation, and unsupported input-message forwarding MUST fail explicitly without altering embedded geometry.
 **Verification**: Test
 
 ### MEDIA-VIDEO-7 Native video planes
 
 **Rule**: With GPU rendering, decoded host pictures MUST use four reusable presentable buffers per stream: NV12 on Apple, NV21 on Android. Display MUST transfer each picture's presentable lease at most once. Guest pixel requests MUST convert on demand using the stream matrix and range.
+**Verification**: Test
+
+### MEDIA-VIDEO-8 VMR configuration and interfaces
+
+**Rule**: VMR rendering mode MUST default to windowed and lock after its first explicit setting. Interfaces MUST follow the selected mode, and stream-count queries MUST fail before mixing is enabled.
+**Verification**: Test
+
+### MEDIA-VIDEO-9 VMR pins and enumeration
+
+**Rule**: Mixing MUST publish the requested numbered input pins. VMR pins MUST share their filter's reference count, and pin enumerators MUST retain their filter. Enumerators MUST observe added pins after Reset.
+**Verification**: Test
+
+### MEDIA-VIDEO-10 VMR bitmap negotiation
+
+**Rule**: VMR connection MUST interpret supported bitmap depths independently of subtype labels, while rejecting paletted RGB subtypes. QueryAccept MUST accept a null subtype with a video information format. A sample without a stop time MUST retain its start timestamp.
+**Verification**: Test
+
+### MEDIA-VIDEO-11 VMR readiness and paused samples
+
+**Rule**: Connected VMR transitions MUST return S_FALSE before receiving a sample, and paused GetState MUST report an intermediate state. Paused Receive MUST publish and hold the first sample until Run, Stop, or flushing, including samples marked preroll. Flush completion MUST require a new sample, while end of stream MUST complete readiness.
+**Verification**: Test
+
+### MEDIA-VIDEO-12 VMR guest windows
+
+**Rule**: Windowed VMR MUST own a guest USER window and honor its caption, styles, owner, geometry, visibility, and message forwarding. Graph startup MUST show windowed VMR windows only when AutoShow is enabled. Windowed and windowless rendering MUST use the existing video provider.
+**Verification**: Test
+
+### MEDIA-VIDEO-13 VMR video outputs
+
+**Rule**: VMR basic-video getters MUST validate required outputs before checking connection. VMR snapshots MUST retain the last RGB32 image across playback states and preserve a supplied size when copying pixels.
+**Verification**: Test
+
+### MEDIA-VIDEO-14 Renderless VMR ownership
+
+**Rule**: Renderless VMR MUST retain the guest allocator-presenter and DirectDraw device and allocate surfaces during allocator configuration. Samples MUST populate those surfaces and invoke PrepareSurface followed by PresentImage with their timestamps. Renderless VMR MUST NOT publish frames through the host video provider.
 **Verification**: Test

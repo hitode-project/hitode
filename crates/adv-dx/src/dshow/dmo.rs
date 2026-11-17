@@ -1012,7 +1012,7 @@ pub(super) fn interface_methods(interface: &str) -> Option<Vec<(&'static str, Co
 
 pub(super) fn release_method(env: &mut Env<'_>, this: u32) -> Option<Outcome> {
     let key = canonical(env, this)?;
-    let owner = filter::pin_parent(env, this).unwrap_or(key);
+    let owner = state(env).pins.get(&key).map_or(key, |p| p.filter);
     let com = state(env).com;
     let id = com.identity::<Obj>(&env.sys.objects, owner)?;
     if com.references(&env.sys.objects, id) != Some(1) {
