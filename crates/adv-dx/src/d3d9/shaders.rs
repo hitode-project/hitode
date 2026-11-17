@@ -271,7 +271,7 @@ pub(super) struct Bindings {
     pub textures: [Option<Id>; 20],
 }
 impl Bindings {
-    fn binding(&self, stage: Stage) -> Option<Id> {
+    pub(super) fn binding(&self, stage: Stage) -> Option<Id> {
         match stage {
             Stage::Vertex => self.vertex,
             Stage::Pixel => self.pixel,
@@ -283,7 +283,7 @@ impl Bindings {
             Stage::Pixel => &self.pixel_constants,
         }
     }
-    fn constants_mut(&mut self, stage: Stage) -> &mut Constants {
+    pub(super) fn constants_mut(&mut self, stage: Stage) -> &mut Constants {
         match stage {
             Stage::Vertex => &mut self.vertex_constants,
             Stage::Pixel => &mut self.pixel_constants,
@@ -571,29 +571,44 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
         Some(new)
     };
     let d = device(env, this.addr()).unwrap();
-    if d.recording.is_none() && d.shaders.binding(stage) == new {
+    let old = d.hot.borrow().shaders.binding(stage);
+    if d.recording.is_none() && old == new {
         return 0;
     }
-    if new.is_some_and(|new| {
-        bound(env, new).is_none_or(|s| s.device != id || s.parsed.stage != stage)
-    }) {
-        return INVALID;
-    }
+    let new_ptr = match new {
+        Some(new) => {
+            let Some(shader) =
+                bound(env, new).filter(|s| s.device == id && s.parsed.stage == stage)
+            else {
+                return INVALID;
+            };
+            shader.pointer
+        }
+        None => 0,
+    };
     if let Some(code) = stateblocks::record_shader(env, id, stage, new) {
         return code;
     }
-    let old = device(env, this.addr()).unwrap().shaders.binding(stage);
     if new != old && new.is_some_and(|new| !com(env).retain_internal(&mut env.sys.objects, new)) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
-    match stage {
-        Stage::Vertex => d.shaders.vertex = new,
-        Stage::Pixel => d.shaders.pixel = new,
-    };
-    d.touch(8 + usize::from(stage == Stage::Pixel));
+    {
+        let mut hot = d.hot.borrow_mut();
+        match stage {
+            Stage::Vertex => {
+                hot.shaders.vertex = new;
+                hot.vertex_shader_ptr = new_ptr;
+            }
+            Stage::Pixel => {
+                hot.shaders.pixel = new;
+                hot.pixel_shader_ptr = new_ptr;
+            }
+        }
+        hot.touch(8 + usize::from(stage == Stage::Pixel));
+    }
     if new != old {
         release_binding(env, old);
     }
@@ -606,7 +621,7 @@ fn get_shader(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>, stag
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let Some(id) = d.shaders.binding(stage) else {
+    let Some(id) = d.hot.borrow().shaders.binding(stage) else {
         return 0;
     };
     let Some(s) = bound(env, id) else {
@@ -656,9 +671,17 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, id: Id) {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return;
     };
-    let old = std::mem::take(&mut d.shaders);
-    d.refresh_all();
-    let recording = d.recording.take();
+    let (old, recording) = {
+        let mut hot = d.hot.borrow_mut();
+        let old = std::mem::take(&mut hot.shaders);
+        hot.vertex_shader_ptr = 0;
+        hot.pixel_shader_ptr = 0;
+        hot.texture_ptrs = [0; 20];
+        hot.texture_clean = 0;
+        hot.recording = false;
+        hot.refresh_all();
+        (old, d.recording.take())
+    };
     release_bindings(env, old);
     if let Some(recording) = recording {
         stateblocks::release_snapshot(env, recording);
@@ -670,7 +693,13 @@ pub(super) enum ConstantKind {
     Integer,
     Boolean,
 }
-fn constant_limit(stage: Stage, kind: ConstantKind) -> u32 {
+pub(super) fn constant_width(kind: ConstantKind) -> u32 {
+    match kind {
+        ConstantKind::Boolean => 4,
+        _ => 16,
+    }
+}
+pub(super) fn constant_limit(stage: Stage, kind: ConstantKind) -> u32 {
     match kind {
         ConstantKind::Float => match stage {
             Stage::Vertex => 256,
@@ -679,64 +708,19 @@ fn constant_limit(stage: Stage, kind: ConstantKind) -> u32 {
         _ => 16,
     }
 }
-fn constant_range(start: u32, count: u32, limit: u32) -> Option<std::ops::Range<usize>> {
+pub(super) fn constant_range(start: u32, count: u32, limit: u32) -> Option<std::ops::Range<usize>> {
     let end = start.checked_add(count)?;
     (start <= limit && end <= limit).then_some(start as usize..end as usize)
 }
-fn constants_set(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
-    start: u32,
-    input: GuestPtr<u8>,
-    count: u32,
-    stage: Stage,
-    kind: ConstantKind,
-) -> u32 {
-    let Some(id) = device_id(env, this.addr()) else {
-        return INVALID;
-    };
-    let Some(range) = constant_range(start, count, constant_limit(stage, kind)) else {
-        return INVALID;
-    };
-    let width = match kind {
-        ConstantKind::Boolean => 4,
-        _ => 16,
-    };
-    let bytes = count * width;
-    if adv_abi::guest::check_range(env.cpu, input.addr(), bytes, Prot::READ).is_err() {
-        return INVALID;
-    }
-    let mut storage = [0u8; 4096];
-    let data = &mut storage[..bytes as usize];
-    if bytes != 0 && env.cpu.read(input.addr(), data).is_err() {
-        return INVALID;
-    }
-    store_constants(env, id, range, data, stage, kind)
-}
-fn store_constants(
-    env: &mut Env<'_>,
-    id: Id,
+pub(super) fn apply_constants(
+    constants: &mut Constants,
     range: std::ops::Range<usize>,
     data: &[u8],
-    stage: Stage,
     kind: ConstantKind,
-) -> u32 {
-    let width = match kind {
-        ConstantKind::Boolean => 4,
-        _ => 16,
-    };
-    let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
-        return INVALID;
-    };
-    let live = d.recording.is_none();
-    let constants = if let Some(recording) = d.recording.as_mut() {
-        recording.mark_constants(stage, kind, range.clone());
-        recording.shaders.constants_mut(stage)
-    } else {
-        d.shaders.constants_mut(stage)
-    };
+) -> bool {
+    let width = constant_width(kind) as usize;
     let mut changed = false;
-    for (register, bytes) in range.zip(data.chunks_exact(width as usize)) {
+    for (register, bytes) in range.zip(data.chunks_exact(width)) {
         match kind {
             ConstantKind::Float => {
                 let value = std::array::from_fn(|i| {
@@ -756,8 +740,79 @@ fn store_constants(
             }
         }
     }
-    if live && changed {
-        d.touch(13 + usize::from(stage == Stage::Pixel));
+    changed
+}
+pub(super) fn read_constants(
+    constants: &Constants,
+    range: std::ops::Range<usize>,
+    output: &mut [u8],
+    kind: ConstantKind,
+) {
+    let width = constant_width(kind) as usize;
+    for (register, slot) in range.zip(output.chunks_exact_mut(width)) {
+        match kind {
+            ConstantKind::Float => {
+                for (i, &value) in constants.floats[register].iter().enumerate() {
+                    slot[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            ConstantKind::Integer => {
+                for (i, &value) in constants.integers[register].iter().enumerate() {
+                    slot[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            ConstantKind::Boolean => {
+                slot.copy_from_slice(&constants.booleans[register].to_le_bytes());
+            }
+        }
+    }
+}
+fn constants_set(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    start: u32,
+    input: GuestPtr<u8>,
+    count: u32,
+    stage: Stage,
+    kind: ConstantKind,
+) -> u32 {
+    let Some(id) = device_id(env, this.addr()) else {
+        return INVALID;
+    };
+    let Some(range) = constant_range(start, count, constant_limit(stage, kind)) else {
+        return INVALID;
+    };
+    let bytes = count * constant_width(kind);
+    if adv_abi::guest::check_range(env.cpu, input.addr(), bytes, Prot::READ).is_err() {
+        return INVALID;
+    }
+    let mut storage = [0u8; 4096];
+    let data = &mut storage[..bytes as usize];
+    if bytes != 0 && env.cpu.read(input.addr(), data).is_err() {
+        return INVALID;
+    }
+    store_constants(env, id, range, data, stage, kind)
+}
+fn store_constants(
+    env: &mut Env<'_>,
+    id: Id,
+    range: std::ops::Range<usize>,
+    data: &[u8],
+    stage: Stage,
+    kind: ConstantKind,
+) -> u32 {
+    let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
+        return INVALID;
+    };
+    if let Some(recording) = d.recording.as_mut() {
+        recording.mark_constants(stage, kind, range.clone());
+        apply_constants(recording.shaders.constants_mut(stage), range, data, kind);
+    } else {
+        let mut hot = d.hot.borrow_mut();
+        let changed = apply_constants(hot.shaders.constants_mut(stage), range, data, kind);
+        if changed {
+            hot.touch(13 + usize::from(stage == Stage::Pixel));
+        }
     }
     0
 }
@@ -776,31 +831,23 @@ fn constants_get(
     let Some(range) = constant_range(start, count, constant_limit(stage, kind)) else {
         return INVALID;
     };
-    let constants = d.shaders.constants(stage);
-    let bytes: Vec<u8> = match kind {
-        ConstantKind::Float => constants.floats[range]
-            .iter()
-            .flatten()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ConstantKind::Integer => constants.integers[range]
-            .iter()
-            .flatten()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        ConstantKind::Boolean => constants.booleans[range]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-    };
-    if adv_abi::guest::check_range(env.cpu, output.addr(), bytes.len() as u32, Prot::WRITE).is_err()
-    {
+    let bytes = range.len() * constant_width(kind) as usize;
+    let mut storage = [0u8; 4096];
+    read_constants(
+        d.hot.borrow().shaders.constants(stage),
+        range,
+        &mut storage[..bytes],
+        kind,
+    );
+    if adv_abi::guest::check_range(env.cpu, output.addr(), bytes as u32, Prot::WRITE).is_err() {
         return INVALID;
     }
-    if bytes.is_empty() {
+    if bytes == 0 {
         return 0;
     }
-    env.cpu.write(output.addr(), &bytes).map_or(INVALID, |()| 0)
+    env.cpu
+        .write(output.addr(), &storage[..bytes])
+        .map_or(INVALID, |()| 0)
 }
 macro_rules! constant_api {
     ($set:ident,$get:ident,$set_name:tt,$get_name:tt,$stage:ident,$kind:ident,$ty:ty) => {

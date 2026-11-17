@@ -341,7 +341,7 @@ fn zero_indexed_up_frees_zero_public_bindings_and_clears_offset_stride_without_g
     );
     assert_eq!(release(&mut env, ib), 0);
     if let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) {
-        d.scene = true;
+        d.hot.borrow_mut().scene = true;
     }
     assert!(matches!(
         draw_indexed_up(
@@ -361,12 +361,13 @@ fn zero_indexed_up_frees_zero_public_bindings_and_clears_offset_stride_without_g
     assert!(com(&env).get_identity(&env.sys.objects, vb_id).is_none());
     assert!(com(&env).get_identity(&env.sys.objects, ib_id).is_none());
     let d = super::super::device(&env, device).unwrap();
+    let hot = d.hot.borrow();
     assert_eq!(
         (
-            d.buffers.streams[0].buffer,
-            d.buffers.streams[0].offset,
-            d.buffers.streams[0].stride,
-            d.buffers.indices
+            hot.buffers.streams[0].buffer,
+            hot.buffers.streams[0].offset,
+            hot.buffers.streams[0].stride,
+            hot.buffers.indices
         ),
         (None, 0, 0, None)
     );

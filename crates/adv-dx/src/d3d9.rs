@@ -1,6 +1,8 @@
 //! D3D9 interface semantics over common COM identities and neutral GPU commands.
 //! Assembly supplies private guest allocation, memory DCs and window/display operations. Native frames
 //! use the same store and mailbox as GDI/DirectDraw, without a CPU round trip.
+//! Hot COM state setters, getters, scene boundaries, and unchanged bindings run as direct bodies over
+//! shared device and state-block storage (`direct::body_services`), falling back via `Stop::Guest`.
 // Typed SDK signatures determine the parameter count, including COM `this`.
 #![allow(clippy::too_many_arguments)]
 use adv_abi::com::{Com, ComIdentity, Destroyed, Iid, QueryError};
@@ -29,6 +31,7 @@ mod capabilities;
 mod creation;
 mod cursor;
 mod dc;
+mod direct;
 mod dirty;
 mod fixed;
 mod format;
@@ -45,7 +48,10 @@ mod targets;
 mod tests;
 mod unchanged;
 mod update_texture;
+use direct::{HotDevice, SharedD3D9};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 const INVALID: u32 = 0x8876086c;
@@ -123,80 +129,113 @@ struct Device {
     creator: u32,
     preserve_fpu: bool,
     creation: creation::State,
-    scene: bool,
     needs_reset: bool,
     back_buffer: Option<Id>,
     swap_chain: Option<Id>,
     queries: queries::DeviceState,
     depth_stencil: Option<Id>,
-    texture: Option<Id>,
     /// Borrowed surface identity; its controlling resource has one internal ref.
     render_target: Option<Id>,
-    buffers: buffers::Bindings,
     /// Declarations GetVertexDeclaration made for FVFs, internally retained.
     implicit_declarations: BTreeMap<u32, Id>,
-    fixed: fixed::CachedFixed,
-    shaders: shaders::Bindings,
+    hot: Rc<RefCell<HotDevice>>,
     recording: Option<shaders::stateblocks::Snapshot>,
-    versions: [u64; 15],
-    fingerprints: [u128; 15],
     frame: recording::Recording,
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
     misc: Misc,
 }
+#[cfg(test)]
 impl Device {
-    fn class_key(&self, class: usize) -> u128 {
-        use recording::hash;
-        let f = &self.fixed;
-        match class {
-            0 => hash((&f.render, f.material.map(f32::to_bits), &f.lights)),
-            1 => hash((&f.stage, &f.stage_slots)),
-            2 => hash((&f.sampler, &f.sampler_slots)),
-            3 => hash((
-                f.viewport.X,
-                f.viewport.Y,
-                f.viewport.Width,
-                f.viewport.Height,
-                f.viewport.MinZ.to_bits(),
-                f.viewport.MaxZ.to_bits(),
-            )),
-            4 => hash((
-                f.scissor.left,
-                f.scissor.top,
-                f.scissor.right,
-                f.scissor.bottom,
-            )),
-            5 => hash(f.transforms.map(|v| v.map(f32::to_bits))),
-            6 => hash(f.clip_planes.map(|v| v.map(f32::to_bits))),
-            7 => hash((f.fvf, self.buffers.declaration)),
-            8 => hash(self.shaders.vertex),
-            9 => hash(self.shaders.pixel),
-            10 => hash((
-                self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride)),
-                self.buffers.frequencies,
-            )),
-            11 => hash(self.buffers.indices),
-            12 => hash((self.texture, self.shaders.textures)),
-            13 => self.shaders.vertex_constants.fingerprint(),
-            14 => self.shaders.pixel_constants.fingerprint(),
-            _ => unreachable!(),
+    fn touch(&self, class: usize) {
+        self.hot.borrow_mut().touch(class);
+    }
+    fn refresh_all(&self) {
+        self.hot.borrow_mut().refresh_all();
+    }
+}
+
+pub(in crate::d3d9) fn sync_hot_bindings(env: &Env<'_>, device_id: Id, dirty: u32) {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device_id) else {
+        return;
+    };
+    let (decl, vs, ps, streams, indices, textures) = {
+        let hot = d.hot.borrow();
+        (
+            (dirty & (1 << 7) != 0).then_some(hot.buffers.declaration),
+            (dirty & (1 << 8) != 0).then_some(hot.shaders.vertex),
+            (dirty & (1 << 9) != 0).then_some(hot.shaders.pixel),
+            (dirty & (1 << 10) != 0).then_some(hot.buffers.streams),
+            (dirty & (1 << 11) != 0).then_some(hot.buffers.indices),
+            (dirty & (1 << 12) != 0).then(|| (hot.texture, hot.shaders.textures)),
+        )
+    };
+    let decl_ptr = decl.map(|id| {
+        id.and_then(|id| match com(env).get_identity(&env.sys.objects, id) {
+            Some(Payload::Declaration(decl)) => Some(decl.pointer),
+            _ => None,
+        })
+        .unwrap_or(0)
+    });
+    let shader_ptr = |id: Option<Id>| {
+        id.and_then(|id| shaders::bound(env, id))
+            .map_or(0, |s| s.pointer)
+    };
+    let vs_ptr = vs.map(shader_ptr);
+    let ps_ptr = ps.map(shader_ptr);
+    let stream_info = streams.map(|streams| {
+        streams.map(|s| {
+            s.buffer
+                .and_then(|id| match com(env).get_identity(&env.sys.objects, id) {
+                    Some(Payload::Buffer(b)) => Some((b.pointer, b.len)),
+                    _ => None,
+                })
+                .unwrap_or((0, 0))
+        })
+    });
+    let idx_ptr = indices.map(|id| {
+        id.and_then(|id| match com(env).get_identity(&env.sys.objects, id) {
+            Some(Payload::Buffer(b)) => Some(b.pointer),
+            _ => None,
+        })
+        .unwrap_or(0)
+    });
+    let tex_info = textures.map(|(slot0, slots)| {
+        std::array::from_fn::<_, 20, _>(|slot| {
+            let id = if slot == 0 { slot0 } else { slots[slot] };
+            let ptr = id
+                .and_then(|id| match com(env).get_identity(&env.sys.objects, id) {
+                    Some(Payload::Resource(r)) => Some(r.pointer),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let clean = ptr != 0 && resources::is_texture_clean(env, ptr);
+            (ptr, clean)
+        })
+    });
+    let mut hot = d.hot.borrow_mut();
+    if let Some(ptr) = decl_ptr {
+        hot.declaration_ptr = ptr;
+    }
+    if let Some(ptr) = vs_ptr {
+        hot.vertex_shader_ptr = ptr;
+    }
+    if let Some(ptr) = ps_ptr {
+        hot.pixel_shader_ptr = ptr;
+    }
+    if let Some(info) = stream_info {
+        for (i, (ptr, len)) in info.into_iter().enumerate() {
+            hot.stream_ptrs[i] = ptr;
+            hot.stream_lens[i] = len;
         }
     }
-    fn touch(&mut self, class: usize) {
-        self.versions[class] += 1;
-        self.fingerprints[class] = self.class_key(class);
+    if let Some(ptr) = idx_ptr {
+        hot.indices_ptr = ptr;
     }
-    fn refresh_all(&mut self) {
-        self.fingerprints = std::array::from_fn(|class| self.class_key(class));
-    }
-    /// Refreshes only the classes in `dirty`, one bit per class.
-    fn refresh(&mut self, dirty: u32) {
-        for class in 0..self.fingerprints.len() {
-            if dirty & (1 << class) != 0 {
-                self.fingerprints[class] = self.class_key(class);
-            }
+    if let Some(info) = tex_info {
+        for (slot, (ptr, clean)) in info.into_iter().enumerate() {
+            hot.set_texture_slot(slot, ptr, clean);
         }
     }
 }
@@ -226,6 +265,7 @@ pub struct State {
     shader_cache: Option<std::path::PathBuf>,
     frames: FrameCounters,
     verify_frames: bool,
+    shared: Rc<RefCell<SharedD3D9>>,
 }
 /// Shader model capability gates. SM2 passed its differential fixtures and the
 /// engine matrix and is reported by default; SM3 stays an explicit opt-in.
@@ -486,6 +526,11 @@ pub fn install<B: Backend>(
                 .thunks
                 .publish(&mut machine.cpu, "d3d9.dll", &method)
                 .map_err(|e| e.to_string())?;
+            if let Some(body) = direct::lookup(&method)
+                && let Some(index) = machine.sys.thunks.published_index("d3d9.dll", &method)
+            {
+                machine.sys.bind_thunk_body(index, body);
+            }
             let slot = signature.com_slot.unwrap();
             machine
                 .cpu
@@ -516,7 +561,9 @@ pub fn install<B: Backend>(
         shader_cache: None,
         frames: FrameCounters::default(),
         verify_frames: std::env::var("ADV_VERIFY_FRAMES").as_deref() == Ok("1"),
+        shared: Rc::new(RefCell::new(SharedD3D9::default())),
     });
+    machine.sys.add_body_services(direct::body_services);
     Ok(())
 }
 pub fn set_gpu(ext: &mut Ext, mut gpu: Gpu) -> Result<(), String> {
@@ -644,21 +691,36 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     }
 
     if let Payload::Device(device) = destroyed.value {
+        {
+            let mut shared = env.ext.get::<State>().shared.borrow_mut();
+            shared.remove_device(device.pointer);
+            for &pointer in &destroyed.interfaces {
+                shared.remove_device(pointer);
+            }
+        }
         let provider = env.ext.get::<State>().provider;
         (provider.device_released)(env, device.pointer);
         targets::release_binding(env, device.render_target);
         depth::release_binding(env, device.depth_stencil);
-        buffers::release_bindings(env, device.buffers);
+        let (buffers, shaders, texture) = {
+            let mut hot = device.hot.borrow_mut();
+            (
+                std::mem::take(&mut hot.buffers),
+                std::mem::take(&mut hot.shaders),
+                hot.texture.take(),
+            )
+        };
+        buffers::release_bindings(env, buffers);
         for id in device.implicit_declarations.into_values() {
             if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
                 destroy(env, dead);
             }
         }
-        shaders::release_bindings(env, device.shaders);
+        shaders::release_bindings(env, shaders);
         if let Some(recording) = device.recording {
             shaders::stateblocks::release_snapshot(env, recording);
         }
-        for binding in [device.texture, device.back_buffer, device.swap_chain]
+        for binding in [texture, device.back_buffer, device.swap_chain]
             .into_iter()
             .flatten()
         {
@@ -681,6 +743,12 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     } else if let Payload::Query(q) = destroyed.value {
         queries::destroy(env, q);
     } else if let Payload::StateBlock(block) = destroyed.value {
+        {
+            let mut shared = env.ext.get::<State>().shared.borrow_mut();
+            for &pointer in &destroyed.interfaces {
+                shared.remove_state_block(pointer);
+            }
+        }
         shaders::stateblocks::destroy(env, *block);
     }
     for pointer in destroyed.interfaces {
@@ -1165,7 +1233,8 @@ fn create_device(
     let mut fixed =
         fixed::CachedFixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
-    let mut device = Device {
+    let hot = Rc::new(RefCell::new(HotDevice::new(fixed)));
+    let device = Device {
         children: BTreeMap::new(),
         pointer: 0,
         factory,
@@ -1175,27 +1244,20 @@ fn create_device(
         creator: env.context,
         preserve_fpu: flags & 2 != 0,
         creation,
-        scene: false,
         needs_reset: false,
         back_buffer: None,
         swap_chain: None,
         queries: queries::DeviceState::default(),
         depth_stencil: None,
-        texture: None,
         render_target: None,
-        buffers: buffers::Bindings::default(),
         implicit_declarations: BTreeMap::new(),
-        fixed,
-        shaders: shaders::Bindings::default(),
+        hot: Rc::clone(&hot),
         recording: None,
-        versions: [0; 15],
-        fingerprints: [0; 15],
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,
         misc: Misc::default(),
     };
-    device.refresh_all();
     let Some((pointer, id)) = object(
         env,
         "IDirect3DDevice9",
@@ -1208,7 +1270,13 @@ fn create_device(
     };
     if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         device.pointer = pointer;
+        device.hot.borrow_mut().pointer = pointer;
     }
+    env.ext
+        .get::<State>()
+        .shared
+        .borrow_mut()
+        .register_device(pointer, hot);
     let back_buffer = resources::implicit_back_buffer(env, id, normalized, surface);
     let Some(back_buffer) = back_buffer else {
         release(env, pointer);
@@ -1217,6 +1285,7 @@ fn create_device(
     if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         device.back_buffer = Some(back_buffer);
     }
+    targets::refresh_hot_id(env, id);
     let depth = match depth::implicit(env, id, normalized) {
         Ok(value) => value,
         Err(error) => {
@@ -1314,7 +1383,7 @@ fn reset(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if d.creator != env.context || d.scene {
+    if d.creator != env.context || d.hot.borrow().scene {
         return Outcome::Return(INVALID);
     }
     let focus = d.parameters.hDeviceWindow;
@@ -1322,7 +1391,7 @@ fn reset(
     let surface = d.surface;
     let old_buffer = d.back_buffer;
     let old_depth = d.depth_stencil;
-    let old_texture = d.texture;
+    let old_texture = d.hot.borrow().texture;
     let old_front = d.front;
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
@@ -1416,13 +1485,14 @@ fn reset(
         d.front = None;
         d.back_buffer = Some(new_buffer);
         d.depth_stencil = new_depth;
-        d.texture = None;
         d.needs_reset = false;
         d.gpu_lost = false;
         d.frame = recording::Recording::default();
         d.creation.reset();
-        *d.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
-        d.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
+        let mut hot = d.hot.borrow_mut();
+        hot.texture = None;
+        *hot.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+        hot.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     }
     depth::release_binding(env, old_depth);
     presentation::release(env, old_front);
@@ -1441,26 +1511,26 @@ fn reset(
 }
 #[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state)]
 fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    else {
+    let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    if d.scene {
+    let mut hot = d.hot.borrow_mut();
+    if hot.scene {
         return INVALID;
     }
-    d.scene = true;
+    hot.scene = true;
     0
 }
 #[win32(d3d9, name = "IDirect3DDevice9::EndScene", level = state)]
 fn end_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    else {
+    let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    if !d.scene {
+    let mut hot = d.hot.borrow_mut();
+    if !hot.scene {
         return INVALID;
     }
-    d.scene = false;
+    hot.scene = false;
     0
 }
 fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
@@ -1792,12 +1862,18 @@ fn clear(
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
+    let rectangle = device(env, this.addr())
+        .unwrap()
+        .hot
+        .borrow()
+        .fixed
+        .clear_rect();
     dispatch(
         env,
         id,
         Operation::Clear {
             target,
-            rectangle: device(env, this.addr()).unwrap().fixed.clear_rect(),
+            rectangle,
             color: (flags & 1 != 0).then_some(color),
             depth: (flags & 2 != 0).then_some(z),
             stencil: (flags & 4 != 0).then_some(stencil),
@@ -1816,7 +1892,7 @@ fn present(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if d.scene {
+    if d.hot.borrow().scene {
         return Outcome::Return(INVALID);
     }
     let parameters = d.parameters;
@@ -1934,23 +2010,40 @@ fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>)
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    if d.shaders.pixel.is_none() {
-        if let Err(error) = fixed::second_stage(&d.fixed) {
-            adv_abi::warn_unavailable(env, "IDirect3DDevice9::ValidateDevice", error.reason);
-            return error.code;
+    let (second_err, stage_err) = {
+        let hot = d.hot.borrow();
+        if hot.shaders.pixel.is_none() {
+            (
+                fixed::second_stage(&hot.fixed).err(),
+                hot.texture.is_some()
+                    && (fixed::combine(
+                        hot.fixed.stage[&1],
+                        hot.fixed.stage[&2],
+                        hot.fixed.stage[&3],
+                    )
+                    .is_none()
+                        || fixed::combine(
+                            hot.fixed.stage[&4],
+                            hot.fixed.stage[&5],
+                            hot.fixed.stage[&6],
+                        )
+                        .is_none()),
+            )
+        } else {
+            (None, false)
         }
-        if d.texture.is_some()
-            && (fixed::combine(d.fixed.stage[&1], d.fixed.stage[&2], d.fixed.stage[&3]).is_none()
-                || fixed::combine(d.fixed.stage[&4], d.fixed.stage[&5], d.fixed.stage[&6])
-                    .is_none())
-        {
-            adv_abi::warn_unavailable(
-                env,
-                "IDirect3DDevice9::ValidateDevice",
-                "texture stage combination is unsupported by drawing",
-            );
-            return UNAVAILABLE;
-        }
+    };
+    if let Some(error) = second_err {
+        adv_abi::warn_unavailable(env, "IDirect3DDevice9::ValidateDevice", error.reason);
+        return error.code;
+    }
+    if stage_err {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::ValidateDevice",
+            "texture stage combination is unsupported by drawing",
+        );
+        return UNAVAILABLE;
     }
     passes.write(env.cpu, 1).map_or(INVALID, |()| 0)
 }

@@ -99,8 +99,8 @@ pub fn observe_host_calls(on: bool) {
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
-    /// Personality service storage and server thread identity for direct bodies.
-    pub body_services: Option<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
+    /// Personality and subsystem service storage hooks for direct bodies.
+    pub body_services: Vec<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
     poll_observed: Option<Observation>,
@@ -288,6 +288,17 @@ impl Sys {
         self.direct_bodies.insert(at, body);
     }
 
+    /// Register a hook that populates [`adv_cpu::body::Services`] in registration order.
+    pub fn add_body_services(&mut self, hook: fn(&Sys, &Ext, &mut adv_cpu::body::Services)) {
+        if !self
+            .body_services
+            .iter()
+            .any(|existing| std::ptr::fn_addr_eq(*existing, hook))
+        {
+            self.body_services.push(hook);
+        }
+    }
+
     pub fn services(&self, ext: &Ext) -> adv_cpu::body::Services {
         let mut services = adv_cpu::body::Services {
             clock: self.clock.body_pointer(),
@@ -309,7 +320,7 @@ impl Sys {
                 .map_or(0, |c| c.teb),
             ..Default::default()
         };
-        if let Some(prepare) = self.body_services {
+        for prepare in &self.body_services {
             prepare(self, ext, &mut services);
         }
         services
@@ -2194,7 +2205,7 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
-            body_services: None,
+            body_services: Vec::new(),
             poll_wake: None,
             poll_observed: None,
             invocation_arguments: None,
@@ -3377,5 +3388,56 @@ impl<B: Backend> Machine<B> {
                 other => return other,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod body_services_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Order(Rc<RefCell<Vec<&'static str>>>);
+
+    fn hook_user(_sys: &Sys, ext: &Ext, services: &mut adv_cpu::body::Services) {
+        ext.get::<Order>().0.borrow_mut().push("user");
+        services.user_state = 0x1000 as *const std::ffi::c_void;
+    }
+
+    fn hook_d3d9(_sys: &Sys, ext: &Ext, services: &mut adv_cpu::body::Services) {
+        assert_eq!(services.user_state, 0x1000 as *const std::ffi::c_void);
+        ext.get::<Order>().0.borrow_mut().push("d3d9");
+        services.d3d9_state = 0x2000 as *const std::ffi::c_void;
+    }
+
+    struct Empty;
+    impl Resolver for Empty {
+        fn host_fn(&self, _: &str, _: &str) -> Option<HostFn> {
+            None
+        }
+        fn provides(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    // spec: A64-CALL-2
+    #[test]
+    fn body_services_hooks_run_in_registration_order_without_overwriting() {
+        let mut machine = Machine::new(
+            adv_cpu::JitCpu::new(layout::PARK_ADDR, false).unwrap(),
+            Empty,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        machine.ext.insert(Order(calls.clone()));
+        machine.sys.add_body_services(hook_user);
+        machine.sys.add_body_services(hook_d3d9);
+        machine.sys.add_body_services(hook_user);
+
+        let services = machine.sys.services(&machine.ext);
+        assert_eq!(*calls.borrow(), vec!["user", "d3d9"]);
+        assert_eq!(services.user_state, 0x1000 as *const std::ffi::c_void);
+        assert_eq!(services.d3d9_state, 0x2000 as *const std::ffi::c_void);
     }
 }

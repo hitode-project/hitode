@@ -459,8 +459,9 @@ fn draw_reads(
     ) {
         return Err("not a triangle list or strip");
     }
+    let hot = device.hot.borrow();
     // Neutral vertices mean POSITIONT bypassed the bound vertex shader.
-    let vertex = device
+    let vertex = hot
         .shaders
         .vertex
         .filter(|_| {
@@ -479,7 +480,7 @@ fn draw_reads(
     }) {
         return Err("vertex shader samples or is untranslated");
     }
-    let pixel = device.shaders.pixel.and_then(|id| shaders::bound(env, id));
+    let pixel = hot.shaders.pixel.and_then(|id| shaders::bound(env, id));
     let samples = if let Some(pixel) = pixel {
         let constants = draw.programmable.as_ref().map(|p| &p.pixel_constants);
         let constant = |n: usize| constants.map_or([0.; 4], |c| c.register(n).map(f32::from_bits));
@@ -537,10 +538,9 @@ fn draw_reads(
             )
         };
         let resource = if slot == 0 {
-            device.texture
+            hot.texture
         } else {
-            *device
-                .shaders
+            *hot.shaders
                 .textures
                 .get(slot)
                 .ok_or("texture is not bound")?

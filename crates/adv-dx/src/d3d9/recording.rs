@@ -16,6 +16,7 @@ pub(super) use key::rect;
 pub(super) use reuse::indexed;
 pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     let d = device(env, pointer).unwrap();
+    let hot = d.hot.borrow();
     let constants = |id: Option<Id>, c: &shaders::Constants| {
         c.key(
             id.and_then(|id| shaders::bound(env, id))
@@ -24,12 +25,12 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
         )
     };
     hash((
-        d.fixed.key(),
-        d.shaders.vertex,
-        d.shaders.pixel,
-        d.buffers.declaration,
-        constants(d.shaders.vertex, &d.shaders.vertex_constants),
-        constants(d.shaders.pixel, &d.shaders.pixel_constants),
+        hot.fixed.key(),
+        hot.shaders.vertex,
+        hot.shaders.pixel,
+        hot.buffers.declaration,
+        constants(hot.shaders.vertex, &hot.shaders.vertex_constants),
+        constants(hot.shaders.pixel, &hot.shaders.pixel_constants),
     ))
 }
 
@@ -956,6 +957,9 @@ fn clear_upload_lock(env: &mut Env<'_>, resource: Id, level: Option<u32>, dirty:
             r.lock = None;
         }
     }
+    if dirty {
+        resources::invalidate_hot_texture(env, resource);
+    }
 }
 fn release_upload(env: &mut Env<'_>, owner: Id, resource: Id, level: Option<u32>, dirty: bool) {
     let held = &mut frame(env, owner).held_uploads;
@@ -1261,7 +1265,7 @@ fn finish(
     f.partial = false;
     f.verdict = None;
     if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {
-        d.fixed.finish_inputs();
+        d.hot.borrow().fixed.finish_inputs();
     }
 }
 fn verify_pixels(

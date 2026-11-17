@@ -92,7 +92,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
                     programmable::transformed::position(input.v[0], d.state.viewport)?;
             }
         } else {
-            let shader = shaders::bound(env, device.shaders.vertex?)?;
+            let shader = shaders::bound(env, device.hot.borrow().shaders.vertex?)?;
             let translation = shader.translation.as_ref().ok()?;
             for n in 0..p.vertex_count {
                 let input = vertex_input(p, n)?;

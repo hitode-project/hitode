@@ -54,6 +54,18 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(set_clip_plane_ABI);
     registry.register(get_clip_plane_ABI);
 }
+pub(super) fn apply_clip_plane_raw(f: &mut fixed::Fixed, index: u32, values: [f32; 4]) -> bool {
+    let changed = f.clip_planes[index as usize].map(f32::to_bits) != values.map(f32::to_bits);
+    f.clip_planes[index as usize] = values;
+    changed
+}
+pub(super) fn apply_clip_plane(f: &mut fixed::CachedFixed, index: u32, values: [f32; 4]) -> bool {
+    let changed = apply_clip_plane_raw(f.state_mut(), index, values);
+    if changed {
+        f.invalidate_key();
+    }
+    changed
+}
 #[win32(d3d9,name="IDirect3DDevice9::SetClipPlane",level=state)]
 fn set_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: GuestPtr<f32>) -> u32 {
     if index >= 6 || device(env, this.addr()).is_none() {
@@ -65,23 +77,14 @@ fn set_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
     if values.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    else {
-        return INVALID;
-    };
-    let fixed = if let Some(record) = &mut d.recording {
-        &mut record.fixed
-    } else {
-        &mut *d.fixed
-    };
-    let changed = fixed.clip_planes[index as usize].map(f32::to_bits) != values.map(f32::to_bits);
-    fixed.clip_planes[index as usize] = values;
-    shaders::stateblocks::mark_fixed(
+    if !fixed::mutate_fixed_raw(
         env,
         this.addr(),
         shaders::stateblocks::FixedKey::ClipPlane(index as usize),
-        changed,
-    );
+        |f| apply_clip_plane_raw(f, index, values),
+    ) {
+        return INVALID;
+    }
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetClipPlane",level=implement)]
@@ -89,7 +92,14 @@ fn get_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let Some(values) = d.fixed.clip_planes.get(index as usize).copied() else {
+    let Some(values) = d
+        .hot
+        .borrow()
+        .fixed
+        .clip_planes
+        .get(index as usize)
+        .copied()
+    else {
         return INVALID;
     };
     GuestPtr::<[f32; 4]>::new(plane.addr())
@@ -101,13 +111,14 @@ fn get_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
 /// stages combine a second stage, which only the assembled program draws.
 pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
     device(env, pointer).is_some_and(|d| {
-        d.shaders.vertex.is_some()
-            || d.shaders.pixel.is_some()
+        let hot = d.hot.borrow();
+        hot.shaders.vertex.is_some()
+            || hot.shaders.pixel.is_some()
             || fixed_features(
-                &d.fixed,
+                &hot.fixed,
                 fixed::layout(env, pointer).ok().map(|l| l.transformed),
             ) != 0
-            || !matches!(fixed::second_stage(&d.fixed), Ok(None))
+            || !matches!(fixed::second_stage(&hot.fixed), Ok(None))
     })
 }
 fn fixed_features(f: &fixed::Fixed, transformed: Option<bool>) -> u32 {
@@ -159,13 +170,14 @@ struct Input {
 }
 fn inputs(env: &Env<'_>, pointer: u32, vs: &Shader) -> Result<Vec<Input>, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
-    let elements = if let Some(id) = d.buffers.declaration {
+    let hot = d.hot.borrow();
+    let elements = if let Some(id) = hot.buffers.declaration {
         let Some(Payload::Declaration(decl)) = com(env).get_identity(&env.sys.objects, id) else {
             return Err(INVALID);
         };
         decl.elements.clone()
     } else {
-        let layout = fixed::Layout::from_fvf(d.fixed.fvf).ok_or(UNAVAILABLE)?;
+        let layout = fixed::Layout::from_fvf(hot.fixed.fvf).ok_or(UNAVAILABLE)?;
         if layout.transformed {
             return Err(INVALID);
         }
@@ -261,7 +273,8 @@ pub(super) fn sampler_slot(sampler: u32) -> Option<usize> {
 }
 fn pretransformed(env: &Env<'_>, pointer: u32) -> Result<bool, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
-    if let Some(id) = d.buffers.declaration {
+    let hot = d.hot.borrow();
+    if let Some(id) = hot.buffers.declaration {
         let Some(Payload::Declaration(declaration)) = com(env).get_identity(&env.sys.objects, id)
         else {
             return Err(INVALID);
@@ -272,7 +285,7 @@ fn pretransformed(env: &Env<'_>, pointer: u32) -> Result<bool, u32> {
             .take_while(|e| e[0] != 255)
             .any(|e| e[6] == 9 && e[7] == 0))
     } else {
-        Ok(d.fixed.fvf & 0x0e == 4)
+        Ok(hot.fixed.fvf & 0x0e == 4)
     }
 }
 pub(super) fn prepare(
@@ -290,7 +303,8 @@ pub(super) fn prepare(
     {
         let detail = device(env, pointer)
             .map(|d| {
-                [d.shaders.vertex, d.shaders.pixel]
+                let hot = d.hot.borrow();
+                [hot.shaders.vertex, hot.shaders.pixel]
                     .into_iter()
                     .flatten()
                     .filter_map(|id| shaders::bound(env, id))
@@ -316,8 +330,14 @@ fn prepare_checked(
     indices: Option<&[u32]>,
     start: u32,
 ) -> Result<fixed::Draw, u32> {
-    let d = device(env, pointer).ok_or(INVALID)?;
-    if !d.scene || d.needs_reset {
+    let hot_cell = std::rc::Rc::clone(&device(env, pointer).ok_or(INVALID)?.hot);
+    let (vs_id, ps_id, needs_reset) = (
+        hot_cell.borrow().shaders.vertex,
+        hot_cell.borrow().shaders.pixel,
+        device(env, pointer).unwrap().needs_reset,
+    );
+    let hot = hot_cell.borrow();
+    if !hot.scene || needs_reset {
         return Err(INVALID);
     }
     // POSITIONT/FVF XYZRHW bypasses vertex processing even while a vertex
@@ -327,20 +347,21 @@ fn prepare_checked(
         if pretransformed(env, pointer)? {
             None
         } else {
-            d.shaders.vertex
+            vs_id
         },
     )?;
-    let ps = stage(env, d.shaders.pixel)?;
+    let ps = stage(env, ps_id)?;
     let vt = vs.as_ref().map(|s| s.translation.as_ref());
     let pt = ps.as_ref().map(|s| s.translation.as_ref());
     let length = fixed::primitive_length(kind, count)?;
     if indices.is_some_and(|i| i.len() != length as usize) {
         return Err(INVALID);
     }
-    let instanced =
-        indices.is_some() && up.is_none() && d.buffers.frequencies[0] & buffers::INDEXED_DATA != 0;
+    let instanced = indices.is_some()
+        && up.is_none()
+        && hot.buffers.frequencies[0] & buffers::INDEXED_DATA != 0;
     let instance_count = if instanced {
-        buffers::instances(&d.buffers)
+        buffers::instances(&hot.buffers)
     } else {
         1
     };
@@ -353,15 +374,15 @@ fn prepare_checked(
     if let Some(layout) = fixed_layout {
         // Instanced fixed draws take the raw path, which has none of the
         // fixed-function effects.
-        if (!layout.transformed && d.fixed.render[&137] != 0)
-            || fixed_features(&d.fixed, Some(layout.transformed)) != 0
+        if (!layout.transformed && hot.fixed.render[&137] != 0)
+            || fixed_features(&hot.fixed, Some(layout.transformed)) != 0
             || layout.specular.is_some()
         {
             return Err(UNAVAILABLE);
         }
-        if d.shaders.vertex.is_none()
-            && d.shaders.pixel.is_none()
-            && (d.fixed.render[&28] != 0 || d.fixed.render[&152] != 0)
+        if hot.shaders.vertex.is_none()
+            && hot.shaders.pixel.is_none()
+            && (hot.fixed.render[&28] != 0 || hot.fixed.render[&152] != 0)
         {
             return Err(UNAVAILABLE);
         }
@@ -385,6 +406,7 @@ fn prepare_checked(
         let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
         let (target, image, state) =
             fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+        drop(hot);
         env.ext.get_mut::<State>().programs.last_draw = Some((kind, up.map(|(_, stride)| stride)));
         (
             fixed::Draw {
@@ -402,9 +424,10 @@ fn prepare_checked(
         )
     } else if fixed_raw
         || (pretransformed(env, pointer)?
-            && fixed_features(&d.fixed, Some(true)) == 0
+            && fixed_features(&hot.fixed, Some(true)) == 0
             && fixed::layout(env, pointer).is_ok_and(|l| l.specular.is_none()))
     {
+        drop(hot);
         let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
         let inputs = transformed::inputs(layout);
         let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
@@ -445,6 +468,7 @@ fn prepare_checked(
             inputs,
         )
     } else {
+        drop(hot);
         // The shared fixed decoder validates all declaration streams and expands
         // indices/fans before assembling the neutral programmable stream.
         let draw = if let Some((data, stride)) = up {
@@ -478,7 +502,8 @@ fn prepare_checked(
         };
         let mut inputs = Vec::new();
         if let Some(count) = count {
-            let f = &device(env, pointer).unwrap().fixed;
+            let hot = hot_cell.borrow();
+            let f = &hot.fixed;
             let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
             let effects = f.render[&29] != 0 || f.render[&28] != 0 || layout.specular.is_some();
             let scaled = kind == 1 && !layout.transformed && f.render[&157] != 0;
@@ -557,7 +582,7 @@ fn prepare_checked(
         draw.state.topology = adv_device::gpu::Topology::Triangles;
         draw.state.cull = adv_device::gpu::Cull::None;
     }
-    let d = device(env, pointer).ok_or(INVALID)?;
+    let hot = hot_cell.borrow();
     let mut bindings = Vec::new();
     let mut slots = Vec::new();
     for (vertex, t) in [(true, vt), (false, pt)] {
@@ -582,7 +607,7 @@ fn prepare_checked(
             image: draw.image.clone(),
             sampler: draw.state.sampler,
         });
-        let second = fixed::second_stage(&d.fixed).map_err(|e| e.code)?;
+        let second = fixed::second_stage(&hot.fixed).map_err(|e| e.code)?;
         if second.is_some() {
             slots.push((false, 1));
             bindings.push(texture(env, pointer, 1, &draw.state)?);
@@ -613,20 +638,20 @@ fn prepare_checked(
     );
     parameters[2][3] = u32::from(kind == 1);
     parameters[13] = second.unwrap_or_default();
-    parameters[36] = fixed::lighting::color(d.fixed.render[&60]).map(f32::to_bits);
+    parameters[36] = fixed::lighting::color(hot.fixed.render[&60]).map(f32::to_bits);
     parameters[37] = [
-        d.fixed.stage[&1],
-        d.fixed.stage[&2] | d.fixed.stage[&3] << 8,
-        d.fixed.stage[&4],
-        d.fixed.stage[&5] | d.fixed.stage[&6] << 8,
+        hot.fixed.stage[&1],
+        hot.fixed.stage[&2] | hot.fixed.stage[&3] << 8,
+        hot.fixed.stage[&4],
+        hot.fixed.stage[&5] | hot.fixed.stage[&6] << 8,
     ];
 
-    parameters[38] = [d.fixed.render[&195], d.fixed.render[&175], 0, 0];
+    parameters[38] = [hot.fixed.render[&195], hot.fixed.render[&175], 0, 0];
     parameters[15][0] = u32::from(transformed);
     if fixed_layout.is_some_and(|layout| !layout.transformed) {
         parameters[15][0] = 2;
-        let mut matrix = d.fixed.transforms[0];
-        for next in &d.fixed.transforms[1..] {
+        let mut matrix = hot.fixed.transforms[0];
+        for next in &hot.fixed.transforms[1..] {
             matrix = std::array::from_fn(|i| {
                 (0..4)
                     .map(|k| matrix[(i / 4) * 4 + k] * next[k * 4 + i % 4])
@@ -638,15 +663,15 @@ fn prepare_checked(
         }
     }
     parameters[3] = [
-        d.fixed.render[&152],
-        d.fixed.render[&28],
-        d.fixed.render[&35],
+        hot.fixed.render[&152],
+        hot.fixed.render[&28],
+        hot.fixed.render[&35],
         0,
     ];
     for n in 0..6 {
-        parameters[4 + n] = d.fixed.clip_planes[n].map(f32::to_bits);
+        parameters[4 + n] = hot.fixed.clip_planes[n].map(f32::to_bits);
     }
-    let color = d.fixed.render[&34];
+    let color = hot.fixed.render[&34];
     parameters[10] = [
         ((color >> 16) & 255) as f32 / 255.,
         ((color >> 8) & 255) as f32 / 255.,
@@ -655,15 +680,15 @@ fn prepare_checked(
     ]
     .map(f32::to_bits);
     parameters[11] = [
-        d.fixed.render[&36],
-        d.fixed.render[&37],
-        d.fixed.render[&38],
-        d.fixed.render[&154],
+        hot.fixed.render[&36],
+        hot.fixed.render[&37],
+        hot.fixed.render[&38],
+        hot.fixed.render[&154],
     ];
     parameters[12] = [
-        d.fixed.render[&155],
-        d.fixed.render[&166],
-        d.fixed.render[&156],
+        hot.fixed.render[&155],
+        hot.fixed.render[&166],
+        hot.fixed.render[&156],
         0,
     ];
     for (ordinal, binding) in bindings.iter().enumerate() {
@@ -678,7 +703,7 @@ fn prepare_checked(
     }
     let usage = [vt, pt].map(|t| t.map_or(Default::default(), |t| t.constants));
     let mut extra = Vec::new();
-    for (n, stage) in d.fixed.stage_slots.iter().enumerate() {
+    for (n, stage) in hot.fixed.stage_slots.iter().enumerate() {
         if usage[1].registers[4] & (1 << (32 + n)) != 0 {
             extra.push((288 + n, [7, 8, 9, 10].map(|k| stage[&k])));
         }
@@ -686,16 +711,16 @@ fn prepare_checked(
             extra.push((296 + n, [stage[&22], stage[&23], 0, 0]));
         }
     }
-    let pixel_constants = d.shaders.pixel_constants.snapshot(usage[1], &extra);
-    let vertex_constants = d.shaders.vertex_constants.snapshot(usage[0], &[]);
+    let pixel_constants = hot.shaders.pixel_constants.snapshot(usage[1], &extra);
+    let vertex_constants = hot.shaders.vertex_constants.snapshot(usage[0], &[]);
     let key = ProgramKey {
         vertex: vs.as_ref().map(|s| s.id),
         pixel: ps.as_ref().map(|s| s.id),
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
         second: second.is_some(),
-        features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
+        features: (hot.fixed.render[&152], hot.fixed.render[&28] != 0),
         fixed: fixed_features(
-            &d.fixed,
+            &hot.fixed,
             if vs.is_none() {
                 Some(pretransformed(env, pointer)?)
             } else {
@@ -704,6 +729,7 @@ fn prepare_checked(
         ) & if kind == 1 { u32::MAX } else { !256 },
     };
     draw.program_key = recording::hash(&key);
+    drop(hot);
     let cache = &mut env.ext.get_mut::<State>().programs;
     let program = if let Some(program) = cache.entries.get(&key) {
         program.clone()
@@ -765,11 +791,12 @@ fn texture(
     state: &adv_device::gpu::DrawState,
 ) -> Result<ProgramTexture, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
+    let hot = d.hot.borrow();
     // Extended slots share the same resource ownership rules as stage zero.
     let id = if slot == 0 {
-        d.texture
+        hot.texture
     } else {
-        *d.shaders.textures.get(slot).ok_or(INVALID)?
+        *hot.shaders.textures.get(slot).ok_or(INVALID)?
     };
     let Some(id) = id else {
         return Ok(ProgramTexture {
@@ -786,7 +813,7 @@ fn texture(
     let image = (env.ext.get::<State>().provider.target)(env.ext, r.surface.ok_or(INVALID)?)
         .ok_or(INVALID)?
         .image;
-    let mut sampler = d.fixed.program_sampler(slot)?;
+    let mut sampler = hot.fixed.program_sampler(slot)?;
     sampler.first_level = if sampler.mip.is_none() {
         r.lod
     } else {

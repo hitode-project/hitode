@@ -111,6 +111,7 @@ pub struct Services {
     pub context: u32,
     pub thread_state: *const std::ffi::c_void,
     pub user_state: *const std::ffi::c_void,
+    pub d3d9_state: *const std::ffi::c_void,
 }
 
 impl Default for Services {
@@ -124,6 +125,7 @@ impl Default for Services {
             context: 0,
             thread_state: std::ptr::null(),
             user_state: std::ptr::null(),
+            d3d9_state: std::ptr::null(),
         }
     }
 }

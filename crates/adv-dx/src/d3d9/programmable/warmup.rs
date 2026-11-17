@@ -22,7 +22,8 @@ fn schedule(
     let Some(d) = device(env, pointer) else {
         return;
     };
-    let mut ids = [d.shaders.vertex, d.shaders.pixel];
+    let hot = d.hot.borrow();
+    let mut ids = [hot.shaders.vertex, hot.shaders.pixel];
     if let Some((stage, id)) = candidate {
         ids[usize::from(stage == crate::shader::Stage::Pixel)] = Some(id);
     }
@@ -49,9 +50,12 @@ fn schedule(
         pixel: ids[1],
         inputs: inputs.iter().map(|i| (i.register, i.format)).collect(),
         second: false,
-        features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
-        fixed: fixed_features(&d.fixed, None),
+        features: (hot.fixed.render[&152], hot.fixed.render[&28] != 0),
+        fixed: fixed_features(&hot.fixed, None),
     };
+    let streams_meta = hot.buffers.streams;
+    let frequencies = hot.buffers.frequencies;
+    drop(hot);
     // The first draw is predicted to match the last one (triangle lists
     // before any); raster conversion and attachments are the draw's own.
     let (kind, up_stride) = env
@@ -80,10 +84,10 @@ fn schedule(
             (!attributes.is_empty()).then(|| VertexStream {
                 stride: up_stride
                     .filter(|_| n == 0)
-                    .unwrap_or(d.buffers.streams[n].stride),
+                    .unwrap_or(streams_meta[n].stride),
                 attributes,
-                instance: d.buffers.frequencies[0] & buffers::INDEXED_DATA != 0
-                    && d.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0,
+                instance: frequencies[0] & buffers::INDEXED_DATA != 0
+                    && frequencies[n] & buffers::INSTANCE_DATA != 0,
                 bytes: Vec::new().into(),
             })
         })

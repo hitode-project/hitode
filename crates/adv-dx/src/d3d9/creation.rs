@@ -82,7 +82,7 @@ fn set_dialogs(env: &mut Env<'_>, this: GuestPtr<()>, enable_dialogs: i32) -> u3
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    if d.scene {
+    if d.hot.borrow().scene {
         return INVALID;
     }
     // Windowed devices ignore the mode. Fullscreen dialogs need a lockable,

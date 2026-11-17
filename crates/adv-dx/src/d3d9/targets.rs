@@ -49,12 +49,23 @@ pub(super) fn release_binding(env: &mut Env<'_>, binding: Option<Id>) {
     }
 }
 
+pub(super) fn refresh_hot_id(env: &Env<'_>, device_id: Id) {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device_id) else {
+        return;
+    };
+    let size = draw_target(env, d.pointer)
+        .ok()
+        .map(|t| (t.image.width(), t.image.height()));
+    d.hot.borrow_mut().target_size = size;
+}
+
 pub(super) fn reset_binding(env: &mut Env<'_>, device: Id) {
     let old = match com(env).get_identity_mut(&mut env.sys.objects, device) {
         Some(Payload::Device(d)) => d.render_target.take(),
         _ => None,
     };
     release_binding(env, old);
+    refresh_hot_id(env, device);
 }
 
 #[win32(d3d9,name="IDirect3DDevice9::CreateRenderTarget",level=implement)]
@@ -169,13 +180,17 @@ fn set(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, surface: GuestPtr<()>)
     }
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.render_target = Some(new);
-        d.fixed.target_changed(width, height);
-        d.touch(3);
-        d.touch(4);
+        {
+            let mut hot = d.hot.borrow_mut();
+            hot.fixed.target_changed(width, height);
+            hot.touch(3);
+            hot.touch(4);
+        }
     }
     if old != Some(new) {
         release_binding(env, old);
     }
+    refresh_hot_id(env, device_id);
     0
 }
 

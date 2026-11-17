@@ -134,24 +134,35 @@ pub(in crate::d3d9) struct Snapshot {
     texture: Option<Id>,
     mask: Mask,
 }
+pub(in crate::d3d9) struct HotStateBlock {
+    pub(in crate::d3d9) device: Rc<std::cell::RefCell<super::super::HotDevice>>,
+    pub(in crate::d3d9) classes: u16,
+    pub(in crate::d3d9) fingerprints: [u128; 15],
+}
+impl HotStateBlock {
+    pub(in crate::d3d9) fn current(&self, d: &super::super::HotDevice) -> bool {
+        (0..15).all(|c| self.classes & (1 << c) == 0 || self.fingerprints[c] == d.fingerprints[c])
+    }
+}
 pub(in crate::d3d9) struct StateBlock {
     pointer: u32,
     pub(in crate::d3d9) device: Id,
     snapshot: Option<Rc<Snapshot>>,
-    fingerprints: [u128; 15],
-    classes: u16,
+    pub(in crate::d3d9) hot: Rc<std::cell::RefCell<HotStateBlock>>,
 }
 impl StateBlock {
     /// Whether every class holding a member still matches the device, so
     /// Capture and Apply change nothing.
-    fn current(&self, d: &super::super::Device) -> bool {
-        (0..15).all(|c| self.classes & (1 << c) == 0 || self.fingerprints[c] == d.fingerprints[c])
+    fn current(&self, d: &super::super::HotDevice) -> bool {
+        self.hot.borrow().current(d)
     }
-    fn members(&self, d: &super::super::Device) -> Mask {
+    fn members(&self, d: &super::super::HotDevice) -> Mask {
         let mut m = self.snapshot.as_ref().unwrap().mask.clone();
-        let changed = |class| self.fingerprints[class] != d.fingerprints[class];
+        let fingerprints = self.hot.borrow().fingerprints;
+        let classes = self.hot.borrow().classes;
+        let changed = |class| fingerprints[class] != d.fingerprints[class];
         // Classes without members never transfer, so they stay clean.
-        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & self.classes;
+        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & classes;
         if !changed(0) {
             m.render = Default::default();
             m.material = false;
@@ -201,11 +212,12 @@ impl Snapshot {
         let Payload::Device(d) = com(env).get_identity(&env.sys.objects, id)? else {
             return None;
         };
+        let hot = d.hot.borrow();
         Some(Self {
             fixed: fixed::Fixed {
-                fvf: d.fixed.fvf,
-                render: d.fixed.render.capture(mask.render.iter()),
-                stage: d.fixed.stage.capture(mask.stage.iter()),
+                fvf: hot.fixed.fvf,
+                render: hot.fixed.render.capture(mask.render.iter()),
+                stage: hot.fixed.stage.capture(mask.stage.iter()),
                 stage_slots: std::array::from_fn(|slot| {
                     let keys: Slots<i32, 4> = mask
                         .stage_slots
@@ -213,9 +225,9 @@ impl Snapshot {
                         .filter(|&(n, _)| n == slot)
                         .map(|(_, i)| i)
                         .collect();
-                    d.fixed.stage_slots[slot].capture(keys.iter())
+                    hot.fixed.stage_slots[slot].capture(keys.iter())
                 }),
-                sampler: d.fixed.sampler.capture(mask.sampler.iter()),
+                sampler: hot.fixed.sampler.capture(mask.sampler.iter()),
                 sampler_slots: std::array::from_fn(|slot| {
                     let keys: Slots<i32, 4> = mask
                         .sampler_slots
@@ -223,18 +235,18 @@ impl Snapshot {
                         .filter(|&(n, _)| n == slot)
                         .map(|(_, i)| i)
                         .collect();
-                    d.fixed.sampler_slots[slot].capture(keys.iter())
+                    hot.fixed.sampler_slots[slot].capture(keys.iter())
                 }),
-                viewport: d.fixed.viewport,
-                scissor: d.fixed.scissor,
-                transforms: d.fixed.transforms,
-                clip_planes: d.fixed.clip_planes,
-                material: d.fixed.material,
-                lights: d.fixed.lights.clone(),
+                viewport: hot.fixed.viewport,
+                scissor: hot.fixed.scissor,
+                transforms: hot.fixed.transforms,
+                clip_planes: hot.fixed.clip_planes,
+                material: hot.fixed.material,
+                lights: hot.fixed.lights.clone(),
             },
-            shaders: d.shaders.clone(),
-            buffers: d.buffers.clone(),
-            texture: d.texture,
+            shaders: hot.shaders.clone(),
+            buffers: hot.buffers.clone(),
+            texture: hot.texture,
             mask,
         })
     }
@@ -284,7 +296,7 @@ pub(in crate::d3d9) fn unchanged(env: &mut Env<'_>, pointer: u32, _capture: bool
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
         return false;
     };
-    let unchanged = d.recording.is_none() && b.current(d);
+    let unchanged = d.recording.is_none() && b.current(&d.hot.borrow());
     #[cfg(feature = "d3d9-counters")]
     if unchanged && !_capture {
         count_apply(env, 0);
@@ -306,31 +318,21 @@ pub(in crate::d3d9) enum FixedKey {
     Transform(usize),
     ClipPlane(usize),
 }
-pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey, changed: bool) {
-    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
-    else {
-        return;
-    };
-    let Some(r) = d.recording.as_mut() else {
-        if !changed {
-            return;
+impl FixedKey {
+    pub(in crate::d3d9) fn class(&self) -> usize {
+        match self {
+            Self::Fvf => 7,
+            Self::Render(_) | Self::Material | Self::Light(_) | Self::LightEnable(_) => 0,
+            Self::Stage(_) | Self::StageSlot(_, _) => 1,
+            Self::Sampler(_) | Self::SamplerSlot(_, _) => 2,
+            Self::Viewport => 3,
+            Self::Scissor => 4,
+            Self::Transform(_) => 5,
+            Self::ClipPlane(_) => 6,
         }
-        let class = match key {
-            FixedKey::Fvf => 7,
-            FixedKey::Render(_)
-            | FixedKey::Material
-            | FixedKey::Light(_)
-            | FixedKey::LightEnable(_) => 0,
-            FixedKey::Stage(_) | FixedKey::StageSlot(_, _) => 1,
-            FixedKey::Sampler(_) | FixedKey::SamplerSlot(_, _) => 2,
-            FixedKey::Viewport => 3,
-            FixedKey::Scissor => 4,
-            FixedKey::Transform(_) => 5,
-            FixedKey::ClipPlane(_) => 6,
-        };
-        d.touch(class);
-        return;
-    };
+    }
+}
+pub(in crate::d3d9) fn record_fixed_key(r: &mut Snapshot, key: FixedKey) {
     match key {
         FixedKey::Fvf => r.mask.fvf = true,
         FixedKey::Material => r.mask.material = true,
@@ -504,6 +506,7 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
     let Payload::Device(d) = com(env).get_identity(&env.sys.objects, device)? else {
         return None;
     };
+    let hot = d.hot.borrow();
     let all = kind == 1;
     let vertex = all || kind == 3;
     let pixel = all || kind == 2;
@@ -520,12 +523,12 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         dirty: 0,
         material: vertex,
         lights: if vertex {
-            d.fixed.lights.keys().copied().collect()
+            hot.fixed.lights.keys().copied().collect()
         } else {
             Default::default()
         },
         light_enable: if vertex {
-            d.fixed.lights.keys().copied().collect()
+            hot.fixed.lights.keys().copied().collect()
         } else {
             Default::default()
         },
@@ -560,7 +563,7 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         } else {
             Slots::default()
         },
-        render: d
+        render: hot
             .fixed
             .render
             .keys()
@@ -570,14 +573,14 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
                     || (pixel && (matches!(*i, 9 | 36 | 37 | 38) || !vertex_render.contains(i)))
             })
             .collect(),
-        stage: d
+        stage: hot
             .fixed
             .stage
             .keys()
             .copied()
             .filter(|i| all || (vertex && matches!(i, 11 | 24)) || (pixel && !matches!(i, 11 | 24)))
             .collect(),
-        stage_slots: d
+        stage_slots: hot
             .fixed
             .stage_slots
             .iter()
@@ -593,11 +596,11 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
             })
             .collect(),
         sampler: if pixel {
-            d.fixed.sampler.keys().copied().collect()
+            hot.fixed.sampler.keys().copied().collect()
         } else {
             Slots::default()
         },
-        sampler_slots: d
+        sampler_slots: hot
             .fixed
             .sampler_slots
             .iter()
@@ -627,6 +630,16 @@ fn make(
     output: GuestPtr<u32>,
     fingerprints: [u128; 15],
 ) -> u32 {
+    let Some(hot_device) = com(env)
+        .get_identity(&env.sys.objects, device)
+        .and_then(|p| match p {
+            Payload::Device(d) => Some(Rc::clone(&d.hot)),
+            _ => None,
+        })
+    else {
+        release_snapshot(env, snapshot);
+        return INVALID;
+    };
     if com(env)
         .add_ref_identity(&mut env.sys.objects, device)
         .is_none()
@@ -635,6 +648,11 @@ fn make(
         return OUT_OF_MEMORY;
     }
     let retained = snapshot.identities();
+    let hot = Rc::new(std::cell::RefCell::new(HotStateBlock {
+        device: hot_device,
+        classes: snapshot.mask.classes(),
+        fingerprints,
+    }));
     let Some((pointer, id)) = object(
         env,
         "IDirect3DStateBlock9",
@@ -642,9 +660,8 @@ fn make(
         Payload::StateBlock(Box::new(StateBlock {
             pointer: 0,
             device,
-            classes: snapshot.mask.classes(),
             snapshot: Some(Rc::new(snapshot)),
-            fingerprints,
+            hot: Rc::clone(&hot),
         })),
     ) else {
         for id in retained {
@@ -656,6 +673,11 @@ fn make(
     if let Some(Payload::StateBlock(b)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         b.pointer = pointer;
     }
+    env.ext
+        .get::<State>()
+        .shared
+        .borrow_mut()
+        .register_state_block(pointer, hot);
     if output.write(env.cpu, pointer).is_err() {
         release(env, pointer);
         return INVALID;
@@ -685,7 +707,7 @@ pub(in crate::d3d9) fn create(
     if !retain_snapshot(env, &snapshot) {
         return OUT_OF_MEMORY;
     }
-    let fingerprints = device(env, this.addr()).unwrap().fingerprints;
+    let fingerprints = device(env, this.addr()).unwrap().hot.borrow().fingerprints;
     make(env, id, snapshot, output, fingerprints)
 }
 #[win32(d3d9,name="IDirect3DDevice9::BeginStateBlock",level=state)]
@@ -701,6 +723,7 @@ pub(in crate::d3d9) fn begin(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     d.recording = Some(snapshot);
+    d.hot.borrow_mut().recording = true;
     0
 }
 #[win32(d3d9,name="IDirect3DDevice9::EndStateBlock",level=implement)]
@@ -717,6 +740,7 @@ pub(in crate::d3d9) fn end(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestP
     let Some(snapshot) = d.recording.take() else {
         return INVALID;
     };
+    d.hot.borrow_mut().recording = false;
     make(env, id, snapshot, output, [u128::MAX; 15])
 }
 #[win32(d3d9,name="IDirect3DStateBlock9::GetDevice",level=implement)]
@@ -753,27 +777,36 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    if b.current(d) {
+    let (unchanged, mask, fingerprints) = {
+        let hot = d.hot.borrow();
+        if b.current(&hot) {
+            (true, Mask::default(), [0; 15])
+        } else {
+            (false, b.members(&hot), hot.fingerprints)
+        }
+    };
+    if unchanged {
         return 0;
     }
-    let mask = b.members(d);
-    let fingerprints = d.fingerprints;
     if mask.dirty == 0 {
         let Some(Payload::StateBlock(b)) =
             com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
         else {
             unreachable!()
         };
-        b.fingerprints = fingerprints;
+        b.hot.borrow_mut().fingerprints = fingerprints;
         return 0;
     }
-    let changes = changes(
-        &old.shaders,
-        &old.buffers,
-        old.texture,
-        (&d.shaders, &d.buffers, d.texture),
-        &mask,
-    );
+    let changes = {
+        let hot = d.hot.borrow();
+        changes(
+            &old.shaders,
+            &old.buffers,
+            old.texture,
+            (&hot.shaders, &hot.buffers, hot.texture),
+            &mask,
+        )
+    };
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
@@ -787,23 +820,26 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         unreachable!();
     };
-    transfer(
-        (
-            || &mut old.fixed,
-            &mut old.shaders,
-            &mut old.buffers,
-            &mut old.texture,
-        ),
-        (&d.fixed, &d.shaders, &d.buffers, d.texture),
-        &mask,
-    );
+    {
+        let hot = d.hot.borrow();
+        transfer(
+            (
+                || &mut old.fixed,
+                &mut old.shaders,
+                &mut old.buffers,
+                &mut old.texture,
+            ),
+            (&hot.fixed, &hot.shaders, &hot.buffers, hot.texture),
+            &mask,
+        );
+    }
     let Some(Payload::StateBlock(b)) =
         com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
         unreachable!();
     };
     b.snapshot = Some(snapshot);
-    b.fingerprints = fingerprints;
+    b.hot.borrow_mut().fingerprints = fingerprints;
     release_changes(env, &changes);
     0
 }
@@ -831,67 +867,83 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    if b.current(d) {
+    let (unchanged, mask, fingerprints) = {
+        let hot = d.hot.borrow();
+        if b.current(&hot) {
+            (true, Mask::default(), [0; 15])
+        } else {
+            (false, b.members(&hot), hot.fingerprints)
+        }
+    };
+    if unchanged {
         #[cfg(feature = "d3d9-counters")]
         count_apply(env, 0);
         return 0;
     }
-    let mask = b.members(d);
-    let fingerprints = d.fingerprints;
     if mask.dirty == 0 {
         let Some(Payload::StateBlock(b)) =
             com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
         else {
             unreachable!()
         };
-        b.fingerprints = fingerprints;
+        b.hot.borrow_mut().fingerprints = fingerprints;
         #[cfg(feature = "d3d9-counters")]
         count_apply(env, 0);
         return 0;
     }
     let snapshot = Rc::clone(snapshot);
-    let changes = changes(
-        &d.shaders,
-        &d.buffers,
-        d.texture,
-        (&snapshot.shaders, &snapshot.buffers, snapshot.texture),
-        &mask,
-    );
+    let changes = {
+        let hot = d.hot.borrow();
+        changes(
+            &hot.shaders,
+            &hot.buffers,
+            hot.texture,
+            (&snapshot.shaders, &snapshot.buffers, snapshot.texture),
+            &mask,
+        )
+    };
     if !retain_changes(env, &changes) {
         return OUT_OF_MEMORY;
     }
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
-    transfer(
-        (
-            || &mut *d.fixed,
-            &mut d.shaders,
-            &mut d.buffers,
-            &mut d.texture,
-        ),
-        (
-            &snapshot.fixed,
-            &snapshot.shaders,
-            &snapshot.buffers,
-            snapshot.texture,
-        ),
-        &mask,
-    );
-    // Other blocks must observe the restored classes; this block now matches.
-    for (class, v) in d.versions.iter_mut().enumerate() {
-        if mask.dirty & (1 << class) != 0 {
-            *v = v.checked_add(1).expect("state version exhausted");
+    let fingerprints = {
+        let mut hot = d.hot.borrow_mut();
+        let hot = &mut *hot;
+        transfer(
+            (
+                || &mut *hot.fixed,
+                &mut hot.shaders,
+                &mut hot.buffers,
+                &mut hot.texture,
+            ),
+            (
+                &snapshot.fixed,
+                &snapshot.shaders,
+                &snapshot.buffers,
+                snapshot.texture,
+            ),
+            &mask,
+        );
+        // Other blocks must observe the restored classes; this block now matches.
+        for (class, v) in hot.versions.iter_mut().enumerate() {
+            if mask.dirty & (1 << class) != 0 {
+                *v = v.checked_add(1).expect("state version exhausted");
+            }
         }
+        hot.refresh(u32::from(mask.dirty));
+        hot.fingerprints
+    };
+    if mask.dirty & ((1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12)) != 0 {
+        super::super::sync_hot_bindings(env, id, u32::from(mask.dirty));
     }
-    d.refresh(u32::from(mask.dirty));
-    let fingerprints = d.fingerprints;
     let Some(Payload::StateBlock(b)) =
         com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
         unreachable!();
     };
-    b.fingerprints = fingerprints;
+    b.hot.borrow_mut().fingerprints = fingerprints;
     #[cfg(feature = "d3d9-counters")]
     count_apply(env, mask.items());
     release_changes(env, &changes);
@@ -1195,10 +1247,12 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        let fixed = &mut *d.fixed;
+        let mut hot = d.hot.borrow_mut();
+        let fixed = &mut *hot.fixed;
         let z_enable = 1 - fixed.render[&7];
         fixed.render.insert(7, z_enable);
-        d.touch(0);
+        hot.touch(0);
+        drop(hot);
         assert_eq!(apply(&mut env, this), 0);
         assert_eq!(apply(&mut env, this), 0);
         let work = env.ext.get::<State>().frames;
@@ -1236,17 +1290,30 @@ mod tests {
         assert_eq!(capture(&mut env, this_block), 0);
         let b = block(&env, this_block.addr()).unwrap();
         assert_eq!(Rc::as_ptr(b.snapshot.as_ref().unwrap()), saved);
-        assert_eq!(b.fingerprints, device(&env, pointer).unwrap().fingerprints);
+        assert_eq!(
+            b.hot.borrow().fingerprints,
+            device(&env, pointer).unwrap().hot.borrow().fingerprints
+        );
         assert_eq!(fixed::set_render(&mut env, this, 14, 1), 0);
         assert_eq!(apply(&mut env, this_block), 0);
         assert_eq!(
-            block(&env, this_block.addr()).unwrap().fingerprints,
-            device(&env, pointer).unwrap().fingerprints
+            block(&env, this_block.addr())
+                .unwrap()
+                .hot
+                .borrow()
+                .fingerprints,
+            device(&env, pointer).unwrap().hot.borrow().fingerprints
         );
         assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
         assert_eq!(apply(&mut env, this_block), 0);
-        assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
-        assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 1);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().fixed.render[&22],
+            3
+        );
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().fixed.render[&14],
+            1
+        );
     }
 
     #[test]
@@ -1272,34 +1339,44 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(fixed::set_render(&mut env, this, 14, 0), 0);
             assert_eq!(apply(&mut env, block_this), 0);
-            assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 0);
+            assert_eq!(
+                device(&env, pointer).unwrap().hot.borrow().fixed.render[&14],
+                0
+            );
             assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
             assert_eq!(apply(&mut env, block_this), 0);
-            assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
+            assert_eq!(
+                device(&env, pointer).unwrap().hot.borrow().fixed.render[&22],
+                3
+            );
             assert_eq!(capture(&mut env, block_this), 0);
         }
         assert_eq!(fixed::set_render(&mut env, this, 22, 2), 0);
         assert_eq!(capture(&mut env, block_this), 0);
         assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
         assert_eq!(apply(&mut env, block_this), 0);
-        assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 2);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().fixed.render[&22],
+            2
+        );
     }
 
     fn fingerprint(d: &super::super::super::Device) -> u128 {
+        let hot = d.hot.borrow();
         super::super::super::recording::hash((
-            super::super::super::recording::fixed_key(&d.fixed),
-            d.shaders
+            super::super::super::recording::fixed_key(&hot.fixed),
+            hot.shaders
                 .vertex_constants
                 .floats
                 .map(|r| r.map(f32::to_bits)),
-            d.shaders.vertex_constants.integers,
-            d.shaders.vertex_constants.booleans,
-            d.shaders
+            hot.shaders.vertex_constants.integers,
+            hot.shaders.vertex_constants.booleans,
+            hot.shaders
                 .pixel_constants
                 .floats
                 .map(|r| r.map(f32::to_bits)),
-            d.shaders.pixel_constants.integers,
-            d.shaders.pixel_constants.booleans,
+            hot.shaders.pixel_constants.integers,
+            hot.shaders.pixel_constants.booleans,
         ))
     }
 
@@ -1325,13 +1402,15 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        let fixed = &mut *d.fixed;
-        let z_enable = 1 - fixed.render[&7];
-        fixed.render.insert(7, z_enable);
-        d.touch(0);
+        {
+            let mut hot = d.hot.borrow_mut();
+            let z_enable = 1 - hot.fixed.render[&7];
+            hot.fixed.render.insert(7, z_enable);
+            hot.touch(0);
+        }
         let b = block(&env, this.addr()).unwrap();
         let d = device(&env, pointer).unwrap();
-        let members = b.members(d);
+        let members = b.members(&d.hot.borrow());
         assert!(members.render.contains(&7));
         assert_eq!(members.dirty, 1);
         assert_eq!(capture(&mut env, this), 0);
@@ -1343,63 +1422,77 @@ mod tests {
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        let fixed = &mut *d.fixed;
-        for value in fixed.render.values_mut() {
-            *value ^= 1;
-        }
-        for map in std::iter::once(&mut fixed.stage)
-            .chain(&mut fixed.stage_slots)
-            .chain(std::iter::once(&mut fixed.sampler))
-            .chain(fixed.sampler_slots.iter_mut().skip(1))
         {
-            for value in map.values_mut() {
+            let mut hot = d.hot.borrow_mut();
+            let fixed = &mut *hot.fixed;
+            for value in fixed.render.values_mut() {
                 *value ^= 1;
             }
+            for map in std::iter::once(&mut fixed.stage)
+                .chain(&mut fixed.stage_slots)
+                .chain(std::iter::once(&mut fixed.sampler))
+                .chain(fixed.sampler_slots.iter_mut().skip(1))
+            {
+                for value in map.values_mut() {
+                    *value ^= 1;
+                }
+            }
+            fixed.fvf ^= 4;
+            fixed.viewport.MinZ = -0.;
+            fixed.scissor.left = 1;
+            fixed.transforms.fill([2.; 16]);
+            fixed.clip_planes.fill([3.; 4]);
+            let shaders = &mut hot.shaders;
+            for (constants, limit) in [
+                (&mut shaders.vertex_constants, 256),
+                (&mut shaders.pixel_constants, 224),
+            ] {
+                constants.floats[..limit].fill([f32::from_bits(0x7fc0_1234); 4]);
+                constants.integers.fill([-7; 4]);
+                constants.booleans.fill(-1);
+            }
+            hot.refresh_all();
         }
-        fixed.fvf ^= 4;
-        fixed.viewport.MinZ = -0.;
-        fixed.scissor.left = 1;
-        fixed.transforms.fill([2.; 16]);
-        fixed.clip_planes.fill([3.; 4]);
-        for (constants, limit) in [
-            (&mut d.shaders.vertex_constants, 256),
-            (&mut d.shaders.pixel_constants, 224),
-        ] {
-            constants.floats[..limit].fill([f32::from_bits(0x7fc0_1234); 4]);
-            constants.integers.fill([-7; 4]);
-            constants.booleans.fill(-1);
-        }
-        d.refresh_all();
         assert_eq!(apply(&mut env, this), 0);
         assert_eq!(fingerprint(device(&env, pointer).unwrap()), expected);
-        let versions = device(&env, pointer).unwrap().versions;
+        let versions = device(&env, pointer).unwrap().hot.borrow().versions;
         assert_eq!(apply(&mut env, this), 0);
-        assert_eq!(device(&env, pointer).unwrap().versions, versions);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().versions,
+            versions
+        );
         // Mutate after Capture, then compare the optimized path with full transfer.
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        d.shaders.vertex_constants.floats[3][0] = -0.;
-        d.touch(13);
+        {
+            let mut hot = d.hot.borrow_mut();
+            hot.shaders.vertex_constants.floats[3][0] = -0.;
+            hot.touch(13);
+        }
         let snapshot = Rc::clone(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
-        transfer(
-            (
-                || &mut *d.fixed,
-                &mut d.shaders,
-                &mut d.buffers,
-                &mut d.texture,
-            ),
-            (
-                &snapshot.fixed,
-                &snapshot.shaders,
-                &snapshot.buffers,
-                snapshot.texture,
-            ),
-            &snapshot.mask,
-        );
+        {
+            let mut hot = d.hot.borrow_mut();
+            let hot = &mut *hot;
+            transfer(
+                (
+                    || &mut *hot.fixed,
+                    &mut hot.shaders,
+                    &mut hot.buffers,
+                    &mut hot.texture,
+                ),
+                (
+                    &snapshot.fixed,
+                    &snapshot.shaders,
+                    &snapshot.buffers,
+                    snapshot.texture,
+                ),
+                &snapshot.mask,
+            );
+        }
         assert_eq!(fingerprint(d), expected);
         drop(snapshot);
         assert_eq!(apply(&mut env, this), 0);

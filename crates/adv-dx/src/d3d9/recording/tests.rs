@@ -526,17 +526,19 @@ fn fixed_key_cache_tracks_setters_stateblock_apply_and_reset_between_draws() {
         let pointer = f.device;
         let e = env(f);
         let d = device(&e, pointer).unwrap();
-        let fresh = fixed_key(&d.fixed);
-        assert_eq!(d.fixed.key(), fresh);
+        let hot = d.hot.borrow();
+        let fresh = fixed_key(&hot.fixed);
+        assert_eq!(hot.fixed.key(), fresh);
         let empty = xxhash_rust::xxh3::Xxh3::new().digest128();
         let expected = hash((
             fresh,
-            d.shaders.vertex,
-            d.shaders.pixel,
-            d.buffers.declaration,
+            hot.shaders.vertex,
+            hot.shaders.pixel,
+            hot.buffers.declaration,
             empty,
             empty,
         ));
+        drop(hot);
         assert_eq!(draw_key(&e, pointer), expected);
         assert_eq!(draw_key(&e, pointer), expected);
         (fresh, expected)
@@ -1151,14 +1153,17 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
             Some(Payload::Device(d)) => d,
             _ => unreachable!(),
         };
-        match n {
-            0 => d.shaders.vertex = Some(first),
-            1 => d.shaders.pixel = Some(first),
-            2 => d.buffers.declaration = Some(first),
-            3 => d.shaders.vertex_constants.floats[0][0] = -0.0,
-            4 => d.shaders.pixel_constants.integers[0][0] = 1,
-            _ => d.shaders.pixel_constants.booleans[0] = 2,
-        };
+        {
+            let mut hot = d.hot.borrow_mut();
+            match n {
+                0 => hot.shaders.vertex = Some(first),
+                1 => hot.shaders.pixel = Some(first),
+                2 => hot.buffers.declaration = Some(first),
+                3 => hot.shaders.vertex_constants.floats[0][0] = -0.0,
+                4 => hot.shaders.pixel_constants.integers[0][0] = 1,
+                _ => hot.shaders.pixel_constants.booleans[0] = 2,
+            };
+        }
         assert_eq!(
             draw_key(&env(&mut f), pointer) != baseline,
             n < 3,
@@ -1167,8 +1172,9 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         if let Some(Payload::Device(d)) =
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {
-            d.shaders = shaders::Bindings::default();
-            d.buffers = buffers::Bindings::default();
+            let mut hot = d.hot.borrow_mut();
+            hot.shaders = shaders::Bindings::default();
+            hot.buffers = buffers::Bindings::default();
         }
     }
     let mut keys = Vec::new();
@@ -1176,8 +1182,9 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         if let Some(Payload::Device(d)) =
             com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
         {
-            d.texture = Some(resource);
-            d.versions[12] += 1;
+            let mut hot = d.hot.borrow_mut();
+            hot.texture = Some(resource);
+            hot.versions[12] += 1;
         }
         clear(&mut f, 0xff000000);
         let mut d = draw(&mut f);
@@ -1190,8 +1197,9 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
     if let Some(Payload::Device(d)) =
         com(&env(&mut f)).get_identity_mut(&mut f.m.sys.objects, owner)
     {
-        d.texture = None;
-        d.versions[12] += 1;
+        let mut hot = d.hot.borrow_mut();
+        hot.texture = None;
+        hot.versions[12] += 1;
     }
     let locked = f.lock(source, 0, 0);
     f.m.cpu.write(locked.pBits, &vec![64; 16 * 12 * 4]).unwrap();

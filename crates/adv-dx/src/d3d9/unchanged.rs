@@ -38,14 +38,15 @@ fn rebinds(env: &Env<'_>, name: &str) -> Option<bool> {
     if d.recording.is_some() {
         return Some(false);
     }
+    let hot = d.hot.borrow();
     let (old, pointer) = match name {
-        "IDirect3DDevice9::SetFVF" => (d.buffers.declaration, 0),
-        "IDirect3DDevice9::SetVertexDeclaration" => (d.buffers.declaration, arg(1)?),
-        "IDirect3DDevice9::SetVertexShader" => (d.shaders.vertex, arg(1)?),
-        "IDirect3DDevice9::SetPixelShader" => (d.shaders.pixel, arg(1)?),
-        "IDirect3DDevice9::SetIndices" => (d.buffers.indices, arg(1)?),
+        "IDirect3DDevice9::SetFVF" => (hot.buffers.declaration, 0),
+        "IDirect3DDevice9::SetVertexDeclaration" => (hot.buffers.declaration, arg(1)?),
+        "IDirect3DDevice9::SetVertexShader" => (hot.shaders.vertex, arg(1)?),
+        "IDirect3DDevice9::SetPixelShader" => (hot.shaders.pixel, arg(1)?),
+        "IDirect3DDevice9::SetIndices" => (hot.buffers.indices, arg(1)?),
         "IDirect3DDevice9::SetStreamSource" => {
-            (d.buffers.streams.get(arg(1)? as usize)?.buffer, arg(2)?)
+            (hot.buffers.streams.get(arg(1)? as usize)?.buffer, arg(2)?)
         }
         "IDirect3DDevice9::SetTexture" => {
             let slot = programmable::sampler_slot(arg(1)?)?;
@@ -59,9 +60,9 @@ fn rebinds(env: &Env<'_>, name: &str) -> Option<bool> {
                 return Some(false);
             }
             let old = if slot == 0 {
-                d.texture
+                hot.texture
             } else {
-                d.shaders.textures[slot]
+                hot.shaders.textures[slot]
             };
             (old, pointer)
         }
@@ -77,10 +78,10 @@ fn rebinds(env: &Env<'_>, name: &str) -> Option<bool> {
     }
     Some(match name {
         // FVF 0 is never accepted; any other bound FVF was validated.
-        "IDirect3DDevice9::SetFVF" => d.fixed.fvf != 0 && arg(1) == Some(d.fixed.fvf),
-        "IDirect3DDevice9::SetVertexDeclaration" => d.fixed.fvf == 0,
+        "IDirect3DDevice9::SetFVF" => hot.fixed.fvf != 0 && arg(1) == Some(hot.fixed.fvf),
+        "IDirect3DDevice9::SetVertexDeclaration" => hot.fixed.fvf == 0,
         "IDirect3DDevice9::SetStreamSource" => {
-            let stream = &d.buffers.streams[arg(1)? as usize];
+            let stream = &hot.buffers.streams[arg(1)? as usize];
             new.is_none() || (arg(3) == Some(stream.offset) && arg(4) == Some(stream.stride))
         }
         _ => true,

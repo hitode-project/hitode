@@ -50,6 +50,9 @@ fn add(env: &mut Env<'_>, this: GuestPtr<()>, rectangle: GuestPtr<RECT>) -> Outc
             None => level.mark_all(),
         }
     }
+    if let Some(id) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) {
+        resources::invalidate_hot_texture(env, id);
+    }
     if deferred {
         Outcome::Return(0)
     } else {
@@ -192,6 +195,7 @@ fn uploaded(env: &mut Env<'_>, id: Id, index: u32, rectangle: Rect, outcome: Out
                 r.levels[index as usize].upload_probe = None;
                 r.levels[index as usize].lock = None;
             }
+            resources::invalidate_hot_texture(env, id);
             Outcome::Return(error)
         }
         Outcome::Block {

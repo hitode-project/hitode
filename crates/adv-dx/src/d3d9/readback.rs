@@ -352,8 +352,17 @@ fn locked_rect(r: &Resource, rectangle: Rect) -> D3DLOCKED_RECT {
     }
 }
 fn set_lock(env: &mut Env<'_>, resource: Id, lock: Option<Lock>) {
-    if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, resource) {
+    let device = if let Some(Payload::Resource(r)) =
+        com(env).get_identity_mut(&mut env.sys.objects, resource)
+    {
         r.lock = lock;
+        Some(r.device)
+    } else {
+        None
+    };
+    if let Some(device) = device {
+        super::targets::refresh_hot_id(env, device);
+        resources::invalidate_hot_texture(env, resource);
     }
 }
 #[win32(d3d9,name="IDirect3DSurface9::UnlockRect",level=implement)]
@@ -442,23 +451,26 @@ pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled:
     if let Operation::Upload {
         resource, level, ..
     } = operation
-        && let Some(Payload::Resource(r)) =
-            com(env).get_identity_mut(&mut env.sys.objects, *resource)
     {
-        if let Some(level) = level {
-            if let Some(selected) = r.levels.get_mut(*level as usize) {
-                selected.mark_all();
-                if cancelled {
-                    selected.lock = None;
-                } else if let Some(lock) = &mut selected.lock {
-                    lock.ready = true;
+        if let Some(Payload::Resource(r)) =
+            com(env).get_identity_mut(&mut env.sys.objects, *resource)
+        {
+            if let Some(level) = level {
+                if let Some(selected) = r.levels.get_mut(*level as usize) {
+                    selected.mark_all();
+                    if cancelled {
+                        selected.lock = None;
+                    } else if let Some(lock) = &mut selected.lock {
+                        lock.ready = true;
+                    }
                 }
+            } else if cancelled {
+                r.lock = None;
+            } else if let Some(lock) = &mut r.lock {
+                lock.ready = true;
             }
-        } else if cancelled {
-            r.lock = None;
-        } else if let Some(lock) = &mut r.lock {
-            lock.ready = true;
         }
+        resources::invalidate_hot_texture(env, *resource);
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]

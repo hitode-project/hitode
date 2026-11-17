@@ -41,6 +41,9 @@ fn surfaces(env: &mut Env<'_>, id: Id, views: &[Option<u32>], dirty: bool) {
             r.surface = surface;
         }
     }
+    if dirty {
+        resources::invalidate_hot_texture(env, id);
+    }
 }
 
 #[win32(d3d9, name = "IDirect3DDevice9::EvictManagedResources", level = implement)]
@@ -51,11 +54,13 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
-    let bound: Vec<_> = d
-        .texture
-        .into_iter()
-        .chain(d.shaders.textures.iter().copied().flatten())
-        .collect();
+    let bound: Vec<_> = {
+        let hot = d.hot.borrow();
+        hot.texture
+            .into_iter()
+            .chain(hot.shaders.textures.iter().copied().flatten())
+            .collect()
+    };
     let recording = d.recording.is_some();
     let identities: Vec<_> = d.children.values().copied().collect();
     let mut textures = Vec::new();

@@ -343,6 +343,8 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
     assert!(
         super::super::device(&env(&mut machine), device)
             .unwrap()
+            .hot
+            .borrow()
             .texture
             .is_none()
     );
@@ -388,6 +390,8 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
     assert!(
         super::super::device(&env(&mut machine), device)
             .unwrap()
+            .hot
+            .borrow()
             .texture
             .is_none()
     );

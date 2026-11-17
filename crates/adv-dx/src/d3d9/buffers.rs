@@ -412,7 +412,7 @@ fn set_stream(
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let Some(old) = d.buffers.streams.get(stream as usize).copied() else {
+    let Some(old) = d.hot.borrow().buffers.streams.get(stream as usize).copied() else {
         return INVALID;
     };
     let device = com(env)
@@ -432,14 +432,17 @@ fn set_stream(
     {
         return 0;
     }
-    if let Some(new) = new {
+    let (new_ptr, new_len) = if let Some(new) = new {
         let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, new) else {
             return INVALID;
         };
         if b.kind != Kind::Vertex || b.device != device || offset > b.len || stride > 2048 {
             return INVALID;
         }
-    }
+        (b.pointer, b.len)
+    } else {
+        (0, 0)
+    };
     let recorded = Stream {
         buffer: new,
         offset: if new.is_some() { offset } else { old.offset },
@@ -457,12 +460,17 @@ fn set_stream(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.buffers.streams[stream as usize] = Stream {
-        buffer: new,
-        offset: if new.is_some() { offset } else { old.offset },
-        stride: if new.is_some() { stride } else { old.stride },
-    };
-    d.touch(10);
+    {
+        let mut hot = d.hot.borrow_mut();
+        hot.buffers.streams[stream as usize] = Stream {
+            buffer: new,
+            offset: if new.is_some() { offset } else { old.offset },
+            stride: if new.is_some() { stride } else { old.stride },
+        };
+        hot.stream_ptrs[stream as usize] = new_ptr;
+        hot.stream_lens[stream as usize] = new_len;
+        hot.touch(10);
+    }
     if new != old.buffer
         && let Some(id) = old.buffer
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -486,7 +494,7 @@ fn get_stream(
     if d.needs_reset {
         return INVALID;
     }
-    let Some(s) = d.buffers.streams.get(stream as usize).copied() else {
+    let Some(s) = d.hot.borrow().buffers.streams.get(stream as usize).copied() else {
         return INVALID;
     };
     if [output, offset, stride]
@@ -518,24 +526,33 @@ fn get_stream(
     }
     0
 }
-#[win32(d3d9, name = "IDirect3DDevice9::SetStreamSourceFreq", level = implement)]
-fn set_stream_freq(env: &mut Env<'_>, this: GuestPtr<()>, stream: u32, setting: u32) -> u32 {
-    if device(env, this.addr()).is_none()
-        || stream >= 16
+pub(super) fn check_stream_freq(stream: u32, setting: u32) -> Result<bool, u32> {
+    if stream >= 16
         || setting & 0x3fff_ffff == 0
         || setting & (INDEXED_DATA | INSTANCE_DATA) == (INDEXED_DATA | INSTANCE_DATA)
         || (stream == 0 && setting & INSTANCE_DATA != 0)
         || (stream != 0 && setting & INDEXED_DATA != 0)
     {
+        return Err(INVALID);
+    }
+    Ok(setting == 1 || setting & INDEXED_DATA != 0 || setting == INSTANCE_DATA | 1)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetStreamSourceFreq", level = implement)]
+fn set_stream_freq(env: &mut Env<'_>, this: GuestPtr<()>, stream: u32, setting: u32) -> u32 {
+    if device(env, this.addr()).is_none() {
         return INVALID;
     }
-    if setting != 1 && setting & INDEXED_DATA == 0 && setting != INSTANCE_DATA | 1 {
-        adv_abi::warn_unavailable(
-            env,
-            "IDirect3DDevice9::SetStreamSourceFreq",
-            "stream divisors other than one are unavailable",
-        );
-        return UNAVAILABLE;
+    match check_stream_freq(stream, setting) {
+        Err(code) => return code,
+        Ok(false) => {
+            adv_abi::warn_unavailable(
+                env,
+                "IDirect3DDevice9::SetStreamSourceFreq",
+                "stream divisors other than one are unavailable",
+            );
+            return UNAVAILABLE;
+        }
+        Ok(true) => {}
     }
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -543,9 +560,12 @@ fn set_stream_freq(env: &mut Env<'_>, this: GuestPtr<()>, stream: u32, setting: 
     };
     if let Some(record) = &mut d.recording {
         super::shaders::stateblocks::record_frequency(record, stream as usize, setting);
-    } else if d.buffers.frequencies[stream as usize] != setting {
-        d.buffers.frequencies[stream as usize] = setting;
-        d.touch(10);
+    } else {
+        let mut hot = d.hot.borrow_mut();
+        if hot.buffers.frequencies[stream as usize] != setting {
+            hot.buffers.frequencies[stream as usize] = setting;
+            hot.touch(10);
+        }
     }
     0
 }
@@ -559,7 +579,7 @@ fn get_stream_freq(
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let Some(&setting) = d.buffers.frequencies.get(stream as usize) else {
+    let Some(&setting) = d.hot.borrow().buffers.frequencies.get(stream as usize) else {
         return INVALID;
     };
     output.write(env.cpu, setting).map_or(INVALID, |()| 0)
@@ -569,7 +589,7 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let old = d.buffers.indices;
+    let old = d.hot.borrow().buffers.indices;
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
@@ -584,7 +604,13 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     if d.recording.is_none() && new == old {
         return 0;
     }
-    if new.is_some_and(|new| !matches!(com(env).get_identity(&env.sys.objects, new), Some(Payload::Buffer(b)) if b.kind == Kind::Index && b.device == device)) { return INVALID; }
+    let new_ptr = match new {
+        Some(new) => match com(env).get_identity(&env.sys.objects, new) {
+            Some(Payload::Buffer(b)) if b.kind == Kind::Index && b.device == device => b.pointer,
+            _ => return INVALID,
+        },
+        None => 0,
+    };
     if let Some(result) = super::shaders::stateblocks::record_indices(env, device, new) {
         return result;
     }
@@ -594,8 +620,12 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.buffers.indices = new;
-    d.touch(11);
+    {
+        let mut hot = d.hot.borrow_mut();
+        hot.buffers.indices = new;
+        hot.indices_ptr = new_ptr;
+        hot.touch(11);
+    }
     if new != old
         && let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -609,7 +639,7 @@ fn get_indices(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> 
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
     };
-    let pointer = match d.buffers.indices {
+    let pointer = match d.hot.borrow().buffers.indices {
         Some(id) => match com(env).get_identity(&env.sys.objects, id) {
             Some(Payload::Buffer(b)) => b.pointer,
             _ => return INVALID,
@@ -634,19 +664,26 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this) else {
         return;
     };
-    let old = std::mem::take(&mut d.buffers.streams[0]);
-    if old.buffer.is_some() || old.offset != 0 || old.stride != 0 {
-        d.touch(10);
-    }
-    let stream = old.buffer;
-    let indices = if indexed {
-        d.buffers.indices.take()
-    } else {
-        None
+    let (stream, indices) = {
+        let mut hot = d.hot.borrow_mut();
+        let old = std::mem::take(&mut hot.buffers.streams[0]);
+        hot.stream_ptrs[0] = 0;
+        hot.stream_lens[0] = 0;
+        if old.buffer.is_some() || old.offset != 0 || old.stride != 0 {
+            hot.touch(10);
+        }
+        let stream = old.buffer;
+        let indices = if indexed {
+            hot.indices_ptr = 0;
+            hot.buffers.indices.take()
+        } else {
+            None
+        };
+        if indices.is_some() {
+            hot.touch(11);
+        }
+        (stream, indices)
     };
-    if indices.is_some() {
-        d.touch(11);
-    }
     for id in [stream, indices].into_iter().flatten() {
         if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
             super::destroy(env, dead);
@@ -656,7 +693,13 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
 
 pub(super) fn stream_data(env: &Env<'_>, this: u32, number: u16) -> Result<(u32, u32, u32), u32> {
     let d = device(env, this).ok_or(INVALID)?;
-    let stream = *d.buffers.streams.get(number as usize).ok_or(INVALID)?;
+    let stream = *d
+        .hot
+        .borrow()
+        .buffers
+        .streams
+        .get(number as usize)
+        .ok_or(INVALID)?;
     let id = stream.buffer.ok_or(INVALID)?;
     let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, id) else {
         return Err(INVALID);
@@ -757,9 +800,10 @@ fn draw_indexed(
             return Err(INVALID);
         }
         let d = device(env, this.addr()).ok_or(INVALID)?;
-        let Some(Payload::Buffer(b)) =
-            com(env).get_identity(&env.sys.objects, d.buffers.indices.ok_or(INVALID)?)
-        else {
+        let Some(Payload::Buffer(b)) = com(env).get_identity(
+            &env.sys.objects,
+            d.hot.borrow().buffers.indices.ok_or(INVALID)?,
+        ) else {
             return Err(INVALID);
         };
         if b.kind != Kind::Index || b.locks != 0 {
@@ -791,7 +835,8 @@ fn draw_indexed(
         Err(error) => return Outcome::Return(error),
     };
     if super::programmable::active(env, this.addr())
-        || device(env, this.addr()).is_some_and(|d| d.buffers.frequencies[0] & INDEXED_DATA != 0)
+        || device(env, this.addr())
+            .is_some_and(|d| d.hot.borrow().buffers.frequencies[0] & INDEXED_DATA != 0)
     {
         return recording::indexed(env, this.addr(), (kind, count, &indices), |env| {
             super::programmable::prepare(env, this.addr(), kind, count, None, Some(&indices), 0)
@@ -853,7 +898,14 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, device: Id) {
     else {
         return;
     };
-    let bindings = std::mem::take(&mut device.buffers);
+    let bindings = {
+        let mut hot = device.hot.borrow_mut();
+        hot.stream_ptrs = [0; 16];
+        hot.stream_lens = [0; 16];
+        hot.indices_ptr = 0;
+        hot.declaration_ptr = 0;
+        std::mem::take(&mut hot.buffers)
+    };
     release_bindings(env, bindings);
 }
 pub(super) fn has_outstanding_default(env: &Env<'_>, device: Id) -> bool {

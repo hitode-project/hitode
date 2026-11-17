@@ -191,7 +191,12 @@ fn d3d9_reuse_invalidates_all_draw_inputs() {
         let before = builds.get();
         if name == "SetStreamSource" {
             // Keep a valid stream while changing its stride and captured span.
-            let buffer = device(&env(&mut f), d).unwrap().buffers.streams[0]
+            let buffer = device(&env(&mut f), d)
+                .unwrap()
+                .hot
+                .borrow()
+                .buffers
+                .streams[0]
                 .buffer
                 .unwrap();
             let Some(Payload::Buffer(buffer)) =
@@ -356,11 +361,14 @@ fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_statebloc
             clear(&mut f, 0xff000000);
             for &n in sequence {
                 f.okay("IDirect3DStateBlock9::Capture", &[block]);
-                let fingerprints = device(&env(&mut f), d).unwrap().fingerprints;
+                let fingerprints = device(&env(&mut f), d).unwrap().hot.borrow().fingerprints;
                 f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 1]);
                 f.okay("IDirect3DDevice9::SetSamplerState", &[d, 0, 5, 2]);
                 f.okay("IDirect3DStateBlock9::Apply", &[block]);
-                assert_eq!(device(&env(&mut f), d).unwrap().fingerprints, fingerprints);
+                assert_eq!(
+                    device(&env(&mut f), d).unwrap().hot.borrow().fingerprints,
+                    fingerprints
+                );
                 f.okay("IDirect3DDevice9::SetSamplerState", &[d, 0, 5, 1]);
                 let owner = id(&mut f);
                 let outcome = if full {
@@ -430,7 +438,9 @@ fn d3d9_reuse_signature_prefix_rechecks_locked_streams() {
     assert_eq!(builds.get(), 1);
     let d = f.device;
     let e = env(&mut f);
-    let buffer = device(&e, d).unwrap().buffers.streams[0].buffer.unwrap();
+    let buffer = device(&e, d).unwrap().hot.borrow().buffers.streams[0]
+        .buffer
+        .unwrap();
     let Some(Payload::Buffer(buffer)) = com(&e).get_identity(&e.sys.objects, buffer) else {
         panic!()
     };

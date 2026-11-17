@@ -96,8 +96,8 @@ mod state_tests {
         let mut env = env(&mut machine);
         let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
         let this = GuestPtr::new(pointer);
-        let initial = device(&env, pointer).unwrap().versions;
-        let sampler = device(&env, pointer).unwrap().fixed.sampler[&5];
+        let initial = device(&env, pointer).unwrap().hot.borrow().versions;
+        let sampler = device(&env, pointer).unwrap().hot.borrow().fixed.sampler[&5];
         for _ in 0..2 {
             assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
             assert_eq!(call(&mut env, set_stage_ABI, &[pointer, 1, 11, 1]), 0);
@@ -107,38 +107,53 @@ mod state_tests {
             );
             assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
         }
-        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().versions,
+            initial
+        );
         assert_eq!(stateblocks::begin(&mut env, this), 0);
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
         assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
         assert_eq!(stateblocks::end(&mut env, this, GuestPtr::new(DATA)), 0);
         let block = GuestPtr::new(env.cpu.read_u32(DATA).unwrap());
-        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().versions,
+            initial
+        );
         let bits = [0x8000_0000u32, 0x7fc0_1234, 0, 0];
         assert_eq!(
             vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
             0
         );
-        let changed = device(&env, pointer).unwrap().versions;
+        let changed = device(&env, pointer).unwrap().hot.borrow().versions;
         assert_eq!(changed[13], initial[13] + 1);
         assert_eq!(
             vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
             0
         );
-        assert_eq!(device(&env, pointer).unwrap().versions, changed);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().versions,
+            changed
+        );
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 14, 0]), 0);
         assert_eq!(stateblocks::apply(&mut env, block), 0);
         let d = device(&env, pointer).unwrap();
-        assert_eq!(d.fixed.render[&22], 3);
-        assert_eq!(d.fixed.render[&14], 0, "uncaptured state is retained");
-        assert_eq!(
-            d.shaders.vertex_constants.floats[3].map(f32::to_bits),
-            [0; 4]
-        );
-        let restored = d.versions;
+        let restored = {
+            let hot = d.hot.borrow();
+            assert_eq!(hot.fixed.render[&22], 3);
+            assert_eq!(hot.fixed.render[&14], 0, "uncaptured state is retained");
+            assert_eq!(
+                hot.shaders.vertex_constants.floats[3].map(f32::to_bits),
+                [0; 4]
+            );
+            hot.versions
+        };
         assert_eq!(stateblocks::apply(&mut env, block), 0);
-        assert_eq!(device(&env, pointer).unwrap().versions, restored);
+        assert_eq!(
+            device(&env, pointer).unwrap().hot.borrow().versions,
+            restored
+        );
     }
 
     // spec: GFX-REC-2, GFX-SHADER-4
@@ -157,24 +172,28 @@ mod state_tests {
             0
         );
         let block = env.cpu.read_u32(DATA).unwrap();
-        let key = device(&env, pointer).unwrap().fixed.key();
+        let key = device(&env, pointer).unwrap().hot.borrow().fixed.key();
         assert_eq!(vertex_constant(&mut env, pointer, 0, &[0x3f; 16]), 0);
         assert_eq!(
             super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
             0
         );
-        let d = device(&env, pointer).unwrap();
-        assert_eq!(d.fixed.key.get(), Some(key));
-        assert_eq!(d.shaders.vertex_constants.floats[0], [0.; 4]);
+        {
+            let d = device(&env, pointer).unwrap();
+            let hot = d.hot.borrow();
+            assert_eq!(hot.fixed.key.get(), Some(key));
+            assert_eq!(hot.shaders.vertex_constants.floats[0], [0.; 4]);
+        }
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
-        device(&env, pointer).unwrap().fixed.key();
+        device(&env, pointer).unwrap().hot.borrow().fixed.key();
         assert_eq!(
             super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
             0
         );
         let d = device(&env, pointer).unwrap();
-        assert_eq!(d.fixed.key.get(), None);
-        assert_eq!(d.fixed.key(), key);
+        let hot = d.hot.borrow();
+        assert_eq!(hot.fixed.key.get(), None);
+        assert_eq!(hot.fixed.key(), key);
     }
 
     #[test]
@@ -626,7 +645,7 @@ mod fixed_completion {
             r.desc.Height = 12;
         }
         if let Some(Payload::Device(d)) = com(&e).get_identity_mut(&mut e.sys.objects, owner) {
-            d.scene = true;
+            d.hot.borrow_mut().scene = true;
             d.render_target = Some(back);
         }
         e.ext.get_mut::<State>().provider.target =
@@ -696,7 +715,7 @@ mod fixed_completion {
         )
         .unwrap();
         if let Some(Payload::Device(d)) = com(e).get_identity_mut(&mut e.sys.objects, owner) {
-            d.texture = Some(id);
+            d.hot.borrow_mut().texture = Some(id);
             d.touch(12);
         }
         e.ext.get_mut::<State>().provider.target = |ext, key| match key {
@@ -917,10 +936,10 @@ mod fixed_completion {
         for index in 0..8 {
             assert_eq!(light_enable(&mut e, this, index, 1), 0);
         }
-        assert!(active(current(&e, p).unwrap()).is_ok());
+        assert!(active(&current(&e, p).unwrap()).is_ok());
         assert_eq!(light_enable(&mut e, this, u32::MAX, 1), 0);
         assert_eq!(
-            active(current(&e, p).unwrap()).err().unwrap().code,
+            active(&current(&e, p).unwrap()).err().unwrap().code,
             UNAVAILABLE
         );
     }

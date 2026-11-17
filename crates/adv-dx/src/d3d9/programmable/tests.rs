@@ -503,7 +503,7 @@ fn d3d9_package_d_instanced_offsets_match_two_draws() {
             ext: &mut f.m.ext,
             thunk: 0,
         };
-        let binding = device(&e, f.device).unwrap().buffers.streams[1];
+        let binding = device(&e, f.device).unwrap().hot.borrow().buffers.streams[1];
         let Some(Payload::Buffer(buffer)) =
             com(&e).get_identity(&e.sys.objects, binding.buffer.unwrap())
         else {

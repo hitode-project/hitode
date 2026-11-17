@@ -898,6 +898,9 @@ pub(super) fn texture_lock(
             }
         }
     }
+    if let Some(id) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) {
+        invalidate_hot_texture(env, id);
+    }
     0
 }
 #[win32(d3d9,name="IDirect3DTexture9::UnlockRect",level=implement)]
@@ -1005,6 +1008,32 @@ fn texture_restored(
         other => other,
     }
 }
+pub(super) fn is_texture_clean(env: &Env<'_>, pointer: u32) -> bool {
+    resource(env, pointer).is_some_and(|r| {
+        r.desc.Pool != 1
+            || (!residency::cold(env, pointer)
+                && !r.levels.iter().any(|l| l.dirty.is_some())
+                && !locked(env, r))
+    })
+}
+pub(super) fn invalidate_hot_texture(env: &Env<'_>, id: Id) {
+    let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, id) else {
+        return;
+    };
+    let device_id = r.device;
+    let pointer = r.container.map_or(r.pointer, |c| {
+        com(env)
+            .get_identity(&env.sys.objects, c)
+            .and_then(|p| match p {
+                Payload::Resource(parent) => Some(parent.pointer),
+                _ => None,
+            })
+            .unwrap_or(r.pointer)
+    });
+    if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, device_id) {
+        d.hot.borrow_mut().clear_texture_clean(pointer);
+    }
+}
 fn set_texture_binding(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -1017,10 +1046,13 @@ fn set_texture_binding(
     let Some(slot) = super::programmable::sampler_slot(stage) else {
         return INVALID;
     };
-    let old = if slot == 0 {
-        d.texture
-    } else {
-        d.shaders.textures[slot]
+    let old = {
+        let hot = d.hot.borrow();
+        if slot == 0 {
+            hot.texture
+        } else {
+            hot.shaders.textures[slot]
+        }
     };
     let device_id = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
@@ -1034,10 +1066,17 @@ fn set_texture_binding(
         Some(id)
     };
     if d.recording.is_none() && old == candidate {
+        if !texture.is_null() {
+            let hot = Rc::clone(&d.hot);
+            if is_texture_clean(env, texture.addr()) {
+                hot.borrow_mut()
+                    .set_texture_slot(slot, texture.addr(), true);
+            }
+        }
         return 0;
     }
-    let new = if texture.is_null() {
-        None
+    let (new, new_ptr) = if texture.is_null() {
+        (None, 0)
     } else {
         let Some(Payload::Resource(r)) =
             candidate.and_then(|id| com(env).get_identity(&env.sys.objects, id))
@@ -1047,7 +1086,7 @@ fn set_texture_binding(
         if r.kind != Kind::Texture || r.device != device_id || r.desc.Pool > 1 {
             return INVALID;
         }
-        candidate
+        (candidate, r.pointer)
     };
     if let Some(result) =
         super::shaders::stateblocks::record_texture_slot(env, device_id, slot, new)
@@ -1055,6 +1094,13 @@ fn set_texture_binding(
         return result;
     }
     if old == new {
+        if new_ptr != 0 && is_texture_clean(env, new_ptr) {
+            device(env, this.addr())
+                .unwrap()
+                .hot
+                .borrow_mut()
+                .set_texture_slot(slot, new_ptr, true);
+        }
         return 0;
     }
     if let Some(id) = new
@@ -1062,14 +1108,16 @@ fn set_texture_binding(
     {
         return OUT_OF_MEMORY;
     }
-    if let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
-    {
+    let clean = new_ptr != 0 && is_texture_clean(env, new_ptr);
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
+        let mut hot = d.hot.borrow_mut();
         if slot == 0 {
-            d.texture = new;
+            hot.texture = new;
         } else {
-            d.shaders.textures[slot] = new;
+            hot.shaders.textures[slot] = new;
         }
-        d.touch(12);
+        hot.set_texture_slot(slot, new_ptr, clean);
+        hot.touch(12);
     }
     if let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -1090,10 +1138,13 @@ fn get_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, output: GuestP
     let Some(slot) = super::programmable::sampler_slot(stage) else {
         return INVALID;
     };
-    let Some(id) = (if slot == 0 {
-        d.texture
-    } else {
-        d.shaders.textures[slot]
+    let Some(id) = ({
+        let hot = d.hot.borrow();
+        if slot == 0 {
+            hot.texture
+        } else {
+            hot.shaders.textures[slot]
+        }
     }) else {
         return 0;
     };
