@@ -235,11 +235,12 @@ fn graph_faces_share_identity_and_report_state() {
         S_OK
     );
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), graph::STOPPED);
+    // spec: MEDIA-GRAPH-15
+    // Nothing in an empty graph seeks.
     assert_eq!(
         method(&mut m, "IMediaSeeking::GetDuration", &[seeking, DATA]),
-        S_OK
+        E_NOTIMPL
     );
-    assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
 #[test]
@@ -1024,8 +1025,19 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         Outcome::Return(S_OK)
     ));
 
+    // The graph asks its guest members for IMediaSeeking, newest first; the
+    // host timeline answers for the DMO stage and its upstream.
+    let refused: &[(u32, &[u32], u32)] = &[
+        (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+        (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+    ];
     assert_eq!(
-        method(&mut m, "IMediaSeeking::GetDuration", &[seeking, DATA]),
+        method_calls(
+            &mut m,
+            "IMediaSeeking::GetDuration",
+            &[seeking, DATA],
+            refused
+        ),
         S_OK
     );
     let mut dur = [0u8; 8];
@@ -1057,13 +1069,26 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
         m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
     }
     let handler = m.sys.thunks.get(seek_thunk).f.handler;
-    let outcome = handler(&mut Env {
+    let mut outcome = handler(&mut Env {
         context: m.sys.current,
         cpu: &mut m.cpu,
         sys: &mut m.sys,
         ext: &mut m.ext,
         thunk: seek_thunk,
     });
+    for &(target, args, value) in refused {
+        let Outcome::Call {
+            target: called,
+            args: passed,
+            then,
+            ..
+        } = outcome
+        else {
+            panic!("SetPositions must ask {target:#x} for IMediaSeeking");
+        };
+        assert_eq!((called, passed[0]), (target, args[0]));
+        outcome = then(&mut env(&mut m), adv_machine::Resume::Returned(value));
+    }
     let Outcome::Call {
         target, args, then, ..
     } = outcome
@@ -1174,6 +1199,10 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             &[
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
+                // Stopped, the graph re-seeks its streams to the kept position.
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
+                (0x7100_030e, &[upstream_seek, ANY, 1, ANY, 0], S_OK),
             ],
         ),
         S_OK
