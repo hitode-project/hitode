@@ -32,6 +32,8 @@ const OBJECT_NOT_FOUND: u32 = 0x88781161;
 const CLASS_NOT_REGISTERED: u32 = 0x80040154;
 const CTRL_3D: u32 = 0x10;
 const CTRL_PAN: u32 = 0x40;
+const CTRL_FREQUENCY: u32 = 0x20;
+const CTRL_VOLUME: u32 = 0x80;
 const CTRL_FX: u32 = 0x200;
 const MUTE_3D_AT_MAX_DISTANCE: u32 = 0x20000;
 const LOC_DEFER: u32 = 0x40000;
@@ -386,13 +388,6 @@ struct Object {
     properties: u32,
     buffer: Option<Buffer>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Lock {
-    p1: u32,
-    n1: u32,
-    p2: u32,
-    n2: u32,
-}
 struct ChunkDump {
     writer: std::io::BufWriter<std::fs::File>,
     path: std::path::PathBuf,
@@ -440,7 +435,12 @@ struct Buffer {
     queued_frames: u64,
     notice_bytes: u64,
     notifications: Vec<(u32, u32)>,
-    lock: Option<Lock>,
+    /// Whether a deferred buffer has its voice, which it reports as
+    /// DSBSTATUS_LOCSOFTWARE once AcquireResources or Play allocated it.
+    acquired: bool,
+    /// Locked pieces as (offset, length). Like Windows, a buffer holds any
+    /// number of disjoint locks, each unlocked by its start.
+    locks: Vec<(u32, u32)>,
     trace_pcm: Option<Vec<u8>>,
     trace_generation: u64,
     trace_chunks: Option<ChunkDump>,
@@ -640,7 +640,7 @@ impl Sound {
         let mut status = AudioSourceStatus::default();
         for buffer in self.buffers(objects).filter(|buffer| buffer.len != 0) {
             status.buffers += 1;
-            status.locked += u64::from(buffer.lock.is_some());
+            status.locked += u64::from(!buffer.locks.is_empty());
             if buffer.playing && (buffer.looping || buffer.progress(now) < u64::from(buffer.len)) {
                 status.playing += 1;
                 status.looping += u64::from(buffer.looping);
@@ -1114,10 +1114,14 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, CallError>
         && (buffer.looping
             || buffer.len == 0
             || buffer.progress(e.sys.clock.now_us()) < u64::from(buffer.len));
-    if playing || buffer.lock.is_some() {
+    if playing || !buffer.locks.is_empty() {
         return Ok(INVALID_CALL);
     }
     let count = args[1];
+    // Like Windows, a count and its arrays come together or not at all.
+    if (count == 0) != (args[2] == 0) || (count == 0 && args[3] != 0) {
+        return Ok(INVALID);
+    }
     if count == 0 {
         // No DSP, interface, array or per-effect allocation exists to retire.
         return Ok(0);
@@ -1437,12 +1441,13 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     if e.cpu.read_u32(fp + 8)? != format.rate * format.align() {
                         return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
                     }
-                    if format.bits != 16 || format.float {
+                    // Effects take 8- or 16-bit PCM, as on Windows.
+                    if !matches!(format.bits, 8 | 16) || format.float {
                         adv_abi::warn_unavailable(
                             e,
                             &format!("dsound.dll!{full}"),
                             &format!(
-                                "CTRLFX empty-chain profile requires 16-bit PCM: flags=0x{flags:08x}, bytes={len}, rate={}, channels={}, bits={} (HRESULT=0x80004001)",
+                                "CTRLFX empty-chain profile requires 8- or 16-bit PCM: flags=0x{flags:08x}, bytes={len}, rate={}, channels={}, bits={} (HRESULT=0x80004001)",
                                 format.rate, format.channels, format.bits,
                             ),
                         );
@@ -1580,7 +1585,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     queued_frames: 0,
                     notice_bytes: 0,
                     notifications: Vec::new(),
-                    lock: None,
+                    acquired: false,
+                    locks: Vec::new(),
                     trace_pcm: None,
                     trace_generation: 0,
                     trace_chunks: None,
@@ -1720,7 +1726,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     queued_frames: 0,
                     notice_bytes: 0,
                     notifications: Vec::new(),
-                    lock: None,
+                    acquired: false,
+                    locks: Vec::new(),
                     trace_pcm: None,
                     trace_generation: 0,
                     trace_chunks: None,
@@ -1861,6 +1868,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
         }
         // The software PCM backing is already reserved and the FX chain is
         // empty. No hardware/DSP resource is claimed and nothing starts playing.
+        let object = com.get_mut::<Object>(&mut e.sys.objects, a).unwrap();
+        object.buffer.as_mut().unwrap().acquired = true;
         return Ok(0);
     }
     if name == "Play" {
@@ -1935,6 +1944,22 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             0
         }
         "GetVolume" | "GetPan" | "GetFrequency" | "GetStatus" => {
+            // Like Windows, volume and pan need their controls before the
+            // output is checked, and a primary's frequency is never available.
+            let control = match name {
+                "GetVolume" => CTRL_VOLUME,
+                "GetPan" => CTRL_PAN,
+                _ => 0,
+            };
+            if buf.flags & control != control {
+                return Ok(CONTROL_UNAVAILABLE);
+            }
+            if b == 0 {
+                return Ok(INVALID);
+            }
+            if name == "GetFrequency" && buf.flags & 1 != 0 && buf.flags & CTRL_FREQUENCY == 0 {
+                return Ok(CONTROL_UNAVAILABLE);
+            }
             let value = match name {
                 "GetVolume" => buf.volume as u32,
                 "GetPan" => buf.pan as u32,
@@ -1948,12 +1973,16 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                                 || buf.looping
                                 || buf.progress(now) < u64::from(buf.len)),
                     ) | if buf.playing && buf.looping { 4 } else { 0 }
+                        | if buf.acquired { 0x10 } else { 0 }
                 }
             };
             e.cpu.write_u32(b, value)?;
             0
         }
         "SetVolume" => {
+            if buf.flags & CTRL_VOLUME == 0 {
+                return Ok(CONTROL_UNAVAILABLE);
+            }
             if !(-10000..=0).contains(&(b as i32)) {
                 return Ok(INVALID);
             }
@@ -1962,14 +1991,25 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             0
         }
         "SetPan" => {
+            // A primary checks the control first, a secondary the range.
+            let primary = buf.flags & 1 != 0;
+            if primary && buf.flags & CTRL_PAN == 0 {
+                return Ok(CONTROL_UNAVAILABLE);
+            }
             if !(-10000..=10000).contains(&(b as i32)) {
                 return Ok(INVALID);
+            }
+            if buf.flags & CTRL_PAN == 0 {
+                return Ok(CONTROL_UNAVAILABLE);
             }
             buf.pan = b as i32;
             spatialize(&s.audio, &s.listener.applied, buf, now);
             0
         }
         "SetFrequency" => {
+            if buf.flags & 1 != 0 || buf.flags & CTRL_FREQUENCY == 0 {
+                return Ok(CONTROL_UNAVAILABLE);
+            }
             let freq = if b == 0 { buf.format.rate } else { b };
             if !(100..=200000).contains(&freq) {
                 return Ok(INVALID);
@@ -2039,6 +2079,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             0
         }
         "Play" => {
+            buf.acquired |= buf.flags & LOC_DEFER != 0;
             let ended = !buf.looping && buf.len != 0 && buf.progress(now) >= u64::from(buf.len);
             let starting = !buf.playing || ended;
             let generation = if starting {
@@ -2157,11 +2198,20 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             if buf.len == 0 {
                 return Ok(INVALID_CALL);
             }
-            if buf.lock.is_some() {
+            // Like Windows, the first address and size are required, and
+            // every output given is cleared before the range is checked.
+            let [p1, n1_out, p2, n2_out] = [args[3], args[4], args[5], args[6]];
+            if p1 == 0 {
                 return Ok(INVALID);
             }
-            if args[3] == 0 || args[4] == 0 {
+            e.cpu.write_u32(p1, 0)?;
+            if n1_out == 0 {
                 return Ok(INVALID);
+            }
+            for output in [n1_out, p2, n2_out] {
+                if output != 0 {
+                    e.cpu.write_u32(output, 0)?;
+                }
             }
             let flags = args[7];
             if flags & !3 != 0 {
@@ -2172,41 +2222,40 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             } else {
                 b
             };
-            let (offset, len) = if flags & 2 != 0 {
-                (0, buf.len)
-            } else {
-                (offset, c)
-            };
+            // DSBLOCK_ENTIREBUFFER takes the whole length from the offset.
+            let len = if flags & 2 != 0 { buf.len } else { c };
             if offset >= buf.len || len == 0 || len > buf.len {
                 return Ok(INVALID);
             }
             let n1 = len.min(buf.len - offset);
-            let n2 = if args[5] == 0 { 0 } else { len - n1 };
-            if n2 != 0 && args[6] == 0 {
+            let n2 = len - n1;
+            let pieces = [(offset, n1), (0, n2)];
+            let overlaps = |&(at, n): &(u32, u32)| {
+                n != 0
+                    && buf
+                        .locks
+                        .iter()
+                        .any(|&(other, m)| at < other + m && other < at + n)
+            };
+            if pieces.iter().any(overlaps) {
                 return Ok(INVALID);
             }
             let Some(storage) = buf.storage.as_ref() else {
                 return Ok(INVALID_CALL);
             };
-            let lock = Lock {
-                p1: storage.addr + offset,
-                n1,
-                p2: if n2 != 0 { storage.addr } else { 0 },
-                n2,
-            };
-            for (ptr, value) in [
-                (args[3], lock.p1),
-                (args[4], lock.n1),
-                (args[5], lock.p2),
-                (args[6], lock.n2),
+            let address2 = if n2 != 0 { storage.addr } else { 0 };
+            for (output, value) in [
+                (p1, storage.addr + offset),
+                (n1_out, n1),
+                (p2, address2),
+                (n2_out, n2),
             ] {
-                if ptr != 0 {
-                    e.cpu.write_u32(ptr, value)?;
-                } else if ptr == args[3] || ptr == args[4] {
-                    return Ok(INVALID);
+                if output != 0 {
+                    e.cpu.write_u32(output, value)?;
                 }
             }
-            buf.lock = Some(lock);
+            buf.locks
+                .extend(pieces.into_iter().filter(|&(_, n)| n != 0));
             let storage_id = storage.id;
             let sharing_audio_ids: Vec<u64> = s
                 .buffer_ids
@@ -2217,65 +2266,71 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 })
                 .collect();
             for audio_id in sharing_audio_ids {
-                s.audio.written(audio_id, offset, n1 + n2);
+                s.audio.written(audio_id, offset, len);
             }
             0
         }
         "Unlock" => {
-            if !buf.lock.is_some_and(|lock| {
-                lock.p1 == b && lock.p2 == args[3] && c <= lock.n1 && args[4] <= lock.n2
-            }) {
-                return Ok(INVALID);
-            }
+            // Each address ends the lock starting there, whatever its size;
+            // the first one matching no lock stops with the earlier ones ended.
             let storage_addr = buf.storage_addr();
             let storage_id = buf.storage.as_ref().map(|storage| storage.id);
-            if let Some(lock) = buf.lock.take() {
-                if let Some(dump) = buf.trace_chunks.as_mut() {
-                    let file_offset = dump.bytes;
-                    for (address, len) in [(lock.p1, c), (lock.p2, args[4])] {
-                        if len != 0 {
-                            let mut bytes = vec![0; len as usize];
-                            e.cpu
-                                .read(address, &mut bytes)
-                                .map_err(|error| error.to_string())?;
-                            dump.writer
-                                .write_all(&bytes)
-                                .map_err(|error| error.to_string())?;
-                            dump.bytes += u64::from(len);
-                        }
-                    }
-                    if let Some(trace) = s.trace.as_mut() {
-                        let _ = writeln!(
-                            trace,
-                            "dma-write us={now} id={a:08x} generation={} byte_offset={} count={} file_offset={file_offset} path={:?}",
-                            buf.trace_generation,
-                            lock.p1 - storage_addr,
-                            c + args[4],
-                            dump.path
-                        );
+            let mut ended = Vec::new();
+            let mut result = 0;
+            for (address, size) in [(b, c), (args[3], args[4])] {
+                if address == 0 {
+                    continue;
+                }
+                let at = address.wrapping_sub(storage_addr);
+                let Some(i) = buf.locks.iter().position(|&(start, _)| start == at) else {
+                    result = INVALID;
+                    break;
+                };
+                let (start, n) = buf.locks.swap_remove(i);
+                ended.push((start, size.min(n)));
+            }
+            if let Some(dump) = buf.trace_chunks.as_mut() {
+                let file_offset = dump.bytes;
+                for &(start, len) in &ended {
+                    if len != 0 {
+                        let mut bytes = vec![0; len as usize];
+                        e.cpu
+                            .read(storage_addr + start, &mut bytes)
+                            .map_err(|error| error.to_string())?;
+                        dump.writer
+                            .write_all(&bytes)
+                            .map_err(|error| error.to_string())?;
+                        dump.bytes += u64::from(len);
                     }
                 }
-                if let Some(storage_id) = storage_id {
-                    let sharing_audio_ids: Vec<u64> = s
-                        .buffer_ids
-                        .values()
-                        .filter_map(|&ident| {
-                            let other =
-                                s.com.get_identity(&e.sys.objects, ident)?.buffer.as_ref()?;
-                            (other.storage.as_ref()?.id == storage_id).then_some(other.audio_id)
-                        })
-                        .collect();
-                    for audio_id in sharing_audio_ids {
-                        if c != 0 {
-                            s.audio.committed(audio_id, lock.p1 - storage_addr, c);
-                        }
-                        if args[4] != 0 {
-                            s.audio.committed(audio_id, lock.p2 - storage_addr, args[4]);
+                if let (Some(trace), Some(&(start, _))) = (s.trace.as_mut(), ended.first()) {
+                    let _ = writeln!(
+                        trace,
+                        "dma-write us={now} id={a:08x} generation={} byte_offset={start} count={} file_offset={file_offset} path={:?}",
+                        buf.trace_generation,
+                        ended.iter().map(|&(_, len)| len).sum::<u32>(),
+                        dump.path
+                    );
+                }
+            }
+            if let Some(storage_id) = storage_id {
+                let sharing_audio_ids: Vec<u64> = s
+                    .buffer_ids
+                    .values()
+                    .filter_map(|&ident| {
+                        let other = s.com.get_identity(&e.sys.objects, ident)?.buffer.as_ref()?;
+                        (other.storage.as_ref()?.id == storage_id).then_some(other.audio_id)
+                    })
+                    .collect();
+                for audio_id in sharing_audio_ids {
+                    for &(start, len) in &ended {
+                        if len != 0 {
+                            s.audio.committed(audio_id, start, len);
                         }
                     }
                 }
             }
-            0
+            result
         }
         _ => {
             return Err(CallError::Fail(format!(
@@ -3235,7 +3290,7 @@ mod tests {
         }
         assert_eq!(m.sys.objects.object_count(), owners);
     }
-    // spec: DEV-AUDIO-10
+    // spec: DEV-AUDIO-10, DEV-AUDIO-12
     #[test]
     fn each_device_has_one_primary_buffer_that_outlives_its_references() {
         let mut m = machine();
@@ -3322,6 +3377,23 @@ mod tests {
         let args = [device, DATA, DATA + 128, 0];
         assert_eq!(call(&mut m, "IDirectSound::CreateSoundBuffer", &args), 0);
         let secondary = m.cpu.read_u32(DATA + 128).unwrap();
+        // Controls the buffers were not created with are unavailable.
+        let unavailable = CONTROL_UNAVAILABLE;
+        let out = DATA + 220;
+        for (name, args, expected) in [
+            ("GetVolume", [primary, out], 0),
+            ("GetPan", [primary, out], unavailable),
+            ("GetFrequency", [primary, out], unavailable),
+            ("SetFrequency", [primary, 22050], unavailable),
+            ("SetVolume", [secondary, 0], unavailable),
+            ("SetPan", [secondary, 20000], INVALID),
+            ("SetPan", [secondary, 0], unavailable),
+            ("SetFrequency", [secondary, 22050], unavailable),
+            ("GetFrequency", [secondary, out], 0),
+        ] {
+            let full = format!("IDirectSoundBuffer8::{name}");
+            assert_eq!(call(&mut m, &full, &args), expected, "{name}");
+        }
         m.cpu.write_u32(DATA + 200, 20).unwrap();
         let caps = [secondary, DATA + 200];
         assert_eq!(call(&mut m, "IDirectSoundBuffer8::GetCaps", &caps), 0);
@@ -3383,6 +3455,8 @@ mod tests {
         assert_eq!(call(&mut m, "SetVelocity", &[listener, 0, 0, 0, 0]), 0);
         let zero = [listener, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(call(&mut m, "SetOrientation", &zero), INVALID);
+        let parallel = [listener, f(1.0), f(1.0), f(1.0), f(1.0), f(1.0), f(1.0), 0];
+        assert_eq!(call(&mut m, "SetOrientation", &parallel), INVALID);
         assert_eq!(
             call(&mut m, "SetPosition", &[listener, f(9.0), 0, 0, 2]),
             INVALID
@@ -3695,6 +3769,7 @@ mod tests {
         assert!(m.ext.get::<Sound>().pending_release.is_empty());
     }
 
+    // spec: DEV-AUDIO-11
     #[test]
     fn wrap_lock_aliases_guest_storage_and_rejects_invalid_unlock() {
         let mut m = machine();
@@ -3723,21 +3798,47 @@ mod tests {
         assert_eq!(p1, p2 + 90);
         m.cpu.write(p1, &[255; 10]).unwrap();
         m.cpu.write(p2, &[0; 10]).unwrap();
+        // A lock overlapping one held fails and clears every output.
+        let lock = |m: &mut Machine<JitCpu>, at: u32, n: u32| {
+            let outputs = [DATA + 128, DATA + 132, DATA + 136, DATA + 140];
+            for output in outputs {
+                m.cpu.write_u32(output, 0xdead_beef).unwrap();
+            }
+            let hr = invoke(
+                m,
+                "IDirectSoundBuffer8::Lock",
+                &[b, at, n, outputs[0], outputs[1], outputs[2], outputs[3], 0],
+            );
+            (hr, outputs.map(|output| m.cpu.read_u32(output).unwrap()))
+        };
+        assert_eq!(lock(&mut m, 5, 10), (INVALID, [0; 4]));
+        // Disjoint locks coexist, and each address ends its own lock.
+        let (hr, [middle, ..]) = lock(&mut m, 40, 10);
+        assert_eq!((hr, middle), (0, p2 + 40));
+        assert_eq!(
+            invoke(
+                &mut m,
+                "IDirectSoundBuffer8::Unlock",
+                &[b, middle, 10, 0, 0]
+            ),
+            0
+        );
+        // Windows ignores the sizes given to Unlock.
         assert_eq!(
             invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[b, p1, 11, p2, 10]),
-            INVALID
+            0
         );
         assert_eq!(
             invoke(&mut m, "IDirectSoundBuffer8::Unlock", &[b, p1, 9, p2, 10]),
-            0
+            INVALID
         );
         assert!(
             m.ext
                 .get::<Sound>()
                 .buffer(&m.sys.objects, b)
                 .unwrap()
-                .lock
-                .is_none()
+                .locks
+                .is_empty()
         );
         assert_eq!(
             invoke(
@@ -3752,8 +3853,8 @@ mod tests {
                 .get::<Sound>()
                 .buffer(&m.sys.objects, b)
                 .unwrap()
-                .lock
-                .is_none()
+                .locks
+                .is_empty()
         );
     }
     #[test]
@@ -4690,20 +4791,20 @@ mod tests {
         assert_eq!(p1, orig_storage);
         // Lock on dup while orig is locked must be independent (orig is locked, dup is not)
         assert!(
-            m.ext
+            !m.ext
                 .get::<Sound>()
                 .buffer(&m.sys.objects, orig)
                 .unwrap()
-                .lock
-                .is_some()
+                .locks
+                .is_empty()
         );
         assert!(
             m.ext
                 .get::<Sound>()
                 .buffer(&m.sys.objects, dup)
                 .unwrap()
-                .lock
-                .is_none()
+                .locks
+                .is_empty()
         );
 
         // Write new samples via orig lock

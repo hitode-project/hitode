@@ -166,6 +166,10 @@ impl Listener {
 /// The orientation stored for `front` and `top`: a unit front and the unit
 /// part of top perpendicular to it. Zero or parallel vectors are rejected.
 pub(super) fn orientation(front: Vector, top: Vector) -> Option<(Vector, Vector)> {
+    // Like Windows, front and top at no angle to each other are invalid.
+    if top.length() == 0.0 || front.dot(top) / (front.length() * top.length()) >= 1.0 {
+        return None;
+    }
     let front = front.unit()?;
     let along = top.dot(front);
     let top = Vector::new(

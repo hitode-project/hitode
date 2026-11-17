@@ -105,7 +105,8 @@ fn empty_fx_chain_uses_real_pcm_guest_vtable_and_keeps_failed_dsp_unpublished() 
         INVALID
     );
     assert_eq!(m.sys.objects.object_count(), objects);
-    descriptor(&mut m, FLAGS, BYTES, Format { bits: 8, ..format });
+    // Effects take only 8- or 16-bit PCM.
+    descriptor(&mut m, FLAGS, BYTES, Format { bits: 24, ..format });
     assert_eq!(
         invoke(
             &mut m,
@@ -268,7 +269,13 @@ fn empty_fx_chain_uses_real_pcm_guest_vtable_and_keeps_failed_dsp_unpublished() 
     assert_eq!(invoke(&mut m, "IDirectSoundBuffer8::Stop", &[buffer]), 0);
     let before = m.sys.objects.object_count();
     for (count, descriptor, result, hr) in
-        [(65, u32::MAX, u32::MAX, UNSUPPORTED), (1, 0, 0, INVALID)]
+        // A count and its arrays come together, as on Windows.
+        [
+            (65, u32::MAX, u32::MAX, UNSUPPORTED),
+            (1, 0, 0, INVALID),
+            (0, DATA + 320, 0, INVALID),
+            (0, 0, DATA + 368, INVALID),
+        ]
     {
         assert_eq!(
             invoke(
