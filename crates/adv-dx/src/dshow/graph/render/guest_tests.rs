@@ -830,11 +830,14 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
     assert_eq!(m.ext.get::<Presentation>().updates.len(), updates + 1);
     video::pump_video(&mut m).unwrap();
     assert_eq!(m.ext.get::<Presentation>().updates.len(), updates + 1);
-    assert_eq!(invoke(&mut m, control, "IMediaControl", "Stop", &[]), S_OK);
-    assert_eq!(m.ext.get::<State>().graphs[&graph].state, STOPPED);
+    // The stream thread leaves once stopping; Stop then has no thread to join.
+    let session = *m.ext.get::<State>().sessions.keys().next().unwrap();
+    stream::stop(&mut env(&mut m), session);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Signaled));
     assert_eq!(finish(&mut m, outcome), 0);
     assert!(m.ext.get::<State>().sessions.is_empty());
+    assert_eq!(invoke(&mut m, control, "IMediaControl", "Stop", &[]), S_OK);
+    assert_eq!(m.ext.get::<State>().graphs[&graph].state, STOPPED);
 
     assert_eq!(invoke(&mut m, basic, "IBasicVideo", "Release", &[]), 3);
     assert_eq!(invoke(&mut m, control, "IMediaControl", "Release", &[]), 2);
