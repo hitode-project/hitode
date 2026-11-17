@@ -168,8 +168,28 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-WMV-2 Input and allocation
 
-**Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. When supplied, guest IWMReaderAllocatorEx MUST own the buffer receiving each delivered sample.
-**Verification**: Review — packet tests use prepared demuxed data and do not exercise full IStream admission or guest sample allocation.
+**Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. Stream and output allocators MUST remain separate, receive zero flags and timestamps, and own compressed and decoded buffers respectively. Once used, both allocator slots for that stream MUST reject changes, and allocation failure MUST return `NS_E_NO_MORE_SAMPLES`.
+**Verification**: Test
+
+### MEDIA-WMV-3 Output properties
+
+**Rule**: Synchronous readers MUST number audio outputs before video and return independent output-property snapshots. Output formats MUST default to PCM audio and RGB24 video, with full source and target rectangles. Format negotiation MUST reject incompatible major types, unsupported video layouts, changed video dimensions, and audio channel expansion with Windows HRESULTs.
+**Verification**: Test
+
+### MEDIA-WMV-4 Reader arguments
+
+**Rule**: `GetStreamSelected` and compressed-sample mode methods MUST return `E_INVALIDARG` for invalid stream numbers, and nonexistent profile stream numbers MUST return `NS_E_NO_STREAM`. Invalid selections MUST preserve the previous selection, and end-of-stream MUST preserve timestamps while reporting an explicitly requested stream number. Reading any stream MUST require an output number or stream number destination.
+**Verification**: Test
+
+### MEDIA-WMV-5 Header metadata
+
+**Rule**: ASF duration MUST come from the header's play duration minus preroll, and compressed ASF video samples MUST report one-millisecond durations. Missing attributes MUST leave destinations unchanged, and `WM/VideoFrameRate` MUST return `ASF_E_NOTFOUND` when absent. Insufficient attribute buffers MUST update the required size without changing the attribute type or value.
+**Verification**: Test
+
+### MEDIA-WMV-6 Reader settings and identities
+
+**Rule**: Synchronous readers MUST expose profile, header, language-list, packet-size, playlist-burn, and timecode interface identities. Output settings MUST follow Windows defaults and applicability for audio and video, retain assigned values, and return `E_UNEXPECTED` before opening.
+**Verification**: Test
 
 ## Embedded video
 
