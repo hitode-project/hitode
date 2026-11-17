@@ -260,6 +260,10 @@ fn event_timeouts_leave_no_event_code() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
+/// An expected guest-call argument that matches any value, such as a pointer
+/// the host allocated.
+const ANY: u32 = u32::MAX;
+
 /// Run a quartz method that calls back into the guest exactly once per item
 /// of `expected`, checking each call's target and arguments.
 fn method_calls(
@@ -298,6 +302,11 @@ fn method_calls(
         else {
             panic!("{name} must call {target:#x}");
         };
+        let passed: Vec<u32> = passed
+            .iter()
+            .zip(args.iter().chain(std::iter::repeat(&0)))
+            .map(|(&p, &a)| if a == ANY { ANY } else { p })
+            .collect();
         assert_eq!((called, passed.as_slice()), (target, args));
         outcome = then(&mut env(m), adv_machine::Resume::Returned(value));
     }
@@ -378,6 +387,232 @@ fn graph_holds_its_site_and_answers_get_site_through_it() {
         ),
         0
     );
+    assert!(m.ext.get::<State>().graphs.is_empty());
+}
+
+// spec: MEDIA-GRAPH-11, MEDIA-GRAPH-12
+#[test]
+fn graph_names_members_counts_changes_and_hands_out_its_clock() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let version = query(&mut m, graph, IID_IGRAPHVERSION);
+    let media = query(&mut m, graph, IID_IMEDIAFILTER);
+    let filters = [DATA + 512, DATA + 640];
+    for (i, &filter) in filters.iter().enumerate() {
+        m.cpu.write_u32(filter, filter + 4).unwrap();
+        for slot in 0..16 {
+            let target = 0x7200_0000 + (i as u32) * 0x100 + slot;
+            m.cpu.write_u32(filter + 4 + slot * 4, target).unwrap();
+        }
+    }
+    let clock = DATA + 768;
+    m.cpu.write_u32(clock, clock + 4).unwrap();
+    for slot in 0..3 {
+        m.cpu
+            .write_u32(clock + 4 + slot * 4, 0x7300_0000 + slot)
+            .unwrap();
+    }
+    let output = DATA + 16;
+    let versioned = |m: &mut Machine<JitCpu>| {
+        assert_eq!(
+            method(m, "IGraphVersion::QueryVersion", &[version, output]),
+            S_OK
+        );
+        m.cpu.read_u32(output).unwrap()
+    };
+    assert_eq!(versioned(&mut m), 0);
+    let name = DATA + 64;
+    let wide = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    // A nameless filter takes the counter's first name and no clock yet.
+    let [first, second] = filters;
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, first, 0],
+            &[
+                (0x7200_0001, &[first], 2),
+                (0x7200_000d, &[first, graph, ANY], S_OK),
+                (0x7200_0008, &[first, 0], S_OK),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(versioned(&mut m), 1);
+    m.cpu.write(name, &wide("0001")).unwrap();
+    // A taken name gets the counter appended.
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::AddFilter",
+            &[graph, second, name],
+            &[
+                (0x7200_0101, &[second], 2),
+                (0x7200_010d, &[second, graph, ANY], S_OK),
+                (0x7200_0108, &[second, 0], S_OK),
+            ],
+        ),
+        VFW_S_DUPLICATE_NAME
+    );
+    m.cpu.write(name, &wide("0001 0002")).unwrap();
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::FindFilterByName",
+            &[graph, name, output],
+            &[(0x7200_0101, &[second], 3)],
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), second);
+    // Every member receives the clock the graph keeps and hands back.
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaFilter::SetSyncSource",
+            &[media, clock],
+            &[
+                (0x7200_0008, &[first, clock], S_OK),
+                (0x7200_0108, &[second, clock], S_OK),
+                (0x7300_0001, &[clock], 2),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaFilter::GetSyncSource",
+            &[media, output],
+            &[(0x7300_0001, &[clock], 3)],
+        ),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), clock);
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaFilter::SetSyncSource",
+            &[media, 0],
+            &[
+                (0x7200_0008, &[first, 0], S_OK),
+                (0x7200_0108, &[second, 0], S_OK),
+                (0x7300_0002, &[clock], 1),
+            ],
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method(&mut m, "IMediaFilter::GetSyncSource", &[media, output]),
+        S_FALSE
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    // Automation interfaces describe themselves with one type library entry.
+    let video = query(&mut m, graph, IID_IBASICVIDEO2);
+    assert_eq!(
+        method(&mut m, "IBasicVideo2::GetTypeInfoCount", &[video, output]),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
+}
+
+// spec: MEDIA-GRAPH-10
+#[test]
+fn aggregated_graph_keeps_its_inner_count_and_forwards_other_faces_to_the_outer() {
+    let mut m = machine();
+    let (outer, output) = (DATA + 512, DATA + 128);
+    m.cpu.write_u32(outer, outer + 4).unwrap();
+    for slot in 0..3 {
+        m.cpu
+            .write_u32(outer + 4 + slot * 4, 0x7100_0000 + slot)
+            .unwrap();
+    }
+    let (outer_query, outer_add, outer_release) = (0x7100_0000, 0x7100_0001, 0x7100_0002);
+    let create = |m: &mut Machine<JitCpu>, iid| {
+        m.cpu.write_u32(output, 0xdead).unwrap();
+        let outcome =
+            crate::test_support::activate(&mut env(m), CLSID_FILTERGRAPH, iid, outer, output);
+        let Outcome::Return(hr) = outcome else {
+            panic!("activation needed a guest call")
+        };
+        (hr, m.cpu.read_u32(output).unwrap())
+    };
+    assert_eq!(create(&mut m, IID_IFILTERGRAPH2), (E_NOINTERFACE, 0));
+    let (hr, inner) = create(&mut m, adv_os::com::IUNKNOWN);
+    assert_eq!(hr, S_OK);
+    assert_eq!(method(&mut m, "IUnknown::AddRef", &[inner]), 2);
+    assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 1);
+    let iid = DATA + 256;
+    m.cpu.write(iid, &adv_os::com::IUNKNOWN).unwrap();
+    assert_eq!(
+        method(&mut m, "IUnknown::QueryInterface", &[inner, iid, output]),
+        S_OK
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), inner);
+    assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 1);
+    // Other interfaces retain the outer object, never the inner count.
+    m.cpu.write(iid, &IID_IFILTERGRAPH2).unwrap();
+    let outer_only: &[u32] = &[outer];
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IUnknown::QueryInterface",
+            &[inner, iid, output],
+            &[(outer_add, outer_only, 2)],
+        ),
+        S_OK
+    );
+    let graph = m.cpu.read_u32(output).unwrap();
+    assert_ne!(graph, inner);
+    let unknown_iid = DATA + 272;
+    m.cpu.write(unknown_iid, &[0x5a; 16]).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IUnknown::QueryInterface",
+            &[inner, unknown_iid, output]
+        ),
+        E_NOINTERFACE
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    for (iid, args) in [
+        (iid, [graph, iid, output]),
+        (unknown_iid, [graph, unknown_iid, output]),
+    ] {
+        assert_eq!(
+            method_calls(
+                &mut m,
+                "IFilterGraph2::QueryInterface",
+                &args,
+                &[(outer_query, &[outer, iid, output], S_OK)],
+            ),
+            S_OK
+        );
+    }
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IMediaControl::AddRef",
+            &[graph + 8],
+            &[(outer_add, outer_only, 3)],
+        ),
+        3
+    );
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::Release",
+            &[graph],
+            &[(outer_release, outer_only, 1)],
+        ),
+        1
+    );
+    assert_eq!(method(&mut m, "IUnknown::Release", &[inner]), 0);
     assert!(m.ext.get::<State>().graphs.is_empty());
 }
 
@@ -723,7 +958,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             &[graph, source, 0],
             &[
                 (0x7100_0001, &[source], 2),
-                (0x7100_000d, &[source, graph, 0], S_OK),
+                (0x7100_000d, &[source, graph, ANY], S_OK),
+                (0x7100_0008, &[source, 0], S_OK),
             ],
         ),
         S_OK
@@ -739,7 +975,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             &[graph, renderer, 0],
             &[
                 (0x7100_0101, &[renderer], 2),
-                (0x7100_010d, &[renderer, graph, 0], S_OK),
+                (0x7100_010d, &[renderer, graph, ANY], S_OK),
+                (0x7100_0108, &[renderer, 0], S_OK),
             ],
         ),
         S_OK
@@ -852,6 +1089,9 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Pause",
             &[control],
             &[
+                // No member has a clock and no system clock exists here.
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
             ],
@@ -864,6 +1104,8 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
             "IMediaControl::Run",
             &[control],
             &[
+                (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
+                (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0106, &[renderer, 0, 0], S_OK),
                 (0x7100_0006, &[source, 0, 0], S_OK),
             ],

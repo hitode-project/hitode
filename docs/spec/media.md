@@ -91,7 +91,25 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: GetEvent MUST zero the event code before it waits, so a timeout returns `E_ABORT` with code zero.
 **Verification**: Test
 
-## Stream delivery
+### MEDIA-GRAPH-10 Aggregation
+
+**Rule**: An aggregated filter graph MUST be created only for IUnknown, and any other IID MUST return `E_NOINTERFACE` with a NULL output. Its inner IUnknown MUST keep its own count and answer IUnknown with itself. Every other interface MUST forward QueryInterface, AddRef and Release to the outer object.
+**Verification**: Test
+
+### MEDIA-GRAPH-11 Member names
+
+**Rule**: AddFilter MUST give a nameless filter the graph counter's next free four-digit name, starting at `0001`. A taken name MUST get the counter appended and return `VFW_S_DUPLICATE_NAME`. IGraphVersion MUST change on every membership change.
+**Verification**: Test
+
+### MEDIA-GRAPH-12 Reference clock
+
+**Rule**: The graph MUST hold one reference to its reference clock and give it to every member, including later ones. Removal and final release MUST clear a member's clock. Until a clock is set explicitly, leaving Stopped MUST choose the newest member's own clock, otherwise a system clock.
+**Verification**: Test
+
+### MEDIA-GRAPH-13 Automation and filter mapper
+
+**Rule**: Automation interfaces MUST answer IDispatch through the quartz type library. IFilterMapper, IFilterMapper2 and IFilterMapper3 MUST come from an aggregated system filter mapper.
+**Verification**: Review — unit tests cover GetTypeInfoCount only; the type library and the mapper come from Wine's quartz, which unit tests do not load.
 
 ### MEDIA-STREAM-1 Pull delivery
 
