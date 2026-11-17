@@ -1,6 +1,6 @@
-//! Guest members in the order quartz transitions them: sorted topologically
-//! from their pins' connections at each change, downstream first, starting
-//! from the newest member.
+//! Members in the order quartz transitions them: sorted topologically from
+//! their pins' connections at each change, downstream first, starting from
+//! the newest member. Host members take their place among guest ones.
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
@@ -13,18 +13,36 @@ pub(super) type Sorted = Box<dyn FnOnce(&mut Env<'_>, Vec<u32>) -> Outcome>;
 /// QueryPinInfo's PIN_INFO, then QueryDirection's and the pointer outputs.
 const PIN_INFO: u32 = 264;
 
-pub(super) fn guest_members(env: &mut Env<'_>, graph: u32, then: Sorted) -> Outcome {
-    let members: Vec<u32> = g(env, graph)
+/// A member to transition: a host filter by its canonical pointer, or a guest
+/// filter by the pointer it joined with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Node {
+    Host(u32),
+    Guest(u32),
+}
+
+pub(super) type Ordered = Box<dyn FnOnce(&mut Env<'_>, Vec<Node>) -> Outcome>;
+
+/// Every member, downstream first.
+pub(super) fn members(env: &mut Env<'_>, graph: u32, then: Ordered) -> Outcome {
+    let joined: Vec<(u32, u32, Node)> = g(env, graph)
         .members
         .iter()
         .rev()
-        .filter(|m| m.host.is_none())
-        .map(|m| m.filter)
+        .map(|m| match m.host {
+            Some(host) => (host, m.filter, Node::Host(host)),
+            None => (m.filter, m.filter, Node::Guest(m.filter)),
+        })
         .collect();
+    let nodes: Vec<(u32, Node)> = joined.iter().map(|&(key, _, node)| (key, node)).collect();
+    let keys: Vec<u32> = nodes.iter().map(|&(key, _)| key).collect();
     let Some(scratch) = alloc(env, PIN_INFO + 12) else {
-        return then(env, members);
+        return then(env, nodes.into_iter().map(|(_, node)| node).collect());
     };
-    let pending = members.iter().copied().collect();
+    let pending = joined
+        .iter()
+        .map(|&(key, pointer, node)| (key, pointer, matches!(node, Node::Host(_))))
+        .collect();
     upstreams(
         env,
         pending,
@@ -32,7 +50,29 @@ pub(super) fn guest_members(env: &mut Env<'_>, graph: u32, then: Sorted) -> Outc
         Vec::new(),
         Box::new(move |env, edges| {
             free(env, scratch);
-            then(env, sort(&members, &edges))
+            let sorted = sort(&keys, &edges)
+                .into_iter()
+                .filter_map(|key| nodes.iter().find(|&&(k, _)| k == key).map(|&(_, n)| n))
+                .collect();
+            then(env, sorted)
+        }),
+    )
+}
+
+/// Guest members alone, in the order of [`members`].
+pub(super) fn guest_members(env: &mut Env<'_>, graph: u32, then: Sorted) -> Outcome {
+    members(
+        env,
+        graph,
+        Box::new(move |env, nodes| {
+            let guests = nodes
+                .into_iter()
+                .filter_map(|node| match node {
+                    Node::Guest(filter) => Some(filter),
+                    Node::Host(_) => None,
+                })
+                .collect();
+            then(env, guests)
         }),
     )
 }
@@ -70,16 +110,35 @@ type Found = Box<dyn FnOnce(&mut Env<'_>, Edges) -> Outcome>;
 
 fn upstreams(
     env: &mut Env<'_>,
-    mut pending: VecDeque<u32>,
+    mut pending: VecDeque<(u32, u32, bool)>,
     scratch: u32,
     edges: Edges,
     then: Found,
 ) -> Outcome {
-    let Some(filter) = pending.pop_front() else {
+    let Some((filter, pointer, host)) = pending.pop_front() else {
         return then(env, edges);
     };
+    if host {
+        // A host filter's own pins are known; only a guest peer's owner is asked.
+        let state = env.ext.get::<State>();
+        let peers: VecDeque<u32> = state.filters[&filter]
+            .pins
+            .iter()
+            .map(|p| &state.pins[p])
+            .filter(|p| p.dir == INPUT && p.peer != 0)
+            .map(|p| p.peer)
+            .collect();
+        return host_inputs(
+            env,
+            filter,
+            peers,
+            scratch,
+            edges,
+            Box::new(move |env, edges| upstreams(env, pending, scratch, edges, then)),
+        );
+    }
     let _ = env.cpu.write_u32(scratch, 0);
-    guest_call(env, filter, 10, vec![scratch], move |env, hr| {
+    guest_call(env, pointer, 10, vec![scratch], move |env, hr| {
         let pins = env.cpu.read_u32(scratch).unwrap_or(0);
         if hr != S_OK || pins == 0 {
             return upstreams(env, pending, scratch, edges, then);
@@ -92,6 +151,34 @@ fn upstreams(
             edges,
             Box::new(move |env, edges| upstreams(env, pending, scratch, edges, then)),
         )
+    })
+}
+
+fn host_inputs(
+    env: &mut Env<'_>,
+    filter: u32,
+    mut peers: VecDeque<u32>,
+    scratch: u32,
+    mut edges: Edges,
+    then: Found,
+) -> Outcome {
+    let Some(peer) = peers.pop_front() else {
+        return then(env, edges);
+    };
+    if let Some(pin) = crate::dshow::filter::host_pin(env, peer) {
+        edges.push((filter, env.ext.get::<State>().pins[&pin].filter));
+        return host_inputs(env, filter, peers, scratch, edges, then);
+    }
+    let _ = env.cpu.write_u32(scratch, 0);
+    guest_call(env, peer, 8, vec![scratch], move |env, hr| {
+        let from = env.cpu.read_u32(scratch).unwrap_or(0);
+        if hr != S_OK || from == 0 {
+            return host_inputs(env, filter, peers, scratch, edges, then);
+        }
+        edges.push((filter, from));
+        guest_call(env, from, 2, vec![], move |env, _| {
+            host_inputs(env, filter, peers, scratch, edges, then)
+        })
     })
 }
 
@@ -141,7 +228,7 @@ fn inputs(
                     if hr != S_OK || from == 0 {
                         return release_peer(env, edges);
                     }
-                    edges.push((filter, from));
+                    edges.push((filter, crate::dshow::canonical(env, from).unwrap_or(from)));
                     guest_call(env, from, 2, vec![], move |env, _| release_peer(env, edges))
                 })
             })

@@ -982,40 +982,72 @@ fn each_guest_filter(
     )
 }
 
-fn transition_hosts(env: &mut Env<'_>, graph: u32, value: u32, start: i64, then: Then) -> Outcome {
-    let mut hosts: Vec<u32> = g(env, graph)
-        .members
-        .iter()
-        .filter_map(|m| m.host)
-        .collect();
-    if value != STOPPED {
-        hosts.reverse();
-    }
-    transition_host_list(env, hosts, value, start, Vec::new(), then)
+/// Pause or run every member, downstream first: host filters directly and
+/// guest filters through `slot` with `args`. Guest sources feeding host
+/// stages go last (MEDIA-DMO-4).
+fn transition_members(
+    env: &mut Env<'_>,
+    graph: u32,
+    value: u32,
+    slot: u32,
+    args: Vec<u32>,
+    start: i64,
+    then: Then,
+) -> Outcome {
+    let feeding = super::dmo::upstream_filters(env, graph);
+    order::members(
+        env,
+        graph,
+        Box::new(move |env, nodes| {
+            let (sources, mut nodes) = feeding_first(nodes, &feeding);
+            nodes.extend(sources);
+            let step = Step {
+                value,
+                slot,
+                args,
+                start,
+            };
+            transition_nodes(env, nodes, step, Vec::new(), then)
+        }),
+    )
 }
 
-fn transition_host_list(
-    env: &mut Env<'_>,
-    mut hosts: Vec<u32>,
+/// Split sorted members into the guest sources in `feeding` and the rest.
+fn feeding_first(
+    nodes: Vec<order::Node>,
+    feeding: &[u32],
+) -> (VecDeque<order::Node>, VecDeque<order::Node>) {
+    nodes
+        .into_iter()
+        .partition(|node| matches!(node, order::Node::Guest(f) if feeding.contains(f)))
+}
+
+struct Step {
     value: u32,
+    slot: u32,
+    args: Vec<u32>,
     start: i64,
+}
+
+fn transition_nodes(
+    env: &mut Env<'_>,
+    mut nodes: VecDeque<order::Node>,
+    step: Step,
     mut results: Vec<u32>,
     then: Then,
 ) -> Outcome {
-    if hosts.is_empty() {
+    let Some(node) = nodes.pop_front() else {
         return then(env, results);
+    };
+    let (value, slot, args, start) = (step.value, step.slot, step.args.clone(), step.start);
+    let next = move |env: &mut Env<'_>, hr: u32| {
+        results.push(hr);
+        transition_nodes(env, nodes, step, results, then)
+    };
+    match node {
+        order::Node::Host(host) => filter::transition(env, host, value, start, Box::new(next)),
+        order::Node::Guest(filter) => guest_call(env, filter, slot, args, next),
     }
-    let host = hosts.remove(0);
-    filter::transition(
-        env,
-        host,
-        value,
-        start,
-        Box::new(move |env, hr| {
-            results.push(hr);
-            transition_host_list(env, hosts, value, start, results, then)
-        }),
-    )
 }
 
 pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
@@ -1048,36 +1080,29 @@ fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
 fn pause_members(env: &mut Env<'_>, graph: u32, previous: u32, then: Then) -> Outcome {
     // Downstream first: host decoders fed by a guest source must accept the
     // samples its streaming threads push as soon as it pauses.
-    transition_hosts(
+    transition_members(
         env,
         graph,
         PAUSED,
+        5,
+        vec![],
         0,
-        Box::new(move |env, mut host_results| {
-            each_guest_filter(
-                env,
-                graph,
-                5,
-                vec![],
-                Box::new(move |env, results| {
-                    let now = env.sys.clock.now_us();
-                    let graph_state = g(env, graph);
-                    graph_state.position = graph_state.position(now);
-                    graph_state.origin = None;
-                    graph_state.state = PAUSED;
-                    if previous == STOPPED {
-                        start_sessions(env, graph);
-                    } else {
-                        // A push stream keeps going until its renderers hold
-                        // the next sample, which completes their pause.
-                        for id in sessions_of(env, graph) {
-                            stream::repreroll(env, id);
-                        }
-                    }
-                    host_results.extend(results);
-                    flush_posts(env, Box::new(move |env, _| then(env, host_results)))
-                }),
-            )
+        Box::new(move |env, results| {
+            let now = env.sys.clock.now_us();
+            let graph_state = g(env, graph);
+            graph_state.position = graph_state.position(now);
+            graph_state.origin = None;
+            graph_state.state = PAUSED;
+            if previous == STOPPED {
+                start_sessions(env, graph);
+            } else {
+                // A push stream keeps going until its renderers hold
+                // the next sample, which completes their pause.
+                for id in sessions_of(env, graph) {
+                    stream::repreroll(env, id);
+                }
+            }
+            flush_posts(env, Box::new(move |env, _| then(env, results)))
         }),
     )
 }
@@ -1188,29 +1213,21 @@ fn ran(env: &mut Env<'_>, graph: u32, start: u64, then: Then) -> Outcome {
                 graph,
                 Box::new(move |env| {
                     // Without a caller's start, tStart only orders samples; stream time starts at 0.
-                    each_guest_filter(
+                    transition_members(
                         env,
                         graph,
+                        RUNNING,
                         6,
                         vec![start as u32, (start >> 32) as u32],
-                        Box::new(move |env, mut results| {
+                        start as i64,
+                        Box::new(move |env, results| {
                             let now = env.sys.clock.now_us();
-                            let graph_state = g(env, graph);
-                            graph_state.origin = Some(now);
-                            graph_state.state = RUNNING;
-                            transition_hosts(
-                                env,
-                                graph,
-                                RUNNING,
-                                start as i64,
-                                Box::new(move |env, host_results| {
-                                    results.extend(host_results);
-                                    if state(env).graphs.contains_key(&graph) {
-                                        wake_sessions(env, graph);
-                                    }
-                                    flush_posts(env, Box::new(move |env, _| then(env, results)))
-                                }),
-                            )
+                            if let Some(graph_state) = state(env).graphs.get_mut(&graph) {
+                                graph_state.origin = Some(now);
+                                graph_state.state = RUNNING;
+                                wake_sessions(env, graph);
+                            }
+                            flush_posts(env, Box::new(move |env, _| then(env, results)))
                         }),
                     )
                 }),
@@ -1403,75 +1420,55 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         graph_state.stopping = true;
     }
     // Wake blocked host stages first, then stop upstream guest sources before
-    // host stages and downstream guest renderers (MEDIA-DMO-4).
+    // the other members, downstream first (MEDIA-DMO-4).
     super::dmo::begin_stop(env, graph);
     super::vmr::begin_stop(env, graph);
-    order::guest_members(
+    let mut feeding = super::dmo::upstream_filters(env, graph);
+    feeding.extend(super::vmr::upstream_filters(env, graph));
+    order::members(
         env,
         graph,
-        Box::new(move |env, members| {
-            let mut sources = super::dmo::upstream_filters(env, graph);
-            sources.extend(super::vmr::upstream_filters(env, graph));
-            let (feeding, rest): (Vec<u32>, Vec<u32>) = members
+        Box::new(move |env, nodes| {
+            let (sources, rest) = feeding_first(nodes, &feeding);
+            let upstream_calls = sources
                 .into_iter()
-                .partition(|filter| sources.contains(filter));
-            let upstream_calls = feeding
-                .into_iter()
-                .map(|filter| Call(filter, 4, vec![]))
+                .filter_map(|node| match node {
+                    order::Node::Guest(filter) => Some(Call(filter, 4, vec![])),
+                    order::Node::Host(_) => None,
+                })
                 .collect();
             chain(
                 env,
                 upstream_calls,
                 Vec::new(),
-                Box::new(move |env, mut results| {
-                    let finish_stop = move |env: &mut Env<'_>, mut results: Vec<u32>| {
-                        if state(env).graphs.contains_key(&graph) {
-                            stop_sessions(env, graph);
-                        }
-                        let downstream_calls = rest
-                            .into_iter()
-                            .map(|filter| Call(filter, 4, vec![]))
-                            .collect();
-                        chain(
-                            env,
-                            downstream_calls,
-                            Vec::new(),
-                            Box::new(move |env, more| {
-                                results.extend(more);
-                                join(
-                                    env,
-                                    graph,
-                                    Box::new(move |env, _| {
-                                        let Some(graph_state) = state(env).graphs.get_mut(&graph)
-                                        else {
-                                            return then(env, results);
-                                        };
-                                        graph_state.stopping = false;
-                                        // Quartz re-seeks every stream to the kept position.
-                                        seeking::rewind(
-                                            env,
-                                            graph,
-                                            Box::new(move |env| then(env, results)),
-                                        )
-                                    }),
-                                )
-                            }),
-                        )
-                    };
-                    if state(env).graphs.contains_key(&graph) {
-                        transition_hosts(
+                Box::new(move |env, results| {
+                    let finish: Then = Box::new(move |env, more| {
+                        let mut results = results;
+                        results.extend(more);
+                        join(
                             env,
                             graph,
-                            STOPPED,
-                            0,
-                            Box::new(move |env, host_results| {
-                                results.extend(host_results);
-                                finish_stop(env, results)
+                            Box::new(move |env, _| {
+                                let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
+                                    return then(env, results);
+                                };
+                                graph_state.stopping = false;
+                                // Quartz re-seeks every stream to the kept position.
+                                seeking::rewind(env, graph, Box::new(move |env| then(env, results)))
                             }),
                         )
-                    } else {
-                        finish_stop(env, results)
+                    });
+                    if !state(env).graphs.contains_key(&graph) {
+                        return finish(env, Vec::new());
                     }
+                    stop_sessions(env, graph);
+                    let step = Step {
+                        value: STOPPED,
+                        slot: 4,
+                        args: Vec::new(),
+                        start: 0,
+                    };
+                    transition_nodes(env, rest, step, Vec::new(), finish)
                 }),
             )
         }),

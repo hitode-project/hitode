@@ -30,6 +30,8 @@ struct PullSource {
     disconnects: u32,
     graph: u32,
     controls: Vec<u32>,
+    /// For each state change, whether the host filters downstream already had it.
+    hosts_ahead: Vec<bool>,
     enum_next: bool,
 }
 
@@ -170,7 +172,13 @@ fn callback(env: &mut Env<'_>) -> Outcome {
                 12 => PAUSED,
                 _ => RUNNING,
             };
-            env.ext.get_mut::<PullSource>().controls.push(state);
+            let hosts_ahead = crate::dshow::state(env)
+                .filters
+                .values()
+                .all(|filter| filter.state == state);
+            let source = env.ext.get_mut::<PullSource>();
+            source.controls.push(state);
+            source.hosts_ahead.push(hosts_ahead);
             r(S_OK)
         }
         16 => {
@@ -281,6 +289,7 @@ fn fixture(bytes: Vec<u8>) -> (Machine<JitCpu>, u32) {
         disconnects: 0,
         graph: 0,
         controls: Vec::new(),
+        hosts_ahead: Vec::new(),
         enum_next: false,
     });
     let mut methods = BTreeMap::new();
@@ -606,6 +615,12 @@ fn unclocked_video_presents_every_picture_at_once_and_completes_at_the_stop() {
     m.cpu.write_u32(STACK + 4, worker).unwrap();
     let outcome = stream::thread_entry(&mut env(&mut m));
     assert_eq!(finish(&mut m, outcome), 0);
+    // spec: MEDIA-GRAPH-25
+    // The host splitter, decoder and renderer pause and run before the guest
+    // source feeding them.
+    let source = m.ext.get::<PullSource>();
+    assert_eq!(source.controls, [PAUSED, RUNNING]);
+    assert_eq!(source.hosts_ahead, [true, true]);
     // The clock never moves: each wake takes the next picture regardless.
     for _ in 0..16 {
         if m.ext.get::<State>().graphs[&graph].completion.is_some() {
@@ -638,6 +653,26 @@ fn unclocked_video_presents_every_picture_at_once_and_completes_at_the_stop() {
     );
     assert_eq!(crate::dshow::graph::current(&env(&mut m), graph), stop);
     drop(then);
+}
+
+#[cfg(feature = "media")]
+#[test]
+// spec: MEDIA-GRAPH-26
+fn file_splitter_outputs_take_the_types_their_headers_give() {
+    let bytes = movie();
+    let video = filter::output_type(MEDIATYPE_VIDEO, &bytes);
+    assert_eq!(video.sub, MEDIASUBTYPE_MPEG1PAYLOAD);
+    // MPEG1VIDEOINFO ends with the sequence header the stream begins with.
+    assert_eq!(video.format.len(), 112);
+    assert_eq!(&video.format[96..100], &[0, 0, 1, 0xb3]);
+    let audio = filter::output_type(MEDIATYPE_AUDIO, &bytes);
+    assert_eq!(audio.format_type, FORMAT_WAVEFORMATEX);
+    // Without a readable header the output keeps the bare payload type.
+    let bare = filter::output_type(MEDIATYPE_VIDEO, &[]);
+    assert_eq!(
+        (bare.sub, bare.format_type, bare.format.len()),
+        (MEDIASUBTYPE_MPEG1PAYLOAD, GUID_NULL, 0)
+    );
 }
 
 fn invoke(

@@ -168,8 +168,13 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-25 Transition order
 
-**Rule**: Each Stop, Pause and Run MUST first sort guest members by their pins' connections, downstream before upstream, starting from the newest member. Members MUST then change state in that order.
+**Rule**: Each Stop, Pause and Run MUST first sort all members by their pins' connections, downstream before upstream, starting from the newest member. Host members MUST take their places by their own pins. Members MUST then change state in that order.
 **Verification**: Test
+
+### MEDIA-GRAPH-26 Rendered file splitters
+
+**Rule**: RenderFile's splitter outputs MUST carry the media types their stream headers give, as IAsyncReader splitters' do. Each output MUST try the graph's members before a host decoder. A guest input MUST receive the file's demuxed packets.
+**Verification**: Test — header types; members-first rendering and packet delivery also require review.
 
 ### MEDIA-STREAM-1 Pull delivery
 
