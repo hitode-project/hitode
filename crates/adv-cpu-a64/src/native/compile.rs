@@ -30,6 +30,7 @@ pub(super) struct Request {
     pub checked: FxHashSet<u32>,
     pub all_checked: bool,
     pub refused: FxHashSet<u32>,
+    pub cuts: FxHashSet<u32>,
     pub count_entries: bool,
 }
 
@@ -89,6 +90,7 @@ fn compile(request: Request) -> Compiled {
         checked,
         all_checked,
         refused,
+        cuts,
         count_entries,
     } = request;
     let mut unit = Unit::default();
@@ -102,8 +104,22 @@ fn compile(request: Request) -> Compiled {
     let resident = if task == Task::Job {
         None
     } else {
+        let mut cut_unit;
+        let unit = if cuts.is_empty() {
+            &unit
+        } else {
+            let cut: Vec<_> = unit
+                .trace
+                .insts
+                .iter()
+                .map(|i| cuts.contains(&i.pc))
+                .collect();
+            cut_unit = Unit::default();
+            cut_unit.trace = unit.trace.cut(&cut);
+            &cut_unit
+        };
         match front::build_with(
-            &unit,
+            unit,
             proof.as_ref(),
             &at,
             &|pc| all_checked || checked.contains(&pc),
@@ -116,7 +132,7 @@ fn compile(request: Request) -> Compiled {
                     &built.func.entry,
                     count_entries,
                 );
-                let (cuts, us) = (built.cuts, started.elapsed().as_micros());
+                let (cuts, us) = (built.cuts + cuts.len(), started.elapsed().as_micros());
                 crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
                 Some(Form { built, lowered })
             }

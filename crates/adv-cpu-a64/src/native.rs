@@ -1312,10 +1312,14 @@ impl Native {
         // Inline forms may refill the countdown, and a cold exit may leave
         // it negative.
         let mut retired = (budget + self.runtime.completed).wrapping_sub(self.runtime.countdown);
-        if exit == Exit::Optimized {
-            retired -= u64::from(self.materialize_inline(cpu, memory));
+        let resident_cold = if exit == Exit::Optimized {
+            let (refund, site, reason, checked) = self.materialize_inline(cpu, memory);
+            retired -= u64::from(refund);
             exit = Exit::Dispatch;
-        }
+            Some((site, reason, checked))
+        } else {
+            None
+        };
         if exit == Exit::Fault {
             let pc = self.faults.capture.pc.get();
             let site = self.faults.site(pc).expect("faulting site");
@@ -1339,6 +1343,10 @@ impl Native {
         self.resident_arrival(cpu);
         self.environment_miss();
         self.finish_probation();
+        if let Some((site, reason, checked)) = resident_cold {
+            // A rebuild may replace versions named by this run's entry events.
+            self.resident_cold_exit(self.runtime.opt_head, site, reason, checked);
+        }
         if budget_exit {
             self.sample(memory, cpu.eip);
         }
@@ -1477,11 +1485,14 @@ impl Native {
 
     /// Rebuilds the guest state at a cold inline exit from the entry
     /// baseline and the exit's record. Returns the record's refund.
-    fn materialize_inline(&mut self, cpu: &mut CpuState, memory: &Memory) -> u32 {
-        self.diagnostics.resident_cold_exits += 1;
+    fn materialize_inline(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &Memory,
+    ) -> (u32, u32, ResidentCold, bool) {
         let eip = self.runtime.opt_head;
         let index = self.runtime.resident_version as usize;
-        let head = self.heads.get_mut(&eip).expect("resident head");
+        let head = &self.heads[&eip];
         let version = &head.versions[index];
         let record = &version.records[self.runtime.opt_record as usize];
         translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
@@ -1502,13 +1513,24 @@ impl Native {
         if version.assumed.mmx || cpu.mmx_mode != 0 {
             cpu.refresh_mmx();
         }
-        let (site, reason) = if self.runtime.resident_cold != ResidentCold::Other {
-            (self.runtime.resident_site, self.runtime.resident_cold)
-        } else if let Some(site) = self.faults.site(self.faults.capture.pc.get()) {
-            (site.eip, ResidentCold::HostFault)
+        let fault = self.faults.site(self.faults.capture.pc.get());
+        if self.runtime.resident_cold != ResidentCold::Other {
+            (
+                refund,
+                self.runtime.resident_site,
+                self.runtime.resident_cold,
+                false,
+            )
+        } else if let Some(site) = fault {
+            (refund, site.eip, ResidentCold::HostFault, site.checked)
         } else {
-            (record.eip, ResidentCold::Other)
-        };
+            (refund, record.eip, ResidentCold::Other, false)
+        }
+    }
+
+    fn resident_cold_exit(&mut self, eip: u32, site: u32, reason: ResidentCold, checked: bool) {
+        self.diagnostics.resident_cold_exits += 1;
+        let head = self.heads.get_mut(&eip).unwrap();
         let count = head.cold_counts.entry((site, reason)).or_default();
         *count += 1;
         if count.is_power_of_two() {
@@ -1517,21 +1539,17 @@ impl Native {
                 format_args!("resident\tcold\t{site}\t{reason:?}\t{count}"),
             );
         }
-        if matches!(
-            reason,
-            ResidentCold::HostFault | ResidentCold::BlockedAccess
-        ) {
-            let count = head.cold.entry(site).or_default();
-            *count = count.saturating_add(1);
-            if *count == head::COLD_EXITS {
-                head.checked.insert(site);
-                head.rebuilds = (1 << head.versions.len()) - 1;
-                self.rebuild_resident(eip);
+        if *count >= u64::from(head::COLD_EXITS) && !head.unprofitable {
+            match reason {
+                ResidentCold::FrameDisjoint => self.refuse_resident_fact(eip, u32::MAX),
+                ResidentCold::HostFault if !checked => {
+                    if head.checked.insert(site) {
+                        self.rebuild_resident_versions(eip);
+                    }
+                }
+                _ => self.cut_resident_site(eip, site, reason),
             }
-        } else if reason == ResidentCold::FrameDisjoint && *count == u64::from(head::COLD_EXITS) {
-            self.refuse_resident_fact(eip, u32::MAX);
         }
-        refund
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
@@ -2267,6 +2285,7 @@ impl Native {
             checked,
             all_checked: self.checks != Checks::Adaptive,
             refused: head.refused.clone(),
+            cuts: head.cuts.clone(),
             count_entries: self.count_resident_entries,
         });
     }
@@ -2278,6 +2297,9 @@ impl Native {
         }
         let eip = cpu.eip;
         let head = self.heads.get_mut(&eip).unwrap();
+        if head.rebuilds != 0 || matches!(head.pending, Some(compile::Task::Replace(_))) {
+            return;
+        }
         if point == 1 {
             if head.pending.is_none() && head.versions.len() < head::VERSIONS {
                 self.request_resident(eip, compile::Task::Append, cpu.clone());
@@ -2364,9 +2386,40 @@ impl Native {
         }
     }
 
+    fn cut_resident_site(&mut self, eip: u32, site: u32, reason: ResidentCold) {
+        let head = self.heads.get_mut(&eip).unwrap();
+        if head.cuts.insert(site) {
+            if head
+                .trace
+                .reaches_latch_without(&|pc| head.cuts.contains(&pc))
+            {
+                self.rebuild_resident_versions(eip);
+            } else {
+                crate::jit_map::declined(eip, reason);
+                self.demote_resident(eip);
+            }
+        }
+    }
+
+    fn rebuild_resident_versions(&mut self, eip: u32) {
+        let head = self.heads.get_mut(&eip).unwrap();
+        head.rebuilds = (1 << head.versions.len()) - 1;
+        self.rebuild_resident(eip);
+    }
+
     fn rebuild_resident(&mut self, eip: u32) {
         let head = self.heads.get_mut(&eip).unwrap();
-        if !head.unprofitable && head.pending.is_none() && head.rebuilds != 0 {
+        if head.unprofitable || head.rebuilds == 0 {
+            return;
+        }
+        let (trampoline, tier1) = (head.trampoline, head.tier1);
+        // A sampled link may bypass the trampoline. Send those links
+        // through it too until all stale versions have been replaced.
+        self.cache
+            .patch(trampoline, head::branch(trampoline, tier1));
+        self.repoint_resident_edges(eip, Some(trampoline));
+        let head = self.heads.get_mut(&eip).unwrap();
+        if head.pending.is_none() {
             let index = head.rebuilds.trailing_zeros() as usize;
             head.rebuilds &= !(1 << index);
             let at = head.versions[index].at.clone();
@@ -2396,6 +2449,7 @@ impl Native {
             checked: FxHashSet::default(),
             all_checked: false,
             refused: FxHashSet::default(),
+            cuts: FxHashSet::default(),
             count_entries: false,
         });
         self.install_optimized(false);
@@ -2463,10 +2517,15 @@ impl Native {
                     }
                 }
             }
-            if let Some(form) = done.resident
-                && !self.heads[&eip].unprofitable
+            let head = &self.heads[&eip];
+            if !head.unprofitable
+                && (done.task != compile::Task::Append || head.rebuilds == 0)
+                && !done
+                    .resident
+                    .is_some_and(|form| self.install_resident(eip, done.task, done.at, form))
+                && matches!(done.task, compile::Task::Replace(_))
             {
-                self.install_resident(eip, done.task, done.at, form);
+                self.demote_resident(eip);
             }
             let head = &self.heads[&eip];
             if done.task == compile::Task::Discover && head.trampoline == 0 {
@@ -2518,7 +2577,7 @@ impl Native {
         task: compile::Task,
         at: CpuState,
         form: compile::Form,
-    ) {
+    ) -> bool {
         let compile::Form { built, mut lowered } = form;
         let source = self.heads[&eip].source;
         let mut probation = None;
@@ -2531,7 +2590,7 @@ impl Native {
         {
             if tier1 <= lowered.iteration_words {
                 self.demote_resident(eip);
-                return;
+                return true;
             }
             probation = Some(head::Probation {
                 patches: Vec::new(),
@@ -2551,7 +2610,7 @@ impl Native {
                 words.extend(head::fallback(eip, tier1, self.stubs.exit));
             }
             if self.cache.append(&words).is_none() {
-                return;
+                return false;
             }
             (trampoline, tier1)
         } else {
@@ -2577,7 +2636,7 @@ impl Native {
             },
         );
         if self.cache.append(&entry.words).is_none() {
-            return;
+            return false;
         }
         for &(point, transition) in &lowered.transitions {
             self.direct_points
@@ -2641,8 +2700,10 @@ impl Native {
             let last = &head.versions.last().unwrap().slot;
             last.limit.set(last.misses.get().wrapping_add(head::MISSES));
         }
-        self.cache
-            .patch(trampoline, head::branch(trampoline, head.versions[0].probe));
+        if head.rebuilds == 0 {
+            self.cache
+                .patch(trampoline, head::branch(trampoline, head.versions[0].probe));
+        }
         for pair in head.versions.windows(2) {
             self.cache
                 .patch(pair[0].next, head::branch(pair[0].next, pair[1].entry));
@@ -2650,6 +2711,7 @@ impl Native {
         self.uses_permissions = true;
         self.faults.end.set(self.cache.next());
         self.repoint_resident_edges(eip, Some(trampoline));
+        true
     }
 
     fn repoint_resident_edges(&mut self, eip: u32, resident: Option<usize>) {
@@ -3394,10 +3456,12 @@ mod tests {
         assert!(first.plain_sites.contains(&u32::MAX));
         let old = first.entry;
         state.eip = OUTSIDE;
+        native.compiler = compile::Compiler::background();
 
         for _ in 0..head::COLD_EXITS {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
+        native.install_optimized(true);
         let resident = &native.heads[&HEAD];
         let site = (HEAD + 4, ResidentCold::FrameDisjoint);
         assert_eq!(resident.cold_counts[&site], u64::from(head::COLD_EXITS));
@@ -3438,10 +3502,169 @@ mod tests {
         assert!(resident.checked.contains(&HEAD));
         assert_ne!(resident.versions[0].entry, old);
 
-        let mut state = resident_cpu(OUTSIDE, 3);
-        state.regs[6] = DATA + 0x4000 - 4;
-        enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!(state.eip, stop);
+        for _ in 0..100 {
+            let mut state = resident_cpu(OUTSIDE, 3);
+            state.regs[6] = DATA + 0x4000 - 4;
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
+            }
+        }
+        assert_eq!(
+            native.diagnostics.resident_cold_exits,
+            u64::from(head::COLD_EXITS)
+        );
+    }
+
+    fn repeated_optional_cold_site(
+        (instruction, site_offset): (&[u8], u32),
+        reason: ResidentCold,
+        checked: bool,
+        setup: impl FnOnce(&mut Memory, &mut CpuState),
+    ) {
+        // test ebx,ebx; jz latch; <instruction>; dec ecx; jne HEAD; int3
+        let mut body = vec![0x85, 0xdb, 0x74, instruction.len() as u8];
+        body.extend_from_slice(instruction);
+        body.extend_from_slice(&[0x49, 0x75, (-(body.len() as i8 + 3)) as u8, 0xcc]);
+        let (mut memory, mut native, stop) = resident_loop(&body);
+        let site = HEAD + 4 + site_offset;
+        if checked {
+            native.checks = Checks::All;
+        }
+        let mut state = resident_cpu(HEAD, 4);
+        state.regs[3] = 1;
+        setup(&mut memory, &mut state);
+        native.count_resident_entries = true;
+        assert!(native.force_resident_at(&mut memory, state.clone()));
+        let old = native.heads[&HEAD].versions[0].entry;
+        state.eip = OUTSIDE;
+        for _ in 0..head::COLD_EXITS {
+            enter(&mut native, &mut memory, stop, &mut state.clone());
+        }
+        let head = &native.heads[&HEAD];
+        let cold = u64::from(head::COLD_EXITS);
+        assert_eq!(head.cold_counts.get(&(site, reason)), Some(&cold));
+        assert!(head.cuts.contains(&site));
+        assert_ne!(head.versions[0].entry, old);
+
+        let first = enter(&mut native, &mut memory, stop, &mut state.clone());
+        assert!(first.retired > 0);
+        assert_eq!(native.diagnostics.resident_cold_exits, cold);
+
+        let entries = native.diagnostics.resident_entries;
+        for _ in 0..100 {
+            let mut state = state.clone();
+            state.regs[3] = 0;
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
+            }
+        }
+        assert!(native.diagnostics.resident_entries >= entries + 100);
+        assert_eq!(native.diagnostics.resident_cold_exits, cold);
+    }
+
+    // spec: A64-OPT-4, A64-OPT-9
+    #[test]
+    fn repeated_validation_cuts_before_the_instruction() {
+        // mulss xmm0,xmm1 overflows and would set a clear MXCSR bit.
+        repeated_optional_cold_site(
+            (&[0xf3, 0x0f, 0x59, 0xc1], 0),
+            ResidentCold::Validation,
+            false,
+            |_, state| {
+                state.mxcsr = 0x1fa0;
+                state.xmm[0][..4].copy_from_slice(&f32::MAX.to_le_bytes());
+                state.xmm[1][..4].copy_from_slice(&2f32.to_le_bytes());
+            },
+        );
+    }
+
+    // spec: A64-MEM-7, A64-OPT-9
+    #[test]
+    fn repeated_blocked_access_cuts_before_the_instruction() {
+        // mov eax,[esi]
+        repeated_optional_cold_site(
+            (&[0x8b, 0x06], 0),
+            ResidentCold::BlockedAccess,
+            true,
+            |memory, state| {
+                memory.map(DATA, 0x4000, 0).unwrap();
+                state.regs[6] = DATA;
+            },
+        );
+    }
+
+    // spec: A64-MEM-7, A64-OPT-9
+    #[test]
+    fn repeated_checked_host_fault_cuts_before_the_instruction() {
+        // mov eax,[esi]; lea esi,[esi+4] (the load must run in the loop).
+        repeated_optional_cold_site(
+            (&[0x8b, 0x06, 0x8d, 0x76, 4], 0),
+            ResidentCold::HostFault,
+            true,
+            |memory, state| {
+                memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+                state.regs[6] = DATA;
+                // SAFETY: the test owns this mapped window page. Keep the
+                // permission table readable to exercise a checked host fault.
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(
+                            (memory.window_base().unwrap() + DATA as usize) as *mut libc::c_void,
+                            0x4000,
+                            libc::PROT_NONE,
+                        )
+                    },
+                    0
+                );
+            },
+        );
+    }
+
+    // spec: A64-OPT-5, A64-OPT-9
+    #[test]
+    fn repeated_page_cross_cuts_before_the_instruction() {
+        // mov eax,[esi]; mov [esi],eax
+        repeated_optional_cold_site(
+            (&[0x8b, 0x06, 0x89, 0x06], 2),
+            ResidentCold::PageCross,
+            false,
+            |memory, state| {
+                memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+                state.regs[6] = DATA + 0xfff;
+            },
+        );
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn repeated_division_cuts_before_the_instruction() {
+        // div esi with a zero divisor.
+        repeated_optional_cold_site((&[0xf7, 0xf6], 0), ResidentCold::Division, false, |_, _| {});
+    }
+
+    // spec: A64-MEM-7, A64-OPT-9
+    #[test]
+    fn repeated_blocked_access_on_every_iteration_declines_the_head() {
+        // mov eax,[esi]; lea esi,[esi+4]; dec ecx; jne HEAD; int3
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x8b, 0x06, 0x8d, 0x76, 4, 0x49, 0x75, 0xf8, 0xcc]);
+        memory.map(DATA, 0x4000, 0).unwrap();
+        native.checks = Checks::All;
+        assert!(native.force_resident(&mut memory, HEAD));
+        let mut state = resident_cpu(OUTSIDE, 4);
+        state.regs[6] = DATA;
+        for _ in 0..head::COLD_EXITS {
+            enter(&mut native, &mut memory, stop, &mut state.clone());
+        }
+        assert!(native.heads[&HEAD].unprofitable);
+        for _ in 0..100 {
+            let mut state = state.clone();
+            assert_eq!(
+                enter(&mut native, &mut memory, stop, &mut state).exit,
+                Exit::Fault
+            );
+            assert_eq!(state.eip, HEAD);
+        }
         assert_eq!(
             native.diagnostics.resident_cold_exits,
             u64::from(head::COLD_EXITS)

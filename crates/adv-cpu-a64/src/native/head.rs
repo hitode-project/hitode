@@ -36,7 +36,7 @@ pub(super) struct Head {
     pub versions: Vec<Version>,
     pub checked: FxHashSet<u32>,
     pub refused: FxHashSet<u32>,
-    pub cold: FxHashMap<u32, u8>,
+    pub cuts: FxHashSet<u32>,
     pub cold_counts: FxHashMap<(u32, ResidentCold), u64>,
     /// Versions to rebuild once the current request settles.
     pub rebuilds: u8,
@@ -57,7 +57,7 @@ impl Head {
             versions: Vec::new(),
             checked: FxHashSet::default(),
             refused: FxHashSet::default(),
-            cold: FxHashMap::default(),
+            cuts: FxHashSet::default(),
             cold_counts: FxHashMap::default(),
             rebuilds: 0,
             pending: None,

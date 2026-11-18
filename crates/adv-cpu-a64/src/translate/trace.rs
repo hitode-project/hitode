@@ -917,6 +917,32 @@ impl Trace {
         }) && any
     }
 
+    /// A resident cut keeps the loop only if a path still takes a latch.
+    pub(crate) fn reaches_latch_without(&self, cut: &dyn Fn(u32) -> bool) -> bool {
+        let mut seen = vec![false; self.len()];
+        let mut work = vec![0];
+        while let Some(i) = work.pop() {
+            if seen[i] || cut(self.insts[i].pc) {
+                continue;
+            }
+            seen[i] = true;
+            let inst = &self.insts[i];
+            let next = match inst.next {
+                Next::Fall if i + 1 < self.len() => Some(Edge::Internal(i + 1)),
+                Next::Edge(edge) => Some(edge),
+                _ => None,
+            };
+            for edge in [next, inst.taken].into_iter().flatten() {
+                match edge {
+                    Edge::Internal(0) => return true,
+                    Edge::Internal(to) => work.push(to),
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
     pub fn has_loop(&self) -> bool {
         self.insts.iter().enumerate().any(|(index, inst)| {
             matches!(inst.taken, Some(Edge::Internal(to)) if to <= index)
