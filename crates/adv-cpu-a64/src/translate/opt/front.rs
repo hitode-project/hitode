@@ -27,6 +27,7 @@ pub(crate) struct Built {
     pub assumed: Assumed,
     /// Appended-path instructions that leave instead of running.
     pub cuts: usize,
+    pub plain_sites: Vec<u32>,
 }
 
 /// Entry facts checked by admission before selecting this form.
@@ -158,8 +159,9 @@ pub(crate) fn build_with(
     proof: Option<&Proof>,
     at: &CpuState,
     checked: &dyn Fn(u32) -> bool,
+    refused: &dyn Fn(u32) -> bool,
 ) -> Result<Built, Reject> {
-    let _ = checked;
+    let _ = (checked, refused);
     build(unit, proof.ok_or(Reject::Empty)?, at)
 }
 
@@ -174,6 +176,7 @@ pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, 
                     func,
                     assumed,
                     cuts,
+                    plain_sites: Vec::new(),
                 });
             }
             Err(reject) => reject,

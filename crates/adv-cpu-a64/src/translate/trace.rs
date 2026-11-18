@@ -87,8 +87,11 @@ pub struct Inst {
 }
 
 impl Inst {
-    pub(crate) fn inlined(&self) -> bool {
-        self.frame != 0
+    pub(super) fn backward_jump(&self, target: u32) -> bool {
+        if target > self.pc {
+            return false;
+        }
+        matches!(self.op, Op::Jmp(_) | Op::Jcc(..))
     }
 }
 
@@ -103,6 +106,7 @@ struct Frame {
 #[derive(Default)]
 pub struct Trace {
     pub insts: Vec<Inst>,
+    pub(crate) x86: Vec<Option<iced_x86::Instruction>>,
     /// Guest bytes the trace was decoded from, as (address, length).
     pub code: Vec<(u32, u32)>,
     /// End of each instruction's region: the next region start.
@@ -282,6 +286,7 @@ impl Trace {
     pub(crate) fn detached(&self) -> Self {
         Self {
             insts: self.insts.clone(),
+            x86: self.x86.clone(),
             code: self.code.clone(),
             region_end: self.region_end.clone(),
             merge: self.merge.clone(),
@@ -804,6 +809,7 @@ impl Trace {
         }
         let mut trace = Trace {
             insts,
+            x86: self.x86.clone(),
             code: self.code.clone(),
             frames: self.frames.clone(),
             slots: self.slots.clone(),
@@ -852,8 +858,15 @@ impl Trace {
         self.observe_in.resize(len, FlagSet::NONE);
         self.observe_out.clear();
         self.observe_out.resize(len, FlagSet::NONE);
-        while self.liveness(true) && backward {}
-        while self.liveness(false) && backward {}
+        while self.liveness(true, false) && backward {}
+        while self.liveness(false, false) && backward {}
+    }
+
+    /// Tier-1 resident links publish canonical state even on an edge that
+    /// stayed within the same prepaid region in the analysis trace.
+    pub(super) fn observe_back_links(&mut self) {
+        while self.liveness(true, true) {}
+        while self.liveness(false, true) {}
     }
 
     /// Whether the trace can stop after one outer iteration: edges reenter
@@ -915,9 +928,15 @@ impl Trace {
         i64::from(self.owed(to)) - i64::from(self.unused(from))
     }
 
-    fn edge_live(&self, from: usize, edge: Edge, observe: bool) -> FlagSet {
+    fn edge_live(&self, from: usize, edge: Edge, observe: bool, resident: bool) -> FlagSet {
         match edge {
-            Edge::Internal(to) if observe && self.net(from, to) > 0 => FlagSet::ALL,
+            Edge::Internal(to)
+                if observe
+                    && (self.net(from, to) > 0
+                        || resident && self.insts[from].backward_jump(self.insts[to].pc)) =>
+            {
+                FlagSet::ALL
+            }
             Edge::Internal(to) => {
                 if observe {
                     self.observe_in[to]
@@ -930,7 +949,7 @@ impl Trace {
     }
 
     /// Recovery observations constrain merges; recipes serve other sites.
-    fn liveness(&mut self, observe: bool) -> bool {
+    fn liveness(&mut self, observe: bool, resident: bool) -> bool {
         let mut changed = false;
         for index in (0..self.len()).rev() {
             let inst = &self.insts[index];
@@ -942,13 +961,13 @@ impl Trace {
                         self.live_in[index + 1]
                     }
                 }
-                Next::Edge(edge) => self.edge_live(index, edge, observe),
+                Next::Edge(edge) => self.edge_live(index, edge, observe, resident),
                 Next::Dynamic => FlagSet::ALL,
             };
             if let Some(taken) = inst.taken
                 && (observe || matches!(taken, Edge::Internal(_)))
             {
-                out = out.or(self.edge_live(index, taken, observe));
+                out = out.or(self.edge_live(index, taken, observe, resident));
             }
             if inst.mode != Mode::Plain || inst.spin && observe {
                 out = FlagSet::ALL;

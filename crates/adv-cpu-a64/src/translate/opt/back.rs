@@ -40,6 +40,13 @@ pub(crate) struct Lowered {
     pub miss: usize,
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
+    pub entry_words: u32,
+    pub exit_words: u32,
+    pub iteration_words: u32,
+    pub iteration_retired: u32,
+    pub iteration_pcs: Vec<u32>,
+    pub probation: Vec<usize>,
+    pub probation_slot: usize,
     pub cold: usize,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
@@ -115,6 +122,13 @@ fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
         entry: 0,
         miss,
         env_miss: miss,
+        entry_words: 0,
+        exit_words: 0,
+        iteration_words: 0,
+        iteration_retired: 0,
+        iteration_pcs: Vec::new(),
+        probation: Vec::new(),
+        probation_slot: 0,
         cold,
         links: e.links,
         exit,

@@ -166,6 +166,15 @@ pub struct Runtime {
     pub offer_gate: u64,
     /// The head EIP of the inline form whose cold exit reached `opt_exit`.
     pub opt_head: u32,
+    /// Version whose cold exit reached the owner.
+    pub resident_version: u32,
+    /// Back edge sampled at a resident entry.
+    pub resident_point: usize,
+    /// Head and version with an environment miss due for a rebuild.
+    pub resident_env: u64,
+    pub resident_fact: u32,
+    pub resident_site: u32,
+    pub resident_probation: u64,
 }
 
 impl Runtime {
@@ -225,6 +234,12 @@ impl Runtime {
             opt_entry: OptEntryState::default(),
             offer_gate: 0,
             opt_head: 0,
+            resident_version: 0,
+            resident_point: 0,
+            resident_env: 0,
+            resident_fact: 0,
+            resident_site: u32::MAX,
+            resident_probation: 0,
         }
     }
 }
@@ -1123,4 +1138,53 @@ mod tests {
         assert_eq!(outcome, adv_cpu_core::RunOutcome::ReachedStop);
         executor.state.eflags
     }
+}
+
+#[cfg(native)]
+pub(crate) const RESIDENT_VERSION: u32 = field(offset_of!(Runtime, resident_version));
+#[cfg(native)]
+pub(crate) const RESIDENT_POINT: u32 = field(offset_of!(Runtime, resident_point));
+#[cfg(native)]
+pub(crate) const RESIDENT_ENV: u32 = field(offset_of!(Runtime, resident_env));
+#[cfg(native)]
+pub(crate) const RESIDENT_FACT: u32 = field(offset_of!(Runtime, resident_fact));
+
+#[cfg(native)]
+pub(crate) const RESIDENT_PROBATION: u32 = field(offset_of!(Runtime, resident_probation));
+
+/// The backward link's patch word precedes the ordinary dispatch prefix.
+/// x14 identifies the edge on the resident trampoline's sampled path.
+pub(crate) fn emit_link_point(asm: &mut crate::asm::Asm, eip: u32, back: bool) -> usize {
+    if back {
+        asm.emit(adr(r(14), 4));
+    }
+    let point = asm.offset();
+    if back {
+        asm.emit(b(4));
+    }
+    asm.emit_all(&[
+        movz(W, r(1), eip as u16, 0),
+        movk(W, r(1), (eip >> 16) as u16, 16),
+        adr(r(2), point as i32 - asm.offset() as i32 - 8),
+    ]);
+    point
+}
+
+/// Byte offsets from a backward link's patch word.
+pub(crate) const BACK_COUNT: usize = 20;
+pub(crate) const BACK_UNIT: usize = 40;
+pub(crate) const BACK_COUNTER: usize = 44;
+
+pub(crate) fn emit_back_count(asm: &mut crate::asm::Asm) {
+    asm.emit_all(&[
+        // LDR x3, #24, the literal at BACK_COUNTER.
+        0x5800_00c3,
+        ldr(W, r(4), r(3), 0),
+        sub_imm(W, r(4), r(4), 1, false),
+        str(W, r(4), r(3), 0),
+        cbz(W, false, r(4), -32),
+        b(0),
+        0,
+        0,
+    ]);
 }

@@ -2790,6 +2790,7 @@ impl Translator<'_> {
                 self.trace.unused(cold.index),
                 false,
                 false,
+                false,
             );
             return;
         }
