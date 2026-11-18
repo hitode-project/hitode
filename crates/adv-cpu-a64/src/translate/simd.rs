@@ -42,16 +42,17 @@
 //! inexact needs no tracking), or when it cannot be inexact, with no
 //! denormal operand, and its values rule out every other exception: no
 //! infinite or NaN result, no zero or subnormal product or quotient that
-//! zero operands do not explain, no NaN compared or widened, no saturated
-//! integer. Anything else takes a slow path that redoes the instruction
-//! between a cleared and a read FPSR: invalid, divide by zero, overflow and
-//! underflow leave for the interpreter before the destination changes,
-//! which also settles x86's negative default NaN and its tininess after
-//! rounding; inexact sets PE, and a denormal operand, which A64 does not
-//! report without FZ, sets DE from a check of the bits. A false alarm only
-//! costs the slow path. Scalar forms ignore upper lanes; NaN signaling
-//! follows each x86 predicate. EFLAGS comparisons leave for the
-//! interpreter on any NaN.
+//! zero operands do not explain, no product, quotient or narrowing in the
+//! min normal binade, which rounding up may have reached from a tiny value,
+//! no NaN compared or widened, no saturated integer. Anything else takes a
+//! slow path that redoes the instruction between a cleared and a read FPSR:
+//! invalid, divide by zero, overflow and underflow leave for the
+//! interpreter before the destination changes, which also settles x86's
+//! negative default NaN and its tininess after rounding; inexact sets PE,
+//! and a denormal operand, which A64 does not report without FZ, sets DE
+//! from a check of the bits. A false alarm only costs the slow path. Scalar
+//! forms ignore upper lanes; NaN signaling follows each x86 predicate.
+//! EFLAGS comparisons leave for the interpreter on any NaN.
 
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
@@ -1719,14 +1720,15 @@ impl Translator<'_> {
                 let sum = matches!(op, Float::Fadd | Float::Fsub);
                 let tiny = self.result_bits(double, V0, !sum);
                 if rounded {
-                    // Overflow can saturate to max finite. A product
-                    // rounded up to min normal can also raise underflow.
+                    // Overflow can saturate to max finite.
                     self.emit(add_imm(W, X16, X17, 1, false));
                     self.asm.tbz(true, X16, 8, slow);
-                    if !sum {
-                        self.emit(eor_imm(W, X16, X17, 2));
-                        self.asm.cbz(W, false, X16, slow);
-                    }
+                }
+                if !sum {
+                    // A product or quotient rounded up to min normal can
+                    // be tiny after rounding and raise underflow.
+                    self.emit(eor_imm(W, X16, X17, 2));
+                    self.asm.cbz(W, false, X16, slow);
                 }
                 if sum {
                     // A tiny sum is exact: only infinities and NaNs.
@@ -1741,7 +1743,7 @@ impl Translator<'_> {
             }
             Kind::Float(op, _) | Kind::Double(op, _) => {
                 let arr = if double { Arr::D2 } else { Arr::S4 };
-                // v6 lanes with an infinity or NaN, v5 zeros and subnormals.
+                // v6 lanes with an infinity or NaN, v5 lanes that may be tiny.
                 if double {
                     self.emit(movz(X, X16, 0x7ff0, 48));
                 } else {
@@ -1761,16 +1763,16 @@ impl Translator<'_> {
                 if !matches!(op, Float::Fadd | Float::Fsub) {
                     // A product with a zero factor, or a zero dividend, is
                     // an exact zero.
+                    // Lanes below the binade above min normal: zeros,
+                    // subnormals and products rounded up to min normal,
+                    // which can be tiny after rounding.
                     self.emit(vzero(true, V2));
-                    if rounded {
-                        self.emit_all(&[
-                            movz(W, X16, 0x0100, 16),
-                            vdup(arr, v4, X16),
-                            vsame(Same::Uqsub, arr, v5, v4, v5),
-                        ]);
+                    if double {
+                        self.emit(movz(X, X16, 0x0020, 48));
                     } else {
-                        self.emit(vsame(Same::Cmeq, arr, v5, v5, V2));
+                        self.emit(movz(W, X16, 0x0100, 16));
                     }
+                    self.emit_all(&[vdup(arr, v4, X16), vsame(Same::Uqsub, arr, v5, v4, v5)]);
                     self.emit(vcompare(Float::Fcmeq, false, double, v3, a.unwrap(), V2));
                     if op == Float::Fmul {
                         self.emit_all(&[
@@ -1789,6 +1791,9 @@ impl Translator<'_> {
             }
             Kind::Narrow(..) => {
                 let tiny = self.result_bits(false, V0, true);
+                // Rounded up to min normal, as for products.
+                self.emit(eor_imm(W, X16, X17, 2));
+                self.asm.cbz(W, false, X16, slow);
                 let label = self.asm.label();
                 self.asm.cbz(W, false, tiny, label);
                 Some(label)
