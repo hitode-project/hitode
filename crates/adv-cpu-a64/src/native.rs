@@ -361,7 +361,18 @@ struct Linked {
     original: u32,
     next: u32,
     back: bool,
+    direct: Option<usize>,
     sample: Option<(usize, u8)>,
+}
+
+impl Linked {
+    fn branch(&self, target: usize) -> u32 {
+        if self.original & 0xFC00_0000 == 0x9400_0000 {
+            bl((target as i64 - self.point as i64) as i32)
+        } else {
+            head::branch(self.point, target)
+        }
+    }
 }
 
 struct InternalEdge {
@@ -370,6 +381,8 @@ struct InternalEdge {
     transition: usize,
     link: usize,
     source: u32,
+    source_pc: u32,
+    back: bool,
     sample: Option<(usize, u8)>,
 }
 
@@ -481,6 +494,16 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
     }
     // A first visit runs in the owner; the point links on the next one.
     let entry = native.units.get(&eip).copied();
+    if entry.is_none()
+        && native.direct_points.contains_key(&point)
+        && let Some(head) = native.heads.get(&eip)
+        && head.trampoline != 0
+        && !head.unprofitable
+    {
+        native.patch(point, eip, head.tier1);
+        native.cache.sync();
+        return point;
+    }
     if entry.is_none()
         && (!crate::translate::Fetcher::fetchable(memory, eip) || native.first_visit(eip))
     {
@@ -792,6 +815,7 @@ pub(crate) struct Native {
     /// Link points of the units the current translation placed.
     points: Vec<(usize, u32, bool)>,
     back_points: FxHashSet<usize>,
+    direct_points: FxHashMap<usize, usize>,
     internal_edges: FxHashMap<u32, Vec<InternalEdge>>,
     /// Counter addresses survive unit replacement and link restoration.
     counters: FxHashMap<u32, Box<Cell<u32>>>,
@@ -976,6 +1000,7 @@ impl Native {
             linked: Vec::new(),
             points: Vec::new(),
             back_points: FxHashSet::default(),
+            direct_points: FxHashMap::default(),
             internal_edges: FxHashMap::default(),
             counters: FxHashMap::default(),
             heads: FxHashMap::default(),
@@ -1539,6 +1564,14 @@ impl Native {
                 // Reload the back edge's identity after the dispatch stub.
                 return Ok(point - 4);
             }
+            if self.direct_points.contains_key(&point)
+                && self
+                    .heads
+                    .get(&eip)
+                    .is_some_and(|head| head.trampoline != 0 && !head.unprofitable)
+            {
+                return Ok(point);
+            }
         }
         Ok(entry.unit)
     }
@@ -1553,6 +1586,7 @@ impl Native {
             original,
             next: next.unwrap_or(u32::MAX),
             back,
+            direct: self.direct_points.get(&point).copied(),
             sample: None,
         };
         if back {
@@ -1563,24 +1597,30 @@ impl Native {
         self.linked.push(link);
     }
 
+    fn enters_resident(link: &Linked, head: &head::Head) -> bool {
+        head.trampoline != 0 && !head.unprofitable && (link.back || link.direct.is_some())
+    }
+
     fn route_link(cache: &mut CodeCache, link: &Linked, head: Option<&head::Head>, unit: usize) {
         let point = link.point;
-        let target = if link.back {
-            match head {
-                Some(head) if head.unprofitable => unit,
-                Some(head) if head.trampoline != 0 => head.trampoline,
-                Some(_) => unit,
-                _ => point + runtime::BACK_COUNT,
+        let target = if let Some(head) = head.filter(|head| Self::enters_resident(link, head)) {
+            if link.back {
+                head.trampoline
+            } else if let Some(transition) = link.direct {
+                cache.patch(
+                    transition + 4,
+                    head::branch(transition + 4, head.trampoline),
+                );
+                transition
+            } else {
+                unit
             }
+        } else if link.back && head.is_none() {
+            point + runtime::BACK_COUNT
         } else {
             unit
         };
-        let word = if link.original & 0xFC00_0000 == 0x9400_0000 {
-            bl((target as i64 - point as i64) as i32)
-        } else {
-            head::branch(point, target)
-        };
-        cache.patch(point, word);
+        cache.patch(point, link.branch(target));
     }
 
     /// Tier-1 replacement keeps old continuations and all their watches.
@@ -1600,9 +1640,9 @@ impl Native {
             if link.back {
                 let fallback = link.point + runtime::BACK_UNIT;
                 self.cache.patch(fallback, head::branch(fallback, new.unit));
-                if resident.is_some_and(|head| head.trampoline != 0 && !head.unprofitable) {
-                    continue;
-                }
+            }
+            if resident.is_some_and(|head| Self::enters_resident(link, head)) {
+                continue;
             }
             Self::route_link(&mut self.cache, link, resident, new.unit);
         }
@@ -1864,6 +1904,7 @@ impl Native {
         self.links.clear();
         self.linked.clear();
         self.back_points.clear();
+        self.direct_points.clear();
         self.internal_edges.clear();
         self.counters.clear();
         self.heads.clear();
@@ -2043,6 +2084,9 @@ impl Native {
             for link in work.links() {
                 let point = at + link.offset;
                 self.points.push((point, link.eip, link.main));
+                if let Some(transition) = link.direct {
+                    self.direct_points.insert(point, at + transition);
+                }
                 if link.back {
                     self.back_points.insert(point);
                     let (address, _) = self.counter(link.eip);
@@ -2056,14 +2100,28 @@ impl Native {
                     transition: at + link.transition,
                     link: at + link.link,
                     source: eip,
+                    source_pc: link.source_pc,
+                    back: link.counter.is_some(),
                     sample: None,
                 };
-                let (address, value) = self.counter(link.eip);
-                self.bind_counter(at + link.counter, address);
+                let value = if let Some(counter) = link.counter {
+                    let (address, value) = self.counter(link.eip);
+                    self.bind_counter(at + counter, address);
+                    value
+                } else {
+                    u32::MAX
+                };
                 let resident = self.heads.get(&link.eip);
-                if let Some(head) =
-                    resident.filter(|head| head.trampoline != 0 && !head.unprofitable)
-                {
+                if let Some(head) = resident.filter(|head| {
+                    head.trampoline != 0
+                        && !head.unprofitable
+                        && (edge.back
+                            || !head
+                                .trace
+                                .insts
+                                .iter()
+                                .any(|inst| inst.pc == edge.source_pc))
+                }) {
                     self.cache
                         .patch(edge.link, head::branch(edge.link, head.trampoline));
                     self.cache
@@ -2162,7 +2220,7 @@ impl Native {
 
     fn stop_counting(&mut self, eip: u32) {
         self.counters[&eip].set(u32::MAX);
-        self.repoint_back_edges(eip, None);
+        self.repoint_resident_edges(eip, None);
     }
 
     fn discover(&mut self, memory: &mut Memory, eip: u32, source: u32, at: CpuState) {
@@ -2237,7 +2295,9 @@ impl Native {
             while self.linked[next as usize].point != point {
                 next = self.linked[next as usize].next;
             }
-            (point, &mut self.linked[next as usize].sample)
+            let edge = &mut self.linked[next as usize];
+            let patch = edge.direct.map_or(point, |transition| transition + 4);
+            (patch, &mut edge.sample)
         };
         let version = head.versions.iter().position(|version| {
             cpu.rep.is_none()
@@ -2410,7 +2470,7 @@ impl Native {
             }
             let head = &self.heads[&eip];
             if done.task == compile::Task::Discover && head.trampoline == 0 {
-                self.repoint_back_edges(eip, None);
+                self.repoint_resident_edges(eip, None);
             }
             self.rebuild_resident(eip);
         }
@@ -2519,6 +2579,10 @@ impl Native {
         if self.cache.append(&entry.words).is_none() {
             return;
         }
+        for &(point, transition) in &lowered.transitions {
+            self.direct_points
+                .insert(entry.form + point, entry.form + transition);
+        }
         let from = self.faults.sites.len().saturating_sub(1);
         self.faults.sites.extend(
             lowered
@@ -2585,28 +2649,43 @@ impl Native {
         }
         self.uses_permissions = true;
         self.faults.end.set(self.cache.next());
-        self.repoint_back_edges(eip, Some(trampoline));
+        self.repoint_resident_edges(eip, Some(trampoline));
     }
 
-    fn repoint_back_edges(&mut self, eip: u32, resident: Option<usize>) {
+    fn repoint_resident_edges(&mut self, eip: u32, resident: Option<usize>) {
         self.repoint_internal_edges(eip, resident);
         let mut link = self.links.get(&eip).copied().unwrap_or(u32::MAX);
         while let Some(edge) = self.linked.get_mut(link as usize) {
             link = edge.next;
-            if edge.back {
+            if edge.back || edge.direct.is_some() {
                 edge.sample = None;
-                let target = resident.unwrap_or_else(|| self.units[&eip].unit);
-                self.cache
-                    .patch(edge.point, head::branch(edge.point, target));
+                let unit = self
+                    .units
+                    .get(&eip)
+                    .map_or_else(|| self.heads[&eip].tier1, |entry| entry.unit);
+                if resident.is_none() {
+                    self.cache.patch(edge.point, edge.branch(unit));
+                } else {
+                    Self::route_link(&mut self.cache, edge, self.heads.get(&eip), unit);
+                }
             }
         }
         self.cache.sync();
     }
 
     fn repoint_internal_edges(&mut self, eip: u32, resident: Option<usize>) {
+        let head = self.heads.get(&eip);
         for edge in self.internal_edges.get_mut(&eip).into_iter().flatten() {
             edge.sample = None;
-            let target = if let Some(resident) = resident {
+            let target = if let Some(resident) = resident.filter(|_| {
+                edge.back
+                    || !head
+                        .unwrap()
+                        .trace
+                        .insts
+                        .iter()
+                        .any(|inst| inst.pc == edge.source_pc)
+            }) {
                 self.cache
                     .patch(edge.link, head::branch(edge.link, resident));
                 edge.transition
@@ -2641,7 +2720,7 @@ impl Native {
         let head = self.heads.get_mut(&eip).unwrap();
         head.unprofitable = true;
         head.versions.clear();
-        self.repoint_back_edges(eip, None);
+        self.repoint_resident_edges(eip, None);
     }
 
     /// Budget samples select Tier-1 loop traces.
@@ -2918,7 +2997,7 @@ mod tests {
 
     // spec: A64-OPT-8, A64-OPT-9
     #[test]
-    fn resident_discovery_installs_only_back_edges_and_survives_promotion() {
+    fn resident_links_survive_tier1_promotion() {
         let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
         let invalidations = native.diagnostics.global_invalidations;
         let mut state = resident_cpu(OUTSIDE + 16, head::HOT);
@@ -2938,6 +3017,7 @@ mod tests {
             (edge.point, edge.transition, edge.target, edge.link);
         let link = outside_link(&native, HEAD);
         let (outside, unresolved) = (link.point, link.original);
+        let arrival = link.direct.unwrap();
         assert_eq!(native.heads[&HEAD].versions.len(), 1);
         let trampoline = native.heads[&HEAD].trampoline;
         assert_eq!(native.cache.word(back), head::branch(back, transition));
@@ -2945,7 +3025,7 @@ mod tests {
             native.cache.word(resident),
             head::branch(resident, trampoline)
         );
-        assert_eq!(native.cache.word(outside), head::branch(outside, unit));
+        assert_eq!(native.cache.word(outside), head::branch(outside, arrival));
         assert_eq!(native.table[table][1], unit as u64);
 
         native.promotion = 1;
@@ -2958,7 +3038,7 @@ mod tests {
             native.cache.word(resident),
             head::branch(resident, trampoline)
         );
-        assert_eq!(native.cache.word(outside), head::branch(outside, new));
+        assert_eq!(native.cache.word(outside), head::branch(outside, arrival));
         assert_eq!(native.table[table][1], new as u64);
         assert_eq!(
             native.cache.word(native.heads[&HEAD].tier1),
@@ -2997,10 +3077,11 @@ mod tests {
             native.cache.word(edge.link),
             self::head::branch(edge.link, head.trampoline)
         );
-        let outside = outside_link(&native, HEAD).point;
+        let outside = outside_link(&native, HEAD);
+        let transition = outside.direct.unwrap();
         assert_eq!(
-            native.cache.word(outside),
-            self::head::branch(outside, native.units[&HEAD].unit)
+            native.cache.word(outside.point),
+            self::head::branch(outside.point, transition)
         );
     }
 
@@ -3027,12 +3108,14 @@ mod tests {
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 25));
         assert!(!native.units.contains_key(&head));
-        let edge = &native.internal_edges[&head][0];
-        let (point, target) = (edge.point, edge.target);
-        assert_eq!(
-            native.cache.word(point),
-            head::branch(point, edge.transition)
-        );
+        let edges = &native.internal_edges[&head];
+        assert!(edges.iter().any(|edge| !edge.back));
+        for edge in edges {
+            assert_eq!(
+                native.cache.word(edge.point),
+                head::branch(edge.point, edge.transition)
+            );
+        }
         assert_eq!(native.heads[&head].versions[0].at.regs[1], 1);
 
         let mut state = resident_cpu(HEAD, 3);
@@ -3044,17 +3127,22 @@ mod tests {
         let mut state = resident_cpu(HEAD, 2);
         state.mxcsr ^= 0x2000;
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (head, 13));
+        assert_eq!((state.eip, run.retired), (head, 1));
         assert!(!native.units.contains_key(&head));
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (stop, 12));
+        assert_eq!((state.eip, run.retired), (stop, 24));
         assert!(native.units.contains_key(&head));
 
         memory.protect(HEAD, 0x4000, READ | WRITE).unwrap();
         memory.write(head, &[0xcc]).unwrap();
         native.invalidate(&mut memory);
         assert!(!native.heads.contains_key(&head));
-        assert_eq!(native.cache.word(point), head::branch(point, target));
+        for edge in &native.internal_edges[&head] {
+            assert_eq!(
+                native.cache.word(edge.point),
+                head::branch(edge.point, edge.target)
+            );
+        }
     }
 
     // spec: A64-CTL-15, A64-OPT-8
@@ -3174,7 +3262,7 @@ mod tests {
                 .versions
                 .iter()
                 .zip(before)
-                .all(|(v, before)| v.slot.misses.get() == before + 1)
+                .all(|(v, before)| v.slot.misses.get() == before + 2)
         );
         let last = resident.versions.last().unwrap();
         assert_eq!(
@@ -3188,10 +3276,11 @@ mod tests {
             enter(&mut native, &mut memory, stop, &mut state);
         }
         let resident = &native.heads[&HEAD];
-        let back = native.internal_edges[&HEAD][0].link;
+        let transition = outside_link(&native, HEAD).direct.unwrap();
+        let patch = transition + 4;
         assert_eq!(
-            native.cache.word(back),
-            head::branch(back, resident.versions[2].entry)
+            native.cache.word(patch),
+            head::branch(patch, resident.versions[2].entry)
         );
     }
 
@@ -3271,8 +3360,8 @@ mod tests {
         let mut state = resident_cpu(OUTSIDE, 2);
         state.regs[6] = DATA;
         enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!(native.heads[&HEAD].versions[0].slot.env[0].get(), 1);
-        for _ in 1..head::MISSES {
+        assert_eq!(native.heads[&HEAD].versions[0].slot.env[0].get(), 2);
+        for _ in 1..head::MISSES.div_ceil(2) {
             let mut state = resident_cpu(OUTSIDE, 2);
             state.regs[6] = DATA;
             enter(&mut native, &mut memory, stop, &mut state);
@@ -3353,9 +3442,7 @@ mod tests {
         );
     }
 
-    // spec: A64-OPT-8
-    #[test]
-    fn resident_probation_demotes_short_invocations_and_keeps_long_ones() {
+    fn probation_loop(trips: u32) -> (Memory, Native, u32) {
         let mut body = Vec::new();
         for value in 0..6 {
             body.extend_from_slice(&[0xb8, value, 0, 0, 0]);
@@ -3363,41 +3450,70 @@ mod tests {
         body.extend_from_slice(STORE_LOOP);
         let latch = body.len() - 2;
         body[latch] = (-(latch as i32 + 1)) as u8;
-        for (trips, demoted) in [(2, true), (100, false)] {
-            let (mut memory, mut native, stop) = resident_loop(&body);
-            native.translate(&mut memory, HEAD).unwrap();
-            native.discover(&mut memory, HEAD, HEAD, resident_cpu(HEAD, trips));
-            native.install_optimized(true);
-            let invalidations = native.diagnostics.global_invalidations;
-            let patches = native.heads[&HEAD].versions[0]
-                .probation
-                .as_ref()
-                .unwrap()
-                .patches
-                .clone();
-            for _ in 0..300 {
-                let mut state = resident_cpu(OUTSIDE, trips);
-                while state.eip != stop {
-                    enter(&mut native, &mut memory, stop, &mut state);
-                }
-            }
-            let resident = &native.heads[&HEAD];
-            assert_eq!(resident.unprofitable, demoted);
-            assert_eq!(native.diagnostics.global_invalidations, invalidations);
-            let edge = &native.internal_edges[&HEAD][0];
-            if demoted {
-                assert_eq!(
-                    native.cache.word(edge.point),
-                    head::branch(edge.point, edge.target)
-                );
-            } else {
-                assert!(
-                    patches
-                        .into_iter()
-                        .all(|word| native.cache.word(word) == crate::encode::NOP)
-                );
+        let (mut memory, mut native, stop) = resident_loop(&body);
+        native.translate(&mut memory, HEAD).unwrap();
+        native.discover(&mut memory, HEAD, HEAD, resident_cpu(HEAD, trips));
+        native.install_optimized(true);
+        (memory, native, stop)
+    }
+
+    // spec: A64-OPT-8
+    #[test]
+    fn outside_arrival_runs_the_first_iteration_in_resident_until_demotion() {
+        let (mut memory, mut native, stop) = probation_loop(2);
+        let invalidations = native.diagnostics.global_invalidations;
+        let mut state = resident_cpu(OUTSIDE, 2);
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!(state.eip, stop);
+        let slot = &native.heads[&HEAD].versions[0].slot;
+        assert_eq!(slot.entries.get(), 1);
+        // Only the two instructions leading into the loop retire in Tier 1.
+        assert_eq!(u64::from(run.retired) - slot.countdown[1].get(), 2);
+
+        for _ in 1..300 {
+            let mut state = resident_cpu(OUTSIDE, 2);
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
             }
         }
+        assert!(native.heads[&HEAD].unprofitable);
+        assert_eq!(native.diagnostics.global_invalidations, invalidations);
+        let outside = outside_link(&native, HEAD);
+        assert_eq!(
+            native.cache.word(outside.point),
+            outside.branch(native.units[&HEAD].unit)
+        );
+        let edge = &native.internal_edges[&HEAD][0];
+        assert_eq!(
+            native.cache.word(edge.point),
+            head::branch(edge.point, edge.target)
+        );
+    }
+
+    // spec: A64-OPT-8
+    #[test]
+    fn resident_probation_keeps_long_invocations() {
+        let (mut memory, mut native, stop) = probation_loop(100);
+        let invalidations = native.diagnostics.global_invalidations;
+        let patches = native.heads[&HEAD].versions[0]
+            .probation
+            .as_ref()
+            .unwrap()
+            .patches
+            .clone();
+        for _ in 0..300 {
+            let mut state = resident_cpu(OUTSIDE, 100);
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
+            }
+        }
+        assert!(!native.heads[&HEAD].unprofitable);
+        assert_eq!(native.diagnostics.global_invalidations, invalidations);
+        assert!(
+            patches
+                .into_iter()
+                .all(|word| native.cache.word(word) == crate::encode::NOP)
+        );
     }
 
     // spec: A64-REG-6, A64-MEM-1

@@ -218,16 +218,18 @@ pub struct Link {
     /// the end of the trace, rather than a side exit.
     pub main: bool,
     pub back: bool,
+    pub direct: Option<usize>,
 }
 
-/// A patchable internal back edge and its out-of-line paths, in byte offsets.
+/// A patchable internal edge and its out-of-line paths, in byte offsets.
 pub(crate) struct InternalLink {
     pub eip: u32,
     pub point: usize,
     pub target: usize,
     pub transition: usize,
     pub link: usize,
-    pub counter: usize,
+    pub counter: Option<usize>,
+    pub source_pc: u32,
 }
 
 impl Workspace {
@@ -431,9 +433,9 @@ enum Cold {
         /// What an x87 run it leaves from does first.
         x87: Option<x87::Arrive>,
     },
-    ResidentBack {
+    ResidentEdge {
         point: Label,
-        count: Label,
+        count: Option<Label>,
         inline: bool,
         target: Label,
         state: State,
@@ -441,6 +443,7 @@ enum Cold {
         x87: Option<x87::Leave>,
         eip: u32,
         refund: u32,
+        source_pc: u32,
     },
     /// A backward edge arriving without some of its merge's entry set.
     Load {
@@ -623,7 +626,7 @@ pub fn translate(
     work.unit.prepare_regions(memory, admit, checked);
     work.code.resident_links = work.resident_links;
     if work.resident_links {
-        work.unit.trace.observe_back_links();
+        work.unit.trace.observe_resident_links();
     }
     Jit {
         code: &mut work.code,
@@ -807,6 +810,13 @@ fn emit_link_point(asm: &mut Asm, eip: u32) {
     crate::runtime::emit_link_point(asm, eip, false);
 }
 
+fn emit_link_transition(asm: &mut Asm, point: usize) -> usize {
+    let transition = asm.offset();
+    asm.emit(adr(X14, point as i32 - transition as i32));
+    asm.emit(b(0));
+    transition
+}
+
 fn emit_target(asm: &mut Asm, eip: u32) {
     asm.emit_all(&[
         movz(W, Reg::new(1), eip as u16, 0),
@@ -917,6 +927,16 @@ impl Translator<'_> {
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
             self.vector.cpu = false;
+        }
+        if self.resident_links
+            && index > 0
+            && trace.insts[index - 1].next == Next::Fall
+            && trace.resident_edge(index - 1, index)
+        {
+            let next = self.asm.label();
+            let target = self.resident_edge(index - 1, index, next, self.x87_leaving(), true);
+            self.asm.b(target);
+            self.asm.bind(next);
         }
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
@@ -1226,27 +1246,29 @@ impl Translator<'_> {
             self.emit(add_imm(X, X9, X9, (-net) as u32, false));
         }
         let x87 = x87.or_else(|| self.x87_leaving());
-        let target = self.resident_back(to, target, x87, true);
+        let target = self.resident_edge(self.index, to, target, x87, true);
         self.asm.b(target);
     }
 
-    fn resident_back(
+    fn resident_edge(
         &mut self,
+        from: usize,
         to: usize,
         target: Label,
         x87: Option<x87::Leave>,
         inline: bool,
     ) -> Label {
         let eip = self.trace.insts[to].pc;
-        if !self.resident_links || !self.trace.insts[self.index].resident_backedge(eip) {
+        if !self.resident_links || !self.trace.resident_edge(from, to) {
             return target;
         }
         let point = self.asm.label();
-        let count = self.asm.label();
+        let source = self.trace.insts[from];
+        let count = source.resident_backedge(eip).then(|| self.asm.label());
         if inline {
             self.asm.bind(point);
         }
-        self.push_cold(Cold::ResidentBack {
+        self.push_cold(Cold::ResidentEdge {
             point,
             count,
             inline,
@@ -1256,8 +1278,13 @@ impl Translator<'_> {
             x87,
             eip,
             refund: self.trace.owed(to),
+            source_pc: source.pc,
         });
-        if inline { count } else { point }
+        if inline {
+            count.unwrap_or(target)
+        } else {
+            point
+        }
     }
 
     /// A jcc at the current instruction whose taken edge is `taken`.
@@ -1349,7 +1376,7 @@ impl Translator<'_> {
                         (self.asm.label(), self.asm.label(), self.asm.label());
                     self.emit(sub_imm(X, X9, X9, net, false));
                     self.asm.tbz(true, X9, 63, refuse);
-                    let target = self.resident_back(to, target, self.x87_leaving(), false);
+                    let target = self.resident_edge(from, to, target, self.x87_leaving(), false);
                     self.jump_if(test, target);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
@@ -1373,7 +1400,7 @@ impl Translator<'_> {
                         x87: self.x87_leaving(),
                     });
                 } else if net == 0 {
-                    let target = self.resident_back(to, target, self.x87_leaving(), false);
+                    let target = self.resident_edge(from, to, target, self.x87_leaving(), false);
                     self.jump_if(test, target);
                 } else {
                     let label = self.asm.label();
@@ -1393,8 +1420,7 @@ impl Translator<'_> {
                 let x87 = self.x87_arriving(to);
                 let net = self.trace.net(from, to);
                 if (net == 0 || (net < 0 && -net < 4096))
-                    && !(self.resident_links
-                        && self.trace.insts[from].resident_backedge(self.trace.insts[to].pc))
+                    && !(self.resident_links && self.trace.resident_edge(from, to))
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
                     && self.vector.dirty & !self.entry[to].dirty == 0
@@ -1968,16 +1994,22 @@ impl Translator<'_> {
             return;
         }
         let offset = crate::runtime::emit_link_point(self.asm, eip, back);
+        self.far(self.stubs.dispatch);
+        let direct = if back {
+            crate::runtime::emit_back_count(self.asm);
+            None
+        } else if self.resident_links {
+            Some(emit_link_transition(self.asm, offset))
+        } else {
+            None
+        };
         self.links.push(Link {
             offset,
             eip,
             main,
             back,
+            direct,
         });
-        self.far(self.stubs.dispatch);
-        if back {
-            crate::runtime::emit_back_count(self.asm);
-        }
     }
 
     fn target(&mut self, eip: u32) {
@@ -2102,7 +2134,7 @@ impl Translator<'_> {
                 self.index = from;
                 self.jump(to, x87);
             }
-            Cold::ResidentBack {
+            Cold::ResidentEdge {
                 point,
                 count,
                 inline,
@@ -2112,80 +2144,84 @@ impl Translator<'_> {
                 x87,
                 eip,
                 refund,
+                source_pc,
             } => {
-                const SP: Reg = Reg::new(31);
-                let counter = self.asm.label();
-                let hot = self.asm.label();
                 if !inline {
                     self.asm.bind(point);
-                    self.emit(b(4));
+                    self.asm.b(count.unwrap_or(target));
                 }
-                self.asm.bind(count);
-                self.asm.adr(X0, counter);
-                self.emit_all(&[
-                    ldr(X, X0, X0, 0),
-                    ldr(W, X1, X0, 0),
-                    sub_imm(W, X1, X1, 1, false),
-                    str(W, X1, X0, 0),
-                ]);
-                self.asm.cbz(W, false, X1, hot);
-                self.asm.b(target);
-                self.asm.bind(hot);
-                crate::runtime::emit_save_light(self.asm);
-                self.emit(stp_v(
-                    VSize::Q,
-                    Index::Pre,
-                    VReg::new(24),
-                    VReg::new(25),
-                    SP,
-                    -128,
-                ));
-                for i in 1..4 {
+                let counter = count.map(|count| {
+                    const SP: Reg = Reg::new(31);
+                    let counter = self.asm.label();
+                    let hot = self.asm.label();
+                    self.asm.bind(count);
+                    self.asm.adr(X0, counter);
+                    self.emit_all(&[
+                        ldr(X, X0, X0, 0),
+                        ldr(W, X1, X0, 0),
+                        sub_imm(W, X1, X1, 1, false),
+                        str(W, X1, X0, 0),
+                    ]);
+                    self.asm.cbz(W, false, X1, hot);
+                    self.asm.b(target);
+                    self.asm.bind(hot);
+                    crate::runtime::emit_save_light(self.asm);
                     self.emit(stp_v(
                         VSize::Q,
-                        Index::Offset,
-                        VReg::new(24 + i * 2),
-                        VReg::new(25 + i * 2),
+                        Index::Pre,
+                        VReg::new(24),
+                        VReg::new(25),
                         SP,
-                        i32::from(i) * 32,
+                        -128,
                     ));
-                }
-                self.state = state;
-                self.vector.dirty = simd_dirty;
-                if let Some(x87) = x87 {
-                    self.x87_leave(x87);
-                }
-                self.flush_simd();
-                self.canonicalize();
-                self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
-                crate::runtime::emit_store_guest(self.asm);
-                self.target(eip);
-                self.asm.adr(X2, point);
-                self.emit_all(&[
-                    mov(X, X0, RUNTIME),
-                    ldr(X, X16, RUNTIME, crate::runtime::RESIDENT_DISCOVER),
-                    blr(X16),
-                ]);
-                for i in (1..4).rev() {
+                    for i in 1..4 {
+                        self.emit(stp_v(
+                            VSize::Q,
+                            Index::Offset,
+                            VReg::new(24 + i * 2),
+                            VReg::new(25 + i * 2),
+                            SP,
+                            i32::from(i) * 32,
+                        ));
+                    }
+                    self.state = state;
+                    self.vector.dirty = simd_dirty;
+                    if let Some(x87) = x87 {
+                        self.x87_leave(x87);
+                    }
+                    self.flush_simd();
+                    self.canonicalize();
+                    self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
+                    crate::runtime::emit_store_guest(self.asm);
+                    self.target(eip);
+                    self.asm.adr(X2, point);
+                    self.emit_all(&[
+                        mov(X, X0, RUNTIME),
+                        ldr(X, X16, RUNTIME, crate::runtime::RESIDENT_DISCOVER),
+                        blr(X16),
+                    ]);
+                    for i in (1..4).rev() {
+                        self.emit(ldp_v(
+                            VSize::Q,
+                            Index::Offset,
+                            VReg::new(24 + i * 2),
+                            VReg::new(25 + i * 2),
+                            SP,
+                            i32::from(i) * 32,
+                        ));
+                    }
                     self.emit(ldp_v(
                         VSize::Q,
-                        Index::Offset,
-                        VReg::new(24 + i * 2),
-                        VReg::new(25 + i * 2),
+                        Index::Post,
+                        VReg::new(24),
+                        VReg::new(25),
                         SP,
-                        i32::from(i) * 32,
+                        128,
                     ));
-                }
-                self.emit(ldp_v(
-                    VSize::Q,
-                    Index::Post,
-                    VReg::new(24),
-                    VReg::new(25),
-                    SP,
-                    128,
-                ));
-                crate::runtime::emit_restore_light(self.asm);
-                self.asm.b(target);
+                    crate::runtime::emit_restore_light(self.asm);
+                    self.asm.b(target);
+                    counter
+                });
 
                 let transition = self.asm.offset();
                 self.state = state;
@@ -2199,15 +2235,19 @@ impl Translator<'_> {
                 self.asm.adr(X14, point);
                 let link = self.asm.offset();
                 self.emit(b(0));
-                self.asm.bind(counter);
-                self.emit_all(&[0, 0]);
+                let counter = counter.map(|counter| {
+                    self.asm.bind(counter);
+                    self.emit_all(&[0, 0]);
+                    self.asm.position(counter)
+                });
                 self.internal_links.push(InternalLink {
                     eip,
                     point: self.asm.position(point),
                     target: 0,
                     transition,
                     link,
-                    counter: self.asm.position(counter),
+                    counter,
+                    source_pc,
                 });
                 self.internal_targets.push(target);
             }
@@ -2378,15 +2418,20 @@ impl Translator<'_> {
                 point,
             } => {
                 self.asm.bind(label);
-                self.links.push(Link {
-                    offset: self.asm.position(point),
-                    eip: target,
-                    main: true,
-                    back: false,
-                });
                 self.target(target);
                 self.asm.adr(Reg::new(2), point);
                 self.far(self.stubs.dispatch);
+                let offset = self.asm.position(point);
+                let direct = self
+                    .resident_links
+                    .then(|| emit_link_transition(self.asm, offset));
+                self.links.push(Link {
+                    offset,
+                    eip: target,
+                    main: true,
+                    back: false,
+                    direct,
+                });
             }
             Cold::Access {
                 label,

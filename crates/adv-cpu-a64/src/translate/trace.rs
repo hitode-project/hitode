@@ -114,6 +114,7 @@ pub struct Trace {
     region_end: Vec<usize>,
     /// Instructions that internal edges reach.
     pub merge: Vec<bool>,
+    resident_heads: Vec<bool>,
     /// Flags read on entry to each instruction.
     pub live_in: Vec<FlagSet>,
     /// Flags read after each instruction, on any path.
@@ -291,6 +292,7 @@ impl Trace {
             code: self.code.clone(),
             region_end: self.region_end.clone(),
             merge: self.merge.clone(),
+            resident_heads: Vec::new(),
             live_in: self.live_in.clone(),
             live_out: self.live_out.clone(),
             observe_in: self.observe_in.clone(),
@@ -866,9 +868,31 @@ impl Trace {
 
     /// The discovery and resident paths of a back edge can observe every
     /// flag even when its Tier-1 path stays internal.
-    pub(super) fn observe_back_links(&mut self) {
+    pub(super) fn observe_resident_links(&mut self) {
+        self.resident_heads.clear();
+        self.resident_heads.resize(self.len(), false);
+        for inst in &self.insts {
+            let next = match inst.next {
+                Next::Edge(edge) => Some(edge),
+                _ => None,
+            };
+            for edge in [next, inst.taken].into_iter().flatten() {
+                if let Edge::Internal(to) = edge
+                    && inst.resident_backedge(self.insts[to].pc)
+                {
+                    self.resident_heads[to] = true;
+                }
+            }
+        }
         while self.liveness(true, true) {}
         while self.liveness(false, true) {}
+    }
+
+    pub(super) fn resident_edge(&self, from: usize, to: usize) -> bool {
+        let inst = &self.insts[from];
+        self.resident_heads.get(to) == Some(&true)
+            && !inst.spin
+            && !matches!(inst.op, Op::Call(_) | Op::Ret(_))
     }
 
     /// Whether the trace can stop after one outer iteration: edges reenter
@@ -934,8 +958,7 @@ impl Trace {
         match edge {
             Edge::Internal(to)
                 if observe
-                    && (self.net(from, to) > 0
-                        || resident && self.insts[from].resident_backedge(self.insts[to].pc)) =>
+                    && (self.net(from, to) > 0 || resident && self.resident_edge(from, to)) =>
             {
                 FlagSet::ALL
             }
@@ -956,13 +979,7 @@ impl Trace {
         for index in (0..self.len()).rev() {
             let inst = &self.insts[index];
             let mut out = match inst.next {
-                Next::Fall => {
-                    if observe {
-                        self.observe_in[index + 1]
-                    } else {
-                        self.live_in[index + 1]
-                    }
-                }
+                Next::Fall => self.edge_live(index, Edge::Internal(index + 1), observe, resident),
                 Next::Edge(edge) => self.edge_live(index, edge, observe, resident),
                 Next::Dynamic => FlagSet::ALL,
             };

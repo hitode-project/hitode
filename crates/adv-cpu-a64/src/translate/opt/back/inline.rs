@@ -2,7 +2,7 @@
 
 use super::super::recovery::{self, IrRecord, Location, Recipe, X87};
 use super::*;
-use crate::translate::emit_link_point;
+use crate::translate::{emit_link_point, emit_link_transition};
 
 const CPU: Reg = Reg::new(0);
 const FLAGS: Reg = Reg::new(1);
@@ -345,7 +345,13 @@ impl Emitter<'_> {
         }
     }
 
-    pub(super) fn inline_exit(&mut self, ir: &IrRecord, assumed: &Assumed, bytes: u64) {
+    pub(super) fn inline_exit(
+        &mut self,
+        ir: &IrRecord,
+        assumed: &Assumed,
+        bytes: u64,
+        arrival: bool,
+    ) {
         let start = self.asm.offset();
         let record = recovery::lower_record(ir, &self.locations);
         self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
@@ -403,9 +409,14 @@ impl Emitter<'_> {
             probation.call(&mut self.asm, false);
             self.exit_words = self.exit_words.max(self.words_since(start));
         }
-        self.links.push((self.asm.offset(), record.eip));
+        let point = self.asm.offset();
+        self.links.push((point, record.eip));
         emit_link_point(&mut self.asm, record.eip);
         self.asm.emit(0); // Bound to the Tier-1 dispatch stub on placement.
+        if arrival {
+            let transition = emit_link_transition(&mut self.asm, point);
+            self.transitions.push((point, transition));
+        }
     }
 
     fn bias_stack(&mut self) {

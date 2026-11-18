@@ -1386,7 +1386,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(incoming.exit, Exit::Dispatch);
-        assert_eq!((cpu.eip, incoming.retired), (head, 6));
+        assert_eq!((cpu.eip, incoming.retired), (head, 1));
 
         let first = state(&mut executor, head, OUTPUT, COUNT);
         let second = state(&mut executor, head, OUTPUT + SPACE, COUNT);

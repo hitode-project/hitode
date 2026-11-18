@@ -60,6 +60,8 @@ pub(crate) struct Lowered {
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
+    /// Ordinary exits eligible for another resident head, as (link, transition) offsets.
+    pub transitions: Vec<(usize, usize)>,
     pub words: Vec<u32>,
     pub sites: Vec<(usize, Site)>,
     pub marks: Vec<Mark>,
@@ -91,7 +93,7 @@ pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> 
     lower_form(func, Some((assumed, entry)), false, false)
 }
 
-/// A resident form: entered from Tier-1 back edges, accessing guest memory
+/// A resident form entered from patchable links, accessing guest memory
 /// through the window (A64-OPT-9).
 pub(crate) fn lower_resident(
     func: &Func,
@@ -157,6 +159,7 @@ fn lower_form(
         probation: e.probation.map_or_else(Vec::new, |p| p.calls),
         probation_slot,
         links: e.links,
+        transitions: e.transitions,
         exit,
         words,
         sites: e.sites,
@@ -226,7 +229,7 @@ fn emit<'a>(
         cold,
         failures: Vec::new(),
         normal: if inline.is_some() {
-            vec![None; func.records.len()]
+            vec![[None; 2]; func.records.len()]
         } else {
             Vec::new()
         },
@@ -249,6 +252,7 @@ fn emit<'a>(
         fp_checks: Vec::new(),
         edges: Vec::new(),
         links: Vec::new(),
+        transitions: Vec::new(),
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
@@ -355,7 +359,7 @@ fn emit<'a>(
             }
             End::Exit(id) => {
                 let exit = if inline.is_some() {
-                    e.normal_exit(*id)
+                    e.normal_exit(*id, false)
                 } else {
                     e.cold[id.0 as usize]
                 };
@@ -375,11 +379,19 @@ fn emit<'a>(
         e.checkpoints();
     }
     if let Some((assumed, _)) = inline {
-        for (i, label) in std::mem::take(&mut e.normal).into_iter().enumerate() {
-            if let Some(label) = label {
-                e.asm.bind(label);
-                e.mark(Part::Body, func.records[i].eip);
-                e.inline_exit(&func.records[i], assumed, bytes);
+        let head = func.blocks[0].head.unwrap().record;
+        let head = func.records[head.0 as usize].eip;
+        for (i, [normal, checkpoint]) in std::mem::take(&mut e.normal).into_iter().enumerate() {
+            let record = &func.records[i];
+            for (label, arrival) in [
+                (normal, resident && record.eip != head),
+                (checkpoint, false),
+            ] {
+                if let Some(label) = label {
+                    e.asm.bind(label);
+                    e.mark(Part::Body, record.eip);
+                    e.inline_exit(record, assumed, bytes, arrival);
+                }
             }
         }
     }
@@ -435,7 +447,7 @@ struct Emitter<'a> {
     blocks: Vec<Label>,
     cold: Vec<Label>,
     failures: Vec<(Label, RecordId, ResidentCold, u32)>,
-    normal: Vec<Option<Label>>,
+    normal: Vec<[Option<Label>; 2]>,
     resident: bool,
     env_miss: Option<Label>,
     probation: Option<resident::Probation>,
@@ -455,6 +467,7 @@ struct Emitter<'a> {
     fp_checks: Vec<FpCheck>,
     edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
+    transitions: Vec<(usize, usize)>,
 }
 
 impl CheckedEmitter for Emitter<'_> {
@@ -472,8 +485,9 @@ impl<'a> Emitter<'a> {
         if self.resident { WINDOW } else { ALIAS }
     }
 
-    fn normal_exit(&mut self, record: RecordId) -> Label {
-        *self.normal[record.0 as usize].get_or_insert_with(|| self.asm.label())
+    fn normal_exit(&mut self, record: RecordId, checkpoint: bool) -> Label {
+        *self.normal[record.0 as usize][usize::from(checkpoint)]
+            .get_or_insert_with(|| self.asm.label())
     }
 
     fn words_since(&self, start: usize) -> u32 {
@@ -884,7 +898,7 @@ impl<'a> Emitter<'a> {
             self.asm.b(resume);
             self.asm.bind(leave);
             if self.resident {
-                let exit = self.normal_exit(record);
+                let exit = self.normal_exit(record, true);
                 self.asm.b(exit);
             } else {
                 self.asm
