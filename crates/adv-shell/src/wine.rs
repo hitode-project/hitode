@@ -427,6 +427,18 @@ fn report(
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
+    #[cfg(feature = "gpu")]
+    if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
+        fields.push(format!(
+            "\"d3d9\": {}",
+            serde_json::json!({
+                "fixed_draws": counters.fixed_draws,
+                "fixed_shaders_built": counters.fixed_shaders_built,
+                "fixed_shader_cache_hits": counters.fixed_shader_cache_hits,
+            })
+        ));
+    }
+
     let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),
         |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",

@@ -41,7 +41,7 @@ fn full(image: &Image) -> Rect {
 fn size(r: Rect) -> (u32, u32) {
     (r.x + r.w, r.y + r.h)
 }
-pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> Rect {
+pub(in crate::d3d9) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> Rect {
     match operation {
         Operation::Clear { rectangle, .. } | Operation::Upload { rectangle, .. } => *rectangle,
         Operation::Copy { region, .. } => *region,
@@ -51,9 +51,10 @@ pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> R
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
     use crate::shader::interpreter::{self, NoTextures};
-    if d.programmable.as_ref().is_some_and(|p| {
-        p.instance_count != 1 || p.parameters[15][0] == 2 || p.streams.iter().any(|s| s.instance)
-    }) {
+    if d.programmable
+        .as_ref()
+        .is_some_and(|p| p.instance_count != 1 || p.streams.iter().any(|s| s.instance))
+    {
         return None;
     }
     let mut positions = [[0.; 4]; 64];
@@ -71,7 +72,25 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
     } else {
         1.
     };
-    if !d.vertices.is_empty() {
+    if let Some(fixed) = &d.fixed_vertex {
+        let p = d.programmable.as_ref()?;
+        let length = p.indices.as_ref().map_or(fixed.count as usize, |i| i.len());
+        if length > 64 {
+            return None;
+        }
+        count = length;
+        for (n, position) in positions[..count].iter_mut().enumerate() {
+            let (clip, eye) = fixed_position(d, n)?;
+            *position = clip;
+            if let Some([a, b, c]) = fixed.point_scale {
+                let [x, y, z] = eye;
+                let distance = (x * x + y * y + z * z).sqrt();
+                let size = d.state.viewport.height * f32::from_bits(p.parameters[11][3])
+                    / (a + b * distance + c * distance * distance).sqrt();
+                margin = margin.max(1. + point_size(size)? * 0.5);
+            }
+        }
+    } else if !d.vertices.is_empty() {
         if d.vertices.len() > 64 {
             return None;
         }
@@ -142,12 +161,61 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
     .clipped(full(&d.target.image));
     Some(d.state.scissor.map_or(r, |s| r.clipped(s)))
 }
+fn fixed_index(p: &adv_device::gpu::ProgrammableDraw, ordinal: usize) -> usize {
+    if let Some(indices) = &p.indices {
+        indices[ordinal] as usize
+    } else if p.parameters[2][3] != 0 {
+        ordinal * 6
+    } else {
+        ordinal
+    }
+}
+
+fn fixed_position(d: &fixed::Draw, ordinal: usize) -> Option<([f32; 4], [f32; 3])> {
+    let fixed = d.fixed_vertex.as_ref()?;
+    let p = d.programmable.as_ref()?;
+    let n = fixed_index(p, ordinal);
+    let (stream, attribute) = p.streams.iter().find_map(|stream| {
+        stream
+            .attributes
+            .iter()
+            .find(|a| a.location == 0)
+            .map(|a| (stream, a))
+    })?;
+    let mut bytes = [0; 16];
+    stream.bytes.read_vertex(
+        n,
+        stream.stride as usize,
+        attribute.offset as usize,
+        &mut bytes[..attribute.format.size() as usize],
+    )?;
+    let mut raw =
+        std::array::from_fn(|n| f32::from_le_bytes(bytes[n * 4..][..4].try_into().unwrap()));
+    let viewport = d.state.viewport;
+    if let Some([world, view, projection]) = &fixed.transforms {
+        raw[3] = 1.;
+        let eye = fixed::row(fixed::row(raw, world), view);
+        let mut clip = fixed::row(eye, projection);
+        clip[0] += clip[3] / viewport.width;
+        clip[1] -= clip[3] / viewport.height;
+        Some((clip, [eye[0], eye[1], eye[2]]))
+    } else {
+        programmable::transformed::position(raw, viewport).map(|clip| (clip, [0.; 3]))
+    }
+}
+
 pub(in crate::d3d9) fn vertex_input(
     p: &adv_device::gpu::ProgrammableDraw,
     n: u32,
 ) -> Option<crate::shader::interpreter::Inputs> {
+    stream_input(&p.streams, n)
+}
+pub(in crate::d3d9) fn stream_input(
+    streams: &[adv_device::gpu::VertexStream],
+    n: u32,
+) -> Option<crate::shader::interpreter::Inputs> {
     let mut input = crate::shader::interpreter::Inputs::default();
-    for stream in &p.streams {
+    for stream in streams {
         for a in &stream.attributes {
             if a.format == AttributeFormat::Bgra8Unorm {
                 let mut bytes = [0; 4];

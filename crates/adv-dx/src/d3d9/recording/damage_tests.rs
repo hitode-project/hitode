@@ -153,6 +153,7 @@ fn check_sparse_constants(verify: bool) {
                     programmable: Some(full.clone()),
                     recording_key: d.recording_key,
                     program_key: d.program_key,
+                    fixed_vertex: None,
                 }),
             );
             assert_eq!(full_bounds, *frame_bounds.last().unwrap());

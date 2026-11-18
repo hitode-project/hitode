@@ -1,4 +1,7 @@
-//! Translate documented D3D9 fixed-function state into neutral drawing commands.
+//! D3D9 fixed state supplies raster state, raw vertex layouts and generated
+//! shader inputs. Damage can read bounded positions from the retained streams.
+//! Fixed lines using the neutral rasterizer still decode positions on the CPU
+//! for its inclusive endpoint and LASTPIXEL rules.
 use super::*;
 use adv_abi::types::D3DVIEWPORT9;
 use adv_device::gpu::{
@@ -6,17 +9,15 @@ use adv_device::gpu::{
     StencilOp, TextureOp, Topology, Vertex, Viewport,
 };
 use adv_device::surface::Rect;
-mod input;
 pub(super) mod lighting;
 mod state_map;
 use state_map::StateMap;
 
-pub(super) type CapturedSpans = Vec<(u32, Arc<[u8]>)>;
+pub(super) type CapturedSpans = Vec<(u32, adv_device::gpu::VertexBytes)>;
 
 pub(super) struct CachedFixed {
     state: Fixed,
     key: std::cell::Cell<Option<u128>>,
-    inputs: std::cell::RefCell<input::GeometryCache>,
     pub(super) captures: std::cell::RefCell<Option<CapturedSpans>>,
 }
 impl CachedFixed {
@@ -24,7 +25,6 @@ impl CachedFixed {
         Self {
             state: Fixed::new(width, height),
             key: std::cell::Cell::new(None),
-            inputs: Default::default(),
             captures: Default::default(),
         }
     }
@@ -42,28 +42,19 @@ impl CachedFixed {
         address: u32,
         length: u32,
     ) -> Result<adv_device::gpu::VertexBytes, u32> {
-        let bytes = match env.cpu.shared_bytes(address, length as usize) {
-            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
-            None => {
-                let mut bytes = vec![0; length as usize];
-                env.cpu.read(address, &mut bytes).map_err(|_| INVALID)?;
-                std::borrow::Cow::Owned(bytes)
-            }
+        let bytes = if let Some(bytes) = env.cpu.shared_bytes(address, length as usize) {
+            bytes.to_vec()
+        } else {
+            let mut bytes = vec![0; length as usize];
+            env.cpu.read(address, &mut bytes).map_err(|_| INVALID)?;
+            bytes
         };
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
+        let bytes = adv_device::gpu::VertexBytes::captured(bytes, key);
         if let Some(captures) = self.captures.borrow_mut().as_mut() {
-            captures.push((address, Arc::from(bytes.as_ref())));
+            captures.push((address, bytes.clone()));
         }
-        let mut captures = self.inputs.borrow_mut();
-        if let Some(bytes) = captures.stream(key) {
-            return Ok(bytes);
-        }
-        let bytes = adv_device::gpu::VertexBytes::captured(bytes.into_owned(), key);
-        captures.insert_stream(key, bytes.clone());
         Ok(bytes)
-    }
-    pub(super) fn finish_inputs(&self) {
-        self.inputs.borrow_mut().finish();
     }
     pub(super) fn state_mut(&mut self) -> &mut Fixed {
         &mut self.state
@@ -101,7 +92,7 @@ pub(super) struct Fixed {
     pub(super) lights: BTreeMap<u32, lighting::Light>,
 }
 /// Byte offsets and source streams of the FVF-equivalent fixed inputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Layout {
     pub transformed: bool,
     pub position: u32,
@@ -153,17 +144,12 @@ impl Layout {
         })
     }
 }
-impl Layout {
-    pub(super) fn coordinate_count(self) -> usize {
-        self.texcoords
-            .iter()
-            .rposition(Option::is_some)
-            .map_or(0, |n| n + 1)
-    }
-    fn extended_coordinates(self) -> bool {
-        self.coordinate_count() > 1
-            || self.texcoords[0].is_some_and(|(_, _, dimensions)| dimensions != 2)
-    }
+#[derive(Clone)]
+pub(super) struct VertexBounds {
+    pub transforms: Option<[[f32; 16]; 3]>,
+    pub point_scale: Option<[f32; 3]>,
+    pub count: u32,
+    pub fixed_pixel: bool,
 }
 #[derive(Clone)]
 pub(super) struct Draw {
@@ -175,7 +161,9 @@ pub(super) struct Draw {
     pub programmable: Option<Arc<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
     pub program_key: u128,
+    pub fixed_vertex: Option<VertexBounds>,
 }
+#[derive(Debug)]
 pub(super) struct Rejected {
     pub code: u32,
     pub reason: &'static str,
@@ -1232,7 +1220,7 @@ pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
         _ => return None,
     })
 }
-fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
+pub(super) fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
     std::array::from_fn(|column| (0..4).map(|i| vector[i] * matrix[i * 4 + column]).sum())
 }
 /// Draw-bound buffers supply every declared input stream. UP callers still
@@ -1245,43 +1233,9 @@ pub(super) fn prepare_bound(
     start: u32,
     indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
-    if log::log_enabled!(log::Level::Debug)
-        && let Some(id) = device(env, pointer).and_then(|d| d.hot.borrow().buffers.declaration)
-    {
-        log::debug!(
-            target: "adv_dx::d3d9::fixed::input",
-            "bound declaration {}",
-            super::declaration::describe(env, id)
-        );
-    }
-    prepare_input_checked(
-        env,
-        pointer,
-        kind,
-        count,
-        input::Input::Bound { start },
-        indices,
-    )
-    .map_err(|error| {
-        if error.code == UNAVAILABLE {
-            warn_rejected(
-                env,
-                if indices.is_some() {
-                    "IDirect3DDevice9::DrawIndexedPrimitive"
-                } else {
-                    "IDirect3DDevice9::DrawPrimitive"
-                },
-                pointer,
-                kind,
-                GuestPtr::new(0),
-                0,
-                error.code,
-                error.reason,
-            );
-        }
-        error.code
-    })
+    programmable::prepare(env, pointer, kind, count, None, indices, start)
 }
+
 pub(super) fn primitive_length(kind: i32, count: u32) -> Result<u32, u32> {
     if count == 0 || count > 131_072 {
         return Err(INVALID);
@@ -1314,296 +1268,45 @@ pub(super) fn prepare(
     stride: u32,
     indices: Option<&[u32]>,
 ) -> Result<Draw, u32> {
-    prepare_checked(env, pointer, kind, count, data, stride, indices).map_err(|error| {
-        // Unsupported (not invalid) inputs name the missing capability.
-        if error.code == UNAVAILABLE {
-            let api = if indices.is_some() {
-                "IDirect3DDevice9::DrawIndexedPrimitive"
-            } else {
-                "IDirect3DDevice9::DrawPrimitive"
-            };
-            warn_rejected(
-                env,
-                api,
-                pointer,
-                kind,
-                data,
-                stride,
-                error.code,
-                error.reason,
-            );
-        }
-        error.code
-    })
+    programmable::prepare(env, pointer, kind, count, Some((data, stride)), indices, 0)
 }
-fn prepare_checked(
-    env: &Env<'_>,
-    pointer: u32,
-    kind: i32,
+pub(super) fn prepare_lines(
+    draw: &mut Draw,
+    streams: &[adv_device::gpu::VertexStream],
+    indices: Option<&adv_device::gpu::IndexBytes>,
     count: u32,
-    data: GuestPtr<u8>,
-    stride: u32,
-    indices: Option<&[u32]>,
-) -> Result<Draw, Rejected> {
-    prepare_input_checked(
-        env,
-        pointer,
-        kind,
-        count,
-        input::Input::Up {
-            data: data.addr(),
-            stride,
-        },
-        indices,
-    )
-}
-fn prepare_input_checked(
-    env: &Env<'_>,
-    pointer: u32,
-    kind: i32,
-    count: u32,
-    source: input::Input,
-    indices: Option<&[u32]>,
-) -> Result<Draw, Rejected> {
-    let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
-    let hot = d.hot.borrow();
-    let f = &hot.fixed;
-    if !hot.scene {
-        return Err(rejected(INVALID, "draw outside BeginScene/EndScene"));
-    }
-    if hot.shaders.vertex.is_none() && hot.shaders.pixel.is_none() && f.render[&152] != 0 {
-        return Err(rejected(
-            UNAVAILABLE,
-            "clip planes require the programmable draw path",
-        ));
-    }
-    let mut layout = layout(env, pointer)?;
-    if hot.buffers.declaration.is_none()
-        && let input::Input::Up { stride, .. } = source
-    {
-        // UP uploads one stride of bytes per vertex. Trailing FVF texture
-        // inputs outside that record must not read the next vertex.
-        for coordinate in &mut layout.texcoords {
-            if coordinate.is_some_and(|(_, offset, _)| offset >= stride) {
-                *coordinate = None;
+) -> Result<(), u32> {
+    let bounds = draw.fixed_vertex.take().unwrap();
+    let mut vertices = Vec::with_capacity(count as usize);
+    let has_color = streams
+        .iter()
+        .any(|s| s.attributes.iter().any(|a| a.location == 1));
+    for ordinal in 0..count {
+        let n = indices.map_or(ordinal, |i| i[ordinal as usize]);
+        let v = recording::damage::stream_input(streams, n)
+            .ok_or(INVALID)?
+            .v;
+        let mut position = v[0];
+        let viewport = draw.state.viewport;
+        if let Some(transforms) = &bounds.transforms {
+            for matrix in transforms {
+                position = row(position, matrix);
             }
-        }
-    }
-    let lit = !layout.transformed && f.render[&137] != 0;
-    let lights = if lit { lighting::active(f)? } else { [None; 8] };
-    let normal_matrix = lit.then(|| lighting::normal_matrix(f));
-    let effects = f.render[&29] != 0 || f.render[&28] != 0 || layout.specular.is_some();
-    let scaled = kind == 1 && !layout.transformed && f.render[&157] != 0;
-    let length = primitive_length(kind, count)
-        .map_err(|code| rejected(code, "invalid or excessive primitive count"))?;
-    if indices.is_some_and(|v| v.len() != length as usize) {
-        return Err(rejected(
-            INVALID,
-            "index count does not match primitive count",
-        ));
-    }
-    let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
-    let last = indices
-        .and_then(|v| v.iter().max().copied())
-        .unwrap_or(length - 1);
-    let mut input = input::Reader::new(env, pointer, layout, source, first, last, length)?;
-    let base_key = super::recording::draw_key(env, pointer);
-    let captured = input.captured_key(indices, length);
-    let geometry_key = captured.map(|key| super::recording::hash((base_key, kind, count, key)));
-    if let Some(geometry) = geometry_key.and_then(|key| hot.fixed.inputs.borrow_mut().get(key)) {
-        let (target, image, state) = prepare_state(env, pointer, kind)?;
-        return Ok(Draw {
-            target,
-            image,
-            state,
-            vertices: geometry.vertices,
-            texcoords: geometry.texcoords,
-            programmable: None,
-            recording_key: geometry_key.unwrap(),
-            program_key: 0,
-        });
-    }
-    let mut input_key = xxhash_rust::xxh3::Xxh3::new();
-    std::hash::Hash::hash(&indices, &mut input_key);
-    let mut vertices = Vec::with_capacity(length as usize);
-    let coordinate_count = if effects || scaled {
-        layout.coordinate_count().max(1) + usize::from(effects) + usize::from(scaled)
-    } else {
-        layout.coordinate_count()
-    };
-    let mut texcoords = if layout.extended_coordinates() || effects || scaled {
-        let output_length = if kind == 6 {
-            count.checked_mul(3).ok_or(INVALID)?
+            position[0] += position[3] / viewport.width;
+            position[1] -= position[3] / viewport.height;
         } else {
-            length
-        };
-        if output_length
-            .checked_mul(32 + coordinate_count as u32 * 16)
-            .is_none_or(|bytes| bytes > 16 * 1024 * 1024)
-        {
-            return Err(rejected(
-                INVALID,
-                "expanded texture-coordinate stream exceeds the draw budget",
-            ));
-        }
-        Some(Vec::with_capacity(length as usize * coordinate_count))
-    } else {
-        None
-    };
-    for ordinal in 0..length {
-        let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
-        input.read(env, index)?;
-        if captured.is_none() {
-            input.hash(&mut input_key);
-        }
-        let word = |stream: u16, at: u32| input.word(stream, at);
-        let float = |stream, at| f32::from_le_bytes(word(stream, at));
-        let at = layout.position;
-        let ps = layout.streams[0];
-        let mut p = [float(ps, at), float(ps, at + 4), float(ps, at + 8), 1.];
-        let eye = if lit || scaled || (!layout.transformed && f.render[&28] != 0) {
-            row(row(p, &f.transforms[0]), &f.transforms[1])
-        } else {
-            [0.; 4]
-        };
-        let raw_z = p[2];
-        if layout.transformed {
-            let rhw = float(ps, at + 12);
-            if rhw == 0. || !rhw.is_finite() {
-                return Err(rejected(INVALID, "vertex RHW is zero or not finite"));
-            }
-            let w = 1. / rhw;
-            p = [
-                (((p[0] + 0.5 - f.viewport.X as f32) / f.viewport.Width as f32) * 2. - 1.) * w,
-                (1. - ((p[1] + 0.5 - f.viewport.Y as f32) / f.viewport.Height as f32) * 2.) * w,
-                p[2] * w,
-                w,
-            ];
-        } else {
-            for matrix in &f.transforms {
-                p = row(p, matrix);
-            }
-            // D3D9 integer pixel centres map to the host's half-integer centres.
-            p[0] += p[3] / f.viewport.Width as f32;
-            p[1] -= p[3] / f.viewport.Height as f32;
-        }
-        if p.iter().any(|v| !v.is_finite()) {
-            return Err(rejected(
-                INVALID,
-                "transformed vertex position is not finite",
-            ));
-        }
-        let mut color = [1.; 4];
-        if let Some(at) = layout.color {
-            let argb = u32::from_le_bytes(word(layout.streams[1], at));
-            color = [
-                ((argb >> 16) & 255) as f32 / 255.,
-                ((argb >> 8) & 255) as f32 / 255.,
-                (argb & 255) as f32 / 255.,
-                (argb >> 24) as f32 / 255.,
-            ];
-        }
-        let mut specular = layout.specular.map_or([0.; 4], |(stream, at)| {
-            lighting::color(u32::from_le_bytes(word(stream, at)))
-        });
-        if lit {
-            let normal = layout.normal.map_or([0.; 3], |(stream, at)| {
-                [
-                    float(stream, at),
-                    float(stream, at + 4),
-                    float(stream, at + 8),
-                ]
-            });
-            (color, specular) = lighting::illuminate(
-                f,
-                &lights,
-                eye,
-                normal,
-                normal_matrix.as_ref().unwrap(),
-                layout.color.map(|_| color),
-                layout.specular.map(|_| specular),
-            );
-        }
-        let mut coordinates = [[0., 0., 0., 1.]; 10];
-        if effects {
-            let fog = lighting::fog(f, layout.transformed, raw_z, eye, specular[3]);
-            coordinates[layout.coordinate_count().max(1)] =
-                [specular[0], specular[1], specular[2], fog];
-        }
-        if scaled {
-            let distance = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]).sqrt();
-            let [a, b, c] = [158, 159, 160].map(|k| f32::from_bits(f.render[&k]));
-            coordinates[coordinate_count - 1][0] = f.viewport.Height as f32
-                * f32::from_bits(f.render[&154])
-                / (a + b * distance + c * distance * distance).sqrt();
-        }
-        for (n, coordinate) in layout.texcoords.iter().enumerate() {
-            if let Some((stream, offset, dimensions)) = *coordinate {
-                for (component, value) in
-                    coordinates[n][..dimensions as usize].iter_mut().enumerate()
-                {
-                    *value = float(stream, offset + component as u32 * 4);
-                }
-                if coordinates[n].iter().any(|v| !v.is_finite()) {
-                    return Err(rejected(
-                        INVALID,
-                        "vertex texture coordinates are not finite",
-                    ));
-                }
-            }
-        }
-        let uv = [coordinates[0][0], coordinates[0][1]];
-        if let Some(values) = &mut texcoords {
-            values.extend_from_slice(&coordinates[..coordinate_count]);
+            position = programmable::transformed::position(position, viewport).ok_or(INVALID)?;
         }
         vertices.push(Vertex {
-            position: p,
-            color,
-            uv,
+            position,
+            color: if has_color { v[1] } else { [1.; 4] },
+            uv: [v[2][0], v[2][1]],
         });
     }
-    if kind == 6 {
-        let mut fan = Vec::with_capacity(count as usize * 3);
-        for i in 1..vertices.len() - 1 {
-            fan.extend_from_slice(&[vertices[0], vertices[i], vertices[i + 1]]);
-        }
-        vertices = fan;
-        if let Some(values) = &mut texcoords {
-            let mut fan = Vec::with_capacity(count as usize * 3 * coordinate_count);
-            for n in 1..length as usize - 1 {
-                for index in [0, n, n + 1] {
-                    fan.extend_from_slice(
-                        &values[index * coordinate_count..(index + 1) * coordinate_count],
-                    );
-                }
-            }
-            *values = fan;
-        }
-    }
-    let (target, image, state) = prepare_state(env, pointer, kind)?;
-    let geometry = input::Geometry {
-        vertices: vertices.into(),
-        texcoords: texcoords.map(|values| (coordinate_count, values.into())),
-    };
-    if let Some(key) = geometry_key {
-        hot.fixed.inputs.borrow_mut().insert(key, geometry.clone());
-    }
-    Ok(Draw {
-        target,
-        image,
-        vertices: geometry.vertices,
-        texcoords: geometry.texcoords,
-        state,
-        programmable: None,
-        recording_key: super::recording::hash((
-            base_key,
-            kind,
-            count,
-            captured.unwrap_or_else(|| input_key.digest128()),
-        )),
-        program_key: 0,
-    })
+    draw.vertices = vertices.into();
+    Ok(())
 }
+
 pub(super) fn prepare_state(
     env: &Env<'_>,
     pointer: u32,
@@ -1811,11 +1514,31 @@ fn draw_up(
         super::buffers::clear_up_bindings(env, this.addr(), false);
         return Outcome::Return(0);
     }
-    let result = if super::programmable::active(env, this.addr()) {
-        super::programmable::prepare(env, this.addr(), kind, count, Some((data, stride)), None, 0)
-            .map_err(|code| rejected(code, "programmable draw rejected"))
+    let result = if let Some(d) = device(env, this.addr()) {
+        if !d.hot.borrow().scene {
+            Err(rejected(INVALID, "draw outside BeginScene/EndScene"))
+        } else {
+            prepare(env, this.addr(), kind, count, data, stride, None).map_err(|code| {
+                let reason = if code == UNAVAILABLE
+                    && layout(env, this.addr()).is_ok_and(|l| {
+                        l.streams[0] != 0
+                            || (l.color.is_some() && l.streams[1] != 0)
+                            || l.normal.is_some_and(|(stream, _)| stream != 0)
+                            || l.specular.is_some_and(|(stream, _)| stream != 0)
+                            || l.texcoords
+                                .iter()
+                                .flatten()
+                                .any(|(stream, _, _)| *stream != 0)
+                    }) {
+                    "UP fixed-function declarations require all inputs on stream 0"
+                } else {
+                    "draw input or state rejected"
+                };
+                rejected(code, reason)
+            })
+        }
     } else {
-        prepare_checked(env, this.addr(), kind, count, data, stride, None)
+        Err(rejected(INVALID, "invalid device interface"))
     };
     let draw = match result {
         Ok(d) => d,
@@ -1931,11 +1654,10 @@ mod tests {
         let original = current(&env, device).unwrap().render[&152];
         assert_eq!(set_render(&mut env, this, 152, 1), 0);
         // Rejection happens before vertex access or queued GPU work.
-        let error = prepare_checked(&env, device, 5, 1, GuestPtr::new(0), 16, None)
-            .err()
-            .unwrap();
-        assert_eq!(error.code, UNAVAILABLE);
-        assert!(error.reason.contains("programmable draw path"));
+        assert_eq!(
+            prepare(&mut env, device, 5, 1, GuestPtr::new(0), 16, None).err(),
+            Some(UNAVAILABLE)
+        );
         assert_eq!(set_render(&mut env, this, 152, original), 0);
         assert!(env.ext.get::<State>().pending.is_empty());
     }

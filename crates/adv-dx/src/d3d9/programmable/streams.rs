@@ -25,7 +25,7 @@ pub(super) fn capture(
             .max()
             .unwrap();
         let (data, stride, available) = if let Some((data, stride)) = up {
-            if n != 0 {
+            if n != 0 || data.is_null() || stride == 0 {
                 return Err(INVALID);
             }
             (data.addr(), stride, u32::MAX)

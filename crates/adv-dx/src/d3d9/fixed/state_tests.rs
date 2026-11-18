@@ -596,14 +596,16 @@ mod state_tests {
                 assert_eq!(call(&mut env, set_fvf_ABI, &[pointer, fvf]), 0);
             }
             let draw = prepare(&mut env, pointer, 4, 1, GuestPtr::new(vertices), 28, None).unwrap();
-            decoded.push(draw.vertices);
+            let p = draw.programmable.as_ref().unwrap();
+            decoded.push(
+                (0..3)
+                    .map(|n| recording::damage::vertex_input(p, n).unwrap().v)
+                    .collect::<Vec<_>>(),
+            );
         }
-        let fields = |v: &[adv_device::gpu::Vertex]| -> Vec<_> {
-            v.iter().map(|v| (v.position, v.color, v.uv)).collect()
-        };
-        assert_eq!(fields(&decoded[0]), fields(&decoded[1]));
-        assert_eq!(fields(&decoded[0]), fields(&decoded[2]));
-        assert_eq!(decoded[0][0].uv, [0.25, 0.75]);
+        assert_eq!(decoded[0], decoded[1]);
+        assert_eq!(decoded[0], decoded[2]);
+        assert_eq!(decoded[0][0][2], [0.25, 0.75, 0., 1.]);
         assert_eq!(call(&mut env, end_scene_ABI, &[pointer]), 0);
         // Reset restores the default (no declaration) and drops the binding.
         assert_eq!(release(&mut env, decl), 0);
@@ -779,6 +781,211 @@ mod fixed_completion {
             "{got:?} expected {expected:?}"
         );
     }
+    // spec: GFX-INPUT-3, GFX-INPUT-4, GFX-FIXED-1, GFX-FIXED-2, GFX-REC-4
+    #[test]
+    fn generated_fixed_shader_matches_cpu_pixels_and_damage() {
+        let (mut m, pointer, target) = fixture();
+        let mut e = env(&mut m);
+        let this = GuestPtr::new(pointer);
+        texture(&mut e, pointer, [128, 192, 224, 255]);
+        let reference = e
+            .ext
+            .get::<State>()
+            .gpu
+            .as_ref()
+            .unwrap()
+            .target(16, 12, false)
+            .unwrap();
+        let blank = Some([0., 0., 0., 1.]);
+        light(&mut e, pointer, 3, [0.5, 0.25, 0.125]);
+        let world_matrix = current(&e, pointer).unwrap().transforms[0];
+        let world = store(&mut e, world_matrix);
+        let mut matrix = world.read(e.cpu).unwrap();
+        matrix[12] = 0.125;
+        world.write(e.cpu, matrix).unwrap();
+        assert_eq!(set_transform(&mut e, this, 256, world), 0);
+        let scissor = store(
+            &mut e,
+            RECT {
+                left: 3,
+                top: 2,
+                right: 12,
+                bottom: 9,
+            },
+        );
+        assert_eq!(set_scissor(&mut e, this, scissor), 0);
+        let color = 0xff804020;
+        let highlight = 0xff208040;
+        let read = |gpu: &mut Gpu, target: &Target| {
+            let mut ticket = gpu.readback(&target.image, None).unwrap();
+            ticket.take_completion_job().unwrap()();
+            ticket.poll().unwrap().unwrap()
+        };
+        for (transformed, lit, source, point, scissored, trailing) in [
+            (true, false, 0, false, false, false),
+            (true, false, 0, false, true, true),
+            (false, false, 0, false, true, false),
+            (false, true, 0, false, false, false),
+            (false, true, 1, false, true, false),
+            (false, true, 2, false, true, false),
+            (false, false, 0, true, true, false),
+        ] {
+            for (state, value) in [
+                (137, u32::from(lit)),
+                (145, source),
+                (174, u32::from(scissored)),
+                (156, u32::from(point)),
+                (157, u32::from(point)),
+                (154, 2f32.to_bits()),
+                (158, 36f32.to_bits()),
+            ] {
+                assert_eq!(set_render(&mut e, this, state, value), 0);
+            }
+            let fvf = (if transformed { 4 } else { 2 | 0x10 })
+                | 0xc0
+                | if trailing { 0x300 } else { 0x100 };
+            assert_eq!(set_fvf(&mut e, this, fvf), 0);
+            let input = if transformed {
+                vec![[2., 2., 0.5, 0.5], [12., 2., 0.5, 0.5], [2., 10., 0.5, 0.5]]
+            } else if point {
+                vec![[0., 0., 0.5, 1.]]
+            } else {
+                vec![
+                    [-0.75, 0.75, 0.5, 1.],
+                    [0.5, 0.75, 0.5, 1.],
+                    [-0.75, -0.75, 0.5, 1.],
+                ]
+            };
+            let mut words = Vec::new();
+            for raw in &input {
+                words.extend(
+                    raw[..if transformed { 4 } else { 3 }]
+                        .iter()
+                        .map(|v: &f32| v.to_bits()),
+                );
+                if !transformed {
+                    words.extend([0, 0, (-1f32).to_bits()]);
+                }
+                words.extend([color, highlight, 0.25f32.to_bits(), 0.75f32.to_bits()]);
+            }
+            let data = alloc(&mut e, (words.len() * 4) as u32).unwrap();
+            e.cpu.write(data, bytemuck::cast_slice(&words)).unwrap();
+            let stride = (words.len() * 4 / input.len()) as u32;
+            let draw = prepare(
+                &mut e,
+                pointer,
+                if point { 1 } else { 4 },
+                1,
+                GuestPtr::new(data),
+                stride,
+                None,
+            )
+            .unwrap();
+            let f = current(&e, pointer).unwrap();
+            let v = draw.state.viewport;
+            let lights = active(&f).unwrap();
+            let normal_matrix = normal_matrix(&f);
+            let decoded: Vec<_> = input
+                .iter()
+                .map(|&raw| {
+                    let [x, y, z, rhw] = raw;
+                    let (position, eye) = if transformed {
+                        let w = 1. / rhw;
+                        (
+                            [
+                                (((x + 0.5 - v.x) / v.width) * 2. - 1.) * w,
+                                (1. - ((y + 0.5 - v.y) / v.height) * 2.) * w,
+                                z * w,
+                                w,
+                            ],
+                            [0.; 4],
+                        )
+                    } else {
+                        let eye = row(row(raw, &f.transforms[0]), &f.transforms[1]);
+                        let mut position = row(eye, &f.transforms[2]);
+                        position[0] += position[3] / v.width;
+                        position[1] -= position[3] / v.height;
+                        (position, eye)
+                    };
+                    let diffuse = lighting::color(color);
+                    let color = if lit {
+                        illuminate(
+                            &f,
+                            &lights,
+                            eye,
+                            [0., 0., -1.],
+                            &normal_matrix,
+                            Some(diffuse),
+                            Some(lighting::color(highlight)),
+                        )
+                        .0
+                    } else {
+                        diffuse
+                    };
+                    Vertex {
+                        position,
+                        color,
+                        uv: [0.25, 0.75],
+                    }
+                })
+                .collect();
+            drop(f);
+            let mut old = draw.clone();
+            old.fixed_vertex = None;
+            old.vertices = decoded.clone().into();
+            let bounds = |draw| {
+                recording::damage::bounds(&e, device(&e, pointer).unwrap(), &Operation::Draw(draw))
+            };
+            if point {
+                let baseline = bounds(old.clone());
+                let old_program = Arc::make_mut(old.programmable.as_mut().unwrap());
+                old_program.parameters[11][3] = 4f32.to_bits();
+                assert_ne!(bounds(draw.clone()), baseline);
+            }
+            assert_eq!(
+                bounds(draw.clone()),
+                bounds(old),
+                "{:?}",
+                (transformed, lit, source, point, scissored, trailing)
+            );
+            let gpu = e.ext.get_mut::<State>().gpu.as_mut().unwrap();
+            gpu.clear(&target, blank, None).unwrap();
+            gpu.clear(&reference, blank, None).unwrap();
+            gpu.draw_programmable(&target, draw.programmable.as_ref().unwrap(), &draw.state)
+                .unwrap();
+            let decoded = if point {
+                let vertex = decoded[0];
+                [
+                    (-1., 1.),
+                    (-1., -1.),
+                    (1., 1.),
+                    (1., 1.),
+                    (-1., -1.),
+                    (1., -1.),
+                ]
+                .map(|(x, y)| {
+                    let mut vertex = vertex;
+                    vertex.position[0] += x * 4. / v.width;
+                    vertex.position[1] += y * 4. / v.height;
+                    vertex.uv = [(x + 1.) * 0.5, (1. - y) * 0.5];
+                    vertex
+                })
+                .to_vec()
+            } else {
+                decoded
+            };
+            gpu.draw(&reference, &decoded, draw.image.as_ref(), draw.state)
+                .unwrap();
+            let actual = read(gpu, &target);
+            let expected = read(gpu, &reference);
+            assert!(
+                actual == expected,
+                "different pixels for {:?}",
+                (transformed, lit, source, point, scissored, trailing)
+            );
+        }
+    }
+
     // spec: GFX-FIXED-1
     #[test]
     fn directional_light_pixels() {

@@ -194,6 +194,7 @@ fn draw(f: &mut Fixture) -> fixed::Draw {
         programmable: None,
         recording_key: 0,
         program_key: 0,
+        fixed_vertex: None,
     }
 }
 fn record_draw(f: &mut Fixture, d: fixed::Draw) {

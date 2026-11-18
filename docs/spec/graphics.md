@@ -151,8 +151,7 @@ Full clears replace previous dependencies; partial clears, draws and copies reta
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
 Fixed-state draw keys may be cached between changes; unchanged setters preserve the key, and mutations invalidate it. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
 Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
-Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
-Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
+Fixed draws MUST retain their raw vertex streams and index order. Vertex buffer draws MUST see guest-writable stream contents when they are admitted.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
@@ -166,7 +165,7 @@ Diagnostics count successful submissions and input vertices, including instances
 **Rule**: Each target subresource MUST accumulate recording-time differences, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST be a cell region (DEV-FRAME-5) without promoting bounded damage to the whole target based on coverage alone.
 **Verification**: Test
 
-Bounds use decoded XYZRHW or CPU world/view/projection positions, or the scalar vertex shader interpreter for at most 64 float-input vertices. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clears, copies and uploads use their destination rectangles. Size/format changes and Reset invalidate history. Reads of targets written in the frame, including targets uploaded after an earlier read, extend their producers' execution instead (GFX-REC-5).
+At most 64 vertices supply bounds. Fixed draws read XYZRHW positions or apply world, view and projection to the position alone. Programmable draws use the scalar vertex shader interpreter with float inputs. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clears, copies and uploads use their destination rectangles. Size/format changes and Reset invalidate history. Reads of targets written in the frame, including targets uploaded after an earlier read, extend their producers' execution instead (GFX-REC-5).
 Clears and copies MUST compare their written region independently of its old destination values, including partial clears of padded depth/stencil attachments. Attachment histories MUST use their own extent; execution clips MUST remain inside the logical color view. Depth and stencil changes MUST contribute to required execution and tested draws without directly enlarging published color damage. A proven attachment read MUST propagate the changes of the version it reads at the same pixel coordinates.
 Sampled writes with unchanged command inputs MAY realign past removed writes and compare their source changes, while retaining the removed writes' bounds.
 
@@ -348,7 +347,9 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-INPUT-3 Pretransformed vertices
 
-**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. Programmable pretransformed draws MUST capture stream bytes and indices and map positions in the vertex stage, interpolating only the varyings the pixel stage reads.
+**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. The generated vertex stage MUST map XYZRHW from raw streams and interpolate only the varyings the pixel stage reads.
+
+Pretransformed draws MUST retain index order.
 **Verification**: Test
 
 ### GFX-INPUT-4 Fixed texture coordinates
@@ -358,7 +359,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-INPUT-5 Fixed raster limits
 
-**Rule**: Fixed drawing MUST reject active fog, user clipping, or unsupported point-size effects instead of silently ignoring them.
+**Rule**: Fixed drawing MUST reject unsupported user clipping or point-size effects instead of silently ignoring them.
 **Verification**: Test
 
 ### GFX-INPUT-6 Expanded upload bound
@@ -489,7 +490,7 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 
 ### GFX-FIXED-2 Fog, texture factor and shading
 
-**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed pipeline variants MUST preserve existing unlit pipeline recipes and cache identities.
+**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed vertex stages MUST run on the shared GPU shader path and specialize on layout, lighting, fog and point-scaling inputs.
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
 

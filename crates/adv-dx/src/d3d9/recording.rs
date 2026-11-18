@@ -5,7 +5,7 @@
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
 use rustc_hash::FxHashMap as HashMap;
-mod damage;
+pub(super) mod damage;
 mod key;
 mod passes;
 mod reuse;
@@ -119,6 +119,9 @@ pub(super) enum Reason {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
+    pub fixed_draws: u64,
+    pub fixed_shaders_built: u64,
+    pub fixed_shader_cache_hits: u64,
     pub recorded_draws: u64,
     pub recorded_draw_bytes: u64,
     pub recording_lookups: u64,
@@ -618,10 +621,13 @@ fn append(
     if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
         draw.target = target;
     }
+    let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
     f.commands.push(operation);
     f.nodes.push(f.damage.len().checked_sub(1));
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
-    env.ext.get_mut::<State>().frames.recorded_commands += 1;
+    let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.recorded_commands += 1;
+    counters.fixed_draws += u64::from(fixed);
     if limit {
         let outcome = barrier(env, owner, Reason::Limit, |_| Outcome::Return(0));
         // Parking allocation failure rejects the incoming command. Successful
@@ -650,7 +656,9 @@ fn append(
                 }
                 d.queries.scanned = len;
             }
-            env.ext.get_mut::<State>().frames.recorded_commands -= 1;
+            let counters = &mut env.ext.get_mut::<State>().frames;
+            counters.recorded_commands -= 1;
+            counters.fixed_draws -= u64::from(fixed);
             #[cfg(feature = "d3d9-counters")]
             if let Some((bytes, lookups)) = work {
                 let count = &mut env.ext.get_mut::<State>().frames;
@@ -1264,9 +1272,6 @@ fn finish(
     f.reuse.finish();
     f.partial = false;
     f.verdict = None;
-    if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {
-        d.hot.borrow().fixed.finish_inputs();
-    }
 }
 fn verify_pixels(
     env: &mut Env<'_>,

@@ -203,16 +203,16 @@ fn signature(
     }
     Ok((h.digest128(), target))
 }
-fn unchanged(env: &Env<'_>, spans: &[(u32, Arc<[u8]>)]) -> bool {
+fn unchanged(env: &Env<'_>, spans: &[(u32, adv_device::gpu::VertexBytes)]) -> bool {
     spans.iter().all(|(address, old)| {
         if adv_abi::guest::check_range(env.cpu, *address, old.len() as u32, Prot::READ).is_err() {
             return false;
         }
         if let Some(bytes) = env.cpu.shared_bytes(*address, old.len()) {
-            bytes == old.as_ref()
+            bytes == old.as_slice()
         } else {
             let mut bytes = vec![0; old.len()];
-            env.cpu.read(*address, &mut bytes).is_ok() && bytes == old.as_ref()
+            env.cpu.read(*address, &mut bytes).is_ok() && bytes == old.as_slice()
         }
     })
 }

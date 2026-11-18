@@ -337,6 +337,7 @@ fn fixed_completion_unlit_pipeline_identity() {
         second: false,
         features: (0, false),
         fixed: 0,
+        fixed_vertex: None,
     };
     assert_eq!(
         recording::hash(&key),

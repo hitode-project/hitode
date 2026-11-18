@@ -475,26 +475,10 @@ impl Gpu {
             bytes[parameters_offset..parameters_offset + 640]
                 .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
             for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                // Copy recipes directly, avoiding their deferred Vec payload.
-                let width = if stream.stride == 0 {
-                    stream
-                        .attributes
-                        .iter()
-                        .map(|a| a.offset + a.format.size())
-                        .max()
-                        .unwrap() as usize
-                } else {
-                    stream.stride as usize
-                };
-                for (n, out) in bytes[offset as usize..offset as usize + stream.bytes.len()]
-                    .chunks_mut(width)
-                    .enumerate()
-                {
-                    stream
-                        .bytes
-                        .read_vertex(n, stream.stride as usize, 0, out)
-                        .expect("validated vertex range");
-                }
+                let offset = offset as usize;
+                stream
+                    .bytes
+                    .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
             }
             if let Some(indices) = &draw.indices {
                 bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));

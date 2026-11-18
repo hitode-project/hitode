@@ -235,7 +235,8 @@ impl Prepared {
     pub(super) fn ignores_sampled_color(&self, content: Content) -> bool {
         content.2 != 0
             && matches!(&self.operation, Operation::Draw(d)
-                if d.programmable.is_none() && d.state.alpha_test == adv_device::gpu::Compare::Always)
+                if (d.programmable.is_none() || d.fixed_vertex.as_ref().is_some_and(|v| v.fixed_pixel))
+                    && d.state.alpha_test == adv_device::gpu::Compare::Always)
     }
 
     pub(super) fn attachment_command(&self, command: u128, contents: &Contents) -> u128 {
@@ -409,6 +410,7 @@ pub(super) fn prepare(
                 programmable,
                 recording_key,
                 program_key,
+                ..
             } = draw;
             if texture
                 .iter()
