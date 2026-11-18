@@ -692,7 +692,7 @@ fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
     });
     assert_eq!(trial.live.state.regs[0], u32::from(VALUE));
     let missed = COUNT - trial.live.state.regs[1];
-    assert!(missed >= 2 && missed < COUNT);
+    assert!((2..COUNT).contains(&missed));
 
     // Replay the write at the sample that saw it. The number of polls made
     // before the writer ran depends on host scheduling.

@@ -179,6 +179,7 @@ pub struct Runtime {
     /// Head and version with an environment miss due for a rebuild.
     pub resident_env: u64,
     pub resident_probation: u64,
+    pub resident_discover: u64,
 }
 
 impl Runtime {
@@ -245,6 +246,7 @@ impl Runtime {
             resident_point: 0,
             resident_env: 0,
             resident_probation: 0,
+            resident_discover: 0,
         }
     }
 }
@@ -553,7 +555,7 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
 
 /// Saves what light helpers keep (A64-REG-4): x5-x17, NZCV, LR and the
 /// XMM registers units cache.
-fn emit_save_light(asm: &mut Asm) {
+pub(crate) fn emit_save_light(asm: &mut Asm) {
     asm.emit_all(&[
         stp(X, Pre, r(5), r(6), SP, -128),
         stp(X, Offset, r(7), r(8), SP, 16),
@@ -572,7 +574,7 @@ fn emit_save_light(asm: &mut Asm) {
 }
 
 /// Restores what `emit_save_light` saved; uses x1.
-fn emit_restore_light(asm: &mut Asm) {
+pub(crate) fn emit_restore_light(asm: &mut Asm) {
     asm.emit_all(&[
         ldp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
         ldp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
@@ -865,7 +867,7 @@ fn emit_opt_exit(asm: &mut Asm) {
 
 /// Stores the guest registers and flags to the `CpuState` at x0; uses x1
 /// to x5.
-fn emit_store_guest(asm: &mut Asm) {
+pub(crate) fn emit_store_guest(asm: &mut Asm) {
     for (i, (a, b)) in GUEST.into_iter().enumerate() {
         // The low halves of x23 and x24 are ESP and EBP themselves.
         asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
@@ -1156,6 +1158,7 @@ pub(crate) const RESIDENT_FACT: u32 = field(offset_of!(Runtime, resident_fact));
 
 #[cfg(native)]
 pub(crate) const RESIDENT_PROBATION: u32 = field(offset_of!(Runtime, resident_probation));
+pub(crate) const RESIDENT_DISCOVER: u32 = field(offset_of!(Runtime, resident_discover));
 
 /// The backward link's patch word precedes the ordinary dispatch prefix.
 /// x14 identifies the edge on the resident trampoline's sampled path.

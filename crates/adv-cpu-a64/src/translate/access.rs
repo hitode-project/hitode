@@ -261,7 +261,7 @@ impl Translator<'_> {
 
     /// Branch when the last byte enters another page, preserving NZCV.
     pub(super) fn page_crossing(&mut self, address: Reg, width: u32, crossing: Label) {
-        page_crossing(&mut self.asm, address, width, crossing);
+        page_crossing(self.asm, address, width, crossing);
     }
 
     /// Select the window or alias for one page. Uses x3 and x4, preserving NZCV.
@@ -274,7 +274,7 @@ impl Translator<'_> {
         slow: Label,
     ) {
         let (alias, done) = (self.asm.label(), self.asm.label());
-        check_class(&mut self.asm, address, runtime::CLASSES, store, alias, slow);
+        check_class(self.asm, address, runtime::CLASSES, store, alias, slow);
         self.emit(mov(X, base, WINDOW));
         self.asm.b(done);
         self.asm.bind(alias);
@@ -284,7 +284,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn checked_alias(&mut self, address: Reg, store: bool, page: bool, slow: Label) {
-        checked_alias(&mut self.asm, address, store, page, slow);
+        checked_alias(self.asm, address, store, page, slow);
     }
 }
 
@@ -334,7 +334,7 @@ pub(super) trait CheckedEmitter {
 
 impl CheckedEmitter for Translator<'_> {
     fn access_asm(&mut self) -> &mut Asm {
-        &mut self.asm
+        self.asm
     }
 
     fn access_site(&mut self) {

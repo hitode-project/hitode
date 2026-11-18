@@ -13,7 +13,7 @@ impl Native {
                 eip: head,
                 ..CpuState::default()
             };
-            self.discover(memory, head, at);
+            self.discover(memory, head, head, at);
             self.install_optimized(true);
         }
         if let Some(job) = self.computation.get_mut(&head) {

@@ -864,8 +864,8 @@ impl Trace {
         while self.liveness(false, false) && backward {}
     }
 
-    /// Tier-1 resident links publish canonical state even on an edge that
-    /// stayed within the same prepaid region in the analysis trace.
+    /// The discovery and resident paths of a back edge can observe every
+    /// flag even when its Tier-1 path stays internal.
     pub(super) fn observe_back_links(&mut self) {
         while self.liveness(true, true) {}
         while self.liveness(false, true) {}

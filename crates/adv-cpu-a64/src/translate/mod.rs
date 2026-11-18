@@ -200,6 +200,7 @@ pub struct Code {
     cold: Vec<(u32, Cold)>,
     far: Vec<(usize, usize)>,
     links: Vec<Link>,
+    internal_links: Vec<InternalLink>,
     marks: Vec<Mark>,
     retired: u32,
     pub(crate) uses_permissions: bool,
@@ -217,6 +218,16 @@ pub struct Link {
     /// the end of the trace, rather than a side exit.
     pub main: bool,
     pub back: bool,
+}
+
+/// A patchable internal back edge and its out-of-line paths, in byte offsets.
+pub(crate) struct InternalLink {
+    pub eip: u32,
+    pub point: usize,
+    pub target: usize,
+    pub transition: usize,
+    pub link: usize,
+    pub counter: usize,
 }
 
 impl Workspace {
@@ -243,6 +254,10 @@ impl Workspace {
 
     pub fn links(&self) -> &[Link] {
         &self.code.links
+    }
+
+    pub(crate) fn internal_links(&self) -> &[InternalLink] {
+        &self.code.internal_links
     }
 
     /// Where each stretch of the unit starts, for samplers.
@@ -416,6 +431,17 @@ enum Cold {
         /// What an x87 run it leaves from does first.
         x87: Option<x87::Arrive>,
     },
+    ResidentBack {
+        point: Label,
+        count: Label,
+        inline: bool,
+        target: Label,
+        state: State,
+        simd_dirty: u16,
+        x87: Option<x87::Leave>,
+        eip: u32,
+        refund: u32,
+    },
     /// A backward edge arriving without some of its merge's entry set.
     Load {
         label: Label,
@@ -528,6 +554,8 @@ struct Translator<'a> {
     /// Branches to stubs: word index and target address.
     far: &'a mut Vec<(usize, usize)>,
     links: &'a mut Vec<Link>,
+    internal_links: &'a mut Vec<InternalLink>,
+    internal_targets: Vec<Label>,
     tables: &'a mut Vec<tables::Table>,
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
@@ -652,6 +680,7 @@ impl Jit<'_> {
             cold,
             far,
             links,
+            internal_links,
             marks,
             retired,
             uses_permissions,
@@ -670,6 +699,7 @@ impl Jit<'_> {
         cold.clear();
         far.clear();
         links.clear();
+        internal_links.clear();
         marks.clear();
         let mut t = Translator {
             asm,
@@ -681,6 +711,8 @@ impl Jit<'_> {
             marks,
             far,
             links,
+            internal_links,
+            internal_targets: Vec::new(),
             tables,
             stubs: self.stubs,
             checked: self.checked,
@@ -948,7 +980,7 @@ impl Translator<'_> {
     /// Detects a short straight-line MMX loop whose peeled first iteration
     /// avoids per-iteration x87 guards, dead pre-loads, or backedge flushes.
     fn mmx_peel_plan(&self, head: usize) -> Option<(usize, residency::Entry)> {
-        if self.computation || self.resident_links || self.x87.active || !self.trace.merge[head] {
+        if self.computation || self.x87.active || !self.trace.merge[head] {
             return None;
         }
         let insts = &self.trace.insts;
@@ -1121,12 +1153,7 @@ impl Translator<'_> {
         match edge {
             Edge::Internal(to) => {
                 self.spin_edge(to, None);
-                let eip = self.trace.insts[to].pc;
-                if self.resident_links && self.trace.insts[self.index].backward_jump(eip) {
-                    self.follow_exit(Exit::Dispatch, eip, unused, true);
-                } else {
-                    self.jump(to, self.x87_arriving(to));
-                }
+                self.jump(to, self.x87_arriving(to));
             }
             Edge::Exit(eip) => self.follow_exit(Exit::Dispatch, eip, unused, true),
             Edge::Interpret(eip) => self.follow_exit(Exit::Interpret, eip, unused, false),
@@ -1198,7 +1225,39 @@ impl Translator<'_> {
         } else if net < 0 {
             self.emit(add_imm(X, X9, X9, (-net) as u32, false));
         }
+        let x87 = x87.or_else(|| self.x87_leaving());
+        let target = self.resident_back(to, target, x87, true);
         self.asm.b(target);
+    }
+
+    fn resident_back(
+        &mut self,
+        to: usize,
+        target: Label,
+        x87: Option<x87::Leave>,
+        inline: bool,
+    ) -> Label {
+        let eip = self.trace.insts[to].pc;
+        if !self.resident_links || !self.trace.insts[self.index].backward_jump(eip) {
+            return target;
+        }
+        let point = self.asm.label();
+        let count = self.asm.label();
+        if inline {
+            self.asm.bind(point);
+        }
+        self.push_cold(Cold::ResidentBack {
+            point,
+            count,
+            inline,
+            target,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            x87,
+            eip,
+            refund: self.trace.owed(to),
+        });
+        if inline { count } else { point }
     }
 
     /// A jcc at the current instruction whose taken edge is `taken`.
@@ -1217,17 +1276,6 @@ impl Translator<'_> {
             self.publish(!self.entry[to].dirty);
         }
         let from = self.index;
-        let taken = match taken {
-            Edge::Internal(to)
-                if self.resident_links
-                    && self.trace.insts[from].backward_jump(self.trace.insts[to].pc) =>
-            {
-                // Keep the loop edge's flag conversion on the fall-through too.
-                self.convert(self.trace.live_in[to]);
-                Edge::Exit(self.trace.insts[to].pc)
-            }
-            edge => edge,
-        };
         match taken {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
@@ -1301,6 +1349,7 @@ impl Translator<'_> {
                         (self.asm.label(), self.asm.label(), self.asm.label());
                     self.emit(sub_imm(X, X9, X9, net, false));
                     self.asm.tbz(true, X9, 63, refuse);
+                    let target = self.resident_back(to, target, self.x87_leaving(), false);
                     self.jump_if(test, target);
                     self.emit(add_imm(X, X9, X9, net, false));
                     self.asm.bind(resume);
@@ -1324,6 +1373,7 @@ impl Translator<'_> {
                         x87: self.x87_leaving(),
                     });
                 } else if net == 0 {
+                    let target = self.resident_back(to, target, self.x87_leaving(), false);
                     self.jump_if(test, target);
                 } else {
                     let label = self.asm.label();
@@ -1343,6 +1393,8 @@ impl Translator<'_> {
                 let x87 = self.x87_arriving(to);
                 let net = self.trace.net(from, to);
                 if (net == 0 || (net < 0 && -net < 4096))
+                    && !(self.resident_links
+                        && self.trace.insts[from].backward_jump(self.trace.insts[to].pc))
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
                     && self.vector.dirty & !self.entry[to].dirty == 0
@@ -2044,6 +2096,115 @@ impl Translator<'_> {
                 self.index = from;
                 self.jump(to, x87);
             }
+            Cold::ResidentBack {
+                point,
+                count,
+                inline,
+                target,
+                state,
+                simd_dirty,
+                x87,
+                eip,
+                refund,
+            } => {
+                const SP: Reg = Reg::new(31);
+                let counter = self.asm.label();
+                let hot = self.asm.label();
+                if !inline {
+                    self.asm.bind(point);
+                    self.emit(b(4));
+                }
+                self.asm.bind(count);
+                self.asm.adr(X0, counter);
+                self.emit_all(&[
+                    ldr(X, X0, X0, 0),
+                    ldr(W, X1, X0, 0),
+                    sub_imm(W, X1, X1, 1, false),
+                    str(W, X1, X0, 0),
+                ]);
+                self.asm.cbz(W, false, X1, hot);
+                self.asm.b(target);
+                self.asm.bind(hot);
+                crate::runtime::emit_save_light(self.asm);
+                self.emit(stp_v(
+                    VSize::Q,
+                    Index::Pre,
+                    VReg::new(24),
+                    VReg::new(25),
+                    SP,
+                    -128,
+                ));
+                for i in 1..4 {
+                    self.emit(stp_v(
+                        VSize::Q,
+                        Index::Offset,
+                        VReg::new(24 + i * 2),
+                        VReg::new(25 + i * 2),
+                        SP,
+                        i32::from(i) * 32,
+                    ));
+                }
+                self.state = state;
+                self.vector.dirty = simd_dirty;
+                if let Some(x87) = x87 {
+                    self.x87_leave(x87);
+                }
+                self.flush_simd();
+                self.canonicalize();
+                self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
+                crate::runtime::emit_store_guest(self.asm);
+                self.target(eip);
+                self.asm.adr(X2, point);
+                self.emit_all(&[
+                    mov(X, X0, RUNTIME),
+                    ldr(X, X16, RUNTIME, crate::runtime::RESIDENT_DISCOVER),
+                    blr(X16),
+                ]);
+                for i in (1..4).rev() {
+                    self.emit(ldp_v(
+                        VSize::Q,
+                        Index::Offset,
+                        VReg::new(24 + i * 2),
+                        VReg::new(25 + i * 2),
+                        SP,
+                        i32::from(i) * 32,
+                    ));
+                }
+                self.emit(ldp_v(
+                    VSize::Q,
+                    Index::Post,
+                    VReg::new(24),
+                    VReg::new(25),
+                    SP,
+                    128,
+                ));
+                crate::runtime::emit_restore_light(self.asm);
+                self.asm.b(target);
+
+                let transition = self.asm.offset();
+                self.state = state;
+                self.vector.dirty = simd_dirty;
+                if let Some(x87) = x87 {
+                    self.x87_leave(x87);
+                }
+                self.flush_simd();
+                self.canonicalize();
+                self.emit(add_imm(X, X9, X9, refund, false));
+                self.asm.adr(X14, point);
+                let link = self.asm.offset();
+                self.emit(b(0));
+                self.asm.bind(counter);
+                self.emit_all(&[0, 0]);
+                self.internal_links.push(InternalLink {
+                    eip,
+                    point: self.asm.position(point),
+                    target: 0,
+                    transition,
+                    link,
+                    counter: self.asm.position(counter),
+                });
+                self.internal_targets.push(target);
+            }
             Cold::Load {
                 label,
                 vector,
@@ -2308,6 +2469,9 @@ impl Translator<'_> {
         for &(index, label) in &self.x87_sites {
             let (at, site) = &mut self.sites[index];
             site.resume = (self.asm.position(label) - *at) as i32;
+        }
+        for (link, target) in self.internal_links.iter_mut().zip(self.internal_targets) {
+            link.target = self.asm.position(target);
         }
         self.asm.resolve();
         let words = self.asm.words_mut();

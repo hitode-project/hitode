@@ -26,6 +26,8 @@ const PROBATION: u32 = 256;
 pub(super) struct Head {
     /// The Tier-1 address at discovery identifies this trace's lifetime.
     pub code: usize,
+    /// The Tier-1 unit containing the back edge that reached the threshold.
+    pub source: u32,
     pub trace: Trace,
     pub trampoline: usize,
     pub tier1: usize,
@@ -42,9 +44,10 @@ pub(super) struct Head {
 }
 
 impl Head {
-    pub fn new(code: usize, trace: Trace) -> Self {
+    pub fn new(code: usize, source: u32, trace: Trace) -> Self {
         Self {
             code,
+            source,
             trace,
             trampoline: 0,
             tier1: 0,
@@ -312,6 +315,13 @@ fn guest_exit(asm: &mut Asm, head: u32) {
         movz(W, r(1), head as u16, 0),
         movk(W, r(1), (head >> 16) as u16, 16),
     ]);
+}
+
+pub(super) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
+    let mut asm = Asm::new();
+    guest_exit(&mut asm, head);
+    asm.emit(branch(at + asm.offset(), exit));
+    asm.finish()
 }
 
 fn offer(asm: &mut Asm, job: &worker::Prepared, leave: Label) {
