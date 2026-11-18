@@ -483,7 +483,7 @@ impl Emitter<'_> {
         }
     }
 
-    /// Stores the expanded binary80 register and returns its tag in U.
+    /// Stores the binary80 register and its MMX alias, returning its tag in U.
     fn binary80(&mut self, i: u32, value: Reg) {
         let small = self.asm.label();
         let special = self.asm.label();
@@ -526,6 +526,7 @@ impl Emitter<'_> {
             orr(W, S2, S2, S3, Lsl, 15),
             stur(X, T, S4, 10 * i as i32),
             strh(S2, S4, 10 * i + 8),
+            str(X, T, CPU, runtime::MMX + 8 * i),
         ]);
     }
 

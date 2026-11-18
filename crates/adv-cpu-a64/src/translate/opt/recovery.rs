@@ -350,6 +350,7 @@ fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::
         {
             let value = binary80(values.locate(*location) as u64);
             cpu.x87.regs[i] = value;
+            cpu.mmx[i] = value.significand();
             cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
         }
     }

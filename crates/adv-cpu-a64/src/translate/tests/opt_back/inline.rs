@@ -90,6 +90,48 @@ impl InlineRun {
         }
     }
 
+    fn linked(
+        h: &Harness,
+        lowered: &back::Lowered,
+        memory: &mut Memory,
+        eip: u32,
+        len: usize,
+        control: u16,
+    ) -> Self {
+        let at = Self::new(h, lowered, &[]).code.len() * 4;
+        let addr = |off| HOST_CODE as usize + off;
+        let stubs = Stubs {
+            call: addr(h.forbidden),
+            exit: addr(h.stubs.exit),
+            dispatch: addr(h.dispatch),
+            lookup: addr(h.forbidden),
+            lookup_slow: addr(h.forbidden),
+            ret_miss: addr(h.forbidden),
+            access: addr(h.forbidden),
+            interpret: addr(h.forbidden),
+            fault: addr(h.forbidden),
+            opt_exit: addr(h.forbidden),
+        };
+        let mut work = Workspace::default();
+        translate(
+            &mut work,
+            memory,
+            eip,
+            &[eip + len as u32],
+            &|_| false,
+            0,
+            Features { flagm: false },
+            addr(at),
+            stubs,
+            &|_, _| None,
+            &|_| None,
+            &|_, _| Vec::new(),
+            control,
+            false,
+        );
+        Self::new(h, lowered, work.words())
+    }
+
     /// Models a Tier-1 predecessor with stale CPU GPRs and mapped flags.
     fn with_stale_integer_state(mut self) -> Self {
         let trampoline = self.code.len() * 4;
@@ -461,6 +503,72 @@ fn opt_inline_entry_equivalence() {
     assert!(counts.into_iter().all(|count| count > 0), "{counts:?}");
 }
 
+// spec: A64F-FP-4, A64-OPT-6
+#[test]
+fn opt_x87_exits_publish_the_alias_read_by_tier1_mmx() {
+    let x87 = bytes(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fst(st1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let mmx = bytes(|a| a.movq2dq(xmm0, mm1).unwrap());
+    let successor = CODE + x87.len() as u32;
+    let mut cpu = initial();
+    cpu.regs[7] = DATA + 32;
+    cpu.x87.status = 0x20;
+    // Negative infinity has exponent 0xffff, so the Tier-1 MMX alias
+    // check can pass even though x87 wrote the slot.
+    cpu.x87.regs[0] = X87Register::from_parts(1 << 63, 0xffff);
+    cpu.x87.regs[1] = X87Register::from_parts(3 << 62, 0x4000);
+    cpu.x87.tag = 0xfff2;
+    cpu.refresh_mmx();
+    let built = guest_fp_form(&x87, &cpu);
+    assert!(built.assumed.x87 && !built.assumed.mmx);
+    let params = opt::admit(
+        &built.func.entry,
+        &built.assumed,
+        &cpu,
+        |_, _| unreachable!(),
+    )
+    .unwrap();
+    let code = [x87.as_slice(), mmx.as_slice()].concat();
+    let expected = reference(&code, &[], &cpu).xmm[0];
+
+    let mut h = test_harness();
+    let captured = h.run_opt_inner(&built.func, &params, 100, 0, 0);
+    let mut job = cpu.clone();
+    materialize(
+        &captured.lowered.records[captured.record.0 as usize],
+        &captured.registers,
+        &captured.spills,
+        &captured.lowered.flags,
+        &mut job,
+        |_, _| unreachable!(),
+    );
+    assert_eq!(job.eip, successor);
+    let (job, exit, _) = h.run(&mmx, &[], &job, false);
+    assert_eq!(exit, Exit::Dispatch);
+
+    let lowered = back::lower_inline(&built.func, &built.assumed, &built.func.entry);
+    let run = InlineRun::linked(
+        &h,
+        &lowered,
+        &mut memory(&code, &[]),
+        successor,
+        mmx.len(),
+        cpu.x87.control,
+    );
+    assert_eq!(run.run(&mut h, &cpu, 100), Exit::Dispatch);
+    let inline = h.emu.read(CPU + u64::from(runtime::XMM), 16);
+    assert_eq!(
+        (job.xmm[0], inline.as_slice()),
+        (expected, expected.as_slice())
+    );
+}
+
 // spec: A64-CTL-7, A64-OPT-6
 #[test]
 fn opt_inline_negative_countdown_takes_the_tier1_budget_exit() {
@@ -489,39 +597,14 @@ fn opt_inline_negative_countdown_takes_the_tier1_budget_exit() {
     f.end(block, End::Exit(exit));
 
     let lowered = back::lower_inline(&f, &assumptions(&cpu), &f.entry);
-    let inline = InlineRun::new(&h, &lowered, &[]);
-    let at = inline.code.len() * 4;
-    let addr = |off| HOST_CODE as usize + off;
-    let stubs = Stubs {
-        call: addr(h.forbidden),
-        exit: addr(h.stubs.exit),
-        dispatch: addr(h.dispatch),
-        lookup: addr(h.forbidden),
-        lookup_slow: addr(h.forbidden),
-        ret_miss: addr(h.forbidden),
-        access: addr(h.forbidden),
-        interpret: addr(h.forbidden),
-        fault: addr(h.forbidden),
-        opt_exit: addr(h.forbidden),
-    };
-    let mut work = Workspace::default();
-    translate(
-        &mut work,
+    let run = InlineRun::linked(
+        &h,
+        &lowered,
         &mut memory,
         successor,
-        &[successor + guest.len() as u32],
-        &|_| false,
-        0,
-        Features { flagm: false },
-        addr(at),
-        stubs,
-        &|_, _| None,
-        &|_| None,
-        &|_, _| Vec::new(),
+        guest.len(),
         cpu.x87.control,
-        false,
     );
-    let run = InlineRun::new(&h, &lowered, work.words());
     assert_eq!(run.run(&mut h, &cpu, (-3i64) as u64), Exit::Budget);
     assert_eq!(countdown(&h) as i64, -3);
     assert_state(
