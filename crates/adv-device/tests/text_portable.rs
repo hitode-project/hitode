@@ -1674,3 +1674,234 @@ fn host_smoothing_changes_paint_without_changing_outline_requests() {
     }
     assert_eq!(images[0], images[1]);
 }
+
+// spec: DEV-FONT-1 DEV-FONT-8 DEV-FONT-9
+#[test]
+#[cfg(target_vendor = "apple")]
+fn apple_hvgl_outlines_render_without_drift_and_support_all_formats() {
+    #[cfg(target_os = "ios")]
+    let mut text = Text::default();
+    #[cfg(target_os = "macos")]
+    let mut text = {
+        let dir = std::path::Path::new(
+            "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved",
+        );
+        if !dir.join("PingFangUI.ttc").is_file() {
+            return;
+        }
+        Text::with_font_directories(&[dir.to_path_buf()])
+    };
+
+    let mut request = font("PingFang SC");
+    request.encoding = Encoding::SimplifiedChinese;
+    request.height = -24;
+
+    // Exact match uses the face's Windows cell (1060 + 340 at 1000 upem -> 33 px).
+    let metrics = text.metrics(&request).unwrap();
+    assert_eq!(metrics.height, 33);
+
+    // Automatic CJK substitution (e.g. SimSun -> PingFang SC) uses the one-em
+    // typographic box (DEV-FONT-9).
+    let mut sub = request.clone();
+    sub.face = "SimSun".into();
+    let sub_metrics = text.metrics(&sub).unwrap();
+    assert_eq!(sub_metrics.height, 24);
+    assert_eq!(
+        text.resolved_character(&sub, 0x4E2D).unwrap().family,
+        "PingFang SC"
+    );
+
+    // Space glyph has no outline contours and must still succeed cleanly.
+    let space = text
+        .glyph(
+            &request,
+            glyph(Character::Unicode(0x0020), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    assert_eq!(space.metrics.width, 0);
+    assert_eq!(space.metrics.height, 0);
+    assert!(space.metrics.advance_x > 0);
+
+    // Non-empty CJK and Latin glyphs must render crisp bitmaps and valid outlines.
+    for code in [0x4E2Du32, 0x56FD, 0x6C38, 0x0041, 0x0067, 0x3002] {
+        let gray = text
+            .glyph(
+                &request,
+                glyph(Character::Unicode(code), GlyphFormat::Gray8),
+            )
+            .unwrap();
+        assert!(gray.metrics.width > 0 && gray.metrics.height > 0);
+        assert!(gray.metrics.origin_y <= metrics.ascent);
+        assert!(gray.metrics.origin_y - gray.metrics.height as i32 >= -metrics.descent);
+        assert!(matches!(&gray.data, GlyphData::Bitmap(bytes) if bytes.iter().any(|&b| b != 0)));
+
+        let mono = text
+            .glyph(
+                &request,
+                glyph(Character::Unicode(code), GlyphFormat::Monochrome),
+            )
+            .unwrap();
+        assert_eq!(mono.metrics, gray.metrics);
+        assert!(matches!(&mono.data, GlyphData::Bitmap(bytes) if bytes.iter().any(|&b| b != 0)));
+
+        for format in [GlyphFormat::QuadraticOutline, GlyphFormat::CubicOutline] {
+            let outline = text
+                .glyph(&request, glyph(Character::Unicode(code), format))
+                .unwrap();
+            assert_eq!(outline.metrics, gray.metrics);
+            assert!(matches!(
+                &outline.data,
+                GlyphData::Outline(contours) if !contours.is_empty()
+            ));
+        }
+    }
+
+    // Variable weight axis (`wght`) must produce heavier coverage for bold.
+    let regular = text
+        .glyph(
+            &request,
+            glyph(Character::Unicode(0x4E2D), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    let mut bold_request = request.clone();
+    bold_request.weight = 700;
+    let bold = text
+        .glyph(
+            &bold_request,
+            glyph(Character::Unicode(0x4E2D), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    let sum = |g: &Glyph| match &g.data {
+        GlyphData::Bitmap(b) => b.iter().map(|&v| u64::from(v)).sum::<u64>(),
+        _ => 0,
+    };
+    assert!(
+        sum(&bold) > sum(&regular),
+        "expected bold wght to carry more ink than regular"
+    );
+
+    // Synthetic italic and explicit width scaling must render cleanly without drift.
+    let mut styled = request.clone();
+    styled.italic = true;
+    styled.width = 16;
+    let styled_glyph = text
+        .glyph(
+            &styled,
+            glyph(Character::Unicode(0x4E2D), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    assert!(styled_glyph.metrics.width > 0 && styled_glyph.metrics.height > 0);
+    assert!(styled_glyph.metrics.advance_x > regular.metrics.advance_x);
+
+    // Vertical `@PingFang SC` rotation and GSUB vertical punctuation must work cleanly.
+    let mut vertical = request.clone();
+    vertical.face = "@PingFang SC".into();
+    let vert_glyph = text
+        .glyph(
+            &vertical,
+            glyph(Character::Unicode(0x3002), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    assert!(vert_glyph.metrics.width > 0 && vert_glyph.metrics.height > 0);
+
+    // Paint a full mixed run and confirm pixels land inside the expected row range.
+    let mut canvas = vec![0u8; 128 * 32 * 4];
+    text.paint(
+        &request,
+        Paint {
+            input: TextInput::Unicode(&[0x4E2D, 0x56FD, 0x0041, 0x0067]),
+            origin: Point { x: 4, y: 28 },
+            horizontal: Horizontal::Left,
+            vertical: Vertical::Baseline,
+            foreground: [255, 255, 255],
+            background: [0, 0, 0],
+            opaque_background: false,
+            clip: None,
+            fill: None,
+        },
+        Pixels {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 128,
+                h: 32,
+            },
+            pitch: 128 * 4,
+            format: PixelFormat::Bgra32,
+            bytes: &mut canvas,
+        },
+    )
+    .unwrap();
+    assert!(canvas.iter().any(|&b| b != 0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_pingfang_hvgl_matches_cff_metrics_and_origins() {
+    let hvgl_dir = std::path::Path::new(
+        "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved",
+    );
+    if !hvgl_dir.join("PingFangUI.ttc").is_file() {
+        return;
+    }
+    let mut cff_text = Text::default();
+    let mut hvgl_text = Text::with_font_directories(&[hvgl_dir.to_path_buf()]);
+    let mut request = font("PingFang SC");
+    request.encoding = Encoding::SimplifiedChinese;
+    request.height = -24;
+
+    if cff_text
+        .resolved_character(&request, 0x4E2D)
+        .unwrap()
+        .family
+        != "PingFang SC"
+    {
+        return;
+    }
+    for code in [0x4E2Du32, 0x56FD, 0x6C38, 0x0041, 0x0067, 0x3002] {
+        let a = cff_text
+            .glyph(
+                &request,
+                glyph(Character::Unicode(code), GlyphFormat::Gray8),
+            )
+            .unwrap();
+        let b = hvgl_text
+            .glyph(
+                &request,
+                glyph(Character::Unicode(code), GlyphFormat::Gray8),
+            )
+            .unwrap();
+        assert_eq!(
+            a.metrics.advance_x, b.metrics.advance_x,
+            "advance_x U+{code:04X}"
+        );
+        assert_eq!(
+            a.metrics.advance_y, b.metrics.advance_y,
+            "advance_y U+{code:04X}"
+        );
+        assert!(
+            (a.metrics.origin_x - b.metrics.origin_x).abs() <= 1,
+            "origin_x drift U+{code:04X}: cff={} hvgl={}",
+            a.metrics.origin_x,
+            b.metrics.origin_x
+        );
+        assert!(
+            (a.metrics.origin_y - b.metrics.origin_y).abs() <= 1,
+            "origin_y drift U+{code:04X}: cff={} hvgl={}",
+            a.metrics.origin_y,
+            b.metrics.origin_y
+        );
+        assert!(
+            (a.metrics.width as i32 - b.metrics.width as i32).abs() <= 1,
+            "width drift U+{code:04X}: cff={} hvgl={}",
+            a.metrics.width,
+            b.metrics.width
+        );
+        assert!(
+            (a.metrics.height as i32 - b.metrics.height as i32).abs() <= 1,
+            "height drift U+{code:04X}: cff={} hvgl={}",
+            a.metrics.height,
+            b.metrics.height
+        );
+    }
+}
