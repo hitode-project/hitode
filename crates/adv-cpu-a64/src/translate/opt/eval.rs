@@ -336,9 +336,25 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             0
         }
         Op::PageCross { addr, width, .. } => {
-            let page = adv_cpu_core::memory::PAGE_SIZE;
-            if get(addr) as usize % page > page - usize::from(width) {
-                return None;
+            use adv_cpu_core::memory::{EXEC, PAGE_SIZE, WRITE};
+            let addr = get(addr) as u32;
+            let width = usize::from(width);
+            if addr as usize % PAGE_SIZE > PAGE_SIZE - width {
+                #[cfg(unix)]
+                let plain = memory.computation_range(addr, width, true);
+                #[cfg(not(unix))]
+                let plain =
+                    memory.accessible(addr, width, WRITE) && !memory.shared_range(addr, width);
+                if !plain {
+                    return None;
+                }
+                let page = (addr - memory.base) as usize / PAGE_SIZE;
+                if memory.native_permissions()[page..=page + 1]
+                    .iter()
+                    .any(|class| class & (WRITE | EXEC) != WRITE)
+                {
+                    return None;
+                }
             }
             0
         }

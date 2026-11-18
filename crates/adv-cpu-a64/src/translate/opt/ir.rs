@@ -275,8 +275,8 @@ pub(crate) enum Op {
         bytes: u32,
         write: bool,
     },
-    /// Recovers to `record` when `addr..addr + width` crosses a page,
-    /// before a store whose region already read those bytes.
+    /// Protects a crossing store whose region already read those bytes.
+    /// Recovers to `record` if either page is not ordinary and writable.
     PageCross {
         addr: Value,
         width: u8,

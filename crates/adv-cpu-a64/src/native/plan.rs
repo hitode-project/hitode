@@ -10,11 +10,21 @@
 //! | Baseline | Back-edge threshold | Profile and request a build |
 //! | Profiling | Compile done | Install a resident form or decline |
 //! | Resident | Context miss, cold exit, or probation end | Train, rebuild, or decline |
+//! | Resident | Unchecked host faults | Two at one site: check faulting sites on its stream |
+//! | Resident | Other cold exits | At least two at a site and more than one per eight iterations: cut, refuse, or demote |
 //! | Declined | Code invalidation | Reset discovery |
 //! | Offerable | Admission failure or job completion | Cache, back off, or re-offer |
 //!
 //! The policy constants below govern discovery, probation, faults, version
 //! limits and re-offers. A settled decline adds no work to the baseline loop.
+//! A cut rejoins Tier-1 and loses resident work on each affected iteration.
+//! Budget about 32 host instructions for that transfer and lost work, versus
+//! about 256 for a cold exit's state dump, Rust recovery and re-entry. The
+//! break-even rate is 32/256. Each cold window uses admitted entries or the
+//! retirement-based iteration estimate, whichever is larger. It ends after
+//! 256 entries or probation end. A cold exit beyond 256 estimated iterations
+//! starts a fresh sample, as does a change to the version chain. Windows reuse
+//! the probation calls, which are patched out on settled forms between windows.
 
 use super::*;
 
@@ -23,7 +33,9 @@ pub(super) const VERSIONS: usize = 3;
 pub(super) const SAMPLE: u32 = 8;
 pub(super) const PROBES: u8 = 8;
 pub(super) const MISSES: u32 = 4;
-pub(super) const COLD_EXITS: u8 = 2;
+pub(super) const CHECKED_FAULTS: u64 = 2;
+const COLD_MIN_EXITS: u64 = 2;
+const COLD_ITERATIONS_PER_EXIT: u64 = 8;
 pub(crate) const CHECK_AFTER: u32 = 8;
 pub(crate) const PROMOTION: u8 = 4;
 pub(super) const RESPECIALIZE: u8 = 2;
@@ -364,12 +376,21 @@ pub(super) struct ResidentPlan {
     pub refused: FxHashSet<u32>,
     pub cuts: FxHashSet<u32>,
     pub cold_counts: FxHashMap<(u32, ResidentCold), u64>,
+    cold_window: Option<ColdWindow>,
     /// Versions to rebuild once the current request settles.
     pub rebuilds: u8,
     pub pending: Option<compile::Task>,
     state: ResidentState,
     has_proof: bool,
     recorded_gap: bool,
+}
+
+#[derive(Default)]
+struct ColdWindow {
+    start_entries: u64,
+    start_iterations: u64,
+    cold_iterations: u64,
+    exits: FxHashMap<(u32, ResidentCold), u64>,
 }
 
 impl ResidentPlan {
@@ -388,6 +409,7 @@ impl ResidentPlan {
             refused: FxHashSet::default(),
             cuts: FxHashSet::default(),
             cold_counts: FxHashMap::default(),
+            cold_window: None,
             rebuilds: 0,
             pending: None,
             state: ResidentState::Profiling,
@@ -404,6 +426,47 @@ impl ResidentPlan {
             ResidentState::Declined(reason) => Some(reason),
             _ => None,
         }
+    }
+
+    fn accounted(&self) -> (u64, u64) {
+        self.versions
+            .iter()
+            .fold((0, 0), |(entries, iterations), version| {
+                (
+                    entries + version.slot.entries.get(),
+                    iterations + version.iterations(version.slot.countdown[1].get()),
+                )
+            })
+    }
+
+    fn check_stream(&mut self, site: u32) {
+        let stream = |inst: &iced_x86::Instruction| {
+            inst.op_kinds()
+                .any(|kind| kind == iced_x86::OpKind::Memory)
+                .then(|| {
+                    (
+                        inst.memory_segment(),
+                        inst.memory_base(),
+                        inst.memory_index(),
+                        inst.memory_index_scale(),
+                    )
+                })
+        };
+        let sites = self.trace.insts.iter().zip(&self.trace.x86);
+        if let Some(key) = sites
+            .clone()
+            .find(|(inst, _)| inst.pc == site)
+            .and_then(|(_, decoded)| stream(decoded.as_ref()?))
+        {
+            self.checked.extend(sites.filter_map(|(inst, decoded)| {
+                (self
+                    .cold_counts
+                    .contains_key(&(inst.pc, ResidentCold::HostFault))
+                    && stream(decoded.as_ref()?) == Some(key))
+                .then_some(inst.pc)
+            }));
+        }
+        self.checked.insert(site);
     }
 }
 
@@ -439,27 +502,106 @@ impl Native {
         site: u32,
         reason: ResidentCold,
         checked: bool,
+        refund: u32,
     ) {
         self.diagnostics.resident_cold_exits += 1;
+        *self
+            .diagnostics
+            .resident_cold_exits_by_reason
+            .entry(reason)
+            .or_default() += 1;
         let head = self.plans.resident_mut(eip).unwrap();
         let count = head.cold_counts.entry((site, reason)).or_default();
         *count += 1;
+        let count = *count;
         if count.is_power_of_two() {
             crate::jit_map::optimized(
                 eip,
                 format_args!("resident\tcold\t{site}\t{reason:?}\t{count}"),
             );
         }
-        if *count >= u64::from(plan::COLD_EXITS) && !head.declined() {
-            match reason {
-                ResidentCold::FrameDisjoint => self.refuse_resident_fact(eip, u32::MAX),
-                ResidentCold::HostFault if !checked => {
-                    if head.checked.insert(site) {
-                        self.rebuild_resident_versions(eip);
-                    }
-                }
-                _ => self.cut_resident_site(eip, site, reason),
+        if head.declined() {
+            return;
+        }
+        if reason == ResidentCold::HostFault && !checked {
+            if count >= CHECKED_FAULTS && !head.checked.contains(&site) {
+                head.check_stream(site);
+                crate::jit_map::optimized(
+                    eip,
+                    format_args!("resident\tchecked\t{site}\t{reason:?}"),
+                );
+                self.rebuild_resident_versions(eip);
             }
+            return;
+        }
+        if head.cold_window.is_none() {
+            for version in &head.versions {
+                if version.probation.is_none() {
+                    version.slot.entries.set(0);
+                    version.slot.countdown[1].set(0);
+                    version.account(&mut self.code.cache, true);
+                }
+            }
+            self.code.cache.sync();
+            let (start_entries, start_iterations) = head.accounted();
+            head.cold_window = Some(ColdWindow {
+                start_entries,
+                start_iterations,
+                ..ColdWindow::default()
+            });
+        }
+        let (entries, iterations) = head.accounted();
+        let version = &head.versions[self.runtime.resident_version as usize];
+        let window = head.cold_window.as_mut().unwrap();
+        if entries > window.start_entries {
+            let retired = self
+                .runtime
+                .completed
+                .wrapping_sub(self.runtime.countdown)
+                .wrapping_sub(version.slot.countdown[0].get())
+                .wrapping_sub(u64::from(refund));
+            window.cold_iterations += version.iterations(retired);
+        }
+        let visits = 1
+            + (entries - window.start_entries)
+                .max(iterations - window.start_iterations + window.cold_iterations);
+        if visits > u64::from(PROBATION) {
+            *window = ColdWindow {
+                start_entries: entries,
+                start_iterations: iterations,
+                ..ColdWindow::default()
+            };
+        }
+        let exits = window.exits.entry((site, reason)).or_default();
+        *exits += 1;
+        if *exits >= COLD_MIN_EXITS && *exits * COLD_ITERATIONS_PER_EXIT > visits {
+            self.stop_cold_window(eip);
+            if reason == ResidentCold::FrameDisjoint {
+                self.refuse_resident_fact(eip, u32::MAX);
+                *self
+                    .diagnostics
+                    .resident_refusals_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+                crate::jit_map::optimized(
+                    eip,
+                    format_args!("resident\trefused\t{site}\t{reason:?}"),
+                );
+            } else {
+                self.cut_resident_site(eip, site, reason);
+            }
+        }
+    }
+
+    fn stop_cold_window(&mut self, eip: u32) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.cold_window.take().is_some() {
+            for version in &head.versions {
+                if version.probation.is_none() {
+                    version.account(&mut self.code.cache, false);
+                }
+            }
+            self.code.cache.sync();
         }
     }
 
@@ -1184,8 +1326,19 @@ impl Native {
                 .trace
                 .reaches_latch_without(&|pc| head.cuts.contains(&pc))
             {
+                *self
+                    .diagnostics
+                    .resident_cuts_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+                crate::jit_map::optimized(eip, format_args!("resident\tcut\t{site}\t{reason:?}"));
                 self.rebuild_resident_versions(eip);
             } else {
+                *self
+                    .diagnostics
+                    .resident_demotions_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
                 crate::jit_map::declined(eip, reason);
                 self.decline_resident(eip, Decline::Cold(reason));
             }
@@ -1204,6 +1357,7 @@ impl Native {
             return;
         }
         let (trampoline, tier1) = (head.trampoline, head.tier1);
+        self.stop_cold_window(eip);
         // A sampled link may bypass the trampoline. Send those links
         // through it too until all stale versions have been replaced.
         self.code.repoint(trampoline, tier1);
@@ -1298,13 +1452,13 @@ impl Native {
                 return true;
             }
             probation = Some(head::Probation {
-                patches: Vec::new(),
                 iteration_retired: u64::from(lowered.iteration_retired),
                 saved_words: u64::from(tier1 - lowered.iteration_words),
                 entry_exit_words: u64::from(lowered.entry_words + lowered.exit_words),
             });
         }
         let gate = self.plans.job(eip).map(JobPlan::gate);
+        self.stop_cold_window(eip);
         let head = self.plans.resident_mut(eip).unwrap();
         let (trampoline, tier1) = if head.trampoline == 0 {
             let trampoline = self.code.cache.next();
@@ -1327,8 +1481,8 @@ impl Native {
             _ => head.versions.len(),
         };
         let slot = Box::<head::Slot>::default();
-        let entry = head::emit(
-            (eip, index, probation.is_some()),
+        let mut entry = head::emit(
+            (eip, index),
             &head.sample,
             &slot,
             gate,
@@ -1341,6 +1495,19 @@ impl Native {
                 opt_exit: self.code.stubs.opt_exit,
             },
         );
+        let accounting = lowered
+            .probation
+            .iter()
+            .map(|word| {
+                let point = entry.form + word * 4;
+                let placed = (entry.form - self.code.cache.next()) / 4 + word;
+                let call = entry.words[placed];
+                if probation.is_none() {
+                    entry.words[placed] = crate::encode::NOP;
+                }
+                (point, call)
+            })
+            .collect();
         if self.code.cache.append(&entry.words).is_none() {
             return false;
         }
@@ -1371,13 +1538,6 @@ impl Native {
         if self.inline_saved.len() < lowered.spill_cells {
             self.inline_saved.resize(lowered.spill_cells, 0);
         }
-        if let Some(probation) = &mut probation {
-            probation.patches = lowered
-                .probation
-                .iter()
-                .map(|word| entry.form + word * 4)
-                .collect();
-        }
         let version = head::Version {
             entry: entry.entry,
             probe: entry.probe,
@@ -1390,6 +1550,8 @@ impl Native {
             flags: lowered.flags,
             slot,
             probation,
+            accounting,
+            iteration_retired: u64::from(lowered.iteration_retired),
         };
         if index == head.versions.len() {
             head.versions.push(version);
@@ -1496,12 +1658,13 @@ impl Native {
         }
         let eip = (event >> 32) as u32;
         let index = event as u32 as usize - 1;
+        self.stop_cold_window(eip);
         let version = &mut self.plans.resident_mut(eip).unwrap().versions[index];
-        let probation = version.probation.take().unwrap();
+        let Some(probation) = version.probation.take() else {
+            return;
+        };
         if probation.profitable(&version.slot) {
-            for point in probation.patches {
-                self.code.cache.patch(point, crate::encode::NOP);
-            }
+            version.account(&mut self.code.cache, false);
             self.code.cache.sync();
         } else {
             crate::jit_map::demoted(
@@ -1515,6 +1678,7 @@ impl Native {
     }
 
     pub(super) fn decline_resident(&mut self, eip: u32, reason: Decline) {
+        self.stop_cold_window(eip);
         let head = self.plans.resident_mut(eip).unwrap();
         if head.has_proof && !head.recorded_gap {
             crate::jit_map::optimized(eip, format_args!("coverage-gap\t{reason}"));

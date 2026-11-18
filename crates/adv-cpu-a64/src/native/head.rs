@@ -37,10 +37,23 @@ pub(super) struct Version {
     pub flags: Vec<Option<FlagRecipe>>,
     pub slot: Box<Slot>,
     pub probation: Option<Probation>,
+    pub iteration_retired: u64,
+    pub accounting: Vec<(usize, u32)>,
+}
+
+impl Version {
+    pub fn iterations(&self, retired: u64) -> u64 {
+        retired.checked_div(self.iteration_retired).unwrap_or(0)
+    }
+
+    pub fn account(&self, cache: &mut crate::cache::CodeCache, enabled: bool) {
+        for &(point, call) in &self.accounting {
+            cache.patch(point, if enabled { call } else { NOP });
+        }
+    }
 }
 
 pub(super) struct Probation {
-    pub patches: Vec<usize>,
     pub iteration_retired: u64,
     pub saved_words: u64,
     pub entry_exit_words: u64,
@@ -83,7 +96,7 @@ pub(super) struct Entry {
 /// Prefix and resident form, with the context-miss continuation patchable
 /// independently of the Tier-1 fallback shared by the head's versions.
 pub(super) fn emit(
-    (head, version, probation): (u32, usize, bool),
+    (head, version): (u32, usize),
     sample: &Cell<u32>,
     slot: &Slot,
     gate: Option<OfferEntry>,
@@ -175,26 +188,22 @@ pub(super) fn emit(
     asm.emit(0);
 
     asm.bind(account);
-    if probation {
-        constant(&mut asm, r(16), std::ptr::from_ref(&slot.entries) as u64);
-        asm.emit_all(&[
-            ldr(X, r(17), r(16), 0),
-            add_imm(X, r(17), r(17), 1, false),
-            str(X, r(17), r(16), 0),
-            sub_imm(X, r(17), r(17), PROBATION, false),
-        ]);
-        asm.tbz(true, r(17), 63, snapshot);
-        constant(
-            &mut asm,
-            r(17),
-            (u64::from(head) << 32) | (version as u64 + 1),
-        );
-        asm.emit(str(X, r(17), RT, runtime::RESIDENT_PROBATION));
-    }
+    constant(&mut asm, r(16), std::ptr::from_ref(&slot.entries) as u64);
+    asm.emit_all(&[
+        ldr(X, r(17), r(16), 0),
+        add_imm(X, r(17), r(17), 1, false),
+        str(X, r(17), r(16), 0),
+        sub_imm(X, r(17), r(17), PROBATION, false),
+    ]);
+    asm.tbz(true, r(17), 63, snapshot);
+    constant(
+        &mut asm,
+        r(17),
+        (u64::from(head) << 32) | (version as u64 + 1),
+    );
+    asm.emit(str(X, r(17), RT, runtime::RESIDENT_PROBATION));
     asm.bind(snapshot);
-    if probation {
-        asm.emit(0);
-    }
+    asm.emit(0);
 
     asm.bind(probe);
     if version == 0 {
@@ -219,26 +228,20 @@ pub(super) fn emit(
 
     let form_at = at + asm.offset();
     let address = |label| at + asm.position(label);
-    let mut patches = vec![
+    let call = form.probation[0];
+    let from = form_at + call * 4;
+    let offset = ((form.words[call] << 6) as i32 >> 4) as isize;
+    form.words[call] = bl((address(account) as i64 - from as i64) as i32);
+    let pointer = slot.countdown.as_ptr() as u64;
+    form.words[form.probation_slot] = pointer as u32;
+    form.words[form.probation_slot + 1] = (pointer >> 32) as u32;
+    let patches = [
         (address(next), targets.tier1),
         (address(tier1), targets.tier1),
         (address(exit), targets.exit),
         (address(opt_exit), targets.opt_exit),
+        (address(snapshot), from.wrapping_add_signed(offset)),
     ];
-    if probation {
-        let call = form.probation[0];
-        let from = form_at + call * 4;
-        let offset = ((form.words[call] << 6) as i32 >> 4) as isize;
-        patches.push((address(snapshot), from.wrapping_add_signed(offset)));
-        form.words[call] = bl((address(account) as i64 - from as i64) as i32);
-        let pointer = slot.countdown.as_ptr() as u64;
-        form.words[form.probation_slot] = pointer as u32;
-        form.words[form.probation_slot + 1] = (pointer >> 32) as u32;
-    } else {
-        for &call in &form.probation {
-            form.words[call] = NOP;
-        }
-    }
     form.place(form_at, address(tail));
     form.words[form.miss] = branch(form_at + form.miss * 4, address(miss));
     // On the frozen back end the two labels share a word.

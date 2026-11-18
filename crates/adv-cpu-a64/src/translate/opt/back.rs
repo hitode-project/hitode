@@ -257,6 +257,8 @@ fn emit<'a>(
         iteration: cost::Iteration::default(),
         fact_misses: Vec::new(),
         checked_accesses: Vec::new(),
+        page_cross: None,
+        page_crossings: Vec::new(),
         batch_backedges,
         guest_eip: 0,
         locations: allocation.locations.clone(),
@@ -441,6 +443,7 @@ fn emit<'a>(
         e.asm.b(resume);
     }
     e.checked_accesses();
+    e.page_crossings();
     if let Some(pages) = batch_pages {
         resident::batch_pages(&mut e.asm, pages);
     }
@@ -503,6 +506,8 @@ struct Emitter<'a> {
     iteration: cost::Iteration,
     fact_misses: Vec<Label>,
     checked_accesses: Vec<resident::CheckedAccess>,
+    page_cross: Option<RecordId>,
+    page_crossings: Vec<resident::PageCrossing>,
     batch_backedges: Vec<Option<(Block, Label)>>,
     guest_eip: u32,
     locations: Vec<Host>,
@@ -1174,15 +1179,7 @@ impl<'a> Emitter<'a> {
         };
         match op {
             Op::PlainPage { addr, bytes, write } => self.plain_page(addr, bytes, write),
-            Op::PageCross {
-                addr,
-                width,
-                record,
-            } => {
-                let addr = self.gp(addr, U);
-                let fail = self.failure(record, ResidentCold::PageCross);
-                page_crossing(&mut self.asm, addr, u32::from(width), fail);
-            }
+            Op::PageCross { record, .. } => self.page_cross = Some(record),
             Op::FrameDisjoint {
                 addr,
                 width,

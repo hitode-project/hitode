@@ -16,8 +16,19 @@ pub(super) struct CheckedAccess {
     site: Label,
     resume: Label,
     slow: Label,
-    crossing: Label,
+    crossing: Option<Label>,
     region: RecordId,
+    eip: u32,
+}
+
+pub(super) struct PageCrossing {
+    address: Reg,
+    width: u32,
+    crossing: Label,
+    direct: u32,
+    fault: Site,
+    resume: Label,
+    fail: Label,
     eip: u32,
 }
 
@@ -31,27 +42,80 @@ impl Emitter<'_> {
         store: bool,
         checked: bool,
     ) {
-        if !self.resident || !checked {
+        let width = u32::from(width);
+        let checked = self.resident && checked;
+        let page_cross = self.page_cross.take();
+        let crossing = (checked || page_cross.is_some()).then(|| self.asm.label());
+        let site_index = self.sites.len();
+        let resume = if checked {
+            let slow = self.asm.label();
+            let crossing = crossing.unwrap();
+            let (site, resume) = self.checked_memory(address, width, store, direct, slow, crossing);
+            let kind = width | if store { runtime::ACCESS_STORE } else { 0 };
+            self.checked_accesses.push(CheckedAccess {
+                address,
+                value,
+                kind,
+                site,
+                resume,
+                slow,
+                crossing: page_cross.is_none().then_some(crossing),
+                region: self.region,
+                eip: self.guest_eip,
+            });
+            Some(resume)
+        } else {
+            if let Some(crossing) = crossing {
+                page_crossing(&mut self.asm, address, width, crossing);
+            }
             self.site(false);
             self.asm.emit(direct);
-            return;
+            crossing.map(|_| {
+                let label = self.asm.label();
+                self.asm.bind(label);
+                label
+            })
+        };
+        if let Some(record) = page_cross {
+            let fail = self.failure(record, ResidentCold::PageCross);
+            self.page_crossings.push(PageCrossing {
+                address,
+                width,
+                crossing: crossing.unwrap(),
+                direct,
+                fault: self.sites[site_index].1,
+                resume: resume.unwrap(),
+                fail,
+                eip: self.guest_eip,
+            });
         }
+    }
 
-        let (slow, crossing) = (self.asm.label(), self.asm.label());
-        let width = u32::from(width);
-        let (site, resume) = self.checked_memory(address, width, store, direct, slow, crossing);
-        let kind = width | if store { runtime::ACCESS_STORE } else { 0 };
-        self.checked_accesses.push(CheckedAccess {
-            address,
-            value,
-            kind,
-            site,
-            resume,
-            slow,
-            crossing,
-            region: self.region,
-            eip: self.guest_eip,
-        });
+    pub(super) fn page_crossings(&mut self) {
+        let counter = offset_of!(Runtime, resident_page_crossings) as u32;
+        for cross in std::mem::take(&mut self.page_crossings) {
+            self.asm.bind(cross.crossing);
+            self.mark(Part::Cold, cross.eip);
+            let blocked = self.asm.label();
+            // Preserve the flags and any scalar store value reloaded into T.
+            self.asm
+                .emit_all(&[mrs_nzcv(X5), stp(X, Index::Pre, T, X5, SP, -16)]);
+            self.plain_span(cross.address, cross.width, true, blocked);
+            self.asm
+                .emit_all(&[ldp(X, Index::Post, T, X5, SP, 16), msr_nzcv(X5)]);
+            self.sites.push((self.asm.offset(), cross.fault));
+            self.asm.emit_all(&[
+                cross.direct,
+                ldr(X, X0, RT, counter),
+                add_imm(X, X0, X0, 1, false),
+                str(X, X0, RT, counter),
+            ]);
+            self.asm.b(cross.resume);
+            self.asm.bind(blocked);
+            self.asm
+                .emit_all(&[ldp(X, Index::Post, T, X5, SP, 16), msr_nzcv(X5)]);
+            self.asm.b(cross.fail);
+        }
     }
 
     pub(super) fn checked_accesses(&mut self) {
@@ -88,7 +152,9 @@ impl Emitter<'_> {
             self.asm.tbz(false, X4, SHARED.trailing_zeros(), blocked);
             self.asm.tbz(true, X4, LINEAR.trailing_zeros(), blocked);
 
-            self.asm.bind(crossing);
+            if let Some(crossing) = crossing {
+                self.asm.bind(crossing);
+            }
             let width = kind & 31;
             self.asm.emit(mov(W, X1, address));
             if store {

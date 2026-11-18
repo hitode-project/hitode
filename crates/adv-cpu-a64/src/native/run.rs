@@ -142,6 +142,7 @@ impl Native {
         }
         let translated = owner.translated;
         self.diagnostics.resident_entries += self.runtime.resident_entries;
+        self.diagnostics.resident_page_crossings += self.runtime.resident_page_crossings;
         let mut exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
         let budget_exit = exit == Exit::Budget;
@@ -163,7 +164,7 @@ impl Native {
             let (refund, site, reason, checked) = self.materialize_inline(cpu, memory);
             retired -= u64::from(refund);
             exit = Exit::Dispatch;
-            Some((site, reason, checked))
+            Some((site, reason, checked, refund))
         } else {
             None
         };
@@ -193,9 +194,9 @@ impl Native {
         self.resident_arrival(cpu);
         self.environment_miss();
         self.finish_probation();
-        if let Some((site, reason, checked)) = resident_cold {
+        if let Some((site, reason, checked, refund)) = resident_cold {
             // A rebuild may replace versions named by this run's entry events.
-            self.resident_cold_exit(self.runtime.opt_head, site, reason, checked);
+            self.resident_cold_exit(self.runtime.opt_head, site, reason, checked, refund);
         }
         if budget_exit {
             self.sample(memory, cpu.eip);
@@ -259,6 +260,7 @@ impl Native {
         runtime.resident_site = u32::MAX;
         runtime.resident_cold = ResidentCold::Other;
         runtime.resident_entries = 0;
+        runtime.resident_page_crossings = 0;
         runtime.offer_gate = gate;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;

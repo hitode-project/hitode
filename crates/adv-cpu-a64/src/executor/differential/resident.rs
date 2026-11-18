@@ -1237,7 +1237,39 @@ fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
     trial.same_state();
 }
 
-// spec: A64-OPT-9, A64-MEM-5
+// spec: A64-OPT-5, A64-OPT-9
+#[test]
+fn a_read_modify_write_crossing_plain_pages_stays_in_the_form() {
+    let image = Image::loop_body(|a, head, _| {
+        a.add(dword_ptr(esi), eax).unwrap();
+        a.add(esi, 5).unwrap();
+        latch(a, head);
+    });
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    let mut state = initial(8);
+    state.regs[0] = 0x1234_5678;
+    state.regs[6] = boundary - 7;
+    for checks in [Checks::Adaptive, Checks::All] {
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            "plain cross-page RMW",
+            &[(SPECIAL, 2 * HOST_PAGE)],
+            |m| {
+                m.map(SPECIAL, 2 * HOST_PAGE, READ | WRITE).unwrap();
+                m.write(boundary - 7, &[0x81; 40]).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().checks = checks;
+        trial.install();
+        assert_eq!(trial.compare(128), (RunOutcome::ReachedStop, 33));
+        let diagnostics = &trial.live.native.as_ref().unwrap().diagnostics;
+        assert_eq!(diagnostics.resident_cold_exits, 0);
+        assert_eq!(diagnostics.resident_page_crossings, 1);
+    }
+}
+
+// spec: A64-OPT-5, A64-OPT-9, A64-MEM-5
 #[test]
 fn a_read_modify_write_crossing_into_read_only_memory_has_precise_state() {
     let image = Image::loop_body(|a, head, _| {
@@ -1264,6 +1296,12 @@ fn a_read_modify_write_crossing_into_read_only_memory_has_precise_state() {
     let (outcome, retired) = trial.compare(128);
     assert!(matches!(outcome, RunOutcome::WriteFault { address, .. } if address == boundary));
     assert_eq!(retired, 5);
+    let diagnostics = &trial.live.native.as_ref().unwrap().diagnostics;
+    assert_eq!(
+        diagnostics.resident_cold_exits_by_reason[&crate::runtime::ResidentCold::PageCross],
+        1
+    );
+    assert_eq!(diagnostics.resident_page_crossings, 0);
 }
 
 // spec: A64-OPT-9, A64-MEM-7, A64-MEM-11

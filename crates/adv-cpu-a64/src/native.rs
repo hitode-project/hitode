@@ -351,7 +351,7 @@ fn features() -> Features {
 
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Diagnostics {
     pub first_visits: u64,
     pub first_declined: u64,
@@ -390,6 +390,11 @@ pub(crate) struct Diagnostics {
     pub rust_decisions_on_decided_sites: u64,
     /// Resident form exits that went through Rust (A64-OPT-9).
     pub resident_cold_exits: u64,
+    pub resident_cold_exits_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
+    pub resident_cuts_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
+    pub resident_refusals_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
+    pub resident_demotions_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
+    pub resident_page_crossings: u64,
     /// Fills of the whole indirect table, which also reset the shadow stack.
     pub global_invalidations: u64,
 }
@@ -1196,7 +1201,7 @@ mod tests {
             while state.eip != stop {
                 retired += u64::from(enter(&mut native, &mut memory, stop, &mut state).retired);
             }
-            let diag = native.diagnostics;
+            let diag = &native.diagnostics;
             assert_eq!(diag.rust_decisions_on_decided_sites, 0);
             assert_eq!(diag.optimized_runs, 0);
             assert_eq!(diag.alone_evaluations, 0);
@@ -1650,13 +1655,14 @@ mod tests {
         state.eip = OUTSIDE;
         native.compiler = compile::Compiler::background();
 
-        for _ in 0..plan::COLD_EXITS {
+        for _ in 0..2 {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
         native.install_optimized(true);
         let resident = native.plans.resident(HEAD).unwrap();
         let site = (HEAD + 4, ResidentCold::FrameDisjoint);
-        assert_eq!(resident.cold_counts[&site], u64::from(plan::COLD_EXITS));
+        assert_eq!(resident.cold_counts[&site], 2);
+        assert_eq!(native.diagnostics.resident_refusals_by_reason[&site.1], 1);
         assert_ne!(resident.versions[0].entry, old);
         assert!(!resident.versions[0].plain_sites.contains(&u32::MAX));
 
@@ -1675,24 +1681,36 @@ mod tests {
 
     // spec: A64-MEM-7, A64-OPT-9
     #[test]
-    fn two_resident_cold_exits_rebuild_the_site_as_checked() {
+    fn unchecked_host_faults_rebuild_one_stream_as_checked() {
         let (mut memory, mut native, stop) = resident_loop(&[
-            0x8b, 0x06, 0x83, 0xc6, 4, 0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf3, 0xcc,
+            0x8b, 0x06, 0x8b, 0x56, 4, 0x83, 0xc6, 8, 0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf0,
+            0xcc,
         ]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         memory.map_shared_audio(DATA + 0x4000, 0x1000).unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
         let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
-        for expected in 1..=u64::from(plan::COLD_EXITS) {
+        let mut state = resident_cpu(OUTSIDE, 3);
+        state.regs[6] = DATA + 0x4000 - 4;
+        enter(&mut native, &mut memory, stop, &mut state);
+        let resident = native.plans.resident(HEAD).unwrap();
+        assert_eq!(
+            resident.cold_counts[&(HEAD + 2, ResidentCold::HostFault)],
+            1
+        );
+        assert_eq!(resident.versions[0].entry, old);
+        for expected in 1..=plan::CHECKED_FAULTS {
             let mut state = resident_cpu(OUTSIDE, 3);
-            state.regs[6] = DATA + 0x4000 - 4;
+            state.regs[6] = DATA + 0x4000;
             enter(&mut native, &mut memory, stop, &mut state);
-            assert_eq!(native.diagnostics.resident_cold_exits, expected);
+            assert_eq!(native.diagnostics.resident_cold_exits, expected + 1);
             assert_eq!(state.eip, HEAD);
         }
         let resident = native.plans.resident(HEAD).unwrap();
-        assert!(resident.checked.contains(&HEAD));
+        assert_eq!(resident.checked.len(), 2);
+        assert!(resident.checked.contains(&HEAD) && resident.checked.contains(&(HEAD + 2)));
         assert_ne!(resident.versions[0].entry, old);
+        let checked_entry = resident.versions[0].entry;
 
         for _ in 0..100 {
             let mut state = resident_cpu(OUTSIDE, 3);
@@ -1703,7 +1721,11 @@ mod tests {
         }
         assert_eq!(
             native.diagnostics.resident_cold_exits,
-            u64::from(plan::COLD_EXITS)
+            plan::CHECKED_FAULTS + 1
+        );
+        assert_eq!(
+            native.plans.resident(HEAD).unwrap().versions[0].entry,
+            checked_entry
         );
     }
 
@@ -1729,13 +1751,14 @@ mod tests {
         assert!(native.force_resident_at(&mut memory, state.clone()));
         let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
         state.eip = OUTSIDE;
-        for _ in 0..plan::COLD_EXITS {
+        for _ in 0..2 {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
         let head = native.plans.resident(HEAD).unwrap();
-        let cold = u64::from(plan::COLD_EXITS);
+        let cold = 2;
         assert_eq!(head.cold_counts.get(&(site, reason)), Some(&cold));
         assert!(head.cuts.contains(&site));
+        assert_eq!(native.diagnostics.resident_cuts_by_reason[&reason], 1);
         assert_ne!(head.versions[0].entry, old);
 
         let first = enter(&mut native, &mut memory, stop, &mut state.clone());
@@ -1815,16 +1838,44 @@ mod tests {
     // spec: A64-OPT-5, A64-OPT-9
     #[test]
     fn repeated_page_cross_cuts_before_the_instruction() {
-        // mov eax,[esi]; mov [esi],eax
+        // movzx eax,byte [esi]; mov [esi],eax
         repeated_optional_cold_site(
-            (&[0x8b, 0x06, 0x89, 0x06], 2),
+            (&[0x0f, 0xb6, 0x06, 0x89, 0x06], 3),
             ResidentCold::PageCross,
             false,
             |memory, state| {
                 memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+                memory.protect(DATA + 0x1000, 0x3000, READ).unwrap();
                 state.regs[6] = DATA + 0xfff;
             },
         );
+    }
+
+    // spec: A64-OPT-9, A64-OPT-14
+    #[test]
+    fn rare_page_cross_exits_keep_the_site_resident() {
+        // movzx eax,byte [esi]; mov [esi],eax; dec ecx; jne HEAD; int3
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x0f, 0xb6, 0x06, 0x89, 0x06, 0x49, 0x75, 0xf8, 0xcc]);
+        memory.map(DATA, 0x8000, READ | WRITE).unwrap();
+        memory.protect(DATA + 0x4000, 0x4000, READ).unwrap();
+        assert!(native.force_resident(&mut memory, HEAD));
+        let entry = native.plans.resident(HEAD).unwrap().versions[0].entry;
+        let mut crossing = resident_cpu(OUTSIDE, 4);
+        crossing.regs[6] = DATA + 0x3fff;
+        enter(&mut native, &mut memory, stop, &mut crossing.clone());
+
+        // One admitted invocation runs hundreds of iterations without crossing.
+        let mut plain = resident_cpu(OUTSIDE, 512);
+        plain.regs[6] = DATA;
+        while plain.eip != stop {
+            enter(&mut native, &mut memory, stop, &mut plain);
+        }
+        enter(&mut native, &mut memory, stop, &mut crossing);
+        let head = native.plans.resident(HEAD).unwrap();
+        assert_eq!(head.cold_counts[&(HEAD + 3, ResidentCold::PageCross)], 2);
+        assert!(head.cuts.is_empty() && !head.declined());
+        assert_eq!(head.versions[0].entry, entry);
     }
 
     // spec: A64-OPT-9
@@ -1845,10 +1896,14 @@ mod tests {
         assert!(native.force_resident(&mut memory, HEAD));
         let mut state = resident_cpu(OUTSIDE, 4);
         state.regs[6] = DATA;
-        for _ in 0..plan::COLD_EXITS {
+        for _ in 0..2 {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
         assert!(native.plans.resident(HEAD).unwrap().declined());
+        assert_eq!(
+            native.diagnostics.resident_demotions_by_reason[&ResidentCold::BlockedAccess],
+            1
+        );
         for _ in 0..100 {
             let mut state = state.clone();
             assert_eq!(
@@ -1857,10 +1912,7 @@ mod tests {
             );
             assert_eq!(state.eip, HEAD);
         }
-        assert_eq!(
-            native.diagnostics.resident_cold_exits,
-            u64::from(plan::COLD_EXITS)
-        );
+        assert_eq!(native.diagnostics.resident_cold_exits, 2);
     }
 
     fn probation_loop(trips: u32) -> (Memory, Native, u32) {
@@ -1921,12 +1973,9 @@ mod tests {
     fn resident_probation_keeps_long_invocations() {
         let (mut memory, mut native, stop) = probation_loop(100);
         let invalidations = native.diagnostics.global_invalidations;
-        let patches = native.plans.resident(HEAD).unwrap().versions[0]
-            .probation
-            .as_ref()
-            .unwrap()
-            .patches
-            .clone();
+        let version = &native.plans.resident(HEAD).unwrap().versions[0];
+        assert!(version.probation.is_some());
+        let patches = version.accounting.clone();
         for _ in 0..300 {
             let mut state = resident_cpu(OUTSIDE, 100);
             while state.eip != stop {
@@ -1938,7 +1987,7 @@ mod tests {
         assert!(
             patches
                 .into_iter()
-                .all(|word| native.code.cache.word(word) == crate::encode::NOP)
+                .all(|(point, _)| native.code.cache.word(point) == crate::encode::NOP)
         );
     }
 

@@ -184,6 +184,7 @@ pub struct Runtime {
     pub resident_probation: u64,
     pub resident_discover: u64,
     pub resident_entries: u64,
+    pub resident_page_crossings: u64,
 }
 
 impl Runtime {
@@ -255,11 +256,12 @@ impl Runtime {
             resident_probation: 0,
             resident_discover: 0,
             resident_entries: 0,
+            resident_page_crossings: 0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u32)]
 pub(crate) enum ResidentCold {
     Other,

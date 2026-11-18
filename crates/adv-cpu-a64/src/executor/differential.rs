@@ -1906,7 +1906,7 @@ fn translated(
         executor.state.clone(),
         snapshot(executor.memory()),
         native,
-        executor.native.as_ref().unwrap().diagnostics,
+        executor.native.as_ref().unwrap().diagnostics.clone(),
     )
 }
 
