@@ -10,5 +10,8 @@ config_types.h supplies the fixed-width C integer types for these headers.
 
 Local change: decode.c and decint.h support suspending at stripe callbacks
 so guest continuations can run before decoding the following stripe.
-Independent native planes may share two persistent workers, joining before
-frame publication. Scalar decoding remains available as the test oracle.
+Whole-frame decoding reconstructs fragment-row bands on a shared worker pool,
+then filters and post-processes independent planes. Striped decoding retains
+the original pipeline and filter delays.
+Residual decoding builds a flattened Huffman lookup from the imported setup
+and refills a 64-bit reservoir with the reference reader's cursor and EOF rules.
