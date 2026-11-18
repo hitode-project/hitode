@@ -5,7 +5,7 @@ use adv_cpu_core::memory::{EXEC, PAGE_SIZE, READ, SHARED, WRITE};
 
 use super::{BASE, CODE, CpuState, DATA, Executor, LEN, Memory, Rng, RunOutcome, STACK};
 use super::{BlockEncoderOptions, alu_imm};
-use crate::native::Checks;
+use crate::native::{Checks, Run};
 use crate::runtime::Exit;
 use iced_x86::code_asm::*;
 
@@ -196,6 +196,23 @@ impl<'a> Trial<'a> {
         }
     }
 
+    fn run_native(&mut self, fuel: u64) -> Option<Run> {
+        self.live.memory.attach().unwrap();
+        self.live.state.settle_flags();
+        self.live
+            .native
+            .as_mut()
+            .unwrap()
+            .run(
+                &mut self.live.state,
+                &mut self.live.memory,
+                self.stop,
+                fuel,
+                null_mut(),
+            )
+            .unwrap()
+    }
+
     /// Check every return from native code, then compare any instruction the
     /// owner must finish in Tier 0. A wrong retirement count advances the
     /// reference to a different instruction or a different loop iteration.
@@ -211,22 +228,7 @@ impl<'a> Trial<'a> {
             if retired == fuel {
                 return (RunOutcome::Budget, retired);
             }
-            self.live.memory.attach().unwrap();
-            self.live.state.settle_flags();
-            let run = self
-                .live
-                .native
-                .as_mut()
-                .unwrap()
-                .run(
-                    &mut self.live.state,
-                    &mut self.live.memory,
-                    stop,
-                    fuel - retired,
-                    null_mut(),
-                )
-                .unwrap();
-            if let Some(run) = run {
+            if let Some(run) = self.run_native(fuel - retired) {
                 let units = u64::from(run.retired);
                 assert!(
                     units <= fuel - retired,
@@ -700,7 +702,7 @@ fn a_loop_carried_carry_stays_in_tier1() {
     assert_eq!(trial.compare(32), (RunOutcome::ReachedStop, 14));
 }
 
-// spec: A64-OPT-9, A64-MEM-5
+// spec: A64-OPT-6, A64-OPT-9, A64-MEM-5
 #[test]
 fn a_load_from_a_protected_page_reports_exact_fault_state() {
     let image = Image::loop_body(|a, head, _| {
@@ -712,7 +714,7 @@ fn a_load_from_a_protected_page_reports_exact_fault_state() {
     });
     let boundary = SPECIAL + HOST_PAGE as u32;
     let mut state = initial(8);
-    state.regs[6] = boundary - 4;
+    state.regs[6] = boundary - 8;
     let mut trial = Trial::new(
         &image,
         &state,
@@ -720,15 +722,25 @@ fn a_load_from_a_protected_page_reports_exact_fault_state() {
         &[(SPECIAL, HOST_PAGE)],
         |m| {
             m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+            m.write(boundary - 8, &0x1234_5678u32.to_le_bytes())
+                .unwrap();
             m.write(boundary - 4, &0xfedc_ba98u32.to_le_bytes())
                 .unwrap();
             m.map(boundary, HOST_PAGE, 0).unwrap();
         },
     );
     trial.install();
-    let (outcome, retired) = trial.compare(128);
+    let run = trial.run_native(128).unwrap();
+    assert_eq!((run.exit, run.retired), (Exit::Dispatch, 15));
+    assert_eq!(
+        trial.reference.run(image.stop, 15).unwrap(),
+        RunOutcome::Budget
+    );
+    trial.same_position_and_memory(15, false);
+    trial.same_state();
+    let (outcome, retired) = trial.compare(128 - 15);
     assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
-    assert_eq!(retired, 9);
+    assert_eq!(retired, 0);
     assert!(
         trial
             .live

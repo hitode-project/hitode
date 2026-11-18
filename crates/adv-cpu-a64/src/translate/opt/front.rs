@@ -382,9 +382,15 @@ fn build_trace(
         }
     }
     let mut complete = Vec::new();
-    if resident.is_some() {
+    if let Some(accesses) = &accesses {
         for (i, from) in arrivals.iter().enumerate() {
-            complete.push(i == 0 || from.iter().any(|&p| unit.trace.net(p, i) > 0));
+            // A faulting instruction observes even the registers it would
+            // have overwritten on success (A64-OPT-6).
+            let may_fault = accesses[i].as_ref().is_none_or(|uses| {
+                uses.iter()
+                    .any(|access| frame_offset(access.mem, &offsets[i]).is_none())
+            });
+            complete.push(i == 0 || may_fault || from.iter().any(|&p| unit.trace.net(p, i) > 0));
         }
     }
     let models = model::analyze(unit, at, &offsets, &[], write_through)?;
