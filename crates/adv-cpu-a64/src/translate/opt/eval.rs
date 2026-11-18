@@ -294,7 +294,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             0
         }
-        Op::Validate | Op::PlainPage { .. } | Op::PageCross { .. } => 0,
+        Op::Validate | Op::PlainPage { .. } | Op::PageCross { .. } | Op::FrameDisjoint { .. } => 0,
     })
 }
 
@@ -808,6 +808,7 @@ mod tests {
                 value: p,
                 after,
                 checked: false,
+                pc: 0,
             },
         );
         f.end(b, End::Exit(exit));
@@ -869,6 +870,7 @@ mod tests {
                 value: unmapped,
                 after,
                 checked: false,
+                pc: 0,
             },
         );
         f.end(b, End::Exit(exit));

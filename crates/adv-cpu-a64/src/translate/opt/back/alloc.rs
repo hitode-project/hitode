@@ -19,8 +19,9 @@ pub(super) struct Allocation {
 }
 
 // spec: A64-OPT-6, A64-OPT-7
-pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
-    let reserved = |r| [9, 16, 17, 18, 28, 29].contains(&r) || inline && r <= 5;
+pub(super) fn allocate(func: &Func, inline: bool, resident: bool) -> Allocation {
+    let reserved =
+        |r| [9, 16, 17, 18, 28, 29].contains(&r) || inline && r <= 5 || resident && r == 27;
     let n = func.types.len();
     let mut operations = vec![None; n];
     let mut vectors = if inline { E.number() as u8 } else { 29 };
@@ -135,7 +136,11 @@ pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
                 }
             }
             if op.can_fail() {
-                for v in func.records[region.0 as usize].uses() {
+                let record = match op {
+                    Op::FrameDisjoint { record, .. } => *record,
+                    _ => region,
+                };
+                for v in func.records[record.0 as usize].uses() {
                     read(v, position + 1, false, false);
                 }
             }

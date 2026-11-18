@@ -166,6 +166,12 @@ pub struct Runtime {
     pub offer_gate: u64,
     /// The head EIP of the inline form whose cold exit reached `opt_exit`.
     pub opt_head: u32,
+    /// Ordinal of the resident entry fact that failed.
+    pub resident_fact: u32,
+    /// Guest EIP of the checked resident access that was blocked.
+    pub resident_site: u32,
+    /// Owner access stub entry that preserves optimized register values.
+    pub resident_access: u64,
 }
 
 impl Runtime {
@@ -225,6 +231,9 @@ impl Runtime {
             opt_entry: OptEntryState::default(),
             offer_gate: 0,
             opt_head: 0,
+            resident_fact: 0,
+            resident_site: 0,
+            resident_access: 0,
         }
     }
 }

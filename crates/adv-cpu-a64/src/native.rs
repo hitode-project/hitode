@@ -843,7 +843,33 @@ impl Native {
     pub fn new(window: usize) -> Result<Self, String> {
         let mut cache = CodeCache::new(CACHE_LEN)?;
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
-        let stubs = runtime::stubs();
+        unsafe extern "C" fn resident_access(
+            runtime: *mut Runtime,
+            address: u32,
+            site: usize,
+            value: u32,
+            kind: u32,
+        ) -> u64 {
+            if kind & runtime::ACCESS_STORE != 0 {
+                // SAFETY: the owner and memory are live as in `access`.
+                let owner = unsafe { &*((*runtime).owner as *const Owner) };
+                let memory = unsafe { &*owner.memory };
+                let last = address.wrapping_add((kind & 31) - 1);
+                if [address, last].into_iter().any(|at| {
+                    memory.file_page_copy_on_write(at).is_some() && memory.shared_range(at, 1)
+                }) {
+                    return 1 << 32;
+                }
+            }
+            // SAFETY: same owner and arguments as the Tier-1 stub.
+            unsafe { access(runtime, address, site, value, kind) }
+        }
+
+        let mut stubs = runtime::stubs();
+        let access_entry = stubs.code.len() * 4;
+        stubs.code.extend(translate::opt::back::access_stub(
+            resident_access as *const () as u64,
+        ));
         let base = cache.append(&stubs.code).ok_or("stubs do not fit")?;
         crate::jit_map::record_stubs(
             base,
@@ -859,6 +885,7 @@ impl Native {
                 (stubs.ret_miss, "ret_miss"),
                 (stubs.shadow_reset, "shadow_reset"),
                 (stubs.access, "access"),
+                (access_entry, "resident_access"),
                 (stubs.interpret, "interpret"),
                 (stubs.call, "call"),
             ],
@@ -871,6 +898,7 @@ impl Native {
         let shadow = ShadowStack::new()?;
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
         runtime.table = table.as_mut_ptr() as u64;
+        runtime.resident_access = (base + access_entry) as u64;
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {

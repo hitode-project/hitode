@@ -4,8 +4,13 @@
 //! Floating point runs under the canonical FPCR and validates by value
 //! (A64-OPT-4).
 mod alloc;
+mod cost;
 mod flags;
 mod inline;
+mod resident;
+
+#[cfg(any(native, test))]
+pub(crate) use resident::access_stub;
 
 use super::front::Assumed;
 use super::ir::*;
@@ -16,7 +21,8 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::jit_map::{Mark, Part};
 use crate::runtime::{self, Runtime};
-use crate::translate::{Carry, Overflow, Sense, Site, fp_class};
+use crate::translate::access::{CheckedEmitter, Value as AccessReg, page_crossing};
+use crate::translate::{Carry, Overflow, Sense, Site, WINDOW, fp_class};
 use std::mem::offset_of;
 
 const T: Reg = Reg::new(16);
@@ -41,6 +47,16 @@ pub(crate) struct Lowered {
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
     pub cold: usize,
+    /// Static costs of the resident entry, longest normal exit, and a loop iteration.
+    pub entry_words: u32,
+    pub exit_words: u32,
+    pub iteration_words: u32,
+    pub iteration_retired: u32,
+    pub iteration_pcs: Vec<u32>,
+    /// Entry snapshot and normal exit accounting calls, patched to NOP after probation.
+    pub probation: Vec<usize>,
+    /// Two words holding the address of the probation counters, bound at placement.
+    pub probation_slot: usize,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
@@ -66,29 +82,30 @@ impl Lowered {
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None)
+    lower_form(func, None, false)
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)))
+    lower_form(func, Some((assumed, entry)), false)
 }
 
 /// A resident form: entered from Tier-1 back edges, accessing guest memory
 /// through the window (A64-OPT-9).
 pub(crate) fn lower_resident(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
-    lower_inline(func, assumed, entry)
+    debug_assert_eq!(func.entry, entry);
+    lower_form(func, Some((assumed, entry)), true)
 }
 
-fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
+fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>, resident: bool) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let allocation = alloc::allocate(func, inline.is_some());
+    let allocation = alloc::allocate(func, inline.is_some(), resident);
     let mut asm = Asm::new();
     // A bit test whose target lands out of range is emitted wide, and the
     // form again, as the ordinary translator does.
     let (mut e, exit, miss, cold) = loop {
-        let (mut e, exit, miss, cold) = emit(func, &allocation, asm, inline);
+        let (mut e, exit, miss, cold) = emit(func, &allocation, asm, inline, resident);
         if !e.asm.widen_bit_tests() {
             break (e, exit, miss, cold);
         }
@@ -108,14 +125,26 @@ fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
     let exit = e.asm.position(exit) / 4;
     let miss = miss.map_or(0, |label| e.asm.position(label) / 4);
     let cold = cold.map_or(0, |label| e.asm.position(label) / 4);
+    let env_miss = e.env_miss.map_or(miss, |label| e.asm.position(label) / 4);
+    let probation_slot = e
+        .probation
+        .as_ref()
+        .map_or(0, |p| e.asm.position(p.slot) / 4);
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
     Lowered {
         entry: 0,
         miss,
-        env_miss: miss,
+        env_miss,
         cold,
+        entry_words: e.entry_words,
+        exit_words: e.exit_words,
+        iteration_words: e.iteration.words,
+        iteration_retired: e.iteration.retired,
+        iteration_pcs: e.iteration.pcs,
+        probation: e.probation.map_or_else(Vec::new, |p| p.calls),
+        probation_slot,
         links: e.links,
         exit,
         words,
@@ -149,6 +178,7 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
+    resident: bool,
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -167,11 +197,35 @@ fn emit<'a>(
     {
         branch_only[v.0 as usize] = false;
     }
+    let env_miss = resident.then(|| asm.label());
+    let probation = resident.then(|| resident::Probation::new(&mut asm));
+    let last_fact = resident
+        .then(|| {
+            func.blocks[0]
+                .insts
+                .iter()
+                .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
+        })
+        .flatten();
     let mut e = Emitter {
         func,
         asm,
         blocks,
         cold,
+        normal: if inline.is_some() {
+            vec![None; func.records.len()]
+        } else {
+            Vec::new()
+        },
+        resident,
+        env_miss,
+        probation,
+        entry_words: 0,
+        exit_words: 0,
+        iteration: cost::Iteration::default(),
+        fact_misses: Vec::new(),
+        checked_accesses: Vec::new(),
+        guest_eip: 0,
         locations: allocation.locations.clone(),
         defs: allocation.defs.clone(),
         flags,
@@ -190,38 +244,50 @@ fn emit<'a>(
     let (miss, cold) = if let Some((assumed, entry)) = inline {
         let miss = e.asm.label();
         let cold = e.asm.label();
-        e.inline_entry(assumed, entry, bytes, miss, cold);
+        e.inline_entry(assumed, entry, bytes, miss, cold, last_fact.is_some());
         (Some(miss), Some(cold))
     } else {
         e.stack_frame(bytes, true);
         e.job_entry();
         (None, None)
     };
-    let mut normal = if inline.is_some() {
-        vec![None; func.records.len()]
-    } else {
-        Vec::new()
-    };
-    let refund = func.records[first.0 as usize].refund;
-    e.charge(i64::from(refund), first, false);
+    if last_fact.is_none() {
+        e.begin_body(first);
+    }
+    let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
     for (b, data) in func.blocks.iter().enumerate() {
         if e.through(Block(b as u32)).is_some() {
             continue;
         }
-        e.asm.bind(e.blocks[b]);
+        let delayed = b == 0 && last_fact.is_some();
+        if !delayed {
+            e.asm.bind(e.blocks[b]);
+        }
+        let mut start = e.asm.offset();
         e.region = allocation.regions[b];
         e.mark(
             Part::Body,
             data.eip.unwrap_or(func.records[e.region.0 as usize].eip),
         );
-        for &(result, op) in &data.insts {
+        for (i, &(result, op)) in data.insts.iter().enumerate() {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
             }
             e.op(result, op);
+            if b == 0 && last_fact == Some(i) {
+                e.entry_frames(&func.entry);
+                e.begin_body(first);
+                e.asm.bind(e.blocks[b]);
+                start = e.asm.offset();
+            }
         }
         match &data.end {
-            End::Jump(t) => e.edge(t, b + 1),
+            End::Jump(t) => {
+                let edge = e.asm.offset();
+                e.edge(t, b + 1);
+                costs[b].edges[0] = e.words_since(edge);
+                costs[b].body = ((edge - start) / 4) as u32;
+            }
             End::Branch { cond, taken, fall } => {
                 let test = if let Some(Op::Test { flags, cond: cc }) = e.defs[cond.0 as usize]
                     && branch_only[cond.0 as usize]
@@ -245,33 +311,41 @@ fn emit<'a>(
                     e.blocks[jump.block.0 as usize]
                 } else {
                     let label = e.asm.label();
-                    e.edges.push((label, jump.clone()));
+                    e.edges.push((label, jump.clone(), b, usize::from(!when)));
                     label
                 };
                 match test {
                     Ok(c) => e.asm.b_cond(if when { c } else { c.invert() }, target),
                     Err(r) => e.asm.cbz(W, when, r, target),
                 }
+                let edge = e.asm.offset();
                 e.edge(inline, b + 1);
+                costs[b].edges[usize::from(when)] = e.words_since(edge);
+                costs[b].body = ((edge - start) / 4) as u32;
             }
             End::Exit(id) => {
-                let i = id.0 as usize;
-                let label = if inline.is_some() {
-                    *normal[i].get_or_insert_with(|| e.asm.label())
+                let exit = if inline.is_some() {
+                    e.normal_exit(*id)
                 } else {
-                    e.cold[i]
+                    e.cold[id.0 as usize]
                 };
-                e.asm.b(label);
+                e.asm.b(exit);
             }
             End::Unset => unreachable!(),
         }
     }
-    for (label, target) in std::mem::take(&mut e.edges) {
+    for (label, target, block, index) in std::mem::take(&mut e.edges) {
         e.asm.bind(label);
+        let start = e.asm.offset();
         e.edge(&target, usize::MAX);
+        costs[block].edges[index] = e.words_since(start);
+    }
+    if resident {
+        e.iteration = cost::iteration(func, &costs);
+        e.checkpoints();
     }
     if let Some((assumed, _)) = inline {
-        for (i, label) in normal.into_iter().enumerate() {
+        for (i, label) in std::mem::take(&mut e.normal).into_iter().enumerate() {
             if let Some(label) = label {
                 e.asm.bind(label);
                 e.mark(Part::Body, func.records[i].eip);
@@ -279,8 +353,17 @@ fn emit<'a>(
             }
         }
     }
-    e.checkpoints();
+    if !resident {
+        e.checkpoints();
+    }
     e.fp_checks();
+    e.checked_accesses();
+    if let Some(probation) = &e.probation {
+        probation.emit(&mut e.asm);
+    }
+    if let Some(miss) = env_miss {
+        e.environment_misses(bytes, miss);
+    }
     // spec: A64-OPT-6
     let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
@@ -293,7 +376,7 @@ fn emit<'a>(
     e.asm.bind(exit);
     // Permanently undefined until placed.
     e.asm.emit(0);
-    for label in [miss, cold].into_iter().flatten() {
+    for label in [miss, cold, env_miss].into_iter().flatten() {
         e.asm.bind(label);
         e.asm.emit(0);
     }
@@ -314,6 +397,16 @@ struct Emitter<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     cold: Vec<Label>,
+    normal: Vec<Option<Label>>,
+    resident: bool,
+    env_miss: Option<Label>,
+    probation: Option<resident::Probation>,
+    entry_words: u32,
+    exit_words: u32,
+    iteration: cost::Iteration,
+    fact_misses: Vec<Label>,
+    checked_accesses: Vec<resident::CheckedAccess>,
+    guest_eip: u32,
     locations: Vec<Host>,
     defs: Vec<Option<Op>>,
     flags: Vec<Option<FlagRecipe>>,
@@ -322,11 +415,47 @@ struct Emitter<'a> {
     region: RecordId,
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
-    edges: Vec<(Label, Target)>,
+    edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
 }
 
+impl CheckedEmitter for Emitter<'_> {
+    fn access_asm(&mut self) -> &mut Asm {
+        &mut self.asm
+    }
+
+    fn access_site(&mut self) {
+        self.site(true);
+    }
+}
+
 impl<'a> Emitter<'a> {
+    fn data_view(&self) -> Reg {
+        if self.resident { WINDOW } else { ALIAS }
+    }
+
+    fn normal_exit(&mut self, record: RecordId) -> Label {
+        *self.normal[record.0 as usize].get_or_insert_with(|| self.asm.label())
+    }
+
+    fn words_since(&self, start: usize) -> u32 {
+        ((self.asm.offset() - start) / 4) as u32
+    }
+
+    fn begin_body(&mut self, record: RecordId) {
+        if let Some(probation) = &mut self.probation {
+            probation.call(&mut self.asm, true);
+        }
+        self.charge(
+            i64::from(self.func.records[record.0 as usize].refund),
+            record,
+            false,
+        );
+        if self.resident {
+            self.entry_words = self.words_since(0);
+        }
+    }
+
     fn stack_frame(&mut self, bytes: u64, enter: bool) {
         if bytes == 0 {
             return;
@@ -610,7 +739,7 @@ impl<'a> Emitter<'a> {
             }
         };
         self.asm.emit(instruction);
-        if head_exit {
+        if head_exit && !self.resident {
             let resume = self.asm.label();
             self.asm.emit(ldr(W, T, RT, runtime::HEAD_EXIT));
             self.asm.cbz(W, false, T, resume);
@@ -637,7 +766,8 @@ impl<'a> Emitter<'a> {
             // A recall leaves through the record as the ordinary form's
             // budget exit does.
             let leave = self.asm.label();
-            let recalled = if self.func.head_exit.is_some() {
+            let defer_recall = self.func.head_exit.is_some() && !self.resident;
+            let recalled = if defer_recall {
                 self.asm.label()
             } else {
                 leave
@@ -658,7 +788,7 @@ impl<'a> Emitter<'a> {
                 ]);
                 self.asm.cbz(W, true, T, recalled);
             }
-            if self.func.head_exit.is_some() {
+            if defer_recall {
                 self.asm.b(refill);
                 self.asm.bind(recalled);
                 self.asm.emit_all(&[
@@ -686,9 +816,14 @@ impl<'a> Emitter<'a> {
             self.imm(COUNT, u64::from(runtime::COMPUTATION_SLICE - refund));
             self.asm.b(resume);
             self.asm.bind(leave);
-            self.asm
-                .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::OPT_RECALLED)]);
-            self.asm.b(self.cold[record.0 as usize]);
+            if self.resident {
+                let exit = self.normal_exit(record);
+                self.asm.b(exit);
+            } else {
+                self.asm
+                    .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::OPT_RECALLED)]);
+                self.asm.b(self.cold[record.0 as usize]);
+            }
         }
     }
 
@@ -798,19 +933,23 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn site(&mut self) {
+    fn site(&mut self, checked: bool) {
         let record = &self.func.records[self.region.0 as usize];
         self.sites.push((
             self.asm.offset(),
             Site {
-                eip: record.eip,
+                eip: if self.resident {
+                    self.guest_eip
+                } else {
+                    record.eip
+                },
                 refund: record.refund,
                 sense: Sense::Subtraction,
                 carry: Carry::Host,
                 recipe: crate::translate::Recipe::Canonical,
                 nz: None,
                 overflow: Overflow::Host,
-                checked: false,
+                checked,
                 simd_dirty: 0,
                 resume: 0,
                 opt_record: Some(self.region.0),
@@ -824,8 +963,29 @@ impl<'a> Emitter<'a> {
         let d = result.map_or(T, |v| self.rd(v));
         let q = result.map_or(A, |v| self.vd(v));
         match op {
-            Op::PlainPage { .. } | Op::PageCross { .. } => {
-                unreachable!("only resident forms hold page checks (A64-OPT-9)")
+            Op::PlainPage { addr, bytes, write } => self.plain_page(addr, bytes, write),
+            Op::PageCross {
+                addr,
+                width,
+                record,
+            } => {
+                let addr = self.gp(addr, U);
+                page_crossing(
+                    &mut self.asm,
+                    addr,
+                    u32::from(width),
+                    self.cold[record.0 as usize],
+                );
+            }
+            Op::FrameDisjoint {
+                addr,
+                width,
+                base,
+                lo,
+                hi,
+                record,
+            } => {
+                self.frame_disjoint(addr, width, base, lo, hi, self.cold[record.0 as usize]);
             }
             Op::Constant(_, bits) => {
                 if !matches!(loc, Some(Host::Constant(_))) {
@@ -1350,23 +1510,34 @@ impl<'a> Emitter<'a> {
                 }
             }
             Op::Load {
-                ty, width, addr, ..
+                ty,
+                width,
+                addr,
+                checked,
+                pc,
             } => {
+                self.guest_eip = pc;
                 let addr = self.gp(addr, U);
-                self.site();
-                if matches!(ty, Type::I32 | Type::I64) {
-                    self.asm.emit(match width {
-                        1 => ldr_narrow(Narrow::Byte, d, ALIAS, addr),
-                        2 => ldr_narrow(Narrow::Half, d, ALIAS, addr),
-                        _ => ldr_reg(if width == 8 { X } else { W }, d, ALIAS, addr, false),
-                    });
+                let base = self.data_view();
+                let (word, reg) = if matches!(ty, Type::I32 | Type::I64) {
+                    (
+                        match width {
+                            1 => ldr_narrow(Narrow::Byte, d, base, addr),
+                            2 => ldr_narrow(Narrow::Half, d, base, addr),
+                            _ => ldr_reg(if width == 8 { X } else { W }, d, base, addr, false),
+                        },
+                        AccessReg::Scalar(d),
+                    )
                 } else {
-                    self.asm.emit(vldr_reg(mem_size(width), q, ALIAS, addr));
-                }
+                    let size = mem_size(width);
+                    (vldr_reg(size, q, base, addr), AccessReg::Vector(size, q))
+                };
+                self.memory_access(addr, width, reg, word, false, checked);
             }
             Op::Host(addr) => {
                 let addr = self.gp(addr, U);
-                self.asm.emit(add_ext(X, d, ALIAS, addr, Extend::Uxtw, 0));
+                self.asm
+                    .emit(add_ext(X, d, self.data_view(), addr, Extend::Uxtw, 0));
             }
             Op::FrameLoad { ty, base, offset } => {
                 let base = self.gp(base, U);
@@ -1397,22 +1568,31 @@ impl<'a> Emitter<'a> {
                 addr,
                 value,
                 after,
-                ..
+                checked,
+                pc,
             } => {
+                self.guest_eip = pc;
                 let addr = self.gp(addr, U);
-                if matches!(self.func.ty(value), Type::I32 | Type::I64) {
-                    let value = self.gp(value, T);
-                    self.site();
-                    self.asm.emit(match width {
-                        1 => str_narrow(Narrow::Byte, value, ALIAS, addr),
-                        2 => str_narrow(Narrow::Half, value, ALIAS, addr),
-                        _ => str_reg(if width == 8 { X } else { W }, value, ALIAS, addr, false),
-                    });
+                let base = self.data_view();
+                let (word, reg) = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                    let src = self.gp(value, T);
+                    (
+                        match width {
+                            1 => str_narrow(Narrow::Byte, src, base, addr),
+                            2 => str_narrow(Narrow::Half, src, base, addr),
+                            _ => str_reg(if width == 8 { X } else { W }, src, base, addr, false),
+                        },
+                        AccessReg::Scalar(src),
+                    )
                 } else {
-                    let value = self.vr(value, A);
-                    self.site();
-                    self.asm.emit(vstr_reg(mem_size(width), value, ALIAS, addr));
-                }
+                    let src = self.vr(value, A);
+                    let size = mem_size(width);
+                    (
+                        vstr_reg(size, src, base, addr),
+                        AccessReg::Vector(size, src),
+                    )
+                };
+                self.memory_access(addr, width, reg, word, true, checked);
                 self.region = after;
                 self.mark(Part::Body, self.func.records[after.0 as usize].eip);
             }

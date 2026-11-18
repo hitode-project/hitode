@@ -39,6 +39,8 @@ pub(crate) struct Assumed {
     pub tags: u16,
     /// ESP modulo 16, when the unit aligns ESP.
     pub esp_low: Option<u8>,
+    /// EBP relative to ESP, when EBP addresses frame cells.
+    pub ebp: Option<i32>,
     pub denormal: bool,
     /// Whether the form runs x87 instructions, so that the x87 facts hold.
     pub x87: bool,
@@ -255,6 +257,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
             .iter()
             .any(|i| matches!(i.op, decode::Op::Alu(decode::Alu::And, Src::Reg(ESP), _)))
             .then_some((at.regs[ESP as usize] & 15) as u8),
+        ebp: None,
         denormal: at.x87.status & 2 != 0,
         x87,
         mmx,
@@ -547,6 +550,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                     value,
                     after,
                     checked: false,
+                    pc: inst.pc,
                 },
             );
         }
@@ -677,6 +681,7 @@ impl Front<'_> {
                 width,
                 addr,
                 checked: false,
+                pc: self.unit.trace.insts[self.index].pc,
             });
             self.loads.insert(value, self.index);
             Ok(value)

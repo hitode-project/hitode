@@ -226,6 +226,7 @@ pub(crate) enum Op {
         addr: Value,
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
+        pc: u32,
     },
     /// A store outside the frame: an effect point. Region `after` starts at
     /// the guest boundary after it.
@@ -236,6 +237,7 @@ pub(crate) enum Op {
         after: RecordId,
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
+        pc: u32,
     },
     /// An entry fact of a resident form: the pages `addr..addr + bytes`
     /// are ordinary (A64-MEM-14). Only the entry block holds these, before
@@ -243,12 +245,22 @@ pub(crate) enum Op {
     PlainPage {
         addr: Value,
         bytes: u32,
+        write: bool,
     },
-    /// Leaves through `record` when `addr..addr + width` crosses a page,
-    /// before a store whose region already read those bytes.
+    /// Returns to the enclosing region through `record` when a store
+    /// crosses a page and the region already read bytes it would write.
     PageCross {
         addr: Value,
         width: u8,
+        record: RecordId,
+    },
+    /// Fails to the region start if the access overlaps the live frame.
+    FrameDisjoint {
+        addr: Value,
+        width: u8,
+        base: Value,
+        lo: i32,
+        hi: i32,
         record: RecordId,
     },
     /// The host address of a guest address: the base frame accesses add
@@ -319,6 +331,9 @@ impl Op {
             }
             | Op::FrameStore {
                 base: a, value: b, ..
+            }
+            | Op::FrameDisjoint {
+                addr: a, base: b, ..
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b }
@@ -349,6 +364,7 @@ impl Op {
                     | Op::FromInt(_)
                     | Op::Load { .. }
                     | Op::Store { .. }
+                    | Op::FrameDisjoint { .. }
                     | Op::X87Load { .. }
                     | Op::SseInput { .. }
             )
@@ -543,7 +559,8 @@ impl Func {
             | Op::SseInput { .. }
             | Op::Validate
             | Op::PlainPage { .. }
-            | Op::PageCross { .. } => {
+            | Op::PageCross { .. }
+            | Op::FrameDisjoint { .. } => {
                 return None;
             }
         })

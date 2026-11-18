@@ -90,6 +90,9 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         }
         | Op::FrameStore {
             base: a, value: b, ..
+        }
+        | Op::FrameDisjoint {
+            addr: a, base: b, ..
         } => {
             f(a);
             f(b);
@@ -407,11 +410,15 @@ fn propagate(func: &mut Func) -> bool {
             }
             defs[r.0 as usize] = Some(*op);
             if op.pure() || block_index == 0 && matches!(op, Op::Load { .. }) {
-                if let Some((_, other)) = numbered.iter().find(|(other, _)| other == op) {
+                let mut key = *op;
+                if let Op::Load { pc, .. } = &mut key {
+                    *pc = 0;
+                }
+                if let Some((_, other)) = numbered.iter().find(|(other, _)| *other == key) {
                     alias[r.0 as usize] = *other;
                     changed = true;
                 } else {
-                    numbered.push((*op, r));
+                    numbered.push((key, r));
                 }
             }
         }
