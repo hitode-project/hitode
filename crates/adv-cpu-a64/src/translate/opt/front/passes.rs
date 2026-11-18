@@ -71,6 +71,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
         | Op::Load { addr: a, .. }
+        | Op::PlainPage { addr: a, .. }
+        | Op::PageCross { addr: a, .. }
         | Op::Host(a)
         | Op::FrameLoad { base: a, .. }
         | Op::X87Load { bits: a, .. }

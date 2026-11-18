@@ -53,10 +53,10 @@ fn compile(request: Request) -> Compiled {
     let started = std::time::Instant::now();
     let mut unit = Unit::default();
     unit.trace = trace;
-    let form = match front::build(&unit, &proof, &at) {
+    let form = match front::build_with(&unit, Some(&proof), &at, &|_| false) {
         Ok(built) => {
             let lowered = back::lower(&built.func);
-            let inline = back::lower_inline(&built.func, &built.assumed, &built.func.entry);
+            let inline = back::lower_resident(&built.func, &built.assumed, &built.func.entry);
             let (cuts, us) = (built.cuts, started.elapsed().as_micros());
             crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
             Some(Form {

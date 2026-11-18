@@ -151,6 +151,18 @@ struct Front<'a> {
 /// (a branch target the compiler laid out away from the fall-through) that
 /// the form refuses leaves at its EIP instead, so that a cold path does not
 /// keep its hot loop in the ordinary form.
+/// Builds a resident form of `unit` (A64-OPT-9). A proof only adds facts;
+/// accesses at the guest EIPs `checked` names test page classes first.
+pub(crate) fn build_with(
+    unit: &Unit,
+    proof: Option<&Proof>,
+    at: &CpuState,
+    checked: &dyn Fn(u32) -> bool,
+) -> Result<Built, Reject> {
+    let _ = checked;
+    build(unit, proof.ok_or(Reject::Empty)?, at)
+}
+
 pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, Reject> {
     let mut cut = vec![false; unit.trace.len()];
     let mut view = None::<Unit>;
@@ -534,6 +546,7 @@ fn build_trace(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<(Func, Assum
                     addr,
                     value,
                     after,
+                    checked: false,
                 },
             );
         }
@@ -659,7 +672,12 @@ impl Front<'_> {
             Ok(self.bits(ty, out))
         } else {
             let addr = self.address(mem)?;
-            let value = self.value(Op::Load { ty, width, addr });
+            let value = self.value(Op::Load {
+                ty,
+                width,
+                addr,
+                checked: false,
+            });
             self.loads.insert(value, self.index);
             Ok(value)
         }

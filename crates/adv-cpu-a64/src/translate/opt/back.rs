@@ -38,6 +38,8 @@ pub(crate) struct Lowered {
     /// The inline entry, miss and cold branch words.
     pub entry: usize,
     pub miss: usize,
+    /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
+    pub env_miss: usize,
     pub cold: usize,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
@@ -73,6 +75,12 @@ pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> 
     lower_form(func, Some((assumed, entry)))
 }
 
+/// A resident form: entered from Tier-1 back edges, accessing guest memory
+/// through the window (A64-OPT-9).
+pub(crate) fn lower_resident(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
+    lower_inline(func, assumed, entry)
+}
+
 fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func, inline.is_some());
@@ -106,6 +114,7 @@ fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
     Lowered {
         entry: 0,
         miss,
+        env_miss: miss,
         cold,
         links: e.links,
         exit,
@@ -815,6 +824,9 @@ impl<'a> Emitter<'a> {
         let d = result.map_or(T, |v| self.rd(v));
         let q = result.map_or(A, |v| self.vd(v));
         match op {
+            Op::PlainPage { .. } | Op::PageCross { .. } => {
+                unreachable!("only resident forms hold page checks (A64-OPT-9)")
+            }
             Op::Constant(_, bits) => {
                 if !matches!(loc, Some(Host::Constant(_))) {
                     self.copy(loc.unwrap(), Host::Constant(bits), self.func.ty(out));
@@ -1337,7 +1349,9 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Op::Load { ty, width, addr } => {
+            Op::Load {
+                ty, width, addr, ..
+            } => {
                 let addr = self.gp(addr, U);
                 self.site();
                 if matches!(ty, Type::I32 | Type::I64) {
@@ -1383,6 +1397,7 @@ impl<'a> Emitter<'a> {
                 addr,
                 value,
                 after,
+                ..
             } => {
                 let addr = self.gp(addr, U);
                 if matches!(self.func.ty(value), Type::I32 | Type::I64) {

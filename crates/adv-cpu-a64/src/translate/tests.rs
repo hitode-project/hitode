@@ -3167,6 +3167,7 @@ pub(in crate::translate) mod opt_back {
                     addr: p[0],
                     value: p[1],
                     after,
+                    checked: false,
                 },
             );
             let loaded = f
@@ -3176,6 +3177,7 @@ pub(in crate::translate) mod opt_back {
                         ty,
                         width,
                         addr: p[0],
+                        checked: false,
                     },
                 )
                 .unwrap();
@@ -3202,6 +3204,7 @@ pub(in crate::translate) mod opt_back {
                         addr: p[0],
                         value: p[1],
                         after,
+                        checked: false,
                     },
                 );
                 p[1]
@@ -3212,6 +3215,7 @@ pub(in crate::translate) mod opt_back {
                         ty: Type::I64,
                         width: 8,
                         addr: p[0],
+                        checked: false,
                     },
                 )
                 .unwrap()
@@ -3513,6 +3517,7 @@ pub(in crate::translate) mod opt_back {
                 addr: p[0],
                 value: p[1],
                 after,
+                checked: false,
             },
         );
         let v = f.push(b, Op::Fp(FpOp::Mul, p[2], p[3])).unwrap();

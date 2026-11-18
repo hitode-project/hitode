@@ -224,6 +224,8 @@ pub(crate) enum Op {
         ty: Type,
         width: u8,
         addr: Value,
+        /// Tests page classes first, as Tier-1 checked accesses do.
+        checked: bool,
     },
     /// A store outside the frame: an effect point. Region `after` starts at
     /// the guest boundary after it.
@@ -232,6 +234,22 @@ pub(crate) enum Op {
         addr: Value,
         value: Value,
         after: RecordId,
+        /// Tests page classes first, as Tier-1 checked accesses do.
+        checked: bool,
+    },
+    /// An entry fact of a resident form: the pages `addr..addr + bytes`
+    /// are ordinary (A64-MEM-14). Only the entry block holds these, before
+    /// any effect; a failure is an environment miss.
+    PlainPage {
+        addr: Value,
+        bytes: u32,
+    },
+    /// Leaves through `record` when `addr..addr + width` crosses a page,
+    /// before a store whose region already read those bytes.
+    PageCross {
+        addr: Value,
+        width: u8,
+        record: RecordId,
     },
     /// The host address of a guest address: the base frame accesses add
     /// their offsets to.
@@ -282,6 +300,8 @@ impl Op {
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::Load { addr: a, .. }
+            | Op::PlainPage { addr: a, .. }
+            | Op::PageCross { addr: a, .. }
             | Op::Host(a)
             | Op::FrameLoad { base: a, .. }
             | Op::X87Load { bits: a, .. }
@@ -518,7 +538,12 @@ impl Func {
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
             Op::Vec(..) | Op::VecUnary(..) => Type::V128,
-            Op::Store { .. } | Op::FrameStore { .. } | Op::SseInput { .. } | Op::Validate => {
+            Op::Store { .. }
+            | Op::FrameStore { .. }
+            | Op::SseInput { .. }
+            | Op::Validate
+            | Op::PlainPage { .. }
+            | Op::PageCross { .. } => {
                 return None;
             }
         })

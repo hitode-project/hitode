@@ -393,6 +393,10 @@ pub(crate) struct Diagnostics {
     /// Optimized forms the owner ran in place, and their instructions.
     pub optimized_runs: u64,
     pub optimized_retired: u64,
+    /// Resident form exits that went through Rust (A64-OPT-9).
+    pub resident_cold_exits: u64,
+    /// Fills of the whole indirect table, which also reset the shadow stack.
+    pub global_invalidations: u64,
 }
 
 pub(crate) struct Run {
@@ -1406,6 +1410,7 @@ impl Native {
     /// Rebuilds the guest state at a cold inline exit from the entry
     /// baseline and the exit's record. Returns the record's refund.
     fn materialize_inline(&mut self, cpu: &mut CpuState, memory: &Memory) -> u32 {
+        self.diagnostics.resident_cold_exits += 1;
         let prepared = &self.computation[&self.runtime.opt_head];
         let inline = prepared.inline.as_ref().expect("installed inline form");
         translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
@@ -1713,6 +1718,7 @@ impl Native {
     /// Empties the indirect table and the shadow stack, which may lead to
     /// dropped units.
     fn forget_dynamic(&mut self) {
+        self.diagnostics.global_invalidations += 1;
         self.table.fill(EMPTY);
         self.runtime.shadow = self.shadow.top();
     }
