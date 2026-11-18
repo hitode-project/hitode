@@ -172,7 +172,7 @@ fn alias_proof_includes_the_scalar_tail() {
         .insts
         .swap(0, 1);
     let batch = plan(&fixture.func, &[&TestKernel]).pop().unwrap();
-    assert_eq!(batch.alias, [(0, 1)]);
+    assert_eq!(batch.alias, [(0, 1, false)]);
 }
 
 #[test]

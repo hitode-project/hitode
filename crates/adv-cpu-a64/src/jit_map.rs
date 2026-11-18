@@ -295,7 +295,25 @@ pub(crate) fn declined(head: u32, reason: crate::runtime::ResidentCold) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static VECTORIZED: std::cell::RefCell<Option<Vec<(u32, u8)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn collect_vectorized(run: impl FnOnce()) -> Vec<(u32, u8)> {
+    VECTORIZED.with_borrow_mut(|rows| *rows = Some(Vec::new()));
+    run();
+    VECTORIZED.with_borrow_mut(|rows| rows.take().unwrap())
+}
+
 pub(crate) fn vectorized(head: u32, kernel: &str, lanes: u8, streams: usize) {
+    #[cfg(test)]
+    VECTORIZED.with_borrow_mut(|rows| {
+        if let Some(rows) = rows {
+            rows.push((head, lanes));
+        }
+    });
     if let Some(files) = files() {
         let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
         let _ = writeln!(files.3, "vectorized\t{head}\t{kernel}\t{lanes}\t{streams}");

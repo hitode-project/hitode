@@ -116,7 +116,7 @@ fn lower_form(
     count_entries: bool,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let batches = loops::plan(func, &[]);
+    let batches = loops::plan(func, &[&loops::vector::Vector]);
     let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
     let mut asm = Asm::new();
     // A bit test whose target lands out of range is emitted wide, and the
@@ -287,6 +287,7 @@ fn emit<'a>(
         e.begin_body(first, count_entries);
     }
     let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
+    let mut head_batch = None;
     for (b, data) in func.blocks.iter().enumerate() {
         if e.through(Block(b as u32)).is_some() {
             continue;
@@ -309,6 +310,10 @@ fn emit<'a>(
             .find(|batch| batch.loop_.head.0 as usize == b)
         {
             e.batch(batch);
+            if func.head_exit == Some(batch.loop_.head) {
+                head_batch = Some((e.words_since(start), u32::from(batch.plan.lanes)));
+            }
+            start = e.asm.offset();
         }
         for (i, &(result, op)) in data.insts.iter().enumerate() {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
@@ -397,6 +402,11 @@ fn emit<'a>(
     }
     if resident {
         e.iteration = cost::iteration(func, &costs);
+        if let Some((words, lanes)) = head_batch {
+            // A passing batch replaces lanes iterations and is followed by
+            // one scalar iteration through the original body.
+            e.iteration.words = (e.iteration.words + words).div_ceil(lanes + 1);
+        }
         e.checkpoints();
     }
     if let Some((assumed, _)) = inline {

@@ -1515,8 +1515,14 @@ mod tests {
         native.pace.set(Some(Pace::default()));
         let mut results = Vec::new();
         let mut memories = Vec::new();
-        // The first job shows the iteration's cost; the second splits.
-        for _ in 0..2 {
+        // Keep the first job's retirement sample and give the second a
+        // serial estimate that warrants a split on every host.
+        for run in 0..2 {
+            if run == 1 {
+                let sample = &native.computation[&CODE].per_iteration;
+                let (retired, _) = sample.get().unwrap();
+                sample.set(Some((retired, 1_000_000.0 / f64::from(N))));
+            }
             reset(executor.memory_mut());
             let mut retired = 0;
             native.with_computation(

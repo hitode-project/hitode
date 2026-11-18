@@ -538,6 +538,8 @@ pub(crate) struct Func {
     pub kept: u32,
     /// Charged heads in resident forms leave through complete records.
     pub resident: bool,
+    /// Guest calls and returns translated into the SSA form.
+    pub calls: Vec<u32>,
     /// Guest EIPs of resident checks whose operations produce a value.
     pub cold_pcs: BTreeMap<Value, u32>,
 }

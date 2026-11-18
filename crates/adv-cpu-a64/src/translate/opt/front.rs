@@ -611,6 +611,11 @@ fn build_trace(
         })
         .collect::<Result<_, Reject>>()?;
     func.head_exit = unit.trace.returns_at_head().then_some(Block(1));
+    func.calls = insts
+        .iter()
+        .filter(|inst| matches!(inst.op, decode::Op::Call(_) | decode::Op::Ret(_)))
+        .map(|inst| inst.pc)
+        .collect();
     func.entry = entry_sources.into_iter().chain(entry_cells).collect();
     let mut f = Front {
         unit,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::translate::X4;
+use crate::translate::{X4, X5};
 
 use iced_x86::ConditionCode as Cc;
 use loops::{Affine, Batch, Span, Trip};
@@ -19,6 +19,20 @@ impl BatchEmitter<'_, '_> {
         self.emitter.batch_gp(value, scratch)
     }
 
+    pub fn immediate(&mut self, dst: Reg, value: u64) {
+        self.emitter.imm(dst, value);
+    }
+
+    pub fn vector_invariant(&mut self, value: Value, scratch: VReg) -> VReg {
+        self.emitter.vr(value, scratch)
+    }
+
+    pub fn adjust_charge(&mut self, count: Reg, extra: i32) {
+        self.emitter.imm(U, i64::from(extra) as u64);
+        self.asm()
+            .emit_all(&[mul(X, U, count, U), add(X, X5, X5, U, Lsl, 0)]);
+    }
+
     pub fn address(&mut self, addr: Affine) -> Reg {
         self.emitter.batch_address(addr, T, U);
         let view = self.emitter.data_view();
@@ -32,7 +46,8 @@ impl Emitter<'_> {
         let scalar = self.asm.label();
         let lanes = u32::from(batch.plan.lanes);
         let charge = u64::from(batch.loop_.charge) * u64::from(lanes);
-        self.imm(T, charge);
+        let additional = batch.prefix_charge;
+        self.imm(T, charge + u64::from(lanes + 1) * additional);
         self.asm.emit(cmp(X, COUNT, T, Lsl, 0));
         self.asm.b_cond(Cond::Lt, scalar);
         if !self.resident && self.func.head_exit == Some(batch.loop_.head) {
@@ -53,10 +68,10 @@ impl Emitter<'_> {
                 self.asm.b_cond(Cond::Hs, scalar);
             }
         }
-        for &(a, b) in &batch.alias {
+        for &(a, b, in_place) in &batch.alias {
             let a = batch.spans[a];
             let b = batch.spans[b];
-            self.batch_disjoint(a, b, scalar);
+            self.batch_disjoint(a, b, in_place, scalar);
         }
         for frame in &batch.frame {
             for &span in batch.spans.iter().filter(|s| s.write) {
@@ -65,7 +80,7 @@ impl Emitter<'_> {
                     bytes: frame.bytes,
                     write: false,
                 };
-                self.batch_disjoint(span, frame, scalar);
+                self.batch_disjoint(span, frame, false, scalar);
             }
         }
         for stream in &batch.crossings {
@@ -76,7 +91,13 @@ impl Emitter<'_> {
             page_crossing(&mut self.asm, T, u32::from(stream.width), scalar);
         }
 
+        if additional != 0 || batch.variable_charge {
+            self.asm.emit(movz(X, X5, 0, 0));
+        }
         batch.plan.body.lower(&mut BatchEmitter { emitter: self });
+        if additional != 0 || batch.variable_charge {
+            self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
+        }
         self.imm(T, charge);
         BatchEmitter { emitter: self }
             .asm()
@@ -121,13 +142,22 @@ impl Emitter<'_> {
         self.batch_add(dst, src, addr.offset, scratch);
     }
 
-    fn batch_disjoint(&mut self, a: Span, b: Span, scalar: Label) {
+    fn batch_disjoint(&mut self, a: Span, b: Span, in_place: bool, scalar: Label) {
         self.batch_address(a.start, X0, T);
         self.batch_address(b.start, X1, T);
+        let same = in_place.then(|| {
+            let same = self.asm.label();
+            self.asm.emit(cmp(W, X0, X1, Lsl, 0));
+            self.asm.b_cond(Cond::Eq, same);
+            same
+        });
         for (l, r, bytes) in [(X1, X0, a.bytes), (X0, X1, b.bytes)] {
             self.asm.emit(sub(W, T, l, r, Lsl, 0));
             self.batch_cmp(T, bytes, U);
             self.asm.b_cond(Cond::Lo, scalar);
+        }
+        if let Some(same) = same {
+            self.asm.bind(same);
         }
     }
 
@@ -145,14 +175,16 @@ impl Emitter<'_> {
         let bound = trip.bound.map_or(Reg::new(31), |v| self.batch_gp(v, X0));
         if trip.again == Cc::ne {
             let (shift, inverse, mask) = trip.equality();
-            self.asm.emit(sub(W, T, bound, T, Lsl, 0));
+            let decrement = shift == 0 && inverse == u32::MAX;
+            let (a, b) = if decrement { (T, bound) } else { (bound, T) };
+            self.asm.emit(sub(W, T, a, b, Lsl, 0));
             let passes = self.asm.label();
             if shift != 0 {
                 self.asm.emit(and_imm(W, U, T, (1u64 << shift) - 1));
                 self.asm.cbz(W, true, U, passes);
                 self.asm.emit(lsr_imm(W, T, T, shift));
             }
-            if inverse != 1 {
+            if inverse != 1 && !decrement {
                 self.imm(U, u64::from(inverse));
                 self.asm.emit(mul(W, T, T, U));
             }

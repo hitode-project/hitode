@@ -8,6 +8,8 @@ use super::back::BatchEmitter;
 use super::ir::*;
 use super::verify::{dominates, dominators};
 
+pub(super) mod vector;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reject {
     Control,
@@ -89,12 +91,37 @@ impl Stream {
 pub(super) struct Loop {
     pub head: Block,
     pub latch: Block,
+    pub latch_taken: bool,
     pub blocks: Vec<Block>,
     pub carried: Vec<(Value, Value)>,
     pub ivs: Vec<Iv>,
     pub trip: Trip,
     pub streams: Vec<Stream>,
     pub charge: u32,
+}
+
+impl Loop {
+    fn groups(&self) -> Vec<Vec<(usize, Stream)>> {
+        let mut groups: Vec<Vec<(usize, Stream)>> = Vec::new();
+        for (i, &s) in self.streams.iter().enumerate() {
+            // Adjacent columns of an interleave share one page and alias span.
+            if let Some(group) = groups.iter_mut().find(|g| {
+                let &(_, previous) = g.last().unwrap();
+                let bytes = u32::from(s.width) * (g.len() as u32 + 1);
+                previous.width == s.width
+                    && previous.stride == s.stride
+                    && previous.write() == s.write()
+                    && previous.addr.offset.checked_add(u32::from(s.width)) == Some(s.addr.offset)
+                    && previous.addr.base == s.addr.base
+                    && bytes <= s.stride.unsigned_abs()
+            }) {
+                group.push((i, s));
+            } else {
+                groups.push(vec![(i, s)]);
+            }
+        }
+        groups
+    }
 }
 
 pub(super) struct Defs {
@@ -139,7 +166,7 @@ impl Defs {
             || self.blocks[v.0 as usize].is_some_and(|b| !blocks.contains(&b))
     }
 
-    fn affine(&self, mut v: Value) -> Affine {
+    pub fn affine(&self, mut v: Value) -> Affine {
         let mut offset = 0u32;
         while let Some(Op::Int(op @ (IntOp::Add | IntOp::Sub), a, b)) = self.op(v) {
             let Some(n) = self.constant(b) else { break };
@@ -281,7 +308,8 @@ fn classify(
     let Some(Op::Test { flags, mut cond }) = defs.op(*cond) else {
         return Err(Reject::Latch);
     };
-    if !std::ptr::eq(taken, edge) {
+    let latch_taken = std::ptr::eq(taken, edge);
+    if !latch_taken {
         cond = invert(cond).ok_or(Reject::Latch)?;
     }
     let Some(Op::Flags {
@@ -303,6 +331,13 @@ fn classify(
                 u32::MAX
             };
             (defs.affine(a).shifted(offset), None)
+        }
+        FlagKind::Logic if matches!(cond, Cc::e | Cc::ne | Cc::l | Cc::le | Cc::g | Cc::ge) => {
+            (defs.affine(a), None)
+        }
+        FlagKind::Add if matches!(cond, Cc::e | Cc::ne) => {
+            let n = defs.constant(b).ok_or(Reject::Latch)? as u32;
+            (defs.affine(a).shifted(n), None)
         }
         _ => return Err(Reject::Latch),
     };
@@ -348,6 +383,7 @@ fn classify(
     Ok(Loop {
         head: Block(head as u32),
         latch: Block(latch as u32),
+        latch_taken,
         blocks,
         carried,
         ivs,
@@ -422,9 +458,11 @@ pub(super) struct Batch {
     pub loop_: Loop,
     pub plan: Plan,
     pub spans: Vec<Span>,
-    pub alias: Vec<(usize, usize)>,
+    pub alias: Vec<(usize, usize, bool)>,
     pub frame: Vec<Frame>,
     pub crossings: Vec<Stream>,
+    pub prefix_charge: u64,
+    pub variable_charge: bool,
 }
 
 impl Batch {
@@ -439,24 +477,7 @@ impl Batch {
     }
 
     fn new(func: &Func, loop_: Loop, plan: Plan) -> Option<Self> {
-        let mut groups: Vec<Vec<(usize, Stream)>> = Vec::new();
-        for (i, &s) in loop_.streams.iter().enumerate() {
-            // Adjacent columns of an interleave share one page and alias span.
-            if let Some(group) = groups.iter_mut().find(|g| {
-                let &(_, previous) = g.last().unwrap();
-                let bytes = u32::from(s.width) * (g.len() as u32 + 1);
-                previous.width == s.width
-                    && previous.stride == s.stride
-                    && previous.write() == s.write()
-                    && previous.addr.offset.checked_add(u32::from(s.width)) == Some(s.addr.offset)
-                    && previous.addr.base == s.addr.base
-                    && bytes <= s.stride.unsigned_abs()
-            }) {
-                group.push((i, s));
-            } else {
-                groups.push(vec![(i, s)]);
-            }
-        }
+        let groups = loop_.groups();
         let spans = groups
             .iter()
             .map(|group| {
@@ -498,13 +519,12 @@ impl Batch {
                     && reads.iter().zip(writes).all(|(&(r, read), &(w, write))| {
                         !read.write()
                             && r < w
-                            && read.addr == write.addr
                             && read.stride == write.stride
                             && read.width == write.width
                             && u32::from(read.width) <= read.stride.unsigned_abs()
                     });
-                if !in_place {
-                    alias.push((a, b));
+                if !in_place || spans[a].start != spans[b].start {
+                    alias.push((a, b, in_place));
                 }
             }
         }
@@ -547,6 +567,17 @@ impl Batch {
                 }
             }
         }
+        // A positive internal edge is a scalar checkpoint. Cover the
+        // largest possible debit, including internal edges of the tail.
+        let internal = loop_
+            .blocks
+            .iter()
+            .filter(|&&b| b != loop_.latch)
+            .flat_map(|b| func.blocks[b.0 as usize].end.targets())
+            .map(|target| target.charge);
+        let (prefix_charge, variable_charge) = internal.fold((0, false), |(sum, any), charge| {
+            (sum + u64::from(charge.max(0) as u32), any || charge != 0)
+        });
         Some(Self {
             loop_,
             plan,
@@ -554,6 +585,8 @@ impl Batch {
             alias,
             frame,
             crossings,
+            prefix_charge,
+            variable_charge,
         })
     }
 }

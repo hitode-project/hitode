@@ -1305,3 +1305,291 @@ fn a_hoistable_load_rechecks_the_page_class_between_entries() {
         "the PlainPage miss should run Tier 1 without a resident fault"
     );
 }
+
+fn vector_image(width: u8) -> Image {
+    Image::with_prelude(
+        |a, stop| {
+            a.test(ecx, ecx).unwrap();
+            a.je(stop).unwrap();
+        },
+        |a, head, _| {
+            match width {
+                1 => a.movzx(eax, byte_ptr(esi)),
+                2 => a.movzx(eax, word_ptr(esi)),
+                4 => a.mov(eax, dword_ptr(esi)),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            a.xor(eax, 13).unwrap();
+            a.and(
+                eax,
+                match width {
+                    1 => 255,
+                    2 => 65535,
+                    _ => -1,
+                },
+            )
+            .unwrap();
+            a.shr(eax, 1).unwrap();
+            a.not(eax).unwrap();
+            a.imul_3(eax, eax, 3).unwrap();
+            a.add(eax, edx).unwrap();
+            a.sub(eax, 7).unwrap();
+            match width {
+                1 => a.mov(byte_ptr(edi), al),
+                2 => a.mov(word_ptr(edi), ax),
+                4 => a.mov(dword_ptr(edi), eax),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            a.add(esi, i32::from(width)).unwrap();
+            a.add(edi, i32::from(width)).unwrap();
+            latch(a, head);
+        },
+        observe_registers,
+    )
+}
+
+fn vector_install(trial: &mut Trial<'_>, at: CpuState, lanes: u8) {
+    let compiled = crate::jit_map::collect_vectorized(|| assert!(trial.try_install_at(at)));
+    assert!(
+        compiled.contains(&(trial.head, lanes)),
+        "{}: expected {lanes} vector lanes, got {compiled:?}",
+        trial.context
+    );
+}
+
+fn vector_data(seed: u64) -> Vec<u8> {
+    let mut rng = Rng(seed);
+    (0..4096).map(|_| rng.next() as u8).collect()
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_seeded_elementwise_widths_and_exact_tails() {
+    for width in [1, 2, 4] {
+        let lanes = 16 / width;
+        let image = vector_image(width);
+        for count in [0, 1, lanes - 1, lanes, lanes + 1, 3 * lanes + 7] {
+            let mut cpu = initial(u32::from(count));
+            cpu.regs[2] = 0x8765_4321;
+            let data = vector_data(0xcafe + u64::from(count));
+            let mut trial = Trial::new(
+                &image,
+                &cpu,
+                format!("width {width}, trip count {count}"),
+                &[],
+                |m| {
+                    m.write(DATA, &data).unwrap();
+                },
+            );
+            vector_install(&mut trial, cpu, lanes);
+            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+            trial.compare_epilogue();
+        }
+    }
+}
+
+fn interleave_image(channels: usize, unpack: bool) -> Image {
+    Image::loop_body(|a, head, _| {
+        let planes = [esi, ebx, edx, ebp];
+        for (i, &plane) in planes[..channels].iter().enumerate() {
+            let interleaved = byte_ptr(edi + i as i32);
+            let planar = byte_ptr(plane);
+            let (src, dst) = if unpack {
+                (interleaved, planar)
+            } else {
+                (planar, interleaved)
+            };
+            a.mov(al, src).unwrap();
+            a.mov(dst, al).unwrap();
+            a.inc(plane).unwrap();
+        }
+        a.add(edi, channels as i32).unwrap();
+        a.cmp(edi, ecx).unwrap();
+        a.jb(head).unwrap();
+    })
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_interleaves_and_deinterleaves_two_three_and_four_streams() {
+    for channels in [2, 3, 4] {
+        for unpack in [false, true] {
+            let image = interleave_image(channels, unpack);
+            let mut cpu = initial(OUTPUT + 59 * channels as u32);
+            for (i, r) in [6, 3, 2, 5].into_iter().enumerate() {
+                cpu.regs[r] = DATA + 0x400 * i as u32;
+            }
+            cpu.regs[0] = 0x1234_5600;
+            let data = vector_data(0x941b);
+            let mut trial = Trial::new(
+                &image,
+                &cpu,
+                format!("{channels} planes, unpack {unpack}"),
+                &[],
+                |m| {
+                    m.write(DATA, &data).unwrap();
+                    m.write(OUTPUT, &data[..256]).unwrap();
+                },
+            );
+            vector_install(&mut trial, cpu, 16);
+            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        }
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_guard_declines_overlaps_and_protected_spans() {
+    let image = vector_image(1);
+    let mut cpu = initial(63);
+    cpu.regs[7] = DATA + 3;
+    let data = vector_data(123);
+    let mut overlap = Trial::new(&image, &cpu, "overlapping vector span", &[], |m| {
+        m.write(DATA, &data).unwrap();
+    });
+    vector_install(&mut overlap, cpu, 16);
+    assert_eq!(overlap.compare(4096).0, RunOutcome::ReachedStop);
+
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    let mut cpu = initial(63);
+    cpu.regs[6] = boundary - 9;
+    let mut protected = Trial::new(&image, &cpu, "protected vector span", &[], |m| {
+        m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+        m.map(boundary, HOST_PAGE, 0).unwrap();
+        m.write(boundary - 9, &data[..9]).unwrap();
+    });
+    vector_install(&mut protected, cpu, 16);
+    let (outcome, retired) = protected.compare(4096);
+    assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
+    assert_eq!(retired, 2 + 13 * 9);
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_guard_declines_watched_code_and_insufficient_countdown() {
+    let image = vector_image(1);
+    let mut cpu = initial(71);
+    cpu.regs[6] = image.head;
+    let mut watched = Trial::new(&image, &cpu, "watched vector input", &[], |_| {});
+    vector_install(&mut watched, cpu, 16);
+    assert_eq!(watched.compare(4096).0, RunOutcome::ReachedStop);
+
+    let cpu = initial(71);
+    let data = vector_data(456);
+    let mut countdown = Trial::new(&image, &cpu, "vector countdown", &[], |m| {
+        m.write(DATA, &data).unwrap();
+    });
+    vector_install(&mut countdown, cpu, 16);
+    assert_eq!(countdown.compare(277), (RunOutcome::Budget, 277));
+    assert_eq!(countdown.compare(4096).0, RunOutcome::ReachedStop);
+    countdown.compare_epilogue();
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_clamps_via_cmov_or_a_pure_branch() {
+    for branch in [false, true] {
+        let image = Image::loop_body(|a, head, _| {
+            a.movsx(eax, word_ptr(esi)).unwrap();
+            a.add(eax, 129).unwrap();
+            a.cmp(eax, edx).unwrap();
+            if branch {
+                let mut join = a.create_label();
+                a.jle(join).unwrap();
+                a.mov(eax, edx).unwrap();
+                a.set_label(&mut join).unwrap();
+            } else {
+                a.cmovg(eax, edx).unwrap();
+            }
+            a.mov(word_ptr(edi), ax).unwrap();
+            a.add(esi, 2).unwrap();
+            a.add(edi, 2).unwrap();
+            latch(a, head);
+        });
+        let mut cpu = initial(79);
+        cpu.regs[2] = 1333;
+        let data = vector_data(789);
+        let mut trial = Trial::new(&image, &cpu, format!("branch clamp {branch}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+        });
+        vector_install(&mut trial, cpu, 4);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_unrolls_independent_packed_integer_iterations() {
+    for xmm in [false, true] {
+        let width = if xmm { 16 } else { 8 };
+        let image = Image::loop_body(|a, head, _| {
+            if xmm {
+                a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+                a.paddusb(xmm0, xmm1).unwrap();
+                a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
+            } else {
+                a.movq(mm0, qword_ptr(esi)).unwrap();
+                a.paddusb(mm0, mm1).unwrap();
+                a.movq(qword_ptr(edi), mm0).unwrap();
+            }
+            a.add(esi, width).unwrap();
+            a.add(edi, width).unwrap();
+            latch(a, head);
+        });
+        let mut cpu = initial(49);
+        cpu.xmm[1] = [122; 16];
+        cpu.mmx[1] = 0x4161_8151_6171_8191;
+        let data = vector_data(1239);
+        let mut trial = Trial::new(&image, &cpu, format!("packed width {width}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+        });
+        vector_install(&mut trial, cpu, 2);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_signed_bound_in_a_frame_cell() {
+    let image = Image::loop_body(|a, head, _| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.add(eax, 71).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.inc(esi).unwrap();
+        a.inc(edi).unwrap();
+        a.inc(ecx).unwrap();
+        a.cmp(ecx, dword_ptr(esp + 4)).unwrap();
+        a.jl(head).unwrap();
+    });
+    let cpu = initial((-100i32) as u32);
+    let data = vector_data(1277);
+    let mut trial = Trial::new(&image, &cpu, "signed frame bound", &[], |m| {
+        m.write(DATA, &data).unwrap();
+        m.write(FRAME + 4, &(-29i32).to_le_bytes()).unwrap();
+    });
+    vector_install(&mut trial, cpu, 16);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_declines_a_loop_carried_reduction() {
+    let image = Image::loop_body(|a, head, _| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.add(ebx, eax).unwrap();
+        a.mov(byte_ptr(edi), bl).unwrap();
+        a.inc(esi).unwrap();
+        a.inc(edi).unwrap();
+        latch(a, head);
+    });
+    let cpu = initial(61);
+    let data = vector_data(1833);
+    let mut trial = Trial::new(&image, &cpu, "loop-carried reduction", &[], |m| {
+        m.write(DATA, &data).unwrap();
+    });
+    let compiled = crate::jit_map::collect_vectorized(|| assert!(trial.try_install_at(cpu)));
+    assert!(compiled.is_empty());
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+}
