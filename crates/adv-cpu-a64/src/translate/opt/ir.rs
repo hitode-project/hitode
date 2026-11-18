@@ -230,6 +230,7 @@ pub(crate) enum Op {
     },
     Fp(FpOp, Value, Value),
     Fp32(FpOp, Value, Value),
+    SseFp64(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
     /// A signed integer as F64; fails when it is not exactly representable.
     FromInt(Value),
@@ -237,6 +238,7 @@ pub(crate) enum Op {
     ToInt {
         value: Value,
         wide: bool,
+        sse: bool,
     },
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
@@ -347,6 +349,7 @@ impl Op {
             Op::Int(_, a, b)
             | Op::Fp(_, a, b)
             | Op::Fp32(_, a, b)
+            | Op::SseFp64(_, a, b)
             | Op::Vec(_, a, b)
             | Op::Div {
                 dividend: a,
@@ -376,7 +379,11 @@ impl Op {
     /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
-            Op::Fp(..) | Op::Fp32(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
+            Op::Fp(..)
+            | Op::Fp32(..)
+            | Op::SseFp64(..)
+            | Op::ToInt { .. }
+            | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
         }
@@ -596,7 +603,11 @@ impl Func {
             | Op::VecToInt(..) => Type::I32,
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
-            Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
+            Op::Fp(..)
+            | Op::SseFp64(..)
+            | Op::FpUnary(..)
+            | Op::FromInt(_)
+            | Op::X87Load { .. } => Type::F64,
             Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) => Type::V128,
             Op::Store { .. }
             | Op::FrameStore { .. }

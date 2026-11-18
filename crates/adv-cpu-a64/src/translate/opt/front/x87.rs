@@ -122,6 +122,7 @@ impl Front<'_> {
                 let integer = self.value(Op::ToInt {
                     value,
                     wide: width == 8,
+                    sse: false,
                 });
                 let mem = x.mem.ok_or(Reject::Unsupported(self.index))?;
                 self.write(mem, width, integer)?;

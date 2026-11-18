@@ -104,6 +104,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         Op::Int(_, a, b)
         | Op::Fp(_, a, b)
         | Op::Fp32(_, a, b)
+        | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
         | Op::Div {
             dividend: a,
@@ -1044,6 +1045,7 @@ fn sse_inputs(func: &mut Func) {
                 let lanes = |v: Value| clean[v.0 as usize];
                 let mask = match op {
                     Op::Fp(..)
+                    | Op::SseFp64(..)
                     | Op::FromInt(_)
                     | Op::Vec(VecOp::LessF64, ..)
                     | Op::X87Load { single: true, .. }

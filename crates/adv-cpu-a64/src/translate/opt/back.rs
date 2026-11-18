@@ -23,6 +23,7 @@ use crate::jit_map::{Mark, Part};
 use crate::runtime::{self, ResidentCold, Runtime};
 use crate::translate::access::{CheckedEmitter, Value as AccessReg, page_crossing};
 use crate::translate::{Carry, Overflow, Sense, Site, WINDOW, fp_class};
+use crate::translate::{X0, X1, X2, X3};
 use std::mem::offset_of;
 
 const T: Reg = Reg::new(16);
@@ -250,6 +251,10 @@ fn emit<'a>(
         region: RecordId(0),
         checkpoints: Vec::new(),
         fp_checks: Vec::new(),
+        invalid_ints: Vec::new(),
+        mxcsr: inline
+            .filter(|_| resident)
+            .map(|(assumed, _)| assumed.mxcsr),
         edges: Vec::new(),
         links: Vec::new(),
         transitions: Vec::new(),
@@ -399,6 +404,11 @@ fn emit<'a>(
         e.checkpoints();
     }
     e.fp_checks();
+    for (check, dst, resume) in std::mem::take(&mut e.invalid_ints) {
+        e.asm.bind(check);
+        e.asm.emit(movz(W, dst, 0x8000, 16));
+        e.asm.b(resume);
+    }
     e.checked_accesses();
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);
@@ -435,6 +445,9 @@ struct FpCheck {
     op: FpOp,
     a: VReg,
     b: VReg,
+    result: VReg,
+    double: bool,
+    sse: bool,
     check: Label,
     resume: Label,
     region: RecordId,
@@ -465,6 +478,8 @@ struct Emitter<'a> {
     region: RecordId,
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
+    invalid_ints: Vec<(Label, Reg, Label)>,
+    mxcsr: Option<u32>,
     edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
     transitions: Vec<(usize, usize)>,
@@ -909,53 +924,83 @@ impl<'a> Emitter<'a> {
     }
 
     // spec: A64-OPT-4
-    fn fp(&mut self, op: FpOp, dst: VReg, a: VReg, b: VReg) {
+    fn fp(&mut self, op: FpOp, dst: VReg, [a, b]: [VReg; 2], double: bool, sse: bool) {
         // A cold check may still need an operand after the arithmetic.
-        let result = if dst == a || dst == b { C } else { dst };
-        self.asm.emit(dfloat(
-            match op {
-                FpOp::Add => Float::Fadd,
-                FpOp::Sub => Float::Fsub,
-                FpOp::Mul => Float::Fmul,
-                FpOp::Div => Float::Fdiv,
-            },
-            result,
-            a,
-            b,
-        ));
-        let check = self.asm.label();
+        let result = if double && (dst == a || dst == b) {
+            C
+        } else {
+            dst
+        };
+        let float = match op {
+            FpOp::Add => Float::Fadd,
+            FpOp::Sub => Float::Fsub,
+            FpOp::Mul => Float::Fmul,
+            FpOp::Div => Float::Fdiv,
+        };
+        self.asm.emit(if double {
+            dfloat(float, result, a, b)
+        } else {
+            sfloat(float, result, a, b)
+        });
+        let fail = self.fail();
+        let sse = sse && self.resident;
+        let check = if double || sse {
+            self.asm.label()
+        } else {
+            fail
+        };
         let resume = self.asm.label();
         let sum = matches!(op, FpOp::Add | FpOp::Sub);
-        fp_class::result_bits(&mut self.asm, true, result, T, U, sum.then_some(U));
-        if sum {
+        fp_class::result_bits(
+            &mut self.asm,
+            double,
+            result,
+            T,
+            U,
+            (double && sum).then_some(U),
+        );
+        if sum && double {
             self.asm.cbz(W, false, U, check);
+        } else if sum {
+            self.asm.tbz(true, U, 8, check);
         } else {
-            // Exponents 2 through 2046 are safely normal.
-            self.asm
-                .emit_all(&[sub_imm(W, U, U, 3, false), cmp_imm(W, U, 2045, false)]);
+            // Exclude zero, the smallest normal binade, infinities and NaNs.
+            self.asm.emit_all(&[
+                sub_imm(W, U, U, 3, false),
+                cmp_imm(W, U, if double { 2045 } else { 253 }, false),
+            ]);
             self.asm.b_cond(Cond::Hs, check);
         }
         self.asm.bind(resume);
         if dst != result {
             self.asm.emit(vmov(false, dst, result));
         }
-        let fail = self.fail();
-        self.fp_checks.push(FpCheck {
-            op,
-            a,
-            b,
-            check,
-            resume,
-            region: self.region,
-            fail,
-        });
+        if check != fail {
+            self.fp_checks.push(FpCheck {
+                op,
+                a,
+                b,
+                result,
+                double,
+                sse,
+                check,
+                resume,
+                region: self.region,
+                fail,
+            });
+        }
     }
 
     fn fp_checks(&mut self) {
+        let exact = self.asm.label();
+        let mut uses_exact = false;
         for FpCheck {
             op,
             a,
             b,
+            result,
+            double,
+            sse,
             check,
             resume,
             region,
@@ -964,6 +1009,42 @@ impl<'a> Emitter<'a> {
         {
             self.asm.bind(check);
             self.mark(Part::Cold, self.func.records[region.0 as usize].eip);
+            if sse {
+                uses_exact = true;
+                let size = if double { X } else { W };
+                // Silence commonly comes here. A zero factor or dividend
+                // already produced the exact signed zero.
+                let slow = self.asm.label();
+                self.asm.emit(lsl_imm(size, T, T, 1));
+                self.asm.cbz(size, true, T, slow);
+                if matches!(op, FpOp::Add | FpOp::Sub) {
+                    self.asm.b(resume);
+                } else {
+                    for operand in [Some(a), (op == FpOp::Mul).then_some(b)]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.asm
+                            .emit_all(&[fmov_from_v(size, T, operand), lsl_imm(size, T, T, 1)]);
+                        self.asm.cbz(size, false, T, resume);
+                    }
+                }
+                self.asm.bind(slow);
+                self.asm
+                    .emit_all(&[fmov_from_v(size, X0, a), fmov_from_v(size, X1, b)]);
+                self.imm(X2, op as u64);
+                self.imm(X3, if double { 8 } else { 4 });
+                self.asm.bl(exact);
+                let missing = !self.mxcsr.unwrap() & 0x3f;
+                if missing != 0 {
+                    self.imm(U, u64::from(missing));
+                    self.asm.emit(and(W, T, X1, U, Lsl, 0));
+                    self.asm.cbz(W, true, T, fail);
+                }
+                self.asm.emit(fmov_to_v(size, result, X0));
+                self.asm.b(resume);
+                continue;
+            }
             let nonfinite = self.asm.label();
             self.asm.emit_all(&[
                 lsl_imm(X, T, T, 1),
@@ -1014,6 +1095,10 @@ impl<'a> Emitter<'a> {
             }
             self.asm.b(fail);
         }
+        if uses_exact {
+            self.asm.bind(exact);
+            resident::preserve_call(&mut self.asm, exact_sse as *const () as u64);
+        }
     }
 
     fn site(&mut self, checked: bool) {
@@ -1044,7 +1129,14 @@ impl<'a> Emitter<'a> {
         let out = result.unwrap_or(Value(0));
         let loc = result.map(|v| self.locations[v.0 as usize]);
         let d = result.map_or(T, |v| self.rd(v));
-        let q = result.map_or(A, |v| self.vd(v));
+        let q = if self.resident
+            && matches!(op, Op::Fp32(..))
+            && matches!(loc, Some(Host::Spill(..)))
+        {
+            C
+        } else {
+            result.map_or(A, |v| self.vd(v))
+        };
         match op {
             Op::PlainPage { addr, bytes, write } => self.plain_page(addr, bytes, write),
             Op::PageCross {
@@ -1077,6 +1169,9 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.asm.emit(compare(kind, a, b));
+                if self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
+                    return;
+                }
                 let fail = self.fail();
                 if kind == FlagKind::OrderedCompare {
                     self.asm.b_cond(Cond::Vs, fail);
@@ -1248,36 +1343,16 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Op::Fp(op, a, b) => {
+            Op::Fp(fp, a, b) | Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.fp(op, q, a, b);
-            }
-            Op::Fp32(op, a, b) => {
-                let a = self.vr(a, A);
-                let b = self.vr(b, B);
-                self.asm.emit(sfloat(
-                    match op {
-                        FpOp::Add => Float::Fadd,
-                        FpOp::Sub => Float::Fsub,
-                        FpOp::Mul => Float::Fmul,
-                        FpOp::Div => Float::Fdiv,
-                    },
+                self.fp(
+                    fp,
                     q,
-                    a,
-                    b,
-                ));
-                let fail = self.fail();
-                let sum = matches!(op, FpOp::Add | FpOp::Sub);
-                fp_class::result_bits(&mut self.asm, false, q, T, U, None);
-                if sum {
-                    self.asm.tbz(true, U, 8, fail);
-                } else {
-                    // The boundary exponents need Tier-1's status handling.
-                    self.asm
-                        .emit_all(&[sub_imm(W, U, U, 3, false), cmp_imm(W, U, 253, false)]);
-                    self.asm.b_cond(Cond::Hs, fail);
-                }
+                    [a, b],
+                    !matches!(op, Op::Fp32(..)),
+                    !matches!(op, Op::Fp(..)),
+                );
             }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);
@@ -1309,7 +1384,7 @@ impl<'a> Emitter<'a> {
                     self.asm.b_cond(Cond::Lo, fail);
                 }
             }
-            Op::ToInt { value, wide } => {
+            Op::ToInt { value, wide, sse } => {
                 let a = self.vr(value, A);
                 // Compare the magnitude to the exclusive limit for the
                 // operand's sign. NaNs and infinities also exceed either limit.
@@ -1322,10 +1397,19 @@ impl<'a> Emitter<'a> {
                     and_imm(X, T, T, i64::MAX as u64),
                     cmp(X, T, U, Lsl, 0),
                 ]);
-                let fail = self.fail();
-                self.asm.b_cond(Cond::Hs, fail);
+                let bound = if sse && self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
+                    let (check, resume) = (self.asm.label(), self.asm.label());
+                    self.invalid_ints.push((check, d, resume));
+                    (check, Some(resume))
+                } else {
+                    (self.fail(), None)
+                };
+                self.asm.b_cond(Cond::Hs, bound.0);
                 self.asm
                     .emit(fcvt_int(if wide { X } else { W }, true, d, a));
+                if let Some(resume) = bound.1 {
+                    self.asm.bind(resume);
+                }
             }
             Op::VecUnary(op, a) => {
                 let a = self.vr(a, A);
@@ -1607,16 +1691,18 @@ impl<'a> Emitter<'a> {
                         }
                     }
                     VecOp::LessF64 => {
-                        let fail = self.fail();
-                        fp_class::nan_operands(
-                            &mut self.asm,
-                            false,
-                            true,
-                            &[a, b],
-                            T,
-                            [C, D],
-                            fail,
-                        );
+                        if self.mxcsr.is_none_or(|mxcsr| mxcsr & 1 == 0) {
+                            let fail = self.fail();
+                            fp_class::nan_operands(
+                                &mut self.asm,
+                                false,
+                                true,
+                                &[a, b],
+                                T,
+                                [C, D],
+                                fail,
+                            );
+                        }
                         self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a));
                     }
                 }
@@ -1799,6 +1885,25 @@ impl<'a> Emitter<'a> {
             self.copy(loc, src, ty);
         }
     }
+}
+
+#[repr(C)]
+struct SseResult {
+    bits: u64,
+    flags: u64,
+}
+
+extern "C" fn exact_sse(a: u64, b: u64, op: u8, width: u8) -> SseResult {
+    use adv_cpu_core::floating::softfloat;
+    softfloat::configure_sse(0x1f80);
+    let bits = softfloat::sse_binary(a, b, op, width);
+    let mut flags = u64::from(softfloat::flags());
+    // The double-precision input pass relies on validated arithmetic
+    // producing normal or zero values when DE is clear.
+    if width == 8 && f64::from_bits(bits).is_subnormal() {
+        flags |= 2;
+    }
+    SseResult { bits, flags }
 }
 
 fn add_immediate(n: u64) -> Option<(u32, bool)> {

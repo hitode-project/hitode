@@ -226,6 +226,13 @@ impl Emitter<'_> {
 #[cfg(any(native, test))]
 pub(crate) fn access_stub(helper: u64) -> Vec<u32> {
     let mut asm = Asm::new();
+    asm.emit(mov(X, X0, RT));
+    preserve_call(&mut asm, helper);
+    asm.finish()
+}
+
+/// Calls a helper with arguments in x0-x5, preserving all allocated values.
+pub(super) fn preserve_call(asm: &mut Asm, helper: u64) {
     let frame = 96 + 28 * 16;
     asm.emit_all(&[
         sub_imm(X, SP, SP, frame, false),
@@ -257,7 +264,6 @@ pub(crate) fn access_stub(helper: u64) -> Vec<u32> {
         asm.emit(movk(X, T, (helper >> shift) as u16, shift));
     }
     asm.emit_all(&[
-        mov(X, X0, RT),
         stp(X, Index::Pre, RT, Reg::LR, SP, -16),
         mov_sp(RT, SP),
         blr(T),
@@ -289,7 +295,6 @@ pub(crate) fn access_stub(helper: u64) -> Vec<u32> {
         msr_nzcv(T),
         ret(Reg::LR),
     ]);
-    asm.finish()
 }
 
 pub(super) struct Probation {

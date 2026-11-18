@@ -129,6 +129,8 @@ pub(super) fn allocate(func: &Func, inline: bool, resident: bool) -> Allocation 
             position += 2;
             if !matches!(op, Op::Flags { kind, .. } if !kind.floating()) {
                 for v in op.uses() {
+                    // Scalar SSE cold checks still need the original inputs.
+                    let position = position + usize::from(resident && matches!(op, Op::Fp32(..)));
                     read(
                         v,
                         position,

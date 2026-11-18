@@ -168,7 +168,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 Type::Flags => unreachable!("no reinterpretation as flags"),
             }
         }
-        Op::Fp(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::Fp(op, a, b) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
         Op::Fp32(op, a, b) => {
             let a = f32::from_bits(get(a) as u32);
             let b = f32::from_bits(get(b) as u32);
@@ -203,7 +203,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             float(n as f64)?
         }
-        Op::ToInt { value, wide } => {
+        Op::ToInt { value, wide, .. } => {
             let x = f(value);
             let (lo, hi) = if wide {
                 (i64::MIN as f64, -(i64::MIN as f64))

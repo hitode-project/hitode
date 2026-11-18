@@ -123,6 +123,10 @@ impl<'a> Trial<'a> {
     }
 
     fn try_install(&mut self) -> bool {
+        self.try_install_at(CpuState::default())
+    }
+
+    fn try_install_at(&mut self, mut at: CpuState) -> bool {
         let native = self.live.native.as_mut().unwrap();
         let memory = &mut self.live.memory;
         memory.attach().unwrap();
@@ -130,7 +134,8 @@ impl<'a> Trial<'a> {
         native
             .run(&mut self.live.state, memory, self.stop, 0, null_mut())
             .unwrap();
-        native.force_resident(memory, self.head)
+        at.eip = self.head;
+        native.force_resident_at(memory, at)
     }
 
     fn install(&mut self) {
@@ -832,6 +837,32 @@ fn a_false_cmov_still_faults_on_its_memory_source() {
             .resident_cold_exits
             > 0
     );
+}
+
+// spec: A64-OPT-4, A64-OPT-9, A64F-FP-5
+#[test]
+fn sse_invalid_results_resume_when_mxcsr_invalid_is_already_set() {
+    let image = Image::loop_body(|a, head, _| {
+        a.comisd(xmm0, xmm1).unwrap();
+        a.setp(al).unwrap();
+        a.ucomisd(xmm1, xmm0).unwrap();
+        a.setp(bl).unwrap();
+        a.movaps(xmm2, xmm0).unwrap();
+        a.cmppd(xmm2, xmm1, 1).unwrap();
+        a.cvttsd2si(edx, xmm0).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(4);
+    state.mxcsr |= 0x21;
+    state.xmm[0][..8].copy_from_slice(&0x7ff8_0000_0000_1234u64.to_le_bytes());
+    state.xmm[1][..8].copy_from_slice(&0x7ff0_0000_0000_5678u64.to_le_bytes());
+    state.xmm[1][8..].copy_from_slice(&1f64.to_le_bytes());
+    let mut trial = Trial::new(&image, &state, "SSE masked invalid", &[], |_| {});
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
 }
 
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7

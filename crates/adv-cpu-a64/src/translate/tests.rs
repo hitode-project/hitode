@@ -3331,7 +3331,16 @@ pub(in crate::translate) mod opt_back {
         }
         for wide in [false, true] {
             let (mut f, b, p, _) = start(&[Type::F64]);
-            let v = f.push(b, Op::ToInt { value: p[0], wide }).unwrap();
+            let v = f
+                .push(
+                    b,
+                    Op::ToInt {
+                        value: p[0],
+                        wide,
+                        sse: false,
+                    },
+                )
+                .unwrap();
             f.push(b, Op::Validate);
             finish(&mut f, b, v);
             for x in [12.7, -8.9, f64::INFINITY, f64::NAN, 1e100] {

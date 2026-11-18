@@ -137,7 +137,7 @@ impl Front<'_> {
                 } else {
                     let a = self.bits(Type::F64, dst);
                     let b = self.bits(Type::F64, src);
-                    let result = self.value(Op::Fp(op, a, b));
+                    let result = self.value(Op::SseFp64(op, a, b));
                     self.low(dst, result)
                 }
             }
@@ -155,7 +155,11 @@ impl Front<'_> {
             Kind::ScalarToInt(true, true) => {
                 self.sse_input(src, None, false, false);
                 let value = self.bits(Type::F64, src);
-                self.value(Op::ToInt { value, wide: false })
+                self.value(Op::ToInt {
+                    value,
+                    wide: false,
+                    sse: true,
+                })
             }
             Kind::FlagCompare(true, ordered) => {
                 self.sse_input(dst, Some(src), false, false);
