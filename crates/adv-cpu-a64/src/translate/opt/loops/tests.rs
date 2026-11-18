@@ -162,11 +162,11 @@ fn charged_latch_and_frame_bound() {
 
 // spec: A64-OPT-10
 #[test]
-fn alias_proof_includes_the_scalar_tail() {
+fn same_iteration_alias_requires_the_load_before_the_store() {
     let mut fixture = fixture(Cc::ne);
     let batch = plan(&fixture.func, &[&TestKernel]).pop().unwrap();
     assert_eq!(batch.spans.len(), 2);
-    assert!(batch.spans.iter().all(|s| s.bytes == 17));
+    assert!(batch.spans.iter().all(|s| s.width == 1 && s.step == 16));
     assert!(batch.alias.is_empty());
     fixture.func.blocks[fixture.body.0 as usize]
         .insts

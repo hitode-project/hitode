@@ -126,6 +126,8 @@ pub struct Runtime {
     pub channel_batches: u64,
     #[cfg(test)]
     pub native_batches: u64,
+    #[cfg(test)]
+    pub vector_regions: u64,
     /// A refused access's x87 publish continuation, or zero for `fault`.
     pub access_resume: u64,
     /// What direct bodies receive in x0: the window and `classes`.
@@ -194,6 +196,8 @@ impl Runtime {
             channel_batches: 0,
             #[cfg(test)]
             native_batches: 0,
+            #[cfg(test)]
+            vector_regions: 0,
             cpu,
             window,
             access_vector: [0; 16],

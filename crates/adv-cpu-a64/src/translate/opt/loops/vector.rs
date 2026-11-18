@@ -1,6 +1,6 @@
 //! Replace an independent integer data path with a vector of guest iterations.
 //! Compute only the low bits observed by stores. All architectural state is
-//! established by the original iteration following the batch.
+//! established by the original scalar iteration following the batch region.
 
 use std::collections::BTreeMap;
 
@@ -136,16 +136,12 @@ impl LoopKernel for Vector {
             return None;
         }
         let groups = loop_.groups();
-        let mut backwards = None;
         for group in &groups {
             let s = group[0].1;
-            if group.len() > 4
-                || s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
-                || backwards.is_some_and(|b| b != (s.stride < 0))
+            if group.len() > 4 || s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
             {
                 return None;
             }
-            backwards = Some(s.stride < 0);
         }
 
         let paths = Paths::new(func, loop_)?;

@@ -1799,6 +1799,11 @@ impl Native {
     }
 
     #[cfg(test)]
+    pub(crate) fn vector_regions(&self) -> u64 {
+        self.runtime.vector_regions
+    }
+
+    #[cfg(test)]
     pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
         self.units.get(&eip).map(|entry| entry.unit)
     }

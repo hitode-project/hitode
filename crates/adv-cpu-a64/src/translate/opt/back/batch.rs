@@ -42,66 +42,82 @@ impl BatchEmitter<'_, '_> {
 }
 
 impl Emitter<'_> {
-    pub(super) fn batch(&mut self, batch: &Batch) {
+    pub(super) fn batch(&mut self, batch: &Batch, pages: Option<Label>, backedge: Label) -> u32 {
+        let entry = self.asm.label();
+        let inner = self.asm.label();
         let scalar = self.asm.label();
+        let body = self.asm.label();
         let lanes = u32::from(batch.plan.lanes);
         let charge = u64::from(batch.loop_.charge) * u64::from(lanes);
-        let additional = batch.prefix_charge;
-        self.imm(T, charge + u64::from(lanes + 1) * additional);
-        self.asm.emit(cmp(X, COUNT, T, Lsl, 0));
-        self.asm.b_cond(Cond::Lt, scalar);
+        let prefix = batch.prefix_charge;
+
+        self.asm.bind(entry);
+        #[cfg(test)]
+        {
+            let entries = offset_of!(Runtime, vector_regions) as u32;
+            self.asm.emit_all(&[
+                ldr(X, T, RT, entries),
+                add_imm(X, T, T, 1, false),
+                str(X, T, RT, entries),
+            ]);
+        }
         if !self.resident && self.func.head_exit == Some(batch.loop_.head) {
             // Split jobs and deferred recalls still stop at their scalar edge.
             self.asm.emit(ldr(W, T, RT, runtime::HEAD_EXIT));
             self.asm.cbz(W, true, T, scalar);
         }
+        if prefix != 0 {
+            self.imm(T, prefix);
+            self.asm.emit(sub(X, X3, COUNT, T, Lsl, 0));
+        } else {
+            self.asm.emit(mov(X, X3, COUNT));
+        }
+        self.asm.tbz(true, X3, 63, scalar);
+        self.batch_div(X3, X3, charge + u64::from(lanes) * prefix);
         self.batch_trip(batch.loop_.trip, lanes, scalar);
+        self.asm.cbz(X, false, X3, scalar);
+
         for &span in &batch.spans {
-            self.batch_address(span.start, U, T);
-            if self.resident {
-                self.plain_span(U, span.bytes, span.write, true, scalar);
-            } else {
-                // The job lease grants the scalar accesses through the alias.
-                // Check that the interval is a single contiguous guest span.
-                self.imm(T, u64::from(span.bytes - 1));
-                self.asm.emit(adds(W, Reg::new(31), U, T, Lsl, 0));
-                self.asm.b_cond(Cond::Hs, scalar);
-            }
+            self.batch_range(span, batch.backwards, pages, scalar);
+            self.asm.cbz(X, false, X3, scalar);
         }
         for &(a, b, in_place) in &batch.alias {
-            let a = batch.spans[a];
-            let b = batch.spans[b];
-            self.batch_disjoint(a, b, in_place, scalar);
+            self.batch_disjoint(
+                batch.spans[a],
+                batch.spans[b],
+                batch.backwards,
+                in_place,
+                scalar,
+            );
         }
         for frame in &batch.frame {
             for &span in batch.spans.iter().filter(|s| s.write) {
                 let frame = Span {
                     start: frame.start,
-                    bytes: frame.bytes,
+                    width: frame.bytes,
+                    step: 0,
                     write: false,
                 };
-                self.batch_disjoint(span, frame, false, scalar);
+                self.batch_disjoint(span, frame, batch.backwards, false, scalar);
             }
         }
+        self.asm.cbz(X, false, X3, scalar);
         for stream in &batch.crossings {
-            let addr = stream
-                .addr
-                .shifted((stream.stride as u32).wrapping_mul(lanes));
-            self.batch_address(addr, T, U);
+            // The first scalar iteration must reconstruct the guest state
+            // without taking a PageCross cut.
+            let step = (stream.stride as u32).wrapping_mul(lanes);
+            self.batch_address(stream.addr, T, U);
+            self.imm(U, u64::from(step));
+            self.asm
+                .emit_all(&[mul(W, U, U, X3), add(W, T, T, U, Lsl, 0)]);
             page_crossing(&mut self.asm, T, u32::from(stream.width), scalar);
         }
 
-        if additional != 0 || batch.variable_charge {
-            self.asm.emit(movz(X, X5, 0, 0));
-        }
-        batch.plan.body.lower(&mut BatchEmitter { emitter: self });
-        if additional != 0 || batch.variable_charge {
-            self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
-        }
         self.imm(T, charge);
-        BatchEmitter { emitter: self }
-            .asm()
-            .emit(sub(X, COUNT, COUNT, T, Lsl, 0));
+        self.asm.emit_all(&[mul(X, X5, X3, T), mov(X, X4, X3)]);
+        self.asm.bind(inner);
+        let inner_start = self.asm.offset();
+        batch.plan.body.lower(&mut BatchEmitter { emitter: self });
         for iv in &batch.loop_.ivs {
             let loc = self.locations[iv.base.0 as usize];
             let src = self.gp_at(loc, T);
@@ -112,7 +128,23 @@ impl Emitter<'_> {
             self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes), U);
             self.copy(loc, Host::Register(dst), Type::I32);
         }
+        self.asm.emit(sub_imm(X, X4, X4, 1, false));
+        self.asm.cbz(X, true, X4, inner);
+        let words = self.words_since(inner_start);
+        self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
+        self.asm.b(entry);
+
+        // The scalar latch still charges and checkpoints before reaching
+        // this edge. Retry the guards after one strip, unless the loop has
+        // already ended in its scalar tail.
+        self.asm.bind(backedge);
+        self.asm.emit(sub_imm(W, X5, X5, 1, false));
+        self.asm.cbz(W, true, X5, body);
+        self.asm.b(entry);
         self.asm.bind(scalar);
+        self.asm.emit(movz(W, X5, lanes as u16, 0));
+        self.asm.bind(body);
+        words
     }
 
     fn batch_gp(&mut self, value: Value, scratch: Reg) -> Reg {
@@ -142,46 +174,118 @@ impl Emitter<'_> {
         self.batch_add(dst, src, addr.offset, scratch);
     }
 
-    fn batch_disjoint(&mut self, a: Span, b: Span, in_place: bool, scalar: Label) {
-        self.batch_address(a.start, X0, T);
-        self.batch_address(b.start, X1, T);
+    // Reverse streams use the complemented address of the first high byte
+    // so their union grows upward in the same coordinates as forward streams.
+    fn batch_span_start(&mut self, span: Span, backwards: bool, dst: Reg) {
+        self.batch_address(span.start, dst, T);
+        if backwards {
+            self.batch_add(dst, dst, span.width - 1, T);
+            self.asm.emit(mvn(W, dst, dst));
+        }
+    }
+
+    fn batch_range(&mut self, span: Span, backwards: bool, pages: Option<Label>, scalar: Label) {
+        const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
+        self.batch_span_start(span, backwards, X0);
+        if backwards && span.width > 1 {
+            // A first scalar access that straddles guest zero has no interval.
+            self.imm(T, u64::from(u32::MAX - (span.width - 1)));
+            self.asm.emit(cmp(W, X0, T, Lsl, 0));
+            self.asm.b_cond(Cond::Hi, scalar);
+        }
+        if let Some(pages) = pages {
+            self.imm(T, u64::from(span.step));
+            self.asm.emit_all(&[
+                mul(X, X1, X3, T),
+                add_imm(X, X1, X1, span.width - 1, false),
+                add(X, X1, X1, X0, Lsl, 0),
+                lsr_imm(X, X1, X1, PAGE_SHIFT),
+                lsr_imm(W, X0, X0, PAGE_SHIFT),
+            ]);
+            self.imm(
+                X2,
+                if backwards {
+                    u64::from(u32::MAX >> PAGE_SHIFT)
+                } else {
+                    0
+                },
+            );
+            self.imm(X5, if span.write { 8 } else { 0 });
+            self.asm.bl(pages);
+            self.batch_span_start(span, backwards, X1);
+            self.asm.emit(sub(X, X2, X0, X1, Lsl, 0));
+        } else {
+            // The owner admits all scalar accesses of a job. The combined
+            // interval must also stay contiguous in the alias.
+            self.imm(T, 1 << 32);
+            self.asm.emit(sub(X, X2, T, X0, Lsl, 0));
+        }
+        self.batch_span_limit(span, scalar);
+    }
+
+    fn batch_disjoint(&mut self, a: Span, b: Span, backwards: bool, in_place: bool, scalar: Label) {
+        self.batch_span_start(a, backwards, X0);
+        self.batch_span_start(b, backwards, X1);
         let same = in_place.then(|| {
             let same = self.asm.label();
             self.asm.emit(cmp(W, X0, X1, Lsl, 0));
             self.asm.b_cond(Cond::Eq, same);
             same
         });
-        for (l, r, bytes) in [(X1, X0, a.bytes), (X0, X1, b.bytes)] {
-            self.asm.emit(sub(W, T, l, r, Lsl, 0));
-            self.batch_cmp(T, bytes, U);
-            self.asm.b_cond(Cond::Lo, scalar);
+        for (l, r, span) in [(X1, X0, a), (X0, X1, b)] {
+            self.asm.emit(sub(W, X2, l, r, Lsl, 0));
+            self.batch_span_limit(span, scalar);
         }
         if let Some(same) = same {
             self.asm.bind(same);
         }
     }
 
-    fn batch_cmp(&mut self, r: Reg, bits: u32, scratch: Reg) {
-        if let Some((imm, shift)) = add_immediate(u64::from(bits)) {
-            self.asm.emit(cmp_imm(W, r, imm, shift));
+    // X2 is the distance to the first unavailable byte. Reserve the scalar
+    // iteration as well as all whole batches before that byte.
+    fn batch_span_limit(&mut self, span: Span, scalar: Label) {
+        if let Some((width, shift)) = add_immediate(u64::from(span.width)) {
+            self.asm.emit(subs_imm(X, X2, X2, width, shift));
         } else {
-            self.imm(scratch, u64::from(bits));
-            self.asm.emit(cmp(W, r, scratch, Lsl, 0));
+            self.imm(T, u64::from(span.width));
+            self.asm.emit(subs(X, X2, X2, T, Lsl, 0));
         }
+        self.asm.b_cond(Cond::Lt, scalar);
+        if span.step != 0 {
+            self.batch_div(X2, X2, u64::from(span.step));
+            self.batch_min(X2);
+        }
+    }
+
+    fn batch_div(&mut self, dst: Reg, src: Reg, divisor: u64) {
+        if divisor.is_power_of_two() {
+            self.asm
+                .emit(lsr_imm(X, dst, src, divisor.trailing_zeros()));
+        } else {
+            self.imm(U, divisor);
+            self.asm.emit(udiv(X, dst, src, U));
+        }
+    }
+
+    fn batch_min(&mut self, bound: Reg) {
+        self.asm
+            .emit_all(&[cmp(X, X3, bound, Lsl, 0), csel(X, X3, X3, bound, Cond::Ls)]);
     }
 
     fn batch_trip(&mut self, trip: Trip, lanes: u32, scalar: Label) {
         self.batch_address(trip.value, T, U);
-        let bound = trip.bound.map_or(Reg::new(31), |v| self.batch_gp(v, X0));
+        let bound = trip.bound.map_or(Reg::ZR, |v| self.batch_gp(v, X0));
+        // trip.value is the first latch value. Count the consecutive latch
+        // tests that pass, leaving the first failing iteration scalar.
         if trip.again == Cc::ne {
             let (shift, inverse, mask) = trip.equality();
             let decrement = shift == 0 && inverse == u32::MAX;
             let (a, b) = if decrement { (T, bound) } else { (bound, T) };
             self.asm.emit(sub(W, T, a, b, Lsl, 0));
-            let passes = self.asm.label();
+            let unbounded = self.asm.label();
             if shift != 0 {
                 self.asm.emit(and_imm(W, U, T, (1u64 << shift) - 1));
-                self.asm.cbz(W, true, U, passes);
+                self.asm.cbz(W, true, U, unbounded);
                 self.asm.emit(lsr_imm(W, T, T, shift));
             }
             if inverse != 1 && !decrement {
@@ -191,46 +295,53 @@ impl Emitter<'_> {
             if mask != u32::MAX {
                 self.asm.emit(and_imm(W, T, T, u64::from(mask)));
             }
-            self.batch_cmp(T, lanes, U);
-            self.asm.b_cond(Cond::Lo, scalar);
-            self.asm.bind(passes);
+            self.batch_div(T, T, u64::from(lanes));
+            self.batch_min(T);
+            self.asm.bind(unbounded);
             return;
         }
-        if trip.again == Cc::e {
-            if lanes > 1 {
-                self.asm.b(scalar);
-            } else {
-                self.asm.emit(cmp(W, T, bound, Lsl, 0));
-                self.asm.b_cond(Cond::Ne, scalar);
-            }
-            return;
-        }
-        let (fail, signed) = match trip.again {
-            Cc::a => (Cond::Ls, false),
-            Cc::ae => (Cond::Lo, false),
-            Cc::b => (Cond::Hs, false),
-            Cc::be => (Cond::Hi, false),
-            Cc::g => (Cond::Le, true),
-            Cc::ge => (Cond::Lt, true),
-            Cc::l => (Cond::Ge, true),
-            Cc::le => (Cond::Gt, true),
+        let (fail, signed, upper, strict) = match trip.again {
+            Cc::e => (Cond::Ne, false, false, false),
+            Cc::a => (Cond::Ls, false, false, true),
+            Cc::ae => (Cond::Lo, false, false, false),
+            Cc::b => (Cond::Hs, false, true, true),
+            Cc::be => (Cond::Hi, false, true, false),
+            Cc::g => (Cond::Le, true, false, true),
+            Cc::ge => (Cond::Lt, true, false, false),
+            Cc::l => (Cond::Ge, true, true, true),
+            Cc::le => (Cond::Gt, true, true, false),
             _ => unreachable!(),
         };
         self.asm.emit(cmp(W, T, bound, Lsl, 0));
         self.asm.b_cond(fail, scalar);
-        if signed {
-            self.asm.emit(sbfx(X, T, T, 0, 32));
-        }
-        self.imm(U, (i64::from(trip.stride) * i64::from(lanes - 1)) as u64);
-        self.asm.emit(add(X, U, T, U, Lsl, 0));
-        self.asm.emit(if signed {
-            sbfx(X, X4, U, 0, 32)
+        if trip.again == Cc::e {
+            self.imm(T, u64::from(1 / lanes));
         } else {
-            mov(W, X4, U)
-        });
-        self.asm.emit(cmp(X, U, X4, Lsl, 0));
-        self.asm.b_cond(Cond::Ne, scalar);
-        self.asm.emit(cmp(W, U, bound, Lsl, 0));
-        self.asm.b_cond(fail, scalar);
+            let backwards = trip.stride < 0;
+            let toward_bound = upper != backwards;
+            let bias = (if signed { 1u64 << 31 } else { 0 })
+                ^ if backwards { u64::from(u32::MAX) } else { 0 };
+            let normalize = |dst, src| match bias {
+                0 => mov(W, dst, src),
+                0xffff_ffff => mvn(W, dst, src),
+                _ => eor_imm(W, dst, src, bias),
+            };
+            if bias != 0 {
+                self.asm.emit(normalize(T, T));
+            }
+            if toward_bound {
+                self.asm.emit(normalize(X0, bound));
+            } else {
+                self.asm.emit(mvn(W, X0, Reg::ZR));
+            }
+            self.asm.emit(sub(W, T, X0, T, Lsl, 0));
+            if toward_bound && strict {
+                self.asm.emit(sub_imm(W, T, T, 1, false));
+            }
+            self.batch_div(T, T, u64::from(trip.stride.unsigned_abs()));
+            self.asm.emit(add_imm(X, T, T, 1, false));
+            self.batch_div(T, T, u64::from(lanes));
+        }
+        self.batch_min(T);
     }
 }

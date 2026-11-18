@@ -425,7 +425,7 @@ pub(super) fn swap(cc: Cc) -> Option<Cc> {
 }
 
 /// Kernel recognition sees the original, verified SSA and the natural loop.
-/// Lowering runs only after the stage has checked the full batch.
+/// A kernel body runs only inside a checked batch region.
 pub(super) trait LoopKernel {
     fn recognize(&self, func: &Func, loop_: &Loop) -> Option<Plan>;
 }
@@ -444,7 +444,8 @@ pub(super) struct Plan {
 #[derive(Clone, Copy)]
 pub(super) struct Span {
     pub start: Affine,
-    pub bytes: u32,
+    pub width: u32,
+    pub step: u32,
     pub write: bool,
 }
 
@@ -458,11 +459,11 @@ pub(super) struct Batch {
     pub loop_: Loop,
     pub plan: Plan,
     pub spans: Vec<Span>,
+    pub backwards: bool,
     pub alias: Vec<(usize, usize, bool)>,
     pub frame: Vec<Frame>,
     pub crossings: Vec<Stream>,
     pub prefix_charge: u64,
-    pub variable_charge: bool,
 }
 
 impl Batch {
@@ -478,28 +479,20 @@ impl Batch {
 
     fn new(func: &Func, loop_: Loop, plan: Plan) -> Option<Self> {
         let groups = loop_.groups();
+        let backwards = groups.first().is_some_and(|g| g[0].1.stride < 0);
         let spans = groups
             .iter()
             .map(|group| {
                 let (_, s) = group[0];
-                let tail = u32::from(plan.lanes);
-                let offset = if s.stride < 0 {
-                    (s.stride as u32).wrapping_mul(tail)
-                } else {
-                    0
-                };
-                let bytes = s
-                    .stride
-                    .unsigned_abs()
-                    .checked_mul(tail)?
-                    .checked_add(u32::from(s.width) * group.len() as u32)?;
                 let width = u32::from(s.width) * group.len() as u32;
-                if !func.resident && width != s.stride.unsigned_abs() {
+                let stride = s.stride.unsigned_abs();
+                if (s.stride < 0) != backwards || !func.resident && width != stride {
                     return None;
                 }
                 Some(Span {
-                    start: s.addr.shifted(offset),
-                    bytes,
+                    start: s.addr,
+                    width,
+                    step: stride.checked_mul(u32::from(plan.lanes))?,
                     write: s.write(),
                 })
             })
@@ -569,24 +562,22 @@ impl Batch {
         }
         // A positive internal edge is a scalar checkpoint. Cover the
         // largest possible debit, including internal edges of the tail.
-        let internal = loop_
+        let prefix_charge = loop_
             .blocks
             .iter()
             .filter(|&&b| b != loop_.latch)
             .flat_map(|b| func.blocks[b.0 as usize].end.targets())
-            .map(|target| target.charge);
-        let (prefix_charge, variable_charge) = internal.fold((0, false), |(sum, any), charge| {
-            (sum + u64::from(charge.max(0) as u32), any || charge != 0)
-        });
+            .map(|target| target.charge.max(0) as u64)
+            .sum();
         Some(Self {
             loop_,
             plan,
             spans,
+            backwards,
             alias,
             frame,
             crossings,
             prefix_charge,
-            variable_charge,
         })
     }
 }

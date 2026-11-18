@@ -224,6 +224,11 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
+    let batch_pages = (resident && !batches.is_empty()).then(|| asm.label());
+    let mut batch_backedges = vec![None; func.blocks.len()];
+    for batch in batches {
+        batch_backedges[batch.loop_.latch.0 as usize] = Some((batch.loop_.head, asm.label()));
+    }
     let probation = resident.then(|| resident::Probation::new(&mut asm));
     let last_fact = resident
         .then(|| {
@@ -252,6 +257,7 @@ fn emit<'a>(
         iteration: cost::Iteration::default(),
         fact_misses: Vec::new(),
         checked_accesses: Vec::new(),
+        batch_backedges,
         guest_eip: 0,
         locations: allocation.locations.clone(),
         defs: allocation.defs.clone(),
@@ -309,9 +315,10 @@ fn emit<'a>(
             .iter()
             .find(|batch| batch.loop_.head.0 as usize == b)
         {
-            e.batch(batch);
+            let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
+            let words = e.batch(batch, batch_pages, backedge);
             if func.head_exit == Some(batch.loop_.head) {
-                head_batch = Some((e.words_since(start), u32::from(batch.plan.lanes)));
+                head_batch = Some((words, u32::from(batch.plan.lanes)));
             }
             start = e.asm.offset();
         }
@@ -344,7 +351,7 @@ fn emit<'a>(
         match &data.end {
             End::Jump(t) => {
                 let edge = e.asm.offset();
-                e.edge(t, b + 1);
+                e.edge(t, b + 1, b);
                 costs[b].edges[0] = e.words_since(edge);
                 costs[b].body = ((edge - start) / 4) as u32;
             }
@@ -379,7 +386,7 @@ fn emit<'a>(
                     Err(r) => e.asm.cbz(W, when, r, target),
                 }
                 let edge = e.asm.offset();
-                e.edge(inline, b + 1);
+                e.edge(inline, b + 1, b);
                 costs[b].edges[usize::from(when)] = e.words_since(edge);
                 costs[b].body = ((edge - start) / 4) as u32;
             }
@@ -397,15 +404,13 @@ fn emit<'a>(
     for (label, target, block, index) in std::mem::take(&mut e.edges) {
         e.asm.bind(label);
         let start = e.asm.offset();
-        e.edge(&target, usize::MAX);
+        e.edge(&target, usize::MAX, block);
         costs[block].edges[index] = e.words_since(start);
     }
     if resident {
         e.iteration = cost::iteration(func, &costs);
         if let Some((words, lanes)) = head_batch {
-            // A passing batch replaces lanes iterations and is followed by
-            // one scalar iteration through the original body.
-            e.iteration.words = (e.iteration.words + words).div_ceil(lanes + 1);
+            e.iteration.words = words.div_ceil(lanes);
         }
         e.checkpoints();
     }
@@ -436,6 +441,9 @@ fn emit<'a>(
         e.asm.b(resume);
     }
     e.checked_accesses();
+    if let Some(pages) = batch_pages {
+        resident::batch_pages(&mut e.asm, pages);
+    }
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);
         e.mark(Part::Cold, pc);
@@ -495,6 +503,7 @@ struct Emitter<'a> {
     iteration: cost::Iteration,
     fact_misses: Vec<Label>,
     checked_accesses: Vec<resident::CheckedAccess>,
+    batch_backedges: Vec<Option<(Block, Label)>>,
     guest_eip: u32,
     locations: Vec<Host>,
     defs: Vec<Option<Op>>,
@@ -729,7 +738,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn edge(&mut self, target: &Target, next: usize) {
+    fn edge(&mut self, target: &Target, next: usize, from: usize) {
         self.parallel_moves(self.moves(target));
         if target.charge != 0 {
             let record = self.func.blocks[target.block.0 as usize]
@@ -743,7 +752,11 @@ impl<'a> Emitter<'a> {
             );
         }
         if let Some(through) = self.through(target.block) {
-            self.edge(through, next);
+            self.edge(through, next, from);
+        } else if let Some((head, backedge)) = self.batch_backedges[from]
+            && target.block == head
+        {
+            self.asm.b(backedge);
         } else if target.block.0 as usize != next {
             self.asm.b(self.blocks[target.block.0 as usize]);
         }

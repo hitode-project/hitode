@@ -1370,9 +1370,15 @@ fn vector_seeded_elementwise_widths_and_exact_tails() {
     for width in [1, 2, 4] {
         let lanes = 16 / width;
         let image = vector_image(width);
-        for count in [0, 1, lanes - 1, lanes, lanes + 1, 3 * lanes + 7] {
-            let mut cpu = initial(u32::from(count));
+        let short = [0, 1, lanes - 1, lanes, lanes + 1, 3 * lanes + 7];
+        for count in short
+            .map(u32::from)
+            .into_iter()
+            .chain((width == 1).then_some(5007))
+        {
+            let mut cpu = initial(count);
             cpu.regs[2] = 0x8765_4321;
+            cpu.regs[7] = DATA + 0x2000;
             let data = vector_data(0xcafe + u64::from(count));
             let mut trial = Trial::new(
                 &image,
@@ -1381,34 +1387,61 @@ fn vector_seeded_elementwise_widths_and_exact_tails() {
                 &[],
                 |m| {
                     m.write(DATA, &data).unwrap();
+                    m.write(DATA + 0x1000, &data).unwrap();
                 },
             );
             vector_install(&mut trial, cpu, lanes);
-            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+            assert_eq!(trial.compare(70_000).0, RunOutcome::ReachedStop);
             trial.compare_epilogue();
         }
     }
 }
 
+// spec: A64-OPT-10
+#[test]
+fn vector_region_hoists_guards_over_plain_pages() {
+    let image = vector_image(1);
+    let mut cpu = initial(4096);
+    cpu.regs[6] = DATA + 23;
+    cpu.regs[7] = DATA + 0x2000 + 61;
+    let data = vector_data(829);
+    let mut trial = Trial::new(&image, &cpu, "strip-mined byte loop", &[], |m| {
+        m.write(DATA, &data).unwrap();
+        m.write(DATA + 0x1000, &data[..23]).unwrap();
+    });
+    vector_install(&mut trial, cpu, 16);
+    assert_eq!(
+        trial.compare(60_000),
+        (RunOutcome::ReachedStop, 2 + 13 * 4096)
+    );
+    let entries = trial.live.native.as_ref().unwrap().vector_regions();
+    assert!(
+        (1..=3).contains(&entries),
+        "region entry evaluated {entries} times"
+    );
+}
+
 fn interleave_image(channels: usize, unpack: bool) -> Image {
-    Image::loop_body(|a, head, _| {
-        let planes = [esi, ebx, edx, ebp];
-        for (i, &plane) in planes[..channels].iter().enumerate() {
-            let interleaved = byte_ptr(edi + i as i32);
-            let planar = byte_ptr(plane);
-            let (src, dst) = if unpack {
-                (interleaved, planar)
-            } else {
-                (planar, interleaved)
-            };
-            a.mov(al, src).unwrap();
-            a.mov(dst, al).unwrap();
-            a.inc(plane).unwrap();
-        }
-        a.add(edi, channels as i32).unwrap();
-        a.cmp(edi, ecx).unwrap();
-        a.jb(head).unwrap();
-    })
+    Image::loop_body(|a, head, _| interleave_body(a, head, channels, unpack))
+}
+
+fn interleave_body(a: &mut CodeAssembler, head: CodeLabel, channels: usize, unpack: bool) {
+    let planes = [esi, ebx, edx, ebp];
+    for (i, &plane) in planes[..channels].iter().enumerate() {
+        let interleaved = byte_ptr(edi + i as i32);
+        let planar = byte_ptr(plane);
+        let (src, dst) = if unpack {
+            (interleaved, planar)
+        } else {
+            (planar, interleaved)
+        };
+        a.mov(al, src).unwrap();
+        a.mov(dst, al).unwrap();
+        a.inc(plane).unwrap();
+    }
+    a.add(edi, channels as i32).unwrap();
+    a.cmp(edi, ecx).unwrap();
+    a.jb(head).unwrap();
 }
 
 // spec: A64-OPT-10
@@ -1441,50 +1474,167 @@ fn vector_interleaves_and_deinterleaves_two_three_and_four_streams() {
 
 // spec: A64-OPT-10
 #[test]
-fn vector_guard_declines_overlaps_and_protected_spans() {
+fn vector_region_limits_the_union_of_aliasing_streams() {
     let image = vector_image(1);
-    let mut cpu = initial(63);
-    cpu.regs[7] = DATA + 3;
     let data = vector_data(123);
-    let mut overlap = Trial::new(&image, &cpu, "overlapping vector span", &[], |m| {
-        m.write(DATA, &data).unwrap();
-    });
-    vector_install(&mut overlap, cpu, 16);
-    assert_eq!(overlap.compare(4096).0, RunOutcome::ReachedStop);
-
-    let boundary = SPECIAL + HOST_PAGE as u32;
-    let mut cpu = initial(63);
-    cpu.regs[6] = boundary - 9;
-    let mut protected = Trial::new(&image, &cpu, "protected vector span", &[], |m| {
-        m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
-        m.map(boundary, HOST_PAGE, 0).unwrap();
-        m.write(boundary - 9, &data[..9]).unwrap();
-    });
-    vector_install(&mut protected, cpu, 16);
-    let (outcome, retired) = protected.compare(4096);
-    assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
-    assert_eq!(retired, 2 + 13 * 9);
+    for (gap, entries) in [(3, 5), (49, 3)] {
+        let mut cpu = initial(79);
+        cpu.regs[7] = DATA + gap;
+        let mut trial = Trial::new(&image, &cpu, format!("alias gap {gap}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+        });
+        vector_install(&mut trial, cpu, 16);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert_eq!(
+            trial.live.native.as_ref().unwrap().vector_regions(),
+            entries
+        );
+    }
 }
 
 // spec: A64-OPT-10
 #[test]
-fn vector_guard_declines_watched_code_and_insufficient_countdown() {
-    let image = vector_image(1);
-    let mut cpu = initial(71);
-    cpu.regs[6] = image.head;
-    let mut watched = Trial::new(&image, &cpu, "watched vector input", &[], |_| {});
-    vector_install(&mut watched, cpu, 16);
-    assert_eq!(watched.compare(4096).0, RunOutcome::ReachedStop);
-
-    let cpu = initial(71);
-    let data = vector_data(456);
-    let mut countdown = Trial::new(&image, &cpu, "vector countdown", &[], |m| {
-        m.write(DATA, &data).unwrap();
+fn vector_region_stops_at_a_protected_page_on_each_stream() {
+    let image = Image::loop_body(|a, head, _| {
+        a.test(ecx, ecx).unwrap();
+        interleave_body(a, head, 4, false);
     });
-    vector_install(&mut countdown, cpu, 16);
-    assert_eq!(countdown.compare(277), (RunOutcome::Budget, 277));
-    assert_eq!(countdown.compare(4096).0, RunOutcome::ReachedStop);
-    countdown.compare_epilogue();
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    let data = vector_data(295);
+    let planes = [6, 3, 2, 5];
+    for (index, stream) in planes.into_iter().chain([7]).enumerate() {
+        let mut cpu = initial(0);
+        for (i, r) in planes.into_iter().enumerate() {
+            cpu.regs[r] = DATA + 0x300 * i as u32;
+        }
+        let width = if stream == 7 { 4 } else { 1 };
+        cpu.regs[stream] = boundary - 49 * width;
+        cpu.regs[1] = cpu.regs[7] + 4 * 79;
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("protected stream in register {stream}"),
+            &[(SPECIAL, HOST_PAGE)],
+            |m| {
+                m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+                m.map(boundary, HOST_PAGE, if stream == 7 { READ } else { 0 })
+                    .unwrap();
+                m.write(DATA, &data).unwrap();
+                m.write(cpu.regs[stream], &data[..49 * width as usize])
+                    .unwrap();
+            },
+        );
+        vector_install(&mut trial, cpu.clone(), 16);
+        let (outcome, retired) = trial.compare(4096);
+        if stream == 7 {
+            assert!(
+                matches!(outcome, RunOutcome::WriteFault { address, .. } if address == boundary)
+            );
+            assert_eq!(retired, 3 + 16 * 49);
+        } else {
+            assert!(
+                matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary)
+            );
+            assert_eq!(retired, 2 + 16 * 49 + 3 * index as u64);
+        }
+        let entries = trial.live.native.as_ref().unwrap().vector_regions();
+        assert!(
+            (2..=3).contains(&entries),
+            "region entry evaluated {entries} times"
+        );
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_region_walks_backwards_with_an_unsigned_trip_bound() {
+    let image = Image::loop_body(|a, head, _| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.xor(eax, 123).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.sub(esi, 1).unwrap();
+        a.sub(edi, 1).unwrap();
+        a.cmp(esi, ecx).unwrap();
+        a.ja(head).unwrap();
+    });
+    let mut cpu = initial(DATA + 23);
+    cpu.regs[6] = DATA + 0x1000 + 23;
+    cpu.regs[7] = DATA + 0x3000 + 17;
+    let data = vector_data(918);
+    let mut trial = Trial::new(&image, &cpu, "backwards unsigned bound", &[], |m| {
+        m.write(DATA + 24, &data).unwrap();
+    });
+    vector_install(&mut trial, cpu, 16);
+    assert_eq!(
+        trial.compare(40_000),
+        (RunOutcome::ReachedStop, 1 + 7 * 4096)
+    );
+    assert_eq!(trial.live.native.as_ref().unwrap().vector_regions(), 2);
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_region_stops_at_watched_and_checked_pages() {
+    let image = vector_image(1);
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    let data = vector_data(473);
+    for watched in [true, false] {
+        let count = if watched {
+            49 + PAGE_SIZE as u32 + 127
+        } else {
+            71
+        };
+        let mut cpu = initial(count);
+        cpu.regs[6] = boundary - 49;
+        let mut trial = Trial::new(&image, &cpu, format!("watched page {watched}"), &[], |m| {
+            m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+            if watched {
+                m.map(boundary, HOST_PAGE, READ | WRITE).unwrap();
+            } else {
+                m.map_shared_audio(boundary, PAGE_SIZE).unwrap();
+            }
+            m.write(cpu.regs[6], &data[..(count as usize).min(data.len())])
+                .unwrap();
+            if watched {
+                m.watch_code(boundary, 1);
+                m.write(boundary + PAGE_SIZE as u32, &data[..127]).unwrap();
+            }
+        });
+        vector_install(&mut trial, cpu.clone(), 16);
+        assert_eq!(trial.compare(60_000).0, RunOutcome::ReachedStop);
+        let entries = trial.live.native.as_ref().unwrap().vector_regions();
+        if watched {
+            // The watched page runs scalar. The plain pages on either side
+            // use batches, including when the scalar strip leaves that page.
+            let watched_strips = (PAGE_SIZE / 16) as u64;
+            let all_strips = u64::from(count.div_ceil(16));
+            assert!(
+                (watched_strips..all_strips).contains(&entries),
+                "region entry evaluated {entries} times"
+            );
+        } else {
+            assert!(entries >= 3, "region entry evaluated {entries} times");
+        }
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_region_charges_countdown_at_and_after_batch_boundaries() {
+    let image = vector_image(1);
+    let data = vector_data(456);
+    for iterations in [33, 34] {
+        let fuel = 2 + 13 * iterations;
+        let cpu = initial(71);
+        let mut trial = Trial::new(&image, &cpu, format!("countdown {fuel}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+        });
+        vector_install(&mut trial, cpu, 16);
+        assert_eq!(trial.compare(fuel), (RunOutcome::Budget, fuel));
+        assert_eq!(trial.live.native.as_ref().unwrap().vector_regions(), 2);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        trial.compare_epilogue();
+    }
 }
 
 // spec: A64-OPT-10

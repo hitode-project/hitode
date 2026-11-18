@@ -170,17 +170,10 @@ impl Emitter<'_> {
         }
 
         let addr = self.gp(addr, U);
-        self.plain_span(addr, bytes, write, false, miss);
+        self.plain_span(addr, bytes, write, miss);
     }
 
-    pub(super) fn plain_span(
-        &mut self,
-        addr: Reg,
-        bytes: u32,
-        write: bool,
-        batch: bool,
-        miss: Label,
-    ) {
+    fn plain_span(&mut self, addr: Reg, bytes: u32, write: bool, miss: Label) {
         let next = self.asm.label();
         self.asm
             .emit_all(&[ldr(W, X0, RT, MEMORY_BASE), cmp(W, addr, X0, Lsl, 0)]);
@@ -197,7 +190,7 @@ impl Emitter<'_> {
         ]);
         self.asm.b_cond(Cond::Hs, miss);
         self.asm.emit(ldr(X, X3, RT, PLAIN_PAGES));
-        if write || batch {
+        if write {
             self.asm.emit(lsr_imm(W, X0, X0, 12));
         }
 
@@ -210,7 +203,7 @@ impl Emitter<'_> {
             shiftv(X, Lsr, X5, X5, X1),
         ]);
         self.asm.tbz(false, X5, 0, miss);
-        if write || batch {
+        if write {
             self.asm
                 .emit_all(&[ldr(X, X5, X4, 16), shiftv(X, Lsr, X5, X5, X1)]);
             self.asm.tbz(true, X5, 0, miss);
@@ -221,17 +214,66 @@ impl Emitter<'_> {
                 ldr(X, X4, RT, runtime::CLASSES),
                 ldr_narrow(Narrow::Byte, X5, X4, X5),
             ]);
-            let permission = if write { WRITE } else { READ };
-            self.asm.tbz(false, X5, permission.trailing_zeros(), miss);
-            if write {
-                self.asm
-                    .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
-            }
+            self.asm.tbz(false, X5, WRITE.trailing_zeros(), miss);
+            self.asm
+                .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
         }
         self.asm
             .emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);
         self.asm.b_cond(Cond::Ls, next);
     }
+}
+
+/// Walks the candidate pages of one stream. X0 and X1 are the first and
+/// last pages in stream order. XOR with X2 gives the actual guest page.
+/// X5 is the bitmap offset (0 for reads, 8 for writes). Returns the
+/// projected byte boundary of the first unproved page in X0, preserving K
+/// in X3 and all allocated values.
+pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
+    use adv_cpu_core::memory::EXEC;
+    const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
+    let write = asm.label();
+    let next = asm.label();
+    let done = asm.label();
+    asm.bind(entry);
+    asm.emit_all(&[
+        eor(W, X4, X0, X2, Lsl, 0),
+        ldr(W, U, RT, MEMORY_BASE),
+        sub(W, U, X4, U, Lsr, PAGE_SHIFT),
+        ldr(W, T, RT, MEMORY_PAGES),
+        cmp(W, U, T, Lsl, 0),
+    ]);
+    asm.b_cond(Cond::Hs, done);
+    asm.emit_all(&[
+        lsr_imm(W, T, U, 6),
+        add(W, T, T, T, Lsl, 1),
+        ldr(X, X4, RT, PLAIN_PAGES),
+        add_ext(X, T, X4, T, Extend::Uxtw, 3),
+        add(X, X4, T, X5, Lsl, 0),
+        ldr(X, X4, X4, 0),
+        ldr(X, T, T, 16),
+        bic(X, T, X4, T, Lsl, 0),
+        shiftv(X, Lsr, T, T, U),
+    ]);
+    asm.tbz(false, T, 0, done);
+    // The bitmap grants guest permission. The window class also accounts
+    // for the host protection intersection on hosts with larger pages.
+    asm.emit_all(&[
+        eor(W, X4, X0, X2, Lsl, 0),
+        ldr(X, T, RT, runtime::CLASSES),
+        ldr_narrow(Narrow::Byte, T, T, X4),
+    ]);
+    asm.cbz(W, true, X5, write);
+    asm.tbz(false, T, READ.trailing_zeros(), done);
+    asm.b(next);
+    asm.bind(write);
+    asm.tbz(false, T, WRITE.trailing_zeros(), done);
+    asm.tbz(true, T, EXEC.trailing_zeros(), done);
+    asm.bind(next);
+    asm.emit_all(&[add_imm(W, X0, X0, 1, false), cmp(X, X0, X1, Lsl, 0)]);
+    asm.b_cond(Cond::Ls, entry);
+    asm.bind(done);
+    asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
 }
 
 /// Like the Tier-1 access stub, calls the owner's access helper. The
