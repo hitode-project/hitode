@@ -4,7 +4,7 @@
 //! cost, so splitting does not change the measure it is chosen from. It may
 //! fill 60% of the frame period: 1/60 s, unless frames keep sleeping to
 //! their own longer interval.
-use adv_cpu::backend::Pace;
+use adv_cpu::backend::{Pace, host_tick_hz, host_ticks};
 use std::time::{Duration, Instant};
 
 const DEFAULT_PERIOD_NS: u64 = 1_000_000_000 / 60;
@@ -73,8 +73,30 @@ impl FrameLoad {
             work_ns: self.work(now),
             last_ns: self.work_ns,
             saved_ns: self.saved_ns,
-            limit_ns: self.period_ns * LOAD.0 / LOAD.1,
+            limit_ns: self.limit_ns(),
         }
+    }
+
+    fn limit_ns(&self) -> u64 {
+        self.period_ns * LOAD.0 / LOAD.1
+    }
+
+    pub(crate) fn split_gate(&self) -> (bool, u64) {
+        let Some(last) = self.last else {
+            return (true, u64::MAX);
+        };
+        let limit = self.limit_ns();
+        let over = self.work_ns > limit.saturating_add(self.saved_ns);
+        // Sample the counter first so the time between reads advances the gate.
+        let ticks = host_ticks();
+        let elapsed = nanos(Instant::now() - last);
+        // Work saturates at zero before adding saved time. Credited idle beyond
+        // elapsed time must not defer a loop whose cost alone exceeds the limit.
+        let offset_ns = i128::from(limit) - i128::from(elapsed.saturating_sub(self.idle_ns));
+        let offset_ticks = (offset_ns * i128::from(host_tick_hz())).div_euclid(1_000_000_000);
+        // Leave one tick for arrivals between counter increments.
+        let deadline = (i128::from(ticks) + offset_ticks - 1).clamp(0, i128::from(u64::MAX)) as u64;
+        (over, deadline)
     }
 
     pub(crate) fn period_ns(&self) -> u64 {

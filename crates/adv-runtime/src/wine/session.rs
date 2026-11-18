@@ -1159,7 +1159,6 @@ impl Session {
             self.fonts.configure(&mut machine)?;
             adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
-            machine.sys.frame_pacer = self.machine.sys.frame_pacer.clone();
             if let Some(vsync) = self
                 .machine
                 .ext

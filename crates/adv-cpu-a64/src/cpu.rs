@@ -534,6 +534,10 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.allow_computation()
     }
 
+    fn offer_gate(&self) -> Option<&adv_cpu_core::backend::OfferGate> {
+        self.handler.offer_gate()
+    }
+
     fn allow_spin_yield(&self) -> bool {
         self.handler.allow_spin_yield()
     }

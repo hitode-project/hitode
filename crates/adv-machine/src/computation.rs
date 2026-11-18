@@ -282,11 +282,11 @@ fn complete<C>(sys: &mut Sys, regs: &mut [Option<C>], done: Completion<C>, local
     context.spin.ran(done.elapsed);
     context.progress.new_work();
     context.progress.ran(done.retired);
-    context.yielded = false;
+    sys.set_yielded(id, false);
     sys.wakes.mark_turn(id, false);
     let ns = done.elapsed.as_nanos() as u64;
     if local {
-        sys.load.computed(done.helpers);
+        sys.computed_on_owner(done.helpers);
         sys.scheduling
             .context_run(id as usize, done.elapsed, 0, true);
         sys.stats.total.cpu_runs += 1;
@@ -372,6 +372,136 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap()
+    }
+
+    // spec: PROC-MACH-13
+    #[test]
+    fn published_offer_gate_conservatively_matches_rust_decisions() {
+        use crate::{Dispatch, OBSERVING, Trace, frame_spin::FramePacer, observe_host_calls};
+        use adv_cpu::backend::{TrapHandler, host_tick_hz, host_ticks};
+        use adv_sync::input::KeyState;
+        use std::sync::{Arc, atomic::Ordering};
+
+        struct Pacer(Arc<KeyState>);
+
+        impl FramePacer for Pacer {
+            fn until_vsync(&self) -> Option<Duration> {
+                None
+            }
+
+            fn input_held(&self) -> bool {
+                self.0.any_pressed()
+            }
+        }
+
+        let mut m = machine(false);
+        const CONTEXTS: u32 = 4;
+        for _ in 0..CONTEXTS {
+            m.spawn("test", CODE, &[], 0x1_0000).unwrap();
+        }
+        m.switch_to(0).unwrap();
+        let keys = Arc::new(KeyState::default());
+        m.sys
+            .set_frame_pacer(Some(Arc::new(Pacer(keys.clone()))), Some(keys.clone()));
+        let offer = m.sys.offer.clone();
+        let mut computation = true;
+        m.sys.publish_offer_policy(computation);
+        assert_ne!(offer.gate.split_over.load(Ordering::Relaxed), 0);
+        m.sys.complete_frame();
+        assert_eq!(offer.gate.split_over.load(Ordering::Relaxed), 0);
+
+        let check = |m: &mut Machine<Cpu>, computation, costs| {
+            let mut dispatch = Dispatch {
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                parked: None,
+                yield_on_frame: false,
+                defer_work: false,
+                computation,
+            };
+            let stamps = |sys: &Sys| {
+                std::array::from_fn::<_, { CONTEXTS as usize }, _>(|i| sys.contexts[i].computed)
+            };
+            let before = stamps(dispatch.sys);
+            let clear = dispatch.offer_gate().unwrap().stale.load(Ordering::Acquire) == 0;
+            let allowed = dispatch.allow_computation();
+            if clear {
+                assert!(!allowed);
+                assert_eq!(stamps(dispatch.sys), before);
+            }
+
+            let pace = dispatch.pace();
+            let now = host_ticks();
+            let gate = dispatch.offer_gate().unwrap();
+            let over = gate.split_over.load(Ordering::Acquire);
+            let deadline = gate.split_deadline.load(Ordering::Relaxed);
+            if let Some(pace) = pace {
+                for cost in costs {
+                    let cost_ticks =
+                        (u128::from(cost) * u128::from(host_tick_hz())).div_ceil(1_000_000_000);
+                    if pace.need(cost) > 0 {
+                        assert!(over != 0 || u128::from(now) + cost_ticks > u128::from(deadline));
+                    }
+                }
+            } else {
+                assert_eq!((over, deadline), (0, u64::MAX));
+            }
+        };
+
+        check(&mut m, computation, [1, 4_000_000]);
+        check(&mut m, computation, [1, 4_000_000]);
+        assert_eq!(offer.gate.stale.load(Ordering::Acquire), 0);
+        std::thread::scope(|scope| scope.spawn(|| keys.set(17, true)).join().unwrap());
+        assert_ne!(offer.gate.stale.load(Ordering::Acquire), 0);
+        assert_ne!(offer.gate.split_over.load(Ordering::Acquire), 0);
+        check(&mut m, computation, [1, 4_000_000]);
+        keys.release_all();
+        assert_eq!(offer.gate.split_over.load(Ordering::Acquire), 0);
+        m.sys.host_idle(Duration::from_secs(1), false);
+        check(&mut m, computation, [1, 10_000_000]);
+
+        let mut seed = 0x2d59_d7e1_5bf2_767d_u64;
+        for _ in 0..2_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let id = (seed >> 8) as u32 % CONTEXTS;
+            let time = Duration::from_nanos((seed >> 24) % 18_000_000);
+            match seed % 11 {
+                0 if m.sys.context(id).suspend_count == 0 => {
+                    m.sys.suspend_context(id).unwrap();
+                }
+                0 => {
+                    m.sys.resume_context(id).unwrap();
+                }
+                1 => m.sys.set_yielded(id, seed & 16 != 0),
+                2 => m.sys.complete_frame(),
+                3 if m.sys.context(id).is_ready() => m.switch_to(id).unwrap(),
+                4 => computation = !computation,
+                5 => observe_host_calls(!OBSERVING.get()),
+                6 => {
+                    m.sys.trace = if m.sys.trace.enabled() {
+                        Trace::default()
+                    } else {
+                        Trace::to_writer(Box::new(io::sink()))
+                    };
+                }
+                7 => m.sys.host_idle(time, seed & 32 != 0),
+                8 => m.sys.computed_on_owner(time),
+                9 => m.sys.call_limit = m.sys.call_limit.is_none().then_some(500),
+                10 => keys.set(17, !keys.any_pressed()),
+                _ => {}
+            }
+            m.sys.publish_offer_policy(computation);
+            check(&mut m, computation, [seed >> 46, (seed >> 32) % 32_000_000]);
+        }
+        observe_host_calls(false);
+        keys.release_all();
+        m.sys.trace = Trace::default();
+        m.sys.call_limit = None;
+        m.sys.publish_offer_policy(true);
+        m.sys.set_frame_pacer(Some(Arc::new(Pacer(keys))), None);
+        assert_ne!(offer.gate.split_over.load(Ordering::Acquire), 0);
     }
 
     // spec: PROC-MACH-1 PROC-MACH-5

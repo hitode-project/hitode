@@ -51,7 +51,8 @@ fn machine(shape: Loop, pacer: Option<Arc<Pacer>>) -> Machine<UnicornCpu> {
     });
     let mut m = Machine::new(UnicornCpu::new(PARK_ADDR).unwrap(), registry, Clock::real()).unwrap();
     m.set_execution_budget(Some(Duration::from_secs(2)));
-    m.sys.frame_pacer = pacer.map(|p| p as Arc<dyn FramePacer>);
+    m.sys
+        .set_frame_pacer(pacer.map(|p| p as Arc<dyn FramePacer>), None);
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     let frame = m.resolve_import("test", "frame").unwrap();
     let peek = m.resolve_import("test", "peek").unwrap();

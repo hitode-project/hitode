@@ -90,7 +90,10 @@ fn start(
             if let Some(vsync) = &pacer.vsync {
                 machine.ext.insert(vsync.clone());
             }
-            machine.sys.frame_pacer = Some(Arc::new(pacer));
+            let keys = pacer.keys.clone();
+            machine
+                .sys
+                .set_frame_pacer(Some(Arc::new(pacer)), Some(keys));
         }
         Session::configure_graphics(machine, options.d3d9_sm3, Some(options.gpu_cache_dir()));
         if let Some(gpu) = host.gpu {
