@@ -57,6 +57,8 @@ use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
 mod head;
+#[cfg(test)]
+mod testing;
 mod worker;
 
 /// Offer gates for runs whose handler publishes none: no offer is possible,

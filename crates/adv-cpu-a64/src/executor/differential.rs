@@ -1909,6 +1909,9 @@ type Config = (Features, bool, Checks);
 mod native_instructions;
 
 #[cfg(native)]
+mod resident;
+
+#[cfg(native)]
 fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     let program = program(seed);
     let (outcome, state, memory) = reference(&program, budget);
