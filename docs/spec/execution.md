@@ -62,6 +62,14 @@ Native host protection MUST retain its executable-page write barrier.
 
 This is the behavior of processors that report FDP_EXCPTN_ONLY. Translated forms then need not store the operand address of every x87 memory access.
 
+### EXEC-CORE-9 Underflow tininess
+
+**Rule**: Every engine MUST detect tininess after rounding, for x87 and SSE alike. A result is tiny when its exact value, rounded to the destination precision with an unbounded exponent, lies below the smallest normal number.
+**Verification**: Test
+**Basis**: Berkeley SoftFloat's 8086 and 8086-SSE specializations and QEMU's x86 targets detect tininess after rounding; A64 detects it before rounding.
+
+A product that rounds up to the smallest normal number therefore raises underflow only when it is tiny by that measure.
+
 ## Host calls
 
 ### EXEC-CALL-1 Host call bookkeeping

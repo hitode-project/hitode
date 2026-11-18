@@ -6,7 +6,8 @@ THREAD_LOCAL unsigned char adv_sf_rounded_up = 0;
 void adv_sf_config(uint8_t rounding, uint8_t precision) {
     softfloat_roundingMode = rounding;
     extF80_roundingPrecision = precision;
-    softfloat_detectTininess = softfloat_tininess_beforeRounding;
+    /* x86 detects tininess after rounding, for x87 and SSE alike (EXEC-CORE-9). */
+    softfloat_detectTininess = softfloat_tininess_afterRounding;
     softfloat_exceptionFlags = 0;
     adv_sf_rounded_up = 0;
 }

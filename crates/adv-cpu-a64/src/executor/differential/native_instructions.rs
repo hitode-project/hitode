@@ -1388,6 +1388,61 @@ fn sse_values_choose_between_the_fast_and_the_slow_path() {
     }
 }
 
+/// x86 detects tininess after rounding. A product or narrowing that rounds
+/// up to min normal raises underflow exactly when rounding the exact value
+/// with an unbounded exponent stays below min normal, and runs natively
+/// only as the slow path that tells.
+// spec: A64F-FP-5, EXEC-CORE-9
+#[test]
+fn values_rounded_up_to_min_normal_raise_underflow_after_rounding() {
+    let p = f64::powi;
+    // (form, dst lanes, src lanes, lane width, whether UE is raised).
+    let near = |x: f64, scale: i32| ((1.0 - x) * p(2.0, scale), (1.0 + x) * p(2.0, scale));
+    let (a, b) = near(p(2.0, -27) + p(2.0, -29), -511);
+    let (c, d) = near(p(2.0, -27), -511);
+    let (e, f) = near(1.5 * p(2.0, -13), -63);
+    let narrow = (p(2.0, -126) * (1.0 - 1.5 * p(2.0, -25))).to_bits();
+    let cases: [(u8, u64, u64, usize, bool); 6] = [
+        (0, a.to_bits(), b.to_bits(), 8, true),
+        (0, c.to_bits(), d.to_bits(), 8, false),
+        (1, a.to_bits(), b.to_bits(), 8, true),
+        (1, c.to_bits(), d.to_bits(), 8, false),
+        (
+            2,
+            (e as f32).to_bits().into(),
+            (f as f32).to_bits().into(),
+            4,
+            true,
+        ),
+        (3, narrow, 0, 8, true),
+    ];
+    for (form, dst, src, width, underflow) in cases {
+        let mut program = fixture(|a| {
+            a.add(eax, ecx).unwrap();
+            match form {
+                0 => a.mulsd(xmm0, xmm1),
+                1 => a.mulpd(xmm0, xmm1),
+                2 => a.mulps(xmm0, xmm1),
+                _ => a.cvtsd2ss(xmm2, xmm0),
+            }
+            .unwrap();
+        });
+        for (x, value) in [(0, dst), (1, src)] {
+            for lane in program.state.xmm[x].chunks_mut(width) {
+                lane.copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+        }
+        program.state.mxcsr = 0x1fa0;
+        let config = (Features { flagm: false }, false, Checks::Adaptive);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        let outcome = native.run(program.stop, 100).unwrap();
+        assert_eq!(outcome, oracle.run(program.stop, 100).unwrap());
+        same(&native, &oracle);
+        assert_eq!(oracle.state.mxcsr & 0x10 != 0, underflow, "form={form}");
+    }
+}
+
 // spec: A64-FLAG-2, A64-FLAG-3, A64-FLAG-4, A64-FLAG-5
 #[test]
 fn j1_fault_recipes_match_interpreter_before_dead_flag_rewrites() {
