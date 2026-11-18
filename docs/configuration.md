@@ -99,6 +99,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_SAMPLES` | Fixture | Unset: tests that need games skip; `tools/smoke.py` reads its game list from `smoke.json` there |
 | `ADV_SMOKE` | Fixture | The game list of `tools/smoke.py` (shape: `tools/smoke.example.json`); unset: `$ADV_SAMPLES/smoke.json` |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
+| `ADV_STATIC_CODEC_TEST_IMAGE` | Fixture | Unset: skip the local PE fixture for bundled Theora and MDCT signatures |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
 | `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `metal` |
 | `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |
@@ -134,7 +135,7 @@ device loss; builds without it omit the executor hooks.
 | `--no-time-skip` | Diagnostic | Absent: startup clock polling and Ctrl time skip allowed when their conditions hold |
 | `--codepage` | Feature | `auto`: 936 for marked or mostly GB2312 executables, otherwise 932; `932`, `936` and `950` (Big5) override |
 | `--headless` | Fixture | Off: a host window is shown |
-| `--codec-kernels` | Diagnostic | `native`; `guest` or `verify` compare Vorbis kernels and admitted Theora decoders |
+| `--codec-kernels` | Diagnostic | `native`; `guest` runs guest code and `verify` compares guest and native results. The report's `codec` section includes MDCT and Theora counters. |
 | `--audio` | Feature | Off; headless runs simulate the device. To become default or be removed with the normal-play audio baseline |
 | `--hidden` | Fixture | Off |
 | `--gpu-software` | Diagnostic | Off: the adapter is chosen automatically |

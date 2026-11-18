@@ -92,7 +92,8 @@ fn note_image(env: &mut Env<'_>, base: u32, size: u32, ranges: &[ExecutableRange
         || env
             .ext
             .try_get::<adv_nt::identity::Images>()
-            .is_some_and(|images| images.0.contains_key(&base))
+            .and_then(|images| images.0.get(&base))
+            .is_some_and(adv_nt::identity::Module::is_distribution)
         || env.ext.get::<Images>().mapped.contains_key(&base)
     {
         return;

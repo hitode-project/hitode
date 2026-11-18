@@ -450,6 +450,34 @@ fn report(
                 .map_or_else(|| "null".into(), json)
         ));
     }
+    if let Some(kernels) = adv_runtime::wine::codec::stats(&session.machine.ext) {
+        let theora = kernels.theora;
+        codec.pop();
+        codec.push_str(&format!(
+            concat!(
+                ", \"mdct\": {{\"installed\": {}, \"native_calls\": {}, \"verify_calls\": {}, ",
+                "\"fallback_calls\": {}, \"last_rejection\": {}}}, ",
+                "\"theora\": {{\"installed\": {}, \"initialized\": {}, \"native_frames\": {}, ",
+                "\"compared_bytes\": {}, \"different_bytes\": {}, \"state_mismatches\": {}, ",
+                "\"reason\": {}}}}}"
+            ),
+            kernels.installed,
+            kernels.native_calls,
+            kernels.verify_calls,
+            kernels.fallback_calls,
+            kernels
+                .last_rejection
+                .as_deref()
+                .map_or_else(|| "null".into(), json),
+            theora.installed,
+            theora.initialized,
+            theora.native_frames,
+            theora.compared_bytes,
+            theora.different_bytes,
+            theora.state_mismatches,
+            theora.reason.as_deref().map_or_else(|| "null".into(), json),
+        ));
+    }
     fields.push(format!("\"codec\": {codec}"));
     if let Some(diagnostics) = &sys.stats.wait_diagnostics {
         fields.push(format!("\"wait_diagnostics\": {}", diagnostics.json()));
