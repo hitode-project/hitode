@@ -1,0 +1,22 @@
+# prologue packetout 03309e929ecc5ab5bb2c4b4c1ff6392f52741f0ba3425f3b8bca7a15e643d96d mov(ecx,[esp]) test(ecx,ecx)
+# prologue packetpeek 03309e929ecc5ab5bb2c4b4c1ff6392f52741f0ba3425f3b8bca7a15e643d96d mov(ecx,[esp]) test(ecx,ecx)
+code packet 293 d183876f1639fa18b992c9073b40ea392c2580d005a7066f40c746cbec24648d
+code packetout 31 ea71fde4b7a6cc6e5ceca549e5ce7354022cbbb8bf653c0ecb4254c8ac8b2e23
+code packetpeek 31 ff69cc62c7f18d0f5d5c541b7bb4877f7f76b82e0ae816a49f09aeb425e381d0
+field body_data packet 0x26 1
+field body_returned packet 0xc4 0
+field granule_vals packet 0xe3 1
+field lacing_packet packet 0x15 0
+field lacing_returned packet 0x12 1
+field lacing_vals packet 0x23 1
+field packet_bos packet 0xc7 0
+field packet_bytes packet 0xec 1
+field packet_data packet 0x26 1
+field packet_eos packet 0xc4 0
+field packet_granulepos packet 0x23 1
+field packet_packetno packet 0xd7 0
+field packetno packet 0x35 0
+link packetout 20 rel packet 0
+link packetpeek 20 rel packet 0
+root packetout 6
+root packetpeek 6

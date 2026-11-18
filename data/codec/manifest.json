@@ -1,0 +1,3505 @@
+{
+  "schema": 1,
+  "sources": {
+    "ogg": {
+      "1.3.0": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.0.tar.xz",
+        "sha256": "231725029c843492914f24e74085e734bca6f1d6446ac72df39b0c3a9d4bc74b"
+      },
+      "1.3.1": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.1.tar.xz",
+        "sha256": "3a5bad78d81afb78908326d11761c0fb1a0662ee7150b6ad587cc586838cdcfa"
+      },
+      "1.3.2": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.2.tar.xz",
+        "sha256": "3f687ccdd5ac8b52d76328fbbfebc70c459a40ea891dbf3dccb74a210826e79b"
+      },
+      "1.3.3": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.3.tar.xz",
+        "sha256": "4f3fc6178a533d392064f14776b23c397ed4b9f48f5de297aba73b643f955c08"
+      },
+      "1.3.4": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.4.tar.xz",
+        "sha256": "c163bc12bc300c401b6aa35907ac682671ea376f13ae0969a220f7ddf71893fe"
+      },
+      "1.3.5": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.xz",
+        "sha256": "c4d91be36fc8e54deae7575241e03f4211eb102afb3fc0775fbbc1b740016705"
+      },
+      "1.3.6": {
+        "url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.6.tar.xz",
+        "sha256": "5c8253428e181840cd20d41f3ca16557a9cc04bad4a3d04cce84808677fa1061"
+      }
+    },
+    "theora": {
+      "1.1.1": {
+        "url": "https://downloads.xiph.org/releases/theora/libtheora-1.1.1.tar.xz",
+        "sha256": "f36da409947aa2b3dcc6af0a8c2e3144bc19db2ed547d64e9171c59c66561c61"
+      },
+      "1.2.0": {
+        "url": "https://downloads.xiph.org/releases/theora/libtheora-1.2.0.tar.xz",
+        "sha256": "ebdf77a8f5c0a8f7a9e42323844fa09502b34eb1d1fece7b5f54da41fe2122ec"
+      }
+    },
+    "vorbis": {
+      "1.3.7": {
+        "url": "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz",
+        "sha256": "b33cc4934322bcbf6efcbacf49e3ca01aadbea4114ec9589d1b1e9d20f72954b"
+      }
+    }
+  },
+  "source_dependencies": {
+    "theora": {
+      "ogg": "1.3.6"
+    },
+    "vorbis": {
+      "ogg": "1.3.6"
+    }
+  },
+  "toolchains": {
+    "clang-cl": "clang version 23.1.2 (https://github.com/llvm/llvm-project 85ac560262434c9ccfc0c183ec22d4138ed647fb)",
+    "mingw": "i686-w64-mingw32-gcc (GCC) 13-win32",
+    "msvc-v140": "19.00.24247.2",
+    "msvc-v141": "19.16.27054",
+    "msvc-v142": "19.29.30159",
+    "msvc-v143": "19.44.35229"
+  },
+  "families": {
+    "ogg-upstream-x86-1bcbca4b06f79ccd.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-1fcc2ff222142b69.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-49aa18bd51ec8f71.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-66e6219476b84e3a.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-70a906ce18aa7a1f.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-73e9b969f4b95d83.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-80fda2940188b7cd.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-8cd4d6b64911a913.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-c9b0b9d2beb8d5b5.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-d761ef6a669132cf.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "clang-cl",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "-m32",
+            "/O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-e1cb33dd5efd7e85.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-eb6379b3320678ea.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-f28920e6bb86c413.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "mingw",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "ogg-upstream-x86-fbe717a9691d1019.txt": {
+      "library": "ogg",
+      "alternate_roots": [
+        "packetout",
+        "packetpeek"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.0",
+            "1.3.1",
+            "1.3.2",
+            "1.3.3",
+            "1.3.4",
+            "1.3.5",
+            "1.3.6"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-057d59f27c87b839.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-0e2df071aa422645.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-21a9da0fd7a7a7ae.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-2dd3aeb37dea82ea.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 2,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-39de9643e304bcd1.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "init"
+      ],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "mingw",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-O2"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-4131e4cb6cd2b853.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "init"
+      ],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "clang-cl",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "-m32",
+            "/O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-4468e54d0ff1e99e.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-51c9dd85952373ca.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-57987851866f2eba.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-63f89d3654af8676.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 3,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-65259e561347b349.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-65b4f0ca913b0900.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "pp_level"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-7d5a717825ee9a69.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-82df25660d636dc4.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-83a64b0217f871e6.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "init"
+      ],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "mingw",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-O2"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-85ccf4cf964d90e0.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-8827a7649a1de033.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-8cf4bdd94c541892.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-98399918c2e50cf4.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-983d200f2316cfe5.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "clear"
+      ],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-99c73c98da500724.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-a29ab5358111b68f.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-a541cf6294600053.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-ada67dd72aa52b41.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-adc8c6b7cb1abc11.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-b1bc7275e6338821.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-b4d9a287bb8f075d.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "clear"
+      ],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 2,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-bd6ef8eebe8193b8.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-bdd99af0c1995360.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-c0d26e82337172b7.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "pp_level"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-c55d728674872ecb.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "ref_planes"
+      ],
+      "negative_addends": 3,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-c5ba31c8b41c2bec.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "frame_type"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-c9be4555c4c6248e.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [
+        "frame_type",
+        "pp_level",
+        "stripe"
+      ],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-cb7b7764c6e61b46.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-cdea5b9573df3462.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.2.0"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG",
+            "OC_X86_ASM"
+          ]
+        }
+      ]
+    },
+    "theora-upstream-x86-f4b38c75a76d2fc0.txt": {
+      "library": "theora",
+      "alternate_roots": [
+        "packet",
+        "alloc",
+        "free"
+      ],
+      "absent_hooks": [
+        "init"
+      ],
+      "literal_fields": [],
+      "negative_addends": 1,
+      "producers": [
+        {
+          "toolchain": "clang-cl",
+          "versions": [
+            "1.1.1"
+          ],
+          "flags": [
+            "/Gy",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "-m32",
+            "/O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-07c99a2fd084eb6e.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "clang-cl",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "-m32",
+            "/O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-24a6bd718a845092.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-4bed32a1e83a6f9f.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-5ad9e6c61a3b2a31.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-5c1622bfa537ce4a.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-5f35f1a0683d13ae.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "mingw",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-O2"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-61d39ea2ebbea566.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-6846484a81ecf1b1.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-763e2516e0975121.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-82ed36ccace2030a.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-836ff47bcdcd0917.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-849987c4ace84395.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-868eaac7180884d0.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-a9f15982b5eaf4bb.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O2"
+          ]
+        },
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/Ox"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-bdef4b8b24c339bf.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v141",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-c2baa28afe5712b7.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v142",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-ef7ad862b9cf7eac.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v143",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O1",
+            "/GL"
+          ],
+          "defines": [
+            "NDEBUG"
+          ],
+          "link_flags": [
+            "/LTCG",
+            "/DEBUG:FULL",
+            "/OPT:REF,NOICF",
+            "/INCREMENTAL:NO"
+          ],
+          "driver_flags": [
+            "/O1"
+          ]
+        }
+      ]
+    },
+    "vorbis-upstream-x86-f7e57c7a4f683b65.txt": {
+      "library": "vorbis",
+      "alternate_roots": [
+        "main"
+      ],
+      "absent_hooks": [],
+      "literal_fields": [],
+      "negative_addends": 0,
+      "producers": [
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/O2",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        },
+        {
+          "toolchain": "msvc-v140",
+          "versions": [
+            "1.3.7"
+          ],
+          "flags": [
+            "/Gy",
+            "/Gw",
+            "/MD",
+            "/Gd",
+            "/Z7",
+            "/Ox",
+            "/GL-"
+          ],
+          "defines": [
+            "NDEBUG"
+          ]
+        }
+      ]
+    }
+  },
+  "legacy_comparison": {
+    "theora-msvc-x86.txt": {
+      "reproduced": false,
+      "example": {
+        "library_version": "1.1.1",
+        "compiler_version": "19.44.35229",
+        "flags": [
+          "/Gy",
+          "/Gw",
+          "/MD",
+          "/Gd",
+          "/Z7",
+          "/O2",
+          "/GL",
+          "/Oy-"
+        ],
+        "link_flags": [
+          "/LTCG",
+          "/DEBUG:FULL",
+          "/OPT:REF,NOICF",
+          "/INCREMENTAL:NO"
+        ],
+        "compiled_hook_lengths": {
+          "packet": 2292,
+          "init": 1126,
+          "clear": 88
+        },
+        "legacy_hook_lengths": {
+          "packet": 2397,
+          "init": 629,
+          "clear": 88
+        }
+      },
+      "findings": [
+        "The normalized 88-byte clear digest also differs. The tested optimizations produce different inlining and the public packet entry retained by the driver uses cdecl. The legacy packet entry receives its first two arguments in registers.",
+        "The MSVC probes give decoder context sizes of 54032 for 1.1.1 and 57184 for 1.2.0. The legacy initialization extent is 54160."
+      ]
+    },
+    "vorbis-mdct-sse-x86.txt": {
+      "reproduced": false,
+      "closest_build": {
+        "library_version": "1.3.7",
+        "compiler_version": "19.44.35229",
+        "flags": [
+          "/Gy",
+          "/Gw",
+          "/MD",
+          "/Gd",
+          "/Z7",
+          "/O2",
+          "/GL",
+          "/Oy-"
+        ],
+        "link_flags": [
+          "/LTCG",
+          "/DEBUG:FULL",
+          "/OPT:REF,NOICF",
+          "/INCREMENTAL:NO"
+        ],
+        "matching_function_lengths": 5,
+        "matching_legacy_hashes": [
+          "bitreverse",
+          "butterfly16",
+          "first"
+        ],
+        "compiled_entry_call_offsets": [
+          383,
+          396
+        ],
+        "legacy_entry_call_offsets": [
+          384,
+          397
+        ]
+      },
+      "findings": [
+        "The public entry uses cdecl stack arguments. The legacy entry takes its first two arguments in registers. Compiling the driver with /GL produces a 425-byte bitreverse helper compared with 423 bytes in the legacy file, and still moves the entry call sites.",
+        "The butterflies call sites and absolute constants match. Its legacy hash differs. The legacy normalization includes rel32 displacements, which depend on the linked placement of the helpers."
+      ]
+    }
+  }
+}

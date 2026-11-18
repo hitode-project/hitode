@@ -1,0 +1,25 @@
+# prologue packetout 85688703380e789525a3ac71bfa8c088e54e29a8e62d3e0f0421479fb25e9e02 mov(ecx,[esp]) call(imm)
+# prologue packetpeek 85688703380e789525a3ac71bfa8c088e54e29a8e62d3e0f0421479fb25e9e02 mov(ecx,[esp]) call(imm)
+code n4 16 30951816556e3fcc6ae54fd208988844628611fe446cf2cf1913d679ac0d0c31
+code packet 278 f3f4070372a4b3335b5e1670c8e01633e5e86ceb6d5ac025f95936fd0d44471d
+code packetout 29 bfa8beb569e5f72f5f691223571b4b83805cff6a6822d933840d91b5f472a5a0
+code packetpeek 29 2a7464ba9a3a4b5afa7598fc556cd94acb679729ed4283af181cc94e4fa87da1
+field body_data packet 0x22 1
+field body_returned packet 0xb7 0
+field granule_vals packet 0xd6 1
+field lacing_packet packet 0x12 0
+field lacing_returned packet 0xf 1
+field lacing_vals packet 0x1e 1
+field packet_bos packet 0xba 0
+field packet_bytes packet 0x87 1
+field packet_data packet 0x22 1
+field packet_eos packet 0xb7 0
+field packet_granulepos packet 0x1e 1
+field packet_packetno packet 0xca 0
+field packetno packet 0x33 0
+link packetout 23 rel packet 0
+link packetout 5 rel n4 0
+link packetpeek 23 rel packet 0
+link packetpeek 5 rel n4 0
+root packetout 9
+root packetpeek 9

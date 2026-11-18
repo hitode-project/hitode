@@ -1,0 +1,38 @@
+# prologue main f2ee094292a08968bf136cf202e51d0ba26c255910c2216db047e746e7e294c8 sub(esp,imm) mov(ecx,[esp])
+code bitreverse 410 48151095ab6ce7c9373f032eaca8f3b58e1be0186c0a367f26994710295e66b7
+code butterflies 1324 7b1fb28702aed5a964ae60ebebba12e07c85cdf71c1a248150e5ede0f6e2d606
+code butterfly16 596 0f77c21907f285dc76055a4529f6a4cfc375114d54acd8c6a74bb9008f37d065
+code first 408 82ccac95a4186f263b45127a8cdf5459767f72bfbaee89fcebb69adb24a9ecd2
+code main 887 14ad21acbdf903dc5aa549ac8917400d37eebae20f25e2ef3432baa05d06c7ce
+data n10 4 d99e58435243d9fef9c88273b8d553b4fba4d0baf8009d29eae74fa99e0d9f57
+data n6 16 df141773470ba96aff5d6e9264a0bd638c9c6f3bb7ad30881cf4db943b5dd021
+data n7 4 42330c5ebb47616d428694d4617388de61bf50dfccb67f9e363efca8a2c89b84
+data n8 4 f006fdfb2ffdf20a391f483db9a1cc2b4b6a15e11d162da44ad6d4b1c8118302
+data n9 4 723c8fdc213c6caa05324e5d35fed7b7ba12565f07d26abf773735a424004953
+field bitrev_offset bitreverse 0xd 1
+field log2n_offset butterflies 0x7 1
+field lookup_bytes 20
+field n_offset main 0x14 1
+field scale_offset 16
+field trig_offset butterflies 0x3 1
+link bitreverse 135 abs n10 0
+link bitreverse 173 abs n10 0
+link bitreverse 327 abs n10 0
+link bitreverse 335 abs n10 0
+link butterflies 1187 abs n9 0
+link butterflies 1195 abs n9 0
+link butterflies 1276 rel butterfly16 0
+link butterflies 1284 rel butterfly16 0
+link butterflies 1292 abs n7 0
+link butterflies 1303 abs n8 0
+link butterflies 38 rel first 0
+link butterflies 618 abs n7 0
+link butterflies 629 abs n8 0
+link butterflies 862 abs n9 0
+link butterflies 870 abs n9 0
+link butterfly16 71 abs n9 0
+link main 11 abs n6 0
+link main 393 rel butterflies 0
+link main 409 rel bitreverse 0
+link main 425 abs n6 0
+root main 7

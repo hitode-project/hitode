@@ -1,0 +1,26 @@
+# prologue main 8e9ec400bed5ee0403d30e366782864f99a02168a4f91dbeeea98a75ea6b2974 push(ebp) push(edi) push(esi) push(ebx) sub(esp,imm)
+code bitreverse 262 e9e868e0918c469ae4ef1e17f5ae7359f7c8412728aa570a579eeb5da3912e6b
+code butterfly16 395 64df240602691a344c1fe4d30546cb5d5cb7222f8561f0a96f298d622e6b4bcf
+code first 296 d9fb0bcaa0bd84308bbc81078ab08976c8b62e573df2a1045c2b2a0280a8bd62
+code main 785 2324d08fc453dac9d2ccfed394259dcfc0dbc31ec6001f54ce746c139bb06343
+code n5 460 08cbec26c613eacd337e798f3cbf03fd5d442851151b2e50cc91e0c77403ed7c
+code n6 331 69af0573a0e9a5a9a36c468a18b7f9984b2e21060e60f8bbd08f779cf6450009
+data n7 36 c6051e673f157d36ca4878f24f7f54f05b82d1c510f5034699871a9571c95baf
+field bitrev_offset bitreverse 0xd 1
+field log2n_offset main 0x79 0
+field lookup_bytes 20
+field n_offset main 0x13 1
+field scale_offset 16
+field trig_offset main 0x15 1
+link bitreverse 116 abs n7 0
+link butterfly16 46 abs n7 4
+link main 313 rel n5 0
+link main 332 rel bitreverse 0
+link main 642 rel first 0
+link main 751 rel n6 0
+link n5 158 abs n7 4
+link n5 448 rel butterfly16 0
+link n5 456 rel butterfly16 0
+link n5 78 abs n7 8
+link n5 88 abs n7 12
+root main 7
