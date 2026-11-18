@@ -1509,6 +1509,13 @@ fn interleave_image(channels: usize, unpack: bool) -> Image {
 }
 
 fn interleave_body(a: &mut CodeAssembler, head: CodeLabel, channels: usize, unpack: bool) {
+    interleave_bytes(a, channels, unpack);
+    a.add(edi, channels as i32).unwrap();
+    a.cmp(edi, ecx).unwrap();
+    a.jb(head).unwrap();
+}
+
+fn interleave_bytes(a: &mut CodeAssembler, channels: usize, unpack: bool) {
     let planes = [esi, ebx, edx, ebp];
     for (i, &plane) in planes[..channels].iter().enumerate() {
         let interleaved = byte_ptr(edi + i as i32);
@@ -1522,9 +1529,47 @@ fn interleave_body(a: &mut CodeAssembler, head: CodeLabel, channels: usize, unpa
         a.mov(dst, al).unwrap();
         a.inc(plane).unwrap();
     }
-    a.add(edi, channels as i32).unwrap();
-    a.cmp(edi, ecx).unwrap();
-    a.jb(head).unwrap();
+}
+
+// spec: A64-OPT-6, A64-OPT-10
+#[test]
+fn vector_pack_recovers_latch_flags_after_a_strip() {
+    let image = Image::loop_body(|a, outer, _| {
+        let mut head = a.create_label();
+        // The pack's entry recipe uses EAX, which the pack overwrites.
+        a.cmp(eax, 0).unwrap();
+        a.set_label(&mut head).unwrap();
+        interleave_bytes(a, 4, false);
+        a.cmp(edi, ecx).unwrap();
+        a.lea(edi, dword_ptr(edi + 4)).unwrap();
+        a.jb(head).unwrap();
+        a.add(ecx, 321).unwrap();
+        a.jmp(outer).unwrap();
+    });
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    // The first outer iteration takes one scalar trip before entering the form.
+    let mut cpu = initial(OUTPUT - 1);
+    cpu.regs[6] = boundary - 50;
+    cpu.regs[3] = DATA;
+    cpu.regs[2] = DATA + 0x400;
+    cpu.regs[5] = DATA + 0x800;
+    let data = vector_data(295);
+    let mut trial = Trial::new(&image, &cpu, "pack latch flags", &[], |m| {
+        m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+        m.map(boundary, HOST_PAGE, 0).unwrap();
+        m.write(cpu.regs[6], &data[..50]).unwrap();
+        m.write(DATA, &data).unwrap();
+    });
+    let compiled = crate::jit_map::collect_vectorized(|| assert!(trial.try_install_at(cpu)));
+    let &[(head, 16)] = compiled.as_slice() else {
+        panic!("expected a 16-lane pack kernel, got {compiled:?}");
+    };
+    let (outcome, retired) = trial.compare(4096);
+    assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
+    assert_eq!(retired, 1 + 18 + 1 + 15 * 49);
+    assert_eq!(trial.live.state.eip, head);
+    assert_eq!(trial.live.state.eflags, 0x87);
+    assert_eq!(trial.live.native.as_ref().unwrap().vector_regions(), 3);
 }
 
 // spec: A64-OPT-10

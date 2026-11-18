@@ -345,7 +345,7 @@ fn transport(
             };
             FlagSelect::Induction { current, initial }
         } else {
-            FlagSelect::Tag(func.param(phi.block, Type::I32))
+            FlagSelect::Tag(func.flag_param(phi.block, Type::I32))
         };
         let head_params = func.blocks[phi.block.0 as usize].params.clone();
         let operands = origins
@@ -380,7 +380,7 @@ fn transport(
                     }) {
                         p
                     } else {
-                        func.param(phi.block, ty)
+                        func.flag_param(phi.block, ty)
                     });
                 });
                 (v, args)

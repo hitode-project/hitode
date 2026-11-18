@@ -6,7 +6,7 @@
 //! emission offsets by the private alias base.
 
 use iced_x86::ConditionCode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::recovery::IrRecord;
 
@@ -541,6 +541,8 @@ pub(crate) struct Func {
     pub kept: u32,
     /// Charged heads in resident forms leave through complete records.
     pub resident: bool,
+    /// Block parameters introduced solely to carry lazy EFLAGS recipes.
+    pub flag_params: BTreeSet<Value>,
     /// Guest calls and returns translated into the SSA form.
     pub calls: Vec<u32>,
     /// Guest EIPs of resident checks whose operations produce a value.
@@ -562,6 +564,12 @@ impl Func {
     pub(crate) fn param(&mut self, block: Block, ty: Type) -> Value {
         let value = self.value(ty);
         self.blocks[block.0 as usize].params.push(value);
+        value
+    }
+
+    pub(crate) fn flag_param(&mut self, block: Block, ty: Type) -> Value {
+        let value = self.param(block, ty);
+        self.flag_params.insert(value);
         value
     }
 

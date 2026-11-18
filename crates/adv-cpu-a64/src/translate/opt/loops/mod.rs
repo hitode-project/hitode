@@ -86,14 +86,16 @@ impl Stream {
     }
 }
 
-/// The header parameters and the arguments of the one returning edge are
-/// parallel arrays. The blocks are in topological order inside the iteration.
+/// The blocks are in topological order inside the iteration.
 pub(super) struct Loop {
     pub head: Block,
     pub latch: Block,
     pub latch_taken: bool,
     pub blocks: Vec<Block>,
+    /// Header parameters and their returning edge arguments.
     pub carried: Vec<(Value, Value)>,
+    /// Returning edge values needed only by lazy head flag recipes.
+    pub flag_carried: Vec<(Value, Value)>,
     pub ivs: Vec<Iv>,
     pub trip: Trip,
     pub streams: Vec<Stream>,
@@ -281,12 +283,12 @@ fn classify(
         return Err(Reject::Control);
     }
 
-    let carried: Vec<_> = func.blocks[head]
+    let (flag_carried, carried): (Vec<_>, Vec<_>) = func.blocks[head]
         .params
         .iter()
         .copied()
         .zip(back.args.iter().copied())
-        .collect();
+        .partition(|(p, _)| func.flag_params.contains(p));
     let ivs: Vec<_> = carried
         .iter()
         .filter_map(|&(p, a)| {
@@ -386,6 +388,7 @@ fn classify(
         latch_taken,
         blocks,
         carried,
+        flag_carried,
         ivs,
         trip,
         streams,
@@ -526,29 +529,20 @@ impl Batch {
 
         let defs = Defs::new(func);
         let mut recovery = Vec::new();
-        if let Some(head) = func.blocks[loop_.head.0 as usize].head {
-            let record = &func.records[head.record.0 as usize];
-            for &(param, arg) in &loop_.carried {
-                if param == arg
-                    || loop_.ivs.iter().any(|iv| iv.base == param)
-                    || !record
-                        .flag_groups
-                        .iter()
-                        .any(|group| group.uses().any(|v| v == param))
-                {
-                    continue;
-                }
-                if func.ty(param) != Type::I32 {
-                    return None;
-                }
-                let mut value = defs.affine(arg);
-                if let Some(iv) = loop_.ivs.iter().find(|iv| iv.base == value.base) {
-                    value.offset = value.offset.wrapping_sub(iv.stride as u32);
-                } else if !defs.invariant(&loop_.blocks, value.base) {
-                    return None;
-                }
-                recovery.push((param, value));
+        for &(param, arg) in &loop_.flag_carried {
+            if param == arg {
+                continue;
             }
+            if func.ty(param) != Type::I32 {
+                return None;
+            }
+            let mut value = defs.affine(arg);
+            if let Some(iv) = loop_.ivs.iter().find(|iv| iv.base == value.base) {
+                value.offset = value.offset.wrapping_sub(iv.stride as u32);
+            } else if !defs.invariant(&loop_.blocks, value.base) {
+                return None;
+            }
+            recovery.push((param, value));
         }
         let mut frame = Vec::new();
         let mut crossings = Vec::new();
