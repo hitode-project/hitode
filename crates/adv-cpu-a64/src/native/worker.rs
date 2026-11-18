@@ -11,7 +11,9 @@ use adv_cpu_core::backend::{Completion, Computation, Pace};
 use adv_sync::WakeEvent;
 use rustc_hash::FxHashMap;
 
-use super::{ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Runtime, Site, record_branch};
+use super::{
+    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Runtime, Site, alias_base, record_branch,
+};
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
 use crate::translate::computation::{Evaluation, Plan, Proof, Range};
@@ -46,6 +48,7 @@ pub(super) struct Prepared {
     forms: std::cell::Cell<u8>,
     building: std::cell::Cell<bool>,
     skip: std::cell::Cell<u32>,
+    owner_runs: std::cell::Cell<u64>,
     mode: std::cell::Cell<Mode>,
     /// Instructions and time per outer iteration, once a job showed them.
     per_iteration: std::cell::Cell<Option<(u64, f64)>>,
@@ -77,6 +80,7 @@ impl Prepared {
             forms: std::cell::Cell::new(0),
             building: std::cell::Cell::new(false),
             skip: std::cell::Cell::new(0),
+            owner_runs: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
             per_iteration: std::cell::Cell::new(None),
             cost: std::cell::Cell::new(0),
@@ -133,6 +137,12 @@ impl Prepared {
             self.skip.set(skip - 1);
             false
         }
+    }
+
+    pub fn record_owner_run(&self) -> u64 {
+        let n = self.owner_runs.get().wrapping_add(1);
+        self.owner_runs.set(n);
+        n
     }
 
     fn observe(&self, entry: u32, iteration: bool, done: &Done) {
@@ -197,12 +207,20 @@ pub(super) struct Optimized {
 pub(super) struct Faults<'a> {
     pub code: &'a Code,
     pub stub: usize,
+    pub capture: &'a FaultCapture,
+}
+
+#[derive(Default)]
+pub(super) struct ExecuteScratch {
+    pub params: Vec<u128>,
+    pub saved: Vec<u128>,
     pub capture: FaultCapture,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
     pub enter: Enter,
+    pub opt_enter: Enter,
     pub window: u64,
     pub alias: u64,
     pub fault: usize,
@@ -255,8 +273,8 @@ fn run(
     mut context: ExecutionContext,
     entry: Entry,
     (code, head_exit): (&Code, u32),
-    signals: &Signals,
-    recall_mask: u32,
+    (signals, recall_mask): (&Signals, u32),
+    scratch: &mut ExecuteScratch,
 ) -> Done {
     runtime.countdown = u64::from(COMPUTATION_SLICE);
     runtime.recall = signals.recall.as_ptr() as u64;
@@ -268,9 +286,11 @@ fn run(
     let started = Instant::now();
     let cpu = context.cpu_mut();
     cpu.settle_flags();
-    cpu.refresh_mmx();
-    let optimized = admit(code, cpu, entry.alias);
-    let (exit, retired) = execute(runtime, cpu, entry, code, optimized.as_ref());
+    if code.optimized.as_deref().is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
+        cpu.refresh_mmx();
+    }
+    let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
+    let (exit, retired) = execute(runtime, cpu, entry, code, optimized, scratch, true);
     let elapsed = started.elapsed();
     record_branch(cpu, runtime.branch, cpu.eip);
     context.finish_computation(exit);
@@ -293,22 +313,23 @@ fn run(
     }
 }
 
-/// The optimized form of `code` and its entry cells, if it has one whose
-/// entry facts hold at `cpu`. `alias` reaches the admitted frame.
+/// The optimized form of `code` if it has one whose entry facts hold at
+/// `cpu`, filling `params`. `alias` reaches the admitted frame.
 pub(super) fn admit<'a>(
     code: &'a Code,
     cpu: &CpuState,
     alias: u64,
-) -> Option<(&'a Optimized, Vec<u128>)> {
+    params: &mut Vec<u128>,
+) -> Option<&'a Optimized> {
     let o = code.optimized.as_deref()?;
     // SAFETY: admission granted the frame's ranges.
-    let cells = crate::translate::opt::admit(&o.entry, &o.assumed, cpu, |addr, width| unsafe {
+    crate::translate::opt::admit_into(&o.entry, &o.assumed, cpu, params, |addr, width| unsafe {
         let mut bytes = [0; 8];
         let at = alias.wrapping_add(u64::from(addr)) as *const u8;
         std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), usize::from(width));
         u64::from_le_bytes(bytes)
-    })?;
-    Some((o, cells))
+    })
+    .then_some(o)
 }
 
 /// Enters `code`, or `optimized`, its admitted form, on this thread. The
@@ -321,21 +342,26 @@ pub(super) fn execute(
     cpu: &mut CpuState,
     entry: Entry,
     code: &Code,
-    optimized: Option<&(&Optimized, Vec<u128>)>,
+    optimized: Option<&Optimized>,
+    scratch: &mut ExecuteScratch,
+    sync_icache: bool,
 ) -> (Exit, u64) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
-    let mut saved = vec![0u128; optimized.map_or(0, |(o, _)| o.cells)];
     let entry_esp = cpu.regs[ESP];
-    let code = optimized.map_or(code, |(o, _)| &o.code);
-    if let Some((o, cells)) = optimized {
-        runtime.opt_params = cells.as_ptr() as u64;
-        runtime.opt_save = saved.as_mut_ptr() as u64;
+    let code = optimized.map_or(code, |o| &o.code);
+    if let Some(o) = optimized {
+        if scratch.saved.len() < o.cells {
+            scratch.saved.resize(o.cells, 0);
+        }
+        runtime.opt_params = scratch.params.as_ptr() as u64;
+        runtime.opt_save = scratch.saved.as_mut_ptr() as u64;
         runtime.opt_cells = o.cells as u64;
     }
+    scratch.capture.pc.set(0);
     let faults = Faults {
         code,
         stub: entry.fault,
-        capture: FaultCapture::default(),
+        capture: &scratch.capture,
     };
     let countdown = runtime.countdown;
     runtime.cpu = cpu;
@@ -349,10 +375,17 @@ pub(super) fn execute(
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
     unsafe {
-        // Instruction-cache maintenance is done by the publishing owner.
-        // Its ISB does not synchronize this thread's instruction stream.
-        std::arch::asm!("isb", options(nostack, preserves_flags));
-        (entry.enter)(runtime, code.entry);
+        if sync_icache {
+            // Instruction-cache maintenance is done by the publishing owner.
+            // Its ISB does not synchronize a helper thread's instruction stream.
+            std::arch::asm!("isb", options(nostack, preserves_flags));
+        }
+        let target_enter = if optimized.is_some() {
+            entry.opt_enter
+        } else {
+            entry.enter
+        };
+        target_enter(runtime, code.entry);
     }
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
@@ -360,13 +393,13 @@ pub(super) fn execute(
     // An optimized form may leave with a negative countdown.
     let mut retired = (runtime.completed + countdown).wrapping_sub(runtime.countdown);
     if exit == Exit::Optimized {
-        let (o, _) = optimized.expect("optimized entry");
+        let o = optimized.expect("optimized entry");
         let record = &o.records[runtime.opt_record as usize];
         // SAFETY: as above, the frame lies in the leased ranges.
         let refund = recovery::materialize(
             record,
             &runtime.opt_dump,
-            &saved,
+            &scratch.saved,
             &o.flags,
             cpu,
             |offset, bytes| unsafe {
@@ -388,7 +421,9 @@ pub(super) fn execute(
         faults.capture.recover(cpu, site, runtime.temps);
         retired -= u64::from(site.refund);
     }
-    cpu.refresh_mmx();
+    if optimized.is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
+        cpu.refresh_mmx();
+    }
     (exit, retired)
 }
 
@@ -515,7 +550,7 @@ impl Blocks {
         }
     }
 
-    fn drain(&self, runtime: &mut Runtime) -> Drained {
+    fn drain(&self, runtime: &mut Runtime, scratch: &mut ExecuteScratch) -> Drained {
         let started = Instant::now();
         let thread = self.threads.fetch_add(1, Ordering::Relaxed);
         let mut out = Drained::default();
@@ -546,8 +581,8 @@ impl Blocks {
                 context,
                 self.entry,
                 (&self.code, iterations),
-                &quiet,
-                0,
+                (&quiet, 0),
+                scratch,
             )
             .completion;
             let cpu = done.context.as_ref().expect("block context").cpu();
@@ -608,12 +643,13 @@ impl Pool {
                     }
                     crate::cache::execution_thread();
                     let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
+                    let mut scratch = ExecuteScratch::default();
                     loop {
                         let job = recv.lock().unwrap().recv();
                         let task = match job {
                             Ok(Job::Whole(task)) => *task,
                             Ok(Job::Blocks(blocks, done)) => {
-                                let drained = blocks.drain(&mut runtime);
+                                let drained = blocks.drain(&mut runtime, &mut scratch);
                                 active.fetch_sub(1, Ordering::Release);
                                 let _ = done.send(drained);
                                 continue;
@@ -626,8 +662,8 @@ impl Pool {
                             task.context,
                             task.entry,
                             (&task.code, u32::from(task.once)),
-                            &task.signals,
-                            RECALL,
+                            (&task.signals, RECALL),
+                            &mut scratch,
                         );
                         if result.completion.requires_owner {
                             task.signals
@@ -675,19 +711,99 @@ impl Pool {
     }
 }
 
+const PAGE_GRANTS: usize = 256;
+
+struct PageGrants {
+    slots: [u64; PAGE_GRANTS],
+}
+
+impl Default for PageGrants {
+    fn default() -> Self {
+        Self {
+            slots: [0; PAGE_GRANTS],
+        }
+    }
+}
+
+impl PageGrants {
+    fn clear(&mut self) {
+        self.slots.fill(0);
+    }
+
+    #[inline]
+    fn allows(&mut self, memory: &Memory, start: u32, end: u64, write: bool) -> bool {
+        if end <= u64::from(start) {
+            return false;
+        }
+        let Ok(last_byte) = u32::try_from(end - 1) else {
+            return false;
+        };
+        let first = start >> 12;
+        let last = last_byte >> 12;
+        let need_bit = 1u64 << if write { 33 } else { 32 };
+        for page in first..=last {
+            let tag = u64::from(page) + 1;
+            let idx = ((page ^ (page >> 8)) as usize) & (PAGE_GRANTS - 1);
+            let slot = self.slots[idx];
+            if (slot & 0xffff_ffff) == tag && (slot & need_bit) != 0 {
+                continue;
+            }
+            let page_addr = page << 12;
+            if memory.computation_range(page_addr, 4096, write) {
+                let base = if (slot & 0xffff_ffff) == tag {
+                    slot
+                } else {
+                    tag
+                };
+                self.slots[idx] = base | need_bit;
+                continue;
+            }
+            let Ok(len) = usize::try_from(end - u64::from(start)) else {
+                return false;
+            };
+            return memory.computation_range(start, len, write);
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Admission {
     eval: Evaluation,
-    grants: Vec<Range>,
+    grants: PageGrants,
     generation: (u64, u64),
     spare: Vec<Vec<Range>>,
 }
 
 impl Admission {
+    fn sync_generation(&mut self, memory: &Memory) {
+        let generation = (memory.identity(), memory.map_generation());
+        if self.generation != generation {
+            self.generation = generation;
+            self.grants.clear();
+        }
+    }
+
     /// Whether the owner may run the computation at `cpu` itself, with no
     /// job active: its ranges evaluate and are ordinary memory.
-    pub(super) fn alone(&mut self, proof: &Proof, cpu: &CpuState, memory: &Memory) -> bool {
-        self.ranges(proof, cpu, memory, &[]).is_some()
+    pub(super) fn alone(
+        &mut self,
+        proof: &Proof,
+        cpu: &CpuState,
+        memory: &Memory,
+        alias: u64,
+    ) -> bool {
+        self.sync_generation(memory);
+        let grants = &mut self.grants;
+        let Some((ranges, outputs)) = proof.evaluate_alone(cpu, &mut self.eval, |addr| {
+            parameter(memory, grants, alias, &[], addr)
+        }) else {
+            return false;
+        };
+        ranges.iter().chain(outputs).all(|range| {
+            self.grants
+                .allows(memory, range.start, range.end, range.write)
+        })
     }
 
     fn ranges<'a>(
@@ -697,18 +813,20 @@ impl Admission {
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<&'a [Range]> {
-        let generation = (memory.identity(), memory.map_generation());
-        if self.generation != generation {
-            self.generation = generation;
-            self.grants.clear();
-        }
+        self.sync_generation(memory);
+        let alias = alias_base(memory);
         let grants = &mut self.grants;
         let ranges = proof.evaluate(cpu, &mut self.eval, |addr| {
-            parameter(memory, grants, active, addr)
+            parameter(memory, grants, alias, active, addr)
         })?;
         ranges
             .iter()
-            .all(|range| !conflicts(range, active) && grant(memory, &mut self.grants, range))
+            .all(|range| {
+                !conflicts(range, active)
+                    && self
+                        .grants
+                        .allows(memory, range.start, range.end, range.write)
+            })
             .then_some(ranges)
     }
 }
@@ -722,9 +840,10 @@ impl Admission {
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<Plan> {
+        let alias = alias_base(memory);
         let grants = &mut self.grants;
         proof.plan(cpu, &mut self.eval, |addr| {
-            parameter(memory, grants, active, addr)
+            parameter(memory, grants, alias, active, addr)
         })
     }
 }
@@ -738,14 +857,18 @@ impl Admission {
         };
         !self.eval.admitted().iter().any(overlaps)
             && !conflicts(region, active)
-            && grant(memory, &mut self.grants, region)
+            && self
+                .grants
+                .allows(memory, region.start, region.end, region.write)
     }
 }
 
 /// One ordinary four-byte parameter cell, after checking active write leases.
+#[inline]
 fn parameter(
     memory: &Memory,
-    grants: &mut Vec<Range>,
+    grants: &mut PageGrants,
+    alias: u64,
     active: &[ActiveTask],
     addr: u32,
 ) -> Option<u32> {
@@ -754,31 +877,16 @@ fn parameter(
         end: u64::from(addr) + 4,
         write: false,
     };
-    if conflicts(&range, active) || !grant(memory, grants, &range) {
+    if (!active.is_empty() && conflicts(&range, active))
+        || !grants.allows(memory, range.start, range.end, false)
+    {
         return None;
     }
-    let mut bytes = [0; 4];
-    memory.read_into(addr, &mut bytes).ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
-fn grant(memory: &Memory, cache: &mut Vec<Range>, range: &Range) -> bool {
-    if cache.iter().any(|grant| {
-        grant.start == range.start && grant.end == range.end && grant.write == range.write
-    }) {
-        return true;
-    }
-    let Ok(len) = usize::try_from(range.end - u64::from(range.start)) else {
-        return false;
-    };
-    if !memory.computation_range(range.start, len, range.write) {
-        return false;
-    }
-    if cache.len() == 64 {
-        cache.clear();
-    }
-    cache.push(*range);
-    true
+    // SAFETY: `grants.allows(..., false)` verified `range` is committed,
+    // readable, ordinary non-shared storage within `memory`'s private alias.
+    Some(u32::from_le(unsafe {
+        std::ptr::read_unaligned(alias.wrapping_add(u64::from(addr)) as *const u32)
+    }))
 }
 
 struct ActiveTask {
@@ -930,7 +1038,7 @@ impl<'a> Session<'a> {
         let submitted = (0..helpers)
             .take_while(|_| self.pool.submit(Job::Blocks(blocks.clone(), send.clone())))
             .count();
-        let mut total = blocks.drain(&mut self.runtime);
+        let mut total = blocks.drain(&mut self.runtime, &mut ExecuteScratch::default());
         let mut helped = Duration::ZERO;
         self.counts.splits += 1;
         self.counts.wakes += submitted as u64;
@@ -1120,14 +1228,15 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             };
             return Some(self.account(guest_entry, false, done));
         }
+        let mut scratch = ExecuteScratch::default();
         let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
             (&code, u32::from(iteration)),
-            &self.signals,
-            LOCAL,
+            (&self.signals, LOCAL),
+            &mut scratch,
         );
         if let Some(plan) = plan
             && !done.completion.requires_owner
@@ -1334,19 +1443,23 @@ mod tests {
             second.unwrap(),
             Entry {
                 enter: native.enter,
+                opt_enter: native.opt_enter,
                 window: native.runtime.window,
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
             (&native.computation.get(&head).unwrap().code, 0),
-            &Signals {
-                recall: Arc::new(AtomicU32::new(0)),
-                pending: (
-                    Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)),
-                    adv_sync::pending::DEADLINE,
-                ),
-            },
-            LOCAL,
+            (
+                &Signals {
+                    recall: Arc::new(AtomicU32::new(0)),
+                    pending: (
+                        Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)),
+                        adv_sync::pending::DEADLINE,
+                    ),
+                },
+                LOCAL,
+            ),
+            &mut ExecuteScratch::default(),
         )
         .completion;
         assert!(!local.requires_owner);
@@ -1473,6 +1586,7 @@ mod tests {
             start: start.clone().unwrap(),
             entry: Entry {
                 enter: native.enter,
+                opt_enter: native.opt_enter,
                 window: native.runtime.window,
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
@@ -2028,6 +2142,7 @@ mod tests {
                 assert!(prepared.code.optimized.is_some());
                 let entry = Entry {
                     enter: native.enter,
+                    opt_enter: native.opt_enter,
                     window: native.runtime.window,
                     alias: super::super::alias_base(executor.memory()),
                     fault: native.stubs.fault,
@@ -2046,8 +2161,8 @@ mod tests {
                     start.clone().unwrap(),
                     entry,
                     (&prepared.code, 0),
-                    &signals,
-                    LOCAL,
+                    (&signals, LOCAL),
+                    &mut ExecuteScratch::default(),
                 )
                 .completion;
                 assert!(cut.optimized > 0 && cut.retired < u64::from(COUNT) * 13);
@@ -2118,8 +2233,8 @@ mod tests {
                         f_start,
                         fault_entry,
                         (&native.computation[&CODE].code, 0),
-                        &clean_signals,
-                        LOCAL,
+                        (&clean_signals, LOCAL),
+                        &mut ExecuteScratch::default(),
                     );
                     assert_eq!(done.admitted, Some(true));
                     let faulted = done.completion;
@@ -2352,16 +2467,20 @@ mod tests {
             context,
             Entry {
                 enter: native.enter,
+                opt_enter: native.opt_enter,
                 window: native.runtime.window,
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.stubs.fault,
             },
             (&native.computation[&outer].code, 0),
-            &Signals {
-                recall: Arc::new(AtomicU32::new(RECALL)),
-                pending: (Arc::new(AtomicU32::new(0)), 0),
-            },
-            RECALL,
+            (
+                &Signals {
+                    recall: Arc::new(AtomicU32::new(RECALL)),
+                    pending: (Arc::new(AtomicU32::new(0)), 0),
+                },
+                RECALL,
+            ),
+            &mut ExecuteScratch::default(),
         )
         .completion;
         assert!(recalled.requires_owner);
@@ -2389,6 +2508,266 @@ mod tests {
             serial += result.retired;
         }
         panic!("serial continuation did not offer the prepared head");
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn page_grant_cache_invalidates_on_protection_and_watch_code() {
+        let _pool = exclusive_pool();
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut loop_head = a.create_label();
+        a.set_label(&mut loop_head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(loop_head).unwrap();
+        let head = CODE + 1;
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        {
+            let memory = executor.memory_mut();
+            memory.map(INPUT, 0x2_0000, READ | WRITE).unwrap();
+            memory.map(OUTPUT, 0x2_0000, READ | WRITE).unwrap();
+        }
+        native.first_visits = false;
+        native.set_computation_offer(true, None);
+        let mut init_regs = [0u32; 8];
+        init_regs[1] = 20_000;
+        init_regs[6] = INPUT;
+        init_regs[7] = OUTPUT;
+        let mut cpu = CpuState {
+            eip: CODE,
+            regs: init_regs,
+            ..Default::default()
+        };
+        for _ in 0..500 {
+            if native.diagnostics.optimized_runs > 0 {
+                break;
+            }
+            if cpu.eip == stop {
+                cpu.eip = CODE;
+                cpu.regs[1] = 20_000;
+                cpu.regs[6] = INPUT;
+                cpu.regs[7] = OUTPUT;
+            }
+            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            native.diagnostics.optimized_runs > 0,
+            "loop did not promote and run optimized"
+        );
+        let prepared = &native.computation[&head];
+        let memory = executor.memory();
+        let alias = super::alias_base(memory);
+
+        // Initial check and sliding pointers inside the first page and across
+        // the second page must all be admitted via PageGrants.
+        cpu.eip = head;
+        cpu.regs[1] = 4;
+        cpu.regs[6] = INPUT;
+        cpu.regs[7] = OUTPUT;
+        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+        cpu.regs[6] = INPUT + 64;
+        cpu.regs[7] = OUTPUT + 64;
+        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+        cpu.regs[6] = INPUT + 0x1000;
+        cpu.regs[7] = OUTPUT + 0x1000;
+        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+
+        // Removing read permission on the cached first input page invalidates it.
+        executor.memory_mut().protect(INPUT, 4096, 0).unwrap();
+        cpu.regs[6] = INPUT + 64;
+        cpu.regs[7] = OUTPUT + 64;
+        assert!(
+            !native
+                .admission
+                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+        );
+
+        // Restoring permissions re-admits; watching code inside the output page
+        // rejects writes into the watched line while respecting exact ranges.
+        executor
+            .memory_mut()
+            .protect(INPUT, 4096, READ | WRITE)
+            .unwrap();
+        assert!(
+            native
+                .admission
+                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+        );
+
+        executor.memory_mut().watch_code(OUTPUT + 128, 64);
+        cpu.regs[6] = INPUT + 128;
+        cpu.regs[7] = OUTPUT + 128;
+        assert!(
+            !native
+                .admission
+                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+        );
+    }
+
+    // spec: A64-OPT-1 A64-OPT-5
+    #[test]
+    fn shadow_caller_absorbs_distant_inner_candidate() {
+        let _pool = exclusive_pool();
+        let outer = CODE;
+        let inner = CODE + 0x6000;
+        let src = 0x10_0000u32;
+        let dst = 0x20_0000u32;
+        let stack_base = 0x30_0000u32;
+        let stack = stack_base + 0x2000;
+
+        let mut oa = CodeAssembler::new(32).unwrap();
+        let mut row_loop = oa.create_label();
+        oa.set_label(&mut row_loop).unwrap();
+        oa.push(ecx).unwrap();
+        oa.push(esi).unwrap();
+        oa.push(edi).unwrap();
+        oa.mov(ecx, 16).unwrap();
+        oa.call(u64::from(inner)).unwrap();
+        oa.pop(edi).unwrap();
+        oa.pop(esi).unwrap();
+        oa.pop(ecx).unwrap();
+        oa.add(esi, 64).unwrap();
+        oa.add(edi, 64).unwrap();
+        oa.dec(ecx).unwrap();
+        oa.jne(row_loop).unwrap();
+        let outer_code = oa.assemble(u64::from(outer)).unwrap();
+        let stop = outer + outer_code.len() as u32;
+        oa.int3().unwrap();
+        let outer_with_stop = oa.assemble(u64::from(outer)).unwrap();
+
+        let mut ia = CodeAssembler::new(32).unwrap();
+        let mut inner_loop = ia.create_label();
+        ia.set_label(&mut inner_loop).unwrap();
+        ia.mov(eax, dword_ptr(esi)).unwrap();
+        ia.add(eax, 3).unwrap();
+        ia.mov(dword_ptr(edi), eax).unwrap();
+        ia.add(esi, 4).unwrap();
+        ia.add(edi, 4).unwrap();
+        ia.dec(ecx).unwrap();
+        ia.jne(inner_loop).unwrap();
+        ia.ret().unwrap();
+        let inner_code = ia.assemble(u64::from(inner)).unwrap();
+
+        let mut executor = Executor::interpreted_address_space().unwrap();
+        {
+            let memory = executor.memory_mut();
+            memory.map(outer, 0x8000, READ | WRITE).unwrap();
+            memory.write(outer, &outer_with_stop).unwrap();
+            memory.write(inner, &inner_code).unwrap();
+            memory.protect(outer, 0x8000, READ | EXEC).unwrap();
+            memory.map(src, 0x4_0000, READ | WRITE).unwrap();
+            memory.map(dst, 0x4_0000, READ | WRITE).unwrap();
+            memory.map(stack_base, 0x4000, READ | WRITE).unwrap();
+            for i in 0..0x1000u32 {
+                let addr = src + i * 4;
+                memory.write(addr, &i.to_le_bytes()).unwrap();
+            }
+        }
+        let mut native = Native::new(executor.memory().window_base().unwrap()).unwrap();
+        native.first_visits = false;
+        native.set_computation_offer(true, None);
+        native.promotion = 1;
+
+        // First promote `inner` via budget exits returning to `stop` so `ret_pc` is never a stop.
+        let mut cpu = CpuState::default();
+        for _ in 0..8 {
+            executor
+                .memory_mut()
+                .write(stack, &stop.to_le_bytes())
+                .unwrap();
+            cpu.eip = inner;
+            cpu.regs[1] = 20_000;
+            cpu.regs[4] = stack;
+            cpu.regs[6] = src;
+            cpu.regs[7] = dst;
+            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20);
+        }
+        for _ in 0..200 {
+            executor
+                .memory_mut()
+                .write(stack, &stop.to_le_bytes())
+                .unwrap();
+            cpu.eip = inner;
+            cpu.regs[1] = 16;
+            cpu.regs[4] = stack;
+            cpu.regs[6] = src;
+            cpu.regs[7] = dst;
+            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20);
+            if native.diagnostics.optimized_runs > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            native.candidates.contains(&inner),
+            "inner loop did not become a candidate"
+        );
+
+        // Now call `outer` repeatedly with short row counts (< SLICE); shadow caller
+        // sampling must discover `outer`, absorb `inner`, and retire `inner` as a candidate.
+        let run_to_stop = |native: &mut Native, executor: &mut Executor, cpu: &mut CpuState| {
+            let mut steps = 0usize;
+            while cpu.eip != stop {
+                steps += 1;
+                assert!(steps < 500, "too many dispatches before stop");
+                let _ = alone(native, executor, cpu, stop, 1 << 20);
+            }
+            steps
+        };
+        for _ in 0..200 {
+            cpu.eip = outer;
+            cpu.regs[1] = 32;
+            cpu.regs[4] = stack;
+            cpu.regs[6] = src;
+            cpu.regs[7] = dst;
+            run_to_stop(&mut native, &mut executor, &mut cpu);
+            assert_eq!(cpu.eip, stop);
+            if native.candidates.contains(&outer) && !native.candidates.contains(&inner) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            native.candidates.contains(&outer),
+            "outer caller across >4KiB gap was not promoted"
+        );
+        assert!(
+            !native.candidates.contains(&inner),
+            "absorbed inner loop remained a separate candidate"
+        );
+
+        // Execute the promoted outer loop cleanly and verify it runs to `stop`
+        // in one optimized dispatch with exact output memory.
+        executor
+            .memory_mut()
+            .write(dst, &vec![0u8; 32 * 64])
+            .unwrap();
+        let before_runs = native.diagnostics.optimized_runs;
+        cpu.eip = outer;
+        cpu.regs[1] = 32;
+        cpu.regs[4] = stack;
+        cpu.regs[6] = src;
+        cpu.regs[7] = dst;
+        let steps = run_to_stop(&mut native, &mut executor, &mut cpu);
+        assert_eq!(steps, 1);
+        assert_eq!(cpu.eip, stop);
+        assert!(native.diagnostics.optimized_runs > before_runs);
+        for row in 0..32u32 {
+            for col in 0..16u32 {
+                let off = row * 64 + col * 4;
+                let bytes = executor.memory().read(dst + off, 4).unwrap();
+                let got = u32::from_le_bytes(bytes.try_into().unwrap());
+                let expected = (off / 4) + 3;
+                assert_eq!(got, expected, "row={row} col={col}");
+            }
+        }
     }
 
     /// No peer runs beside this context.
@@ -2751,6 +3130,7 @@ mod tests {
         };
         let entry = Entry {
             enter: native.enter,
+            opt_enter: native.opt_enter,
             window: native.runtime.window,
             // Point this fixture at the protected view to inject a fault.
             alias: native.runtime.window,
@@ -2783,8 +3163,8 @@ mod tests {
             second,
             entry,
             (&code, 0),
-            &signals,
-            LOCAL,
+            (&signals, LOCAL),
+            &mut ExecuteScratch::default(),
         )
         .completion;
         for result in [
@@ -2911,6 +3291,7 @@ mod tests {
         // Only actual deadline recalls activate the alternate fixed form.
         let entry = Entry {
             enter: native.enter,
+            opt_enter: native.opt_enter,
             window: native.runtime.window,
             alias: super::super::alias_base(executor.memory()),
             fault: native.stubs.fault,
@@ -2930,8 +3311,8 @@ mod tests {
                 start.clone(),
                 entry,
                 (&prepared.code, 0),
-                &pending,
-                RECALL,
+                (&pending, RECALL),
+                &mut ExecuteScratch::default(),
             );
             assert!(done.deadline_recall);
             prepared.observe(CODE, false, &done);
@@ -2949,8 +3330,8 @@ mod tests {
             start.clone(),
             entry,
             (&prepared.code, 1),
-            &recalled,
-            RECALL,
+            (&recalled, RECALL),
+            &mut ExecuteScratch::default(),
         )
         .completion;
         assert!(!done.requires_owner);
@@ -3058,6 +3439,7 @@ mod tests {
         );
         let entry = Entry {
             enter: native.enter,
+            opt_enter: native.opt_enter,
             window: native.runtime.window,
             alias: super::super::alias_base(executor.memory()),
             fault: native.stubs.fault,
@@ -3111,8 +3493,8 @@ mod tests {
                 start.clone(),
                 entry,
                 (&code, 0),
-                &signals,
-                LOCAL,
+                (&signals, LOCAL),
+                &mut ExecuteScratch::default(),
             )
             .completion;
             // A pending deadline finishes the iteration and returns at the head.

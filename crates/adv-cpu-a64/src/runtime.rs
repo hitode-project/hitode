@@ -269,6 +269,7 @@ impl Exit {
 pub struct Stubs {
     pub code: Vec<u32>,
     pub enter: usize,
+    pub opt_enter: usize,
     pub opt_exit: usize,
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
@@ -401,6 +402,8 @@ pub fn stubs() -> Stubs {
     let mut asm = Asm::new();
     let enter = asm.offset();
     emit_enter(&mut asm);
+    let opt_enter = asm.offset();
+    emit_opt_enter(&mut asm);
     let exit_label = asm.label();
     asm.bind(exit_label);
     let exit = asm.offset();
@@ -446,6 +449,7 @@ pub fn stubs() -> Stubs {
         call,
         code: asm.finish(),
         enter,
+        opt_enter,
         opt_exit,
         exit,
         fault,
@@ -654,8 +658,7 @@ fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
     asm.b(exit);
 }
 
-/// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
-fn emit_enter(asm: &mut Asm) {
+fn emit_enter_frame(asm: &mut Asm) {
     asm.emit(stp(X, Pre, r(29), Reg::LR, SP, -FRAME));
     for (i, (a, b)) in SAVED.into_iter().enumerate() {
         asm.emit(stp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
@@ -668,6 +671,13 @@ fn emit_enter(asm: &mut Asm) {
         mov_sp(r(16), SP),
         str(X, r(16), RUNTIME, HOST_SP),
         mov(X, r(17), r(1)),
+    ]);
+}
+
+/// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
+fn emit_enter(asm: &mut Asm) {
+    emit_enter_frame(asm);
+    asm.emit_all(&[
         ldr(X, WINDOW, RUNTIME, WINDOW_BASE),
         ldr(X, r(28), RUNTIME, SHADOW),
         ldr(X, r(9), RUNTIME, COUNTDOWN),
@@ -675,6 +685,17 @@ fn emit_enter(asm: &mut Asm) {
     ]);
     emit_load_guest(asm);
     asm.emit(br(r(17)));
+}
+
+/// `opt_enter(runtime: *mut Runtime, target: usize)` for optimized forms,
+/// which load all live state from `opt_params` and need no guest register setup.
+fn emit_opt_enter(asm: &mut Asm) {
+    emit_enter_frame(asm);
+    asm.emit_all(&[
+        ldr(X, r(28), RUNTIME, SHADOW),
+        ldr(X, r(9), RUNTIME, COUNTDOWN),
+        br(r(17)),
+    ]);
 }
 
 /// Loads the guest registers and flags from the `CpuState` at x0; uses x1

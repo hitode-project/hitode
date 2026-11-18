@@ -2305,6 +2305,47 @@ impl Proof {
         scratch: &'a mut Evaluation,
         mut read: impl FnMut(u32) -> Option<u32>,
     ) -> Option<&'a [Range]> {
+        self.evaluate_core(cpu, scratch, &mut read)?;
+        scratch.ranges.extend_from_slice(&scratch.outputs);
+        // Sort and combine each access class separately; read-sharing must
+        // not grow a write reservation beyond the bytes it can modify.
+        scratch.ranges.sort_unstable_by_key(|r| (r.write, r.start));
+        let mut len = 0;
+        for i in 0..scratch.ranges.len() {
+            let next = scratch.ranges[i];
+            if len > 0
+                && scratch.ranges[len - 1].write == next.write
+                && u64::from(next.start) <= scratch.ranges[len - 1].end
+            {
+                scratch.ranges[len - 1].end = scratch.ranges[len - 1].end.max(next.end);
+            } else {
+                scratch.ranges[len] = next;
+                len += 1;
+            }
+        }
+        scratch.ranges.truncate(len);
+        Some(&scratch.ranges)
+    }
+
+    /// Evaluate at the matching unit entry for owner-only in-place execution
+    /// (no active peer jobs), skipping range coalescing and sorting. Parameter
+    /// cells read via `read` are already granted by the reader.
+    pub(crate) fn evaluate_alone<'a>(
+        &self,
+        cpu: &CpuState,
+        scratch: &'a mut Evaluation,
+        mut read: impl FnMut(u32) -> Option<u32>,
+    ) -> Option<(&'a [Range], &'a [Range])> {
+        self.evaluate_core(cpu, scratch, &mut read)?;
+        Some((&scratch.ranges, &scratch.outputs))
+    }
+
+    fn evaluate_core(
+        &self,
+        cpu: &CpuState,
+        scratch: &mut Evaluation,
+        read: &mut impl FnMut(u32) -> Option<u32>,
+    ) -> Option<()> {
         scratch.values.clear();
         scratch.values.resize(self.exprs.len(), None);
         scratch.words.clear();
@@ -2322,14 +2363,12 @@ impl Proof {
         for &check in &self.checks {
             match check {
                 Check::Positive(expr, max) => {
-                    if !(1..=max).contains(&self.value(expr, cpu, scratch, &mut read)?) {
+                    if !(1..=max).contains(&self.value(expr, cpu, scratch, read)?) {
                         return None;
                     }
                 }
                 Check::Equal(a, b) => {
-                    if self.value(a, cpu, scratch, &mut read)?
-                        != self.value(b, cpu, scratch, &mut read)?
-                    {
+                    if self.value(a, cpu, scratch, read)? != self.value(b, cpu, scratch, read)? {
                         return None;
                     }
                 }
@@ -2341,8 +2380,7 @@ impl Proof {
             }
         }
         for effect in &self.effects {
-            let Some((lo, hi)) =
-                self.interval(&effect.addr, &effect.limits, cpu, scratch, &mut read)?
+            let Some((lo, hi)) = self.interval(&effect.addr, &effect.limits, cpu, scratch, read)?
             else {
                 continue;
             };
@@ -2419,25 +2457,7 @@ impl Proof {
                 return None;
             }
         }
-        scratch.ranges.extend_from_slice(&scratch.outputs);
-        // Sort and combine each access class separately; read-sharing must
-        // not grow a write reservation beyond the bytes it can modify.
-        scratch.ranges.sort_unstable_by_key(|r| (r.write, r.start));
-        let mut len = 0;
-        for i in 0..scratch.ranges.len() {
-            let next = scratch.ranges[i];
-            if len > 0
-                && scratch.ranges[len - 1].write == next.write
-                && u64::from(next.start) <= scratch.ranges[len - 1].end
-            {
-                scratch.ranges[len - 1].end = scratch.ranges[len - 1].end.max(next.end);
-            } else {
-                scratch.ranges[len] = next;
-                len += 1;
-            }
-        }
-        scratch.ranges.truncate(len);
-        Some(&scratch.ranges)
+        Some(())
     }
 
     /// The least and greatest guest address `form` takes over the segment,

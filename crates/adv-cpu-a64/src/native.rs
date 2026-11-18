@@ -713,6 +713,7 @@ pub(crate) struct Native {
     pub(crate) pending_mask: u32,
     cache: CodeCache,
     enter: Enter,
+    opt_enter: Enter,
     stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     stub_len: usize,
@@ -788,6 +789,7 @@ pub(crate) struct Native {
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
     admission: worker::Admission,
+    opt_scratch: worker::ExecuteScratch,
     /// Builds optimized forms, which `install_optimized` adopts.
     compiler: compile::Compiler,
     pub(crate) features: Features,
@@ -813,6 +815,7 @@ impl Native {
             base + 4 * stubs.code.len(),
             &[
                 (stubs.enter, "enter"),
+                (stubs.opt_enter, "opt_enter"),
                 (stubs.exit, "exit"),
                 (stubs.fault, "fault"),
                 (stubs.dispatch, "dispatch"),
@@ -825,9 +828,10 @@ impl Native {
                 (stubs.call, "call"),
             ],
         );
-        // SAFETY: `enter` follows the C calling convention with the
-        // signature of `Enter`; see `runtime::emit_enter`.
+        // SAFETY: `enter` and `opt_enter` follow the C calling convention with
+        // the signature of `Enter`; see `runtime::emit_enter` and `emit_opt_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
+        let opt_enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.opt_enter) };
         let mut table = empty_table();
         let shadow = ShadowStack::new()?;
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
@@ -854,6 +858,7 @@ impl Native {
             },
             cache,
             enter,
+            opt_enter,
             stubs: Stubs {
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
@@ -910,6 +915,7 @@ impl Native {
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
             admission: worker::Admission::default(),
+            opt_scratch: worker::ExecuteScratch::default(),
             compiler: compile::Compiler::new(),
             features: features(),
             runtime,
@@ -982,6 +988,7 @@ impl Native {
         self.cache.sync();
         let entry = worker::Entry {
             enter: self.enter,
+            opt_enter: self.opt_enter,
             window: self.runtime.window,
             alias: alias_base(memory),
             fault: self.stubs.fault,
@@ -1021,12 +1028,30 @@ impl Native {
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
-                self.candidates
-                    .retain(|&inside| !(candidate < inside && inside < end));
+                let mut absorbed = Vec::new();
+                self.candidates.retain(|&inside| {
+                    let enclose = candidate < inside && inside < end;
+                    let inlined = probed
+                        .trace
+                        .insts
+                        .iter()
+                        .any(|inst| inst.inlined() && inst.pc == inside);
+                    if enclose || inlined {
+                        if !enclose {
+                            absorbed.push(inside);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.candidates.push(candidate);
                 // Units inlining the new boundary or a candidate it encloses,
                 // or linking to them, come from these pages.
                 self.cut(candidate, end);
+                for inside in absorbed {
+                    self.cut(inside, inside.saturating_add(1));
+                }
                 self.probed = Some(probed);
             } else {
                 self.rejected_candidates.insert(candidate);
@@ -1085,17 +1110,24 @@ impl Native {
         }
         // Reaching the computation tells peers it is here, offered or not,
         // and takes the frame's pace for a split.
-        if self.skip_offer != Some(cpu.eip)
+        if self.computation_enabled
+            && self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && (self.offer_computation()
-                | (prepared.proof.splits() && self.offer_split(prepared.cost())))
-            && prepared.worth_offering()
         {
-            return Ok(Some(Run {
-                exit: Exit::Computation,
-                retired: 0,
-                translated,
-            }));
+            let mut offer = self.offer_computation();
+            let split = prepared.proof.splits() && prepared.cost() > 0;
+            if (offer || split) && prepared.worth_offering() {
+                if split {
+                    offer |= self.offer_split(prepared.cost());
+                }
+                if offer {
+                    return Ok(Some(Run {
+                        exit: Exit::Computation,
+                        retired: 0,
+                        translated,
+                    }));
+                }
+            }
         }
         if u64::from(entry.retired) > fuel {
             self.diagnostics.over_fuel += 1;
@@ -1116,7 +1148,11 @@ impl Native {
         if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
         }
-        if let Some(word) = &self.interrupt {
+        if let Some(word) = &self.interrupt
+            && word.load(std::sync::atomic::Ordering::Relaxed)
+                & (adv_sync::pending::STOP | adv_sync::pending::WORK)
+                != 0
+        {
             word.fetch_and(
                 !(adv_sync::pending::STOP | adv_sync::pending::WORK),
                 std::sync::atomic::Ordering::AcqRel,
@@ -1216,22 +1252,26 @@ impl Native {
     fn run_optimized(
         &mut self,
         cpu: &mut CpuState,
-        memory: &Memory,
+        memory: &mut Memory,
         fuel: u64,
     ) -> Option<(Exit, u32)> {
         static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let prepared = self.computation.get(&cpu.eip)?;
-        prepared.code.optimized.as_ref()?;
-        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
+        let form = prepared.code.optimized.as_deref()?;
+        let alias = alias_base(memory);
+        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory, alias) {
             return None;
         }
-        cpu.refresh_mmx();
-        let alias = alias_base(memory);
-        let optimized = worker::admit(&prepared.code, cpu, alias);
+        if form.assumed.mmx || cpu.mmx_mode != 0 {
+            cpu.refresh_mmx();
+        }
+        let optimized = worker::admit(&prepared.code, cpu, alias, &mut self.opt_scratch.params);
         prepared.admitted(optimized.is_some());
         let optimized = optimized?;
+        let owner_runs = prepared.record_owner_run();
         let entry = worker::Entry {
             enter: self.enter,
+            opt_enter: self.opt_enter,
             window: self.runtime.window,
             alias,
             fault: self.stubs.fault,
@@ -1250,8 +1290,15 @@ impl Native {
         runtime.deferred = 0;
         runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
         let shadow = runtime.shadow;
-        let (exit, retired) =
-            worker::execute(runtime, cpu, entry, &prepared.code, Some(&optimized));
+        let (exit, retired) = worker::execute(
+            runtime,
+            cpu,
+            entry,
+            &prepared.code,
+            Some(optimized),
+            &mut self.opt_scratch,
+            false,
+        );
         runtime.shadow = shadow;
         self.diagnostics.optimized_runs += 1;
         self.diagnostics.optimized_retired += retired;
@@ -1261,6 +1308,13 @@ impl Native {
         if exit == Exit::Fault {
             self.diagnostics.faults += 1;
         }
+        if retired < SLICE
+            && self.computation_enabled
+            && self.nominated.is_none()
+            && (owner_runs == 8 || owner_runs == 64 || (owner_runs & 4095) == 0)
+        {
+            self.nominate_shadow_caller(memory);
+        }
         // A recall here is pending owner work, which dispatch sees.
         let exit = if exit == Exit::Recall {
             Exit::Dispatch
@@ -1268,6 +1322,46 @@ impl Native {
             exit
         };
         Some((exit, retired as u32))
+    }
+
+    fn nominate_shadow_caller(&mut self, memory: &mut Memory) {
+        let callers = self.shadow_callers();
+        if callers.is_empty() {
+            return;
+        }
+        let mut best: Option<(u32, u32)> = None;
+        let mut promote: Option<u32> = None;
+        for (entry, ret_eip) in callers {
+            let point = ret_eip.saturating_sub(1);
+            let trace = self.loop_trace(memory, entry, &self.stops);
+            let Some((head, end)) = translate::computation_extent(&trace) else {
+                continue;
+            };
+            if !(head <= point && point < end) {
+                continue;
+            }
+            if self.record_extent((head, end)) {
+                crate::jit_map::optimized(head, format_args!("extent\t{end}\t-"));
+            }
+            if !self.is_stop(head)
+                && !self.rejected_candidates.contains(&head)
+                && best.is_none_or(|(b_head, b_end)| end - head > b_end - b_head)
+            {
+                best = Some((head, end));
+                promote = Some(entry);
+            }
+        }
+        if let Some((head, end)) = best {
+            self.nominated = Some((head, end));
+        }
+        if let Some(entry) = promote
+            && self.promoted.insert(entry)
+        {
+            crate::jit_map::optimized(entry, format_args!("promoted\t{entry}\t-"));
+            self.diagnostics.promotions += 1;
+            self.drop_unit(entry);
+            self.forget_dynamic();
+        }
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
@@ -1908,8 +2002,8 @@ impl Native {
 
     /// A budget exit samples where owner time goes. It nominates the
     /// computation enclosing EIP. Once EIP has `promotion` samples, it and
-    /// the nearby entry with the widest computation extent around it take
-    /// loop traces.
+    /// the nearby or shadow-caller entry with the widest computation extent
+    /// take loop traces.
     fn sample(&mut self, memory: &mut Memory, eip: u32) {
         if self.computation_enabled
             && let Some((candidate, end)) = self.enclosing_computation(eip)
@@ -1917,31 +2011,52 @@ impl Native {
         {
             self.nominated = Some((candidate, end));
         }
-        if self.promotion == 0 || self.promoted.contains(&eip) {
+        if self.promotion == 0 {
             return;
         }
-        let count = self.samples.entry(eip).or_default();
-        *count += 1;
-        if *count < self.promotion {
+        let promoted = self.promoted.contains(&eip);
+        if promoted && (self.nominated.is_some() || !self.computation_enabled) {
             return;
         }
-        self.samples.remove(&eip);
-        let nearby: Vec<u32> = self
-            .units
-            .keys()
-            .copied()
-            .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
-            .collect();
+        if !promoted {
+            let count = self.samples.entry(eip).or_default();
+            *count += 1;
+            if *count < self.promotion {
+                return;
+            }
+            self.samples.remove(&eip);
+        }
+        let mut candidates: Vec<(u32, u32)> = if promoted {
+            Vec::new()
+        } else {
+            self.units
+                .keys()
+                .copied()
+                .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
+                .map(|entry| (entry, eip))
+                .collect()
+        };
+        if self.computation_enabled {
+            for (caller, ret_eip) in self.shadow_callers() {
+                if (!promoted || !self.promoted.contains(&caller))
+                    && !candidates.iter().any(|&(entry, _)| entry == caller)
+                {
+                    candidates.push((caller, ret_eip.saturating_sub(1)));
+                }
+            }
+        }
         // Entries retranslate only when control next enters them, so every
         // enclosing loop's extent is recorded now. Nomination then tries the
         // outermost first and falls back inward as proofs are rejected.
         let mut outer: Option<(u32, u32)> = None;
+        let mut caller_outer: Option<(u32, u32)> = None;
         // Nearby traces without a loop, and with loops elsewhere.
         let (mut flat, mut elsewhere) = (0, 0);
-        for &entry in &nearby {
+        for &(entry, point) in &candidates {
             let trace = self.loop_trace(memory, entry, &self.stops);
             let extent = translate::computation_extent(&trace);
-            let Some((head, end)) = extent.filter(|&(head, end)| head <= eip && eip < end) else {
+            let Some((head, end)) = extent.filter(|&(head, end)| head <= point && point < end)
+            else {
                 if extent.is_some() {
                     elsewhere += 1;
                 } else {
@@ -1956,22 +2071,77 @@ impl Native {
             if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
                 outer = Some((entry, size));
             }
+            if point != eip
+                && self.computation_enabled
+                && !self.is_stop(head)
+                && !self.rejected_candidates.contains(&head)
+                && caller_outer.is_none_or(|(c_head, c_end)| end - head > c_end - c_head)
+            {
+                caller_outer = Some((head, end));
+            }
         }
-        if outer.is_none() {
-            let tried = nearby.len();
+        if let Some((head, end)) = caller_outer
+            && self
+                .nominated
+                .is_none_or(|(n_head, n_end)| end - head > n_end - n_head)
+        {
+            self.nominated = Some((head, end));
+        }
+        if !promoted && outer.is_none() {
+            let tried = candidates.len();
             crate::jit_map::optimized(
                 eip,
                 format_args!("unlooped\t-\t{tried} tried, {flat} flat, {elsewhere} elsewhere"),
             );
         }
-        for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
+        let mut changed = false;
+        let promote_self = (!promoted).then_some(eip);
+        for entry in promote_self
+            .into_iter()
+            .chain(outer.map(|(entry, _)| entry))
+        {
             if self.promoted.insert(entry) {
                 crate::jit_map::optimized(entry, format_args!("promoted\t{eip}\t-"));
                 self.diagnostics.promotions += 1;
                 self.drop_unit(entry);
+                changed = true;
             }
         }
-        self.forget_dynamic();
+        if changed {
+            self.forget_dynamic();
+        }
+    }
+
+    fn shadow_callers(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let top = self.shadow.top();
+        let (_, guard_end) = self.shadow.guard();
+        let mut at = self.runtime.shadow;
+        if at < guard_end as u64 || at >= top || !at.is_multiple_of(16) {
+            return out;
+        }
+        for _ in 0..16 {
+            if at >= top {
+                break;
+            }
+            // SAFETY: `at` is 16-byte aligned within the live shadow stack below `top`.
+            let (host_lr, ret_eip) = unsafe {
+                let ptr = at as *const u64;
+                (ptr.read() as usize, ptr.add(1).read())
+            };
+            if host_lr == 0 || ret_eip > u64::from(u32::MAX) {
+                break;
+            }
+            let idx = self.placed.partition_point(|&(start, _)| start <= host_lr);
+            if let Some(&(start, entry_eip)) = idx.checked_sub(1).map(|i| &self.placed[i])
+                && self.units.get(&entry_eip).is_some_and(|u| u.unit == start)
+                && !out.iter().any(|&(entry, _)| entry == entry_eip)
+            {
+                out.push((entry_eip, ret_eip as u32));
+            }
+            at += 16;
+        }
+        out
     }
 
     /// Whether the extent is new.
@@ -1997,8 +2167,28 @@ impl Native {
     }
 
     fn prove_candidate(&self, memory: &mut Memory, eip: u32, end: u32) -> Option<Probed> {
-        // The installed owner trace watches the code. Reuse this proof
-        // only if that trace has identical decoded effects and edges.
+        // Prefer inlining direct-called inner candidates into an enclosing
+        // computation; fall back to cutting outside candidates if needed.
+        if self.candidates.is_empty() {
+            let trace = self.loop_trace(memory, eip, &self.stops);
+            let proof = computation_proof(memory, &trace)?;
+            return Some(Probed { eip, trace, proof });
+        }
+        let whole = self.loop_trace(memory, eip, &self.stops);
+        let hits_external_at_root = self.candidates.iter().any(|&c| {
+            !(eip < c && c < end)
+                && whole
+                    .insts
+                    .iter()
+                    .any(|inst| !inst.inlined() && inst.pc == c)
+        });
+        if !hits_external_at_root && let Some(proof) = computation_proof(memory, &whole) {
+            return Some(Probed {
+                eip,
+                trace: whole,
+                proof,
+            });
+        }
         let mut stops = self.stops.clone();
         stops.extend(
             self.candidates
