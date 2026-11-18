@@ -186,6 +186,7 @@ pub struct Workspace {
     pub(crate) code: Code,
     /// Translate the next entry as cold: one path, no loop trace.
     pub(crate) cold: bool,
+    pub(crate) resident_links: bool,
 }
 
 /// The JIT back end's output, in buffers the next unit reuses.
@@ -202,6 +203,7 @@ pub struct Code {
     marks: Vec<Mark>,
     retired: u32,
     pub(crate) uses_permissions: bool,
+    resident_links: bool,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -214,6 +216,7 @@ pub struct Link {
     /// Whether the trace's main path leaves through it: a real call, or
     /// the end of the trace, rather than a side exit.
     pub main: bool,
+    pub back: bool,
 }
 
 impl Workspace {
@@ -559,6 +562,7 @@ struct Translator<'a> {
     control: u16,
     pe: bool,
     computation: bool,
+    resident_links: bool,
     #[cfg(native)]
     proof: Option<&'a computation::Proof>,
 }
@@ -589,6 +593,10 @@ pub fn translate(
     work.unit
         .build(memory, eip, stops, host, redirect, !work.cold);
     work.unit.prepare_regions(memory, admit, checked);
+    work.code.resident_links = work.resident_links;
+    if work.resident_links {
+        work.unit.trace.observe_back_links();
+    }
     Jit {
         code: &mut work.code,
         features,
@@ -647,6 +655,7 @@ impl Jit<'_> {
             marks,
             retired,
             uses_permissions,
+            resident_links,
         } = &mut *self.code;
         let Unit {
             trace,
@@ -693,6 +702,7 @@ impl Jit<'_> {
             control: self.control,
             pe: self.pe,
             computation,
+            resident_links: *resident_links && !computation,
             #[cfg(native)]
             proof: self.proof,
         };
@@ -723,26 +733,6 @@ pub(crate) struct ComputationCode<'a> {
     pub words: &'a [u32],
     pub sites: &'a [(usize, Site)],
     pub marks: &'a [Mark],
-}
-
-/// The outer loop extent seen in this owner trace. A later budget exit
-/// can start inside it, where decoding can only see the inner backedge.
-#[cfg(native)]
-pub(crate) fn computation_extent(trace: &Trace) -> Option<(u32, u32)> {
-    let head = computation::candidate(trace)?;
-    let end = trace.insts[..trace.primary]
-        .iter()
-        .enumerate()
-        .filter(|&(from, inst)| {
-            let backedge = |edge| {
-                matches!(edge, Edge::Internal(to) if to <= from && trace.insts[to].pc == head)
-            };
-            inst.taken.is_some_and(backedge)
-                || matches!(inst.next, Next::Edge(edge) if backedge(edge))
-        })
-        .map(|(_, inst)| inst.next_pc)
-        .max()?;
-    (head < end).then_some((head, end))
 }
 
 #[cfg(native)]
@@ -780,11 +770,9 @@ pub(crate) fn lower_computation<'a>(
     })
 }
 
-/// The patchable transfer prefix, followed by a branch to the dispatch stub.
+// Optimized normal exits use the ordinary four-word link layout.
 fn emit_link_point(asm: &mut Asm, eip: u32) {
-    let point = asm.offset();
-    emit_target(asm, eip);
-    asm.emit(adr(Reg::new(2), point as i32 - asm.offset() as i32));
+    crate::runtime::emit_link_point(asm, eip, false);
 }
 
 fn emit_target(asm: &mut Asm, eip: u32) {
@@ -960,7 +948,7 @@ impl Translator<'_> {
     /// Detects a short straight-line MMX loop whose peeled first iteration
     /// avoids per-iteration x87 guards, dead pre-loads, or backedge flushes.
     fn mmx_peel_plan(&self, head: usize) -> Option<(usize, residency::Entry)> {
-        if self.computation || self.x87.active || !self.trace.merge[head] {
+        if self.computation || self.resident_links || self.x87.active || !self.trace.merge[head] {
             return None;
         }
         let insts = &self.trace.insts;
@@ -1133,7 +1121,12 @@ impl Translator<'_> {
         match edge {
             Edge::Internal(to) => {
                 self.spin_edge(to, None);
-                self.jump(to, self.x87_arriving(to));
+                let eip = self.trace.insts[to].pc;
+                if self.resident_links && self.trace.insts[self.index].backward_jump(eip) {
+                    self.follow_exit(Exit::Dispatch, eip, unused, true);
+                } else {
+                    self.jump(to, self.x87_arriving(to));
+                }
             }
             Edge::Exit(eip) => self.follow_exit(Exit::Dispatch, eip, unused, true),
             Edge::Interpret(eip) => self.follow_exit(Exit::Interpret, eip, unused, false),
@@ -1141,6 +1134,7 @@ impl Translator<'_> {
     }
 
     fn follow_exit(&mut self, exit: Exit, eip: u32, refund: u32, link: bool) {
+        let back = self.resident_links && link && self.trace.insts[self.index].backward_jump(eip);
         if let Some(x87) = self.x87_leaving() {
             let label = self.asm.label();
             self.asm.b(label);
@@ -1155,7 +1149,7 @@ impl Translator<'_> {
                 x87: Some(x87),
             });
         } else {
-            self.leave(exit, eip, refund, link, link);
+            self.leave(exit, eip, refund, link, link, back);
         }
     }
 
@@ -1223,6 +1217,17 @@ impl Translator<'_> {
             self.publish(!self.entry[to].dirty);
         }
         let from = self.index;
+        let taken = match taken {
+            Edge::Internal(to)
+                if self.resident_links
+                    && self.trace.insts[from].backward_jump(self.trace.insts[to].pc) =>
+            {
+                // Keep the loop edge's flag conversion on the fall-through too.
+                self.convert(self.trace.live_in[to]);
+                Edge::Exit(self.trace.insts[to].pc)
+            }
+            edge => edge,
+        };
         match taken {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
@@ -1882,14 +1887,14 @@ impl Translator<'_> {
 
     /// Canonical flags, the refund for this path, then the exit: through a
     /// link point if `link`, on the main path if `main`, else to the owner.
-    fn leave(&mut self, exit: Exit, eip: u32, refund: u32, link: bool, main: bool) {
+    fn leave(&mut self, exit: Exit, eip: u32, refund: u32, link: bool, main: bool, back: bool) {
         self.flush_simd();
         self.canonicalize();
         if refund != 0 {
             self.emit(add_imm(X, X9, X9, refund, false));
         }
         if link {
-            self.dispatch(eip, main);
+            self.dispatch(eip, main, back);
         } else {
             self.exit(exit, eip);
         }
@@ -1905,19 +1910,22 @@ impl Translator<'_> {
     /// Continues at `eip` through the owner's helper: w1 the EIP and x2
     /// the link point, the first word, which the helper may patch into a
     /// branch to the target unit.
-    fn dispatch(&mut self, eip: u32, main: bool) {
+    fn dispatch(&mut self, eip: u32, main: bool, back: bool) {
         if self.computation {
             self.exit(Exit::Dispatch, eip);
             return;
         }
-        let point = self.asm.offset();
+        let offset = crate::runtime::emit_link_point(self.asm, eip, back);
         self.links.push(Link {
-            offset: point,
+            offset,
             eip,
             main,
+            back,
         });
-        emit_link_point(self.asm, eip);
         self.far(self.stubs.dispatch);
+        if back {
+            crate::runtime::emit_back_count(self.asm);
+        }
     }
 
     fn target(&mut self, eip: u32) {
@@ -1967,7 +1975,7 @@ impl Translator<'_> {
         self.far(self.stubs.exit);
     }
 
-    fn cold(&mut self, cold: Cold, at: usize) {
+    fn cold(&mut self, cold: Cold, at: usize, pc: u32) {
         match cold {
             Cold::InlineBody {
                 label,
@@ -2019,7 +2027,8 @@ impl Translator<'_> {
                 if let Some(x87) = x87 {
                     self.x87_leave(x87);
                 }
-                self.leave(exit, eip, refund, link, false);
+                let back = self.resident_links && link && eip <= pc;
+                self.leave(exit, eip, refund, link, false, back);
             }
             Cold::Edge {
                 label,
@@ -2206,6 +2215,7 @@ impl Translator<'_> {
                     offset: self.asm.position(point),
                     eip: target,
                     main: true,
+                    back: false,
                 });
                 self.target(target);
                 self.asm.adr(Reg::new(2), point);
@@ -2290,7 +2300,7 @@ impl Translator<'_> {
                 break;
             };
             self.mark(pc, Part::Cold);
-            self.cold(cold, at);
+            self.cold(cold, at, pc);
         }
         if (self.computation || self.trace.has_loop()) && self.asm.widen_bit_tests() {
             return true;

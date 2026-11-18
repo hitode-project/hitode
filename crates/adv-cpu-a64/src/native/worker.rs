@@ -42,13 +42,10 @@ const MXCSR_FLAGS: u32 = 0x3f;
 pub(super) struct Prepared {
     pub code: Code,
     pub proof: Proof,
-    /// What the optimized form is built from, again when entry states
-    /// keep missing its facts.
-    pub trace: Arc<crate::translate::Trace>,
-    /// Counters the head entry block updates in place (A64-OPT-8).
-    pub slot: Box<Slot>,
-    /// The inline form the head entry block enters, once installed.
-    pub inline: Option<Inline>,
+    /// The serial cost of a split loop in host ticks.
+    pub split_ticks: Box<std::cell::Cell<u64>>,
+    pub trace: crate::translate::Trace,
+    misses: std::cell::Cell<u32>,
     /// Optimized forms requested, and whether one is being built.
     forms: std::cell::Cell<u8>,
     building: std::cell::Cell<bool>,
@@ -58,39 +55,6 @@ pub(super) struct Prepared {
     per_iteration: std::cell::Cell<Option<(u64, f64)>>,
     /// Serial ns of the last job that showed them.
     cost: std::cell::Cell<u64>,
-}
-
-/// Owner arrival counters shared by Rust and the head entry block, which
-/// reads them through a fixed heap address.
-#[repr(C)]
-#[derive(Default)]
-pub(super) struct Slot {
-    /// Consecutive entries the optimized form did not admit, and the count
-    /// at which an entry goes to Rust to build another.
-    pub misses: std::cell::Cell<u32>,
-    pub miss_limit: std::cell::Cell<u32>,
-    /// Owner arrivals, and the one that nominates a shadow caller.
-    pub runs: std::cell::Cell<u32>,
-    pub nominate: std::cell::Cell<u32>,
-    /// The serial cost of a split loop in host ticks, or 0 when it never
-    /// splits.
-    pub split_ticks: std::cell::Cell<u64>,
-}
-
-impl Slot {
-    pub const MISSES: u32 = std::mem::offset_of!(Slot, misses) as u32;
-    pub const RUNS: u32 = std::mem::offset_of!(Slot, runs) as u32;
-    pub const SPLIT_TICKS: u32 = std::mem::offset_of!(Slot, split_ticks) as u32;
-}
-
-/// The installed inline form of a computation (A64-OPT-8).
-pub(super) struct Inline {
-    /// The word every link to the head branches to: a branch to the
-    /// current entry block.
-    pub trampoline: usize,
-    pub records: Vec<Record<Host>>,
-    pub flags: Vec<Option<FlagRecipe>>,
-    pub assumed_mmx: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,13 +76,9 @@ impl Prepared {
         Self {
             code,
             proof,
-            trace: Arc::new(trace),
-            slot: Box::new(Slot {
-                miss_limit: NO_LIMIT.into(),
-                nominate: 8.into(),
-                ..Slot::default()
-            }),
-            inline: None,
+            trace,
+            split_ticks: Box::default(),
+            misses: std::cell::Cell::new(0),
             forms: std::cell::Cell::new(0),
             building: std::cell::Cell::new(false),
             skip: std::cell::Cell::new(0),
@@ -130,7 +90,7 @@ impl Prepared {
 
     /// Counts an entry whose state the optimized form did or did not admit.
     pub fn admitted(&self, admitted: bool) {
-        let misses = &self.slot.misses;
+        let misses = &self.misses;
         misses.set(if admitted {
             0
         } else {
@@ -144,28 +104,18 @@ impl Prepared {
         !self.building.get()
             && match self.forms.get() {
                 0 => true,
-                forms => forms <= RESPECIALIZE && self.slot.misses.get() >= MISSES,
+                forms => forms <= RESPECIALIZE && self.misses.get() >= MISSES,
             }
     }
 
     pub fn requested(&self) {
         self.forms.set(self.forms.get() + 1);
         self.building.set(true);
-        self.slot.misses.set(0);
-        self.limit_misses();
+        self.misses.set(0);
     }
 
     pub fn built(&self) {
         self.building.set(false);
-        self.limit_misses();
-    }
-
-    /// Entry blocks send the miss that `wants_form` would act on to Rust.
-    fn limit_misses(&self) {
-        let respecializes = !self.building.get() && (1..=RESPECIALIZE).contains(&self.forms.get());
-        self.slot
-            .miss_limit
-            .set(if respecializes { MISSES } else { NO_LIMIT });
     }
 
     /// The code and whether a job stops after one outer iteration.
@@ -191,23 +141,6 @@ impl Prepared {
         }
     }
 
-    /// Counts an owner arrival that runs in place. Returns whether it is
-    /// the 8th, the 64th or a multiple of 4096, which nominate a caller.
-    pub fn record_owner_run(&self) -> bool {
-        let slot = &self.slot;
-        let n = slot.runs.get().wrapping_add(1);
-        slot.runs.set(n);
-        let due = n == slot.nominate.get();
-        if due {
-            slot.nominate.set(match n {
-                ..8 => 8,
-                8..64 => 64,
-                _ => (n | 4095).wrapping_add(1),
-            });
-        }
-        due
-    }
-
     fn set_cost(&self, ns: u64) {
         self.cost.set(ns);
         let ticks = if self.proof.splits() && ns > 0 {
@@ -218,7 +151,7 @@ impl Prepared {
         } else {
             0
         };
-        self.slot.split_ticks.set(ticks);
+        self.split_ticks.set(ticks);
     }
 
     fn observe(&self, entry: u32, iteration: bool, done: &Done) {
@@ -1386,7 +1319,6 @@ mod tests {
         memory.write(CODE, &words).unwrap();
         memory.protect(CODE, 0x4000, READ | EXEC).unwrap();
         let mut native = Native::new(memory.window_base().unwrap()).unwrap();
-        // These tests nominate from the first budget exit; promotion has its own test.
         native.promotion = 0;
         (executor, native)
     }
@@ -1438,22 +1370,12 @@ mod tests {
         cpu.regs[6] = INPUT + 0x4000;
         cpu.regs[7] = OUTPUT + SPACE * 2;
         native.first_visits = false;
-        // Warm the ordinary incoming trace before the scheduler first
-        // requests a candidate. It includes the loop, without a rendezvous.
         let warm = native
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
             .unwrap()
             .unwrap();
-        assert_eq!(warm.exit, Exit::Dispatch);
-        assert_eq!(cpu.eip, head);
+        assert_eq!((warm.exit, cpu.eip), (Exit::Dispatch, head));
         native.set_computation_offer(true, None);
-        cpu.eip = CODE;
-        let warm = native
-            .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
-            .unwrap()
-            .unwrap();
-        assert_eq!(warm.exit, Exit::Dispatch);
-        assert_eq!(cpu.eip, head);
         let entry = native
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
             .unwrap()
@@ -1466,7 +1388,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(incoming.exit, Exit::Dispatch);
-        assert_eq!((cpu.eip, incoming.retired), (head, 1));
+        assert_eq!((cpu.eip, incoming.retired), (head, 6));
 
         let first = state(&mut executor, head, OUTPUT, COUNT);
         let second = state(&mut executor, head, OUTPUT + SPACE, COUNT);
@@ -1577,9 +1499,9 @@ mod tests {
         reset: impl Fn(&mut Memory),
         check: &[(u32, usize)],
     ) -> (u64, ExecutionContext) {
-        native.candidates.push(CODE);
-        native.set_computation_offer(true, None);
         let mut cpu = start.as_ref().unwrap().cpu().clone();
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        native.set_computation_offer(true, None);
         let offer = native
             .run(
                 &mut cpu,
@@ -1776,9 +1698,9 @@ mod tests {
         executor.state.x87.control = 0x27f;
         executor.state.x87.status = 0x20;
         let start = Some(executor.save_context().unwrap());
-        native.candidates.push(CODE);
-        native.set_computation_offer(true, None);
         let mut cpu = start.as_ref().unwrap().cpu().clone();
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        native.set_computation_offer(true, None);
         let offer = native
             .run(
                 &mut cpu,
@@ -1951,9 +1873,9 @@ mod tests {
         executor.state.x87.regs[0] = adv_cpu_core::X87Register::from_parts(seed_mm0, 0x3fff);
         executor.state.refresh_mmx();
         let start = Some(executor.save_context().unwrap());
-        native.candidates.push(CODE);
-        native.set_computation_offer(true, None);
         let mut cpu = start.as_ref().unwrap().cpu().clone();
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        native.set_computation_offer(true, None);
         let offer = native
             .run(
                 &mut cpu,
@@ -2020,9 +1942,9 @@ mod tests {
         executor.state.x87.control = 0x27e;
         executor.state.x87.status = 0x81;
         let pending = Some(executor.save_context().unwrap());
-        native.candidates.push(CODE);
-        native.set_computation_offer(true, None);
         let mut cpu = clean.as_ref().unwrap().cpu().clone();
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        native.set_computation_offer(true, None);
         let offer = native
             .run(
                 &mut cpu,
@@ -2199,9 +2121,9 @@ mod tests {
                 init(&mut interp, COUNT, SRC);
 
                 let start = Some(executor.save_context().unwrap());
-                native.candidates.push(CODE);
-                native.set_computation_offer(true, None);
                 let mut cpu = start.as_ref().unwrap().cpu().clone();
+                native.prepare_job(executor.memory_mut(), stop, &cpu);
+                native.set_computation_offer(true, None);
                 let offer = native
                     .run(
                         &mut cpu,
@@ -2476,116 +2398,6 @@ mod tests {
         assert_eq!(word(&executor, DST + 4 * (N - 1)), (N - 1) * 7);
     }
 
-    // spec: A64-CTL-9 A64-TR-9
-    #[test]
-    fn a_warm_inner_budget_nominates_the_enclosing_loop() {
-        let mut a = CodeAssembler::new(32).unwrap();
-        let mut outer = a.create_label();
-        let mut inner = a.create_label();
-        // A row longer than RECALL_GRACE budgets.
-        const ROW: u32 = (crate::runtime::RECALL_GRACE + 4) * COMPUTATION_SLICE / 4;
-        a.nop().unwrap();
-        a.set_label(&mut outer).unwrap();
-        a.mov(ecx, ROW).unwrap();
-        a.set_label(&mut inner).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(edi, 4).unwrap();
-        a.dec(ecx).unwrap();
-        a.jne(inner).unwrap();
-        a.dec(ebx).unwrap();
-        a.jne(outer).unwrap();
-        a.int3().unwrap();
-        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
-        let (mut executor, mut native) = fixture(&mut a);
-        let memory = executor.memory_mut();
-        memory.map(OUTPUT, ROW as usize * 8, READ | WRITE).unwrap();
-        let outer = CODE + 1;
-        let inner = outer + 5;
-        let mut cpu = adv_cpu_core::CpuState {
-            eip: CODE,
-            ..Default::default()
-        };
-        cpu.regs[3] = 2;
-        cpu.regs[7] = OUTPUT;
-        native.first_visits = false;
-        let warm = native
-            .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
-            .unwrap()
-            .unwrap();
-        assert_eq!((warm.exit, cpu.eip), (Exit::Dispatch, inner));
-        native.set_computation_offer(true, None);
-        let warm = native
-            .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
-            .unwrap()
-            .unwrap();
-        assert_eq!((warm.exit, cpu.eip), (Exit::Dispatch, inner));
-        assert_eq!(native.nominated.map(|(head, _)| head), Some(outer));
-        native.candidates.push(inner);
-        cpu.eip = outer;
-        let offer = native
-            .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
-            .unwrap()
-            .unwrap();
-        assert_eq!(offer.exit, Exit::Computation);
-        assert!(!native.candidates.contains(&inner));
-
-        // A recall waits RECALL_GRACE budgets for the head, then publishes an
-        // interior PC. Resume the prefix on the owner and offer only at the
-        // original proved head.
-        let mut context = executor.save_context().unwrap();
-        cpu.regs[3] = 2;
-        cpu.regs[7] = OUTPUT;
-        context.cpu_mut().clone_from(&cpu);
-        native.cache.sync();
-        let recalled = run(
-            &mut Runtime::new(std::ptr::null_mut(), 0),
-            1,
-            context,
-            Entry {
-                enter: native.enter,
-                opt_enter: native.opt_enter,
-                window: native.runtime.window,
-                alias: super::super::alias_base(executor.memory()),
-                fault: native.stubs.fault,
-            },
-            (&native.computation[&outer].code, 0),
-            (
-                &Signals {
-                    recall: Arc::new(AtomicU32::new(RECALL)),
-                    pending: (Arc::new(AtomicU32::new(0)), 0),
-                },
-                RECALL,
-            ),
-            &mut ExecuteScratch::default(),
-        )
-        .completion;
-        assert!(recalled.requires_owner);
-        cpu = recalled.context.unwrap().cpu().clone();
-        assert_eq!(cpu.eip, inner);
-        native.set_computation_offer(true, Some(cpu.eip));
-        let mut serial = 0;
-        for _ in 0..8 {
-            let result = native
-                .run(
-                    &mut cpu,
-                    executor.memory_mut(),
-                    stop,
-                    1 << 16,
-                    std::ptr::null_mut(),
-                )
-                .unwrap()
-                .unwrap();
-            if result.exit == Exit::Computation {
-                assert_eq!(cpu.eip, outer);
-                assert!(serial > 0);
-                return;
-            }
-            assert_eq!(result.exit, Exit::Dispatch);
-            serial += result.retired;
-        }
-        panic!("serial continuation did not offer the prepared head");
-    }
-
     // spec: A64-OPT-1
     #[test]
     fn page_grant_cache_invalidates_on_protection_and_watch_code() {
@@ -2620,23 +2432,10 @@ mod tests {
             regs: init_regs,
             ..Default::default()
         };
-        for _ in 0..500 {
-            if native.diagnostics.optimized_runs > 0 {
-                break;
-            }
-            if cpu.eip == stop {
-                cpu.eip = CODE;
-                cpu.regs[1] = 20_000;
-                cpu.regs[6] = INPUT;
-                cpu.regs[7] = OUTPUT;
-            }
-            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(
-            native.diagnostics.optimized_runs > 0,
-            "loop did not promote and run optimized"
-        );
+        cpu.eip = head;
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+        assert!(native.diagnostics.optimized_runs > 0);
         let prepared = &native.computation[&head];
         let memory = executor.memory();
         let alias = super::alias_base(memory);
@@ -2685,165 +2484,6 @@ mod tests {
                 .admission
                 .alone(&prepared.proof, &cpu, executor.memory(), alias)
         );
-    }
-
-    // spec: A64-OPT-1 A64-OPT-5
-    #[test]
-    fn shadow_caller_absorbs_distant_inner_candidate() {
-        let _pool = exclusive_pool();
-        let outer = CODE;
-        let inner = CODE + 0x6000;
-        let src = 0x10_0000u32;
-        let dst = 0x20_0000u32;
-        let stack_base = 0x30_0000u32;
-        let stack = stack_base + 0x2000;
-
-        let mut oa = CodeAssembler::new(32).unwrap();
-        let mut row_loop = oa.create_label();
-        oa.set_label(&mut row_loop).unwrap();
-        oa.push(ecx).unwrap();
-        oa.push(esi).unwrap();
-        oa.push(edi).unwrap();
-        oa.mov(ecx, 16).unwrap();
-        oa.call(u64::from(inner)).unwrap();
-        oa.pop(edi).unwrap();
-        oa.pop(esi).unwrap();
-        oa.pop(ecx).unwrap();
-        oa.add(esi, 64).unwrap();
-        oa.add(edi, 64).unwrap();
-        oa.dec(ecx).unwrap();
-        oa.jne(row_loop).unwrap();
-        let outer_code = oa.assemble(u64::from(outer)).unwrap();
-        let stop = outer + outer_code.len() as u32;
-        oa.int3().unwrap();
-        let outer_with_stop = oa.assemble(u64::from(outer)).unwrap();
-
-        let mut ia = CodeAssembler::new(32).unwrap();
-        let mut inner_loop = ia.create_label();
-        ia.set_label(&mut inner_loop).unwrap();
-        ia.mov(eax, dword_ptr(esi)).unwrap();
-        ia.add(eax, 3).unwrap();
-        ia.mov(dword_ptr(edi), eax).unwrap();
-        ia.add(esi, 4).unwrap();
-        ia.add(edi, 4).unwrap();
-        ia.dec(ecx).unwrap();
-        ia.jne(inner_loop).unwrap();
-        ia.ret().unwrap();
-        let inner_code = ia.assemble(u64::from(inner)).unwrap();
-
-        let mut executor = Executor::interpreted_address_space().unwrap();
-        {
-            let memory = executor.memory_mut();
-            memory.map(outer, 0x8000, READ | WRITE).unwrap();
-            memory.write(outer, &outer_with_stop).unwrap();
-            memory.write(inner, &inner_code).unwrap();
-            memory.protect(outer, 0x8000, READ | EXEC).unwrap();
-            memory.map(src, 0x4_0000, READ | WRITE).unwrap();
-            memory.map(dst, 0x4_0000, READ | WRITE).unwrap();
-            memory.map(stack_base, 0x4000, READ | WRITE).unwrap();
-            for i in 0..0x1000u32 {
-                let addr = src + i * 4;
-                memory.write(addr, &i.to_le_bytes()).unwrap();
-            }
-        }
-        let mut native = Native::new(executor.memory().window_base().unwrap()).unwrap();
-        native.first_visits = false;
-        native.set_computation_offer(true, None);
-        native.promotion = 1;
-
-        // First promote `inner` via budget exits returning to `stop` so `ret_pc` is never a stop.
-        let mut cpu = CpuState::default();
-        for _ in 0..8 {
-            executor
-                .memory_mut()
-                .write(stack, &stop.to_le_bytes())
-                .unwrap();
-            cpu.eip = inner;
-            cpu.regs[1] = 20_000;
-            cpu.regs[4] = stack;
-            cpu.regs[6] = src;
-            cpu.regs[7] = dst;
-            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20);
-        }
-        for _ in 0..200 {
-            executor
-                .memory_mut()
-                .write(stack, &stop.to_le_bytes())
-                .unwrap();
-            cpu.eip = inner;
-            cpu.regs[1] = 16;
-            cpu.regs[4] = stack;
-            cpu.regs[6] = src;
-            cpu.regs[7] = dst;
-            let _ = alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20);
-            if native.diagnostics.optimized_runs > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(
-            native.candidates.contains(&inner),
-            "inner loop did not become a candidate"
-        );
-
-        // Now call `outer` repeatedly with short row counts (< SLICE); shadow caller
-        // sampling must discover `outer`, absorb `inner`, and retire `inner` as a candidate.
-        let run_to_stop = |native: &mut Native, executor: &mut Executor, cpu: &mut CpuState| {
-            let mut steps = 0usize;
-            while cpu.eip != stop {
-                steps += 1;
-                assert!(steps < 500, "too many dispatches before stop");
-                let _ = alone(native, executor, cpu, stop, 1 << 20);
-            }
-            steps
-        };
-        for _ in 0..200 {
-            cpu.eip = outer;
-            cpu.regs[1] = 32;
-            cpu.regs[4] = stack;
-            cpu.regs[6] = src;
-            cpu.regs[7] = dst;
-            run_to_stop(&mut native, &mut executor, &mut cpu);
-            assert_eq!(cpu.eip, stop);
-            if native.candidates.contains(&outer) && !native.candidates.contains(&inner) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(
-            native.candidates.contains(&outer),
-            "outer caller across >4KiB gap was not promoted"
-        );
-        assert!(
-            !native.candidates.contains(&inner),
-            "absorbed inner loop remained a separate candidate"
-        );
-
-        // Execute the promoted outer loop cleanly and verify it runs to `stop`
-        // in one optimized dispatch with exact output memory.
-        executor
-            .memory_mut()
-            .write(dst, &vec![0u8; 32 * 64])
-            .unwrap();
-        let before_runs = native.diagnostics.optimized_runs;
-        cpu.eip = outer;
-        cpu.regs[1] = 32;
-        cpu.regs[4] = stack;
-        cpu.regs[6] = src;
-        cpu.regs[7] = dst;
-        let steps = run_to_stop(&mut native, &mut executor, &mut cpu);
-        assert_eq!(steps, 1);
-        assert_eq!(cpu.eip, stop);
-        assert!(native.diagnostics.optimized_runs > before_runs);
-        for row in 0..32u32 {
-            for col in 0..16u32 {
-                let off = row * 64 + col * 4;
-                let bytes = executor.memory().read(dst + off, 4).unwrap();
-                let got = u32::from_le_bytes(bytes.try_into().unwrap());
-                let expected = (off / 4) + 3;
-                assert_eq!(got, expected, "row={row} col={col}");
-            }
-        }
     }
 
     /// No peer runs beside this context.
@@ -2937,27 +2577,22 @@ mod tests {
         let (mut executor, mut native, stop) = copy_loop();
         let head = CODE + 1;
         let mut cpu = CpuState::default();
+        start(&mut cpu, head);
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
+        assert!(native.computation[&head].code.optimized.is_some());
         let mut run = |native: &mut Native, cpu: &mut CpuState, fuel| {
             alone(native, &mut executor, cpu, stop, fuel)
         };
 
-        // Budget exits nominate the loop and the next entry proves it.
-        start(&mut cpu, CODE);
-        while native.diagnostics.optimized_runs == 0 {
-            assert_ne!(cpu.eip, stop, "the loop never ran optimized");
-            run(&mut native, &mut cpu, 1 << 16);
-        }
-        assert!(native.computation[&head].code.optimized.is_some());
-
         // Fuel just above one budget: each run leaves at the first refill,
         // and the runs retire the loop exactly.
-        start(&mut cpu, CODE);
+        start(&mut cpu, head);
         let before = native.diagnostics.optimized_runs;
         let mut retired = 0;
         while cpu.eip != stop {
             retired += run(&mut native, &mut cpu, (1 << 16) + 1000);
         }
-        assert_eq!(retired, 1 + 5 * COUNT);
+        assert_eq!(retired, 5 * COUNT);
         assert!(native.diagnostics.optimized_runs > before + 1);
 
         // Unbounded fuel runs the whole loop at once; pending owner work
@@ -2975,165 +2610,14 @@ mod tests {
         );
     }
 
-    // spec: A64-OPT-8
-    #[test]
-    fn translated_arrivals_enter_the_inline_form_through_the_head_block() {
-        const INNER: u32 = 300;
-        const OUTER: u32 = 400;
-        // outer: three moves, the copy loop at `head`, then dec ebx; jne.
-        let mut a = CodeAssembler::new(32).unwrap();
-        a.nop().unwrap();
-        let mut outer = a.create_label();
-        let mut head = a.create_label();
-        a.set_label(&mut outer).unwrap();
-        a.mov(ecx, INNER).unwrap();
-        a.mov(esi, INPUT).unwrap();
-        a.mov(edi, OUTPUT).unwrap();
-        a.set_label(&mut head).unwrap();
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.add(eax, ebx).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(esi, 4).unwrap();
-        a.add(edi, 4).unwrap();
-        a.dec(ecx).unwrap();
-        a.jne(head).unwrap();
-        a.dec(ebx).unwrap();
-        a.jne(outer).unwrap();
-        a.int3().unwrap();
-        let code = a.assemble(u64::from(CODE)).unwrap();
-        let stop = CODE + code.len() as u32 - 1;
-        // nop, three 5-byte moves.
-        let head = CODE + 16;
-        let (mut executor, mut native) = fixture(&mut a);
-        let memory = executor.memory_mut();
-        memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
-        let input: Vec<u8> = (0..4 * INNER).map(|i| (i * 7) as u8).collect();
-        memory.write(INPUT, &input).unwrap();
-        memory.map(OUTPUT, 0x4000, READ | WRITE).unwrap();
-        native.first_visits = false;
-        native.candidates.push(head);
-        native.set_computation_offer(true, None);
-        let begin = |cpu: &mut CpuState| {
-            *cpu = CpuState::default();
-            cpu.eip = CODE;
-            cpu.regs[3] = OUTER;
-        };
-        let mut cpu = CpuState::default();
-        begin(&mut cpu);
-        for _ in 0..100 {
-            if native
-                .computation
-                .get(&head)
-                .is_some_and(|prepared| prepared.inline.is_some())
-            {
-                break;
-            }
-            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-        }
-        let heads: Vec<_> = native.computation.keys().collect();
-        assert!(
-            native
-                .computation
-                .get(&head)
-                .is_some_and(|p| p.inline.is_some()),
-            "no inline form at {head:#x}: {heads:x?}"
-        );
-        let check = |executor: &Executor, cpu: &CpuState| {
-            assert_eq!(cpu.eip, stop);
-            assert_eq!(cpu.regs[1], 0);
-            assert_eq!(cpu.regs[3], 0);
-            assert_eq!(cpu.regs[6], INPUT + 4 * INNER);
-            assert_eq!(cpu.regs[7], OUTPUT + 4 * INNER);
-            // The last outer pass adds ebx = 1 to each input word.
-            let output = executor.memory().read(OUTPUT, 4 * INNER as usize).unwrap();
-            for (i, word) in output.chunks(4).enumerate() {
-                let x = u32::from_le_bytes(input[4 * i..4 * i + 4].try_into().unwrap());
-                assert_eq!(word, (x + 1).to_le_bytes(), "word {i}");
-            }
-        };
-        let expected = u64::from(1 + OUTER * (3 + 7 * INNER + 2));
-
-        // Ample fuel: arrivals from the outer loop stay in translated code.
-        let slot = &native.computation[&head].slot;
-        let (runs, rust) = (slot.runs.get(), native.diagnostics.optimized_runs);
-        begin(&mut cpu);
-        let mut retired = 0;
-        let mut owner_runs = 0;
-        while cpu.eip != stop {
-            retired += u64::from(alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20));
-            owner_runs += 1;
-        }
-        assert_eq!(retired, expected);
-        check(&executor, &cpu);
-        let entries = native.computation[&head].slot.runs.get() - runs;
-        assert!(entries >= OUTER - owner_runs, "{entries} block entries");
-        assert!(native.diagnostics.optimized_runs - rust < u64::from(owner_runs) + 4);
-
-        // Fuel below the loop's length: refills stop at the fuel, cold
-        // exits rebuild the state, and the runs still retire it exactly.
-        let cold = native.diagnostics.optimized_runs;
-        begin(&mut cpu);
-        let mut retired = 0;
-        while cpu.eip != stop {
-            let fuel = 700 + retired % 389;
-            retired += u64::from(alone(&mut native, &mut executor, &mut cpu, stop, fuel));
-        }
-        assert_eq!(retired, expected);
-        check(&executor, &cpu);
-        assert!(native.diagnostics.optimized_runs > cold + 10);
-    }
-
-    // spec: A64-OPT-1
-    #[test]
-    fn background_forms_install_at_a_later_entry_unless_stale() {
-        let (mut executor, mut native, stop) = copy_loop();
-        native.compiler = super::super::compile::Compiler::background();
-        let head = CODE + 1;
-        let mut cpu = CpuState::default();
-        start(&mut cpu, CODE);
-        while !native.computation.contains_key(&head) {
-            assert_ne!(cpu.eip, stop, "the loop was never proved");
-            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-        }
-        native.install_optimized(true);
-        assert!(native.computation[&head].code.optimized.is_some());
-
-        // A form requested for a unit that is dropped before it installs
-        // takes no code space.
-        native.request_optimized(head, cpu.clone());
-        native.cut(head, head + 1);
-        let used = native.cache.used();
-        native.install_optimized(true);
-        assert!(!native.computation.contains_key(&head));
-        assert_eq!(native.cache.used(), used);
-
-        // The loop proves again, and runs optimized once its form installs.
-        start(&mut cpu, CODE);
-        let mut retired = 0;
-        while cpu.eip != stop {
-            retired += alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-        }
-        assert_eq!(retired, 1 + 5 * COUNT);
-        native.install_optimized(true);
-        start(&mut cpu, head);
-        let before = native.diagnostics.optimized_runs;
-        assert_eq!(
-            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 40),
-            5 * COUNT
-        );
-        assert_eq!(native.diagnostics.optimized_runs, before + 1);
-    }
-
     // spec: A64-OPT-1
     #[test]
     fn entry_states_the_form_keeps_missing_build_at_most_two_more() {
         let (mut executor, mut native, stop) = copy_loop();
         let head = CODE + 1;
         let mut cpu = CpuState::default();
-        start(&mut cpu, CODE);
-        while native.diagnostics.optimized_runs == 0 {
-            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-        }
+        start(&mut cpu, head);
+        native.prepare_job(executor.memory_mut(), stop, &cpu);
         // Every form assumes MXCSR's control bits: each new rounding mode
         // misses MISSES entries, then the next entry builds for it.
         for (mode, rebuilds) in [(1, true), (2, true), (3, false)] {
@@ -3172,9 +2656,9 @@ mod tests {
         let (mut executor, mut native) = fixture(&mut a);
         let context = state(&mut executor, CODE, OUTPUT, 2);
         let memory = executor.memory_mut();
-        native.candidates.push(CODE);
-        native.set_computation_offer(true, None);
         let mut cpu = context.as_ref().unwrap().cpu().clone();
+        native.prepare_job(memory, stop, &cpu);
+        native.set_computation_offer(true, None);
         let result = native
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
             .unwrap()
@@ -3221,7 +2705,7 @@ mod tests {
         initial.cpu_mut().regs[4] = STACK;
         let mut serial = initial.cpu().clone();
         let memory = executor.memory_mut();
-        native.candidates.push(CODE);
+        native.prepare_job(memory, TARGET, &serial);
         native.set_computation_offer(true, None);
         assert_eq!(
             native
@@ -3426,7 +2910,7 @@ mod tests {
         cpu.x87.regs[1] = cpu.x87.regs[0];
         cpu.xmm[1] = [3; 16];
         cpu.eflags = 0x8d7;
-        native.candidates.push(CODE);
+        native.prepare_job(executor.memory_mut(), stop, start.cpu());
         native.set_computation_offer(true, None);
         assert_eq!(
             native
@@ -3447,6 +2931,7 @@ mod tests {
         // A separate ordinary translator stops at the same original head.
         let mut owner = Native::new(native.runtime.window as usize).unwrap();
         owner.first_visits = false;
+        owner.keep_ordinary(CODE + 5); // The inner head follows mov ecx,imm32.
         owner.observe_stop(stop);
         let mut serial = start.clone();
         let mut first = None;
@@ -3610,7 +3095,7 @@ mod tests {
         cpu.xmm[1] = [3; 16];
         cpu.eflags = 0x8d7;
 
-        native.candidates.push(CODE);
+        native.prepare_job(executor.memory_mut(), stop, start.cpu());
         native.set_computation_offer(true, None);
         let mut state = start.cpu().clone();
         assert_eq!(

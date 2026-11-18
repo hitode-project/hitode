@@ -16,10 +16,6 @@ use super::simd::{Kind, Loc};
 use super::trace::{Edge, Mode, Next, Trace};
 
 mod carried;
-mod guard;
-
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use guard::emit_guard;
 
 type ExprId = usize;
 type VarId = usize;
@@ -437,30 +433,6 @@ impl Graph {
             heads,
         })
     }
-}
-
-/// Find the outermost returning loop in a prepared trace. A nominated site
-/// still needs its own trace and proof before it can be admitted.
-pub(crate) fn candidate(trace: &Trace) -> Option<u32> {
-    trace.insts[..trace.primary]
-        .iter()
-        .enumerate()
-        .flat_map(|(from, inst)| {
-            [
-                inst.taken,
-                match inst.next {
-                    Next::Edge(edge) => Some(edge),
-                    _ => None,
-                },
-            ]
-            .into_iter()
-            .filter_map(move |edge| match edge {
-                Some(Edge::Internal(to)) if to <= from => Some(to),
-                _ => None,
-            })
-        })
-        .min()
-        .map(|head| trace.insts[head].pc)
 }
 
 /// Why a trace has no proof: the stage that refused it and the trace
@@ -2897,7 +2869,6 @@ pub(crate) mod tests {
     #[test]
     fn bounds_nested_descending_rows_and_live_stack_count() {
         let t = nested_descending_rows();
-        assert_eq!(candidate(&t), Some(CODE));
         let proof = Proof::build(&t).expect("nested range proof");
         let mut cpu = CpuState::default();
         cpu.regs[4..8].copy_from_slice(&[FRAME, PARAMS, INPUT, OUTPUT]);
@@ -3091,7 +3062,6 @@ pub(crate) mod tests {
             a.jne(row).unwrap();
             a.int3().unwrap();
         });
-        assert_eq!(candidate(&t), Some(CODE));
         let proof = Proof::build(&t).expect("row blend proof");
         const TABLE: u32 = 0x60000;
         // eax pixels, edx source row, ebx the latch step, ebp target row.

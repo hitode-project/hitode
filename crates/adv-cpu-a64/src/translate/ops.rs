@@ -745,7 +745,7 @@ impl Translator<'_> {
             self.emit(movz(W, X0, Exit::Yield as u16, 0));
             self.far(self.stubs.exit);
         } else {
-            self.leave(Exit::Yield, eip, refund, false, false);
+            self.leave(Exit::Yield, eip, refund, false, false, false);
         }
     }
 
