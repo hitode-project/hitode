@@ -31,11 +31,19 @@ impl Image {
         build: impl FnOnce(&mut CodeAssembler, CodeLabel, CodeLabel),
         finish: impl FnOnce(&mut CodeAssembler),
     ) -> Self {
+        Self::with_prelude(|a, _| a.nop().unwrap(), build, finish)
+    }
+
+    fn with_prelude(
+        prelude: impl FnOnce(&mut CodeAssembler, CodeLabel),
+        build: impl FnOnce(&mut CodeAssembler, CodeLabel, CodeLabel),
+        finish: impl FnOnce(&mut CodeAssembler),
+    ) -> Self {
         let mut a = CodeAssembler::new(32).unwrap();
         let mut head = a.create_label();
         let mut stop = a.create_label();
         // Start outside the loop so the form is reached from Tier 1.
-        a.nop().unwrap();
+        prelude(&mut a, stop);
         a.set_label(&mut head).unwrap();
         build(&mut a, head, stop);
         a.set_label(&mut stop).unwrap();
@@ -275,6 +283,198 @@ impl<'a> Trial<'a> {
         );
         self.same_position_and_memory(FUEL - self.live.state.fuel, true);
         self.same_state();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InnerRole {
+    ShiftCount,
+    WordIndex,
+}
+
+fn nested_frame_loop(role: InnerRole, frame_offset: i32, locals: i32) -> Image {
+    Image::with_prelude(
+        |a, stop| {
+            a.lea(ebp, esp + frame_offset).unwrap();
+            a.mov(edx, dword_ptr(ebp - 8)).unwrap();
+            a.xor(edi, edi).unwrap();
+            a.test(edx, edx).unwrap();
+            a.jle(stop).unwrap();
+            a.mov(esi, dword_ptr(ebp - 12)).unwrap();
+            a.mov(ecx, dword_ptr(ebp - 4)).unwrap();
+        },
+        |a, head, stop| {
+            let mut inner = a.create_label();
+            let mut reload = a.create_label();
+            let mut join = a.create_label();
+            a.mov(dl, byte_ptr(edi + ecx)).unwrap();
+            a.xor(eax, eax).unwrap();
+            a.xor(ecx, ecx).unwrap();
+            a.movsx(ebx, dl).unwrap();
+            a.test(dl, dl).unwrap();
+            a.jle(reload).unwrap();
+            a.set_label(&mut inner).unwrap();
+            let word = match role {
+                InnerRole::ShiftCount => dword_ptr(esi),
+                InnerRole::WordIndex => dword_ptr(esi + ecx * 4),
+            };
+            a.mov(edx, word).unwrap();
+            for local in 0..locals {
+                a.xor(eax, dword_ptr(ebp + 32 + 4 * local)).unwrap();
+            }
+            a.add(eax, eax).unwrap();
+            if matches!(role, InnerRole::ShiftCount) {
+                a.shr(edx, cl).unwrap();
+            }
+            a.inc(ecx).unwrap();
+            a.and(edx, 1).unwrap();
+            a.or(eax, edx).unwrap();
+            a.cmp(ecx, ebx).unwrap();
+            a.jl(inner).unwrap();
+            a.mov(ecx, dword_ptr(ebp - 4)).unwrap();
+            a.mov(dl, byte_ptr(edi + ecx)).unwrap();
+            a.jmp(join).unwrap();
+            a.set_label(&mut reload).unwrap();
+            a.mov(ecx, dword_ptr(ebp - 4)).unwrap();
+            a.set_label(&mut join).unwrap();
+            a.cmp(dword_ptr(ebp + 8), 0).unwrap();
+            a.je(stop).unwrap();
+            a.inc(edi).unwrap();
+            a.cmp(edi, dword_ptr(ebp - 8)).unwrap();
+            a.jl(head).unwrap();
+        },
+        observe_registers,
+    )
+}
+
+fn nested_frame_trial(
+    role: InnerRole,
+    frame_offset: i32,
+    table: &[u8],
+    word: u32,
+    soft_word: bool,
+    context: impl Into<String>,
+) -> Trial<'static> {
+    // Keep more values live across the checked load than fit in registers.
+    let locals = if soft_word { 18 } else { 0 };
+    let image = nested_frame_loop(role, frame_offset, locals);
+    let extra: &[_] = if soft_word {
+        &[(SPECIAL, PAGE_SIZE)]
+    } else {
+        &[]
+    };
+    let mut trial = Trial::new(&image, &initial(0), context, extra, |m| {
+        m.write(DATA, table).unwrap();
+        let word_addr = if soft_word {
+            soft_page(m, word);
+            SPECIAL
+        } else {
+            let words: Vec<_> = (0..32)
+                .flat_map(|i| word.rotate_left(i).to_le_bytes())
+                .collect();
+            m.write(DATA + 0x800, &words).unwrap();
+            DATA + 0x800
+        };
+        let frame = FRAME + frame_offset as u32;
+        for local in 0..locals as u32 {
+            m.write(
+                frame + 32 + 4 * local,
+                &word.rotate_left(local).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        for (offset, value) in [
+            (-12, word_addr),
+            (-8, table.len() as u32),
+            (-4, DATA),
+            (8, 1),
+        ] {
+            m.write(frame.wrapping_add_signed(offset), &value.to_le_bytes())
+                .unwrap();
+        }
+    });
+    if soft_word {
+        trial.live.native.as_mut().unwrap().checks = Checks::All;
+    }
+    trial
+}
+
+fn enter_nested_loop(trial: &mut Trial<'_>, force: bool) {
+    let initial = trial.live.state.clone();
+    if force {
+        assert_eq!(trial.compare(7), (RunOutcome::Budget, 7));
+        assert_eq!(trial.live.state.eip, trial.head);
+        trial.live.memory.attach().unwrap();
+        assert!(
+            trial
+                .live
+                .native
+                .as_mut()
+                .unwrap()
+                .force_resident_at(&mut trial.live.memory, trial.live.state.clone(),)
+        );
+    } else {
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert!(native.unit_address(trial.head).is_none());
+        assert_eq!(native.resident_arrivals(trial.head), Some(0));
+    }
+    trial.live.state = initial.clone();
+    trial.reference.state = initial;
+}
+
+// spec: A64-OPT-7, A64-OPT-8, A64-OPT-9
+#[test]
+fn nested_loop_reloads_the_table_base_at_the_outer_head() {
+    let table: Vec<u8> = [3, 0, 1, 0xff, 5].into_iter().cycle().take(96).collect();
+    for (force, soft_word) in [(true, false), (false, false), (true, true), (false, true)] {
+        let mut trial = nested_frame_trial(
+            InnerRole::ShiftCount,
+            16,
+            &table,
+            0x1234_567d,
+            soft_word,
+            format!("nested frame loop force {force} soft word {soft_word}"),
+        );
+        enter_nested_loop(&mut trial, force);
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .resident_arrivals(trial.head)
+                .unwrap()
+                > 0
+        );
+        trial.compare_epilogue();
+    }
+}
+
+// spec: A64-OPT-9
+#[test]
+fn seeded_nested_loops_reload_registers_reused_in_inner_loops() {
+    for role in [InnerRole::ShiftCount, InnerRole::WordIndex] {
+        for seed in SEEDS {
+            let mut rng = Rng(seed);
+            let frame_offset = 4 * rng.below(9) as i32;
+            let table: Vec<_> = (0..24)
+                .map(|_| (rng.below(12) as u8).wrapping_sub(2))
+                .collect();
+            let mut trial = nested_frame_trial(
+                role,
+                frame_offset,
+                &table,
+                rng.next() as u32,
+                false,
+                format!("{role:?} seed {seed:#x}"),
+            );
+            enter_nested_loop(&mut trial, true);
+            assert_eq!(trial.compare(32), (RunOutcome::Budget, 32));
+            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+            trial.compare_epilogue();
+        }
     }
 }
 
