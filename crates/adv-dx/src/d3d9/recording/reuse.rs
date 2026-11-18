@@ -17,12 +17,14 @@ enum Mode {
     Bound(u32),
 }
 
+type SampleBinding = (usize, Id, u32, ImageId, u8);
+
 #[derive(PartialEq, Eq, Hash)]
 struct Signature {
     request: (i32, u32, Mode),
     state: [u128; 15],
     target: (Option<Id>, Option<Id>, key::TargetKey),
-    textures: SmallVec<[(usize, Id, u32, ImageId, u8); 2]>,
+    textures: SmallVec<[SampleBinding; 2]>,
     reads: SmallVec<[(Option<u128>, bool); 4]>,
     independent: [bool; 3],
 }
@@ -171,16 +173,16 @@ fn signature(
     Ok((signature, target))
 }
 fn unchanged(env: &Env<'_>, spans: &fixed::CapturedSpans, up: Option<u32>) -> bool {
-    spans.iter().all(|(address, old)| {
-        let address = up.unwrap_or(*address);
-        if adv_abi::guest::check_range(env.cpu, address, old.len() as u32, Prot::READ).is_err() {
+    spans.iter().all(|span| {
+        let address = up.unwrap_or(span.address);
+        if adv_abi::guest::check_range(env.cpu, address, span.length as u32, Prot::READ).is_err() {
             return false;
         }
-        if let Some(bytes) = env.cpu.shared_bytes(address, old.len()) {
-            bytes == old.as_slice()
+        if let Some(bytes) = env.cpu.shared_bytes(address, span.length) {
+            span.matches(bytes)
         } else {
-            let mut bytes = vec![0; old.len()];
-            env.cpu.read(address, &mut bytes).is_ok() && bytes == old.as_slice()
+            let mut bytes = vec![0; span.length];
+            env.cpu.read(address, &mut bytes).is_ok() && span.matches(&bytes)
         }
     })
 }

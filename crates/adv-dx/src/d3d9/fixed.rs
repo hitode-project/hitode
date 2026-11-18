@@ -13,7 +13,27 @@ pub(super) mod lighting;
 mod state_map;
 use state_map::StateMap;
 
-pub(super) type CapturedSpans = Vec<(u32, adv_device::gpu::VertexBytes)>;
+pub(super) type CapturedSpans = Vec<CapturedSpan>;
+
+#[derive(Clone)]
+pub(super) struct CapturedSpan {
+    pub address: u32,
+    pub length: usize,
+    bytes: adv_device::gpu::VertexBytes,
+    repack: Option<(usize, usize)>,
+}
+
+impl CapturedSpan {
+    pub fn matches(&self, raw: &[u8]) -> bool {
+        if let Some((stride, aligned)) = self.repack {
+            raw.chunks(stride)
+                .zip(self.bytes.chunks(aligned))
+                .all(|(source, packed)| source == &packed[..source.len()])
+        } else {
+            raw == self.bytes.as_slice()
+        }
+    }
+}
 
 pub(super) struct CachedFixed {
     state: Fixed,
@@ -41,18 +61,34 @@ impl CachedFixed {
         env: &Env<'_>,
         address: u32,
         length: u32,
+        repack: Option<(usize, usize)>,
     ) -> Result<adv_device::gpu::VertexBytes, u32> {
-        let bytes = if let Some(bytes) = env.cpu.shared_bytes(address, length as usize) {
-            bytes.to_vec()
+        use std::borrow::Cow;
+        let raw = if let Some(bytes) = env.cpu.shared_bytes(address, length as usize) {
+            Cow::Borrowed(bytes)
         } else {
             let mut bytes = vec![0; length as usize];
             env.cpu.read(address, &mut bytes).map_err(|_| INVALID)?;
+            Cow::Owned(bytes)
+        };
+        let bytes = if let Some((stride, aligned)) = repack {
+            let mut bytes = vec![0; raw.len().div_ceil(stride) * aligned];
+            for (source, packed) in raw.chunks(stride).zip(bytes.chunks_mut(aligned)) {
+                packed[..source.len()].copy_from_slice(source);
+            }
             bytes
+        } else {
+            raw.into_owned()
         };
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
         let bytes = adv_device::gpu::VertexBytes::captured(bytes, key);
         if let Some(captures) = self.captures.borrow_mut().as_mut() {
-            captures.push((address, bytes.clone()));
+            captures.push(CapturedSpan {
+                address,
+                length: length as usize,
+                bytes: bytes.clone(),
+                repack,
+            });
         }
         Ok(bytes)
     }

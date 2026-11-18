@@ -421,8 +421,16 @@ fn prepare_checked(
     if up.is_some() && fixed_layout.is_some() && input_spec.iter().any(|i| i.stream != 0) {
         return Err(UNAVAILABLE);
     }
-    let mut streams =
-        streams::capture(env, pointer, &input_spec, up, start, first, last, instanced)?;
+    let mut streams = streams::capture(
+        env,
+        pointer,
+        &input_spec,
+        up,
+        start,
+        first..=last,
+        instanced,
+        fixed_layout.is_some(),
+    )?;
     let (target, image, state) = fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
     let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
     env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);

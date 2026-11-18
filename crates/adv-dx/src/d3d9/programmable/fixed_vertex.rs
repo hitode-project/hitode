@@ -121,9 +121,9 @@ impl Variant {
         for (out, row) in values.iter_mut().zip(
             f.transforms
                 .iter()
-                .flat_map(|matrix| matrix.chunks_exact(4)),
+                .flat_map(|matrix| matrix.as_chunks::<4>().0),
         ) {
-            out.copy_from_slice(row);
+            *out = *row;
         }
         let mut count = 12;
         if self.scaled {
@@ -135,8 +135,8 @@ impl Variant {
             for (out, row) in values[13..16].iter_mut().zip(normal) {
                 out[..3].copy_from_slice(&row);
             }
-            for (out, row) in values[16..20].iter_mut().zip(f.material.chunks_exact(4)) {
-                out.copy_from_slice(row);
+            for (out, row) in values[16..20].iter_mut().zip(f.material.as_chunks::<4>().0) {
+                *out = *row;
             }
             values[20] = fixed::lighting::color(f.render[&139]);
             values[21][0] = f.material[16];

@@ -821,14 +821,15 @@ mod fixed_completion {
             ticket.take_completion_job().unwrap()();
             ticket.poll().unwrap().unwrap()
         };
-        for (transformed, lit, source, point, scissored, trailing) in [
-            (true, false, 0, false, false, false),
-            (true, false, 0, false, true, true),
-            (false, false, 0, false, true, false),
-            (false, true, 0, false, false, false),
-            (false, true, 1, false, true, false),
-            (false, true, 2, false, true, false),
-            (false, false, 0, true, true, false),
+        for (transformed, lit, source, point, scissored, trailing, padding) in [
+            (true, false, 0, false, false, false, 0),
+            (true, false, 0, false, false, false, 1),
+            (true, false, 0, false, true, true, 0),
+            (false, false, 0, false, true, false, 0),
+            (false, true, 0, false, false, false, 0),
+            (false, true, 1, false, true, false, 0),
+            (false, true, 2, false, true, false, 0),
+            (false, false, 0, true, true, false, 0),
         ] {
             for (state, value) in [
                 (137, u32::from(lit)),
@@ -868,9 +869,15 @@ mod fixed_completion {
                 }
                 words.extend([color, highlight, 0.25f32.to_bits(), 0.75f32.to_bits()]);
             }
-            let data = alloc(&mut e, (words.len() * 4) as u32).unwrap();
-            e.cpu.write(data, bytemuck::cast_slice(&words)).unwrap();
-            let stride = (words.len() * 4 / input.len()) as u32;
+            let record_words = words.len() / input.len();
+            let stride = (record_words * 4 + padding) as u32;
+            let mut bytes = Vec::new();
+            for record in words.chunks(record_words) {
+                bytes.extend_from_slice(bytemuck::cast_slice(record));
+                bytes.extend_from_slice(&[0xa5][..padding]);
+            }
+            let data = alloc(&mut e, bytes.len() as u32).unwrap();
+            e.cpu.write(data, &bytes).unwrap();
             let draw = prepare(
                 &mut e,
                 pointer,
@@ -946,7 +953,15 @@ mod fixed_completion {
                 bounds(draw.clone()),
                 bounds(old),
                 "{:?}",
-                (transformed, lit, source, point, scissored, trailing)
+                (
+                    transformed,
+                    lit,
+                    source,
+                    point,
+                    scissored,
+                    trailing,
+                    padding
+                )
             );
             let gpu = e.ext.get_mut::<State>().gpu.as_mut().unwrap();
             gpu.clear(&target, blank, None).unwrap();
@@ -981,7 +996,15 @@ mod fixed_completion {
             assert!(
                 actual == expected,
                 "different pixels for {:?}",
-                (transformed, lit, source, point, scissored, trailing)
+                (
+                    transformed,
+                    lit,
+                    source,
+                    point,
+                    scissored,
+                    trailing,
+                    padding
+                )
             );
         }
     }

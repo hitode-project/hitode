@@ -356,7 +356,7 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-INPUT-4 Fixed texture coordinates
 
-**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading. Fixed vertex processing for FVF UP draws MUST omit trailing texture coordinates starting outside the uploaded stride.
+**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading. Fixed vertex processing for FVF UP draws MUST omit trailing texture coordinates starting outside the guest stride. Fixed UP draws MUST preserve unaligned guest strides by padding captured records for GPU fetch.
 **Verification**: Test
 
 ### GFX-INPUT-5 Fixed raster limits
