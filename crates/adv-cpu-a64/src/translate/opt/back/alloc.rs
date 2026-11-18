@@ -19,14 +19,24 @@ pub(super) struct Allocation {
 }
 
 // spec: A64-OPT-6, A64-OPT-7
-pub(super) fn allocate(func: &Func, inline: bool, resident: bool) -> Allocation {
+pub(super) fn allocate(
+    func: &Func,
+    inline: bool,
+    resident: bool,
+    batches: &[loops::Batch],
+) -> Allocation {
     // Resident access and probation calls use LR while allocated values are live.
     let reserved = |r| {
-        [9, 16, 17, 18, 28, 29].contains(&r) || inline && r <= 5 || resident && matches!(r, 27 | 30)
+        [9, 16, 17, 18, 28, 29].contains(&r)
+            || (inline || !batches.is_empty()) && r <= 5
+            || resident && matches!(r, 27 | 30)
     };
     let n = func.types.len();
     let mut operations = vec![None; n];
     let mut vectors = if inline { E.number() as u8 } else { 29 };
+    if !batches.is_empty() {
+        vectors = vectors.min(16);
+    }
     let mut constants = vec![None; n];
     let mut hints = vec![Vec::new(); n];
     for data in &func.blocks {
@@ -124,6 +134,14 @@ pub(super) fn allocate(func: &Func, inline: bool, resident: bool) -> Allocation 
         };
         for v in func.records[region.0 as usize].uses() {
             read(v, position, false, false);
+        }
+        if let Some(batch) = batches
+            .iter()
+            .find(|batch| batch.loop_.head.0 as usize == b)
+        {
+            for v in batch.inputs() {
+                read(v, position, true, false);
+            }
         }
         for (result, op) in &data.insts {
             position += 2;

@@ -170,6 +170,17 @@ impl Emitter<'_> {
         }
 
         let addr = self.gp(addr, U);
+        self.plain_span(addr, bytes, write, false, miss);
+    }
+
+    pub(super) fn plain_span(
+        &mut self,
+        addr: Reg,
+        bytes: u32,
+        write: bool,
+        batch: bool,
+        miss: Label,
+    ) {
         let next = self.asm.label();
         self.asm
             .emit_all(&[ldr(W, X0, RT, MEMORY_BASE), cmp(W, addr, X0, Lsl, 0)]);
@@ -186,7 +197,7 @@ impl Emitter<'_> {
         ]);
         self.asm.b_cond(Cond::Hs, miss);
         self.asm.emit(ldr(X, X3, RT, PLAIN_PAGES));
-        if write {
+        if write || batch {
             self.asm.emit(lsr_imm(W, X0, X0, 12));
         }
 
@@ -199,7 +210,7 @@ impl Emitter<'_> {
             shiftv(X, Lsr, X5, X5, X1),
         ]);
         self.asm.tbz(false, X5, 0, miss);
-        if write {
+        if write || batch {
             self.asm
                 .emit_all(&[ldr(X, X5, X4, 16), shiftv(X, Lsr, X5, X5, X1)]);
             self.asm.tbz(true, X5, 0, miss);
@@ -210,9 +221,12 @@ impl Emitter<'_> {
                 ldr(X, X4, RT, runtime::CLASSES),
                 ldr_narrow(Narrow::Byte, X5, X4, X5),
             ]);
-            self.asm.tbz(false, X5, WRITE.trailing_zeros(), miss);
-            self.asm
-                .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
+            let permission = if write { WRITE } else { READ };
+            self.asm.tbz(false, X5, permission.trailing_zeros(), miss);
+            if write {
+                self.asm
+                    .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
+            }
         }
         self.asm
             .emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);

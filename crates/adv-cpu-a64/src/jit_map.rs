@@ -295,6 +295,20 @@ pub(crate) fn declined(head: u32, reason: crate::runtime::ResidentCold) {
     }
 }
 
+pub(crate) fn vectorized(head: u32, kernel: &str, lanes: u8, streams: usize) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(files.3, "vectorized\t{head}\t{kernel}\t{lanes}\t{streams}");
+    }
+}
+
+pub(crate) fn loop_reject(head: u32, reason: std::fmt::Arguments<'_>) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(files.3, "loopreject\t{head}\t{reason}");
+    }
+}
+
 /// `insn-{pid}.tsv` rows of a unit, keyed by its `jit-{pid}.tsv` row: Unix
 /// ns, native base, start and end offsets of each stretch, guest
 /// instruction, part and class (a64 has none).

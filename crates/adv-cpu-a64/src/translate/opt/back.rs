@@ -4,6 +4,7 @@
 //! Floating point runs under the canonical FPCR and validates by value
 //! (A64-OPT-4).
 mod alloc;
+mod batch;
 mod cost;
 mod flags;
 mod inline;
@@ -14,6 +15,7 @@ pub(crate) use resident::access_stub;
 
 use super::front::Assumed;
 use super::ir::*;
+use super::loops;
 use super::recovery::{FlagRecipe, Host, Record};
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
@@ -24,6 +26,7 @@ use crate::runtime::{self, ResidentCold, Runtime};
 use crate::translate::access::{CheckedEmitter, Value as AccessReg, page_crossing};
 use crate::translate::{Carry, Overflow, Sense, Site, WINDOW, fp_class};
 use crate::translate::{X0, X1, X2, X3};
+pub(super) use batch::BatchEmitter;
 use std::mem::offset_of;
 
 const T: Reg = Reg::new(16);
@@ -113,13 +116,20 @@ fn lower_form(
     count_entries: bool,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let allocation = alloc::allocate(func, inline.is_some(), resident);
+    let batches = loops::plan(func, &[]);
+    let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
     let mut asm = Asm::new();
     // A bit test whose target lands out of range is emitted wide, and the
     // form again, as the ordinary translator does.
     let (mut e, exit, miss, cold) = loop {
-        let (mut e, exit, miss, cold) =
-            emit(func, &allocation, asm, inline, resident, count_entries);
+        let (mut e, exit, miss, cold) = emit(
+            func,
+            &allocation,
+            asm,
+            inline,
+            (resident, count_entries),
+            &batches,
+        );
         if !e.asm.widen_bit_tests() {
             break (e, exit, miss, cold);
         }
@@ -193,8 +203,8 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
-    resident: bool,
-    count_entries: bool,
+    (resident, count_entries): (bool, bool),
+    batches: &[loops::Batch],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -294,6 +304,12 @@ fn emit<'a>(
                 .copied()
                 .unwrap_or(func.records[e.region.0 as usize].eip),
         );
+        if let Some(batch) = batches
+            .iter()
+            .find(|batch| batch.loop_.head.0 as usize == b)
+        {
+            e.batch(batch);
+        }
         for (i, &(result, op)) in data.insts.iter().enumerate() {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
@@ -725,19 +741,7 @@ impl<'a> Emitter<'a> {
     /// A head that only names the record of one charged arrival and jumps on
     /// with charge 0. Its code is laid out inline on that arrival's edge.
     fn through(&self, block: Block) -> Option<&'a Target> {
-        let data = &self.func.blocks[block.0 as usize];
-        match &data.end {
-            End::Jump(t)
-                if data.head.is_some()
-                    && block.0 != 0
-                    && data.params.is_empty()
-                    && data.insts.is_empty()
-                    && t.charge == 0 =>
-            {
-                Some(t)
-            }
-            _ => None,
-        }
+        loops::through(self.func, block)
     }
     /// A frame cell access at `offset` from the host address in `base`,
     /// through U when the offset needs computing.

@@ -295,7 +295,7 @@ fn effects(func: &Func) -> Result<(), Error> {
 
 /// Immediate dominators by the iterative algorithm of Cooper, Harvey and
 /// Kennedy over reverse postorder. Unreachable blocks have none.
-fn dominators(func: &Func) -> Vec<Option<usize>> {
+pub(super) fn dominators(func: &Func) -> Vec<Option<usize>> {
     let n = func.blocks.len();
     let succ = |b: usize| func.blocks[b].end.targets().map(|t| t.block.0 as usize);
     let mut order = Vec::with_capacity(n);
@@ -359,7 +359,7 @@ fn dominators(func: &Func) -> Vec<Option<usize>> {
     idom
 }
 
-fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
+pub(super) fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
     loop {
         if a == b {
             return true;

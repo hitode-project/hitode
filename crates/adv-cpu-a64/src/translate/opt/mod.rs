@@ -65,6 +65,7 @@ pub(crate) mod back;
 pub(crate) mod eval;
 pub(crate) mod front;
 pub(crate) mod ir;
+mod loops;
 pub(crate) mod recovery;
 pub(crate) mod verify;
 
