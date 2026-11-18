@@ -50,6 +50,29 @@ use adv_machine::{
     Clock, RunResult,
     layout::{PAGE, PARK_ADDR},
 };
+const REF_PLANES: u32 = 300;
+const CURRENT: u32 = 896;
+const GRANPOS: u32 = 904;
+const FRAME_TYPE: u32 = 912;
+const OUTPUT: u32 = 54104;
+const STRIPE: u32 = 54152;
+const FIXTURE_LAYOUT: Layout = Layout {
+    info_bytes: 64,
+    init_bytes: STRIPE + 8,
+    info: 0,
+    ref_planes: REF_PLANES,
+    ref_indices: 276,
+    plane_allocation: 588,
+    keyframe: 888,
+    current: CURRENT,
+    granpos: GRANPOS,
+    frame_type: FRAME_TYPE,
+    bias: FRAME_TYPE + 1,
+    pp_level: 53572,
+    output: OUTPUT,
+    stripe: STRIPE,
+};
+
 const CODE: u32 = 0x0040_0000;
 const CONTEXT: u32 = 0x0041_0000;
 const PACKET: u32 = CONTEXT + 0xf000;
@@ -118,6 +141,7 @@ fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
     machine.ext.insert(Provider {
         mode,
         bindings: vec![Binding {
+            layout: FIXTURE_LAYOUT,
             allocator: SLOT,
             live: true,
             init: entry(),
@@ -223,7 +247,13 @@ fn family_fixture() -> (Family, Vec<u8>) {
         0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0xb8, 8, 0, 0, 0, 0xc9, 0xc3,
     ]);
     bytes[0x400..0x404].copy_from_slice(&42u32.to_le_bytes());
-    let text = "root init 6\nhook packet 6\nhook clear 6\ncode init 28 7172a948bdc2bc02c6a0002a3cf85feb18b2659e95825d32fdff7047d1455bf3\nlink init 7 rel packet 0\nlink init 12 rel clear 0\nlink init 17 abs malloc 0\nlink init 22 abs table 0\ncode packet 13 07dd12334a3dbd22a6baa2c8312ca2a02f01d11911d4d45a75d75f82f512143c\ncode clear 13 a8f24299d952d9a343f5d23d104f1acab809a2f524b4a907332d0cca0e222009\nslot malloc\ndata table 4 e8a4b2ee7ede79a3afb332b5b6cc3d952a65fd8cffb897f5d18016577c33d7cc\n";
+    let text = concat!(
+        "root init 6\nhook packet 6\nhook clear 6\ncode init 28 7172a948bdc2bc02c6a0002a3cf85feb18b2659e95825d32fdff7047d1455bf3\nlink init 7 rel packet 0\nlink init 12 rel clear 0\nlink init 17 abs malloc 0\nlink init 22 abs table 0\ncode packet 13 07dd12334a3dbd22a6baa2c8312ca2a02f01d11911d4d45a75d75f82f512143c\ncode clear 13 a8f24299d952d9a343f5d23d104f1acab809a2f524b4a907332d0cca0e222009\nslot malloc\ndata table 4 e8a4b2ee7ede79a3afb332b5b6cc3d952a65fd8cffb897f5d18016577c33d7cc\n",
+        "field info_bytes 64\nfield init_bytes 54160\nfield info 0\nfield ref_planes 300\n",
+        "field ref_indices 276\nfield plane_allocation 588\nfield keyframe 888\nfield current 896\n",
+        "field granpos 904\nfield frame_type 912\nfield bias 913\nfield pp_level 53572\n",
+        "field output 54104\nfield stripe 54152\n",
+    );
     (Family::parse(text).unwrap(), bytes)
 }
 
@@ -413,7 +443,7 @@ fn packet_pixels_state_and_result_match_guest() {
             }
             observations.push((
                 pixels,
-                state_read(&m.cpu, CONTEXT).unwrap(),
+                state_read(&m.cpu, CONTEXT, FIXTURE_LAYOUT).unwrap(),
                 read(&m.cpu, GRANULE, 8).unwrap(),
                 m.cpu.read_u32(RESULT).unwrap(),
             ));

@@ -9,17 +9,6 @@ use std::time::Instant;
 
 const FAMILY: &str = include_str!("../../../../data/codec/theora-msvc-x86.txt");
 const MODULE: &str = "adv-theora";
-// Reviewed Xiph x86/MMX ABI: reference indices precede the plane buffers.
-const INFO: usize = 64;
-const REF_PLANES: u32 = 300;
-const KEYFRAME: u32 = 888;
-const CURRENT: u32 = 896;
-const GRANPOS: u32 = 904;
-const FRAME_TYPE: u32 = 912;
-const PP_LEVEL: u32 = 53572;
-const OUTPUT: u32 = 54104;
-const STRIPE: u32 = 54152;
-
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub installed: u64,
@@ -32,7 +21,74 @@ pub struct Stats {
     pub decode_ns: u64,
     pub reason: Option<String>,
 }
+#[derive(Clone, Copy)]
+struct Layout {
+    info_bytes: u32,
+    init_bytes: u32,
+    info: u32,
+    ref_planes: u32,
+    ref_indices: u32,
+    plane_allocation: u32,
+    keyframe: u32,
+    current: u32,
+    granpos: u32,
+    frame_type: u32,
+    bias: u32,
+    pp_level: u32,
+    output: u32,
+    stripe: u32,
+}
+impl Layout {
+    fn from_fields(fields: &BTreeMap<String, u32>) -> Result<Self, String> {
+        let get = |name: &str| {
+            fields
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("missing Theora layout field {name}"))
+        };
+        let layout = Self {
+            info_bytes: get("info_bytes")?,
+            init_bytes: get("init_bytes")?,
+            info: get("info")?,
+            ref_planes: get("ref_planes")?,
+            ref_indices: get("ref_indices")?,
+            plane_allocation: get("plane_allocation")?,
+            keyframe: get("keyframe")?,
+            current: get("current")?,
+            granpos: get("granpos")?,
+            frame_type: get("frame_type")?,
+            bias: get("bias")?,
+            pp_level: get("pp_level")?,
+            output: get("output")?,
+            stripe: get("stripe")?,
+        };
+        for (offset, size) in [
+            (layout.info, layout.info_bytes),
+            (layout.ref_planes, 48),
+            (layout.ref_indices, 24),
+            (layout.plane_allocation, 4),
+            (layout.keyframe, 8),
+            (layout.current, 8),
+            (layout.granpos, 8),
+            (layout.frame_type, 1),
+            (layout.bias, 1),
+            (layout.pp_level, 4),
+            (layout.output, 48),
+            (layout.stripe, 8),
+        ] {
+            if offset
+                .checked_add(size)
+                .is_none_or(|end| end > layout.init_bytes)
+            {
+                return Err("Theora layout field outside decoder header".into());
+            }
+        }
+        Ok(layout)
+    }
+}
+
 struct Binding {
+    layout: Layout,
     live: bool,
     allocator: u32,
     init: Entry,
@@ -96,6 +152,7 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
     let Some(library) = family.scan(ranges, &mut |a, n| read(e.cpu, a, n).ok()) else {
         return Ok(());
     };
+    let layout = Layout::from_fields(&library.layout)?;
     let index = e.ext.get::<Provider>().bindings.len();
     let mut hooks = Vec::new();
     for name in ["init", "packet", "clear"] {
@@ -129,6 +186,7 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
     let mut hooks = hooks.into_iter();
     let provider = e.ext.get_mut::<Provider>();
     provider.bindings.push(Binding {
+        layout,
         live: true,
         allocator: library.symbols["malloc"],
         init: hooks.next().unwrap(),
@@ -187,7 +245,7 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 fn wide(bytes: &[u8], at: usize) -> i64 {
     i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
-fn setup(cpu: &dyn Guest, info: u32, address: u32) -> Result<Setup, String> {
+fn setup(cpu: &dyn Guest, info: u32, address: u32, info_bytes: u32) -> Result<Setup, String> {
     let raw = read(cpu, address, 712)?;
     let huffman = (0..80)
         .map(|i| {
@@ -256,7 +314,9 @@ fn setup(cpu: &dyn Guest, info: u32, address: u32) -> Result<Setup, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Setup {
-        info: read(cpu, info, INFO)?.try_into().unwrap(),
+        info: read(cpu, info, info_bytes as usize)?
+            .try_into()
+            .map_err(|_| "unsupported Theora info size")?,
         huffman: huffman.try_into().ok().unwrap(),
         dc_scale: std::array::from_fn(|i| {
             u16::from_le_bytes(raw[320 + i * 2..322 + i * 2].try_into().unwrap())
@@ -281,7 +341,13 @@ fn init(e: &mut Env<'_>) -> Outcome {
     let provider = e.ext.get_mut::<Provider>();
     provider.decoders.remove(&address);
     let target = provider.bindings[index].init.original;
-    let native = setup(e.cpu, info, tables).and_then(|s| Decoder::new(&s).map_err(str::to_owned));
+    let native = setup(
+        e.cpu,
+        info,
+        tables,
+        provider.bindings[index].layout.info_bytes,
+    )
+    .and_then(|s| Decoder::new(&s).map_err(str::to_owned));
     if e.ext.get::<Provider>().mode == Mode::Native {
         return match native {
             Ok(native) => native_init(e, index, address, native),
@@ -329,7 +395,9 @@ fn native_init(e: &mut Env<'_>, index: usize, address: u32, native: Decoder) -> 
     let Ok(size) = u32::try_from(ysize + 2 * csize) else {
         return Outcome::Return((-23i32) as u32);
     };
-    let slot = e.ext.get::<Provider>().bindings[index].allocator;
+    let binding = &e.ext.get::<Provider>().bindings[index];
+    let layout = binding.layout;
+    let slot = binding.allocator;
     let allocator = match read(e.cpu, slot, 4) {
         Ok(value) => word(&value, 0),
         Err(error) => return Outcome::Fail(error),
@@ -339,15 +407,19 @@ fn native_init(e: &mut Env<'_>, index: usize, address: u32, native: Decoder) -> 
         if allocation == 0 {
             return Outcome::Return((-1i32) as u32);
         }
-        let mut header = vec![0u8; (STRIPE + 8) as usize];
-        header[..64].copy_from_slice(&info);
-        header[CURRENT as usize..CURRENT as usize + 8].copy_from_slice(&(-1i64).to_le_bytes());
-        header[FRAME_TYPE as usize] = 255;
-        header[FRAME_TYPE as usize + 1] = bias;
+        let mut header = vec![0u8; layout.init_bytes as usize];
+        header[layout.ref_indices as usize..layout.ref_indices as usize + 24].fill(255);
+        let mut write = |offset: u32, value: &[u8]| {
+            let start = offset as usize;
+            header[start..start + value.len()].copy_from_slice(value);
+        };
+        write(layout.info, &info);
+        write(layout.current, &(-1i64).to_le_bytes());
+        write(layout.frame_type, &[255]);
+        write(layout.bias, &[bias]);
         // The reviewed clear routine frees this allocation once; all other
         // guest-private allocations and Huffman pointers are null.
-        header[588..592].copy_from_slice(&allocation.to_le_bytes());
-        header[276..300].fill(255);
+        write(layout.plane_allocation, &allocation.to_le_bytes());
         let mut base = allocation;
         for plane in 0..3 {
             let (w, h, stride, pad_x, pad_y, bytes) = if plane == 0 {
@@ -364,9 +436,9 @@ fn native_init(e: &mut Env<'_>, index: usize, address: u32, native: Decoder) -> 
             };
             let top = base + pad_x + pad_y * stride;
             let data = top + (h - 1) * stride;
-            let at = REF_PLANES as usize + plane * 16;
+            let at = layout.ref_planes + plane * 16;
             for (offset, value) in [(0, w), (4, h), (8, (-(stride as i32)) as u32), (12, data)] {
-                header[at + offset..at + offset + 4].copy_from_slice(&value.to_le_bytes());
+                write(at + offset, &value.to_le_bytes());
             }
             base += bytes;
         }
@@ -388,14 +460,24 @@ fn native_init(e: &mut Env<'_>, index: usize, address: u32, native: Decoder) -> 
     })
 }
 
-fn state(cpu: &dyn Guest, address: u32) -> Result<State, String> {
-    let bytes = read(cpu, address + KEYFRAME, 25)?;
+fn state(cpu: &dyn Guest, address: u32, layout: Layout) -> Result<State, String> {
+    let mut counter = [0; 8];
+    let mut read_counter = |offset| {
+        cpu.read(address + offset, &mut counter)
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(i64::from_le_bytes(counter))
+    };
+    let mut frame_type = [0];
+    cpu.read(address + layout.frame_type, &mut frame_type)
+        .map_err(|e| e.to_string())?;
     Ok(State {
-        keyframe_num: wide(&bytes, 0),
-        curframe_num: wide(&bytes, 8),
-        granpos: wide(&bytes, 16),
-        frame_type: bytes[24],
-        pp_level: word(&read(cpu, address + PP_LEVEL, 4)?, 0) as i32,
+        keyframe_num: read_counter(layout.keyframe)?,
+        curframe_num: read_counter(layout.current)?,
+        granpos: read_counter(layout.granpos)?,
+        frame_type: frame_type[0],
+        pp_level: cpu
+            .read_u32(address + layout.pp_level)
+            .map_err(|e| e.to_string())? as i32,
     })
 }
 fn packet(e: &mut Env<'_>) -> Outcome {
@@ -448,8 +530,9 @@ fn decode(
         let granpos_out = e.cpu.arg(0).map_err(|e| e.to_string())?;
         (packet, input, granpos_out)
     };
-    let mut state = state(e.cpu, address)?;
-    let stripe = read(e.cpu, address + STRIPE, 8)?;
+    let layout = binding.layout;
+    let mut state = state(e.cpu, address, layout)?;
+    let stripe = read(e.cpu, address + layout.stripe, 8)?;
     let started = Instant::now();
     let provider = e.ext.get_mut::<Provider>();
     let instance = provider.decoders.get_mut(&address).unwrap();
@@ -490,7 +573,7 @@ fn decode(
             vec![granpos_out],
             move |e, resume| {
                 let comparison = (|| -> Result<(), String> {
-                    let actual = state_read(e.cpu, address)?;
+                    let actual = state_read(e.cpu, address, layout)?;
                     let provider = e.ext.get_mut::<Provider>();
                     provider.stats.state_mismatches += u64::from(
                         resume.value() != result as u32
@@ -503,7 +586,7 @@ fn decode(
                                 ),
                     );
                     if let Some(planes) = planes {
-                        let descriptors = read(e.cpu, address + OUTPUT, 48)?;
+                        let descriptors = read(e.cpu, address + layout.output, 48)?;
                         for (i, (width, height, bytes)) in planes.into_iter().enumerate() {
                             let stride = word(&descriptors, i * 16 + 8) as i32;
                             let pointer = word(&descriptors, i * 16 + 12);
@@ -539,7 +622,7 @@ fn decode(
         ));
     }
     if result >= 0 && (result != 1 || !instance.published) {
-        let descriptors = read(e.cpu, address + REF_PLANES, 48)?;
+        let descriptors = read(e.cpu, address + layout.ref_planes, 48)?;
         let dimensions = decoder.dimensions().ok_or("native frame unavailable")?;
         for (i, (width, height)) in dimensions.into_iter().enumerate() {
             let stride = word(&descriptors, i * 16 + 8) as i32;
@@ -587,21 +670,21 @@ fn decode(
             }
         }
         e.cpu
-            .write(address + OUTPUT, &descriptors)
+            .write(address + layout.output, &descriptors)
             .map_err(|e| e.to_string())?;
         instance.published = true;
     }
     for (offset, value) in [
-        (KEYFRAME, state.keyframe_num),
-        (CURRENT, state.curframe_num),
-        (GRANPOS, state.granpos),
+        (layout.keyframe, state.keyframe_num),
+        (layout.current, state.curframe_num),
+        (layout.granpos, state.granpos),
     ] {
         e.cpu
             .write(address + offset, &value.to_le_bytes())
             .map_err(|e| e.to_string())?;
     }
     e.cpu
-        .write(address + FRAME_TYPE, &[state.frame_type])
+        .write(address + layout.frame_type, &[state.frame_type])
         .map_err(|e| e.to_string())?;
     if result >= 0 && granpos_out != 0 {
         e.cpu
@@ -609,7 +692,7 @@ fn decode(
             .map_err(|e| e.to_string())?;
     }
     if let Some((first, end)) = rows {
-        let mut descriptors = read(e.cpu, address + OUTPUT, 48)?;
+        let mut descriptors = read(e.cpu, address + layout.output, 48)?;
         for i in 0..3 {
             let stride = word(&descriptors, i * 16 + 8) as i32;
             let height = word(&descriptors, i * 16 + 4) as i32;
@@ -646,8 +729,12 @@ fn decode(
     e.ext.get_mut::<Provider>().stats.native_frames += 1;
     Ok(Outcome::Return(result as u32))
 }
-fn state_read(cpu: &dyn Guest, address: u32) -> Result<(i64, i64, i64, u8), String> {
-    let s = state(cpu, address)?;
+fn state_read(
+    cpu: &dyn Guest,
+    address: u32,
+    layout: Layout,
+) -> Result<(i64, i64, i64, u8), String> {
+    let s = state(cpu, address, layout)?;
     Ok((s.keyframe_num, s.curframe_num, s.granpos, s.frame_type))
 }
 

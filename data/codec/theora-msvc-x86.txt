@@ -1,6 +1,22 @@
 # Xiph libtheora decoder, MSVC x86 integer/MMX ABI family.
 # Source: https://downloads.xiph.org/releases/theora/ (BSD-3-Clause).
 # Only hashes, lengths and operand offsets; no guest addresses or code bytes.
+# Decoder fields are identified by their memory operands in the closure.
+# The info copy and native-initialized header extents are aggregate sizes.
+field info_bytes 64
+field init_bytes 54160
+field info n14 0xc2 0
+field ref_planes packet 0x22c 1
+field ref_indices packet 0x216 0
+field plane_allocation clear 0x12 0
+field keyframe packet 0x2ce 1
+field current packet 0x2da 1
+field granpos packet 0x328 0
+field frame_type packet 0x25 1
+field bias n14 0x23d 0
+field pp_level init 0x202 0
+field output packet 0x254 0
+field stripe init 0x231 0
 root packet 6
 root init 6
 hook clear 7

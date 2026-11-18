@@ -37,6 +37,15 @@ const INPUT: u32 = DATA + 0x3000;
 const OUTPUT: u32 = DATA + 0x4000;
 const RESULT: u32 = 0xabcd_1234;
 
+const FIXTURE_LAYOUT: [(&str, u32); 6] = [
+    ("lookup_bytes", 20),
+    ("n_offset", 0),
+    ("log2n_offset", 4),
+    ("trig_offset", 8),
+    ("bitrev_offset", 12),
+    ("scale_offset", 16),
+];
+
 /// An authored ABI fixture, not a codec fingerprint. It writes one sample,
 /// raises a masked x87 divide-by-zero, and returns a diagnostic EAX value.
 fn fixture(mode: Mode) -> Machine<JitCpu> {
@@ -89,6 +98,10 @@ fn fixture_cpu(mode: Mode, registers: bool, jit: bool) -> Machine<JitCpu> {
     let matched = Match {
         entry: ENTRY,
         prologue_len: 8,
+        layout: FIXTURE_LAYOUT
+            .into_iter()
+            .map(|(name, value)| (name.into(), value))
+            .collect(),
         profile: Profile {
             kernel: if registers { REGISTER_KERNEL } else { KERNEL }.into(),
             properties: BTreeMap::from([("table_pi_bits".into(), TABLE_PI_BITS)]),
@@ -379,13 +392,10 @@ fn signature_admission_rejects_a_near_miss_without_patching_code() {
                 "format 1\nid authored-mdct-abi\nsource authored ABI fixture\nlicense CC0 fixture\nprofile {}\ncandidate cdecl-stack32\nentry main\nfunction main {length} {hash} 8\n",
                 if registers { REGISTER_KERNEL } else { KERNEL }
             );
+            for (key, value) in FIXTURE_LAYOUT {
+                text.push_str(&format!("field {key} {value}\n"));
+            }
             for (key, value) in [
-                ("lookup_bytes", 20),
-                ("n_offset", 0),
-                ("log2n_offset", 4),
-                ("trig_offset", 8),
-                ("bitrev_offset", 12),
-                ("scale_offset", 16),
                 ("min_n", 64),
                 ("max_n", 8192),
                 ("table_pi_bits", TABLE_PI_BITS),

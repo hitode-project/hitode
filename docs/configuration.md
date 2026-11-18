@@ -99,7 +99,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_SAMPLES` | Fixture | Unset: tests that need games skip; `tools/smoke.py` reads its game list from `smoke.json` there |
 | `ADV_SMOKE` | Fixture | The game list of `tools/smoke.py` (shape: `tools/smoke.example.json`); unset: `$ADV_SAMPLES/smoke.json` |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
-| `ADV_STATIC_CODEC_TEST_IMAGE` | Fixture | Unset: skip the local PE fixture for bundled Theora and MDCT signatures |
+| `ADV_STATIC_CODEC_TEST_IMAGE` | Fixture | Unset: skip the local PE fixtures. Takes a path list with a Theora and SSE MDCT image first, and an optional x87 MDCT image second. |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
 | `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `metal` |
 | `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |

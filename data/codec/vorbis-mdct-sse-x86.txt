@@ -11,12 +11,13 @@ license source algorithm BSD-3-Clause; metadata contains fingerprints only
 profile vorbis-mdct-backward-f32-register32
 candidate frame-ebp32
 entry main
-property lookup_bytes 20
-property n_offset 0
-property log2n_offset 4
-property trig_offset 8
-property bitrev_offset 12
-property scale_offset 16
+# The inverse transform never reads the aggregate size or the forward scale.
+field lookup_bytes 20
+field scale_offset 16
+field n_offset main 0x17 1
+field log2n_offset butterflies 0xa 1
+field trig_offset butterflies 0x6 1
+field bitrev_offset bitreverse 0xf 1
 property min_n 64
 property max_n 8192
 # The reviewed SSE initializer rounds trig arguments to binary32.

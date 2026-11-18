@@ -84,33 +84,102 @@ fn recorded_guest_images_are_scanned() {
     assert!(stats(&m.ext).unwrap().last_rejection.is_none());
 }
 
-// spec: CODEC-MAP-1
+// spec: CODEC-MAP-1, CODEC-CALL-1, CODEC-CALL-2
 #[test]
 fn local_static_codec_image_binds_bundled_families() {
-    let Some(path) = std::env::var_os("ADV_STATIC_CODEC_TEST_IMAGE") else {
+    let Some(paths) = std::env::var_os("ADV_STATIC_CODEC_TEST_IMAGE") else {
         return;
     };
-    let path = Path::new(&path);
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => panic!("reading local codec fixture: {error}"),
-    };
-    let pe = adv_pe::Pe::parse(&bytes).unwrap();
-    let mut m = machine(Mode::Verify);
-    let base = pe.image_base;
-    let size = pe.size_of_image.next_multiple_of(PAGE);
-    m.cpu.map(base, size, Prot::RX).unwrap();
-    m.cpu.write(base, &pe.image).unwrap();
-    adv_nt::identity::note_ntdll(&mut m, path, &bytes);
-    m.visit_context(None, |e| {
-        let binding = *e.ext.get::<adv_nt::section::ImageBinding>();
-        (binding.mapped)(e, base, &pe, Some(path));
-    })
-    .unwrap();
-    let stats = stats(&m.ext).unwrap();
-    assert!(stats.installed > 0, "{stats:?}");
-    assert!(stats.theora.installed > 0, "{stats:?}");
+    for (index, path) in std::env::split_paths(&paths).enumerate() {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("reading local codec fixture: {error}"),
+        };
+        let pe = adv_pe::Pe::parse(&bytes).unwrap();
+        let mut m = machine(Mode::Verify);
+        let base = pe.image_base;
+        let size = pe.size_of_image.next_multiple_of(PAGE);
+        m.cpu.map(base, size, Prot::RX).unwrap();
+        m.cpu.write(base, &pe.image).unwrap();
+        adv_nt::identity::note_ntdll(&mut m, &path, &bytes);
+        m.visit_context(None, |e| {
+            let binding = *e.ext.get::<adv_nt::section::ImageBinding>();
+            (binding.mapped)(e, base, &pe, Some(&path));
+        })
+        .unwrap();
+        let stats = stats(&m.ext).unwrap();
+        assert!(stats.installed > 0, "{stats:?}");
+
+        let ranges: Vec<_> = pe
+            .sections
+            .iter()
+            .filter(|s| s.is_executable())
+            .map(|s| ExecutableRange {
+                start: base + s.virtual_address,
+                len: s.mem_size(),
+            })
+            .collect();
+        let mut read = |address, len| {
+            let mut bytes = vec![0; len];
+            m.cpu
+                .read(address, &mut bytes)
+                .map(|()| bytes)
+                .map_err(|error| error.to_string())
+        };
+        let kernel = BUNDLED_SIGNATURES
+            .split("\n---\n")
+            .nth(usize::from(index == 0))
+            .unwrap();
+        let signature = adv_abi::code_signature::Signature::parse(kernel).unwrap();
+        for matched in adv_abi::code_signature::scan(&signature, &ranges, &mut read).unwrap() {
+            assert_eq!(
+                matched.layout,
+                [
+                    ("lookup_bytes", 20),
+                    ("n_offset", 0),
+                    ("log2n_offset", 4),
+                    ("trig_offset", 8),
+                    ("bitrev_offset", 12),
+                    ("scale_offset", 16),
+                ]
+                .into_iter()
+                .map(|(name, offset)| (name.into(), offset))
+                .collect()
+            );
+        }
+
+        if index == 0 {
+            assert!(stats.theora.installed > 0, "{stats:?}");
+            let family = adv_abi::library_signature::Family::parse(include_str!(
+                "../../../../data/codec/theora-msvc-x86.txt"
+            ))
+            .unwrap();
+            let matched = family.scan(&ranges, &mut |a, n| read(a, n).ok()).unwrap();
+            assert_eq!(
+                matched.layout,
+                [
+                    ("info_bytes", 64),
+                    ("init_bytes", 54160),
+                    ("info", 0),
+                    ("ref_planes", 300),
+                    ("ref_indices", 276),
+                    ("plane_allocation", 588),
+                    ("keyframe", 888),
+                    ("current", 896),
+                    ("granpos", 904),
+                    ("frame_type", 912),
+                    ("bias", 913),
+                    ("pp_level", 53572),
+                    ("output", 54104),
+                    ("stripe", 54152),
+                ]
+                .into_iter()
+                .map(|(name, offset)| (name.into(), offset))
+                .collect()
+            );
+        }
+    }
 }
 
 // spec: CODEC-MAP-1
