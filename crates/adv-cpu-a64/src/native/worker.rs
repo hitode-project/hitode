@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use adv_cpu_core::CpuState;
 use adv_cpu_core::backend::{Completion, Computation, Pace};
+use adv_cpu_core::trap::Bridge;
 use adv_sync::WakeEvent;
 use rustc_hash::FxHashMap;
 
 use super::{
-    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Runtime, Site, alias_base, record_branch,
+    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base,
+    record_branch,
 };
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
@@ -20,6 +22,78 @@ use crate::translate::computation::{Evaluation, Plan, Proof, Range};
 use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
 use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
+
+impl Native {
+    pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        self.computation_enabled = enabled;
+        self.skip_offer = skip;
+    }
+
+    pub(crate) fn progressed(&mut self) {
+        self.skip_offer = None;
+    }
+
+    pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
+        self.skip_offer.take()
+    }
+
+    /// Whether the computation reached at EIP goes to the job layer
+    /// because a peer runs beside it; otherwise the owner runs it.
+    pub(super) fn offer_computation(&self) -> bool {
+        self.computation_enabled
+            && (self.bridge.is_null()
+                // SAFETY: this query occurs only within the owning run.
+                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
+    }
+
+    /// A single context may offer a loop whose blocks split when the
+    /// frame's pace needs it to save time on a loop of serial `cost` ns.
+    pub(super) fn offer_split(&self, cost: u64) -> bool {
+        if !self.bridge.is_null() {
+            // SAFETY: this query occurs only within the owning run.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            self.pace
+                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
+        }
+        self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
+    }
+
+    pub(crate) fn with_computation(
+        &mut self,
+        memory: &mut Memory,
+        retired: &mut u64,
+        pending: (Arc<std::sync::atomic::AtomicU32>, u32),
+        wake: Option<adv_sync::WakeEvent>,
+        visit: &mut dyn FnMut(
+            &mut dyn adv_cpu_core::backend::Computation<Option<crate::ExecutionContext>>,
+        ),
+    ) {
+        if self.computation.is_empty() || memory.attach().is_err() {
+            return;
+        }
+        self.invalidate(memory);
+        self.code.cache.sync();
+        let entry = Entry {
+            enter: self.code.enter,
+            opt_enter: self.code.opt_enter,
+            window: self.runtime.window,
+            alias: alias_base(memory),
+            fault: self.code.stubs.fault,
+        };
+        if let Some(mut session) = Session::new(
+            entry,
+            &self.computation,
+            memory,
+            &mut self.admission,
+            (retired, &mut self.retired_forms),
+            Notifications { pending, wake },
+            (self.pace.get(), &mut self.diagnostics.split),
+        ) {
+            visit(&mut session);
+        }
+    }
+}
 
 /// A helper's wake latency until helpers have shown theirs: it starts
 /// claiming this long after the owner.
@@ -1438,11 +1512,11 @@ mod tests {
             3,
             second.unwrap(),
             Entry {
-                enter: native.enter,
-                opt_enter: native.opt_enter,
+                enter: native.code.enter,
+                opt_enter: native.code.opt_enter,
                 window: native.runtime.window,
                 alias: super::super::alias_base(executor.memory()),
-                fault: native.stubs.fault,
+                fault: native.code.stubs.fault,
             },
             (&native.computation.get(&head).unwrap().code, 0),
             (
@@ -1587,11 +1661,11 @@ mod tests {
             plan: plan.expect("blocks"),
             start: start.clone().unwrap(),
             entry: Entry {
-                enter: native.enter,
-                opt_enter: native.opt_enter,
+                enter: native.code.enter,
+                opt_enter: native.code.opt_enter,
                 window: native.runtime.window,
                 alias: super::super::alias_base(executor.memory()),
-                fault: native.stubs.fault,
+                fault: native.code.stubs.fault,
             },
             code: native.computation[&CODE].code.clone(),
             signals: Signals {
@@ -2143,11 +2217,11 @@ mod tests {
                 let prepared = &native.computation[&CODE];
                 assert!(prepared.code.optimized.is_some());
                 let entry = Entry {
-                    enter: native.enter,
-                    opt_enter: native.opt_enter,
+                    enter: native.code.enter,
+                    opt_enter: native.code.opt_enter,
                     window: native.runtime.window,
                     alias: super::super::alias_base(executor.memory()),
-                    fault: native.stubs.fault,
+                    fault: native.code.stubs.fault,
                 };
                 let signals = Signals {
                     recall: Arc::new(AtomicU32::new(0)),
@@ -2782,7 +2856,7 @@ mod tests {
             &|_| None,
             true,
         );
-        let at = native.cache.next();
+        let at = native.code.cache.next();
         let mut scratch = translate::Code::default();
         let emitted = translate::lower_computation(
             &mut work.unit,
@@ -2790,12 +2864,12 @@ mod tests {
             CODE,
             native.features,
             at,
-            native.stubs,
+            native.code.stubs,
             (0x37f, false, None),
         )
         .unwrap();
-        assert_eq!(native.cache.append(emitted.words), Some(at));
-        native.cache.sync();
+        assert_eq!(native.code.cache.append(emitted.words), Some(at));
+        native.code.cache.sync();
         let code = Code {
             entry: at,
             end: at + emitted.words.len() * 4,
@@ -2807,12 +2881,12 @@ mod tests {
             optimized: None,
         };
         let entry = Entry {
-            enter: native.enter,
-            opt_enter: native.opt_enter,
+            enter: native.code.enter,
+            opt_enter: native.code.opt_enter,
             window: native.runtime.window,
             // Point this fixture at the protected view to inject a fault.
             alias: native.runtime.window,
-            fault: native.stubs.fault,
+            fault: native.code.stubs.fault,
         };
         let first = state(&mut executor, CODE, OUTPUT, 31).unwrap();
         let mut second = state(&mut executor, CODE, OUTPUT + 4, 57).unwrap();
@@ -2930,7 +3004,7 @@ mod tests {
                 .exit,
             Exit::Computation,
         );
-        native.cache.sync();
+        native.code.cache.sync();
 
         // A separate ordinary translator stops at the same original head.
         let mut owner = Native::new(native.runtime.window as usize).unwrap();
@@ -2969,11 +3043,11 @@ mod tests {
 
         // Only actual deadline recalls activate the alternate fixed form.
         let entry = Entry {
-            enter: native.enter,
-            opt_enter: native.opt_enter,
+            enter: native.code.enter,
+            opt_enter: native.code.opt_enter,
             window: native.runtime.window,
             alias: super::super::alias_base(executor.memory()),
-            fault: native.stubs.fault,
+            fault: native.code.stubs.fault,
         };
         let prepared = &native.computation[&CODE];
         let pending = Signals {
@@ -3117,11 +3191,11 @@ mod tests {
             Exit::Computation
         );
         let entry = Entry {
-            enter: native.enter,
-            opt_enter: native.opt_enter,
+            enter: native.code.enter,
+            opt_enter: native.code.opt_enter,
             window: native.runtime.window,
             alias: super::super::alias_base(executor.memory()),
-            fault: native.stubs.fault,
+            fault: native.code.stubs.fault,
         };
         let code = native
             .computation
@@ -3129,7 +3203,7 @@ mod tests {
             .expect("prepared x87 and SIMD")
             .code
             .clone();
-        native.cache.sync();
+        native.code.cache.sync();
         native.set_computation_offer(false, None);
         let mut serial = start.clone();
         let run_owner =

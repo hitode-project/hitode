@@ -14,11 +14,11 @@ impl Native {
     pub(crate) fn force_resident_at(&mut self, memory: &mut Memory, at: CpuState) -> bool {
         let head = at.eip;
         self.invalidate(memory);
-        if !self.units.contains_key(&head) {
+        if !self.code.units.contains_key(&head) {
             self.translate(memory, head).unwrap();
         }
         // Exercise resident execution independently of its profitability.
-        self.tier1_words.remove(&head);
+        self.code.tier1_words.remove(&head);
         if !self.heads.contains_key(&head) {
             self.discover(memory, head, head, at);
             self.install_optimized(true);
