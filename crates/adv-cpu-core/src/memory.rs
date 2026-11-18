@@ -183,6 +183,7 @@ pub struct Memory {
     /// The 64-byte lines of each page that hold such bytes, bit `i` for
     /// line `i`, so translated stores can tell data on a code page.
     code_lines: Vec<u64>,
+    plain_pages: Vec<Cell<u64>>,
     pub mapped: Arc<Vec<bool>>,
     /// Pages changed since the controller last looked, each with its version
     /// before the first change, and the changed bytes while they stay few.
@@ -259,6 +260,15 @@ impl Memory {
         self.walk_host_range(first, last)
     }
 
+    #[inline]
+    fn include_host_page(&self, info: &mut HostRange, page: usize) {
+        info.committed &= self.mapped[page];
+        info.protection &= self.perms[page];
+        info.flags |= self.perms[page];
+        info.watched |= self.watched[page];
+        info.resident |= self.resident_pages[page];
+    }
+
     fn walk_host_range(&self, first: u32, last: u32) -> HostRange {
         let mut info = HostRange {
             first,
@@ -272,11 +282,7 @@ impl Memory {
             self.host_access.set(counts);
         }
         for page in first as usize..=last as usize {
-            info.committed &= self.mapped[page];
-            info.protection &= self.perms[page];
-            info.flags |= self.perms[page];
-            info.watched |= self.watched[page];
-            info.resident |= self.resident_pages[page];
+            self.include_host_page(&mut info, page);
         }
         if info.protection & SHARED != 0
             && let Some(SharedPage::Storage { storage, offset }) =
@@ -420,6 +426,7 @@ impl Memory {
                     old.start..page + 1
                 }));
             }
+            self.update_plain_pages(page..page + 1);
         }
         if let Some(pages) = fresh {
             // Translated code must not store to observed code directly.
@@ -437,24 +444,31 @@ impl Memory {
         self.code_lines.as_ptr()
     }
 
+    /// Stable bitmap of computation grants, indexed from `base`.
+    /// Each group of 64 pages has a read word, a write word before
+    /// byte-level code checks, and an observed-code word, in that order.
+    /// The owner updates these words between generated accesses.
+    pub fn plain_pages(&self) -> *const u64 {
+        self.plain_pages.as_ptr().cast()
+    }
+
+    fn blocks_executable_writes(&self, flags: u8) -> bool {
+        !self.selective_code_writes() && flags & EXEC != 0
+    }
+
+    fn observed_code(&self, page: usize, bytes: std::ops::Range<usize>) -> bool {
+        self.watched[page]
+            && self
+                .code
+                .get(&page)
+                .is_some_and(|bits| bit_words(bytes).any(|(word, mask)| bits[word] & mask != 0))
+    }
+
     /// Software-checked memory changes code only when a store reaches bytes
     /// observed as code; other data on a code page is ordinary data.
     fn writes_code(&self, range: &std::ops::Range<usize>) -> bool {
-        if range.is_empty() {
-            return false;
-        }
-        if !self.selective_code_writes()
-            && (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-                .any(|page| self.perms[page] & EXEC != 0)
-        {
-            return true;
-        }
         page_spans(range.clone()).any(|(page, bytes)| {
-            self.watched[page]
-                && self
-                    .code
-                    .get(&page)
-                    .is_some_and(|bits| bit_words(bytes).any(|(word, mask)| bits[word] & mask != 0))
+            self.blocks_executable_writes(self.perms[page]) || self.observed_code(page, bytes)
         })
     }
 
@@ -510,6 +524,7 @@ impl Memory {
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             code_lines: vec![0; len / PAGE_SIZE],
+            plain_pages: vec![Cell::new(0); 3 * (len / PAGE_SIZE).div_ceil(64)],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -531,6 +546,10 @@ impl Memory {
     }
 
     pub fn reserve(base: u32, len: usize) -> Result<Self, String> {
+        Self::reserve_with_plain_pages(base, len, len / PAGE_SIZE)
+    }
+
+    fn reserve_with_plain_pages(base: u32, len: usize, plain_pages: usize) -> Result<Self, String> {
         if !base.is_multiple_of(4096)
             || len == 0
             || !len.is_multiple_of(4096)
@@ -557,6 +576,7 @@ impl Memory {
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
             code_lines: vec![0; len / PAGE_SIZE],
+            plain_pages: vec![Cell::new(0); 3 * plain_pages.div_ceil(64)],
             code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -607,7 +627,7 @@ impl Memory {
         len: usize,
         host_size: usize,
     ) -> Result<Self, String> {
-        let mut memory = Self::reserve(base, PAGE_SIZE)?;
+        let mut memory = Self::reserve_with_plain_pages(base, PAGE_SIZE, len / PAGE_SIZE)?;
         memory.tenant = crate::virtual_memory::GuestWindow::tenant();
         // SAFETY: the family selects this memory's process to build it, so
         // no other process uses the window now; it maps its views back
@@ -638,6 +658,7 @@ impl Memory {
         memory.resident_pages = vec![false; len / PAGE_SIZE];
         memory.mapped = Arc::new(vec![false; len / PAGE_SIZE]);
         memory.reservation = Some(reservation);
+        // All pages start unmapped, so attaching the window leaves every bit clear.
         memory.window = Some(window);
         Ok(memory)
     }
@@ -793,15 +814,51 @@ impl Memory {
         let Ok(range) = self.range(addr, len) else {
             return false;
         };
-        let info = self.host_range(&range);
         let permission = if write { WRITE } else { READ };
         !range.is_empty()
-            && info.committed
-            && info.protection & permission != 0
-            && info.flags & (SHARED | LINEAR | AUDIO) == 0
-            && !info.resident
+            && self.computation_permissions(self.host_range(&range)) & permission != 0
             && (!write || !self.writes_code(&range))
-            && self.window.is_some()
+    }
+
+    #[cfg(unix)]
+    fn computation_permissions(&self, info: HostRange) -> u8 {
+        if !info.committed
+            || info.flags & (SHARED | LINEAR | AUDIO) != 0
+            || info.resident
+            || self.window.is_none()
+        {
+            return 0;
+        }
+        let eligible = if self.blocks_executable_writes(info.flags) {
+            READ
+        } else {
+            READ | WRITE
+        };
+        info.protection & eligible
+    }
+
+    fn update_plain_pages(&self, pages: std::ops::Range<usize>) {
+        #[cfg(unix)]
+        if self.window.is_some() {
+            for page in pages {
+                let mut info = HostRange::EMPTY;
+                self.include_host_page(&mut info, page);
+                let permissions = self.computation_permissions(info);
+                let grants = [
+                    permissions & READ != 0,
+                    permissions & WRITE != 0,
+                    self.observed_code(page, 0..PAGE_SIZE),
+                ];
+                let mask = 1 << (page % 64);
+                for (offset, allowed) in grants.into_iter().enumerate() {
+                    let word = &self.plain_pages[3 * (page / 64) + offset];
+                    let bit = if allowed { mask } else { 0 };
+                    word.set((word.get() & !mask) | bit);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pages;
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
@@ -815,7 +872,8 @@ impl Memory {
         if let Err(error) = self.protect(addr, len, perms) {
             self.decommit_pages(pages.start * PAGE_SIZE, len)?;
             self.map_generation += 1;
-            Arc::make_mut(&mut self.mapped)[pages].fill(false);
+            Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
+            self.update_plain_pages(pages);
             return Err(error);
         }
         Ok(())
@@ -836,6 +894,7 @@ impl Memory {
         for page in resident {
             self.resident.remove(&page).unwrap().evict();
             self.resident_pages[page] = false;
+            self.update_plain_pages(page..page + 1);
         }
         #[cfg(unix)]
         self.unlinearize(pages.clone())?;
@@ -871,7 +930,8 @@ impl Memory {
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(false);
         self.fast.invalidate(pages.clone());
-        Arc::make_mut(&mut self.perms)[pages].fill(0);
+        Arc::make_mut(&mut self.perms)[pages.clone()].fill(0);
+        self.update_plain_pages(pages);
         self.touch(addr, len);
         Ok(())
     }
@@ -1277,6 +1337,7 @@ impl Memory {
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages.clone()].fill(READ | WRITE | SHARED);
+        self.update_plain_pages(pages.clone());
         #[cfg(unix)]
         self.linearize(pages);
         self.touch(addr, len);
@@ -1325,6 +1386,7 @@ impl Memory {
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
+        self.update_plain_pages(pages.clone());
         for page in pages.clone() {
             if self.coherent.contains(&page)
                 && self.watched[page]
@@ -1481,6 +1543,7 @@ impl Memory {
         for page in &mut Arc::make_mut(&mut self.perms)[linear.clone()] {
             *page |= LINEAR;
         }
+        self.update_plain_pages(linear.clone());
         self.fast.invalidate(linear);
     }
 
@@ -1504,6 +1567,7 @@ impl Memory {
             for page in &mut Arc::make_mut(&mut self.perms)[pages.clone()] {
                 *page &= !LINEAR;
             }
+            self.update_plain_pages(pages.clone());
             self.fast.invalidate(pages);
         }
         Ok(())
@@ -1531,6 +1595,7 @@ impl Memory {
 
             Arc::make_mut(&mut self.perms)[page] |= SHARED;
         }
+        self.update_plain_pages(pages.clone());
         self.fast.invalidate(pages);
         if let Err(error) = self.protect(addr, bytes.len(), perms) {
             let _ = self.unmap(addr, bytes.len());
@@ -1571,6 +1636,7 @@ impl Memory {
             self.private_copy_pages[page] = Some(false);
             Arc::make_mut(&mut self.perms)[page] &= !SHARED;
 
+            self.update_plain_pages(page..page + 1);
             self.fast.invalidate(page..page + 1);
         }
         if !changed.is_empty() {
@@ -1613,7 +1679,8 @@ impl Memory {
         self.map_generation += 1;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
-        Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
+        Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
+        self.update_plain_pages(pages);
         self.touch(addr, len);
         Ok(())
     }
@@ -1649,6 +1716,7 @@ impl Memory {
         self.resident.insert(page, storage);
         self.resident_pages[page] = true;
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
+        self.update_plain_pages(page..page + 1);
         if self.sync_window(page..page + 1).is_err() {
             // Translated code then reaches the page as a soft page.
             log::warn!("cannot open resident file page {page:#x} in the guest window");
@@ -1927,19 +1995,18 @@ impl Memory {
         {
             return Err("executable file views are not supported".into());
         }
+        let pages = range.start / PAGE_SIZE..range.end / PAGE_SIZE;
         self.map_generation += 1;
-        self.fast
-            .invalidate(range.start / PAGE_SIZE..range.end / PAGE_SIZE);
-        for page in
-            &mut Arc::make_mut(&mut self.perms)[range.start / PAGE_SIZE..range.end / PAGE_SIZE]
-        {
+        self.fast.invalidate(pages.clone());
+        for page in &mut Arc::make_mut(&mut self.perms)[pages.clone()] {
             *page = perms | (*page & (SHARED | AUDIO | LINEAR));
         }
+        self.update_plain_pages(pages.clone());
         #[cfg(unix)]
-        self.keep_overlays_exact(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
+        self.keep_overlays_exact(pages.clone())?;
         // Revoke validation even if synchronizing host protection fails.
         self.touch(addr, len);
-        self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
+        self.sync_window(pages)?;
         Ok(())
     }
 
@@ -2494,6 +2561,146 @@ mod file_page_tests {
 mod window_tests {
     use super::*;
     use crate::virtual_memory::GuestAccess::{Read, Write};
+
+    // spec: A64-MEM-14
+    #[test]
+    fn plain_page_bits_follow_computation_ranges() {
+        let base = 0x11000;
+        let len = 137 * PAGE_SIZE;
+        let bit = |bitmap: *const u64, page: usize, offset: usize| {
+            let word = 3 * (page / 64) + offset;
+            // SAFETY: callers use a live bitmap and an in-bounds page and word offset.
+            unsafe { bitmap.add(word).read() & (1u64 << (page % 64)) != 0 }
+        };
+        let check = |memory: &Memory, bitmap: *const u64, step| {
+            assert_eq!(memory.plain_pages(), bitmap);
+            for page in 0..len / PAGE_SIZE {
+                let start = page * PAGE_SIZE;
+                let address = base + start as u32;
+                let observed = bit(bitmap, page, 2);
+                assert_eq!(
+                    bit(bitmap, page, 0),
+                    memory.computation_range(address, PAGE_SIZE, false),
+                    "step {step}, page {page}, read"
+                );
+                assert_eq!(
+                    bit(bitmap, page, 1) && !observed,
+                    memory.computation_range(address, PAGE_SIZE, true),
+                    "step {step}, page {page}, write"
+                );
+                assert_eq!(
+                    observed,
+                    memory.window_base().is_some()
+                        && memory.writes_code(&(start..start + PAGE_SIZE)),
+                    "step {step}, page {page}, observed code"
+                );
+                if observed {
+                    // SAFETY: the code line table holds one word per page.
+                    let lines = unsafe { memory.code_lines().add(page).read() };
+                    for line in 0..PAGE_SIZE / 64 {
+                        if lines & (1 << line) == 0 {
+                            let start = start + line * 64;
+                            assert!(!memory.writes_code(&(start..start + 64)));
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut reserved = Memory::reserve(base, len).unwrap();
+        let bitmap = reserved.plain_pages();
+        reserved.map(base, len, READ | WRITE).unwrap();
+        reserved.watch_code(base, 1);
+        check(&reserved, bitmap, 0);
+
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(base, len, host).unwrap();
+            let bitmap = memory.plain_pages();
+            let first = (base as usize).next_multiple_of(host);
+            let blocks = (base as usize + len - first) / host;
+            let bytes = vec![0; host];
+            let mut random = 0x713e_4a95_u64;
+            check(&memory, bitmap, 0);
+            for step in 1..=768 {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let block = first + ((random >> 8) as usize % blocks) * host;
+                let offset = ((random >> 16) as usize % (host / PAGE_SIZE)) * PAGE_SIZE;
+                let address = (block + offset) as u32;
+                let block = block as u32;
+                let perms = (random >> 24) as u8 & 7;
+                if memory.mapped[(block - base) as usize / PAGE_SIZE] {
+                    match random % 8 {
+                        0..=2 => memory.unmap(block, host).unwrap(),
+                        3..=4 => {
+                            let perms = if memory.file_page_copy_on_write(address).is_some() {
+                                perms & !EXEC
+                            } else {
+                                perms
+                            };
+                            memory.protect(address, PAGE_SIZE, perms).unwrap();
+                        }
+                        5 => memory.watch_code(address + PAGE_SIZE as u32 - 3, 7),
+                        _ => {
+                            let write = random & 1 != 0;
+                            let permission = if write { WRITE } else { READ };
+                            if memory.accessible(address, 1, permission)
+                                && (!write || !memory.stores_code(address, 1))
+                            {
+                                memory.prepare_native_access(address, 1, write).unwrap();
+                            }
+                        }
+                    }
+                } else {
+                    match random % 8 {
+                        4 => {
+                            memory.map_shared_audio(block, host).unwrap();
+                        }
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "android",
+                            target_os = "macos",
+                            target_os = "ios"
+                        ))]
+                        5 => memory
+                            .map_shared_file(
+                                block,
+                                host,
+                                SharedAllocation::new(host).unwrap(),
+                                READ | WRITE,
+                                false,
+                            )
+                            .unwrap(),
+                        6 => {
+                            let pages: Vec<_> = (0..host / PAGE_SIZE)
+                                .map(|_| crate::backend::FilePage::new([0; PAGE_SIZE]))
+                                .collect();
+                            memory
+                                .map_file_pages(block, &pages, READ | WRITE, perms & WRITE != 0)
+                                .unwrap();
+                        }
+                        7 => memory.map_private_copy_pages(block, &bytes, perms).unwrap(),
+                        _ => memory.map(block, host, perms).unwrap(),
+                    }
+                }
+                check(&memory, bitmap, step);
+
+                let start = address + ((random >> 32) as u32 % PAGE_SIZE as u32);
+                let width = 1 + (random >> 48) as usize % (2 * PAGE_SIZE);
+                for width in [1, width.min(len - (start - base) as usize)] {
+                    let range = memory.range(start, width).unwrap();
+                    let writable = page_spans(range.clone()).all(|(page, _)| bit(bitmap, page, 1));
+                    assert_eq!(
+                        memory.computation_range(start, width, true),
+                        writable && !memory.writes_code(&range),
+                        "step {step}, write of {width} bytes at {start:#x}"
+                    );
+                }
+            }
+        }
+    }
 
     // spec: IOS-MEM-2
     #[test]
