@@ -1370,11 +1370,9 @@ mod tests {
         cpu.regs[6] = INPUT + 0x4000;
         cpu.regs[7] = OUTPUT + SPACE * 2;
         native.first_visits = false;
-        let warm = native
-            .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
-            .unwrap()
-            .unwrap();
-        assert_eq!((warm.exit, cpu.eip), (Exit::Dispatch, head));
+        native.observe_stop(stop);
+        assert!(native.force_resident(memory, head));
+        cpu.eip = head;
         native.set_computation_offer(true, None);
         let entry = native
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())

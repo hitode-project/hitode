@@ -2987,10 +2987,9 @@ mod tests {
     // spec: A64-OPT-8, A64-OPT-9
     #[test]
     fn a_plain_page_miss_rebuilds_without_the_fact() {
-        // mov eax,[esi]; mov [edi],eax; add edi,4; dec ecx; jne HEAD; int3
-        let (mut memory, mut native, stop) = resident_loop(&[
-            0x8b, 0x06, 0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf6, 0xcc,
-        ]);
+        // mov eax,[esi]; add ebx,eax; dec ecx; jne HEAD; int3
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x8b, 0x06, 0x01, 0xc3, 0x49, 0x75, 0xf9, 0xcc]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         native.checked.insert(HEAD);
         assert!(native.force_resident(&mut memory, HEAD));
@@ -2999,7 +2998,7 @@ mod tests {
         let old = first.entry;
 
         memory.unmap(DATA, 0x4000).unwrap();
-        memory.map_shared_audio(DATA, 0x4000).unwrap();
+        memory.map_shared_audio(DATA, 0x1000).unwrap();
         let mut state = resident_cpu(OUTSIDE, 2);
         state.regs[6] = DATA;
         enter(&mut native, &mut memory, stop, &mut state);
@@ -3022,7 +3021,7 @@ mod tests {
             0x8b, 0x06, 0x83, 0xc6, 4, 0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf3, 0xcc,
         ]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
-        memory.map_shared_audio(DATA + 0x4000, 0x4000).unwrap();
+        memory.map_shared_audio(DATA + 0x4000, 0x1000).unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
         let old = native.heads[&HEAD].versions[0].entry;
         for expected in 1..=u64::from(head::COLD_EXITS) {
@@ -3058,7 +3057,9 @@ mod tests {
         body[latch] = (-(latch as i32 + 1)) as u8;
         for (trips, demoted) in [(2, true), (100, false)] {
             let (mut memory, mut native, stop) = resident_loop(&body);
-            assert!(native.force_resident(&mut memory, HEAD));
+            native.translate(&mut memory, HEAD).unwrap();
+            native.discover(&mut memory, HEAD, resident_cpu(HEAD, trips));
+            native.install_optimized(true);
             let invalidations = native.diagnostics.global_invalidations;
             let patches = native.heads[&HEAD].versions[0]
                 .probation
