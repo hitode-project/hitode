@@ -1786,7 +1786,6 @@ mod opt_back {
 
     const AREA: u64 = 0x4000_0000;
     const PARAMETER: u64 = AREA;
-    const SAVED_FPCR: u64 = 1 << 25;
 
     struct Captured {
         cpu: CpuState,
@@ -1812,9 +1811,8 @@ mod opt_back {
             let wrapper = code.len() * 4;
             code.extend_from_slice(&[
                 stp(X, Index::Pre, Reg::LR, Reg::ZR, Reg::new(31), -16),
-                movz(X, X16, (SAVED_FPCR >> 16) as u16, 16),
-                msr_fpcr(X16),
-                bl(self.stubs.enter as i32 - (wrapper + 12) as i32),
+                msr_fpcr(Reg::ZR),
+                bl(self.stubs.enter as i32 - (wrapper + 8) as i32),
                 mrs_fpcr(X16),
                 ldp(X, Index::Post, Reg::LR, Reg::ZR, Reg::new(31), 16),
                 ret(Reg::LR),
@@ -1894,7 +1892,7 @@ mod opt_back {
                     .call_at(&tail, fault)
                     .expect("fault recovery returns");
             }
-            assert_eq!(self.emu.x(X16), SAVED_FPCR, "FPCR restored");
+            assert_eq!(self.emu.x(X16), 0, "canonical FPCR");
             assert_eq!(self.emu.x(Reg::new(18)), 0x1818);
             for n in 19..30 {
                 assert_eq!(
@@ -1993,6 +1991,328 @@ mod opt_back {
             mmx: [Some(Location::Constant(0)); 8],
             mmx_meta: None,
             frame: Vec::new(),
+        }
+    }
+
+    // spec: A64-OPT-4
+    #[test]
+    fn opt_back_fp_state_is_never_accessed() {
+        // Lowering checks every form built by the back-end and front-end
+        // tests. The entry and optimized exit stubs complete that path.
+        let stubs = runtime::stubs();
+        back::assert_no_fp_state(&stubs.code[stubs.enter / 4..stubs.exit / 4]);
+        back::assert_no_fp_state(&stubs.code[stubs.opt_exit / 4..]);
+    }
+
+    fn floating_pairs() -> [(f64, f64); 23] {
+        let near = |x: f64| {
+            let scale = 2f64.powi(-511);
+            ((1.0 - x) * scale, (1.0 + x) * scale)
+        };
+        let min = f64::MIN_POSITIVE;
+        let max = f64::MAX;
+        let inf = f64::INFINITY;
+        let sub = f64::from_bits(1);
+        let quiet = f64::from_bits(0xfff8_0000_0000_0123);
+        let signaling = f64::from_bits(0x7ff0_0000_0000_0456);
+        [
+            (1.5, -2.25),
+            (0.0, -0.0),
+            (-0.0, -2.0),
+            (min, 1.0),
+            (-min, 0.5),
+            (min, -min.next_up()),
+            (sub, -sub),
+            (-sub, max),
+            (1.0, sub),
+            (max, max),
+            (-max, -max),
+            (inf, -inf),
+            (-inf, 0.0),
+            (1.0, inf),
+            (1.0, -0.0),
+            (quiet, f64::NAN),
+            (1.0, quiet),
+            (signaling, quiet),
+            (quiet, signaling),
+            (1.0, signaling),
+            (min, max),
+            near(2f64.powi(-27) + 2f64.powi(-29)),
+            near(2f64.powi(-27)),
+        ]
+    }
+
+    fn guest_fp_form(code: &[u8], at: &CpuState) -> opt::front::Built {
+        let mut unit = Unit::default();
+        unit.build(
+            &mut memory(code, &[]),
+            CODE,
+            &[CODE + code.len() as u32],
+            &|_, _| None,
+            &|_| None,
+            true,
+        );
+        let mut proof = computation::Proof::build(&unit.trace).unwrap();
+        proof.prove_split(&unit.trace, |pc, len| {
+            let start = (pc - CODE) as usize;
+            let bytes = &code[start..start + len as usize];
+            Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+        });
+        opt::front::build(&unit, &proof, at).unwrap()
+    }
+
+    fn guest_fp_pair(
+        h: &mut Harness,
+        code: &[u8],
+        built: &opt::front::Built,
+        at: &CpuState,
+        data: &[u8; 48],
+        frame: &[u8; 8],
+    ) -> bool {
+        let frame_addr = at.regs[4] - 8;
+        let mut reference = memory(code, data);
+        reference.write(frame_addr, frame).unwrap();
+        let params = opt::admit(&built.func.entry, &built.assumed, at, |addr, width| {
+            let mut bytes = [0; 8];
+            reference
+                .read_into(addr, &mut bytes[..width as usize])
+                .unwrap();
+            u64::from_le_bytes(bytes)
+        })
+        .unwrap();
+        let mut ir_memory = memory(code, data);
+        ir_memory.write(frame_addr, frame).unwrap();
+        let run = eval::run(&built.func, &params, &mut ir_memory, 1000);
+        let (want_record, failed) = match run.outcome {
+            eval::Outcome::Exit(record) => (record, false),
+            eval::Outcome::Fail(record) => (record, true),
+            _ => panic!("optimized form did not finish"),
+        };
+
+        h.emu.write(WINDOW_BASE + u64::from(DATA), data);
+        h.emu.write(WINDOW_BASE + u64::from(frame_addr), frame);
+        let captured = h.run_opt(&built.func, &params, 1000, 0, 0);
+        assert_eq!(captured.record, want_record);
+        let data_after = h.emu.read(WINDOW_BASE + u64::from(DATA), data.len());
+        let mut actual = memory(code, &data_after);
+        actual.write(frame_addr, frame).unwrap();
+        let mut got = at.clone();
+        materialize(
+            &captured.lowered.records[captured.record.0 as usize],
+            &captured.registers,
+            &captured.spills,
+            &captured.lowered.flags,
+            &mut got,
+            |offset, bytes| {
+                actual
+                    .write(at.regs[4].wrapping_add_signed(offset), bytes)
+                    .unwrap()
+            },
+        );
+
+        let stop = CODE + code.len() as u32;
+        let mut want = at.clone();
+        let mut interpreter = Interpreter::new();
+        for (cpu, memory) in [(&mut got, &mut actual), (&mut want, &mut reference)] {
+            for _ in 0..100 {
+                if cpu.eip == stop {
+                    break;
+                }
+                assert_eq!(
+                    interpreter.step(cpu, memory),
+                    adv_cpu_core::interpreter::Step::Executed,
+                );
+            }
+            assert_eq!(cpu.eip, stop);
+        }
+        assert_eq!(got.regs, want.regs);
+        assert_eq!(got.eflags, want.eflags);
+        assert_eq!(got.xmm, want.xmm);
+        assert_eq!(got.mxcsr, want.mxcsr);
+        assert_eq!(got.x87.status & !0x200, want.x87.status & !0x200);
+        assert_eq!(got.x87.tag, want.x87.tag);
+        assert_eq!(
+            actual.read_data(DATA, data.len()).unwrap(),
+            reference.read_data(DATA, data.len()).unwrap()
+        );
+        failed
+    }
+
+    // spec: A64-OPT-4, A64-OPT-5, A64-OPT-6, EXEC-CORE-9
+    #[test]
+    fn opt_back_guest_sse_value_pairs() {
+        let mut h = harness();
+        let mut at = initial();
+        let pairs = floating_pairs();
+        at.regs[7] = DATA + 32;
+        h.emu
+            .map(WINDOW_BASE + u64::from(at.regs[4] - 0x1000), 0x1000);
+        for op in 0..12 {
+            let code = bytes(|a| {
+                let mut head = a.create_label();
+                a.set_label(&mut head).unwrap();
+                if op == 9 {
+                    a.mov(dword_ptr(edi + 8), ecx).unwrap();
+                }
+                match op {
+                    0 => a.addsd(xmm0, xmm1),
+                    1 => a.subsd(xmm0, xmm1),
+                    2 => a.mulsd(xmm0, xmm1),
+                    3 => a.divsd(xmm0, xmm1),
+                    4 => a.cmpltpd(xmm0, xmm1),
+                    5 => a.ucomisd(xmm0, xmm1),
+                    6 => a.comisd(xmm0, xmm1),
+                    7 => a.cvttsd2si(eax, xmm0),
+                    8 => a.cvtsi2sd(xmm0, edx),
+                    9 => a.addsd(xmm0, qword_ptr(esi)),
+                    10 => a.addsd(xmm0, qword_ptr(esp - 8)),
+                    _ => {
+                        a.cvtsi2sd(xmm1, edx).unwrap();
+                        a.addsd(xmm0, xmm1).unwrap();
+                        a.cvttsd2si(eax, xmm0)
+                    }
+                }
+                .unwrap();
+                if matches!(op, 5 | 6) {
+                    a.adc(eax, 0).unwrap();
+                }
+                a.movsd_2(qword_ptr(edi), xmm0).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            });
+            for mxcsr in [0x1fa0, 0x1fa2] {
+                at.mxcsr = mxcsr;
+                let built = guest_fp_form(&code, &at);
+                if op == 11 {
+                    let checks: Vec<_> = built
+                        .func
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.insts)
+                        .filter_map(|(_, op)| match op {
+                            Op::SseInput { b, .. } => Some(b),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(checks.len(), usize::from(mxcsr & 2 == 0));
+                    assert!(checks.iter().all(|b| b.is_none()));
+                }
+                let extra = [
+                    (i32::MIN as f64 - 0.75, 0.0),
+                    (i32::MIN as f64 - 1.0, 0.0),
+                    (-(i32::MIN as f64), 0.0),
+                ];
+                for (i, (lhs, rhs)) in pairs.into_iter().chain(extra).enumerate() {
+                    at.regs[2] = [0, 1, u32::MAX, i32::MIN as u32, i32::MAX as u32][i % 5];
+                    let lanes = |lo: f64, hi: f64| {
+                        (u128::from(lo.to_bits()) | u128::from(hi.to_bits()) << 64).to_le_bytes()
+                    };
+                    at.xmm[0] = if op == 4 && i % 2 == 0 {
+                        lanes(2.0, lhs)
+                    } else {
+                        lanes(lhs, 2.0)
+                    };
+                    at.xmm[1] = if op == 4 && i % 2 == 0 {
+                        lanes(1.0, rhs)
+                    } else {
+                        lanes(rhs, 1.0)
+                    };
+                    let mut data = [0; 48];
+                    data[..8].copy_from_slice(&rhs.to_le_bytes());
+                    let failed =
+                        guest_fp_pair(&mut h, &code, &built, &at, &data, &rhs.to_le_bytes());
+                    if op == 4 && (lhs.is_subnormal() || rhs.is_subnormal()) {
+                        assert_eq!(failed, mxcsr & 2 == 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: A64-OPT-4, A64-OPT-5, A64-OPT-6
+    #[test]
+    fn opt_back_guest_x87_value_pairs() {
+        let mut h = harness();
+        let mut at = initial();
+        h.emu
+            .map(WINDOW_BASE + u64::from(at.regs[4] - 0x1000), 0x1000);
+        for op in 0..9 {
+            let mut pairs: Vec<(u64, u64)> = floating_pairs()
+                .into_iter()
+                .map(|(a, b)| (a.to_bits(), b.to_bits()))
+                .collect();
+            let code = bytes(|a| {
+                let mut head = a.create_label();
+                a.set_label(&mut head).unwrap();
+                match op {
+                    6 => a.fild(qword_ptr(esi)),
+                    8 => a.fld(dword_ptr(esi)),
+                    _ => a.fld(qword_ptr(esi)),
+                }
+                .unwrap();
+                match op {
+                    0 => a.fadd(qword_ptr(esi + 8)),
+                    1 => a.fsub(qword_ptr(esi + 8)),
+                    2 => a.fmul(qword_ptr(esi + 8)),
+                    3 => a.fdiv(qword_ptr(esi + 8)),
+                    _ => Ok(()),
+                }
+                .unwrap();
+                match op {
+                    4 => a.fistp(dword_ptr(edi)),
+                    5 => a.fistp(qword_ptr(edi)),
+                    _ => a.fstp(qword_ptr(edi)),
+                }
+                .unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            });
+            at.regs[7] = DATA + 32;
+            at.x87.control = if matches!(op, 4 | 5) { 0x0e7f } else { 0x027f };
+            if op == 4 {
+                pairs.extend(
+                    [
+                        i32::MIN as f64 - 0.75,
+                        i32::MIN as f64 - 1.0,
+                        -(i32::MIN as f64),
+                    ]
+                    .map(|a| (a.to_bits(), 0)),
+                );
+            } else if op == 5 {
+                let min = i64::MIN as f64;
+                pairs.extend(
+                    [min.next_down(), min, -min, (-min).next_down()].map(|a| (a.to_bits(), 0)),
+                );
+            } else if op == 6 {
+                pairs.clear();
+                for n in [
+                    1i64,
+                    (1 << 53) - 1,
+                    1 << 53,
+                    (1 << 53) + 1,
+                    (1 << 53) + 2,
+                    i64::MAX,
+                ] {
+                    pairs.extend([(n as u64, 0), ((-n) as u64, 0)]);
+                }
+                pairs.push((i64::MIN as u64, 0));
+            } else if op == 8 {
+                pairs = floating_pairs()
+                    .into_iter()
+                    .map(|(a, b)| (((a as f32).to_bits() as u64), (b as f32).to_bits() as u64))
+                    .collect();
+                pairs.extend([(1, 0), (0x8000_0001, 0), (0x7f80_0001, 0)]);
+            }
+            for status in [0x20, 0x22] {
+                at.x87.status = status;
+                let built = guest_fp_form(&code, &at);
+                for (lhs, rhs) in pairs.iter().copied() {
+                    let mut data = [0; 48];
+                    data[..8].copy_from_slice(&lhs.to_le_bytes());
+                    data[8..16].copy_from_slice(&rhs.to_le_bytes());
+                    guest_fp_pair(&mut h, &code, &built, &at, &data, &[0; 8]);
+                }
+            }
         }
     }
 
@@ -2692,7 +3012,7 @@ mod opt_back {
 
     // spec: A64-OPT-4, A64-OPT-6
     #[test]
-    fn opt_back_failures_recover_the_region_and_restore_fpcr() {
+    fn opt_back_failures_recover_the_region_under_canonical_fpcr() {
         let mut h = harness();
         let (mut f, b, p, entry) = start(&[Type::F64, Type::F64]);
         f.records[entry.0 as usize].x87.as_mut().unwrap().valid = 3;
@@ -3483,21 +3803,12 @@ mod opt_back {
         let start = lower.marks[1].offset as usize / 4;
         assert_eq!(lower.words[start - 2], sub_imm(X, X9, X9, 3, false));
         assert_eq!(lower.words[start - 1] & 0xfff8_001f, tbz(true, X9, 63, 0));
-        assert_eq!(
-            body(&lower, 0).len(),
-            4,
-            "three-word Validate plus exit branch"
-        );
-        assert_eq!(
-            body(&lower, 0)[..2],
-            [mrs_fpsr(X16), and_imm(W, X16, X16, 0xffff_ff8f)]
-        );
-        assert_eq!(body(&lower, 0)[2] & 0xff00_001f, cbz(W, true, X16, 0));
+        assert_eq!(body(&lower, 0).len(), 1, "Validate emits no code");
     }
 
     // spec: A64-OPT-4, A64-OPT-7
     #[test]
-    fn opt_back_counted_floating_loop_has_no_backedge_or_arithmetic_moves() {
+    fn opt_back_counted_floating_loop_has_no_backedge_moves() {
         for split in [false, true] {
             let (mut f, entry, p, _) = start(&[Type::F64, Type::F64, Type::I32]);
             let head_record = f.record(record(0x1100));
@@ -3562,23 +3873,23 @@ mod opt_back {
             let head_code = body(&lower, 1);
             assert_eq!(
                 head_code[0],
-                dfloat(Float::Fadd, VReg::new(0), VReg::new(0), VReg::new(1))
+                dfloat(Float::Fadd, VReg::new(31), VReg::new(0), VReg::new(1))
             );
             assert_eq!(
                 head_code.len(),
-                9,
-                "FADD, Validate, SUB, CBZ, then the inline backedge"
+                12,
+                "FADD, result check, SUB, CBZ, then the inline backedge"
             );
             // The exit edge is bare, so the loop leaves with one CBZ and the
             // taken backedge holds only its two-word charge and branch; no
             // register or memory copies.
             assert_eq!(
-                head_code[5] & 0xff00_0000,
+                head_code[8] & 0xff00_0000,
                 cbz(W, false, Reg::new(0), 0) & 0xff00_0000
             );
-            assert_eq!(head_code[6], sub_imm(X, X9, X9, 3, false));
-            assert_eq!(head_code[7] & 0xfff8_001f, tbz(true, X9, 63, 0));
-            assert_eq!(head_code[8] & 0xfc00_0000, crate::encode::b(0));
+            assert_eq!(head_code[9], sub_imm(X, X9, X9, 3, false));
+            assert_eq!(head_code[10] & 0xfff8_001f, tbz(true, X9, 63, 0));
+            assert_eq!(head_code[11] & 0xfc00_0000, crate::encode::b(0));
             let mut h = harness();
             compare(
                 &f,
@@ -3625,11 +3936,13 @@ mod opt_back {
     fn opt_back_widens_checkpoint_bit_tests_across_large_forms() {
         let (mut f, b, p, entry) = start(&[Type::I32]);
         f.records[entry.0 as usize].refund = 3;
-        // Three words per Validate puts the entry checkpoint past 32 KiB.
-        for _ in 0..3000 {
-            f.push(b, Op::Validate);
+        // The body puts the entry checkpoint past 32 KiB.
+        let one = f.push(b, Op::Constant(Type::I32, 1)).unwrap();
+        let mut value = p[0];
+        for _ in 0..9000 {
+            value = f.push(b, Op::Int(IntOp::Add, value, one)).unwrap();
         }
-        let exit = finish(&mut f, b, p[0]);
+        let exit = finish(&mut f, b, value);
         let mut h = harness();
         let ran = h.run_opt(&f, &[0x1234], 10, 0, 0);
         assert!(ran.lowered.words.len() > 8192);

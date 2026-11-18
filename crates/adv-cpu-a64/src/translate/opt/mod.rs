@@ -35,16 +35,13 @@
 //! and nothing that can fail follows it before the head starts a region, so
 //! no failure returns past it.
 //!
-//! **Floating point.** Let `a` and `b` be non-NaN binary64 values.
-//! Under precision 53 and rounding to nearest, x87 rounds `a op b` once to 53
-//! bits with an exponent range containing binary64's. With `FPCR.FZ` set, no
-//! IDC means neither operand is a nonzero denormal; no IOC, no NaN result;
-//! no OFC, no overflow; no UFC, a result that is zero or normal. In the
-//! remaining cases both round the same exact value once to the same set, so
-//! the results agree bit for bit. The status word changes only in PE, set at
-//! entry, and C1, which recovery recomputes. Operands stay non-NaN by
-//! induction: entry values are checked at admission, x87 loads check, and an
-//! operation without IOC on non-NaN operands has a non-NaN result.
+//! **Floating point (A64-OPT-4).** Under the default FPCR and x87 precision
+//! 53, AArch64 and x87 round once to the same precision. The value checks
+//! exclude exceptions other than PE, assumed at entry, and results near the
+//! binary64 range limits that could differ from x87's wider exponent range.
+//! Recovery recomputes C1. x87 operands stay non-NaN: admission and loads
+//! reject NaNs, and arithmetic rejects a NaN from numeric operands.
+//! SSE can propagate quiet NaNs and checks subnormal inputs when DE is clear.
 //!
 //! **Recovery (A64-OPT-5, A64-OPT-6).** Between a region start `p` and the next
 //! effect point nothing reaches memory outside the frame, because stores are

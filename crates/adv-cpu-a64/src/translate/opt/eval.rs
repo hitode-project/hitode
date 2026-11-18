@@ -1,8 +1,8 @@
 //! Executes a `Func` as the reference semantics of the IR. Front-end tests
 //! compare it with the interpreter, and back-end tests compare emitted code
 //! with it. Integer flags come from the interpreter's own functions. Floating
-//! point follows AArch64 with `FPCR.FZ` set and `FPCR.DN` clear: denormal
-//! inputs flush to zero with IDC, and tiny results flush to zero with UFC.
+//! point uses the default FPCR semantics and checks operand and result values
+//! at each operation, recovering to its region start on failure.
 
 use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
@@ -13,16 +13,6 @@ use super::ir::{
     VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
-
-pub(crate) const IOC: u32 = 1;
-pub(crate) const DZC: u32 = 1 << 1;
-pub(crate) const OFC: u32 = 1 << 2;
-pub(crate) const UFC: u32 = 1 << 3;
-pub(crate) const IDC: u32 = 1 << 7;
-/// The cumulative FPSR flags a validation checks.
-pub(crate) const CHECKED: u32 = IOC | DZC | OFC | UFC | IDC;
-
-const DEFAULT_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -46,7 +36,6 @@ pub(crate) struct Run {
 /// Runs `func` from block 0 with `params`, for at most `limit` instructions.
 pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usize) -> Run {
     let mut values = vec![0u128; func.types.len()];
-    let mut fpsr = 0u32;
     let mut block = Block(0);
     let mut args = params.to_vec();
     let mut region = None;
@@ -66,7 +55,7 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
             if steps > limit {
                 break 'run Outcome::Limit;
             }
-            match step(func, op, &values, &mut fpsr, memory) {
+            match step(func, op, &values, memory) {
                 Some(bits) => {
                     if let Some(r) = result {
                         values[r.0 as usize] = bits;
@@ -103,13 +92,7 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
 }
 
 /// One instruction's result bits, or `None` when it fails.
-fn step(
-    func: &Func,
-    op: &Op,
-    values: &[u128],
-    fpsr: &mut u32,
-    memory: &mut Memory,
-) -> Option<u128> {
+fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u128> {
     let get = |v: Value| values[v.0 as usize];
     let wide = |v: Value| func.ty(v) == Type::I64;
     let f = |v: Value| f64::from_bits(get(v) as u64);
@@ -172,8 +155,7 @@ fn step(
             get(a),
             get(b),
             prior.map_or(0, |p| get(p) as u32),
-            fpsr,
-        )),
+        )?),
         Op::Test { flags, cond } => u128::from(integer::condition_true(cond, get(flags) as u32)),
         Op::Select { cond, a, b } => get(if get(cond) != 0 { a } else { b }),
         Op::Bits { to, value } => {
@@ -185,7 +167,7 @@ fn step(
                 Type::Flags => unreachable!("no reinterpretation as flags"),
             }
         }
-        Op::Fp(op, a, b) => float(arithmetic(op, f(a), f(b), fpsr))?,
+        Op::Fp(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
         Op::FpUnary(op, a) => {
             let x = f(a);
             match op {
@@ -199,39 +181,45 @@ fn step(
             } else {
                 i64::from(get(a) as u32 as i32)
             };
-            let x = n as f64;
-            if x as i128 != i128::from(n) {
+            let magnitude = n.unsigned_abs();
+            if 64u32.saturating_sub(magnitude.leading_zeros() + magnitude.trailing_zeros()) > 53 {
                 return None;
             }
-            float(x)?
+            float(n as f64)?
         }
         Op::ToInt { value, wide } => {
-            let x = input(f(value), fpsr);
+            let x = f(value);
             let (lo, hi) = if wide {
                 (i64::MIN as f64, -(i64::MIN as f64))
             } else {
                 (f64::from(i32::MIN), -f64::from(i32::MIN))
             };
             let t = x.trunc();
-            let n = if x.is_nan() || t < lo || t >= hi {
-                *fpsr |= IOC;
-                if x.is_nan() {
-                    0
-                } else if t < lo {
-                    lo as i64
-                } else {
-                    hi as i64 - 1
-                }
-            } else {
-                t as i64
-            };
+            if x.is_nan() || t < lo || t >= hi {
+                return None;
+            }
+            let n = t as i64;
             if wide {
                 u128::from(n as u64)
             } else {
                 u128::from(n as u32)
             }
         }
-        Op::Vec(op, a, b) => vector(op, get(a), get(b), fpsr),
+        Op::Vec(VecOp::LessF64, a, b) => {
+            let mut result = 0;
+            for shift in [0, 64] {
+                let a = f64::from_bits((get(a) >> shift) as u64);
+                let b = f64::from_bits((get(b) >> shift) as u64);
+                if a.is_nan() || b.is_nan() {
+                    return None;
+                }
+                if a < b {
+                    result |= u128::from(u64::MAX) << shift;
+                }
+            }
+            result
+        }
+        Op::Vec(op, a, b) => vector(op, get(a), get(b)),
         Op::VecUnary(op, a) => vector_unary(op, get(a)),
         Op::VecToInt(op, a) => u128::from(vector_to_int(op, get(a))),
         Op::Load { width, addr, .. } => {
@@ -285,22 +273,28 @@ fn step(
         } => {
             let (x, tiny) = if single {
                 let x = f32::from_bits(get(bits) as u32);
-                (f64::from(x), x != 0.0 && x.abs() < f32::MIN_POSITIVE)
+                (f64::from(x), denormal && x.is_subnormal())
             } else {
                 let x = f(bits);
-                (x, denormal && x != 0.0 && x.abs() < f64::MIN_POSITIVE)
+                (x, denormal && x.is_subnormal())
             };
             if x.is_nan() || tiny {
                 return None;
             }
             float(x)?
         }
-        Op::Validate => {
-            if *fpsr & CHECKED != 0 {
-                return None;
+        Op::SseInput { a, b, packed } => {
+            for v in [Some(a), b].into_iter().flatten() {
+                let bits = get(v);
+                if f64::from_bits(bits as u64).is_subnormal()
+                    || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
+                {
+                    return None;
+                }
             }
             0
         }
+        Op::Validate => 0,
     })
 }
 
@@ -342,7 +336,7 @@ fn int(op: IntOp, a: u64, b: u64, wide: bool) -> u128 {
     }
 }
 
-fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32, fpsr: &mut u32) -> u32 {
+fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32> {
     let (x, y) = (a as u32, b as u32);
     let mut out = prior;
     match kind {
@@ -382,11 +376,11 @@ fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32, fpsr: &mut u32
             out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
         }
         FlagKind::UnorderedCompare | FlagKind::OrderedCompare => {
-            let p = input(f64::from_bits(a as u64), fpsr);
-            let q = input(f64::from_bits(b as u64), fpsr);
+            let p = f64::from_bits(a as u64);
+            let q = f64::from_bits(b as u64);
             let ordered = kind == FlagKind::OrderedCompare;
             if signaling(p) || signaling(q) || ordered && (p.is_nan() || q.is_nan()) {
-                *fpsr |= IOC;
+                return None;
             }
             let set = if p.is_nan() || q.is_nan() {
                 ZF | PF | CF
@@ -400,44 +394,19 @@ fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32, fpsr: &mut u32
             out = out & !(ZF | PF | CF | OF | integer::SF | integer::AF) | set;
         }
     }
-    out
+    Some(out)
 }
 
 fn signaling(x: f64) -> bool {
     x.is_nan() && x.to_bits() & 1 << 51 == 0
 }
 
-/// An operand after FZ: nonzero denormals become zero and set IDC.
-fn input(x: f64, fpsr: &mut u32) -> f64 {
-    if x != 0.0 && x.abs() < f64::MIN_POSITIVE {
-        *fpsr |= IDC;
-        0.0f64.copysign(x)
-    } else {
-        x
+fn arithmetic(op: FpOp, a: f64, b: f64) -> Option<f64> {
+    if signaling(a) || signaling(b) {
+        return None;
     }
-}
-
-/// A NaN operand's result: quieted, with IOC for a signaling one.
-fn quiet(x: f64, fpsr: &mut u32) -> f64 {
-    if signaling(x) {
-        *fpsr |= IOC;
-    }
-    f64::from_bits(x.to_bits() | 1 << 51)
-}
-
-fn arithmetic(op: FpOp, a: f64, b: f64, fpsr: &mut u32) -> f64 {
-    let (a, b) = (input(a, fpsr), input(b, fpsr));
     if a.is_nan() || b.is_nan() {
-        // AArch64 returns the first signaling NaN, else the first quiet one.
-        let first = if signaling(a) || !signaling(b) && a.is_nan() {
-            a
-        } else {
-            b
-        };
-        if signaling(a) || signaling(b) {
-            *fpsr |= IOC;
-        }
-        return quiet(first, &mut 0);
+        return Some(if a.is_nan() { a } else { b });
     }
     let r = match op {
         FpOp::Add => a + b,
@@ -445,44 +414,15 @@ fn arithmetic(op: FpOp, a: f64, b: f64, fpsr: &mut u32) -> f64 {
         FpOp::Mul => a * b,
         FpOp::Div => a / b,
     };
-    if r.is_nan() {
-        *fpsr |= IOC;
-        return f64::from_bits(DEFAULT_NAN);
+    if r.is_nan() || r.is_infinite() && a.is_finite() && b.is_finite() || r.is_subnormal() {
+        return None;
     }
-    if r.is_infinite() {
-        if a.is_finite() && b.is_finite() {
-            *fpsr |= if op == FpOp::Div && b == 0.0 {
-                DZC
-            } else {
-                OFC
-            };
-        }
-        return r;
+    if matches!(op, FpOp::Mul | FpOp::Div)
+        && (r.abs() == f64::MIN_POSITIVE || r == 0.0 && a != 0.0 && (op != FpOp::Mul || b != 0.0))
+    {
+        return None;
     }
-    // Whether the exact result is nonzero, its sign, and the sign of the
-    // exact result minus `r`, which tells a tiny value that rounded up to
-    // the smallest normal. A tiny exact sum is exact (Hauser).
-    let (nonzero, sign, error) = match op {
-        FpOp::Add | FpOp::Sub => (r != 0.0, r, 0.0),
-        FpOp::Mul => (
-            a != 0.0 && b != 0.0,
-            a.signum() * b.signum(),
-            a.mul_add(b, -r),
-        ),
-        FpOp::Div => (
-            a != 0.0 && b.is_finite(),
-            a.signum() * b.signum(),
-            (-r).mul_add(b, a) * b.signum(),
-        ),
-    };
-    let tiny = nonzero
-        && (r.abs() < f64::MIN_POSITIVE
-            || r.abs() == f64::MIN_POSITIVE && error != 0.0 && error.signum() != r.signum());
-    if tiny {
-        *fpsr |= UFC;
-        return 0.0f64.copysign(sign);
-    }
-    r
+    Some(r)
 }
 
 fn vec_signed(value: u64, bits: usize) -> i64 {
@@ -592,13 +532,8 @@ fn vector_to_int(op: VecToInt, a: u128) -> u32 {
     }
 }
 
-fn vector(op: VecOp, a: u128, b: u128, fpsr: &mut u32) -> u128 {
+fn vector(op: VecOp, a: u128, b: u128) -> u128 {
     use crate::encode::{Narrowing, Permute, Same};
-    let lanes64 = |f: &mut dyn FnMut(u64, u64) -> u64| {
-        let lo = f(a as u64, b as u64);
-        let hi = f((a >> 64) as u64, (b >> 64) as u64);
-        u128::from(lo) | u128::from(hi) << 64
-    };
     let mask_full = |v: u128, full: bool| {
         if full { v } else { v & u128::from(u64::MAX) }
     };
@@ -792,16 +727,7 @@ fn vector(op: VecOp, a: u128, b: u128, fpsr: &mut u32) -> u128 {
             let out = (a & !(0xffffu128 << shift)) | (word << shift);
             mask_full(out, full)
         }
-        VecOp::LessF64 => lanes64(&mut |x, y| {
-            let (p, q) = (
-                input(f64::from_bits(x), fpsr),
-                input(f64::from_bits(y), fpsr),
-            );
-            if p.is_nan() || q.is_nan() {
-                *fpsr |= IOC;
-            }
-            if p < q { u64::MAX } else { 0 }
-        }),
+        VecOp::LessF64 => unreachable!("handled by step"),
     }
 }
 

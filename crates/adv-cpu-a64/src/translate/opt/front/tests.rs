@@ -51,6 +51,7 @@ fn built(code: &[u8], at: &CpuState) -> (Unit, Proof, Built) {
     prove(&mut proof, &unit, code);
     let built = build(&unit, &proof, at).unwrap();
     assert_eq!(verify::verify(&built.func), Ok(()));
+    super::super::back::lower(&built.func);
     (unit, proof, built)
 }
 
