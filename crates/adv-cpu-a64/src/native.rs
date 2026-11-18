@@ -2402,6 +2402,299 @@ mod tests {
         cpu
     }
 
+    /// Run the guard between the canonical entry and exit stubs.
+    fn place_computation_guard(
+        native: &mut Native,
+        proof: &translate::computation::Proof,
+    ) -> usize {
+        use crate::asm::Asm;
+        use crate::encode::{mov, mov_sp, str};
+        use std::mem::offset_of;
+
+        let mut asm = Asm::new();
+        let fail = asm.label();
+        let cold = asm.label();
+        let exit = asm.label();
+        translate::computation::emit_guard(&mut asm, proof, fail, cold);
+        asm.emit(movz(W, Reg::new(1), 0, 0));
+        asm.b(exit);
+        asm.bind(fail);
+        asm.emit(movz(W, Reg::new(1), 1, 0));
+        asm.b(exit);
+        asm.bind(cold);
+        asm.emit(movz(W, Reg::new(1), 2, 0));
+        asm.bind(exit);
+        // The usual exit captures x7 and x8. Record the raw lazy sources,
+        // DF and the restored host stack before the exit consumes them.
+        let runtime = Reg::new(29);
+        asm.emit_all(&[
+            mov(X, Reg::new(7), Reg::new(10)),
+            mov(X, Reg::new(8), Reg::new(11)),
+            str(X, Reg::new(12), runtime, offset_of!(Runtime, branch) as u32),
+            mov_sp(Reg::new(0), Reg::new(31)),
+            str(X, Reg::new(0), runtime, offset_of!(Runtime, resume) as u32),
+            movz(W, Reg::new(0), Exit::Dispatch as u16, 0),
+        ]);
+        let pc = native.cache.next() + asm.offset();
+        asm.emit(b((native.stubs.exit as i64 - pc as i64) as i32));
+        native.cache.append(&asm.finish()).unwrap()
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn computation_guard_matches_owner_admission() {
+        use adv_cpu_core::memory::EXEC;
+        use iced_x86::code_asm::*;
+        use translate::computation::tests::{
+            frame_cached_rows, nested_descending_rows, row, trace, wrapping_gather,
+        };
+        use translate::computation::{Evaluation, Proof};
+
+        let copy = |a: &mut CodeAssembler| {
+            row(|a| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            })(a);
+        };
+        let frame = Proof::build(&trace(|a| {
+            frame_cached_rows(a, false);
+            a.int3().unwrap();
+        }))
+        .expect("frame cache proof");
+        assert!(frame.frame_cache().is_some());
+        let fixtures = [
+            ("copy", Proof::build(&trace(copy)).unwrap()),
+            (
+                "nested descending rows",
+                Proof::build(&nested_descending_rows()).unwrap(),
+            ),
+            (
+                "signed and normalized division",
+                Proof::build(&wrapping_gather()).unwrap(),
+            ),
+            ("outer loop with frame cache", frame),
+            (
+                "gathered dword table",
+                Proof::build(&trace(row(|a| {
+                    a.mov(eax, dword_ptr(esi)).unwrap();
+                    a.mov(al, byte_ptr(eax)).unwrap();
+                    a.mov(byte_ptr(edi), al).unwrap();
+                })))
+                .unwrap(),
+            ),
+            (
+                "stack alignment",
+                Proof::build(&trace(|a| {
+                    a.and(esp, -8).unwrap();
+                    copy(a);
+                }))
+                .unwrap(),
+            ),
+        ];
+
+        const PAGE: u32 = 4096;
+        const PAGES: u32 = 136;
+        const BOUNDARY: u32 = 64 * PAGE;
+        let mut seed = 0x7a57_9315u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut outcomes = [0; 3];
+        let mut cold_admission = [false; 2];
+
+        // Both reservations start partway through a 64-page bitmap group.
+        // The upper one permits an exclusive range end of exactly 2^32.
+        for base in [0x19000u32, 0u32.wrapping_sub(PAGES * PAGE)] {
+            let frame = base + 2 * PAGE;
+            let params = base + 8 * PAGE;
+            let input = base + 16 * PAGE;
+            let output = base + 24 * PAGE;
+            let table = base + 33 * PAGE;
+            let mut native = None;
+            let mut targets = Vec::new();
+            let mut admission = worker::Admission::default();
+            for layout in 0..12 {
+                let mut memory = Memory::window(base, (PAGES * PAGE) as usize).unwrap();
+                let native = native.get_or_insert_with(|| {
+                    let mut native = Native::new(memory.window_base().unwrap()).unwrap();
+                    targets.extend(
+                        fixtures
+                            .iter()
+                            .map(|(_, proof)| place_computation_guard(&mut native, proof)),
+                    );
+                    native.cache.sync();
+                    native
+                });
+                for page in 0..PAGES {
+                    let choice = random() % 12;
+                    if layout >= 3 && choice == 0 {
+                        continue;
+                    }
+                    let addr = base + page * PAGE;
+                    let permissions = if layout < 3 {
+                        READ | WRITE
+                    } else {
+                        match choice {
+                            1 => 0,
+                            2 => READ | EXEC,
+                            3 => WRITE,
+                            4 => READ | WRITE | EXEC,
+                            _ => READ | WRITE,
+                        }
+                    };
+                    memory.map(addr, PAGE as usize, permissions).unwrap();
+                    if layout >= 3 && choice % 3 == 0 {
+                        memory.watch_code(addr + (random() % PAGE), 1);
+                    }
+                }
+                let mut words = vec![
+                    (frame, 9),
+                    (frame + 8, 3),
+                    (params, if layout < 3 { 5 } else { random() & 15 }),
+                    (
+                        params + 4,
+                        if layout < 3 {
+                            (-16i32) as u32
+                        } else {
+                            random()
+                        },
+                    ),
+                    (base + BOUNDARY - 2, 5),
+                    (base + BOUNDARY + 2, (-16i32) as u32),
+                ];
+                words.extend((0..64).map(|i| (table + 4 * i, input + (random() & 255))));
+                for (addr, value) in words {
+                    if memory.committed(addr, 4).is_ok() {
+                        memory.write(addr, &value.to_le_bytes()).unwrap();
+                    }
+                }
+                if layout == 1 {
+                    memory.watch_code(output + 8, 1);
+                    memory.watch_code(base + BOUNDARY - 1, 2);
+                }
+                if layout == 2 {
+                    // The first watch shares a line with the copy but no bytes.
+                    // The second shares a page with the copy but no lines.
+                    memory.watch_code(output + 48, 1);
+                    memory.watch_code(output + 128, 1);
+                }
+                native.classify(&mut memory);
+                native.runtime.plain_pages = memory.plain_pages() as u64;
+                native.runtime.memory_base = memory.base;
+                native.runtime.memory_pages = (memory.len / PAGE as usize) as u32;
+
+                for (fixture, ((name, proof), &target)) in fixtures.iter().zip(&targets).enumerate()
+                {
+                    for sample in 0..64 {
+                        let mut cpu = CpuState {
+                            regs: [
+                                random(),
+                                4,
+                                3,
+                                3,
+                                frame,
+                                params,
+                                if fixture == 4 { table } else { input },
+                                output,
+                            ],
+                            eflags: 0x202 | (random() & 0xcd5),
+                            ..CpuState::default()
+                        };
+                        match sample {
+                            0 => {}
+                            1 => cpu.regs[1] = 0,
+                            2 => cpu.regs[4] += 1,
+                            3 => cpu.regs[7] = base.wrapping_add(PAGES * PAGE - 1),
+                            4 => {
+                                cpu.regs[6] = base + 2 * BOUNDARY - 8;
+                                cpu.regs[7] = base + BOUNDARY - 8;
+                            }
+                            5 => cpu.regs[5] = frame,
+                            6 => cpu.regs[5] = base + BOUNDARY - 2,
+                            7 => {
+                                cpu.regs[1] = 1;
+                                cpu.regs[6] = base.wrapping_add(PAGES * PAGE - 4);
+                                cpu.regs[7] = cpu.regs[6];
+                            }
+                            8 => {
+                                cpu.regs[1] = 2;
+                                cpu.regs[7] = output + 96;
+                            }
+                            _ => {
+                                cpu.regs[1] = random() & 63;
+                                let reg = (random() & 7) as usize;
+                                cpu.regs[reg] = match random() % 4 {
+                                    0 => u32::MAX - (random() & 63),
+                                    1 => random(),
+                                    2 => cpu.regs[4] + (random() & 31),
+                                    _ => base + random() % (PAGES * PAGE),
+                                };
+                            }
+                        }
+                        let admitted = admission.alone(proof, &cpu, &memory, native.runtime.alias);
+                        let mut actual = cpu.clone();
+                        native.runtime.cpu = &raw mut actual;
+                        let countdown = u64::MAX >> 1;
+                        native.runtime.countdown = countdown;
+                        // SAFETY: target was emitted into this cache for the
+                        // canonical entry and exits through this runtime's stub.
+                        unsafe { (native.enter)(&mut *native.runtime, target) };
+                        let outcome = actual.eip as usize;
+                        outcomes[outcome] += 1;
+                        let context = (name, base, layout, sample, cpu.regs);
+                        if outcome == 2 {
+                            cold_admission[usize::from(admitted)] = true;
+                            let mut scratch = Evaluation::default();
+                            let (ranges, outputs) = proof
+                                .evaluate_alone(&cpu, &mut scratch, |addr| {
+                                    memory.computation_range(addr, 4, false).then(|| {
+                                        u32::from_le_bytes(
+                                            memory.read(addr, 4).unwrap().try_into().unwrap(),
+                                        )
+                                    })
+                                })
+                                .unwrap();
+                            assert!(
+                                ranges.iter().chain(outputs).any(|r| {
+                                    let start = r.start & !63;
+                                    let end = (r.end + 63) & !63;
+                                    r.write
+                                        && memory
+                                            .stores_code(start, (end - u64::from(start)) as usize)
+                                }),
+                                "cold without a watched line: {context:?}"
+                            );
+                        } else {
+                            assert_eq!(outcome == 0, admitted, "{context:?}");
+                        }
+                        assert_eq!(actual.regs, cpu.regs, "{context:?}");
+                        assert_eq!(actual.eflags, cpu.eflags, "{context:?}");
+                        assert_eq!(native.runtime.countdown, countdown, "{context:?}");
+                        assert_eq!(
+                            native.runtime.temps,
+                            [
+                                u64::from((cpu.eflags >> 2 & 1) ^ 1),
+                                u64::from(cpu.eflags & 0x10)
+                            ],
+                            "{context:?}"
+                        );
+                        assert_eq!(
+                            native.runtime.branch,
+                            u64::from(cpu.eflags >> 10 & 1),
+                            "{context:?}"
+                        );
+                        assert_eq!(native.runtime.resume, native.runtime.host_sp, "{context:?}");
+                    }
+                }
+            }
+        }
+        assert!(outcomes.iter().all(|&count| count > 0), "{outcomes:?}");
+        assert_eq!(cold_admission, [true, true]);
+    }
+
     // spec: A64-REG-6, A64-MEM-1
     #[test]
     fn the_window_is_aligned_and_biases_the_stack_registers() {

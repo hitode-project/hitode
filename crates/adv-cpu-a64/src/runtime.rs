@@ -93,6 +93,10 @@ pub struct Runtime {
     /// The ordinary-memory alias and raw permission table, biased to guest zero.
     pub alias: u64,
     pub alias_classes: u64,
+    /// Read, write and observed-code masks in groups of 64 guest pages.
+    pub plain_pages: u64,
+    pub memory_base: u32,
+    pub memory_pages: u32,
     /// `interpret(runtime, helper, countdown) -> status`, called by
     /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
     /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
@@ -183,6 +187,9 @@ impl Runtime {
             classes: 0,
             alias: 0,
             alias_classes: 0,
+            plain_pages: 0,
+            memory_base: 0,
+            memory_pages: 0,
             code_lines: 0,
             interpret: 0,
             exit: 0,

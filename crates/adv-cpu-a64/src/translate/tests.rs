@@ -1587,37 +1587,7 @@ fn j1_forward_internal_jcc_inlines_and_peeled_mmx_loop_minimizes_guards() {
 fn admitted_frame_values_are_reloaded_at_each_outer_iteration() {
     let mut h = Harness::new();
     for overlapping_store in [false, true] {
-        let code = bytes(|a| {
-            let mut outer = a.create_label();
-            let mut inner = a.create_label();
-            let mut alternate = a.create_label();
-            let mut output = a.create_label();
-            a.set_label(&mut outer).unwrap();
-            a.mov(dword_ptr(esp + 4), ebx).unwrap();
-            a.mov(dword_ptr(esp + 8), 7).unwrap();
-            a.mov(dword_ptr(esp + 12), 11).unwrap();
-            a.mov(ecx, 4).unwrap();
-            a.set_label(&mut inner).unwrap();
-            a.mov(eax, dword_ptr(esp + 4)).unwrap();
-            a.test(ebx, 1).unwrap();
-            a.jz(alternate).unwrap();
-            a.imul_2(eax, dword_ptr(esp + 8)).unwrap();
-            a.jmp(output).unwrap();
-            a.set_label(&mut alternate).unwrap();
-            a.imul_2(eax, dword_ptr(esp + 12)).unwrap();
-            if overlapping_store {
-                a.mov(byte_ptr(esp + 5), al).unwrap();
-            }
-            a.set_label(&mut output).unwrap();
-            a.mov(edx, dword_ptr(esp + 4)).unwrap();
-            a.add(eax, edx).unwrap();
-            a.mov(dword_ptr(edi), eax).unwrap();
-            a.add(edi, 4).unwrap();
-            a.dec(ecx).unwrap();
-            a.jne(inner).unwrap();
-            a.dec(ebx).unwrap();
-            a.jne(outer).unwrap();
-        });
+        let code = bytes(|a| computation::tests::frame_cached_rows(a, overlapping_store));
         let work = j1_unit(&code);
         let proof = computation::Proof::build(&work.unit.trace).expect("nested proof");
         let cache = proof.frame_cache().expect("inner loop residence");

@@ -16,6 +16,10 @@ use super::simd::{Kind, Loc};
 use super::trace::{Edge, Mode, Next, Trace};
 
 mod carried;
+mod guard;
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use guard::emit_guard;
 
 type ExprId = usize;
 type VarId = usize;
@@ -2639,7 +2643,7 @@ impl Proof {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use adv_cpu_core::Memory;
     use iced_x86::code_asm::*;
@@ -2650,7 +2654,7 @@ mod tests {
     const INPUT: u32 = 0x40000;
     const OUTPUT: u32 = 0x50000;
 
-    fn trace(assemble: impl FnOnce(&mut CodeAssembler)) -> Trace {
+    pub(crate) fn trace(assemble: impl FnOnce(&mut CodeAssembler)) -> Trace {
         let mut a = CodeAssembler::new(32).unwrap();
         assemble(&mut a);
         let code = a.assemble(u64::from(CODE)).unwrap();
@@ -2679,7 +2683,7 @@ mod tests {
     }
 
     /// `head: body; add esi,4; add edi,4; dec ecx; jne head; int3`
-    fn row(body: impl Fn(&mut CodeAssembler)) -> impl Fn(&mut CodeAssembler) {
+    pub(crate) fn row(body: impl Fn(&mut CodeAssembler)) -> impl Fn(&mut CodeAssembler) {
         move |a| {
             let mut head = a.create_label();
             a.set_label(&mut head).unwrap();
@@ -2690,6 +2694,39 @@ mod tests {
             a.jne(head).unwrap();
             a.int3().unwrap();
         }
+    }
+
+    #[cfg(native)]
+    pub(crate) fn frame_cached_rows(a: &mut CodeAssembler, overlapping_store: bool) {
+        let mut outer = a.create_label();
+        let mut inner = a.create_label();
+        let mut alternate = a.create_label();
+        let mut output = a.create_label();
+        a.set_label(&mut outer).unwrap();
+        a.mov(dword_ptr(esp + 4), ebx).unwrap();
+        a.mov(dword_ptr(esp + 8), 7).unwrap();
+        a.mov(dword_ptr(esp + 12), 11).unwrap();
+        a.mov(ecx, 4).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.mov(eax, dword_ptr(esp + 4)).unwrap();
+        a.test(ebx, 1).unwrap();
+        a.jz(alternate).unwrap();
+        a.imul_2(eax, dword_ptr(esp + 8)).unwrap();
+        a.jmp(output).unwrap();
+        a.set_label(&mut alternate).unwrap();
+        a.imul_2(eax, dword_ptr(esp + 12)).unwrap();
+        if overlapping_store {
+            a.mov(byte_ptr(esp + 5), al).unwrap();
+        }
+        a.set_label(&mut output).unwrap();
+        a.mov(edx, dword_ptr(esp + 4)).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(inner).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(outer).unwrap();
     }
 
     fn plan(proof: &Proof, count: u32) -> Option<Plan> {
@@ -2819,10 +2856,8 @@ mod tests {
         }
     }
 
-    // spec: A64-TR-9
-    #[test]
-    fn bounds_nested_descending_rows_and_live_stack_count() {
-        let t = trace(|a| {
+    pub(crate) fn nested_descending_rows() -> Trace {
+        trace(|a| {
             let mut row = a.create_label();
             let mut pixel = a.create_label();
             a.set_label(&mut row).unwrap();
@@ -2838,7 +2873,13 @@ mod tests {
             a.sub(dword_ptr(esp + 8), 1).unwrap();
             a.jne(row).unwrap();
             a.int3().unwrap();
-        });
+        })
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn bounds_nested_descending_rows_and_live_stack_count() {
+        let t = nested_descending_rows();
         assert_eq!(candidate(&t), Some(CODE));
         let proof = Proof::build(&t).expect("nested range proof");
         let mut cpu = CpuState::default();
@@ -3132,10 +3173,8 @@ mod tests {
         assert!(proof.evaluate(&cpu, &mut scratch, read).is_none());
     }
 
-    // spec: A64-TR-9
-    #[test]
-    fn bounds_both_arms_of_a_wrapping_gather() {
-        let t = trace(|a| {
+    pub(crate) fn wrapping_gather() -> Trace {
+        trace(|a| {
             let mut again = a.create_label();
             let mut wrap = a.create_label();
             let mut read = a.create_label();
@@ -3166,7 +3205,13 @@ mod tests {
             a.sub(dword_ptr(esp), 1).unwrap();
             a.jne(again).unwrap();
             a.int3().unwrap();
-        });
+        })
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn bounds_both_arms_of_a_wrapping_gather() {
+        let t = wrapping_gather();
         let proof = Proof::build(&t).expect("bounded gather proof");
         let divisions: Vec<_> = (0..t.len()).filter_map(|i| proof.division(i)).collect();
         assert_eq!(divisions, [Division::SignExtended, Division::Normalized]);
