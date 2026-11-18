@@ -13,7 +13,7 @@ use crate::runtime::{self, Exit, ResidentCold};
 use crate::translate::Trace;
 use crate::translate::opt::{back::Lowered, front::Assumed, ir::Source, recovery::*};
 
-use super::{compile, worker};
+use super::compile;
 
 pub(super) const HOT: u32 = 64;
 pub(super) const VERSIONS: usize = 3;
@@ -139,7 +139,7 @@ pub(super) fn emit(
     (head, version, probation): (u32, usize, bool),
     sample: &Cell<u32>,
     slot: &Slot,
-    job: Option<&worker::Prepared>,
+    gate: Option<Option<u64>>,
     form: &mut Lowered,
     at: usize,
     targets: Targets,
@@ -259,8 +259,8 @@ pub(super) fn emit(
         asm.b(leave);
     }
     asm.bind(entry);
-    if let Some(job) = job {
-        offer(&mut asm, job, leave);
+    if let Some(split_ticks) = gate {
+        offer(&mut asm, split_ticks, leave);
     }
 
     let form_at = at + asm.offset();
@@ -326,15 +326,15 @@ pub(super) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
     asm.finish()
 }
 
-fn offer(asm: &mut Asm, job: &worker::Prepared, leave: Label) {
+fn offer(asm: &mut Asm, split_ticks: Option<u64>, leave: Label) {
     asm.emit_all(&[
         ldr(X, GATE, RT, runtime::OFFER_GATE),
         ldr(W, r(17), GATE, 0),
     ]);
     asm.cbz(W, true, r(17), leave);
-    if job.proof.splits() {
+    if let Some(split_ticks) = split_ticks {
         let affordable = asm.label();
-        constant(asm, SLOT, std::ptr::from_ref(&*job.split_ticks) as u64);
+        constant(asm, SLOT, split_ticks);
         asm.emit(ldr(X, r(17), SLOT, 0));
         asm.cbz(X, false, r(17), affordable);
         asm.emit(ldr(W, r(0), GATE, 4));

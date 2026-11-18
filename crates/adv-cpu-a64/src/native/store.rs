@@ -243,7 +243,7 @@ impl Native {
         self.repoint_internal_edges(eip, None);
         self.heads.remove(&eip);
         self.code.tier1_words.remove(&eip);
-        self.computation.remove(&eip);
+        self.offload.invalidate(eip);
         self.code.units.remove(&eip).is_some()
     }
 
@@ -291,7 +291,7 @@ impl Native {
         self.diagnostics.clears += 1;
         self.code.cache.truncate(self.code.stub_len);
         self.code.units.clear();
-        self.computation.clear();
+        self.offload.clear();
         self.code.rows.clear();
         self.code.table_sources.clear();
         self.code.uses_permissions = false;

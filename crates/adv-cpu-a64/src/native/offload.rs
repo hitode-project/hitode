@@ -10,11 +10,11 @@ use adv_cpu_core::CpuState;
 use adv_cpu_core::backend::{Completion, Computation, Pace};
 use adv_cpu_core::trap::Bridge;
 use adv_sync::WakeEvent;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base,
-    record_branch,
+    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base, compile,
+    record_branch, translate,
 };
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
@@ -23,24 +23,61 @@ use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
 use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
 
+#[derive(Default)]
+pub(super) struct Offload {
+    jobs: FxHashMap<u32, WorkerJob>,
+    unit_code: translate::Code,
+    admission: Admission,
+    pub(super) enabled: bool,
+    skip_offer: Option<u32>,
+}
+
+impl Offload {
+    pub(super) fn proof(&self, eip: u32) -> Option<Proof> {
+        self.jobs.get(&eip).map(|job| job.proof.clone())
+    }
+
+    /// The stable split-cost cell read by the resident offer gate.
+    pub(super) fn gate(&self, eip: u32) -> Option<Option<u64>> {
+        self.jobs.get(&eip).map(|job| {
+            job.proof
+                .splits()
+                .then(|| std::ptr::from_ref(&*job.split_ticks) as u64)
+        })
+    }
+
+    pub(super) fn invalidate(&mut self, eip: u32) {
+        self.jobs.remove(&eip);
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.jobs.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, eip: u32) -> bool {
+        self.jobs.contains_key(&eip)
+    }
+}
+
 impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
-        self.computation_enabled = enabled;
-        self.skip_offer = skip;
+        self.offload.enabled = enabled;
+        self.offload.skip_offer = skip;
     }
 
     pub(crate) fn progressed(&mut self) {
-        self.skip_offer = None;
+        self.offload.skip_offer = None;
     }
 
     pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
-        self.skip_offer.take()
+        self.offload.skip_offer.take()
     }
 
     /// Whether the computation reached at EIP goes to the job layer
-    /// because a peer runs beside it; otherwise the owner runs it.
+    /// because a peer runs beside it.
     pub(super) fn offer_computation(&self) -> bool {
-        self.computation_enabled
+        self.offload.enabled
             && (self.bridge.is_null()
                 // SAFETY: this query occurs only within the owning run.
                 || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
@@ -56,7 +93,7 @@ impl Native {
             self.pace
                 .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
         }
-        self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
+        self.offload.enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
     }
 
     pub(crate) fn with_computation(
@@ -69,7 +106,7 @@ impl Native {
             &mut dyn adv_cpu_core::backend::Computation<Option<crate::ExecutionContext>>,
         ),
     ) {
-        if self.computation.is_empty() || memory.attach().is_err() {
+        if self.offload.jobs.is_empty() || memory.attach().is_err() {
             return;
         }
         self.invalidate(memory);
@@ -83,15 +120,179 @@ impl Native {
         };
         if let Some(mut session) = Session::new(
             entry,
-            &self.computation,
+            &self.offload.jobs,
             memory,
-            &mut self.admission,
+            &mut self.offload.admission,
             (retired, &mut self.retired_forms),
             Notifications { pending, wake },
             (self.pace.get(), &mut self.diagnostics.split),
         ) {
             visit(&mut session);
         }
+    }
+
+    pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
+        if self
+            .offload
+            .jobs
+            .get(&cpu.eip)
+            .is_some_and(WorkerJob::wants_form)
+            && self
+                .heads
+                .get(&cpu.eip)
+                .is_none_or(|head| head.pending.is_none())
+        {
+            self.request_optimized(cpu.eip, cpu.clone());
+        }
+        let Some(job) = self.offload.jobs.get(&cpu.eip) else {
+            return false;
+        };
+        if !self.offload.enabled || self.offload.skip_offer == Some(cpu.eip) {
+            return false;
+        }
+        let split = job.proof.splits() && job.cost() > 0;
+        let peer = self.offer_computation();
+        let paced = split && self.offer_split(job.cost());
+        (peer || paced) && job.worth_offering()
+    }
+
+    pub(super) fn place_job(
+        &mut self,
+        eip: u32,
+        at: &CpuState,
+        trace: translate::Trace,
+        job: compile::Job,
+    ) {
+        let mut unit = translate::Unit::default();
+        unit.trace = trace;
+        let iterates = unit.trace.returns_at_head();
+        if let Some(code) = self.emit_computation(
+            &mut unit,
+            eip,
+            (at.x87.control, at.x87.status & 0x20 != 0),
+            &job.proof,
+        ) {
+            self.diagnostics.split_proofs += u64::from(job.proof.splits());
+            let prepared = WorkerJob::new(code, iterates, job.proof, unit.trace);
+            prepared.requested();
+            prepared.built();
+            self.offload.jobs.insert(eip, prepared);
+            if let Some(form) = job.form {
+                self.install_job(eip, form);
+            }
+        }
+    }
+
+    pub(super) fn finish_job(&mut self, eip: u32, code: usize, job: Option<compile::Job>) -> bool {
+        let Some(prepared) = self
+            .offload
+            .jobs
+            .get(&eip)
+            .filter(|prepared| prepared.code.entry == code)
+        else {
+            return false;
+        };
+        prepared.built();
+        if let Some(form) = job.and_then(|job| job.form) {
+            self.install_job(eip, form);
+        }
+        true
+    }
+
+    fn emit_computation(
+        &mut self,
+        unit: &mut translate::Unit,
+        eip: u32,
+        (control, pe): (u16, bool),
+        proof: &translate::computation::Proof,
+    ) -> Option<Code> {
+        let retired = unit.trace.prepaid(0);
+        let code = translate::lower_computation(
+            unit,
+            &mut self.offload.unit_code,
+            eip,
+            self.features,
+            self.code.cache.next(),
+            self.code.stubs,
+            (control, pe, Some(proof)),
+        )?;
+        let entry = self.code.cache.append(code.words)?;
+        let mut sites: Vec<_> = code
+            .sites
+            .iter()
+            .map(|&(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        crate::jit_map::record(entry, code.words, eip, retired, code.marks, "a64");
+        Some(Code {
+            entry,
+            end: entry + code.words.len() * 4,
+            sites: sites.into(),
+            optimized: None,
+        })
+    }
+
+    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
+        at.refresh_mmx();
+        let prepared = &self.offload.jobs[&eip];
+        prepared.requested();
+        if let Some(head) = self.heads.get_mut(&eip) {
+            head.pending = Some(compile::Task::Job);
+            if let Some(last) = head.versions.last() {
+                last.slot.limit.set(0);
+            }
+        }
+        self.compiler.request(compile::Request {
+            eip,
+            generation: self.code.generation,
+            code: prepared.code.entry,
+            task: compile::Task::Job,
+            trace: prepared.trace.detached(),
+            proof: Some(prepared.proof.clone()),
+            at,
+            checked: FxHashSet::default(),
+            all_checked: false,
+            refused: FxHashSet::default(),
+            cuts: FxHashSet::default(),
+            count_entries: false,
+        });
+        self.install_optimized(false);
+    }
+
+    fn install_job(&mut self, eip: u32, form: compile::JobForm) {
+        let compile::JobForm { built, mut lowered } = form;
+        lowered.place(self.code.cache.next(), self.code.stubs.opt_exit);
+        let Some(entry) = self.code.cache.append(&lowered.words) else {
+            return;
+        };
+        let mut sites: Vec<_> = lowered
+            .sites
+            .into_iter()
+            .map(|(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        let job = self.offload.jobs.get_mut(&eip).unwrap();
+        crate::jit_map::record(
+            entry,
+            &lowered.words,
+            eip,
+            job.trace.prepaid(0),
+            &lowered.marks,
+            "a64-opt",
+        );
+        job.code.optimized = Some(Arc::new(Optimized {
+            code: Code {
+                entry,
+                end: entry + lowered.words.len() * 4,
+                sites: sites.into(),
+                optimized: None,
+            },
+            entry: built.func.entry,
+            assumed: built.assumed,
+            records: lowered.records,
+            flags: lowered.flags,
+            cells: lowered.spill_cells,
+        }));
     }
 }
 
@@ -113,7 +314,7 @@ const NO_LIMIT: u32 = i32::MAX as u32;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
 
-pub(super) struct Prepared {
+struct WorkerJob {
     pub code: Code,
     pub proof: Proof,
     /// The serial cost of a split loop in host ticks.
@@ -139,7 +340,7 @@ enum Mode {
     WholeOnly,
 }
 
-impl Prepared {
+impl WorkerJob {
     /// `iterates` when the code can stop after one outer iteration.
     pub fn new(code: Code, iterates: bool, proof: Proof, trace: crate::translate::Trace) -> Self {
         let mode = if iterates {
@@ -269,7 +470,7 @@ impl Prepared {
 }
 
 #[derive(Clone)]
-pub(super) struct Code {
+struct Code {
     pub entry: usize,
     pub end: usize,
     pub sites: Arc<[(usize, Site)]>,
@@ -278,7 +479,7 @@ pub(super) struct Code {
 }
 
 /// An optimized form of the same unit (A64-OPT-1).
-pub(super) struct Optimized {
+struct Optimized {
     pub code: Code,
     pub entry: Vec<Source>,
     pub assumed: Assumed,
@@ -288,20 +489,34 @@ pub(super) struct Optimized {
 }
 
 pub(super) struct Faults<'a> {
-    pub code: &'a Code,
-    pub stub: usize,
-    pub capture: &'a FaultCapture,
+    code: &'a Code,
+    stub: usize,
+    capture: &'a FaultCapture,
+}
+
+impl Faults<'_> {
+    pub(super) fn record(
+        &self,
+        pc: usize,
+        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
+    ) -> usize {
+        if !(self.code.entry..self.code.end).contains(&pc) {
+            return 0;
+        }
+        super::site_at(&self.code.sites, pc)
+            .map_or(0, |site| self.capture.record(site, pc, self.stub, snapshot))
+    }
 }
 
 #[derive(Default)]
-pub(super) struct ExecuteScratch {
+struct ExecuteScratch {
     pub params: Vec<u128>,
     pub saved: Vec<u128>,
     pub capture: FaultCapture,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Entry {
+struct Entry {
     pub enter: Enter,
     pub opt_enter: Enter,
     pub window: u64,
@@ -332,7 +547,7 @@ const OWNER_NEEDED: u32 = 2;
 /// The owner's own job also stops for its ordinary work.
 const LOCAL: u32 = RECALL | OWNER_NEEDED;
 
-pub(super) struct Notifications {
+struct Notifications {
     pub pending: (Arc<AtomicU32>, u32),
     pub wake: Option<WakeEvent>,
 }
@@ -373,7 +588,7 @@ fn run(
         cpu.refresh_mmx();
     }
     let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
-    let (exit, retired) = execute(runtime, cpu, entry, code, optimized, scratch, true);
+    let (exit, retired) = execute(runtime, cpu, entry, code, optimized, scratch);
     let elapsed = started.elapsed();
     record_branch(cpu, runtime.branch, cpu.eip);
     context.finish_computation(exit);
@@ -398,7 +613,7 @@ fn run(
 
 /// The optimized form of `code` if it has one whose entry facts hold at
 /// `cpu`, filling `params`. `alias` reaches the admitted frame.
-pub(super) fn admit<'a>(
+fn admit<'a>(
     code: &'a Code,
     cpu: &CpuState,
     alias: u64,
@@ -420,14 +635,13 @@ pub(super) fn admit<'a>(
 /// `runtime`, and holds the admitted ranges unshared. Returns the exit,
 /// with an optimized one resolved to `Recall` or `Dispatch`, and the
 /// instructions retired.
-pub(super) fn execute(
+fn execute(
     runtime: &mut Runtime,
     cpu: &mut CpuState,
     entry: Entry,
     code: &Code,
     optimized: Option<&Optimized>,
     scratch: &mut ExecuteScratch,
-    sync_icache: bool,
 ) -> (Exit, u64) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
@@ -458,11 +672,8 @@ pub(super) fn execute(
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
     unsafe {
-        if sync_icache {
-            // Instruction-cache maintenance is done by the publishing owner.
-            // Its ISB does not synchronize a helper thread's instruction stream.
-            std::arch::asm!("isb", options(nostack, preserves_flags));
-        }
+        // The publisher's ISB does not synchronize the worker's instruction stream.
+        std::arch::asm!("isb", options(nostack, preserves_flags));
         let target_enter = if optimized.is_some() {
             entry.opt_enter
         } else {
@@ -851,7 +1062,7 @@ impl PageGrants {
 }
 
 #[derive(Default)]
-pub(super) struct Admission {
+struct Admission {
     eval: Evaluation,
     grants: PageGrants,
     generation: (u64, u64),
@@ -865,28 +1076,6 @@ impl Admission {
             self.generation = generation;
             self.grants.clear();
         }
-    }
-
-    /// Whether the owner may run the computation at `cpu` itself, with no
-    /// job active: its ranges evaluate and are ordinary memory.
-    pub(super) fn alone(
-        &mut self,
-        proof: &Proof,
-        cpu: &CpuState,
-        memory: &Memory,
-        alias: u64,
-    ) -> bool {
-        self.sync_generation(memory);
-        let grants = &mut self.grants;
-        let Some((ranges, outputs)) = proof.evaluate_alone(cpu, &mut self.eval, |addr| {
-            parameter(memory, grants, alias, &[], addr)
-        }) else {
-            return false;
-        };
-        ranges.iter().chain(outputs).all(|range| {
-            self.grants
-                .allows(memory, range.start, range.end, range.write)
-        })
     }
 
     fn ranges<'a>(
@@ -989,9 +1178,9 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
     })
 }
 
-pub(super) struct Session<'a> {
+struct Session<'a> {
     entry: Entry,
-    prepared: &'a FxHashMap<u32, Prepared>,
+    prepared: &'a FxHashMap<u32, WorkerJob>,
     memory: &'a Memory,
     admission: &'a mut Admission,
     retired: &'a mut u64,
@@ -1010,7 +1199,7 @@ pub(super) struct Session<'a> {
 impl<'a> Session<'a> {
     pub(super) fn new(
         entry: Entry,
-        prepared: &'a FxHashMap<u32, Prepared>,
+        prepared: &'a FxHashMap<u32, WorkerJob>,
         memory: &'a Memory,
         admission: &'a mut Admission,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
@@ -1229,7 +1418,7 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
 
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
-fn learn(prepared: &Prepared, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+fn learn(prepared: &WorkerJob, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
     if iterations == 0 || done.requires_owner {
         return;
     }
@@ -1518,7 +1707,7 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.code.stubs.fault,
             },
-            (&native.computation.get(&head).unwrap().code, 0),
+            (&native.offload.jobs.get(&head).unwrap().code, 0),
             (
                 &Signals {
                     recall: Arc::new(AtomicU32::new(0)),
@@ -1540,7 +1729,7 @@ mod tests {
         let memory = executor.memory_mut();
         memory.write(head, &[0xcc]).unwrap();
         native.invalidate(memory);
-        assert!(!native.computation.contains_key(&head));
+        assert!(!native.offload.jobs.contains_key(&head));
     }
 
     // spec: A64-TR-9
@@ -1585,7 +1774,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(offer.exit, Exit::Computation);
-        assert!(native.computation[&CODE].proof.splits());
+        assert!(native.offload.jobs[&CODE].proof.splits());
         native.pace.set(Some(Pace::default()));
         let mut results = Vec::new();
         let mut memories = Vec::new();
@@ -1593,7 +1782,7 @@ mod tests {
         // serial estimate that warrants a split on every host.
         for run in 0..2 {
             if run == 1 {
-                let sample = &native.computation[&CODE].per_iteration;
+                let sample = &native.offload.jobs[&CODE].per_iteration;
                 let (retired, _) = sample.get().unwrap();
                 sample.set(Some((retired, 1_000_000.0 / f64::from(N))));
             }
@@ -1642,7 +1831,7 @@ mod tests {
         claimed: u32,
     ) -> Blocks {
         let (proof, cpu) = (
-            &native.computation[&CODE].proof,
+            &native.offload.jobs[&CODE].proof,
             start.as_ref().unwrap().cpu(),
         );
         let mut scratch = Evaluation::default();
@@ -1667,7 +1856,7 @@ mod tests {
                 alias: super::super::alias_base(executor.memory()),
                 fault: native.code.stubs.fault,
             },
-            code: native.computation[&CODE].code.clone(),
+            code: native.offload.jobs[&CODE].code.clone(),
             signals: Signals {
                 recall: Arc::new(AtomicU32::new(0)),
                 pending: (Arc::new(AtomicU32::new(0)), 0),
@@ -1965,7 +2154,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(offer.exit, Exit::Computation);
-        assert!(!native.computation[&CODE].proof.splits());
+        assert!(!native.offload.jobs[&CODE].proof.splits());
         let mut retired = 0;
         let mut done = None;
         native.with_computation(
@@ -2045,7 +2234,7 @@ mod tests {
             &mut |scope| clean_done = scope.run_local(1, &clean),
         );
         assert!(clean_done.unwrap().optimized > 0);
-        assert!(native.computation[&CODE].code.optimized.is_some());
+        assert!(native.offload.jobs[&CODE].code.optimized.is_some());
         let mut pending_done = None;
         native.with_computation(
             executor.memory_mut(),
@@ -2214,7 +2403,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(offer.exit, Exit::Computation);
                 native.install_optimized(true);
-                let prepared = &native.computation[&CODE];
+                let prepared = &native.offload.jobs[&CODE];
                 assert!(prepared.code.optimized.is_some());
                 let entry = Entry {
                     enter: native.code.enter,
@@ -2308,7 +2497,7 @@ mod tests {
                         3,
                         f_start,
                         fault_entry,
-                        (&native.computation[&CODE].code, 0),
+                        (&native.offload.jobs[&CODE].code, 0),
                         (&clean_signals, LOCAL),
                         &mut ExecuteScratch::default(),
                     );
@@ -2512,11 +2701,8 @@ mod tests {
         };
         cpu.eip = head;
         native.prepare_job(executor.memory_mut(), stop, &cpu);
-        alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-        assert!(native.diagnostics.optimized_runs > 0);
-        let prepared = &native.computation[&head];
+        let prepared = &native.offload.jobs[&head];
         let memory = executor.memory();
-        let alias = super::alias_base(memory);
 
         // Initial check and sliding pointers inside the first page and across
         // the second page must all be admitted via PageGrants.
@@ -2524,13 +2710,31 @@ mod tests {
         cpu.regs[1] = 4;
         cpu.regs[6] = INPUT;
         cpu.regs[7] = OUTPUT;
-        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+        assert!(
+            native
+                .offload
+                .admission
+                .ranges(&prepared.proof, &cpu, memory, &[])
+                .is_some()
+        );
         cpu.regs[6] = INPUT + 64;
         cpu.regs[7] = OUTPUT + 64;
-        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+        assert!(
+            native
+                .offload
+                .admission
+                .ranges(&prepared.proof, &cpu, memory, &[])
+                .is_some()
+        );
         cpu.regs[6] = INPUT + 0x1000;
         cpu.regs[7] = OUTPUT + 0x1000;
-        assert!(native.admission.alone(&prepared.proof, &cpu, memory, alias));
+        assert!(
+            native
+                .offload
+                .admission
+                .ranges(&prepared.proof, &cpu, memory, &[])
+                .is_some()
+        );
 
         // Removing read permission on the cached first input page invalidates it.
         executor.memory_mut().protect(INPUT, 4096, 0).unwrap();
@@ -2538,8 +2742,10 @@ mod tests {
         cpu.regs[7] = OUTPUT + 64;
         assert!(
             !native
+                .offload
                 .admission
-                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .is_some()
         );
 
         // Restoring permissions re-admits; watching code inside the output page
@@ -2550,8 +2756,10 @@ mod tests {
             .unwrap();
         assert!(
             native
+                .offload
                 .admission
-                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .is_some()
         );
 
         executor.memory_mut().watch_code(OUTPUT + 128, 64);
@@ -2559,159 +2767,11 @@ mod tests {
         cpu.regs[7] = OUTPUT + 128;
         assert!(
             !native
+                .offload
                 .admission
-                .alone(&prepared.proof, &cpu, executor.memory(), alias)
+                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .is_some()
         );
-    }
-
-    /// No peer runs beside this context.
-    struct Alone;
-
-    impl adv_cpu_core::trap::ExecutionTrap for Alone {
-        fn allow_computation(&mut self) -> bool {
-            false
-        }
-
-        /// Never offering, it publishes a clear gate, so head entry blocks
-        /// keep arrivals in translated code (A64-OPT-8).
-        fn offer_gate(&self) -> Option<&adv_cpu_core::backend::OfferGate> {
-            Some(&super::super::CLEAR_GATE)
-        }
-
-        fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
-            unreachable!("no host calls")
-        }
-    }
-
-    /// A copy loop of COUNT words from INPUT, entered at CODE with its
-    /// head at CODE + 1, and the address after it.
-    fn copy_loop() -> (Executor, Native, u32) {
-        let mut a = CodeAssembler::new(32).unwrap();
-        a.nop().unwrap();
-        let mut loop_head = a.create_label();
-        a.set_label(&mut loop_head).unwrap();
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(edi, 4).unwrap();
-        a.dec(ecx).unwrap();
-        a.jne(loop_head).unwrap();
-        a.int3().unwrap();
-        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
-        let (mut executor, mut native) = fixture(&mut a);
-        let memory = executor.memory_mut();
-        memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
-        memory.write(INPUT, &0x1234_5678u32.to_le_bytes()).unwrap();
-        memory.map(OUTPUT, SPACE as usize, READ | WRITE).unwrap();
-        native.first_visits = false;
-        native.set_computation_offer(true, None);
-        (executor, native, stop)
-    }
-
-    fn start(cpu: &mut CpuState, eip: u32) {
-        cpu.eip = eip;
-        cpu.regs[1] = COUNT;
-        cpu.regs[6] = INPUT;
-        cpu.regs[7] = OUTPUT;
-    }
-
-    /// One owner run of the copy loop with no peer beside it.
-    fn alone(
-        native: &mut Native,
-        executor: &mut Executor,
-        cpu: &mut CpuState,
-        stop: u32,
-        fuel: u64,
-    ) -> u32 {
-        let mut handler = Alone;
-        let memory = executor.memory_mut();
-        let mut bridge = adv_cpu_core::trap::Bridge {
-            timestamp: Default::default(),
-            memory,
-            error: None,
-            trap: None,
-            calls: 0,
-            handler: Some(&mut handler),
-            parked: false,
-            deadline: None,
-            clock_due: true,
-            unclocked_bytes: 0,
-            bulk_calls: 0,
-            bulk_bytes: 0,
-            cliffs: Default::default(),
-            scratch: Default::default(),
-        };
-        let run = native
-            .run(cpu, memory, stop, fuel, (&raw mut bridge).cast())
-            .unwrap()
-            .unwrap();
-        assert_ne!(run.exit, Exit::Computation);
-        assert!(u64::from(run.retired) <= fuel);
-        run.retired
-    }
-
-    // spec: A64-OPT-1
-    #[test]
-    fn a_computation_without_a_computing_peer_runs_optimized_on_the_owner() {
-        let (mut executor, mut native, stop) = copy_loop();
-        let head = CODE + 1;
-        let mut cpu = CpuState::default();
-        start(&mut cpu, head);
-        native.prepare_job(executor.memory_mut(), stop, &cpu);
-        assert!(native.computation[&head].code.optimized.is_some());
-        let mut run = |native: &mut Native, cpu: &mut CpuState, fuel| {
-            alone(native, &mut executor, cpu, stop, fuel)
-        };
-
-        // Fuel just above one budget: each run leaves at the first refill,
-        // and the runs retire the loop exactly.
-        start(&mut cpu, head);
-        let before = native.diagnostics.optimized_runs;
-        let mut retired = 0;
-        while cpu.eip != stop {
-            retired += run(&mut native, &mut cpu, (1 << 16) + 1000);
-        }
-        assert_eq!(retired, 5 * COUNT);
-        assert!(native.diagnostics.optimized_runs > before + 1);
-
-        // Unbounded fuel runs the whole loop at once; pending owner work
-        // leaves at a checkpoint.
-        start(&mut cpu, head);
-        assert_eq!(run(&mut native, &mut cpu, 1 << 40), 5 * COUNT);
-        assert_eq!(cpu.eip, stop);
-        native.interrupt = Some(Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE)));
-        start(&mut cpu, head);
-        assert!(run(&mut native, &mut cpu, 1 << 40) < 5 * COUNT);
-        assert_ne!(cpu.eip, stop);
-        assert_eq!(
-            executor.memory().read(OUTPUT + 4 * (COUNT - 1), 4).unwrap(),
-            [0x78, 0x56, 0x34, 0x12]
-        );
-    }
-
-    // spec: A64-OPT-1
-    #[test]
-    fn entry_states_the_form_keeps_missing_build_at_most_two_more() {
-        let (mut executor, mut native, stop) = copy_loop();
-        let head = CODE + 1;
-        let mut cpu = CpuState::default();
-        start(&mut cpu, head);
-        native.prepare_job(executor.memory_mut(), stop, &cpu);
-        // Every form assumes MXCSR's control bits: each new rounding mode
-        // misses MISSES entries, then the next entry builds for it.
-        for (mode, rebuilds) in [(1, true), (2, true), (3, false)] {
-            cpu.mxcsr = 0x1f80 | mode << 13;
-            for _ in 0..MISSES {
-                let before = native.diagnostics.optimized_runs;
-                start(&mut cpu, head);
-                alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-                assert_eq!(native.diagnostics.optimized_runs, before);
-            }
-            let before = native.diagnostics.optimized_runs;
-            start(&mut cpu, head);
-            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
-            assert_eq!(native.diagnostics.optimized_runs > before, rebuilds);
-        }
-        assert_eq!(native.computation[&head].forms.get(), 1 + RESPECIALIZE);
     }
 
     // spec: A64-CTL-10 A64-TR-9
@@ -2743,15 +2803,15 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit, Exit::Computation);
         assert!(native.unit_address(CODE).is_some());
-        assert!(native.computation.contains_key(&CODE));
+        assert!(native.offload.jobs.contains_key(&CODE));
         let middle = CODE + 4096u32.div_ceil(nop.len() as u32) * nop.len() as u32;
         memory.write(middle, &[0xcc]).unwrap();
         native.invalidate(memory);
         assert!(native.unit_address(CODE).is_none());
-        assert!(!native.computation.contains_key(&CODE));
+        assert!(!native.offload.jobs.contains_key(&CODE));
     }
 
-    // spec: A64-CTL-4 A64-CTL-6 A64-CTL-9
+    // spec: A64-CTL-4 A64-CTL-6 A64-CTL-9 A64-OPT-11
     #[test]
     fn an_inlined_return_mismatch_exits_with_the_committed_transfer() {
         const TARGET: u32 = CODE + 0x80;
@@ -2799,6 +2859,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((owner.exit, owner.retired), (Exit::Dispatch, 4));
+        assert_eq!(native.diagnostics.optimized_runs, 0);
         assert_eq!(
             (serial.eip, serial.regs[4], serial.regs[0]),
             (TARGET, STACK, 17)
@@ -3049,7 +3110,7 @@ mod tests {
             alias: super::super::alias_base(executor.memory()),
             fault: native.code.stubs.fault,
         };
-        let prepared = &native.computation[&CODE];
+        let prepared = &native.offload.jobs[&CODE];
         let pending = Signals {
             recall: Arc::new(AtomicU32::new(0)),
             pending: (
@@ -3118,7 +3179,7 @@ mod tests {
 
         // A short row disables only that form, even if old whole-job
         // completions arrive after the trial has been selected.
-        let prepared = &native.computation[&CODE];
+        let prepared = &native.offload.jobs[&CODE];
         prepared.mode.set(Mode::Trial);
         let mut sample = Done {
             completion: Completion {
@@ -3198,7 +3259,8 @@ mod tests {
             fault: native.code.stubs.fault,
         };
         let code = native
-            .computation
+            .offload
+            .jobs
             .get(&CODE)
             .expect("prepared x87 and SIMD")
             .code

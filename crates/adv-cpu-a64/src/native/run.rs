@@ -55,36 +55,12 @@ impl Native {
                 (entry?, self.code.cache.used().saturating_sub(before))
             }
         };
-        if self
-            .computation
-            .get(&cpu.eip)
-            .is_some_and(worker::Prepared::wants_form)
-            && self
-                .heads
-                .get(&cpu.eip)
-                .is_none_or(|head| head.pending.is_none())
-        {
-            self.request_optimized(cpu.eip, cpu.clone());
-        }
-        // Reaching the computation tells peers it is here, offered or not,
-        // and takes the frame's pace for a split.
-        if self.computation_enabled
-            && self.skip_offer != Some(cpu.eip)
-            && let Some(prepared) = self.computation.get(&cpu.eip)
-        {
-            // An arrival the owner keeps changes no state, so the published
-            // gate can decide it in translated code (PROC-MACH-13).
-            let split = prepared.proof.splits() && prepared.cost() > 0;
-            let peer = self.offer_computation();
-            // This also takes the pace a split plans with.
-            let paced = split && self.offer_split(prepared.cost());
-            if (peer || paced) && prepared.worth_offering() {
-                return Ok(Some(Run {
-                    exit: Exit::Computation,
-                    retired: 0,
-                    translated,
-                }));
-            }
+        if self.offer_job(cpu) {
+            return Ok(Some(Run {
+                exit: Exit::Computation,
+                retired: 0,
+                translated,
+            }));
         }
         if u64::from(entry.retired) > fuel {
             self.diagnostics.over_fuel += 1;
@@ -117,16 +93,6 @@ impl Native {
             );
         }
         self.code.cache.sync();
-        if let Some((exit, retired)) = self.run_optimized(cpu, memory, fuel) {
-            if retired != 0 {
-                self.progressed();
-            }
-            return Ok(Some(Run {
-                exit,
-                retired,
-                translated,
-            }));
-        }
         self.code.faults.end.set(self.code.cache.next());
         self.prepare_inline(cpu, memory, fuel, budget);
         let runtime: *mut Runtime = &mut *self.runtime;
@@ -172,7 +138,7 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
-            Exit::Optimized => self.diagnostics.optimized_runs += 1,
+            Exit::Optimized => {}
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
@@ -240,76 +206,6 @@ impl Native {
         }))
     }
 
-    /// Runs the optimized form of the computation at EIP in place when its
-    /// ranges and entry facts admit (A64-OPT-1). It leaves at a checkpoint
-    /// once owner work is pending, and refills only while within `fuel`.
-    pub(super) fn run_optimized(
-        &mut self,
-        cpu: &mut CpuState,
-        memory: &mut Memory,
-        fuel: u64,
-    ) -> Option<(Exit, u32)> {
-        static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let prepared = self.computation.get(&cpu.eip)?;
-        let form = prepared.code.optimized.as_deref()?;
-        let alias = alias_base(memory);
-        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory, alias) {
-            return None;
-        }
-        if form.assumed.mmx || cpu.mmx_mode != 0 {
-            cpu.refresh_mmx();
-        }
-        let optimized = worker::admit(&prepared.code, cpu, alias, &mut self.opt_scratch.params);
-        prepared.admitted(optimized.is_some());
-        let optimized = optimized?;
-        let entry = worker::Entry {
-            enter: self.code.enter,
-            opt_enter: self.code.opt_enter,
-            window: self.runtime.window,
-            alias,
-            fault: self.code.stubs.fault,
-        };
-        let budget = fuel.min(SLICE);
-        let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
-            (word.as_ptr(), self.pending_mask)
-        });
-        let runtime = &mut *self.runtime;
-        runtime.countdown = budget;
-        runtime.recall = NEVER.as_ptr() as u64;
-        runtime.recall_mask = 0;
-        runtime.computation_pending = pending as u64;
-        runtime.computation_pending_mask = mask;
-        runtime.head_exit = 0;
-        runtime.deferred = 0;
-        runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
-        let shadow = runtime.shadow;
-        let (exit, retired) = worker::execute(
-            runtime,
-            cpu,
-            entry,
-            &prepared.code,
-            Some(optimized),
-            &mut self.opt_scratch,
-            false,
-        );
-        runtime.shadow = shadow;
-        self.diagnostics.optimized_runs += 1;
-        self.diagnostics.optimized_retired += retired;
-        if let Some(forms) = &mut self.retired_forms {
-            forms[0] += retired;
-        }
-        if exit == Exit::Fault {
-            self.diagnostics.faults += 1;
-        }
-        // A recall here is pending owner work, which dispatch sees.
-        let exit = if exit == Exit::Recall {
-            Exit::Dispatch
-        } else {
-            exit
-        };
-        Some((exit, retired as u32))
-    }
-
     /// Points the runtime at what head entry blocks and inline forms read
     /// during a translated run of `budget` within `fuel` (A64-OPT-8).
     pub(super) fn prepare_inline(
@@ -320,7 +216,7 @@ impl Native {
         budget: u64,
     ) {
         static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let gate = if !self.computation_enabled {
+        let gate = if !self.offload.enabled {
             &CLEAR_GATE
         } else if self.bridge.is_null() {
             &STALE_GATE
@@ -375,7 +271,7 @@ impl Native {
         let version = &head.versions[index];
         let record = &version.records[self.runtime.opt_record as usize];
         translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
-        let (alias, entry_esp) = (alias_base(memory), cpu.regs[worker::ESP]);
+        let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
         self.runtime.shadow = self.runtime.opt_dump.x[28];
         let refund = translate::opt::recovery::materialize(
             record,

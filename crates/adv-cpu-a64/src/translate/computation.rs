@@ -2320,19 +2320,6 @@ impl Proof {
         Some(&scratch.ranges)
     }
 
-    /// Evaluate at the matching unit entry for owner-only in-place execution
-    /// (no active peer jobs), skipping range coalescing and sorting. Parameter
-    /// cells read via `read` are already granted by the reader.
-    pub(crate) fn evaluate_alone<'a>(
-        &self,
-        cpu: &CpuState,
-        scratch: &'a mut Evaluation,
-        mut read: impl FnMut(u32) -> Option<u32>,
-    ) -> Option<(&'a [Range], &'a [Range])> {
-        self.evaluate_core(cpu, scratch, &mut read)?;
-        Some((&scratch.ranges, &scratch.outputs))
-    }
-
     fn evaluate_core(
         &self,
         cpu: &CpuState,

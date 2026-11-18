@@ -23,9 +23,6 @@ impl Native {
             self.discover(memory, head, head, at);
             self.install_optimized(true);
         }
-        if let Some(job) = self.computation.get_mut(&head) {
-            job.code.optimized = None;
-        }
         self.heads
             .get(&head)
             .is_some_and(|head| !head.versions.is_empty())

@@ -57,11 +57,11 @@ use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
 mod head;
+mod offload;
 mod run;
 mod store;
 #[cfg(test)]
 mod testing;
-mod worker;
 
 /// Offer gates for runs whose handler publishes none: no offer is possible,
 /// or Rust decides every arrival.
@@ -163,7 +163,7 @@ impl Faults {
 enum Active {
     None,
     Owner(*const Faults),
-    Worker(*const worker::Faults<'static>),
+    Worker(*const offload::Faults<'static>),
 }
 
 thread_local! {
@@ -220,12 +220,7 @@ unsafe fn on_fault(
                     // SAFETY: the worker keeps its private capture and unit
                     // side table alive while its entry is active on this thread.
                     let faults = unsafe { &*faults };
-                    if !(faults.code.entry..faults.code.end).contains(&pc) {
-                        return 0;
-                    }
-                    return site_at(&faults.code.sites, pc).map_or(0, |site| {
-                        faults.capture.record(site, pc, faults.stub, snapshot)
-                    });
+                    return faults.record(pc, snapshot);
                 }
                 Active::Owner(faults) => faults,
             };
@@ -415,10 +410,10 @@ pub(crate) struct Diagnostics {
     pub helper_exits: u64,
     /// Proofs whose head loop splits, and how its blocks ran.
     pub split_proofs: u64,
-    pub split: worker::SplitCounts,
-    /// Optimized forms the owner ran in place, and their instructions.
+    pub split: offload::SplitCounts,
+    /// Detached optimized forms entered by the ordinary owner run loop.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reported by Debug"))]
     pub optimized_runs: u64,
-    pub optimized_retired: u64,
     /// Admitted resident entries when the JIT map is enabled.
     pub resident_entries: u64,
     /// Resident form exits that went through Rust (A64-OPT-9).
@@ -833,16 +828,12 @@ pub(crate) struct Native {
     /// Budget exits by EIP, and the entries promoted to loop traces.
     samples: FxHashMap<u32, u8>,
     promoted: FxHashSet<u32>,
-    computation_enabled: bool,
     count_resident_entries: bool,
     /// The frame's pace when the owner last reached a loop whose blocks
     /// split (A64-TR-9).
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
-    skip_offer: Option<u32>,
-    computation: FxHashMap<u32, worker::Prepared>,
-    computation_code: translate::Code,
-    admission: worker::Admission,
-    opt_scratch: worker::ExecuteScratch,
+    offload: offload::Offload,
+    resident_params: Vec<u128>,
     /// Where `opt_exit` saves an inline form's spill cells.
     inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
@@ -997,14 +988,10 @@ impl Native {
             promotion: PROMOTION,
             samples: FxHashMap::default(),
             promoted: FxHashSet::default(),
-            computation_enabled: false,
             count_resident_entries: crate::jit_map::enabled(),
             pace: std::cell::Cell::new(None),
-            skip_offer: None,
-            computation: FxHashMap::default(),
-            computation_code: translate::Code::default(),
-            admission: worker::Admission::default(),
-            opt_scratch: worker::ExecuteScratch::default(),
+            offload: offload::Offload::default(),
+            resident_params: Vec::new(),
             inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
             features: features(),
@@ -1191,39 +1178,6 @@ impl Native {
         self.classified_epoch = Some(memory.epoch);
     }
 
-    fn emit_computation(
-        &mut self,
-        unit: &mut translate::Unit,
-        eip: u32,
-        (control, pe): (u16, bool),
-        proof: &translate::computation::Proof,
-    ) -> Option<worker::Code> {
-        let retired = unit.trace.prepaid(0);
-        let code = translate::lower_computation(
-            unit,
-            &mut self.computation_code,
-            eip,
-            self.features,
-            self.code.cache.next(),
-            self.code.stubs,
-            (control, pe, Some(proof)),
-        )?;
-        let entry = self.code.cache.append(code.words)?;
-        let mut sites: Vec<_> = code
-            .sites
-            .iter()
-            .map(|&(offset, site)| (entry + offset, site))
-            .collect();
-        sites.sort_unstable_by_key(|&(pc, _)| pc);
-        crate::jit_map::record(entry, code.words, eip, retired, code.marks, "a64");
-        Some(worker::Code {
-            entry,
-            end: entry + code.words.len() * 4,
-            sites: sites.into(),
-            optimized: None,
-        })
-    }
-
     fn counter(&mut self, eip: u32) -> (u64, u32) {
         let count = self.counters.entry(eip).or_insert_with(|| {
             let value = head::HOT;
@@ -1287,7 +1241,7 @@ impl Native {
             code: head.code,
             task,
             trace: head.trace.detached(),
-            proof: self.computation.get(&eip).map(|job| job.proof.clone()),
+            proof: self.offload.proof(eip),
             at,
             checked,
             all_checked: self.checks != Checks::Adaptive,
@@ -1336,7 +1290,7 @@ impl Native {
                     &version.sources,
                     &version.assumed,
                     cpu,
-                    &mut self.opt_scratch.params,
+                    &mut self.resident_params,
                     |_, _| 0,
                 )
         });
@@ -1437,34 +1391,6 @@ impl Native {
         }
     }
 
-    /// A Rust job arrival may specialize the detached form independently.
-    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
-        at.refresh_mmx();
-        let prepared = &self.computation[&eip];
-        prepared.requested();
-        if let Some(head) = self.heads.get_mut(&eip) {
-            head.pending = Some(compile::Task::Job);
-            if let Some(last) = head.versions.last() {
-                last.slot.limit.set(0);
-            }
-        }
-        self.compiler.request(compile::Request {
-            eip,
-            generation: self.code.generation,
-            code: prepared.code.entry,
-            task: compile::Task::Job,
-            trace: prepared.trace.detached(),
-            proof: Some(prepared.proof.clone()),
-            at,
-            checked: FxHashSet::default(),
-            all_checked: false,
-            refused: FxHashSet::default(),
-            cuts: FxHashSet::default(),
-            count_entries: false,
-        });
-        self.install_optimized(false);
-    }
-
     fn install_optimized(&mut self, wait: bool) {
         while let Some(done) = self.compiler.next(wait) {
             let eip = done.eip;
@@ -1472,16 +1398,8 @@ impl Native {
                 continue;
             }
             if done.task == compile::Task::Job {
-                let Some(job) = self
-                    .computation
-                    .get(&eip)
-                    .filter(|job| job.code.entry == done.code)
-                else {
+                if !self.finish_job(eip, done.code, done.job) {
                     continue;
-                };
-                job.built();
-                if let Some((_, Some(form))) = done.job {
-                    self.install_job(eip, form);
                 }
                 if let Some(head) = self.heads.get_mut(&eip) {
                     head.pending = None;
@@ -1504,28 +1422,9 @@ impl Native {
                 continue;
             };
             head.pending = None;
-            if let Some((proof, optimized)) = done.job {
-                let mut unit = translate::Unit::default();
-                unit.trace = head.trace.detached();
-                let iterates = unit.trace.returns_at_head();
-                if let Some(code) = self.emit_computation(
-                    &mut unit,
-                    eip,
-                    (done.at.x87.control, done.at.x87.status & 0x20 != 0),
-                    &proof,
-                ) {
-                    self.diagnostics.split_proofs += u64::from(proof.splits());
-                    self.computation.insert(
-                        eip,
-                        worker::Prepared::new(code, iterates, proof, unit.trace),
-                    );
-                    let job = &self.computation[&eip];
-                    job.requested();
-                    job.built();
-                    if let Some(form) = optimized {
-                        self.install_job(eip, form);
-                    }
-                }
+            if let Some(job) = done.job {
+                let trace = head.trace.detached();
+                self.place_job(eip, &done.at, trace, job);
             }
             let head = &self.heads[&eip];
             if !head.unprofitable
@@ -1545,50 +1444,14 @@ impl Native {
         }
     }
 
-    fn install_job(&mut self, eip: u32, form: compile::Form) {
-        let compile::Form { built, mut lowered } = form;
-        lowered.place(self.code.cache.next(), self.code.stubs.opt_exit);
-        let Some(entry) = self.code.cache.append(&lowered.words) else {
-            return;
-        };
-        let mut sites: Vec<_> = lowered
-            .sites
-            .into_iter()
-            .map(|(offset, site)| (entry + offset, site))
-            .collect();
-        sites.sort_unstable_by_key(|&(pc, _)| pc);
-        let job = self.computation.get_mut(&eip).unwrap();
-        crate::jit_map::record(
-            entry,
-            &lowered.words,
-            eip,
-            job.trace.prepaid(0),
-            &lowered.marks,
-            "a64-opt",
-        );
-        job.code.optimized = Some(Arc::new(worker::Optimized {
-            code: worker::Code {
-                entry,
-                end: entry + lowered.words.len() * 4,
-                sites: sites.into(),
-                optimized: None,
-            },
-            entry: built.func.entry,
-            assumed: built.assumed,
-            records: lowered.records,
-            flags: lowered.flags,
-            cells: lowered.spill_cells,
-        }));
-    }
-
     fn install_resident(
         &mut self,
         eip: u32,
         task: compile::Task,
         at: CpuState,
-        form: compile::Form,
+        form: compile::ResidentForm,
     ) -> bool {
-        let compile::Form { built, mut lowered } = form;
+        let compile::ResidentForm { built, mut lowered } = form;
         let source = self.heads[&eip].source;
         let mut probation = None;
         if lowered.iteration_retired != 0
@@ -1635,7 +1498,7 @@ impl Native {
             (eip, index, probation.is_some()),
             &head.sample,
             &slot,
-            self.computation.get(&eip),
+            self.offload.gate(eip),
             &mut lowered,
             self.code.cache.next(),
             head::Targets {
@@ -2091,7 +1954,7 @@ mod tests {
         state.regs[6] = DATA;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 2 + 3 * (head::HOT + 1)));
-        assert!(!native.computation.contains_key(&HEAD));
+        assert!(!native.offload.contains(HEAD));
         let head = &native.heads[&HEAD];
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(head.versions.len(), 1);
@@ -2366,7 +2229,7 @@ mod tests {
             assert_eq!(native.heads[&eip].versions.len(), 1);
         }
         assert!(!native.heads.contains_key(&stale));
-        assert!(!native.computation.contains_key(&stale));
+        assert!(!native.offload.contains(stale));
     }
 
     // spec: A64-OPT-8, A64-OPT-9

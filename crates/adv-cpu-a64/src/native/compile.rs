@@ -40,11 +40,21 @@ pub(super) struct Compiled {
     pub code: usize,
     pub task: Task,
     pub at: CpuState,
-    pub resident: Option<Form>,
-    pub job: Option<(Proof, Option<Form>)>,
+    pub resident: Option<ResidentForm>,
+    pub job: Option<Job>,
 }
 
-pub(super) struct Form {
+pub(super) struct ResidentForm {
+    pub built: front::Built,
+    pub lowered: back::Lowered,
+}
+
+pub(super) struct Job {
+    pub proof: Proof,
+    pub form: Option<JobForm>,
+}
+
+pub(super) struct JobForm {
     pub built: front::Built,
     pub lowered: back::Lowered,
 }
@@ -134,7 +144,7 @@ fn compile(request: Request) -> Compiled {
                 );
                 let (cuts, us) = (built.cuts + cuts.len(), started.elapsed().as_micros());
                 crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
-                Some(Form { built, lowered })
+                Some(ResidentForm { built, lowered })
             }
             Err(reject) => {
                 let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
@@ -146,11 +156,11 @@ fn compile(request: Request) -> Compiled {
     };
     let job = if matches!(task, Task::Discover | Task::Job) {
         proof.map(|proof| {
-            let form = front::build(&unit, &proof, &at).ok().map(|built| Form {
+            let form = front::build(&unit, &proof, &at).ok().map(|built| JobForm {
                 lowered: back::lower(&built.func),
                 built,
             });
-            (proof, form)
+            Job { proof, form }
         })
     } else {
         None
