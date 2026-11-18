@@ -22,10 +22,16 @@ pub(super) struct Allocation {
 pub(super) fn allocate(func: &Func) -> Allocation {
     let n = func.types.len();
     let mut operations = vec![None; n];
+    let mut vectors = 29;
     let mut constants = vec![None; n];
     let mut hints = vec![Vec::new(); n];
     for data in &func.blocks {
         for &(result, op) in &data.insts {
+            match op {
+                Op::SseInput { packed: true, .. } => vectors = vectors.min(F.number() as u8),
+                Op::Vec(VecOp::LessF64, ..) => vectors = vectors.min(D.number() as u8),
+                _ => {}
+            }
             if let Some(v) = result {
                 operations[v.0 as usize] = Some(op);
                 if let Op::Constant(_, bits) = op {
@@ -240,7 +246,7 @@ pub(super) fn allocate(func: &Func) -> Allocation {
                 _ => None,
             });
         let free = preferences
-            .chain(0..if vector { 29 } else { 31 })
+            .chain(0..if vector { vectors } else { 31 })
             .find_map(|reg| {
                 if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
                     return None;

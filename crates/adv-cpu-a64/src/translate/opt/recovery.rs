@@ -221,15 +221,7 @@ impl Locations<'_> {
                 out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
             }
             UnorderedCompare | OrderedCompare => {
-                let input = |bits| {
-                    let x = f64::from_bits(bits);
-                    if x.is_subnormal() {
-                        0.0f64.copysign(x)
-                    } else {
-                        x
-                    }
-                };
-                let (a, b) = (input(a as u64), input(b as u64));
+                let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
                 let set = if a.is_nan() || b.is_nan() {
                     ZF | PF | CF
                 } else if a < b {

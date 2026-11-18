@@ -211,7 +211,7 @@ pub(crate) enum Op {
     FpUnary(FpUnary, Value),
     /// A signed integer as F64; fails when it is not exactly representable.
     FromInt(Value),
-    /// F64 to a signed integer, truncating; out of range sets IOC.
+    /// F64 to a signed integer, truncating; fails on NaN or out of range.
     ToInt {
         value: Value,
         wide: bool,
@@ -253,14 +253,19 @@ pub(crate) enum Op {
         value: Value,
     },
     /// The x87 reading of binary64 bits, or of binary32 bits widened
-    /// exactly when `single`. Fails on NaN, and on nonzero denormals when
-    /// `denormal` or `single`, since FZ would flush a binary32 denormal.
+    /// exactly when `single`. Fails on NaN and, when `denormal`, subnormals.
     X87Load {
         bits: Value,
         denormal: bool,
         single: bool,
     },
-    /// Fails when IOC, DZC, OFC, UFC or IDC is set.
+    /// Checks raw SSE binary64 lanes for denormals when MXCSR.DE is clear.
+    SseInput {
+        a: Value,
+        b: Option<Value>,
+        packed: bool,
+    },
+    /// Effect boundary for floating-point checks.
     Validate,
 }
 
@@ -268,6 +273,7 @@ impl Op {
     pub(crate) fn uses(&self) -> impl Iterator<Item = Value> {
         let list: [Option<Value>; 3] = match *self {
             Op::Constant(..) | Op::Validate => [None; 3],
+            Op::SseInput { a, b, .. } => [Some(a), b, None],
             Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
@@ -305,7 +311,7 @@ impl Op {
         list.into_iter().flatten()
     }
 
-    /// Whether the operation can set a flag that validation checks.
+    /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
             Op::Fp(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
@@ -316,20 +322,21 @@ impl Op {
 
     /// Whether the operation can fail to the enclosing region start.
     pub(crate) fn can_fail(&self) -> bool {
-        matches!(
-            self,
-            Op::Div { proved: false, .. }
-                | Op::FromInt(_)
-                | Op::Load { .. }
-                | Op::Store { .. }
-                | Op::X87Load { .. }
-                | Op::Validate
-        )
+        self.floating()
+            || matches!(
+                self,
+                Op::Div { proved: false, .. }
+                    | Op::FromInt(_)
+                    | Op::Load { .. }
+                    | Op::Store { .. }
+                    | Op::X87Load { .. }
+                    | Op::SseInput { .. }
+            )
     }
 
     /// Whether the operation must stay although nothing uses its result.
     pub(crate) fn effect(&self) -> bool {
-        self.can_fail() || self.floating() || matches!(self, Op::FrameStore { .. })
+        self.can_fail() || matches!(self, Op::FrameStore { .. } | Op::Validate)
     }
 
     /// Whether the result depends only on the operands, so that equal
@@ -511,7 +518,9 @@ impl Func {
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
             Op::Vec(..) | Op::VecUnary(..) => Type::V128,
-            Op::Store { .. } | Op::FrameStore { .. } | Op::Validate => return None,
+            Op::Store { .. } | Op::FrameStore { .. } | Op::SseInput { .. } | Op::Validate => {
+                return None;
+            }
         })
     }
 }

@@ -45,6 +45,7 @@
 //!
 //! Each admitted execution gets a private runtime. Recall, deadlines and
 //! host notifications are observed only at exhausted instruction budgets.
+//! Optimized forms enter and leave under the canonical host FPCR (A64-OPT-4).
 
 use std::mem::offset_of;
 
@@ -145,7 +146,6 @@ pub struct Runtime {
     pub deferred: u32,
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
-    pub opt_fpcr: u64,
     /// Where `opt_exit` saves the form's `opt_cells` spill cells before it
     /// discards their stack frame.
     pub opt_save: u64,
@@ -201,7 +201,6 @@ impl Runtime {
             head_exit: 0,
             deferred: 0,
             opt_params: 0,
-            opt_fpcr: 0,
             opt_save: 0,
             opt_cells: 0,
             opt_record: 0,
@@ -770,8 +769,6 @@ fn emit_opt_exit(asm: &mut Asm) {
     asm.b(copy);
     asm.bind(done);
     asm.emit_all(&[
-        ldr(X, r(16), RUNTIME, offset_of!(Runtime, opt_fpcr) as u32),
-        msr_fpcr(r(16)),
         movz(W, r(16), Exit::Optimized as u16, 0),
         str(W, r(16), RUNTIME, EXIT),
         str(X, r(9), RUNTIME, COUNTDOWN),
