@@ -2,7 +2,7 @@
 //!
 //! Code and immutable tables are hashed in full. Declared pointer/call fields
 //! are normalized and their graph is checked separately, including shared
-//! targets and jump-table addends. Slots identify mutable CRT state and imports;
+//! targets and signed 32-bit addends. Slots identify mutable CRT state and imports;
 //! their addresses participate in graph identity, their values do not.
 //! Layout fields use `field NAME VALUE` or `field NAME ROLE OFFSET OPERAND`.
 use crate::code_signature::{ExecutableRange, Field};
@@ -13,7 +13,7 @@ struct Link {
     offset: usize,
     relative: bool,
     target: String,
-    addend: u32,
+    addend: i32,
 }
 struct Node {
     code: bool,
@@ -108,7 +108,7 @@ impl Family {
                         offset: integer(2)?,
                         relative: *kind == "rel",
                         target: (*target).into(),
-                        addend: integer(5)? as u32,
+                        addend: fields[5].parse().map_err(|_| "bad link addend")?,
                     },
                 )),
                 _ => return Err("bad library signature directive".into()),
@@ -202,7 +202,7 @@ impl Family {
                 } else {
                     word
                 };
-                let target = pointer.checked_sub(link.addend)?;
+                let target = pointer.wrapping_sub(link.addend as u32);
                 if resolved
                     .insert(link.target.clone(), target)
                     .is_some_and(|old| old != target)
@@ -260,7 +260,7 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture(base: u32, helper: u32, table: u32) -> (Family, Vec<u8>) {
+    fn fixture(base: u32, helper: u32, table: u32, addend: i32) -> (Family, Vec<u8>) {
         let mut memory = vec![0u8; 1024];
         // Authored stack frame; call helper; load a table word; return.
         let code = [
@@ -268,14 +268,14 @@ mod tests {
         ];
         memory[..code.len()].copy_from_slice(&code);
         memory[7..11].copy_from_slice(&helper.wrapping_sub(base + 11).to_le_bytes());
-        memory[12..16].copy_from_slice(&table.to_le_bytes());
+        memory[12..16].copy_from_slice(&table.wrapping_add_signed(addend).to_le_bytes());
         let h = (helper - base) as usize;
         memory[h..h + 6].copy_from_slice(&[0xb8, 7, 0, 0, 0, 0xc3]);
         let t = (table - base) as usize;
         memory[t..t + 4].copy_from_slice(&42u32.to_le_bytes());
         let digest = |b: &[u8]| format!("{:x}", Sha256::digest(b));
         let text = format!(
-            "root entry 6\ncode entry {} {}\nlink entry 7 rel helper 0\nlink entry 12 abs table 0\ncode helper 6 {}\ndata table 4 {}\n",
+            "root entry 6\ncode entry {} {}\nlink entry 7 rel helper 0\nlink entry 12 abs table {addend}\ncode helper 6 {}\ndata table 4 {}\n",
             code.len(),
             digest(&code),
             digest(&memory[h..h + 6]),
@@ -302,7 +302,7 @@ mod tests {
     // spec: CODEC-MAP-1, CODEC-CALL-2
     #[test]
     fn layout_rejects_a_register_operand() {
-        let (mut family, memory) = fixture(0x10000, 0x10100, 0x10200);
+        let (mut family, memory) = fixture(0x10000, 0x10100, 0x10200, 0);
         assert!(admit(&family, &memory, 0x10000));
         // MOV EBP,ESP in the fingerprinted prologue has no memory operand.
         family.fields.insert(
@@ -315,9 +315,9 @@ mod tests {
     // spec: DEV-VIDEO-1
     #[test]
     fn relocation_and_relinking_preserve_only_the_reviewed_graph() {
-        let (family, memory) = fixture(0x10000, 0x10100, 0x10200);
+        let (family, memory) = fixture(0x10000, 0x10100, 0x10200, 0);
         assert!(admit(&family, &memory, 0x10000));
-        let (_, mut moved) = fixture(0x50000, 0x50280, 0x50080);
+        let (_, mut moved) = fixture(0x50000, 0x50280, 0x50080, 0);
         assert!(admit(&family, &moved, 0x50000));
         moved[0x80] ^= 1;
         assert!(!admit(&family, &moved, 0x50000));
@@ -327,5 +327,14 @@ mod tests {
         moved[0x281] ^= 1;
         moved[7] ^= 1;
         assert!(!admit(&family, &moved, 0x50000));
+    }
+
+    // spec: DEV-VIDEO-1
+    #[test]
+    fn negative_addend_resolves_the_table_base() {
+        let (family, mut memory) = fixture(0x10000, 0x10100, 0x10200, -8);
+        assert!(admit(&family, &memory, 0x10000));
+        memory[12..16].copy_from_slice(&0x10200u32.to_le_bytes());
+        assert!(!admit(&family, &memory, 0x10000));
     }
 }

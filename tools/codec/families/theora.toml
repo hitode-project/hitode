@@ -1,0 +1,51 @@
+sources = ["apiwrapper", "bitpack", "decapiwrapper", "decinfo", "decode", "dequant", "fragment", "huffdec", "idct", "info", "internal", "quant", "state"]
+# Linking resolves the relocation to the base of the mode table minus one row.
+biased_symbols = { OC_MODE_ALPHABETS = -8 }
+header = '"decint.h"'
+roots = { packet = "th_decode_packetin", alloc = "th_decode_alloc", free = "th_decode_free" }
+hooks = { init = "oc_dec_init", clear = "oc_state_clear" }
+roles = { state_init = "oc_state_init" }
+driver = '''
+int main(int argc, char **argv) {
+  th_info info;
+  th_comment comment;
+  th_setup_info *setup = 0;
+  ogg_packet packet = {0};
+  ogg_int64_t granpos;
+  th_info_init(&info);
+  th_comment_init(&comment);
+  packet.packet = (unsigned char *)argv[0];
+  packet.bytes = argc;
+  int status = th_decode_headerin(&info, &comment, &setup, &packet);
+  th_dec_ctx *decoder = th_decode_alloc(&info, setup);
+  if (decoder) status = th_decode_packetin(decoder, &packet, &granpos);
+  th_decode_free(decoder);
+  th_setup_free(setup);
+  th_info_clear(&info);
+  th_comment_clear(&comment);
+  return status;
+}
+'''
+
+[versions]
+"1.1.1" = "f36da409947aa2b3dcc6af0a8c2e3144bc19db2ed547d64e9171c59c66561c61"
+"1.2.0" = "ebdf77a8f5c0a8f7a9e42323844fa09502b34eb1d1fece7b5f54da41fe2122ec"
+
+[fields]
+info_bytes = ["sizeof(th_info)"]
+init_bytes = ["sizeof(oc_dec_ctx)"]
+info = ["offsetof(oc_theora_state, info)", "oc_state_init", "oc_dec_init", "th_decode_alloc"]
+ref_planes = ["offsetof(oc_theora_state, ref_frame_bufs)", "th_decode_packetin", "oc_state_ref_bufs_init", "oc_state_init"]
+ref_indices = ["offsetof(oc_theora_state, ref_frame_idx)", "th_decode_packetin", "oc_dec_init_dummy_frame", "oc_state_ref_bufs_init", "oc_state_init"]
+plane_allocation = ["offsetof(oc_theora_state, ref_frame_data)", "oc_state_clear", "oc_state_ref_bufs_clear", "th_decode_free"]
+keyframe = ["offsetof(oc_theora_state, keyframe_num)", "th_decode_packetin", "oc_state_init"]
+current = ["offsetof(oc_theora_state, curframe_num)", "th_decode_packetin", "oc_state_init", "th_decode_alloc"]
+granpos = ["offsetof(oc_theora_state, granpos)", "th_decode_packetin"]
+frame_type = ["offsetof(oc_theora_state, frame_type)", "th_decode_packetin", "oc_dec_frame_header_unpack"]
+bias = ["offsetof(oc_theora_state, granpos_bias)", "oc_state_init", "th_decode_packetin", "th_decode_alloc"]
+pp_level = ["offsetof(oc_dec_ctx, pp_level)", "oc_dec_init", "th_decode_alloc", "th_decode_packetin"]
+output = ["offsetof(oc_dec_ctx, pp_frame_buf)", "th_decode_packetin", "oc_dec_init_dummy_frame", "oc_dec_postprocess_init"]
+stripe = ["offsetof(oc_dec_ctx, stripe_cb)", "oc_dec_init", "th_decode_alloc", "th_decode_packetin"]
+
+[overrides."1.2.0"]
+plane_allocation = ["offsetof(oc_theora_state, ref_frame_handle)", "oc_state_clear", "oc_state_ref_bufs_clear", "th_decode_free"]

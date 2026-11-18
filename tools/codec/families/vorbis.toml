@@ -1,0 +1,25 @@
+sources = ["lib/mdct.c"]
+header = '"mdct.h"'
+roots = { main = "mdct_backward" }
+roles = { bitreverse = "mdct_bitreverse", butterflies = "mdct_butterflies", first = "mdct_butterfly_first", butterfly16 = "mdct_butterfly_16" }
+driver = '''
+int main(int argc, char **argv) {
+  mdct_lookup lookup;
+  float input[64] = {0}, output[64];
+  mdct_init(&lookup, 64);
+  mdct_backward(&lookup, input, output);
+  mdct_clear(&lookup);
+  return output[argc & 63] != 0;
+}
+'''
+
+[versions]
+"1.3.7" = "b33cc4934322bcbf6efcbacf49e3ca01aadbea4114ec9589d1b1e9d20f72954b"
+
+[fields]
+lookup_bytes = ["sizeof(mdct_lookup)"]
+n_offset = ["offsetof(mdct_lookup, n)", "mdct_backward"]
+log2n_offset = ["offsetof(mdct_lookup, log2n)", "mdct_butterflies", "mdct_backward"]
+trig_offset = ["offsetof(mdct_lookup, trig)", "mdct_butterflies", "mdct_backward"]
+bitrev_offset = ["offsetof(mdct_lookup, bitrev)", "mdct_bitreverse", "mdct_backward"]
+scale_offset = ["offsetof(mdct_lookup, scale)"] # The inverse transform does not read scale.

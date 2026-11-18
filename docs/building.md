@@ -75,6 +75,33 @@ The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams an
 MCI. Run `cargo test --release -p adv-runtime --test wine_midi` with
 `ADV_WINE_DIST` set.
 
+## Static codec fingerprints
+
+`tools/codec/families/generate.py` compiles checksum-pinned Xiph releases and
+extracts relocatable code and data fingerprints. Use Python 3.12 or newer with
+Capstone 5. For MSVC and clang-cl, run from the selected x86 developer command
+prompt. MSVC `/GL` builds also need `llvm-pdbutil` on `PATH` and use a small
+public-API driver to link the library objects. MinGW uses `i686-w64-mingw32-gcc`
+from WSL on Windows.
+
+```sh
+python tools/codec/families/generate.py --compiler msvc --work BUILD --output FAMILIES
+```
+
+Omit `--library`, `--version` and `--flag` to run all pinned releases and the
+compiler's matrix. To build one configuration, pass the library and version
+along with a `--flag=OPTION` argument for each compiler flag. Builds for
+different toolsets can share the output directory. The tool names each family
+by its normalized fingerprint and records each build in a compiler manifest.
+
+The recipes supply the hook symbols and source fields. The generator reads
+layout values from a compiled `offsetof` probe and identifies operands with
+those values in the corresponding functions. The manifest identifies fields
+recorded as compiled layout values and hooks absent from the closure. Root
+records give the prologue length, and their comments give the normalized
+prologue hash and instruction shape. Links use signed 32-bit addends. The runtime binds its
+explicitly reviewed families.
+
 ## Tests
 
 ```sh
