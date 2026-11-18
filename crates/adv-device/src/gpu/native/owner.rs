@@ -426,26 +426,30 @@ impl State {
             Command::DiscardDepth(depth) => depth.0.owner.lock().unwrap().discard(),
             Command::Readback {
                 image,
-                rect,
+                regions,
                 into,
                 done,
             } => {
                 let (image, _, mip) = self.image(&image)?;
-                self.encoder().copy_image_to_buffer(
-                    ImageCopy {
-                        image: &image,
-                        mip,
-                        layer: 0,
-                        origin: (rect.x, rect.y, 0),
-                    },
-                    BufferCopy {
-                        buffer: &into,
-                        offset: 0,
-                        row_pitch: rect.w * 4,
-                        rows: rect.h,
-                    },
-                    extent(rect),
-                );
+                let mut offset = 0;
+                for rect in regions {
+                    self.encoder().copy_image_to_buffer(
+                        ImageCopy {
+                            image: &image,
+                            mip,
+                            layer: 0,
+                            origin: (rect.x, rect.y, 0),
+                        },
+                        BufferCopy {
+                            buffer: &into,
+                            offset,
+                            row_pitch: rect.w * 4,
+                            rows: rect.h,
+                        },
+                        extent(rect),
+                    );
+                    offset += u64::from(rect.w) * u64::from(rect.h) * 4;
+                }
                 let token = self.submit(None)?;
                 self.queue.on_complete(token, done);
             }
@@ -950,7 +954,7 @@ mod tests {
             let (send, done) = mpsc::channel();
             self.producer.push(Command::Readback {
                 image: image.clone(),
-                rect: rect(0, 0, image.width(), image.height()),
+                regions: vec![rect(0, 0, image.width(), image.height())],
                 into: buffer.clone(),
                 done: Box::new(move || send.send(()).unwrap()),
             });

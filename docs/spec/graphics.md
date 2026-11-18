@@ -223,6 +223,8 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 Blocking readbacks MUST preserve the source pixels before another guest context can write them.
 **Verification**: Test
 
+Readbacks into an unchanged destination baseline MUST transfer only the source damage since that baseline. Unknown damage MUST transfer the whole target. The background worker MUST copy and convert mapped staging pixels before the owner publishes them to guest memory. Execution reports MUST include GPU readback bytes and bytes per completed frame.
+
 ### GFX-REC-11 Versioned frame recording
 
 **Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse previous-frame identities and preparation, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.

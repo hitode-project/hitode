@@ -430,13 +430,17 @@ fn report(
     #[cfg(feature = "gpu")]
     if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
         fields.push(format!(
-            "\"d3d9\": {}",
-            serde_json::json!({
-                "fixed_draws": counters.fixed_draws,
-                "fixed_shaders_built": counters.fixed_shaders_built,
-                "fixed_shader_cache_hits": counters.fixed_shader_cache_hits,
-                "draw_key_hashes": counters.draw_key_hashes,
-            })
+            concat!(
+                "\"d3d9\": {{\"fixed_draws\": {}, \"fixed_shaders_built\": {}, ",
+                "\"fixed_shader_cache_hits\": {}, \"draw_key_hashes\": {}, ",
+                "\"readback_bytes\": {}, \"readback_bytes_per_frame\": {:.2}}}"
+            ),
+            counters.fixed_draws,
+            counters.fixed_shaders_built,
+            counters.fixed_shader_cache_hits,
+            counters.draw_key_hashes,
+            counters.readback_bytes,
+            counters.readback_bytes as f64 / counters.presents.max(1) as f64,
         ));
     }
 

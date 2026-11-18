@@ -842,6 +842,10 @@ impl Analysis {
         self.planned = true;
         promotions
     }
+    pub fn write_bounds(&self, n: usize) -> Option<Rect> {
+        self.nodes.get(n).map(|node| node.record.bounds)
+    }
+
     /// The scissors write `n` of the frame executes in; `None` runs it whole.
     pub fn clip(&self, n: usize) -> Option<&[Rect]> {
         self.clips.get(n)?.as_deref()

@@ -106,11 +106,11 @@ pub(crate) enum Command {
     /// The executor's depth buffer is undefined from here
     /// (D3D9 `DISCARD_DEPTHSTENCIL`).
     DiscardDepth(super::Depth),
-    /// Copy `rect` of `image` into `into` and submit; `done` runs when the
-    /// bytes are readable.
+    /// Pack the requested rectangles into `into` in order and submit.
+    /// `done` runs when the bytes are readable.
     Readback {
         image: Image,
-        rect: Rect,
+        regions: Vec<Rect>,
         into: Buffer,
         done: Box<dyn FnOnce() + Send>,
     },

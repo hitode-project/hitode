@@ -139,6 +139,8 @@ pub struct Counters {
     pub fixed_shaders_built: u64,
     pub fixed_shader_cache_hits: u64,
     pub draw_key_hashes: u64,
+    pub readback_bytes: u64,
+    pub presents: u64,
     pub recorded_draws: u64,
     pub recorded_draw_bytes: u64,
     pub recording_lookups: u64,
@@ -203,6 +205,15 @@ fn lookup(count: u64) {
 fn lookups() -> u64 {
     LOOKUPS.get()
 }
+struct ReadbackTarget {
+    source: Content,
+    destination: u32,
+    storage: u32,
+    version: Option<u128>,
+    damage: adv_device::surface::Region,
+    in_flight: Option<u32>,
+}
+
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
@@ -215,6 +226,7 @@ pub(super) struct Recording {
     observe: Option<Content>,
     select: Option<HashMap<usize, Vec<Content>>>,
     reuse: reuse::Cache,
+    readback_targets: HashMap<adv_device::gpu::ImageId, ReadbackTarget>,
     passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Region>,
@@ -247,6 +259,7 @@ impl Recording {
     /// Drops the damage analysis; pending commands then run whole.
     fn forget_damage(&mut self) {
         self.damage.invalidate();
+        self.readback_targets.clear();
         self.nodes.fill(None);
     }
 }
@@ -257,12 +270,89 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         f.binding_cache = None;
         f.reuse.invalidate();
         f.damage.forget(pointer);
+        f.readback_targets
+            .retain(|_, r| r.source.3 != pointer && r.destination != pointer);
         if changed {
             f.partial = true;
             f.last = None;
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
+pub(super) fn readback_regions(
+    env: &mut Env<'_>,
+    owner: Id,
+    source: Id,
+    destination: u32,
+    storage: u32,
+    event: u32,
+    image: &adv_device::gpu::Image,
+) -> Vec<adv_device::surface::Rect> {
+    use adv_device::surface::{Region, rects};
+    let source = key::content(env, source, None, 0);
+    let f = frame(env, owner);
+    let version = f.contents.get(&source).copied();
+    let size = (image.width(), image.height());
+    let regions = if let Some(r) = f.readback_targets.get(&image.id()).filter(|r| {
+        r.source == source
+            && r.destination == destination
+            && r.storage == storage
+            && r.in_flight.is_none()
+    }) {
+        if r.version.is_some() && r.version == version {
+            Vec::new()
+        } else {
+            rects(&r.damage)
+        }
+    } else {
+        vec![adv_device::surface::Rect {
+            x: 0,
+            y: 0,
+            w: size.0,
+            h: size.1,
+        }]
+    };
+    invalidate_readback_destination(env, owner, storage);
+    frame(env, owner).readback_targets.insert(
+        image.id(),
+        ReadbackTarget {
+            source,
+            destination,
+            storage,
+            version,
+            damage: Region::empty(size),
+            in_flight: Some(event),
+        },
+    );
+    regions
+}
+
+pub(super) fn invalidate_readback_destination(env: &mut Env<'_>, owner: Id, storage: u32) {
+    frame(env, owner)
+        .readback_targets
+        .retain(|_, r| r.storage != storage);
+}
+
+pub(super) fn complete_readback(
+    env: &mut Env<'_>,
+    owner: Id,
+    slot: adv_device::gpu::ImageId,
+    event: u32,
+    success: bool,
+) {
+    let targets = &mut frame(env, owner).readback_targets;
+    if let Some(r) = targets
+        .get_mut(&slot)
+        .filter(|r| r.in_flight == Some(event))
+    {
+        if success {
+            r.in_flight = None;
+        } else {
+            targets.remove(&slot);
+        }
+    }
+}
+
 /// What the frame being presented changed since the previous presentation, when known.
 pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Region> {
     f.verify_region.clone()
@@ -750,7 +840,10 @@ pub(super) fn flush(
         && let Some(operation) = restore_operation(env, owner)
     {
         execute_gpu(env, &operation)?;
-        frame(env, owner).baseline = Some(damage::image(&operation).unwrap().clone());
+        let image = damage::image(&operation).unwrap();
+        let f = frame(env, owner);
+        f.baseline = Some(image.clone());
+        f.readback_targets.remove(&image.id());
     }
     loop {
         let f = frame(env, owner);
@@ -972,6 +1065,20 @@ fn submitted(
         }
         _ => 7,
     };
+    let color = match operation {
+        Operation::Draw(d) => d.state.color_write != 0,
+        Operation::Clear { color, .. } => color.is_some(),
+        _ => true,
+    };
+    if color {
+        let f = frame(env, owner);
+        if let Some(readback) = f.readback_targets.get_mut(&image.id()) {
+            let area = node
+                .and_then(|n| f.damage.write_bounds(n))
+                .map_or(area, |r| area.clipped(r));
+            readback.damage.add(area.into());
+        }
+    }
     let repeated = node.is_some_and(|n| {
         frame(env, owner)
             .damage
@@ -1285,6 +1392,7 @@ fn finish(
     };
     trace::work(&f.damage.work, f.damage.planned);
     let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.presents += 1;
     counters.changed_pixels += changed;
     counters.executed_pixels += execution_area;
     counters.extra_pixels += extra;
