@@ -15,6 +15,8 @@ use std::{
 };
 use zeno::{Command, Vector};
 
+#[cfg(target_vendor = "apple")]
+mod apple;
 mod discovery;
 mod enumeration;
 mod placement;
@@ -35,6 +37,8 @@ struct FaceStore {
     file_order: VecDeque<PathBuf>,
     file_bytes: usize,
     legacy_families: BTreeMap<ID, Vec<String>>,
+    #[cfg(target_vendor = "apple")]
+    core_descriptors: BTreeMap<ID, Option<apple::CoreDescriptor>>,
 }
 #[derive(Clone)]
 struct Resource {
@@ -1392,6 +1396,8 @@ pub(super) struct Font {
     profile: Option<Arc<profile::Loaded>>,
     resolved: Mutex<BTreeMap<u32, (Arc<Face>, GlyphId)>>,
     hints: Mutex<BTreeMap<(ID, bool), HintingInstance>>,
+    #[cfg(target_vendor = "apple")]
+    core_fonts: Mutex<BTreeMap<ID, apple::CoreFont>>,
     em: f32,
     xscale: f32,
     metrics: TextMetrics,
@@ -1434,6 +1440,8 @@ impl Font {
             profile,
             resolved: Mutex::default(),
             hints: Mutex::default(),
+            #[cfg(target_vendor = "apple")]
+            core_fonts: Mutex::default(),
             em,
             xscale,
             metrics,
@@ -1857,6 +1865,52 @@ impl Font {
             .collect()
     }
 
+    #[cfg(target_vendor = "apple")]
+    fn draw_apple_outline(
+        &self,
+        face: &Face,
+        font: &FontRef<'_>,
+        glyph: GlyphId,
+        pen: &mut Pen,
+    ) -> Result<(), TextError> {
+        let mut core_fonts = self
+            .core_fonts
+            .lock()
+            .map_err(|_| TextError::Glyph("CoreText font cache lock poisoned".into()))?;
+        let core_font = match core_fonts.entry(face.info.id) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let cached = self
+                    .store
+                    .lock()
+                    .map_err(|_| TextError::Glyph("font cache lock poisoned".into()))?
+                    .core_descriptors
+                    .get(&face.info.id)
+                    .cloned();
+                let descriptor = match cached {
+                    Some(descriptor) => descriptor,
+                    None => {
+                        let resolved = apple::descriptor_for_face(face)?;
+                        self.store
+                            .lock()
+                            .map_err(|_| TextError::Glyph("font cache lock poisoned".into()))?
+                            .core_descriptors
+                            .insert(face.info.id, resolved.clone());
+                        resolved
+                    }
+                };
+                entry.insert(apple::create_font(
+                    face,
+                    font,
+                    descriptor.as_ref(),
+                    self.em,
+                    &self.request,
+                )?)
+            }
+        };
+        apple::draw_outline(core_font, glyph, pen)
+    }
+
     pub(super) fn glyph(&self, request: GlyphRequest) -> Result<Glyph, TextError> {
         let (face, glyph, code) = match request.character {
             Character::GlyphIndex(index) => (Arc::clone(&self.primary), GlyphId::new(index), None),
@@ -1916,12 +1970,6 @@ impl Font {
 
         let loc = location(&font, &self.request);
         let outlines = font.outline_glyphs();
-        let outline = outlines.get(glyph).ok_or_else(|| {
-            TextError::Glyph(
-                "glyph has no supported scalable outline (embedded bitmap/color fonts unsupported)"
-                    .into(),
-            )
-        })?;
         let italic = self.request.italic
             && face.info.style == Style::Normal
             && font.axes().get_by_tag(skrifa::Tag::new(b"ital")).is_none()
@@ -1932,43 +1980,60 @@ impl Font {
             xscale: self.xscale,
             italic,
         };
-        if request.hinted {
-            let mono = request.format == GlyphFormat::Monochrome
-                || self.request.quality == Quality::Monochrome;
-            let mut hints = self
-                .hints
-                .lock()
-                .map_err(|_| TextError::Glyph("font hinter lock poisoned".into()))?;
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                hints.entry((face.info.id, mono))
-            {
-                let hint = HintingInstance::new(
-                    &outlines,
-                    Size::new(self.em),
-                    &loc,
-                    if mono {
-                        Target::Mono
-                    } else {
-                        Target::Smooth {
-                            mode: Default::default(),
-                            symmetric_rendering: false,
-                            preserve_linear_metrics: true,
-                        }
-                    },
-                )
-                .map_err(|e| TextError::Glyph(format!("font hinting: {e}")))?;
-                entry.insert(hint);
+        if let Some(outline) = outlines.get(glyph) {
+            if request.hinted {
+                let mono = request.format == GlyphFormat::Monochrome
+                    || self.request.quality == Quality::Monochrome;
+                let mut hints = self
+                    .hints
+                    .lock()
+                    .map_err(|_| TextError::Glyph("font hinter lock poisoned".into()))?;
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    hints.entry((face.info.id, mono))
+                {
+                    let hint = HintingInstance::new(
+                        &outlines,
+                        Size::new(self.em),
+                        &loc,
+                        if mono {
+                            Target::Mono
+                        } else {
+                            Target::Smooth {
+                                mode: Default::default(),
+                                symmetric_rendering: false,
+                                preserve_linear_metrics: true,
+                            }
+                        },
+                    )
+                    .map_err(|e| TextError::Glyph(format!("font hinting: {e}")))?;
+                    entry.insert(hint);
+                }
+                outline
+                    .draw(
+                        DrawSettings::hinted(&hints[&(face.info.id, mono)], false),
+                        &mut pen,
+                    )
+                    .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
+            } else {
+                outline
+                    .draw(DrawSettings::unhinted(Size::new(self.em), &loc), &mut pen)
+                    .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
             }
-            outline
-                .draw(
-                    DrawSettings::hinted(&hints[&(face.info.id, mono)], false),
-                    &mut pen,
-                )
-                .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
         } else {
-            outline
-                .draw(DrawSettings::unhinted(Size::new(self.em), &loc), &mut pen)
-                .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
+            #[cfg(target_vendor = "apple")]
+            if font.table_data(skrifa::Tag::new(b"hvgl")).is_some() {
+                self.draw_apple_outline(&face, &font, glyph, &mut pen)?;
+            } else {
+                return Err(TextError::Glyph(
+                    "glyph has no supported scalable outline (embedded bitmap/color fonts unsupported)"
+                        .into(),
+                ));
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            return Err(TextError::Glyph(
+                "glyph has no supported scalable outline (embedded bitmap/color fonts unsupported)"
+                    .into(),
+            ));
         }
         if synthetic_bold(&self.request, &font, face.info.weight.0) {
             synthesis::embolden(&mut pen.commands, 1.0);
