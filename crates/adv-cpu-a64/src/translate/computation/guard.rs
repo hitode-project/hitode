@@ -1,7 +1,5 @@
 //! Lower owner-only computation admission at a canonical unit entry.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::mem::offset_of;
 
 use super::{

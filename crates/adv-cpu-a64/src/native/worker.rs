@@ -31,8 +31,11 @@ const BLOCKS_PER_THREAD: f64 = 4.0;
 const ROUND_NS: f64 = 10_000.0;
 /// Entries in a row the optimized form must miss before another is built
 /// for the state at the next, and how many more may be built.
-const MISSES: u8 = 4;
+const MISSES: u32 = 4;
 const RESPECIALIZE: u8 = 2;
+/// A miss limit no count reaches: a sign test of `misses - limit` stays
+/// negative.
+const NO_LIMIT: u32 = i32::MAX as u32;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
 
@@ -42,18 +45,52 @@ pub(super) struct Prepared {
     /// What the optimized form is built from, again when entry states
     /// keep missing its facts.
     pub trace: Arc<crate::translate::Trace>,
-    /// Consecutive entries the optimized form did not admit.
-    misses: std::cell::Cell<u8>,
+    /// Counters the head entry block updates in place (A64-OPT-8).
+    pub slot: Box<Slot>,
+    /// The inline form the head entry block enters, once installed.
+    pub inline: Option<Inline>,
     /// Optimized forms requested, and whether one is being built.
     forms: std::cell::Cell<u8>,
     building: std::cell::Cell<bool>,
     skip: std::cell::Cell<u32>,
-    owner_runs: std::cell::Cell<u64>,
     mode: std::cell::Cell<Mode>,
     /// Instructions and time per outer iteration, once a job showed them.
     per_iteration: std::cell::Cell<Option<(u64, f64)>>,
     /// Serial ns of the last job that showed them.
     cost: std::cell::Cell<u64>,
+}
+
+/// Owner arrival counters shared by Rust and the head entry block, which
+/// reads them through a fixed heap address.
+#[repr(C)]
+#[derive(Default)]
+pub(super) struct Slot {
+    /// Consecutive entries the optimized form did not admit, and the count
+    /// at which an entry goes to Rust to build another.
+    pub misses: std::cell::Cell<u32>,
+    pub miss_limit: std::cell::Cell<u32>,
+    /// Owner arrivals, and the one that nominates a shadow caller.
+    pub runs: std::cell::Cell<u32>,
+    pub nominate: std::cell::Cell<u32>,
+    /// The serial cost of a split loop in host ticks, or 0 when it never
+    /// splits.
+    pub split_ticks: std::cell::Cell<u64>,
+}
+
+impl Slot {
+    pub const MISSES: u32 = std::mem::offset_of!(Slot, misses) as u32;
+    pub const RUNS: u32 = std::mem::offset_of!(Slot, runs) as u32;
+    pub const SPLIT_TICKS: u32 = std::mem::offset_of!(Slot, split_ticks) as u32;
+}
+
+/// The installed inline form of a computation (A64-OPT-8).
+pub(super) struct Inline {
+    /// The word every link to the head branches to: a branch to the
+    /// current entry block.
+    pub trampoline: usize,
+    pub records: Vec<Record<Host>>,
+    pub flags: Vec<Option<FlagRecipe>>,
+    pub assumed_mmx: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -76,11 +113,15 @@ impl Prepared {
             code,
             proof,
             trace: Arc::new(trace),
-            misses: std::cell::Cell::new(0),
+            slot: Box::new(Slot {
+                miss_limit: NO_LIMIT.into(),
+                nominate: 8.into(),
+                ..Slot::default()
+            }),
+            inline: None,
             forms: std::cell::Cell::new(0),
             building: std::cell::Cell::new(false),
             skip: std::cell::Cell::new(0),
-            owner_runs: std::cell::Cell::new(0),
             mode: std::cell::Cell::new(mode),
             per_iteration: std::cell::Cell::new(None),
             cost: std::cell::Cell::new(0),
@@ -89,10 +130,11 @@ impl Prepared {
 
     /// Counts an entry whose state the optimized form did or did not admit.
     pub fn admitted(&self, admitted: bool) {
-        self.misses.set(if admitted {
+        let misses = &self.slot.misses;
+        misses.set(if admitted {
             0
         } else {
-            self.misses.get().saturating_add(1)
+            (misses.get() + 1).min(NO_LIMIT)
         });
     }
 
@@ -102,18 +144,28 @@ impl Prepared {
         !self.building.get()
             && match self.forms.get() {
                 0 => true,
-                forms => forms <= RESPECIALIZE && self.misses.get() >= MISSES,
+                forms => forms <= RESPECIALIZE && self.slot.misses.get() >= MISSES,
             }
     }
 
     pub fn requested(&self) {
         self.forms.set(self.forms.get() + 1);
         self.building.set(true);
-        self.misses.set(0);
+        self.slot.misses.set(0);
+        self.limit_misses();
     }
 
     pub fn built(&self) {
         self.building.set(false);
+        self.limit_misses();
+    }
+
+    /// Entry blocks send the miss that `wants_form` would act on to Rust.
+    fn limit_misses(&self) {
+        let respecializes = !self.building.get() && (1..=RESPECIALIZE).contains(&self.forms.get());
+        self.slot
+            .miss_limit
+            .set(if respecializes { MISSES } else { NO_LIMIT });
     }
 
     /// The code and whether a job stops after one outer iteration.
@@ -139,10 +191,34 @@ impl Prepared {
         }
     }
 
-    pub fn record_owner_run(&self) -> u64 {
-        let n = self.owner_runs.get().wrapping_add(1);
-        self.owner_runs.set(n);
-        n
+    /// Counts an owner arrival that runs in place. Returns whether it is
+    /// the 8th, the 64th or a multiple of 4096, which nominate a caller.
+    pub fn record_owner_run(&self) -> bool {
+        let slot = &self.slot;
+        let n = slot.runs.get().wrapping_add(1);
+        slot.runs.set(n);
+        let due = n == slot.nominate.get();
+        if due {
+            slot.nominate.set(match n {
+                ..8 => 8,
+                8..64 => 64,
+                _ => (n | 4095).wrapping_add(1),
+            });
+        }
+        due
+    }
+
+    fn set_cost(&self, ns: u64) {
+        self.cost.set(ns);
+        let ticks = if self.proof.splits() && ns > 0 {
+            let hz = u128::from(adv_cpu_core::backend::host_tick_hz());
+            (u128::from(ns) * hz)
+                .div_ceil(1_000_000_000)
+                .min(u128::from(u64::MAX)) as u64
+        } else {
+            0
+        };
+        self.slot.split_ticks.set(ticks);
     }
 
     fn observe(&self, entry: u32, iteration: bool, done: &Done) {
@@ -476,7 +552,7 @@ struct Drained {
     last: Option<(Completion<Option<ExecutionContext>>, u32)>,
 }
 
-const ESP: usize = 4;
+pub(super) const ESP: usize = 4;
 
 /// The distance between private frames, in cache lines, which keeps each copy of the span
 /// below every byte live at the real frame, including those between ESP and
@@ -1152,7 +1228,7 @@ fn learn(prepared: &Prepared, done: &Completion<Option<ExecutionContext>>, itera
     }
     let n = u64::from(iterations);
     let ns = (done.elapsed + done.helpers).as_nanos() as f64;
-    prepared.cost.set(ns as u64);
+    prepared.set_cost(ns as u64);
     prepared
         .per_iteration
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
@@ -2778,6 +2854,12 @@ mod tests {
             false
         }
 
+        /// Never offering, it publishes a clear gate, so head entry blocks
+        /// keep arrivals in translated code (A64-OPT-8).
+        fn offer_gate(&self) -> Option<&adv_cpu_core::backend::OfferGate> {
+            Some(&super::super::CLEAR_GATE)
+        }
+
         fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
             unreachable!("no host calls")
         }
@@ -2891,6 +2973,114 @@ mod tests {
             executor.memory().read(OUTPUT + 4 * (COUNT - 1), 4).unwrap(),
             [0x78, 0x56, 0x34, 0x12]
         );
+    }
+
+    // spec: A64-OPT-8
+    #[test]
+    fn translated_arrivals_enter_the_inline_form_through_the_head_block() {
+        const INNER: u32 = 300;
+        const OUTER: u32 = 400;
+        // outer: three moves, the copy loop at `head`, then dec ebx; jne.
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut outer = a.create_label();
+        let mut head = a.create_label();
+        a.set_label(&mut outer).unwrap();
+        a.mov(ecx, INNER).unwrap();
+        a.mov(esi, INPUT).unwrap();
+        a.mov(edi, OUTPUT).unwrap();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, ebx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(outer).unwrap();
+        a.int3().unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let stop = CODE + code.len() as u32 - 1;
+        // nop, three 5-byte moves.
+        let head = CODE + 16;
+        let (mut executor, mut native) = fixture(&mut a);
+        let memory = executor.memory_mut();
+        memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
+        let input: Vec<u8> = (0..4 * INNER).map(|i| (i * 7) as u8).collect();
+        memory.write(INPUT, &input).unwrap();
+        memory.map(OUTPUT, 0x4000, READ | WRITE).unwrap();
+        native.first_visits = false;
+        native.candidates.push(head);
+        native.set_computation_offer(true, None);
+        let begin = |cpu: &mut CpuState| {
+            *cpu = CpuState::default();
+            cpu.eip = CODE;
+            cpu.regs[3] = OUTER;
+        };
+        let mut cpu = CpuState::default();
+        begin(&mut cpu);
+        for _ in 0..100 {
+            if native
+                .computation
+                .get(&head)
+                .is_some_and(|prepared| prepared.inline.is_some())
+            {
+                break;
+            }
+            alone(&mut native, &mut executor, &mut cpu, stop, 1 << 16);
+        }
+        let heads: Vec<_> = native.computation.keys().collect();
+        assert!(
+            native
+                .computation
+                .get(&head)
+                .is_some_and(|p| p.inline.is_some()),
+            "no inline form at {head:#x}: {heads:x?}"
+        );
+        let check = |executor: &Executor, cpu: &CpuState| {
+            assert_eq!(cpu.eip, stop);
+            assert_eq!(cpu.regs[1], 0);
+            assert_eq!(cpu.regs[3], 0);
+            assert_eq!(cpu.regs[6], INPUT + 4 * INNER);
+            assert_eq!(cpu.regs[7], OUTPUT + 4 * INNER);
+            // The last outer pass adds ebx = 1 to each input word.
+            let output = executor.memory().read(OUTPUT, 4 * INNER as usize).unwrap();
+            for (i, word) in output.chunks(4).enumerate() {
+                let x = u32::from_le_bytes(input[4 * i..4 * i + 4].try_into().unwrap());
+                assert_eq!(word, (x + 1).to_le_bytes(), "word {i}");
+            }
+        };
+        let expected = u64::from(1 + OUTER * (3 + 7 * INNER + 2));
+
+        // Ample fuel: arrivals from the outer loop stay in translated code.
+        let slot = &native.computation[&head].slot;
+        let (runs, rust) = (slot.runs.get(), native.diagnostics.optimized_runs);
+        begin(&mut cpu);
+        let mut retired = 0;
+        let mut owner_runs = 0;
+        while cpu.eip != stop {
+            retired += u64::from(alone(&mut native, &mut executor, &mut cpu, stop, 1 << 20));
+            owner_runs += 1;
+        }
+        assert_eq!(retired, expected);
+        check(&executor, &cpu);
+        let entries = native.computation[&head].slot.runs.get() - runs;
+        assert!(entries >= OUTER - owner_runs, "{entries} block entries");
+        assert!(native.diagnostics.optimized_runs - rust < u64::from(owner_runs) + 4);
+
+        // Fuel below the loop's length: refills stop at the fuel, cold
+        // exits rebuild the state, and the runs still retire it exactly.
+        let cold = native.diagnostics.optimized_runs;
+        begin(&mut cpu);
+        let mut retired = 0;
+        while cpu.eip != stop {
+            let fuel = 700 + retired % 389;
+            retired += u64::from(alone(&mut native, &mut executor, &mut cpu, stop, fuel));
+        }
+        assert_eq!(retired, expected);
+        check(&executor, &cpu);
+        assert!(native.diagnostics.optimized_runs > cold + 10);
     }
 
     // spec: A64-OPT-1

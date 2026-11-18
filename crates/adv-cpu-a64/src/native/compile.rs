@@ -35,6 +35,8 @@ pub(super) struct Compiled {
 pub(super) struct Form {
     pub built: front::Built,
     pub lowered: back::Lowered,
+    /// The same form entered from Tier-1 code (A64-OPT-8).
+    pub inline: back::Lowered,
     /// Instructions the entry region prepays, for the JIT map.
     pub prepaid: u32,
 }
@@ -54,10 +56,12 @@ fn compile(request: Request) -> Compiled {
     let form = match front::build(&unit, &proof, &at) {
         Ok(built) => {
             let lowered = back::lower(&built.func);
+            let inline = back::lower_inline(&built.func, &built.assumed, &built.func.entry);
             let (cuts, us) = (built.cuts, started.elapsed().as_micros());
             crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
             Some(Form {
                 lowered,
+                inline,
                 built,
                 prepaid: unit.trace.prepaid(0),
             })

@@ -813,6 +813,11 @@ pub const fn mrs_nzcv(rt: Reg) -> u32 {
     0xD53B_4200 | rt.number()
 }
 
+/// `mrs rt, cntvct_el0`.
+pub const fn mrs_cntvct(rt: Reg) -> u32 {
+    0xD53B_E040 | rt.number()
+}
+
 /// `mrs rt, fpsr`.
 pub const fn mrs_fpsr(rt: Reg) -> u32 {
     0xD53B_4420 | rt.number()

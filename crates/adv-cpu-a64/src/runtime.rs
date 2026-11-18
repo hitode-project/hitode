@@ -162,6 +162,10 @@ pub struct Runtime {
     pub rep_pending: u32,
     /// Tier-1 state at the last admitted inline entry.
     pub opt_entry: OptEntryState,
+    /// The machine's `OfferGate` that head entry blocks read (A64-OPT-8).
+    pub offer_gate: u64,
+    /// The head EIP of the inline form whose cold exit reached `opt_exit`.
+    pub opt_head: u32,
 }
 
 impl Runtime {
@@ -219,6 +223,8 @@ impl Runtime {
             opt_dump: RegisterDump::default(),
             rep_pending: 0,
             opt_entry: OptEntryState::default(),
+            offer_gate: 0,
+            opt_head: 0,
         }
     }
 }
@@ -382,6 +388,9 @@ pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
+pub(crate) const OPT_CELLS: u32 = field(offset_of!(Runtime, opt_cells));
+pub(crate) const OPT_HEAD: u32 = field(offset_of!(Runtime, opt_head));
+pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.

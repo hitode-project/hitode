@@ -42,7 +42,9 @@ use iced_x86::Code;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
@@ -54,7 +56,21 @@ use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
+mod head;
 mod worker;
+
+/// Offer gates for runs whose handler publishes none: no offer is possible,
+/// or Rust decides every arrival.
+static CLEAR_GATE: OfferGate = OfferGate {
+    stale: AtomicU32::new(0),
+    split_over: AtomicU32::new(0),
+    split_deadline: AtomicU64::new(u64::MAX),
+};
+static STALE_GATE: OfferGate = OfferGate {
+    stale: AtomicU32::new(1),
+    split_over: AtomicU32::new(0),
+    split_deadline: AtomicU64::new(u64::MAX),
+};
 
 const CACHE_LEN: usize = 64 << 20;
 
@@ -412,8 +428,21 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
         let cpu = unsafe { &mut *(*runtime).cpu };
         record_branch(cpu, branch, eip);
     }
-    if native.is_stop(eip) || owner.error.is_some() {
+    if owner.error.is_some() {
         return 0;
+    }
+    if native.is_stop(eip) {
+        // A head with an inline form links to its entry block (A64-OPT-8).
+        let Some(trampoline) = native.trampoline(eip) else {
+            return 0;
+        };
+        if point == 0 {
+            native.table[runtime::table_slot(eip)] = [u64::from(eip), trampoline as u64];
+        } else {
+            native.patch(point, eip, trampoline);
+            native.cache.sync();
+        }
+        return trampoline;
     }
     // A first visit runs in the owner; the point links on the next one.
     let entry = native.units.get(&eip).copied();
@@ -790,6 +819,8 @@ pub(crate) struct Native {
     computation_code: translate::Code,
     admission: worker::Admission,
     opt_scratch: worker::ExecuteScratch,
+    /// Where `opt_exit` saves an inline form's spill cells.
+    inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
     compiler: compile::Compiler,
     pub(crate) features: Features,
@@ -916,6 +947,7 @@ impl Native {
             computation_code: translate::Code::default(),
             admission: worker::Admission::default(),
             opt_scratch: worker::ExecuteScratch::default(),
+            inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
             features: features(),
             runtime,
@@ -965,6 +997,11 @@ impl Native {
                 .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
         }
         self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
+    }
+
+    fn trampoline(&self, eip: u32) -> Option<usize> {
+        let inline = self.computation.get(&eip)?.inline.as_ref()?;
+        Some(inline.trampoline)
     }
 
     fn is_stop(&self, eip: u32) -> bool {
@@ -1114,19 +1151,18 @@ impl Native {
             && self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
         {
-            let mut offer = self.offer_computation();
+            // An arrival the owner keeps changes no state, so the published
+            // gate can decide it in translated code (PROC-MACH-13).
             let split = prepared.proof.splits() && prepared.cost() > 0;
-            if (offer || split) && prepared.worth_offering() {
-                if split {
-                    offer |= self.offer_split(prepared.cost());
-                }
-                if offer {
-                    return Ok(Some(Run {
-                        exit: Exit::Computation,
-                        retired: 0,
-                        translated,
-                    }));
-                }
+            let peer = self.offer_computation();
+            // This also takes the pace a split plans with.
+            let paced = split && self.offer_split(prepared.cost());
+            if (peer || paced) && prepared.worth_offering() {
+                return Ok(Some(Run {
+                    exit: Exit::Computation,
+                    retired: 0,
+                    translated,
+                }));
             }
         }
         if u64::from(entry.retired) > fuel {
@@ -1170,6 +1206,7 @@ impl Native {
             }));
         }
         self.faults.end.set(self.cache.next());
+        self.prepare_inline(cpu, memory, fuel, budget);
         let runtime: *mut Runtime = &mut *self.runtime;
         let faults: *const Faults = &self.faults;
         let enter = self.enter;
@@ -1210,14 +1247,20 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
-            Exit::Optimized => unreachable!("optimized forms leave through `worker::execute`"),
+            Exit::Optimized => self.diagnostics.optimized_runs += 1,
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
-        let mut retired = budget - self.runtime.countdown;
+        // Inline forms may refill the countdown, and a cold exit may leave
+        // it negative.
+        let mut retired = (budget + self.runtime.completed).wrapping_sub(self.runtime.countdown);
+        if exit == Exit::Optimized {
+            retired -= u64::from(self.materialize_inline(cpu, memory));
+            exit = Exit::Dispatch;
+        }
         if exit == Exit::Fault {
             let pc = self.faults.capture.pc.get();
             let site = self.faults.site(pc).expect("faulting site");
@@ -1258,6 +1301,8 @@ impl Native {
         static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let prepared = self.computation.get(&cpu.eip)?;
         let form = prepared.code.optimized.as_deref()?;
+        // Entry blocks count the arrivals they keep as well.
+        let nominates = prepared.record_owner_run();
         let alias = alias_base(memory);
         if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory, alias) {
             return None;
@@ -1268,7 +1313,6 @@ impl Native {
         let optimized = worker::admit(&prepared.code, cpu, alias, &mut self.opt_scratch.params);
         prepared.admitted(optimized.is_some());
         let optimized = optimized?;
-        let owner_runs = prepared.record_owner_run();
         let entry = worker::Entry {
             enter: self.enter,
             opt_enter: self.opt_enter,
@@ -1308,11 +1352,7 @@ impl Native {
         if exit == Exit::Fault {
             self.diagnostics.faults += 1;
         }
-        if retired < SLICE
-            && self.computation_enabled
-            && self.nominated.is_none()
-            && (owner_runs == 8 || owner_runs == 64 || (owner_runs & 4095) == 0)
-        {
+        if retired < SLICE && self.computation_enabled && self.nominated.is_none() && nominates {
             self.nominate_shadow_caller(memory);
         }
         // A recall here is pending owner work, which dispatch sees.
@@ -1322,6 +1362,70 @@ impl Native {
             exit
         };
         Some((exit, retired as u32))
+    }
+
+    /// Points the runtime at what head entry blocks and inline forms read
+    /// during a translated run of `budget` within `fuel` (A64-OPT-8).
+    fn prepare_inline(&mut self, cpu: &CpuState, memory: &Memory, fuel: u64, budget: u64) {
+        static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let gate = if !self.computation_enabled {
+            &CLEAR_GATE
+        } else if self.bridge.is_null() {
+            &STALE_GATE
+        } else {
+            // SAFETY: the run's bridge outlives it.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            bridge
+                .handler
+                .as_ref()
+                .and_then(|handler| handler.offer_gate())
+                .unwrap_or(&STALE_GATE)
+        };
+        let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
+            (word.as_ptr(), self.pending_mask)
+        });
+        let runtime = &mut *self.runtime;
+        runtime.offer_gate = std::ptr::from_ref(gate) as u64;
+        runtime.alias = alias_base(memory);
+        runtime.plain_pages = memory.plain_pages() as u64;
+        runtime.memory_base = memory.base;
+        runtime.memory_pages = (memory.len / adv_cpu_core::memory::PAGE_SIZE) as u32;
+        runtime.rep_pending = u32::from(cpu.rep.is_some());
+        runtime.recall = NEVER.as_ptr() as u64;
+        runtime.recall_mask = 0;
+        runtime.computation_pending = pending as u64;
+        runtime.computation_pending_mask = mask;
+        runtime.head_exit = 0;
+        runtime.deferred = 0;
+        runtime.completed = 0;
+        runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
+        runtime.opt_recalled = 0;
+        runtime.opt_save = self.inline_saved.as_mut_ptr() as u64;
+    }
+
+    /// Rebuilds the guest state at a cold inline exit from the entry
+    /// baseline and the exit's record. Returns the record's refund.
+    fn materialize_inline(&mut self, cpu: &mut CpuState, memory: &Memory) -> u32 {
+        let prepared = &self.computation[&self.runtime.opt_head];
+        let inline = prepared.inline.as_ref().expect("installed inline form");
+        translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
+        let (alias, entry_esp) = (alias_base(memory), cpu.regs[worker::ESP]);
+        let refund = translate::opt::recovery::materialize(
+            &inline.records[self.runtime.opt_record as usize],
+            &self.runtime.opt_dump,
+            &self.inline_saved,
+            &inline.flags,
+            cpu,
+            // SAFETY: the entry block admitted the frame's ranges.
+            |offset, bytes| unsafe {
+                let at = alias.wrapping_add(u64::from(entry_esp.wrapping_add_signed(offset)));
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+            },
+        );
+        if inline.assumed_mmx || cpu.mmx_mode != 0 {
+            cpu.refresh_mmx();
+        }
+        refund
     }
 
     fn nominate_shadow_caller(&mut self, memory: &mut Memory) {
@@ -1964,6 +2068,7 @@ impl Native {
             let Some(mut form) = done.form else {
                 continue;
             };
+            let assumed_mmx = form.built.assumed.mmx;
             let lowered = &mut form.lowered;
             lowered.place(self.cache.next(), self.stubs.opt_exit);
             let Some(entry) = self.cache.append(&lowered.words) else {
@@ -1997,6 +2102,77 @@ impl Native {
                 flags: std::mem::take(&mut lowered.flags),
                 cells: lowered.spill_cells,
             }));
+            let Some(unit) = self.units.get(&done.eip).map(|entry| entry.unit) else {
+                continue;
+            };
+            // The entry block and the inline form, which links into Tier 1.
+            let inline = &mut form.inline;
+            let at = self.cache.next();
+            let targets = head::Targets {
+                unit,
+                exit: self.stubs.exit,
+                dispatch: self.stubs.dispatch,
+                opt_exit: self.stubs.opt_exit,
+            };
+            let (words, entry) = head::emit(
+                &prepared.proof,
+                done.eip,
+                &prepared.slot,
+                inline,
+                at,
+                &targets,
+            );
+            if self.cache.append(&words).is_none() {
+                continue;
+            }
+            let form_at = at + (words.len() - inline.words.len()) * 4;
+            let from = self.faults.sites.len().saturating_sub(1);
+            self.faults.sites.extend(
+                inline
+                    .sites
+                    .iter()
+                    .map(|&(offset, site)| (form_at + offset, site)),
+            );
+            if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
+                self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
+            }
+            crate::jit_map::record(
+                form_at,
+                &inline.words,
+                done.eip,
+                form.prepaid,
+                &inline.marks,
+                "a64-opt-inline",
+            );
+            if self.inline_saved.len() < inline.spill_cells {
+                self.inline_saved.resize(inline.spill_cells, 0);
+                self.runtime.opt_save = self.inline_saved.as_mut_ptr() as u64;
+            }
+            let entry = at + entry;
+            let records = std::mem::take(&mut inline.records);
+            let flags = std::mem::take(&mut inline.flags);
+            let trampoline = match &prepared.inline {
+                Some(old) => {
+                    let offset = entry as i64 - old.trampoline as i64;
+                    self.cache.patch(old.trampoline, b(offset as i32));
+                    old.trampoline
+                }
+                None => {
+                    let trampoline = self.cache.next();
+                    let offset = entry as i64 - trampoline as i64;
+                    if self.cache.append(&[b(offset as i32)]).is_none() {
+                        continue;
+                    }
+                    trampoline
+                }
+            };
+            prepared.inline = Some(worker::Inline {
+                trampoline,
+                records,
+                flags,
+                assumed_mmx,
+            });
+            self.faults.end.set(self.cache.next());
         }
     }
 
