@@ -1518,6 +1518,7 @@ impl<'a> Emitter<'a> {
                 addr,
                 checked,
                 pc,
+                clock,
             } => {
                 self.guest_eip = pc;
                 let addr = self.gp(addr, U);
@@ -1536,6 +1537,12 @@ impl<'a> Emitter<'a> {
                     (vldr_reg(size, q, base, addr), AccessReg::Vector(size, q))
                 };
                 self.memory_access(addr, width, reg, word, false, checked);
+                if clock {
+                    self.asm.emit_all(&[
+                        ldr(X, U, RT, runtime::CPU_STATE),
+                        str(X, RT, U, runtime::CLOCK_READ),
+                    ]);
+                }
             }
             Op::Host(addr) => {
                 let addr = self.gp(addr, U);

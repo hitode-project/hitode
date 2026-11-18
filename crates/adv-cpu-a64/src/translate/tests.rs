@@ -2023,6 +2023,7 @@ pub(in crate::translate) mod opt_back {
                     addr,
                     checked,
                     pc,
+                    clock: false,
                 },
             )
             .unwrap()
@@ -3855,6 +3856,7 @@ pub(in crate::translate) mod opt_back {
                         addr: p[0],
                         checked: false,
                         pc: 0,
+                        clock: false,
                     },
                 )
                 .unwrap();
@@ -3895,6 +3897,7 @@ pub(in crate::translate) mod opt_back {
                         addr: p[0],
                         checked: false,
                         pc: 0,
+                        clock: false,
                     },
                 )
                 .unwrap()

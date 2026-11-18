@@ -858,13 +858,15 @@ impl Front<'_> {
         }
     }
     fn load(&mut self, addr: Value, width: u8, ty: Type) -> Value {
-        let pc = self.unit.trace.insts[self.index].pc;
+        let inst = self.unit.trace.insts[self.index];
+        let pc = inst.pc;
         let value = self.value(Op::Load {
             ty,
             width,
             addr,
             pc,
             checked: self.checked.is_some_and(|checked| checked(pc)),
+            clock: inst.op.reads_clock(),
         });
         self.loads.insert(value, self.index);
         value

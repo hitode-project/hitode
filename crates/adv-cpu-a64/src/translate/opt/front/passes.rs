@@ -423,7 +423,7 @@ fn propagate(func: &mut Func) -> bool {
                 }
             }
             defs[r.0 as usize] = Some(*op);
-            if op.pure() || block_index == 0 && matches!(op, Op::Load { .. }) {
+            if op.pure() || block_index == 0 && matches!(op, Op::Load { clock: false, .. }) {
                 if let Some((_, other)) = numbered.iter().find(|(other, _)| match (*other, *op) {
                     (
                         Op::Load {
@@ -1215,7 +1215,13 @@ fn hoist(
             .any(|(_, op)| matches!(op, Op::FrameStore { .. }))
     });
     let invariant = |r: Value, op: Op| {
-        let Op::Load { addr, width, .. } = op else {
+        let Op::Load {
+            addr,
+            width,
+            clock: false,
+            ..
+        } = op
+        else {
             return false;
         };
         loads.get(&r).is_some_and(|&i| {
@@ -1380,7 +1386,15 @@ fn hoist(
 }
 
 fn hoist_effect(op: Op) -> bool {
-    op.effect() && !matches!(op, Op::Load { checked: false, .. } | Op::PlainPage { .. })
+    op.effect()
+        && !matches!(
+            op,
+            Op::Load {
+                checked: false,
+                clock: false,
+                ..
+            } | Op::PlainPage { .. }
+        )
 }
 
 /// Blocks that run on every iteration of a loop that encloses them: the
@@ -1512,6 +1526,7 @@ fn group_stores(
                         addr,
                         width,
                         checked,
+                        clock: false,
                         ..
                     },
                 ) => loads.get(&r).is_some_and(|&load| {

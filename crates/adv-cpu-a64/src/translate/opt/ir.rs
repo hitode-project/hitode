@@ -234,6 +234,8 @@ pub(crate) enum Op {
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
         pc: u32,
+        /// A shared clock observation stays at its original instruction.
+        clock: bool,
     },
     /// A memory store: an effect point. Region `after` starts at
     /// the guest boundary after it.

@@ -3054,6 +3054,51 @@ mod tests {
         );
     }
 
+    // spec: A64-OPT-9, PROC-CLOCK-7
+    #[test]
+    fn resident_clock_polls_mark_observation_and_resample() {
+        const PAGE: u32 = 0x7ffe_0000;
+        let (mut memory, mut native, stop) = resident_loop(&[
+            0xa1, 0x20, 3, 0xfe, 0x7f, // mov eax,[clock]
+            0x8b, 0x15, 0x20, 3, 0xfe, 0x7f, // mov edx,[clock]
+            0x85, 0xc0, // test eax,eax
+            0x75, 9, // jne stop
+            0x88, 0x0d, 0x20, 3, 2, 0, // mov [DATA + 0x320],cl
+            0x49, 0x75, 0xe8, // dec ecx; jne HEAD
+            0xcc,
+        ]);
+        // The second view updates the shared clock between polls.
+        let storage = memory.map_shared_audio(PAGE, 0x4000).unwrap();
+        memory
+            .map_shared_file(DATA, 0x4000, storage, READ | WRITE, false)
+            .unwrap();
+        assert!(native.force_resident(&mut memory, HEAD));
+        assert!(native.heads[&HEAD].versions[0].plain_sites.is_empty());
+        for pc in [HEAD, HEAD + 5] {
+            assert!(
+                native
+                    .faults
+                    .sites
+                    .iter()
+                    .any(|&(_, site)| { site.eip == pc && site.opt_record.is_some() })
+            );
+        }
+
+        // Start after the loads, so only a resident arrival marks the clock.
+        let mut state = resident_cpu(HEAD + 11, 0x100);
+        state.regs[0] = 0;
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!((run.exit, run.retired), (Exit::Dispatch, 16));
+        let head = &native.heads[&HEAD];
+        assert_eq!(head.sample.get(), head::SAMPLE - 1);
+        assert_eq!(head.versions[0].slot.misses.get(), 0);
+        assert_eq!(
+            (state.eip, state.regs[0], state.regs[2]),
+            (stop, 0xff, 0xff)
+        );
+        assert_ne!(state.clock_read, 0);
+    }
+
     // spec: A64-OPT-8
     #[test]
     fn resident_context_misses_chain_three_versions_and_stable_edges_link_directly() {
