@@ -158,6 +158,10 @@ struct th_dec_ctx{
   int adv_yfrag0;
   int adv_yfrag_end;
   int adv_slots;
+  int adv_refs;
+  unsigned adv_reserved;
+  unsigned char *adv_dc_qis[6];
+  unsigned char *adv_pp_data[6];
 # if defined(OC_DEC_USE_VTABLE)
   /*Table for decoder acceleration functions.*/
   oc_dec_opt_vtable      opt_vtable;

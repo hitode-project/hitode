@@ -366,12 +366,12 @@ void oc_dec_accel_init_c(oc_dec_ctx *_dec){
 }
 
 static int oc_dec_init(oc_dec_ctx *_dec,const th_info *_info,
- const th_setup_info *_setup){
+ const th_setup_info *_setup,int refs){
   int qti;
   int pli;
   int qi;
   int ret;
-  ret=oc_state_init(&_dec->state,_info,3);
+  ret=oc_state_init(&_dec->state,_info,refs);
   if(ret<0)return ret;
   ret=oc_huff_trees_copy(_dec->huff_tables,
    (const ogg_int16_t *const *)_setup->huff_tables);
@@ -420,6 +420,10 @@ static int oc_dec_init(oc_dec_ctx *_dec,const th_info *_info,
   _dec->adv_stripe_yield=0;
   _dec->adv_pending=0;
   _dec->adv_slots=1;
+  _dec->adv_refs=refs;
+  _dec->adv_reserved=0;
+  memset(_dec->adv_dc_qis,0,sizeof(_dec->adv_dc_qis));
+  memset(_dec->adv_pp_data,0,sizeof(_dec->adv_pp_data));
   _dec->stripe_cb.ctx=NULL;
   _dec->stripe_cb.stripe_decoded=NULL;
 #if defined(HAVE_CAIRO)
@@ -436,9 +440,17 @@ static void oc_dec_clear(oc_dec_ctx *_dec){
 #if defined(HAVE_CAIRO)
   _ogg_free(_dec->telemetry_frame_data);
 #endif
-  _ogg_free(_dec->pp_frame_data);
+  if(_dec->adv_refs>3){
+    for(int refi=0;refi<_dec->adv_refs;refi++){
+      _ogg_free(_dec->adv_pp_data[refi]);
+      _ogg_free(_dec->adv_dc_qis[refi]);
+    }
+  }
+  else{
+    _ogg_free(_dec->pp_frame_data);
+    _ogg_free(_dec->dc_qis);
+  }
   _ogg_free(_dec->variances);
-  _ogg_free(_dec->dc_qis);
   _ogg_free(_dec->dct_tokens);
   oc_huff_trees_clear(_dec->huff_tables);
   oc_state_clear(&_dec->state);
@@ -1246,7 +1258,7 @@ static int oc_dec_postprocess_init(oc_dec_ctx *_dec){
   }
   /*pp_level 1: Stop after updating DC quantization indices.*/
   if(_dec->pp_level<=OC_PP_LEVEL_TRACKDCQI){
-    if(_dec->variances!=NULL){
+    if(_dec->variances!=NULL || _dec->pp_frame_data!=NULL){
       _ogg_free(_dec->variances);
       _dec->variances=NULL;
       _ogg_free(_dec->pp_frame_data);
@@ -1254,7 +1266,7 @@ static int oc_dec_postprocess_init(oc_dec_ctx *_dec){
     }
     return 1;
   }
-  if(_dec->variances==NULL){
+  if(_dec->pp_frame_data==NULL){
     size_t frame_sz;
     size_t c_sz;
     int    c_w;
@@ -1269,7 +1281,7 @@ static int oc_dec_postprocess_init(oc_dec_ctx *_dec){
     frame_sz+=c_sz<<1;
     _dec->pp_frame_data=(unsigned char *)_ogg_malloc(
      frame_sz*sizeof(_dec->pp_frame_data[0]));
-    _dec->variances=(int *)_ogg_malloc(
+    if(_dec->variances==NULL)_dec->variances=(int *)_ogg_malloc(
      _dec->state.nfrags*sizeof(_dec->variances[0]));
     if(_dec->variances==NULL||_dec->pp_frame_data==NULL){
       _ogg_free(_dec->pp_frame_data);
@@ -1355,14 +1367,39 @@ static void oc_dec_pipeline_init(oc_dec_ctx *_dec,
   /*Initialize any buffers needed for post-processing.
     We also save the current post-processing level, to guard against the user
      changing it from a callback.*/
+  int refi=_dec->state.ref_frame_idx[OC_FRAME_SELF];
+  if(_dec->adv_refs>3){
+    /*The previous frame owns the quantizer history. Write changes only to
+       the free destination slot, which also owns its postprocessed pixels.*/
+    unsigned char *previous=_dec->dc_qis;
+    _dec->dc_qis=_dec->adv_dc_qis[refi];
+    if(previous==NULL || _dec->pp_level<=OC_PP_LEVEL_DISABLED){
+      _ogg_free(_dec->dc_qis);
+      _dec->dc_qis=NULL;
+    }
+    else{
+      if(_dec->dc_qis==NULL)_dec->dc_qis=_ogg_malloc(_dec->state.nfrags);
+      if(_dec->dc_qis!=NULL)memcpy(_dec->dc_qis,previous,_dec->state.nfrags);
+    }
+    _dec->pp_frame_data=_dec->adv_pp_data[refi];
+    _dec->pp_frame_state=0;
+    if(_dec->pp_level<=OC_PP_LEVEL_DISABLED){
+      _ogg_free(_dec->pp_frame_data);
+      _dec->pp_frame_data=NULL;
+    }
+  }
   if(!oc_dec_postprocess_init(_dec))_pipe->pp_level=_dec->pp_level;
   /*If we don't have enough information to post-process, disable it, regardless
      of the user-requested level.*/
   else{
     _pipe->pp_level=OC_PP_LEVEL_DISABLED;
     memcpy(_dec->pp_frame_buf,
-     _dec->state.ref_frame_bufs[_dec->state.ref_frame_idx[OC_FRAME_SELF]],
+     _dec->state.ref_frame_bufs[refi],
      sizeof(_dec->pp_frame_buf[0])*3);
+  }
+  if(_dec->adv_refs>3){
+    _dec->adv_dc_qis[refi]=_dec->dc_qis;
+    _dec->adv_pp_data[refi]=_dec->pp_frame_data;
   }
   /*Clear down the DCT coefficient buffer for the first block.*/
   memset(_pipe->dct_coeffs,0,64*sizeof(_pipe->dct_coeffs[0]));
@@ -1941,16 +1978,21 @@ static void oc_dec_dering_frag_rows(oc_dec_ctx *_dec,th_img_plane *_img,
 
 
 
-th_dec_ctx *th_decode_alloc(const th_info *_info,const th_setup_info *_setup){
+th_dec_ctx *adv_theora_alloc(const th_info *_info,const th_setup_info *_setup,
+ int refs){
   oc_dec_ctx *dec;
   if(_info==NULL||_setup==NULL)return NULL;
   dec=oc_aligned_malloc(sizeof(*dec),16);
-  if(dec==NULL||oc_dec_init(dec,_info,_setup)<0){
+  if(dec==NULL||oc_dec_init(dec,_info,_setup,refs)<0){
     oc_aligned_free(dec);
     return NULL;
   }
   dec->state.curframe_num=0;
   return dec;
+}
+
+th_dec_ctx *th_decode_alloc(const th_info *_info,const th_setup_info *_setup){
+  return adv_theora_alloc(_info,_setup,3);
 }
 
 void th_decode_free(th_dec_ctx *_dec){
@@ -2033,7 +2075,7 @@ int th_decode_ctl(th_dec_ctx *_dec,int _req,void *_buf,
 /*We're decoding an INTER frame, but have no initialized reference
    buffers (i.e., decoding did not start on a key frame).
   We initialize them to a solid gray here.*/
-static void oc_dec_init_dummy_frame(th_dec_ctx *_dec){
+static void oc_dec_init_dummy_frame(th_dec_ctx *_dec,int refi){
   th_info   *info;
   size_t     yplane_sz;
   size_t     cplane_sz;
@@ -2042,14 +2084,14 @@ static void oc_dec_init_dummy_frame(th_dec_ctx *_dec){
   int        yheight;
   int        chstride;
   int        cheight;
-  _dec->state.ref_frame_idx[OC_FRAME_GOLD]=0;
-  _dec->state.ref_frame_idx[OC_FRAME_PREV]=0;
-  _dec->state.ref_frame_idx[OC_FRAME_SELF]=0;
+  _dec->state.ref_frame_idx[OC_FRAME_GOLD]=
+   _dec->state.ref_frame_idx[OC_FRAME_PREV]=
+   _dec->state.ref_frame_idx[OC_FRAME_SELF]=refi;
   _dec->state.ref_frame_data[OC_FRAME_GOLD]=
    _dec->state.ref_frame_data[OC_FRAME_PREV]=
    _dec->state.ref_frame_data[OC_FRAME_SELF]=
-   _dec->state.ref_frame_bufs[0][0].data;
-  memcpy(_dec->pp_frame_buf,_dec->state.ref_frame_bufs[0],
+   _dec->state.ref_frame_bufs[refi][0].data;
+  memcpy(_dec->pp_frame_buf,_dec->state.ref_frame_bufs[refi],
    sizeof(_dec->pp_frame_buf[0])*3);
   info=&_dec->state.info;
   yhstride=abs(_dec->state.ref_ystride[0]);
@@ -2059,7 +2101,22 @@ static void oc_dec_init_dummy_frame(th_dec_ctx *_dec){
   yplane_sz=yhstride*(size_t)yheight+16;
   cplane_sz=chstride*(size_t)cheight;
   yoffset=yhstride*(ptrdiff_t)(yheight-OC_UMV_PADDING-1)+OC_UMV_PADDING;
-  memset(_dec->state.ref_frame_data[0]-yoffset,0x80,yplane_sz+2*cplane_sz);
+  memset(_dec->state.ref_frame_bufs[refi][0].data-yoffset,0x80,
+   yplane_sz+2*cplane_sz);
+  if(_dec->adv_refs>3){
+    _ogg_free(_dec->adv_dc_qis[refi]);
+    _dec->adv_dc_qis[refi]=_dec->dc_qis=NULL;
+  }
+}
+
+static int adv_free_ref(const th_dec_ctx *dec){
+  int refi;
+  for(refi=0;refi<dec->adv_refs;refi++){
+    if(!(dec->adv_reserved&(1U<<refi))&&
+     refi!=dec->state.ref_frame_idx[OC_FRAME_GOLD]&&
+     refi!=dec->state.ref_frame_idx[OC_FRAME_PREV])return refi;
+  }
+  return -1;
 }
 
 #if defined(HAVE_CAIRO)
@@ -2882,7 +2939,9 @@ int th_decode_packetin(th_dec_ctx *_dec,const ogg_packet *_op,
   if(_dec->state.frame_type!=OC_INTRA_FRAME&&
    (_dec->state.ref_frame_idx[OC_FRAME_GOLD]<0||
    _dec->state.ref_frame_idx[OC_FRAME_PREV]<0)){
-    oc_dec_init_dummy_frame(_dec);
+    int refi=adv_free_ref(_dec);
+    if(refi<0)return TH_EFAULT;
+    oc_dec_init_dummy_frame(_dec,refi);
   }
   /*If this was an inter frame with no coded blocks...*/
   if(_dec->state.ntotal_coded_fragis<=0){
@@ -2911,8 +2970,8 @@ int th_decode_packetin(th_dec_ctx *_dec,const ogg_packet *_op,
      _dec->telemetry_qi||_dec->telemetry_bits;
 #endif
     /*Select a free buffer to use for the reconstructed version of this frame.*/
-    for(refi=0;refi==_dec->state.ref_frame_idx[OC_FRAME_GOLD]||
-     refi==_dec->state.ref_frame_idx[OC_FRAME_PREV];refi++);
+    refi=adv_free_ref(_dec);
+    if(refi<0)return TH_EFAULT;
     _dec->state.ref_frame_idx[OC_FRAME_SELF]=refi;
     _dec->state.ref_frame_data[OC_FRAME_SELF]=
      _dec->state.ref_frame_bufs[refi][0].data;

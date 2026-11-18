@@ -1,0 +1,18 @@
+# Xiph libogg stream extraction, MSVC x86.
+# Source: https://downloads.xiph.org/releases/ogg/ (BSD-3-Clause).
+# The shared packetout/packetpeek implementation takes an advance flag.
+field body_data packet 0xba 1
+field body_fill pagein 0x1b5 1
+field body_returned packet 0xbc 1
+field lacing_vals packet 0x20 1
+field granule_vals packet 0xd3 1
+field lacing_packet packet 0x13 0
+field lacing_returned packet 0x10 1
+field packetno packet 0xc1 1
+root packet 6
+code packet 274 8e30661cf6049abc5969abe652be0efc837a5611e8afd84273e19c79b869074c
+root reset 6
+code reset 139 6e28df3273ad5b6c5162564b15b35869d6be55c8c1976bce4d09f0e78c51f1cd
+# The page-in body has only intra-image relative calls.
+root pagein 6
+code pagein 1024 b6c613fadf5e1e170b9b75ce8e0b3d58c834073963531e9970d293147fa842b7
