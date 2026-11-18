@@ -19,6 +19,7 @@ impl Resolver for Platform {
             "free" => (free as adv_machine::Handler, 1),
             "done" => (done as adv_machine::Handler, 0),
             "stripe" => (stripe as adv_machine::Handler, 4),
+            "predict" => (predict_fixture as adv_machine::Handler, 0),
             _ => return host_fn(module, name),
         };
         Some(HostFn {
@@ -44,6 +45,28 @@ fn free(e: &mut Env<'_>) -> Outcome {
 }
 fn done(_: &mut Env<'_>) -> Outcome {
     Outcome::ExitProcess(0)
+}
+
+fn predict_fixture(e: &mut Env<'_>) -> Outcome {
+    let provider = e.ext.get_mut::<Provider>();
+    let decoder = &mut provider.decoders.get_mut(&CONTEXT).unwrap().decoder;
+    assert!(decoder.predict(
+        initial_control(0),
+        RUN_AHEAD_DEPTH,
+        |depth| {
+            (0..depth)
+                .map(|packetno| Packet {
+                    bytes: Vec::new(),
+                    bos: 0,
+                    eos: 0,
+                    granulepos: -1,
+                    packetno: packetno as i64,
+                })
+                .collect()
+        },
+        &mut provider.stats.run_ahead,
+    ));
+    Outcome::Return(0)
 }
 
 use adv_machine::{
@@ -107,7 +130,7 @@ fn create(e: &mut Env<'_>) -> Outcome {
         loop_filter_limits: [16; 64],
         ranges: std::array::from_fn(|_| (vec![63], vec![16; 128])),
     };
-    native_init(e, 0, CONTEXT, Decoder::new(&setup).unwrap())
+    native_init(e, 0, CONTEXT, Decoder::with_run_ahead(&setup).unwrap())
 }
 fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
     let mut machine = Machine::new(
@@ -121,6 +144,7 @@ fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
     let malloc = machine.resolve_import(MODULE, "malloc").unwrap();
     let free = machine.resolve_import(MODULE, "free").unwrap();
     machine.cpu.write_u32(SLOT, malloc).unwrap();
+    ogg::install(&mut machine.ext);
     let mut original_clear = Asm::new(CODE + 0x300);
     original_clear
         .mov_eax_mem(CONTEXT + 588)
@@ -131,6 +155,10 @@ fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
     machine
         .cpu
         .write(CODE + 0x300, &original_clear.bytes)
+        .unwrap();
+    machine
+        .cpu
+        .write(CODE + 0x380, &[0x31, 0xc0, 0xc3])
         .unwrap();
     let entry = || Entry {
         entry: CODE + 0x300,
@@ -147,6 +175,11 @@ fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
             init: entry(),
             packet: entry(),
             clear: entry(),
+            ctl: Some(Entry {
+                entry: CODE + 0x380,
+                original: CODE + 0x380,
+                ..entry()
+            }),
             snapshots: Vec::new(),
         }],
         decoders: BTreeMap::new(),
@@ -205,7 +238,10 @@ fn native_lifetime_uses_guest_allocator_and_preserves_first_duplicate_frame() {
             continue;
         }
         assert_eq!(machine.cpu.read_u32(RESULT + 4).unwrap(), 1);
-        assert_eq!(wide(&read(&machine.cpu, GRANULE, 8).unwrap(), 0), 64);
+        assert_eq!(
+            i64::from_le_bytes(read(&machine.cpu, GRANULE, 8).unwrap().try_into().unwrap()),
+            64
+        );
         let descriptors = read(&machine.cpu, CONTEXT + OUTPUT, 48).unwrap();
         for plane in 0..3 {
             let width = word(&descriptors, plane * 16);
@@ -547,4 +583,232 @@ fn unmapping_retires_decoder_state_outside_the_image() {
     assert!(m.ext.get::<Provider>().decoders.is_empty());
     assert!(!m.ext.get::<Provider>().bindings[0].live);
     assert!(m.sys.redirects.is_empty());
+}
+
+// Packed decoder tables and packets from the libtheora 1.2.0 encoder.
+// The source is twelve generated 320x224 YUV frames with a moving rectangle,
+// 8 fps, quality 30 and a four-frame keyframe interval.
+fn generated_stream() -> (Setup, Vec<Packet>) {
+    fn take<'a>(bytes: &mut &'a [u8], count: usize) -> &'a [u8] {
+        let (head, tail) = bytes.split_at(count);
+        *bytes = tail;
+        head
+    }
+
+    let mut bytes = include_bytes!("../data/theora-run-ahead.bin").as_slice();
+    let info = take(&mut bytes, 64).try_into().unwrap();
+    let huffman = std::array::from_fn(|_| {
+        let count = u16::from_le_bytes(take(&mut bytes, 2).try_into().unwrap());
+        take(&mut bytes, usize::from(count) * 2)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .copied()
+            .map(i16::from_le_bytes)
+            .collect()
+    });
+    let dc_scale =
+        std::array::from_fn(|_| u16::from_le_bytes(take(&mut bytes, 2).try_into().unwrap()));
+    let ac_scale =
+        std::array::from_fn(|_| u16::from_le_bytes(take(&mut bytes, 2).try_into().unwrap()));
+    let loop_filter_limits = take(&mut bytes, 64).try_into().unwrap();
+    let ranges = std::array::from_fn(|_| {
+        let count = word(take(&mut bytes, 4), 0) as usize;
+        let sizes = (0..count)
+            .map(|_| i32::from_le_bytes(take(&mut bytes, 4).try_into().unwrap()))
+            .collect();
+        let matrices = take(&mut bytes, (count + 1) * 64).to_vec();
+        (sizes, matrices)
+    });
+    let mut packets = Vec::new();
+    while !bytes.is_empty() {
+        let header = take(&mut bytes, 28);
+        packets.push(Packet {
+            bytes: take(&mut bytes, word(header, 0) as usize).to_vec(),
+            bos: word(header, 4),
+            eos: word(header, 8),
+            granulepos: i64::from_le_bytes(header[12..20].try_into().unwrap()),
+            packetno: i64::from_le_bytes(header[20..28].try_into().unwrap()),
+        });
+    }
+    (
+        Setup {
+            info,
+            huffman,
+            dc_scale,
+            ac_scale,
+            loop_filter_limits,
+            ranges,
+        },
+        packets,
+    )
+}
+
+fn initial_control(pp_level: i32) -> Control {
+    Control {
+        state: State {
+            pp_level,
+            frame_type: 255,
+            ..State::default()
+        },
+        stripe: [0; 8],
+    }
+}
+
+fn synchronous_stage(
+    ahead: &mut RunAhead<Decoder>,
+    packet: &Packet,
+    control: &mut Control,
+    counters: &mut run_ahead::Stats,
+) {
+    let stage = ahead.decoder(counters).stage(packet, control);
+    ahead.publish(stage);
+}
+
+fn compare_frame(
+    ahead: &RunAhead<Decoder>,
+    sync: &mut Decoder,
+    packet: &Packet,
+    state: &mut State,
+) {
+    let result = decode_packet(sync, packet, false, state);
+    let stage = ahead.committed();
+    assert_eq!(stage.result, result);
+    assert_eq!(stage.state, *state);
+    assert!(stage.frame.references_match(sync));
+    assert_eq!(
+        tight_planes(&stage.frame.output().unwrap()).unwrap(),
+        tight_planes(&sync.output().unwrap()).unwrap(),
+    );
+}
+
+// spec: CODEC-CALL-3, DEV-VIDEO-1
+#[test]
+fn generated_streams_commit_exact_stages_on_shared_workers() {
+    let (setup, packets) = generated_stream();
+    assert_eq!(packets.len(), 12);
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for pp_level in [0, 7] {
+            let (setup, packets, start) = (&setup, &packets, &start);
+            scope.spawn(move || {
+                let mut sync = Decoder::new(setup).unwrap();
+                let decoder = Decoder::with_run_ahead(setup).unwrap();
+                let initial = Stage {
+                    result: 0,
+                    state: State::default(),
+                    frame: decoder.snapshot(),
+                };
+                let mut ahead = RunAhead::new(decoder, initial);
+                let mut control = initial_control(pp_level);
+                let mut sync_state = control.state;
+                let mut counters = run_ahead::Stats::default();
+                start.wait();
+                synchronous_stage(&mut ahead, &packets[0], &mut control, &mut counters);
+                compare_frame(&ahead, &mut sync, &packets[0], &mut sync_state);
+                for batch in packets[1..].chunks(RUN_AHEAD_DEPTH) {
+                    ahead.predict(
+                        control.clone(),
+                        RUN_AHEAD_DEPTH,
+                        |_| batch.to_vec(),
+                        &mut counters,
+                    );
+                    for packet in batch {
+                        assert!(ahead.try_commit(packet, &control, &mut counters));
+                        compare_frame(&ahead, &mut sync, packet, &mut sync_state);
+                        control.state = ahead.committed().state;
+                    }
+                }
+                assert_eq!(counters.committed, 11);
+                assert_eq!(counters.predicted, counters.committed);
+                assert_eq!(counters.mismatched, 0);
+            });
+        }
+    });
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn substituted_packet_and_changed_controls_restore_committed_references() {
+    let (setup, packets) = generated_stream();
+    let mut sync = Decoder::new(&setup).unwrap();
+    let decoder = Decoder::with_run_ahead(&setup).unwrap();
+    let initial = Stage {
+        result: 0,
+        state: State::default(),
+        frame: decoder.snapshot(),
+    };
+    let mut ahead = RunAhead::new(decoder, initial);
+    let mut control = initial_control(7);
+    let mut sync_state = control.state;
+    let mut stats = run_ahead::Stats::default();
+    synchronous_stage(&mut ahead, &packets[0], &mut control, &mut stats);
+    compare_frame(&ahead, &mut sync, &packets[0], &mut sync_state);
+
+    ahead.predict(
+        control.clone(),
+        RUN_AHEAD_DEPTH,
+        |_| packets[1..3].to_vec(),
+        &mut stats,
+    );
+    let mut substitute = packets[1].clone();
+    substitute.bytes = packets[2].bytes.clone();
+    assert!(!ahead.try_commit(&substitute, &control, &mut stats));
+    synchronous_stage(&mut ahead, &substitute, &mut control, &mut stats);
+    compare_frame(&ahead, &mut sync, &substitute, &mut sync_state);
+    assert_eq!(stats.mismatched, 1);
+    assert_eq!(stats.discarded, 2);
+
+    ahead.predict(
+        control.clone(),
+        RUN_AHEAD_DEPTH,
+        |_| packets[2..4].to_vec(),
+        &mut stats,
+    );
+    control.state.pp_level = 0;
+    sync_state.pp_level = 0;
+    assert!(!ahead.try_commit(&packets[2], &control, &mut stats));
+    synchronous_stage(&mut ahead, &packets[2], &mut control, &mut stats);
+    compare_frame(&ahead, &mut sync, &packets[2], &mut sync_state);
+    assert_eq!(stats.mismatched, 2);
+    assert_eq!(stats.mismatched_controls, 1);
+    assert_eq!(stats.discarded, 4);
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn callable_control_and_clear_each_discard_pending_packets() {
+    let mut machine = fixture(Mode::Native, false);
+    let ctor = machine.resolve_import(MODULE, "create").unwrap();
+    let predict = machine.resolve_import(MODULE, "predict").unwrap();
+    let ctl = machine.resolve_import(MODULE, "ctl_0").unwrap();
+    let clear = machine.resolve_import(MODULE, "clear_0").unwrap();
+    let done = machine.resolve_import(MODULE, "done").unwrap();
+    let mut caller = Asm::new(CODE);
+    caller.call(ctor).call(predict);
+    caller
+        .push_imm(0)
+        .push_imm(0)
+        .push_imm(1)
+        .push_imm(CONTEXT)
+        .call(ctl)
+        .add_esp(16);
+    caller
+        .call(predict)
+        .mov_ecx_imm(CONTEXT)
+        .call(clear)
+        .call(done);
+    machine.cpu.write(CODE, &caller.bytes).unwrap();
+    machine
+        .spawn("Theora run-ahead lifetime fixture", CODE, &[], 0x10000)
+        .unwrap();
+    assert!(matches!(
+        machine.run_virtual(1_000_000),
+        RunResult::Exited(0)
+    ));
+    let provider = machine.ext.get::<Provider>();
+    assert!(provider.decoders.is_empty());
+    assert_eq!(provider.stats.run_ahead.predicted, 4);
+    assert_eq!(provider.stats.run_ahead.discarded, 4);
+    assert_eq!(provider.stats.run_ahead.committed, 0);
 }

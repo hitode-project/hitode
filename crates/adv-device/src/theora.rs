@@ -1,9 +1,11 @@
 //! Packet-level Theora decoding. The caller owns stream I/O and presentation time.
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub keyframe_num: i64,
     pub curframe_num: i64,
@@ -13,12 +15,20 @@ pub struct State {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct RawPlane {
     width: i32,
     height: i32,
     stride: i32,
     data: *const u8,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RawFrame {
+    refs: [i32; 3],
+    frame_type: i32,
+    planes: [RawPlane; 3],
 }
 
 /// Tightly packed rows in the decoder's internal plane orientation.
@@ -56,7 +66,7 @@ struct RawSetup {
 }
 
 unsafe extern "C" {
-    fn adv_theora_create(info: *const u8, setup: *const RawSetup) -> *mut c_void;
+    fn adv_theora_create(info: *const u8, setup: *const RawSetup, refs: i32) -> *mut c_void;
     fn adv_theora_info_size() -> usize;
     fn adv_theora_info(decoder: *mut c_void, info: *mut u8) -> u8;
     fn adv_theora_destroy(decoder: *mut c_void);
@@ -68,31 +78,91 @@ unsafe extern "C" {
         granulepos: i64,
         eos: i32,
         striped: i32,
+        reserved: u32,
         state: *mut State,
     ) -> i32;
     fn adv_theora_stripe(decoder: *mut c_void, range: *mut i32);
     fn adv_theora_planes(decoder: *mut c_void, planes: *mut RawPlane);
+    fn adv_theora_snapshot(decoder: *mut c_void, frame: *mut RawFrame, ready: i32);
+    fn adv_theora_restore(decoder: *mut c_void, frame: *const RawFrame);
+    fn adv_theora_verify_refs(
+        staged: *const c_void,
+        frame: *const RawFrame,
+        synchronous: *const c_void,
+    ) -> i32;
+}
+
+pub const RUN_AHEAD_DEPTH: usize = 2;
+const REFERENCE_SLOTS: usize = 3 + RUN_AHEAD_DEPTH;
+
+struct Native(NonNull<c_void>);
+
+// SAFETY: only the unique Decoder may call into the mutable context. Frames
+// keep the allocation alive and read only pixels in leased reference slots.
+unsafe impl Send for Native {}
+// SAFETY: sharing the allocation does not grant access to the mutable context.
+unsafe impl Sync for Native {}
+
+impl Drop for Native {
+    fn drop(&mut self) {
+        // SAFETY: the unique decoder and all leases have been released.
+        unsafe { adv_theora_destroy(self.0.as_ptr()) };
+    }
 }
 
 pub struct Decoder {
-    native: NonNull<c_void>,
+    native: Arc<Native>,
+    slots: Option<[Arc<()>; REFERENCE_SLOTS]>,
     planes: [Plane; 3],
     ready: bool,
     pending_rows: Option<(usize, usize)>,
 }
 
-// SAFETY: the decoder owns its allocations and is accessed through &mut self.
-unsafe impl Send for Decoder {}
+/// A completed decode's reference indices and output, pinned against reuse.
+pub struct Frame {
+    raw: RawFrame,
+    ready: bool,
+    native: Arc<Native>,
+    _slots: [Option<Arc<()>>; 3],
+}
 
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        // SAFETY: exactly the decoder returned by create, with no live C calls.
-        unsafe { adv_theora_destroy(self.native.as_ptr()) };
+// SAFETY: the leases pin the pixels and the allocation for the frame lifetime.
+unsafe impl Send for Frame {}
+
+impl Frame {
+    /// Compare logical reference roles, padded pixels and postprocessing history.
+    pub fn references_match(&self, synchronous: &Decoder) -> bool {
+        assert!(synchronous.pending_rows.is_none());
+        // SAFETY: the staged references are leased and the synchronous context
+        // is borrowed. The verifier only reads immutable descriptors and pixels.
+        unsafe {
+            adv_theora_verify_refs(
+                self.native.0.as_ptr(),
+                &self.raw,
+                synchronous.native.0.as_ptr(),
+            ) != 0
+        }
+    }
+
+    pub fn output(&self) -> Option<Output<'_>> {
+        self.ready.then_some(Output {
+            raw: self.raw.planes,
+            pending_rows: None,
+            lifetime: PhantomData,
+        })
     }
 }
 
 impl Decoder {
     pub fn new(setup: &Setup) -> Result<Self, &'static str> {
+        Self::create(setup, false)
+    }
+
+    pub fn with_run_ahead(setup: &Setup) -> Result<Self, &'static str> {
+        Self::create(setup, true)
+    }
+
+    fn create(setup: &Setup, run_ahead: bool) -> Result<Self, &'static str> {
         for (sizes, matrices) in &setup.ranges {
             if sizes.is_empty()
                 || sizes.len() > 63
@@ -123,19 +193,52 @@ impl Decoder {
         };
         // SAFETY: validated setup arrays remain borrowed until create returns;
         // libtheora copies all tables and retains no borrowed pointers.
-        let native = unsafe { adv_theora_create(setup.info.as_ptr(), &raw) };
+        let refs = if run_ahead { REFERENCE_SLOTS as i32 } else { 3 };
+        let native = unsafe { adv_theora_create(setup.info.as_ptr(), &raw, refs) };
         Ok(Self {
-            native: NonNull::new(native).ok_or("Theora initialization failed")?,
+            native: Arc::new(Native(
+                NonNull::new(native).ok_or("Theora initialization failed")?,
+            )),
+            slots: run_ahead.then(|| std::array::from_fn(|_| Arc::new(()))),
             planes: std::array::from_fn(|_| Plane::default()),
             ready: false,
             pending_rows: None,
         })
     }
 
+    pub fn snapshot(&self) -> Frame {
+        assert!(self.pending_rows.is_none());
+        let slots = self.slots.as_ref().expect("run-ahead decoder");
+        let mut raw = RawFrame::default();
+        // SAFETY: no mutable decode is active and the result contains descriptors only.
+        unsafe {
+            adv_theora_snapshot(self.native.0.as_ptr(), &mut raw, i32::from(self.ready));
+        }
+        let leases = raw.refs.map(|index| {
+            usize::try_from(index)
+                .ok()
+                .map(|index| Arc::clone(&slots[index]))
+        });
+        Frame {
+            raw,
+            ready: self.ready,
+            native: Arc::clone(&self.native),
+            _slots: leases,
+        }
+    }
+
+    pub fn restore(&mut self, frame: &Frame) {
+        assert!(Arc::ptr_eq(&self.native, &frame.native));
+        assert!(self.pending_rows.is_none());
+        // SAFETY: the frame pins all referenced slots of this context.
+        unsafe { adv_theora_restore(self.native.0.as_ptr(), &frame.raw) };
+        self.ready = frame.ready;
+    }
+
     pub fn initialized_info(&self) -> ([u8; 64], u8) {
         let mut info = [0; 64];
         // SAFETY: create verified the fixed-width info ABI; this is an owned copy.
-        let bias = unsafe { adv_theora_info(self.native.as_ptr(), info.as_mut_ptr()) };
+        let bias = unsafe { adv_theora_info(self.native.0.as_ptr(), info.as_mut_ptr()) };
         (info, bias)
     }
 
@@ -148,17 +251,23 @@ impl Decoder {
         striped: bool,
         state: &mut State,
     ) -> i32 {
+        let reserved = self.slots.as_ref().map_or(0, |slots| {
+            slots.iter().enumerate().fold(0, |mask, (index, slot)| {
+                mask | (u32::from(Arc::strong_count(slot) > 1) << index)
+            })
+        });
         // SAFETY: the decoder is exclusively borrowed; packet bytes and state
         // remain valid until the synchronous decode completes.
         let result = unsafe {
             adv_theora_decode(
-                self.native.as_ptr(),
+                self.native.0.as_ptr(),
                 packet.as_ptr(),
                 packet.len(),
                 packetno,
                 granulepos,
                 i32::from(eos),
                 i32::from(striped),
+                reserved,
                 state,
             )
         };
@@ -171,77 +280,40 @@ impl Decoder {
         let mut range = [0; 2];
         // SAFETY: the two output integers belong to this decoder's continuation.
         unsafe {
-            adv_theora_stripe(self.native.as_ptr(), range.as_mut_ptr());
+            adv_theora_stripe(self.native.0.as_ptr(), range.as_mut_ptr());
         }
         (range[0] as usize, range[1] as usize)
     }
 
-    fn raw_planes(&self) -> Option<[RawPlane; 3]> {
+    pub fn output(&self) -> Option<Output<'_>> {
         if !self.ready {
             return None;
         }
-        let mut raw = [RawPlane {
-            width: 0,
-            height: 0,
-            stride: 0,
-            data: std::ptr::null(),
-        }; 3];
+        let mut raw = [RawPlane::default(); 3];
         // SAFETY: the decoder writes exactly three descriptors.
         unsafe {
-            adv_theora_planes(self.native.as_ptr(), raw.as_mut_ptr());
+            adv_theora_planes(self.native.0.as_ptr(), raw.as_mut_ptr());
         }
-        Some(raw)
+        Some(Output {
+            raw,
+            pending_rows: self.pending_rows,
+            lifetime: PhantomData,
+        })
     }
 
     pub fn dimensions(&self) -> Option<[(usize, usize); 3]> {
-        Some(
-            self.raw_planes()?
-                .map(|p| (p.width as usize, p.height as usize)),
-        )
+        Some(self.output()?.dimensions())
     }
 
-    /// Copy valid decoded rows into padded output without an intermediate image.
-    /// The destination starts at the lowest address, for either stride sign.
     pub fn copy_plane(
         &self,
         plane: usize,
         destination: &mut [u8],
         stride: i32,
     ) -> Result<std::ops::Range<usize>, &'static str> {
-        let raw = self.raw_planes().ok_or("No decoded Theora frame")?;
-        let source = raw.get(plane).ok_or("Invalid Theora plane")?;
-        let (width, height) = (source.width as usize, source.height as usize);
-        let pitch = stride.unsigned_abs() as usize;
-        let size = pitch
-            .checked_mul(height - 1)
-            .and_then(|n| n.checked_add(width))
-            .ok_or("Plane size overflow")?;
-        if pitch < width || destination.len() < size {
-            return Err("Output plane is too small");
-        }
-        let (first, end) = self.pending_rows.map_or((0, height), |(first, end)| {
-            (
-                height - end * 8 * height / raw[0].height as usize,
-                height - first * 8 * height / raw[0].height as usize,
-            )
-        });
-        for row in first..end {
-            // SAFETY: only initialized rows reported by the decoder are read;
-            // the exclusive decoder lifetime keeps all source storage alive.
-            let input = unsafe {
-                std::slice::from_raw_parts(
-                    source.data.offset(row as isize * source.stride as isize),
-                    width,
-                )
-            };
-            let offset = if stride < 0 { height - 1 - row } else { row } * pitch;
-            destination[offset..offset + width].copy_from_slice(input);
-        }
-        Ok(if stride < 0 {
-            height - end..height - first
-        } else {
-            first..end
-        })
+        self.output()
+            .ok_or("No decoded Theora frame")?
+            .copy_plane(plane, destination, stride)
     }
 
     /// Owned tight planes for differential verification.
@@ -258,6 +330,62 @@ impl Decoder {
             };
         }
         Some(&self.planes)
+    }
+}
+
+/// Read-only planes borrowed from a decoder or a staged frame.
+pub struct Output<'a> {
+    raw: [RawPlane; 3],
+    pending_rows: Option<(usize, usize)>,
+    lifetime: PhantomData<&'a ()>,
+}
+
+impl Output<'_> {
+    pub fn dimensions(&self) -> [(usize, usize); 3] {
+        self.raw.map(|p| (p.width as usize, p.height as usize))
+    }
+
+    /// Copy valid decoded rows into padded output without an intermediate image.
+    /// The destination starts at the lowest address, for either stride sign.
+    pub fn copy_plane(
+        &self,
+        plane: usize,
+        destination: &mut [u8],
+        stride: i32,
+    ) -> Result<std::ops::Range<usize>, &'static str> {
+        let source = self.raw.get(plane).ok_or("Invalid Theora plane")?;
+        let (width, height) = (source.width as usize, source.height as usize);
+        let pitch = stride.unsigned_abs() as usize;
+        let size = pitch
+            .checked_mul(height - 1)
+            .and_then(|n| n.checked_add(width))
+            .ok_or("Plane size overflow")?;
+        if pitch < width || destination.len() < size {
+            return Err("Output plane is too small");
+        }
+        let (first, end) = self.pending_rows.map_or((0, height), |(first, end)| {
+            (
+                height - end * 8 * height / self.raw[0].height as usize,
+                height - first * 8 * height / self.raw[0].height as usize,
+            )
+        });
+        for row in first..end {
+            // SAFETY: only initialized rows reported by the decoder are read;
+            // the output borrow prevents reuse of the underlying frame.
+            let input = unsafe {
+                std::slice::from_raw_parts(
+                    source.data.offset(row as isize * source.stride as isize),
+                    width,
+                )
+            };
+            let offset = if stride < 0 { height - 1 - row } else { row } * pitch;
+            destination[offset..offset + width].copy_from_slice(input);
+        }
+        Ok(if stride < 0 {
+            height - end..height - first
+        } else {
+            first..end
+        })
     }
 }
 
@@ -820,156 +948,6 @@ mod neon_tests {
                     assert_eq!(actual, expected, "reconstruction mode={mode}");
                 }
             }
-        }
-    }
-}
-
-mod parallel {
-    use std::{
-        ffi::c_void,
-        sync::{Arc, Mutex, OnceLock, mpsc},
-        thread,
-    };
-
-    type Run = unsafe extern "C" fn(*mut c_void, i32);
-
-    struct Job {
-        context: usize,
-        index: i32,
-        run: Run,
-        done: mpsc::Sender<()>,
-    }
-
-    struct Pool {
-        send: mpsc::Sender<Job>,
-        slots: i32,
-        caller: Mutex<()>,
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn performance_cores() -> Option<usize> {
-        unsafe extern "C" {
-            fn sysctlbyname(
-                name: *const std::ffi::c_char,
-                old: *mut c_void,
-                old_len: *mut usize,
-                new: *mut c_void,
-                new_len: usize,
-            ) -> i32;
-        }
-        let mut count = 0i32;
-        let mut size = std::mem::size_of_val(&count);
-        // SAFETY: the output points to a writable int and the name is terminated.
-        let result = unsafe {
-            sysctlbyname(
-                c"hw.perflevel0.physicalcpu".as_ptr(),
-                (&mut count as *mut i32).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (result == 0 && count > 0).then_some(count as usize)
-    }
-
-    #[cfg(target_os = "android")]
-    fn performance_cores() -> Option<usize> {
-        let frequencies: Vec<u64> = std::fs::read_dir("/sys/devices/system/cpu")
-            .ok()?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name();
-                name.to_str()?.strip_prefix("cpu")?.parse::<u32>().ok()?;
-                let path = entry.path().join("cpufreq/cpuinfo_max_freq");
-                std::fs::read_to_string(path).ok()?.trim().parse().ok()
-            })
-            .collect();
-        let fastest = frequencies.iter().max()?;
-        Some(frequencies.iter().filter(|&freq| freq == fastest).count())
-    }
-
-    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
-    fn performance_cores() -> Option<usize> {
-        None
-    }
-
-    impl Pool {
-        fn new() -> Option<Self> {
-            let cores = performance_cores()
-                .or_else(|| thread::available_parallelism().ok().map(usize::from))
-                .unwrap_or(1);
-            let workers = cores.saturating_sub(1).max(2);
-            let (send, recv) = mpsc::channel::<Job>();
-            let recv = Arc::new(Mutex::new(recv));
-            for worker in 0..workers {
-                let recv = Arc::clone(&recv);
-                thread::Builder::new()
-                    .name(format!("adv-theora-{worker}"))
-                    .spawn(move || {
-                        #[cfg(target_vendor = "apple")]
-                        unsafe {
-                            unsafe extern "C" {
-                                fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
-                            }
-                            // These jobs are on the visible frame's critical path.
-                            pthread_set_qos_class_self_np(0x21, 0);
-                        }
-                        loop {
-                            let job = recv.lock().expect("Theora queue lock").recv();
-                            let Ok(job) = job else {
-                                break;
-                            };
-                            // SAFETY: dispatch joins each task before its context
-                            // expires. Each task owns disjoint storage for its phase.
-                            unsafe { (job.run)(job.context as *mut c_void, job.index) };
-                            let _ = job.done.send(());
-                        }
-                    })
-                    .ok()?;
-            }
-            Some(Self {
-                send,
-                slots: workers as i32 + 1,
-                caller: Mutex::new(()),
-            })
-        }
-    }
-
-    fn pool() -> Option<&'static Pool> {
-        static POOL: OnceLock<Option<Pool>> = OnceLock::new();
-        POOL.get_or_init(Pool::new).as_ref()
-    }
-
-    #[unsafe(no_mangle)]
-    extern "C" fn adv_theora_slots() -> i32 {
-        pool().map_or(1, |pool| pool.slots)
-    }
-
-    #[unsafe(no_mangle)]
-    unsafe extern "C" fn adv_theora_dispatch(context: *mut c_void, count: i32, run: Run) {
-        let pool = pool().expect("Theora pool was initialized before banding");
-        // Concurrent decoders share the queue and one caller slot. A caller
-        // without the slot can still submit work without waiting for the lock.
-        let caller = pool.caller.try_lock().ok();
-        let first = i32::from(caller.is_some());
-        let (done, completion) = mpsc::channel();
-        for index in first..count {
-            pool.send
-                .send(Job {
-                    context: context as usize,
-                    index,
-                    run,
-                    done: done.clone(),
-                })
-                .expect("live Theora workers");
-        }
-        if caller.is_some() {
-            // SAFETY: the first band or plane was reserved for this caller.
-            unsafe { run(context, 0) };
-        }
-        drop(caller);
-        for _ in first..count {
-            completion.recv().expect("Theora task completed");
         }
     }
 }

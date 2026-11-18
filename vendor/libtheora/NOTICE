@@ -15,3 +15,5 @@ then filters and post-processes independent planes. Striped decoding retains
 the original pipeline and filter delays.
 Residual decoding builds a flattened Huffman lookup from the imported setup
 and refills a 64-bit reservoir with the reference reader's cursor and EOF rules.
+Run-ahead reserves reference slots while staged frames are live. Each slot
+keeps its postprocessed output and DC quantizer history with its pixels.

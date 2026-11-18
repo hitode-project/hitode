@@ -1,8 +1,12 @@
 //! Whole-packet execution for the reviewed static Theora decoder ABI.
-use super::{Entry, Mode};
+use super::{
+    Entry, Mode,
+    ogg::{self, Packet, Source},
+    run_ahead::{self, RunAhead, Staging},
+};
 use adv_abi::{code_signature::ExecutableRange, library_signature::Family};
 use adv_cpu::backend::{Guest, GuestExt, Reg};
-use adv_device::theora::{Decoder, Setup, State};
+use adv_device::theora::{Decoder, Frame, Output, RUN_AHEAD_DEPTH, Setup, State};
 use adv_machine::{Conv, Env, Ext, HostFn, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -19,6 +23,7 @@ pub struct Stats {
     pub different_bytes: u64,
     pub state_mismatches: u64,
     pub decode_ns: u64,
+    pub run_ahead: run_ahead::Stats,
     pub reason: Option<String>,
 }
 #[derive(Clone, Copy)]
@@ -94,13 +99,67 @@ struct Binding {
     init: Entry,
     packet: Entry,
     clear: Entry,
+    ctl: Option<Entry>,
     snapshots: Vec<(u32, Vec<u8>)>,
 }
 struct Instance {
     binding: usize,
-    decoder: Decoder,
+    decoder: RunAhead<Decoder>,
+    verify: Option<Decoder>,
+    source: Option<Source>,
+    next_packetno: Option<i64>,
     uploads: [Vec<u8>; 3],
     published: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Control {
+    state: State,
+    stripe: [u8; 8],
+}
+
+pub(super) struct Stage {
+    result: i32,
+    state: State,
+    frame: Frame,
+}
+
+impl Staging for Decoder {
+    type Input = Packet;
+    type Control = Control;
+    type Stage = Stage;
+
+    fn stage(&mut self, input: &Packet, control: &mut Control) -> Stage {
+        let result = decode_packet(self, input, false, &mut control.state);
+        Stage {
+            result,
+            state: control.state,
+            frame: self.snapshot(),
+        }
+    }
+
+    fn restore(&mut self, committed: &Stage) {
+        self.restore(&committed.frame);
+    }
+}
+
+impl Instance {
+    fn new(binding: usize, decoder: Decoder, verify: Option<Decoder>) -> Self {
+        let initial = Stage {
+            result: 0,
+            state: State::default(),
+            frame: decoder.snapshot(),
+        };
+        Self {
+            binding,
+            decoder: RunAhead::new(decoder, initial),
+            verify,
+            source: None,
+            next_packetno: None,
+            uploads: std::array::from_fn(|_| Vec::new()),
+            published: false,
+        }
+    }
 }
 struct Provider {
     mode: Mode,
@@ -132,6 +191,7 @@ pub(super) fn host_fn(module: &str, name: &str) -> Option<HostFn> {
         "init" => (init as adv_machine::Handler, 1),
         "packet" => (packet as adv_machine::Handler, 1),
         "clear" => (clear as adv_machine::Handler, 0),
+        "ctl" => (ctl as adv_machine::Handler, 4),
         _ => return None,
     };
     Some(HostFn {
@@ -155,7 +215,10 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
     let layout = Layout::from_fields(&library.layout)?;
     let index = e.ext.get::<Provider>().bindings.len();
     let mut hooks = Vec::new();
-    for name in ["init", "packet", "clear"] {
+    for name in ["init", "packet", "clear"]
+        .into_iter()
+        .chain(library.hooks.contains_key("ctl").then_some("ctl"))
+    {
         let &(address, prefix) = &library.hooks[name];
         let bytes = &library
             .snapshots
@@ -173,7 +236,7 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
             bytes,
         )?);
     }
-    // Publish all three redirects together, after every trampoline exists.
+    // Publish the redirects together, after every trampoline exists.
     for hook in &hooks {
         let bytes = &library
             .snapshots
@@ -192,6 +255,7 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
         init: hooks.next().unwrap(),
         packet: hooks.next().unwrap(),
         clear: hooks.next().unwrap(),
+        ctl: hooks.next(),
         snapshots: library.snapshots,
     });
     provider.stats.installed += 1;
@@ -207,9 +271,23 @@ pub(super) fn forget(ext: &mut Ext, base: u32, size: u32) {
             binding.live = false;
         }
     }
-    provider
-        .decoders
-        .retain(|_, instance| provider.bindings[instance.binding].live);
+    provider.decoders.retain(|_, instance| {
+        let live = provider.bindings[instance.binding].live;
+        if !live {
+            instance.decoder.invalidate(&mut provider.stats.run_ahead);
+        }
+        live
+    });
+}
+
+pub(super) fn invalidate_sources(ext: &mut Ext, invalid: impl Fn(Source) -> bool) {
+    let provider = ext.get_mut::<Provider>();
+    for instance in provider.decoders.values_mut() {
+        if instance.source.is_some_and(&invalid) {
+            instance.decoder.invalidate(&mut provider.stats.run_ahead);
+            instance.source = None;
+        }
+    }
 }
 
 fn original(e: &mut Env<'_>, target: u32) -> Outcome {
@@ -231,8 +309,29 @@ fn clear(e: &mut Env<'_>) -> Outcome {
     }
     let address = e.cpu.reg(Reg::Ecx);
     let provider = e.ext.get_mut::<Provider>();
-    provider.decoders.remove(&address);
+    remove_decoder(provider, address);
     original(e, e.ext.get::<Provider>().bindings[index].clear.original)
+}
+
+fn remove_decoder(provider: &mut Provider, address: u32) {
+    if let Some(mut instance) = provider.decoders.remove(&address) {
+        instance.decoder.invalidate(&mut provider.stats.run_ahead);
+    }
+}
+
+fn ctl(e: &mut Env<'_>) -> Outcome {
+    let index = index(e);
+    let address = e.arg(0);
+    let provider = e.ext.get_mut::<Provider>();
+    let binding = &provider.bindings[index];
+    if !binding.live {
+        return Outcome::Fail("Theora binding image was retired".into());
+    }
+    let target = binding.ctl.as_ref().unwrap().original;
+    if let Some(instance) = provider.decoders.get_mut(&address) {
+        instance.decoder.invalidate(&mut provider.stats.run_ahead);
+    }
+    original(e, target)
 }
 fn read(cpu: &dyn Guest, address: u32, len: usize) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0; len];
@@ -241,9 +340,6 @@ fn read(cpu: &dyn Guest, address: u32, len: usize) -> Result<Vec<u8>, String> {
 }
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-fn wide(bytes: &[u8], at: usize) -> i64 {
-    i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 fn setup(cpu: &dyn Guest, info: u32, address: u32, info_bytes: u32) -> Result<Setup, String> {
     let raw = read(cpu, address, 712)?;
@@ -339,18 +435,25 @@ fn init(e: &mut Env<'_>) -> Outcome {
         return Outcome::Fail("unreadable Theora initialization".into());
     };
     let provider = e.ext.get_mut::<Provider>();
-    provider.decoders.remove(&address);
+    remove_decoder(provider, address);
     let target = provider.bindings[index].init.original;
+    let mode = provider.mode;
     let native = setup(
         e.cpu,
         info,
         tables,
         provider.bindings[index].layout.info_bytes,
     )
-    .and_then(|s| Decoder::new(&s).map_err(str::to_owned));
-    if e.ext.get::<Provider>().mode == Mode::Native {
+    .and_then(|setup| {
+        let decoder = Decoder::with_run_ahead(&setup)?;
+        let verify = (mode == Mode::Verify)
+            .then(|| Decoder::new(&setup))
+            .transpose()?;
+        Ok((decoder, verify))
+    });
+    if mode == Mode::Native {
         return match native {
-            Ok(native) => native_init(e, index, address, native),
+            Ok((native, _)) => native_init(e, index, address, native),
             Err(reason) => {
                 e.ext.get_mut::<Provider>().stats.reason = Some(reason);
                 original(e, target)
@@ -361,16 +464,10 @@ fn init(e: &mut Env<'_>) -> Outcome {
         if result.value() == 0 {
             let provider = e.ext.get_mut::<Provider>();
             match native {
-                Ok(native) => {
-                    provider.decoders.insert(
-                        address,
-                        Instance {
-                            binding: index,
-                            decoder: native,
-                            uploads: std::array::from_fn(|_| Vec::new()),
-                            published: false,
-                        },
-                    );
+                Ok((native, verify)) => {
+                    provider
+                        .decoders
+                        .insert(address, Instance::new(index, native, verify));
                     provider.stats.initialized += 1;
                 }
                 Err(reason) => provider.stats.reason = Some(reason),
@@ -446,15 +543,9 @@ fn native_init(e: &mut Env<'_>, index: usize, address: u32, native: Decoder) -> 
             return Outcome::Fail(error.to_string());
         }
         let provider = e.ext.get_mut::<Provider>();
-        provider.decoders.insert(
-            address,
-            Instance {
-                binding: index,
-                decoder: native,
-                uploads: std::array::from_fn(|_| Vec::new()),
-                published: false,
-            },
-        );
+        provider
+            .decoders
+            .insert(address, Instance::new(index, native, None));
         provider.stats.initialized += 1;
         Outcome::Return(0)
     })
@@ -489,6 +580,10 @@ fn packet(e: &mut Env<'_>) -> Outcome {
     let op = e.cpu.reg(Reg::Edx);
     let target = e.ext.get::<Provider>().bindings[index].packet.original;
     if op == 0 {
+        let provider = e.ext.get_mut::<Provider>();
+        if let Some(instance) = provider.decoders.get_mut(&address) {
+            instance.decoder.invalidate(&mut provider.stats.run_ahead);
+        }
         return Outcome::Return((-1i32) as u32);
     }
     if !e.ext.get::<Provider>().decoders.contains_key(&address) {
@@ -499,13 +594,93 @@ fn packet(e: &mut Env<'_>) -> Outcome {
         Err(error) => Outcome::Fail(format!("Theora: {error}")),
     }
 }
+fn decode_packet(decoder: &mut Decoder, packet: &Packet, striped: bool, state: &mut State) -> i32 {
+    decoder.decode(
+        &packet.bytes,
+        packet.packetno,
+        packet.granulepos,
+        packet.eos != 0,
+        striped,
+        state,
+    )
+}
+
+pub(super) fn waiting_for_page(ext: &Ext, source: Source) -> Vec<u32> {
+    ext.get::<Provider>()
+        .decoders
+        .iter()
+        .filter_map(|(&address, instance)| {
+            (instance.source == Some(source) && !instance.decoder.has_predictions())
+                .then_some(address)
+        })
+        .collect()
+}
+
+pub(super) fn page_buffered(e: &mut Env<'_>, address: u32, source: Source) {
+    if e.ext
+        .get::<Provider>()
+        .decoders
+        .get(&address)
+        .is_some_and(|instance| instance.source == Some(source))
+    {
+        predict(e, address, false);
+    }
+}
+
+fn packet_finished(e: &mut Env<'_>, address: u32, packetno: i64) {
+    e.ext
+        .get_mut::<Provider>()
+        .decoders
+        .get_mut(&address)
+        .unwrap()
+        .next_packetno = Some(packetno.wrapping_add(1));
+    predict(e, address, true);
+}
+
+fn predict(e: &mut Env<'_>, address: u32, count_miss: bool) {
+    let provider = e.ext.get::<Provider>();
+    let instance = &provider.decoders[&address];
+    if instance.decoder.has_predictions() {
+        return;
+    }
+    let layout = provider.bindings[instance.binding].layout;
+    let control = state(e.cpu, address, layout).and_then(|state| {
+        let stripe = read(e.cpu, address + layout.stripe, 8)?.try_into().unwrap();
+        Ok(Control { state, stripe })
+    });
+    let callback = control
+        .as_ref()
+        .is_ok_and(|control| word(&control.stripe, 4) != 0);
+    let packets = instance
+        .source
+        .zip(instance.next_packetno)
+        .filter(|_| !callback && control.is_ok())
+        .map_or_else(Vec::new, |(source, next)| {
+            ogg::predict(e.cpu, e.ext, source, next, RUN_AHEAD_DEPTH)
+        });
+    let provider = e.ext.get_mut::<Provider>();
+    let stats = &mut provider.stats.run_ahead;
+    let predicted = control.is_ok_and(|control| {
+        provider
+            .decoders
+            .get_mut(&address)
+            .unwrap()
+            .decoder
+            .predict(control, RUN_AHEAD_DEPTH, |_| packets, stats)
+    });
+    if count_miss && !predicted {
+        stats.no_prediction += 1;
+        stats.no_prediction_callback += u64::from(callback);
+    }
+}
+
 fn decode(
     e: &mut Env<'_>,
     index: usize,
     address: u32,
     op: u32,
     target: u32,
-    saved: Option<(Vec<u8>, Vec<u8>, u32)>,
+    saved: Option<(Packet, u32)>,
 ) -> Result<Outcome, String> {
     e.cpu.quiesce_memory();
     let binding = &e.ext.get::<Provider>().bindings[index];
@@ -518,65 +693,110 @@ fn decode(
     }) {
         return Err("admitted library changed during decoding".into());
     }
-    let (packet, input, granpos_out) = if let Some(saved) = saved {
+    let layout = binding.layout;
+    let observation = saved.is_none().then(|| ogg::take(e.ext, op)).flatten();
+    let (packet, granpos_out) = if let Some(saved) = saved {
         saved
     } else {
-        let packet = read(e.cpu, op, 32)?;
-        let length = word(&packet, 4) as i32;
-        if length < 0 {
-            return Err("negative packet length".into());
-        }
-        let input = read(e.cpu, word(&packet, 0), length as usize)?;
-        let granpos_out = e.cpu.arg(0).map_err(|e| e.to_string())?;
-        (packet, input, granpos_out)
+        (
+            Packet::read(e.cpu, op)?,
+            e.cpu.arg(0).map_err(|e| e.to_string())?,
+        )
     };
-    let layout = binding.layout;
     let mut state = state(e.cpu, address, layout)?;
-    let stripe = read(e.cpu, address + layout.stripe, 8)?;
+    let stripe = read(e.cpu, address + layout.stripe, 8)?.try_into().unwrap();
+    let control = Control { state, stripe };
+    let callback = word(&stripe, 4) != 0;
     let started = Instant::now();
     let provider = e.ext.get_mut::<Provider>();
     let instance = provider.decoders.get_mut(&address).unwrap();
-    let decoder = &mut instance.decoder;
-    // Stripe decoding stays on the execution owner; whole-frame device
-    // dispatch waits for plane workers. Only guest callbacks yield here.
-    let result = loop {
-        let result = decoder.decode(
-            &input,
-            wide(&packet, 24),
-            wide(&packet, 16),
-            word(&packet, 12) != 0,
-            true,
+    let mode = provider.mode;
+    let stats = &mut provider.stats;
+    if let Some((source, advanced)) = observation {
+        let source = advanced.then_some(source);
+        if instance.source.is_some() && instance.source != source {
+            instance.decoder.invalidate(&mut stats.run_ahead);
+        }
+        instance.source = source;
+    }
+    let hit = instance
+        .decoder
+        .try_commit(&packet, &control, &mut stats.run_ahead);
+    let (result, rows) = if hit {
+        let committed = instance.decoder.committed();
+        state = committed.state;
+        (committed.result, None)
+    } else {
+        let decoder = instance.decoder.decoder(&mut stats.run_ahead);
+        let result = decode_packet(
+            decoder,
+            &packet,
+            mode == Mode::Native && callback,
             &mut state,
         );
-        if result != 2 || (provider.mode == Mode::Native && word(&stripe, 4) != 0) {
-            break result;
+        if result == 2 {
+            (result, Some(decoder.stripe()))
+        } else {
+            let frame = decoder.snapshot();
+            instance.decoder.publish(Stage {
+                result,
+                state,
+                frame,
+            });
+            (result, None)
         }
     };
-    provider.stats.decode_ns += started.elapsed().as_nanos() as u64;
-    provider.stats.frames += u64::from(result != 2);
-    let mode = provider.mode;
-    // Take owned output for the guest continuation. The native decoder retains
-    // its reference frames across calls, independently of guest allocations.
-    let rows = (result == 2).then(|| decoder.stripe());
-    let planes = if result >= 0 && mode == Mode::Verify {
-        decoder.planes().map(|p| {
-            p.iter()
-                .map(|p| (p.width, p.height, p.data.clone()))
-                .collect::<Vec<_>>()
-        })
-    } else {
-        None
-    };
+    stats.decode_ns += started.elapsed().as_nanos() as u64;
+    stats.frames += u64::from(result != 2);
     if mode == Mode::Verify {
+        let frame = &instance.decoder.committed().frame;
+        let planes = if result >= 0 {
+            frame.output().as_ref().map(tight_planes).transpose()?
+        } else {
+            None
+        };
+        if let Some(sync) = &mut instance.verify {
+            let mut sync_state = control.state;
+            let sync_result = decode_packet(sync, &packet, false, &mut sync_state);
+            if hit {
+                stats.state_mismatches += u64::from(
+                    sync_result != result || sync_state != state || !frame.references_match(sync),
+                );
+                if result >= 0 {
+                    match (planes.as_ref(), sync.planes()) {
+                        (Some(planes), Some(expected)) => {
+                            for ((width, height, bytes), expected) in planes.iter().zip(expected) {
+                                stats.state_mismatches += u64::from(
+                                    (*width, *height) != (expected.width, expected.height),
+                                );
+                                compare_bytes(stats, bytes, &expected.data);
+                            }
+                        }
+                        (None, None) => {}
+                        _ => stats.state_mismatches += 1,
+                    }
+                }
+            }
+        }
         return Ok(Outcome::call(
             target,
             vec![granpos_out],
             move |e, resume| {
                 let comparison = (|| -> Result<(), String> {
                     let actual = state_read(e.cpu, address, layout)?;
+                    let actual_granpos = if result >= 0 && granpos_out != 0 {
+                        let mut bytes = [0; 8];
+                        e.cpu
+                            .read(granpos_out, &mut bytes)
+                            .map_err(|err| err.to_string())?;
+                        i64::from_le_bytes(bytes)
+                    } else {
+                        state.granpos
+                    };
                     let provider = e.ext.get_mut::<Provider>();
                     provider.stats.state_mismatches += u64::from(
                         resume.value() != result as u32
+                            || actual_granpos != state.granpos
                             || actual
                                 != (
                                     state.keyframe_num,
@@ -602,29 +822,31 @@ fn decode(
                                     width,
                                 )?;
                                 let s = &mut e.ext.get_mut::<Provider>().stats;
-                                s.compared_bytes += width as u64;
-                                s.different_bytes += actual
-                                    .iter()
-                                    .zip(&bytes[y * width..(y + 1) * width])
-                                    .filter(|(a, b)| a != b)
-                                    .count()
-                                    as u64;
+                                compare_bytes(s, &actual, &bytes[y * width..(y + 1) * width]);
                             }
                         }
                     }
                     Ok(())
                 })();
                 if let Err(error) = comparison {
-                    e.ext.get_mut::<Provider>().stats.reason = Some(error);
+                    let stats = &mut e.ext.get_mut::<Provider>().stats;
+                    stats.state_mismatches += 1;
+                    stats.reason = Some(error);
                 }
+                packet_finished(e, address, packet.packetno);
                 Outcome::Return(resume.value())
             },
         ));
     }
     if result >= 0 && (result != 1 || !instance.published) {
         let descriptors = read(e.cpu, address + layout.ref_planes, 48)?;
-        let dimensions = decoder.dimensions().ok_or("native frame unavailable")?;
-        for (i, (width, height)) in dimensions.into_iter().enumerate() {
+        let output = if rows.is_some() {
+            instance.decoder.decoder(&mut stats.run_ahead).output()
+        } else {
+            instance.decoder.committed().frame.output()
+        };
+        let planes = output.ok_or("native frame unavailable")?;
+        for (i, (width, height)) in planes.dimensions().into_iter().enumerate() {
             let stride = word(&descriptors, i * 16 + 8) as i32;
             let pointer = word(&descriptors, i * 16 + 12);
             if word(&descriptors, i * 16) as usize != width
@@ -658,7 +880,7 @@ fn decode(
             }
             let output = &mut instance.uploads[i];
             output.resize(size, 0);
-            let valid = decoder
+            let valid = planes
                 .copy_plane(i, output, stride)
                 .map_err(str::to_owned)?;
             if !valid.is_empty() {
@@ -713,22 +935,35 @@ fn decode(
             word(&stripe, 4),
             vec![word(&stripe, 0), scratch, first as u32, end as u32],
             scratch,
-            move |e, _| match decode(
-                e,
-                index,
-                address,
-                op,
-                target,
-                Some((packet, input, granpos_out)),
-            ) {
+            move |e, _| match decode(e, index, address, op, target, Some((packet, granpos_out))) {
                 Ok(outcome) => outcome,
                 Err(error) => Outcome::Fail(format!("Theora continuation: {error}")),
             },
         ));
     }
     e.ext.get_mut::<Provider>().stats.native_frames += 1;
+    packet_finished(e, address, packet.packetno);
     Ok(Outcome::Return(result as u32))
 }
+
+type TightPlanes = [(usize, usize, Vec<u8>); 3];
+
+fn tight_planes(output: &Output<'_>) -> Result<TightPlanes, String> {
+    let mut planes = output.dimensions().map(|(w, h)| (w, h, vec![0; w * h]));
+    for (i, (width, _, bytes)) in planes.iter_mut().enumerate() {
+        output
+            .copy_plane(i, bytes, *width as i32)
+            .map_err(str::to_owned)?;
+    }
+    Ok(planes)
+}
+
+fn compare_bytes(stats: &mut Stats, actual: &[u8], expected: &[u8]) {
+    stats.compared_bytes += expected.len() as u64;
+    stats.different_bytes += actual.len().abs_diff(expected.len()) as u64
+        + actual.iter().zip(expected).filter(|(a, b)| a != b).count() as u64;
+}
+
 fn state_read(
     cpu: &dyn Guest,
     address: u32,
