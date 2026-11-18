@@ -1795,6 +1795,676 @@ pub(in crate::translate) mod opt_back {
     use super::*;
     use crate::encode::bl;
 
+    mod resident {
+        use super::*;
+        use crate::translate::opt::front::Assumed;
+        use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
+
+        const ALIAS: u64 = 8 << 32;
+        const SHADOW_TOP: u64 = 0x5_5000_1230;
+        const CLASSES: u64 = CONTEXT + 0x2000;
+        const RAW: u64 = CLASSES + 0x100;
+        const LINES: u64 = CLASSES + 0x200;
+        const PLAIN: u64 = CLASSES + 0x600;
+        const HELPER_VALUE: u32 = 0x2700;
+        const HELPER_KIND: u32 = 0x2704;
+        const SLOT: u64 = CONTEXT + 0x2800;
+
+        fn start(sources: &[Source]) -> (Func, Block, Vec<Value>) {
+            let mut f = Func {
+                kept: (1 << 24) - 1,
+                entry: sources.iter().copied().chain([Source::Eflags]).collect(),
+                ..Func::default()
+            };
+            let b = f.block(Some(Head {
+                record: RecordId(0),
+            }));
+            let params = sources.iter().map(|s| f.param(b, s.ty())).collect();
+            let flags = f.param(b, Type::Flags);
+            f.record(Record {
+                eip: CODE,
+                refund: 0,
+                regs: [None; 8],
+                eflags: Some(Location::At(flags)),
+                x87: None,
+                xmm: [None; 8],
+                mmx: [None; 8],
+                mmx_meta: None,
+                frame: vec![],
+            });
+            (f, b, params)
+        }
+
+        fn state_at(f: &Func, eip: u32, result: Value) -> IrRecord {
+            let mut state = f.records[0].clone();
+            state.eip = eip;
+            state.regs[0] = Some(Location::At(result));
+            state
+        }
+
+        fn assumptions(cpu: &CpuState) -> Assumed {
+            Assumed {
+                control: cpu.x87.control,
+                status: cpu.x87.status,
+                mxcsr: cpu.mxcsr,
+                top: 0,
+                tags: cpu.x87.tag,
+                esp_low: None,
+                ebp: None,
+                denormal: false,
+                x87: false,
+                mmx: false,
+                mxcsr_mask: 0,
+            }
+        }
+
+        fn lower(f: &Func, cpu: &CpuState) -> back::Lowered {
+            back::lower_resident(f, &assumptions(cpu), &f.entry)
+        }
+
+        fn word(h: &Harness, address: u64) -> u32 {
+            u32::from_le_bytes(h.emu.read(address, 4).try_into().unwrap())
+        }
+
+        fn run(
+            h: &mut Harness,
+            form: &back::Lowered,
+            cpu: &CpuState,
+            countdown: u64,
+            fault: Option<u32>,
+        ) -> Exit {
+            let mut code = h.prefix.clone();
+            // Stand in for the C owner, including its caller-saved clobbers.
+            let helper = code.len() * 4;
+            let shared_read = helper + 12;
+            code.extend([
+                str(W, X4, X0, HELPER_KIND),
+                tbz(
+                    false,
+                    X4,
+                    runtime::ACCESS_STORE.trailing_zeros(),
+                    (shared_read - helper - 4) as i32,
+                ),
+                str(W, X3, X0, HELPER_VALUE),
+                ldr(W, X0, X0, HELPER_VALUE),
+            ]);
+            for n in 6..16 {
+                code.push(movz(W, Reg::new(n), 0xffff, 0));
+            }
+            code.extend([
+                fmov_to_v(X, VReg::new(0), Reg::ZR),
+                fmov_to_v(X, VReg::new(31), Reg::ZR),
+                vins(3, VReg::new(8), 1, VReg::new(31), 0),
+                cmp(W, X0, Reg::ZR, Lsl, 0),
+                ret(Reg::LR),
+            ]);
+            let access = code.len() * 4;
+            code.extend(back::access_stub(HOST_CODE + helper as u64));
+            let mut leave = |exit: Exit| {
+                let at = code.len() * 4;
+                code.extend([
+                    movz(W, X1, cpu.eip as u16, 0),
+                    movk(W, X1, (cpu.eip >> 16) as u16, 16),
+                    movz(W, X0, exit as u16, 0),
+                    b(h.stubs.exit as i32 - at as i32 - 12),
+                ]);
+                at
+            };
+            let miss = leave(Exit::Recall);
+            let env_miss = leave(Exit::Interpret);
+            let at = code.len() * 4;
+            let mut words = form.words.clone();
+            let branch = |from: usize, to: usize| b(to as i32 - (at + from * 4) as i32);
+            words[form.exit] = branch(form.exit, h.stubs.opt_exit);
+            words[form.miss] = branch(form.miss, miss);
+            words[form.cold] = branch(form.cold, h.forbidden);
+            words[form.env_miss] = branch(form.env_miss, env_miss);
+            words[form.probation_slot] = SLOT as u32;
+            words[form.probation_slot + 1] = (SLOT >> 32) as u32;
+            for &(offset, _) in &form.links {
+                words[offset / 4 + 3] = branch(offset / 4 + 3, h.dispatch);
+            }
+            code.extend(words);
+            let mut runtime = vec![0; size_of::<runtime::Runtime>()];
+            for (offset, value) in [
+                (offset_of!(runtime::Runtime, cpu), CPU),
+                (offset_of!(runtime::Runtime, window), WINDOW_BASE),
+                (offset_of!(runtime::Runtime, shadow), SHADOW_TOP),
+                (offset_of!(runtime::Runtime, alias), ALIAS),
+                (offset_of!(runtime::Runtime, countdown), countdown),
+                (offset_of!(runtime::Runtime, recall), CONTEXT),
+                (offset_of!(runtime::Runtime, computation_pending), CONTEXT),
+                (offset_of!(runtime::Runtime, opt_save), CONTEXT + 0x3000),
+                (
+                    offset_of!(runtime::Runtime, opt_cells),
+                    form.spill_cells as u64,
+                ),
+                (offset_of!(runtime::Runtime, classes), CLASSES),
+                (offset_of!(runtime::Runtime, alias_classes), RAW),
+                (
+                    offset_of!(runtime::Runtime, body)
+                        + offset_of!(adv_cpu_core::body::BodyContext, classes),
+                    CLASSES,
+                ),
+                (offset_of!(runtime::Runtime, code_lines), LINES),
+                (
+                    offset_of!(runtime::Runtime, resident_access),
+                    HOST_CODE + access as u64,
+                ),
+                (
+                    offset_of!(runtime::Runtime, memory_base),
+                    u64::from(CODE) | (80 << 32),
+                ),
+                (offset_of!(runtime::Runtime, plain_pages), PLAIN),
+            ] {
+                runtime[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            let limit = offset_of!(runtime::Runtime, completed_limit);
+            runtime[limit..limit + 8].copy_from_slice(&h.emu.read(CONTEXT + limit as u64, 8));
+            h.emu.write(CONTEXT, &runtime);
+            h.emu.write(CONTEXT + u64::from(HELPER_KIND), &[0; 4]);
+            h.emu.write(CPU, &state_bytes(cpu));
+            h.emu.set_x(X0, CONTEXT);
+            h.emu.set_x(X1, HOST_CODE + at as u64);
+            h.emu.set_sp(HOST_STACK);
+            let result = h.emu.call_at(&code, h.stubs.enter);
+            if let Some(eip) = fault {
+                assert_eq!(
+                    result.unwrap_err(),
+                    unicorn_engine::unicorn_const::uc_error::READ_UNMAPPED
+                );
+                let (offset, site) = form.sites.iter().find(|(_, site)| site.eip == eip).unwrap();
+                h.emu
+                    .call_loaded_at(at + offset.wrapping_add_signed(site.resume as isize))
+                    .unwrap();
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(h.emu.sp(), HOST_STACK);
+            assert_eq!(
+                h.emu
+                    .read(CONTEXT + offset_of!(runtime::Runtime, shadow) as u64, 8),
+                SHADOW_TOP.to_le_bytes(),
+            );
+            Exit::from_raw(word(h, CONTEXT + offset_of!(runtime::Runtime, exit) as u64)).unwrap()
+        }
+
+        fn recovered(h: &Harness, f: &back::Lowered, mut cpu: CpuState, id: RecordId) -> CpuState {
+            assert_eq!(
+                word(h, CONTEXT + offset_of!(runtime::Runtime, opt_record) as u64),
+                id.0
+            );
+            let dump = CONTEXT + offset_of!(runtime::Runtime, opt_dump) as u64;
+            let x = |i| u64::from_le_bytes(h.emu.read(dump + 8 * i, 8).try_into().unwrap());
+            assert_eq!(x(28), SHADOW_TOP);
+            let regs = runtime::RegisterDump {
+                x: std::array::from_fn(|i| x(i as u64)),
+                ..Default::default()
+            };
+            assert_eq!(f.spill_cells, 0);
+            materialize(
+                &f.records[id.0 as usize],
+                &regs,
+                &[],
+                &f.flags,
+                &mut cpu,
+                |_, _| unreachable!("no dirty frame cells"),
+            );
+            cpu
+        }
+
+        fn load(f: &mut Func, b: Block, addr: Value, pc: u32, checked: bool) -> Value {
+            f.push(
+                b,
+                Op::Load {
+                    ty: Type::I32,
+                    width: 4,
+                    addr,
+                    checked,
+                    pc,
+                },
+            )
+            .unwrap()
+        }
+
+        fn store(
+            f: &mut Func,
+            b: Block,
+            addr: Value,
+            value: Value,
+            after: RecordId,
+            checked: bool,
+        ) {
+            f.push(
+                b,
+                Op::Store {
+                    width: 4,
+                    addr,
+                    value,
+                    after,
+                    checked,
+                    pc: CODE + 6,
+                },
+            );
+        }
+
+        // spec: A64-OPT-9, A64-OPT-7
+        #[test]
+        fn window_memory_and_fault_recovery() {
+            let (mut f, b, p) = start(&[Source::Reg(0), Source::Reg(1), Source::Reg(2)]);
+            let first = load(&mut f, b, p[0], CODE + 2, false);
+            let after = f.record(state_at(&f, CODE + 8, first));
+            store(&mut f, b, p[1], first, after, false);
+            let host = f.push(b, Op::Host(p[1])).unwrap();
+            let from_frame = f
+                .push(
+                    b,
+                    Op::FrameLoad {
+                        ty: Type::I32,
+                        base: host,
+                        offset: 0,
+                    },
+                )
+                .unwrap();
+            let last = load(&mut f, b, p[2], CODE + 10, false);
+            let sum = f.push(b, Op::Int(IntOp::Add, last, from_frame)).unwrap();
+            let end = f.record(state_at(&f, CODE + 12, sum));
+            f.end(b, End::Exit(end));
+
+            let mut cpu = initial();
+            cpu.regs[..3].copy_from_slice(&[DATA, DATA + 4, DATA + 8]);
+            let form = lower(&f, &cpu);
+            assert_eq!(form.sites.len(), 3);
+            for &(offset, _) in &form.sites {
+                assert_eq!(form.words[offset / 4] >> 5 & 31, 27);
+            }
+            let mut h = harness();
+            h.emu.map(ALIAS + u64::from(DATA), 0x20000);
+            h.emu
+                .write(WINDOW_BASE + u64::from(DATA), &7u32.to_le_bytes());
+            h.emu
+                .write(WINDOW_BASE + u64::from(DATA + 8), &11u32.to_le_bytes());
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, CPU), 18);
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(DATA + 4)), 7);
+            assert_eq!(word(&h, ALIAS + u64::from(DATA + 4)), 0);
+
+            cpu.regs[2] = DATA + 0x10000; // Its alias exists, but its window page is protected.
+            assert_eq!(
+                run(&mut h, &form, &cpu, 100, Some(CODE + 10)),
+                Exit::Optimized
+            );
+            let mut expected = cpu.clone();
+            expected.eip = CODE + 8;
+            expected.regs[0] = 7;
+            assert_eq!(
+                state_bytes(&recovered(&h, &form, cpu, after)),
+                state_bytes(&expected)
+            );
+        }
+
+        // spec: A64-OPT-9, A64-MEM-7
+        #[test]
+        fn checked_window_alias_owner_and_blocked_paths() {
+            let mut sources = vec![Source::Reg(0), Source::Reg(1)];
+            sources.extend((0..9).map(|i| Source::Xmm(i % 8)));
+            let (mut f, b, p) = start(&sources);
+            let first = load(&mut f, b, p[0], CODE + 2, true);
+            let after = f.record(f.records[0].clone());
+            store(&mut f, b, p[1], first, after, true);
+            let mut state = state_at(&f, CODE + 8, first);
+            for (dst, &value) in state.xmm.iter_mut().zip(&p[3..11]) {
+                *dst = Some(Location::At(value));
+            }
+            let exit = f.record(state);
+            f.end(b, End::Exit(exit));
+
+            let mut cpu = initial();
+            for (i, xmm) in cpu.xmm.iter_mut().enumerate() {
+                *xmm = [i as u8 + 1; 16];
+            }
+            let normal = DATA;
+            let watched = DATA + 4096;
+            let shared = DATA + 0x10000;
+            let mut h = harness();
+            h.emu.map(ALIAS + u64::from(DATA), 0x20000);
+            for (page, class) in [
+                (normal, READ | WRITE),
+                (watched, READ | WRITE | EXEC),
+                (shared, READ | WRITE | SHARED),
+            ] {
+                h.emu.write(CLASSES + u64::from(page >> 12), &[class]);
+                h.emu.write(RAW + u64::from(page >> 12), &[class]);
+            }
+            h.emu
+                .write(LINES + 8 * u64::from(watched >> 12), &1u64.to_le_bytes());
+            h.emu
+                .write(WINDOW_BASE + u64::from(normal), &0x1234u32.to_le_bytes());
+            let form = lower(&f, &cpu);
+            assert_eq!(form.sites.len(), 4);
+            assert!(form.sites.iter().all(|(_, site)| site.checked));
+
+            cpu.regs[..2].copy_from_slice(&[normal, normal + 4]);
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(normal + 4)), 0x1234);
+            assert_eq!(word(&h, CONTEXT + u64::from(HELPER_KIND)), 0);
+
+            cpu.regs[1] = watched + 64;
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, ALIAS + u64::from(watched + 64)), 0x1234);
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(watched + 64)), 0);
+            assert_eq!(word(&h, CONTEXT + u64::from(HELPER_KIND)), 0);
+
+            cpu.regs[1] = watched;
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Optimized);
+            assert_eq!(
+                word(
+                    &h,
+                    CONTEXT + offset_of!(runtime::Runtime, resident_site) as u64
+                ),
+                CODE + 6
+            );
+            assert_eq!(word(&h, CONTEXT + u64::from(HELPER_KIND)), 0);
+            assert_eq!(
+                state_bytes(&recovered(&h, &form, cpu.clone(), RecordId(0))),
+                state_bytes(&cpu)
+            );
+
+            cpu.regs[..2].copy_from_slice(&[shared, shared + 4]);
+            h.emu
+                .write(CONTEXT + u64::from(HELPER_VALUE), &0x5678u32.to_le_bytes());
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, CPU), 0x5678);
+            assert_eq!(
+                word(&h, CONTEXT + u64::from(HELPER_KIND)),
+                4 | runtime::ACCESS_STORE
+            );
+            let xmm = h.emu.read(CPU + u64::from(runtime::XMM), 128);
+            assert_eq!(
+                xmm,
+                cpu.xmm[1..]
+                    .iter()
+                    .chain(&cpu.xmm[..1])
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+
+            cpu.regs[..2].copy_from_slice(&[normal + 4093, normal + 4]);
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, CONTEXT + u64::from(HELPER_KIND)), 4);
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(normal + 4)), 0x5678);
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        #[cfg(unix)]
+        fn plain_page_checks_every_page_and_the_requested_permission() {
+            let (mut f, b, p) = start(&[
+                Source::Reg(0),
+                Source::Reg(1),
+                Source::Frame {
+                    offset: 0,
+                    width: 4,
+                },
+            ]);
+            f.push(
+                b,
+                Op::PlainPage {
+                    addr: p[0],
+                    bytes: 4,
+                    write: false,
+                },
+            );
+            f.push(
+                b,
+                Op::PlainPage {
+                    addr: p[1],
+                    bytes: 4,
+                    write: true,
+                },
+            );
+            let exit = f.record(state_at(&f, CODE + 8, p[2]));
+            f.end(b, End::Exit(exit));
+            let mut cpu = initial();
+            let last = CODE + 64 * 4096;
+            cpu.regs[..2].copy_from_slice(&[CODE, last - 2]);
+            cpu.regs[4] = DATA;
+            let form = lower(&f, &cpu);
+            assert_ne!(form.miss, form.env_miss);
+            let mut h = harness();
+            h.emu
+                .write(WINDOW_BASE + u64::from(DATA), &0x3344u32.to_le_bytes());
+            let mut memory = Memory::window(CODE, 80 * 4096).unwrap();
+            memory.map(CODE, 80 * 4096, READ | WRITE).unwrap();
+            memory.protect(CODE, 4096, READ).unwrap();
+            let snapshot = |h: &mut Harness, memory: &mut Memory| {
+                // SAFETY: this Memory has two live groups of three bitmap words.
+                let bitmap = unsafe { std::slice::from_raw_parts(memory.plain_pages(), 6) };
+                h.emu.write(
+                    PLAIN,
+                    &bitmap
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                );
+                h.emu.write(
+                    CLASSES + u64::from(CODE >> 12),
+                    &memory.native_permissions(),
+                );
+            };
+            snapshot(&mut h, &mut memory);
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            assert_eq!(word(&h, CPU), 0x3344);
+
+            memory.unmap(last, 4096).unwrap();
+            memory.map_shared_audio(last, 4096).unwrap();
+            snapshot(&mut h, &mut memory);
+            cpu.regs[4] = DATA + 0x20000; // A missed fact leaves before reading the frame.
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Interpret);
+            assert_eq!(
+                word(
+                    &h,
+                    CONTEXT + offset_of!(runtime::Runtime, resident_fact) as u64
+                ),
+                1
+            );
+            assert_eq!(h.emu.read(CPU, size_of::<CpuState>()), state_bytes(&cpu));
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        fn page_cross_and_countdown_leave_at_their_exact_record() {
+            let (mut f, b, p) = start(&[Source::Reg(0)]);
+            f.records[0].refund = 1;
+            let next = f.push(b, Op::Constant(Type::I32, 0x1234)).unwrap();
+            let old = load(&mut f, b, p[0], CODE + 2, false);
+            f.push(
+                b,
+                Op::PageCross {
+                    addr: p[0],
+                    width: 4,
+                    record: RecordId(0),
+                },
+            );
+            let after = f.record(f.records[0].clone());
+            store(&mut f, b, p[0], next, after, false);
+            let exit = f.record(state_at(&f, CODE + 9, old));
+            f.records[exit.0 as usize].refund = 0;
+            f.end(b, End::Exit(exit));
+            let mut cpu = initial();
+            let mut form = lower(&f, &cpu);
+            assert_eq!(form.probation.len(), 3);
+            assert!(form.entry_words > 0 && form.exit_words > 0);
+            assert_eq!((form.iteration_words, form.iteration_retired), (0, 0));
+            let mut h = harness();
+            cpu.regs[0] = DATA + 4092;
+            assert_eq!(run(&mut h, &form, &cpu, 1, None), Exit::Dispatch);
+            assert_eq!(word(&h, CPU + u64::from(runtime::EIP)), CODE + 9);
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(cpu.regs[0])), 0x1234);
+
+            cpu.regs[0] += 1;
+            assert_eq!(run(&mut h, &form, &cpu, 1, None), Exit::Optimized);
+            assert_eq!(
+                state_bytes(&recovered(&h, &form, cpu.clone(), RecordId(0))),
+                state_bytes(&cpu)
+            );
+            assert_eq!(word(&h, WINDOW_BASE + u64::from(cpu.regs[0])), 0x12);
+            assert_eq!(run(&mut h, &form, &cpu, 0, None), Exit::Dispatch);
+            assert_eq!(h.emu.read(CPU, size_of::<CpuState>()), state_bytes(&cpu));
+            assert_eq!(word(&h, SLOT + 8), 1);
+            for &word in &form.probation {
+                form.words[word] = NOP;
+            }
+            cpu.regs[0] -= 1;
+            assert_eq!(run(&mut h, &form, &cpu, 1, None), Exit::Dispatch);
+            assert_eq!(word(&h, SLOT), 0);
+            assert_eq!(word(&h, SLOT + 8), 1);
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        fn probation_accounts_for_a_refill_before_a_normal_exit() {
+            let (mut f, head, p) = start(&[Source::Reg(0)]);
+            f.head_exit = Some(head);
+            let tail = f.block(None);
+            let one = f.push(head, Op::Constant(Type::I32, 1)).unwrap();
+            let left = f.push(head, Op::Int(IntOp::Sub, p[0], one)).unwrap();
+            let flags = f.blocks[0].params[1];
+            f.end(
+                head,
+                End::Branch {
+                    cond: left,
+                    taken: Target {
+                        block: head,
+                        args: vec![left, flags],
+                        charge: 3,
+                    },
+                    fall: Target {
+                        block: tail,
+                        args: vec![],
+                        charge: 0,
+                    },
+                },
+            );
+            let exit = f.record(state_at(&f, CODE + 8, left));
+            f.end(tail, End::Exit(exit));
+            let mut cpu = initial();
+            cpu.regs[0] = 2;
+            let form = lower(&f, &cpu);
+            let mut h = harness();
+            h.emu.write(
+                CONTEXT + offset_of!(runtime::Runtime, completed_limit) as u64,
+                &u64::MAX.to_le_bytes(),
+            );
+            assert_eq!(run(&mut h, &form, &cpu, 1, None), Exit::Dispatch);
+            assert_eq!(word(&h, CPU), 0);
+            assert_eq!(
+                word(&h, CONTEXT + offset_of!(runtime::Runtime, completed) as u64),
+                runtime::COMPUTATION_SLICE + 2
+            );
+            assert_eq!(word(&h, SLOT + 8), 3);
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        fn ebp_relative_to_esp_is_a_context_fact() {
+            let (mut f, b, _) = start(&[]);
+            let exit = f.record(f.records[0].clone());
+            f.end(b, End::Exit(exit));
+            let mut cpu = initial();
+            let mut assumed = assumptions(&cpu);
+            assumed.ebp = Some(-12);
+            cpu.regs[4] = 8;
+            cpu.regs[5] = 8_u32.wrapping_sub(12);
+            let form = back::lower_resident(&f, &assumed, &f.entry);
+            let mut h = harness();
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
+            cpu.regs[5] ^= 1;
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Recall);
+            assert_eq!(h.emu.read(CPU, size_of::<CpuState>()), state_bytes(&cpu));
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        fn frame_disjoint_checks_both_ends_of_a_wrapping_interval() {
+            let (mut f, b, p) = start(&[Source::Reg(0), Source::Reg(4)]);
+            f.push(
+                b,
+                Op::FrameDisjoint {
+                    addr: p[0],
+                    width: 4,
+                    base: p[1],
+                    lo: -4,
+                    hi: 8,
+                    record: RecordId(0),
+                },
+            );
+            let exit = f.record(f.records[0].clone());
+            f.end(b, End::Exit(exit));
+            let mut cpu = initial();
+            cpu.regs[4] = 0xffff_fffc;
+            let form = lower(&f, &cpu);
+            let mut h = harness();
+            for (addr, expected) in [
+                (0xffff_fff4, Exit::Dispatch),
+                (0xffff_fff5, Exit::Optimized),
+                (3, Exit::Optimized),
+                (4, Exit::Dispatch),
+            ] {
+                cpu.regs[0] = addr;
+                assert_eq!(run(&mut h, &form, &cpu, 100, None), expected);
+                if expected == Exit::Optimized {
+                    assert_eq!(
+                        state_bytes(&recovered(&h, &form, cpu.clone(), RecordId(0))),
+                        state_bytes(&cpu)
+                    );
+                }
+            }
+        }
+
+        // spec: A64-OPT-9
+        #[test]
+        fn iteration_cost_carries_the_retirement_of_the_longest_path() {
+            let (mut f, head, p) = start(&[Source::Reg(0)]);
+            f.head_exit = Some(head);
+            let slow = f.block(None);
+            f.blocks[head.0 as usize].eip = Some(CODE);
+            f.blocks[slow.0 as usize].eip = Some(CODE + 4);
+            let flags = f.blocks[0].params[1];
+            f.end(
+                head,
+                End::Branch {
+                    cond: p[0],
+                    taken: Target {
+                        block: head,
+                        args: vec![p[0], flags],
+                        charge: 1,
+                    },
+                    fall: Target {
+                        block: slow,
+                        args: vec![],
+                        charge: 0,
+                    },
+                },
+            );
+            let value = load(&mut f, slow, p[0], CODE + 4, false);
+            let sum = f.push(slow, Op::Int(IntOp::Add, p[0], value)).unwrap();
+            f.end(
+                slow,
+                End::Jump(Target {
+                    block: head,
+                    args: vec![sum, flags],
+                    charge: 4,
+                }),
+            );
+            let form = lower(&f, &initial());
+            assert_eq!(form.iteration_retired, 4);
+            assert!(form.iteration_words >= 5);
+            assert_eq!(form.iteration_pcs, [CODE, CODE + 4]);
+        }
+    }
+
     const AREA: u64 = 0x4000_0000;
     const PARAMETER: u64 = AREA;
 
@@ -3168,6 +3838,7 @@ pub(in crate::translate) mod opt_back {
                     value: p[1],
                     after,
                     checked: false,
+                    pc: 0,
                 },
             );
             let loaded = f
@@ -3178,6 +3849,7 @@ pub(in crate::translate) mod opt_back {
                         width,
                         addr: p[0],
                         checked: false,
+                        pc: 0,
                     },
                 )
                 .unwrap();
@@ -3205,6 +3877,7 @@ pub(in crate::translate) mod opt_back {
                         value: p[1],
                         after,
                         checked: false,
+                        pc: 0,
                     },
                 );
                 p[1]
@@ -3216,6 +3889,7 @@ pub(in crate::translate) mod opt_back {
                         width: 8,
                         addr: p[0],
                         checked: false,
+                        pc: 0,
                     },
                 )
                 .unwrap()
@@ -3518,6 +4192,7 @@ pub(in crate::translate) mod opt_back {
                 value: p[1],
                 after,
                 checked: false,
+                pc: 0,
             },
         );
         let v = f.push(b, Op::Fp(FpOp::Mul, p[2], p[3])).unwrap();

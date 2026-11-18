@@ -165,6 +165,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::SseInput { a, b, .. } => is(a, Type::V128) && b.is_none_or(|b| is(b, Type::V128)),
         Op::Constant(..) | Op::Bits { .. } | Op::Validate => true,
         Op::PlainPage { addr, .. } | Op::PageCross { addr, .. } => is(addr, Type::I32),
+        Op::FrameDisjoint { addr, base, .. } => is(addr, Type::I32) && is(base, Type::I32),
     }
 }
 
@@ -392,6 +393,7 @@ mod tests {
                 value: bits,
                 after,
                 checked: false,
+                pc: 0,
             },
         );
         let exit = f.record(record([Some(eax); 8]));
@@ -438,6 +440,7 @@ mod tests {
                 value: eax,
                 after,
                 checked: false,
+                pc: 0,
             },
         );
         let exit = f.record(record([Some(eax); 8]));
@@ -510,6 +513,7 @@ mod tests {
                     value: eax,
                     after: early,
                     checked: false,
+                    pc: 0,
                 },
             ),
         );

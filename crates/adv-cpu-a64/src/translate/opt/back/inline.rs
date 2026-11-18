@@ -10,7 +10,6 @@ const S2: Reg = Reg::new(2);
 const S3: Reg = Reg::new(3);
 const S4: Reg = Reg::new(4);
 const S5: Reg = Reg::new(5);
-const WINDOW: Reg = Reg::new(27);
 const ESP: Reg = Reg::new(23);
 const PF: Reg = Reg::new(10);
 const AF: Reg = Reg::new(11);
@@ -32,6 +31,7 @@ impl Emitter<'_> {
         bytes: u64,
         miss: Label,
         cold: Label,
+        delay_frames: bool,
     ) {
         self.asm
             .emit_all(&[ldr(X, CPU, RT, CPU_PTR), ldr(W, T, CPU, runtime::MMX_MODE)]);
@@ -69,8 +69,10 @@ impl Emitter<'_> {
             runtime::emit_read_flags(&mut self.asm);
             self.asm.emit(mov(W, FLAGS, S4));
         }
-        self.asm
-            .emit_all(&[str(X, ALIAS, RT, SHADOW), ldr(X, ALIAS, RT, runtime::ALIAS)]);
+        if !self.resident {
+            self.asm
+                .emit_all(&[str(X, ALIAS, RT, SHADOW), ldr(X, ALIAS, RT, runtime::ALIAS)]);
+        }
         let mut moves = Vec::new();
         for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
             if let Source::Reg(i) = source {
@@ -89,7 +91,7 @@ impl Emitter<'_> {
             let dst = self.locations[param.0 as usize];
             let ty = self.func.ty(param);
             let src = match source {
-                Source::Reg(_) | Source::X87(_) => continue,
+                Source::Reg(_) | Source::X87(_) | Source::Frame { .. } => continue,
                 Source::Eflags => Host::Register(FLAGS),
                 Source::Xmm(i) => {
                     let out = self.vd(param);
@@ -117,14 +119,62 @@ impl Emitter<'_> {
                     self.asm.emit(ldrh(out, CPU, runtime::X87_OPCODE));
                     Host::Register(out)
                 }
-                Source::Frame { offset, width } => {
-                    let out = self.rd(param);
-                    self.frame_cell(true, out, offset, width);
-                    Host::Register(out)
-                }
             };
             self.copy(dst, src, ty);
         }
+        if !delay_frames {
+            self.entry_frames(entry);
+        }
+    }
+
+    pub(super) fn entry_frames(&mut self, entry: &[Source]) {
+        for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
+            if let Source::Frame { offset, width } = source {
+                let out = self.rd(param);
+                self.frame_cell(true, out, offset, width);
+                self.copy(
+                    self.locations[param.0 as usize],
+                    Host::Register(out),
+                    source.ty(),
+                );
+            }
+        }
+    }
+
+    /// Leave an entry whose page facts failed in the Tier-1 assignment.
+    pub(super) fn environment_misses(&mut self, bytes: u64, miss: Label) {
+        let facts = std::mem::take(&mut self.fact_misses);
+        if facts.is_empty() {
+            return;
+        }
+        let restore = self.asm.label();
+        for (ordinal, label) in facts.into_iter().enumerate() {
+            self.asm.bind(label);
+            self.imm(T, ordinal as u64);
+            self.asm
+                .emit(str(W, T, RT, offset_of!(Runtime, resident_fact) as u32));
+            self.asm.b(restore);
+        }
+        self.asm.bind(restore);
+        self.asm.emit(add_imm(X, S4, RT, ENTRY, false));
+        for i in (0..8).step_by(2) {
+            self.asm.emit(ldp(
+                W,
+                Index::Offset,
+                guest(i),
+                guest(i + 1),
+                S4,
+                ENTRY_REGS as i32 + 4 * i32::from(i),
+            ));
+        }
+        self.asm.emit_all(&[
+            ldp(X, Index::Offset, T, PF, S4, ENTRY_NZCV),
+            ldp(X, Index::Offset, AF, DF, S4, ENTRY_AF),
+            msr_nzcv(T),
+        ]);
+        self.bias_stack();
+        self.stack_frame(bytes, false);
+        self.asm.b(miss);
     }
 
     fn entry_facts(&mut self, assumed: &Assumed, miss: Label) {
@@ -165,6 +215,12 @@ impl Emitter<'_> {
         if let Some(low) = assumed.esp_low {
             self.asm.emit(and_imm(W, T, ESP, 15));
             self.imm(U, u64::from(low));
+            self.asm.emit(eor(W, T, T, U, Lsl, 0));
+            self.asm.cbz(W, true, T, miss);
+        }
+        if let Some(offset) = assumed.ebp {
+            self.asm.emit(sub(W, T, guest(5), ESP, Lsl, 0));
+            self.imm(U, u64::from(offset as u32));
             self.asm.emit(eor(W, T, T, U, Lsl, 0));
             self.asm.cbz(W, true, T, miss);
         }
@@ -256,6 +312,7 @@ impl Emitter<'_> {
             self.imm(U, u64::from(offset as u32));
             self.asm.emit(add(W, S2, S2, U, Lsl, 0));
         }
+        let base = self.data_view();
         let mut consumed = 0;
         for chunk in [8, 4, 2, 1].into_iter().filter(|chunk| width & chunk != 0) {
             let value = if consumed == 0 { reg } else { S3 };
@@ -263,14 +320,14 @@ impl Emitter<'_> {
                 self.asm.emit(lsr_imm(X, value, reg, consumed * 8));
             }
             self.asm.emit(match (load, chunk) {
-                (true, 1) => ldr_narrow(Narrow::Byte, value, ALIAS, S2),
-                (true, 2) => ldr_narrow(Narrow::Half, value, ALIAS, S2),
-                (true, 4) => ldr_reg(W, value, ALIAS, S2, false),
-                (true, 8) => ldr_reg(X, value, ALIAS, S2, false),
-                (false, 1) => str_narrow(Narrow::Byte, value, ALIAS, S2),
-                (false, 2) => str_narrow(Narrow::Half, value, ALIAS, S2),
-                (false, 4) => str_reg(W, value, ALIAS, S2, false),
-                (false, 8) => str_reg(X, value, ALIAS, S2, false),
+                (true, 1) => ldr_narrow(Narrow::Byte, value, base, S2),
+                (true, 2) => ldr_narrow(Narrow::Half, value, base, S2),
+                (true, 4) => ldr_reg(W, value, base, S2, false),
+                (true, 8) => ldr_reg(X, value, base, S2, false),
+                (false, 1) => str_narrow(Narrow::Byte, value, base, S2),
+                (false, 2) => str_narrow(Narrow::Half, value, base, S2),
+                (false, 4) => str_reg(W, value, base, S2, false),
+                (false, 8) => str_reg(X, value, base, S2, false),
                 _ => unreachable!(),
             });
             if load && consumed != 0 {
@@ -284,6 +341,7 @@ impl Emitter<'_> {
     }
 
     pub(super) fn inline_exit(&mut self, ir: &IrRecord, assumed: &Assumed, bytes: u64) {
+        let start = self.asm.offset();
         let record = recovery::lower_record(ir, &self.locations);
         self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
         for &(offset, width, value) in &record.frame {
@@ -328,18 +386,28 @@ impl Emitter<'_> {
                 ));
             }
         }
-        self.asm.emit_all(&[
-            ldr(X, ALIAS, RT, SHADOW),
-            ldr(X, WINDOW, RT, WINDOW_BASE),
-            add_ext(X, ESP, WINDOW, ESP, Extend::Uxtw, 0),
-            add_ext(X, guest(5), WINDOW, guest(5), Extend::Uxtw, 0),
-        ]);
+        if !self.resident {
+            self.asm
+                .emit_all(&[ldr(X, ALIAS, RT, SHADOW), ldr(X, WINDOW, RT, WINDOW_BASE)]);
+        }
+        self.bias_stack();
         runtime::emit_load_flags(&mut self.asm);
         self.charge(-i64::from(record.refund), RecordId(0), false);
         self.stack_frame(bytes, false);
+        if let Some(probation) = &mut self.probation {
+            probation.call(&mut self.asm, false);
+            self.exit_words = self.exit_words.max(self.words_since(start));
+        }
         self.links.push((self.asm.offset(), record.eip));
         emit_link_point(&mut self.asm, record.eip);
         self.asm.emit(0); // Bound to the Tier-1 dispatch stub on placement.
+    }
+
+    fn bias_stack(&mut self) {
+        self.asm.emit_all(&[
+            add_ext(X, ESP, WINDOW, ESP, Extend::Uxtw, 0),
+            add_ext(X, guest(5), WINDOW, guest(5), Extend::Uxtw, 0),
+        ]);
     }
 
     /// Flags computed from the entry value preserve every unmapped bit.

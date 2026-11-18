@@ -5,7 +5,7 @@
 //! a refused access faults as a host fault at its site would, so dirty SIMD
 //! registers need no publication first.
 
-use crate::asm::Label;
+use crate::asm::{Asm, Label};
 use crate::encode::Extend::Uxtw;
 use crate::encode::Index::{Post, Pre};
 use crate::encode::Shift::Lsl;
@@ -46,6 +46,7 @@ pub(super) enum Dir {
 }
 
 /// The register a checked access transfers through the stub.
+#[derive(Clone, Copy)]
 pub(super) enum Value {
     Scalar(Reg),
     Vector(VMem, VReg),
@@ -215,8 +216,14 @@ impl Translator<'_> {
     /// The remaining cases use `access`. Uses x3 and x4.
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
         let slow = self.asm.label();
-        let (site, resume) =
-            self.checked_memory(address, kind & 31, kind & ACCESS_STORE != 0, direct, slow);
+        let (site, resume) = self.checked_memory(
+            address,
+            kind & 31,
+            kind & ACCESS_STORE != 0,
+            direct,
+            slow,
+            slow,
+        );
         self.push_cold(Cold::Access {
             label: slow,
             resume,
@@ -236,7 +243,8 @@ impl Translator<'_> {
         };
         if self.checking {
             let slow = self.asm.label();
-            let (site, resume) = self.checked_memory(address, size.bytes(), store, direct, slow);
+            let (site, resume) =
+                self.checked_memory(address, size.bytes(), store, direct, slow, slow);
             self.push_cold(Cold::Access {
                 label: slow,
                 resume,
@@ -251,45 +259,9 @@ impl Translator<'_> {
         }
     }
 
-    /// Emit one scalar or vector access after the same window/alias checks.
-    /// The caller owns the slow path.
-    pub(super) fn checked_memory(
-        &mut self,
-        address: Reg,
-        width: u32,
-        store: bool,
-        direct: u32,
-        slow: Label,
-    ) -> (Label, Label) {
-        let alias = self.asm.label();
-        self.page_crossing(address, width, slow);
-        self.check_class(address, runtime::CLASSES, store, alias, slow);
-        let (site, resume) = (self.asm.label(), self.asm.label());
-        self.asm.bind(site);
-        self.site();
-        self.emit(direct);
-        self.asm.b(resume);
-        self.asm.bind(alias);
-        // The window class already granted the guest R/W bit, so this index
-        // is inside Memory's raw table even when its base is not zero.
-        self.checked_alias(address, store, false, slow);
-        self.emit(ldr(X, X3, RUNTIME, runtime::ALIAS));
-        self.site();
-        // Keep the access width and extension; only replace its base register.
-        self.emit((direct & !(31 << 5)) | (X3.number() << 5));
-        self.asm.bind(resume);
-        (site, resume)
-    }
-
     /// Branch when the last byte enters another page, preserving NZCV.
     pub(super) fn page_crossing(&mut self, address: Reg, width: u32, crossing: Label) {
-        if width > 1 {
-            self.emit_all(&[
-                add_imm(W, X4, address, width - 1, false),
-                eor(W, X4, X4, address, Lsl, 0),
-            ]);
-            self.asm.tbz(true, X4, PAGE_SHIFT, crossing);
-        }
+        page_crossing(&mut self.asm, address, width, crossing);
     }
 
     /// Select the window or alias for one page. Uses x3 and x4, preserving NZCV.
@@ -302,7 +274,7 @@ impl Translator<'_> {
         slow: Label,
     ) {
         let (alias, done) = (self.asm.label(), self.asm.label());
-        self.check_class(address, runtime::CLASSES, store, alias, slow);
+        check_class(&mut self.asm, address, runtime::CLASSES, store, alias, slow);
         self.emit(mov(X, base, WINDOW));
         self.asm.b(done);
         self.asm.bind(alias);
@@ -311,67 +283,136 @@ impl Translator<'_> {
         self.asm.bind(done);
     }
 
-    /// Verify the alias class after the window class granted the guest
-    /// permission. A store to a writable page that is not shared takes the
-    /// alias unless its line or the next holds watched code (A64-CTL-10):
-    /// the raw class marks a guest RWX page, the derived class a watched
-    /// data page. An access is at most 64 bytes; with `page` the caller
-    /// keeps the alias for the rest of the page, which then holds no code.
     pub(super) fn checked_alias(&mut self, address: Reg, store: bool, page: bool, slow: Label) {
-        if !store {
-            self.check_class(address, runtime::ALIAS_CLASSES, false, slow, slow);
-            return;
-        }
-        let (lines, done) = (self.asm.label(), self.asm.label());
-        let bit = |permission: u8| permission.trailing_zeros();
-        let class = |table| {
-            [
-                ldr(X, X3, RUNTIME, table),
-                lsr_imm(W, X4, address, PAGE_SHIFT),
-                ldr_narrow(Narrow::Byte, X4, X3, X4),
-            ]
-        };
-        self.emit_all(&class(runtime::ALIAS_CLASSES));
-        self.asm.tbz(false, X4, bit(WRITE), slow);
-        self.asm.tbz(true, X4, bit(SHARED), slow);
-        self.asm.tbz(true, X4, bit(EXEC), lines);
-        self.emit_all(&class(runtime::BODY_CLASSES));
-        self.asm.tbz(false, X4, bit(EXEC), done);
-        self.asm.bind(lines);
-        self.emit_all(&[
-            ldr(X, X3, RUNTIME, runtime::CODE_LINES),
-            lsr_imm(W, X4, address, PAGE_SHIFT),
-            ldr_reg(X, X3, X3, X4, true),
-        ]);
-        if !page {
-            self.emit_all(&[
-                lsr_imm(W, X4, address, 6),
-                shiftv(X, Shift::Lsr, X3, X3, X4),
-                and_imm(X, X3, X3, 3),
-            ]);
-        }
-        self.asm.cbz(X, true, X3, slow);
-        self.asm.bind(done);
+        checked_alias(&mut self.asm, address, store, page, slow);
+    }
+}
+
+pub(super) trait CheckedEmitter {
+    fn access_asm(&mut self) -> &mut Asm;
+    fn access_site(&mut self);
+
+    /// Emit one scalar or vector access after the same window/alias checks.
+    /// The caller owns the slow path.
+    fn checked_memory(
+        &mut self,
+        address: Reg,
+        width: u32,
+        store: bool,
+        direct: u32,
+        slow: Label,
+        crossing: Label,
+    ) -> (Label, Label) {
+        let alias = self.access_asm().label();
+        page_crossing(self.access_asm(), address, width, crossing);
+        check_class(
+            self.access_asm(),
+            address,
+            runtime::CLASSES,
+            store,
+            alias,
+            slow,
+        );
+        let (site, resume) = (self.access_asm().label(), self.access_asm().label());
+        self.access_asm().bind(site);
+        self.access_site();
+        self.access_asm().emit(direct);
+        self.access_asm().b(resume);
+        self.access_asm().bind(alias);
+        // The window class already granted the guest R/W bit, so this index
+        // is inside Memory's raw table even when its base is not zero.
+        checked_alias(self.access_asm(), address, store, false, slow);
+        self.access_asm().emit(ldr(X, X3, RUNTIME, runtime::ALIAS));
+        self.access_site();
+        // Keep the access width and extension; only replace its base register.
+        self.access_asm()
+            .emit((direct & !(31 << 5)) | (X3.number() << 5));
+        self.access_asm().bind(resume);
+        (site, resume)
+    }
+}
+
+impl CheckedEmitter for Translator<'_> {
+    fn access_asm(&mut self) -> &mut Asm {
+        &mut self.asm
     }
 
-    /// Test guest permission and excluded classes with the same scratch and NZCV contract.
-    fn check_class(&mut self, address: Reg, table: u32, store: bool, excluded: Label, slow: Label) {
-        self.emit_all(&[
+    fn access_site(&mut self) {
+        self.site();
+    }
+}
+
+/// Branch when the last byte enters another page, preserving NZCV.
+pub(super) fn page_crossing(asm: &mut Asm, address: Reg, width: u32, crossing: Label) {
+    if width > 1 {
+        asm.emit_all(&[
+            add_imm(W, X4, address, width - 1, false),
+            eor(W, X4, X4, address, Lsl, 0),
+        ]);
+        asm.tbz(true, X4, PAGE_SHIFT, crossing);
+    }
+}
+
+/// Verify the alias class after the window class granted the guest
+/// permission. A store to a writable page that is not shared takes the
+/// alias unless its line or the next holds watched code (A64-CTL-10):
+/// the raw class marks a guest RWX page, the derived class a watched
+/// data page. An access is at most 64 bytes; with `page` the caller
+/// keeps the alias for the rest of the page, which then holds no code.
+fn checked_alias(asm: &mut Asm, address: Reg, store: bool, page: bool, slow: Label) {
+    if !store {
+        check_class(asm, address, runtime::ALIAS_CLASSES, false, slow, slow);
+        return;
+    }
+    let (lines, done) = (asm.label(), asm.label());
+    let bit = |permission: u8| permission.trailing_zeros();
+    let class = |table| {
+        [
             ldr(X, X3, RUNTIME, table),
             lsr_imm(W, X4, address, PAGE_SHIFT),
             ldr_narrow(Narrow::Byte, X4, X3, X4),
+        ]
+    };
+    asm.emit_all(&class(runtime::ALIAS_CLASSES));
+    asm.tbz(false, X4, bit(WRITE), slow);
+    asm.tbz(true, X4, bit(SHARED), slow);
+    asm.tbz(true, X4, bit(EXEC), lines);
+    asm.emit_all(&class(runtime::BODY_CLASSES));
+    asm.tbz(false, X4, bit(EXEC), done);
+    asm.bind(lines);
+    asm.emit_all(&[
+        ldr(X, X3, RUNTIME, runtime::CODE_LINES),
+        lsr_imm(W, X4, address, PAGE_SHIFT),
+        ldr_reg(X, X3, X3, X4, true),
+    ]);
+    if !page {
+        asm.emit_all(&[
+            lsr_imm(W, X4, address, 6),
+            shiftv(X, Shift::Lsr, X3, X3, X4),
+            and_imm(X, X3, X3, 3),
         ]);
-        // Permitted, not shared, and for a store not a code barrier.
-        let bit = |permission: u8| permission.trailing_zeros();
-        let (needed, blocked) = if store {
-            (WRITE, &[EXEC, SHARED][..])
-        } else {
-            (READ, &[SHARED][..])
-        };
-        self.asm.tbz(false, X4, bit(needed), slow);
-        for &permission in blocked {
-            self.asm.tbz(true, X4, bit(permission), excluded);
-        }
+    }
+    asm.cbz(X, true, X3, slow);
+    asm.bind(done);
+}
+
+/// Test guest permission and excluded classes with the same scratch and NZCV contract.
+fn check_class(asm: &mut Asm, address: Reg, table: u32, store: bool, excluded: Label, slow: Label) {
+    asm.emit_all(&[
+        ldr(X, X3, RUNTIME, table),
+        lsr_imm(W, X4, address, PAGE_SHIFT),
+        ldr_narrow(Narrow::Byte, X4, X3, X4),
+    ]);
+    // Permitted, not shared, and for a store not a code barrier.
+    let bit = |permission: u8| permission.trailing_zeros();
+    let (needed, blocked) = if store {
+        (WRITE, &[EXEC, SHARED][..])
+    } else {
+        (READ, &[SHARED][..])
+    };
+    asm.tbz(false, X4, bit(needed), slow);
+    for &permission in blocked {
+        asm.tbz(true, X4, bit(permission), excluded);
     }
 }
 
