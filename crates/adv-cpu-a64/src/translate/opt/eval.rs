@@ -114,6 +114,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 IntUnary::SignExtend16 => narrow(x as i16 as u64),
                 IntUnary::Low32 | IntUnary::Widen => narrow(x),
                 IntUnary::High32 => narrow(x >> 32),
+                IntUnary::ByteSwap => u128::from((x as u32).swap_bytes()),
                 IntUnary::SignWiden => u128::from(x as u32 as i32 as i64 as u64),
             }
         }
@@ -168,6 +169,21 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
         }
         Op::Fp(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::Fp32(op, a, b) => {
+            let a = f32::from_bits(get(a) as u32);
+            let b = f32::from_bits(get(b) as u32);
+            let sum = matches!(op, FpOp::Add | FpOp::Sub);
+            let r = match op {
+                FpOp::Add => a + b,
+                FpOp::Sub => a - b,
+                FpOp::Mul => a * b,
+                FpOp::Div => a / b,
+            };
+            if !r.is_finite() || !sum && r.abs() <= f32::MIN_POSITIVE {
+                return None;
+            }
+            u128::from(r.to_bits())
+        }
         Op::FpUnary(op, a) => {
             let x = f(a);
             match op {
@@ -283,12 +299,21 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             float(x)?
         }
-        Op::SseInput { a, b, packed, .. } => {
+        Op::SseInput {
+            a,
+            b,
+            packed,
+            single,
+            ..
+        } => {
             for v in [Some(a), b].into_iter().flatten() {
                 let bits = get(v);
-                if f64::from_bits(bits as u64).is_subnormal()
-                    || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
-                {
+                if if single {
+                    f32::from_bits(bits as u32).is_subnormal()
+                } else {
+                    f64::from_bits(bits as u64).is_subnormal()
+                        || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
+                } {
                     return None;
                 }
             }
@@ -358,6 +383,8 @@ fn int(op: IntOp, a: u64, b: u64, wide: bool) -> u128 {
         IntOp::Shl => a << shift,
         IntOp::Shr => a >> shift,
         IntOp::Sar => (sign(a) >> shift) as u64,
+        IntOp::Ror if wide => a.rotate_right(shift),
+        IntOp::Ror => u64::from((a as u32).rotate_right(shift)),
         IntOp::Mul => a.wrapping_mul(b),
         IntOp::MulHighSigned if wide => {
             ((i128::from(a as i64) * i128::from(b as i64)) >> 64) as u64
@@ -373,7 +400,7 @@ fn int(op: IntOp, a: u64, b: u64, wide: bool) -> u128 {
     }
 }
 
-fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32> {
+pub(super) fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32> {
     let (x, y) = (a as u32, b as u32);
     let mut out = prior;
     match kind {
@@ -404,6 +431,22 @@ fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32>
                     _ => M::Sar,
                 };
                 integer::shift(&mut out, kind, x, count, width);
+            }
+        }
+        FlagKind::CarryBit => out = out & !CF | (x & 1),
+        FlagKind::MulUnsigned => {
+            out = out & !(CF | OF) | if x != 0 { CF | OF } else { 0 };
+        }
+        FlagKind::Rol | FlagKind::Ror => {
+            let count = y & 31;
+            if count != 0 {
+                let left = kind == FlagKind::Rol;
+                let carry = (x >> if left { 0 } else { 31 }) & 1;
+                out = out & !CF | carry;
+                if count == 1 {
+                    let overflow = (x >> 31) ^ if left { carry } else { (x >> 30) & 1 };
+                    out = out & !OF | (overflow << 11);
+                }
             }
         }
         FlagKind::MulSigned => {
@@ -503,6 +546,7 @@ fn vec_shift(op: crate::encode::ShiftImm, log2: u8, full: bool, a: u128, count: 
 fn vector_unary(op: VecUnary, a: u128) -> u128 {
     match op {
         VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
+        VecUnary::NarrowScalar => u128::from((f64::from_bits(a as u64) as f32).to_bits()),
         VecUnary::Low64 => a & u128::from(u64::MAX),
         VecUnary::High64 => a >> 64,
         VecUnary::Shuffle(log2, imm, full) => {

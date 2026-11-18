@@ -90,7 +90,7 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
     }
     let mut register_only = vec![false; func.types.len()];
     for (&p, source) in blocks[0].params.iter().zip(&func.entry) {
-        register_only[p.0 as usize] = matches!(source, Source::Reg(_));
+        register_only[p.0 as usize] = matches!(source, Source::Reg(_) | Source::FsBase);
     }
     let mut fact_prefix = true;
     let mut plain_count = 0;
@@ -194,6 +194,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         }
         Op::Test { flags, .. } => is(flags, Type::Flags),
         Op::Select { cond, a, b } => is(cond, Type::I32) && func.ty(a) == func.ty(b),
+        Op::Fp32(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
         Op::Fp(_, a, b) => is(a, Type::F64) && is(b, Type::F64),
         Op::FpUnary(_, a) | Op::ToInt { value: a, .. } => is(a, Type::F64),
         Op::Vec(_, a, b) => is(a, Type::V128) && is(b, Type::V128),

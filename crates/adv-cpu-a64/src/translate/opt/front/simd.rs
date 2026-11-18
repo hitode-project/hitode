@@ -13,8 +13,10 @@ impl Front<'_> {
         }
         // Frame cells are at most eight bytes, and an aligned access must
         // not fault where the guest's would: its address is a constant.
-        let constant =
-            s.mem.base.is_none() && s.mem.index.is_none() && s.mem.disp.is_multiple_of(16);
+        let constant = !s.mem.fs
+            && s.mem.base.is_none()
+            && s.mem.index.is_none()
+            && s.mem.disp.is_multiple_of(16);
         if s.memory()
             && (s.aligned && !constant || s.width == 16 && self.frame_offset(s.mem).is_some())
         {
@@ -32,7 +34,7 @@ impl Front<'_> {
             Loc::Mem => self.read(
                 s.mem,
                 s.width,
-                if s.kind == Kind::InsertWord {
+                if matches!(s.kind, Kind::InsertWord | Kind::ScalarFromInt(_)) {
                     Type::I32
                 } else {
                     Type::V128
@@ -116,10 +118,10 @@ impl Front<'_> {
             }
             Kind::ShiftBy(op, log2) => self.value(Op::Vec(VecOp::Shift(op, log2, full), dst, src)),
             Kind::Compare(false, true) if s.imm == 1 => {
-                self.sse_input(dst, Some(src), true);
+                self.sse_input(dst, Some(src), true, false);
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
-            Kind::Double(op, true) => {
+            Kind::Double(op, true) | Kind::Float(op, true) => {
                 let op = match op {
                     Float::Fadd => FpOp::Add,
                     Float::Fsub => FpOp::Sub,
@@ -127,24 +129,36 @@ impl Front<'_> {
                     Float::Fdiv => FpOp::Div,
                     _ => return Err(Reject::Unsupported(self.index)),
                 };
-                self.sse_input(dst, Some(src), false);
-                let a = self.bits(Type::F64, dst);
-                let b = self.bits(Type::F64, src);
-                let result = self.value(Op::Fp(op, a, b));
-                self.low(dst, result)
+                let single = matches!(s.kind, Kind::Float(..));
+                self.sse_input(dst, Some(src), false, single);
+                if single {
+                    let result = self.value(Op::Fp32(op, dst, src));
+                    self.value(Op::Vec(VecOp::MoveLow32, dst, result))
+                } else {
+                    let a = self.bits(Type::F64, dst);
+                    let b = self.bits(Type::F64, src);
+                    let result = self.value(Op::Fp(op, a, b));
+                    self.low(dst, result)
+                }
             }
-            Kind::ScalarFromInt(true) => {
+            Kind::ScalarFromInt(double) => {
                 let src = self.bits(Type::I32, src);
                 let result = self.value(Op::FromInt(src));
-                self.low(dst, result)
+                if double {
+                    self.low(dst, result)
+                } else {
+                    let result = self.bits(Type::V128, result);
+                    let result = self.value(Op::VecUnary(VecUnary::NarrowScalar, result));
+                    self.value(Op::Vec(VecOp::MoveLow32, dst, result))
+                }
             }
             Kind::ScalarToInt(true, true) => {
-                self.sse_input(src, None, false);
+                self.sse_input(src, None, false, false);
                 let value = self.bits(Type::F64, src);
                 self.value(Op::ToInt { value, wide: false })
             }
             Kind::FlagCompare(true, ordered) => {
-                self.sse_input(dst, Some(src), false);
+                self.sse_input(dst, Some(src), false, false);
                 let a = self.bits(Type::F64, dst);
                 let b = self.bits(Type::F64, src);
                 self.state.flags = self.value(Op::Flags {
@@ -210,11 +224,19 @@ impl Front<'_> {
             }
         }
     }
-    fn sse_input(&mut self, a: Value, b: Option<Value>, packed: bool) {
+    fn sse_input(&mut self, a: Value, b: Option<Value>, packed: bool, single: bool) {
         if self.assumed.mxcsr & 2 == 0 {
             let pc = self.func.blocks[self.block.0 as usize].pcs[0];
-            self.func
-                .push(self.block, Op::SseInput { a, b, packed, pc });
+            self.func.push(
+                self.block,
+                Op::SseInput {
+                    a,
+                    b,
+                    packed,
+                    single,
+                    pc,
+                },
+            );
         }
     }
 

@@ -225,6 +225,9 @@ impl Locations<'_> {
                     );
                 }
             }
+            CarryBit | MulUnsigned | Rol | Ror => {
+                out = super::eval::flags(r.kind, r.width, a, b, out).unwrap();
+            }
             MulSigned => {
                 let product =
                     integer::signed(a as u32, r.width) * integer::signed(b as u32, r.width);

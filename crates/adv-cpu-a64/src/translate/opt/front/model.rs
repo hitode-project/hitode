@@ -241,6 +241,7 @@ impl Model {
         }
     }
     fn step(&mut self, op: decode::Op, offsets: &[Option<i32>; 8], i: usize) -> Result<(), Reject> {
+        use crate::translate::integer::Integer;
         use decode::Op as D;
         let part = |s| match s {
             Src::Reg(r) => Part::Reg(r),
@@ -409,7 +410,27 @@ impl Model {
                 });
                 self.write(dst, width, v, offsets);
             }
-            D::Shift(_, dst, _) => self.write(part(dst), 4, None, offsets),
+            D::Shift(_, dst, _) => {
+                self.write(part(dst), 4, None, offsets);
+                self.flags = None;
+            }
+            D::Cmov(_, dst, _) | D::Integer(Integer::Bswap(dst)) => {
+                self.write(Part::Reg(dst), 4, None, offsets);
+            }
+            D::Setcc(_, dst) => self.write(Part::Reg(dst), 1, None, offsets),
+            D::Integer(Integer::Set(_, dst)) => self.write(dst, 1, None, offsets),
+            D::Integer(Integer::Cmov(_, dst, _, width) | Integer::Extend(dst, _, _, width, _)) => {
+                self.write(dst, width, None, offsets)
+            }
+            D::Integer(Integer::NarrowShift(_, dst, width, count)) if count != 0 => {
+                self.write(Part::Reg(dst), width, None, offsets);
+                self.flags = None;
+            }
+            D::Integer(Integer::TestBit(..)) => self.flags = None,
+            D::Parts(p) if matches!(p.kind, M::Adc | M::Sbb) => {
+                self.write(p.dst, p.width, None, offsets);
+                self.flags = None;
+            }
             D::Pop(r) => {
                 let v = self.read(
                     Part::Mem(Mem {
@@ -455,7 +476,12 @@ impl Model {
                     (0, 0)
                 }
             }
-            D::Integer(crate::translate::integer::Integer::Divide(..)) => {
+            D::Integer(Integer::Multiply(..)) => {
+                self.regs[0] = (0, 0);
+                self.regs[2] = (0, 0);
+                self.flags = None;
+            }
+            D::Integer(Integer::Divide(..)) => {
                 self.regs[0] = (0, 0);
                 self.regs[2] = (0, 0);
             }

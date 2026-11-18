@@ -76,6 +76,7 @@ fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
         .iter()
         .map(|s| match *s {
             Source::Reg(i) => u128::from(at.regs[i as usize]),
+            Source::FsBase => u128::from(at.fs_base),
             Source::Eflags => u128::from(at.eflags),
             Source::X87Ip => u128::from(at.x87.ip),
             Source::X87Opcode => u128::from(at.x87.opcode),
@@ -1314,7 +1315,7 @@ fn a_refused_instruction_on_a_cold_path_leaves_there() {
         });
         a.jmp(done).unwrap();
         a.set_label(&mut cold).unwrap();
-        a.cvtsi2ss(xmm0, eax).unwrap();
+        a.cvttss2si(eax, xmm0).unwrap();
         a.jmp(back).unwrap();
         a.set_label(&mut done).unwrap();
         a.nop().unwrap();

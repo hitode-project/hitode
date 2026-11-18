@@ -1099,6 +1099,7 @@ impl<'a> Emitter<'a> {
                         IntOp::Shl => shiftv(size, Lsl, d, a, b),
                         IntOp::Shr => shiftv(size, Lsr, d, a, b),
                         IntOp::Sar => shiftv(size, Asr, d, a, b),
+                        IntOp::Ror => rorv(size, d, a, b),
                         IntOp::Mul => mul(size, d, a, b),
                         IntOp::MulHighSigned if size == X => smulh(d, a, b),
                         IntOp::MulHighUnsigned if size == X => umulh(d, a, b),
@@ -1126,6 +1127,7 @@ impl<'a> Emitter<'a> {
                     IntUnary::SignExtend16 => sbfx(W, d, a, 0, 16),
                     IntUnary::High32 => lsr_imm(X, d, a, 32),
                     IntUnary::SignWiden => sbfx(X, d, a, 0, 32),
+                    IntUnary::ByteSwap => rev(W, d, a),
                     _ => mov(W, d, a),
                 });
             }
@@ -1237,6 +1239,32 @@ impl<'a> Emitter<'a> {
                 let b = self.vr(b, B);
                 self.fp(op, q, a, b);
             }
+            Op::Fp32(op, a, b) => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                self.asm.emit(sfloat(
+                    match op {
+                        FpOp::Add => Float::Fadd,
+                        FpOp::Sub => Float::Fsub,
+                        FpOp::Mul => Float::Fmul,
+                        FpOp::Div => Float::Fdiv,
+                    },
+                    q,
+                    a,
+                    b,
+                ));
+                let fail = self.fail();
+                let sum = matches!(op, FpOp::Add | FpOp::Sub);
+                fp_class::result_bits(&mut self.asm, false, q, T, U, None);
+                if sum {
+                    self.asm.tbz(true, U, 8, fail);
+                } else {
+                    // The boundary exponents need Tier-1's status handling.
+                    self.asm
+                        .emit_all(&[sub_imm(W, U, U, 3, false), cmp_imm(W, U, 253, false)]);
+                    self.asm.b_cond(Cond::Hs, fail);
+                }
+            }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);
                 self.asm.emit(unary(
@@ -1288,6 +1316,7 @@ impl<'a> Emitter<'a> {
             Op::VecUnary(op, a) => {
                 let a = self.vr(a, A);
                 match op {
+                    VecUnary::NarrowScalar => self.asm.emit(unary(Unary::Narrow, q, a)),
                     VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
                     VecUnary::High64 => {
                         self.asm.emit_all(&[vins(3, q, 0, a, 1), vmov(false, q, q)])
@@ -1707,7 +1736,13 @@ impl<'a> Emitter<'a> {
                     self.asm.emit(unary(Unary::Widen, q, q));
                 }
             }
-            Op::SseInput { a, b, packed, pc } => {
+            Op::SseInput {
+                a,
+                b,
+                packed,
+                single,
+                pc,
+            } => {
                 self.guest_eip = pc;
                 let a = self.vr(a, A);
                 let b = b.map(|b| self.vr(b, B));
@@ -1726,7 +1761,7 @@ impl<'a> Emitter<'a> {
                     for input in [Some(a), b].into_iter().flatten() {
                         fp_class::scalar_denormal(
                             &mut self.asm,
-                            true,
+                            !single,
                             input,
                             T,
                             U,
@@ -1789,12 +1824,13 @@ fn int_immediate(op: IntOp, size: Size, d: Reg, a: Reg, n: u64) -> Option<u32> {
                 _ => eor_imm(size, d, a, n),
             }
         }
-        IntOp::Shl | IntOp::Shr | IntOp::Sar => {
+        IntOp::Shl | IntOp::Shr | IntOp::Sar | IntOp::Ror => {
             let n = (n & if size == X { 63 } else { 31 }) as u32;
             match op {
                 IntOp::Shl => lsl_imm(size, d, a, n),
                 IntOp::Shr => lsr_imm(size, d, a, n),
-                _ => asr_imm(size, d, a, n),
+                IntOp::Sar => asr_imm(size, d, a, n),
+                _ => ror_imm(size, d, a, n),
             }
         }
         _ => return None,

@@ -103,6 +103,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::Test { flags: a, .. } => f(a),
         Op::Int(_, a, b)
         | Op::Fp(_, a, b)
+        | Op::Fp32(_, a, b)
         | Op::Vec(_, a, b)
         | Op::Div {
             dividend: a,
@@ -318,7 +319,11 @@ fn observed(func: &Func, defs: &[Option<Op>]) -> Vec<FlagSet> {
             {
                 let read = match kind {
                     FlagKind::AddCarry | FlagKind::SubBorrow => FlagSet::CF,
-                    FlagKind::Shl | FlagKind::Shr | FlagKind::Sar => seen[v],
+                    FlagKind::Shl
+                    | FlagKind::Shr
+                    | FlagKind::Sar
+                    | FlagKind::Rol
+                    | FlagKind::Ror => seen[v],
                     _ => FlagSet::NONE,
                 };
                 let passed = seen[v].minus(seen[v].minus(kept(kind)));
@@ -344,6 +349,10 @@ fn observed(func: &Func, defs: &[Option<Op>]) -> Vec<FlagSet> {
 fn kept(kind: FlagKind) -> FlagSet {
     match kind {
         FlagKind::Increment | FlagKind::Decrement => FlagSet::CF,
+        FlagKind::CarryBit => FlagSet::ALL.minus(FlagSet::CF),
+        FlagKind::MulSigned | FlagKind::MulUnsigned | FlagKind::Rol | FlagKind::Ror => {
+            FlagSet::ALL.minus(FlagSet::CF.or(FlagSet::OF))
+        }
         _ => FlagSet::NONE,
     }
 }
@@ -688,6 +697,7 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
                     IntUnary::Low32 => x & u128::from(u32::MAX),
                     IntUnary::High32 => x >> 32,
                     IntUnary::Widen => x & u128::from(u32::MAX),
+                    IntUnary::ByteSwap => u128::from((x as u32).swap_bytes()),
                     IntUnary::SignWiden => u128::from(x as u32 as i32 as i64 as u64),
                 },
                 if matches!(op, IntUnary::Low32 | IntUnary::High32) {
@@ -716,6 +726,8 @@ fn fold(op: Op, defs: &[Option<Op>], types: &[Type]) -> Option<u128> {
                     IntOp::Mul => a.wrapping_mul(b),
                     IntOp::Shl => a << shift,
                     IntOp::Shr => a >> shift,
+                    IntOp::Ror if ty == Type::I64 => u128::from((a as u64).rotate_right(shift)),
+                    IntOp::Ror => u128::from((a as u32).rotate_right(shift)),
                     IntOp::Sar => {
                         if ty == Type::I64 {
                             (a as u64 as i64 >> shift) as u64 as u128
@@ -1078,7 +1090,15 @@ fn sse_inputs(func: &mut Func) {
     for block in &mut func.blocks {
         let mut checked = BTreeMap::<Value, u8>::new();
         block.insts.retain_mut(|(_, op)| {
-            let Op::SseInput { a, b, packed, pc } = *op else {
+            // A clean double lane can still contain a single subnormal.
+            let Op::SseInput {
+                a,
+                b,
+                packed,
+                single: false,
+                pc,
+            } = *op
+            else {
                 return true;
             };
             let mask = if packed { 3 } else { 1 };
@@ -1094,6 +1114,7 @@ fn sse_inputs(func: &mut Func) {
                 a,
                 b: inputs.next(),
                 packed,
+                single: false,
                 pc,
             };
             true

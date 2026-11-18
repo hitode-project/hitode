@@ -4,7 +4,7 @@ use iced_x86::ConditionCode as CC;
 
 // Positive conditions: O, B, E, BE, S, P, L, LE; their partners invert.
 // A cleared mask bit selects a recipe over just the needed guest status bits.
-const CONDITIONS: [(u8, [Cond; 8]); 14] = {
+const CONDITIONS: [(u8, [Cond; 8]); 18] = {
     use Cond::*;
     [
         (0xd7, [Vs, Hs, Eq, Eq, Mi, Eq, Lt, Le]), // Add
@@ -21,6 +21,10 @@ const CONDITIONS: [(u8, [Cond; 8]); 14] = {
         (0, [Eq; 8]),
         (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // UCOMISD
         (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // COMISD
+        (0, [Eq; 8]),
+        (0, [Eq; 8]),
+        (0, [Eq; 8]),
+        (0, [Eq; 8]),
     ]
 };
 
@@ -179,9 +183,24 @@ impl Emitter<'_> {
         let (kind, width, a, b, prior) = (r.kind, r.width, r.a, r.b, r.prior);
         use FlagKind::*;
         if matches!(kind, Increment | Decrement) && bit == 0
-            || kind == MulSigned && !matches!(bit, 0 | 11)
+            || matches!(kind, MulSigned | MulUnsigned | Rol | Ror) && !matches!(bit, 0 | 11)
+            || kind == CarryBit && bit != 0
         {
             self.prior_bit(prior, bit);
+            return;
+        }
+        if matches!(kind, CarryBit | MulUnsigned) {
+            let ar = self.gp_at(a, T);
+            if kind == CarryBit {
+                self.asm.emit(and_imm(W, T, ar, 1));
+            } else {
+                self.asm
+                    .emit_all(&[cmp_imm(W, ar, 0, false), cset(W, T, Cond::Ne)]);
+            }
+            return;
+        }
+        if matches!(kind, Rol | Ror) {
+            self.rotate_bit(r, bit);
             return;
         }
         if bit == 4 {
@@ -268,6 +287,51 @@ impl Emitter<'_> {
                 mvn(W, T, T),
                 and_imm(W, T, T, 1),
             ]),
+        }
+    }
+
+    fn rotate_bit(&mut self, r: FlagRecipe, bit: u32) {
+        let old = self.asm.label();
+        let done = self.asm.label();
+        if let Some(count) = r.immediate {
+            let count = count & 31;
+            if count == 0 || bit == 11 && count != 1 {
+                self.prior_bit(r.prior, bit);
+                return;
+            }
+        } else {
+            let count = self.gp_at(r.b, U);
+            self.asm.emit(and_imm(W, U, count, 31));
+            if bit == 11 {
+                self.asm.emit(cmp_imm(W, U, 1, false));
+                self.asm.b_cond(Cond::Ne, old);
+            } else {
+                self.asm.cbz(W, false, U, old);
+            }
+        }
+        let result = self.gp_at(r.a, T);
+        let carry = if r.kind == FlagKind::Rol { 0 } else { 31 };
+        self.asm.emit(if bit == 0 {
+            ubfx(W, T, result, carry, 1)
+        } else {
+            eor(
+                W,
+                T,
+                result,
+                result,
+                Lsr,
+                31 - if carry == 0 { 0 } else { 30 },
+            )
+        });
+        if bit == 11 {
+            self.asm
+                .emit(ubfx(W, T, T, if carry == 0 { 0 } else { 30 }, 1));
+        }
+        if r.immediate.is_none() {
+            self.asm.b(done);
+            self.asm.bind(old);
+            self.prior_bit(r.prior, bit);
+            self.asm.bind(done);
         }
     }
 

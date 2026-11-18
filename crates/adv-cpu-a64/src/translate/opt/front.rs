@@ -150,6 +150,7 @@ struct Front<'a> {
     /// The host address of entry ESP plus `bias`.
     base: Value,
     bias: i32,
+    fs_base: Option<Value>,
     state: State,
     loads: BTreeMap<Value, usize>,
     stores: BTreeMap<RecordId, usize>,
@@ -630,6 +631,7 @@ fn build_trace(
         carried,
         base,
         bias,
+        fs_base: None,
         state: entry_state,
         loads: BTreeMap::new(),
         stores: BTreeMap::new(),
@@ -798,10 +800,11 @@ impl Front<'_> {
         }
     }
     fn address(&mut self, mem: Mem) -> Result<Value, Reject> {
-        if mem.fs || mem.address_bits != 32 {
+        if mem.address_bits != 32 {
             return Err(Reject::Unsupported(self.index));
         }
         if self.checked.is_none()
+            && !mem.fs
             && mem
                 .base
                 .is_some_and(|r| self.offsets[self.index][r as usize].is_some())
@@ -817,6 +820,13 @@ impl Front<'_> {
             let scale = self.imm(mem.scale);
             let index = self.int(IntOp::Mul, self.state.regs[index as usize], scale);
             addr = self.int(IntOp::Add, addr, index);
+        }
+        if mem.fs {
+            let base = *self.fs_base.get_or_insert_with(|| {
+                self.func.entry.push(Source::FsBase);
+                self.func.param(Block(0), Type::I32)
+            });
+            addr = self.int(IntOp::Add, addr, base);
         }
         Ok(addr)
     }
@@ -1102,6 +1112,9 @@ fn frame_offset(mem: Mem, offsets: &[Option<i32>; 8]) -> Option<i32> {
 type Layout = (Vec<Offsets>, Vec<i32>, BTreeMap<i32, u8>, bool);
 
 fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<Layout, Reject> {
+    use crate::translate::integer::Integer;
+    use decode::Op as D;
+
     let trace = &unit.trace;
     let mut offsets = vec![None; trace.len()];
     let mut entry = [None; 8];
@@ -1184,9 +1197,17 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
             }
             decode::Op::Fild64(mem, ..) => access(mem, 8),
             decode::Op::Simd(s) if s.memory() => access(s.mem, s.width),
-            decode::Op::Integer(crate::translate::integer::Integer::Divide(Src::Mem(mem), ..)) => {
-                access(mem, 4)
-            }
+            D::Integer(
+                Integer::Divide(Src::Mem(mem), ..)
+                | Integer::Multiply(Src::Mem(mem), _)
+                | Integer::TestBit(Src::Mem(mem), _),
+            )
+            | D::Cmov(_, _, Src::Mem(mem)) => access(mem, 4),
+            D::Integer(
+                Integer::Cmov(_, _, Part::Mem(mem), width)
+                | Integer::Extend(_, Part::Mem(mem), width, ..),
+            ) => access(mem, width),
+            D::Integer(Integer::Set(_, Part::Mem(mem))) => access(mem, 1),
             decode::Op::Parts(p) => {
                 if let Some(mem) = p.memory() {
                     access(mem, p.width);
@@ -1333,7 +1354,26 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
             | decode::Op::Imul(dst, ..)
             | decode::Op::Extend(dst, ..)
             | decode::Op::Carry(_, dst, _) => regs[dst as usize] = None,
-            decode::Op::Shift(_, Src::Reg(dst), _) => regs[dst as usize] = None,
+            D::Shift(_, Src::Reg(dst), _)
+            | D::Cmov(_, dst, _)
+            | D::Integer(Integer::Bswap(dst)) => regs[dst as usize] = None,
+            D::Integer(Integer::Multiply(..)) => {
+                regs[0] = None;
+                regs[2] = None;
+            }
+            D::Setcc(_, dst) => regs[(dst % 4) as usize] = None,
+            D::Integer(Integer::Set(_, Part::Reg(dst))) => regs[(dst % 4) as usize] = None,
+            D::Integer(
+                Integer::Cmov(_, Part::Reg(dst), _, _)
+                | Integer::Extend(Part::Reg(dst), ..)
+                | Integer::NarrowShift(_, dst, _, _),
+            ) => regs[dst as usize] = None,
+            D::Parts(p) if matches!(p.kind, iced_x86::Mnemonic::Adc | iced_x86::Mnemonic::Sbb) => {
+                if let Part::Reg(dst) = p.dst {
+                    let dst = if p.width == 1 { dst % 4 } else { dst };
+                    regs[dst as usize] = None;
+                }
+            }
             decode::Op::NarrowStep(_, width, Part::Reg(dst)) if resident => {
                 let dst = if width == 1 && dst >= 4 { dst - 4 } else { dst };
                 regs[dst as usize] = None;
@@ -1373,7 +1413,15 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                 Some((mem, 4))
             }
             decode::Op::StepMemory(_, mem) => Some((mem, 4)),
-            decode::Op::NarrowStep(_, width, Part::Mem(mem)) => Some((mem, width)),
+            D::NarrowStep(_, width, Part::Mem(mem)) => Some((mem, width)),
+            D::Shift(_, Src::Mem(mem), _) => Some((mem, 4)),
+            D::Integer(Integer::Set(_, Part::Mem(mem))) => Some((mem, 1)),
+            D::Parts(p) if matches!(p.kind, iced_x86::Mnemonic::Adc | iced_x86::Mnemonic::Sbb) => {
+                match p.dst {
+                    Part::Mem(mem) => Some((mem, p.width)),
+                    _ => None,
+                }
+            }
             _ => None,
         };
         if let Some((mem, width)) = overwritten

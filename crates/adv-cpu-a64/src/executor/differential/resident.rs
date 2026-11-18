@@ -684,6 +684,226 @@ fn seeded_loops_with_pointer_reads_indexed_stores_early_exits_and_stack_escapes(
     }
 }
 
+// spec: A64-OPT-9, A64-FLAG-2, A64-FLAG-4
+#[test]
+fn seeded_integer_memory_forms_and_flag_consumers() {
+    for seed in SEEDS {
+        let mut rng = Rng(seed);
+        let image = Image::assemble(
+            |a, head, _| {
+                a.mov(eax, dword_ptr(0x10).fs()).unwrap();
+                a.mov(ebx, dword_ptr(0x14).fs()).unwrap();
+                a.bt(dword_ptr(esi), 31).unwrap();
+                a.cmovb(eax, ebx).unwrap();
+                a.cmovb(ebx, dword_ptr(esi + 4)).unwrap();
+                a.setb(ah).unwrap();
+                a.movsx(dx, byte_ptr(esi + 1)).unwrap();
+                a.movzx(ebp, word_ptr(esi + 2)).unwrap();
+                a.bswap(eax).unwrap();
+                a.shl(ah, 9).unwrap();
+                a.sar(dx, 16).unwrap();
+                a.setb(al).unwrap();
+                a.push(dword_ptr(esi)).unwrap();
+                a.pop(edx).unwrap();
+                a.mul(ebx).unwrap();
+                a.seto(byte_ptr(edi)).unwrap();
+                a.setb(byte_ptr(edi + 1)).unwrap();
+                a.imul(dword_ptr(esi + 4)).unwrap();
+                a.seto(byte_ptr(edi + 2)).unwrap();
+                a.setb(byte_ptr(edi + 3)).unwrap();
+                a.adc(byte_ptr(esi + 1), ah).unwrap();
+                a.sbb(word_ptr(esi + 2), dx).unwrap();
+                a.adc(dword_ptr(esi + 4), eax).unwrap();
+                a.sbb(bx, word_ptr(esi + 4)).unwrap();
+                a.seto(byte_ptr(edi + 4)).unwrap();
+                a.setb(byte_ptr(edi + 5)).unwrap();
+                a.sete(byte_ptr(edi + 6)).unwrap();
+                a.setp(byte_ptr(edi + 7)).unwrap();
+                a.mov(dword_ptr(edi + 8), eax).unwrap();
+                a.mov(dword_ptr(edi + 12), edx).unwrap();
+                a.add(esi, 8).unwrap();
+                a.add(edi, 16).unwrap();
+                latch(a, head);
+            },
+            observe_registers,
+        );
+        let mut state = initial(8);
+        state.fs_base = DATA + 0x800;
+        let mut words: Vec<u8> = (0..64).map(|_| rng.next() as u8).collect();
+        words[3] |= 0x80;
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            format!("integer memory seed {seed:#x}"),
+            &[],
+            |m| {
+                m.write(DATA, &words).unwrap();
+                m.write(state.fs_base + 0x10, &0xfedc_ba89u32.to_le_bytes())
+                    .unwrap();
+                m.write(state.fs_base + 0x14, &0x8000_0001u32.to_le_bytes())
+                    .unwrap();
+            },
+        );
+        trial.install();
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .resident_arrivals(image.head)
+                .unwrap()
+                > 0
+        );
+        trial.compare_epilogue();
+    }
+}
+
+// spec: A64-OPT-9, A64-FLAG-2
+#[test]
+fn seeded_rotates_keep_flags_for_zero_and_mask_cl() {
+    for seed in SEEDS {
+        let input = Rng(seed).next() as u32;
+        let image = Image::assemble(
+            |a, head, _| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(ebx, eax).unwrap();
+                a.cmp(edx, 1).unwrap();
+                a.rol(eax, cl).unwrap();
+                a.setb(byte_ptr(edi)).unwrap();
+                a.seto(byte_ptr(edi + 1)).unwrap();
+                a.sets(byte_ptr(edi + 2)).unwrap();
+                a.ror(ebx, cl).unwrap();
+                a.setb(byte_ptr(edi + 3)).unwrap();
+                a.seto(byte_ptr(edi + 4)).unwrap();
+                a.rol(eax, 1).unwrap();
+                a.ror(ebx, 31).unwrap();
+                a.rol(eax, 32).unwrap();
+                a.ror(ebx, 33).unwrap();
+                a.setb(byte_ptr(edi + 5)).unwrap();
+                a.seto(byte_ptr(edi + 6)).unwrap();
+                a.mov(dword_ptr(edi + 8), eax).unwrap();
+                a.mov(dword_ptr(edi + 12), ebx).unwrap();
+                a.add(edi, 16).unwrap();
+                a.sub(ecx, 1).unwrap();
+                a.jae(head).unwrap();
+            },
+            observe_registers,
+        );
+        let mut state = initial(33);
+        state.regs[2] = 0x8000_0000;
+        let mut trial = Trial::new(&image, &state, format!("rotate seed {seed:#x}"), &[], |m| {
+            m.write(DATA, &input.to_le_bytes()).unwrap();
+        });
+        trial.install();
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        trial.compare_epilogue();
+    }
+}
+
+// spec: A64-OPT-9, A64-MEM-5
+#[test]
+fn a_false_cmov_still_faults_on_its_memory_source() {
+    let image = Image::loop_body(|a, head, _| {
+        a.cmp(ecx, ecx).unwrap();
+        a.cmovne(eax, dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(4);
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    state.regs[6] = boundary - 4;
+    let mut trial = Trial::new(&image, &state, "false cmov", &[], |m| {
+        m.map(SPECIAL, HOST_PAGE, READ).unwrap();
+        m.map(boundary, HOST_PAGE, 0).unwrap();
+    });
+    trial.install();
+    let (outcome, retired) = trial.compare(128);
+    assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
+    assert_eq!(retired, 7);
+    assert!(
+        trial
+            .live
+            .native
+            .as_ref()
+            .unwrap()
+            .diagnostics
+            .resident_cold_exits
+            > 0
+    );
+}
+
+// spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
+#[test]
+fn seeded_scalar_sse_memory_forms_cross_a_page() {
+    for seed in SEEDS {
+        let mut rng = Rng(seed);
+        let boundary = SPECIAL + HOST_PAGE as u32;
+        let image = Image::assemble(
+            |a, head, _| {
+                a.movsd_2(xmm0, qword_ptr(esi)).unwrap();
+                a.movss(xmm1, dword_ptr(esi + 10)).unwrap();
+                a.movq(xmm2, qword_ptr(esi)).unwrap();
+                a.movd(xmm3, dword_ptr(esi + 10)).unwrap();
+                a.cvtsi2ss(xmm4, dword_ptr(esi + 16)).unwrap();
+                a.cvtsi2sd(xmm5, dword_ptr(esi + 16)).unwrap();
+                a.mulss(xmm1, dword_ptr(esi + 10)).unwrap();
+                a.addss(xmm1, dword_ptr(esi + 10)).unwrap();
+                a.subss(xmm1, dword_ptr(esi + 10)).unwrap();
+                a.divss(xmm1, dword_ptr(esi + 10)).unwrap();
+                a.mulsd(xmm0, qword_ptr(esi)).unwrap();
+                a.addsd(xmm0, qword_ptr(esi)).unwrap();
+                a.subsd(xmm0, qword_ptr(esi)).unwrap();
+                a.divsd(xmm0, qword_ptr(esi)).unwrap();
+                a.movsd_2(qword_ptr(edi), xmm0).unwrap();
+                a.movss(dword_ptr(edi + 8), xmm1).unwrap();
+                a.movq(qword_ptr(edi + 12), xmm2).unwrap();
+                a.movd(dword_ptr(edi + 20), xmm3).unwrap();
+                a.add(edi, 24).unwrap();
+                latch(a, head);
+            },
+            observe_registers,
+        );
+        let mut state = initial(4);
+        state.regs[6] = boundary - 4;
+        state.mxcsr |= 0x20;
+        state.xmm[0] = [0x55; 16];
+        state.xmm[1] = [0xaa; 16];
+        state.xmm[4] = [0x55; 16];
+        state.xmm[5] = [0x55; 16];
+        let double = 1.25 + rng.below(32) as f64;
+        let single = 1.75 + rng.below(32) as f32;
+        let integer = (rng.next() as u32) | (1 << 24);
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            format!("scalar SSE seed {seed:#x}"),
+            &[(SPECIAL, 2 * HOST_PAGE)],
+            |m| {
+                m.map(SPECIAL, 2 * HOST_PAGE, READ | WRITE).unwrap();
+                m.write(boundary - 4, &double.to_le_bytes()).unwrap();
+                m.write(boundary + 6, &single.to_le_bytes()).unwrap();
+                m.write(boundary + 12, &integer.to_le_bytes()).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().checks = Checks::All;
+        trial.install();
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert_eq!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits,
+            0
+        );
+        trial.compare_epilogue();
+    }
+}
+
 // spec: A64-OPT-9, A64-FLAG-3
 #[test]
 fn a_loop_carried_carry_stays_in_tier1() {

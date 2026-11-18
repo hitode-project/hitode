@@ -109,6 +109,11 @@ impl Emitter<'_> {
                         .emit(vldr(VMem::D, out, CPU, runtime::MMX + 8 * u32::from(i)));
                     Host::Vector(out)
                 }
+                Source::FsBase => {
+                    let out = self.rd(param);
+                    self.asm.emit(ldr(W, out, CPU, runtime::FS_BASE));
+                    Host::Register(out)
+                }
                 Source::X87Ip => {
                     let out = self.rd(param);
                     self.asm.emit(ldr(W, out, CPU, runtime::X87_IP));

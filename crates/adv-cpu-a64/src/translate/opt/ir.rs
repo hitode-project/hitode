@@ -47,6 +47,7 @@ pub(crate) enum IntOp {
     Shl,
     Shr,
     Sar,
+    Ror,
     Mul,
     MulHighSigned,
     MulHighUnsigned,
@@ -68,6 +69,7 @@ pub(crate) enum IntUnary {
     Widen,
     /// An I32 sign-extended to I64.
     SignWiden,
+    ByteSwap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +116,8 @@ pub(crate) enum VecOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecUnary {
     ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
+    /// Narrows a binary64 scalar to binary32.
+    NarrowScalar,
     /// Zeroes bits 64..128 of a V128 value.
     Low64,
     /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
@@ -150,6 +154,10 @@ pub(crate) enum FlagKind {
     UnorderedCompare,
     /// `comisd`: the same flags, but a quiet NaN also raises invalid.
     OrderedCompare,
+    CarryBit,
+    MulUnsigned,
+    Rol,
+    Ror,
 }
 
 impl FlagKind {
@@ -163,7 +171,12 @@ impl FlagKind {
     pub(crate) fn reads_b(self) -> bool {
         !matches!(
             self,
-            FlagKind::Logic | FlagKind::Increment | FlagKind::Decrement | FlagKind::Negate
+            FlagKind::Logic
+                | FlagKind::Increment
+                | FlagKind::Decrement
+                | FlagKind::Negate
+                | FlagKind::CarryBit
+                | FlagKind::MulUnsigned
         )
     }
 }
@@ -216,6 +229,7 @@ pub(crate) enum Op {
         value: Value,
     },
     Fp(FpOp, Value, Value),
+    Fp32(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
     /// A signed integer as F64; fails when it is not exactly representable.
     FromInt(Value),
@@ -299,11 +313,12 @@ pub(crate) enum Op {
         denormal: bool,
         single: bool,
     },
-    /// Checks raw SSE binary64 lanes for denormals when MXCSR.DE is clear.
+    /// Checks raw SSE lanes for denormals when MXCSR.DE is clear.
     SseInput {
         a: Value,
         b: Option<Value>,
         packed: bool,
+        single: bool,
         pc: u32,
     },
     /// Effect boundary for floating-point checks.
@@ -331,6 +346,7 @@ impl Op {
             | Op::Test { flags: a, .. } => [Some(a), None, None],
             Op::Int(_, a, b)
             | Op::Fp(_, a, b)
+            | Op::Fp32(_, a, b)
             | Op::Vec(_, a, b)
             | Op::Div {
                 dividend: a,
@@ -360,7 +376,7 @@ impl Op {
     /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
-            Op::Fp(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
+            Op::Fp(..) | Op::Fp32(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
         }
@@ -476,6 +492,7 @@ pub(crate) enum Source {
     /// The x87 last instruction pointer and opcode, I32.
     X87Ip,
     X87Opcode,
+    FsBase,
     /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
     /// Narrower accesses extract from these.
     Frame {
@@ -487,7 +504,7 @@ pub(crate) enum Source {
 impl Source {
     pub(crate) fn ty(self) -> Type {
         match self {
-            Source::Reg(_) | Source::X87Ip | Source::X87Opcode => Type::I32,
+            Source::Reg(_) | Source::X87Ip | Source::X87Opcode | Source::FsBase => Type::I32,
             Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,
@@ -580,7 +597,7 @@ impl Func {
             Op::ToInt { wide: true, .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) | Op::VecUnary(..) => Type::V128,
+            Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) => Type::V128,
             Op::Store { .. }
             | Op::FrameStore { .. }
             | Op::SseInput { .. }
