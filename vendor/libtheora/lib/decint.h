@@ -124,12 +124,11 @@ struct th_dec_ctx{
   oc_pack_buf            opb;
   /*Huffman decode trees.*/
   ogg_int16_t           *huff_tables[TH_NHUFFMAN_TABLES];
+  adv_huff_table         adv_huff[TH_NHUFFMAN_TABLES];
   /*The DCT token lists.*/
   unsigned char         *dct_tokens;
   /*The extra bits associated with DCT tokens.*/
   unsigned char         *extra_bits;
-  /*The number of dct tokens unpacked so far.*/
-  int                    dct_tokens_count;
   /*The out-of-loop post-processing level.*/
   int                    pp_level;
   /*The DC scale used for out-of-loop deblocking.*/

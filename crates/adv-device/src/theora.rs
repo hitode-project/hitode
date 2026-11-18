@@ -304,6 +304,79 @@ fn validate_tree(tree: &[i16]) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" {
+        fn adv_theora_test_huffman(tree: *const i16, data: *const u8, size: i32) -> i32;
+        fn adv_theora_test_setup_huffman(
+            header: *const u8,
+            bytes: usize,
+            data: *const u8,
+            size: i32,
+        ) -> i32;
+    }
+
+    fn random_word(seed: &mut u32) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed
+    }
+
+    fn random_huffman_node(tree: &mut Vec<i16>, seed: &mut u32, width: u32, depth: u32) -> i16 {
+        let node = tree.len();
+        let count = 1usize << width;
+        tree.resize(node + 1 + count, 0);
+        tree[node] = width as i16;
+        let mut i = 0;
+        while i < count {
+            let random = random_word(seed);
+            let entry = node + 1 + i;
+            if depth != 0 && random & 3 == 0 {
+                tree[entry] = random_huffman_node(tree, seed, 1 + (random >> 2) % 4, depth - 1);
+                i += 1;
+            } else {
+                let alignment = (i | count).trailing_zeros();
+                let repeat = (random >> 2) % (alignment + 1);
+                let leaf = ((width - repeat) << 8) | ((random >> 8) % 92);
+                let slots = 1 << repeat;
+                tree[entry..entry + slots].fill(-(leaf as i16));
+                i += slots;
+            }
+        }
+        node.try_into().unwrap()
+    }
+
+    // spec: DEV-VIDEO-1
+    #[test]
+    fn theora_entropy_matches_reference_on_setup_and_random_trees() {
+        // A setup packet produced by libtheora 1.2.0 for a synthetic 32x32 stream.
+        let header = include_bytes!("../tests/data/theora-setup.bin");
+        let mut seed = 0xa6d5_fc31;
+        let data: [u8; 48] = std::array::from_fn(|_| random_word(&mut seed) as u8);
+        // SAFETY: both pointers cover the supplied sizes for the synchronous test.
+        let result = unsafe {
+            adv_theora_test_setup_huffman(
+                header.as_ptr(),
+                header.len(),
+                data.as_ptr(),
+                data.len() as i32,
+            )
+        };
+        assert_eq!(result, 0, "setup parse or table {result} differed");
+        for case in 0..128 {
+            let mut tree = Vec::new();
+            let width = case % 10 + 1;
+            let depth = if width > 6 { 0 } else { 8 };
+            random_huffman_node(&mut tree, &mut seed, width, depth);
+            validate_tree(&tree).unwrap();
+            let data: [u8; 48] = std::array::from_fn(|_| random_word(&mut seed) as u8);
+            // SAFETY: the validated tree and all packet prefixes are live.
+            let result =
+                unsafe { adv_theora_test_huffman(tree.as_ptr(), data.as_ptr(), data.len() as i32) };
+            assert_eq!(result, 1, "random tree {case}");
+        }
+    }
+
     fn setup(format: u32) -> Setup {
         let mut info = [0u8; 64];
         info[..3].copy_from_slice(&[3, 2, 1]);

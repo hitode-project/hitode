@@ -379,6 +379,9 @@ static int oc_dec_init(oc_dec_ctx *_dec,const th_info *_info,
     oc_state_clear(&_dec->state);
     return ret;
   }
+  for(int i=0;i<TH_NHUFFMAN_TABLES;i++){
+    adv_huff_table_init(_dec->adv_huff+i,_dec->huff_tables[i]);
+  }
   /*For each fragment, allocate one byte for every DCT coefficient token, plus
      one byte for extra-bits for each token, plus one more byte for the long
      EOB run, just in case it's the very last token and has a run length of
@@ -1048,42 +1051,44 @@ static void adv_bands_init(const oc_theora_state *state,adv_recon_band *band,
   }
 }
 
+/*Save the compact token stream for reconstruction while returning its
+   code word for run accounting and DC prediction. */
+static inline int oc_dec_token_unpack(oc_pack_buf *opb,
+ const adv_huff_table *table,unsigned char **tokens){
+  unsigned char *out=*tokens;
+  int token=adv_huff_token_decode(opb,table);
+  int cw=OC_DCT_CODE_WORD[token];
+  *out++=(unsigned char)token;
+  if(OC_DCT_TOKEN_NEEDS_MORE(token)){
+    int eb=(int)adv_pack_read(opb,OC_INTERNAL_DCT_TOKEN_EXTRA_BITS[token]);
+    *out++=(unsigned char)eb;
+    if(token==OC_DCT_TOKEN_FAT_EOB)*out++=(unsigned char)(eb>>8);
+    cw+=eb<<OC_DCT_TOKEN_EB_POS(token);
+  }
+  *tokens=out;
+  return cw;
+}
+
 /*Unpack DC in coded order, carrying EOB runs across bands and planes.
   The DC values are needed later for serial spatial prediction. */
 static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
- adv_recon_band *bands,int count){
-  unsigned char *dct_tokens=_dec->dct_tokens;
-  oc_fragment   *frags=_dec->state.frags;
-  ptrdiff_t      eobs=0;
-  ptrdiff_t      ti=0;
+ adv_recon_band *bands,int count,unsigned char **tokens){
+  oc_fragment *frags=_dec->state.frags;
+  ptrdiff_t eobs=0;
   for(int bi=0;bi<count;bi++){
     adv_recon_band *band=bands+bi;
-    const ogg_int16_t *tree=_dec->huff_tables[_huff_idxs[band->pli+1>>1]];
+    const adv_huff_table *table=_dec->adv_huff+_huff_idxs[band->pli+1>>1];
     const ptrdiff_t *coded_fragis=band->coded_fragis;
     ptrdiff_t run_counts[64]={0};
     ptrdiff_t fragii=0;
     ptrdiff_t eobi=OC_MINI(eobs,band->ncoded);
     ptrdiff_t eob_count=eobi;
     band->eob_runs[0]=eobs;
-    band->ti[0]=ti;
+    band->ti[0]=*tokens-_dec->dct_tokens;
     eobs-=eobi;
     while(eobi-->0)frags[coded_fragis[fragii++]].dc=0;
     while(fragii<band->ncoded){
-      int token;
-      int cw;
-      int eb;
-      int skip;
-      token=oc_huff_token_decode(&_dec->opb,tree);
-      dct_tokens[ti++]=(unsigned char)token;
-      if(OC_DCT_TOKEN_NEEDS_MORE(token)){
-        eb=(int)oc_pack_read(&_dec->opb,
-         OC_INTERNAL_DCT_TOKEN_EXTRA_BITS[token]);
-        dct_tokens[ti++]=(unsigned char)eb;
-        if(token==OC_DCT_TOKEN_FAT_EOB)dct_tokens[ti++]=(unsigned char)(eb>>8);
-        eb<<=OC_DCT_TOKEN_EB_POS(token);
-      }
-      else eb=0;
-      cw=OC_DCT_CODE_WORD[token]+eb;
+      int cw=oc_dec_token_unpack(&_dec->opb,table,tokens);
       eobs=cw>>OC_DCT_CW_EOB_SHIFT&0xFFF;
       if(cw==OC_DCT_CW_FINISH)eobs=OC_DCT_EOB_FINISH;
       if(eobs){
@@ -1094,7 +1099,7 @@ static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
       }
       else{
         int coeff;
-        skip=(unsigned char)(cw>>OC_DCT_CW_RLEN_SHIFT);
+        int skip=(unsigned char)(cw>>OC_DCT_CW_RLEN_SHIFT);
         cw^=-(cw&1<<OC_DCT_CW_FLIP_BIT);
         coeff=cw>>OC_DCT_CW_MAG_SHIFT;
         if(skip)coeff=0;
@@ -1106,7 +1111,6 @@ static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
     for(int rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
     for(int rli=0;rli<64;rli++)band->ntoks_left[rli]-=run_counts[rli];
   }
-  _dec->dct_tokens_count=ti;
   return eobs;
 }
 
@@ -1115,38 +1119,22 @@ static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
    started at earlier coefficients. Carrying EOB between bands yields the
    same token cursor and outstanding run as consuming the whole plane. */
 static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
- adv_recon_band *bands,int count,ptrdiff_t _eobs){
-  unsigned char *dct_tokens=_dec->dct_tokens;
-  ptrdiff_t ti=_dec->dct_tokens_count;
+ adv_recon_band *bands,int count,ptrdiff_t _eobs,unsigned char **tokens){
   for(int bi=0;bi<count;bi++){
     adv_recon_band *band=bands+bi;
-    const ogg_int16_t *tree=_dec->huff_tables[_huff_idxs[band->pli+1>>1]];
+    const adv_huff_table *table=_dec->adv_huff+_huff_idxs[band->pli+1>>1];
     ptrdiff_t run_counts[64]={0};
     ptrdiff_t eob_count=0;
     size_t ntoks_left=band->ntoks_left[_zzi];
     size_t ntoks=0;
     band->eob_runs[_zzi]=_eobs;
-    band->ti[_zzi]=ti;
+    band->ti[_zzi]=*tokens-_dec->dct_tokens;
     if(ntoks_left==0)continue;
     while(ntoks+_eobs<ntoks_left){
-      int token;
-      int cw;
-      int eb;
-      int skip;
       ntoks+=_eobs;
       eob_count+=_eobs;
-      token=oc_huff_token_decode(&_dec->opb,tree);
-      dct_tokens[ti++]=(unsigned char)token;
-      if(OC_DCT_TOKEN_NEEDS_MORE(token)){
-        eb=(int)oc_pack_read(&_dec->opb,
-         OC_INTERNAL_DCT_TOKEN_EXTRA_BITS[token]);
-        dct_tokens[ti++]=(unsigned char)eb;
-        if(token==OC_DCT_TOKEN_FAT_EOB)dct_tokens[ti++]=(unsigned char)(eb>>8);
-        eb<<=OC_DCT_TOKEN_EB_POS(token);
-      }
-      else eb=0;
-      cw=OC_DCT_CODE_WORD[token]+eb;
-      skip=(unsigned char)(cw>>OC_DCT_CW_RLEN_SHIFT);
+      int cw=oc_dec_token_unpack(&_dec->opb,table,tokens);
+      int skip=(unsigned char)(cw>>OC_DCT_CW_RLEN_SHIFT);
       _eobs=cw>>OC_DCT_CW_EOB_SHIFT&0xFFF;
       if(cw==OC_DCT_CW_FINISH)_eobs=OC_DCT_EOB_FINISH;
       if(_eobs==0){
@@ -1160,7 +1148,6 @@ static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
     for(int rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
     for(int rli=0;rli<64-_zzi;rli++)band->ntoks_left[_zzi+rli]-=run_counts[rli];
   }
-  _dec->dct_tokens_count=ti;
   return _eobs;
 }
 
@@ -1190,27 +1177,23 @@ static void oc_dec_residual_tokens_unpack(oc_dec_ctx *_dec,
   static const unsigned char OC_HUFF_LIST_MAX[5]={1,6,15,28,64};
   int        huff_idxs[2];
   ptrdiff_t  eobs;
-  long       val;
+  unsigned char *tokens=_dec->dct_tokens;
   int        zzi;
   int        hgi;
-  val=oc_pack_read(&_dec->opb,4);
-  huff_idxs[0]=(int)val;
-  val=oc_pack_read(&_dec->opb,4);
-  huff_idxs[1]=(int)val;
-  eobs=oc_dec_dc_coeff_unpack(_dec,huff_idxs,bands,count);
+  huff_idxs[0]=adv_pack_read(&_dec->opb,4);
+  huff_idxs[1]=adv_pack_read(&_dec->opb,4);
+  eobs=oc_dec_dc_coeff_unpack(_dec,huff_idxs,bands,count,&tokens);
 #if defined(HAVE_CAIRO)
   _dec->telemetry_dc_bytes=oc_pack_bytes_left(&_dec->opb);
 #endif
-  val=oc_pack_read(&_dec->opb,4);
-  huff_idxs[0]=(int)val;
-  val=oc_pack_read(&_dec->opb,4);
-  huff_idxs[1]=(int)val;
+  huff_idxs[0]=adv_pack_read(&_dec->opb,4);
+  huff_idxs[1]=adv_pack_read(&_dec->opb,4);
   zzi=1;
   for(hgi=1;hgi<5;hgi++){
     huff_idxs[0]+=16;
     huff_idxs[1]+=16;
     for(;zzi<OC_HUFF_LIST_MAX[hgi];zzi++){
-      eobs=oc_dec_ac_coeff_unpack(_dec,zzi,huff_idxs,bands,count,eobs);
+      eobs=oc_dec_ac_coeff_unpack(_dec,zzi,huff_idxs,bands,count,eobs,&tokens);
     }
   }
   /*TODO: eobs should be exactly zero, or 4096 or greater.

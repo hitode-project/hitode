@@ -91,3 +91,56 @@ unsigned char adv_theora_info(void *opaque, unsigned char info[64]) {
   memcpy(info, &decoder->state.info, sizeof(th_info));
   return decoder->state.granpos_bias;
 }
+
+/*Exercise both readers through complete and byte-truncated packet prefixes. */
+int adv_theora_test_huffman(const int16_t *tree, const unsigned char *data, int size) {
+  adv_huff_table table;
+  adv_huff_table_init(&table, tree);
+  for (int len = 0; len <= size; len++) {
+    for (int first = 0; first < 2; first++) {
+      oc_pack_buf reference, fast;
+      oc_pack_readinit(&reference, (unsigned char *)data, len);
+      fast = reference;
+      for (int i = 0; i < len * 8 + 16; i++) {
+        int want, got;
+        if ((i + first) % 3 == 0) {
+          int bits = 1 + i / 3 % 12;
+          want = (int)oc_pack_read_c(&reference, bits);
+          got = adv_pack_read(&fast, bits);
+        }
+        else {
+          want = oc_huff_token_decode_c(&reference, tree);
+          got = adv_huff_token_decode(&fast, &table);
+        }
+        if (want != got || reference.ptr != fast.ptr || reference.stop != fast.stop ||
+         reference.window != fast.window || reference.bits != fast.bits ||
+         reference.eof != fast.eof) {
+          return 0;
+        }
+      }
+    }
+  }
+  return 1;
+}
+
+int adv_theora_test_setup_huffman(const unsigned char *header, size_t bytes,
+ const unsigned char *data, int size) {
+  th_setup_info setup = {0};
+  oc_pack_buf opb;
+  int result = -1;
+  if (bytes < 7 || memcmp(header, "\202theora", 7) != 0) return result;
+  oc_pack_readinit(&opb, (unsigned char *)header + 7, (long)bytes - 7);
+  if (oc_quant_params_unpack(&opb, &setup.qinfo) == 0 &&
+   oc_huff_trees_unpack(&opb, setup.huff_tables) == 0) {
+    result = 0;
+    for (int i = 0; i < TH_NHUFFMAN_TABLES; i++) {
+      if (!adv_theora_test_huffman(setup.huff_tables[i], data, size)) {
+        result = i + 1;
+        break;
+      }
+    }
+  }
+  oc_huff_trees_clear(setup.huff_tables);
+  oc_quant_params_clear(&setup.qinfo);
+  return result;
+}
