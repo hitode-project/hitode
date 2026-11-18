@@ -184,6 +184,7 @@ fn fixture(mode: Mode, fail: bool) -> Machine<JitCpu> {
         }],
         decoders: BTreeMap::new(),
         stats: Stats::default(),
+        file_counts: Arc::default(),
     });
     machine.ext.insert(Allocator {
         fail,
@@ -808,7 +809,273 @@ fn callable_control_and_clear_each_discard_pending_packets() {
     ));
     let provider = machine.ext.get::<Provider>();
     assert!(provider.decoders.is_empty());
-    assert_eq!(provider.stats.run_ahead.predicted, 4);
-    assert_eq!(provider.stats.run_ahead.discarded, 4);
+    let predicted = 2 * RUN_AHEAD_DEPTH as u64;
+    assert_eq!(provider.stats.run_ahead.predicted, predicted);
+    assert_eq!(provider.stats.run_ahead.discarded, predicted);
     assert_eq!(provider.stats.run_ahead.committed, 0);
+}
+
+const SERIAL: u32 = 123456;
+
+fn ogg_page(sequence: u32, flags: u8, granulepos: i64, laces: &[u8], body: &[u8]) -> Vec<u8> {
+    use super::super::readahead::crc;
+
+    let mut page = b"OggS\0".to_vec();
+    page.push(flags);
+    page.extend(granulepos.to_le_bytes());
+    page.extend(SERIAL.to_le_bytes());
+    page.extend(sequence.to_le_bytes());
+    page.extend([0; 4]);
+    page.push(laces.len().try_into().unwrap());
+    page.extend(laces);
+    page.extend(body);
+    let checksum = crc(&page);
+    page[22..26].copy_from_slice(&checksum.to_le_bytes());
+    page
+}
+
+fn packet_page(sequence: u32, flags: u8, packet: &Packet, skip: usize) -> Vec<u8> {
+    let bytes = &packet.bytes[skip..];
+    let mut laces = vec![255; bytes.len() / 255];
+    laces.push((bytes.len() % 255) as u8);
+    ogg_page(sequence, flags, packet.granulepos, &laces, bytes)
+}
+
+fn packet_file(name: &str, bytes: &[u8]) -> std::fs::File {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!("adv-ogg-{name}-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.write_all(bytes).unwrap();
+    file
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn file_prediction_checks_crc_and_reassembles_continued_packets() {
+    use super::super::readahead::{Packets, Tail};
+    use adv_nt::file::ReadSource;
+    use std::io::Seek;
+    use std::os::unix::fs::FileExt;
+
+    let (_, packets) = generated_stream();
+    let mut expected = packets
+        .iter()
+        .find(|p| p.bytes.len() > 255)
+        .unwrap()
+        .clone();
+    expected.bos = 0x100;
+    expected.eos = 0;
+    let start = ogg_page(4, 2, -1, &[255], &expected.bytes[..255]);
+    let end = packet_page(5, 1, &expected, 255);
+    let mut last = packets.last().unwrap().clone();
+    last.packetno = expected.packetno + 1;
+    last.bos = 0;
+    last.eos = 0x200;
+    let last_page = packet_page(6, 4, &last, 0);
+    let data = [start.as_slice(), &end, &last_page].concat();
+    let file = Arc::new(packet_file("pages", &data));
+    let tail = Tail {
+        source: ReadSource {
+            file: Arc::clone(&file),
+            offset: 0,
+        },
+        serial: SERIAL,
+        sequence: 4,
+        eos: false,
+    };
+    let mut cursor = Packets::new(tail.clone(), expected.packetno, Vec::new(), 0);
+    assert_eq!(cursor.next(), Some(expected.clone()));
+    assert_eq!(cursor.next(), Some(last));
+    assert!(cursor.next().is_none());
+    assert_eq!((&*file).stream_position().unwrap(), data.len() as u64);
+
+    let mut cursor = Packets::new(
+        Tail {
+            source: ReadSource {
+                offset: start.len() as u64,
+                ..tail.source.clone()
+            },
+            sequence: 5,
+            ..tail.clone()
+        },
+        expected.packetno,
+        expected.bytes[..255].to_vec(),
+        expected.bos,
+    );
+    assert_eq!(cursor.next(), Some(expected.clone()));
+
+    file.write_all_at(&[end[22] ^ 1], start.len() as u64 + 22)
+        .unwrap();
+    let mut cursor = Packets::new(tail, expected.packetno, Vec::new(), 0);
+    assert!(cursor.next().is_none());
+    assert!(cursor.next().is_none());
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn file_prediction_refills_only_one_slot_per_commit() {
+    use super::super::readahead::{Packets, Tail};
+    use adv_nt::file::ReadSource;
+
+    let (setup, mut packets) = generated_stream();
+    packets.last_mut().unwrap().eos = 0x200;
+    let pages: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .flat_map(|(i, packet)| {
+            packet_page(
+                i as u32,
+                if i + 1 == packets.len() { 4 } else { 0 },
+                packet,
+                0,
+            )
+        })
+        .collect();
+    let file = Arc::new(packet_file("rolling", &pages));
+    let mut cursor = Packets::new(
+        Tail {
+            source: ReadSource { file, offset: 0 },
+            serial: SERIAL,
+            sequence: 0,
+            eos: false,
+        },
+        packets[0].packetno,
+        Vec::new(),
+        0,
+    );
+    let mut instance = Instance::new(0, Decoder::with_run_ahead(&setup).unwrap(), None);
+    let mut control = initial_control(0);
+    let mut sync_state = control.state;
+    let mut sync = Decoder::new(&setup).unwrap();
+    let mut stats = run_ahead::Stats::default();
+    let counts = Arc::new(run_ahead::FileCounts::default());
+
+    assert!(instance.decoder.predict_file(
+        control.clone(),
+        RUN_AHEAD_DEPTH,
+        move || cursor.next().map(|p| (p, true)),
+        Arc::clone(&counts),
+        &mut stats
+    ));
+    for packet in &packets {
+        assert!(instance.decoder.try_commit(packet, &control, &mut stats));
+        compare_frame(&instance.decoder, &mut sync, packet, &mut sync_state);
+        control.state = instance.decoder.committed().state;
+        assert!(counts.readahead_packets.load(Ordering::Relaxed) <= stats.committed + 2);
+        assert!(instance.decoder.refill_file(RUN_AHEAD_DEPTH));
+    }
+    assert_eq!(stats.committed, packets.len() as u64);
+    assert_eq!(
+        stats.owner_wait_ns,
+        stats.wait_in_flight_ns + stats.wait_not_started_ns
+    );
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn seek_and_file_rewrite_restore_exact_theora_output() {
+    use super::super::readahead::Packets;
+    use adv_nt::file::ReadSource;
+    use std::{os::unix::fs::FileExt, sync::mpsc};
+
+    let (setup, packets) = generated_stream();
+    let mut substitute = packets[1].clone();
+    substitute.bytes = packets[2].bytes.clone();
+    for seek in [true, false] {
+        let data = [&[0; 64][..], &packet_page(1, 0, &packets[1], 0)].concat();
+        let file = Arc::new(packet_file("rewrite", &data));
+        let source_at = |offset| ReadSource {
+            file: Arc::clone(&file),
+            offset,
+        };
+        let mut ext = Ext::default();
+        ogg::install(&mut ext);
+        install(&mut ext, Mode::Native);
+        let (source, tail) = ogg::tests::link_fixture(&mut ext, source_at(0), SERIAL, 0);
+        let mut cursor = Packets::new(tail.clone(), packets[1].packetno, Vec::new(), 0);
+        let provider = ext.get_mut::<Provider>();
+        let mut sync = Decoder::new(&setup).unwrap();
+        let mut instance = Instance::new(0, Decoder::with_run_ahead(&setup).unwrap(), None);
+        instance.source = Some(source);
+        let mut control = initial_control(7);
+        let mut sync_state = control.state;
+        let stats = &mut provider.stats.run_ahead;
+        synchronous_stage(&mut instance.decoder, &packets[0], &mut control, stats);
+        compare_frame(&instance.decoder, &mut sync, &packets[0], &mut sync_state);
+
+        let (send, read) = mpsc::channel();
+        assert!(instance.decoder.predict_file(
+            control.clone(),
+            RUN_AHEAD_DEPTH,
+            move || {
+                let packet = cursor.next()?;
+                send.send(()).unwrap();
+                Some((packet, true))
+            },
+            Arc::clone(&provider.file_counts),
+            stats
+        ));
+        provider.decoders.insert(0, instance);
+        read.recv().unwrap();
+
+        let actual = if seek {
+            ogg::tests::link_fixture(&mut ext, source_at(32), SERIAL, 1);
+            packets[1].clone()
+        } else {
+            file.write_all_at(&packet_page(1, 0, &substitute, 0), tail.source.offset)
+                .unwrap();
+            Packets::new(tail, packets[1].packetno, Vec::new(), 0)
+                .next()
+                .unwrap()
+        };
+        let provider = ext.get_mut::<Provider>();
+        let instance = provider.decoders.get_mut(&0).unwrap();
+        let stats = &mut provider.stats.run_ahead;
+        assert_eq!(instance.source.is_none(), seek);
+        assert!(!instance.decoder.try_commit(&actual, &control, stats));
+        synchronous_stage(&mut instance.decoder, &actual, &mut control, stats);
+        compare_frame(&instance.decoder, &mut sync, &actual, &mut sync_state);
+        assert_eq!(stats.unlinked_wrote, u64::from(seek));
+        assert_eq!(stats.mismatched, u64::from(!seek));
+        assert_eq!(stats.committed, 0);
+        if !seek {
+            assert_eq!(stats.discarded, 1);
+            assert_eq!(actual, substitute);
+        }
+    }
+}
+
+// spec: CODEC-CALL-3
+#[test]
+fn copied_page_links_by_its_header_within_observed_file_reads() {
+    use super::super::readahead::Page;
+    use adv_nt::file::ReadSource;
+
+    let (_, packets) = generated_stream();
+    let page = packet_page(12, 0, &packets[0], 0);
+    let marker = Page::new(page[..27].try_into().unwrap(), page.len() as u32).unwrap();
+    let offset = 8190;
+    let mut bytes = vec![0; offset];
+    bytes[..27].copy_from_slice(&page[..27]);
+    bytes[22] ^= 1;
+    bytes.extend(&page);
+    let file = Arc::new(packet_file("copied", &bytes));
+    let source = ReadSource { file, offset: 0 };
+    assert!(
+        marker
+            .locate(&[(source.clone(), offset as u32 + 26)])
+            .is_none()
+    );
+    let found = marker.locate(&[(source, bytes.len() as u32)]).unwrap();
+    assert_eq!(found.offset, offset as u64);
+    let tail = marker.tail(found);
+    assert_eq!(tail.source.offset, bytes.len() as u64);
+    assert_eq!(tail.sequence, 13);
+    assert_eq!(tail.serial, SERIAL);
 }

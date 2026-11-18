@@ -141,7 +141,7 @@ fn binds_relocated_functions_and_predicts_only_complete_packets_across_pages() {
         assert!(advanced);
         assert_eq!(take(&mut m.ext, peek), Some((source, false)));
 
-        let first = predict(&m.cpu, &m.ext, source, 0, 2);
+        let first = predict(&m.cpu, &m.ext, source, 0, 2).0;
         assert_eq!(
             first,
             [Packet {
@@ -153,7 +153,7 @@ fn binds_relocated_functions_and_predicts_only_complete_packets_across_pages() {
             }]
         );
         write_stream(&mut m, 257, 1, 1, 2, 1);
-        assert!(predict(&m.cpu, &m.ext, source, 1, 2).is_empty());
+        assert!(predict(&m.cpu, &m.ext, source, 1, 2).0.is_empty());
 
         // A continued page completes the split packet and ends with an empty EOS packet.
         write_stream(&mut m, 260, 4, 1, 2, 1);
@@ -164,7 +164,7 @@ fn binds_relocated_functions_and_predicts_only_complete_packets_across_pages() {
         m.cpu.write(granules + 24, &91i64.to_le_bytes()).unwrap();
         let mut expected = vec![91; 255];
         expected.extend([2, 4, 6]);
-        let predicted = predict(&m.cpu, &m.ext, source, 1, 2);
+        let predicted = predict(&m.cpu, &m.ext, source, 1, 2).0;
         assert_eq!(
             predicted,
             [
@@ -188,6 +188,25 @@ fn binds_relocated_functions_and_predicts_only_complete_packets_across_pages() {
         assert_eq!(m.cpu.read_u32(stream + 28).unwrap(), 1);
         assert_eq!(m.cpu.read_u32(stream + 32).unwrap(), 1);
         m.cpu.write_u32(laces + 4, 0x400).unwrap();
-        assert!(predict(&m.cpu, &m.ext, source, 1, 2).is_empty());
+        assert!(predict(&m.cpu, &m.ext, source, 1, 2).0.is_empty());
     }
+}
+
+pub(in crate::codec) fn link_fixture(
+    ext: &mut Ext,
+    read: ReadSource,
+    serial: u32,
+    sequence: u32,
+) -> (Source, Tail) {
+    let source = Source {
+        binding: 0,
+        stream: 128,
+    };
+    let mut header = [0; 27];
+    header[..4].copy_from_slice(b"OggS");
+    header[14..18].copy_from_slice(&serial.to_le_bytes());
+    header[18..22].copy_from_slice(&sequence.to_le_bytes());
+    link_page(ext, source, Page::new(&header, 64).unwrap(), Some(read));
+    let tail = ext.get::<Streams>().pages[&source].tail.clone().unwrap();
+    (source, tail)
 }

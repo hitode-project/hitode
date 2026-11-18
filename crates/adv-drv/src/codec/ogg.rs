@@ -1,9 +1,19 @@
-//! Read-only prediction from a reviewed libogg packet queue.
-use super::Entry;
+//! Read-only prediction from a reviewed libogg packet queue and its file.
+use super::{
+    Entry,
+    readahead::{self, Page, Tail},
+};
 use adv_abi::{code_signature::ExecutableRange, library_signature::Family};
 use adv_cpu::backend::{Guest, GuestExt, Reg};
 use adv_machine::{Conv, Env, Ext, HostFn, Outcome};
-use std::collections::BTreeMap;
+use adv_nt::file::{ReadSource, RecentReads};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+};
 
 const FAMILY: &str = include_str!("../../../../data/codec/ogg-msvc-x86.txt");
 const MODULE: &str = "adv-ogg";
@@ -37,7 +47,7 @@ impl Packet {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Source {
     binding: usize,
     stream: u32,
@@ -170,6 +180,18 @@ struct Streams {
     bindings: Vec<Binding>,
     // A packet object may be filled on one guest thread and consumed on another.
     observed: BTreeMap<u32, (Source, bool)>,
+    pages: BTreeMap<Source, PageState>,
+}
+
+#[derive(Default)]
+struct PageState {
+    tail: Option<Tail>,
+    lookup: Option<Lookup>,
+}
+
+struct Lookup {
+    page: Page,
+    result: Option<Receiver<Option<ReadSource>>>,
 }
 
 pub(super) fn install(ext: &mut Ext) {
@@ -237,6 +259,7 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
     super::redirect(e.sys, &packet, packet_bytes);
     super::redirect(e.sys, &reset, reset_bytes);
     super::redirect(e.sys, &pagein, pagein_bytes);
+    e.ext.get_or_default::<RecentReads>();
     e.ext.get_mut::<Streams>().bindings.push(Binding {
         live: true,
         layout,
@@ -246,6 +269,73 @@ fn bind_family(e: &mut Env<'_>, ranges: &[ExecutableRange], family: &Family) -> 
         snapshots: library.snapshots,
     });
     Ok(())
+}
+
+fn observe_page(e: &Env<'_>, page: u32) -> Option<(Page, Option<ReadSource>)> {
+    let header = e.cpu.read_u32(page).ok()?;
+    let header_len = e.cpu.read_u32(page.checked_add(4)?).ok()?;
+    let body = e.cpu.read_u32(page.checked_add(8)?).ok()?;
+    let len = header_len.checked_add(e.cpu.read_u32(page.checked_add(12)?).ok()?)?;
+    if header_len < 27 {
+        return None;
+    }
+    let mut fields = [0; 27];
+    e.cpu.read(header, &mut fields).ok()?;
+    let page = Page::new(&fields, len)?;
+    let direct = (header.checked_add(header_len)? == body)
+        .then(|| e.ext.get::<RecentReads>().direct(header, len))
+        .flatten();
+    Some((page, direct))
+}
+
+fn link_page(ext: &mut Ext, source: Source, page: Page, file: Option<ReadSource>) {
+    let state = ext.get_mut::<Streams>().pages.entry(source).or_default();
+    state.lookup = None;
+    let continued = state.tail.as_ref().is_some_and(|tail| {
+        file.as_ref().is_some_and(|file| {
+            tail.serial == page.serial()
+                && tail.sequence == page.sequence()
+                && Arc::ptr_eq(&tail.source.file, &file.file)
+                && tail.source.offset == file.offset
+        })
+    });
+    let unlinked = state.tail.is_some() && !continued;
+    let found = file.is_some();
+    state.tail = file.map(|file| page.tail(file));
+    if unlinked {
+        super::theora::invalidate_sources(ext, |seen| seen == source);
+    }
+    let stats = super::theora::run_ahead_stats(ext);
+    stats.unlinked_wrote += u64::from(unlinked || !found);
+    stats.linked += u64::from(found && !continued);
+}
+
+/// Poll a copied-page lookup without waiting on the owner. File staging can
+/// start as soon as the latest accepted page has a known file position.
+pub(super) fn locate_page(ext: &mut Ext, source: Source) {
+    let Some(lookup) = ext
+        .get_mut::<Streams>()
+        .pages
+        .get_mut(&source)
+        .and_then(|state| state.lookup.as_mut())
+    else {
+        return;
+    };
+    let page = lookup.page;
+    if let Some(result) = &lookup.result {
+        match result.try_recv() {
+            Ok(file) => link_page(ext, source, page, file),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => link_page(ext, source, page, None),
+        }
+    } else if adv_device::codec_workers::available() {
+        let (send, result) = mpsc::channel();
+        lookup.result = Some(result);
+        let ranges: Vec<_> = ext.get::<RecentReads>().ranges().collect();
+        adv_device::codec_workers::submit_speculation(move || {
+            let _ = send.send(page.locate(&ranges));
+        });
+    }
 }
 
 fn pagein(e: &mut Env<'_>) -> Outcome {
@@ -259,13 +349,32 @@ fn pagein(e: &mut Env<'_>) -> Outcome {
         stream: e.arg(0),
     };
     let original = binding.pagein.original;
-    let waiting = super::theora::waiting_for_page(e.ext, source);
-    if waiting.is_empty() {
+    let page = observe_page(e, e.arg(1));
+    let paired = super::theora::paired(e.ext, source);
+    if page.is_none() && paired.is_empty() {
         return super::original(e, original);
     }
     Outcome::call(original, vec![source.stream, e.arg(1)], move |e, result| {
         if result.value() == 0 {
-            for address in waiting {
+            if !paired.is_empty() {
+                locate_page(e.ext, source);
+            }
+            if let Some((page, file)) = page {
+                if file.is_some() {
+                    link_page(e.ext, source, page, file);
+                } else {
+                    e.ext
+                        .get_mut::<Streams>()
+                        .pages
+                        .entry(source)
+                        .or_default()
+                        .lookup = Some(Lookup { page, result: None });
+                    if !paired.is_empty() {
+                        locate_page(e.ext, source);
+                    }
+                }
+            }
+            for address in paired {
                 super::theora::page_buffered(e, address, source);
             }
         }
@@ -285,6 +394,9 @@ pub(super) fn forget(ext: &mut Ext, base: u32, size: u32) {
     streams
         .observed
         .retain(|_, (source, _)| streams.bindings[source.binding].live);
+    streams
+        .pages
+        .retain(|source, _| !retired.contains(&source.binding));
     super::theora::invalidate_sources(ext, |source| retired.contains(&source.binding));
 }
 
@@ -332,9 +444,9 @@ fn reset(e: &mut Env<'_>) -> Outcome {
 }
 
 fn invalidate(ext: &mut Ext, source: Source) {
-    ext.get_mut::<Streams>()
-        .observed
-        .retain(|_, (seen, _)| *seen != source);
+    let streams = ext.get_mut::<Streams>();
+    streams.observed.retain(|_, (seen, _)| *seen != source);
+    streams.pages.remove(&source);
     super::theora::invalidate_sources(ext, |seen| seen == source);
 }
 
@@ -348,7 +460,7 @@ pub(super) fn predict(
     source: Source,
     next: i64,
     depth: usize,
-) -> Vec<Packet> {
+) -> (Vec<Packet>, Option<readahead::Packets>) {
     let binding = &ext.get::<Streams>().bindings[source.binding];
     if !binding.live
         || !binding.snapshots.iter().all(|(a, expected)| {
@@ -361,17 +473,44 @@ pub(super) fn predict(
             )
         })
     {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let Some(mut cursor) = binding.layout.cursor(cpu, source.stream) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if cursor.packetno != next {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    (0..depth).map_while(|_| cursor.next(cpu)).collect()
+    let packets: Vec<_> = (0..depth).map_while(|_| cursor.next(cpu)).collect();
+    let tail = (cursor.lace == cursor.end)
+        .then(|| {
+            let page = ext.get::<Streams>().pages.get(&source)?;
+            let tail = page
+                .tail
+                .as_ref()
+                .filter(|tail| !tail.eos && page.lookup.is_none())?;
+            let len = cursor.filled.checked_sub(cursor.returned)? as usize;
+            let start = cursor.body.checked_add(cursor.returned)?;
+            let mut partial = vec![0; len];
+            cpu.read(start, &mut partial).ok()?;
+            let bos = if len == 0 {
+                0
+            } else {
+                cpu.read_u32(cursor.laces.checked_add(cursor.lace.checked_mul(4)?)?)
+                    .ok()?
+                    & 0x100
+            };
+            Some(readahead::Packets::new(
+                tail.clone(),
+                cursor.packetno,
+                partial,
+                bos,
+            ))
+        })
+        .flatten();
+    (packets, tail)
 }
 
 #[cfg(test)]
 #[path = "../../tests/codec/ogg.rs"]
-mod tests;
+pub(super) mod tests;

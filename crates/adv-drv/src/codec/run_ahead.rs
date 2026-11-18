@@ -3,9 +3,9 @@ use adv_device::codec_workers;
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, TryRecvError},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
     time::Instant,
 };
@@ -20,6 +20,12 @@ pub struct Stats {
     pub no_prediction: u64,
     pub no_prediction_callback: u64,
     pub owner_wait_ns: u64,
+    pub wait_not_started_ns: u64,
+    pub wait_in_flight_ns: u64,
+    pub lead_packets_sum: u64,
+    pub linked: u64,
+    pub unlinked_wrote: u64,
+    pub readahead_packets: u64,
 }
 
 pub(super) trait Staging: Send + 'static {
@@ -31,22 +37,100 @@ pub(super) trait Staging: Send + 'static {
     fn restore(&mut self, committed: &Self::Stage);
 }
 
+type Input<S> = Arc<OnceLock<<S as Staging>::Input>>;
+type ResultOf<S> = Option<(<S as Staging>::Control, <S as Staging>::Stage)>;
+const STARTED: u8 = 1;
+const READY: u8 = 2;
+
 struct Prediction<S: Staging> {
-    input: Arc<S::Input>,
-    result: Receiver<(S::Control, S::Stage)>,
+    input: Input<S>,
+    progress: Arc<AtomicU8>,
+    result: Receiver<ResultOf<S>>,
+}
+
+struct Request<S: Staging> {
+    input: Input<S>,
+    progress: Arc<AtomicU8>,
+    result: Sender<ResultOf<S>>,
+}
+
+struct Worker<S: Staging> {
+    decoder: S,
+    control: S::Control,
+    predict: Option<Box<dyn FnMut() -> Option<S::Input> + Send>>,
+}
+
+struct Queue<S: Staging> {
+    idle: Option<Worker<S>>,
+    requests: VecDeque<Request<S>>,
+    scheduled: bool,
+    cancelled: bool,
 }
 
 struct Batch<S: Staging> {
     pending: VecDeque<Prediction<S>>,
-    queued: Arc<Mutex<Option<S>>>,
-    finished: Receiver<S>,
-    cancelled: Arc<AtomicBool>,
+    queue: Arc<(Mutex<Queue<S>>, Condvar)>,
+    file: bool,
+}
+
+impl<S: Staging> Batch<S> {
+    fn request(&mut self, inputs: impl IntoIterator<Item = Option<S::Input>>) {
+        let (lock, _) = &*self.queue;
+        let mut queue = lock.lock().unwrap();
+        for input in inputs {
+            let input = Arc::new(input.map_or_else(OnceLock::new, OnceLock::from));
+            let progress = Arc::new(AtomicU8::new(0));
+            let (send, result) = mpsc::channel();
+            queue.requests.push_back(Request {
+                input: Arc::clone(&input),
+                progress: Arc::clone(&progress),
+                result: send,
+            });
+            self.pending.push_back(Prediction {
+                input,
+                progress,
+                result,
+            });
+        }
+        if queue.scheduled || queue.requests.is_empty() {
+            return;
+        }
+        queue.scheduled = true;
+        let shared = Arc::clone(&self.queue);
+        codec_workers::submit_speculation(move || {
+            let (lock, ready) = &*shared;
+            let mut queue = lock.lock().unwrap();
+            let Some(mut worker) = queue.idle.take() else {
+                return;
+            };
+            while let Some(request) = queue.requests.pop_front() {
+                request.progress.store(STARTED, Ordering::Relaxed);
+                drop(queue);
+                let input = request.input.get().or_else(|| {
+                    let input = worker.predict.as_mut()?()?;
+                    Some(request.input.get_or_init(|| input))
+                });
+                let result = input.map(|input| {
+                    let before = worker.control.clone();
+                    let stage = worker.decoder.stage(input, &mut worker.control);
+                    request.progress.store(READY, Ordering::Relaxed);
+                    (before, stage)
+                });
+                let _ = request.result.send(result);
+                queue = lock.lock().unwrap();
+            }
+            queue.idle = Some(worker);
+            queue.scheduled = false;
+            ready.notify_one();
+        });
+    }
 }
 
 impl<S: Staging> Drop for Batch<S> {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-        self.queued.lock().unwrap().take();
+        let mut queue = self.queue.0.lock().unwrap();
+        queue.requests.clear();
+        queue.idle.take();
     }
 }
 
@@ -81,18 +165,33 @@ impl<S: Staging> RunAhead<S> {
         if let Some(batch) = &mut self.batch
             && !batch.pending.is_empty()
         {
-            batch.cancelled.store(true, Ordering::Relaxed);
-            stats.discarded += batch.pending.len() as u64;
+            let mut queue = batch.queue.0.lock().unwrap();
+            queue.cancelled = true;
+            queue.requests.clear();
+            stats.discarded += batch
+                .pending
+                .iter()
+                .filter(|p| p.input.get().is_some())
+                .count() as u64;
             batch.pending.clear();
+            if let Some(worker) = &mut queue.idle {
+                worker.predict = None;
+            }
         }
     }
 
     pub(super) fn decoder(&mut self, stats: &mut Stats) -> &mut S {
         self.invalidate(stats);
         if let Some(batch) = self.batch.take() {
-            let queued = batch.queued.lock().unwrap().take();
-            let mut decoder = queued.unwrap_or_else(|| wait(&batch.finished, stats));
-            if batch.cancelled.load(Ordering::Relaxed) {
+            let (lock, ready) = &*batch.queue;
+            let mut queue = lock.lock().unwrap();
+            if queue.idle.is_none() {
+                let start = Instant::now();
+                queue = ready.wait_while(queue, |q| q.idle.is_none()).unwrap();
+                record_wait(stats, true, start);
+            }
+            let mut decoder = queue.idle.take().unwrap().decoder;
+            if queue.cancelled {
                 decoder.restore(&self.committed);
             }
             self.decoder = Some(decoder);
@@ -106,15 +205,51 @@ impl<S: Staging> RunAhead<S> {
         control: &S::Control,
         stats: &mut Stats,
     ) -> bool {
-        let Some(prediction) = self.batch.as_ref().and_then(|b| b.pending.front()) else {
+        let Some(batch) = &mut self.batch else {
             return false;
         };
-        if *prediction.input == *input {
-            let (expected, result) = wait(&prediction.result, stats);
+        let Some(prediction) = batch.pending.front() else {
+            return false;
+        };
+        let started = prediction.progress.load(Ordering::Relaxed) >= STARTED;
+        let lead = batch
+            .pending
+            .iter()
+            .take_while(|p| p.progress.load(Ordering::Relaxed) == READY)
+            .count();
+        let mut result = None;
+        if prediction
+            .input
+            .get()
+            .is_none_or(|expected| expected == input)
+        {
+            result = match prediction.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    let start = Instant::now();
+                    let result = prediction
+                        .result
+                        .recv()
+                        .expect("codec worker completed its job");
+                    record_wait(stats, started, start);
+                    result
+                }
+                Err(TryRecvError::Disconnected) => panic!("codec worker lost its job"),
+            };
+            if prediction.input.get().is_none() {
+                // The file predictor stopped before producing this packet.
+                self.invalidate(stats);
+                return false;
+            }
+        }
+        if let Some((expected, result)) = result
+            && prediction.input.get() == Some(input)
+        {
             if expected == *control {
-                self.batch.as_mut().unwrap().pending.pop_front();
+                batch.pending.pop_front();
                 self.committed = result;
                 stats.committed += 1;
+                stats.lead_packets_sum += lead as u64;
                 return true;
             }
             stats.mismatched_controls += 1;
@@ -124,9 +259,35 @@ impl<S: Staging> RunAhead<S> {
         false
     }
 
+    fn start(
+        &mut self,
+        control: S::Control,
+        predict: Option<Box<dyn FnMut() -> Option<S::Input> + Send>>,
+        stats: &mut Stats,
+    ) {
+        self.decoder(stats);
+        self.batch = Some(Batch {
+            pending: VecDeque::new(),
+            file: predict.is_some(),
+            queue: Arc::new((
+                Mutex::new(Queue {
+                    idle: Some(Worker {
+                        decoder: self.decoder.take().unwrap(),
+                        control,
+                        predict,
+                    }),
+                    requests: VecDeque::new(),
+                    scheduled: false,
+                    cancelled: false,
+                }),
+                Condvar::new(),
+            )),
+        });
+    }
+
     pub(super) fn predict(
         &mut self,
-        mut control: S::Control,
+        control: S::Control,
         depth: usize,
         predict: impl FnOnce(usize) -> Vec<S::Input>,
         stats: &mut Stats,
@@ -134,60 +295,70 @@ impl<S: Staging> RunAhead<S> {
         if self.has_predictions() || !codec_workers::available() {
             return false;
         }
-        let mut jobs = Vec::new();
-        let mut pending = VecDeque::new();
-        for input in predict(depth).into_iter().take(depth) {
-            let input = Arc::new(input);
-            let (send, result) = mpsc::channel();
-            pending.push_back(Prediction {
-                input: Arc::clone(&input),
-                result,
-            });
-            jobs.push((input, send));
-        }
-        if jobs.is_empty() {
+        let mut inputs = predict(depth);
+        inputs.truncate(depth);
+        if inputs.is_empty() {
             return false;
         }
-        stats.predicted += jobs.len() as u64;
-        self.decoder(stats);
-        let queued = Arc::new(Mutex::new(self.decoder.take()));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (finish, finished) = mpsc::channel();
-        self.batch = Some(Batch {
-            pending,
-            queued: Arc::clone(&queued),
-            finished,
-            cancelled: Arc::clone(&cancelled),
-        });
-        codec_workers::submit_speculation(move || {
-            let Some(mut decoder) = queued.lock().unwrap().take() else {
-                return;
-            };
-            for (input, send) in jobs {
-                if cancelled.load(Ordering::Relaxed) {
-                    break;
+        stats.predicted += inputs.len() as u64;
+        self.start(control, None, stats);
+        self.batch
+            .as_mut()
+            .unwrap()
+            .request(inputs.into_iter().map(Some));
+        true
+    }
+
+    pub(super) fn predict_file(
+        &mut self,
+        control: S::Control,
+        depth: usize,
+        mut predict: impl FnMut() -> Option<(S::Input, bool)> + Send + 'static,
+        counts: Arc<FileCounts>,
+        stats: &mut Stats,
+    ) -> bool {
+        if self.has_predictions() || !codec_workers::available() {
+            return false;
+        }
+        self.start(
+            control,
+            Some(Box::new(move || {
+                let (input, from_file) = predict()?;
+                counts.predicted.fetch_add(1, Ordering::Relaxed);
+                if from_file {
+                    counts.readahead_packets.fetch_add(1, Ordering::Relaxed);
                 }
-                let before = control.clone();
-                let result = decoder.stage(&input, &mut control);
-                if send.send((before, result)).is_err() {
-                    break;
-                }
-            }
-            let _ = finish.send(decoder);
-        });
+                Some(input)
+            })),
+            stats,
+        );
+        self.refill_file(depth)
+    }
+
+    pub(super) fn refill_file(&mut self, depth: usize) -> bool {
+        let Some(batch) = &mut self.batch else {
+            return false;
+        };
+        if !batch.file || batch.pending.is_empty() && batch.queue.0.lock().unwrap().cancelled {
+            return false;
+        }
+        batch.request((batch.pending.len()..depth).map(|_| None));
         true
     }
 }
 
-fn wait<T>(receiver: &Receiver<T>, stats: &mut Stats) -> T {
-    match receiver.try_recv() {
-        Ok(result) => result,
-        Err(TryRecvError::Empty) => {
-            let started = Instant::now();
-            let result = receiver.recv().expect("codec worker completed its job");
-            stats.owner_wait_ns += started.elapsed().as_nanos() as u64;
-            result
-        }
-        Err(TryRecvError::Disconnected) => panic!("codec worker lost its job"),
+#[derive(Default)]
+pub(super) struct FileCounts {
+    pub predicted: AtomicU64,
+    pub readahead_packets: AtomicU64,
+}
+
+fn record_wait(stats: &mut Stats, started: bool, start: Instant) {
+    let elapsed = start.elapsed().as_nanos() as u64;
+    stats.owner_wait_ns += elapsed;
+    if started {
+        stats.wait_in_flight_ns += elapsed;
+    } else {
+        stats.wait_not_started_ns += elapsed;
     }
 }

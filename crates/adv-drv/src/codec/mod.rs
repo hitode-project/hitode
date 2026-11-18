@@ -11,6 +11,7 @@ use adv_machine::{Env, Ext, HostFn, Outcome, Sys, layout::PAGE};
 
 mod mdct;
 mod ogg;
+mod readahead;
 mod rows;
 mod run_ahead;
 mod theora;

@@ -463,6 +463,8 @@ fn report(
                 "\"predicted\": {}, \"committed\": {}, \"mismatched\": {}, ",
                 "\"mismatched_controls\": {}, \"discarded\": {}, ",
                 "\"no_prediction\": {}, \"no_prediction_callback\": {}, \"owner_wait_ns\": {}, ",
+                "\"linked\": {}, \"unlinked_wrote\": {}, \"readahead_packets\": {}, ",
+                "\"wait_not_started_ns\": {}, \"wait_in_flight_ns\": {}, \"lead_packets_sum\": {}, ",
                 "\"reason\": {}}}}}"
             ),
             kernels.installed,
@@ -488,6 +490,12 @@ fn report(
             run_ahead.no_prediction,
             run_ahead.no_prediction_callback,
             run_ahead.owner_wait_ns,
+            run_ahead.linked,
+            run_ahead.unlinked_wrote,
+            run_ahead.readahead_packets,
+            run_ahead.wait_not_started_ns,
+            run_ahead.wait_in_flight_ns,
+            run_ahead.lead_packets_sum,
             theora.reason.as_deref().map_or_else(|| "null".into(), json),
         ));
     }

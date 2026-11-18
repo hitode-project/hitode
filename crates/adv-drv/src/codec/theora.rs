@@ -9,6 +9,7 @@ use adv_cpu::backend::{Guest, GuestExt, Reg};
 use adv_device::theora::{Decoder, Frame, Output, RUN_AHEAD_DEPTH, Setup, State};
 use adv_machine::{Conv, Env, Ext, HostFn, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Instant;
 
 const FAMILY: &str = include_str!("../../../../data/codec/theora-msvc-x86.txt");
@@ -166,11 +167,20 @@ struct Provider {
     bindings: Vec<Binding>,
     decoders: BTreeMap<u32, Instance>,
     stats: Stats,
+    file_counts: Arc<run_ahead::FileCounts>,
 }
 
 pub(super) fn stats(ext: &Ext) -> Stats {
-    ext.try_get::<Provider>()
-        .map_or_else(Stats::default, |p| p.stats.clone())
+    ext.try_get::<Provider>().map_or_else(Stats::default, |p| {
+        let mut stats = p.stats.clone();
+        stats.run_ahead.predicted += p.file_counts.predicted.load(Ordering::Relaxed);
+        stats.run_ahead.readahead_packets = p.file_counts.readahead_packets.load(Ordering::Relaxed);
+        stats
+    })
+}
+
+pub(super) fn run_ahead_stats(ext: &mut Ext) -> &mut run_ahead::Stats {
+    &mut ext.get_mut::<Provider>().stats.run_ahead
 }
 
 pub(super) fn install(ext: &mut Ext, mode: Mode) {
@@ -179,6 +189,7 @@ pub(super) fn install(ext: &mut Ext, mode: Mode) {
         bindings: Vec::new(),
         decoders: BTreeMap::new(),
         stats: Stats::default(),
+        file_counts: Arc::default(),
     });
 }
 
@@ -605,14 +616,11 @@ fn decode_packet(decoder: &mut Decoder, packet: &Packet, striped: bool, state: &
     )
 }
 
-pub(super) fn waiting_for_page(ext: &Ext, source: Source) -> Vec<u32> {
+pub(super) fn paired(ext: &Ext, source: Source) -> Vec<u32> {
     ext.get::<Provider>()
         .decoders
         .iter()
-        .filter_map(|(&address, instance)| {
-            (instance.source == Some(source) && !instance.decoder.has_predictions())
-                .then_some(address)
-        })
+        .filter_map(|(&address, instance)| (instance.source == Some(source)).then_some(address))
         .collect()
 }
 
@@ -638,6 +646,16 @@ fn packet_finished(e: &mut Env<'_>, address: u32, packetno: i64) {
 }
 
 fn predict(e: &mut Env<'_>, address: u32, count_miss: bool) {
+    if e.ext
+        .get_mut::<Provider>()
+        .decoders
+        .get_mut(&address)
+        .unwrap()
+        .decoder
+        .refill_file(RUN_AHEAD_DEPTH)
+    {
+        return;
+    }
     let provider = e.ext.get::<Provider>();
     let instance = &provider.decoders[&address];
     if instance.decoder.has_predictions() {
@@ -651,22 +669,34 @@ fn predict(e: &mut Env<'_>, address: u32, count_miss: bool) {
     let callback = control
         .as_ref()
         .is_ok_and(|control| word(&control.stripe, 4) != 0);
-    let packets = instance
+    let (packets, tail) = instance
         .source
         .zip(instance.next_packetno)
         .filter(|_| !callback && control.is_ok())
-        .map_or_else(Vec::new, |(source, next)| {
+        .map_or_else(Default::default, |(source, next)| {
             ogg::predict(e.cpu, e.ext, source, next, RUN_AHEAD_DEPTH)
         });
     let provider = e.ext.get_mut::<Provider>();
     let stats = &mut provider.stats.run_ahead;
     let predicted = control.is_ok_and(|control| {
-        provider
-            .decoders
-            .get_mut(&address)
-            .unwrap()
-            .decoder
-            .predict(control, RUN_AHEAD_DEPTH, |_| packets, stats)
+        let decoder = &mut provider.decoders.get_mut(&address).unwrap().decoder;
+        if let Some(mut tail) = tail {
+            let mut packets = packets.into_iter();
+            decoder.predict_file(
+                control,
+                RUN_AHEAD_DEPTH,
+                move || {
+                    packets
+                        .next()
+                        .map(|p| (p, false))
+                        .or_else(|| tail.next().map(|p| (p, true)))
+                },
+                Arc::clone(&provider.file_counts),
+                stats,
+            )
+        } else {
+            decoder.predict(control, RUN_AHEAD_DEPTH, |_| packets, stats)
+        }
     });
     if count_miss && !predicted {
         stats.no_prediction += 1;
@@ -695,6 +725,9 @@ fn decode(
     }
     let layout = binding.layout;
     let observation = saved.is_none().then(|| ogg::take(e.ext, op)).flatten();
+    if let Some((source, true)) = observation {
+        ogg::locate_page(e.ext, source);
+    }
     let (packet, granpos_out) = if let Some(saved) = saved {
         saved
     } else {

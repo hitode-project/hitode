@@ -92,7 +92,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-pub const RUN_AHEAD_DEPTH: usize = 2;
+pub const RUN_AHEAD_DEPTH: usize = 3;
 const REFERENCE_SLOTS: usize = 3 + RUN_AHEAD_DEPTH;
 
 struct Native(NonNull<c_void>);

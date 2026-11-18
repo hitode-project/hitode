@@ -771,6 +771,9 @@ Unmapping MUST retire bindings and their decoder state.
 ### CODEC-CALL-3 Packet run-ahead
 
 **Rule**: A predictor MUST read only complete packets from a stream paired by an observed packet output and decoder input.
+File prediction MUST follow accepted pages linked to contiguous ranges of observed file reads.
+Workers MUST use positioned reads and validate Ogg page CRCs before staging file packets of the paired stream.
+Each decoder MUST stage at most three packets. Each file predictor MUST bound its page buffer and release it with the decoder.
 Workers MUST stage results in host storage without changing committed decoder state.
 The owner MUST match packet bytes, metadata, and decoding controls before committing a staged result.
 Seeks, resets, callable controls, and clear MUST invalidate staged results.
