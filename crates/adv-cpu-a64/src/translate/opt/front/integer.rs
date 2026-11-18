@@ -133,7 +133,7 @@ impl Front<'_> {
                 let shift = self.constant(Type::I64, 32);
                 let hi = self.int(IntOp::Shl, hi, shift);
                 let dividend = self.int(IntOp::Or, lo, hi);
-                let proved = signed && self.proof.division(self.index).is_some();
+                let proved = signed && self.division_safe[self.index];
                 let quotient = self.value(Op::Div {
                     signed,
                     dividend,
@@ -339,7 +339,7 @@ impl Front<'_> {
     }
 }
 
-fn part(src: Src) -> Part {
+pub(super) fn part(src: Src) -> Part {
     match src {
         Src::Reg(r) => Part::Reg(r),
         Src::Imm(n) => Part::Imm(n),

@@ -294,7 +294,44 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             0
         }
-        Op::Validate | Op::PlainPage { .. } | Op::PageCross { .. } | Op::FrameDisjoint { .. } => 0,
+        Op::PlainPage { addr, bytes, write } => {
+            let addr = get(addr) as u32;
+            #[cfg(unix)]
+            let plain = memory.computation_range(addr, bytes as usize, write);
+            #[cfg(not(unix))]
+            let plain = {
+                use adv_cpu_core::memory::{READ, WRITE};
+                memory.accessible(addr, bytes as usize, if write { WRITE } else { READ })
+                    && !memory.shared_range(addr, bytes as usize)
+            };
+            if !plain {
+                return None;
+            }
+            0
+        }
+        Op::PageCross { addr, width, .. } => {
+            let page = adv_cpu_core::memory::PAGE_SIZE;
+            if get(addr) as usize % page > page - usize::from(width) {
+                return None;
+            }
+            0
+        }
+        Op::FrameDisjoint {
+            addr,
+            width,
+            base,
+            lo,
+            hi,
+            ..
+        } => {
+            let start = (get(base) as u32).wrapping_add_signed(lo);
+            let bytes = (i64::from(hi) - i64::from(lo)) as u32;
+            if !super::ir::disjoint_ranges(get(addr) as u32, width.into(), start, bytes) {
+                return None;
+            }
+            0
+        }
+        Op::Validate => 0,
     })
 }
 

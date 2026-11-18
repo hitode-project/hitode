@@ -103,6 +103,8 @@ struct Frame {
 #[derive(Default)]
 pub struct Trace {
     pub insts: Vec<Inst>,
+    /// Decoded instructions supplied for optimized builds.
+    pub x86: Vec<Option<iced_x86::Instruction>>,
     /// Guest bytes the trace was decoded from, as (address, length).
     pub code: Vec<(u32, u32)>,
     /// End of each instruction's region: the next region start.
@@ -282,6 +284,7 @@ impl Trace {
     pub(crate) fn detached(&self) -> Self {
         Self {
             insts: self.insts.clone(),
+            x86: self.x86.clone(),
             code: self.code.clone(),
             region_end: self.region_end.clone(),
             merge: self.merge.clone(),
@@ -420,6 +423,7 @@ impl Trace {
         let (limit, end) = bounds;
         self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
+        self.x86.clear();
         self.code.clear();
         self.bodies.clear();
         self.frames.clear();
@@ -804,6 +808,7 @@ impl Trace {
         }
         let mut trace = Trace {
             insts,
+            x86: self.x86.clone(),
             code: self.code.clone(),
             frames: self.frames.clone(),
             slots: self.slots.clone(),

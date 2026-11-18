@@ -2252,6 +2252,23 @@ impl Proof {
             })
     }
 
+    /// Byte separation that holds without admission.
+    pub(crate) fn local_disjoint_effects(&self, store: usize, load: usize) -> bool {
+        let mut writes = self
+            .effects
+            .iter()
+            .filter(|e| e.access == Access::Write && e.indices.contains(&store))
+            .peekable();
+        let mut reads = self
+            .effects
+            .iter()
+            .filter(|e| e.access == Access::Read && e.indices.contains(&load))
+            .peekable();
+        writes.peek().is_some()
+            && reads.peek().is_some()
+            && writes.all(|w| reads.clone().all(|r| self.apart(w, r) == Some(true)))
+    }
+
     /// Whether two effects' bytes are disjoint, when their addresses differ
     /// by a constant: the same loop terms and symbolic base.
     fn apart(&self, a: &Effect, b: &Effect) -> Option<bool> {
