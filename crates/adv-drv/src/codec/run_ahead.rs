@@ -41,11 +41,18 @@ type Input<S> = Arc<OnceLock<<S as Staging>::Input>>;
 type ResultOf<S> = Option<(<S as Staging>::Control, <S as Staging>::Stage)>;
 const STARTED: u8 = 1;
 const READY: u8 = 2;
+const UNAVAILABLE: u8 = 3;
 
 struct Prediction<S: Staging> {
     input: Input<S>,
     progress: Arc<AtomicU8>,
     result: Receiver<ResultOf<S>>,
+}
+
+impl<S: Staging> Prediction<S> {
+    fn unavailable(&self) -> bool {
+        self.progress.load(Ordering::Relaxed) == UNAVAILABLE
+    }
 }
 
 struct Request<S: Staging> {
@@ -116,6 +123,10 @@ impl<S: Staging> Batch<S> {
                     request.progress.store(READY, Ordering::Relaxed);
                     (before, stage)
                 });
+                if result.is_none() {
+                    worker.predict = None;
+                    request.progress.store(UNAVAILABLE, Ordering::Relaxed);
+                }
                 let _ = request.result.send(result);
                 queue = lock.lock().unwrap();
             }
@@ -154,7 +165,10 @@ impl<S: Staging> RunAhead<S> {
     }
 
     pub(super) fn has_predictions(&self) -> bool {
-        self.batch.as_ref().is_some_and(|b| !b.pending.is_empty())
+        self.batch
+            .as_ref()
+            .and_then(|batch| batch.pending.front())
+            .is_some_and(|prediction| !prediction.unavailable())
     }
 
     pub(super) fn publish(&mut self, stage: S::Stage) {
@@ -339,7 +353,10 @@ impl<S: Staging> RunAhead<S> {
         let Some(batch) = &mut self.batch else {
             return false;
         };
-        if !batch.file || batch.pending.is_empty() && batch.queue.0.lock().unwrap().cancelled {
+        if !batch.file
+            || batch.pending.front().is_some_and(Prediction::unavailable)
+            || batch.pending.is_empty() && batch.queue.0.lock().unwrap().cancelled
+        {
             return false;
         }
         batch.request((batch.pending.len()..depth).map(|_| None));
@@ -360,5 +377,47 @@ fn record_wait(stats: &mut Stats, started: bool, start: Instant) {
         stats.wait_in_flight_ns += elapsed;
     } else {
         stats.wait_not_started_ns += elapsed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Decoder(u64);
+
+    impl Staging for Decoder {
+        type Input = u64;
+        type Control = ();
+        type Stage = u64;
+
+        fn stage(&mut self, input: &u64, _: &mut ()) -> u64 {
+            self.0 += input;
+            self.0
+        }
+
+        fn restore(&mut self, committed: &u64) {
+            self.0 = *committed;
+        }
+    }
+
+    // spec: CODEC-CALL-3
+    #[test]
+    fn exhausted_file_prediction_allows_the_next_page_to_stage() {
+        let mut ahead = RunAhead::new(Decoder(0), 0);
+        let mut stats = Stats::default();
+        let mut first = Some((5, true));
+        assert!(ahead.predict_file((), 3, move || first.take(), Arc::default(), &mut stats));
+        assert!(ahead.try_commit(&5, &(), &mut stats));
+
+        let blank = ahead.batch.as_ref().unwrap().pending.front().unwrap();
+        assert!(blank.result.recv().unwrap().is_none());
+        assert!(!ahead.has_predictions());
+        assert!(!ahead.refill_file(3));
+        assert!(ahead.predict((), 3, |_| vec![8], &mut stats));
+        assert!(ahead.try_commit(&8, &(), &mut stats));
+        assert_eq!(*ahead.committed(), 13);
+        assert_eq!(stats.committed, 2);
+        assert_eq!(stats.discarded, 0);
     }
 }

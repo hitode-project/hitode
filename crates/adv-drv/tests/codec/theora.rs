@@ -968,7 +968,9 @@ fn file_prediction_refills_only_one_slot_per_commit() {
         compare_frame(&instance.decoder, &mut sync, packet, &mut sync_state);
         control.state = instance.decoder.committed().state;
         assert!(counts.readahead_packets.load(Ordering::Relaxed) <= stats.committed + 2);
-        assert!(instance.decoder.refill_file(RUN_AHEAD_DEPTH));
+        if packet.eos == 0 {
+            assert!(instance.decoder.refill_file(RUN_AHEAD_DEPTH));
+        }
     }
     assert_eq!(stats.committed, packets.len() as u64);
     assert_eq!(
