@@ -3029,6 +3029,31 @@ mod tests {
         assert_eq!(native.cache.word(point), head::branch(point, target));
     }
 
+    // spec: A64-CTL-15, A64-OPT-8
+    #[test]
+    fn spin_back_edges_stay_in_tier1_and_yield() {
+        // mov eax,[esi]; test eax,eax; je HEAD; int3
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x8b, 0x06, 0x85, 0xc0, 0x74, 0xfa, 0xcc]);
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        native.promotion = 0;
+        let mut state = resident_cpu(HEAD, 0);
+        state.regs[6] = DATA;
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert!(run.retired > 3 * head::HOT);
+        assert!(!native.counters.contains_key(&HEAD));
+        assert!(!native.heads.contains_key(&HEAD));
+        assert!(!native.force_resident(&mut memory, HEAD));
+
+        state.eip = HEAD;
+        native.set_spin_yield(true);
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!(
+            (run.exit, run.retired, state.eip),
+            (Exit::Reschedule, 3, HEAD)
+        );
+    }
+
     // spec: A64-OPT-8
     #[test]
     fn resident_context_misses_chain_three_versions_and_stable_edges_link_directly() {

@@ -197,7 +197,7 @@ pub struct Code {
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
     /// Out-of-line paths with the guest instruction they serve.
-    cold: Vec<(u32, Cold)>,
+    cold: Vec<(usize, Cold)>,
     far: Vec<(usize, usize)>,
     links: Vec<Link>,
     internal_links: Vec<InternalLink>,
@@ -549,7 +549,7 @@ struct Translator<'a> {
     /// The position of each instruction, after any countdown check.
     labels: &'a mut Vec<Label>,
     sites: &'a mut Vec<(usize, Site)>,
-    cold: &'a mut Vec<(u32, Cold)>,
+    cold: &'a mut Vec<(usize, Cold)>,
     marks: &'a mut Vec<Mark>,
     /// Branches to stubs: word index and target address.
     far: &'a mut Vec<(usize, usize)>,
@@ -846,8 +846,7 @@ impl Translator<'_> {
 
     /// Queues an out-of-line path of the current instruction.
     fn push_cold(&mut self, cold: Cold) {
-        let pc = self.trace.insts.get(self.index).map_or(0, |inst| inst.pc);
-        self.cold.push((pc, cold));
+        self.cold.push((self.index, cold));
     }
 
     /// Code from here on does `part` for the guest instruction at `eip`.
@@ -1161,7 +1160,8 @@ impl Translator<'_> {
     }
 
     fn follow_exit(&mut self, exit: Exit, eip: u32, refund: u32, link: bool) {
-        let back = self.resident_links && link && self.trace.insts[self.index].backward_jump(eip);
+        let back =
+            self.resident_links && link && self.trace.insts[self.index].resident_backedge(eip);
         if let Some(x87) = self.x87_leaving() {
             let label = self.asm.label();
             self.asm.b(label);
@@ -1238,7 +1238,7 @@ impl Translator<'_> {
         inline: bool,
     ) -> Label {
         let eip = self.trace.insts[to].pc;
-        if !self.resident_links || !self.trace.insts[self.index].backward_jump(eip) {
+        if !self.resident_links || !self.trace.insts[self.index].resident_backedge(eip) {
             return target;
         }
         let point = self.asm.label();
@@ -1394,7 +1394,7 @@ impl Translator<'_> {
                 let net = self.trace.net(from, to);
                 if (net == 0 || (net < 0 && -net < 4096))
                     && !(self.resident_links
-                        && self.trace.insts[from].backward_jump(self.trace.insts[to].pc))
+                        && self.trace.insts[from].resident_backedge(self.trace.insts[to].pc))
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
                     && self.vector.dirty & !self.entry[to].dirty == 0
@@ -2027,7 +2027,7 @@ impl Translator<'_> {
         self.far(self.stubs.exit);
     }
 
-    fn cold(&mut self, cold: Cold, at: usize, pc: u32) {
+    fn cold(&mut self, cold: Cold, at: usize, source: usize) {
         match cold {
             Cold::InlineBody {
                 label,
@@ -2079,7 +2079,13 @@ impl Translator<'_> {
                 if let Some(x87) = x87 {
                     self.x87_leave(x87);
                 }
-                let back = self.resident_links && link && eip <= pc;
+                let back = self.resident_links
+                    && link
+                    && self
+                        .trace
+                        .insts
+                        .get(source)
+                        .is_some_and(|inst| inst.resident_backedge(eip));
                 self.leave(exit, eip, refund, link, false, back);
             }
             Cold::Edge {
@@ -2452,16 +2458,17 @@ impl Translator<'_> {
             | Cold::Lookup { x87: Some(_), .. } => 1,
             _ => 0,
         };
-        let mut queues: [VecDeque<(u32, Cold)>; 3] = Default::default();
+        let mut queues: [VecDeque<(usize, Cold)>; 3] = Default::default();
         loop {
-            for (pc, cold) in self.cold.drain(..) {
-                queues[rank(&cold)].push_back((pc, cold));
+            for (source, cold) in self.cold.drain(..) {
+                queues[rank(&cold)].push_back((source, cold));
             }
-            let Some((pc, cold)) = queues.iter_mut().find_map(VecDeque::pop_front) else {
+            let Some((source, cold)) = queues.iter_mut().find_map(VecDeque::pop_front) else {
                 break;
             };
+            let pc = self.trace.insts.get(source).map_or(0, |inst| inst.pc);
             self.mark(pc, Part::Cold);
-            self.cold(cold, at, pc);
+            self.cold(cold, at, source);
         }
         if (self.computation || self.trace.has_loop()) && self.asm.widen_bit_tests() {
             return true;

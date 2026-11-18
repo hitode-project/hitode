@@ -87,8 +87,8 @@ pub struct Inst {
 }
 
 impl Inst {
-    pub(super) fn backward_jump(&self, target: u32) -> bool {
-        if target > self.pc {
+    pub(super) fn resident_backedge(&self, target: u32) -> bool {
+        if self.spin || target > self.pc {
             return false;
         }
         matches!(self.op, Op::Jmp(_) | Op::Jcc(..))
@@ -935,7 +935,7 @@ impl Trace {
             Edge::Internal(to)
                 if observe
                     && (self.net(from, to) > 0
-                        || resident && self.insts[from].backward_jump(self.insts[to].pc)) =>
+                        || resident && self.insts[from].resident_backedge(self.insts[to].pc)) =>
             {
                 FlagSet::ALL
             }

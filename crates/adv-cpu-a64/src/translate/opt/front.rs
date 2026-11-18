@@ -170,6 +170,9 @@ pub(crate) fn build_with(
     checked: &dyn Fn(u32) -> bool,
     refused: &dyn Fn(u32) -> bool,
 ) -> Result<Built, Reject> {
+    if let Some(i) = unit.trace.insts.iter().position(|inst| inst.spin) {
+        return Err(Reject::Unsupported(i));
+    }
     let local = Local::default();
     let facts = proof.map_or(&local as &dyn Facts, |proof| proof);
     build_form(
