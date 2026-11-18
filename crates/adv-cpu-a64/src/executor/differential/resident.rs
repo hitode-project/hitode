@@ -114,7 +114,7 @@ impl<'a> Trial<'a> {
         }
     }
 
-    fn install(&mut self) {
+    fn try_install(&mut self) -> bool {
         let native = self.live.native.as_mut().unwrap();
         let memory = &mut self.live.memory;
         memory.attach().unwrap();
@@ -122,8 +122,12 @@ impl<'a> Trial<'a> {
         native
             .run(&mut self.live.state, memory, self.stop, 0, null_mut())
             .unwrap();
+        native.force_resident(memory, self.head)
+    }
+
+    fn install(&mut self) {
         assert!(
-            native.force_resident(memory, self.head),
+            self.try_install(),
             "{}: no resident form at {:#x}",
             self.context,
             self.head,
@@ -370,7 +374,7 @@ fn generated(shape: Shape, seed: u64) {
                 }
                 Shape::Pointer => {
                     a.mov(eax, dword_ptr(eax)).unwrap();
-                    a.adc(eax, ecx).unwrap();
+                    a.add(eax, ecx).unwrap();
                 }
                 Shape::Indexed => {
                     a.mov(dword_ptr(ebx + eax * 4 + displacement), ecx).unwrap();
@@ -476,6 +480,24 @@ fn seeded_loops_with_pointer_reads_indexed_stores_early_exits_and_stack_escapes(
             generated(shape, seed);
         }
     }
+}
+
+// spec: A64-OPT-9, A64-FLAG-3
+#[test]
+fn a_loop_carried_carry_stays_in_tier1() {
+    let image = Image::loop_body(|a, head, _| {
+        a.adc(eax, edx).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(7);
+    state.regs[0] = u32::MAX - 1;
+    state.regs[2] = 1;
+    state.eflags |= 1;
+    let mut trial = Trial::new(&image, &state, "loop-carried carry", &[], |_| {});
+    assert!(!trial.try_install());
+    assert_eq!(trial.compare(8), (RunOutcome::Budget, 8));
+    trial.same_state();
+    assert_eq!(trial.compare(32), (RunOutcome::ReachedStop, 14));
 }
 
 // spec: A64-OPT-9, A64-MEM-5

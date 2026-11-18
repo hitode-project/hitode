@@ -6,6 +6,8 @@ impl Native {
         if !self.units.contains_key(&head) {
             self.translate(memory, head).unwrap();
         }
+        // Exercise resident execution independently of its profitability.
+        self.tier1_words.remove(&head);
         if !self.heads.contains_key(&head) {
             let at = CpuState {
                 eip: head,
