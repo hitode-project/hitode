@@ -11,6 +11,10 @@ pub trait ExecutionTrap {
         false
     }
 
+    fn offer_gate(&self) -> Option<&crate::backend::OfferGate> {
+        None
+    }
+
     fn allow_spin_yield(&self) -> bool {
         false
     }

@@ -94,6 +94,10 @@ pub struct Runtime {
     /// The ordinary-memory alias and raw permission table, biased to guest zero.
     pub alias: u64,
     pub alias_classes: u64,
+    /// Read, write and observed-code masks in groups of 64 guest pages.
+    pub plain_pages: u64,
+    pub memory_base: u32,
+    pub memory_pages: u32,
     /// `interpret(runtime, helper, countdown) -> status`, called by
     /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
     /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
@@ -154,6 +158,14 @@ pub struct Runtime {
     /// Nonzero when an optimized form left at a checkpoint for a recall.
     pub opt_recalled: u32,
     pub opt_dump: RegisterDump,
+    /// Nonzero while the owner has a REP continuation.
+    pub rep_pending: u32,
+    /// Tier-1 state at the last admitted inline entry.
+    pub opt_entry: OptEntryState,
+    /// The machine's `OfferGate` that head entry blocks read (A64-OPT-8).
+    pub offer_gate: u64,
+    /// The head EIP of the inline form whose cold exit reached `opt_exit`.
+    pub opt_head: u32,
 }
 
 impl Runtime {
@@ -183,6 +195,9 @@ impl Runtime {
             classes: 0,
             alias: 0,
             alias_classes: 0,
+            plain_pages: 0,
+            memory_base: 0,
+            memory_pages: 0,
             code_lines: 0,
             interpret: 0,
             exit: 0,
@@ -206,6 +221,10 @@ impl Runtime {
             opt_record: 0,
             opt_recalled: 0,
             opt_dump: RegisterDump::default(),
+            rep_pending: 0,
+            opt_entry: OptEntryState::default(),
+            offer_gate: 0,
+            opt_head: 0,
         }
     }
 }
@@ -217,6 +236,17 @@ pub struct RegisterDump {
     pub x: [u64; 31],
     pub v: [u128; 32],
     pub sp: u64,
+}
+
+/// Raw Tier-1 registers that recovery may need at an inline entry.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct OptEntryState {
+    pub regs: [u32; 8],
+    pub nzcv: u64,
+    pub pf: u64,
+    pub af: u64,
+    pub df: u64,
 }
 
 /// Why translated code returned to the owner.
@@ -268,6 +298,7 @@ impl Exit {
 pub struct Stubs {
     pub code: Vec<u32>,
     pub enter: usize,
+    pub opt_enter: usize,
     pub opt_exit: usize,
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
@@ -357,6 +388,9 @@ pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
+pub(crate) const OPT_CELLS: u32 = field(offset_of!(Runtime, opt_cells));
+pub(crate) const OPT_HEAD: u32 = field(offset_of!(Runtime, opt_head));
+pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
@@ -400,6 +434,8 @@ pub fn stubs() -> Stubs {
     let mut asm = Asm::new();
     let enter = asm.offset();
     emit_enter(&mut asm);
+    let opt_enter = asm.offset();
+    emit_opt_enter(&mut asm);
     let exit_label = asm.label();
     asm.bind(exit_label);
     let exit = asm.offset();
@@ -445,6 +481,7 @@ pub fn stubs() -> Stubs {
         call,
         code: asm.finish(),
         enter,
+        opt_enter,
         opt_exit,
         exit,
         fault,
@@ -653,8 +690,7 @@ fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
     asm.b(exit);
 }
 
-/// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
-fn emit_enter(asm: &mut Asm) {
+fn emit_enter_frame(asm: &mut Asm) {
     asm.emit(stp(X, Pre, r(29), Reg::LR, SP, -FRAME));
     for (i, (a, b)) in SAVED.into_iter().enumerate() {
         asm.emit(stp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
@@ -667,6 +703,13 @@ fn emit_enter(asm: &mut Asm) {
         mov_sp(r(16), SP),
         str(X, r(16), RUNTIME, HOST_SP),
         mov(X, r(17), r(1)),
+    ]);
+}
+
+/// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
+fn emit_enter(asm: &mut Asm) {
+    emit_enter_frame(asm);
+    asm.emit_all(&[
         ldr(X, WINDOW, RUNTIME, WINDOW_BASE),
         ldr(X, r(28), RUNTIME, SHADOW),
         ldr(X, r(9), RUNTIME, COUNTDOWN),
@@ -674,6 +717,17 @@ fn emit_enter(asm: &mut Asm) {
     ]);
     emit_load_guest(asm);
     asm.emit(br(r(17)));
+}
+
+/// `opt_enter(runtime: *mut Runtime, target: usize)` for optimized forms,
+/// which load all live state from `opt_params` and need no guest register setup.
+fn emit_opt_enter(asm: &mut Asm) {
+    emit_enter_frame(asm);
+    asm.emit_all(&[
+        ldr(X, r(28), RUNTIME, SHADOW),
+        ldr(X, r(9), RUNTIME, COUNTDOWN),
+        br(r(17)),
+    ]);
 }
 
 /// Loads the guest registers and flags from the `CpuState` at x0; uses x1
@@ -691,8 +745,13 @@ fn emit_load_guest(asm: &mut Asm) {
             asm.emit(ldp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
         }
     }
+    asm.emit(ldr(W, r(1), r(0), EFLAGS));
+    emit_load_flags(asm);
+}
+
+/// Establish canonical NZCV and lazy PF, AF and DF from w1.
+pub(crate) fn emit_load_flags(asm: &mut Asm) {
     asm.emit_all(&[
-        ldr(W, r(1), r(0), EFLAGS),
         // NZCV in subtraction sense: SF ZF !CF OF.
         and_imm(W, r(2), r(1), 0xc0),
         ubfx(W, r(3), r(1), 0, 1),
@@ -791,6 +850,12 @@ fn emit_store_guest(asm: &mut Asm) {
         // The low halves of x23 and x24 are ESP and EBP themselves.
         asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
     }
+    emit_read_flags(asm);
+    asm.emit(str(W, r(4), r(0), EFLAGS));
+}
+
+/// Assemble EFLAGS in w4 using the unmapped bits in the CpuState at x0.
+pub(crate) fn emit_read_flags(asm: &mut Asm) {
     asm.emit_all(&[
         mrs_nzcv(r(1)),
         // N and Z land on SF and ZF; C is !CF and V is OF.
@@ -815,7 +880,6 @@ fn emit_store_guest(asm: &mut Asm) {
         movz(W, r(5), MAPPED_FLAGS as u16, 0),
         bic(W, r(4), r(4), r(5), Lsl, 0),
         orr(W, r(4), r(4), r(3), Lsl, 0),
-        str(W, r(4), r(0), EFLAGS),
     ]);
 }
 

@@ -42,7 +42,9 @@ use iced_x86::Code;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
@@ -54,7 +56,21 @@ use crate::runtime::{self, Exit, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
+mod head;
 mod worker;
+
+/// Offer gates for runs whose handler publishes none: no offer is possible,
+/// or Rust decides every arrival.
+static CLEAR_GATE: OfferGate = OfferGate {
+    stale: AtomicU32::new(0),
+    split_over: AtomicU32::new(0),
+    split_deadline: AtomicU64::new(u64::MAX),
+};
+static STALE_GATE: OfferGate = OfferGate {
+    stale: AtomicU32::new(1),
+    split_over: AtomicU32::new(0),
+    split_deadline: AtomicU64::new(u64::MAX),
+};
 
 const CACHE_LEN: usize = 64 << 20;
 
@@ -412,8 +428,21 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
         let cpu = unsafe { &mut *(*runtime).cpu };
         record_branch(cpu, branch, eip);
     }
-    if native.is_stop(eip) || owner.error.is_some() {
+    if owner.error.is_some() {
         return 0;
+    }
+    if native.is_stop(eip) {
+        // A head with an inline form links to its entry block (A64-OPT-8).
+        let Some(trampoline) = native.trampoline(eip) else {
+            return 0;
+        };
+        if point == 0 {
+            native.table[runtime::table_slot(eip)] = [u64::from(eip), trampoline as u64];
+        } else {
+            native.patch(point, eip, trampoline);
+            native.cache.sync();
+        }
+        return trampoline;
     }
     // A first visit runs in the owner; the point links on the next one.
     let entry = native.units.get(&eip).copied();
@@ -713,6 +742,7 @@ pub(crate) struct Native {
     pub(crate) pending_mask: u32,
     cache: CodeCache,
     enter: Enter,
+    opt_enter: Enter,
     stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     stub_len: usize,
@@ -788,6 +818,9 @@ pub(crate) struct Native {
     computation: FxHashMap<u32, worker::Prepared>,
     computation_code: translate::Code,
     admission: worker::Admission,
+    opt_scratch: worker::ExecuteScratch,
+    /// Where `opt_exit` saves an inline form's spill cells.
+    inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
     compiler: compile::Compiler,
     pub(crate) features: Features,
@@ -813,6 +846,7 @@ impl Native {
             base + 4 * stubs.code.len(),
             &[
                 (stubs.enter, "enter"),
+                (stubs.opt_enter, "opt_enter"),
                 (stubs.exit, "exit"),
                 (stubs.fault, "fault"),
                 (stubs.dispatch, "dispatch"),
@@ -825,9 +859,10 @@ impl Native {
                 (stubs.call, "call"),
             ],
         );
-        // SAFETY: `enter` follows the C calling convention with the
-        // signature of `Enter`; see `runtime::emit_enter`.
+        // SAFETY: `enter` and `opt_enter` follow the C calling convention with
+        // the signature of `Enter`; see `runtime::emit_enter` and `emit_opt_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
+        let opt_enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.opt_enter) };
         let mut table = empty_table();
         let shadow = ShadowStack::new()?;
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
@@ -854,6 +889,7 @@ impl Native {
             },
             cache,
             enter,
+            opt_enter,
             stubs: Stubs {
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
@@ -910,6 +946,8 @@ impl Native {
             computation: FxHashMap::default(),
             computation_code: translate::Code::default(),
             admission: worker::Admission::default(),
+            opt_scratch: worker::ExecuteScratch::default(),
+            inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
             features: features(),
             runtime,
@@ -961,6 +999,11 @@ impl Native {
         self.computation_enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
     }
 
+    fn trampoline(&self, eip: u32) -> Option<usize> {
+        let inline = self.computation.get(&eip)?.inline.as_ref()?;
+        Some(inline.trampoline)
+    }
+
     fn is_stop(&self, eip: u32) -> bool {
         self.stops.contains(&eip) || self.candidates.contains(&eip)
     }
@@ -982,6 +1025,7 @@ impl Native {
         self.cache.sync();
         let entry = worker::Entry {
             enter: self.enter,
+            opt_enter: self.opt_enter,
             window: self.runtime.window,
             alias: alias_base(memory),
             fault: self.stubs.fault,
@@ -1021,12 +1065,30 @@ impl Native {
             && let Some((candidate, end)) = self.nominated.take()
         {
             if let Some(probed) = self.prove_candidate(memory, candidate, end) {
-                self.candidates
-                    .retain(|&inside| !(candidate < inside && inside < end));
+                let mut absorbed = Vec::new();
+                self.candidates.retain(|&inside| {
+                    let enclose = candidate < inside && inside < end;
+                    let inlined = probed
+                        .trace
+                        .insts
+                        .iter()
+                        .any(|inst| inst.inlined() && inst.pc == inside);
+                    if enclose || inlined {
+                        if !enclose {
+                            absorbed.push(inside);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.candidates.push(candidate);
                 // Units inlining the new boundary or a candidate it encloses,
                 // or linking to them, come from these pages.
                 self.cut(candidate, end);
+                for inside in absorbed {
+                    self.cut(inside, inside.saturating_add(1));
+                }
                 self.probed = Some(probed);
             } else {
                 self.rejected_candidates.insert(candidate);
@@ -1085,17 +1147,23 @@ impl Native {
         }
         // Reaching the computation tells peers it is here, offered or not,
         // and takes the frame's pace for a split.
-        if self.skip_offer != Some(cpu.eip)
+        if self.computation_enabled
+            && self.skip_offer != Some(cpu.eip)
             && let Some(prepared) = self.computation.get(&cpu.eip)
-            && (self.offer_computation()
-                | (prepared.proof.splits() && self.offer_split(prepared.cost())))
-            && prepared.worth_offering()
         {
-            return Ok(Some(Run {
-                exit: Exit::Computation,
-                retired: 0,
-                translated,
-            }));
+            // An arrival the owner keeps changes no state, so the published
+            // gate can decide it in translated code (PROC-MACH-13).
+            let split = prepared.proof.splits() && prepared.cost() > 0;
+            let peer = self.offer_computation();
+            // This also takes the pace a split plans with.
+            let paced = split && self.offer_split(prepared.cost());
+            if (peer || paced) && prepared.worth_offering() {
+                return Ok(Some(Run {
+                    exit: Exit::Computation,
+                    retired: 0,
+                    translated,
+                }));
+            }
         }
         if u64::from(entry.retired) > fuel {
             self.diagnostics.over_fuel += 1;
@@ -1116,7 +1184,11 @@ impl Native {
         if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
         }
-        if let Some(word) = &self.interrupt {
+        if let Some(word) = &self.interrupt
+            && word.load(std::sync::atomic::Ordering::Relaxed)
+                & (adv_sync::pending::STOP | adv_sync::pending::WORK)
+                != 0
+        {
             word.fetch_and(
                 !(adv_sync::pending::STOP | adv_sync::pending::WORK),
                 std::sync::atomic::Ordering::AcqRel,
@@ -1134,6 +1206,7 @@ impl Native {
             }));
         }
         self.faults.end.set(self.cache.next());
+        self.prepare_inline(cpu, memory, fuel, budget);
         let runtime: *mut Runtime = &mut *self.runtime;
         let faults: *const Faults = &self.faults;
         let enter = self.enter;
@@ -1174,14 +1247,20 @@ impl Native {
             exit = Exit::Dispatch;
         }
         match exit {
-            Exit::Optimized => unreachable!("optimized forms leave through `worker::execute`"),
+            Exit::Optimized => self.diagnostics.optimized_runs += 1,
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
-        let mut retired = budget - self.runtime.countdown;
+        // Inline forms may refill the countdown, and a cold exit may leave
+        // it negative.
+        let mut retired = (budget + self.runtime.completed).wrapping_sub(self.runtime.countdown);
+        if exit == Exit::Optimized {
+            retired -= u64::from(self.materialize_inline(cpu, memory));
+            exit = Exit::Dispatch;
+        }
         if exit == Exit::Fault {
             let pc = self.faults.capture.pc.get();
             let site = self.faults.site(pc).expect("faulting site");
@@ -1216,22 +1295,27 @@ impl Native {
     fn run_optimized(
         &mut self,
         cpu: &mut CpuState,
-        memory: &Memory,
+        memory: &mut Memory,
         fuel: u64,
     ) -> Option<(Exit, u32)> {
         static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let prepared = self.computation.get(&cpu.eip)?;
-        prepared.code.optimized.as_ref()?;
-        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory) {
+        let form = prepared.code.optimized.as_deref()?;
+        // Entry blocks count the arrivals they keep as well.
+        let nominates = prepared.record_owner_run();
+        let alias = alias_base(memory);
+        if cpu.rep.is_some() || !self.admission.alone(&prepared.proof, cpu, memory, alias) {
             return None;
         }
-        cpu.refresh_mmx();
-        let alias = alias_base(memory);
-        let optimized = worker::admit(&prepared.code, cpu, alias);
+        if form.assumed.mmx || cpu.mmx_mode != 0 {
+            cpu.refresh_mmx();
+        }
+        let optimized = worker::admit(&prepared.code, cpu, alias, &mut self.opt_scratch.params);
         prepared.admitted(optimized.is_some());
         let optimized = optimized?;
         let entry = worker::Entry {
             enter: self.enter,
+            opt_enter: self.opt_enter,
             window: self.runtime.window,
             alias,
             fault: self.stubs.fault,
@@ -1250,8 +1334,15 @@ impl Native {
         runtime.deferred = 0;
         runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
         let shadow = runtime.shadow;
-        let (exit, retired) =
-            worker::execute(runtime, cpu, entry, &prepared.code, Some(&optimized));
+        let (exit, retired) = worker::execute(
+            runtime,
+            cpu,
+            entry,
+            &prepared.code,
+            Some(optimized),
+            &mut self.opt_scratch,
+            false,
+        );
         runtime.shadow = shadow;
         self.diagnostics.optimized_runs += 1;
         self.diagnostics.optimized_retired += retired;
@@ -1261,6 +1352,9 @@ impl Native {
         if exit == Exit::Fault {
             self.diagnostics.faults += 1;
         }
+        if retired < SLICE && self.computation_enabled && self.nominated.is_none() && nominates {
+            self.nominate_shadow_caller(memory);
+        }
         // A recall here is pending owner work, which dispatch sees.
         let exit = if exit == Exit::Recall {
             Exit::Dispatch
@@ -1268,6 +1362,110 @@ impl Native {
             exit
         };
         Some((exit, retired as u32))
+    }
+
+    /// Points the runtime at what head entry blocks and inline forms read
+    /// during a translated run of `budget` within `fuel` (A64-OPT-8).
+    fn prepare_inline(&mut self, cpu: &CpuState, memory: &Memory, fuel: u64, budget: u64) {
+        static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let gate = if !self.computation_enabled {
+            &CLEAR_GATE
+        } else if self.bridge.is_null() {
+            &STALE_GATE
+        } else {
+            // SAFETY: the run's bridge outlives it.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            bridge
+                .handler
+                .as_ref()
+                .and_then(|handler| handler.offer_gate())
+                .unwrap_or(&STALE_GATE)
+        };
+        let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
+            (word.as_ptr(), self.pending_mask)
+        });
+        let runtime = &mut *self.runtime;
+        runtime.offer_gate = std::ptr::from_ref(gate) as u64;
+        runtime.alias = alias_base(memory);
+        runtime.plain_pages = memory.plain_pages() as u64;
+        runtime.memory_base = memory.base;
+        runtime.memory_pages = (memory.len / adv_cpu_core::memory::PAGE_SIZE) as u32;
+        runtime.rep_pending = u32::from(cpu.rep.is_some());
+        runtime.recall = NEVER.as_ptr() as u64;
+        runtime.recall_mask = 0;
+        runtime.computation_pending = pending as u64;
+        runtime.computation_pending_mask = mask;
+        runtime.head_exit = 0;
+        runtime.deferred = 0;
+        runtime.completed = 0;
+        runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
+        runtime.opt_recalled = 0;
+        runtime.opt_save = self.inline_saved.as_mut_ptr() as u64;
+    }
+
+    /// Rebuilds the guest state at a cold inline exit from the entry
+    /// baseline and the exit's record. Returns the record's refund.
+    fn materialize_inline(&mut self, cpu: &mut CpuState, memory: &Memory) -> u32 {
+        let prepared = &self.computation[&self.runtime.opt_head];
+        let inline = prepared.inline.as_ref().expect("installed inline form");
+        translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
+        let (alias, entry_esp) = (alias_base(memory), cpu.regs[worker::ESP]);
+        let refund = translate::opt::recovery::materialize(
+            &inline.records[self.runtime.opt_record as usize],
+            &self.runtime.opt_dump,
+            &self.inline_saved,
+            &inline.flags,
+            cpu,
+            // SAFETY: the entry block admitted the frame's ranges.
+            |offset, bytes| unsafe {
+                let at = alias.wrapping_add(u64::from(entry_esp.wrapping_add_signed(offset)));
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+            },
+        );
+        if inline.assumed_mmx || cpu.mmx_mode != 0 {
+            cpu.refresh_mmx();
+        }
+        refund
+    }
+
+    fn nominate_shadow_caller(&mut self, memory: &mut Memory) {
+        let callers = self.shadow_callers();
+        if callers.is_empty() {
+            return;
+        }
+        let mut best: Option<(u32, u32)> = None;
+        let mut promote: Option<u32> = None;
+        for (entry, ret_eip) in callers {
+            let point = ret_eip.saturating_sub(1);
+            let trace = self.loop_trace(memory, entry, &self.stops);
+            let Some((head, end)) = translate::computation_extent(&trace) else {
+                continue;
+            };
+            if !(head <= point && point < end) {
+                continue;
+            }
+            if self.record_extent((head, end)) {
+                crate::jit_map::optimized(head, format_args!("extent\t{end}\t-"));
+            }
+            if !self.is_stop(head)
+                && !self.rejected_candidates.contains(&head)
+                && best.is_none_or(|(b_head, b_end)| end - head > b_end - b_head)
+            {
+                best = Some((head, end));
+                promote = Some(entry);
+            }
+        }
+        if let Some((head, end)) = best {
+            self.nominated = Some((head, end));
+        }
+        if let Some(entry) = promote
+            && self.promoted.insert(entry)
+        {
+            crate::jit_map::optimized(entry, format_args!("promoted\t{entry}\t-"));
+            self.diagnostics.promotions += 1;
+            self.drop_unit(entry);
+            self.forget_dynamic();
+        }
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
@@ -1870,6 +2068,7 @@ impl Native {
             let Some(mut form) = done.form else {
                 continue;
             };
+            let assumed_mmx = form.built.assumed.mmx;
             let lowered = &mut form.lowered;
             lowered.place(self.cache.next(), self.stubs.opt_exit);
             let Some(entry) = self.cache.append(&lowered.words) else {
@@ -1903,13 +2102,84 @@ impl Native {
                 flags: std::mem::take(&mut lowered.flags),
                 cells: lowered.spill_cells,
             }));
+            let Some(unit) = self.units.get(&done.eip).map(|entry| entry.unit) else {
+                continue;
+            };
+            // The entry block and the inline form, which links into Tier 1.
+            let inline = &mut form.inline;
+            let at = self.cache.next();
+            let targets = head::Targets {
+                unit,
+                exit: self.stubs.exit,
+                dispatch: self.stubs.dispatch,
+                opt_exit: self.stubs.opt_exit,
+            };
+            let (words, entry) = head::emit(
+                &prepared.proof,
+                done.eip,
+                &prepared.slot,
+                inline,
+                at,
+                &targets,
+            );
+            if self.cache.append(&words).is_none() {
+                continue;
+            }
+            let form_at = at + (words.len() - inline.words.len()) * 4;
+            let from = self.faults.sites.len().saturating_sub(1);
+            self.faults.sites.extend(
+                inline
+                    .sites
+                    .iter()
+                    .map(|&(offset, site)| (form_at + offset, site)),
+            );
+            if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
+                self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
+            }
+            crate::jit_map::record(
+                form_at,
+                &inline.words,
+                done.eip,
+                form.prepaid,
+                &inline.marks,
+                "a64-opt-inline",
+            );
+            if self.inline_saved.len() < inline.spill_cells {
+                self.inline_saved.resize(inline.spill_cells, 0);
+                self.runtime.opt_save = self.inline_saved.as_mut_ptr() as u64;
+            }
+            let entry = at + entry;
+            let records = std::mem::take(&mut inline.records);
+            let flags = std::mem::take(&mut inline.flags);
+            let trampoline = match &prepared.inline {
+                Some(old) => {
+                    let offset = entry as i64 - old.trampoline as i64;
+                    self.cache.patch(old.trampoline, b(offset as i32));
+                    old.trampoline
+                }
+                None => {
+                    let trampoline = self.cache.next();
+                    let offset = entry as i64 - trampoline as i64;
+                    if self.cache.append(&[b(offset as i32)]).is_none() {
+                        continue;
+                    }
+                    trampoline
+                }
+            };
+            prepared.inline = Some(worker::Inline {
+                trampoline,
+                records,
+                flags,
+                assumed_mmx,
+            });
+            self.faults.end.set(self.cache.next());
         }
     }
 
     /// A budget exit samples where owner time goes. It nominates the
     /// computation enclosing EIP. Once EIP has `promotion` samples, it and
-    /// the nearby entry with the widest computation extent around it take
-    /// loop traces.
+    /// the nearby or shadow-caller entry with the widest computation extent
+    /// take loop traces.
     fn sample(&mut self, memory: &mut Memory, eip: u32) {
         if self.computation_enabled
             && let Some((candidate, end)) = self.enclosing_computation(eip)
@@ -1917,31 +2187,52 @@ impl Native {
         {
             self.nominated = Some((candidate, end));
         }
-        if self.promotion == 0 || self.promoted.contains(&eip) {
+        if self.promotion == 0 {
             return;
         }
-        let count = self.samples.entry(eip).or_default();
-        *count += 1;
-        if *count < self.promotion {
+        let promoted = self.promoted.contains(&eip);
+        if promoted && (self.nominated.is_some() || !self.computation_enabled) {
             return;
         }
-        self.samples.remove(&eip);
-        let nearby: Vec<u32> = self
-            .units
-            .keys()
-            .copied()
-            .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
-            .collect();
+        if !promoted {
+            let count = self.samples.entry(eip).or_default();
+            *count += 1;
+            if *count < self.promotion {
+                return;
+            }
+            self.samples.remove(&eip);
+        }
+        let mut candidates: Vec<(u32, u32)> = if promoted {
+            Vec::new()
+        } else {
+            self.units
+                .keys()
+                .copied()
+                .filter(|&entry| entry < eip && eip - entry <= PROMOTION_REACH)
+                .map(|entry| (entry, eip))
+                .collect()
+        };
+        if self.computation_enabled {
+            for (caller, ret_eip) in self.shadow_callers() {
+                if (!promoted || !self.promoted.contains(&caller))
+                    && !candidates.iter().any(|&(entry, _)| entry == caller)
+                {
+                    candidates.push((caller, ret_eip.saturating_sub(1)));
+                }
+            }
+        }
         // Entries retranslate only when control next enters them, so every
         // enclosing loop's extent is recorded now. Nomination then tries the
         // outermost first and falls back inward as proofs are rejected.
         let mut outer: Option<(u32, u32)> = None;
+        let mut caller_outer: Option<(u32, u32)> = None;
         // Nearby traces without a loop, and with loops elsewhere.
         let (mut flat, mut elsewhere) = (0, 0);
-        for &entry in &nearby {
+        for &(entry, point) in &candidates {
             let trace = self.loop_trace(memory, entry, &self.stops);
             let extent = translate::computation_extent(&trace);
-            let Some((head, end)) = extent.filter(|&(head, end)| head <= eip && eip < end) else {
+            let Some((head, end)) = extent.filter(|&(head, end)| head <= point && point < end)
+            else {
                 if extent.is_some() {
                     elsewhere += 1;
                 } else {
@@ -1956,22 +2247,77 @@ impl Native {
             if outer.is_none_or(|(at, best)| size > best || size == best && entry < at) {
                 outer = Some((entry, size));
             }
+            if point != eip
+                && self.computation_enabled
+                && !self.is_stop(head)
+                && !self.rejected_candidates.contains(&head)
+                && caller_outer.is_none_or(|(c_head, c_end)| end - head > c_end - c_head)
+            {
+                caller_outer = Some((head, end));
+            }
         }
-        if outer.is_none() {
-            let tried = nearby.len();
+        if let Some((head, end)) = caller_outer
+            && self
+                .nominated
+                .is_none_or(|(n_head, n_end)| end - head > n_end - n_head)
+        {
+            self.nominated = Some((head, end));
+        }
+        if !promoted && outer.is_none() {
+            let tried = candidates.len();
             crate::jit_map::optimized(
                 eip,
                 format_args!("unlooped\t-\t{tried} tried, {flat} flat, {elsewhere} elsewhere"),
             );
         }
-        for entry in std::iter::once(eip).chain(outer.map(|(entry, _)| entry)) {
+        let mut changed = false;
+        let promote_self = (!promoted).then_some(eip);
+        for entry in promote_self
+            .into_iter()
+            .chain(outer.map(|(entry, _)| entry))
+        {
             if self.promoted.insert(entry) {
                 crate::jit_map::optimized(entry, format_args!("promoted\t{eip}\t-"));
                 self.diagnostics.promotions += 1;
                 self.drop_unit(entry);
+                changed = true;
             }
         }
-        self.forget_dynamic();
+        if changed {
+            self.forget_dynamic();
+        }
+    }
+
+    fn shadow_callers(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let top = self.shadow.top();
+        let (_, guard_end) = self.shadow.guard();
+        let mut at = self.runtime.shadow;
+        if at < guard_end as u64 || at >= top || !at.is_multiple_of(16) {
+            return out;
+        }
+        for _ in 0..16 {
+            if at >= top {
+                break;
+            }
+            // SAFETY: `at` is 16-byte aligned within the live shadow stack below `top`.
+            let (host_lr, ret_eip) = unsafe {
+                let ptr = at as *const u64;
+                (ptr.read() as usize, ptr.add(1).read())
+            };
+            if host_lr == 0 || ret_eip > u64::from(u32::MAX) {
+                break;
+            }
+            let idx = self.placed.partition_point(|&(start, _)| start <= host_lr);
+            if let Some(&(start, entry_eip)) = idx.checked_sub(1).map(|i| &self.placed[i])
+                && self.units.get(&entry_eip).is_some_and(|u| u.unit == start)
+                && !out.iter().any(|&(entry, _)| entry == entry_eip)
+            {
+                out.push((entry_eip, ret_eip as u32));
+            }
+            at += 16;
+        }
+        out
     }
 
     /// Whether the extent is new.
@@ -1997,8 +2343,28 @@ impl Native {
     }
 
     fn prove_candidate(&self, memory: &mut Memory, eip: u32, end: u32) -> Option<Probed> {
-        // The installed owner trace watches the code. Reuse this proof
-        // only if that trace has identical decoded effects and edges.
+        // Prefer inlining direct-called inner candidates into an enclosing
+        // computation; fall back to cutting outside candidates if needed.
+        if self.candidates.is_empty() {
+            let trace = self.loop_trace(memory, eip, &self.stops);
+            let proof = computation_proof(memory, &trace)?;
+            return Some(Probed { eip, trace, proof });
+        }
+        let whole = self.loop_trace(memory, eip, &self.stops);
+        let hits_external_at_root = self.candidates.iter().any(|&c| {
+            !(eip < c && c < end)
+                && whole
+                    .insts
+                    .iter()
+                    .any(|inst| !inst.inlined() && inst.pc == c)
+        });
+        if !hits_external_at_root && let Some(proof) = computation_proof(memory, &whole) {
+            return Some(Probed {
+                eip,
+                trace: whole,
+                proof,
+            });
+        }
         let mut stops = self.stops.clone();
         stops.extend(
             self.candidates
@@ -2210,6 +2576,299 @@ mod tests {
         cpu.regs[1] = ecx;
         cpu.regs[4] = esp;
         cpu
+    }
+
+    /// Run the guard between the canonical entry and exit stubs.
+    fn place_computation_guard(
+        native: &mut Native,
+        proof: &translate::computation::Proof,
+    ) -> usize {
+        use crate::asm::Asm;
+        use crate::encode::{mov, mov_sp, str};
+        use std::mem::offset_of;
+
+        let mut asm = Asm::new();
+        let fail = asm.label();
+        let cold = asm.label();
+        let exit = asm.label();
+        translate::computation::emit_guard(&mut asm, proof, fail, cold);
+        asm.emit(movz(W, Reg::new(1), 0, 0));
+        asm.b(exit);
+        asm.bind(fail);
+        asm.emit(movz(W, Reg::new(1), 1, 0));
+        asm.b(exit);
+        asm.bind(cold);
+        asm.emit(movz(W, Reg::new(1), 2, 0));
+        asm.bind(exit);
+        // The usual exit captures x7 and x8. Record the raw lazy sources,
+        // DF and the restored host stack before the exit consumes them.
+        let runtime = Reg::new(29);
+        asm.emit_all(&[
+            mov(X, Reg::new(7), Reg::new(10)),
+            mov(X, Reg::new(8), Reg::new(11)),
+            str(X, Reg::new(12), runtime, offset_of!(Runtime, branch) as u32),
+            mov_sp(Reg::new(0), Reg::new(31)),
+            str(X, Reg::new(0), runtime, offset_of!(Runtime, resume) as u32),
+            movz(W, Reg::new(0), Exit::Dispatch as u16, 0),
+        ]);
+        let pc = native.cache.next() + asm.offset();
+        asm.emit(b((native.stubs.exit as i64 - pc as i64) as i32));
+        native.cache.append(&asm.finish()).unwrap()
+    }
+
+    // spec: A64-OPT-1
+    #[test]
+    fn computation_guard_matches_owner_admission() {
+        use adv_cpu_core::memory::EXEC;
+        use iced_x86::code_asm::*;
+        use translate::computation::tests::{
+            frame_cached_rows, nested_descending_rows, row, trace, wrapping_gather,
+        };
+        use translate::computation::{Evaluation, Proof};
+
+        let copy = |a: &mut CodeAssembler| {
+            row(|a| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            })(a);
+        };
+        let frame = Proof::build(&trace(|a| {
+            frame_cached_rows(a, false);
+            a.int3().unwrap();
+        }))
+        .expect("frame cache proof");
+        assert!(frame.frame_cache().is_some());
+        let fixtures = [
+            ("copy", Proof::build(&trace(copy)).unwrap()),
+            (
+                "nested descending rows",
+                Proof::build(&nested_descending_rows()).unwrap(),
+            ),
+            (
+                "signed and normalized division",
+                Proof::build(&wrapping_gather()).unwrap(),
+            ),
+            ("outer loop with frame cache", frame),
+            (
+                "gathered dword table",
+                Proof::build(&trace(row(|a| {
+                    a.mov(eax, dword_ptr(esi)).unwrap();
+                    a.mov(al, byte_ptr(eax)).unwrap();
+                    a.mov(byte_ptr(edi), al).unwrap();
+                })))
+                .unwrap(),
+            ),
+            (
+                "stack alignment",
+                Proof::build(&trace(|a| {
+                    a.and(esp, -8).unwrap();
+                    copy(a);
+                }))
+                .unwrap(),
+            ),
+        ];
+
+        const PAGE: u32 = 4096;
+        const PAGES: u32 = 136;
+        const BOUNDARY: u32 = 64 * PAGE;
+        let mut seed = 0x7a57_9315u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut outcomes = [0; 3];
+        let mut cold_admission = [false; 2];
+
+        // Both reservations start partway through a 64-page bitmap group.
+        // The upper one permits an exclusive range end of exactly 2^32.
+        for base in [0x19000u32, 0u32.wrapping_sub(PAGES * PAGE)] {
+            let frame = base + 2 * PAGE;
+            let params = base + 8 * PAGE;
+            let input = base + 16 * PAGE;
+            let output = base + 24 * PAGE;
+            let table = base + 33 * PAGE;
+            let mut native = None;
+            let mut targets = Vec::new();
+            let mut admission = worker::Admission::default();
+            for layout in 0..12 {
+                let mut memory = Memory::window(base, (PAGES * PAGE) as usize).unwrap();
+                let native = native.get_or_insert_with(|| {
+                    let mut native = Native::new(memory.window_base().unwrap()).unwrap();
+                    targets.extend(
+                        fixtures
+                            .iter()
+                            .map(|(_, proof)| place_computation_guard(&mut native, proof)),
+                    );
+                    native.cache.sync();
+                    native
+                });
+                for page in 0..PAGES {
+                    let choice = random() % 12;
+                    if layout >= 3 && choice == 0 {
+                        continue;
+                    }
+                    let addr = base + page * PAGE;
+                    let permissions = if layout < 3 {
+                        READ | WRITE
+                    } else {
+                        match choice {
+                            1 => 0,
+                            2 => READ | EXEC,
+                            3 => WRITE,
+                            4 => READ | WRITE | EXEC,
+                            _ => READ | WRITE,
+                        }
+                    };
+                    memory.map(addr, PAGE as usize, permissions).unwrap();
+                    if layout >= 3 && choice % 3 == 0 {
+                        memory.watch_code(addr + (random() % PAGE), 1);
+                    }
+                }
+                let mut words = vec![
+                    (frame, 9),
+                    (frame + 8, 3),
+                    (params, if layout < 3 { 5 } else { random() & 15 }),
+                    (
+                        params + 4,
+                        if layout < 3 {
+                            (-16i32) as u32
+                        } else {
+                            random()
+                        },
+                    ),
+                    (base + BOUNDARY - 2, 5),
+                    (base + BOUNDARY + 2, (-16i32) as u32),
+                ];
+                words.extend((0..64).map(|i| (table + 4 * i, input + (random() & 255))));
+                for (addr, value) in words {
+                    if memory.committed(addr, 4).is_ok() {
+                        memory.write(addr, &value.to_le_bytes()).unwrap();
+                    }
+                }
+                if layout == 1 {
+                    memory.watch_code(output + 8, 1);
+                    memory.watch_code(base + BOUNDARY - 1, 2);
+                }
+                if layout == 2 {
+                    // The first watch shares a line with the copy but no bytes.
+                    // The second shares a page with the copy but no lines.
+                    memory.watch_code(output + 48, 1);
+                    memory.watch_code(output + 128, 1);
+                }
+                native.classify(&mut memory);
+                native.runtime.plain_pages = memory.plain_pages() as u64;
+                native.runtime.memory_base = memory.base;
+                native.runtime.memory_pages = (memory.len / PAGE as usize) as u32;
+
+                for (fixture, ((name, proof), &target)) in fixtures.iter().zip(&targets).enumerate()
+                {
+                    for sample in 0..64 {
+                        let mut cpu = CpuState {
+                            regs: [
+                                random(),
+                                4,
+                                3,
+                                3,
+                                frame,
+                                params,
+                                if fixture == 4 { table } else { input },
+                                output,
+                            ],
+                            eflags: 0x202 | (random() & 0xcd5),
+                            ..CpuState::default()
+                        };
+                        match sample {
+                            0 => {}
+                            1 => cpu.regs[1] = 0,
+                            2 => cpu.regs[4] += 1,
+                            3 => cpu.regs[7] = base.wrapping_add(PAGES * PAGE - 1),
+                            4 => {
+                                cpu.regs[6] = base + 2 * BOUNDARY - 8;
+                                cpu.regs[7] = base + BOUNDARY - 8;
+                            }
+                            5 => cpu.regs[5] = frame,
+                            6 => cpu.regs[5] = base + BOUNDARY - 2,
+                            7 => {
+                                cpu.regs[1] = 1;
+                                cpu.regs[6] = base.wrapping_add(PAGES * PAGE - 4);
+                                cpu.regs[7] = cpu.regs[6];
+                            }
+                            8 => {
+                                cpu.regs[1] = 2;
+                                cpu.regs[7] = output + 96;
+                            }
+                            _ => {
+                                cpu.regs[1] = random() & 63;
+                                let reg = (random() & 7) as usize;
+                                cpu.regs[reg] = match random() % 4 {
+                                    0 => u32::MAX - (random() & 63),
+                                    1 => random(),
+                                    2 => cpu.regs[4] + (random() & 31),
+                                    _ => base + random() % (PAGES * PAGE),
+                                };
+                            }
+                        }
+                        let admitted = admission.alone(proof, &cpu, &memory, native.runtime.alias);
+                        let mut actual = cpu.clone();
+                        native.runtime.cpu = &raw mut actual;
+                        let countdown = u64::MAX >> 1;
+                        native.runtime.countdown = countdown;
+                        // SAFETY: target was emitted into this cache for the
+                        // canonical entry and exits through this runtime's stub.
+                        unsafe { (native.enter)(&mut *native.runtime, target) };
+                        let outcome = actual.eip as usize;
+                        outcomes[outcome] += 1;
+                        let context = (name, base, layout, sample, cpu.regs);
+                        if outcome == 2 {
+                            cold_admission[usize::from(admitted)] = true;
+                            let mut scratch = Evaluation::default();
+                            let (ranges, outputs) = proof
+                                .evaluate_alone(&cpu, &mut scratch, |addr| {
+                                    memory.computation_range(addr, 4, false).then(|| {
+                                        u32::from_le_bytes(
+                                            memory.read(addr, 4).unwrap().try_into().unwrap(),
+                                        )
+                                    })
+                                })
+                                .unwrap();
+                            assert!(
+                                ranges.iter().chain(outputs).any(|r| {
+                                    let start = r.start & !63;
+                                    let end = (r.end + 63) & !63;
+                                    r.write
+                                        && memory
+                                            .stores_code(start, (end - u64::from(start)) as usize)
+                                }),
+                                "cold without a watched line: {context:?}"
+                            );
+                        } else {
+                            assert_eq!(outcome == 0, admitted, "{context:?}");
+                        }
+                        assert_eq!(actual.regs, cpu.regs, "{context:?}");
+                        assert_eq!(actual.eflags, cpu.eflags, "{context:?}");
+                        assert_eq!(native.runtime.countdown, countdown, "{context:?}");
+                        assert_eq!(
+                            native.runtime.temps,
+                            [
+                                u64::from((cpu.eflags >> 2 & 1) ^ 1),
+                                u64::from(cpu.eflags & 0x10)
+                            ],
+                            "{context:?}"
+                        );
+                        assert_eq!(
+                            native.runtime.branch,
+                            u64::from(cpu.eflags >> 10 & 1),
+                            "{context:?}"
+                        );
+                        assert_eq!(native.runtime.resume, native.runtime.host_sp, "{context:?}");
+                    }
+                }
+            }
+        }
+        assert!(outcomes.iter().all(|&count| count > 0), "{outcomes:?}");
+        assert_eq!(cold_admission, [true, true]);
     }
 
     // spec: A64-REG-6, A64-MEM-1

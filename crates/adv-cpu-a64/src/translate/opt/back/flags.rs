@@ -169,7 +169,7 @@ impl Emitter<'_> {
         }
     }
 
-    fn bit(&mut self, flags: Host, bit: u32) {
+    pub(super) fn bit(&mut self, flags: Host, bit: u32) {
         let Host::Flags(n) = flags else {
             let r = self.gp_at(flags, T);
             self.asm.emit(ubfx(W, T, r, bit, 1));
@@ -182,6 +182,27 @@ impl Emitter<'_> {
             || kind == MulSigned && !matches!(bit, 0 | 11)
         {
             self.prior_bit(prior, bit);
+            return;
+        }
+        if bit == 4 {
+            match kind {
+                Shl | Shr | Sar => self.prior_bit(prior, bit),
+                Logic | UnorderedCompare | OrderedCompare => self.imm(T, 0),
+                _ => {
+                    self.arithmetic(flags, T);
+                    let ar = self.gp_at(a, U);
+                    self.asm.emit(eor(W, T, T, ar, Lsl, 0));
+                    match kind {
+                        Increment | Decrement => self.asm.emit(eor_imm(W, T, T, 1)),
+                        Negate => {}
+                        _ => {
+                            let br = self.gp_at(b, U);
+                            self.asm.emit(eor(W, T, T, br, Lsl, 0));
+                        }
+                    }
+                    self.asm.emit(ubfx(W, T, T, bit, 1));
+                }
+            }
             return;
         }
         if matches!(kind, Shl | Shr | Sar) {

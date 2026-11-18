@@ -263,6 +263,50 @@ fn reference(code: &[u8], data: &[u8], initial: &CpuState) -> CpuState {
     state
 }
 
+fn state_bytes(initial: &CpuState) -> Vec<u8> {
+    let mut state = vec![0; size_of::<CpuState>()];
+    for (n, value) in initial.regs.iter().enumerate() {
+        let at = offset_of!(CpuState, regs) + n * 4;
+        state[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (at, value) in [
+        (offset_of!(CpuState, eip), initial.eip),
+        (offset_of!(CpuState, eflags), initial.eflags),
+        (offset_of!(CpuState, mxcsr), initial.mxcsr),
+        (offset_of!(CpuState, fs_base), initial.fs_base),
+    ] {
+        state[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let at_xmm = offset_of!(CpuState, xmm);
+    state[at_xmm..at_xmm + 128].copy_from_slice(initial.xmm.as_flattened());
+    let at_mmx = offset_of!(CpuState, mmx);
+    for (n, value) in initial.mmx.iter().enumerate() {
+        state[at_mmx + n * 8..at_mmx + n * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let at_x87 = offset_of!(CpuState, x87);
+    let x87 = &initial.x87;
+    for (n, r) in x87.regs.iter().enumerate() {
+        state[at_x87 + n * 10..at_x87 + n * 10 + 10].copy_from_slice(&r.0);
+    }
+    for (at, value) in [
+        (offset_of!(X87State, control), x87.control),
+        (offset_of!(X87State, status), x87.status),
+        (offset_of!(X87State, tag), x87.tag),
+        (offset_of!(X87State, opcode), x87.opcode),
+    ] {
+        state[at_x87 + at..at_x87 + at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    for (at, value) in [
+        (offset_of!(X87State, ip), x87.ip),
+        (offset_of!(X87State, dp), x87.dp),
+    ] {
+        state[at_x87 + at..at_x87 + at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let mmx_mode = offset_of!(CpuState, mmx_mode);
+    state[mmx_mode..mmx_mode + 4].copy_from_slice(&initial.mmx_mode.to_le_bytes());
+    state
+}
+
 struct Harness {
     emu: Emulator,
     loaded: Vec<u32>,
@@ -441,44 +485,7 @@ impl Harness {
         self.emu.write(permissions, &vec![3; 0x100]);
         self.emu.write(CONTEXT + 0x3f00, &1u32.to_le_bytes());
         self.emu.write(CONTEXT, &context);
-        let mut state = vec![0; size_of::<CpuState>()];
-        for (n, value) in initial.regs.iter().enumerate() {
-            let at = offset_of!(CpuState, regs) + n * 4;
-            state[at..at + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        for (at, value) in [
-            (offset_of!(CpuState, eip), initial.eip),
-            (offset_of!(CpuState, eflags), initial.eflags),
-            (offset_of!(CpuState, mxcsr), initial.mxcsr),
-            (offset_of!(CpuState, fs_base), initial.fs_base),
-        ] {
-            state[at..at + 4].copy_from_slice(&value.to_le_bytes());
-        }
-        let at_xmm = offset_of!(CpuState, xmm);
-        state[at_xmm..at_xmm + 128].copy_from_slice(initial.xmm.as_flattened());
-        let at_mmx = offset_of!(CpuState, mmx);
-        for (n, value) in initial.mmx.iter().enumerate() {
-            state[at_mmx + n * 8..at_mmx + n * 8 + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        let at_x87 = offset_of!(CpuState, x87);
-        let x87 = &initial.x87;
-        for (n, r) in x87.regs.iter().enumerate() {
-            state[at_x87 + n * 10..at_x87 + n * 10 + 10].copy_from_slice(&r.0);
-        }
-        for (at, value) in [
-            (offset_of!(X87State, control), x87.control),
-            (offset_of!(X87State, status), x87.status),
-            (offset_of!(X87State, tag), x87.tag),
-            (offset_of!(X87State, opcode), x87.opcode),
-        ] {
-            state[at_x87 + at..at_x87 + at + 2].copy_from_slice(&value.to_le_bytes());
-        }
-        for (at, value) in [
-            (offset_of!(X87State, ip), x87.ip),
-            (offset_of!(X87State, dp), x87.dp),
-        ] {
-            state[at_x87 + at..at_x87 + at + 4].copy_from_slice(&value.to_le_bytes());
-        }
+        let state = state_bytes(initial);
         self.emu.write(CPU, &state);
         self.emu.write(WINDOW_BASE + u64::from(DATA), data);
         self.emu.set_sp(HOST_STACK);
@@ -496,6 +503,9 @@ impl Harness {
         .expect("native unit returns without a helper");
         assert_eq!(self.emu.sp(), HOST_STACK);
         let state = self.emu.read(CPU, size_of::<CpuState>());
+        let at_xmm = offset_of!(CpuState, xmm);
+        let at_mmx = offset_of!(CpuState, mmx);
+        let at_x87 = offset_of!(CpuState, x87);
         let read32 = |at| u32::from_le_bytes(state[at..at + 4].try_into().unwrap());
         let mut actual = initial.clone();
         actual.regs = std::array::from_fn(|n| read32(offset_of!(CpuState, regs) + n * 4));
@@ -1587,37 +1597,7 @@ fn j1_forward_internal_jcc_inlines_and_peeled_mmx_loop_minimizes_guards() {
 fn admitted_frame_values_are_reloaded_at_each_outer_iteration() {
     let mut h = Harness::new();
     for overlapping_store in [false, true] {
-        let code = bytes(|a| {
-            let mut outer = a.create_label();
-            let mut inner = a.create_label();
-            let mut alternate = a.create_label();
-            let mut output = a.create_label();
-            a.set_label(&mut outer).unwrap();
-            a.mov(dword_ptr(esp + 4), ebx).unwrap();
-            a.mov(dword_ptr(esp + 8), 7).unwrap();
-            a.mov(dword_ptr(esp + 12), 11).unwrap();
-            a.mov(ecx, 4).unwrap();
-            a.set_label(&mut inner).unwrap();
-            a.mov(eax, dword_ptr(esp + 4)).unwrap();
-            a.test(ebx, 1).unwrap();
-            a.jz(alternate).unwrap();
-            a.imul_2(eax, dword_ptr(esp + 8)).unwrap();
-            a.jmp(output).unwrap();
-            a.set_label(&mut alternate).unwrap();
-            a.imul_2(eax, dword_ptr(esp + 12)).unwrap();
-            if overlapping_store {
-                a.mov(byte_ptr(esp + 5), al).unwrap();
-            }
-            a.set_label(&mut output).unwrap();
-            a.mov(edx, dword_ptr(esp + 4)).unwrap();
-            a.add(eax, edx).unwrap();
-            a.mov(dword_ptr(edi), eax).unwrap();
-            a.add(edi, 4).unwrap();
-            a.dec(ecx).unwrap();
-            a.jne(inner).unwrap();
-            a.dec(ebx).unwrap();
-            a.jne(outer).unwrap();
-        });
+        let code = bytes(|a| computation::tests::frame_cached_rows(a, overlapping_store));
         let work = j1_unit(&code);
         let proof = computation::Proof::build(&work.unit.trace).expect("nested proof");
         let cache = proof.frame_cache().expect("inner loop residence");
@@ -1808,7 +1788,8 @@ fn table_row_loops_admit_gathered_entries_mirrored_pointers_and_inclusive_bounds
     }
 }
 
-mod opt_back {
+pub(in crate::translate) mod opt_back {
+    pub(in crate::translate) mod inline;
     use super::super::opt::{back, eval, ir::*, recovery::*};
     use super::super::opt::{ir::Op, recovery::Recipe};
     use super::*;
@@ -1830,6 +1811,18 @@ mod opt_back {
 
     impl Harness {
         fn run_opt(
+            &mut self,
+            func: &Func,
+            params: &[u128],
+            budget: u64,
+            recall: u32,
+            head_exit: u32,
+        ) -> Captured {
+            inline::check_backend_snapshots(func);
+            self.run_opt_inner(func, params, budget, recall, head_exit)
+        }
+
+        fn run_opt_inner(
             &mut self,
             func: &Func,
             params: &[u128],
@@ -1995,6 +1988,11 @@ mod opt_back {
         }
     }
 
+    fn checked_lower(func: &Func) -> back::Lowered {
+        inline::check_backend_snapshots(func);
+        back::lower(func)
+    }
+
     fn harness() -> Harness {
         let mut h = Harness::new();
         h.emu.map(AREA, 0x20000);
@@ -2088,7 +2086,9 @@ mod opt_back {
             let bytes = &code[start..start + len as usize];
             Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
         });
-        opt::front::build(&unit, &proof, at).unwrap()
+        let built = opt::front::build(&unit, &proof, at).unwrap();
+        inline::check_guest_snapshots(&built.func, &built.assumed, at);
+        built
     }
 
     fn guest_fp_pair(
@@ -2121,7 +2121,10 @@ mod opt_back {
 
         h.emu.write(WINDOW_BASE + u64::from(DATA), data);
         h.emu.write(WINDOW_BASE + u64::from(frame_addr), frame);
-        let captured = h.run_opt(&built.func, &params, 1000, 0, 0);
+        if !failed {
+            inline::compare_guest_exit(built, at, &reference, want_record);
+        }
+        let captured = h.run_opt_inner(&built.func, &params, 1000, 0, 0);
         assert_eq!(captured.record, want_record);
         let data_after = h.emu.read(WINDOW_BASE + u64::from(DATA), data.len());
         let mut actual = memory(code, &data_after);
@@ -3395,7 +3398,7 @@ mod opt_back {
         let params: Vec<_> = (1..=36).collect();
         let got = compare(&f, &params, &mut h);
         assert_eq!(got.cpu.regs[0], 666 + 30);
-        let mut lowered = back::lower(&f);
+        let mut lowered = checked_lower(&f);
         lowered.place(0, stubs.opt_exit);
         let spill = |&w: &u32| w & 0x3b00_0000 == 0x3900_0000 && (w >> 5) & 31 == 31;
         for block in [head, latch] {
@@ -3743,7 +3746,7 @@ mod opt_back {
         let k = f.push(b, Op::Constant(Type::I32, 7)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
         finish(&mut f, b, v);
-        let mut lower = back::lower(&f);
+        let mut lower = checked_lower(&f);
         lower.place(0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "one ADD plus exit branch");
         assert_eq!(
@@ -3758,7 +3761,7 @@ mod opt_back {
         let k = f.push(b, Op::Constant(Type::I32, 8)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Mul, v, k)).unwrap();
         finish(&mut f, b, v);
-        let mut lower = back::lower(&f);
+        let mut lower = checked_lower(&f);
         lower.place(0, stubs.opt_exit);
         assert_eq!(
             body(&lower, 0)[..2],
@@ -3817,7 +3820,7 @@ mod opt_back {
             let exit = f.record(record(0x2000));
             f.end(block, End::Exit(exit));
         }
-        let mut lower = back::lower(&f);
+        let mut lower = checked_lower(&f);
         lower.place(0, stubs.opt_exit);
         assert_eq!(body(&lower, 0).len(), 2, "CMP plus conditional branch");
         assert_eq!(body(&lower, 0)[0], cmp_imm(W, Reg::new(0), 5, false));
@@ -3828,7 +3831,7 @@ mod opt_back {
         f.push(b, Op::Validate);
         let exit = f.record(record(0x2000));
         f.end(b, End::Exit(exit));
-        let mut lower = back::lower(&f);
+        let mut lower = checked_lower(&f);
         lower.place(0, stubs.opt_exit);
         let start = lower.marks[1].offset as usize / 4;
         assert_eq!(lower.words[start - 2], sub_imm(X, X9, X9, 3, false));
@@ -3898,7 +3901,7 @@ mod opt_back {
                 },
             );
             finish(&mut f, done, total);
-            let mut lower = back::lower(&f);
+            let mut lower = checked_lower(&f);
             lower.place(0, runtime::stubs().opt_exit);
             let head_code = body(&lower, 1);
             assert_eq!(

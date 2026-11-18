@@ -46,12 +46,16 @@ mod wake_queue;
 pub use wake_queue::WakePriority;
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use adv_cpu::backend::asm::Asm;
 use adv_cpu::backend::{
-    Backend, Exit, Guest, GuestExt, MemFault, Prot, Reg, SegmentSetup, TrapAction, TrapHandler,
+    Backend, Exit, Guest, GuestExt, MemFault, OfferGate, Prot, Reg, SegmentSetup, TrapAction,
+    TrapHandler,
 };
+use adv_sync::input::KeyState;
 
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
 pub use ext::Ext;
@@ -95,6 +99,30 @@ thread_local! {
 pub fn observe_host_calls(on: bool) {
     OBSERVING.set(on);
 }
+
+struct PublishedOffer {
+    gate: OfferGate,
+    // The UI may change held input while the owner is running guest code.
+    split: Mutex<SplitOffer>,
+}
+
+#[derive(Default)]
+struct SplitOffer {
+    held: bool,
+    /// None when pace is disabled; otherwise whether frame load is already over.
+    over: Option<bool>,
+}
+
+impl PublishedOffer {
+    fn publish_over(&self, split: &SplitOffer) {
+        self.gate.split_over.store(
+            u32::from(split.over.is_some_and(|over| over || split.held)),
+            Ordering::Release,
+        );
+    }
+}
+
+type HeldListener = dyn Fn(bool) + Send + Sync;
 
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
@@ -187,9 +215,12 @@ pub struct Sys {
     /// Scheduler latency observations, independent of optional execution profiling.
     pub scheduling: scheduling::SchedulingStats,
     /// The host display's frame clock for frame spins (PROC-CLOCK-4).
-    pub frame_pacer: Option<std::sync::Arc<dyn frame_spin::FramePacer>>,
+    frame_pacer: Option<Arc<dyn frame_spin::FramePacer>>,
+    offer_input: Option<(Arc<KeyState>, Arc<HeldListener>)>,
     /// Owner work per frame, which selects loop splitting (PROC-MACH-1).
     load: frame_load::FrameLoad,
+    offer: Arc<PublishedOffer>,
+    offer_policy: (bool, bool, bool, Option<u64>),
     pub schedule_trace: schedule_trace::ScheduleTrace,
     wakes: sched::ActiveContexts,
     wait_deadlines: std::collections::BTreeSet<(u64, CtxId)>,
@@ -274,6 +305,97 @@ impl Env<'_> {
 }
 
 impl Sys {
+    fn new_offer() -> Arc<PublishedOffer> {
+        Arc::new(PublishedOffer {
+            gate: OfferGate {
+                stale: 1.into(),
+                split_over: 0.into(),
+                split_deadline: u64::MAX.into(),
+            },
+            split: Mutex::default(),
+        })
+    }
+
+    fn invalidate_offer(&self) {
+        self.offer.gate.stale.store(1, Ordering::Relaxed);
+    }
+
+    /// Install the frame clock. Pass the key state used by its `input_held`
+    /// so key transitions also reach the published offer gate.
+    pub fn set_frame_pacer(
+        &mut self,
+        pacer: Option<Arc<dyn frame_spin::FramePacer>>,
+        keys: Option<Arc<KeyState>>,
+    ) {
+        if let Some((keys, listener)) = self.offer_input.take() {
+            keys.unwatch_pressed(&listener);
+            self.offer.split.lock().unwrap().held = false;
+        }
+        self.frame_pacer = pacer;
+        if let Some(keys) = keys {
+            let offer = self.offer.clone();
+            let listener: Arc<HeldListener> = Arc::new(move |held| {
+                let mut split = offer.split.lock().unwrap();
+                split.held = held;
+                offer.publish_over(&split);
+                offer.gate.stale.store(1, Ordering::Release);
+            });
+            keys.watch_pressed(&listener);
+            self.offer_input = Some((keys, listener));
+        }
+        self.publish_split();
+    }
+
+    fn publish_offer_policy(&mut self, computation: bool) {
+        // These settings can be changed by the caller or a host handler.
+        let policy = (
+            computation,
+            OBSERVING.get(),
+            self.trace.enabled(),
+            self.call_limit,
+        );
+        if policy != self.offer_policy {
+            self.offer_policy = policy;
+            self.invalidate_offer();
+            self.publish_split();
+        }
+    }
+
+    fn publish_split(&self) {
+        let (computation, observing, tracing, call_limit) = self.offer_policy;
+        let (over, deadline) = if computation && !observing && !tracing && call_limit.is_none() {
+            let (over, deadline) = self.load.split_gate();
+            (
+                Some(over || (self.frame_pacer.is_some() && self.offer_input.is_none())),
+                deadline,
+            )
+        } else {
+            (None, u64::MAX)
+        };
+        let mut split = self.offer.split.lock().unwrap();
+        split.over = over;
+        self.offer
+            .gate
+            .split_deadline
+            .store(deadline, Ordering::Relaxed);
+        self.offer.publish_over(&split);
+    }
+
+    fn set_current(&mut self, id: CtxId) {
+        if self.current != id {
+            self.current = id;
+            self.invalidate_offer();
+        }
+    }
+
+    fn set_yielded(&mut self, id: CtxId, yielded: bool) {
+        let context = &mut self.contexts[id as usize];
+        if context.yielded != yielded {
+            context.yielded = yielded;
+            self.invalidate_offer();
+        }
+    }
+
     /// Bind a complete body to a published host thunk and its copied entries.
     /// The registered handler remains the full path.
     pub fn bind_thunk_body(&mut self, index: u32, body: adv_cpu::body::DirectBody) {
@@ -364,6 +486,9 @@ impl Sys {
         }
         let old = context.suspend_count;
         context.suspend_count += 1;
+        if old == 0 && matches!(context.state, State::Ready { .. }) {
+            self.invalidate_offer();
+        }
         Some(old)
     }
     /// Moves the initial stack pointer of a context that has not started: a
@@ -388,6 +513,9 @@ impl Sys {
         }
         let old = context.suspend_count;
         context.suspend_count = old.saturating_sub(1);
+        if old == 1 && context.is_ready() {
+            self.invalidate_offer();
+        }
         Some(old)
     }
     /// Whether another context fits in the current TEB layout.
@@ -513,6 +641,7 @@ impl Sys {
                 .expect("new context owns execution storage")
                 .slot,
         );
+        self.invalidate_offer();
         self.next_tid += 4;
         Ok(id)
     }
@@ -586,7 +715,11 @@ impl Sys {
     /// too briefly to repay the job layer's round trip (PROC-MACH-1).
     fn computing_peer(&mut self) -> bool {
         let (current, frame) = (self.current, self.completed_frames);
-        self.contexts[current as usize].computed = Some(frame);
+        let context = &mut self.contexts[current as usize];
+        if context.computed != Some(frame) {
+            context.computed = Some(frame);
+            self.invalidate_offer();
+        }
         self.active_contexts().any(|c| {
             c.id != current
                 && c.is_ready()
@@ -606,6 +739,7 @@ impl Sys {
         self.objects.context_finished(id);
         if self.wakes.retire(id) {
             self.finished_contexts.push(id);
+            self.invalidate_offer();
         }
     }
 
@@ -928,17 +1062,25 @@ impl Sys {
     /// pacing slack, not owner work (PROC-MACH-1).
     pub fn host_idle(&mut self, time: std::time::Duration, timed_out: bool) {
         self.load.idle(time, timed_out);
+        self.publish_split();
+    }
+
+    fn computed_on_owner(&mut self, helpers: Duration) {
+        self.load.computed(helpers);
+        self.publish_split();
     }
 
     /// Mark a fully committed frame, after every guest draw callback has returned.
     /// A host handler can then return normally or defer its following work.
     pub fn complete_frame(&mut self) {
         self.completed_frames = self.completed_frames.wrapping_add(1);
+        self.invalidate_offer();
         self.frame_spin_frame();
         if let Some(budget) = &mut self.stats.frame_budget {
             budget.mark_frame(u64::from(self.completed_frames));
         }
         let work = self.load.frame(std::time::Instant::now());
+        self.publish_split();
         self.schedule_trace.event(
             "frame",
             self.current,
@@ -1161,6 +1303,7 @@ impl Sys {
                 reason,
             }),
         };
+        self.invalidate_offer();
     }
 
     /// Virtual time: let every yielding context resume before recognizing a
@@ -1878,7 +2021,10 @@ impl Dispatch<'_> {
                 });
                 TrapAction::Park
             }
-            Ok(()) => TrapAction::Continue,
+            Ok(()) => {
+                self.sys.publish_offer_policy(self.computation);
+                TrapAction::Continue
+            }
             Err(Parked::Raise(fault)) => {
                 let res = self.exception(cpu, exception::Exception::Fault(fault));
                 self.action(cpu, res, frame_before)
@@ -1933,11 +2079,20 @@ impl Dispatch<'_> {
 
 impl TrapHandler for Dispatch<'_> {
     fn allow_computation(&mut self) -> bool {
-        self.sys.computing_peer()
+        self.sys.offer.gate.stale.swap(0, Ordering::Acquire);
+        let offer = self.sys.computing_peer()
             && self.computation
             && !OBSERVING.get()
             && !self.sys.trace.enabled()
-            && self.sys.call_limit.is_none()
+            && self.sys.call_limit.is_none();
+        if offer {
+            self.sys.invalidate_offer();
+        }
+        offer
+    }
+
+    fn offer_gate(&self) -> Option<&OfferGate> {
+        Some(&self.sys.offer.gate)
     }
 
     fn pace(&self) -> Option<adv_cpu::backend::Pace> {
@@ -2219,7 +2374,10 @@ impl<B: Backend> Machine<B> {
             frame: 0,
             completed_frames: 0,
             frame_pacer: None,
+            offer_input: None,
             load: frame_load::FrameLoad::default(),
+            offer: Sys::new_offer(),
+            offer_policy: Default::default(),
             pid: 0x1000,
             peb: PEB_ADDR,
             teb_pages: 1,
@@ -2400,6 +2558,14 @@ impl<B: Backend> Machine<B> {
         self.sys.stats.services_enabled = parent.sys.stats.services_enabled;
         self.sys.call_limit = parent.sys.call_limit;
         self.sys.trace = parent.sys.trace.clone();
+        self.sys.set_frame_pacer(
+            parent.sys.frame_pacer.clone(),
+            parent
+                .sys
+                .offer_input
+                .as_ref()
+                .map(|(keys, _)| keys.clone()),
+        );
     }
 
     pub fn set_frame_handoff(&mut self, required: bool) {
@@ -2484,7 +2650,7 @@ impl<B: Backend> Machine<B> {
     }
 
     fn switch_to(&mut self, id: CtxId) -> Result<(), MemFault> {
-        self.sys.current = id;
+        self.sys.set_current(id);
         if self.loaded == Some(id) {
             return Ok(());
         }
@@ -2566,26 +2732,26 @@ impl<B: Backend> Machine<B> {
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Deferred { then, origin }),
                 };
-                ctx.yielded = false;
+                self.sys.set_yielded(id, false);
                 return Some(RunResult::HostRequest);
             }
             Parked::ServiceYield { resume_eip } => {
                 self.cpu.set_reg(Reg::Eip, resume_eip);
-                ctx.yielded = true;
                 ctx.progress.yielded(resume_eip);
+                self.sys.set_yielded(id, true);
                 self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::HostYield { resume_eip } => {
                 // Both current backends park by replacing EIP with PARK_ADDR.
                 // Other registers already contain the committed trap result.
                 self.cpu.set_reg(Reg::Eip, resume_eip);
-                ctx.yielded = false;
+                self.sys.set_yielded(id, false);
             }
             Parked::Deferred { then, origin } => {
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Deferred { then, origin }),
                 };
-                ctx.yielded = false;
+                self.sys.set_yielded(id, false);
             }
             Parked::Block {
                 wait: Wait::Yield,
@@ -2613,8 +2779,8 @@ impl<B: Backend> Machine<B> {
                         reason: WakeReason::Timeout,
                     }),
                 };
-                ctx.yielded = true;
                 ctx.progress.yielded(site);
+                self.sys.set_yielded(id, true);
                 self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::Block {
@@ -2648,7 +2814,8 @@ impl<B: Backend> Machine<B> {
                     origin,
                     allow_time_skip,
                 };
-                ctx.yielded = false;
+                self.sys.invalidate_offer();
+                self.sys.set_yielded(id, false);
                 self.sys.register_waiter(id as usize);
             }
             Parked::ExitThread(code) => {
@@ -3032,7 +3199,7 @@ impl<B: Backend> Machine<B> {
                 )));
             }
             if soft_remaining.is_some_and(|remaining| remaining.is_zero()) {
-                self.sys.contexts[id as usize].yielded = false;
+                self.sys.set_yielded(id, false);
                 self.sys.rr_last = last;
                 self.sys.trace.flush();
                 return SliceResult::Yielded;
@@ -3115,6 +3282,7 @@ impl<B: Backend> Machine<B> {
             let t0 = self.sys.stats.start();
             let frame_before = self.sys.completed_frames;
             let computation = !self.computation.take_decline(id);
+            self.sys.publish_offer_policy(computation);
             let mut d = Dispatch {
                 sys: &mut self.sys,
                 ext: &mut self.ext,
@@ -3169,8 +3337,8 @@ impl<B: Backend> Machine<B> {
             match exit {
                 Exit::Computation => {
                     let ctx = &mut self.sys.contexts[id as usize];
-                    ctx.yielded = false;
                     ctx.progress.new_work();
+                    self.sys.set_yielded(id, false);
                     if self.sys.schedule_trace.enabled() {
                         self.sys.schedule_trace.event(
                             "compute_offer",
@@ -3185,8 +3353,8 @@ impl<B: Backend> Machine<B> {
                 }
                 Exit::Reschedule => {
                     let ctx = &mut self.sys.contexts[id as usize];
-                    ctx.yielded = false;
                     ctx.progress.new_work();
+                    self.sys.set_yielded(id, false);
                     self.sys.schedule_trace.event(
                         "spin_yield",
                         id,
@@ -3209,7 +3377,7 @@ impl<B: Backend> Machine<B> {
                             recent: self.sys.recent_calls(),
                         }));
                     }
-                    self.sys.contexts[id as usize].yielded = false;
+                    self.sys.set_yielded(id, false);
                     self.sys.rr_last = last;
                     self.sys.scheduling.external_interrupts += 1;
                     return SliceResult::Yielded;
@@ -3254,7 +3422,7 @@ impl<B: Backend> Machine<B> {
                         && !hard_expired
                         && allowance.is_some_and(|a| a.limit != scheduling::Limit::Hard)
                     {
-                        self.sys.contexts[id as usize].yielded = false;
+                        self.sys.set_yielded(id, false);
                         if allowance.is_some_and(|a| a.limit == scheduling::Limit::Reschedule)
                             && slice.is_none_or(|limit| started.elapsed() < limit)
                         {

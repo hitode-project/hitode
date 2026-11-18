@@ -1,9 +1,13 @@
 //! Register-allocated AArch64 computations with cold recovery recipes.
+//! Jobs load entry cells and leave through the capture stub. Inline forms
+//! admit canonical Tier-1 state and publish normal exits at Tier-1 links.
 //! Floating point runs under the canonical FPCR and validates by value
 //! (A64-OPT-4).
 mod alloc;
 mod flags;
+mod inline;
 
+use super::front::Assumed;
 use super::ir::*;
 use super::recovery::{FlagRecipe, Host, Record};
 use crate::asm::{Asm, Label};
@@ -31,6 +35,13 @@ const PARAMS: u32 = offset_of!(Runtime, opt_params) as u32;
 const RECORD: u32 = offset_of!(Runtime, opt_record) as u32;
 
 pub(crate) struct Lowered {
+    /// The inline entry, miss and cold branch words.
+    pub entry: usize,
+    pub miss: usize,
+    pub cold: usize,
+    /// Tier-1 link points as (byte offset, guest EIP). The fourth word
+    /// of each link is bound to the dispatch stub during placement.
+    pub links: Vec<(usize, u32)>,
     pub words: Vec<u32>,
     pub sites: Vec<(usize, Site)>,
     pub marks: Vec<Mark>,
@@ -38,8 +49,8 @@ pub(crate) struct Lowered {
     pub flags: Vec<Option<FlagRecipe>>,
     /// 16-byte cells at the captured SP, discarded by `opt_exit`.
     pub spill_cells: usize,
-    /// The word every record leaves through, a branch to `opt_exit` once
-    /// the code is placed.
+    /// The word job and cold inline exits leave through. Placement binds
+    /// it to `opt_exit`.
     pub exit: usize,
 }
 
@@ -53,15 +64,25 @@ impl Lowered {
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
 pub(crate) fn lower(func: &Func) -> Lowered {
+    lower_form(func, None)
+}
+
+/// Code entered and linked in the Tier-1 register assignment.
+pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
+    debug_assert_eq!(func.entry, entry);
+    lower_form(func, Some((assumed, entry)))
+}
+
+fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let allocation = alloc::allocate(func);
+    let allocation = alloc::allocate(func, inline.is_some());
     let mut asm = Asm::new();
     // A bit test whose target lands out of range is emitted wide, and the
     // form again, as the ordinary translator does.
-    let (mut e, exit) = loop {
-        let (mut e, exit) = emit(func, &allocation, asm);
+    let (mut e, exit, miss, cold) = loop {
+        let (mut e, exit, miss, cold) = emit(func, &allocation, asm, inline);
         if !e.asm.widen_bit_tests() {
-            break (e, exit);
+            break (e, exit, miss, cold);
         }
         asm = e.asm;
         asm.rewind();
@@ -77,10 +98,16 @@ pub(crate) fn lower(func: &Func) -> Lowered {
         .map(|r| super::recovery::lower_record(r, &e.locations))
         .collect();
     let exit = e.asm.position(exit) / 4;
+    let miss = miss.map_or(0, |label| e.asm.position(label) / 4);
+    let cold = cold.map_or(0, |label| e.asm.position(label) / 4);
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
     Lowered {
+        entry: 0,
+        miss,
+        cold,
+        links: e.links,
         exit,
         words,
         sites: e.sites,
@@ -108,7 +135,12 @@ pub(in crate::translate) fn assert_no_fp_state(words: &[u32]) {
 }
 
 /// Emits the form into `asm`, returning its emitter and exit label.
-fn emit<'a>(func: &'a Func, allocation: &alloc::Allocation, mut asm: Asm) -> (Emitter<'a>, Label) {
+fn emit<'a>(
+    func: &'a Func,
+    allocation: &alloc::Allocation,
+    mut asm: Asm,
+    inline: Option<(&Assumed, &[Source])>,
+) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let cold = func.records.iter().map(|_| asm.label()).collect();
@@ -140,33 +172,27 @@ fn emit<'a>(func: &'a Func, allocation: &alloc::Allocation, mut asm: Asm) -> (Em
         checkpoints: Vec::new(),
         fp_checks: Vec::new(),
         edges: Vec::new(),
+        links: Vec::new(),
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
     e.mark(Part::Body, func.records[first.0 as usize].eip);
     let bytes = allocation.spill_cells as u64 * 16;
-    if bytes != 0 {
-        if let Some((n, shift)) = add_immediate(bytes) {
-            e.asm.emit(sub_imm(X, SP, SP, n, shift));
-        } else {
-            e.imm(T, bytes);
-            e.asm.emit(sub_ext(X, SP, SP, T, Extend::Uxtx, 0));
-        }
-    }
-    if !func.entry.is_empty() {
-        e.asm.emit(ldr(X, U, RT, PARAMS));
-    }
-    for (i, &p) in func.blocks[0].params.iter().enumerate() {
-        let loc = e.locations[p.0 as usize];
-        match loc {
-            Host::Register(n) => e.asm.emit(ldr(e.size(p), n, U, i as u32 * 16)),
-            Host::Vector(n) => e.asm.emit(vldr(mem_type(func.ty(p)), n, U, i as u32 * 16)),
-            _ => {
-                e.asm.emit(vldr(mem_type(func.ty(p)), A, U, i as u32 * 16));
-                e.copy(loc, Host::Vector(A), func.ty(p));
-            }
-        }
-    }
+    let (miss, cold) = if let Some((assumed, entry)) = inline {
+        let miss = e.asm.label();
+        let cold = e.asm.label();
+        e.inline_entry(assumed, entry, bytes, miss, cold);
+        (Some(miss), Some(cold))
+    } else {
+        e.stack_frame(bytes, true);
+        e.job_entry();
+        (None, None)
+    };
+    let mut normal = if inline.is_some() {
+        vec![None; func.records.len()]
+    } else {
+        Vec::new()
+    };
     let refund = func.records[first.0 as usize].refund;
     e.charge(i64::from(refund), first, false);
     for (b, data) in func.blocks.iter().enumerate() {
@@ -219,13 +245,30 @@ fn emit<'a>(func: &'a Func, allocation: &alloc::Allocation, mut asm: Asm) -> (Em
                 }
                 e.edge(inline, b + 1);
             }
-            End::Exit(id) => e.asm.b(e.cold[id.0 as usize]),
+            End::Exit(id) => {
+                let i = id.0 as usize;
+                let label = if inline.is_some() {
+                    *normal[i].get_or_insert_with(|| e.asm.label())
+                } else {
+                    e.cold[i]
+                };
+                e.asm.b(label);
+            }
             End::Unset => unreachable!(),
         }
     }
     for (label, target) in std::mem::take(&mut e.edges) {
         e.asm.bind(label);
         e.edge(&target, usize::MAX);
+    }
+    if let Some((assumed, _)) = inline {
+        for (i, label) in normal.into_iter().enumerate() {
+            if let Some(label) = label {
+                e.asm.bind(label);
+                e.mark(Part::Body, func.records[i].eip);
+                e.inline_exit(&func.records[i], assumed, bytes);
+            }
+        }
     }
     e.checkpoints();
     e.fp_checks();
@@ -241,7 +284,11 @@ fn emit<'a>(func: &'a Func, allocation: &alloc::Allocation, mut asm: Asm) -> (Em
     e.asm.bind(exit);
     // Permanently undefined until placed.
     e.asm.emit(0);
-    (e, exit)
+    for label in [miss, cold].into_iter().flatten() {
+        e.asm.bind(label);
+        e.asm.emit(0);
+    }
+    (e, exit, miss, cold)
 }
 
 struct FpCheck {
@@ -267,9 +314,45 @@ struct Emitter<'a> {
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
     edges: Vec<(Label, Target)>,
+    links: Vec<(usize, u32)>,
 }
 
 impl<'a> Emitter<'a> {
+    fn stack_frame(&mut self, bytes: u64, enter: bool) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some((n, shift)) = add_immediate(bytes) {
+            let op = if enter { sub_imm } else { add_imm };
+            self.asm.emit(op(X, SP, SP, n, shift));
+        } else {
+            self.imm(T, bytes);
+            let op = if enter { sub_ext } else { add_ext };
+            self.asm.emit(op(X, SP, SP, T, Extend::Uxtx, 0));
+        }
+    }
+
+    fn job_entry(&mut self) {
+        if !self.func.entry.is_empty() {
+            self.asm.emit(ldr(X, U, RT, PARAMS));
+        }
+        for (i, &p) in self.func.blocks[0].params.iter().enumerate() {
+            let loc = self.locations[p.0 as usize];
+            match loc {
+                Host::Register(n) => self.asm.emit(ldr(self.size(p), n, U, i as u32 * 16)),
+                Host::Vector(n) => {
+                    self.asm
+                        .emit(vldr(mem_type(self.func.ty(p)), n, U, i as u32 * 16));
+                }
+                _ => {
+                    self.asm
+                        .emit(vldr(mem_type(self.func.ty(p)), A, U, i as u32 * 16));
+                    self.copy(loc, Host::Vector(A), self.func.ty(p));
+                }
+            }
+        }
+    }
+
     fn mark(&mut self, part: Part, eip: u32) {
         self.marks.push(Mark {
             offset: self.asm.offset() as u32,
@@ -379,8 +462,8 @@ impl<'a> Emitter<'a> {
             .filter(|(d, s, _)| d != s)
             .collect()
     }
-    fn edge(&mut self, target: &Target, next: usize) {
-        let mut moves = self.moves(target);
+    fn parallel_moves(&mut self, mut moves: Vec<(Host, Host, Type)>) {
+        moves.retain(|(dst, src, _)| dst != src);
         while !moves.is_empty() {
             if let Some(i) = moves
                 .iter()
@@ -403,6 +486,10 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    fn edge(&mut self, target: &Target, next: usize) {
+        self.parallel_moves(self.moves(target));
         if target.charge != 0 {
             let record = self.func.blocks[target.block.0 as usize]
                 .head

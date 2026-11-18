@@ -8,6 +8,7 @@
 //! ([`TrapAction::Park`]). Parking unwinds out of `run`, so only the top-level scheduler
 //! ever re-enters guest code. There is no host→guest recursion.
 
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
 pub use crate::{ArchitecturalState, StateError};
@@ -493,12 +494,61 @@ impl Pace {
     }
 }
 
+/// The machine's published computation offer decision (PROC-MACH-13).
+#[repr(C)]
+pub struct OfferGate {
+    /// Nonzero: Rust must evaluate the offer.
+    pub stale: AtomicU32,
+    /// Nonzero: a split loop must go to Rust whatever its cost.
+    pub split_over: AtomicU32,
+    /// In host ticks: a split loop of `cost` ticks must go to Rust once
+    /// `host_ticks() + cost > split_deadline`.
+    pub split_deadline: AtomicU64,
+}
+
+#[inline]
+pub fn host_ticks() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ticks;
+        // SAFETY: the supported AArch64 hosts expose the virtual counter at EL0.
+        unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack)) };
+        ticks
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[inline]
+pub fn host_tick_hz() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let frequency;
+        // SAFETY: CNTFRQ describes the same accessible virtual counter.
+        unsafe {
+            std::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack))
+        };
+        frequency
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        1_000_000_000
+    }
+}
+
 pub trait TrapHandler {
     /// The current context reached a prepared computation: whether it
     /// should return to the scheduler, for a peer to run beside it.
     /// Instruction debugging and host-call tracing keep execution on the owner.
     fn allow_computation(&mut self) -> bool {
         false
+    }
+
+    fn offer_gate(&self) -> Option<&OfferGate> {
+        None
     }
 
     /// Whether a ready peer can use the next turn on the execution owner.

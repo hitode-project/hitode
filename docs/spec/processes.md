@@ -56,6 +56,11 @@ Recorded guest signalers MUST come from the operation that satisfied the blocked
 **Rule**: A host call that ends the innermost guest call without its return MUST resume that call's continuation with the given result. EBX, EBP, ESI and EDI MUST then hold their values from when that call began, as a returning callee leaves them.
 **Verification**: Test
 
+### PROC-MACH-13 Published offer gate
+
+**Rule**: A stale offer gate or a due split gate MUST send the arrival to the execution owner's Rust decision. A clear gate MUST imply that the Rust decision runs the computation in place without changing state.
+**Verification**: Test
+
 ### PROC-MACH-4 Direct host services
 
 **Rule**: `Env::invoke_host_u32` MUST pass a validated argument snapshot to a registered implementation without running rewritable private thunks. Ordinary API front ends MUST NOT use it to bypass guest hooks.

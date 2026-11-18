@@ -86,6 +86,12 @@ pub struct Inst {
     frame: u16,
 }
 
+impl Inst {
+    pub(crate) fn inlined(&self) -> bool {
+        self.frame != 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Frame {
     parent: u16,
