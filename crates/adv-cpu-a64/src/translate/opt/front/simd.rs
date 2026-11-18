@@ -116,6 +116,7 @@ impl Front<'_> {
             }
             Kind::ShiftBy(op, log2) => self.value(Op::Vec(VecOp::Shift(op, log2, full), dst, src)),
             Kind::Compare(false, true) if s.imm == 1 => {
+                self.sse_input(dst, Some(src), true);
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
             Kind::Double(op, true) => {
@@ -126,6 +127,7 @@ impl Front<'_> {
                     Float::Fdiv => FpOp::Div,
                     _ => return Err(Reject::Unsupported(self.index)),
                 };
+                self.sse_input(dst, Some(src), false);
                 let a = self.bits(Type::F64, dst);
                 let b = self.bits(Type::F64, src);
                 let result = self.value(Op::Fp(op, a, b));
@@ -137,10 +139,12 @@ impl Front<'_> {
                 self.low(dst, result)
             }
             Kind::ScalarToInt(true, true) => {
+                self.sse_input(src, None, false);
                 let value = self.bits(Type::F64, src);
                 self.value(Op::ToInt { value, wide: false })
             }
             Kind::FlagCompare(true, ordered) => {
+                self.sse_input(dst, Some(src), false);
                 let a = self.bits(Type::F64, dst);
                 let b = self.bits(Type::F64, src);
                 self.state.flags = self.value(Op::Flags {
@@ -206,11 +210,14 @@ impl Front<'_> {
             }
         }
     }
+    fn sse_input(&mut self, a: Value, b: Option<Value>, packed: bool) {
+        if self.assumed.mxcsr & 2 == 0 {
+            self.func.push(self.block, Op::SseInput { a, b, packed });
+        }
+    }
+
     fn low(&mut self, dst: Value, src: Value) -> Value {
-        let mask = self.constant(Type::V128, u128::MAX << 64);
-        let hi = self.value(Op::Vec(VecOp::And(true), dst, mask));
-        let lo = self.bits(Type::I64, src);
-        let lo = self.bits(Type::V128, lo);
-        self.value(Op::Vec(VecOp::Or(true), hi, lo))
+        let lo = self.bits(Type::V128, src);
+        self.value(Op::Vec(VecOp::Insert64(false, false), dst, lo))
     }
 }

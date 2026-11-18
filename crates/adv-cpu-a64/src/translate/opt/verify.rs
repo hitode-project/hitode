@@ -162,6 +162,7 @@ fn typed(func: &Func, op: &Op) -> bool {
             (int(value) || is(value, Type::F64)) && is(base, Type::I64)
         }
         Op::X87Load { bits, single, .. } => is(bits, if single { Type::I32 } else { Type::I64 }),
+        Op::SseInput { a, b, .. } => is(a, Type::V128) && b.is_none_or(|b| is(b, Type::V128)),
         Op::Constant(..) | Op::Bits { .. } | Op::Validate => true,
     }
 }

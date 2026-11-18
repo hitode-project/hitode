@@ -255,7 +255,7 @@ impl Front<'_> {
                 let bits = self.read(mem, 4, Type::I32)?;
                 Ok(self.value(Op::X87Load {
                     bits,
-                    denormal: true,
+                    denormal: !self.assumed.denormal,
                     single: true,
                 }))
             }

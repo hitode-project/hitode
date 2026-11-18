@@ -47,6 +47,7 @@ pub(crate) mod computation;
 mod decode;
 pub mod first;
 mod flags;
+mod fp_class;
 mod integer;
 mod native_region;
 mod ops;

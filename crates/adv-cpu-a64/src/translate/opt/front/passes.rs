@@ -48,6 +48,7 @@ pub(super) fn run(
     while propagate(func) {}
     join(func);
     group_stores(func, proof, loads, stores);
+    sse_inputs(func);
     dead(func);
     validations(func);
 }
@@ -56,6 +57,12 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
     let f = |v: &mut Value| *v = resolve(*v, aliases);
     match op {
         Op::Constant(..) | Op::Validate => {}
+        Op::SseInput { a, b, .. } => {
+            f(a);
+            if let Some(b) = b {
+                f(b);
+            }
+        }
         Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }
         | Op::FpUnary(_, a)
@@ -954,6 +961,98 @@ fn dead(func: &mut Func) {
     }
 }
 
+/// A lane produced by validated arithmetic cannot be subnormal. Track which
+/// lanes retain that property through copies, insertions and block parameters.
+fn sse_inputs(func: &mut Func) {
+    if !func.blocks.iter().any(|block| {
+        block
+            .insts
+            .iter()
+            .any(|(_, op)| matches!(op, Op::SseInput { .. }))
+    }) {
+        return;
+    }
+
+    let mut clean = vec![3u8; func.types.len()];
+    for &p in &func.blocks[0].params {
+        clean[p.0 as usize] = 0;
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for &(result, op) in &block.insts {
+                let Some(result) = result else { continue };
+                let lanes = |v: Value| clean[v.0 as usize];
+                let mask = match op {
+                    Op::Fp(..)
+                    | Op::FromInt(_)
+                    | Op::Vec(VecOp::LessF64, ..)
+                    | Op::X87Load { single: true, .. }
+                    | Op::X87Load { denormal: true, .. } => 3,
+                    Op::Constant(_, bits) => {
+                        let clean = |shift| !f64::from_bits((bits >> shift) as u64).is_subnormal();
+                        u8::from(clean(0)) | u8::from(clean(64)) << 1
+                    }
+                    Op::Bits { to, value }
+                        if !matches!(to, Type::I32) && func.ty(value) != Type::I32 =>
+                    {
+                        if to == Type::V128 && func.ty(value) == Type::V128 {
+                            lanes(value)
+                        } else {
+                            lanes(value) & 1 | 2
+                        }
+                    }
+                    Op::Vec(VecOp::Insert64(high, from_high), a, b) => {
+                        let bit = 1 << u8::from(high);
+                        lanes(a) & !bit | ((lanes(b) >> u8::from(from_high) & 1) * bit)
+                    }
+                    Op::VecUnary(VecUnary::Low64, a) => lanes(a) & 1 | 2,
+                    Op::VecUnary(VecUnary::High64, a) => lanes(a) >> 1 | 2,
+                    Op::Select { a, b, .. } => lanes(a) & lanes(b),
+                    _ => 0,
+                };
+                let known = &mut clean[result.0 as usize];
+                changed |= *known != mask;
+                *known = mask;
+            }
+            for t in block.end.targets() {
+                for (&p, &a) in func.blocks[t.block.0 as usize].params.iter().zip(&t.args) {
+                    let mask = clean[p.0 as usize] & clean[a.0 as usize];
+                    changed |= clean[p.0 as usize] != mask;
+                    clean[p.0 as usize] = mask;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for block in &mut func.blocks {
+        let mut checked = BTreeMap::<Value, u8>::new();
+        block.insts.retain_mut(|(_, op)| {
+            let Op::SseInput { a, b, packed } = *op else {
+                return true;
+            };
+            let mask = if packed { 3 } else { 1 };
+            let mut needs_check = |v: &Value| {
+                let known = checked.entry(*v).or_insert(clean[v.0 as usize]);
+                let needed = *known & mask != mask;
+                *known |= mask;
+                needed
+            };
+            let mut inputs = [Some(a), b].into_iter().flatten().filter(&mut needs_check);
+            let Some(a) = inputs.next() else { return false };
+            *op = Op::SseInput {
+                a,
+                b: inputs.next(),
+                packed,
+            };
+            true
+        });
+    }
+}
+
 fn validations(func: &mut Func) {
     let heads: Vec<bool> = func.blocks.iter().map(|b| b.head.is_some()).collect();
     let end_validates =
@@ -1196,7 +1295,10 @@ fn group_stores(
                         proof.disjoint_effects(stores[after], load)
                     })
                 }),
-                (_, Op::Div { .. } | Op::Validate | Op::FrameStore { .. }) => false,
+                (
+                    _,
+                    Op::Div { .. } | Op::SseInput { .. } | Op::Validate | Op::FrameStore { .. },
+                ) => false,
                 _ => true,
             };
             if !cross {
