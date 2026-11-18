@@ -753,7 +753,9 @@ Device decoding follows [device.md](device.md).
 
 ### CODEC-MAP-1 Image binding
 
-**Rule**: Non-distribution images MUST be scanned once per mapping, using executable ranges and the reviewed codec signatures. Distribution images and guest mode MUST NOT be scanned. Unmapping MUST retire bindings and their decoder state.
+**Rule**: Image scans MUST run exactly once per non-distribution mapping in native or verify mode and MUST be skipped for all other mappings.
+Admission MUST use reviewed codec signatures over executable ranges and resolve each layout reference to a displacement in the matched code.
+Unmapping MUST retire bindings and their decoder state.
 **Verification**: Test
 
 ### CODEC-CALL-1 Vorbis transforms

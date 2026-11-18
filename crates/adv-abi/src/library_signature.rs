@@ -4,7 +4,8 @@
 //! are normalized and their graph is checked separately, including shared
 //! targets and jump-table addends. Slots identify mutable CRT state and imports;
 //! their addresses participate in graph identity, their values do not.
-use crate::code_signature::ExecutableRange;
+//! Layout fields use `field NAME VALUE` or `field NAME ROLE OFFSET OPERAND`.
+use crate::code_signature::{ExecutableRange, Field};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,9 +25,11 @@ pub struct Family {
     roots: Vec<(String, usize)>,
     hooks: BTreeMap<String, usize>,
     nodes: BTreeMap<String, Node>,
+    fields: BTreeMap<String, Field>,
 }
 pub struct Library {
     pub symbols: BTreeMap<String, u32>,
+    pub layout: BTreeMap<String, u32>,
     pub hooks: BTreeMap<String, (u32, usize)>,
     pub snapshots: Vec<(u32, Vec<u8>)>,
 }
@@ -36,6 +39,7 @@ impl Family {
             roots: Vec::new(),
             hooks: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            fields: BTreeMap::new(),
         };
         let mut links = Vec::new();
         for line in text
@@ -80,6 +84,12 @@ impl Family {
                             links: Vec::new(),
                         },
                     );
+                }
+                ["field", name, value @ ..] => {
+                    let field = Field::parse(value).map_err(|error| error.to_string())?;
+                    if result.fields.insert((*name).into(), field).is_some() {
+                        return Err("duplicate layout field".into());
+                    }
                 }
                 ["slot", name] => {
                     result.nodes.insert(
@@ -222,7 +232,24 @@ impl Family {
             }
             hooks.insert(name.clone(), (address, prefix));
         }
+        let layout = self
+            .fields
+            .iter()
+            .map(|(name, field)| {
+                let value = field.resolve(|role| {
+                    let node = self.nodes.get(role)?;
+                    let address = resolved.get(role)?;
+                    node.code.then_some(())?;
+                    snapshots
+                        .iter()
+                        .find(|(entry, bytes)| entry == address && bytes.len() == node.len)
+                        .map(|(_, bytes)| bytes.as_slice())
+                })?;
+                Some((name.clone(), value))
+            })
+            .collect::<Option<_>>()?;
         Some(Library {
+            layout,
             hooks,
             snapshots,
             symbols: resolved,
@@ -272,6 +299,19 @@ mod tests {
             )
             .is_some()
     }
+    // spec: CODEC-MAP-1, CODEC-CALL-2
+    #[test]
+    fn layout_rejects_a_register_operand() {
+        let (mut family, memory) = fixture(0x10000, 0x10100, 0x10200);
+        assert!(admit(&family, &memory, 0x10000));
+        // MOV EBP,ESP in the fingerprinted prologue has no memory operand.
+        family.fields.insert(
+            "invalid".into(),
+            Field::parse(&["entry", "1", "0"]).unwrap(),
+        );
+        assert!(!admit(&family, &memory, 0x10000));
+    }
+
     // spec: DEV-VIDEO-1
     #[test]
     fn relocation_and_relinking_preserve_only_the_reviewed_graph() {
