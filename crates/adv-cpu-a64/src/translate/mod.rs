@@ -780,6 +780,20 @@ pub(crate) fn lower_computation<'a>(
     })
 }
 
+/// The patchable transfer prefix, followed by a branch to the dispatch stub.
+fn emit_link_point(asm: &mut Asm, eip: u32) {
+    let point = asm.offset();
+    emit_target(asm, eip);
+    asm.emit(adr(Reg::new(2), point as i32 - asm.offset() as i32));
+}
+
+fn emit_target(asm: &mut Asm, eip: u32) {
+    asm.emit_all(&[
+        movz(W, Reg::new(1), eip as u16, 0),
+        movk(W, Reg::new(1), (eip >> 16) as u16, 16),
+    ]);
+}
+
 impl Translator<'_> {
     fn emit(&mut self, word: u32) {
         self.asm.emit(word);
@@ -1902,15 +1916,12 @@ impl Translator<'_> {
             eip,
             main,
         });
-        self.target(eip);
-        let here = self.asm.offset();
-        self.emit(adr(Reg::new(2), point as i32 - here as i32));
+        emit_link_point(self.asm, eip);
         self.far(self.stubs.dispatch);
     }
 
     fn target(&mut self, eip: u32) {
-        self.emit(movz(W, Reg::new(1), eip as u16, 0));
-        self.emit(movk(W, Reg::new(1), (eip >> 16) as u16, 16));
+        emit_target(self.asm, eip);
     }
 
     /// A branch to the stub at host address `to`, placed by `finish`.

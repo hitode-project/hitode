@@ -19,10 +19,11 @@ pub(super) struct Allocation {
 }
 
 // spec: A64-OPT-6, A64-OPT-7
-pub(super) fn allocate(func: &Func) -> Allocation {
+pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
+    let reserved = |r| [9, 16, 17, 18, 28, 29].contains(&r) || inline && r <= 5;
     let n = func.types.len();
     let mut operations = vec![None; n];
-    let mut vectors = 29;
+    let mut vectors = if inline { E.number() as u8 } else { 29 };
     let mut constants = vec![None; n];
     let mut hints = vec![Vec::new(); n];
     for data in &func.blocks {
@@ -248,7 +249,7 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         let free = preferences
             .chain(0..if vector { vectors } else { 31 })
             .find_map(|reg| {
-                if !vector && [9, 16, 17, 18, 28, 29].contains(&reg) {
+                if !vector && reserved(reg) {
                     return None;
                 }
                 let loc = if vector {
@@ -300,13 +301,11 @@ pub(super) fn allocate(func: &Func) -> Allocation {
         .collect();
     wanted.sort_by_key(|&i| std::cmp::Reverse(weight[i]));
     for i in wanted {
-        let free = (0..31u8)
-            .filter(|r| ![9, 16, 17, 18, 28, 29].contains(r))
-            .find(|&r| {
-                held[usize::from(r)]
-                    .iter()
-                    .all(|&(start, end)| end < starts[i] || ends[i] < start)
-            });
+        let free = (0..31u8).filter(|&r| !reserved(r)).find(|&r| {
+            held[usize::from(r)]
+                .iter()
+                .all(|&(start, end)| end < starts[i] || ends[i] < start)
+        });
         if let Some(r) = free {
             held[usize::from(r)].push((starts[i], ends[i]));
             locations[i] = Host::Register(Reg::new(r));

@@ -2,8 +2,9 @@
 //! region start: where each component lives, or `None` when no execution
 //! from there reads it or the form never changes it, so that the state's
 //! own value stands. The IR names values; emission replaces them by host
-//! locations, and the owner's materializer builds `CpuState` and frame bytes
-//! from a record and the captured host registers.
+//! locations. A normal inline exit writes the record directly into canonical
+//! Tier-1 state. The owner's materializer uses the captured host registers
+//! to rebuild `CpuState` and frame bytes for jobs and cold exits.
 
 use super::ir::{FpOp, Value};
 
@@ -137,6 +138,17 @@ pub(crate) struct FlagRecipe {
     pub immediate: Option<u64>,
 }
 
+/// The leaf that supplies flags an arithmetic recipe never changes.
+pub(crate) fn flag_base(mut flags: Host, recipes: &[Option<FlagRecipe>]) -> Host {
+    while let Host::Flags(i) = flags {
+        flags = recipes[i as usize]
+            .unwrap()
+            .prior
+            .unwrap_or(Host::Constant(0));
+    }
+    flags
+}
+
 pub(crate) type Dump = crate::runtime::RegisterDump;
 
 struct Locations<'a> {
@@ -253,6 +265,23 @@ impl Locations<'_> {
     }
 }
 
+/// Rebuilds the entry baseline before materializing a cold inline record.
+pub(crate) fn restore_inline_entry(
+    entry: &crate::runtime::OptEntryState,
+    cpu: &mut adv_cpu_core::CpuState,
+) {
+    cpu.regs = entry.regs;
+    let nzcv = (entry.nzcv >> 24) as u32;
+    let parity = u32::from((entry.pf as u8).count_ones().is_multiple_of(2));
+    let mapped = (nzcv & 0xc0)
+        | ((nzcv >> 5 ^ 1) & 1)
+        | ((nzcv & 0x10) << 7)
+        | (parity << 2)
+        | (entry.af as u32 & 0x10)
+        | (entry.df as u32) << 10;
+    cpu.eflags = (cpu.eflags & !crate::runtime::MAPPED_FLAGS) | mapped;
+}
+
 /// Restores the record's observable state and frame bytes. The returned
 /// refund is added to the captured countdown to obtain the retired count.
 /// `spills` contains the form's cells read from `dump.sp`.
@@ -321,6 +350,7 @@ fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::
         {
             let value = binary80(values.locate(*location) as u64);
             cpu.x87.regs[i] = value;
+            cpu.mmx[i] = value.significand();
             cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
         }
     }
