@@ -246,7 +246,9 @@ impl Fixed {
     pub(super) fn auto_depth(&mut self, enabled: bool) {
         self.render.insert(7, u32::from(enabled));
     }
-    pub(super) fn target_changed(&mut self, width: u32, height: u32) {
+    pub(super) fn target_changed(&mut self, width: u32, height: u32) -> [bool; 2] {
+        let scissor = self.scissor;
+        let viewport = self.viewport;
         self.scissor = RECT {
             left: 0,
             top: 0,
@@ -261,6 +263,18 @@ impl Fixed {
             MinZ: 0.,
             MaxZ: 1.,
         };
+        [
+            viewport.X != 0
+                || viewport.Y != 0
+                || viewport.Width != width
+                || viewport.Height != height
+                || viewport.MinZ.to_bits() != 0
+                || viewport.MaxZ.to_bits() != 1f32.to_bits(),
+            scissor.left != 0
+                || scissor.top != 0
+                || scissor.right != width as i32
+                || scissor.bottom != height as i32,
+        ]
     }
     pub fn new(width: u32, height: u32) -> Self {
         let sampler = BTreeMap::from([
@@ -1514,64 +1528,35 @@ fn draw_up(
         super::buffers::clear_up_bindings(env, this.addr(), false);
         return Outcome::Return(0);
     }
-    let result = if let Some(d) = device(env, this.addr()) {
-        if !d.hot.borrow().scene {
-            Err(rejected(INVALID, "draw outside BeginScene/EndScene"))
-        } else {
-            prepare(env, this.addr(), kind, count, data, stride, None).map_err(|code| {
-                let reason = if code == UNAVAILABLE
-                    && layout(env, this.addr()).is_ok_and(|l| {
-                        l.streams[0] != 0
-                            || (l.color.is_some() && l.streams[1] != 0)
-                            || l.normal.is_some_and(|(stream, _)| stream != 0)
-                            || l.specular.is_some_and(|(stream, _)| stream != 0)
-                            || l.texcoords
-                                .iter()
-                                .flatten()
-                                .any(|(stream, _, _)| *stream != 0)
-                    }) {
-                    "UP fixed-function declarations require all inputs on stream 0"
-                } else {
-                    "draw input or state rejected"
-                };
-                rejected(code, reason)
-            })
-        }
-    } else {
-        Err(rejected(INVALID, "invalid device interface"))
-    };
-    let draw = match result {
-        Ok(d) => d,
-        Err(error) => {
-            warn_draw_rejected(
-                env,
-                this.addr(),
-                kind,
-                data,
-                stride,
-                error.code,
-                error.reason,
-            );
-            return Outcome::Return(error.code);
-        }
-    };
-    let id = com(env)
-        .identity::<Payload>(&env.sys.objects, this.addr())
-        .unwrap();
-    super::buffers::clear_up_bindings(env, this.addr(), false);
-    let outcome = dispatch(env, id, Operation::Draw(draw));
+    let outcome = recording::up(env, this.addr(), kind, count, data.addr(), stride, |env| {
+        prepare(env, this.addr(), kind, count, data, stride, None)
+    });
     if let Outcome::Return(error) = &outcome
         && *error != 0
     {
-        warn_draw_rejected(
-            env,
-            this.addr(),
-            kind,
-            data,
-            stride,
-            *error,
-            "GPU command rejected after fixed-function input validation",
-        );
+        let reason = if let Some(device) = device(env, this.addr()) {
+            if !device.hot.borrow().scene {
+                "draw outside BeginScene/EndScene"
+            } else if *error == UNAVAILABLE
+                && layout(env, this.addr()).is_ok_and(|l| {
+                    l.streams[0] != 0
+                        || (l.color.is_some() && l.streams[1] != 0)
+                        || l.normal.is_some_and(|(stream, _)| stream != 0)
+                        || l.specular.is_some_and(|(stream, _)| stream != 0)
+                        || l.texcoords
+                            .iter()
+                            .flatten()
+                            .any(|(stream, _, _)| *stream != 0)
+                })
+            {
+                "UP fixed-function declarations require all inputs on stream 0"
+            } else {
+                "draw input or state rejected"
+            }
+        } else {
+            "invalid device interface"
+        };
+        warn_draw_rejected(env, this.addr(), kind, data, stride, *error, reason);
     }
     outcome
 }

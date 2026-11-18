@@ -13,25 +13,41 @@ pub mod trace;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
-pub(super) use reuse::indexed;
-pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
+pub(super) use reuse::{bound, indexed, up};
+pub(super) type DrawStateIdentity = (u128, Option<Id>, Option<Id>, Option<Id>, u128, u128);
+
+pub(super) fn draw_state_identity(env: &Env<'_>, pointer: u32) -> (u128, bool) {
     let d = device(env, pointer).unwrap();
     let hot = d.hot.borrow();
-    let constants = |id: Option<Id>, c: &shaders::Constants| {
-        c.key(
-            id.and_then(|id| shaders::bound(env, id))
-                .and_then(|s| s.translation.as_ref().ok())
-                .map_or(Default::default(), |t| t.constants),
-        )
-    };
-    hash((
+    let identity = (
         hot.fixed.key(),
         hot.shaders.vertex,
         hot.shaders.pixel,
         hot.buffers.declaration,
-        constants(hot.shaders.vertex, &hot.shaders.vertex_constants),
-        constants(hot.shaders.pixel, &hot.shaders.pixel_constants),
-    ))
+        constant_key(env, hot.shaders.vertex, &hot.shaders.vertex_constants),
+        constant_key(env, hot.shaders.pixel, &hot.shaders.pixel_constants),
+    );
+    if let Some((last, key)) = hot.draw_key.get()
+        && last == identity
+    {
+        return (key, false);
+    }
+    let key = hash(identity);
+    hot.draw_key.set(Some((identity, key)));
+    (key, true)
+}
+
+fn constant_key(env: &Env<'_>, id: Option<Id>, constants: &shaders::Constants) -> u128 {
+    constants.key(
+        id.and_then(|id| shaders::bound(env, id))
+            .and_then(|s| s.translation.as_ref().ok())
+            .map_or(Default::default(), |t| t.constants),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
+    draw_state_identity(env, pointer).0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,6 +138,7 @@ pub struct Counters {
     pub fixed_draws: u64,
     pub fixed_shaders_built: u64,
     pub fixed_shader_cache_hits: u64,
+    pub draw_key_hashes: u64,
     pub recorded_draws: u64,
     pub recorded_draw_bytes: u64,
     pub recording_lookups: u64,
@@ -189,6 +206,8 @@ fn lookups() -> u64 {
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    #[cfg(test)]
+    command_identities: Vec<u128>,
     /// The damage analysis write behind each command, while it knows it.
     nodes: Vec<Option<usize>>,
     /// The content a readback flush observes, and the writes, by content,
@@ -209,7 +228,6 @@ pub(super) struct Recording {
     /// Scissors the operation at `head` finished before it was busy.
     part: usize,
     bytes: usize,
-    key: u128,
     contents: Contents,
     binding_cache: Option<key::Bindings>,
     upload: u128,
@@ -226,9 +244,6 @@ pub(super) struct Recording {
     job: Option<adv_sync::background::Task>,
 }
 impl Recording {
-    pub(super) fn invalidate_streams(&mut self) {
-        self.reuse.invalidate_streams();
-    }
     /// Drops the damage analysis; pending commands then run whole.
     fn forget_damage(&mut self) {
         self.damage.invalidate();
@@ -504,7 +519,6 @@ fn append(
     trace::command(index, p, shared.is_some(), &f.contents);
     let previous = limit.then(|| {
         (
-            f.key,
             bytes,
             p.writes
                 .iter()
@@ -518,11 +532,13 @@ fn append(
             .map(|(k, _)| f.contents.get(k).copied())
             .collect()
     });
+    let mut draw_key_hashes = 0;
     let (command, attachment, damage) = if let Some(saved) = shared {
         let slot = hash(target.as_ref().unwrap().image.id());
         f.damage.replay(&saved.damage, slot, &f.contents);
         (saved.command, saved.attachment, saved.damage.clone())
     } else {
+        draw_key_hashes += 1;
         use std::hash::Hash;
         let mut command = xxhash_rust::xxh3::Xxh3::new();
         p.key.hash(&mut command);
@@ -544,7 +560,8 @@ fn append(
             ),
         )
     };
-    for &(k, overwrite) in &p.writes {
+    let mut outputs = Vec::new();
+    for (n, &(k, overwrite)) in p.writes.iter().enumerate() {
         let command = p.write_key(k, if k.2 == 0 { command } else { attachment });
         let slot = f.contents.resolve(k);
         let old = f.contents.slots[slot].1.unwrap_or(0);
@@ -556,12 +573,21 @@ fn append(
         {
             f.upload = f.upload.checked_add(1).expect("upload content exhausted");
             f.upload
-        } else if overwrite {
-            hash((k, command))
+        } else if let Some(saved) = shared.filter(|saved| saved.destinations[n].unwrap_or(0) == old)
+        {
+            saved.outputs[n]
         } else {
-            hash((old, command))
+            draw_key_hashes += 1;
+            if overwrite {
+                hash((k, command))
+            } else {
+                hash((old, command))
+            }
         };
         f.contents.slots[slot].1 = Some(next);
+        if destinations.is_some() {
+            outputs.push(next);
+        }
     }
     if limit
         && let Operation::Upload {
@@ -570,7 +596,6 @@ fn append(
     {
         f.held_uploads.push((*resource, *level));
     }
-    f.key = hash((f.key, command));
     #[cfg(feature = "d3d9-counters")]
     let work = (shared.is_none() && matches!(p.operation, Operation::Draw(_))).then_some((
         (passes::Plan::bytes(p.reads.len(), p.writes.len())
@@ -614,6 +639,7 @@ fn append(
                 damage,
                 pass,
                 destinations,
+                outputs,
             });
         }
     }
@@ -621,28 +647,35 @@ fn append(
     if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
         draw.target = target;
     }
+    let is_draw = matches!(&operation, Operation::Draw(_));
     let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
     f.commands.push(operation);
+    #[cfg(test)]
+    f.command_identities.push(command);
     f.nodes.push(f.damage.len().checked_sub(1));
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     let counters = &mut env.ext.get_mut::<State>().frames;
     counters.recorded_commands += 1;
     counters.fixed_draws += u64::from(fixed);
+    if is_draw {
+        counters.draw_key_hashes += draw_key_hashes;
+    }
     if limit {
         let outcome = barrier(env, owner, Reason::Limit, |_| Outcome::Return(0));
         // Parking allocation failure rejects the incoming command. Successful
         // prefixes stay committed; older accepted commands retain their order.
         if matches!(outcome, Outcome::Return(OUT_OF_MEMORY)) {
-            let (key, bytes, contents) = previous.unwrap();
+            let (bytes, contents) = previous.unwrap();
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             let rejected = f.commands.pop();
+            #[cfg(test)]
+            f.command_identities.pop();
             f.nodes.pop();
             let len = f.commands.len();
             f.passes.truncate(f.commands.len());
             f.forget_damage();
             f.bytes -= bytes;
-            f.key = key;
             for (k, old, had_base) in contents {
                 f.contents.restore(k, old, had_base);
             }
@@ -1268,7 +1301,8 @@ fn finish(
     f.last_copy = copy;
     f.last_serial = serial;
     f.contents.reset();
-    f.key = 0;
+    #[cfg(test)]
+    f.command_identities.clear();
     f.reuse.finish();
     f.partial = false;
     f.verdict = None;

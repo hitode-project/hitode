@@ -149,7 +149,7 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Whole-image upload snapshots are identified by their texels and replace previous pixel dependencies. Partial uploads receive fresh identities and preserve earlier writes. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
-Fixed-state draw keys may be cached between changes; unchanged setters preserve the key, and mutations invalidate it. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
+Unchanged setters MUST preserve their state category generations and keys. State changes MUST advance the affected generations and maintain history-independent category identities. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
 Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
 Fixed draws MUST retain their raw vertex streams and index order. Vertex buffer draws MUST see guest-writable stream contents when they are admitted.
 
@@ -223,10 +223,12 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 Blocking readbacks MUST preserve the source pixels before another guest context can write them.
 **Verification**: Test
 
-### GFX-REC-11 Differential frame recording
+### GFX-REC-11 Versioned frame recording
 
-**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse shared previous-frame entries, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
+**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse previous-frame identities and preparation, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
 **Verification**: Test
+
+Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture.
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 

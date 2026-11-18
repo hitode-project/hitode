@@ -43,7 +43,7 @@ impl std::hash::Hash for ProgramKey {
 }
 #[derive(Default)]
 pub(super) struct ProgramCache {
-    entries: std::collections::HashMap<ProgramKey, Program>,
+    entries: std::collections::HashMap<ProgramKey, (Program, u128)>,
     bytes: usize,
     order: std::collections::VecDeque<ProgramKey>,
     warming: std::collections::HashMap<ProgramKey, adv_device::gpu::compile::Compile<Program>>,
@@ -424,6 +424,8 @@ fn prepare_checked(
     let mut streams =
         streams::capture(env, pointer, &input_spec, up, start, first, last, instanced)?;
     let (target, image, state) = fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+    let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
+    env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);
     let mut draw = fixed::Draw {
         target,
         image,
@@ -431,7 +433,7 @@ fn prepare_checked(
         vertices: Arc::default(),
         texcoords: None,
         programmable: None,
-        recording_key: recording::draw_key(env, pointer),
+        recording_key,
         program_key: 0,
         fixed_vertex: variant
             .as_ref()
@@ -625,12 +627,11 @@ fn prepare_checked(
         fixed: features,
         fixed_vertex: variant,
     };
-    draw.program_key = recording::hash(&key);
     drop(hot);
     let report = env.ext.get_mut::<State>();
     let cache = &mut report.programs;
     let generated = u64::from(key.fixed_vertex.is_some());
-    let program = if let Some(program) = cache.entries.get(&key) {
+    let (program, program_key) = if let Some(program) = cache.entries.get(&key) {
         report.frames.fixed_shader_cache_hits += generated;
         program.clone()
     } else {
@@ -661,18 +662,21 @@ fn prepare_checked(
             report.frames.fixed_shaders_built += generated;
             program
         };
+        let program_key = recording::hash(&key);
+        report.frames.draw_key_hashes += 1;
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if program.source().len() <= MAX_BYTES {
             while cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {
                 let oldest = cache.order.pop_front().unwrap();
-                cache.bytes -= cache.entries.remove(&oldest).unwrap().source().len();
+                cache.bytes -= cache.entries.remove(&oldest).unwrap().0.source().len();
             }
             cache.order.push_back(key.clone());
             cache.bytes += program.source().len();
-            cache.entries.insert(key, program.clone());
+            cache.entries.insert(key, (program.clone(), program_key));
         }
-        program
+        (program, program_key)
     };
+    draw.program_key = program_key;
     draw.programmable = Some(Arc::new(ProgrammableDraw {
         instance_count,
         program,

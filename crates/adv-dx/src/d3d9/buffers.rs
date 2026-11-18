@@ -352,11 +352,6 @@ fn lock(
         return INVALID;
     };
     b.locks = locks;
-    // A retained signature prefix has already checked its stream locks.
-    let owner = b.device;
-    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
-        d.frame.invalidate_streams();
-    }
     0
 }
 fn unlock(env: &mut Env<'_>, this: u32, kind: Kind) -> u32 {
@@ -707,11 +702,9 @@ fn draw(env: &mut Env<'_>, this: GuestPtr<()>, kind: i32, start: u32, count: u32
             fixed::empty_draw(env, this.addr(), kind).map_or_else(|e| e, |()| 0),
         );
     }
-    let result = fixed::prepare_bound(env, this.addr(), kind, count, start, None);
-    match result {
-        Ok(draw) => submit(env, this.addr(), draw, None),
-        Err(error) => Outcome::Return(error),
-    }
+    recording::bound(env, this.addr(), kind, count, start, |env| {
+        fixed::prepare_bound(env, this.addr(), kind, count, start, None)
+    })
 }
 fn decode_indices(
     env: &Env<'_>,

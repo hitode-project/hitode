@@ -925,7 +925,7 @@ fn sampled_target_changes_damage_the_consuming_draw_and_copy_clips_keep_offsets(
         d.image = Some(target.image.clone());
         d.state.texture_op = TextureOp::Texture;
         record_draw(&mut f, d);
-        keys.push(frame(&mut env(&mut f), owner).key);
+        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
         present(&mut f);
     }
     assert_ne!(keys[0], keys[1]);

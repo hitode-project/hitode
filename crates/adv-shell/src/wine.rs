@@ -435,6 +435,7 @@ fn report(
                 "fixed_draws": counters.fixed_draws,
                 "fixed_shaders_built": counters.fixed_shaders_built,
                 "fixed_shader_cache_hits": counters.fixed_shader_cache_hits,
+                "draw_key_hashes": counters.draw_key_hashes,
             })
         ));
     }

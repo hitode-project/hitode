@@ -82,7 +82,7 @@ fn d3d9_reuse_sequence_matches_uncached_commands_keys_and_pixels() {
             }
             reuse_draw(&mut f, &[0, 1, 2], &builds);
         }
-        keys.push(frame(&mut env(&mut f), owner).key);
+        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
         assert_eq!(frame(&mut env(&mut f), owner).commands.len(), 4);
         f.okay("IDirect3DDevice9::EndScene", &[f.device]);
         present(&mut f);
@@ -386,7 +386,7 @@ fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_statebloc
                 assert_eq!(f.finish(outcome), 0);
             }
             let owner = id(&mut f);
-            let key = frame(&mut env(&mut f), owner).key;
+            let key = frame(&mut env(&mut f), owner).command_identities.clone();
             let published = f.m.ext.get::<Presents>().damage.len();
             f.okay("IDirect3DDevice9::EndScene", &[d]);
             present(&mut f);
@@ -479,4 +479,63 @@ fn d3d9_reuse_signature_prefix_rechecks_target_shape() {
     replace(e.ext, surface, target).unwrap();
     reuse_draw(&mut f, &[0, 1, 2], &builds);
     assert_eq!(builds.get(), 2);
+}
+
+// spec: GFX-REC-2, GFX-REC-4, GFX-REC-5, GFX-REC-11
+#[test]
+fn steady_fixed_up_frame_reuses_keys_with_repeated_state_changes() {
+    let mut f = fixture();
+    let device = f.device;
+    f.okay("IDirect3DDevice9::SetFVF", &[device, 0x44]);
+    let vertices = [
+        [
+            1f32.to_bits(),
+            1f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+        [
+            13f32.to_bits(),
+            1f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+        [
+            1f32.to_bits(),
+            9f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+    ];
+    let addresses = [f.packet(vertices), f.packet(vertices)];
+    let frame = |f: &mut Fixture, address| {
+        clear(f, 0xff000000);
+        f.okay("IDirect3DDevice9::BeginScene", &[device]);
+        for cull in [1, 2, 1] {
+            f.okay("IDirect3DDevice9::SetRenderState", &[device, 22, cull]);
+            f.okay(
+                "IDirect3DDevice9::DrawPrimitiveUP",
+                &[device, 4, 1, address, 20],
+            );
+        }
+        f.okay("IDirect3DDevice9::EndScene", &[device]);
+        present(f);
+    };
+    frame(&mut f, addresses[0]);
+    let counts = f.m.ext.get::<State>().frames;
+    assert!(counts.draw_key_hashes > 0);
+    frame(&mut f, addresses[1]);
+    let repeated = f.m.ext.get::<State>().frames;
+    assert_eq!(repeated.fixed_draws - counts.fixed_draws, 3);
+    assert_eq!(repeated.draw_key_hashes, counts.draw_key_hashes);
+    assert_eq!(repeated.eliminated_frames - counts.eliminated_frames, 1);
+
+    f.m.cpu.write_u32(addresses[1] + 16, 0xffff0000).unwrap();
+    frame(&mut f, addresses[1]);
+    let changed = f.m.ext.get::<State>().frames;
+    assert!(changed.draw_key_hashes > repeated.draw_key_hashes);
+    assert_eq!(changed.eliminated_frames, repeated.eliminated_frames);
 }
