@@ -673,14 +673,14 @@ impl Session {
         };
         let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
         let (prefix, drive) = host.prefix(&config)?;
-        let (mounts, game_drive) = files::prepare(&config, options, &prefix)?;
+        let prepared = files::prepare(&config, options, &prefix)?;
         let process_config = Config {
             fonts: "",
             ..config
         };
 
         let mut clock = adv_machine::Clock::real();
-        let shared = host.connect(&config, &mut clock, &wake, mounts.clone())?;
+        let shared = host.connect(&config, &mut clock, &wake, prepared.mounts.clone())?;
         let lease = host::Lease(shared.clone());
         let socket = shared
             .driver
@@ -694,7 +694,7 @@ impl Session {
         let audio = adv_device::AudioControl::new(true);
         if !host.booted() {
             let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
-            boot.ext.insert(mounts.clone());
+            boot.ext.insert(prepared.mounts.clone());
             let command_line = format!("\"{WINEBOOT}\" --restart");
             let startup = Startup {
                 image: WINEBOOT,
@@ -739,7 +739,7 @@ impl Session {
         let mut fonts = host.fonts.prepare(&config, &drive, options)?;
         let config = process_config;
         let mut machine = new_machine(&config, &drive, clock, &wake, &audio)?;
-        machine.ext.insert(mounts);
+        machine.ext.insert(prepared.mounts);
         let stub_gaps = Rc::new(RefCell::new(adv_nt::exception::StubGaps::default()));
         machine.ext.insert(stub_gaps.clone());
         let links = Rc::new(RefCell::new(adv_nt::unix::Links::default()));
@@ -750,9 +750,9 @@ impl Session {
         machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
         prepare(&mut machine)?;
         let startup = Startup {
-            image: &format!(r"{game_drive}:\{name}"),
+            image: &format!("{}{name}", prepared.directory),
             command_line: name,
-            directory: &format!(r"{game_drive}:\"),
+            directory: &prepared.directory,
             environment: ENVIRONMENT,
             locale: config.locale,
             debug: config.debug,
