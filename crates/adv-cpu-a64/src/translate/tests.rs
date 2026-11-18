@@ -1812,6 +1812,7 @@ pub(in crate::translate) mod opt_back {
 
         fn start(sources: &[Source]) -> (Func, Block, Vec<Value>) {
             let mut f = Func {
+                resident: true,
                 kept: (1 << 24) - 1,
                 entry: sources.iter().copied().chain([Source::Eflags]).collect(),
                 ..Func::default()
@@ -2400,12 +2401,16 @@ pub(in crate::translate) mod opt_back {
                     record: RecordId(0),
                 },
             );
+            let after = f.record(f.records[0].clone());
+            store(&mut f, b, p[0], p[1], after, false);
             let exit = f.record(f.records[0].clone());
             f.end(b, End::Exit(exit));
             let mut cpu = initial();
             cpu.regs[4] = 0xffff_fffc;
             let form = lower(&f, &cpu);
             let mut h = harness();
+            h.emu.map(WINDOW_BASE, 0x1000);
+            h.emu.map(WINDOW_BASE + 0xffff_f000, 0x1000);
             for (addr, expected) in [
                 (0xffff_fff4, Exit::Dispatch),
                 (0xffff_fff5, Exit::Optimized),
