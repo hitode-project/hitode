@@ -304,6 +304,79 @@ fn validate_tree(tree: &[i16]) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" {
+        fn adv_theora_test_huffman(tree: *const i16, data: *const u8, size: i32) -> i32;
+        fn adv_theora_test_setup_huffman(
+            header: *const u8,
+            bytes: usize,
+            data: *const u8,
+            size: i32,
+        ) -> i32;
+    }
+
+    fn random_word(seed: &mut u32) -> u32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed
+    }
+
+    fn random_huffman_node(tree: &mut Vec<i16>, seed: &mut u32, width: u32, depth: u32) -> i16 {
+        let node = tree.len();
+        let count = 1usize << width;
+        tree.resize(node + 1 + count, 0);
+        tree[node] = width as i16;
+        let mut i = 0;
+        while i < count {
+            let random = random_word(seed);
+            let entry = node + 1 + i;
+            if depth != 0 && random & 3 == 0 {
+                tree[entry] = random_huffman_node(tree, seed, 1 + (random >> 2) % 4, depth - 1);
+                i += 1;
+            } else {
+                let alignment = (i | count).trailing_zeros();
+                let repeat = (random >> 2) % (alignment + 1);
+                let leaf = ((width - repeat) << 8) | ((random >> 8) % 92);
+                let slots = 1 << repeat;
+                tree[entry..entry + slots].fill(-(leaf as i16));
+                i += slots;
+            }
+        }
+        node.try_into().unwrap()
+    }
+
+    // spec: DEV-VIDEO-1
+    #[test]
+    fn theora_entropy_matches_reference_on_setup_and_random_trees() {
+        // A setup packet produced by libtheora 1.2.0 for a synthetic 32x32 stream.
+        let header = include_bytes!("../tests/data/theora-setup.bin");
+        let mut seed = 0xa6d5_fc31;
+        let data: [u8; 48] = std::array::from_fn(|_| random_word(&mut seed) as u8);
+        // SAFETY: both pointers cover the supplied sizes for the synchronous test.
+        let result = unsafe {
+            adv_theora_test_setup_huffman(
+                header.as_ptr(),
+                header.len(),
+                data.as_ptr(),
+                data.len() as i32,
+            )
+        };
+        assert_eq!(result, 0, "setup parse or table {result} differed");
+        for case in 0..128 {
+            let mut tree = Vec::new();
+            let width = case % 10 + 1;
+            let depth = if width > 6 { 0 } else { 8 };
+            random_huffman_node(&mut tree, &mut seed, width, depth);
+            validate_tree(&tree).unwrap();
+            let data: [u8; 48] = std::array::from_fn(|_| random_word(&mut seed) as u8);
+            // SAFETY: the validated tree and all packet prefixes are live.
+            let result =
+                unsafe { adv_theora_test_huffman(tree.as_ptr(), data.as_ptr(), data.len() as i32) };
+            assert_eq!(result, 1, "random tree {case}");
+        }
+    }
+
     fn setup(format: u32) -> Setup {
         let mut info = [0u8; 64];
         info[..3].copy_from_slice(&[3, 2, 1]);
@@ -346,6 +419,10 @@ mod tests {
         if dc {
             bits.extend(std::iter::repeat_n(false, fragments));
         }
+        pack_bits(bits)
+    }
+
+    fn pack_bits(bits: Vec<bool>) -> Vec<u8> {
         let mut packet = vec![0; bits.len().div_ceil(8)];
         for (i, bit) in bits.into_iter().enumerate() {
             packet[i / 8] |= u8::from(bit) << (7 - i % 8);
@@ -431,6 +508,140 @@ mod tests {
                 assert_eq!(a.curframe_num, b.curframe_num);
             }
         }
+    }
+
+    // Authored I/P packets with a partial final band, uncoded luma,
+    // half-pel prediction and EOB runs that cross band boundaries.
+    fn band_test_stream(format: u32) -> (Setup, [Vec<u8>; 3]) {
+        let mut setup = setup(format);
+        let (width, height) = (528usize, 176usize);
+        for (offset, value) in [(4, width), (8, height), (12, 525), (16, 173)] {
+            setup.info[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes());
+        }
+        setup.huffman = std::array::from_fn(|_| vec![2, -527, -568, -569, -512]);
+        let cw = width >> usize::from(format & 1 == 0);
+        let ch = height >> usize::from(format & 2 == 0);
+        let luma_sb_cols = width.div_ceil(32);
+        let sbs = luma_sb_cols * height.div_ceil(32) + 2 * cw.div_ceil(32) * ch.div_ceil(32);
+        let fragments = (width * height + 2 * cw * ch) / 64;
+        let packet = |inter: bool, golden: bool| {
+            let mut bits = Vec::new();
+            let mut write = |value: usize, n: usize| {
+                bits.extend((0..n).rev().map(|i| value & (1 << i) != 0));
+            };
+            let coded = if inter {
+                write(0b010000000, 9); // Inter, one quantizer.
+                write(0, 1); // All superblocks are fully coded or fully uncoded.
+                write(0b111111, 6);
+                write(sbs - 34, 12);
+                write(0, 1); // First luma superblock row is uncoded.
+                write(0b11110, 5);
+                write(luma_sb_cols - 10, 3);
+                write(0b111111, 6);
+                write(sbs - luma_sb_cols - 34, 12);
+                let coded_mbs = width / 16 * ((height - 32) / 16);
+                write(7, 3); // Fixed macroblock mode codes.
+                for _ in 0..coded_mbs {
+                    write(if golden { 6 } else { 2 }, 3);
+                }
+                write(1, 1); // Fixed motion vector codes.
+                for _ in 0..coded_mbs {
+                    write(2, 6);
+                    write(3, 6);
+                }
+                fragments - width * 32 / 64
+            } else {
+                write(0, 12);
+                fragments
+            };
+            write(0, 8); // DC Huffman table selectors.
+            let eob_count = coded / 3;
+            for i in 0..coded - eob_count {
+                if i == coded / 4 {
+                    write(3, 2);
+                    write(eob_count, 12);
+                }
+                write(1 + ((i / 12) & 1), 2);
+            }
+            write(0, 8); // AC Huffman table selectors.
+            for i in 0..coded - eob_count {
+                write(1 + (i & 1), 2);
+            }
+            write(3, 2);
+            write(0, 12); // End of frame, spanning the remaining coefficients.
+            pack_bits(bits)
+        };
+        (
+            setup,
+            [
+                packet(false, false),
+                packet(true, false),
+                packet(true, true),
+            ],
+        )
+    }
+
+    fn compare_band_stream(setup: &Setup, packets: &[Vec<u8>], pp_level: i32) {
+        let mut parallel = Decoder::new(setup).unwrap();
+        let mut serial = Decoder::new(setup).unwrap();
+        let mut a = State {
+            pp_level,
+            ..State::default()
+        };
+        let mut b = a;
+        let mut previous = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            assert_eq!(
+                parallel.decode(packet, i as i64, -1, false, false, &mut a),
+                0
+            );
+            loop {
+                let result = serial.decode(packet, i as i64, -1, false, true, &mut b);
+                if result != 2 {
+                    assert_eq!(result, 0);
+                    break;
+                }
+            }
+            let frame = pixels(&mut parallel);
+            assert_eq!(a.frame_type, u8::from(i != 0));
+            assert_eq!((a.curframe_num, a.granpos), (b.curframe_num, b.granpos));
+            assert!(
+                frame == pixels(&mut serial),
+                "frame {i}, pp_level {pp_level}"
+            );
+            assert!(frame != previous, "frame {i} must change the image");
+            previous = frame;
+        }
+    }
+
+    // spec: DEV-VIDEO-1
+    #[test]
+    fn parallel_bands_match_serial_for_keyframes_and_inter_frames() {
+        for format in [0, 2, 3] {
+            let (mut setup, packets) = band_test_stream(format);
+            for limit in [0, 16] {
+                setup.loop_filter_limits.fill(limit);
+                for pp_level in 0..=7 {
+                    compare_band_stream(&setup, &packets, pp_level);
+                }
+            }
+        }
+    }
+
+    // spec: DEV-VIDEO-1
+    #[test]
+    fn theora_decoders_share_workers_across_threads() {
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for format in [0, 3] {
+                let start = &start;
+                scope.spawn(move || {
+                    let (setup, packets) = band_test_stream(format);
+                    start.wait();
+                    compare_band_stream(&setup, &packets, 7);
+                });
+            }
+        });
     }
 
     // spec: DEV-VIDEO-1
@@ -616,81 +827,149 @@ mod neon_tests {
 mod parallel {
     use std::{
         ffi::c_void,
-        sync::{OnceLock, mpsc},
+        sync::{Arc, Mutex, OnceLock, mpsc},
         thread,
     };
-    unsafe extern "C" {
-        fn adv_theora_plane(decoder: *mut c_void, plane: i32);
-    }
+
+    type Run = unsafe extern "C" fn(*mut c_void, i32);
+
     struct Job {
-        decoder: usize,
-        plane: i32,
+        context: usize,
+        index: i32,
+        run: Run,
         done: mpsc::Sender<()>,
     }
+
     struct Pool {
-        workers: [mpsc::SyncSender<Job>; 2],
+        send: mpsc::Sender<Job>,
+        slots: i32,
+        caller: Mutex<()>,
     }
+
+    #[cfg(target_vendor = "apple")]
+    fn performance_cores() -> Option<usize> {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut c_void,
+                old_len: *mut usize,
+                new: *mut c_void,
+                new_len: usize,
+            ) -> i32;
+        }
+        let mut count = 0i32;
+        let mut size = std::mem::size_of_val(&count);
+        // SAFETY: the output points to a writable int and the name is terminated.
+        let result = unsafe {
+            sysctlbyname(
+                c"hw.perflevel0.physicalcpu".as_ptr(),
+                (&mut count as *mut i32).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (result == 0 && count > 0).then_some(count as usize)
+    }
+
+    #[cfg(target_os = "android")]
+    fn performance_cores() -> Option<usize> {
+        let frequencies: Vec<u64> = std::fs::read_dir("/sys/devices/system/cpu")
+            .ok()?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                name.to_str()?.strip_prefix("cpu")?.parse::<u32>().ok()?;
+                let path = entry.path().join("cpufreq/cpuinfo_max_freq");
+                std::fs::read_to_string(path).ok()?.trim().parse().ok()
+            })
+            .collect();
+        let fastest = frequencies.iter().max()?;
+        Some(frequencies.iter().filter(|&freq| freq == fastest).count())
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+    fn performance_cores() -> Option<usize> {
+        None
+    }
+
     impl Pool {
         fn new() -> Option<Self> {
-            let mut workers = Vec::new();
-            for plane in 1..3 {
-                let (send, recv) = mpsc::sync_channel::<Job>(1);
+            let cores = performance_cores()
+                .or_else(|| thread::available_parallelism().ok().map(usize::from))
+                .unwrap_or(1);
+            let workers = cores.saturating_sub(1).max(2);
+            let (send, recv) = mpsc::channel::<Job>();
+            let recv = Arc::new(Mutex::new(recv));
+            for worker in 0..workers {
+                let recv = Arc::clone(&recv);
                 thread::Builder::new()
-                    .name(format!("adv-theora-{plane}"))
+                    .name(format!("adv-theora-{worker}"))
                     .spawn(move || {
                         #[cfg(target_vendor = "apple")]
                         unsafe {
                             unsafe extern "C" {
                                 fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
                             }
-                            // These planes are on the visible frame's critical path.
+                            // These jobs are on the visible frame's critical path.
                             pthread_set_qos_class_self_np(0x21, 0);
                         }
-                        while let Ok(job) = recv.recv() {
-                            // SAFETY: dispatch retains the exclusively borrowed decoder
-                            // until both completions arrive. Each task owns one plane.
-                            unsafe {
-                                adv_theora_plane(job.decoder as *mut c_void, job.plane);
-                            }
+                        loop {
+                            let job = recv.lock().expect("Theora queue lock").recv();
+                            let Ok(job) = job else {
+                                break;
+                            };
+                            // SAFETY: dispatch joins each task before its context
+                            // expires. Each task owns disjoint storage for its phase.
+                            unsafe { (job.run)(job.context as *mut c_void, job.index) };
                             let _ = job.done.send(());
                         }
                     })
                     .ok()?;
-                workers.push(send);
             }
             Some(Self {
-                workers: workers.try_into().ok()?,
+                send,
+                slots: workers as i32 + 1,
+                caller: Mutex::new(()),
             })
         }
     }
-    #[unsafe(no_mangle)]
-    unsafe extern "C" fn adv_theora_dispatch(decoder: *mut c_void) {
+
+    fn pool() -> Option<&'static Pool> {
         static POOL: OnceLock<Option<Pool>> = OnceLock::new();
-        let Some(pool) = POOL.get_or_init(Pool::new) else {
-            // Thread allocation failure retains the serial decoder semantics.
-            for plane in 0..3 {
-                unsafe {
-                    adv_theora_plane(decoder, plane);
-                }
-            }
-            return;
-        };
+        POOL.get_or_init(Pool::new).as_ref()
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn adv_theora_slots() -> i32 {
+        pool().map_or(1, |pool| pool.slots)
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn adv_theora_dispatch(context: *mut c_void, count: i32, run: Run) {
+        let pool = pool().expect("Theora pool was initialized before banding");
+        // Concurrent decoders share the queue and one caller slot. A caller
+        // without the slot can still submit work without waiting for the lock.
+        let caller = pool.caller.try_lock().ok();
+        let first = i32::from(caller.is_some());
         let (done, completion) = mpsc::channel();
-        for (i, worker) in pool.workers.iter().enumerate() {
-            worker
+        for index in first..count {
+            pool.send
                 .send(Job {
-                    decoder: decoder as usize,
-                    plane: i as i32 + 1,
+                    context: context as usize,
+                    index,
+                    run,
                     done: done.clone(),
                 })
-                .expect("live Theora worker");
+                .expect("live Theora workers");
         }
-        // SAFETY: the caller owns luma, workers own disjoint chroma storage.
-        unsafe {
-            adv_theora_plane(decoder, 0);
+        if caller.is_some() {
+            // SAFETY: the first band or plane was reserved for this caller.
+            unsafe { run(context, 0) };
         }
-        for _ in 0..2 {
-            completion.recv().expect("Theora plane completed");
+        drop(caller);
+        for _ in first..count {
+            completion.recv().expect("Theora task completed");
         }
     }
 }

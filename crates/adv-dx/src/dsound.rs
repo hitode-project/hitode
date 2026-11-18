@@ -1249,18 +1249,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
     }
     if matches!(name, "#1" | "DirectSoundCreate" | "DirectSoundCreate8") {
         e.cpu.write_u32(b, 0)?;
-        if !e.ext.get::<Sound>().enabled {
-            return Ok(NO_DRIVER);
-        }
-        if a != 0 {
-            match enumeration::read_guid(e, a) {
-                None => return Ok(INVALID),
-                Some(guid) if !enumeration::playback(&guid) => return Ok(NO_DRIVER),
-                Some(_) => {}
-            }
-        }
         if c != 0 {
             return Ok(0x80040110);
+        }
+        if let Err(hr) = enumeration::check_playback_device(e, a) {
+            return Ok(hr);
         }
         let Some(obj) = object(
             e,
@@ -1327,8 +1320,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             if initialized {
                 return Ok(0x88780082);
             }
-            if !e.ext.get::<Sound>().enabled || b != 0 {
-                return Ok(0x88780078);
+            if let Err(hr) = enumeration::check_playback_device(e, b) {
+                return Ok(hr);
             }
             com.get_mut::<Object>(&mut e.sys.objects, a).unwrap().kind = Kind::Device {
                 initialized: true,
@@ -5531,5 +5524,120 @@ mod tests {
         let mut out = [0.0; 4];
         reader.read(&mut out, 1_000_000);
         assert_eq!(out, [0.5, -0.25, 0.5, -0.25]);
+    }
+
+    // spec: DEV-AUDIO-9
+    #[test]
+    fn device_creation_and_initialize_accept_guid_null_while_get_device_id_rejects_it() {
+        let mut m = machine();
+        let owners = m.sys.objects.object_count();
+        let guid_null = [0u8; 16];
+        let bad_guid = [0x11u8; 16];
+
+        let invoke_abi = |m: &mut Machine<JitCpu>, name: &str, args: &[u32]| -> u32 {
+            m.resolve_import("dsound.dll", name).unwrap();
+            let (thunk, handler) = m
+                .sys
+                .thunks
+                .iter()
+                .find(|(_, t)| t.module == "dsound.dll" && t.name == name)
+                .map(|(index, t)| (index, t.f.handler))
+                .unwrap();
+            m.cpu.set_reg(Reg::Esp, STACK);
+            m.cpu.write(STACK, &[0; 40]).unwrap();
+            for (i, &arg) in args.iter().enumerate() {
+                m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+            }
+            match handler(&mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk,
+            }) {
+                Outcome::Return(hr) => hr,
+                _ => panic!("{name} did not return"),
+            }
+        };
+
+        m.cpu.write(DATA, &guid_null).unwrap();
+        m.cpu
+            .write(DATA + 16, &enumeration::PLAYBACK_DEVICE)
+            .unwrap();
+        m.cpu
+            .write(DATA + 32, &enumeration::DEFAULT_PLAYBACK[0])
+            .unwrap();
+        m.cpu.write(DATA + 48, &bad_guid).unwrap();
+
+        for name in ["#1", "DirectSoundCreate", "DirectSoundCreate8"] {
+            for guid_addr in [0, DATA, DATA + 16, DATA + 32] {
+                m.cpu.write_u32(DATA + 128, 0).unwrap();
+                assert_eq!(invoke(&mut m, name, &[guid_addr, DATA + 128, 0]), 0);
+                let ptr = m.cpu.read_u32(DATA + 128).unwrap();
+                assert_ne!(ptr, 0);
+                assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 0);
+            }
+            assert_eq!(invoke(&mut m, name, &[DATA + 48, DATA + 128, 0]), NO_DRIVER);
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            assert_eq!(
+                invoke(&mut m, name, &[DATA + 48, DATA + 128, DATA]),
+                0x8004_0110
+            );
+            assert_eq!(invoke(&mut m, name, &[0x10, DATA + 128, 0]), INVALID);
+            m.ext.get_mut::<Sound>().enabled = false;
+            assert_eq!(invoke(&mut m, name, &[DATA, DATA + 128, 0]), NO_DRIVER);
+            m.ext.get_mut::<Sound>().enabled = true;
+        }
+
+        for (class, iid) in [(CLSID_DEVICE, IID_DEVICE), (CLSID_DEVICE8, IID_DEVICE8)] {
+            for guid_addr in [DATA, DATA + 16, DATA + 32] {
+                assert!(matches!(
+                    activate(&mut m, class, iid, 0, DATA + 128),
+                    Outcome::Return(0)
+                ));
+                let ptr = m.cpu.read_u32(DATA + 128).unwrap();
+                assert_eq!(
+                    invoke(&mut m, "IDirectSound8::Initialize", &[ptr, 0x10]),
+                    INVALID
+                );
+                assert_eq!(
+                    invoke(&mut m, "IDirectSound8::Initialize", &[ptr, DATA + 48]),
+                    NO_DRIVER
+                );
+                m.ext.get_mut::<Sound>().enabled = false;
+                assert_eq!(
+                    invoke(&mut m, "IDirectSound8::Initialize", &[ptr, guid_addr]),
+                    NO_DRIVER
+                );
+                m.ext.get_mut::<Sound>().enabled = true;
+                assert_eq!(
+                    invoke(&mut m, "IDirectSound8::Initialize", &[ptr, guid_addr]),
+                    0
+                );
+                assert_eq!(
+                    invoke(&mut m, "IDirectSound8::Initialize", &[ptr, DATA + 48]),
+                    0x8878_0082
+                );
+                assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[ptr]), 0);
+            }
+        }
+
+        assert_eq!(invoke_abi(&mut m, "GetDeviceID", &[0, DATA + 64]), INVALID);
+        assert_eq!(
+            invoke_abi(&mut m, "GetDeviceID", &[DATA, DATA + 64]),
+            NO_DRIVER
+        );
+        assert_eq!(
+            invoke_abi(&mut m, "GetDeviceID", &[DATA + 48, DATA + 64]),
+            NO_DRIVER
+        );
+        assert_eq!(
+            invoke_abi(&mut m, "GetDeviceID", &[DATA + 32, DATA + 64]),
+            0
+        );
+        let mut resolved = [0u8; 16];
+        m.cpu.read(DATA + 64, &mut resolved).unwrap();
+        assert_eq!(resolved, enumeration::PLAYBACK_DEVICE);
+        assert_eq!(m.sys.objects.object_count(), owners);
     }
 }

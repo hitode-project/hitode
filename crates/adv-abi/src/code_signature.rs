@@ -8,7 +8,8 @@
 //!
 //! Text schema v1 (one directive per line, `#` comments): `format 1`, `id NAME`,
 //! `source TEXT`, `license TEXT`, `profile KERNEL`, `candidate cdecl-stack32|frame-ebp32`,
-//! `entry ROLE`, `property NAME U32`, `function ROLE LENGTH SHA256 PROLOGUE_LEN`,
+//! `entry ROLE`, `property NAME U32`, `field NAME VALUE|ROLE OFFSET OPERAND`,
+//! `function ROLE LENGTH SHA256 PROLOGUE_LEN`,
 //! `constant ROLE F32_BITS_HEX ABS32_OPERAND_OFFSET...`, `call ROLE OFFSET ROLE`.
 //! Integers are decimal or `0x` hexadecimal. Helper prologues use length zero.
 //! Duplicate definitions, unknown directives and incomplete closures fail closed.
@@ -65,6 +66,7 @@ pub struct Signature {
     entry: String,
     frame_ebp: bool,
     functions: BTreeMap<String, Function>,
+    fields: BTreeMap<String, Field>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +93,7 @@ pub struct Match {
     pub entry: u32,
     pub prologue_len: usize,
     pub profile: Profile,
+    pub layout: BTreeMap<String, u32>,
     pub functions: Vec<FunctionSnapshot>,
     pub constants: Vec<ConstantSnapshot>,
 }
@@ -142,6 +145,58 @@ fn number(value: &str) -> Result<u32, Error> {
     parsed.map_err(|_| Error::Invalid(format!("invalid integer {value}")))
 }
 
+/// A layout value, either explicit or read from a matched instruction.
+#[derive(Clone, Debug)]
+pub(crate) enum Field {
+    Value(u32),
+    Displacement {
+        role: String,
+        offset: usize,
+        operand: u32,
+    },
+}
+
+impl Field {
+    pub(crate) fn parse(tokens: &[&str]) -> Result<Self, Error> {
+        match tokens {
+            [value] => Ok(Self::Value(number(value)?)),
+            [role, offset, operand] => Ok(Self::Displacement {
+                role: name(role)?,
+                offset: number(offset)? as usize,
+                operand: number(operand)?,
+            }),
+            _ => Err(Error::Invalid("invalid layout field".into())),
+        }
+    }
+
+    pub(crate) fn resolve<'a>(&self, code: impl FnOnce(&str) -> Option<&'a [u8]>) -> Option<u32> {
+        let (role, offset, operand) = match self {
+            Self::Value(value) => return Some(*value),
+            Self::Displacement {
+                role,
+                offset,
+                operand,
+            } => (role, *offset, *operand),
+        };
+        let bytes = code(role)?;
+        let mut decoder = Decoder::new(32, bytes, DecoderOptions::NONE);
+        while decoder.position() < offset && decoder.can_decode() {
+            if decoder.decode().is_invalid() {
+                return None;
+            }
+        }
+        if decoder.position() != offset {
+            return None;
+        }
+        let instruction = decoder.decode();
+        (!instruction.is_invalid()
+            && operand < instruction.op_count()
+            && instruction.op_kind(operand) == OpKind::Memory
+            && instruction.memory_base() != Register::None)
+            .then(|| instruction.memory_displacement32())
+    }
+}
+
 fn name(value: &str) -> Result<String, Error> {
     if value.is_empty()
         || value.len() > 128
@@ -172,6 +227,7 @@ impl Signature {
         }
         let mut fields = BTreeMap::new();
         let mut properties = BTreeMap::new();
+        let mut layout = BTreeMap::new();
         let mut functions = BTreeMap::new();
         let mut constants = Vec::new();
         let mut calls = Vec::new();
@@ -195,6 +251,14 @@ impl Signature {
                     let key = name(tokens[1])?;
                     if properties.len() >= 32
                         || properties.insert(key, number(tokens[2])?).is_some()
+                    {
+                        return Err(invalid());
+                    }
+                }
+                "field" if tokens.len() >= 3 => {
+                    if layout
+                        .insert(name(tokens[1])?, Field::parse(&tokens[2..])?)
+                        .is_some()
                     {
                         return Err(invalid());
                     }
@@ -354,6 +418,7 @@ impl Signature {
             entry,
             frame_ebp: required("candidate")? == "frame-ebp32",
             functions,
+            fields: layout,
         })
     }
 }
@@ -634,8 +699,27 @@ fn verify(
     if visited.len() != signature.functions.len() {
         return Err(Error::Invalid("incomplete verified closure".into()));
     }
+    let layout = signature
+        .fields
+        .iter()
+        .map(|(name, field)| {
+            let value = field
+                .resolve(|role| {
+                    functions
+                        .iter()
+                        .find(|f| f.role == role)
+                        .map(|f| f.bytes.as_slice())
+                })
+                .ok_or_else(|| Error::Verification {
+                    role: name.clone(),
+                    message: "layout field is not a memory displacement".into(),
+                })?;
+            Ok((name.clone(), value))
+        })
+        .collect::<Result<_, Error>>()?;
     Ok(Match {
         entry,
+        layout,
         prologue_len: signature.functions[&signature.entry].prologue_len,
         profile: signature.profile.clone(),
         functions,

@@ -153,7 +153,7 @@ They MUST preserve output pixels, return values, counters, seek controls, lifecy
 Guest stream I/O and presentation clocks MUST remain guest-controlled.
 Recognition MUST validate complete function/table fingerprints and relocation relationships, independent of game addresses.
 Callback continuations MUST publish completed rows before returning control to guest code.
-Workers MAY process disjoint native planes. They MUST finish before guest observation and MUST NOT access guest CPU state or memory.
+Workers MAY reconstruct disjoint fragment bands and filter disjoint native planes. They MUST finish before guest observation and MUST NOT access guest CPU state or memory.
 Architectural state MUST follow the admitted library ABI, without instruction-level execution accounting inside native calls.
 Changed library code MUST NOT execute against stale native or guest decoder state.
 Unmatched libraries MUST execute their guest implementations.
@@ -178,7 +178,7 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-AUDIO-9 DirectSound playback devices
 
-**Rule**: `DirectSoundEnumerate` MUST list the primary driver entry with a null GUID and empty module first, then the playback device under its fixed GUID. That GUID MUST open the same device as the default aliases. A primary buffer MUST ignore `DSBCAPS_LOCHARDWARE`, and class factories MUST refuse a null output before clearing it and checking the interface.
+**Rule**: `DirectSoundEnumerate` MUST list the primary driver entry with a null GUID and empty module first, then the playback device under its fixed GUID. That GUID, null pointers, `GUID_NULL` and the default playback aliases MUST open and initialize the same device, while `GetDeviceID` MUST reject `GUID_NULL` with `DSERR_NODRIVER`. A primary buffer MUST ignore `DSBCAPS_LOCHARDWARE`, and class factories MUST refuse a null output before clearing it and checking the interface.
 **Verification**: Test
 **Basis**: Wine dsound `dsound`, `dsound8` and `propset` tests, which pass on Windows.
 

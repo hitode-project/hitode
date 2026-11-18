@@ -181,12 +181,6 @@ fn bind_signatures(
     for signature in &signatures {
         let properties = &signature.profile.properties;
         let required = [
-            ("lookup_bytes", 20),
-            ("n_offset", 0),
-            ("log2n_offset", 4),
-            ("trig_offset", 8),
-            ("bitrev_offset", 12),
-            ("scale_offset", 16),
             ("min_n", 64),
             ("max_n", 8192),
             ("table_pi_bits", TABLE_PI_BITS),
@@ -238,7 +232,27 @@ fn bind_signatures(
     Ok(())
 }
 
+const LOOKUP_FIELDS: [&str; 5] = [
+    "n_offset",
+    "log2n_offset",
+    "trig_offset",
+    "bitrev_offset",
+    "scale_offset",
+];
+
 fn bind_one(e: &mut Env<'_>, base: u32, matched: Match) -> Result<(), String> {
+    let layout = &matched.layout;
+    let bytes = layout
+        .get("lookup_bytes")
+        .ok_or("missing MDCT lookup size")?;
+    if LOOKUP_FIELDS.iter().any(|name| {
+        layout
+            .get(*name)
+            .and_then(|offset| offset.checked_add(4))
+            .is_none_or(|end| end > *bytes)
+    }) {
+        return Err("invalid MDCT lookup fields".into());
+    }
     let index = e.ext.get::<Provider>().bindings.len();
     let abi = if matched.profile.kernel == REGISTER_KERNEL {
         "register"
@@ -345,25 +359,30 @@ fn arguments(e: &Env<'_>, index: usize) -> Result<[u32; 3], &'static str> {
 /// Read fresh table contents on every call. A heap pointer is never a content identity.
 fn input(e: &mut Env<'_>, index: usize) -> Result<(u32, Vec<f32>), &'static str> {
     let [lookup, source, output] = arguments(e, index)?;
-    let lookup_span = span(lookup, 20).ok_or("lookup range wraps")?;
-    if !e.cpu.accessible(lookup, 20, Prot::READ) {
+    let layout = &e.ext.get::<Provider>().bindings[index].matched.layout;
+    let lookup_bytes = layout["lookup_bytes"];
+    let lookup_span = span(lookup, lookup_bytes as usize).ok_or("lookup range wraps")?;
+    if !e.cpu.accessible(lookup, lookup_bytes, Prot::READ) {
         return Err("unreadable lookup");
     }
-    let mut words = [0u8; 20];
-    e.cpu
-        .read(lookup, &mut words)
-        .map_err(|_| "unreadable lookup")?;
-    let word = |at| u32::from_le_bytes(words[at..at + 4].try_into().unwrap());
-    let n = word(0) as usize;
+    let words = e
+        .cpu
+        .shared_bytes(lookup, lookup_bytes as usize)
+        .ok_or("nonordinary kernel storage")?;
+    let word = |name| {
+        let at = layout[name] as usize;
+        u32::from_le_bytes(words[at..at + 4].try_into().unwrap())
+    };
+    let n = word("n_offset") as usize;
     if !(64..=8192).contains(&n)
         || !n.is_power_of_two()
-        || word(4) != n.ilog2()
-        || word(16) != (4.0f32 / n as f32).to_bits()
+        || word("log2n_offset") != n.ilog2()
+        || word("scale_offset") != (4.0f32 / n as f32).to_bits()
     {
         return Err("unsupported lookup layout or size");
     }
-    let trig = word(8);
-    let bitrev = word(12);
+    let trig = word("trig_offset");
+    let bitrev = word("bitrev_offset");
     let trig_len = (n + n / 4) * 4;
     let bit_len = n;
     let trig_span = span(trig, trig_len).ok_or("table range wraps")?;
@@ -381,7 +400,6 @@ fn input(e: &mut Env<'_>, index: usize) -> Result<(u32, Vec<f32>), &'static str>
     // private storage. This borrow probe rejects device/file/shared overlays
     // and unsupported backends; no slice survives the probe or guest execution.
     if [
-        (lookup, 20),
         (source, n * 2),
         (output, n * 4),
         (trig, trig_len),

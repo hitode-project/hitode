@@ -511,3 +511,40 @@ int oc_huff_token_decode_c(oc_pack_buf *_opb,const ogg_int16_t *_tree){
   _opb->bits=available;
   return node&255;
 }
+
+void adv_huff_table_init(adv_huff_table *_table,const ogg_int16_t *_tree){
+  _table->tree=_tree;
+  for(int prefix=0;prefix<1<<ADV_HUFF_BITS;prefix++){
+    int node=0;
+    int used=0;
+    _table->entries[prefix]=UINT16_MAX;
+    for(;;){
+      int n=_tree[node];
+      int peek=used+n;
+      if(peek>ADV_HUFF_BITS)break;
+      node=_tree[node+1+(prefix>>(ADV_HUFF_BITS-peek)&((1<<n)-1))];
+      if(node<=0){
+        _table->entries[prefix]=(uint16_t)(peek<<12|
+         (used+(-node>>8))<<8|(-node&255));
+        break;
+      }
+      used=peek;
+    }
+  }
+}
+
+int adv_huff_token_decode_slow(oc_pack_buf *_opb,const adv_huff_table *_table){
+  /*Refilling at the root uses the same cursor and window as the reference.
+    Deeper nodes may need to consume bits before refilling, and a short
+     Huffman tail has different EOF semantics from a fixed-width read. */
+  if(_opb->bits<_table->tree[0]&&adv_pack_refill64(_opb)){
+    unsigned entry=_table->entries[(uint64_t)_opb->window>>(64-ADV_HUFF_BITS)];
+    if((entry>>12)<=ADV_HUFF_BITS){
+      int used=entry>>8&15;
+      _opb->window<<=used;
+      _opb->bits-=used;
+      return entry&255;
+    }
+  }
+  return oc_huff_token_decode_c(_opb,_table->tree);
+}

@@ -69,11 +69,58 @@ impl Volume for OpticalVolume {
     }
 }
 
+/// Drive and mount layout prepared for a Wine session.
+pub(super) struct Prepared {
+    pub mounts: Mounts,
+    pub directory: String,
+}
+
+/// Whether `exe` carries an appended virtual filesystem bundle whose path
+/// matching strips `directory_len + 1` characters, assuming the program
+/// directory never ends with a backslash (which fails at a bare drive root,
+/// where `RtlDosPathNameToNtPathName_U` returns a trailing backslash).
+fn needs_subdirectory_launch(exe: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(exe) else {
+        return false;
+    };
+    let mut header = Vec::new();
+    if file
+        .by_ref()
+        .take(64 * 1024)
+        .read_to_end(&mut header)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(pe) = adv_pe::Pe::parse_headers(&header) else {
+        return false;
+    };
+    if pe.sections.iter().any(|section| {
+        section.name == ".ultra"
+            && pe.entry_rva >= section.virtual_address
+            && pe.entry_rva < section.virtual_address.saturating_add(section.mem_size())
+    }) {
+        return true;
+    }
+    let raw_end = pe
+        .sections
+        .iter()
+        .map(|section| u64::from(section.raw_offset) + u64::from(section.raw_size))
+        .max()
+        .unwrap_or(0);
+    if raw_end == 0 || file.seek(SeekFrom::Start(raw_end)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && &magic == b"XOJUMANJ"
+}
+
 pub(super) fn prepare(
     config: &Config<'_>,
     options: &SessionOptions,
     prefix: &Path,
-) -> Result<(Mounts, char), String> {
+) -> Result<Prepared, String> {
     let game_drive = ('D'..='Z')
         .find(|letter| {
             !options
@@ -82,6 +129,14 @@ pub(super) fn prepare(
                 .any(|(mounted, _)| mounted.to_ascii_uppercase() == *letter)
         })
         .ok_or("no drive letter remains for the program directory")?;
+    let game = std::path::absolute(config.exe.parent().ok_or("the program has no directory")?)
+        .map_err(|e| e.to_string())?;
+    let use_install = options.install_dir.is_none() && needs_subdirectory_launch(config.exe);
+    let directory = if use_install {
+        r"C:\Program Files\".to_owned()
+    } else {
+        format!(r"{game_drive}:\")
+    };
     let mut cfg = adv_os::OsConfig::new(
         config.exe.parent().ok_or("the program has no directory")?,
         config
@@ -91,7 +146,7 @@ pub(super) fn prepare(
             .ok_or("the program name is not Unicode")?,
         prefix,
     );
-    cfg.guest_root = format!("{game_drive}:\\");
+    cfg.guest_root = directory.clone();
     cfg.system_dir = config
         .drive
         .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
@@ -107,17 +162,16 @@ pub(super) fn prepare(
             .map_err(|e| format!("CD-ROM {letter}: {e}"))?;
     }
     let vfs = Rc::new(vfs);
-    let install = options
-        .install_dir
-        .as_ref()
-        .map(|path| {
-            std::fs::create_dir_all(path)
-                .and_then(|_| path.canonicalize())
-                .map_err(|e| e.to_string())
-        })
-        .transpose()?;
-    let game = std::path::absolute(config.exe.parent().ok_or("the program has no directory")?)
-        .map_err(|e| e.to_string())?;
+    let install = if let Some(path) = &options.install_dir {
+        std::fs::create_dir_all(path)
+            .and_then(|_| path.canonicalize())
+            .map(Some)
+            .map_err(|e| e.to_string())?
+    } else if use_install {
+        Some(game.canonicalize().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let configuration = crate::reallive::configuration(&game);
     let root = if options.cdroms.is_empty() && configuration.is_none() {
         None
@@ -180,5 +234,112 @@ pub(super) fn prepare(
         letters.push(letter);
     }
     std::fs::write(managed, letters).map_err(|e| e.to_string())?;
-    Ok((mounts, game_drive))
+    Ok(Prepared { mounts, directory })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_pe::scn;
+    use adv_pe::write::DllWriter;
+
+    fn write_pe(path: &Path, entry_section: &str, overlay: &[u8]) {
+        let mut writer = DllWriter::new("test.exe", 0x0040_0000);
+        let text = writer
+            .section(
+                ".text",
+                vec![0xc3; 16],
+                16,
+                scn::CNT_CODE | scn::MEM_EXECUTE,
+            )
+            .unwrap();
+        let entry = if entry_section == ".text" {
+            text
+        } else {
+            writer
+                .section(
+                    entry_section,
+                    vec![0xc3; 16],
+                    16,
+                    scn::CNT_CODE | scn::MEM_EXECUTE,
+                )
+                .unwrap()
+        };
+        writer.set_entry(entry);
+        let mut bytes = writer.finish().unwrap();
+        bytes.extend_from_slice(overlay);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn test_config<'a>(dist: &'a Path, prefix: &'a Path, exe: &'a Path) -> Config<'a> {
+        Config {
+            dist,
+            prefix,
+            drive: None,
+            locale: 0x409,
+            fonts: "",
+            exe,
+            width: 640,
+            height: 480,
+            jit: true,
+            debug: "",
+            stdout: None,
+        }
+    }
+
+    #[test]
+    fn detects_bundled_vfs_executables_and_reuses_program_files() {
+        let root = std::env::temp_dir().join(format!("adv-files-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+
+        let plain = root.join("plain.exe");
+        write_pe(&plain, ".text", &[]);
+        assert!(!needs_subdirectory_launch(&plain));
+        let prepared = prepare(
+            &test_config(&root, &prefix, &plain),
+            &SessionOptions::default(),
+            &prefix,
+        )
+        .unwrap();
+        assert_eq!(prepared.directory, r"D:\"); // privacy: allow authored guest drive path
+        assert_eq!(prepared.mounts.nt_name(&plain), None);
+
+        let ultra = root.join("ultra.exe");
+        write_pe(&ultra, ".ultra", &[]);
+        assert!(needs_subdirectory_launch(&ultra));
+        let prepared = prepare(
+            &test_config(&root, &prefix, &ultra),
+            &SessionOptions::default(),
+            &prefix,
+        )
+        .unwrap();
+        assert_eq!(prepared.directory, r"C:\Program Files\");
+        assert_eq!(
+            prepared
+                .mounts
+                .nt_name(&ultra.canonicalize().unwrap())
+                .as_deref(),
+            Some(r"\??\C:\Program Files\ultra.exe")
+        );
+
+        let overlay = root.join("overlay.exe");
+        write_pe(&overlay, ".text", b"XOJUMANJ\0\0\0\0");
+        assert!(needs_subdirectory_launch(&overlay));
+
+        let custom_install = root.join("custom-install");
+        let options = SessionOptions {
+            install_dir: Some(custom_install.clone()),
+            ..SessionOptions::default()
+        };
+        let prepared = prepare(&test_config(&root, &prefix, &ultra), &options, &prefix).unwrap();
+        assert_eq!(prepared.directory, r"D:\"); // privacy: allow authored guest drive path
+        assert_eq!(
+            prepared.mounts.nt_name(&ultra.canonicalize().unwrap()),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

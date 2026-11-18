@@ -138,7 +138,7 @@ fn unavailable_w(env: &mut Env<'_>, callback: GuestPtr<()>, context: GuestPtr<()
 }
 
 /// `DSDEVID_DefaultPlayback` and `DSDEVID_DefaultVoicePlayback`.
-const DEFAULT_PLAYBACK: [[u8; 16]; 2] = [
+pub(super) const DEFAULT_PLAYBACK: [[u8; 16]; 2] = [
     [
         0x00, 0x00, 0xf0, 0xde, 0x6d, 0x9c, 0xed, 0x47, 0xaa, 0xf1, 0x4d, 0xda, 0x8f, 0x2b, 0x5c,
         0x03,
@@ -150,13 +150,34 @@ const DEFAULT_PLAYBACK: [[u8; 16]; 2] = [
 ];
 /// {2270EAF5-ED98-4C2D-AE2B-97007FF345C1}, the emulated default playback
 /// device.
-const PLAYBACK_DEVICE: [u8; 16] = [
+pub(super) const PLAYBACK_DEVICE: [u8; 16] = [
     0xf5, 0xea, 0x70, 0x22, 0x98, 0xed, 0x2d, 0x4c, 0xae, 0x2b, 0x97, 0x00, 0x7f, 0xf3, 0x45, 0xc1,
 ];
+const GUID_NULL: [u8; 16] = [0; 16];
 
 /// Whether `guid` names the default playback device, by alias or identity.
 pub(super) fn playback(guid: &[u8; 16]) -> bool {
     *guid == PLAYBACK_DEVICE || DEFAULT_PLAYBACK.contains(guid)
+}
+
+/// Checks whether a device creation or initialization GUID pointer names the
+/// installed playback device. Null pointers and `GUID_NULL` select the default
+/// playback device, whereas `GetDeviceID` still rejects `GUID_NULL`.
+pub(super) fn check_playback_device(env: &mut Env<'_>, address: u32) -> Result<(), u32> {
+    if !env.ext.get::<Sound>().enabled {
+        return Err(NO_DRIVER);
+    }
+    if address == 0 {
+        return Ok(());
+    }
+    let Some(guid) = read_guid(env, address) else {
+        return Err(INVALID);
+    };
+    if guid == GUID_NULL || playback(&guid) {
+        Ok(())
+    } else {
+        Err(NO_DRIVER)
+    }
 }
 
 /// Reads the GUID at `address`, or `None` when it is unreadable.
