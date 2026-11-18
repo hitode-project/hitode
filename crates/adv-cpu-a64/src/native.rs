@@ -33,16 +33,18 @@
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
 //!
-//! Proved computation uses a second entry emitted from the same trace.
-//! Its outer transfers return complete state through fixed exits, and its
-//! faults use a private capture and an immutable unit table. The owner
-//! keeps the code and mapping stable while its computation session is open.
+//! The execution plane spans `run` and `store`. The `plan` arbiter records
+//! decisions and publishes links. The Tier-1 translator and `compile` produce
+//! typed artifacts. `offload` alone consumes worker jobs.
+//! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
 use iced_x86::Code;
+use plan::dispatch;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+use store::{InternalEdge, Linked, Tier1Unit};
 
 use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
@@ -58,6 +60,7 @@ use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 mod compile;
 mod head;
 mod offload;
+mod plan;
 mod run;
 mod store;
 #[cfg(test)]
@@ -81,8 +84,7 @@ const CACHE_LEN: usize = 64 << 20;
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
 const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
-/// Budget exits at one EIP that promote it: a few slices of owner time.
-pub(crate) const PROMOTION: u8 = 4;
+pub(crate) use plan::PROMOTION;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 
@@ -104,8 +106,8 @@ fn empty_table() -> Box<[[u64; 2]]> {
     table.into_boxed_slice()
 }
 
-/// Faults at unchecked sites after which an instruction is checked (A64-MEM-6).
-pub(crate) const CHECK_AFTER: u32 = 8;
+#[cfg(test)]
+pub(crate) use plan::CHECK_AFTER;
 
 /// Page class table entries: every guest page.
 const CLASSES: usize = 1 << 20;
@@ -347,42 +349,6 @@ fn features() -> Features {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Entry {
-    unit: usize,
-    retired: u32,
-}
-
-struct Linked {
-    point: usize,
-    original: u32,
-    next: u32,
-    back: bool,
-    direct: Option<usize>,
-    sample: Option<(usize, u8)>,
-}
-
-impl Linked {
-    fn branch(&self, target: usize) -> u32 {
-        if self.original & 0xFC00_0000 == 0x9400_0000 {
-            bl((target as i64 - self.point as i64) as i32)
-        } else {
-            head::branch(self.point, target)
-        }
-    }
-}
-
-struct InternalEdge {
-    point: usize,
-    target: usize,
-    transition: usize,
-    link: usize,
-    source: u32,
-    source_pc: u32,
-    back: bool,
-    sample: Option<(usize, u8)>,
-}
-
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
 #[derive(Clone, Copy, Debug, Default)]
@@ -416,6 +382,12 @@ pub(crate) struct Diagnostics {
     pub optimized_runs: u64,
     /// Admitted resident entries when the JIT map is enabled.
     pub resident_entries: u64,
+    /// Settled heads with a detached proof and a declined resident form.
+    pub proof_without_resident: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "reported by Debug"))]
+    pub alone_evaluations: u64,
+    /// Training events delivered after a site has stopped sampling links.
+    pub rust_decisions_on_decided_sites: u64,
     /// Resident form exits that went through Rust (A64-OPT-9).
     pub resident_cold_exits: u64,
     /// Fills of the whole indirect table, which also reset the shadow stack.
@@ -460,68 +432,6 @@ unsafe extern "C" fn discover_internal(runtime: *mut Runtime, eip: u32, point: u
     at.eip = eip;
     owner.internal_discovered.push((eip, source, at));
     native.stop_counting(eip);
-}
-
-/// Called by the `dispatch` stub with the guest EIP and the link point to
-/// patch, or 0. Returns the unit to continue at, or 0 to leave.
-unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> usize {
-    // SAFETY: `run` points `owner` at a live `Owner` whose pointees it does
-    // not touch while translated code runs.
-    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
-    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
-    // An indirect transfer missed the table: record it as the interpreter
-    // would, so a jump to nowhere names its source.
-    let branch = std::mem::take(unsafe { &mut (*runtime).branch });
-    if branch != 0 {
-        // SAFETY: the runtime's CPU is live while units run.
-        let cpu = unsafe { &mut *(*runtime).cpu };
-        record_branch(cpu, branch, eip);
-    }
-    if owner.error.is_some() {
-        return 0;
-    }
-    if native.is_stop(eip) {
-        return 0;
-    }
-    let back = native.code.back_points.contains(&point);
-    if back && native.counters[&eip].get() == 0 {
-        native.stop_counting(eip);
-        owner.discovered = Some(eip);
-        return 0;
-    }
-    // A first visit runs in the owner; the point links on the next one.
-    let entry = native.code.units.get(&eip).copied();
-    if entry.is_none()
-        && native.code.direct_points.contains_key(&point)
-        && let Some(head) = native.heads.get(&eip)
-        && head.trampoline != 0
-        && !head.unprofitable
-    {
-        native.patch(point, eip, head.tier1);
-        native.code.cache.sync();
-        return point;
-    }
-    if entry.is_none()
-        && (!crate::translate::Fetcher::fetchable(memory, eip) || native.first_visit(eip))
-    {
-        return 0;
-    }
-    let before = native.code.cache.used();
-    let unit = match native.link(memory, point, eip, entry) {
-        Ok(unit) => unit,
-        Err(error) => {
-            owner.error = Some(error);
-            return 0;
-        }
-    };
-    native.resolve_tables(memory, eip, native.code.units[&eip].unit);
-    if point == 0 {
-        native.code.table[runtime::table_slot(eip)] = [u64::from(eip), unit as u64];
-    }
-    owner.translated += native.code.cache.used().saturating_sub(before);
-    native.code.cache.sync();
-    native.code.faults.end.set(native.code.cache.next());
-    unit
 }
 
 fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
@@ -787,24 +697,14 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 
 pub(crate) struct Native {
     code: store::CodeStore,
+    plans: plan::Arbiter,
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     bridge: *mut std::ffi::c_void,
     pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicU32>>,
     pub(crate) pending_mask: u32,
-    /// Counter addresses survive unit replacement and link restoration.
-    counters: FxHashMap<u32, Box<Cell<u32>>>,
-    heads: FxHashMap<u32, head::Head>,
-    #[cfg(test)]
-    ordinary: FxHashSet<u32>,
-    /// Entries that have run, so a return to one translates it.
-    seen: FxHashSet<u32>,
     /// Whether entries run once before they are translated.
     pub(crate) first_visits: bool,
     pub(crate) checks: Checks,
-    /// Faults at unchecked sites by guest instruction.
-    strikes: FxHashMap<u32, u32>,
-    /// Guest instructions whose accesses check their page first.
-    checked: FxHashSet<u32>,
     /// Faults at unchecked sites so far.
     pub(crate) unchecked_faults: u64,
     /// The run's wall deadline as a virtual counter value.
@@ -825,9 +725,6 @@ pub(crate) struct Native {
     /// Budget exits an entry needs before it is promoted; zero translates
     /// every entry with loop traces.
     pub(crate) promotion: u8,
-    /// Budget exits by EIP, and the entries promoted to loop traces.
-    samples: FxHashMap<u32, u8>,
-    promoted: FxHashSet<u32>,
     count_resident_entries: bool,
     /// The frame's pace when the owner last reached a loop whose blocks
     /// split (A64-TR-9).
@@ -961,19 +858,15 @@ impl Native {
                 table,
                 shadow,
             },
+            plans: plan::Arbiter::new(
+                std::env::var_os("ADV_A64_BASELINE").is_some_and(|value| value == "1"),
+            ),
             images: Default::default(),
             bridge: std::ptr::null_mut(),
             interrupt: None,
             pending_mask: u32::MAX,
-            counters: FxHashMap::default(),
-            heads: FxHashMap::default(),
-            #[cfg(test)]
-            ordinary: FxHashSet::default(),
-            seen: FxHashSet::default(),
             first_visits: true,
             checks: Checks::Adaptive,
-            strikes: FxHashMap::default(),
-            checked: FxHashSet::default(),
             unchecked_faults: 0,
             deadline: None,
             diagnostics: Diagnostics::default(),
@@ -986,8 +879,6 @@ impl Native {
             pending: None,
             stops: Vec::new(),
             promotion: PROMOTION,
-            samples: FxHashMap::default(),
-            promoted: FxHashSet::default(),
             count_resident_entries: crate::jit_map::enabled(),
             pace: std::cell::Cell::new(None),
             offload: offload::Offload::default(),
@@ -1006,30 +897,6 @@ impl Native {
         self.retired_forms = enabled.then_some([0; 5]);
         if enabled {
             crate::jit_map::enable_memory();
-        }
-    }
-
-    fn resident_cold_exit(&mut self, eip: u32, site: u32, reason: ResidentCold, checked: bool) {
-        self.diagnostics.resident_cold_exits += 1;
-        let head = self.heads.get_mut(&eip).unwrap();
-        let count = head.cold_counts.entry((site, reason)).or_default();
-        *count += 1;
-        if count.is_power_of_two() {
-            crate::jit_map::optimized(
-                eip,
-                format_args!("resident\tcold\t{site}\t{reason:?}\t{count}"),
-            );
-        }
-        if *count >= u64::from(head::COLD_EXITS) && !head.unprofitable {
-            match reason {
-                ResidentCold::FrameDisjoint => self.refuse_resident_fact(eip, u32::MAX),
-                ResidentCold::HostFault if !checked => {
-                    if head.checked.insert(site) {
-                        self.rebuild_resident_versions(eip);
-                    }
-                }
-                _ => self.cut_resident_site(eip, site, reason),
-            }
         }
     }
 
@@ -1054,16 +921,6 @@ impl Native {
     /// Whether the run's deadline has passed.
     pub(crate) fn past(&self) -> bool {
         self.deadline.is_some_and(|at| ticks() >= at)
-    }
-
-    /// Keeps the loop at `head` in ordinary units, for tests of their
-    /// mechanisms.
-    #[cfg(test)]
-    pub(crate) fn keep_ordinary(&mut self, head: u32) {
-        self.ordinary.insert(head);
-        if let Some(count) = self.counters.get(&head) {
-            count.set(u32::MAX);
-        }
     }
 
     #[cfg(test)]
@@ -1111,36 +968,9 @@ impl Native {
 
     /// Guest instructions whose accesses check their page.
     pub(crate) fn checked_count(&self) -> usize {
-        self.checked.len()
+        self.plans.checked_count()
     }
 
-    /// Counts a fault at an unchecked site of `eip`, at host address `pc`.
-    /// From `CHECK_AFTER` on, `eip` is checked and a new unit supersedes
-    /// the one holding `pc`.
-    fn strike(&mut self, memory: &mut Memory, eip: u32, pc: usize) {
-        let strikes = self.strikes.entry(eip).or_default();
-        *strikes += 1;
-        if *strikes < CHECK_AFTER {
-            return;
-        }
-        self.checked.insert(eip);
-        let index = self.code.placed.partition_point(|&(start, _)| start <= pc);
-        let Some(&(start, entry)) = index.checked_sub(1).map(|index| &self.code.placed[index])
-        else {
-            return;
-        };
-        // A unit dropped before stays in `placed`.
-        if self
-            .code
-            .units
-            .get(&entry)
-            .is_some_and(|unit| unit.unit == start)
-        {
-            self.replace_unit(memory, entry);
-        }
-    }
-
-    /// Points the runtime at the page classes of the current permissions.
     fn classify(&mut self, memory: &mut Memory) {
         if self.classified_epoch == Some(memory.epoch) {
             return;
@@ -1176,558 +1006,6 @@ impl Native {
             services: self.runtime.body.services,
         };
         self.classified_epoch = Some(memory.epoch);
-    }
-
-    fn counter(&mut self, eip: u32) -> (u64, u32) {
-        let count = self.counters.entry(eip).or_insert_with(|| {
-            let value = head::HOT;
-            #[cfg(test)]
-            let value = if self.ordinary.contains(&eip) {
-                u32::MAX
-            } else {
-                value
-            };
-            Box::new(value.into())
-        });
-        (std::ptr::from_ref(&**count) as u64, count.get())
-    }
-
-    fn bind_counter(&mut self, at: usize, address: u64) {
-        self.code.cache.patch(at, address as u32);
-        self.code.cache.patch(at + 4, (address >> 32) as u32);
-    }
-
-    fn stop_counting(&mut self, eip: u32) {
-        self.counters[&eip].set(u32::MAX);
-        self.repoint_resident_edges(eip, None);
-    }
-
-    fn discover(&mut self, memory: &mut Memory, eip: u32, source: u32, at: CpuState) {
-        let mut trace = self.loop_trace(memory, eip, &self.stops);
-        trace.x86 = trace
-            .insts
-            .iter()
-            .map(|inst| {
-                let mut bytes = [0; 15];
-                let len = inst.next_pc.wrapping_sub(inst.pc) as usize;
-                let bytes = bytes.get_mut(..len)?;
-                memory.read_into(inst.pc, bytes).ok()?;
-                let decoded = iced_x86::Decoder::with_ip(32, bytes, u64::from(inst.pc), 0).decode();
-                (!decoded.is_invalid() && decoded.len() == len).then_some(decoded)
-            })
-            .collect();
-        for &(start, len) in &trace.code {
-            memory.watch_code(start, len as usize);
-        }
-        self.watch_pages(eip, &trace.code);
-        let code = self.code.units[&source].unit;
-        self.heads
-            .insert(eip, head::Head::new(code, source, trace.detached()));
-        self.request_resident(eip, compile::Task::Discover, at);
-    }
-
-    fn request_resident(&mut self, eip: u32, task: compile::Task, mut at: CpuState) {
-        at.refresh_mmx();
-        let head = self.heads.get_mut(&eip).unwrap();
-        head.pending = Some(task);
-        if let Some(last) = head.versions.last() {
-            last.slot.limit.set(0);
-        }
-        let mut checked = self.checked.clone();
-        checked.extend(&head.checked);
-        self.compiler.request(compile::Request {
-            eip,
-            generation: self.code.generation,
-            code: head.code,
-            task,
-            trace: head.trace.detached(),
-            proof: self.offload.proof(eip),
-            at,
-            checked,
-            all_checked: self.checks != Checks::Adaptive,
-            refused: head.refused.clone(),
-            cuts: head.cuts.clone(),
-            count_entries: self.count_resident_entries,
-        });
-    }
-
-    fn resident_arrival(&mut self, cpu: &CpuState) {
-        let point = self.runtime.resident_point;
-        if point == 0 {
-            return;
-        }
-        let eip = cpu.eip;
-        let head = self.heads.get_mut(&eip).unwrap();
-        if head.rebuilds != 0 || matches!(head.pending, Some(compile::Task::Replace(_))) {
-            return;
-        }
-        if point == 1 {
-            if head.pending.is_none() && head.versions.len() < head::VERSIONS {
-                self.request_resident(eip, compile::Task::Append, cpu.clone());
-            }
-            return;
-        }
-        let (patch, sample) = if let Some(edge) = self
-            .code
-            .internal_edges
-            .get_mut(&eip)
-            .and_then(|edges| edges.iter_mut().find(|edge| edge.point == point))
-        {
-            (edge.link, &mut edge.sample)
-        } else {
-            let mut next = self.code.links[&eip];
-            while self.code.linked[next as usize].point != point {
-                next = self.code.linked[next as usize].next;
-            }
-            let edge = &mut self.code.linked[next as usize];
-            let patch = edge.direct.map_or(point, |transition| transition + 4);
-            (patch, &mut edge.sample)
-        };
-        let version = head.versions.iter().position(|version| {
-            cpu.rep.is_none()
-                && cpu.mmx_mode == 0
-                && translate::opt::admit_into(
-                    &version.sources,
-                    &version.assumed,
-                    cpu,
-                    &mut self.resident_params,
-                    |_, _| 0,
-                )
-        });
-        let mut patched = false;
-        if let Some(version) = version {
-            let count = sample
-                .filter(|&(last, _)| last == version)
-                .map_or(1, |(_, count)| count + 1);
-            *sample = Some((version, count));
-            if count == 2 {
-                self.code
-                    .cache
-                    .patch(patch, head::branch(patch, head.versions[version].entry));
-                patched = true;
-            }
-        } else {
-            *sample = None;
-        }
-        head.probes -= 1;
-        if head.probes == 0 {
-            self.code.cache.patch(
-                head.trampoline,
-                head::branch(head.trampoline, head.versions[0].entry),
-            );
-            patched = true;
-        }
-        if patched {
-            self.code.cache.sync();
-        }
-    }
-
-    fn environment_miss(&mut self) {
-        let event = self.runtime.resident_env;
-        if event == 0 {
-            return;
-        }
-        let eip = (event >> 32) as u32;
-        let index = ((event >> 8) & 0xff) as usize - 1;
-        let head = self.heads.get_mut(&eip).unwrap();
-        let version = &head.versions[index];
-        let fact = event as u8 as usize;
-        version.slot.env[fact].set(0);
-        let site = version.plain_sites[fact];
-        self.refuse_resident_fact(eip, site);
-    }
-
-    fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
-        let head = self.heads.get_mut(&eip).unwrap();
-        if head.refused.insert(site) {
-            for (i, version) in head.versions.iter().enumerate() {
-                if version.plain_sites.contains(&site) {
-                    head.rebuilds |= 1 << i;
-                }
-            }
-            self.rebuild_resident(eip);
-        }
-    }
-
-    fn cut_resident_site(&mut self, eip: u32, site: u32, reason: ResidentCold) {
-        let head = self.heads.get_mut(&eip).unwrap();
-        if head.cuts.insert(site) {
-            if head
-                .trace
-                .reaches_latch_without(&|pc| head.cuts.contains(&pc))
-            {
-                self.rebuild_resident_versions(eip);
-            } else {
-                crate::jit_map::declined(eip, reason);
-                self.demote_resident(eip);
-            }
-        }
-    }
-
-    fn rebuild_resident_versions(&mut self, eip: u32) {
-        let head = self.heads.get_mut(&eip).unwrap();
-        head.rebuilds = (1 << head.versions.len()) - 1;
-        self.rebuild_resident(eip);
-    }
-
-    fn rebuild_resident(&mut self, eip: u32) {
-        let head = self.heads.get_mut(&eip).unwrap();
-        if head.unprofitable || head.rebuilds == 0 {
-            return;
-        }
-        let (trampoline, tier1) = (head.trampoline, head.tier1);
-        // A sampled link may bypass the trampoline. Send those links
-        // through it too until all stale versions have been replaced.
-        self.code
-            .cache
-            .patch(trampoline, head::branch(trampoline, tier1));
-        self.repoint_resident_edges(eip, Some(trampoline));
-        let head = self.heads.get_mut(&eip).unwrap();
-        if head.pending.is_none() {
-            let index = head.rebuilds.trailing_zeros() as usize;
-            head.rebuilds &= !(1 << index);
-            let at = head.versions[index].at.clone();
-            self.request_resident(eip, compile::Task::Replace(index), at);
-        }
-    }
-
-    fn install_optimized(&mut self, wait: bool) {
-        while let Some(done) = self.compiler.next(wait) {
-            let eip = done.eip;
-            if done.generation != self.code.generation {
-                continue;
-            }
-            if done.task == compile::Task::Job {
-                if !self.finish_job(eip, done.code, done.job) {
-                    continue;
-                }
-                if let Some(head) = self.heads.get_mut(&eip) {
-                    head.pending = None;
-                    if head.versions.len() < head::VERSIONS
-                        && let Some(last) = head.versions.last()
-                    {
-                        last.slot
-                            .limit
-                            .set(last.slot.misses.get().wrapping_add(head::MISSES));
-                    }
-                    self.rebuild_resident(eip);
-                }
-                continue;
-            }
-            let Some(head) = self
-                .heads
-                .get_mut(&eip)
-                .filter(|head| head.code == done.code)
-            else {
-                continue;
-            };
-            head.pending = None;
-            if let Some(job) = done.job {
-                let trace = head.trace.detached();
-                self.place_job(eip, &done.at, trace, job);
-            }
-            let head = &self.heads[&eip];
-            if !head.unprofitable
-                && (done.task != compile::Task::Append || head.rebuilds == 0)
-                && !done
-                    .resident
-                    .is_some_and(|form| self.install_resident(eip, done.task, done.at, form))
-                && matches!(done.task, compile::Task::Replace(_))
-            {
-                self.demote_resident(eip);
-            }
-            let head = &self.heads[&eip];
-            if done.task == compile::Task::Discover && head.trampoline == 0 {
-                self.repoint_resident_edges(eip, None);
-            }
-            self.rebuild_resident(eip);
-        }
-    }
-
-    fn install_resident(
-        &mut self,
-        eip: u32,
-        task: compile::Task,
-        at: CpuState,
-        form: compile::ResidentForm,
-    ) -> bool {
-        let compile::ResidentForm { built, mut lowered } = form;
-        let source = self.heads[&eip].source;
-        let mut probation = None;
-        if lowered.iteration_retired != 0
-            && let Some(words) = self.code.tier1_words.get(&source)
-            && let Some(tier1) = lowered
-                .iteration_pcs
-                .iter()
-                .try_fold(0u32, |sum, pc| words.get(pc).map(|&words| sum + words))
-        {
-            if tier1 <= lowered.iteration_words {
-                self.demote_resident(eip);
-                return true;
-            }
-            probation = Some(head::Probation {
-                patches: Vec::new(),
-                iteration_retired: u64::from(lowered.iteration_retired),
-                saved_words: u64::from(tier1 - lowered.iteration_words),
-                entry_exit_words: u64::from(lowered.entry_words + lowered.exit_words),
-            });
-        }
-        let head = self.heads.get_mut(&eip).unwrap();
-        let (trampoline, tier1) = if head.trampoline == 0 {
-            let trampoline = self.code.cache.next();
-            let tier1 = trampoline + 4;
-            let mut words = vec![b(4)];
-            if let Some(unit) = self.code.units.get(&eip) {
-                words.push(head::branch(tier1, unit.unit));
-            } else {
-                words.extend(head::fallback(eip, tier1, self.code.stubs.exit));
-            }
-            if self.code.cache.append(&words).is_none() {
-                return false;
-            }
-            (trampoline, tier1)
-        } else {
-            (head.trampoline, head.tier1)
-        };
-        let index = match task {
-            compile::Task::Replace(i) => i,
-            _ => head.versions.len(),
-        };
-        let slot = Box::<head::Slot>::default();
-        let entry = head::emit(
-            (eip, index, probation.is_some()),
-            &head.sample,
-            &slot,
-            self.offload.gate(eip),
-            &mut lowered,
-            self.code.cache.next(),
-            head::Targets {
-                tier1,
-                exit: self.code.stubs.exit,
-                dispatch: self.code.stubs.dispatch,
-                opt_exit: self.code.stubs.opt_exit,
-            },
-        );
-        if self.code.cache.append(&entry.words).is_none() {
-            return false;
-        }
-        for &(point, transition) in &lowered.transitions {
-            self.code
-                .direct_points
-                .insert(entry.form + point, entry.form + transition);
-        }
-        let from = self.code.faults.sites.len().saturating_sub(1);
-        self.code.faults.sites.extend(
-            lowered
-                .sites
-                .iter()
-                .map(|&(offset, site)| (entry.form + offset, site)),
-        );
-        if !self.code.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
-            self.code.faults.sites.sort_unstable_by_key(|&(at, _)| at);
-        }
-        crate::jit_map::optimized(eip, format_args!("installed\t-\t-"));
-        crate::jit_map::record(
-            entry.form,
-            &lowered.words,
-            eip,
-            head.trace.prepaid(0),
-            &lowered.marks,
-            "a64-resident",
-        );
-        if self.inline_saved.len() < lowered.spill_cells {
-            self.inline_saved.resize(lowered.spill_cells, 0);
-        }
-        if let Some(probation) = &mut probation {
-            probation.patches = lowered
-                .probation
-                .iter()
-                .map(|word| entry.form + word * 4)
-                .collect();
-        }
-        let version = head::Version {
-            entry: entry.entry,
-            probe: entry.probe,
-            next: entry.next,
-            at,
-            assumed: built.assumed,
-            sources: built.func.entry,
-            plain_sites: built.plain_sites,
-            records: lowered.records,
-            flags: lowered.flags,
-            slot,
-            probation,
-        };
-        if index == head.versions.len() {
-            head.versions.push(version);
-        } else {
-            head.versions[index] = version;
-        }
-        head.trampoline = trampoline;
-        head.tier1 = tier1;
-        head.probes = head::PROBES;
-        head.sample.set(head::SAMPLE);
-        head.versions
-            .iter()
-            .for_each(|version| version.slot.limit.set(0));
-        if head.versions.len() < head::VERSIONS {
-            let last = &head.versions.last().unwrap().slot;
-            last.limit.set(last.misses.get().wrapping_add(head::MISSES));
-        }
-        if head.rebuilds == 0 {
-            self.code
-                .cache
-                .patch(trampoline, head::branch(trampoline, head.versions[0].probe));
-        }
-        for pair in head.versions.windows(2) {
-            self.code
-                .cache
-                .patch(pair[0].next, head::branch(pair[0].next, pair[1].entry));
-        }
-        self.code.uses_permissions = true;
-        self.code.faults.end.set(self.code.cache.next());
-        self.repoint_resident_edges(eip, Some(trampoline));
-        true
-    }
-
-    fn repoint_resident_edges(&mut self, eip: u32, resident: Option<usize>) {
-        self.repoint_internal_edges(eip, resident);
-        let mut link = self.code.links.get(&eip).copied().unwrap_or(u32::MAX);
-        while let Some(edge) = self.code.linked.get_mut(link as usize) {
-            link = edge.next;
-            if edge.back || edge.direct.is_some() {
-                edge.sample = None;
-                let unit = self
-                    .code
-                    .units
-                    .get(&eip)
-                    .map_or_else(|| self.heads[&eip].tier1, |entry| entry.unit);
-                if resident.is_none() {
-                    self.code.cache.patch(edge.point, edge.branch(unit));
-                } else {
-                    Self::route_link(&mut self.code.cache, edge, self.heads.get(&eip), unit);
-                }
-            }
-        }
-        self.code.cache.sync();
-    }
-
-    fn repoint_internal_edges(&mut self, eip: u32, resident: Option<usize>) {
-        let head = self.heads.get(&eip);
-        for edge in self.code.internal_edges.get_mut(&eip).into_iter().flatten() {
-            edge.sample = None;
-            let target = if let Some(resident) = resident.filter(|_| {
-                edge.back
-                    || !head
-                        .unwrap()
-                        .trace
-                        .insts
-                        .iter()
-                        .any(|inst| inst.pc == edge.source_pc)
-            }) {
-                self.code
-                    .cache
-                    .patch(edge.link, head::branch(edge.link, resident));
-                edge.transition
-            } else {
-                edge.target
-            };
-            self.code
-                .cache
-                .patch(edge.point, head::branch(edge.point, target));
-        }
-    }
-
-    fn finish_probation(&mut self) {
-        let event = self.runtime.resident_probation;
-        if event == 0 {
-            return;
-        }
-        let eip = (event >> 32) as u32;
-        let index = event as u32 as usize - 1;
-        let version = &mut self.heads.get_mut(&eip).unwrap().versions[index];
-        let probation = version.probation.take().unwrap();
-        if probation.profitable(&version.slot) {
-            for point in probation.patches {
-                self.code.cache.patch(point, crate::encode::NOP);
-            }
-            self.code.cache.sync();
-        } else {
-            crate::jit_map::demoted(
-                eip,
-                index,
-                version.slot.entries.get(),
-                version.slot.countdown[1].get() / probation.iteration_retired,
-            );
-            self.demote_resident(eip);
-        }
-    }
-
-    fn demote_resident(&mut self, eip: u32) {
-        let head = self.heads.get_mut(&eip).unwrap();
-        head.unprofitable = true;
-        head.versions.clear();
-        self.repoint_resident_edges(eip, None);
-    }
-
-    /// Budget samples select Tier-1 loop traces.
-    fn sample(&mut self, memory: &mut Memory, eip: u32) {
-        if self.promotion == 0 || self.is_stop(eip) || self.promoted.contains(&eip) {
-            return;
-        }
-        let count = self.samples.entry(eip).or_default();
-        *count += 1;
-        if *count >= self.promotion {
-            self.samples.remove(&eip);
-            self.promoted.insert(eip);
-            self.diagnostics.promotions += 1;
-            crate::jit_map::optimized(eip, format_args!("promoted\t-\t-"));
-            self.replace_unit(memory, eip);
-        }
-    }
-
-    #[cfg(test)]
-    fn prepare_job(&mut self, memory: &mut Memory, stop: u32, at: &CpuState) {
-        self.observe_stop(stop);
-        self.control = at.x87.control;
-        self.pe = at.x87.status & 0x20 != 0;
-        if !self.code.units.contains_key(&at.eip) {
-            self.translate(memory, at.eip).unwrap();
-        }
-        self.discover(memory, at.eip, at.eip, at.clone());
-        self.install_optimized(true);
-        self.demote_resident(at.eip);
-    }
-
-    /// The trace a hot entry at `eip` takes.
-    fn loop_trace(&self, memory: &mut Memory, eip: u32, stops: &[u32]) -> translate::Trace {
-        let mut trace = translate::Trace::default();
-        let handler = if self.bridge.is_null() {
-            None
-        } else {
-            // SAFETY: preparation stays within this owner's bridge call.
-            unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                .handler
-                .as_ref()
-        };
-        trace.build(
-            memory,
-            eip,
-            stops,
-            &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
-            &|pc| {
-                let handler = handler?;
-                let (target, original) = handler.redirect(pc)?;
-                Some(translate::Redirect {
-                    target,
-                    original: original.to_vec(),
-                    checks: handler.redirect_checks(pc).to_vec(),
-                    body: handler.direct_body(pc),
-                })
-            },
-            true,
-        );
-        trace
     }
 }
 
@@ -1798,10 +1076,10 @@ mod tests {
             nz: None,
             overflow: translate::Overflow::Host,
             recipe: Recipe::Canonical,
-            checked: false,
             simd_dirty: 0,
             resume: 0,
             opt_record: None,
+            checked: false,
         };
         let words = [
             load,
@@ -1811,7 +1089,10 @@ mod tests {
             movk(W, Reg::new(1), (next >> 16) as u16, 16),
             b((native.code.stubs.exit as i64 - (at + 20) as i64) as i32),
         ];
-        native.place(eip, &words, &[(0, site)], 1, &[]).unwrap();
+        native
+            .code
+            .install_unit(eip, &words, &[(0, site)], 1, &[])
+            .unwrap();
     }
 
     fn cpu(eip: u32, esp: u32, ecx: u32) -> CpuState {
@@ -1878,16 +1159,83 @@ mod tests {
         }
     }
 
+    // spec: A64-OPT-11 A64-OPT-12 A64-OPT-14
+    #[test]
+    fn worker_only_links_offer_again_after_backoff() {
+        let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+        native.prepare_job(&mut memory, stop, &resident_cpu(HEAD, 20));
+        native.set_computation_offer(true, None);
+        let gate = native.plans.job(HEAD).unwrap().gate_entry;
+        assert!(native.plans.resident(HEAD).unwrap().declined());
+        native.plans.job(HEAD).unwrap().reoffer.set(2);
+        for left in [1, 0] {
+            let mut state = resident_cpu(OUTSIDE, 20);
+            let result = enter(&mut native, &mut memory, stop, &mut state);
+            assert_eq!((result.exit, state.eip), (Exit::Dispatch, stop));
+            assert_eq!(native.plans.job(HEAD).unwrap().reoffer.get(), left);
+        }
+        let mut state = resident_cpu(OUTSIDE, 20);
+        let result = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!((result.exit, state.eip), (Exit::Computation, HEAD));
+        let link = outside_link(&native, HEAD);
+        assert_eq!(native.code.cache.word(link.point), link.branch(gate));
+        assert_eq!(native.diagnostics.optimized_runs, 0);
+        assert_eq!(native.diagnostics.rust_decisions_on_decided_sites, 0);
+    }
+
+    // spec: A64-OPT-12 A64-OPT-13
+    #[test]
+    fn baseline_plans_preserve_tier1_results_and_counters() {
+        let run = |baseline_only, count| {
+            let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+            native.plans.baseline_only = baseline_only;
+            native.count_resident_entries = true;
+            let mut state = resident_cpu(OUTSIDE, count);
+            let first = enter(&mut native, &mut memory, stop, &mut state);
+            let mut retired = u64::from(first.retired);
+            while state.eip != stop {
+                retired += u64::from(enter(&mut native, &mut memory, stop, &mut state).retired);
+            }
+            let diag = native.diagnostics;
+            assert_eq!(diag.rust_decisions_on_decided_sites, 0);
+            assert_eq!(diag.optimized_runs, 0);
+            assert_eq!(diag.alone_evaluations, 0);
+            if baseline_only {
+                assert!(native.plans.resident(HEAD).is_none());
+                assert_eq!(diag.resident_entries, 0);
+            }
+            let memory = memory
+                .read_data(OUTPUT, (count * 4) as usize)
+                .unwrap()
+                .to_vec();
+            (state, retired, memory, diag.tier1_counts())
+        };
+        let (state, retired, memory, counters) = run(false, 8);
+        let baseline = run(true, 8);
+        assert_eq!(
+            (state, retired, memory),
+            (baseline.0, baseline.1, baseline.2)
+        );
+        assert_eq!(counters, baseline.3);
+
+        let enabled = run(false, plan::HOT + 1);
+        let baseline = run(true, plan::HOT + 1);
+        assert_eq!(
+            (enabled.0, enabled.1, enabled.2),
+            (baseline.0, baseline.1, baseline.2)
+        );
+    }
+
     // spec: A64-OPT-8, A64-OPT-9
     #[test]
     fn resident_links_survive_tier1_promotion() {
         let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
         let invalidations = native.diagnostics.global_invalidations;
-        let mut state = resident_cpu(OUTSIDE + 16, head::HOT);
+        let mut state = resident_cpu(OUTSIDE + 16, plan::HOT);
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (stop, 2 + 4 * head::HOT));
-        assert_eq!(native.counters[&HEAD].get(), 1);
-        assert!(!native.heads.contains_key(&HEAD));
+        assert_eq!((state.eip, run.retired), (stop, 2 + 4 * plan::HOT));
+        assert_eq!(native.plans.counter_at(HEAD).unwrap().get(), 1);
+        assert!(!native.plans.resident(HEAD).is_some());
         let unit = native.code.units[&HEAD].unit;
         let table = runtime::table_slot(HEAD);
         assert_eq!(native.code.table[table], [u64::from(HEAD), unit as u64]);
@@ -1901,8 +1249,8 @@ mod tests {
         let link = outside_link(&native, HEAD);
         let (outside, unresolved) = (link.point, link.original);
         let arrival = link.direct.unwrap();
-        assert_eq!(native.heads[&HEAD].versions.len(), 1);
-        let trampoline = native.heads[&HEAD].trampoline;
+        assert_eq!(native.plans.resident(HEAD).unwrap().versions.len(), 1);
+        let trampoline = native.plans.resident(HEAD).unwrap().trampoline;
         assert_eq!(native.code.cache.word(back), head::branch(back, transition));
         assert_eq!(
             native.code.cache.word(resident),
@@ -1930,15 +1278,18 @@ mod tests {
         );
         assert_eq!(native.code.table[table][1], new as u64);
         assert_eq!(
-            native.code.cache.word(native.heads[&HEAD].tier1),
-            head::branch(native.heads[&HEAD].tier1, new)
+            native
+                .code
+                .cache
+                .word(native.plans.resident(HEAD).unwrap().tier1),
+            head::branch(native.plans.resident(HEAD).unwrap().tier1, new)
         );
         assert_eq!(native.diagnostics.global_invalidations, invalidations);
 
         memory.protect(HEAD, 0x4000, READ | WRITE).unwrap();
         memory.write(HEAD, &[0x90]).unwrap();
         native.invalidate(&mut memory);
-        assert!(!native.heads.contains_key(&HEAD));
+        assert!(!native.plans.resident(HEAD).is_some());
         assert_eq!(native.code.cache.word(back), head::branch(back, fallback));
         assert_eq!(native.code.cache.word(outside), unresolved);
         assert_eq!(native.code.table[table], EMPTY);
@@ -1950,12 +1301,12 @@ mod tests {
         let (mut memory, mut native, stop) = resident_loop(&[0x8b, 0x36, 0x49, 0x75, 0xfb, 0xcc]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         memory.write(DATA, &DATA.to_le_bytes()).unwrap();
-        let mut state = resident_cpu(OUTSIDE, head::HOT + 1);
+        let mut state = resident_cpu(OUTSIDE, plan::HOT + 1);
         state.regs[6] = DATA;
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (stop, 2 + 3 * (head::HOT + 1)));
+        assert_eq!((state.eip, run.retired), (stop, 2 + 3 * (plan::HOT + 1)));
         assert!(!native.offload.contains(HEAD));
-        let head = &native.heads[&HEAD];
+        let head = native.plans.resident(HEAD).unwrap();
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(head.versions.len(), 1);
         assert_eq!(
@@ -1987,11 +1338,11 @@ mod tests {
         let (mut memory, mut native, stop) = resident_loop(&body);
         native.promotion = 0;
         let head = HEAD + 1;
-        let mut state = resident_cpu(HEAD, head::HOT);
+        let mut state = resident_cpu(HEAD, plan::HOT);
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (stop, 1 + 12 * head::HOT));
-        assert_eq!(native.counters[&head].get(), 1);
-        assert!(!native.heads.contains_key(&head));
+        assert_eq!((state.eip, run.retired), (stop, 1 + 12 * plan::HOT));
+        assert_eq!(native.plans.counter_at(head).unwrap().get(), 1);
+        assert!(!native.plans.resident(head).is_some());
 
         let mut state = resident_cpu(HEAD, 2);
         let run = enter(&mut native, &mut memory, stop, &mut state);
@@ -2005,12 +1356,21 @@ mod tests {
                 head::branch(edge.point, edge.transition)
             );
         }
-        assert_eq!(native.heads[&head].versions[0].at.regs[1], 1);
+        assert_eq!(
+            native.plans.resident(head).unwrap().versions[0].at.regs[1],
+            1
+        );
 
         let mut state = resident_cpu(HEAD, 3);
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 37));
-        assert_eq!(native.heads[&head].versions[0].slot.entries.get(), 1);
+        assert_eq!(
+            native.plans.resident(head).unwrap().versions[0]
+                .slot
+                .entries
+                .get(),
+            1
+        );
         assert!(!native.code.units.contains_key(&head));
 
         let mut state = resident_cpu(HEAD, 2);
@@ -2025,7 +1385,7 @@ mod tests {
         memory.protect(HEAD, 0x4000, READ | WRITE).unwrap();
         memory.write(head, &[0xcc]).unwrap();
         native.invalidate(&mut memory);
-        assert!(!native.heads.contains_key(&head));
+        assert!(!native.plans.resident(head).is_some());
         for edge in &native.code.internal_edges[&head] {
             assert_eq!(
                 native.code.cache.word(edge.point),
@@ -2045,9 +1405,9 @@ mod tests {
         let mut state = resident_cpu(HEAD, 0);
         state.regs[6] = DATA;
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert!(run.retired > 3 * head::HOT);
-        assert!(!native.counters.contains_key(&HEAD));
-        assert!(!native.heads.contains_key(&HEAD));
+        assert!(run.retired > 3 * plan::HOT);
+        assert!(native.plans.counter_at(HEAD).is_none());
+        assert!(!native.plans.resident(HEAD).is_some());
         assert!(!native.force_resident(&mut memory, HEAD));
 
         state.eip = HEAD;
@@ -2078,7 +1438,11 @@ mod tests {
             .map_shared_file(DATA, 0x4000, storage, READ | WRITE, false)
             .unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
-        assert!(native.heads[&HEAD].versions[0].plain_sites.is_empty());
+        assert!(
+            native.plans.resident(HEAD).unwrap().versions[0]
+                .plain_sites
+                .is_empty()
+        );
         for pc in [HEAD, HEAD + 5] {
             assert!(
                 native
@@ -2095,8 +1459,8 @@ mod tests {
         state.regs[0] = 0;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 16));
-        let head = &native.heads[&HEAD];
-        assert_eq!(head.sample.get(), head::SAMPLE - 1);
+        let head = native.plans.resident(HEAD).unwrap();
+        assert_eq!(head.sample.get(), plan::SAMPLE - 1);
         assert_eq!(head.versions[0].slot.misses.get(), 0);
         assert_eq!(
             (state.eip, state.regs[0], state.regs[2]),
@@ -2113,28 +1477,31 @@ mod tests {
             &mut native,
             &mut memory,
             stop,
-            &mut resident_cpu(OUTSIDE, head::HOT + 1),
+            &mut resident_cpu(OUTSIDE, plan::HOT + 1),
         );
         for mode in 1..=2 {
             let mut state = resident_cpu(OUTSIDE, 10);
             state.mxcsr = 0x1f80 | mode << 13;
             for _ in 0..4 {
                 enter(&mut native, &mut memory, stop, &mut state);
-                if native.heads[&HEAD].versions.len() == mode as usize + 1 {
+                if native.plans.resident(HEAD).unwrap().versions.len() == mode as usize + 1 {
                     break;
                 }
                 state.eip = OUTSIDE;
             }
-            assert_eq!(native.heads[&HEAD].versions.len(), mode as usize + 1);
-            let versions = &native.heads[&HEAD].versions;
+            assert_eq!(
+                native.plans.resident(HEAD).unwrap().versions.len(),
+                mode as usize + 1
+            );
+            let versions = &native.plans.resident(HEAD).unwrap().versions;
             let previous = &versions[mode as usize - 1];
             assert_eq!(
                 native.code.cache.word(previous.next),
                 head::branch(previous.next, versions[mode as usize].entry)
             );
-            assert!(previous.slot.misses.get() >= head::MISSES);
+            assert!(previous.slot.misses.get() >= plan::MISSES);
         }
-        let resident = &native.heads[&HEAD];
+        let resident = native.plans.resident(HEAD).unwrap();
         let before: Vec<_> = resident
             .versions
             .iter()
@@ -2145,8 +1512,8 @@ mod tests {
         state.mxcsr = 0x7f80;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 10));
-        let resident = &native.heads[&HEAD];
-        assert_eq!(resident.versions.len(), head::VERSIONS);
+        let resident = native.plans.resident(HEAD).unwrap();
+        assert_eq!(resident.versions.len(), plan::VERSIONS);
         assert!(
             resident
                 .versions
@@ -2160,12 +1527,12 @@ mod tests {
             head::branch(last.next, resident.tier1)
         );
 
-        for _ in 0..2 * head::SAMPLE {
+        for _ in 0..2 * plan::SAMPLE {
             let mut state = resident_cpu(OUTSIDE, 10);
             state.mxcsr = 0x5f80;
             enter(&mut native, &mut memory, stop, &mut state);
         }
-        let resident = &native.heads[&HEAD];
+        let resident = native.plans.resident(HEAD).unwrap();
         let transition = outside_link(&native, HEAD).direct.unwrap();
         let patch = transition + 4;
         assert_eq!(
@@ -2195,7 +1562,7 @@ mod tests {
         }
         let new = native.code.units[&HEAD].unit;
         assert_ne!(new, old);
-        assert!(native.checked.contains(&HEAD));
+        assert!(native.plans.checked(HEAD));
         assert_eq!(
             native.code.table[runtime::table_slot(HEAD)],
             [u64::from(HEAD), new as u64]
@@ -2226,9 +1593,9 @@ mod tests {
         native.invalidate(&mut memory);
         native.install_optimized(true);
         for eip in [HEAD, other] {
-            assert_eq!(native.heads[&eip].versions.len(), 1);
+            assert_eq!(native.plans.resident(eip).unwrap().versions.len(), 1);
         }
-        assert!(!native.heads.contains_key(&stale));
+        assert!(!native.plans.resident(stale).is_some());
         assert!(!native.offload.contains(stale));
     }
 
@@ -2239,9 +1606,9 @@ mod tests {
         let (mut memory, mut native, stop) =
             resident_loop(&[0x8b, 0x06, 0x01, 0xc3, 0x49, 0x75, 0xf9, 0xcc]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
-        native.checked.insert(HEAD);
+        native.plans.mark_checked(HEAD);
         assert!(native.force_resident(&mut memory, HEAD));
-        let first = &native.heads[&HEAD].versions[0];
+        let first = &native.plans.resident(HEAD).unwrap().versions[0];
         assert!(first.plain_sites.contains(&HEAD));
         let old = first.entry;
 
@@ -2250,13 +1617,16 @@ mod tests {
         let mut state = resident_cpu(OUTSIDE, 2);
         state.regs[6] = DATA;
         enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!(native.heads[&HEAD].versions[0].slot.env[0].get(), 2);
-        for _ in 1..head::MISSES.div_ceil(2) {
+        assert_eq!(
+            native.plans.resident(HEAD).unwrap().versions[0].slot.env[0].get(),
+            2
+        );
+        for _ in 1..plan::MISSES.div_ceil(2) {
             let mut state = resident_cpu(OUTSIDE, 2);
             state.regs[6] = DATA;
             enter(&mut native, &mut memory, stop, &mut state);
         }
-        let resident = &native.heads[&HEAD];
+        let resident = native.plans.resident(HEAD).unwrap();
         assert!(resident.refused.contains(&HEAD));
         assert_ne!(resident.versions[0].entry, old);
         assert!(!resident.versions[0].plain_sites.contains(&HEAD));
@@ -2274,19 +1644,19 @@ mod tests {
         state.regs[4] = DATA;
         state.regs[7] = DATA + 4;
         assert!(native.force_resident_at(&mut memory, state.clone()));
-        let first = &native.heads[&HEAD].versions[0];
+        let first = &native.plans.resident(HEAD).unwrap().versions[0];
         assert!(first.plain_sites.contains(&u32::MAX));
         let old = first.entry;
         state.eip = OUTSIDE;
         native.compiler = compile::Compiler::background();
 
-        for _ in 0..head::COLD_EXITS {
+        for _ in 0..plan::COLD_EXITS {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
         native.install_optimized(true);
-        let resident = &native.heads[&HEAD];
+        let resident = native.plans.resident(HEAD).unwrap();
         let site = (HEAD + 4, ResidentCold::FrameDisjoint);
-        assert_eq!(resident.cold_counts[&site], u64::from(head::COLD_EXITS));
+        assert_eq!(resident.cold_counts[&site], u64::from(plan::COLD_EXITS));
         assert_ne!(resident.versions[0].entry, old);
         assert!(!resident.versions[0].plain_sites.contains(&u32::MAX));
 
@@ -2312,15 +1682,15 @@ mod tests {
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         memory.map_shared_audio(DATA + 0x4000, 0x1000).unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
-        let old = native.heads[&HEAD].versions[0].entry;
-        for expected in 1..=u64::from(head::COLD_EXITS) {
+        let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
+        for expected in 1..=u64::from(plan::COLD_EXITS) {
             let mut state = resident_cpu(OUTSIDE, 3);
             state.regs[6] = DATA + 0x4000 - 4;
             enter(&mut native, &mut memory, stop, &mut state);
             assert_eq!(native.diagnostics.resident_cold_exits, expected);
             assert_eq!(state.eip, HEAD);
         }
-        let resident = &native.heads[&HEAD];
+        let resident = native.plans.resident(HEAD).unwrap();
         assert!(resident.checked.contains(&HEAD));
         assert_ne!(resident.versions[0].entry, old);
 
@@ -2333,7 +1703,7 @@ mod tests {
         }
         assert_eq!(
             native.diagnostics.resident_cold_exits,
-            u64::from(head::COLD_EXITS)
+            u64::from(plan::COLD_EXITS)
         );
     }
 
@@ -2357,13 +1727,13 @@ mod tests {
         setup(&mut memory, &mut state);
         native.count_resident_entries = true;
         assert!(native.force_resident_at(&mut memory, state.clone()));
-        let old = native.heads[&HEAD].versions[0].entry;
+        let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
         state.eip = OUTSIDE;
-        for _ in 0..head::COLD_EXITS {
+        for _ in 0..plan::COLD_EXITS {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
-        let head = &native.heads[&HEAD];
-        let cold = u64::from(head::COLD_EXITS);
+        let head = native.plans.resident(HEAD).unwrap();
+        let cold = u64::from(plan::COLD_EXITS);
         assert_eq!(head.cold_counts.get(&(site, reason)), Some(&cold));
         assert!(head.cuts.contains(&site));
         assert_ne!(head.versions[0].entry, old);
@@ -2475,10 +1845,10 @@ mod tests {
         assert!(native.force_resident(&mut memory, HEAD));
         let mut state = resident_cpu(OUTSIDE, 4);
         state.regs[6] = DATA;
-        for _ in 0..head::COLD_EXITS {
+        for _ in 0..plan::COLD_EXITS {
             enter(&mut native, &mut memory, stop, &mut state.clone());
         }
-        assert!(native.heads[&HEAD].unprofitable);
+        assert!(native.plans.resident(HEAD).unwrap().declined());
         for _ in 0..100 {
             let mut state = state.clone();
             assert_eq!(
@@ -2489,7 +1859,7 @@ mod tests {
         }
         assert_eq!(
             native.diagnostics.resident_cold_exits,
-            u64::from(head::COLD_EXITS)
+            u64::from(plan::COLD_EXITS)
         );
     }
 
@@ -2516,7 +1886,7 @@ mod tests {
         let mut state = resident_cpu(OUTSIDE, 2);
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!(state.eip, stop);
-        let slot = &native.heads[&HEAD].versions[0].slot;
+        let slot = &native.plans.resident(HEAD).unwrap().versions[0].slot;
         assert_eq!(slot.entries.get(), 1);
         // Only the two instructions leading into the loop retire in Tier 1.
         assert_eq!(u64::from(run.retired) - slot.countdown[1].get(), 2);
@@ -2527,12 +1897,17 @@ mod tests {
                 enter(&mut native, &mut memory, stop, &mut state);
             }
         }
-        assert!(native.heads[&HEAD].unprofitable);
+        assert!(native.plans.resident(HEAD).unwrap().declined());
         assert_eq!(native.diagnostics.global_invalidations, invalidations);
         let outside = outside_link(&native, HEAD);
         assert_eq!(
             native.code.cache.word(outside.point),
-            outside.branch(native.code.units[&HEAD].unit)
+            outside.branch(native.plans.job(HEAD).unwrap().gate_entry)
+        );
+        let fallback = native.plans.job(HEAD).unwrap().gate_fallback;
+        assert_eq!(
+            native.code.cache.word(fallback),
+            head::branch(fallback, native.code.units[&HEAD].unit)
         );
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(
@@ -2546,7 +1921,7 @@ mod tests {
     fn resident_probation_keeps_long_invocations() {
         let (mut memory, mut native, stop) = probation_loop(100);
         let invalidations = native.diagnostics.global_invalidations;
-        let patches = native.heads[&HEAD].versions[0]
+        let patches = native.plans.resident(HEAD).unwrap().versions[0]
             .probation
             .as_ref()
             .unwrap()
@@ -2558,7 +1933,7 @@ mod tests {
                 enter(&mut native, &mut memory, stop, &mut state);
             }
         }
-        assert!(!native.heads[&HEAD].unprofitable);
+        assert!(!native.plans.resident(HEAD).unwrap().declined());
         assert_eq!(native.diagnostics.global_invalidations, invalidations);
         assert!(
             patches

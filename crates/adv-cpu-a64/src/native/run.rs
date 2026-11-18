@@ -1,4 +1,7 @@
 //! Owner entry and recovery from translated code.
+//!
+//! Each Rust arrival reads one site plan. Decided links stay in translated
+//! code, with explicit cold and offload events returning to the arbiter.
 
 use super::*;
 
@@ -55,7 +58,13 @@ impl Native {
                 (entry?, self.code.cache.used().saturating_sub(before))
             }
         };
-        if self.offer_job(cpu) {
+        let offer = match self.plans.arrival(cpu.eip) {
+            plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
+                job.offer_due(self.published_gate())
+            }
+            _ => false,
+        };
+        if offer && self.offer_job(cpu) {
             return Ok(Some(Run {
                 exit: Exit::Computation,
                 retired: 0,
@@ -78,7 +87,9 @@ impl Native {
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         self.helper_units = 0;
         let budget = fuel.min(SLICE);
-        if self.code.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty()
+        if self.code.uses_permissions
+            || self.checks != Checks::Adaptive
+            || self.plans.checked_count() != 0
         {
             self.classify(memory);
         }
@@ -175,7 +186,7 @@ impl Native {
             self.discover(memory, head, head, cpu.clone());
         }
         for (head, source, at) in owner.internal_discovered {
-            if self.code.units.contains_key(&source) && !self.heads.contains_key(&head) {
+            if self.code.units.contains_key(&source) && !self.plans.resident(head).is_some() {
                 self.discover(memory, head, source, at);
             }
         }
@@ -198,12 +209,32 @@ impl Native {
         if retired != 0 {
             self.progressed();
         }
+        if exit == Exit::Computation && !self.offer_job(cpu) {
+            self.plans.offer_resume = Some(cpu.eip);
+            exit = Exit::Dispatch;
+        }
         let retired = retired as u32;
         Ok(Some(Run {
             exit,
             retired,
             translated,
         }))
+    }
+
+    fn published_gate(&self) -> &OfferGate {
+        if !self.offload.enabled || self.plans.baseline_only {
+            &CLEAR_GATE
+        } else if self.bridge.is_null() {
+            &STALE_GATE
+        } else {
+            // SAFETY: the run's bridge outlives it.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            bridge
+                .handler
+                .as_ref()
+                .and_then(|handler| handler.offer_gate())
+                .unwrap_or(&STALE_GATE)
+        }
     }
 
     /// Points the runtime at what head entry blocks and inline forms read
@@ -216,19 +247,7 @@ impl Native {
         budget: u64,
     ) {
         static NEVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let gate = if !self.offload.enabled {
-            &CLEAR_GATE
-        } else if self.bridge.is_null() {
-            &STALE_GATE
-        } else {
-            // SAFETY: the run's bridge outlives it.
-            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
-            bridge
-                .handler
-                .as_ref()
-                .and_then(|handler| handler.offer_gate())
-                .unwrap_or(&STALE_GATE)
-        };
+        let gate = std::ptr::from_ref(self.published_gate()) as u64;
         let (pending, mask) = self.interrupt.as_ref().map_or((NEVER.as_ptr(), 0), |word| {
             (word.as_ptr(), self.pending_mask)
         });
@@ -240,7 +259,7 @@ impl Native {
         runtime.resident_site = u32::MAX;
         runtime.resident_cold = ResidentCold::Other;
         runtime.resident_entries = 0;
-        runtime.offer_gate = std::ptr::from_ref(gate) as u64;
+        runtime.offer_gate = gate;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;
         runtime.memory_base = memory.base;
@@ -267,7 +286,7 @@ impl Native {
     ) -> (u32, u32, ResidentCold, bool) {
         let eip = self.runtime.opt_head;
         let index = self.runtime.resident_version as usize;
-        let head = &self.heads[&eip];
+        let head = self.plans.resident(eip).unwrap();
         let version = &head.versions[index];
         let record = &version.records[self.runtime.opt_record as usize];
         translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);

@@ -3,68 +3,15 @@
 use std::cell::Cell;
 
 use adv_cpu_core::CpuState;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
-use crate::runtime::{self, Exit, ResidentCold};
-use crate::translate::Trace;
+use crate::runtime::{self, Exit};
 use crate::translate::opt::{back::Lowered, front::Assumed, ir::Source, recovery::*};
 
-use super::compile;
-
-pub(super) const HOT: u32 = 64;
-pub(super) const VERSIONS: usize = 3;
-pub(super) const SAMPLE: u32 = 8;
-pub(super) const PROBES: u8 = 8;
-pub(super) const MISSES: u32 = 4;
-pub(super) const COLD_EXITS: u8 = 2;
-const PROBATION: u32 = 256;
-
-pub(super) struct Head {
-    /// The Tier-1 address at discovery identifies this trace's lifetime.
-    pub code: usize,
-    /// The Tier-1 unit containing the back edge that reached the threshold.
-    pub source: u32,
-    pub trace: Trace,
-    pub trampoline: usize,
-    pub tier1: usize,
-    pub sample: Box<Cell<u32>>,
-    pub probes: u8,
-    pub versions: Vec<Version>,
-    pub checked: FxHashSet<u32>,
-    pub refused: FxHashSet<u32>,
-    pub cuts: FxHashSet<u32>,
-    pub cold_counts: FxHashMap<(u32, ResidentCold), u64>,
-    /// Versions to rebuild once the current request settles.
-    pub rebuilds: u8,
-    pub pending: Option<compile::Task>,
-    pub unprofitable: bool,
-}
-
-impl Head {
-    pub fn new(code: usize, source: u32, trace: Trace) -> Self {
-        Self {
-            code,
-            source,
-            trace,
-            trampoline: 0,
-            tier1: 0,
-            sample: Box::new(SAMPLE.into()),
-            probes: PROBES,
-            versions: Vec::new(),
-            checked: FxHashSet::default(),
-            refused: FxHashSet::default(),
-            cuts: FxHashSet::default(),
-            cold_counts: FxHashMap::default(),
-            rebuilds: 0,
-            pending: None,
-            unprofitable: false,
-        }
-    }
-}
+use super::plan::{MISSES, PROBATION, SAMPLE};
 
 /// These counters are private to one version and written only by the owner.
 #[derive(Default)]
@@ -139,13 +86,14 @@ pub(super) fn emit(
     (head, version, probation): (u32, usize, bool),
     sample: &Cell<u32>,
     slot: &Slot,
-    gate: Option<Option<u64>>,
+    gate: Option<OfferEntry>,
     form: &mut Lowered,
     at: usize,
     targets: Targets,
 ) -> Entry {
     let mut asm = Asm::new();
     let leave = asm.label();
+    let offer_exit = asm.label();
     let retry = asm.label();
     let miss = asm.label();
     let env = asm.label();
@@ -158,6 +106,12 @@ pub(super) fn emit(
     let tier1 = asm.label();
     let exit = asm.label();
     let opt_exit = asm.label();
+
+    if gate.is_some() {
+        asm.bind(offer_exit);
+        guest_exit(&mut asm, head, Exit::Computation);
+        asm.b(exit);
+    }
 
     asm.bind(next);
     asm.emit(0);
@@ -181,7 +135,7 @@ pub(super) fn emit(
         str(X, r(0), RT, runtime::RESIDENT_POINT),
     ]);
     asm.bind(leave);
-    guest_exit(&mut asm, head);
+    guest_exit(&mut asm, head, Exit::Dispatch);
     asm.bind(exit);
     asm.emit(0);
 
@@ -259,8 +213,8 @@ pub(super) fn emit(
         asm.b(leave);
     }
     asm.bind(entry);
-    if let Some(split_ticks) = gate {
-        offer(&mut asm, split_ticks, leave);
+    if let Some(gate) = gate {
+        offer(&mut asm, gate, offer_exit);
     }
 
     let form_at = at + asm.offset();
@@ -311,9 +265,9 @@ pub(super) fn emit(
     }
 }
 
-fn guest_exit(asm: &mut Asm, head: u32) {
+fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
     asm.emit_all(&[
-        movz(W, r(0), Exit::Dispatch as u16, 0),
+        movz(W, r(0), exit as u16, 0),
         movz(W, r(1), head as u16, 0),
         movk(W, r(1), (head >> 16) as u16, 16),
     ]);
@@ -321,24 +275,54 @@ fn guest_exit(asm: &mut Asm, head: u32) {
 
 pub(super) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
     let mut asm = Asm::new();
-    guest_exit(&mut asm, head);
+    guest_exit(&mut asm, head, Exit::Dispatch);
     asm.emit(branch(at + asm.offset(), exit));
     asm.finish()
 }
 
-fn offer(asm: &mut Asm, split_ticks: Option<u64>, leave: Label) {
+/// Stable plan cells read only by the owner.
+#[derive(Clone, Copy)]
+pub(super) struct OfferEntry {
+    pub reoffer: u64,
+    pub split_ticks: Option<u64>,
+}
+
+pub(super) fn offer_link(
+    head: u32,
+    at: usize,
+    exit: usize,
+    unit: Option<usize>,
+    gate: OfferEntry,
+) -> (Vec<u32>, usize) {
+    let mut asm = Asm::new();
+    let request = asm.label();
+    offer(&mut asm, gate, request);
+    let fallback = at + asm.offset();
+    if let Some(unit) = unit {
+        asm.emit(branch(fallback, unit));
+    } else {
+        asm.emit_all(&self::fallback(head, fallback, exit));
+    }
+    asm.bind(request);
+    guest_exit(&mut asm, head, Exit::Computation);
+    asm.emit(branch(at + asm.offset(), exit));
+    (asm.finish(), fallback)
+}
+
+fn offer(asm: &mut Asm, gate: OfferEntry, leave: Label) {
+    let due = asm.label();
+    let proceed = asm.label();
     asm.emit_all(&[
         ldr(X, GATE, RT, runtime::OFFER_GATE),
         ldr(W, r(17), GATE, 0),
     ]);
-    asm.cbz(W, true, r(17), leave);
-    if let Some(split_ticks) = split_ticks {
-        let affordable = asm.label();
+    if let Some(split_ticks) = gate.split_ticks {
+        asm.cbz(W, true, r(17), due);
         constant(asm, SLOT, split_ticks);
         asm.emit(ldr(X, r(17), SLOT, 0));
-        asm.cbz(X, false, r(17), affordable);
+        asm.cbz(X, false, r(17), proceed);
         asm.emit(ldr(W, r(0), GATE, 4));
-        asm.cbz(W, true, r(0), leave);
+        asm.cbz(W, true, r(0), due);
         asm.emit_all(&[
             mrs_nzcv(r(1)),
             mrs_cntvct(r(0)),
@@ -348,9 +332,16 @@ fn offer(asm: &mut Asm, split_ticks: Option<u64>, leave: Label) {
             cset(W, r(3), Cond::Hi),
             msr_nzcv(r(1)),
         ]);
-        asm.cbz(W, true, r(3), leave);
-        asm.bind(affordable);
+        asm.cbz(W, false, r(3), proceed);
+    } else {
+        asm.cbz(W, false, r(17), proceed);
     }
+    asm.bind(due);
+    constant(asm, SLOT, gate.reoffer);
+    asm.emit(ldr(W, r(0), SLOT, 0));
+    asm.cbz(W, false, r(0), leave);
+    asm.emit_all(&[sub_imm(W, r(0), r(0), 1, false), str(W, r(0), SLOT, 0)]);
+    asm.bind(proceed);
 }
 
 fn constant(asm: &mut Asm, rd: Reg, value: u64) {

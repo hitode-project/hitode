@@ -1,5 +1,9 @@
-//! Execution under an owner-held code and memory lease. Only the owner
-//! evaluates ranges and accepts completions.
+//! Runs worker jobs under an owner-held code and memory lease.
+//!
+//! The service owns job artifacts, pacing and split execution. The arbiter's
+//! offer plan caches positive and negative proof results by the registers,
+//! parameter words and mapping generation the proof reads. The service reuses
+//! evaluation scratch and checks active leases again before each submission.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -12,13 +16,14 @@ use adv_cpu_core::trap::Bridge;
 use adv_sync::WakeEvent;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::plan::{AdmissionCache, Arbiter, JobPlan, REOFFER};
 use super::{
     ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base, compile,
     record_branch, translate,
 };
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
-use crate::translate::computation::{Evaluation, Plan, Proof, Range};
+use crate::translate::computation::{Plan, Proof, Range};
 use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
 use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
@@ -29,21 +34,11 @@ pub(super) struct Offload {
     unit_code: translate::Code,
     admission: Admission,
     pub(super) enabled: bool,
-    skip_offer: Option<u32>,
 }
 
 impl Offload {
     pub(super) fn proof(&self, eip: u32) -> Option<Proof> {
         self.jobs.get(&eip).map(|job| job.proof.clone())
-    }
-
-    /// The stable split-cost cell read by the resident offer gate.
-    pub(super) fn gate(&self, eip: u32) -> Option<Option<u64>> {
-        self.jobs.get(&eip).map(|job| {
-            job.proof
-                .splits()
-                .then(|| std::ptr::from_ref(&*job.split_ticks) as u64)
-        })
     }
 
     pub(super) fn invalidate(&mut self, eip: u32) {
@@ -63,15 +58,15 @@ impl Offload {
 impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
         self.offload.enabled = enabled;
-        self.offload.skip_offer = skip;
+        self.plans.offer_resume = skip;
     }
 
     pub(crate) fn progressed(&mut self) {
-        self.offload.skip_offer = None;
+        self.plans.offer_resume = None;
     }
 
     pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
-        self.offload.skip_offer.take()
+        self.plans.offer_resume.take()
     }
 
     /// Whether the computation reached at EIP goes to the job layer
@@ -106,7 +101,7 @@ impl Native {
             &mut dyn adv_cpu_core::backend::Computation<Option<crate::ExecutionContext>>,
         ),
     ) {
-        if self.offload.jobs.is_empty() || memory.attach().is_err() {
+        if self.plans.baseline_only || self.offload.jobs.is_empty() || memory.attach().is_err() {
             return;
         }
         self.invalidate(memory);
@@ -120,7 +115,7 @@ impl Native {
         };
         if let Some(mut session) = Session::new(
             entry,
-            &self.offload.jobs,
+            (&self.offload.jobs, &mut self.plans),
             memory,
             &mut self.offload.admission,
             (retired, &mut self.retired_forms),
@@ -131,29 +126,26 @@ impl Native {
         }
     }
 
+    /// An offer event is separate from ordinary owner dispatch.
     pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
-        if self
-            .offload
-            .jobs
-            .get(&cpu.eip)
-            .is_some_and(WorkerJob::wants_form)
+        let job = self.plans.job(cpu.eip).unwrap();
+        let cost = job.cost();
+        let split = job.splits && cost > 0;
+        let peer = self.offer_computation();
+        let paced = split && self.offer_split(cost);
+        if !peer && !paced {
+            job.defer_offer();
+            return false;
+        }
+        if job.wants_form()
             && self
-                .heads
-                .get(&cpu.eip)
+                .plans
+                .resident(cpu.eip)
                 .is_none_or(|head| head.pending.is_none())
         {
             self.request_optimized(cpu.eip, cpu.clone());
         }
-        let Some(job) = self.offload.jobs.get(&cpu.eip) else {
-            return false;
-        };
-        if !self.offload.enabled || self.offload.skip_offer == Some(cpu.eip) {
-            return false;
-        }
-        let split = job.proof.splits() && job.cost() > 0;
-        let peer = self.offer_computation();
-        let paced = split && self.offer_split(job.cost());
-        (peer || paced) && job.worth_offering()
+        true
     }
 
     pub(super) fn place_job(
@@ -173,10 +165,19 @@ impl Native {
             &job.proof,
         ) {
             self.diagnostics.split_proofs += u64::from(job.proof.splits());
-            let prepared = WorkerJob::new(code, iterates, job.proof, unit.trace);
-            prepared.requested();
-            prepared.built();
-            self.offload.jobs.insert(eip, prepared);
+            let entry_registers = job.proof.entry_registers();
+            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            policy.requested();
+            policy.built();
+            self.offload.jobs.insert(
+                eip,
+                WorkerJob {
+                    code,
+                    proof: job.proof,
+                    trace: unit.trace,
+                    entry_registers,
+                },
+            );
             if let Some(form) = job.form {
                 self.install_job(eip, form);
             }
@@ -184,7 +185,7 @@ impl Native {
     }
 
     pub(super) fn finish_job(&mut self, eip: u32, code: usize, job: Option<compile::Job>) -> bool {
-        let Some(prepared) = self
+        let Some(_) = self
             .offload
             .jobs
             .get(&eip)
@@ -192,7 +193,7 @@ impl Native {
         else {
             return false;
         };
-        prepared.built();
+        self.plans.job(eip).unwrap().built();
         if let Some(form) = job.and_then(|job| job.form) {
             self.install_job(eip, form);
         }
@@ -235,8 +236,8 @@ impl Native {
     fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
         at.refresh_mmx();
         let prepared = &self.offload.jobs[&eip];
-        prepared.requested();
-        if let Some(head) = self.heads.get_mut(&eip) {
+        self.plans.job(eip).unwrap().requested();
+        if let Some(head) = self.plans.resident_mut(eip) {
             head.pending = Some(compile::Task::Job);
             if let Some(last) = head.versions.last() {
                 last.slot.limit.set(0);
@@ -304,169 +305,14 @@ const WAKE_NS: f64 = 50_000.0;
 const BLOCKS_PER_THREAD: f64 = 4.0;
 /// The owner's fixed work in a split besides its blocks: admission and merge.
 const ROUND_NS: f64 = 10_000.0;
-/// Entries in a row the optimized form must miss before another is built
-/// for the state at the next, and how many more may be built.
-const MISSES: u32 = 4;
-const RESPECIALIZE: u8 = 2;
-/// A miss limit no count reaches: a sign test of `misses - limit` stays
-/// negative.
-const NO_LIMIT: u32 = i32::MAX as u32;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
 
 struct WorkerJob {
-    pub code: Code,
-    pub proof: Proof,
-    /// The serial cost of a split loop in host ticks.
-    pub split_ticks: Box<std::cell::Cell<u64>>,
-    pub trace: crate::translate::Trace,
-    misses: std::cell::Cell<u32>,
-    /// Optimized forms requested, and whether one is being built.
-    forms: std::cell::Cell<u8>,
-    building: std::cell::Cell<bool>,
-    skip: std::cell::Cell<u32>,
-    mode: std::cell::Cell<Mode>,
-    /// Instructions and time per outer iteration, once a job showed them.
-    per_iteration: std::cell::Cell<Option<(u64, f64)>>,
-    /// Serial ns of the last job that showed them.
-    cost: std::cell::Cell<u64>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Whole(u8),
-    Trial,
-    Iteration,
-    WholeOnly,
-}
-
-impl WorkerJob {
-    /// `iterates` when the code can stop after one outer iteration.
-    pub fn new(code: Code, iterates: bool, proof: Proof, trace: crate::translate::Trace) -> Self {
-        let mode = if iterates {
-            Mode::Whole(0)
-        } else {
-            Mode::WholeOnly
-        };
-        Self {
-            code,
-            proof,
-            trace,
-            split_ticks: Box::default(),
-            misses: std::cell::Cell::new(0),
-            forms: std::cell::Cell::new(0),
-            building: std::cell::Cell::new(false),
-            skip: std::cell::Cell::new(0),
-            mode: std::cell::Cell::new(mode),
-            per_iteration: std::cell::Cell::new(None),
-            cost: std::cell::Cell::new(0),
-        }
-    }
-
-    /// Counts an entry whose state the optimized form did or did not admit.
-    pub fn admitted(&self, admitted: bool) {
-        let misses = &self.misses;
-        misses.set(if admitted {
-            0
-        } else {
-            (misses.get() + 1).min(NO_LIMIT)
-        });
-    }
-
-    /// Whether to build a form for the state at this entry: the first one,
-    /// or up to `RESPECIALIZE` more after `MISSES` entries it did not admit.
-    pub fn wants_form(&self) -> bool {
-        !self.building.get()
-            && match self.forms.get() {
-                0 => true,
-                forms => forms <= RESPECIALIZE && self.misses.get() >= MISSES,
-            }
-    }
-
-    pub fn requested(&self) {
-        self.forms.set(self.forms.get() + 1);
-        self.building.set(true);
-        self.misses.set(0);
-    }
-
-    pub fn built(&self) {
-        self.building.set(false);
-    }
-
-    /// The code and whether a job stops after one outer iteration.
-    fn selected(&self) -> (&Code, bool) {
-        (
-            &self.code,
-            matches!(self.mode.get(), Mode::Trial | Mode::Iteration),
-        )
-    }
-
-    /// The serial ns a job of this computation last took, 0 until one ran.
-    pub fn cost(&self) -> u64 {
-        self.cost.get()
-    }
-
-    pub fn worth_offering(&self) -> bool {
-        let skip = self.skip.get();
-        if skip == 0 {
-            true
-        } else {
-            self.skip.set(skip - 1);
-            false
-        }
-    }
-
-    fn set_cost(&self, ns: u64) {
-        self.cost.set(ns);
-        let ticks = if self.proof.splits() && ns > 0 {
-            let hz = u128::from(adv_cpu_core::backend::host_tick_hz());
-            (u128::from(ns) * hz)
-                .div_ceil(1_000_000_000)
-                .min(u128::from(u64::MAX)) as u64
-        } else {
-            0
-        };
-        self.split_ticks.set(ticks);
-    }
-
-    fn observe(&self, entry: u32, iteration: bool, done: &Done) {
-        let completion = &done.completion;
-        if iteration {
-            if self.mode.get() == Mode::Trial
-                && !completion.requires_owner
-                && completion.context.as_ref().unwrap().cpu().eip == entry
-            {
-                self.mode
-                    .set(if completion.elapsed >= Duration::from_micros(50) {
-                        Mode::Iteration
-                    } else {
-                        Mode::WholeOnly
-                    });
-            }
-            return;
-        }
-        if let Mode::Whole(recalls) = self.mode.get()
-            && done.deadline_recall
-        {
-            self.mode.set(if recalls >= 1 {
-                self.skip.set(0);
-                Mode::Trial
-            } else {
-                Mode::Whole(recalls + 1)
-            });
-        }
-        if completion.requires_owner || matches!(self.mode.get(), Mode::Trial | Mode::Iteration) {
-            return;
-        }
-        // Short jobs do not amortize admission and queueing. Give them
-        // another trial after about one ordinary slice.
-        let skip = if completion.elapsed < Duration::from_micros(50) {
-            (u64::from(COMPUTATION_SLICE) / completion.retired.max(1)).max(1) as u32
-        } else {
-            0
-        };
-        self.skip.set(skip);
-    }
+    code: Code,
+    proof: Proof,
+    trace: translate::Trace,
+    entry_registers: u8,
 }
 
 #[derive(Clone)]
@@ -1063,7 +909,6 @@ impl PageGrants {
 
 #[derive(Default)]
 struct Admission {
-    eval: Evaluation,
     grants: PageGrants,
     generation: (u64, u64),
     spare: Vec<Vec<Range>>,
@@ -1079,27 +924,53 @@ impl Admission {
     }
 
     fn ranges<'a>(
-        &'a mut self,
-        proof: &Proof,
-        cpu: &adv_cpu_core::CpuState,
+        &mut self,
+        job: &WorkerJob,
+        cache: &'a mut AdmissionCache,
+        cpu: &CpuState,
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<&'a [Range]> {
         self.sync_generation(memory);
+        let regs = std::array::from_fn(|i| {
+            if job.entry_registers & (1 << i) != 0 {
+                cpu.regs[i]
+            } else {
+                0
+            }
+        });
         let alias = alias_base(memory);
         let grants = &mut self.grants;
-        let ranges = proof.evaluate(cpu, &mut self.eval, |addr| {
-            parameter(memory, grants, alias, active, addr)
-        })?;
-        ranges
-            .iter()
-            .all(|range| {
-                !conflicts(range, active)
-                    && self
-                        .grants
-                        .allows(memory, range.start, range.end, range.write)
-            })
-            .then_some(ranges)
+        if cache.generation != Some(self.generation)
+            || cache.regs != regs
+            || !cache
+                .words
+                .iter()
+                .all(|&(addr, value)| parameter(memory, grants, alias, active, addr) == value)
+        {
+            #[cfg(test)]
+            {
+                cache.evaluations += 1;
+            }
+            cache.generation = Some(self.generation);
+            cache.regs = regs;
+            cache.words.clear();
+            cache.split = None;
+            cache.admitted = job
+                .proof
+                .evaluate(cpu, &mut cache.evaluation, |addr| {
+                    let value = parameter(memory, grants, alias, active, addr);
+                    cache.words.push((addr, value));
+                    value
+                })
+                .is_some_and(|ranges| {
+                    ranges
+                        .iter()
+                        .all(|range| grants.allows(memory, range.start, range.end, range.write))
+                });
+        }
+        let ranges = cache.evaluation.admitted();
+        (cache.admitted && ranges.iter().all(|range| !conflicts(range, active))).then_some(ranges)
     }
 }
 
@@ -1108,14 +979,19 @@ impl Admission {
     fn plan(
         &mut self,
         proof: &Proof,
-        cpu: &adv_cpu_core::CpuState,
+        cache: &mut AdmissionCache,
+        cpu: &CpuState,
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<Plan> {
         let alias = alias_base(memory);
         let grants = &mut self.grants;
-        proof.plan(cpu, &mut self.eval, |addr| {
-            parameter(memory, grants, alias, active, addr)
+        *cache.split.get_or_insert_with(|| {
+            proof.plan(cpu, &mut cache.evaluation, |addr| {
+                let value = parameter(memory, grants, alias, active, addr);
+                cache.words.push((addr, value));
+                value
+            })
         })
     }
 }
@@ -1123,11 +999,17 @@ impl Admission {
 impl Admission {
     /// Whether the evaluated computation may also write `region`, which it
     /// does not otherwise touch.
-    fn private(&mut self, memory: &Memory, active: &[ActiveTask], region: &Range) -> bool {
+    fn private(
+        &mut self,
+        memory: &Memory,
+        active: &[ActiveTask],
+        region: &Range,
+        admitted: &[Range],
+    ) -> bool {
         let overlaps = |other: &Range| {
             u64::from(region.start) < other.end && u64::from(other.start) < region.end
         };
-        !self.eval.admitted().iter().any(overlaps)
+        !admitted.iter().any(overlaps)
             && !conflicts(region, active)
             && self
                 .grants
@@ -1180,7 +1062,8 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
 
 struct Session<'a> {
     entry: Entry,
-    prepared: &'a FxHashMap<u32, WorkerJob>,
+    jobs: &'a FxHashMap<u32, WorkerJob>,
+    plans: &'a mut Arbiter,
     memory: &'a Memory,
     admission: &'a mut Admission,
     retired: &'a mut u64,
@@ -1199,7 +1082,7 @@ struct Session<'a> {
 impl<'a> Session<'a> {
     pub(super) fn new(
         entry: Entry,
-        prepared: &'a FxHashMap<u32, WorkerJob>,
+        (jobs, plans): (&'a FxHashMap<u32, WorkerJob>, &'a mut Arbiter),
         memory: &'a Memory,
         admission: &'a mut Admission,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
@@ -1210,7 +1093,8 @@ impl<'a> Session<'a> {
         let (send, recv) = sync_channel(pool.limit);
         Some(Self {
             entry,
-            prepared,
+            jobs,
+            plans,
             memory,
             admission,
             retired,
@@ -1238,12 +1122,17 @@ impl<'a> Session<'a> {
         if cpu.eflags & ((1 << 8) | (1 << 16)) != 0 || cpu.rep.is_some() || context.has_resume() {
             return None;
         }
-        let prepared = self.prepared.get(&cpu.eip)?;
-        let ranges = self
-            .admission
-            .ranges(&prepared.proof, cpu, self.memory, &self.active)?;
-        let (code, iteration) = prepared.selected();
-        Some((code, ranges, iteration))
+        let job = self.jobs.get(&cpu.eip)?;
+        let policy = self.plans.job_mut(cpu.eip).unwrap();
+        let iteration = policy.iteration();
+        let Some(ranges) =
+            self.admission
+                .ranges(job, &mut policy.admission, cpu, self.memory, &self.active)
+        else {
+            policy.reoffer.set(REOFFER);
+            return None;
+        };
+        Some((&job.code, ranges, iteration))
     }
 
     /// Runs the admitted head loop as blocks of about one budget slice, on
@@ -1286,7 +1175,17 @@ impl<'a> Session<'a> {
                 end: u64::from(start) + u64::from(below - stride) + (frame.1 - frame.0) as u64,
                 write: true,
             };
-            if !self.admission.private(self.memory, &self.active, &region) {
+            let admitted = self
+                .plans
+                .job(context.cpu().eip)
+                .unwrap()
+                .admission
+                .evaluation
+                .admitted();
+            if !self
+                .admission
+                .private(self.memory, &self.active, &region, admitted)
+            {
                 return None;
             }
         }
@@ -1362,7 +1261,11 @@ impl<'a> Session<'a> {
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
         completion.context.as_mut().unwrap().cpu_mut().mxcsr |= total.sticky;
-        learn(&self.prepared[&context.cpu().eip], &completion, iterations);
+        learn(
+            self.plans.job(context.cpu().eip).unwrap(),
+            &completion,
+            iterations,
+        );
         Some(completion)
     }
 
@@ -1372,10 +1275,10 @@ impl<'a> Session<'a> {
         iteration: bool,
         done: Done,
     ) -> Completion<Option<ExecutionContext>> {
-        let prepared = &self.prepared[&entry];
-        prepared.observe(entry, iteration, &done);
+        let policy = self.plans.job(entry).unwrap();
+        policy.observe(entry, iteration, done.deadline_recall, &done.completion);
         if let Some(admitted) = done.admitted {
-            prepared.admitted(admitted);
+            policy.admitted(admitted);
         }
         let retired = done.completion.retired;
         *self.retired += retired;
@@ -1418,7 +1321,7 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
 
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
-fn learn(prepared: &WorkerJob, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+fn learn(prepared: &JobPlan, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
     if iterations == 0 || done.requires_owner {
         return;
     }
@@ -1479,18 +1382,22 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
         let guest_entry = context.cpu().eip;
         let (code, _, iteration) = self.prepare(id, context)?;
         let code = code.clone();
-        let prepared = &self.prepared[&guest_entry];
-        let plan = prepared
-            .proof
-            .splits()
-            .then(|| {
-                self.admission
-                    .plan(&prepared.proof, context.cpu(), self.memory, &self.active)
-            })
-            .flatten();
+        let prepared = &self.jobs[&guest_entry];
+        let plan = if prepared.proof.splits() {
+            let cache = &mut self.plans.job_mut(guest_entry).unwrap().admission;
+            self.admission.plan(
+                &prepared.proof,
+                cache,
+                context.cpu(),
+                self.memory,
+                &self.active,
+            )
+        } else {
+            None
+        };
         if let Some(plan) = plan
             && let Some(pace) = self.pace
-            && let Some(per_iteration) = prepared.per_iteration.get()
+            && let Some(per_iteration) = self.plans.job(guest_entry).unwrap().per_iteration.get()
             && let Some(completion) = self.split(id, context, &code, plan, per_iteration, pace)
         {
             let done = Done {
@@ -1519,7 +1426,11 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
                 (true, true) => 1,
                 (true, false) => 0,
             };
-            learn(prepared, &done.completion, iterations);
+            learn(
+                self.plans.job(guest_entry).unwrap(),
+                &done.completion,
+                iterations,
+            );
         }
         Some(self.account(guest_entry, iteration, done))
     }
@@ -1556,9 +1467,11 @@ mod tests {
     use adv_cpu_core::memory::{EXEC, READ, WRITE};
     use iced_x86::code_asm::*;
 
+    use super::super::plan::Mode;
     use super::*;
     use crate::Executor;
     use crate::native::Native;
+    use crate::translate::computation::Evaluation;
     use crate::translate::{self, Workspace};
 
     const CODE: u32 = 0x1_0000;
@@ -1648,7 +1561,7 @@ mod tests {
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
             .unwrap()
             .unwrap();
-        assert_eq!(incoming.exit, Exit::Dispatch);
+        assert_eq!(incoming.exit, Exit::Computation);
         assert_eq!((cpu.eip, incoming.retired), (head, 1));
 
         let first = state(&mut executor, head, OUTPUT, COUNT);
@@ -1782,7 +1695,7 @@ mod tests {
         // serial estimate that warrants a split on every host.
         for run in 0..2 {
             if run == 1 {
-                let sample = &native.offload.jobs[&CODE].per_iteration;
+                let sample = &native.plans.job(CODE).unwrap().per_iteration;
                 let (retired, _) = sample.get().unwrap();
                 sample.set(Some((retired, 1_000_000.0 / f64::from(N))));
             }
@@ -2665,7 +2578,7 @@ mod tests {
         assert_eq!(word(&executor, DST + 4 * (N - 1)), (N - 1) * 7);
     }
 
-    // spec: A64-OPT-1
+    // spec: A64-OPT-1 A64-OPT-14
     #[test]
     fn page_grant_cache_invalidates_on_protection_and_watch_code() {
         let _pool = exclusive_pool();
@@ -2702,6 +2615,7 @@ mod tests {
         cpu.eip = head;
         native.prepare_job(executor.memory_mut(), stop, &cpu);
         let prepared = &native.offload.jobs[&head];
+        let mut cache = AdmissionCache::default();
         let memory = executor.memory();
 
         // Initial check and sliding pointers inside the first page and across
@@ -2714,7 +2628,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, memory, &[])
+                .ranges(prepared, &mut cache, &cpu, memory, &[])
                 .is_some()
         );
         cpu.regs[6] = INPUT + 64;
@@ -2723,7 +2637,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, memory, &[])
+                .ranges(prepared, &mut cache, &cpu, memory, &[])
                 .is_some()
         );
         cpu.regs[6] = INPUT + 0x1000;
@@ -2732,10 +2646,19 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, memory, &[])
+                .ranges(prepared, &mut cache, &cpu, memory, &[])
                 .is_some()
         );
 
+        let evaluations = cache.evaluations;
+        assert!(
+            native
+                .offload
+                .admission
+                .ranges(prepared, &mut cache, &cpu, memory, &[])
+                .is_some()
+        );
+        assert_eq!(cache.evaluations, evaluations);
         // Removing read permission on the cached first input page invalidates it.
         executor.memory_mut().protect(INPUT, 4096, 0).unwrap();
         cpu.regs[6] = INPUT + 64;
@@ -2744,9 +2667,19 @@ mod tests {
             !native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .ranges(prepared, &mut cache, &cpu, executor.memory(), &[])
                 .is_some()
         );
+
+        let evaluations = cache.evaluations;
+        assert!(
+            native
+                .offload
+                .admission
+                .ranges(prepared, &mut cache, &cpu, executor.memory(), &[])
+                .is_none()
+        );
+        assert_eq!(cache.evaluations, evaluations);
 
         // Restoring permissions re-admits; watching code inside the output page
         // rejects writes into the watched line while respecting exact ranges.
@@ -2758,7 +2691,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .ranges(prepared, &mut cache, &cpu, executor.memory(), &[])
                 .is_some()
         );
 
@@ -2769,7 +2702,7 @@ mod tests {
             !native
                 .offload
                 .admission
-                .ranges(&prepared.proof, &cpu, executor.memory(), &[])
+                .ranges(prepared, &mut cache, &cpu, executor.memory(), &[])
                 .is_some()
         );
     }
@@ -3110,7 +3043,7 @@ mod tests {
             alias: super::super::alias_base(executor.memory()),
             fault: native.code.stubs.fault,
         };
-        let prepared = &native.offload.jobs[&CODE];
+        let prepared = native.plans.job(CODE).unwrap();
         let pending = Signals {
             recall: Arc::new(AtomicU32::new(0)),
             pending: (
@@ -3124,12 +3057,12 @@ mod tests {
                 1,
                 start.clone(),
                 entry,
-                (&prepared.code, 0),
+                (&native.offload.jobs[&CODE].code, 0),
                 (&pending, RECALL),
                 &mut ExecuteScratch::default(),
             );
             assert!(done.deadline_recall);
-            prepared.observe(CODE, false, &done);
+            prepared.observe(CODE, false, done.deadline_recall, &done.completion);
         }
         assert!(prepared.mode.get() == Mode::Trial);
 
@@ -3143,7 +3076,7 @@ mod tests {
             1,
             start.clone(),
             entry,
-            (&prepared.code, 1),
+            (&native.offload.jobs[&CODE].code, 1),
             (&recalled, RECALL),
             &mut ExecuteScratch::default(),
         )
@@ -3179,7 +3112,7 @@ mod tests {
 
         // A short row disables only that form, even if old whole-job
         // completions arrive after the trial has been selected.
-        let prepared = &native.offload.jobs[&CODE];
+        let prepared = native.plans.job(CODE).unwrap();
         prepared.mode.set(Mode::Trial);
         let mut sample = Done {
             completion: Completion {
@@ -3194,14 +3127,14 @@ mod tests {
             deadline_recall: false,
             admitted: None,
         };
-        prepared.observe(CODE, false, &sample);
+        prepared.observe(CODE, false, sample.deadline_recall, &sample.completion);
         assert!(prepared.mode.get() == Mode::Trial);
-        prepared.observe(CODE, true, &sample);
+        prepared.observe(CODE, true, sample.deadline_recall, &sample.completion);
         assert!(prepared.mode.get() == Mode::WholeOnly);
         assert!(prepared.worth_offering());
         prepared.mode.set(Mode::Trial);
         sample.completion.elapsed = Duration::from_micros(100);
-        prepared.observe(CODE, true, &sample);
+        prepared.observe(CODE, true, sample.deadline_recall, &sample.completion);
         assert!(prepared.mode.get() == Mode::Iteration);
     }
 

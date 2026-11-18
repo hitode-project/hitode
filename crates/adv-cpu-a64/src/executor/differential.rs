@@ -1883,12 +1883,20 @@ fn translated(
     program: &Program,
     budget: u64,
     (features, first_visits, checks): Config,
-) -> (RunOutcome, CpuState, Vec<u8>, u64) {
+    baseline_only: bool,
+) -> (
+    RunOutcome,
+    CpuState,
+    Vec<u8>,
+    u64,
+    crate::native::Diagnostics,
+) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     let native = executor.native.as_mut().unwrap();
     native.features = features;
     native.first_visits = first_visits;
     native.checks = checks;
+    native.set_baseline_only(baseline_only);
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();
     let outcome = executor.run(program.stop, budget).unwrap();
@@ -1898,6 +1906,7 @@ fn translated(
         executor.state.clone(),
         snapshot(executor.memory()),
         native,
+        executor.native.as_ref().unwrap().diagnostics,
     )
 }
 
@@ -1915,25 +1924,30 @@ mod resident;
 fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     let program = program(seed);
     let (outcome, state, memory) = reference(&program, budget);
-    let (a64_outcome, a64_state, a64_memory, native) = translated(&program, budget, config);
-    let context = format!("seed {seed} budget {budget} {config:?}");
-    assert_eq!(a64_outcome, outcome, "{context}: outcome");
-    assert_eq!(a64_state.regs, state.regs, "{context}: registers");
-    assert_eq!(a64_state.eip, state.eip, "{context}: eip");
-    assert_eq!(
-        a64_state.eflags, state.eflags,
-        "{context}: eflags {:#x} != {:#x}",
-        a64_state.eflags, state.eflags
-    );
-    assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
-    assert_eq!(
-        a64_state.mxcsr, state.mxcsr,
-        "{context}: mxcsr {:#x} != {:#x}",
-        a64_state.mxcsr, state.mxcsr
-    );
-    assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
-    assert_eq!(a64_state.x87, state.x87, "{context}: x87");
-    assert!(a64_memory == memory, "{context}: memory");
+    let mut native = 0;
+    for baseline_only in [false, true] {
+        let (a64_outcome, a64_state, a64_memory, entries, _) =
+            translated(&program, budget, config, baseline_only);
+        let context = format!("seed {seed} budget {budget} {config:?} baseline {baseline_only}");
+        assert_eq!(a64_outcome, outcome, "{context}: outcome");
+        assert_eq!(a64_state.regs, state.regs, "{context}: registers");
+        assert_eq!(a64_state.eip, state.eip, "{context}: eip");
+        assert_eq!(
+            a64_state.eflags, state.eflags,
+            "{context}: eflags {:#x} != {:#x}",
+            a64_state.eflags, state.eflags
+        );
+        assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
+        assert_eq!(
+            a64_state.mxcsr, state.mxcsr,
+            "{context}: mxcsr {:#x} != {:#x}",
+            a64_state.mxcsr, state.mxcsr
+        );
+        assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
+        assert_eq!(a64_state.x87, state.x87, "{context}: x87");
+        assert!(a64_memory == memory, "{context}: memory");
+        native += entries;
+    }
     native
 }
 
@@ -1960,6 +1974,36 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
         }
     }
     assert!(native > 1000, "translated code ran: {native} entries");
+}
+
+// spec: A64-OPT-12 A64-OPT-13
+#[cfg(native)]
+#[test]
+fn baseline_switch_matches_tier0_and_common_tier1_path_counts() {
+    for seed in 1..=16 {
+        let program = program(seed);
+        for budget in [13, 40, 120, 400, u64::MAX >> 1] {
+            let config = (Features { flagm: true }, true, Checks::Adaptive);
+            let expected = reference(&program, budget);
+            let enabled = translated(&program, budget, config, false);
+            let baseline = translated(&program, budget, config, true);
+            for (outcome, state, memory, _, _) in [&baseline, &enabled] {
+                assert_eq!(*outcome, expected.0);
+                assert_eq!(state.eip, expected.1.eip);
+                assert_eq!(state.regs, expected.1.regs);
+                assert_eq!(state.eflags, expected.1.eflags);
+                assert_eq!(state.mxcsr, expected.1.mxcsr);
+                assert_eq!(state.xmm, expected.1.xmm);
+                assert_eq!(state.mmx, expected.1.mmx);
+                assert_eq!(state.x87, expected.1.x87);
+                assert!(*memory == expected.2);
+            }
+            assert_eq!(baseline.4.resident_entries, 0);
+            assert_eq!(enabled.4.rust_decisions_on_decided_sites, 0);
+            assert_eq!(baseline.3, enabled.3);
+            assert_eq!(baseline.4.tier1_counts(), enabled.4.tier1_counts());
+        }
+    }
 }
 
 /// A loop of the x87 code compilers emit for float expressions, under the
@@ -2828,7 +2872,7 @@ fn first_divergence() {
     let config = (Features { flagm: true }, false, Checks::Adaptive);
     for budget in 1..5000 {
         let (outcome, state, memory) = reference(&program, budget);
-        let (a, b, m, _) = translated(&program, budget, config);
+        let (a, b, m, _, _) = translated(&program, budget, config, false);
         if a != outcome
             || b.regs != state.regs
             || b.eflags != state.eflags

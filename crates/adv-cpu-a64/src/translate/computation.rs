@@ -137,7 +137,6 @@ pub(crate) struct Evaluation {
 }
 
 impl Evaluation {
-    /// The ranges the last evaluation admitted and the words it read since.
     pub(crate) fn admitted(&self) -> &[Range] {
         &self.ranges
     }
@@ -2287,6 +2286,19 @@ impl Proof {
 
     pub(crate) fn division(&self, index: usize) -> Option<Division> {
         self.divisions[index]
+    }
+
+    pub(crate) fn entry_registers(&self) -> u8 {
+        let esp = self
+            .checks
+            .iter()
+            .any(|check| matches!(check, Check::StackAlignment(_)));
+        self.exprs
+            .iter()
+            .fold(u8::from(esp) << ESP, |mask, expr| match expr {
+                Expr::Register(reg) => mask | (1 << reg),
+                _ => mask,
+            })
     }
 
     /// Evaluate at the matching unit entry. The reader grants and reads one

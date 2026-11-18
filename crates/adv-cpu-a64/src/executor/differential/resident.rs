@@ -626,38 +626,49 @@ fn generated(shape: Shape, seed: u64) {
         })
         .collect();
     let pointed: Vec<u8> = (0..256).map(|_| rng.next() as u8).collect();
-    for fuel in [32, 4096] {
-        let mut trial = Trial::new(
-            &image,
-            &state,
-            format!("{shape:?} seed {seed:#x} fuel {fuel}"),
-            &[],
-            |m| {
-                m.write(DATA, &words).unwrap();
-                m.write(DATA + 0x800, &pointed).unwrap();
-            },
-        );
-        trial.install();
-        let (outcome, retired) = trial.compare(fuel);
-        if fuel == 32 {
-            assert_eq!((outcome, retired), (RunOutcome::Budget, fuel));
-            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
-        } else {
-            assert_eq!(outcome, RunOutcome::ReachedStop);
-        }
-        assert_eq!(
-            trial.live.state.regs[1],
-            if matches!(shape, Shape::EarlyExit) {
-                early_count as u32
-            } else {
-                0
+    for baseline_only in [false, true] {
+        for fuel in [32, 4096] {
+            let mut trial = Trial::new(
+                &image,
+                &state,
+                format!("{shape:?} seed {seed:#x} fuel {fuel}"),
+                &[],
+                |m| {
+                    m.write(DATA, &words).unwrap();
+                    m.write(DATA + 0x800, &pointed).unwrap();
+                },
+            );
+            trial
+                .live
+                .native
+                .as_mut()
+                .unwrap()
+                .set_baseline_only(baseline_only);
+            if !baseline_only {
+                trial.install();
             }
-        );
-        trial.compare_epilogue();
+
+            let (outcome, retired) = trial.compare(fuel);
+            if fuel == 32 {
+                assert_eq!((outcome, retired), (RunOutcome::Budget, fuel));
+                assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+            } else {
+                assert_eq!(outcome, RunOutcome::ReachedStop);
+            }
+            assert_eq!(
+                trial.live.state.regs[1],
+                if matches!(shape, Shape::EarlyExit) {
+                    early_count as u32
+                } else {
+                    0
+                }
+            );
+            trial.compare_epilogue();
+        }
     }
 }
 
-// spec: A64-OPT-9
+// spec: A64-OPT-9 A64-OPT-13
 #[test]
 fn seeded_loops_match_at_the_stop_and_at_every_owner_exit() {
     for shape in [

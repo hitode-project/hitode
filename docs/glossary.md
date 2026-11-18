@@ -24,6 +24,13 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | execution form | 执行形式 | The path that executes an instruction: translated unit code, an operation helper, an interpret call, or interpreter execution including first visits. Interpreted REP elements are counted separately; native ones count as translated work. |
 | execution contract | 执行契约 | The state, memory access, exit and recovery rules that Tier 0 and the AArch64 translator share. `CpuState` is the authoritative state. |
 | coherent shared view | 一致共享视图 | A shared file view whose writers all pass through one memory owner; its aliases participate in code invalidation. |
+| artifact | 编译产物 | Code produced for a specific consumer, including a Tier-1 unit, resident form, worker job or native body. |
+| site plan | 站点计划 | The arbiter's chosen dispatch state and counters for a guest instruction address. |
+| arbiter | 仲裁器 | The owner of site plans and the publisher of native links and patches. |
+| overlay | 优化层 | A plan-selected execution path over the Tier-1 baseline. |
+| baseline | 基线 | Tier-1 execution with optimization overlays disabled. |
+| offload service | 卸载服务 | The code that admits, paces and runs detached worker jobs. |
+| worker job | 工作任务 | A detached computation artifact whose effects are proved and admitted before execution. |
 | code cache | 代码缓存 | Translated code retained in one process. |
 | soft page | 软页 | A host page protected more strictly than the 4 KiB permission table says, for mixed permissions, translated code, shared audio memory or first file access. Accesses fault and are emulated, and hot access sites are translated again as checked accesses. |
 | biased ESP / EBP | 偏置 ESP／EBP | In a64, x23 and x24 hold the window base plus ESP and EBP. The window is 4 GiB aligned, so the low 32 bits are the guest value. |

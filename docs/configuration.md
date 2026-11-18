@@ -58,6 +58,7 @@ Header macros, placeholder names in script examples and names read only to clear
 
 | Name | Kind | Default |
 |---|---|---|
+| `ADV_A64_BASELINE` | Diagnostic | Off. Set to `1` to hold site plans at Tier-1 baseline and disable resident and worker overlays. |
 | `ADV_ANDROID_SHELL_BUILD` | Fixture | Build-time label `unrecorded` |
 | `ADV_ARTIFACT_ROOT` | Fixture | The repository `target` |
 | `ADV_AUDIO_CAPTURE_CALLBACK` | Diagnostic | No output |

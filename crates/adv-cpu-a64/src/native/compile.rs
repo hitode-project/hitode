@@ -40,7 +40,7 @@ pub(super) struct Compiled {
     pub code: usize,
     pub task: Task,
     pub at: CpuState,
-    pub resident: Option<ResidentForm>,
+    pub resident: Option<Result<ResidentForm, front::Reject>>,
     pub job: Option<Job>,
 }
 
@@ -144,13 +144,13 @@ fn compile(request: Request) -> Compiled {
                 );
                 let (cuts, us) = (built.cuts + cuts.len(), started.elapsed().as_micros());
                 crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
-                Some(ResidentForm { built, lowered })
+                Some(Ok(ResidentForm { built, lowered }))
             }
             Err(reject) => {
                 let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
                 let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
                 crate::jit_map::optimized(eip, format_args!("{reject:?}\t{pc}\t{op:?}"));
-                None
+                Some(Err(reject))
             }
         }
     };
