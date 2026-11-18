@@ -61,3 +61,7 @@ workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFString", "CFURL"] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["CTFontCollection", "CTFontDescriptor"] }
