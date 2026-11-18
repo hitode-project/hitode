@@ -3,12 +3,23 @@
 use super::*;
 use crate::translate::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
+use adv_cpu_core::memory::PAGE_SIZE;
+
+pub(super) struct Resident<'a> {
+    pub refused: &'a dyn Fn(u32) -> bool,
+    pub regions: &'a BTreeMap<RecordId, RecordId>,
+    pub frame_guards: &'a std::collections::BTreeSet<RecordId>,
+    pub frame_range: Option<(i32, i32)>,
+    pub frame_reads: &'a BTreeMap<u32, Vec<(i32, u8)>>,
+    pub plain_sites: &'a mut Vec<u32>,
+}
 
 pub(super) fn run(
     func: &mut Func,
-    proof: &Proof,
+    facts: &dyn Facts,
     loads: &BTreeMap<Value, usize>,
     stores: &BTreeMap<RecordId, usize>,
+    mut resident: Option<&mut Resident<'_>>,
 ) {
     if let Some(i) = func.entry.iter().position(|s| *s == Source::Eflags) {
         let base = func.blocks[0].params[i];
@@ -44,10 +55,13 @@ pub(super) fn run(
     while entry_flags(func) {
         settle(func);
     }
-    hoist(func, proof, loads);
+    hoist(func, facts, loads, stores, resident.as_deref_mut());
     while propagate(func) {}
+    if let Some(r) = &resident {
+        store_guards(func, facts, loads, stores, r);
+    }
     join(func);
-    group_stores(func, proof, loads, stores);
+    group_stores(func, facts, loads, stores, resident.is_some());
     sse_inputs(func);
     dead(func);
     validations(func);
@@ -90,6 +104,9 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         }
         | Op::FrameStore {
             base: a, value: b, ..
+        }
+        | Op::FrameDisjoint {
+            addr: a, base: b, ..
         } => {
             f(a);
             f(b);
@@ -407,7 +424,25 @@ fn propagate(func: &mut Func) -> bool {
             }
             defs[r.0 as usize] = Some(*op);
             if op.pure() || block_index == 0 && matches!(op, Op::Load { .. }) {
-                if let Some((_, other)) = numbered.iter().find(|(other, _)| other == op) {
+                if let Some((_, other)) = numbered.iter().find(|(other, _)| match (*other, *op) {
+                    (
+                        Op::Load {
+                            ty: a,
+                            width: aw,
+                            addr: av,
+                            checked: ac,
+                            ..
+                        },
+                        Op::Load {
+                            ty: b,
+                            width: bw,
+                            addr: bv,
+                            checked: bc,
+                            ..
+                        },
+                    ) => (a, aw, av, ac) == (b, bw, bv, bc),
+                    _ => other == op,
+                }) {
                     alias[r.0 as usize] = *other;
                     changed = true;
                 } else {
@@ -1065,7 +1100,9 @@ fn validations(func: &mut Func) {
         for (b, block) in func.blocks.iter().enumerate() {
             let mut p = pending[b];
             for (_, op) in &block.insts {
-                p = if matches!(op, Op::Validate | Op::Store { .. } | Op::FrameStore { .. }) {
+                p = if matches!(op, Op::Validate | Op::Store { .. } | Op::FrameStore { .. })
+                    || op.region_guard().is_some()
+                {
                     false
                 } else {
                     p || op.floating()
@@ -1089,7 +1126,9 @@ fn validations(func: &mut Func) {
         let mut p = pending[b];
         let mut insts = Vec::new();
         for inst in std::mem::take(&mut block.insts) {
-            if matches!(inst.1, Op::Store { .. } | Op::FrameStore { .. }) && p {
+            if p && (matches!(inst.1, Op::Store { .. } | Op::FrameStore { .. })
+                || inst.1.region_guard().is_some())
+            {
                 insts.push((None, Op::Validate));
                 p = false;
             }
@@ -1103,6 +1142,35 @@ fn validations(func: &mut Func) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PlainRead {
+    base: Option<Value>,
+    start: u32,
+    bytes: u32,
+    addr: Value,
+    pc: u32,
+}
+
+impl PlainRead {
+    fn merged(mut self, other: Self) -> Option<Self> {
+        if self.base != other.base {
+            return None;
+        }
+        let forward = other.start.wrapping_sub(self.start);
+        let backward = self.start.wrapping_sub(other.start);
+        if forward <= PAGE_SIZE as u32 - other.bytes {
+            self.bytes = self.bytes.max(forward + other.bytes);
+        } else if backward <= PAGE_SIZE as u32 - self.bytes {
+            self.bytes = other.bytes.max(backward + self.bytes);
+            self.start = other.start;
+            self.addr = other.addr;
+        } else {
+            return None;
+        }
+        Some(self)
+    }
+}
+
 /// Moves loads that read invariant memory, and the operations their
 /// addresses need, out of loops into block 0. Only blocks that run on every
 /// iteration give them up: hoisting from a side path would hold a register
@@ -1110,21 +1178,55 @@ fn validations(func: &mut Func) {
 /// they are used, so they hold no register across the loop either. Nothing
 /// moves when the loads would not fit in registers beside what loop heads
 /// carry.
-fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
-    let every = per_iteration(func);
+fn hoist(
+    func: &mut Func,
+    facts: &dyn Facts,
+    loads: &BTreeMap<Value, usize>,
+    stores: &BTreeMap<RecordId, usize>,
+    mut resident: Option<&mut Resident<'_>>,
+) {
+    let every = per_iteration(func, resident.is_some());
     let mut available = vec![false; func.types.len()];
-    for &p in &func.blocks[0].params {
-        available[p.0 as usize] = true;
+    for (&p, source) in func.blocks[0].params.iter().zip(&func.entry) {
+        available[p.0 as usize] = resident.is_none() || matches!(source, Source::Reg(_));
     }
-    for &(r, _) in &func.blocks[0].insts {
-        if let Some(r) = r {
+    for &(r, op) in &func.blocks[0].insts {
+        if let Some(r) = r
+            && (resident.is_none() || op.pure() && op.uses().all(|v| available[v.0 as usize]))
+        {
             available[r.0 as usize] = true;
         }
     }
+    let defs = definitions(func);
+    let writes: Vec<_> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|&(_, op)| match op {
+            Op::Store {
+                addr, width, after, ..
+            } => Some((addr, width, stores[&after])),
+            _ => None,
+        })
+        .collect();
+    let frame_commits = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(_, op)| matches!(op, Op::FrameStore { .. }))
+    });
     let invariant = |r: Value, op: Op| {
-        op.pure()
-            || matches!(op, Op::Load { .. })
-                && loads.get(&r).is_some_and(|&i| proof.invariant_read(i))
+        let Op::Load { addr, width, .. } = op else {
+            return false;
+        };
+        loads.get(&r).is_some_and(|&i| {
+            facts.invariant_read(i)
+                || resident.is_some()
+                    && !frame_commits
+                    && writes.iter().all(|&(store, bytes, site)| {
+                        relation(&defs, store, bytes, addr, width) == Some(true)
+                            || facts.disjoint_effects(site, i)
+                    })
+        })
     };
     // What could move, then what hoisted loads need.
     let mut movable = available.clone();
@@ -1136,7 +1238,7 @@ fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
                 if let Some(r) = r
                     && every[b]
                     && !movable[r.0 as usize]
-                    && invariant(r, op)
+                    && (op.pure() || resident.is_none() && invariant(r, op))
                     && op.uses().all(|v| movable[v.0 as usize])
                 {
                     movable[r.0 as usize] = true;
@@ -1147,6 +1249,54 @@ fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
         }
         if !changed {
             break;
+        }
+    }
+    let mut spans = Vec::<PlainRead>::new();
+    if let Some(resident) = &resident {
+        let mut remaining = MAX_PLAIN_FACTS - resident.plain_sites.len();
+        for (b, block) in func.blocks.iter().enumerate().skip(1) {
+            let mut before_effect = every[b];
+            for &(r, op) in &block.insts {
+                if let (
+                    Some(r),
+                    Op::Load {
+                        addr, width, pc, ..
+                    },
+                ) = (r, op)
+                    && before_effect
+                    && invariant(r, op)
+                    && movable[addr.0 as usize]
+                {
+                    let (base, start) = address(&defs, addr);
+                    let span = PlainRead {
+                        base,
+                        start,
+                        bytes: u32::from(width),
+                        addr,
+                        pc,
+                    };
+                    // The first site identifies the entire span when entry refuses it.
+                    let refused = (resident.refused)(pc);
+                    if let Some((known, merged)) = spans
+                        .iter_mut()
+                        .find_map(|known| known.merged(span).map(|merged| (known, merged)))
+                    {
+                        if (resident.refused)(known.pc) {
+                            *known = merged;
+                        } else if !refused {
+                            *known = merged;
+                            ops.insert(r, op);
+                        }
+                    } else if refused || remaining != 0 {
+                        spans.push(span);
+                        if !refused {
+                            remaining -= 1;
+                            ops.insert(r, op);
+                        }
+                    }
+                }
+                before_effect &= !hoist_effect(op);
+            }
         }
     }
     let mut needed = vec![false; func.types.len()];
@@ -1175,12 +1325,29 @@ fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
         }
         work.extend(ops[&r].uses().filter(|v| ops.contains_key(v)));
     }
+    let mut reused = Vec::new();
+    let entry_tail = if resident.is_some() {
+        let entry = &mut func.blocks[0].insts;
+        let start = entry
+            .iter()
+            .position(|&(r, op)| {
+                !matches!(op, Op::PlainPage { .. }) && r.is_none_or(|r| !available[r.0 as usize])
+            })
+            .unwrap_or(entry.len());
+        entry.split_off(start)
+    } else {
+        Vec::new()
+    };
     loop {
         let mut moved = Vec::new();
         for block in &mut func.blocks[1..] {
             block.insts.retain(|&(r, op)| match r {
                 Some(r) if needed[r.0 as usize] && op.uses().all(|v| available[v.0 as usize]) => {
-                    moved.push((Some(r), op));
+                    if resident.is_some() && matches!(op, Op::Load { .. }) {
+                        reused.push((Some(r), op));
+                    } else {
+                        moved.push((Some(r), op));
+                    }
                     available[r.0 as usize] = true;
                     false
                 }
@@ -1192,11 +1359,33 @@ fn hoist(func: &mut Func, proof: &Proof, loads: &BTreeMap<Value, usize>) {
         }
         func.blocks[0].insts.extend(moved);
     }
+    if let Some(resident) = &mut resident {
+        for span in spans
+            .into_iter()
+            .filter(|span| !(resident.refused)(span.pc))
+        {
+            func.push(
+                Block(0),
+                Op::PlainPage {
+                    addr: span.addr,
+                    bytes: span.bytes,
+                    write: false,
+                },
+            );
+            resident.plain_sites.push(span.pc);
+        }
+        func.blocks[0].insts.extend(reused);
+        func.blocks[0].insts.extend(entry_tail);
+    }
+}
+
+fn hoist_effect(op: Op) -> bool {
+    op.effect() && !matches!(op, Op::Load { checked: false, .. } | Op::PlainPage { .. })
 }
 
 /// Blocks that run on every iteration of a loop that encloses them: the
 /// loop head dominates them and they dominate one of its backedges.
-fn per_iteration(func: &Func) -> Vec<bool> {
+fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
     let count = func.blocks.len();
     let words = count.div_ceil(64);
     let mut predecessors = vec![Vec::new(); count];
@@ -1227,6 +1416,23 @@ fn per_iteration(func: &Func) -> Vec<bool> {
         if !changed {
             break;
         }
+    }
+    if resident {
+        let mut required = Vec::new();
+        let mut has_backedge = false;
+        for (b, block) in func.blocks.iter().enumerate() {
+            let backedge = block
+                .end
+                .targets()
+                .any(|t| has(&dominators[b], t.block.0 as usize));
+            has_backedge |= backedge;
+            if backedge || block.insts.iter().any(|&(_, op)| hoist_effect(op)) {
+                required.push(b);
+            }
+        }
+        return (0..count)
+            .map(|b| has_backedge && required.iter().all(|&end| has(&dominators[end], b)))
+            .collect();
     }
     let mut every = vec![false; count];
     for (latch, data) in func.blocks.iter().enumerate() {
@@ -1276,32 +1482,63 @@ fn join(func: &mut Func) {
 
 fn group_stores(
     func: &mut Func,
-    proof: &Proof,
+    facts: &dyn Facts,
     loads: &BTreeMap<Value, usize>,
     stores: &BTreeMap<RecordId, usize>,
+    resident: bool,
 ) {
+    let defs = definitions(func);
     for block in &mut func.blocks {
         let mut pending = Vec::new();
         let mut output = Vec::new();
         for inst in std::mem::take(&mut block.insts) {
             if matches!(inst.1, Op::Store { .. }) {
-                pending.push(inst);
+                if output
+                    .last()
+                    .is_some_and(|(_, op): &(Option<Value>, Op)| op.region_guard().is_some())
+                {
+                    output.push(inst);
+                } else {
+                    pending.push(inst);
+                }
                 continue;
             }
             let cross = match inst {
-                (Some(r), Op::Load { .. }) => loads.get(&r).is_some_and(|&load| {
+                (
+                    Some(r),
+                    Op::Load {
+                        addr,
+                        width,
+                        checked,
+                        ..
+                    },
+                ) => loads.get(&r).is_some_and(|&load| {
                     pending.iter().all(|(_, op)| {
-                        let Op::Store { after, .. } = op else {
+                        let Op::Store {
+                            after,
+                            addr: store,
+                            width: bytes,
+                            checked: store_checked,
+                            ..
+                        } = *op
+                        else {
                             unreachable!()
                         };
-                        proof.disjoint_effects(stores[after], load)
+                        (!resident || !checked && !store_checked)
+                            && (facts.disjoint_effects(stores[&after], load)
+                                || resident
+                                    && relation(&defs, store, bytes, addr, width) == Some(true))
                     })
                 }),
                 (
                     _,
-                    Op::Div { .. } | Op::SseInput { .. } | Op::Validate | Op::FrameStore { .. },
+                    Op::Div { .. }
+                    | Op::SseInput { .. }
+                    | Op::Validate
+                    | Op::FrameStore { .. }
+                    | Op::PageCross { .. },
                 ) => false,
-                _ => true,
+                (_, op) => !resident || !op.can_fail() && !matches!(op, Op::FrameLoad { .. }),
             };
             if !cross {
                 output.append(&mut pending);
@@ -1310,5 +1547,145 @@ fn group_stores(
         }
         output.append(&mut pending);
         block.insts = output;
+    }
+}
+
+fn definitions(func: &Func) -> Vec<Option<Op>> {
+    let mut defs = vec![None; func.types.len()];
+    for &(r, op) in func.blocks.iter().flat_map(|b| &b.insts) {
+        if let Some(r) = r {
+            defs[r.0 as usize] = Some(op);
+        }
+    }
+    defs
+}
+
+/// An SSA base plus a constant displacement in guest address arithmetic.
+fn address(defs: &[Option<Op>], mut addr: Value) -> (Option<Value>, u32) {
+    let mut offset = 0u32;
+    loop {
+        match defs[addr.0 as usize] {
+            Some(Op::Constant(Type::I32, n)) => return (None, offset.wrapping_add(n as u32)),
+            Some(Op::Int(IntOp::Add, base, c)) if constant(defs, c).is_some() => {
+                offset = offset.wrapping_add(constant(defs, c).unwrap() as u32);
+                addr = base;
+            }
+            _ => return (Some(addr), offset),
+        }
+    }
+}
+
+fn relation(defs: &[Option<Op>], a: Value, aw: u8, b: Value, bw: u8) -> Option<bool> {
+    let (ab, a) = address(defs, a);
+    let (bb, b) = address(defs, b);
+    (ab == bb).then(|| facts::disjoint(a, aw, b, bw))
+}
+
+/// A partial store must not change a load that replay from the region would read.
+fn store_guards(
+    func: &mut Func,
+    facts: &dyn Facts,
+    loads: &BTreeMap<Value, usize>,
+    stores: &BTreeMap<RecordId, usize>,
+    resident: &Resident<'_>,
+) {
+    let defs = definitions(func);
+    let esp = func
+        .entry
+        .iter()
+        .position(|&s| s == Source::Reg(ESP))
+        .map(|i| func.blocks[0].params[i]);
+    let mut incoming = vec![std::collections::BTreeSet::new(); func.blocks.len()];
+    let mut work: Vec<_> = (1..func.blocks.len()).rev().collect();
+    let load = |r: Option<Value>, op: Op| match (r, op) {
+        (Some(r), Op::Load { addr, width, .. }) => {
+            Some((address(&defs, addr), width, loads.get(&r).copied()))
+        }
+        _ => None,
+    };
+    let frame = |eip: Option<u32>| {
+        eip.and_then(|pc| resident.frame_reads.get(&pc))
+            .into_iter()
+            .flatten()
+            .map(|&(offset, width)| ((esp, offset as u32), width, None))
+    };
+    while let Some(b) = work.pop() {
+        let block = &func.blocks[b];
+        let mut read = incoming[b].clone();
+        read.extend(frame(block.eip));
+        for &(r, op) in &block.insts {
+            if matches!(op, Op::Store { .. }) {
+                read.clear();
+            }
+            read.extend(load(r, op));
+        }
+        for t in block.end.targets() {
+            let t = t.block.0 as usize;
+            if func.blocks[t].head.is_none() && !read.is_subset(&incoming[t]) {
+                incoming[t].extend(&read);
+                work.push(t);
+            }
+        }
+    }
+    for (b, block) in func.blocks.iter_mut().enumerate().skip(1) {
+        let mut read = std::mem::take(&mut incoming[b]);
+        read.extend(frame(block.eip));
+        let insts = std::mem::take(&mut block.insts);
+        for (r, op) in insts {
+            if let Op::Store {
+                addr, width, after, ..
+            } = op
+            {
+                let page = PAGE_SIZE as u32;
+                let (base, offset) = address(&defs, addr);
+                let record = resident.regions[&after];
+                let mut guarded_frame = false;
+                if resident.frame_guards.contains(&after)
+                    && let (Some(esp), Some((lo, hi))) = (esp, resident.frame_range)
+                    && (base != Some(esp)
+                        || !disjoint_ranges(
+                            offset,
+                            u32::from(width),
+                            lo as u32,
+                            (i64::from(hi) - i64::from(lo)) as u32,
+                        ))
+                {
+                    block.insts.push((
+                        None,
+                        Op::FrameDisjoint {
+                            addr,
+                            width,
+                            base: esp,
+                            lo,
+                            hi,
+                            record,
+                        },
+                    ));
+                    guarded_frame = true;
+                }
+                if width > 1
+                    && (base.is_some() || offset % page > page - u32::from(width))
+                    && read.iter().any(|&((source, at), size, site)| {
+                        if guarded_frame && site.is_none() {
+                            return false;
+                        }
+                        !(source == base && facts::disjoint(offset, width, at, size)
+                            || site.is_some_and(|i| facts.disjoint_effects(stores[&after], i)))
+                    })
+                {
+                    block.insts.push((
+                        None,
+                        Op::PageCross {
+                            addr,
+                            width,
+                            record,
+                        },
+                    ));
+                }
+                read.clear();
+            }
+            read.extend(load(r, op));
+            block.insts.push((r, op));
+        }
     }
 }

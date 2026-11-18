@@ -12,6 +12,13 @@ use super::recovery::IrRecord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Value(pub u32);
 
+pub(crate) const MAX_PLAIN_FACTS: usize = 8;
+
+/// Disjoint byte ranges in wrapping 32-bit guest address arithmetic.
+pub(crate) fn disjoint_ranges(a: u32, aw: u32, b: u32, bw: u32) -> bool {
+    b.wrapping_sub(a) >= aw && a.wrapping_sub(b) >= bw
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Block(pub u32);
 
@@ -219,15 +226,16 @@ pub(crate) enum Op {
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
     VecToInt(VecToInt, Value),
-    /// A load of `width` bytes outside the frame, zero-extended to `ty`.
+    /// A memory load of `width` bytes, zero-extended to `ty`.
     Load {
         ty: Type,
         width: u8,
         addr: Value,
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
+        pc: u32,
     },
-    /// A store outside the frame: an effect point. Region `after` starts at
+    /// A memory store: an effect point. Region `after` starts at
     /// the guest boundary after it.
     Store {
         width: u8,
@@ -236,6 +244,7 @@ pub(crate) enum Op {
         after: RecordId,
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
+        pc: u32,
     },
     /// An entry fact of a resident form: the pages `addr..addr + bytes`
     /// are ordinary (A64-MEM-14). Only the entry block holds these, before
@@ -243,12 +252,22 @@ pub(crate) enum Op {
     PlainPage {
         addr: Value,
         bytes: u32,
+        write: bool,
     },
-    /// Leaves through `record` when `addr..addr + width` crosses a page,
+    /// Recovers to `record` when `addr..addr + width` crosses a page,
     /// before a store whose region already read those bytes.
     PageCross {
         addr: Value,
         width: u8,
+        record: RecordId,
+    },
+    /// Recovers to the store's region start if its bytes intersect the frame.
+    FrameDisjoint {
+        addr: Value,
+        width: u8,
+        base: Value,
+        lo: i32,
+        hi: i32,
         record: RecordId,
     },
     /// The host address of a guest address: the base frame accesses add
@@ -319,6 +338,9 @@ impl Op {
             }
             | Op::FrameStore {
                 base: a, value: b, ..
+            }
+            | Op::FrameDisjoint {
+                addr: a, base: b, ..
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b }
@@ -347,6 +369,8 @@ impl Op {
                 self,
                 Op::Div { proved: false, .. }
                     | Op::FromInt(_)
+                    | Op::PageCross { .. }
+                    | Op::FrameDisjoint { .. }
                     | Op::Load { .. }
                     | Op::Store { .. }
                     | Op::X87Load { .. }
@@ -354,9 +378,20 @@ impl Op {
             )
     }
 
+    pub(crate) fn region_guard(&self) -> Option<RecordId> {
+        match *self {
+            Op::PageCross { record, .. } | Op::FrameDisjoint { record, .. } => Some(record),
+            _ => None,
+        }
+    }
+
     /// Whether the operation must stay although nothing uses its result.
     pub(crate) fn effect(&self) -> bool {
-        self.can_fail() || matches!(self, Op::FrameStore { .. } | Op::Validate)
+        self.can_fail()
+            || matches!(
+                self,
+                Op::FrameStore { .. } | Op::Validate | Op::PlainPage { .. }
+            )
     }
 
     /// Whether the result depends only on the operands, so that equal
@@ -473,6 +508,8 @@ pub(crate) struct Func {
     /// (bits 16–23) the form never writes: records leave them at their entry
     /// values.
     pub kept: u32,
+    /// Charged heads in resident forms leave through complete records.
+    pub resident: bool,
 }
 
 impl Func {
@@ -543,7 +580,8 @@ impl Func {
             | Op::SseInput { .. }
             | Op::Validate
             | Op::PlainPage { .. }
-            | Op::PageCross { .. } => {
+            | Op::PageCross { .. }
+            | Op::FrameDisjoint { .. } => {
                 return None;
             }
         })

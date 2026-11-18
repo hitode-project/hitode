@@ -2143,3 +2143,363 @@ fn mmx_and_xmm_shuffles_extract_insert_masks_match_interpreter() {
     });
     assert!(built.assumed.mmx);
 }
+
+fn resident_unit(code: &[u8]) -> Unit {
+    let mut memory = memory(code);
+    let mut unit = Unit::default();
+    unit.build(
+        &mut memory,
+        CODE,
+        &[CODE + code.len() as u32],
+        &|_, _| None,
+        &|_| None,
+        true,
+    );
+    unit.trace.x86 = unit
+        .trace
+        .insts
+        .iter()
+        .map(|inst| {
+            let from = (inst.pc - CODE) as usize;
+            let to = (inst.next_pc - CODE) as usize;
+            Some(iced_x86::Decoder::with_ip(32, &code[from..to], u64::from(inst.pc), 0).decode())
+        })
+        .collect();
+    unit
+}
+
+fn resident_loop(body: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+    assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        body(a);
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    })
+}
+
+fn resident(unit: &Unit, proof: Option<&Proof>) -> Built {
+    build_with(unit, proof, &initial(), &|_| false, &|_| false).unwrap()
+}
+
+// spec: A64-OPT-9
+#[test]
+fn resident_accepts_unproved_pointer_reads_and_indexed_stores() {
+    for store in [false, true] {
+        let code = resident_loop(|a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            if store {
+                a.mov(dword_ptr(edi + eax * 4), ebx).unwrap();
+            } else {
+                a.mov(ebx, dword_ptr(eax)).unwrap();
+                a.mov(dword_ptr(edi), ebx).unwrap();
+            }
+            a.add(esi, 4).unwrap();
+        });
+        let unit = resident_unit(&code);
+        let proof = Proof::build(&unit.trace).ok();
+        let checked_pc = unit.trace.insts[1].pc;
+        for proof in std::iter::once(None).chain(proof.as_ref().map(Some)) {
+            let built =
+                build_with(&unit, proof, &initial(), &|pc| pc == checked_pc, &|_| false).unwrap();
+            assert_eq!(
+                count(
+                    &built,
+                    |op| matches!(op, Op::Load { checked: true, pc, .. } | Op::Store { checked: true, pc, .. } if *pc == checked_pc)
+                ),
+                1
+            );
+            assert_eq!(
+                count(
+                    &built,
+                    |op| matches!(op, Op::Load { checked: false, pc, .. } if *pc == CODE)
+                ),
+                1
+            );
+        }
+    }
+}
+
+// spec: A64-OPT-5, A64-OPT-9
+#[test]
+fn resident_hoists_only_with_entry_page_facts_within_budget() {
+    for step in [4, 4096] {
+        let code = resident_loop(|a| {
+            for i in 0..10 {
+                a.mov(eax, dword_ptr(esi + 4088 + i * step)).unwrap();
+            }
+            a.mov(dword_ptr(esi + 64), ebx).unwrap();
+        });
+        let unit = resident_unit(&code);
+        let proof = Proof::build(&unit.trace).unwrap();
+        for proof in [None, Some(&proof)] {
+            let refused = unit.trace.insts[1].pc;
+            let built = build_with(&unit, proof, &initial(), &|_| false, &|pc| {
+                step == 4096 && pc == refused
+            })
+            .unwrap();
+            let entry = &built.func.blocks[0].insts;
+            let sites: Vec<_> = entry
+                .iter()
+                .filter_map(|(_, op)| match op {
+                    Op::Load { pc, .. } => Some(*pc),
+                    _ => None,
+                })
+                .collect();
+            let facts: Vec<_> = entry
+                .iter()
+                .filter_map(|(_, op)| match op {
+                    Op::PlainPage {
+                        bytes,
+                        write: false,
+                        ..
+                    } => Some(*bytes),
+                    _ => None,
+                })
+                .collect();
+            if step == 4 {
+                assert_eq!(built.plain_sites, [CODE]);
+                assert_eq!(facts, [40]);
+                assert_eq!(sites.len(), 10);
+                let rebuilt =
+                    build_with(&unit, proof, &initial(), &|_| false, &|pc| pc == CODE).unwrap();
+                assert!(rebuilt.plain_sites.is_empty());
+            } else {
+                assert_eq!(built.plain_sites, sites);
+                assert_eq!(facts, [4; 8]);
+                assert!(!sites.contains(&refused));
+            }
+            assert_eq!(count(&built, |op| matches!(op, Op::Load { .. })), 10);
+        }
+    }
+}
+
+// spec: A64-OPT-5, A64-OPT-6, A64-OPT-9
+#[test]
+fn resident_page_cross_checks_overlap_in_the_current_region() {
+    for (offset, earlier_store, expected) in [(0, false, 1), (4, false, 0), (0, true, 0)] {
+        let code = resident_loop(|a| {
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            if earlier_store {
+                a.mov(dword_ptr(esi + 8), ebx).unwrap();
+            }
+            a.mov(dword_ptr(esi + offset), eax).unwrap();
+        });
+        let unit = resident_unit(&code);
+        let proof = Proof::build(&unit.trace).unwrap();
+        for proof in [None, Some(&proof)] {
+            let built = resident(&unit, proof);
+            assert_eq!(
+                count(&built, |op| matches!(op, Op::PageCross { .. })),
+                expected
+            );
+            if expected == 0 {
+                continue;
+            }
+            let mut memory = memory(&code);
+            let mut at = initial();
+            at.regs[6] = DATA + 4095;
+            memory.write(DATA + 4095, &123u32.to_le_bytes()).unwrap();
+            let run = eval::run(
+                &built.func,
+                &params(&built.func, &at, &mut memory),
+                &mut memory,
+                1000,
+            );
+            let eval::Outcome::Fail(region) = run.outcome else {
+                panic!("{:?}", run.outcome)
+            };
+            let record = &built.func.records[region.0 as usize];
+            assert_eq!(record.eip, CODE);
+            assert_eq!(run.charged - i64::from(record.refund), 0);
+        }
+    }
+}
+
+// spec: A64-OPT-3, A64-OPT-6, A64-OPT-9
+#[test]
+fn resident_frame_tiers_keep_cells_and_publish_write_through_stores() {
+    for tier in 0..3 {
+        let code = resident_loop(|a| {
+            a.mov(dword_ptr(esp - 4), 7).unwrap();
+            if tier >= 1 {
+                a.mov(ebx, dword_ptr(esi)).unwrap();
+            }
+            if tier >= 2 {
+                a.mov(dword_ptr(esi), 9).unwrap();
+            }
+            a.mov(eax, dword_ptr(esp - 4)).unwrap();
+        });
+        let unit = resident_unit(&code);
+        // A detached proof requires a non-frame output.
+        let proof = Proof::build(&unit.trace).ok();
+        assert_eq!(proof.is_some(), tier == 2);
+        for proof in std::iter::once(None).chain(proof.as_ref().map(Some)) {
+            let built = resident(&unit, proof);
+            assert_eq!(built.plain_sites, [u32::MAX]);
+            assert_eq!(count(&built, |op| matches!(op, Op::Store { .. })), tier);
+            assert_eq!(count(&built, |op| matches!(op, Op::FrameLoad { .. })), 0);
+            assert_eq!(
+                count(&built, |op| matches!(op, Op::FrameDisjoint { .. })),
+                usize::from(tier == 2)
+            );
+            let mut memory = resident_memory();
+            let mut at = initial();
+            at.regs[6] = if tier == 2 { DATA } else { FRAME - 4 };
+            let run = eval::run(
+                &built.func,
+                &params(&built.func, &at, &mut memory),
+                &mut memory,
+                1000,
+            );
+            let eval::Outcome::Exit(exit) = run.outcome else {
+                panic!("{:?}", run.outcome)
+            };
+            let record = &built.func.records[exit.0 as usize];
+            assert_eq!(
+                eval::locate(record.regs[0].as_ref().unwrap(), &run.values),
+                7
+            );
+            if tier == 0 {
+                assert_eq!(record.frame.len(), 1);
+            } else {
+                assert!(built.func.records.iter().all(|r| r.frame.is_empty()));
+                let mut bytes = [0; 4];
+                memory.read_into(FRAME - 4, &mut bytes).unwrap();
+                assert_eq!(u32::from_le_bytes(bytes), 7);
+                if tier == 1 {
+                    assert_eq!(
+                        eval::locate(record.regs[3].as_ref().unwrap(), &run.values),
+                        7
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn resident_memory() -> Memory {
+    #[cfg(unix)]
+    let mut memory = Memory::window(CODE, 0x30000).unwrap();
+    #[cfg(not(unix))]
+    let mut memory = Memory::new(CODE, 0x30000).unwrap();
+    memory.map(CODE, 0x30000, 3).unwrap();
+    memory
+}
+
+// spec: A64-OPT-3, A64-OPT-6, A64-OPT-9
+#[test]
+fn resident_ebp_cells_survive_an_indexed_store_until_it_aliases() {
+    let code = resident_loop(|a| {
+        a.mov(eax, dword_ptr(ebp - 4)).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.mov(dword_ptr(ebp - 4), eax).unwrap();
+        a.mov(esi, eax).unwrap();
+        a.mov(dword_ptr(edi + eax * 4), ebx).unwrap();
+        a.mov(edx, dword_ptr(ebp - 4)).unwrap();
+    });
+    let unit = resident_unit(&code);
+    let proof = Proof::build(&unit.trace).ok();
+    for proof in std::iter::once(None).chain(proof.as_ref().map(Some)) {
+        let mut at = initial();
+        at.regs[EBP as usize] = FRAME + 16;
+        let built = build_with(&unit, proof, &at, &|_| false, &|_| false).unwrap();
+        assert_eq!(built.assumed.ebp, Some(16));
+        assert!(built.func.entry.contains(&Source::Frame {
+            offset: 12,
+            width: 4
+        }));
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::Load { .. } | Op::FrameLoad { .. }
+            )),
+            0
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::FrameDisjoint { lo: 12, hi: 16, .. }
+            )),
+            1
+        );
+        for (destination, expected) in [(DATA, 7u32), (FRAME - 4, 4)] {
+            at.regs[7] = destination;
+            let mut memory = resident_memory();
+            memory.write(FRAME + 12, &1u32.to_le_bytes()).unwrap();
+            let run = eval::run(
+                &built.func,
+                &params(&built.func, &at, &mut memory),
+                &mut memory,
+                1000,
+            );
+            match run.outcome {
+                eval::Outcome::Exit(id) if destination == DATA => {
+                    let record = &built.func.records[id.0 as usize];
+                    assert_eq!(
+                        eval::locate(record.regs[2].as_ref().unwrap(), &run.values),
+                        7
+                    );
+                }
+                eval::Outcome::Fail(id) if destination != DATA => {
+                    let record = &built.func.records[id.0 as usize];
+                    assert_eq!(record.eip, unit.trace.insts[3].pc);
+                    assert_eq!(run.charged - i64::from(record.refund), 3);
+                }
+                other => panic!("{other:?}"),
+            }
+            let mut bytes = [0; 4];
+            memory.read_into(FRAME + 12, &mut bytes).unwrap();
+            assert_eq!(u32::from_le_bytes(bytes), expected);
+        }
+    }
+}
+
+// spec: A64-OPT-3, A64-OPT-9
+#[test]
+fn resident_dynamic_esp_disables_cells_and_escape_uses_write_through() {
+    for dynamic in [false, true] {
+        let code = resident_loop(|a| {
+            a.mov(dword_ptr(esp - 4), 7).unwrap();
+            if dynamic {
+                a.sub(esp, ebx).unwrap();
+            } else {
+                a.mov(eax, esp).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+            }
+        });
+        let unit = resident_unit(&code);
+        let proof = Proof::build(&unit.trace).ok();
+        for proof in std::iter::once(None).chain(proof.as_ref().map(Some)) {
+            let built = resident(&unit, proof);
+            assert_eq!(built.plain_sites.is_empty(), dynamic);
+            assert_eq!(
+                count(&built, |op| matches!(op, Op::Store { .. })),
+                if dynamic { 1 } else { 2 }
+            );
+            assert!(built.func.records.iter().all(|r| r.frame.is_empty()));
+        }
+    }
+}
+
+// spec: A64-OPT-9
+#[test]
+fn resident_division_uses_unconditional_local_facts() {
+    for divisor in [-1, 0, 5] {
+        let code = resident_loop(|a| {
+            a.cdq().unwrap();
+            a.mov(ebx, divisor).unwrap();
+            a.idiv(ebx).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        });
+        let unit = resident_unit(&code);
+        let proof = Proof::build(&unit.trace).ok();
+        for proof in std::iter::once(None).chain(proof.as_ref().map(Some)) {
+            let built = resident(&unit, proof);
+            assert_eq!(
+                count(&built, |op| matches!(op, Op::Div { proved: true, .. })),
+                usize::from(divisor == 5)
+            );
+        }
+    }
+}

@@ -5,9 +5,9 @@
 
 use iced_x86::{InstructionInfoFactory, OpAccess};
 
+use super::facts::{self, Facts};
 use super::{Offsets, frame_offset};
 use crate::translate::Unit;
-use crate::translate::computation::Proof;
 use crate::translate::decode::{self, ESP, Mem};
 use crate::translate::integer::Integer;
 use crate::translate::trace::{Edge, Next};
@@ -77,10 +77,11 @@ pub(super) struct Live {
 
 pub(super) fn analyze(
     unit: &Unit,
-    proof: &Proof,
+    facts: &dyn Facts,
     offsets: &[Offsets],
     frame: &[i32],
     models: &[super::model::Model],
+    cuts: &[bool],
 ) -> Live {
     let n = unit.trace.len();
     let all = Set::all(frame.len());
@@ -105,11 +106,11 @@ pub(super) fn analyze(
         if inst.op == decode::Op::Nop {
             reads.push(read);
             defines.push(define);
-            raising.push(false);
+            raising.push(cuts.get(i) == Some(&true));
             touched.push(Set::empty(frame.len()));
             continue;
         }
-        let Some(ins) = proof.instruction(i) else {
+        let Some(ins) = facts::instruction(unit, facts, i) else {
             reads.push(all.clone());
             defines.push(define);
             raising.push(false);
@@ -175,7 +176,7 @@ pub(super) fn analyze(
         }
         reads.push(read);
         defines.push(define);
-        raising.push(raises);
+        raising.push(raises || cuts.get(i) == Some(&true));
         touched.push(touch);
     }
     let registers = Set {

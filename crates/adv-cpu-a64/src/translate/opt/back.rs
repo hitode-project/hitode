@@ -824,8 +824,8 @@ impl<'a> Emitter<'a> {
         let d = result.map_or(T, |v| self.rd(v));
         let q = result.map_or(A, |v| self.vd(v));
         match op {
-            Op::PlainPage { .. } | Op::PageCross { .. } => {
-                unreachable!("only resident forms hold page checks (A64-OPT-9)")
+            Op::PlainPage { .. } | Op::PageCross { .. } | Op::FrameDisjoint { .. } => {
+                unreachable!("only resident forms hold these memory guards (A64-OPT-9)")
             }
             Op::Constant(_, bits) => {
                 if !matches!(loc, Some(Host::Constant(_))) {

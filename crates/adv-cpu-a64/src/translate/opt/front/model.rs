@@ -61,6 +61,7 @@ pub(super) fn analyze(
     at: &CpuState,
     offsets: &[[Option<i32>; 8]],
     kept: &[Option<BTreeSet<i32>>],
+    write_through: bool,
 ) -> Result<Vec<Model>, Reject> {
     let entry = Model {
         top: at.x87.top() as u8,
@@ -100,6 +101,9 @@ pub(super) fn analyze(
                 Some(inst.next_pc),
                 &offsets[i],
             );
+        }
+        if write_through {
+            m.dirty = Default::default();
         }
         let branch = match inst.op {
             decode::Op::Jcc(Cc::Flags(cc), _) => m

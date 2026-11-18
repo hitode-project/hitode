@@ -31,6 +31,7 @@ fn assumptions(cpu: &CpuState) -> Assumed {
         top: cpu.x87.top() as u8,
         tags: cpu.x87.tag,
         esp_low: None,
+        ebp: None,
         denormal: cpu.x87.status & 2 != 0,
         x87: false,
         mmx: false,
