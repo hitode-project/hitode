@@ -33,12 +33,14 @@ void *adv_theora_create(const unsigned char *info, const AdvTheoraSetup *input) 
   th_dec_ctx *decoder = th_decode_alloc(&parsed, &setup);
 #ifdef ADV_THEORA_NEON
   void adv_theora_accel_init(th_dec_ctx *);
-  void adv_theora_dispatch(void *);
   if (decoder != NULL) {
     adv_theora_accel_init(decoder);
-    decoder->adv_dispatch = (void (*)(th_dec_ctx *))adv_theora_dispatch;
   }
 #endif
+  if (decoder != NULL && decoder->state.nfrags >= 1024) {
+    int adv_theora_slots(void);
+    decoder->adv_slots = adv_theora_slots();
+  }
   return decoder;
 }
 

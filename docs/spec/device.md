@@ -153,7 +153,7 @@ They MUST preserve output pixels, return values, counters, seek controls, lifecy
 Guest stream I/O and presentation clocks MUST remain guest-controlled.
 Recognition MUST validate complete function/table fingerprints and relocation relationships, independent of game addresses.
 Callback continuations MUST publish completed rows before returning control to guest code.
-Workers MAY process disjoint native planes. They MUST finish before guest observation and MUST NOT access guest CPU state or memory.
+Workers MAY reconstruct disjoint fragment bands and filter disjoint native planes. They MUST finish before guest observation and MUST NOT access guest CPU state or memory.
 Architectural state MUST follow the admitted library ABI, without instruction-level execution accounting inside native calls.
 Changed library code MUST NOT execute against stale native or guest decoder state.
 Unmatched libraries MUST execute their guest implementations.

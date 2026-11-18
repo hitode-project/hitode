@@ -416,7 +416,7 @@ static int oc_dec_init(oc_dec_ctx *_dec,const th_info *_info,
   _dec->pp_frame_data=NULL;
   _dec->adv_stripe_yield=0;
   _dec->adv_pending=0;
-  _dec->adv_dispatch=NULL;
+  _dec->adv_slots=1;
   _dec->stripe_cb.ctx=NULL;
   _dec->stripe_cb.stripe_decoded=NULL;
 #if defined(HAVE_CAIRO)
@@ -985,50 +985,95 @@ static void oc_dec_block_qis_unpack(oc_dec_ctx *_dec){
 
 
 
-/*Unpacks the DC coefficient tokens.
-  Unlike when unpacking the AC coefficient tokens, we actually need to decode
-   the DC coefficient values now so that we can do DC prediction.
-  _huff_idx:   The index of the Huffman table to use for each color plane.
-  _ntoks_left: The number of tokens left to be decoded in each color plane for
-                each coefficient.
-               This is updated as EOB tokens and zero run tokens are decoded.
-  Return: The length of any outstanding EOB run.*/
-static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
- ptrdiff_t _ntoks_left[3][64]){
-  unsigned char   *dct_tokens;
-  oc_fragment     *frags;
+/*A band starts at a superblock row, so both fragment lists are contiguous
+   in coded order. Each coefficient has an independent token/EOB cursor. */
+typedef struct {
+  int pli;
   const ptrdiff_t *coded_fragis;
-  ptrdiff_t        ncoded_fragis;
-  ptrdiff_t        fragii;
-  ptrdiff_t        eobs;
-  ptrdiff_t        ti;
-  int              pli;
-  dct_tokens=_dec->dct_tokens;
-  frags=_dec->state.frags;
-  coded_fragis=_dec->state.coded_fragis;
-  ncoded_fragis=fragii=eobs=ti=0;
-  for(pli=0;pli<3;pli++){
-    ptrdiff_t run_counts[64];
-    ptrdiff_t eob_count;
-    ptrdiff_t eobi;
-    int       rli;
-    ncoded_fragis+=_dec->state.ncoded_fragis[pli];
-    memset(run_counts,0,sizeof(run_counts));
-    _dec->eob_runs[pli][0]=eobs;
-    _dec->ti0[pli][0]=ti;
-    /*Continue any previous EOB run, if there was one.*/
-    eobi=eobs;
-    if(ncoded_fragis-fragii<eobi)eobi=ncoded_fragis-fragii;
-    eob_count=eobi;
+  const ptrdiff_t *uncoded_fragis;
+  ptrdiff_t ncoded;
+  ptrdiff_t nuncoded;
+  ptrdiff_t ti[64];
+  ptrdiff_t eob_runs[64];
+  ptrdiff_t ntoks_left[64];
+} adv_recon_band;
+
+static int adv_band_height(const oc_theora_state *state,int pli,int slots){
+  const oc_fragment_plane *plane=state->fplanes+pli;
+  if(slots==1)return plane->nvfrags;
+  /*Use up to two bands' worth of work per execution slot. The superblock
+     row is the smallest unit whose coded order stays inside the band. */
+  return 4*OC_MAXI(1,state->nfrags/(2*slots)/(4*plane->nhfrags));
+}
+
+static int adv_band_count(const oc_theora_state *state,int slots){
+  int count=0;
+  for(int pli=0;pli<3;pli++){
+    int rows=adv_band_height(state,pli,slots);
+    count+=(state->fplanes[pli].nvfrags+rows-1)/rows;
+  }
+  return count;
+}
+
+static void adv_bands_init(const oc_theora_state *state,adv_recon_band *band,
+ int slots){
+  const ptrdiff_t *coded=state->coded_fragis;
+  const ptrdiff_t *uncoded=coded+state->nfrags;
+  for(int pli=0;pli<3;pli++){
+    const oc_fragment_plane *plane=state->fplanes+pli;
+    const ptrdiff_t *coded_end=coded+state->ncoded_fragis[pli];
+    int rows=adv_band_height(state,pli,slots);
+    for(int y=0;y<plane->nvfrags;y+=rows,band++){
+      int end=OC_MINI(y+rows,plane->nvfrags);
+      ptrdiff_t limit=plane->froffset+(ptrdiff_t)end*plane->nhfrags;
+      const ptrdiff_t *lo=coded;
+      const ptrdiff_t *hi=coded_end;
+      /*Within a superblock row, Hilbert order need not be raster order.
+         At the boundary, all earlier fragments have smaller indices. */
+      if(end==plane->nvfrags)lo=hi;
+      while(lo<hi){
+        const ptrdiff_t *mid=lo+(hi-lo)/2;
+        if(*mid<limit)lo=mid+1;
+        else hi=mid;
+      }
+      band->pli=pli;
+      band->coded_fragis=coded;
+      band->uncoded_fragis=uncoded;
+      band->ncoded=lo-coded;
+      band->nuncoded=(ptrdiff_t)(end-y)*plane->nhfrags-band->ncoded;
+      coded=lo;
+      uncoded-=band->nuncoded;
+      for(int zzi=0;zzi<64;zzi++)band->ntoks_left[zzi]=band->ncoded;
+    }
+  }
+}
+
+/*Unpack DC in coded order, carrying EOB runs across bands and planes.
+  The DC values are needed later for serial spatial prediction. */
+static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
+ adv_recon_band *bands,int count){
+  unsigned char *dct_tokens=_dec->dct_tokens;
+  oc_fragment   *frags=_dec->state.frags;
+  ptrdiff_t      eobs=0;
+  ptrdiff_t      ti=0;
+  for(int bi=0;bi<count;bi++){
+    adv_recon_band *band=bands+bi;
+    const ogg_int16_t *tree=_dec->huff_tables[_huff_idxs[band->pli+1>>1]];
+    const ptrdiff_t *coded_fragis=band->coded_fragis;
+    ptrdiff_t run_counts[64]={0};
+    ptrdiff_t fragii=0;
+    ptrdiff_t eobi=OC_MINI(eobs,band->ncoded);
+    ptrdiff_t eob_count=eobi;
+    band->eob_runs[0]=eobs;
+    band->ti[0]=ti;
     eobs-=eobi;
     while(eobi-->0)frags[coded_fragis[fragii++]].dc=0;
-    while(fragii<ncoded_fragis){
+    while(fragii<band->ncoded){
       int token;
       int cw;
       int eb;
       int skip;
-      token=oc_huff_token_decode(&_dec->opb,
-       _dec->huff_tables[_huff_idxs[pli+1>>1]]);
+      token=oc_huff_token_decode(&_dec->opb,tree);
       dct_tokens[ti++]=(unsigned char)token;
       if(OC_DCT_TOKEN_NEEDS_MORE(token)){
         eb=(int)oc_pack_read(&_dec->opb,
@@ -1042,7 +1087,7 @@ static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
       eobs=cw>>OC_DCT_CW_EOB_SHIFT&0xFFF;
       if(cw==OC_DCT_CW_FINISH)eobs=OC_DCT_EOB_FINISH;
       if(eobs){
-        eobi=OC_MINI(eobs,ncoded_fragis-fragii);
+        eobi=OC_MINI(eobs,band->ncoded-fragii);
         eob_count+=eobi;
         eobs-=eobi;
         while(eobi-->0)frags[coded_fragis[fragii++]].dc=0;
@@ -1057,47 +1102,32 @@ static ptrdiff_t oc_dec_dc_coeff_unpack(oc_dec_ctx *_dec,int _huff_idxs[2],
         frags[coded_fragis[fragii++]].dc=coeff;
       }
     }
-    /*Add the total EOB count to the longest run length.*/
     run_counts[63]+=eob_count;
-    /*And convert the run_counts array to a moment table.*/
-    for(rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
-    /*Finally, subtract off the number of coefficients that have been
-       accounted for by runs started in this coefficient.*/
-    for(rli=64;rli-->0;)_ntoks_left[pli][rli]-=run_counts[rli];
+    for(int rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
+    for(int rli=0;rli<64;rli++)band->ntoks_left[rli]-=run_counts[rli];
   }
   _dec->dct_tokens_count=ti;
   return eobs;
 }
 
-/*Unpacks the AC coefficient tokens.
-  This can completely discard coefficient values while unpacking, and so is
-   somewhat simpler than unpacking the DC coefficient tokens.
-  _huff_idx:   The index of the Huffman table to use for each color plane.
-  _ntoks_left: The number of tokens left to be decoded in each color plane for
-                each coefficient.
-               This is updated as EOB tokens and zero run tokens are decoded.
-  _eobs:       The length of any outstanding EOB run from previous
-                coefficients.
-  Return: The length of any outstanding EOB run.*/
+/*The original coefficient-major bitstream order is unchanged by banding.
+  A band's remaining count at zzi excludes exactly its own EOB and zero runs
+   started at earlier coefficients. Carrying EOB between bands yields the
+   same token cursor and outstanding run as consuming the whole plane. */
 static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
- ptrdiff_t _ntoks_left[3][64],ptrdiff_t _eobs){
-  unsigned char *dct_tokens;
-  ptrdiff_t      ti;
-  int            pli;
-  dct_tokens=_dec->dct_tokens;
-  ti=_dec->dct_tokens_count;
-  for(pli=0;pli<3;pli++){
-    ptrdiff_t run_counts[64];
-    ptrdiff_t eob_count;
-    size_t    ntoks_left;
-    size_t    ntoks;
-    int       rli;
-    _dec->eob_runs[pli][_zzi]=_eobs;
-    _dec->ti0[pli][_zzi]=ti;
-    ntoks_left=_ntoks_left[pli][_zzi];
-    memset(run_counts,0,sizeof(run_counts));
-    eob_count=0;
-    ntoks=0;
+ adv_recon_band *bands,int count,ptrdiff_t _eobs){
+  unsigned char *dct_tokens=_dec->dct_tokens;
+  ptrdiff_t ti=_dec->dct_tokens_count;
+  for(int bi=0;bi<count;bi++){
+    adv_recon_band *band=bands+bi;
+    const ogg_int16_t *tree=_dec->huff_tables[_huff_idxs[band->pli+1>>1]];
+    ptrdiff_t run_counts[64]={0};
+    ptrdiff_t eob_count=0;
+    size_t ntoks_left=band->ntoks_left[_zzi];
+    size_t ntoks=0;
+    band->eob_runs[_zzi]=_eobs;
+    band->ti[_zzi]=ti;
+    if(ntoks_left==0)continue;
     while(ntoks+_eobs<ntoks_left){
       int token;
       int cw;
@@ -1105,8 +1135,7 @@ static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
       int skip;
       ntoks+=_eobs;
       eob_count+=_eobs;
-      token=oc_huff_token_decode(&_dec->opb,
-       _dec->huff_tables[_huff_idxs[pli+1>>1]]);
+      token=oc_huff_token_decode(&_dec->opb,tree);
       dct_tokens[ti++]=(unsigned char)token;
       if(OC_DCT_TOKEN_NEEDS_MORE(token)){
         eb=(int)oc_pack_read(&_dec->opb,
@@ -1125,24 +1154,18 @@ static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
         ntoks++;
       }
     }
-    /*Add the portion of the last EOB run actually used by this coefficient.*/
     eob_count+=ntoks_left-ntoks;
-    /*And remove it from the remaining EOB count.*/
     _eobs-=ntoks_left-ntoks;
-    /*Add the total EOB count to the longest run length.*/
     run_counts[63]+=eob_count;
-    /*And convert the run_counts array to a moment table.*/
-    for(rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
-    /*Finally, subtract off the number of coefficients that have been
-       accounted for by runs started in this coefficient.*/
-    for(rli=64-_zzi;rli-->0;)_ntoks_left[pli][_zzi+rli]-=run_counts[rli];
+    for(int rli=63;rli-->0;)run_counts[rli]+=run_counts[rli+1];
+    for(int rli=0;rli<64-_zzi;rli++)band->ntoks_left[_zzi+rli]-=run_counts[rli];
   }
   _dec->dct_tokens_count=ti;
   return _eobs;
 }
 
 /*Tokens describing the DCT coefficients that belong to each fragment are
-   stored in the bitstream grouped by coefficient, not by fragment.
+   stored in the bitstream grouped by coefficient.
 
   This means that we either decode all the tokens in order, building up a
    separate coefficient list for each fragment as we go, and then go back and
@@ -1159,29 +1182,22 @@ static int oc_dec_ac_coeff_unpack(oc_dec_ctx *_dec,int _zzi,int _huff_idxs[2],
    each of the 64 coefficients, instead of a counter for every fragment to
    determine where the next token goes.
 
-  We actually use 3 counters per coefficient, one for each color plane, so we
-   can decode all color planes simultaneously.
-  This lets color conversion, etc., be done as soon as a full MCU (one or
-   two super block rows) is decoded, while the image data is still in cache.*/
+  Each band or serial plane starts with its own cursors, so reconstruction
+   can consume the shared token buffer independently. */
 
-static void oc_dec_residual_tokens_unpack(oc_dec_ctx *_dec){
+static void oc_dec_residual_tokens_unpack(oc_dec_ctx *_dec,
+ adv_recon_band *bands,int count){
   static const unsigned char OC_HUFF_LIST_MAX[5]={1,6,15,28,64};
-  ptrdiff_t  ntoks_left[3][64];
   int        huff_idxs[2];
   ptrdiff_t  eobs;
   long       val;
-  int        pli;
   int        zzi;
   int        hgi;
-  for(pli=0;pli<3;pli++)for(zzi=0;zzi<64;zzi++){
-    ntoks_left[pli][zzi]=_dec->state.ncoded_fragis[pli];
-  }
   val=oc_pack_read(&_dec->opb,4);
   huff_idxs[0]=(int)val;
   val=oc_pack_read(&_dec->opb,4);
   huff_idxs[1]=(int)val;
-  _dec->eob_runs[0][0]=0;
-  eobs=oc_dec_dc_coeff_unpack(_dec,huff_idxs,ntoks_left);
+  eobs=oc_dec_dc_coeff_unpack(_dec,huff_idxs,bands,count);
 #if defined(HAVE_CAIRO)
   _dec->telemetry_dc_bytes=oc_pack_bytes_left(&_dec->opb);
 #endif
@@ -1194,7 +1210,7 @@ static void oc_dec_residual_tokens_unpack(oc_dec_ctx *_dec){
     huff_idxs[0]+=16;
     huff_idxs[1]+=16;
     for(;zzi<OC_HUFF_LIST_MAX[hgi];zzi++){
-      eobs=oc_dec_ac_coeff_unpack(_dec,zzi,huff_idxs,ntoks_left,eobs);
+      eobs=oc_dec_ac_coeff_unpack(_dec,zzi,huff_idxs,bands,count,eobs);
     }
   }
   /*TODO: eobs should be exactly zero, or 4096 or greater.
@@ -1331,32 +1347,13 @@ static int oc_dec_postprocess_init(oc_dec_ctx *_dec){
 /*Initialize the main decoding pipeline.*/
 static void oc_dec_pipeline_init(oc_dec_ctx *_dec,
  oc_dec_pipeline_state *_pipe){
-  const ptrdiff_t *coded_fragis;
-  const ptrdiff_t *uncoded_fragis;
-  int              flimit;
-  int              pli;
-  int              qii;
-  int              qti;
-  int              zzi;
+  int flimit;
+  int pli;
+  int qii;
+  int qti;
   /*If chroma is sub-sampled in the vertical direction, we have to decode two
      super block rows of Y' for each super block row of Cb and Cr.*/
   _pipe->mcu_nvfrags=4<<!(_dec->state.info.pixel_fmt&2);
-  /*Initialize the token and extra bits indices for each plane and
-     coefficient.*/
-  memcpy(_pipe->ti,_dec->ti0,sizeof(_pipe->ti));
-  /*Also copy over the initial the EOB run counts.*/
-  memcpy(_pipe->eob_runs,_dec->eob_runs,sizeof(_pipe->eob_runs));
-  /*Set up per-plane pointers to the coded and uncoded fragments lists.*/
-  coded_fragis=_dec->state.coded_fragis;
-  uncoded_fragis=coded_fragis+_dec->state.nfrags;
-  for(pli=0;pli<3;pli++){
-    ptrdiff_t ncoded_fragis;
-    _pipe->coded_fragis[pli]=coded_fragis;
-    _pipe->uncoded_fragis[pli]=uncoded_fragis;
-    ncoded_fragis=_dec->state.ncoded_fragis[pli];
-    coded_fragis+=ncoded_fragis;
-    uncoded_fragis+=ncoded_fragis-_dec->state.fplanes[pli].nfrags;
-  }
   /*Set up condensed quantizer tables.*/
   for(pli=0;pli<3;pli++){
     for(qii=0;qii<_dec->state.nqis;qii++){
@@ -1385,7 +1382,7 @@ static void oc_dec_pipeline_init(oc_dec_ctx *_dec,
      sizeof(_dec->pp_frame_buf[0])*3);
   }
   /*Clear down the DCT coefficient buffer for the first block.*/
-  for(zzi=0;zzi<64;zzi++)_pipe->dct_coeffs[zzi]=0;
+  memset(_pipe->dct_coeffs,0,64*sizeof(_pipe->dct_coeffs[0]));
 }
 
 /*Undo the DC prediction in a single plane of an MCU (one or two super block
@@ -2740,85 +2737,144 @@ static void oc_render_telemetry(th_dec_ctx *_dec,th_ycbcr_buffer _ycbcr,
 }
 #endif
 
-/* One plane owns its fragments, coefficients, pixels and postprocessing rows.
-   This helper retains the serial filter/border order inside that plane. */
-static void adv_process_mcu_plane(th_dec_ctx *_dec,oc_dec_pipeline_state *_pipe,
- int pli,int refi,int stripe_fragy,int notstart,int notdone,
+/*Keep the original border, deblock and dering delays within a plane.
+  Dering reads neighboring pixels and variances from the deblock pass. */
+static void adv_finish_mcu_plane(th_dec_ctx *_dec,int pli,int refi,
+ int fragy0,int fragy_end,int notstart,int notdone,
  int *_avail_fragy0,int *_avail_fragy_end){
-        oc_fragment_plane *fplane;
-        int                frag_shift;
-        int                pp_offset;
-        int                sdelay;
-        int                edelay;
-        fplane=_dec->state.fplanes+pli;
-        /*Compute the first and last fragment row of the current MCU for this
-           plane.*/
-        frag_shift=pli!=0&&!(_dec->state.info.pixel_fmt&2);
-        _pipe->fragy0[pli]=stripe_fragy>>frag_shift;
-        _pipe->fragy_end[pli]=OC_MINI(fplane->nvfrags,
-         _pipe->fragy0[pli]+(_pipe->mcu_nvfrags>>frag_shift));
-        oc_dec_dc_unpredict_mcu_plane(_dec,_pipe,pli);
-        oc_dec_frags_recon_mcu_plane(_dec,_pipe,pli);
-        sdelay=edelay=0;
-        if(_pipe->loop_filter){
-          sdelay+=notstart;
-          edelay+=notdone;
-          oc_state_loop_filter_frag_rows(&_dec->state,
-           _pipe->bounding_values,OC_FRAME_SELF,pli,
-           _pipe->fragy0[pli]-sdelay,_pipe->fragy_end[pli]-edelay);
-        }
-        /*To fill the borders, we have an additional two pixel delay, since a
-           fragment in the next row could filter its top edge, using two pixels
-           from a fragment in this row.
-          But there's no reason to delay a full fragment between the two.*/
-        oc_state_borders_fill_rows(&_dec->state,refi,pli,
-         (_pipe->fragy0[pli]-sdelay<<3)-(sdelay<<1),
-         (_pipe->fragy_end[pli]-edelay<<3)-(edelay<<1));
-        /*Out-of-loop post-processing.*/
-        pp_offset=3*(pli!=0);
-        if(_pipe->pp_level>=OC_PP_LEVEL_DEBLOCKY+pp_offset){
-          /*Perform de-blocking in one plane.*/
-          sdelay+=notstart;
-          edelay+=notdone;
-          oc_dec_deblock_frag_rows(_dec,_dec->pp_frame_buf,
-           _dec->state.ref_frame_bufs[refi],pli,
-           _pipe->fragy0[pli]-sdelay,_pipe->fragy_end[pli]-edelay);
-          if(_pipe->pp_level>=OC_PP_LEVEL_DERINGY+pp_offset){
-            /*Perform de-ringing in one plane.*/
-            sdelay+=notstart;
-            edelay+=notdone;
-            oc_dec_dering_frag_rows(_dec,_dec->pp_frame_buf,pli,
-             _pipe->fragy0[pli]-sdelay,_pipe->fragy_end[pli]-edelay);
-          }
-        }
-        /*If no post-processing is done, we still need to delay a row for the
-           loop filter, thanks to the strange filtering order VP3 chose.*/
-        else if(_pipe->loop_filter){
-          sdelay+=notstart;
-          edelay+=notdone;
-        }
-        /*Compute the intersection of the available rows in all planes.
-          If chroma is sub-sampled, the effect of each of its delays is
-           doubled, but luma might have more post-processing filters enabled
-           than chroma, so we don't know up front which one is the limiting
-           factor.*/
-        *_avail_fragy0=OC_MINI(*_avail_fragy0,
-         _pipe->fragy0[pli]-sdelay<<frag_shift);
-        *_avail_fragy_end=OC_MINI(*_avail_fragy_end,
-         _pipe->fragy_end[pli]-edelay<<frag_shift);
-
+  const oc_dec_pipeline_state *pipe=&_dec->pipe;
+  int frag_shift=pli!=0&&!(_dec->state.info.pixel_fmt&2);
+  int pp_offset=3*(pli!=0);
+  int sdelay=pipe->loop_filter&&notstart;
+  int edelay=pipe->loop_filter&&notdone;
+  /*To fill the borders, we have an additional two pixel delay, since a
+     fragment in the next row could filter its top edge, using two pixels
+     from a fragment in this row.
+    But there's no reason to delay a full fragment between the two.*/
+  oc_state_borders_fill_rows(&_dec->state,refi,pli,
+   (fragy0-sdelay<<3)-(sdelay<<1),
+   (fragy_end-edelay<<3)-(edelay<<1));
+  /*Out-of-loop post-processing.*/
+  if(pipe->pp_level>=OC_PP_LEVEL_DEBLOCKY+pp_offset){
+    /*Perform de-blocking in one plane.*/
+    sdelay+=notstart;
+    edelay+=notdone;
+    oc_dec_deblock_frag_rows(_dec,_dec->pp_frame_buf,
+     _dec->state.ref_frame_bufs[refi],pli,
+     fragy0-sdelay,fragy_end-edelay);
+    if(pipe->pp_level>=OC_PP_LEVEL_DERINGY+pp_offset){
+      /*Perform de-ringing in one plane.*/
+      sdelay+=notstart;
+      edelay+=notdone;
+      oc_dec_dering_frag_rows(_dec,_dec->pp_frame_buf,pli,
+       fragy0-sdelay,fragy_end-edelay);
+    }
+  }
+  /*If no post-processing is done, we still need to delay a row for the
+     loop filter, thanks to the strange filtering order VP3 chose.*/
+  else if(pipe->loop_filter){
+    sdelay+=notstart;
+    edelay+=notdone;
+  }
+  /*Compute the intersection of the available rows in all planes.
+    If chroma is sub-sampled, the effect of each of its delays is
+     doubled, but luma might have more post-processing filters enabled
+     than chroma, so we don't know up front which one is the limiting
+     factor.*/
+  *_avail_fragy0=OC_MINI(*_avail_fragy0,
+   fragy0-sdelay<<frag_shift);
+  *_avail_fragy_end=OC_MINI(*_avail_fragy_end,
+   fragy_end-edelay<<frag_shift);
 }
 
-void adv_theora_plane(void *opaque,int pli){
+static void adv_process_mcu_plane(th_dec_ctx *dec,int pli,int refi,
+ int stripe_fragy,int notstart,int notdone,int *avail0,int *avail_end){
+  oc_dec_pipeline_state *pipe=&dec->pipe;
+  int shift=pli!=0&&!(dec->state.info.pixel_fmt&2);
+  int first=stripe_fragy>>shift;
+  int end=OC_MINI(dec->state.fplanes[pli].nvfrags,
+   first+(pipe->mcu_nvfrags>>shift));
+  pipe->fragy0[pli]=first;
+  pipe->fragy_end[pli]=end;
+  oc_dec_dc_unpredict_mcu_plane(dec,pipe,pli);
+  oc_dec_frags_recon_mcu_plane(dec,pipe,pli);
+  if(pipe->loop_filter)oc_state_loop_filter_frag_rows(&dec->state,
+   pipe->bounding_values,OC_FRAME_SELF,pli,first-notstart,end-notdone);
+  adv_finish_mcu_plane(dec,pli,refi,first,end,notstart,notdone,avail0,avail_end);
+}
+
+typedef struct {
+  th_dec_ctx *dec;
+  const adv_recon_band *bands;
+} adv_recon_frame;
+
+/*th_decode_packetin selects SELF distinct from PREV and GOLD. In
+  oc_state_frag_recon_c (state.c), SELF selects intra; oc_frag_recon_intra_c
+  (fragment.c) and adv_theora_intra (neon.c) write 128 plus the residue without
+  reading dst. The inter and copy functions in those files load only PREV or
+  GOLD, including both source loads for half-pel motion. The host build uses
+  these C/NEON functions and has no MMX reconstruction override. Once the
+  owner has reversed spatial DC prediction, the only writes are the band's
+  8x8 fragment destinations and its private coefficient/cursor scratch. */
+static void adv_recon_band_run(void *opaque,int bi){
+  const adv_recon_frame *frame=(const adv_recon_frame *)opaque;
+  th_dec_ctx *dec=frame->dec;
+  const adv_recon_band *band=frame->bands+bi;
+  int pli=band->pli;
+  oc_dec_pipeline_state pipe;
+  memset(pipe.dct_coeffs,0,64*sizeof(pipe.dct_coeffs[0]));
+  memcpy(pipe.dequant[pli],dec->pipe.dequant[pli],sizeof(pipe.dequant[pli]));
+  memcpy(pipe.ti[pli],band->ti,sizeof(band->ti));
+  memcpy(pipe.eob_runs[pli],band->eob_runs,sizeof(band->eob_runs));
+  pipe.coded_fragis[pli]=band->coded_fragis;
+  pipe.uncoded_fragis[pli]=band->uncoded_fragis;
+  pipe.ncoded_fragis[pli]=band->ncoded;
+  pipe.nuncoded_fragis[pli]=band->nuncoded;
+  oc_dec_frags_recon_mcu_plane(dec,&pipe,pli);
+  oc_restore_fpu(&dec->state);
+}
+
+static void adv_filter_plane(void *opaque,int pli){
   th_dec_ctx *dec=(th_dec_ctx *)opaque;
-  oc_dec_pipeline_state pipe=dec->pipe;
-  int height=dec->state.fplanes[0].nvfrags;
+  OC_ALIGN16(signed char bounds[256]);
+  memcpy(bounds,dec->pipe.bounding_values,sizeof(bounds));
+  /*Visit edges in the original order. A left edge and a top edge share
+     taps at their intersection, so neighboring filter rows can conflict. */
+  oc_state_loop_filter_frag_rows(&dec->state,bounds,OC_FRAME_SELF,pli,0,
+   dec->state.fplanes[pli].nvfrags);
+  oc_restore_fpu(&dec->state);
+}
+
+static void adv_finish_plane(void *opaque,int pli){
+  th_dec_ctx *dec=(th_dec_ctx *)opaque;
   int refi=dec->state.ref_frame_idx[OC_FRAME_SELF];
-  for(int y=0;y<height;y+=pipe.mcu_nvfrags){
-    int first=height,end=height;
-    adv_process_mcu_plane(dec,&pipe,pli,refi,y,y!=0,
-     y+pipe.mcu_nvfrags<height,&first,&end);
+  int shift=pli!=0&&!(dec->state.info.pixel_fmt&2);
+  int rows=dec->pipe.mcu_nvfrags>>shift;
+  int height=dec->state.fplanes[pli].nvfrags;
+  for(int first=0;first<height;first+=rows){
+    int end=OC_MINI(first+rows,height);
+    int avail0=height<<shift;
+    int avail_end=avail0;
+    adv_finish_mcu_plane(dec,pli,refi,first,end,first!=0,end<height,
+     &avail0,&avail_end);
   }
+}
+
+void adv_theora_dispatch(void *ctx,int count,void (*run)(void *,int));
+
+static void adv_decode_bands(th_dec_ctx *dec,const adv_recon_band *bands,
+ int count){
+  adv_recon_frame frame={dec,bands};
+  for(int pli=0;pli<3;pli++){
+    dec->pipe.fragy0[pli]=0;
+    dec->pipe.fragy_end[pli]=dec->state.fplanes[pli].nvfrags;
+    oc_dec_dc_unpredict_mcu_plane(dec,&dec->pipe,pli);
+  }
+  /*Dispatch returns after every task has completed. In the serial stripe
+     path each delay already limits the next stage to finalized rows. */
+  adv_theora_dispatch(&frame,count,adv_recon_band_run);
+  if(dec->pipe.loop_filter)adv_theora_dispatch(dec,3,adv_filter_plane);
+  adv_theora_dispatch(dec,3,adv_finish_plane);
 }
 
 int th_decode_packetin(th_dec_ctx *_dec,const ogg_packet *_op,
@@ -2905,7 +2961,26 @@ int th_decode_packetin(th_dec_ctx *_dec,const ogg_packet *_op,
 #if defined(HAVE_CAIRO)
     _dec->telemetry_qi_bytes=oc_pack_bytes_left(&_dec->opb);
 #endif
-    oc_dec_residual_tokens_unpack(_dec);
+    adv_recon_band serial[3];
+    adv_recon_band *bands=serial;
+    int slots=1;
+    int count=3;
+    if(_dec->adv_slots>1&&!_dec->adv_stripe_yield&&
+     _dec->stripe_cb.stripe_decoded==NULL
+#ifdef HAVE_CAIRO
+     &&!telemetry
+#endif
+    ){
+      int band_count=adv_band_count(&_dec->state,_dec->adv_slots);
+      adv_recon_band *allocated=_ogg_malloc(band_count*sizeof(*bands));
+      if(allocated!=NULL){
+        bands=allocated;
+        count=band_count;
+        slots=_dec->adv_slots;
+      }
+    }
+    adv_bands_init(&_dec->state,bands,slots);
+    oc_dec_residual_tokens_unpack(_dec,bands,count);
     /*Update granule position.
       This must be done before the striped decode callbacks so that the
        application knows what to do with the frame data.*/
@@ -2937,10 +3012,17 @@ int th_decode_packetin(th_dec_ctx *_dec,const ogg_packet *_op,
        to video memory, color conversion, etc.) to also use the data while it's
        in cache.*/
     oc_dec_pipeline_init(_dec,&_dec->pipe);
-    if(_dec->adv_dispatch!=NULL&&!_dec->adv_stripe_yield&&
-     _dec->stripe_cb.stripe_decoded==NULL&&_dec->state.nfrags>=1024){
-      _dec->adv_dispatch(_dec);
+    if(bands!=serial){
+      adv_decode_bands(_dec,bands,count);
+      _ogg_free(bands);
       goto adv_finish_frame;
+    }
+    for(pli=0;pli<3;pli++){
+      memcpy(_dec->pipe.ti[pli],serial[pli].ti,sizeof(serial[pli].ti));
+      memcpy(_dec->pipe.eob_runs[pli],serial[pli].eob_runs,
+       sizeof(serial[pli].eob_runs));
+      _dec->pipe.coded_fragis[pli]=serial[pli].coded_fragis;
+      _dec->pipe.uncoded_fragis[pli]=serial[pli].uncoded_fragis;
     }
     oc_ycbcr_buffer_flip(stripe_buf,_dec->pp_frame_buf);
     notstart=0;
@@ -2961,7 +3043,7 @@ adv_resume_frame:
       avail_fragy0=avail_fragy_end=_dec->state.fplanes[0].nvfrags;
       notdone=stripe_fragy+_dec->pipe.mcu_nvfrags<avail_fragy_end;
       for(pli=0;pli<3;pli++){
-        adv_process_mcu_plane(_dec,&_dec->pipe,pli,refi,stripe_fragy,
+        adv_process_mcu_plane(_dec,pli,refi,stripe_fragy,
          notstart,notdone,&avail_fragy0,&avail_fragy_end);
       }
 #ifdef HAVE_CAIRO
