@@ -1669,24 +1669,16 @@ impl Translator<'_> {
             | Kind::ScalarToInt(..) => {
                 let inputs: Vec<VReg> = operands.inputs.into_iter().flatten().collect();
                 if simd.kind == Kind::Widen(false) {
-                    fp_class::nan_low_pair(&mut self.asm, s, v3, X16, slow);
+                    fp_class::nan_low_pair(self.asm, s, v3, X16, slow);
                 } else {
-                    fp_class::nan_operands(
-                        &mut self.asm,
-                        scalar,
-                        double,
-                        &inputs,
-                        X16,
-                        [v3, v4],
-                        slow,
-                    );
+                    fp_class::nan_operands(self.asm, scalar, double, &inputs, X16, [v3, v4], slow);
                 }
             }
             _ => {}
         }
         if let Kind::Sqrt(scalar, double) = simd.kind {
             self.floating_op(simd, operands);
-            fp_class::nan_result(&mut self.asm, scalar, double, V0, v3, X16, slow);
+            fp_class::nan_result(self.asm, scalar, double, V0, v3, X16, slow);
             return None;
         }
         if rounded {
@@ -1697,7 +1689,7 @@ impl Translator<'_> {
         match simd.kind {
             Kind::Float(op, _) | Kind::Double(op, _) if scalar => {
                 let sum = matches!(op, Float::Fadd | Float::Fsub);
-                fp_class::result_bits(&mut self.asm, double, V0, X16, X17, (!sum).then_some(X14));
+                fp_class::result_bits(self.asm, double, V0, X16, X17, (!sum).then_some(X14));
                 if rounded {
                     // Overflow can saturate to max finite.
                     self.emit(add_imm(W, X16, X17, 1, false));
@@ -1722,7 +1714,7 @@ impl Translator<'_> {
             }
             Kind::Float(op, _) | Kind::Double(op, _) => {
                 fp_class::packed_arithmetic_mask(
-                    &mut self.asm,
+                    self.asm,
                     double,
                     op,
                     rounded,
@@ -1730,11 +1722,11 @@ impl Translator<'_> {
                     X16,
                     [V2, v3, v4, v5, v6],
                 );
-                fp_class::any_lane(&mut self.asm, v6, X16, slow);
+                fp_class::any_lane(self.asm, v6, X16, slow);
                 None
             }
             Kind::Narrow(..) => {
-                fp_class::result_bits(&mut self.asm, false, V0, X16, X17, Some(X14));
+                fp_class::result_bits(self.asm, false, V0, X16, X17, Some(X14));
                 // Rounded up to min normal, as for products.
                 self.emit(eor_imm(W, X16, X17, 2));
                 self.asm.cbz(W, false, X16, slow);
@@ -1768,7 +1760,7 @@ impl Translator<'_> {
         let inputs = operands.inputs;
         if simd.scalar() {
             for input in inputs.into_iter().flatten() {
-                fp_class::scalar_denormal(&mut self.asm, double, input, X16, X17, to, X13);
+                fp_class::scalar_denormal(self.asm, double, input, X16, X17, to, X13);
             }
             return;
         }
@@ -1777,8 +1769,8 @@ impl Translator<'_> {
             _ if double => Arr::D2,
             _ => Arr::S4,
         };
-        fp_class::packed_denormals(&mut self.asm, arr, double, inputs, X16, [v4, v5, v6, V0]);
-        fp_class::finish_denormals(&mut self.asm, double, v6, [X14, X17, X13], to);
+        fp_class::packed_denormals(self.asm, arr, double, inputs, X16, [v4, v5, v6, V0]);
+        fp_class::finish_denormals(self.asm, double, v6, [X14, X17, X13], to);
     }
 
     /// The operation of `floating`, into v0 (v2 also for EFLAGS compares,
