@@ -2835,7 +2835,6 @@ mod tests {
 
     // spec: A64-OPT-9
     #[test]
-    #[ignore = "needs RF/RB"]
     fn resident_discovery_builds_a_pointer_loop_without_a_proof() {
         let (mut memory, mut native, stop) = resident_loop(&[0x8b, 0x36, 0x49, 0x75, 0xfb, 0xcc]);
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
@@ -2987,7 +2986,6 @@ mod tests {
 
     // spec: A64-OPT-8, A64-OPT-9
     #[test]
-    #[ignore = "needs RF/RB"]
     fn a_plain_page_miss_rebuilds_without_the_fact() {
         // mov eax,[esi]; mov [edi],eax; add edi,4; dec ecx; jne HEAD; int3
         let (mut memory, mut native, stop) = resident_loop(&[
@@ -3019,7 +3017,6 @@ mod tests {
 
     // spec: A64-MEM-7, A64-OPT-9
     #[test]
-    #[ignore = "needs RF/RB"]
     fn two_resident_cold_exits_rebuild_the_site_as_checked() {
         let (mut memory, mut native, stop) = resident_loop(&[
             0x8b, 0x06, 0x83, 0xc6, 4, 0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf3, 0xcc,
@@ -3051,7 +3048,6 @@ mod tests {
 
     // spec: A64-OPT-8
     #[test]
-    #[ignore = "needs RF/RB"]
     fn resident_probation_demotes_short_invocations_and_keeps_long_ones() {
         let mut body = Vec::new();
         for value in 0..6 {

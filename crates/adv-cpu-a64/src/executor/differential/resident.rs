@@ -465,7 +465,6 @@ fn seeded_loops_match_at_the_stop_and_at_every_owner_exit() {
 
 // spec: A64-OPT-9
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn seeded_loops_with_pointer_reads_indexed_stores_early_exits_and_stack_escapes() {
     for shape in [
         Shape::Pointer,
@@ -481,7 +480,6 @@ fn seeded_loops_with_pointer_reads_indexed_stores_early_exits_and_stack_escapes(
 
 // spec: A64-OPT-9, A64-MEM-5
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_load_from_a_protected_page_reports_exact_fault_state() {
     let image = Image::loop_body(|a, head, _| {
         a.add(ebx, ecx).unwrap();
@@ -558,7 +556,6 @@ fn a_store_away_from_code_lines_on_a_watched_page_keeps_code_live() {
 
 // spec: A64-OPT-9, A64-MEM-5, A64-MEM-7
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_store_on_a_watched_code_line_invalidates_the_old_instruction() {
     // The immediate of the first instruction at the head.
     let immediate = CODE + 2;
@@ -588,7 +585,6 @@ fn soft_page(memory: &mut Memory, value: u32) {
 
 // spec: A64-OPT-9, A64-MEM-7, A64-MEM-11
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_shared_soft_page_completes_loads_and_stores() {
     let image = Image::loop_body(|a, head, _| {
         a.mov(eax, dword_ptr(esi)).unwrap();
@@ -614,7 +610,6 @@ fn a_shared_soft_page_completes_loads_and_stores() {
 
 // spec: A64-OPT-9, A64-MEM-11
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
     const COUNT: u32 = 1 << 22;
     const VALUE: u8 = 7;
@@ -698,7 +693,6 @@ fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
 
 // spec: A64-OPT-9, A64-MEM-5
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_read_modify_write_crossing_into_read_only_memory_has_precise_state() {
     let image = Image::loop_body(|a, head, _| {
         a.add(dword_ptr(esi), eax).unwrap();
@@ -728,7 +722,6 @@ fn a_read_modify_write_crossing_into_read_only_memory_has_precise_state() {
 
 // spec: A64-OPT-9, A64-MEM-7, A64-MEM-11
 #[test]
-#[ignore = "needs RF/RB/RP"]
 fn a_hoistable_load_rechecks_the_page_class_between_entries() {
     let image = Image::loop_body(|a, head, _| {
         a.mov(eax, dword_ptr(esi)).unwrap();
