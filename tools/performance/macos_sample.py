@@ -124,6 +124,8 @@ def loop_steps(directory):
     steps, extents = defaultdict(list), {}
     for path in sorted(directory.glob("opt-*.tsv")):
         for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("demoted\t"):
+                continue
             _, eip, step, at, detail = (line.split("\t") + ["-", "-"])[:5]
             if step == "extent":
                 extents[int(eip)] = max(extents.get(int(eip), 0), int(at))

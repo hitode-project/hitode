@@ -7,7 +7,7 @@
 //! links are patched), concatenated in `jit-{pid}.tsv` row order.
 //! `opt-{pid}.tsv` follows each hot loop from its promotion to the stage
 //! that refused it or to its installed optimized form, and records resident
-//! cold exits at powers of two. With the map enabled, resident forms count
+//! cold exits at powers of two and probation demotions. Resident forms count
 //! admitted entries for the run report. [`enable_memory`] keeps address maps for an
 //! in-process sampler, with the names of the shared stubs. A cleared cache
 //! reuses addresses, so attribution takes the newest unit placed before the
@@ -274,6 +274,16 @@ pub(crate) fn optimized(eip: u32, outcome: std::fmt::Arguments<'_>) {
         let row = format!("{}\t{eip}\t{outcome}\n", now_ns());
         let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
         let _ = files.3.write_all(row.as_bytes());
+    }
+}
+
+pub(crate) fn demoted(head: u32, version: usize, entries: u64, iterations: u64) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(
+            files.3,
+            "demoted\t{head}\t{version}\t{entries}\t{iterations}"
+        );
     }
 }
 

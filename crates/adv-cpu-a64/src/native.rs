@@ -2712,6 +2712,12 @@ impl Native {
             }
             self.cache.sync();
         } else {
+            crate::jit_map::demoted(
+                eip,
+                index,
+                version.slot.entries.get(),
+                version.slot.countdown[1].get() / probation.iteration_retired,
+            );
             self.demote_resident(eip);
         }
     }
