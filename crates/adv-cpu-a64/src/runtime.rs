@@ -158,6 +158,10 @@ pub struct Runtime {
     /// Nonzero when an optimized form left at a checkpoint for a recall.
     pub opt_recalled: u32,
     pub opt_dump: RegisterDump,
+    /// Nonzero while the owner has a REP continuation.
+    pub rep_pending: u32,
+    /// Tier-1 state at the last admitted inline entry.
+    pub opt_entry: OptEntryState,
 }
 
 impl Runtime {
@@ -213,6 +217,8 @@ impl Runtime {
             opt_record: 0,
             opt_recalled: 0,
             opt_dump: RegisterDump::default(),
+            rep_pending: 0,
+            opt_entry: OptEntryState::default(),
         }
     }
 }
@@ -224,6 +230,17 @@ pub struct RegisterDump {
     pub x: [u64; 31],
     pub v: [u128; 32],
     pub sp: u64,
+}
+
+/// Raw Tier-1 registers that recovery may need at an inline entry.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct OptEntryState {
+    pub regs: [u32; 8],
+    pub nzcv: u64,
+    pub pf: u64,
+    pub af: u64,
+    pub df: u64,
 }
 
 /// Why translated code returned to the owner.
@@ -719,8 +736,13 @@ fn emit_load_guest(asm: &mut Asm) {
             asm.emit(ldp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
         }
     }
+    asm.emit(ldr(W, r(1), r(0), EFLAGS));
+    emit_load_flags(asm);
+}
+
+/// Establish canonical NZCV and lazy PF, AF and DF from w1.
+pub(crate) fn emit_load_flags(asm: &mut Asm) {
     asm.emit_all(&[
-        ldr(W, r(1), r(0), EFLAGS),
         // NZCV in subtraction sense: SF ZF !CF OF.
         and_imm(W, r(2), r(1), 0xc0),
         ubfx(W, r(3), r(1), 0, 1),
@@ -819,6 +841,12 @@ fn emit_store_guest(asm: &mut Asm) {
         // The low halves of x23 and x24 are ESP and EBP themselves.
         asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
     }
+    emit_read_flags(asm);
+    asm.emit(str(W, r(4), r(0), EFLAGS));
+}
+
+/// Assemble EFLAGS in w4 using the unmapped bits in the CpuState at x0.
+pub(crate) fn emit_read_flags(asm: &mut Asm) {
     asm.emit_all(&[
         mrs_nzcv(r(1)),
         // N and Z land on SF and ZF; C is !CF and V is OF.
@@ -843,7 +871,6 @@ fn emit_store_guest(asm: &mut Asm) {
         movz(W, r(5), MAPPED_FLAGS as u16, 0),
         bic(W, r(4), r(4), r(5), Lsl, 0),
         orr(W, r(4), r(4), r(3), Lsl, 0),
-        str(W, r(4), r(0), EFLAGS),
     ]);
 }
 

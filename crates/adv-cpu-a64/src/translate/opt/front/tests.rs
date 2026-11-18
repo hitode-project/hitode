@@ -52,6 +52,12 @@ fn built(code: &[u8], at: &CpuState) -> (Unit, Proof, Built) {
     let built = build(&unit, &proof, at).unwrap();
     assert_eq!(verify::verify(&built.func), Ok(()));
     super::super::back::lower(&built.func);
+    #[cfg(emulator)]
+    crate::translate::tests::opt_back::inline::check_guest_snapshots(
+        &built.func,
+        &built.assumed,
+        at,
+    );
     (unit, proof, built)
 }
 
@@ -129,6 +135,10 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
     let record = &built.func.records[id.0 as usize];
     let mut reference = memory(code);
     initialize(&mut reference);
+    #[cfg(emulator)]
+    if !fail {
+        crate::translate::tests::opt_back::inline::compare_guest_exit(&built, at, &reference, id);
+    }
     let mut cpu = at.clone();
     let mut interpreter = Interpreter::new();
     let retired = run.charged - i64::from(record.refund);
