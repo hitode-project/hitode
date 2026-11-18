@@ -1,6 +1,8 @@
 //! Canonical Tier-1 edges for register-allocated forms.
 
-use super::super::recovery::{self, IrRecord, Location, Recipe, X87};
+use super::super::recovery::{
+    self, FlagExpr, FlagGroup, FlagSelect, IrRecord, Location, Recipe, X87,
+};
 use super::*;
 use crate::translate::{emit_link_point, emit_link_transition};
 
@@ -377,6 +379,9 @@ impl Emitter<'_> {
             numeric(record.eflags.expect("normal exit has EFLAGS")),
             self.keeps_unmapped_flags(ir.eflags.expect("normal exit has EFLAGS")),
         );
+        for group in &record.flag_groups {
+            self.exit_flag_group(group);
+        }
         self.parallel_moves(
             record
                 .regs
@@ -469,6 +474,94 @@ impl Emitter<'_> {
                 str(W, T, CPU, runtime::EFLAGS),
             ]);
         }
+    }
+
+    fn exit_flag_group(&mut self, group: &FlagGroup<Host>) {
+        let done = self.asm.label();
+        let mut arms = group.arms.iter().peekable();
+        while let Some((tag, expr)) = arms.next() {
+            let next = self.asm.label();
+            if arms.peek().is_some() {
+                match group.select {
+                    FlagSelect::Same => unreachable!(),
+                    FlagSelect::Tag(v) => {
+                        let tag_reg = self.gp_at(v, T);
+                        self.imm(U, u64::from(*tag));
+                        self.asm.emit(cmp(W, tag_reg, U, Lsl, 0));
+                    }
+                    FlagSelect::Induction { current, initial } => {
+                        let current = self.gp_at(current, T);
+                        let initial = self.gp_at(initial, U);
+                        self.asm.emit(cmp(W, current, initial, Lsl, 0));
+                    }
+                }
+                self.asm.b_cond(Cond::Ne, next);
+            }
+            for bit in [0, 2, 4, 6, 7, 11] {
+                if group.mask & (1 << bit) != 0 {
+                    self.exit_flag_bit(expr, bit);
+                    self.asm.emit(bfi(W, FLAGS, T, bit, 1));
+                }
+            }
+            if arms.peek().is_some() {
+                self.asm.b(done);
+            }
+            self.asm.bind(next);
+        }
+        self.asm.bind(done);
+    }
+
+    fn exit_flag_bit(&mut self, expr: &FlagExpr<Host>, bit: u32) {
+        let FlagExpr::Produce {
+            kind,
+            width,
+            a,
+            b,
+            prior,
+            adjust,
+        } = expr
+        else {
+            self.bit(flag_operand(expr), bit);
+            return;
+        };
+        let prior = if **prior == FlagExpr::Constant(0) {
+            None
+        } else {
+            let bit = if matches!(kind, FlagKind::AddCarry | FlagKind::SubBorrow) {
+                0
+            } else {
+                bit
+            };
+            self.exit_flag_bit(prior, bit);
+            self.asm.emit(lsl_imm(W, S2, T, bit));
+            Some(Host::Register(S2))
+        };
+        let mut a = flag_operand(a);
+        if *adjust != 0 {
+            let src = self.gp_at(a, T);
+            if let Some(word) = int_immediate(IntOp::Add, W, S3, src, u64::from(*adjust)) {
+                self.asm.emit(word);
+            } else {
+                self.imm(U, u64::from(*adjust));
+                self.asm.emit(add(W, S3, src, U, Lsl, 0));
+            }
+            a = Host::Register(S3);
+        }
+        let b = flag_operand(b);
+        let flags = Host::Flags(self.flags.len() as u32);
+        self.flags.push(Some(FlagRecipe {
+            kind: *kind,
+            width: *width,
+            a,
+            b,
+            prior,
+            immediate: match b {
+                Host::Constant(n) => Some(n as u64),
+                _ => None,
+            },
+        }));
+        self.bit(flags, bit);
+        self.flags.pop();
     }
 
     fn write_mmx(&mut self, record: &Record<Host>, refresh: bool) {
@@ -663,5 +756,13 @@ fn numeric(location: Location<Host>) -> Host {
         Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => host,
         Location::Constant(bits) => Host::Constant(u128::from(bits)),
         Location::Recipe(Recipe::C1 { .. }) => unreachable!("C1 has its own emission"),
+    }
+}
+
+fn flag_operand(expr: &FlagExpr<Host>) -> Host {
+    match *expr {
+        FlagExpr::At(v) => v,
+        FlagExpr::Constant(bits) => Host::Constant(bits),
+        FlagExpr::Produce { .. } => unreachable!("numeric flag operand"),
     }
 }

@@ -1091,6 +1091,25 @@ fn loop_heads_take_unobserved_flags_from_entry() {
     assert!(matches!(rejected(&carried, &initial()), Reject::Flags(_)));
 }
 
+// spec: A64-OPT-9
+#[test]
+fn resident_pointer_loop_keeps_its_fast_path_instruction_count() {
+    let code = [0x8b, 0x36, 0x49, 0x75, 0xfb]; // mov esi,[esi]; dec ecx; jne CODE
+    let mut unit = Unit::default();
+    unit.build(
+        &mut memory(&code),
+        CODE,
+        &[CODE + code.len() as u32],
+        &|_, _| None,
+        &|_| None,
+        true,
+    );
+    let built = build_with(&unit, None, &initial(), &|_| false, &|_| false).unwrap();
+    let lowered =
+        super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+    assert_eq!((lowered.iteration_retired, lowered.iteration_words), (3, 9));
+}
+
 // spec: A64-OPT-2, A64-OPT-6
 #[test]
 fn x87_register_and_popping_arithmetic_forms() {

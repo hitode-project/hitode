@@ -1364,6 +1364,89 @@ fn vector_data(seed: u64) -> Vec<u8> {
     (0..4096).map(|_| rng.next() as u8).collect()
 }
 
+// spec: A64-OPT-6, A64-FLAG-3
+#[test]
+fn resident_head_load_fault_keeps_arrival_flags() {
+    let image = vector_image(1);
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    for readable in [1, 49] {
+        let mut cpu = initial(79);
+        cpu.regs[6] = boundary - readable;
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("head fault after {readable} iterations"),
+            &[(SPECIAL, HOST_PAGE)],
+            |m| {
+                m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+                m.write(cpu.regs[6], &[0x35; 49][..readable as usize])
+                    .unwrap();
+                m.map(boundary, HOST_PAGE, 0).unwrap();
+            },
+        );
+        vector_install(&mut trial, cpu.clone(), 16);
+        let (outcome, retired) = trial.compare(4096);
+        assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
+        assert_eq!(retired, 2 + 13 * u64::from(readable));
+        assert_eq!(trial.live.state.eip, image.head);
+        assert_eq!(trial.live.state.eflags, 0x6);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits
+                > 0
+        );
+    }
+}
+
+// spec: A64-OPT-6, A64-FLAG-3
+#[test]
+fn resident_head_recovers_flags_from_either_latch() {
+    let image = Image::loop_body(|a, head, stop| {
+        let mut compare = a.create_label();
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.inc(esi).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(compare).unwrap();
+        latch(a, head);
+        a.jmp(stop).unwrap();
+        a.set_label(&mut compare).unwrap();
+        a.lea(ecx, dword_ptr(ecx - 1)).unwrap();
+        a.cmp(ecx, 100).unwrap();
+        a.jb(head).unwrap();
+    });
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    for (path, flags, retired_at_fault) in [(3, 0x3, 21), (0, 0x87, 22)] {
+        let mut cpu = initial(7);
+        cpu.regs[3] = path;
+        cpu.regs[6] = boundary - 3;
+        let mut trial = Trial::new(&image, &cpu, format!("latch {path}"), &[], |m| {
+            m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+            m.map(boundary, HOST_PAGE, 0).unwrap();
+        });
+        trial.install();
+        let (outcome, retired) = trial.compare(128);
+        assert!(matches!(outcome, RunOutcome::ReadFault { address, .. } if address == boundary));
+        assert_eq!(retired, retired_at_fault);
+        assert_eq!(trial.live.state.eip, image.head);
+        assert_eq!(trial.live.state.eflags, flags);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits
+                > 0
+        );
+    }
+}
+
 // spec: A64-OPT-10
 #[test]
 fn vector_seeded_elementwise_widths_and_exact_tails() {
@@ -1618,7 +1701,7 @@ fn vector_region_stops_at_watched_and_checked_pages() {
     }
 }
 
-// spec: A64-OPT-10
+// spec: A64-OPT-6, A64-OPT-10
 #[test]
 fn vector_region_charges_countdown_at_and_after_batch_boundaries() {
     let image = vector_image(1);
@@ -1631,6 +1714,8 @@ fn vector_region_charges_countdown_at_and_after_batch_boundaries() {
         });
         vector_install(&mut trial, cpu, 16);
         assert_eq!(trial.compare(fuel), (RunOutcome::Budget, fuel));
+        assert_eq!(trial.live.state.eip, image.head);
+        trial.same_state();
         assert_eq!(trial.live.native.as_ref().unwrap().vector_regions(), 2);
         assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
         trial.compare_epilogue();

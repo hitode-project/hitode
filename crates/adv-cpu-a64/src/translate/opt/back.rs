@@ -1153,6 +1153,14 @@ impl<'a> Emitter<'a> {
     }
 
     fn op(&mut self, result: Option<Value>, op: Op) {
+        if let Op::Snapshot(v) = op {
+            self.copy(
+                self.locations[result.unwrap().0 as usize],
+                self.locations[v.0 as usize],
+                Type::I32,
+            );
+            return;
+        }
         let out = result.unwrap_or(Value(0));
         let loc = result.map(|v| self.locations[v.0 as usize]);
         let d = result.map_or(T, |v| self.rd(v));
@@ -1210,7 +1218,7 @@ impl<'a> Emitter<'a> {
                     self.asm.bind(ordered);
                 }
             }
-            Op::Flags { .. } => {}
+            Op::Flags { .. } | Op::Snapshot(_) => {}
             Op::Test { flags, cond } => {
                 let c = self.condition(self.locations[flags.0 as usize], cond);
                 self.asm.emit(cset(W, d, c));

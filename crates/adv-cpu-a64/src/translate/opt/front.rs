@@ -984,6 +984,7 @@ impl Front<'_> {
             refund,
             regs: std::array::from_fn(|r| held(r, self.state.regs[r])),
             eflags: Some(Location::Recipe(Recipe::Eflags(self.state.flags))),
+            flag_groups: Vec::new(),
             xmm: std::array::from_fn(|r| held(8 + r, self.state.xmm[r])),
             mmx: std::array::from_fn(|r| held(16 + r, self.state.mmx[r])),
             mmx_meta: self.assumed.mmx.then(|| {

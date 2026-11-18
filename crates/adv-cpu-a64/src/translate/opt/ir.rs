@@ -184,6 +184,8 @@ impl FlagKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Constant(Type, u128),
+    /// Keep a form-entry induction value in a recovery spill cell.
+    Snapshot(Value),
     Int(IntOp, Value, Value),
     IntUnary(IntUnary, Value),
     /// The quotient of the I64 `dividend` by the I32 `divisor`. Unless
@@ -332,7 +334,8 @@ impl Op {
         let list: [Option<Value>; 3] = match *self {
             Op::Constant(..) | Op::Validate => [None; 3],
             Op::SseInput { a, b, .. } => [Some(a), b, None],
-            Op::IntUnary(_, a)
+            Op::Snapshot(a)
+            | Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
             | Op::VecUnary(_, a)
@@ -600,6 +603,7 @@ impl Func {
             Op::IntUnary(_, a) => self.ty(a),
             Op::Div { .. }
             | Op::Remainder { .. }
+            | Op::Snapshot(_)
             | Op::Test { .. }
             | Op::ToInt { wide: false, .. }
             | Op::VecToInt(..) => Type::I32,

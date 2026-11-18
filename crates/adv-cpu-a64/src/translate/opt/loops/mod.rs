@@ -464,6 +464,7 @@ pub(super) struct Batch {
     pub frame: Vec<Frame>,
     pub crossings: Vec<Stream>,
     pub prefix_charge: u64,
+    pub recovery: Vec<(Value, Affine)>,
 }
 
 impl Batch {
@@ -472,6 +473,7 @@ impl Batch {
             .ivs
             .iter()
             .map(|iv| iv.base)
+            .chain(self.recovery.iter().map(|(_, a)| a.base))
             .chain(self.loop_.trip.bound)
             .chain(self.frame.iter().map(|f| f.start.base))
             .chain(self.plan.inputs.iter().copied())
@@ -523,6 +525,31 @@ impl Batch {
         }
 
         let defs = Defs::new(func);
+        let mut recovery = Vec::new();
+        if let Some(head) = func.blocks[loop_.head.0 as usize].head {
+            let record = &func.records[head.record.0 as usize];
+            for &(param, arg) in &loop_.carried {
+                if param == arg
+                    || loop_.ivs.iter().any(|iv| iv.base == param)
+                    || !record
+                        .flag_groups
+                        .iter()
+                        .any(|group| group.uses().any(|v| v == param))
+                {
+                    continue;
+                }
+                if func.ty(param) != Type::I32 {
+                    return None;
+                }
+                let mut value = defs.affine(arg);
+                if let Some(iv) = loop_.ivs.iter().find(|iv| iv.base == value.base) {
+                    value.offset = value.offset.wrapping_sub(iv.stride as u32);
+                } else if !defs.invariant(&loop_.blocks, value.base) {
+                    return None;
+                }
+                recovery.push((param, value));
+            }
+        }
         let mut frame = Vec::new();
         let mut crossings = Vec::new();
         for block in &loop_.blocks {
@@ -578,6 +605,7 @@ impl Batch {
             frame,
             crossings,
             prefix_charge,
+            recovery,
         })
     }
 }

@@ -13,7 +13,7 @@ pub(crate) enum Error {
     Undominated(Value),
     /// An operand of the wrong type, a jump with the wrong arguments, or a
     /// `Flags` parameter outside block 0: flags reach a head only as the
-    /// entry EFLAGS (A64-FLAG-3).
+    /// numeric operands and a recovery selector (A64-FLAG-3).
     Type(Block),
     /// An effect point reached with an unvalidated floating-point result.
     Pending(Block),
@@ -181,6 +181,7 @@ fn typed(func: &Func, op: &Op) -> bool {
     match *op {
         Op::Int(_, a, b) => int(a) && func.ty(a) == func.ty(b),
         Op::IntUnary(_, a) | Op::FromInt(a) => int(a),
+        Op::Snapshot(v) => is(v, Type::I32),
         Op::Div {
             dividend, divisor, ..
         } => is(dividend, Type::I64) && is(divisor, Type::I32),
@@ -383,6 +384,7 @@ mod tests {
             refund: 0,
             regs: regs.map(|r| r.map(Location::At)),
             eflags: Some(Location::Constant(0)),
+            flag_groups: Vec::new(),
             x87: Some(X87 {
                 top: 0,
                 valid: 0,

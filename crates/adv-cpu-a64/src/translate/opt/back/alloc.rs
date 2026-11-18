@@ -254,6 +254,10 @@ pub(super) fn allocate(
     };
     for i in order {
         active.retain(|&(end, ..)| end >= starts[i]);
+        if matches!(operations[i], Some(Op::Snapshot(_))) {
+            locations[i] = spill(i, &mut cells);
+            continue;
+        }
         if matches!(operations[i], Some(Op::Flags { .. })) {
             locations[i] = Host::Flags(i as u32);
             continue;

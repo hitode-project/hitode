@@ -26,6 +26,154 @@ pub(crate) enum Recipe<L> {
     Eflags(L),
 }
 
+/// A flag producer with its inputs, evaluated only during cold recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FlagExpr<L> {
+    At(L),
+    Constant(u128),
+    Produce {
+        kind: super::ir::FlagKind,
+        width: u8,
+        a: Box<Self>,
+        b: Box<Self>,
+        prior: Box<Self>,
+        /// Recover the original input from the arithmetic result.
+        adjust: u32,
+    },
+}
+
+impl<L: Copy> FlagExpr<L> {
+    pub(crate) fn map<M>(&self, map: &mut impl FnMut(L) -> M) -> FlagExpr<M> {
+        match self {
+            Self::At(v) => FlagExpr::At(map(*v)),
+            Self::Constant(bits) => FlagExpr::Constant(*bits),
+            Self::Produce {
+                kind,
+                width,
+                a,
+                b,
+                prior,
+                adjust,
+            } => FlagExpr::Produce {
+                kind: *kind,
+                width: *width,
+                a: Box::new(a.map(map)),
+                b: Box::new(b.map(map)),
+                prior: Box::new(prior.map(map)),
+                adjust: *adjust,
+            },
+        }
+    }
+
+    pub(crate) fn leaves(&self, out: &mut Vec<L>) {
+        match self {
+            Self::At(v) => out.push(*v),
+            Self::Constant(_) => {}
+            Self::Produce { a, b, prior, .. } => {
+                a.leaves(out);
+                b.leaves(out);
+                prior.leaves(out);
+            }
+        }
+    }
+
+    fn evaluate(&self, get: &impl Fn(L) -> u128) -> u128 {
+        match self {
+            Self::At(v) => get(*v),
+            Self::Constant(bits) => *bits,
+            Self::Produce {
+                kind,
+                width,
+                a,
+                b,
+                prior,
+                adjust,
+            } => {
+                let a = a.evaluate(get);
+                let a = if *adjust == 0 {
+                    a
+                } else {
+                    u128::from((a as u32).wrapping_add(*adjust))
+                };
+                u128::from(compute_flags(
+                    *kind,
+                    *width,
+                    a,
+                    b.evaluate(get),
+                    prior.evaluate(get) as u32,
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FlagSelect<L> {
+    Same,
+    Tag(L),
+    /// The first arm is the form entry, the second is the latch.
+    Induction {
+        current: L,
+        initial: L,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlagGroup<L> {
+    pub mask: u32,
+    pub select: FlagSelect<L>,
+    pub arms: Vec<(u32, FlagExpr<L>)>,
+}
+
+impl<L: Copy> FlagGroup<L> {
+    pub(crate) fn map<M>(&self, map: &mut impl FnMut(L) -> M) -> FlagGroup<M> {
+        FlagGroup {
+            mask: self.mask,
+            select: match self.select {
+                FlagSelect::Same => FlagSelect::Same,
+                FlagSelect::Tag(v) => FlagSelect::Tag(map(v)),
+                FlagSelect::Induction { current, initial } => FlagSelect::Induction {
+                    current: map(current),
+                    initial: map(initial),
+                },
+            },
+            arms: self
+                .arms
+                .iter()
+                .map(|(tag, expr)| (*tag, expr.map(map)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn uses(&self) -> impl Iterator<Item = L> {
+        let mut leaves = Vec::new();
+        match self.select {
+            FlagSelect::Same => {}
+            FlagSelect::Tag(v) => leaves.push(v),
+            FlagSelect::Induction { current, initial } => leaves.extend([current, initial]),
+        }
+        for (_, expr) in &self.arms {
+            expr.leaves(&mut leaves);
+        }
+        leaves.into_iter()
+    }
+
+    pub(crate) fn bits(&self, get: impl Fn(L) -> u128) -> u32 {
+        let arm = match self.select {
+            FlagSelect::Same => &self.arms[0],
+            FlagSelect::Tag(v) => self
+                .arms
+                .iter()
+                .find(|(tag, _)| u128::from(*tag) == get(v))
+                .unwrap(),
+            FlagSelect::Induction { current, initial } => {
+                &self.arms[usize::from(get(current) != get(initial))]
+            }
+        };
+        arm.1.evaluate(&get) as u32 & self.mask
+    }
+}
+
 /// The x87 state at a region start. TOP, occupancy, the control word and
 /// the status bits are proven constants.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +203,8 @@ pub(crate) struct Record<L> {
     pub refund: u32,
     pub regs: [Option<Location<L>>; 8],
     pub eflags: Option<Location<L>>,
+    /// Exact arrival recipes for a resident region.
+    pub flag_groups: Vec<FlagGroup<L>>,
     /// `None` when the form runs no x87 instruction: the state's own x87
     /// registers stand.
     pub x87: Option<X87<L>>,
@@ -91,6 +241,7 @@ impl<L: Copy> Record<L> {
                 Location::Recipe(Recipe::C1 { a, b, .. }) => [Some(a), Some(b)],
             })
             .flatten()
+            .chain(self.flag_groups.iter().flat_map(FlagGroup::uses))
     }
 
     /// Whether every component is present but the registers in `kept`
@@ -175,81 +326,11 @@ impl Locations<'_> {
     }
 
     fn flags(&self, index: u32) -> u32 {
-        use super::ir::FlagKind::*;
-        use adv_cpu_core::integer::{self, AF, CF, OF, PF, SF, ZF};
-        use iced_x86::Mnemonic as M;
         let r = self.flags[index as usize].unwrap();
         let a = self.get(r.a);
         let b = if r.kind.reads_b() { self.get(r.b) } else { 0 };
-        let mut out = r.prior.map_or(0, |p| self.get(p) as u32);
-        match r.kind {
-            Add | AddCarry | Sub | SubBorrow => {
-                let carry = u32::from(matches!(r.kind, AddCarry | SubBorrow) && out & CF != 0);
-                integer::arithmetic(
-                    &mut out,
-                    a as u32,
-                    b as u32,
-                    carry,
-                    r.width,
-                    matches!(r.kind, Sub | SubBorrow),
-                );
-            }
-            Logic => {
-                integer::binary(&mut out, M::Or, a as u32, 0, r.width);
-            }
-            Increment | Decrement | Negate => {
-                integer::unary(
-                    &mut out,
-                    match r.kind {
-                        Increment => M::Inc,
-                        Decrement => M::Dec,
-                        _ => M::Neg,
-                    },
-                    a as u32,
-                    r.width,
-                );
-            }
-            Shl | Shr | Sar => {
-                let count = b as u32 & 31;
-                if count != 0 {
-                    integer::shift(
-                        &mut out,
-                        match r.kind {
-                            Shl => M::Shl,
-                            Shr => M::Shr,
-                            _ => M::Sar,
-                        },
-                        a as u32,
-                        count,
-                        r.width,
-                    );
-                }
-            }
-            CarryBit | MulUnsigned | Rol | Ror => {
-                out = super::eval::flags(r.kind, r.width, a, b, out).unwrap();
-            }
-            MulSigned => {
-                let product =
-                    integer::signed(a as u32, r.width) * integer::signed(b as u32, r.width);
-                let overflow =
-                    product != integer::signed(product as u32 & integer::mask(r.width), r.width);
-                out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
-            }
-            UnorderedCompare | OrderedCompare => {
-                let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
-                let set = if a.is_nan() || b.is_nan() {
-                    ZF | PF | CF
-                } else if a < b {
-                    CF
-                } else if a == b {
-                    ZF
-                } else {
-                    0
-                };
-                out = out & !(ZF | PF | CF | OF | SF | AF) | set;
-            }
-        }
-        out
+        let prior = r.prior.map_or(0, |p| self.get(p) as u32);
+        compute_flags(r.kind, r.width, a, b, prior)
     }
 
     fn locate(&self, location: Location<Host>) -> u128 {
@@ -265,6 +346,26 @@ impl Locations<'_> {
                 &[self.get(a), self.get(b)],
             ),
         }
+    }
+}
+
+fn compute_flags(kind: super::ir::FlagKind, width: u8, a: u128, b: u128, prior: u32) -> u32 {
+    use adv_cpu_core::integer::{AF, CF, OF, PF, SF, ZF};
+    if kind.floating() {
+        // Recovery already knows the comparison completed.
+        let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+        let set = if a.is_nan() || b.is_nan() {
+            ZF | PF | CF
+        } else if a < b {
+            CF
+        } else if a == b {
+            ZF
+        } else {
+            0
+        };
+        prior & !(ZF | PF | CF | OF | SF | AF) | set
+    } else {
+        super::eval::flags(kind, width, a, b, prior).unwrap()
     }
 }
 
@@ -309,6 +410,9 @@ pub(crate) fn materialize(
     }
     if let Some(location) = record.eflags {
         cpu.eflags = values.locate(location) as u32;
+        for group in &record.flag_groups {
+            cpu.eflags = cpu.eflags & !group.mask | group.bits(|v| values.get(v));
+        }
     }
     cpu.eip = record.eip;
     if let Some(x87) = &record.x87 {
@@ -428,6 +532,11 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
         refund: record.refund,
         regs: record.regs.map(|l| l.map(loc)),
         eflags: record.eflags.map(loc),
+        flag_groups: record
+            .flag_groups
+            .iter()
+            .map(|group| group.map(&mut |v| locations[v.0 as usize]))
+            .collect(),
         x87: record.x87.as_ref().map(|x| X87 {
             top: x.top,
             valid: x.valid,

@@ -32,6 +32,7 @@ fn fixture(cc: Cc) -> Fixture {
         refund: 4,
         regs: [None; 8],
         eflags: Some(Location::At(flags)),
+        flag_groups: Vec::new(),
         x87: None,
         xmm: [None; 8],
         mmx: [None; 8],

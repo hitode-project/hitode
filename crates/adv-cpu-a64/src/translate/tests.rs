@@ -1827,6 +1827,7 @@ pub(in crate::translate) mod opt_back {
                 refund: 0,
                 regs: [None; 8],
                 eflags: Some(Location::At(flags)),
+                flag_groups: Vec::new(),
                 x87: None,
                 xmm: [None; 8],
                 mmx: [None; 8],
@@ -2681,6 +2682,7 @@ pub(in crate::translate) mod opt_back {
             refund: 0,
             regs: [Some(Location::Constant(0)); 8],
             eflags: Some(Location::Constant(0x202)),
+            flag_groups: Vec::new(),
             x87: Some(X87 {
                 top: 0,
                 valid: 0,

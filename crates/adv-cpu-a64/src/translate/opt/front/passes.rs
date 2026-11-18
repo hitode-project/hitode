@@ -1,6 +1,7 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
 use super::*;
+mod head_flags;
 use crate::translate::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 use adv_cpu_core::memory::PAGE_SIZE;
@@ -50,9 +51,13 @@ pub(super) fn run(
         }
     };
     settle(func);
+    let demand = resident.as_ref().map(|_| {
+        split_resident_checkpoints(func);
+        head_flags::prepare(func)
+    });
     // A head's arrival may be another head's parameter, which settling
     // replaces with the entry's flags.
-    while entry_flags(func) {
+    while entry_flags(func, demand.as_deref()) {
         settle(func);
     }
     hoist(func, facts, loads, stores, resident.as_deref_mut());
@@ -87,7 +92,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
                 f(b);
             }
         }
-        Op::IntUnary(_, a)
+        Op::Snapshot(a)
+        | Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }
         | Op::FpUnary(_, a)
         | Op::VecUnary(_, a)
@@ -148,6 +154,9 @@ fn map_record(record: &mut IrRecord, aliases: &[Value]) {
 }
 
 fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
+    for group in &mut record.flag_groups {
+        *group = group.map(&mut &map);
+    }
     let f = |v: &mut Value| *v = map(*v);
     for loc in record
         .regs
@@ -179,7 +188,7 @@ fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
 /// from the entry EFLAGS or from the parameter itself. A charged arrival first
 /// reaches a head of its own whose record keeps that arrival's exact flags,
 /// since its checkpoint may leave there.
-fn entry_flags(func: &mut Func) -> bool {
+fn entry_flags(func: &mut Func, demand: Option<&[FlagSet]>) -> bool {
     let Some(i) = func.entry.iter().position(|s| *s == Source::Eflags) else {
         return false;
     };
@@ -192,7 +201,7 @@ fn entry_flags(func: &mut Func) -> bool {
             }
         }
     }
-    let observed = observed(func, &defs);
+    let observed = observed(func, &defs, demand);
     let from_entry = |mut v: Value, param: Value, bits: FlagSet| loop {
         if v == base || v == param {
             return true;
@@ -245,32 +254,70 @@ fn entry_flags(func: &mut Func) -> bool {
                 }
             }
             for (s, k, args) in edges {
-                let mut record = func.records[head.record.0 as usize].clone();
-                substitute(&mut record, |v| {
-                    params.iter().position(|&q| q == v).map_or(v, |j| args[j])
-                });
-                let record = func.record(record);
-                let split = func.block(Some(Head { record }));
-                let mut ends = targets_mut(&mut func.blocks[s].end);
-                let target = &mut ends[k];
-                let through = std::mem::take(&mut target.args);
-                target.block = split;
-                func.blocks[split.0 as usize].end = End::Jump(Target {
-                    block: Block(b as u32),
-                    args: through,
-                    charge: 0,
-                });
+                split_checkpoint(func, b, head, &params, s, k, &args);
             }
         }
     }
     changed
 }
 
+fn split_resident_checkpoints(func: &mut Func) {
+    let edges: Vec<_> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(from, block)| {
+            block
+                .end
+                .targets()
+                .enumerate()
+                .filter(|(_, t)| t.charge > 0)
+                .map(move |(k, t)| (from, k, t.clone()))
+        })
+        .collect();
+    for (from, k, edge) in edges {
+        let b = edge.block.0 as usize;
+        let data = &func.blocks[b];
+        let head = data.head.unwrap();
+        let params = data.params.clone();
+        split_checkpoint(func, b, head, &params, from, k, &edge.args);
+    }
+}
+
+fn split_checkpoint(
+    func: &mut Func,
+    b: usize,
+    head: Head,
+    params: &[Value],
+    from: usize,
+    k: usize,
+    args: &[Value],
+) {
+    let mut record = func.records[head.record.0 as usize].clone();
+    substitute(&mut record, |v| {
+        params.iter().position(|&q| q == v).map_or(v, |j| args[j])
+    });
+    let record = func.record(record);
+    let split = func.block(Some(Head { record }));
+    let mut ends = targets_mut(&mut func.blocks[from].end);
+    let target = &mut ends[k];
+    let through = std::mem::take(&mut target.args);
+    target.block = split;
+    func.blocks[split.0 as usize].end = End::Jump(Target {
+        block: Block(b as u32),
+        args: through,
+        charge: 0,
+    });
+}
+
 /// The status flags of each Flags value that tests, exits and checkpoints
 /// may see. A region start's record observes nothing by itself: recovery
 /// there continues with the same uses.
-fn observed(func: &Func, defs: &[Option<Op>]) -> Vec<FlagSet> {
+fn observed(func: &Func, defs: &[Option<Op>], demand: Option<&[FlagSet]>) -> Vec<FlagSet> {
     let mut seen = vec![FlagSet::NONE; func.types.len()];
+    if let Some(demand) = demand {
+        seen[..demand.len()].copy_from_slice(demand);
+    }
     let mut charged = vec![false; func.blocks.len()];
     for block in &func.blocks {
         for t in block.end.targets() {
@@ -287,19 +334,25 @@ fn observed(func: &Func, defs: &[Option<Op>]) -> Vec<FlagSet> {
                 seen[flags.0 as usize] = seen[flags.0 as usize].or(FlagSet::of(cond));
             }
         }
-        if let End::Exit(record) = block.end
+        if demand.is_none()
+            && let End::Exit(record) = block.end
             && let Some(v) = flags(record)
         {
             seen[v.0 as usize] = FlagSet::ALL;
         }
-        if let Some(head) = block.head
+        if demand.is_none()
+            && let Some(head) = block.head
             && charged[b]
             && let Some(v) = flags(head.record)
             && !block.params.contains(&v)
         {
             seen[v.0 as usize] = FlagSet::ALL;
         }
-        for t in block.end.targets().filter(|t| t.charge > 0) {
+        for t in block
+            .end
+            .targets()
+            .filter(|t| demand.is_none() && t.charge > 0)
+        {
             for &v in &t.args {
                 seen[v.0 as usize] = FlagSet::ALL;
             }

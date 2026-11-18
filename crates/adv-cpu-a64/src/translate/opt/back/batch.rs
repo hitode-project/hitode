@@ -131,6 +131,18 @@ impl Emitter<'_> {
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
         let words = self.words_since(inner_start);
+        let recovery_start = self.asm.offset();
+        // Publish the last logical latch's recovery operands once per strip.
+        for &(param, value) in &batch.recovery {
+            let dst = self.rd(param);
+            self.batch_address(value, dst, U);
+            self.copy(
+                self.locations[param.0 as usize],
+                Host::Register(dst),
+                Type::I32,
+            );
+        }
+        let words = words + self.words_since(recovery_start);
         self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
         self.asm.b(entry);
 

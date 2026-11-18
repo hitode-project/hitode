@@ -99,6 +99,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
     let float = |x: f64| Some(u128::from(x.to_bits()));
     Some(match *op {
         Op::Constant(_, bits) => bits,
+        Op::Snapshot(v) => get(v),
         Op::Int(op, a, b) => int(op, get(a) as u64, get(b) as u64, wide(a)),
         Op::IntUnary(op, a) => {
             let x = get(a) as u64;
@@ -860,6 +861,7 @@ mod tests {
             refund: 0,
             regs: [None; 8],
             eflags: None,
+            flag_groups: Vec::new(),
             x87: None,
             xmm: [None; 8],
             mmx: [None; 8],
