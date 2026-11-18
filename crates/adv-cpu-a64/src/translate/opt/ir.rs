@@ -451,8 +451,8 @@ pub(crate) struct BlockData {
     pub insts: Vec<(Option<Value>, Op)>,
     pub end: End,
     pub head: Option<Head>,
-    /// The guest instruction the block translates, for profiles.
-    pub eip: Option<u32>,
+    /// Guest instructions translated by this block, in execution order.
+    pub pcs: Vec<u32>,
 }
 
 /// Where a parameter of block 0 comes from when the job enters. Admission
@@ -519,7 +519,7 @@ impl Func {
             insts: Vec::new(),
             end: End::Unset,
             head,
-            eip: None,
+            pcs: Vec::new(),
         });
         Block(self.blocks.len() as u32 - 1)
     }

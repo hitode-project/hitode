@@ -267,7 +267,10 @@ fn emit<'a>(
         e.region = allocation.regions[b];
         e.mark(
             Part::Body,
-            data.eip.unwrap_or(func.records[e.region.0 as usize].eip),
+            data.pcs
+                .first()
+                .copied()
+                .unwrap_or(func.records[e.region.0 as usize].eip),
         );
         for (i, &(result, op)) in data.insts.iter().enumerate() {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {

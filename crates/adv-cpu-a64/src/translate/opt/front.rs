@@ -531,7 +531,9 @@ fn build_trace(
         .enumerate()
         .map(|(i, model)| {
             let block = func.block(None);
-            func.blocks[block.0 as usize].eip = Some(unit.trace.insts[i].pc);
+            func.blocks[block.0 as usize]
+                .pcs
+                .push(unit.trace.insts[i].pc);
             let params = registers(&mut func, block, &live.entry[i]);
             let x87 = std::array::from_fn(|s| {
                 (assumed.x87 && model.valid >> s & 1 != 0).then(|| func.param(block, Type::F64))

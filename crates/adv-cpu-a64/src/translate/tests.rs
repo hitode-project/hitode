@@ -2434,8 +2434,8 @@ pub(in crate::translate) mod opt_back {
             let (mut f, head, p) = start(&[Source::Reg(0)]);
             f.head_exit = Some(head);
             let slow = f.block(None);
-            f.blocks[head.0 as usize].eip = Some(CODE);
-            f.blocks[slow.0 as usize].eip = Some(CODE + 4);
+            f.blocks[head.0 as usize].pcs.push(CODE);
+            f.blocks[slow.0 as usize].pcs.push(CODE + 4);
             let flags = f.blocks[0].params[1];
             f.end(
                 head,

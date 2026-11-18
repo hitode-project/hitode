@@ -36,7 +36,7 @@ pub(super) fn iteration(func: &Func, costs: &[BlockCost]) -> Iteration {
     let mut block = head;
     loop {
         let i = block.0 as usize;
-        pcs.extend(func.blocks[i].eip);
+        pcs.extend_from_slice(&func.blocks[i].pcs);
         block = paths[i].flatten().unwrap().next;
         if block == head {
             break;

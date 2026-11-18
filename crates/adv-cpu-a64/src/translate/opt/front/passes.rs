@@ -1473,8 +1473,10 @@ fn join(func: &mut Func) {
             break;
         };
         let insts = std::mem::take(&mut func.blocks[b].insts);
+        let pcs = std::mem::take(&mut func.blocks[b].pcs);
         let end = std::mem::replace(&mut func.blocks[b].end, End::Unset);
         func.blocks[a].insts.extend(insts);
+        func.blocks[a].pcs.extend(pcs);
         func.blocks[a].end = end;
         reachable(func);
     }
@@ -1612,7 +1614,7 @@ fn store_guards(
     while let Some(b) = work.pop() {
         let block = &func.blocks[b];
         let mut read = incoming[b].clone();
-        read.extend(frame(block.eip));
+        read.extend(frame(block.pcs.first().copied()));
         for &(r, op) in &block.insts {
             if matches!(op, Op::Store { .. }) {
                 read.clear();
@@ -1629,7 +1631,7 @@ fn store_guards(
     }
     for (b, block) in func.blocks.iter_mut().enumerate().skip(1) {
         let mut read = std::mem::take(&mut incoming[b]);
-        read.extend(frame(block.eip));
+        read.extend(frame(block.pcs.first().copied()));
         let insts = std::mem::take(&mut block.insts);
         for (r, op) in insts {
             if let Op::Store {
