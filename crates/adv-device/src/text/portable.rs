@@ -9,7 +9,7 @@ use skrifa::{
     raw::TableProvider,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
@@ -32,7 +32,9 @@ type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 struct FaceStore {
     faces: BTreeMap<ID, Arc<Face>>,
     files: BTreeMap<PathBuf, FontBytes>,
+    file_order: VecDeque<PathBuf>,
     file_bytes: usize,
+    legacy_families: BTreeMap<ID, Vec<String>>,
 }
 #[derive(Clone)]
 struct Resource {
@@ -104,9 +106,9 @@ fn system_fonts() -> Arc<Database> {
     SYSTEM_FONTS
         .get_or_init(|| {
             let mut db = Database::new();
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             discovery::load_system_fonts(&mut db);
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             db.load_system_fonts();
             // fontdb's system discovery intentionally excludes Android.
             #[cfg(target_os = "android")]
@@ -332,7 +334,7 @@ impl Backend {
                 .filter(|face| {
                     resources.contains(&face.id)
                         && request.default.is_none()
-                        && family_matches(&db, face, &request.face)
+                        && family_matches(&db, &self.store, face, &request.face)
                 })
                 .collect();
             guests.sort_by_key(|face| {
@@ -375,7 +377,7 @@ impl Backend {
         candidates.sort_by_cached_key(|face| {
             let rank = names
                 .iter()
-                .position(|name| family_matches(&db, face, name))
+                .position(|name| family_matches(&db, &self.store, face, name))
                 .unwrap_or(names.len() + usize::from(!face.monospaced && fixed(request)));
             (
                 rank,
@@ -389,7 +391,8 @@ impl Backend {
             TextError::Font("no OpenType fonts found; install fonts or set ADV_FONT_DIR".into())
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
-        let substitute = request.default.is_none() && !family_matches(&db, &face.info, &name);
+        let substitute =
+            request.default.is_none() && !family_matches(&db, &self.store, &face.info, &name);
         let cell = if substitute && !name.is_empty() {
             ideographic_ascent(&face.font()?)
         } else {
@@ -477,7 +480,10 @@ impl Backend {
             .flat_map(|resource| resource.faces.iter().copied())
             .collect();
         let named = face.filter(|name| !name.is_empty());
-        let present = |name: &str| db.faces().any(|info| family_matches(db, info, name));
+        let present = |name: &str| {
+            db.faces()
+                .any(|info| family_matches(db, &self.store, info, name))
+        };
         // A family the host lacks enumerates as the face that draws it, under
         // the requested name, so a presence check agrees with drawing.
         let substitute = |name: &str| {
@@ -498,7 +504,7 @@ impl Backend {
                 // name, so a bold file listed first renames the regular font.
                 let mut faces: Vec<_> = db
                     .faces()
-                    .filter(|info| family_matches(db, info, name))
+                    .filter(|info| family_matches(db, &self.store, info, name))
                     .map(|info| (info, None))
                     .collect();
                 faces.sort_by_key(|(info, _)| {
@@ -794,6 +800,12 @@ fn diagnostic(
         request.italic
     );
 }
+fn touch_file(order: &mut VecDeque<PathBuf>, path: &std::path::Path) {
+    if let Some(pos) = order.iter().position(|entry| entry == path) {
+        order.remove(pos);
+        order.push_back(path.to_path_buf());
+    }
+}
 /// A face source's bytes. Files come through the store's bounded cache, so a
 /// collection's faces and repeated lookups read the file once.
 fn source_bytes(store: &mut FaceStore, source: &Source) -> Result<FontBytes, TextError> {
@@ -801,8 +813,9 @@ fn source_bytes(store: &mut FaceStore, source: &Source) -> Result<FontBytes, Tex
         Source::Binary(bytes) => return Ok(Arc::clone(bytes)),
         Source::File(path) => path,
     };
-    if let Some(bytes) = store.files.get(path) {
-        return Ok(Arc::clone(bytes));
+    if let Some(bytes) = store.files.get(path).cloned() {
+        touch_file(&mut store.file_order, path);
+        return Ok(bytes);
     }
     let length = std::fs::metadata(path).map_err(font_error)?.len();
     if length > MAX_SYSTEM_FONT_BYTES as u64 {
@@ -814,13 +827,19 @@ fn source_bytes(store: &mut FaceStore, source: &Source) -> Result<FontBytes, Tex
         return Err(TextError::Font("system font exceeds data limit".into()));
     }
     // Keep a bounded number of shared collection files. Font owners
-    // independently retain data after this lookup cache is cleared.
-    if store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
-        store.faces.clear();
-        store.files.clear();
-        store.file_bytes = 0;
+    // independently retain data after an entry is evicted.
+    while store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
+        let Some(old) = store.file_order.pop_front() else {
+            break;
+        };
+        if let Some(evicted) = store.files.remove(&old) {
+            store.file_bytes -= evicted.as_ref().as_ref().len();
+        }
+        let evicted_source = old.display().to_string();
+        store.faces.retain(|_, face| face.source != evicted_source);
     }
     store.file_bytes += length;
+    store.file_order.push_back(path.clone());
     store.files.insert(path.clone(), Arc::clone(&bytes));
     Ok(bytes)
 }
@@ -834,8 +853,11 @@ fn load_face(
     let mut store = store
         .lock()
         .map_err(|_| TextError::Font("font cache lock poisoned".into()))?;
-    if let Some(face) = store.faces.get(&id) {
-        return Ok(Arc::clone(face));
+    if let Some(face) = store.faces.get(&id).cloned() {
+        if let Source::File(path) = &face.info.source {
+            touch_file(&mut store.file_order, path);
+        }
+        return Ok(face);
     }
     let info = db
         .face(id)
@@ -871,26 +893,54 @@ fn validate_font(request: &FontRequest) -> Result<(), TextError> {
     }
     Ok(())
 }
-fn family_matches(db: &Database, face: &FaceInfo, name: &str) -> bool {
+fn family_matches(db: &Database, store: &Mutex<FaceStore>, face: &FaceInfo, name: &str) -> bool {
     let name = name.trim_start_matches('@').to_lowercase();
-    face.families
+    if face
+        .families
         .iter()
         .any(|family| family.0.to_lowercase() == name)
         || face.post_script_name.to_lowercase() == name
-        // fontdb keeps only the typographic family when one exists; GDI names
-        // faces by their legacy family. Only faces whose typographic family
-        // prefixes the request are read again.
-        || (face
-            .families
-            .iter()
-            .any(|family| !family.0.is_empty() && name.starts_with(&family.0.to_lowercase()))
-            && db
-                .with_face_data(face.id, |data, index| {
-                    FontRef::from_index(data, index).is_ok_and(|font| {
-                        legacy_families(&font).any(|family| family.to_lowercase() == name)
-                    })
-                })
-                .unwrap_or(false))
+    {
+        return true;
+    }
+    // fontdb keeps only the typographic family when one exists; GDI names
+    // faces by their legacy family. Only faces whose typographic family
+    // prefixes the request are read again (name table only, cached by face).
+    if !face
+        .families
+        .iter()
+        .any(|family| !family.0.is_empty() && name.starts_with(&family.0.to_lowercase()))
+    {
+        return false;
+    }
+    if let Ok(guard) = store.lock()
+        && let Some(cached) = guard.legacy_families.get(&face.id)
+    {
+        return cached.iter().any(|family| family == &name);
+    }
+    let names: Vec<String> = match &face.source {
+        Source::File(path) => discovery::face_metadata(path, face.index, false)
+            .ok()
+            .and_then(|(data, _)| {
+                FontRef::new(&data)
+                    .ok()
+                    .map(|font| legacy_families(&font).map(|f| f.to_lowercase()).collect())
+            })
+            .unwrap_or_default(),
+        Source::Binary(_) => db
+            .with_face_data(face.id, |data, index| {
+                FontRef::from_index(data, index)
+                    .ok()
+                    .map(|font| legacy_families(&font).map(|f| f.to_lowercase()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+    };
+    let matched = names.iter().any(|family| family == &name);
+    if let Ok(mut guard) = store.lock() {
+        guard.legacy_families.insert(face.id, names);
+    }
+    matched
 }
 /// The name ID 1 family in every language the font provides.
 fn legacy_families<'a>(font: &FontRef<'a>) -> impl Iterator<Item = String> + 'a {
@@ -2491,6 +2541,16 @@ mod tests {
         assert!(listed("宋体"));
         assert!(!listed(".SF NS"));
         assert!(!listed(""));
+    }
+    #[test]
+    // spec: DEV-FONT-2
+    fn facestore_eviction_keeps_hot_files_and_unaffected_faces() {
+        let mut order = VecDeque::from([PathBuf::from("a.ttf"), PathBuf::from("b.ttf")]);
+        touch_file(&mut order, std::path::Path::new("a.ttf"));
+        assert_eq!(
+            order,
+            VecDeque::from([PathBuf::from("b.ttf"), PathBuf::from("a.ttf")])
+        );
     }
     fn font(face: &str) -> FontRequest {
         FontRequest {

@@ -1,12 +1,20 @@
 //! System discovery only needs name, OS/2 and post tables for fontdb metadata.
 //! Keep original file sources and collection indices for full glyph loading.
 use super::MAX_SYSTEM_FONT_BYTES;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 use super::{Database, Source};
-#[cfg(any(target_os = "macos", test))]
-use std::sync::Arc;
+#[cfg(target_os = "ios")]
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CFURL};
+#[cfg(target_os = "ios")]
+use objc2_core_text::{
+    CTFontCollection, CTFontDescriptor, kCTFontFamilyNameAttribute, kCTFontURLAttribute,
+};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
-use std::{collections::BTreeSet, path::PathBuf};
+use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+use std::sync::Arc;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
@@ -91,7 +99,16 @@ pub(super) fn face_metadata(path: &Path, index: u32, charmap: bool) -> io::Resul
 }
 #[cfg(any(target_os = "macos", test))]
 fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
+    load_file_with_limit(db, path, None)
+}
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+fn load_file_with_limit(db: &mut Database, path: &Path, limit: Option<u64>) -> io::Result<()> {
     let mut file = File::open(path)?;
+    if let Some(limit) = limit
+        && file.metadata()?.len() > limit
+    {
+        return Ok(());
+    }
     let header = read(&mut file, 0, 12)?;
     let offsets = if &header[..4] == b"ttcf" {
         let count = u32_at(&header, 8) as usize;
@@ -175,6 +192,100 @@ pub(super) fn load_system_fonts(db: &mut Database) {
         load_directory(db, &PathBuf::from(home).join("Library/Fonts"), &mut seen);
     }
 }
+#[cfg(any(target_os = "ios", test))]
+const IOS_CORE_FAMILIES: &[&str] = &[
+    "PingFang SC",
+    "PingFang TC",
+    "PingFang HK",
+    "PingFang MO",
+    "苹方-简",
+    "苹方-繁",
+    "苹方-港",
+    "苹方-澳",
+    "蘋方-簡",
+    "蘋方-繁",
+    "Hiragino Sans GB",
+    "Heiti SC",
+    "Heiti TC",
+    "Songti SC",
+    "Songti TC",
+    "STHeiti",
+    "STSong",
+    "STKaiti",
+    "Kaiti SC",
+    "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN",
+    "Hiragino Mincho ProN",
+    "Hiragino Maru Gothic ProN",
+    "Apple SD Gothic Neo",
+    "AppleMyungjo",
+    "Arial",
+    "Courier New",
+    "Times New Roman",
+    "Times",
+    "Helvetica",
+    "Helvetica Neue",
+    "Menlo",
+    "Georgia",
+    "Trebuchet MS",
+    "Verdana",
+    "Impact",
+    "Symbol",
+];
+#[cfg(any(target_os = "ios", test))]
+fn wanted_ios_font(family: Option<&str>, path: &Path) -> bool {
+    let system = path.to_string_lossy().contains("/System/Library/");
+    !system
+        || family.is_some_and(|name| {
+            IOS_CORE_FAMILIES
+                .iter()
+                .any(|wanted| wanted.eq_ignore_ascii_case(name))
+        })
+}
+#[cfg(target_os = "ios")]
+pub(super) fn load_system_fonts(db: &mut Database) {
+    // CoreText exposes system CJK collections outside /System/Library/Fonts
+    // (such as FontServices' PingFangUI.ttc). Restrict system paths to the
+    // families Windows games and fallbacks actually select, while keeping any
+    // user-installed fonts outside /System/Library/.
+    // SAFETY: kCTFontURLAttribute and kCTFontFamilyNameAttribute are static CoreText keys.
+    let (url_key, family_key) = unsafe { (kCTFontURLAttribute, kCTFontFamilyNameAttribute) };
+    // SAFETY: passing None builds the system-wide available font collection.
+    let collection = unsafe { CTFontCollection::from_available_fonts(None) };
+    // SAFETY: matching_font_descriptors queries the system collection created above.
+    let Some(descriptors) = (unsafe { collection.matching_font_descriptors() }) else {
+        db.load_system_fonts();
+        return;
+    };
+    // SAFETY: matching_font_descriptors returns a CFArray of CTFontDescriptor objects.
+    let descriptors =
+        unsafe { CFRetained::cast_unchecked::<CFArray<CTFontDescriptor>>(descriptors) };
+    let mut seen = BTreeSet::new();
+    for descriptor in descriptors.iter() {
+        // SAFETY: url_key is the static kCTFontURLAttribute key.
+        let Some(url) = (unsafe { descriptor.attribute(url_key) })
+            .and_then(|value| value.downcast::<CFURL>().ok())
+        else {
+            continue;
+        };
+        let Some(path) = url.to_file_path() else {
+            continue;
+        };
+        if seen.contains(&path) {
+            continue;
+        }
+        // SAFETY: family_key is the static kCTFontFamilyNameAttribute key.
+        let family = unsafe { descriptor.attribute(family_key) }
+            .and_then(|value| value.downcast::<CFString>().ok())
+            .map(|name| name.to_string());
+        if wanted_ios_font(family.as_deref(), &path) && seen.insert(path.clone()) {
+            let _ = load_file_with_limit(db, &path, Some(MAX_SYSTEM_FONT_BYTES as u64));
+        }
+    }
+    if db.faces().next().is_none() {
+        db.load_system_fonts();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -227,5 +338,50 @@ mod tests {
         let mut actual = Database::new();
         load_system_fonts(&mut actual);
         compare(&expected, &actual);
+    }
+    // spec: DEV-FONT-1 DEV-FONT-5
+    #[test]
+    fn ios_filter_keeps_core_system_and_non_system_fonts() {
+        let pingfang = Path::new(
+            "/System/Library/PrivateFrameworks/FontServices.framework/CorePrivate/PingFangUI.ttc",
+        );
+        assert!(wanted_ios_font(Some("PingFang SC"), pingfang));
+        assert!(!wanted_ios_font(Some(".PingFang UI SC"), pingfang));
+        assert!(!wanted_ios_font(
+            Some("Devanagari Sangam MN"),
+            Path::new("/System/Library/Fonts/AppFonts/DevanagariSangamMN.ttc")
+        ));
+        assert!(wanted_ios_font(
+            Some("Custom User Font"),
+            Path::new("/private/var/mobile/Library/Fonts/Custom.ttf")
+        ));
+        assert!(wanted_ios_font(
+            None,
+            Path::new("/private/var/mobile/Library/Fonts/Custom.ttf")
+        ));
+    }
+    // spec: DEV-FONT-1 DEV-FONT-5
+    #[test]
+    #[cfg(target_os = "ios")]
+    fn ios_coretext_discovery_finds_simplified_chinese_and_skips_private_faces() {
+        let text = super::super::super::Text::default();
+        let entries = text
+            .enumerate(
+                None,
+                super::super::super::FontEnumeration::FamiliesEx(
+                    super::super::super::Encoding::SimplifiedChinese,
+                ),
+            )
+            .unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.font.face == "PingFang SC"),
+            "expected PingFang SC in SimplifiedChinese enumeration"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.font.face.starts_with('.')),
+            "private dot-prefixed families must stay excluded"
+        );
     }
 }
