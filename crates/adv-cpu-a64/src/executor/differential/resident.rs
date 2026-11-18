@@ -935,6 +935,56 @@ fn seeded_scalar_sse_memory_forms_cross_a_page() {
     }
 }
 
+// spec: A64-OPT-4, A64-OPT-9, A64F-FP-5, EXEC-CORE-9
+#[test]
+fn scalar_single_special_values_and_modes_match_reference() {
+    let image = Image::loop_body(|a, head, _| {
+        a.movaps(xmm1, xmm0).unwrap();
+        a.movaps(xmm2, xmm0).unwrap();
+        a.movaps(xmm3, xmm0).unwrap();
+        a.movaps(xmm4, xmm0).unwrap();
+        a.addss(xmm1, dword_ptr(esi)).unwrap();
+        a.subss(xmm2, dword_ptr(esi)).unwrap();
+        a.mulss(xmm3, dword_ptr(esi)).unwrap();
+        a.divss(xmm4, dword_ptr(esi)).unwrap();
+        latch(a, head);
+    });
+    for modes in [0, 0x40, 0x8000, 0x8040] {
+        for (a, b) in [
+            (0x8000_0000u32, 0x3f80_0000u32), // signed zero
+            (0, 0),                           // zero divided by zero
+            (0x0080_0000, 0x3f00_0000),       // subnormal product
+            (0x0000_0001, 0x4000_0000),       // subnormal operand, zero quotient
+            (0x0080_0000, 0x0080_0001),       // subnormal difference from normal operands
+            (0x7f7f_ffff, 0x4000_0000),       // overflow
+            (0x3f80_0000, 0),                 // divide by zero
+            (0x7f80_0000, 0xff80_0000),       // infinities, including invalid arithmetic
+            (0x7fc0_1234, 0xffc0_5678),       // first quiet NaN's payload
+            (0x7fc0_1234, 0xff80_5678),       // quiet and signaling NaNs
+            (0xff80_5678, 0x3f80_0000),       // quieting a signaling NaN
+        ] {
+            let mut state = initial(4);
+            state.mxcsr |= if modes == 0 { 0x3f } else { modes };
+            state.xmm[0] = [0x55; 16];
+            state.xmm[0][..4].copy_from_slice(&a.to_le_bytes());
+            let mut trial = Trial::new(
+                &image,
+                &state,
+                format!("scalar SSE MXCSR={:#x} {a:#x}, {b:#x}", state.mxcsr),
+                &[],
+                |m| m.write(DATA, &b.to_le_bytes()).unwrap(),
+            );
+            assert_eq!(trial.try_install_at(state), modes == 0);
+            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+            let native = trial.live.native.as_ref().unwrap();
+            if modes == 0 {
+                assert!(native.resident_arrivals(image.head).unwrap() > 0);
+            }
+            assert_eq!(native.diagnostics.resident_cold_exits, 0);
+        }
+    }
+}
+
 // spec: A64-OPT-9, A64-FLAG-3
 #[test]
 fn a_loop_carried_carry_stays_in_tier1() {
