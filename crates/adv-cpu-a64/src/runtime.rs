@@ -168,8 +168,9 @@ pub struct Runtime {
     pub opt_head: u32,
     /// Ordinal of the resident entry fact that failed.
     pub resident_fact: u32,
-    /// Guest EIP of the checked resident access that was blocked.
+    /// Guest EIP and reason for an explicit resident cold branch.
     pub resident_site: u32,
+    pub(crate) resident_cold: ResidentCold,
     /// Owner access stub entry that preserves optimized register values.
     pub resident_access: u64,
     /// Version whose cold exit reached the owner.
@@ -180,6 +181,7 @@ pub struct Runtime {
     pub resident_env: u64,
     pub resident_probation: u64,
     pub resident_discover: u64,
+    pub resident_entries: u64,
 }
 
 impl Runtime {
@@ -241,14 +243,29 @@ impl Runtime {
             opt_head: 0,
             resident_fact: 0,
             resident_site: u32::MAX,
+            resident_cold: ResidentCold::Other,
             resident_access: 0,
             resident_version: 0,
             resident_point: 0,
             resident_env: 0,
             resident_probation: 0,
             resident_discover: 0,
+            resident_entries: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u32)]
+pub(crate) enum ResidentCold {
+    Other,
+    #[cfg(native)]
+    HostFault,
+    Validation,
+    BlockedAccess,
+    PageCross,
+    FrameDisjoint,
+    Division,
 }
 
 /// Host state shared by optimized exits and signal-context capture.

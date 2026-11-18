@@ -9,7 +9,7 @@ use crate::asm::{Asm, Label};
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
-use crate::runtime::{self, Exit};
+use crate::runtime::{self, Exit, ResidentCold};
 use crate::translate::Trace;
 use crate::translate::opt::{back::Lowered, front::Assumed, ir::Source, recovery::*};
 
@@ -37,6 +37,7 @@ pub(super) struct Head {
     pub checked: FxHashSet<u32>,
     pub refused: FxHashSet<u32>,
     pub cold: FxHashMap<u32, u8>,
+    pub cold_counts: FxHashMap<(u32, ResidentCold), u64>,
     /// Versions to rebuild once the current request settles.
     pub rebuilds: u8,
     pub pending: Option<compile::Task>,
@@ -57,6 +58,7 @@ impl Head {
             checked: FxHashSet::default(),
             refused: FxHashSet::default(),
             cold: FxHashMap::default(),
+            cold_counts: FxHashMap::default(),
             rebuilds: 0,
             pending: None,
             unprofitable: false,

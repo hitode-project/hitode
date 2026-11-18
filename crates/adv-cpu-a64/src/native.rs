@@ -52,7 +52,7 @@ use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
 use crate::encode::{b, bl};
-use crate::runtime::{self, Exit, Runtime};
+use crate::runtime::{self, Exit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
@@ -404,6 +404,8 @@ pub(crate) struct Diagnostics {
     /// Optimized forms the owner ran in place, and their instructions.
     pub optimized_runs: u64,
     pub optimized_retired: u64,
+    /// Admitted resident entries when the JIT map is enabled.
+    pub resident_entries: u64,
     /// Resident form exits that went through Rust (A64-OPT-9).
     pub resident_cold_exits: u64,
     /// Fills of the whole indirect table, which also reset the shadow stack.
@@ -847,6 +849,7 @@ pub(crate) struct Native {
     samples: FxHashMap<u32, u8>,
     promoted: FxHashSet<u32>,
     computation_enabled: bool,
+    count_resident_entries: bool,
     /// The frame's pace when the owner last reached a loop whose blocks
     /// split (A64-TR-9).
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
@@ -1008,6 +1011,7 @@ impl Native {
             samples: FxHashMap::default(),
             promoted: FxHashSet::default(),
             computation_enabled: false,
+            count_resident_entries: crate::jit_map::enabled(),
             pace: std::cell::Cell::new(None),
             skip_offer: None,
             computation: FxHashMap::default(),
@@ -1265,6 +1269,7 @@ impl Native {
             return Err(error);
         }
         let translated = owner.translated;
+        self.diagnostics.resident_entries += self.runtime.resident_entries;
         let mut exit = Exit::from_raw(self.runtime.exit)
             .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
         let budget_exit = exit == Exit::Budget;
@@ -1425,6 +1430,8 @@ impl Native {
         runtime.resident_env = 0;
         runtime.resident_probation = 0;
         runtime.resident_site = u32::MAX;
+        runtime.resident_cold = ResidentCold::Other;
+        runtime.resident_entries = 0;
         runtime.offer_gate = std::ptr::from_ref(gate) as u64;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;
@@ -1451,11 +1458,12 @@ impl Native {
         let index = self.runtime.resident_version as usize;
         let head = self.heads.get_mut(&eip).expect("resident head");
         let version = &head.versions[index];
+        let record = &version.records[self.runtime.opt_record as usize];
         translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[worker::ESP]);
         self.runtime.shadow = self.runtime.opt_dump.x[28];
         let refund = translate::opt::recovery::materialize(
-            &version.records[self.runtime.opt_record as usize],
+            record,
             &self.runtime.opt_dump,
             &self.inline_saved,
             &version.flags,
@@ -1469,14 +1477,25 @@ impl Native {
         if version.assumed.mmx || cpu.mmx_mode != 0 {
             cpu.refresh_mmx();
         }
-        let site = self
-            .faults
-            .site(self.faults.capture.pc.get())
-            .map(|site| site.eip)
-            .or_else(|| {
-                (self.runtime.resident_site != u32::MAX).then_some(self.runtime.resident_site)
-            });
-        if let Some(site) = site {
+        let (site, reason) = if self.runtime.resident_cold != ResidentCold::Other {
+            (self.runtime.resident_site, self.runtime.resident_cold)
+        } else if let Some(site) = self.faults.site(self.faults.capture.pc.get()) {
+            (site.eip, ResidentCold::HostFault)
+        } else {
+            (record.eip, ResidentCold::Other)
+        };
+        let count = head.cold_counts.entry((site, reason)).or_default();
+        *count += 1;
+        if count.is_power_of_two() {
+            crate::jit_map::optimized(
+                eip,
+                format_args!("resident\tcold\t{site}\t{reason:?}\t{count}"),
+            );
+        }
+        if matches!(
+            reason,
+            ResidentCold::HostFault | ResidentCold::BlockedAccess
+        ) {
             let count = head.cold.entry(site).or_default();
             *count = count.saturating_add(1);
             if *count == head::COLD_EXITS {
@@ -1484,6 +1503,8 @@ impl Native {
                 head.rebuilds = (1 << head.versions.len()) - 1;
                 self.rebuild_resident(eip);
             }
+        } else if reason == ResidentCold::FrameDisjoint && *count == u64::from(head::COLD_EXITS) {
+            self.refuse_resident_fact(eip, u32::MAX);
         }
         refund
     }
@@ -2188,6 +2209,7 @@ impl Native {
             checked,
             all_checked: self.checks != Checks::Adaptive,
             refused: head.refused.clone(),
+            count_entries: self.count_resident_entries,
         });
     }
 
@@ -2267,6 +2289,11 @@ impl Native {
         let fact = event as u8 as usize;
         version.slot.env[fact].set(0);
         let site = version.plain_sites[fact];
+        self.refuse_resident_fact(eip, site);
+    }
+
+    fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
+        let head = self.heads.get_mut(&eip).unwrap();
         if head.refused.insert(site) {
             for (i, version) in head.versions.iter().enumerate() {
                 if version.plain_sites.contains(&site) {
@@ -2309,6 +2336,7 @@ impl Native {
             checked: FxHashSet::default(),
             all_checked: false,
             refused: FxHashSet::default(),
+            count_entries: false,
         });
         self.install_optimized(false);
     }
@@ -3253,6 +3281,45 @@ mod tests {
         assert!(resident.refused.contains(&HEAD));
         assert_ne!(resident.versions[0].entry, old);
         assert!(!resident.versions[0].plain_sites.contains(&HEAD));
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn repeated_frame_aliases_rebuild_without_cached_frame_cells() {
+        // mov eax,[esp+4]; mov [edi],ecx; dec ecx; jne HEAD; int3
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x8b, 0x44, 0x24, 4, 0x89, 0x0f, 0x49, 0x75, 0xf7, 0xcc]);
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        native.count_resident_entries = true;
+        let mut state = resident_cpu(HEAD, 4);
+        state.regs[4] = DATA;
+        state.regs[7] = DATA + 4;
+        assert!(native.force_resident_at(&mut memory, state.clone()));
+        let first = &native.heads[&HEAD].versions[0];
+        assert!(first.plain_sites.contains(&u32::MAX));
+        let old = first.entry;
+        state.eip = OUTSIDE;
+
+        for _ in 0..head::COLD_EXITS {
+            enter(&mut native, &mut memory, stop, &mut state.clone());
+        }
+        let resident = &native.heads[&HEAD];
+        let site = (HEAD + 4, ResidentCold::FrameDisjoint);
+        assert_eq!(resident.cold_counts[&site], u64::from(head::COLD_EXITS));
+        assert_ne!(resident.versions[0].entry, old);
+        assert!(!resident.versions[0].plain_sites.contains(&u32::MAX));
+
+        let before = native.diagnostics.resident_entries;
+        let cold = native.diagnostics.resident_cold_exits;
+        for _ in 0..100 {
+            let mut state = state.clone();
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
+            }
+            assert_eq!(state.regs[0], 2);
+        }
+        assert_eq!(native.diagnostics.resident_entries - before, 100);
+        assert_eq!(native.diagnostics.resident_cold_exits, cold);
     }
 
     // spec: A64-MEM-7, A64-OPT-9

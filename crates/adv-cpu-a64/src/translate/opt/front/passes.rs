@@ -59,6 +59,16 @@ pub(super) fn run(
     while propagate(func) {}
     if let Some(r) = &resident {
         store_guards(func, facts, loads, stores, r);
+        for block in &func.blocks {
+            if let Some(&pc) = block.pcs.first() {
+                func.cold_pcs
+                    .extend(block.insts.iter().filter_map(|&(value, op)| {
+                        value
+                            .filter(|_| op.can_fail() && !matches!(op, Op::Load { .. }))
+                            .map(|value| (value, pc))
+                    }));
+            }
+        }
     }
     join(func);
     group_stores(func, facts, loads, stores, resident.is_some());
@@ -1068,7 +1078,7 @@ fn sse_inputs(func: &mut Func) {
     for block in &mut func.blocks {
         let mut checked = BTreeMap::<Value, u8>::new();
         block.insts.retain_mut(|(_, op)| {
-            let Op::SseInput { a, b, packed } = *op else {
+            let Op::SseInput { a, b, packed, pc } = *op else {
                 return true;
             };
             let mask = if packed { 3 } else { 1 };
@@ -1084,6 +1094,7 @@ fn sse_inputs(func: &mut Func) {
                 a,
                 b: inputs.next(),
                 packed,
+                pc,
             };
             true
         });

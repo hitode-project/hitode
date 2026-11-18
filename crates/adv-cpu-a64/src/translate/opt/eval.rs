@@ -283,7 +283,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             float(x)?
         }
-        Op::SseInput { a, b, packed } => {
+        Op::SseInput { a, b, packed, .. } => {
             for v in [Some(a), b].into_iter().flatten() {
                 let bits = get(v);
                 if f64::from_bits(bits as u64).is_subnormal()

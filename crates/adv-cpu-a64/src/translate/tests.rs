@@ -1860,7 +1860,7 @@ pub(in crate::translate) mod opt_back {
         }
 
         fn lower(f: &Func, cpu: &CpuState) -> back::Lowered {
-            back::lower_resident(f, &assumptions(cpu), &f.entry)
+            back::lower_resident(f, &assumptions(cpu), &f.entry, false)
         }
 
         fn word(h: &Harness, address: u64) -> u32 {
@@ -2379,7 +2379,7 @@ pub(in crate::translate) mod opt_back {
             assumed.ebp = Some(-12);
             cpu.regs[4] = 8;
             cpu.regs[5] = 8_u32.wrapping_sub(12);
-            let form = back::lower_resident(&f, &assumed, &f.entry);
+            let form = back::lower_resident(&f, &assumed, &f.entry, false);
             let mut h = harness();
             assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Dispatch);
             cpu.regs[5] ^= 1;

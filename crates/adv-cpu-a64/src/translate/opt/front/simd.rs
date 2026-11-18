@@ -212,7 +212,9 @@ impl Front<'_> {
     }
     fn sse_input(&mut self, a: Value, b: Option<Value>, packed: bool) {
         if self.assumed.mxcsr & 2 == 0 {
-            self.func.push(self.block, Op::SseInput { a, b, packed });
+            let pc = self.func.blocks[self.block.0 as usize].pcs[0];
+            self.func
+                .push(self.block, Op::SseInput { a, b, packed, pc });
         }
     }
 

@@ -30,6 +30,7 @@ pub(super) struct Request {
     pub checked: FxHashSet<u32>,
     pub all_checked: bool,
     pub refused: FxHashSet<u32>,
+    pub count_entries: bool,
 }
 
 pub(super) struct Compiled {
@@ -88,6 +89,7 @@ fn compile(request: Request) -> Compiled {
         checked,
         all_checked,
         refused,
+        count_entries,
     } = request;
     let mut unit = Unit::default();
     unit.trace = trace;
@@ -108,7 +110,12 @@ fn compile(request: Request) -> Compiled {
             &|pc| refused.contains(&pc),
         ) {
             Ok(built) => {
-                let lowered = back::lower_resident(&built.func, &built.assumed, &built.func.entry);
+                let lowered = back::lower_resident(
+                    &built.func,
+                    &built.assumed,
+                    &built.func.entry,
+                    count_entries,
+                );
                 let (cuts, us) = (built.cuts, started.elapsed().as_micros());
                 crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
                 Some(Form { built, lowered })

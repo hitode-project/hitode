@@ -7,7 +7,6 @@ use adv_cpu_core::memory::{LINEAR, READ, SHARED, WRITE};
 const MEMORY_BASE: u32 = offset_of!(Runtime, memory_base) as u32;
 const MEMORY_PAGES: u32 = offset_of!(Runtime, memory_pages) as u32;
 const PLAIN_PAGES: u32 = offset_of!(Runtime, plain_pages) as u32;
-const RESIDENT_SITE: u32 = offset_of!(Runtime, resident_site) as u32;
 const RESIDENT_ACCESS: u32 = offset_of!(Runtime, resident_access) as u32;
 
 pub(super) struct CheckedAccess {
@@ -122,8 +121,7 @@ impl Emitter<'_> {
             self.asm.b(resume);
 
             self.asm.bind(blocked);
-            self.imm(T, u64::from(eip));
-            self.asm.emit(str(W, T, RT, RESIDENT_SITE));
+            self.record_cold(ResidentCold::BlockedAccess, eip);
             self.asm.b(self.cold[region.0 as usize]);
         }
     }

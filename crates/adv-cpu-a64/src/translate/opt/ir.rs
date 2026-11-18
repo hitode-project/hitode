@@ -6,6 +6,7 @@
 //! emission offsets by the private alias base.
 
 use iced_x86::ConditionCode;
+use std::collections::BTreeMap;
 
 use super::recovery::IrRecord;
 
@@ -303,6 +304,7 @@ pub(crate) enum Op {
         a: Value,
         b: Option<Value>,
         packed: bool,
+        pc: u32,
     },
     /// Effect boundary for floating-point checks.
     Validate,
@@ -512,6 +514,8 @@ pub(crate) struct Func {
     pub kept: u32,
     /// Charged heads in resident forms leave through complete records.
     pub resident: bool,
+    /// Guest EIPs of resident checks whose operations produce a value.
+    pub cold_pcs: BTreeMap<Value, u32>,
 }
 
 impl Func {

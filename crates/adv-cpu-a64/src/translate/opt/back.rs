@@ -20,7 +20,7 @@ use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::jit_map::{Mark, Part};
-use crate::runtime::{self, Runtime};
+use crate::runtime::{self, ResidentCold, Runtime};
 use crate::translate::access::{CheckedEmitter, Value as AccessReg, page_crossing};
 use crate::translate::{Carry, Overflow, Sense, Site, WINDOW, fp_class};
 use std::mem::offset_of;
@@ -82,30 +82,41 @@ impl Lowered {
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None, false)
+    lower_form(func, None, false, false)
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), false)
+    lower_form(func, Some((assumed, entry)), false, false)
 }
 
 /// A resident form: entered from Tier-1 back edges, accessing guest memory
 /// through the window (A64-OPT-9).
-pub(crate) fn lower_resident(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
+pub(crate) fn lower_resident(
+    func: &Func,
+    assumed: &Assumed,
+    entry: &[Source],
+    count_entries: bool,
+) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), true)
+    lower_form(func, Some((assumed, entry)), true, count_entries)
 }
 
-fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>, resident: bool) -> Lowered {
+fn lower_form(
+    func: &Func,
+    inline: Option<(&Assumed, &[Source])>,
+    resident: bool,
+    count_entries: bool,
+) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let allocation = alloc::allocate(func, inline.is_some(), resident);
     let mut asm = Asm::new();
     // A bit test whose target lands out of range is emitted wide, and the
     // form again, as the ordinary translator does.
     let (mut e, exit, miss, cold) = loop {
-        let (mut e, exit, miss, cold) = emit(func, &allocation, asm, inline, resident);
+        let (mut e, exit, miss, cold) =
+            emit(func, &allocation, asm, inline, resident, count_entries);
         if !e.asm.widen_bit_tests() {
             break (e, exit, miss, cold);
         }
@@ -179,6 +190,7 @@ fn emit<'a>(
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
     resident: bool,
+    count_entries: bool,
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -212,6 +224,7 @@ fn emit<'a>(
         asm,
         blocks,
         cold,
+        failures: Vec::new(),
         normal: if inline.is_some() {
             vec![None; func.records.len()]
         } else {
@@ -252,7 +265,7 @@ fn emit<'a>(
         (None, None)
     };
     if last_fact.is_none() {
-        e.begin_body(first);
+        e.begin_body(first, count_entries);
     }
     let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
     for (b, data) in func.blocks.iter().enumerate() {
@@ -276,10 +289,24 @@ fn emit<'a>(
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
             }
+            e.guest_eip = if op.region_guard().is_some() {
+                data.insts[i + 1..]
+                    .iter()
+                    .take(2)
+                    .find_map(|&(_, next)| match next {
+                        Op::Store { pc, .. } => Some(pc),
+                        _ => None,
+                    })
+                    .expect("store guard precedes its store")
+            } else {
+                result
+                    .and_then(|value| func.cold_pcs.get(&value).copied())
+                    .unwrap_or(func.records[e.region.0 as usize].eip)
+            };
             e.op(result, op);
             if b == 0 && last_fact == Some(i) {
                 e.entry_frames(&func.entry);
-                e.begin_body(first);
+                e.begin_body(first, count_entries);
                 e.asm.bind(e.blocks[b]);
                 start = e.asm.offset();
             }
@@ -361,6 +388,12 @@ fn emit<'a>(
     }
     e.fp_checks();
     e.checked_accesses();
+    for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
+        e.asm.bind(label);
+        e.mark(Part::Cold, pc);
+        e.record_cold(reason, pc);
+        e.asm.b(e.cold[record.0 as usize]);
+    }
     if let Some(probation) = &e.probation {
         probation.emit(&mut e.asm);
     }
@@ -393,6 +426,7 @@ struct FpCheck {
     check: Label,
     resume: Label,
     region: RecordId,
+    fail: Label,
 }
 
 struct Emitter<'a> {
@@ -400,6 +434,7 @@ struct Emitter<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     cold: Vec<Label>,
+    failures: Vec<(Label, RecordId, ResidentCold, u32)>,
     normal: Vec<Option<Label>>,
     resident: bool,
     env_miss: Option<Label>,
@@ -445,7 +480,17 @@ impl<'a> Emitter<'a> {
         ((self.asm.offset() - start) / 4) as u32
     }
 
-    fn begin_body(&mut self, record: RecordId) {
+    fn begin_body(&mut self, record: RecordId, count_entries: bool) {
+        let start = self.asm.offset();
+        if count_entries {
+            let entries = offset_of!(Runtime, resident_entries) as u32;
+            self.asm.emit_all(&[
+                ldr(X, T, RT, entries),
+                add_imm(X, T, T, 1, false),
+                str(X, T, RT, entries),
+            ]);
+        }
+        let diagnostic_words = self.words_since(start);
         if let Some(probation) = &mut self.probation {
             probation.call(&mut self.asm, true);
         }
@@ -455,7 +500,7 @@ impl<'a> Emitter<'a> {
             false,
         );
         if self.resident {
-            self.entry_words = self.words_since(0);
+            self.entry_words = self.words_since(0) - diagnostic_words;
         }
     }
 
@@ -718,8 +763,27 @@ impl<'a> Emitter<'a> {
             self.frame(false, X, T, base, offset);
         }
     }
-    fn fail(&self) -> Label {
-        self.cold[self.region.0 as usize]
+    fn failure(&mut self, record: RecordId, reason: ResidentCold) -> Label {
+        if !self.resident {
+            return self.cold[record.0 as usize];
+        }
+        let label = self.asm.label();
+        self.failures.push((label, record, reason, self.guest_eip));
+        label
+    }
+
+    fn fail(&mut self) -> Label {
+        self.failure(self.region, ResidentCold::Validation)
+    }
+
+    fn record_cold(&mut self, reason: ResidentCold, pc: u32) {
+        self.imm(T, u64::from(pc));
+        self.asm
+            .emit(str(W, T, RT, offset_of!(Runtime, resident_site) as u32));
+        self.asm.emit_all(&[
+            movz(W, T, reason as u16, 0),
+            str(W, T, RT, offset_of!(Runtime, resident_cold) as u32),
+        ]);
     }
 
     fn charge(&mut self, charge: i64, record: RecordId, head_exit: bool) {
@@ -861,6 +925,7 @@ impl<'a> Emitter<'a> {
         if dst != result {
             self.asm.emit(vmov(false, dst, result));
         }
+        let fail = self.fail();
         self.fp_checks.push(FpCheck {
             op,
             a,
@@ -868,6 +933,7 @@ impl<'a> Emitter<'a> {
             check,
             resume,
             region: self.region,
+            fail,
         });
     }
 
@@ -879,11 +945,11 @@ impl<'a> Emitter<'a> {
             check,
             resume,
             region,
+            fail,
         } in std::mem::take(&mut self.fp_checks)
         {
             self.asm.bind(check);
             self.mark(Part::Cold, self.func.records[region.0 as usize].eip);
-            let fail = self.cold[region.0 as usize];
             let nonfinite = self.asm.label();
             self.asm.emit_all(&[
                 lsl_imm(X, T, T, 1),
@@ -973,12 +1039,8 @@ impl<'a> Emitter<'a> {
                 record,
             } => {
                 let addr = self.gp(addr, U);
-                page_crossing(
-                    &mut self.asm,
-                    addr,
-                    u32::from(width),
-                    self.cold[record.0 as usize],
-                );
+                let fail = self.failure(record, ResidentCold::PageCross);
+                page_crossing(&mut self.asm, addr, u32::from(width), fail);
             }
             Op::FrameDisjoint {
                 addr,
@@ -988,7 +1050,8 @@ impl<'a> Emitter<'a> {
                 hi,
                 record,
             } => {
-                self.frame_disjoint(addr, width, base, lo, hi, self.cold[record.0 as usize]);
+                let fail = self.failure(record, ResidentCold::FrameDisjoint);
+                self.frame_disjoint(addr, width, base, lo, hi, fail);
             }
             Op::Constant(_, bits) => {
                 if !matches!(loc, Some(Host::Constant(_))) {
@@ -1074,8 +1137,9 @@ impl<'a> Emitter<'a> {
             } => {
                 let n = self.gp(dividend, T);
                 let mut b = self.gp(divisor, U);
-                if !proved {
-                    self.asm.cbz(W, false, b, self.fail());
+                let fail = (!proved).then(|| self.failure(self.region, ResidentCold::Division));
+                if let Some(fail) = fail {
+                    self.asm.cbz(W, false, b, fail);
                 }
                 if signed {
                     self.asm.emit(sbfx(X, U, b, 0, 32));
@@ -1086,14 +1150,14 @@ impl<'a> Emitter<'a> {
                 } else {
                     udiv(X, d, n, b)
                 });
-                if !proved {
+                if let Some(fail) = fail {
                     self.asm.emit(if signed {
                         sbfx(X, U, d, 0, 32)
                     } else {
                         mov(W, U, d)
                     });
                     self.asm.emit(cmp(X, d, U, Lsl, 0));
-                    self.asm.b_cond(Cond::Ne, self.fail());
+                    self.asm.b_cond(Cond::Ne, fail);
                 }
                 if signed {
                     self.asm.emit(mov(W, d, d));
@@ -1199,7 +1263,8 @@ impl<'a> Emitter<'a> {
                         add(W, T, T, U, Lsl, 0),
                         cmp_imm(W, T, 64 - 53, false),
                     ]);
-                    self.asm.b_cond(Cond::Lo, self.fail());
+                    let fail = self.fail();
+                    self.asm.b_cond(Cond::Lo, fail);
                 }
             }
             Op::ToInt { value, wide } => {
@@ -1215,7 +1280,8 @@ impl<'a> Emitter<'a> {
                     and_imm(X, T, T, i64::MAX as u64),
                     cmp(X, T, U, Lsl, 0),
                 ]);
-                self.asm.b_cond(Cond::Hs, self.fail());
+                let fail = self.fail();
+                self.asm.b_cond(Cond::Hs, fail);
                 self.asm
                     .emit(fcvt_int(if wide { X } else { W }, true, d, a));
             }
@@ -1611,6 +1677,7 @@ impl<'a> Emitter<'a> {
                 denormal,
                 single,
             } => {
+                let fail = self.fail();
                 let r = self.gp(bits, U);
                 let nan = self.asm.label();
                 let done = self.asm.label();
@@ -1628,19 +1695,20 @@ impl<'a> Emitter<'a> {
                 if denormal {
                     self.asm.cbz(W, true, T, done);
                     self.asm.emit(lsl_imm(size, T, r, 1));
-                    self.asm.cbz(size, true, T, self.fail());
+                    self.asm.cbz(size, true, T, fail);
                 }
                 self.asm.b(done);
                 self.asm.bind(nan);
                 self.asm.emit(lsl_imm(size, T, r, high));
-                self.asm.cbz(size, true, T, self.fail());
+                self.asm.cbz(size, true, T, fail);
                 self.asm.bind(done);
                 self.asm.emit(fmov_to_v(size, q, r));
                 if single {
                     self.asm.emit(unary(Unary::Widen, q, q));
                 }
             }
-            Op::SseInput { a, b, packed } => {
+            Op::SseInput { a, b, packed, pc } => {
+                self.guest_eip = pc;
                 let a = self.vr(a, A);
                 let b = b.map(|b| self.vr(b, B));
                 let fail = self.fail();
