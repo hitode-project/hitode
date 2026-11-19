@@ -1599,3 +1599,52 @@ fn system_and_software_events_keep_the_core_outcomes() {
         assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
     }
 }
+
+// spec: A64A-FALL-4, A64-TR-4, A64-VER-1
+#[test]
+fn rep_word_comparison_carries_restart_flags_across_a_slice() {
+    use adv_cpu_core::{EXEC, READ, WRITE};
+
+    let code = [0x64, 0x67, 0xf3, 0xa6]; // REPE CMPSB with FS and word addresses
+    let stop = CODE + code.len() as u32;
+    for blocked in [false, true] {
+        let mut native = Executor::address_space().unwrap();
+        let mut oracle = Executor::interpreted_address_space().unwrap();
+        native.native.as_mut().unwrap().first_visits = false;
+        for cpu in [&mut native, &mut oracle] {
+            cpu.map(CODE, 4096, READ | WRITE | EXEC).unwrap();
+            cpu.map(0, 0x4000, READ | WRITE).unwrap();
+            cpu.map(DATA, 0x10000, READ | WRITE).unwrap();
+            cpu.write(CODE, &code).unwrap();
+            cpu.write(DATA + 0xffff, &[0x83]).unwrap();
+            cpu.write(DATA, &[0x91, 0xb0, 0xa8]).unwrap();
+            cpu.write(0x900, &[0x83, 0x91, 0xb0, 0xa8]).unwrap();
+            cpu.state.eip = CODE;
+            cpu.state.eflags = 0x897;
+            cpu.state.fs_base = DATA;
+            cpu.state.regs[1] = 0xab00_0004;
+            cpu.state.regs[6] = 0xabcd_ffff;
+            cpu.state.regs[7] = 0xcdef_0900;
+            assert_eq!(cpu.run(stop, 1).unwrap(), RunOutcome::Budget);
+            assert_eq!(cpu.state.regs[1], 0xab00_0003);
+            assert_eq!(cpu.state.regs[6], 0xabcd_0000);
+            assert_eq!(cpu.state.regs[7], 0xcdef_0901);
+            assert!(cpu.state.rep.is_some());
+            if blocked {
+                cpu.protect(DATA, 4096, 0).unwrap();
+            }
+        }
+        assert_eq!(native.state.eflags, oracle.state.eflags);
+        assert_eq!(native.state.rep, oracle.state.rep);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.run(stop, 3), oracle.run(stop, 3));
+        assert_eq!(native.state.regs, oracle.state.regs);
+        assert_eq!(native.state.eflags, oracle.state.eflags);
+        assert!(native.state.rep.is_none());
+        if blocked {
+            assert_eq!(native.state.eflags, 0x897);
+        } else {
+            assert_eq!(native.stats.interpreter_entries, 0);
+        }
+    }
+}

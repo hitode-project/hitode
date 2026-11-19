@@ -558,6 +558,7 @@ fn execute(
         faults.capture.recover(cpu, site, runtime.temps);
         retired -= u64::from(site.refund);
     }
+    returned.commit_repeat(cpu);
     if optimized.is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
         cpu.refresh_mmx();
     }

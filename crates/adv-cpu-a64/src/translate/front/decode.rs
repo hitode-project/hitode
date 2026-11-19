@@ -482,7 +482,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
             let source = operand(instruction, 1)?;
             Op::Cmov(instruction.condition_code(), register(0)?, source)
         }
-        _ => return None,
+        _ => return super::plans::strings(instruction).map(Op::Strings),
     })
     .filter(|op| supported(*op))
 }
@@ -858,8 +858,6 @@ fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> O
         Op::Stack(m, part, width, index)
     } else if let Some(simd) = super::plans::simd(&instruction, index) {
         Op::Simd(simd)
-    } else if let Some(strings) = super::plans::strings(&instruction, index) {
-        Op::Strings(strings)
     } else if let Some(integer) = super::plans::integer(&instruction, index) {
         Op::Integer(integer)
     } else if let Some(parts) = super::plans::parts(&instruction) {

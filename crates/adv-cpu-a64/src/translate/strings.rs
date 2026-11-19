@@ -11,15 +11,15 @@
 //! difference's exclusive or, which is the canonical form.
 //!
 //! As in the interpreter, each element of a REP is a unit of the countdown.
-//! When one unit is left, the `interpret` helper runs the next element, so
-//! a REP the countdown cannot finish stops part way exactly as in the
-//! interpreter, flags and continuation included. Checked instructions reuse
+//! A budget cut publishes the completed elements and resumes at the REP.
+//! Comparisons publish the last flags and carry the original flags for an
+//! eventual fault. Checked instructions reuse
 //! the loop, caching each pointer's page and window or alias base. Entering
 //! a different page, including an element's last byte, uses the access
 //! emitter's permission checks without changing NZCV. A crossing element
-//! needs one view that allows both pages. A blocked element hands its current
-//! state to the interpreter. Source overrides use FS's thread base or the
-//! flat segment base. Word address-size overrides stay with the interpreter.
+//! needs one view that allows both pages. A blocked element leaves with a
+//! precise access event. Source overrides use FS's thread base or the flat
+//! segment base. Word addresses wrap before adding the segment base.
 
 #[cfg(test)]
 use super::front::plans::strings as plan;
@@ -30,6 +30,7 @@ use crate::asm::Label;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::runtime::{self, Event, Exit};
 
 use super::access::PAGE_SHIFT;
 use super::{
@@ -62,8 +63,7 @@ pub struct Strings {
     /// 1, 2 or 4 bytes.
     pub width: u8,
     pub rep: Rep,
-    /// The helper that finishes the instruction on the slow path.
-    pub helper: u8,
+    pub word: bool,
     pub fs: bool,
 }
 
@@ -104,16 +104,21 @@ impl Translator<'_> {
         if rep {
             self.remark(crate::jit_map::Part::Rep);
         }
-        let (top, finish, slow, done) = (
+        let (top, finish, blocked, exhausted, done) = (
+            self.asm.label(),
             self.asm.label(),
             self.asm.label(),
             self.asm.label(),
             self.asm.label(),
         );
-        if rep {
-            self.asm.cbz(W, false, ecx, done);
-            self.asm.cbz(X, false, X9, slow);
-        }
+        let refund = if rep {
+            self.string_count_branch(op.word, ecx, done);
+            // The instruction's prepaid unit can pay for its first element.
+            self.emit(add_imm(X, X9, X9, 1, false));
+            self.trace.unused(self.index)
+        } else {
+            self.trace.owed(self.index)
+        };
         // The step: the width, negated when DF is set.
         self.emit_all(&[
             movz(W, X17, u16::from(op.width), 0),
@@ -124,109 +129,157 @@ impl Translator<'_> {
             self.emit_all(&[movz(W, X13, 0xffff, 16), movz(W, X14, 0xffff, 16)]);
         }
         self.asm.bind(top);
-        let from = if op.fs {
-            let address = Reg::new(8);
-            self.emit(ldr(X, address, super::RUNTIME, crate::runtime::CPU_STATE));
-            self.emit(ldr(W, address, address, crate::runtime::FS_BASE));
-            self.emit(add(W, address, address, esi, Lsl, 0));
-            address
+        let mut from = esi;
+        if op.word && matches!(op.kind, Kind::Movs | Kind::Lods | Kind::Cmps) {
+            self.emit(ubfx(W, temp(1), esi, 0, 16));
+            from = temp(1);
+        }
+        if op.fs {
+            self.emit(ldr(X, X16, super::RUNTIME, runtime::CPU_STATE));
+            self.emit(ldr(W, X16, X16, runtime::FS_BASE));
+            self.emit(add(W, temp(1), X16, from, Lsl, 0));
+            from = temp(1);
+        }
+        let to = if op.word && op.kind != Kind::Lods {
+            self.emit(ubfx(W, temp(0), edi, 0, 16));
+            temp(0)
         } else {
-            esi
+            edi
         };
         if self.checking {
             if matches!(op.kind, Kind::Movs | Kind::Lods | Kind::Cmps) {
-                self.string_page(from, op.width, false, (X13, X0, source), slow);
+                self.string_page(from, op.width, false, (X13, X0, source), blocked);
             }
             if op.kind != Kind::Lods {
                 self.string_page(
-                    edi,
+                    to,
                     op.width,
                     matches!(op.kind, Kind::Movs | Kind::Stos),
                     (X14, X1, destination),
-                    slow,
+                    blocked,
                 );
             }
         }
         // The compared operands: the left one and w7.
         let left = match op.kind {
             Kind::Movs => {
-                self.site();
+                self.site_with_refund(refund);
                 self.emit(load(X6, from, source));
-                self.site();
-                self.emit_all(&[
-                    store(X6, edi),
-                    add(W, esi, esi, X17, Lsl, 0),
-                    add(W, edi, edi, X17, Lsl, 0),
-                ]);
+                self.site_with_refund(refund);
+                self.emit(store(X6, to));
+                self.string_advance(esi, op.word);
+                self.string_advance(edi, op.word);
                 None
             }
             Kind::Stos => {
-                self.site();
-                self.emit_all(&[store(eax, edi), add(W, edi, edi, X17, Lsl, 0)]);
+                self.site_with_refund(refund);
+                self.emit(store(eax, to));
+                self.string_advance(edi, op.word);
                 None
             }
             Kind::Lods => {
-                self.site();
+                self.site_with_refund(refund);
                 self.emit(load(X6, from, source));
-                self.emit_all(&[
-                    match op.width {
-                        4 => mov(W, eax, X6),
-                        width => bfi(W, eax, X6, 0, 8 * u32::from(width)),
-                    },
-                    add(W, esi, esi, X17, Lsl, 0),
-                ]);
+                self.emit(match op.width {
+                    4 => mov(W, eax, X6),
+                    width => bfi(W, eax, X6, 0, 8 * u32::from(width)),
+                });
+                self.string_advance(esi, op.word);
                 None
             }
             Kind::Scas => {
-                self.site();
-                self.emit_all(&[
-                    load(temp(0), edi, destination),
-                    add(W, edi, edi, X17, Lsl, 0),
-                ]);
+                self.site_with_refund(refund);
+                self.emit(load(temp(0), to, destination));
+                self.string_advance(edi, op.word);
                 Some(eax)
             }
             Kind::Cmps => {
-                self.site();
+                self.site_with_refund(refund);
                 self.emit(load(X6, from, source));
-                self.site();
-                self.emit_all(&[
-                    load(temp(0), edi, destination),
-                    add(W, esi, esi, X17, Lsl, 0),
-                    add(W, edi, edi, X17, Lsl, 0),
-                ]);
+                self.site_with_refund(refund);
+                self.emit(load(temp(0), to, destination));
+                self.string_advance(esi, op.word);
+                self.string_advance(edi, op.word);
                 Some(X6)
             }
         };
         if rep {
-            // An element charges the countdown once it completes; the
-            // instruction's own charge pays for one of them.
-            self.emit_all(&[sub_imm(W, ecx, ecx, 1, false), sub_imm(X, X9, X9, 1, false)]);
+            let count = if op.word { X16 } else { ecx };
+            self.emit(sub_imm(W, count, ecx, 1, false));
+            if op.word {
+                self.emit(bfi(W, ecx, count, 0, 16));
+            }
+            self.emit(sub_imm(X, X9, X9, 1, false));
             if let Some(left) = left {
-                // Flags change only once the REP ends: a fault in it
-                // leaves those from before the instruction, as the
-                // interpreter does.
                 self.emit(sub(W, X16, left, temp(0), Lsl, 0));
                 if op.width != 4 {
                     self.emit(lsl_imm(W, X16, X16, 32 - 8 * u32::from(op.width)));
                 }
                 self.asm.cbz(W, op.rep == Rep::Rep, X16, finish);
             }
-            self.asm.cbz(W, false, ecx, finish);
+            self.string_count_branch(op.word, ecx, finish);
             self.asm.cbz(X, true, X9, top);
-            self.asm.b(slow);
+            self.asm.b(exhausted);
             self.asm.bind(finish);
-            self.emit(add_imm(X, X9, X9, 1, false));
         }
         if let Some(left) = left {
             self.compare(left, temp(0), op.width);
         }
+        let inst = self.trace.insts[self.index];
         if rep || self.checking {
             self.asm.b(done);
-            self.asm.bind(slow);
-            self.helper(op.helper);
+        }
+        if self.checking {
+            self.asm.bind(blocked);
+            self.follow_exit(Exit::Event(Event::CheckedAccess), inst.pc, refund, false);
+        }
+        if rep {
+            self.asm.bind(exhausted);
+            if let Some(left) = left {
+                self.emit(ldr(X, X0, super::RUNTIME, runtime::CPU_STATE));
+                runtime::emit_read_flags(self.asm, X0);
+                self.emit(mov(W, temp(1), X4));
+                self.compare(left, temp(0), op.width);
+                if refund != 0 {
+                    self.emit(add_imm(X, X9, X9, refund, false));
+                }
+                let descriptor = 6
+                    + op.width.trailing_zeros() as u16
+                    + 6 * u16::from(op.kind == Kind::Scas)
+                    + 3 * u16::from(op.rep == Rep::Repne)
+                    + 32 * u16::from(op.word)
+                    + 64 * u16::from(op.fs);
+                self.emit_all(&[
+                    movz(W, X0, runtime::REP_BUDGET | descriptor, 0),
+                    orr(X, X0, X0, temp(1), Lsl, 32),
+                ]);
+                self.target(inst.pc);
+                self.far(self.stubs.exit);
+            } else {
+                self.follow_exit(self.budget_exit(), inst.pc, refund, false);
+            }
         }
         self.asm.bind(done);
+        self.vector.cpu = false;
         self.state = State::CANONICAL;
+    }
+
+    fn string_count_branch(&mut self, word: bool, count: Reg, label: Label) {
+        let count = if word {
+            self.emit(ubfx(W, X16, count, 0, 16));
+            X16
+        } else {
+            count
+        };
+        self.asm.cbz(W, false, count, label);
+    }
+
+    fn string_advance(&mut self, reg: Reg, word: bool) {
+        let result = if word { X16 } else { reg };
+        self.emit(add(W, result, reg, X17, Lsl, 0));
+        if word {
+            self.emit(bfi(W, reg, result, 0, 16));
+        }
     }
 
     /// Cache one pointer's last checked page and base, selecting a base for this element.
@@ -309,7 +362,7 @@ mod tests {
 
     #[test]
     fn plans_follow_prefixes_and_segments() {
-        let plan = |build: fn(&mut CodeAssembler)| plan(&decode(build), 3);
+        let plan = |build: fn(&mut CodeAssembler)| plan(&decode(build));
         let movsd = plan(|a| a.rep().movsd().unwrap()).unwrap();
         assert_eq!(
             (movsd.kind, movsd.width, movsd.rep),
@@ -317,8 +370,8 @@ mod tests {
         );
         let scasb = plan(|a| a.repne().scasb().unwrap()).unwrap();
         assert_eq!(
-            (scasb.kind, scasb.rep, scasb.helper),
-            (Kind::Scas, Rep::Repne, 3)
+            (scasb.kind, scasb.rep, scasb.word),
+            (Kind::Scas, Rep::Repne, false)
         );
         let cmpsw = plan(|a| a.repe().cmpsw().unwrap()).unwrap();
         assert_eq!((cmpsw.width, cmpsw.rep), (2, Rep::Rep));
@@ -328,7 +381,7 @@ mod tests {
         let decoded =
             iced_x86::Decoder::with_ip(32, &fs_movsd, 0x1000, iced_x86::DecoderOptions::NONE)
                 .decode();
-        assert!(super::plan(&decoded, 0).unwrap().fs);
+        assert!(super::plan(&decoded).unwrap().fs);
         assert_eq!(
             plan(|a| a.repne().stosd().unwrap()).unwrap().rep,
             Rep::Repne

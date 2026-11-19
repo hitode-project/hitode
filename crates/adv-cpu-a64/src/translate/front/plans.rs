@@ -336,7 +336,7 @@ fn double_shift(instruction: &Instruction) -> Option<Parts> {
 }
 
 /// The string instruction `instruction` is, when the loop handles it.
-pub(in crate::translate) fn strings(instruction: &Instruction, helper: u8) -> Option<Strings> {
+pub(in crate::translate) fn strings(instruction: &Instruction) -> Option<Strings> {
     use Code::*;
     let (kind, width) = match instruction.code() {
         Movsb_m8_m8 => (StringKind::Movs, 1),
@@ -356,7 +356,6 @@ pub(in crate::translate) fn strings(instruction: &Instruction, helper: u8) -> Op
         Cmpsd_m32_m32 => (StringKind::Cmps, 4),
         _ => return None,
     };
-    // ESI in its default segment, and 32-bit addresses.
     use iced_x86::OpKind::{MemoryESDI, MemorySegDI, MemorySegSI};
     let short = (0..instruction.op_count()).any(|n| {
         matches!(
@@ -364,7 +363,7 @@ pub(in crate::translate) fn strings(instruction: &Instruction, helper: u8) -> Op
             MemorySegSI | MemorySegDI | MemoryESDI
         )
     });
-    if short || instruction.has_lock_prefix() {
+    if instruction.has_lock_prefix() {
         return None;
     }
     let rep = match (instruction.has_rep_prefix(), instruction.has_repne_prefix()) {
@@ -377,7 +376,7 @@ pub(in crate::translate) fn strings(instruction: &Instruction, helper: u8) -> Op
         kind,
         width,
         rep,
-        helper,
+        word: short,
         fs: matches!(kind, StringKind::Movs | StringKind::Lods | StringKind::Cmps)
             && instruction.segment_prefix() == Register::FS,
     })

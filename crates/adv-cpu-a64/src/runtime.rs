@@ -344,6 +344,21 @@ pub(crate) struct RawExit {
     pub remaining: u64,
 }
 
+pub(crate) const REP_BUDGET: u16 = 0x3000;
+
+#[cfg(native)]
+impl RawExit {
+    pub(crate) fn commit_repeat(&self, cpu: &mut CpuState) {
+        if self.reason as u32 & !0xff == u32::from(REP_BUDGET) {
+            adv_cpu_core::strings::commit_budget_compare(
+                cpu,
+                self.reason as u8,
+                (self.reason >> 32) as u32,
+            );
+        }
+    }
+}
+
 /// Why translated code returned to the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -422,6 +437,7 @@ impl Exit {
                 vector: raw as u8,
                 len: (raw >> 8 & 15) as u8,
             })),
+            0x3000..=0x30ff => Some(Self::Budget),
             _ => None,
         }
     }

@@ -1695,12 +1695,16 @@ impl Translator<'_> {
     }
 
     fn site(&mut self) {
+        self.site_with_refund(self.trace.owed(self.index));
+    }
+
+    fn site_with_refund(&mut self, refund: u32) {
         let inst = self.trace.insts[self.index];
         self.sites.push((
             self.asm.offset(),
             Site {
                 eip: inst.pc,
-                refund: self.trace.owed(self.index),
+                refund,
                 sense: self.state.sense,
                 carry: self.state.carry,
                 recipe: self.state.recipe,

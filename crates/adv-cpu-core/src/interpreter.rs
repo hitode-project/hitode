@@ -99,6 +99,11 @@ impl RepContinuation {
             state.rep = None;
             return;
         }
+        Self::record_compare(state, native as u8, state.eflags);
+    }
+
+    pub(crate) fn record_compare(state: &mut CpuState, descriptor: u8, flags: u32) {
+        let native = descriptor & 31;
         debug_assert!((6..18).contains(&native));
         let operation = StringOp {
             kind: if native < 12 {
@@ -111,8 +116,8 @@ impl RepContinuation {
                 1 => 2,
                 _ => 4,
             },
-            word: false,
-            fs: false,
+            word: descriptor & 32 != 0,
+            fs: descriptor & 64 != 0,
             repeat: true,
             unequal: (native - 6) % 6 >= 3,
         };
@@ -123,9 +128,24 @@ impl RepContinuation {
         {
             state.rep = Some(Self {
                 pc: state.eip,
-                flags: state.eflags,
+                flags,
                 operation,
             });
+        }
+    }
+
+    /// Put the comparison's input flags back while executing native REP.
+    /// The loop does not publish comparison flags until it leaves or finishes.
+    pub fn native_input_flags(&self, state: &CpuState) -> u32 {
+        let mask = if self.operation.word {
+            0xffff
+        } else {
+            u32::MAX
+        };
+        if state.regs[1] & mask == 0 {
+            state.eflags
+        } else {
+            self.flags
         }
     }
 }

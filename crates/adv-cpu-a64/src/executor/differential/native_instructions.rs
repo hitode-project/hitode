@@ -930,12 +930,16 @@ fn checked_strings_cross_ordinary_blocked_and_alias_pages_at_element_boundaries(
                                         let blocked = !alias && (!rep || count > prefix);
                                         assert_eq!(
                                             native.native.as_ref().unwrap().diagnostics.helpers,
-                                            u64::from(blocked),
-                                            "helpers before blocked element"
+                                            0
                                         );
                                         assert_eq!(
                                             native.native.as_ref().unwrap().diagnostics.faults,
-                                            0
+                                            u64::from(blocked),
+                                            "access event at the blocked element"
+                                        );
+                                        assert_eq!(
+                                            native.stats.interpreter_entries,
+                                            u64::from(blocked)
                                         );
                                     }
                                 }

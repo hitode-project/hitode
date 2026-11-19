@@ -984,11 +984,11 @@ mod speed_tests {
         cpu.state.regs[1] = 9;
         cpu.state.regs[6] = 0x20000;
         cpu.state.regs[7] = 0x20100;
-        // Native elements count as translated; the cut element is interpreted.
+        // The budget cut leaves after the last translated element.
         assert_eq!(cpu.run(0x10002, 4).unwrap(), RunOutcome::Budget);
-        assert_eq!(cpu.retired_forms(), Some([3, 0, 0, 0, 1]));
+        assert_eq!(cpu.retired_forms(), Some([4, 0, 0, 0, 0]));
         assert_eq!(cpu.run(0x10002, 20).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(cpu.retired_forms(), Some([8, 0, 0, 0, 1]));
+        assert_eq!(cpu.retired_forms(), Some([9, 0, 0, 0, 0]));
         cpu.count_tier0(true);
         cpu.write(0x11000, &[0x90]).unwrap();
         cpu.state.eip = 0x11000;

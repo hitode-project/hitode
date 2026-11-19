@@ -99,6 +99,11 @@ impl Native {
         self.code.cache.sync();
         self.code.faults.end.set(self.code.cache.next());
         self.prepare_inline(cpu, memory, fuel, budget);
+        let resumed_repeat = cpu.rep.take().map(|rep| {
+            let visible_flags = cpu.eflags;
+            cpu.eflags = rep.native_input_flags(cpu);
+            (rep, visible_flags)
+        });
         let runtime: *mut Runtime = &mut *self.runtime;
         let faults: *const Faults = &self.code.faults;
         let enter = self.code.enter;
@@ -181,6 +186,15 @@ impl Native {
             } else {
                 self.diagnostics.checked_faults += 1;
             }
+        }
+        returned.commit_repeat(cpu);
+        if let Some((rep, visible_flags)) = resumed_repeat
+            && retired == 0
+            && cpu.eip == rep.pc
+            && !matches!(exit, Exit::Event(_))
+        {
+            cpu.rep = Some(rep);
+            cpu.eflags = visible_flags;
         }
         if let Some(head) = owner.discovered {
             self.discover(memory, head, head, cpu.clone());
