@@ -21,6 +21,10 @@ pub enum Command {
     KeyDown(u32),
     KeyUp(u32),
     Text(String),
+    /// A recorded host input message at a canvas point, as the window sends it.
+    Input(u32, u32, u32),
+    /// A recorded host input message on the layer of guest window `.0`.
+    WindowInput(u32, u32, u32, u32),
     Activate(bool),
     Windows,
     Hit(i16, i16),
@@ -54,6 +58,8 @@ impl Command {
                 | Self::KeyDown(_)
                 | Self::KeyUp(_)
                 | Self::Text(_)
+                | Self::Input(..)
+                | Self::WindowInput(..)
                 | Self::Activate(_)
                 | Self::Menu(_)
                 | Self::Dialog(_)
@@ -117,6 +123,24 @@ impl Command {
                 })
             }
             "text" if !rest.is_empty() => Ok(Self::Text(rest.to_owned())),
+            "input" | "window-input" => {
+                let values = rest
+                    .split_whitespace()
+                    .map(|value| match value.strip_prefix("0x") {
+                        Some(hex) => u32::from_str_radix(hex, 16),
+                        None => value.parse(),
+                    })
+                    .collect::<Result<Vec<u32>, _>>()
+                    .map_err(|_| format!("{command} takes decimal or 0x-prefixed numbers"))?;
+                match (command, values.as_slice()) {
+                    ("input", &[message, wparam, lparam]) => Ok(Self::Input(message, wparam, lparam)),
+                    ("window-input", &[window, message, wparam, lparam]) => {
+                        Ok(Self::WindowInput(window, message, wparam, lparam))
+                    }
+                    _ => Err(format!("{command} requires {}MESSAGE WPARAM LPARAM",
+                        if command == "input" { "" } else { "WINDOW " })),
+                }
+            }
             "activate" => match rest {
                 "0" => Ok(Self::Activate(false)),
                 "1" => Ok(Self::Activate(true)),
@@ -156,7 +180,7 @@ impl Command {
             "await-frame" => Ok(Self::AwaitFrame(FrameGateSpec::parse(rest)?)),
             "reset-metrics" if rest.is_empty() => Ok(Self::ResetMetrics),
             _ => Err(
-                "expected click/move X Y, key/key-down/key-up VK, text STRING, activate 0|1, windows, hit X Y, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
+                "expected click/move X Y, key/key-down/key-up VK, text STRING, input MESSAGE WPARAM LPARAM, window-input WINDOW MESSAGE WPARAM LPARAM, activate 0|1, windows, hit X Y, menus, menu ID, dialogs, dialog ID, dialog-track ID VALUE, dialog-close, capture PATH, report PATH, memory ADDRESS LENGTH, reset-metrics, await-frame HASH TIMEOUT_MS [hold VK] [release VK] [current] [probes X,Y,B,G,R,A;...], resume or close"
                     .into(),
             ),
         }
@@ -573,6 +597,10 @@ impl Control {
                         Command::KeyUp(key) => {
                             crate::frontend::update_keys(&keys, 0x101, *key, 0xc000_0001)
                         }
+                        Command::Input(message, wparam, lparam)
+                        | Command::WindowInput(_, message, wparam, lparam) => {
+                            crate::frontend::update_keys(&keys, *message, *wparam, *lparam)
+                        }
                         Command::Close => keys.release_all(),
                         _ => {}
                     }
@@ -745,6 +773,17 @@ mod tests {
             Ok(Command::Click(650, 410))
         );
         assert_eq!(Command::parse("key 0x0d"), Ok(Command::Key(13)));
+        assert_eq!(
+            Command::parse("input 0x201 0x1 0x2a0130"),
+            Ok(Command::Input(0x201, 1, 0x2a_0130))
+        );
+        assert_eq!(
+            Command::parse("window-input 0x10046 513 1 65537"),
+            Ok(Command::WindowInput(0x10046, 0x201, 1, 0x1_0001))
+        );
+        assert!(Command::parse("input 0x201 1").is_err());
+        assert!(Command::parse("window-input 0x201 1 2").is_err());
+        assert!(Command::parse("input 0x201 1 z").is_err());
         assert_eq!(Command::parse("windows"), Ok(Command::Windows));
         assert_eq!(Command::parse("hit 640 -1"), Ok(Command::Hit(640, -1)));
         assert!(Command::parse("hit 1").is_err());

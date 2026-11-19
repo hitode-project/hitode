@@ -15,7 +15,9 @@ use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
 use adv_sync::input::KeyState;
 
-use super::{Finished, Options, control, frontend, json, save_frame, window, window_json};
+use super::{
+    Finished, Options, control, frontend, json, record::Recorder, save_frame, window, window_json,
+};
 
 /// How long the guest runs between looks at the host's events.
 const SLICE: Duration = Duration::from_millis(20);
@@ -623,6 +625,7 @@ fn drive(
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
         .transpose()?;
+    let mut recorder = Recorder::open(options.record_input.as_deref(), started)?;
     let auto_delay = options
         .auto_dialog_ms
         .map(|ms| Duration::from_millis(u64::from(ms)));
@@ -662,6 +665,10 @@ fn drive(
                             });
                             continue;
                         }
+                        Recorder::record(
+                            &mut recorder,
+                            format_args!("input {message:#x} {wparam:#x} {lparam:#x}"),
+                        );
                         session.input_at(adv_runtime::Pointer::Frame, message, wparam, lparam)?;
                     }
                     window::Event::WindowInput {
@@ -670,6 +677,12 @@ fn drive(
                         wparam,
                         lparam,
                     } => {
+                        Recorder::record(
+                            &mut recorder,
+                            format_args!(
+                                "window-input {window:#x} {message:#x} {wparam:#x} {lparam:#x}"
+                            ),
+                        );
                         session.input_at(
                             adv_runtime::Pointer::Window(window),
                             message,
@@ -679,9 +692,11 @@ fn drive(
                     }
 
                     window::Event::Text(text, reply) => {
+                        Recorder::record(&mut recorder, format_args!("text {text}"));
                         let _ = reply.send(session.text(&text));
                     }
                     window::Event::Close => {
+                        Recorder::record(&mut recorder, format_args!("close"));
                         suspension.apply(&mut metrics.audio, None, Some(false), |paused| {
                             session.set_suspended(paused);
                         });
@@ -1105,6 +1120,17 @@ fn answer(session: &mut Session, command: control::Command) -> Result<String, St
                 Err("key has no guest target window".into())
             }
         }
+        Command::Input(message, wparam, lparam) => session
+            .input_at(adv_runtime::Pointer::Frame, message, wparam, lparam)
+            .map(|()| format!("input {message:#x}")),
+        Command::WindowInput(window, message, wparam, lparam) => session
+            .input_at(
+                adv_runtime::Pointer::Window(window),
+                message,
+                wparam,
+                lparam,
+            )
+            .map(|()| format!("window-input {window:#x} {message:#x}")),
         Command::Text(text) => {
             let typed = session.text(&text);
             let total = text.chars().count();
