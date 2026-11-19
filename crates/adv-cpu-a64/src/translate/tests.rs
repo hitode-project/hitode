@@ -865,7 +865,7 @@ impl Harness {
         // Dispatch returns to this test instead of invoking a Rust owner. An
         // unexpected helper must trap, so a semantic match cannot hide fallback.
         let dispatch = prefix.len() * 4;
-        prefix.push(movz(W, X0, Exit::Dispatch as u16, 0));
+        prefix.push(movz(W, X0, Exit::Dispatch.word(), 0));
         prefix.push(b(stubs.exit as i32 - (dispatch as i32 + 4)));
         let forbidden = prefix.len() * 4;
         prefix.push(brk(0x101));
@@ -1578,6 +1578,58 @@ fn j1_unit(code: &[u8]) -> Workspace {
     work
 }
 
+// spec: A64F-FP-5 A64-REG-4 A64-REG-5
+#[cfg(native)]
+#[test]
+fn register_value_call_preserves_cache_within_the_helper_path_count() {
+    let guest = bytes(|a| {
+        a.pxor(xmm7, xmm6).unwrap();
+        a.addss(xmm0, xmm1).unwrap();
+        a.pxor(xmm7, xmm0).unwrap();
+    });
+    let work = j1_unit(&guest);
+    let mut code = Code::default();
+    let at = HOST_CODE as usize;
+    let cpu = CpuState {
+        mxcsr: 0x3fe0,
+        ..CpuState::default()
+    };
+    lower_tier1(
+        &mut code,
+        &work.unit,
+        CODE,
+        &|_| false,
+        0,
+        Features { flagm: false },
+        at,
+        Stubs {
+            call: at,
+            exit: at,
+            dispatch: at,
+            lookup: at,
+            lookup_slow: at,
+            ret_miss: at,
+            access: at,
+            interpret: at,
+            fault: at,
+            opt_exit: at,
+        },
+        false,
+        Key::read(&cpu, work.unit.fact_mask()),
+        0,
+    );
+    let begin = code.asm.position(code.labels[1]) / 4;
+    let end = code.asm.position(code.labels[2]) / 4;
+    let site = &code.asm.words()[begin..end];
+    assert_eq!(site.iter().filter(|&&word| word == blr(X16)).count(), 1);
+    assert!(site.len() <= 3 + 64);
+    for reg in 0..8 {
+        let offset = crate::runtime::XMM + 16 * u32::from(reg);
+        let v = VReg::new(16 + reg);
+        assert!(!site.contains(&(vldur(VMem::Q, v, X5, offset as i32) & !(1 << 22))));
+    }
+}
+
 #[cfg(native)]
 fn proved_division_code(memory_divisor: bool, simd: bool) -> Vec<u8> {
     bytes(|a| {
@@ -1786,9 +1838,9 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
                         words[divide - 5] & 0xff00_0000,
                         cbz(W, false, X0, 0) & 0xff00_0000
                     );
-                    assert_eq!(words[divide + 6] & 0xfc00_0000, b(0));
-                    fixed += 12;
-                    hot += divide - 5 + 12;
+                    assert_eq!(words.len(), divide + 6);
+                    fixed += 11;
+                    hot += words.len();
                 } else {
                     let fixed_words = match proof.division(index).unwrap() {
                         computation::Division::SignExtended => 3,
@@ -1821,10 +1873,10 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
             }
             totals.push((fixed, hot));
         }
-        assert_eq!((totals[0].0, totals[1].0), (52, 20));
-        assert!(totals[0].1 - totals[1].1 >= 32);
+        assert_eq!((totals[0].0, totals[1].0), (48, 20));
+        assert!(totals[0].1 - totals[1].1 >= 28);
         eprintln!(
-            "four DIV + CDQ: fixed 52 -> 20 words; with wrappers {} -> {} (memory={memory_divisor}, simd={simd})",
+            "four DIV + CDQ: fixed 48 -> 20 words; with wrappers {} -> {} (memory={memory_divisor}, simd={simd})",
             totals[0].1, totals[1].1
         );
     }
@@ -2449,7 +2501,7 @@ pub(in crate::translate) mod opt_back {
                 code.extend([
                     movz(W, X1, cpu.eip as u16, 0),
                     movk(W, X1, (cpu.eip >> 16) as u16, 16),
-                    movz(W, X0, exit as u16, 0),
+                    movz(W, X0, exit.word(), 0),
                     b(h.stubs.exit as i32 - at as i32 - 12),
                 ]);
                 at
@@ -3163,7 +3215,7 @@ pub(in crate::translate) mod opt_back {
                 |offset: usize| u64::from_le_bytes(context[offset..][..8].try_into().unwrap());
             assert_eq!(
                 word(offset_of!(runtime::Runtime, exit)),
-                Exit::Optimized as u32
+                Exit::Optimized.raw()
             );
             let base = offset_of!(runtime::Runtime, opt_dump);
             let registers = runtime::RegisterDump {

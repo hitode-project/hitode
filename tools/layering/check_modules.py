@@ -48,8 +48,6 @@ ROLES.update({
 # (Current file, disallowed dependency or parent glob). Delete an entry
 # in the same change that removes its last occurrence.
 TRANSITIONAL: set[tuple[str, str]] = {
-    # Unsupported SSE control classes retain the in-place interpreter helper.
-    ("translate/simd.rs", "interpreter form sse-mxcsr"),
     # Module responsibilities still colocated in the implementation.
     ("asm.rs", "encode"),
     ("native/head.rs", "asm"),

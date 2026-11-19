@@ -79,6 +79,7 @@ pub(super) struct InternalEdge {
 pub(super) struct SlowPaths {
     pub(super) interpreter: BTreeMap<(u32, InterpreterCause), u64>,
     pub(super) helpers: BTreeMap<(u32, runtime::HelperCause), u64>,
+    pub(super) values: BTreeMap<u32, u64>,
 }
 
 pub(super) struct CodeStore {

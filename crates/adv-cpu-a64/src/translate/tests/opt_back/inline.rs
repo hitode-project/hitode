@@ -55,14 +55,14 @@ impl InlineRun {
             mov(X, X8, X2),
             ldr(X, X6, RUNTIME, offset_of!(runtime::Runtime, cpu) as u32),
             ldr(W, X6, X6, runtime::EIP),
-            movz(W, X0, NORMAL as u16, 0),
+            movz(W, X0, NORMAL.word(), 0),
             b(h.stubs.exit as i32 - (dispatch as i32 + 20)),
         ]);
 
-        let mut leave = |reason| {
+        let mut leave = |reason: Exit| {
             let at = code.len() * 4;
             code.extend([
-                movz(W, X0, reason as u16, 0),
+                movz(W, X0, reason.word(), 0),
                 ldr(X, X1, RUNTIME, offset_of!(runtime::Runtime, cpu) as u32),
                 ldr(W, X1, X1, runtime::EIP),
                 b(h.stubs.exit as i32 - (at as i32 + 12)),

@@ -297,8 +297,12 @@ impl<'a> Trial<'a> {
                 self.same_position_and_memory(retired, self.live.state.eip == stop);
                 match run.exit {
                     Exit::Dispatch | Exit::Budget => continue,
-                    Exit::Interpret | Exit::Fault if retired == fuel => continue,
-                    Exit::Interpret | Exit::Fault => {}
+                    Exit::Interpret | Exit::Event(crate::runtime::Event::Replay)
+                        if retired == fuel =>
+                    {
+                        continue;
+                    }
+                    Exit::Interpret | Exit::Event(crate::runtime::Event::Replay) => {}
                     exit => panic!("{}: unexpected native exit {exit:?}", self.context),
                 }
             }

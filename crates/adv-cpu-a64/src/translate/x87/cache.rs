@@ -1113,6 +1113,10 @@ impl Translator<'_> {
         }
     }
 
+    pub(in super::super) fn x87_live_pairs(&self) -> Option<u8> {
+        self.x87.active.then(|| self.x87.model.used())
+    }
+
     pub(super) fn x87_saved_control(&self) -> bool {
         self.x87.active && self.x87.controls.contains(&self.index)
     }
@@ -1142,7 +1146,7 @@ impl Translator<'_> {
         match inst.op {
             Op::Ret(_) => matches!(inst.mode, Mode::Inline(_)),
             Op::Simd(simd) => {
-                !(simd.mmx() || self.tier1 && simd.control_helper(self.facts))
+                !simd.mmx()
                     && !((self.checked)(inst.pc)
                         && simd.memory()
                         && matches!(simd.kind, Kind::InsertWord))

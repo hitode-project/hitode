@@ -49,7 +49,7 @@
 
 use std::mem::offset_of;
 
-use adv_cpu_core::CpuState;
+use adv_cpu_core::{CpuState, floating::ValueFrame};
 
 use crate::asm::Asm;
 use crate::encode::Extend::Uxtw;
@@ -187,6 +187,8 @@ pub struct Runtime {
     pub resident_page_crossings: u64,
     /// Set at a diagnostic helper call site and consumed by that call.
     pub(crate) helper_cause: u32,
+    pub(crate) value: u64,
+    pub(crate) value_frame: ValueFrame,
 }
 
 impl Runtime {
@@ -260,6 +262,8 @@ impl Runtime {
             resident_entries: 0,
             resident_page_crossings: 0,
             helper_cause: 0,
+            value: 0,
+            value_frame: ValueFrame::default(),
         }
     }
 }
@@ -297,41 +301,75 @@ pub struct OptEntryState {
     pub df: u64,
 }
 
+/// An event at a precise guest instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The fault capture and side table identify the instruction to replay.
+    Replay,
+    /// A waiting x87 instruction has an unmasked exception pending.
+    PendingX87,
+    /// An architectural exception, with any state changes already committed.
+    Exception(u8),
+    /// A software interrupt completed; the owner supplies the trap action.
+    Software { vector: u8, len: u8 },
+}
+
 /// Why translated code returned to the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
 pub enum Exit {
     /// Interpret the instruction at EIP, then dispatch.
-    Interpret = 0,
+    Interpret,
     /// Look up or translate the unit at EIP.
-    Dispatch = 1,
-    /// A host fault at a side-table site. EIP is not set; the owner takes it
-    /// from the site, where guest state is exactly that before the
-    /// instruction (A64-FLAG-4).
-    Fault = 2,
+    Dispatch,
+    Event(Event),
     /// The `interpret` helper left a step for the owner to complete.
-    Stepped = 3,
+    Stepped,
     /// A completed service call requests an execution-owner yield.
-    Yield = 4,
+    Yield,
     /// A completed spin backedge requests a productive handoff.
-    Reschedule = 5,
-    Recall = 6,
-    Computation = 7,
+    Reschedule,
+    Recall,
+    Computation,
     /// An ordinary unit exhausted its instruction budget at EIP. The owner
     /// samples EIP, then dispatches.
-    Budget = 8,
+    Budget,
     /// An optimized record and register dump await materialization.
-    Optimized = 9,
+    Optimized,
     /// Owner dispatch selected a first visit in the core interpreter.
-    FirstVisit = 10,
+    FirstVisit,
 }
 
 impl Exit {
+    pub const fn word(self) -> u16 {
+        match self {
+            Self::Interpret => 0,
+            Self::Dispatch => 1,
+            Self::Event(Event::Replay) => 2,
+            Self::Stepped => 3,
+            Self::Yield => 4,
+            Self::Reschedule => 5,
+            Self::Recall => 6,
+            Self::Computation => 7,
+            Self::Budget => 8,
+            Self::Optimized => 9,
+            Self::FirstVisit => 10,
+            Self::Event(Event::PendingX87) => 11,
+            Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
+            Self::Event(Event::Software { vector, len }) => {
+                0x2000 | (len as u16) << 8 | vector as u16
+            }
+        }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.word() as u32
+    }
+
     pub fn from_raw(raw: u32) -> Option<Self> {
         match raw {
             0 => Some(Self::Interpret),
             1 => Some(Self::Dispatch),
-            2 => Some(Self::Fault),
+            2 => Some(Self::Event(Event::Replay)),
             3 => Some(Self::Stepped),
             4 => Some(Self::Yield),
             5 => Some(Self::Reschedule),
@@ -339,6 +377,12 @@ impl Exit {
             7 => Some(Self::Computation),
             8 => Some(Self::Budget),
             9 => Some(Self::Optimized),
+            11 => Some(Self::Event(Event::PendingX87)),
+            0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
+            0x2000..=0x2fff => Some(Self::Event(Event::Software {
+                vector: raw as u8,
+                len: (raw >> 8 & 15) as u8,
+            })),
             _ => None,
         }
     }
@@ -369,7 +413,8 @@ impl ExecutionContext {
     #[cfg(native)]
     pub(crate) fn finish_computation(&mut self, exit: Exit) {
         self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
-        self.resume = matches!(exit, Exit::Interpret | Exit::Fault).then_some((self.cpu.eip, exit));
+        self.resume =
+            matches!(exit, Exit::Interpret | Exit::Event(_)).then_some((self.cpu.eip, exit));
     }
 }
 
@@ -542,7 +587,15 @@ pub fn stubs() -> Stubs {
     let fault_label = asm.label();
     asm.bind(fault_label);
     let fault = asm.offset();
-    asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
+    asm.emit_all(&[
+        movz(
+            W,
+            r(0),
+            Exit::Event(crate::runtime::Event::Replay).word(),
+            0,
+        ),
+        movz(W, r(1), 0, 0),
+    ]);
     asm.b(exit_label);
     let dispatch_label = asm.label();
     asm.bind(dispatch_label);
@@ -627,6 +680,76 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
         sub(X, r(9), r(9), r(1), Lsl, 0),
         mov(W, r(0), r(6)),
         ret(Reg::LR),
+    ]);
+}
+
+const VALUE_CALL: u32 = field(offset_of!(Runtime, value));
+const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
+pub(crate) const VALUE_OPERAND: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, operand));
+pub(crate) const VALUE_XMM: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, xmm));
+pub(crate) const VALUE_MMX: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mmx));
+pub(crate) const VALUE_REGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, regs));
+pub(crate) const VALUE_EFLAGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, eflags));
+pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mxcsr));
+
+/// Calls the value entry with the prepared instruction index in w1. Preserve
+/// the guest flag representation and any live caller-saved vector lanes.
+pub(crate) fn emit_value_call(asm: &mut Asm, xmm: u8, x87: Option<u8>) {
+    let vectors = (0..8)
+        .filter(|n| xmm & (1 << n) != 0)
+        .map(|n| v(16 + n))
+        .chain(x87.into_iter().flat_map(|slots| {
+            std::iter::once(v(7)).chain(
+                (0..8)
+                    .filter(move |n| slots & (1 << n) != 0)
+                    .map(|n| v(24 + n)),
+            )
+        }))
+        .collect::<Vec<_>>();
+    let scalar_bytes = if x87.is_some() { 96 } else { 80 };
+    let frame = scalar_bytes + vectors.len() as i32 * 16;
+    asm.emit_all(&[
+        stp(X, Pre, r(7), r(8), SP, -frame),
+        stp(X, Offset, r(9), r(10), SP, 16),
+        stp(X, Offset, r(11), r(12), SP, 32),
+        mrs_nzcv(r(16)),
+        stp(X, Offset, r(5), r(16), SP, 48),
+        str(X, Reg::LR, SP, 64),
+    ]);
+    if x87.is_some() {
+        asm.emit(stp(X, Offset, r(13), r(15), SP, 80));
+    }
+    for (i, chunk) in vectors.chunks(2).enumerate() {
+        let at = scalar_bytes + i as i32 * 32;
+        asm.emit(match chunk {
+            [a, b] => stp_v(VSize::Q, Offset, *a, *b, SP, at),
+            [a] => vstr(VMem::Q, *a, SP, at as u32),
+            _ => unreachable!(),
+        });
+    }
+    asm.emit_all(&[
+        mov(X, r(0), RUNTIME),
+        ldr(X, r(16), RUNTIME, VALUE_CALL),
+        blr(r(16)),
+    ]);
+    for (i, chunk) in vectors.chunks(2).enumerate() {
+        let at = scalar_bytes + i as i32 * 32;
+        asm.emit(match chunk {
+            [a, b] => ldp_v(VSize::Q, Offset, *a, *b, SP, at),
+            [a] => vldr(VMem::Q, *a, SP, at as u32),
+            _ => unreachable!(),
+        });
+    }
+    if x87.is_some() {
+        asm.emit(ldp(X, Offset, r(13), r(15), SP, 80));
+    }
+    asm.emit_all(&[
+        ldr(X, Reg::LR, SP, 64),
+        ldp(X, Offset, r(5), r(16), SP, 48),
+        msr_nzcv(r(16)),
+        ldp(X, Offset, r(11), r(12), SP, 32),
+        ldp(X, Offset, r(9), r(10), SP, 16),
+        ldp(X, Post, r(7), r(8), SP, frame),
     ]);
 }
 
@@ -785,7 +908,7 @@ fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
     asm.cbz(X, false, r(0), leave);
     asm.emit(br(r(0)));
     asm.bind(leave);
-    asm.emit(movz(W, r(0), Exit::Dispatch as u16, 0));
+    asm.emit(movz(W, r(0), Exit::Dispatch.word(), 0));
     asm.b(exit);
 }
 
@@ -927,7 +1050,7 @@ fn emit_opt_exit(asm: &mut Asm) {
     asm.b(copy);
     asm.bind(done);
     asm.emit_all(&[
-        movz(W, r(16), Exit::Optimized as u16, 0),
+        movz(W, r(16), Exit::Optimized.word(), 0),
         str(W, r(16), RUNTIME, EXIT),
         str(X, r(9), RUNTIME, COUNTDOWN),
         ldr(X, r(16), RUNTIME, HOST_SP),
@@ -1118,7 +1241,7 @@ mod tests {
 
     fn leave(asm: &mut Asm, exit: crate::asm::Label, reason: Exit, eip: u32) {
         asm.emit_all(&[
-            movz(W, r(0), reason as u16, 0),
+            movz(W, r(0), reason.word(), 0),
             movz(W, r(1), eip as u16, 0),
             movk(W, r(1), (eip >> 16) as u16, 16),
         ]);
@@ -1143,7 +1266,7 @@ mod tests {
             assert_eq!(run.regs, cpu.regs);
             assert_eq!(run.xmm, cpu.xmm);
             assert_eq!(run.eip, 0x40_2345);
-            assert_eq!(run.exit, Exit::Dispatch as u32);
+            assert_eq!(run.exit, Exit::Dispatch.raw());
         }
     }
 
@@ -1173,7 +1296,7 @@ mod tests {
         expected[0] += 1;
         expected[4] -= 4;
         assert_eq!(run.regs, expected);
-        assert_eq!(run.exit, Exit::Interpret as u32);
+        assert_eq!(run.exit, Exit::Interpret.raw());
         assert_eq!(run.countdown, (u64::MAX >> 1) - 1);
     }
 

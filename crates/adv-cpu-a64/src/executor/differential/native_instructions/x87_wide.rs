@@ -1544,6 +1544,6 @@ fn tier1_region_mxcsr_uses_another_version() {
         let native = actual.native.as_ref().unwrap();
         assert_eq!(native.tier1_versions(CODE), versions);
         assert_eq!(native.diagnostics.interprets, 0);
-        assert_eq!(native.diagnostics.helpers != 0, mxcsr == 0x9fa0);
+        assert_eq!(native.diagnostics.helpers, 0);
     }
 }

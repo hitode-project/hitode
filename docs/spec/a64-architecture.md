@@ -90,13 +90,18 @@ The chain keeps up to three versions, from most specific to most general. A join
 
 ### A64A-FALL-4 Events
 
-**Rule**: An x87 instruction that raises #MF from a pending unmasked exception MUST deliver the exception through the interpreter at the faulting instruction.
+**Rule**: An x87 instruction raising pending #MF MUST deliver it through the interpreter at the faulting instruction. Generated exceptions MUST carry the committed state to the owner.
 **Applies to**: AArch64
 **Verification**: Test
 
 | Event |
 |---|
 | An x87 instruction that raises #MF from a pending unmasked exception |
+| A host fault or a precise checked-access refusal |
+| A misaligned aligned access or an invalid LDMXCSR value (#GP) |
+| A division that raises #DE |
+| An unmasked SSE exception with the committed MXCSR status (#XM) |
+| INT 0x2e without a host handler |
 
 ## Tier-1 placement
 

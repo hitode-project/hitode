@@ -2083,6 +2083,22 @@ impl Translator<'_> {
         }
     }
 
+    fn architectural_exception(&mut self, vector: u8) -> Label {
+        let label = self.asm.label();
+        let inst = self.trace.insts[self.index];
+        self.push_cold(Cold::Leave {
+            label,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            refund: self.trace.owed(self.index),
+            exit: Exit::Event(crate::runtime::Event::Exception(vector)),
+            eip: inst.pc,
+            link: false,
+            x87: self.x87_leaving(),
+        });
+        label
+    }
+
     /// Canonical flags, the refund for this path, then the exit: through a
     /// link point if `link`, on the main path if `main`, else to the owner.
     fn leave(&mut self, exit: Exit, eip: u32, refund: u32, link: bool, main: bool, back: bool) {
@@ -2100,7 +2116,7 @@ impl Translator<'_> {
 
     /// Leaves translated code: w0 the exit, w1 the EIP.
     fn exit(&mut self, exit: Exit, eip: u32) {
-        self.emit(movz(W, Reg::new(0), exit as u16, 0));
+        self.emit(movz(W, Reg::new(0), exit.word(), 0));
         self.target(eip);
         self.far(self.stubs.exit);
     }
@@ -2212,7 +2228,7 @@ impl Translator<'_> {
         self.emit_all(&[
             str(X, X4, RUNTIME, crate::runtime::INDIRECT_BRANCH),
             mov(W, X1, X16),
-            movz(W, X0, Exit::Dispatch as u16, 0),
+            movz(W, X0, Exit::Dispatch.word(), 0),
         ]);
         self.far(self.stubs.exit);
     }
@@ -2651,7 +2667,10 @@ impl Translator<'_> {
                 }
                 self.asm.b(resume);
             }
-            Cold::Floating(slow) => self.floating_cold(slow),
+            Cold::Floating(slow) => {
+                self.index = source;
+                self.floating_cold(slow);
+            }
             Cold::X87(cold) => self.x87_cold(cold),
             Cold::X87Fault {
                 label,

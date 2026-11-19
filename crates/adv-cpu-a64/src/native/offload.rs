@@ -553,7 +553,7 @@ fn execute(
             Exit::Dispatch
         };
     }
-    if exit == Exit::Fault {
+    if exit == Exit::Event(crate::runtime::Event::Replay) {
         let site = super::site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
         faults.capture.recover(cpu, site, runtime.temps);
         retired -= u64::from(site.refund);

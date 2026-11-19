@@ -270,7 +270,7 @@ pub(super) fn emit(
 
 fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
     asm.emit_all(&[
-        movz(W, r(0), exit as u16, 0),
+        movz(W, r(0), exit.word(), 0),
         movz(W, r(1), head as u16, 0),
         movk(W, r(1), (head >> 16) as u16, 16),
     ]);

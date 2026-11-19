@@ -341,6 +341,21 @@ pub struct Slow {
     resume: Label,
     bail: Label,
     rounded: Option<Label>,
+    value: Option<ValueContinuation>,
+}
+
+struct ValueContinuation {
+    after: Label,
+    state: super::State,
+    vector: Vector,
+    x87: Option<super::x87::Leave>,
+    pairs: Option<u8>,
+    first_pe: bool,
+}
+
+enum ValueOperand {
+    Address(Reg),
+    Loaded(VReg),
 }
 
 /// What a unit knows about its SIMD registers at the instruction being
@@ -426,6 +441,14 @@ fn vmem(bytes: u8) -> VMem {
     }
 }
 
+fn value_simd_offset(loc: Loc) -> (VMem, u32) {
+    match loc {
+        Loc::Xmm(n) => (VMem::Q, runtime::VALUE_XMM + 16 * u32::from(n)),
+        Loc::Mmx(n) => (VMem::D, runtime::VALUE_MMX + 8 * u32::from(n)),
+        _ => unreachable!("a SIMD value operand"),
+    }
+}
+
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
         // A register it also writes is only published once written.
@@ -451,15 +474,11 @@ impl Translator<'_> {
                 t.asm.tbz(true, X16, 7, bail);
             });
         }
-        if self.tier1 && simd.control_helper(self.facts) {
-            self.helper_for(simd.helper, runtime::HelperCause::SseControlClass); // transitional interpreter form: sse-mxcsr
-            return;
-        }
         let address = if simd.memory() {
             let address = self.effective(simd.mem);
             if simd.aligned {
                 // NZCV holds guest flags.
-                let bail = self.bail();
+                let bail = self.architectural_exception(13);
                 self.emit(and_imm(W, X17, address, 15));
                 self.asm.cbz(W, true, X17, bail);
             }
@@ -467,7 +486,16 @@ impl Translator<'_> {
         } else {
             Reg::ZR
         };
-        self.simd_body(simd, address);
+        if self.tier1 && simd.control_helper(self.facts) {
+            self.simd_value(
+                simd,
+                ValueOperand::Address(address),
+                self.x87_leaving(),
+                self.x87_live_pairs(),
+            );
+        } else {
+            self.simd_body(simd, address);
+        }
         if mmx && simd.kind != Kind::Emms && !ready {
             self.as_part(Part::SimdGuard, |t| {
                 t.cpu();
@@ -481,8 +509,116 @@ impl Translator<'_> {
             self.vector.guards.ready = true;
         }
         if mmx {
-            self.pe_ready(first_pe);
+            self.pe_ready(first_pe, self.x87_leaving());
         }
+    }
+
+    /// Evaluate an SSE form using the actual MXCSR and the operands that
+    /// this unit holds. The selected destination is written only on success.
+    fn simd_value(
+        &mut self,
+        simd: Simd,
+        operand: ValueOperand,
+        x87: Option<super::x87::Leave>,
+        pairs: Option<u8>,
+    ) {
+        let flags = matches!(simd.kind, Kind::FlagCompare(..));
+        let reads_dst = matches!(
+            simd.kind,
+            Kind::Float(..)
+                | Kind::Double(..)
+                | Kind::MinMax(..)
+                | Kind::Compare(..)
+                | Kind::FlagCompare(..)
+                | Kind::Sqrt(true, _)
+                | Kind::ScalarFromInt(_)
+                | Kind::Widen(true)
+                | Kind::Narrow(true)
+        ) || simd.kind == Kind::FromInt(false) && simd.width == 8;
+        match simd.src {
+            Loc::Mem => {
+                let size = vmem(simd.width);
+                let value = match operand {
+                    ValueOperand::Address(address) => {
+                        self.simd_access(size, V1, address, false);
+                        V1
+                    }
+                    ValueOperand::Loaded(value) => value,
+                };
+                self.emit(vstr(size, value, RUNTIME, runtime::VALUE_OPERAND));
+            }
+            Loc::Gpr(n) => self.emit(str(
+                W,
+                host(n),
+                RUNTIME,
+                runtime::VALUE_REGS + u32::from(n) * 4,
+            )),
+            loc => self.publish_value_simd(loc),
+        }
+        if reads_dst && simd.dst != simd.src {
+            self.publish_value_simd(simd.dst);
+        }
+        self.cpu();
+        self.emit_all(&[
+            ldr(W, X16, X5, runtime::MXCSR),
+            str(W, X16, RUNTIME, runtime::VALUE_MXCSR),
+        ]);
+        let bail = self.asm.label();
+        let inst = self.trace.insts[self.index];
+        self.push_cold(Cold::Leave {
+            label: bail,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            refund: self.trace.owed(self.index),
+            exit: Exit::Event(runtime::Event::Exception(19)),
+            eip: inst.pc,
+            link: false,
+            x87,
+        });
+        self.mov_imm(super::X1, self.helpers + u32::from(simd.helper));
+        runtime::emit_value_call(self.asm, self.vector.xmm, pairs);
+        self.emit_all(&[
+            ldr(W, X16, RUNTIME, runtime::VALUE_MXCSR),
+            str(W, X16, X5, runtime::MXCSR),
+        ]);
+        self.asm.cbz(W, true, super::X0, bail);
+        if flags {
+            // COMIS/UCOMIS replace the arithmetic flags and preserve DF.
+            use super::{X1, X2, X3, X10, X11};
+            self.emit_all(&[
+                ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS),
+                and_imm(W, X2, X1, 0x40),
+                ubfx(W, X3, X1, 0, 1),
+                eor_imm(W, X3, X3, 1),
+                orr(W, X2, X2, X3, Shift::Lsl, 5),
+                lsl_imm(W, X2, X2, 24),
+                msr_nzcv(X2),
+                ubfx(W, X10, X1, 2, 1),
+                eor_imm(W, X10, X10, 1),
+                movz(W, X11, 0, 0),
+            ]);
+            self.state = super::State::CANONICAL;
+        } else if let Loc::Gpr(n) = simd.dst {
+            self.clobber(Operand::Guest(n));
+            self.emit(ldr(
+                W,
+                super::ops::result(n),
+                RUNTIME,
+                runtime::VALUE_REGS + u32::from(n) * 4,
+            ));
+            self.commit(n);
+        } else {
+            let (size, offset) = value_simd_offset(simd.dst);
+            let destination = self.destination(simd.dst, false);
+            self.emit(vldr(size, destination, RUNTIME, offset));
+            self.written(simd.dst);
+        }
+    }
+
+    fn publish_value_simd(&mut self, loc: Loc) {
+        let (size, offset) = value_simd_offset(loc);
+        let value = self.register(loc);
+        self.emit(vstr(size, value, RUNTIME, offset));
     }
 
     fn simd_body(&mut self, simd: Simd, address: Reg) {
@@ -644,7 +780,7 @@ impl Translator<'_> {
                     super::access::Dir::Load,
                     X13,
                 );
-                let bail = self.bail();
+                let bail = self.architectural_exception(13);
                 self.emit(and_imm(W, X17, X13, 0xffff0000));
                 self.asm.cbz(W, true, X17, bail);
                 self.cpu();
@@ -977,15 +1113,16 @@ impl Translator<'_> {
             self.asm.bind(converted);
             self.emit(vins_general(2, V0, lane, X6));
         }
-        // An unmasked exception is settled by the interpreter before publishing
-        // the destination or MXCSR, just like the other native SIMD operations.
-        let bail = self.bail();
-        self.emit_all(&[lsr_imm(W, X1, X13, 7), bic(W, X2, X0, X1, Shift::Lsl, 0)]);
-        self.asm.cbz(W, true, X2, bail);
+        // Commit sticky flags even on an unmasked exception. The result
+        // remains in the temporary until the architectural check passes.
+        let bail = self.architectural_exception(19);
         self.emit_all(&[
+            lsr_imm(W, X1, X13, 7),
+            bic(W, X2, X0, X1, Shift::Lsl, 0),
             orr(W, X13, X13, X0, Shift::Lsl, 0),
             str(W, X13, X5, runtime::MXCSR),
         ]);
+        self.asm.cbz(W, true, X2, bail);
         let d = self.destination(simd.dst, false);
         self.emit(vmov(simd.full(), d, V0));
         self.written(simd.dst);
@@ -1159,8 +1296,13 @@ impl Translator<'_> {
     /// v0-v6.
     fn floating(&mut self, simd: Simd, address: Reg) {
         self.cpu();
-        let bail = self.bail();
+        let bail = if self.tier1 {
+            self.asm.label()
+        } else {
+            self.bail()
+        };
         let (slow, resume) = (self.asm.label(), self.asm.label());
+        let after = self.tier1.then(|| self.asm.label());
         let inexact = simd.inexact();
         let first_pe = inexact && !self.vector.guards.fp_pe;
         let guards = self.vector.guards;
@@ -1233,6 +1375,14 @@ impl Translator<'_> {
             resume,
             bail,
             rounded,
+            value: after.map(|after| ValueContinuation {
+                after,
+                state: self.state,
+                vector: self.vector,
+                x87: self.x87_leaving(),
+                pairs: self.x87_live_pairs(),
+                first_pe: first_pe && !simd.mmx(),
+            }),
         }));
         if matches!(simd.kind, Kind::ScalarToInt(..)) {
             let Loc::Gpr(index) = simd.dst else {
@@ -1241,7 +1391,10 @@ impl Translator<'_> {
             self.clobber(Operand::Guest(index));
             self.emit(fmov_from_v(W, super::ops::result(index), V0));
             self.commit(index);
-            self.pe_ready(first_pe && !simd.mmx());
+            self.pe_ready(first_pe && !simd.mmx(), self.x87_leaving());
+            if let Some(after) = after {
+                self.asm.bind(after);
+            }
             return;
         }
         if matches!(simd.kind, Kind::FlagCompare(..)) {
@@ -1257,6 +1410,9 @@ impl Translator<'_> {
                 movz(W, super::X11, 0, 0),
             ]);
             self.state = super::State::CANONICAL;
+            if let Some(after) = after {
+                self.asm.bind(after);
+            }
             return;
         }
         let d = self.destination(
@@ -1273,7 +1429,10 @@ impl Translator<'_> {
             let d = self.register(simd.dst);
             self.emit(vins(3, d, 0, V0, 0));
             self.written(simd.dst);
-            self.pe_ready(first_pe && !simd.mmx());
+            self.pe_ready(first_pe && !simd.mmx(), self.x87_leaving());
+            if let Some(after) = after {
+                self.asm.bind(after);
+            }
             return;
         }
         self.emit(match simd.kind {
@@ -1291,18 +1450,20 @@ impl Translator<'_> {
             _ => vmov(true, d, V0),
         });
         self.written(simd.dst);
-        self.pe_ready(first_pe && !simd.mmx());
+        self.pe_ready(first_pe && !simd.mmx(), self.x87_leaving());
+        if let Some(after) = after {
+            self.asm.bind(after);
+        }
     }
 
     /// An exact slow operation can leave PE clear; finish it, then leave
     /// before entering code that assumes the sticky bit has been established.
-    fn pe_ready(&mut self, first: bool) {
+    fn pe_ready(&mut self, first: bool, x87: Option<super::x87::Leave>) {
         if !first {
             return;
         }
         let leave = self.asm.label();
         self.emit(ldr(W, X13, X5, runtime::MXCSR));
-        let x87 = self.x87_leaving();
         if x87.is_some() {
             self.x87_require_bit(X13, 5, leave);
         } else {
@@ -1583,6 +1744,7 @@ impl Translator<'_> {
             resume,
             bail,
             rounded,
+            value,
         } = cold;
         if let Some(rounded) = rounded {
             self.asm.bind(rounded);
@@ -1618,6 +1780,19 @@ impl Translator<'_> {
             str(W, X13, X5, runtime::MXCSR),
         ]);
         self.asm.b(resume);
+        if let Some(value) = value {
+            self.asm.bind(bail);
+            self.state = value.state;
+            self.vector = value.vector;
+            self.simd_value(
+                simd,
+                ValueOperand::Loaded(operands.s),
+                value.x87,
+                value.pairs,
+            );
+            self.pe_ready(value.first_pe, value.x87);
+            self.asm.b(value.after);
+        }
     }
 
     /// The host register of an MMX or XMM operand, loaded if the unit has

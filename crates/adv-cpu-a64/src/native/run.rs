@@ -10,16 +10,16 @@ use adv_cpu_core::{CpuState, Memory};
 use super::plan::{self, dispatch};
 use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
-    alias_base, call, interpret, timestamp,
+    alias_base, call, interpret, timestamp, value,
 };
 use crate::facts::{self, Key};
-use crate::runtime::{Exit, ResidentCold, Runtime};
+use crate::runtime::{Event, Exit, ResidentCold, Runtime};
 use crate::translate;
 
 impl Native {
     /// Runs the unit at `cpu.eip` if it completes at most `fuel` guest
     /// instructions; `None` leaves them to the interpreter. A fault returns
-    /// `Exit::Fault` with EIP at the faulting instruction and the guest state
+    /// `Exit::Event(Event::Replay)` with EIP at the faulting instruction and the guest state
     /// exactly that before it.
     pub fn run(
         &mut self,
@@ -121,6 +121,7 @@ impl Native {
             (*runtime).access = access as *const () as u64;
             (*runtime).fault_simd = (*faults).capture.simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
+            (*runtime).value = value as *const () as u64;
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
@@ -145,7 +146,8 @@ impl Native {
         match exit {
             Exit::Optimized => {}
             Exit::Interpret => self.diagnostics.interprets += 1,
-            Exit::Fault => self.diagnostics.faults += 1,
+            Exit::Event(Event::Replay) => self.diagnostics.faults += 1,
+            Exit::Event(_) => {}
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::FirstVisit => unreachable!("first visits begin in the owner"),
@@ -162,7 +164,7 @@ impl Native {
         } else {
             None
         };
-        if exit == Exit::Fault {
+        if exit == Exit::Event(Event::Replay) {
             let pc = self.code.faults.capture.pc.get();
             let site = self.code.faults.site(pc).expect("faulting site");
             self.code

@@ -152,6 +152,29 @@ impl Translator<'_> {
         if self.x87_cached(x) {
             return;
         }
+        if self.tier1
+            && x.fast == Fast::Wait
+            && self.index == 0
+            && self.facts.pending() == Some(false)
+        {
+            return;
+        }
+        if self.tier1 && x.fast == Fast::StoreStatus && x.mem.is_none() {
+            self.cpu();
+            self.emit(ldrh(X16, X5, runtime::X87_STATUS));
+            if self.index != 0 || self.facts.mmx() != Some(0) {
+                // A deferred MMX entry clears TOP. Reading the status does
+                // not need to materialize any of the aliased stack payloads.
+                let ready = self.asm.label();
+                self.emit(ldr(W, X17, X5, runtime::MMX_MODE));
+                self.asm.tbz(false, X17, 0, ready);
+                self.emit(and_imm(W, X16, X16, 0xffff_c7ff));
+                self.asm.bind(ready);
+            }
+            self.clobber(Operand::Guest(0));
+            self.emit(bfi(W, super::host(0), X16, 0, 16));
+            return;
+        }
         self.flush_simd();
         self.canonicalize();
         if let Some(mem) = x.mem {
@@ -223,7 +246,7 @@ impl Translator<'_> {
             state: super::State::CANONICAL,
             simd_dirty: self.vector.dirty,
             refund: self.trace.owed(index),
-            exit: Exit::Interpret,
+            exit: Exit::Event(runtime::Event::PendingX87),
             eip: self.trace.insts[index].pc,
             link: false,
             x87: Some(cache::Leave::Restore(None)),

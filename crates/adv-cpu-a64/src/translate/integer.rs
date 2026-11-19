@@ -403,12 +403,12 @@ impl Translator<'_> {
         self.state.derivable = None;
     }
 
-    fn quotient(&mut self, src: Part, signed: bool, width: u8, helper: u8) {
+    fn quotient(&mut self, src: Part, signed: bool, width: u8, _helper: u8) {
         self.flush_simd();
         self.canonicalize();
         let address = self.part_address(src);
         self.narrow_read(src, width, address, X8);
-        let (slow, done) = (self.asm.label(), self.asm.label());
+        let slow = self.architectural_exception(0);
         self.asm.cbz(W, false, X8, slow);
         let bits = 8 * u32::from(width);
         if width == 1 {
@@ -440,10 +440,6 @@ impl Translator<'_> {
             Reg::ZR,
             X7,
         );
-        self.asm.b(done);
-        self.asm.bind(slow);
-        self.helper(helper);
-        self.asm.bind(done);
         self.state = State::CANONICAL;
     }
 
@@ -804,7 +800,7 @@ impl Translator<'_> {
         }
     }
 
-    fn divide(&mut self, src: Src, signed: bool, helper: u8) {
+    fn divide(&mut self, src: Src, signed: bool, _helper: u8) {
         #[cfg(native)]
         if signed && let Some(division) = self.proof.and_then(|proof| proof.division(self.index)) {
             let value = self.source(src);
@@ -833,7 +829,7 @@ impl Translator<'_> {
         self.canonicalize();
         let value = self.source(src);
         let (eax, edx) = (host(EAX), host(EDX));
-        let (slow, done) = (self.asm.label(), self.asm.label());
+        let slow = self.architectural_exception(0);
         self.asm.cbz(W, false, value, slow);
         // x16 is EDX:EAX; x17 the quotient and x15 the remainder. Only the
         // low halves of the guest registers are defined.
@@ -862,10 +858,6 @@ impl Translator<'_> {
         self.clobber(Operand::Guest(EAX));
         self.clobber(Operand::Guest(EDX));
         self.emit_all(&[mov(W, eax, X17), mov(W, edx, X15)]);
-        self.asm.b(done);
-        self.asm.bind(slow);
-        self.helper(helper);
-        self.asm.bind(done);
         self.state = State::CANONICAL;
     }
 

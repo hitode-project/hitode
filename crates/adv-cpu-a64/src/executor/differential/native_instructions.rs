@@ -509,7 +509,7 @@ fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
     }
 }
 
-// spec: A64F-FP-5
+// spec: A64F-FP-5 A64A-FALL-4
 #[test]
 fn sse_directed_arithmetic_and_conversion_stay_native() {
     let mut program = fixture(|a| {
@@ -595,19 +595,36 @@ fn sse_directed_arithmetic_preserves_value_exits_and_versions_control_changes() 
             );
             same(&native, &oracle);
             let diagnostics = &native.native.as_ref().unwrap().diagnostics;
-            let unsupported = !crate::facts::masked_mxcsr(mxcsr);
-            assert_eq!(
-                diagnostics.helpers,
-                u64::from(unsupported),
-                "MXCSR={mxcsr:x}"
-            );
-            assert_eq!(
-                diagnostics.interprets,
-                u64::from(!unsupported),
-                "MXCSR={mxcsr:x}"
-            );
+            assert_eq!(diagnostics.helpers, 0, "MXCSR={mxcsr:x}");
+            assert_eq!(diagnostics.interprets, 0, "MXCSR={mxcsr:x}");
+            assert_eq!(native.stats.interpreter_entries, 0, "MXCSR={mxcsr:x}");
         }
     }
+}
+
+// spec: A64F-FP-5 A64-REG-5 A64F-FP-7 A64-VER-1
+#[test]
+fn sse_value_calls_keep_x87_pairs_and_dirty_xmm() {
+    let mut program = fixture(|a| {
+        a.fld1().unwrap();
+        a.pxor(xmm7, xmm6).unwrap();
+        a.addss(xmm0, dword_ptr(ebx)).unwrap();
+        a.fchs().unwrap();
+        a.fstp(dword_ptr(ebx + 4)).unwrap();
+        a.movups(xmmword_ptr(ebx + 16), xmm7).unwrap();
+    });
+    program.state.mxcsr = 0x3fe0;
+    program.state.xmm[6] = [0x55; 16];
+    program.state.xmm[7] = [0xaf; 16];
+    program.state.xmm[0][..4].copy_from_slice(&1.25f32.to_bits().to_le_bytes());
+    program.data[..4].copy_from_slice(&0.5f32.to_bits().to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut native = executor(&program, config, false);
+    let mut oracle = executor(&program, config, true);
+    assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
+    same(&native, &oracle);
+    assert_eq!(native.stats.interpreter_entries, 0);
+    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
 }
 
 // spec: A64F-FP-5

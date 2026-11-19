@@ -749,7 +749,7 @@ impl Translator<'_> {
                 self.emit(add_imm(X, X9, X9, refund, false));
             }
             self.emit(mov(W, X1, X16));
-            self.emit(movz(W, X0, Exit::Yield as u16, 0));
+            self.emit(movz(W, X0, Exit::Yield.word(), 0));
             self.far(self.stubs.exit);
         } else {
             self.leave(Exit::Yield, eip, refund, false, false, false);

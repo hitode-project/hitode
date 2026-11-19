@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use adv_cpu_core::instruction_trace::Trace;
-use adv_cpu_core::interpreter::{Interpreter, Step};
+use adv_cpu_core::interpreter::{Execution, Interpreter, Step};
 use adv_cpu_core::tier_verify::VerifyStats;
 #[cfg(native)]
 use adv_cpu_core::tier_verify::{self, Check, Verifier};
@@ -19,7 +19,7 @@ use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 
 pub use crate::runtime::ExecutionContext;
-use crate::runtime::Exit;
+use crate::runtime::{Event, Exit};
 
 /// Interpreted instructions per decoded block, as in the x64 executor.
 const BLOCK_UNITS: u64 = 256;
@@ -648,8 +648,9 @@ impl Executor {
                 trace.prepare(units, &self.state, &self.memory)
             });
             let resume = self.computation_resume.take().filter(|(pc, exit)| {
-                *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Fault)
+                *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Event(_))
             });
+            let mut interpreted = true;
             let (execution, last_units) = if precise_flags || observed.is_some() {
                 #[cfg(native)]
                 let pc = self.state.eip;
@@ -712,13 +713,28 @@ impl Executor {
                     }
                     #[cfg(not(native))]
                     Exit::Stepped => unreachable!("no translated code"),
+                    Exit::Event(Event::Exception(vector)) => {
+                        interpreted = false;
+                        let step = Step::Trap {
+                            pc: self.state.eip,
+                            vector,
+                        };
+                        (Execution { step, units: 0 }, 0)
+                    }
+                    Exit::Event(Event::Software { vector, len }) => {
+                        interpreted = false;
+                        let pc = self.state.eip;
+                        self.state.eip = pc.wrapping_add(u32::from(len));
+                        let step = Step::Trap { pc, vector };
+                        (Execution { step, units: 0 }, 1)
+                    }
                     // The unit spent the budget; the instruction waits.
-                    Exit::Interpret | Exit::Fault if self.state.fuel == 0 => continue,
-                    Exit::Interpret | Exit::Fault => {
-                        let histogram = if exit == Exit::Interpret {
-                            &mut self.histogram
-                        } else {
+                    Exit::Interpret | Exit::Event(_) if self.state.fuel == 0 => continue,
+                    Exit::Interpret | Exit::Event(_) => {
+                        let histogram = if exit == Exit::Event(Event::Replay) {
                             &mut self.faults
+                        } else {
+                            &mut self.histogram
                         };
                         let pc = self.state.eip;
                         *histogram.entry(pc).or_default() += 1;
@@ -736,17 +752,19 @@ impl Executor {
                 self.interpreter
                     .run_block(&mut self.state, &mut self.memory, units, stop, None)
             };
-            self.stats.interpreter_entries += 1;
-            self.stats.interpreter_instructions += u64::from(execution.units);
+            if interpreted {
+                self.stats.interpreter_entries += 1;
+                self.stats.interpreter_instructions += u64::from(execution.units);
+                bridge
+                    .cliffs
+                    .interpreted(adv_cpu_core::InterpreterReason::Forced, execution.units);
+            }
             #[cfg(native)]
             if execution.units != 0
                 && let Some(native) = &mut self.native
             {
                 native.progressed();
             }
-            bridge
-                .cliffs
-                .interpreted(adv_cpu_core::InterpreterReason::Forced, execution.units);
             self.state.fuel -= u64::from(execution.units);
             let step = match execution.step {
                 Step::ReadTimestamp { pc, next } => {

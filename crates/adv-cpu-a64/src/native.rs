@@ -532,13 +532,31 @@ unsafe extern "C" fn access(
     }
 }
 
+/// Evaluates the prepared operation on only the supplied values.
+unsafe extern "C" fn value(runtime: *mut Runtime, index: u32) -> u32 {
+    // SAFETY: the generated call belongs to the current owner run.
+    let runtime = unsafe { &mut *runtime };
+    let owner = unsafe { &mut *(runtime.owner as *mut Owner) };
+    let native = unsafe { &mut *owner.native };
+    let helper = &native.code.helpers[index as usize];
+    if let Some(paths) = &mut native.code.slow_paths {
+        *paths.values.entry(helper.pc).or_default() += 1;
+    }
+    let operation = helper.value.as_ref().expect("a prepared value instruction");
+    match operation.evaluate(&mut runtime.value_frame) {
+        adv_cpu_core::floating::ValueOutcome::Complete => 0,
+        adv_cpu_core::floating::ValueOutcome::Exception(vector) => u32::from(vector),
+        adv_cpu_core::floating::ValueOutcome::Store { .. } => unreachable!("a SIMD value store"),
+    }
+}
+
 /// Called by the `interpret` stub: runs helper `index` with the guest in
 /// `CpuState`, a REP for at most the countdown left and the instruction
 /// prepaid. Continues if it completed and changed no code or mapping;
 /// otherwise leaves to dispatch where it went, or with the step for the
 /// owner to complete, refunding the instruction (`Runtime::interpret`).
 unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64) -> u64 {
-    const LEAVE: u32 = Exit::Dispatch as u32 + 1;
+    const LEAVE: u32 = Exit::Dispatch.raw() + 1;
     // SAFETY: as in `dispatch`; the runtime's CPU is live while units run.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
@@ -602,7 +620,7 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
         }
         Ok(execution) => {
             native.pending = Some(execution);
-            (Exit::Stepped as u32 + 1, -1)
+            (Exit::Stepped.raw() + 1, -1)
         }
         Err(_) => {
             owner.error = Some(format!("the interpreter panicked at {:#x}", helper.pc));
@@ -621,16 +639,16 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
 /// Called by the `call` stub: EIP in bits 0-31, thunk in 32-47, INT length
 /// in 48-51, and bit 63 for an unrecognized INT (A64-CTL-12).
 unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
-    const LEAVE: u32 = Exit::Dispatch as u32 + 1;
+    const LEAVE: u32 = Exit::Dispatch.raw() + 1;
     // SAFETY: as in `interpret`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
     let cpu = unsafe { &mut *(*runtime).cpu };
     let pc = site as u32;
+    let len = (site >> 48 & 15) as u8;
     if owner.bridge.is_null() {
-        // Without a host the interpreter takes the INT, which is refunded.
         cpu.eip = pc;
-        return (-1i64 as u64) << 32 | u64::from(Exit::Interpret as u32 + 1);
+        return u64::from(Exit::Event(runtime::Event::Software { vector: 0x2e, len }).raw() + 1);
     }
     if native.pending_work() {
         cpu.eip = pc;
@@ -639,7 +657,7 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
     // SAFETY: as in `interpret`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
     // The INT has committed its next PC.
-    let next = pc.wrapping_add((site >> 48 & 15) as u32);
+    let next = pc.wrapping_add(u32::from(len));
     cpu.eip = next;
     let before = (memory.epoch, memory.dirty_pages.len());
     let thunk = (site >> 32 & 0xffff) as u32;
@@ -772,7 +790,7 @@ impl Native {
         };
         let cause = if debug {
             InterpreterCause::DebugFlags
-        } else if exit == Exit::Fault {
+        } else if exit == Exit::Event(crate::runtime::Event::Replay) {
             InterpreterCause::HostFault
         } else {
             match step {
@@ -813,6 +831,9 @@ impl Native {
             }
             for (&(eip, cause), &count) in &paths.helpers {
                 let _ = write!(output, " helper {eip:#010x} {cause:?}={count}");
+            }
+            for (&eip, &count) in &paths.values {
+                let _ = write!(output, " value {eip:#010x}={count}");
             }
         }
         Some(output)
@@ -1168,7 +1189,7 @@ mod tests {
         let words = [
             load,
             sub_imm(X, Reg::new(9), Reg::new(9), 1, false),
-            movz(W, Reg::new(0), Exit::Dispatch as u16, 0),
+            movz(W, Reg::new(0), Exit::Dispatch.word(), 0),
             movz(W, Reg::new(1), next as u16, 0),
             movk(W, Reg::new(1), (next >> 16) as u16, 16),
             b((native.code.stubs.exit as i64 - (at + 20) as i64) as i32),
@@ -1797,13 +1818,13 @@ mod tests {
         state.regs[6] = DATA;
         assert_eq!(
             enter(&mut native, &mut memory, stop, &mut state).exit,
-            Exit::Fault
+            Exit::Event(crate::runtime::Event::Replay)
         );
         let old = native.code.units[&HEAD].unit;
         for _ in 1..CHECK_AFTER {
             assert_eq!(
                 enter(&mut native, &mut memory, stop, &mut state).exit,
-                Exit::Fault
+                Exit::Event(crate::runtime::Event::Replay)
             );
         }
         let new = native.code.units[&HEAD].unit;
@@ -2155,7 +2176,7 @@ mod tests {
             let mut state = state.clone();
             assert_eq!(
                 enter(&mut native, &mut memory, stop, &mut state).exit,
-                Exit::Fault
+                Exit::Event(crate::runtime::Event::Replay)
             );
             assert_eq!(state.eip, HEAD);
         }
@@ -2439,7 +2460,11 @@ mod tests {
                 .run(&mut cpu, &mut memory, STOP, 1, std::ptr::null_mut())
                 .unwrap()
                 .unwrap();
-            assert_eq!((run.exit, run.retired), (Exit::Fault, 0), "{eip:#x}");
+            assert_eq!(
+                (run.exit, run.retired),
+                (Exit::Event(crate::runtime::Event::Replay), 0),
+                "{eip:#x}"
+            );
             assert_eq!(
                 cpu, before,
                 "{eip:#x}: state is exactly that before the instruction"

@@ -6,6 +6,7 @@
 //! `Op` and length (`quick_agrees_with_iced`).
 
 use super::{quick_form, summary::Summary};
+use adv_cpu_core::floating::ValueInstruction;
 pub use adv_cpu_core::interpreter::quick::{Alu, Mem, Narrow8or16, ShiftKind, Src};
 use adv_cpu_core::interpreter::{
     Prepared,
@@ -535,6 +536,7 @@ pub struct Helper {
     pub pc: u32,
     pub next: u32,
     pub prepared: Arc<Prepared>,
+    pub value: Option<ValueInstruction>,
 }
 
 #[derive(Clone, Copy)]
@@ -752,6 +754,7 @@ impl Fetcher {
             pc,
             next: ins.next_ip32(),
             prepared: Arc::clone(prepared),
+            value: ValueInstruction::new(ins, prepared.x87_opcode()),
         });
         if sample.locked {
             self.locked = Some((memory_sized(&ins)?, ins.memory_size().size() as u8, index));
