@@ -76,6 +76,8 @@ pub(super) struct HotDevice {
     pub(super) pixel_shader_ptr: u32,
     pub(super) texture_ptrs: [u32; 20],
     pub(super) texture_clean: u32,
+    /// Unavailable options already reported by the full handler.
+    pub(super) reported: rustc_hash::FxHashSet<[u32; 4]>,
 }
 
 impl HotDevice {
@@ -101,6 +103,7 @@ impl HotDevice {
             pixel_shader_ptr: 0,
             texture_ptrs: [0; 20],
             texture_clean: 0,
+            reported: Default::default(),
         };
         hot.refresh_all();
         hot
@@ -272,9 +275,18 @@ fn set_render<M: Mem>(mem: &mut M, [this, state, value, ..]: [u32; 7]) -> Result
                 }
                 Ok((0u32.into(), changed))
             }
-            Err(code) => Ok((code.into(), false)),
+            Err(code) => reject(hot, [0, 0, state, value], code),
         }
     })
+}
+
+/// The first unavailable rejection of each option takes the full handler,
+/// which reports it; repeats return the code here.
+fn reject(hot: &mut HotDevice, option: [u32; 4], code: u32) -> Result<(Ret, bool), Stop> {
+    if code == UNAVAILABLE && hot.reported.insert(option) {
+        return Err(Stop::Guest);
+    }
+    Ok((code.into(), false))
 }
 
 body!(pub(super) GET_RENDER = get_render, inputs: &[Input::Stack(0), Input::Stack(1), Input::Stack(2)], outputs: EAX, pop: 12);
@@ -301,7 +313,7 @@ fn set_stage<M: Mem>(mem: &mut M, [this, stage, kind, value, ..]: [u32; 7]) -> R
                 }
                 Ok((0u32.into(), changed))
             }
-            Err(code) => Ok((code.into(), false)),
+            Err(code) => reject(hot, [1, stage, kind, value], code),
         }
     })
 }
@@ -333,7 +345,7 @@ fn set_sampler<M: Mem>(
                 }
                 Ok((0u32.into(), changed))
             }
-            Err(code) => Ok((code.into(), false)),
+            Err(code) => reject(hot, [2, sampler, kind, value], code),
         }
     })
 }
@@ -469,7 +481,7 @@ fn get_scissor<M: Mem>(mem: &mut M, [this, output, ..]: [u32; 7]) -> Result<Ret,
 body!(pub(super) SET_TRANSFORM = set_transform, inputs: &[Input::Stack(0), Input::Stack(1), Input::Stack(2)], outputs: EAX, pop: 12);
 fn set_transform<M: Mem>(mem: &mut M, [this, kind, matrix_ptr, ..]: [u32; 7]) -> Result<Ret, Stop> {
     let Some(slot) = fixed::transform_slot(kind as i32) else {
-        return Ok(UNAVAILABLE.into());
+        return with_device_mut(mem, this, |hot| reject(hot, [3, 0, kind, 0], UNAVAILABLE));
     };
     let matrix = read_f32s::<M, 16>(mem, matrix_ptr)?;
     if matrix.iter().any(|v| !v.is_finite()) {
@@ -502,7 +514,7 @@ fn multiply_transform<M: Mem>(
     [this, kind, matrix_ptr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
     let Some(slot) = fixed::transform_slot(kind as i32) else {
-        return Err(Stop::Guest);
+        return with_device_mut(mem, this, |hot| reject(hot, [4, 0, kind, 0], UNAVAILABLE));
     };
     let matrix = read_f32s::<M, 16>(mem, matrix_ptr)?;
     if matrix.iter().any(|v| !v.is_finite()) {

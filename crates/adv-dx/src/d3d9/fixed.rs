@@ -823,9 +823,19 @@ pub(super) fn apply_stage_raw(
             changed,
         ));
     }
+    // Legal SDK operations and arguments this stage does not combine are
+    // unavailable rather than invalid, so callers see them reported.
     let valid = match kind {
-        1 | 4 => matches!(value, 1..=7 | 10),
-        2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 3,
+        1 | 4 => match value {
+            1..=7 | 10 => true,
+            8..=26 => return Err(UNAVAILABLE),
+            _ => false,
+        },
+        2 | 3 | 5 | 6 => match (value & !0x3f, value & 0xf) {
+            (0, 0..=3) => true,
+            (0, 4..=6) => return Err(UNAVAILABLE),
+            _ => false,
+        },
         11 => {
             // Up to eight FVF coordinate sets and the SDK's four automatic
             // generation modes are legal; this decoder supplies set zero only.

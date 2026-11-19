@@ -191,7 +191,7 @@ COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse ov
 | SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF | The incoming object identity, and any offset, stride or FVF, equal the bound state. |
 | StateBlock Capture, Apply | Every captured value equals the device state. |
 
-Hot state setters, getters, scene boundaries, and unchanged bindings or state blocks may run as direct bodies over shared state. Recording, invalid objects, binding changes, and managed-texture flushes fall back to the full handler.
+Hot state setters, getters, scene boundaries, and unchanged bindings or state blocks may run as direct bodies over shared state. Recording, invalid objects, binding changes, managed-texture flushes, and the first unavailable rejection of each option fall back to the full handler, which reports it; repeated rejections return directly.
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 
