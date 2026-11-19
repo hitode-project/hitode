@@ -204,7 +204,7 @@ fn j_file() {
             "directory_boolean_batch",
             "directory_boolean_resume",
             "directory_boolean_single",
-            "directory_hook_legacy_record",
+            "directory_hook_windows_record",
             "flush_file",
             "flush_ex",
             "flush_access",

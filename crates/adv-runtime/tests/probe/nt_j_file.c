@@ -85,32 +85,34 @@ static void enumerate(void)
     RemoveDirectoryW(L"j-enum");
 }
 
-static const WCHAR virtual_name[] = L"virtual-entry.dat";
-static unsigned extended_queries, legacy_queries;
+static const WCHAR *const virtual_names[] = {L"virtual-a.dat", L"virtual-b.dat"};
+static unsigned extended_queries, listed;
 
+/* A hook written against Windows: it answers the record Windows' file
+ * searches ask for and leaves any other class empty, one entry per call. */
 static NTSTATUS WINAPI virtual_directory(HANDLE dir, HANDLE event, void *apc, void *context,
                                         IO_STATUS_BLOCK *io, void *buffer, ULONG length, ULONG class,
                                         ULONG single, UNICODE_STRING *mask, ULONG restart)
 {
-    if (!mask || mask->Length != sizeof(virtual_name) - sizeof(WCHAR)) return (NTSTATUS)0xc000000f;
-    for (unsigned i = 0; i < mask->Length / sizeof(WCHAR); i++)
-        if (mask->Buffer[i] != virtual_name[i]) return (NTSTATUS)0xc000000f;
     io->Status = 0;
     io->Information = 0;
-    if (class == 63) {
+    if (class != 3) {
         extended_queries++;
         return 0;
     }
-    if (class != 3 || length < 94 + mask->Length) return (NTSTATUS)0xc0000003;
-    legacy_queries++;
+    if ((BYTE)restart) listed = 0;
+    if (listed == 2) return (NTSTATUS)0x80000006;
+    const WCHAR *name = virtual_names[listed];
+    ULONG bytes = lstrlenW(name) * sizeof(WCHAR);
+    if (length < 94 + bytes) return (NTSTATUS)0x80000005;
     BYTE *entry = buffer;
     for (unsigned i = 0; i < 94; i++) entry[i] = 0;
-    *(ULONG *)(entry + 40) = 123;
+    *(ULONG *)(entry + 40) = 123 + listed;
     *(ULONG *)(entry + 56) = FILE_ATTRIBUTE_ARCHIVE;
-    *(ULONG *)(entry + 60) = mask->Length;
-    for (unsigned i = 0; i < mask->Length / sizeof(WCHAR); i++)
-        ((WCHAR *)(entry + 94))[i] = virtual_name[i];
-    io->Information = 94 + mask->Length;
+    *(ULONG *)(entry + 60) = bytes;
+    for (unsigned i = 0; i < bytes / sizeof(WCHAR); i++) ((WCHAR *)(entry + 94))[i] = name[i];
+    io->Information = 94 + bytes;
+    listed++;
     return 0;
 }
 
@@ -119,23 +121,37 @@ static void enumerate_hook(void)
     BYTE *entry = (BYTE *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile");
     BYTE original[5];
     DWORD protection, ignored;
-    WIN32_FIND_DATAW found;
+    WIN32_FIND_DATAW exact, first, second, third;
+    BOOL next = FALSE, end = TRUE;
+    DWORD end_error = 0;
     if (!entry || !VirtualProtect(entry, 5, PAGE_EXECUTE_READWRITE, &protection)) {
-        check("directory_hook_legacy_record", FALSE);
+        check("directory_hook_windows_record", FALSE);
         return;
     }
+    CreateDirectoryW(L"j-hook", NULL);
     for (unsigned i = 0; i < 5; i++) original[i] = entry[i];
     entry[0] = 0xe9;
     *(DWORD *)(entry + 1) = (DWORD)(ULONG_PTR)virtual_directory - (DWORD)(ULONG_PTR)(entry + 5);
     FlushInstructionCache(GetCurrentProcess(), entry, 5);
-    HANDLE search = FindFirstFileW(virtual_name, &found);
+    HANDLE lookup = FindFirstFileW(virtual_names[0], &exact);
+    HANDLE search = FindFirstFileW(L"j-hook\\*", &first);
+    if (search != INVALID_HANDLE_VALUE) {
+        next = FindNextFileW(search, &second);
+        end = FindNextFileW(search, &third);
+        end_error = GetLastError();
+    }
     for (unsigned i = 0; i < 5; i++) entry[i] = original[i];
     FlushInstructionCache(GetCurrentProcess(), entry, 5);
     VirtualProtect(entry, 5, protection, &ignored);
+    if (lookup != INVALID_HANDLE_VALUE) FindClose(lookup);
     if (search != INVALID_HANDLE_VALUE) FindClose(search);
-    check("directory_hook_legacy_record", search != INVALID_HANDLE_VALUE &&
-          extended_queries == 1 && legacy_queries == 1 && !lstrcmpW(found.cFileName, virtual_name) &&
-          found.nFileSizeLow == 123 && found.dwFileAttributes == FILE_ATTRIBUTE_ARCHIVE);
+    RemoveDirectoryW(L"j-hook");
+    check("directory_hook_windows_record",
+          lookup != INVALID_HANDLE_VALUE && !lstrcmpW(exact.cFileName, virtual_names[0]) &&
+          exact.nFileSizeLow == 123 && exact.dwFileAttributes == FILE_ATTRIBUTE_ARCHIVE &&
+          search != INVALID_HANDLE_VALUE && !lstrcmpW(first.cFileName, virtual_names[0]) && next &&
+          !lstrcmpW(second.cFileName, virtual_names[1]) && second.nFileSizeLow == 124 && !end &&
+          end_error == ERROR_NO_MORE_FILES && extended_queries == 0);
 }
 
 static void run(void)
