@@ -12,6 +12,7 @@ pub const INFO_LENGTH_MISMATCH: Status = 0xc000_0004;
 pub const ACCESS_VIOLATION: Status = 0xc000_0005;
 pub const INVALID_HANDLE: Status = 0xc000_0008;
 pub const INVALID_PARAMETER: Status = 0xc000_000d;
+pub const INVALID_PARAMETER_4: Status = 0xc000_00f2;
 pub const NO_MEMORY: Status = 0xc000_0017;
 pub const TOO_MANY_OPENED_FILES: Status = 0xc000_011f;
 pub const BUFFER_TOO_SMALL: Status = 0xc000_0023;
