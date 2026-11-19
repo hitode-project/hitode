@@ -1,10 +1,14 @@
 //! Specialized, admitted bulk bridges (A64-TR-8). Admission runs while building
 //! a hot translation. Generated code contains only fixed input expressions,
 //! range guards, a direct kernel call and fixed cursor updates.
+use super::{
+    Cond, Index, Label, Lsl, Narrow, RUNTIME, Reg, Translator, W, WINDOW, X, X0, X1, X2, X3, X4,
+    X5, X6, X9, X10, X11, X12, X15, X16, add, add_imm, and_imm, biased, blr, cmp, cmp_imm, csel,
+    eor, host, ldp, ldr, ldr_narrow, ldr_reg, lsr_imm, movk, movz, mrs_nzcv, msr_nzcv, mul, stp,
+    sub, sub_imm,
+};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 use adv_cpu_core::native_region::{Affine, Aliasing, NativeRegion};
-
-use super::*;
 
 const MINIMUM: u32 = 128;
 const MAXIMUM: u32 = 1024;
@@ -239,7 +243,7 @@ impl Translator<'_> {
         self.emit_all(&[
             ldr(X, X3, RUNTIME, crate::runtime::NATIVE_BATCHES),
             add_imm(X, X3, X3, 1, false),
-            str(X, X3, RUNTIME, crate::runtime::NATIVE_BATCHES),
+            crate::encode::str(X, X3, RUNTIME, crate::runtime::NATIVE_BATCHES),
         ]);
         self.emit(msr_nzcv(X15));
         self.asm.b(done);

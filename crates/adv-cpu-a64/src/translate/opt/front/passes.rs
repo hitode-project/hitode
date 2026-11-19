@@ -1,7 +1,11 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
-use super::*;
 mod head_flags;
+use super::{
+    BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
+    MAX_PLAIN_FACTS, Op, Recipe, RecordId, Source, Target, Type, Value, VecOp, VecUnary,
+    disjoint_ranges, facts,
+};
 use crate::translate::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 use adv_cpu_core::memory::PAGE_SIZE;

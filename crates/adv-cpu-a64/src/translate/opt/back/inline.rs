@@ -3,7 +3,15 @@
 use super::super::recovery::{
     self, FlagExpr, FlagGroup, FlagSelect, IrRecord, Location, Recipe, X87,
 };
-use super::*;
+use super::{
+    A, ALIAS, Assumed, B, C, Cond, D, E, Emitter, Extend, FlagKind, FlagRecipe, Float, FpOp, Host,
+    Index, IntOp, Label, Lsl, Lsr, Narrow, Op, RT, Record, RecordId, Reg, Runtime, Source, T, Type,
+    U, VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, bitmask, clz, cmp,
+    cmp_imm, csel, dfloat, eor, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate, ldp, ldr,
+    ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv, offset_of,
+    orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, tst_imm, ubfx,
+    vfneg2d, vldr, vldur, vstur,
+};
 use crate::translate::{emit_link_point, emit_link_transition};
 
 const CPU: Reg = Reg::new(0);

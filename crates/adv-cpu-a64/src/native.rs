@@ -38,12 +38,10 @@
 //! typed artifacts. `offload` alone consumes worker jobs.
 //! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
-use plan::dispatch;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use store::{InternalEdge, Linked, Tier1Unit};
 
 use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
@@ -52,7 +50,6 @@ use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
-use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
@@ -1058,9 +1055,10 @@ fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
 mod tests {
     use adv_cpu_core::memory::Memory;
 
+    use super::store::Linked;
     use super::*;
     use crate::encode::Size::{W, X};
-    use crate::encode::{Reg, ldr, ldr_reg, ldur, movk, movz, sub_imm};
+    use crate::encode::{Reg, b, ldr, ldr_reg, ldur, movk, movz, sub_imm};
     use crate::translate::{Carry, Recipe};
 
     const X19: Reg = Reg::new(19);

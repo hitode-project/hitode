@@ -26,7 +26,19 @@
 //! starts a fresh sample, as does a change to the version chain. Windows reuse
 //! the probation calls, which are patched out on settled forms between windows.
 
-use super::*;
+use adv_cpu_core::backend::OfferGate;
+use adv_cpu_core::trap::Bridge;
+use adv_cpu_core::{CpuState, Memory};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
+use std::sync::Arc;
+
+use super::store::{self, InternalEdge, Linked, Tier1Unit};
+use super::{Checks, EMPTY, Native, Owner, compile, head, record_branch};
+use crate::cache::CodeCache;
+use crate::encode::b;
+use crate::runtime::{self, ResidentCold, Runtime};
+use crate::translate;
 
 pub(super) const HOT: u32 = 64;
 pub(super) const VERSIONS: usize = 3;
@@ -684,14 +696,14 @@ impl Native {
         );
     }
 
-    pub(super) fn enters_resident(link: &Linked, head: &plan::ResidentPlan) -> bool {
+    pub(super) fn enters_resident(link: &Linked, head: &ResidentPlan) -> bool {
         head.trampoline != 0 && !head.declined() && (link.back || link.direct.is_some())
     }
 
     pub(super) fn route_link(
         cache: &mut CodeCache,
         link: &Linked,
-        head: Option<&plan::ResidentPlan>,
+        head: Option<&ResidentPlan>,
         job: Option<&JobPlan>,
         unit: usize,
     ) {
@@ -1164,7 +1176,7 @@ impl Native {
             return;
         }
         if point == 1 {
-            if head.pending.is_none() && head.versions.len() < plan::VERSIONS {
+            if head.pending.is_none() && head.versions.len() < VERSIONS {
                 self.request_resident(eip, compile::Task::Append, cpu.clone());
             }
             return;
@@ -1330,12 +1342,12 @@ impl Native {
                 }
                 if let Some(head) = self.plans.resident_mut(eip) {
                     head.pending = None;
-                    if head.versions.len() < plan::VERSIONS
+                    if head.versions.len() < VERSIONS
                         && let Some(last) = head.versions.last()
                     {
                         last.slot
                             .limit
-                            .set(last.slot.misses.get().wrapping_add(plan::MISSES));
+                            .set(last.slot.misses.get().wrapping_add(MISSES));
                     }
                     self.rebuild_resident(eip);
                 }
@@ -1508,14 +1520,14 @@ impl Native {
         head.state = ResidentState::Installed;
         head.trampoline = trampoline;
         head.tier1 = tier1;
-        head.probes = plan::PROBES;
-        head.sample.set(plan::SAMPLE);
+        head.probes = PROBES;
+        head.sample.set(SAMPLE);
         head.versions
             .iter()
             .for_each(|version| version.slot.limit.set(0));
-        if head.versions.len() < plan::VERSIONS {
+        if head.versions.len() < VERSIONS {
             let last = &head.versions.last().unwrap().slot;
-            last.limit.set(last.misses.get().wrapping_add(plan::MISSES));
+            last.limit.set(last.misses.get().wrapping_add(MISSES));
         }
         if head.rebuilds == 0 {
             self.code

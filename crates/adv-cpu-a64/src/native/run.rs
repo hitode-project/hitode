@@ -3,7 +3,17 @@
 //! Each Rust arrival reads one site plan. Decided links stay in translated
 //! code, with explicit cold and offload events returning to the arbiter.
 
-use super::*;
+use adv_cpu_core::backend::OfferGate;
+use adv_cpu_core::trap::Bridge;
+use adv_cpu_core::{CpuState, Memory};
+
+use super::plan::{self, dispatch};
+use super::{
+    ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
+    alias_base, call, interpret, timestamp,
+};
+use crate::runtime::{Exit, ResidentCold, Runtime};
+use crate::translate;
 
 impl Native {
     /// Runs the unit at `cpu.eip` if it completes at most `fuel` guest

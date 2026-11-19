@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BTreeMap, Block, CF, End, FlagKind, FlagSet, Func, IntOp, Location, OF, Op, Recipe, Source,
+    Type, Value, constant, definitions, targets_mut,
+};
 use crate::translate::opt::recovery::{FlagExpr, FlagGroup, FlagSelect};
 use crate::translate::opt::verify::{dominates, dominators};
 use adv_cpu_core::integer::{AF, PF, SF, ZF};

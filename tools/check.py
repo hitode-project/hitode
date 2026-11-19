@@ -197,6 +197,7 @@ def check(everything: bool, ci: bool = False) -> bool:
         ok &= run("whitespace and conflict markers", ["git", "diff", "--cached", "--check"])
     ok &= run("privacy", [sys.executable, "tools/privacy/scan.py"])
     ok &= run("layering", [sys.executable, "tools/layering/check_layers.py"])
+    ok &= run("a64 module dependencies", [sys.executable, "tools/layering/check_modules.py"])
     ok &= run("vfs namespace", [sys.executable, "tools/vfs/check_namespace.py"])
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
     ok &= run("wine protocol", [sys.executable, "tools/wine/protocol.py", "--check"])

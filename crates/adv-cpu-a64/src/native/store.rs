@@ -3,7 +3,13 @@
 //! The store places artifacts and holds the data for link, repoint and
 //! invalidation operations. The arbiter alone publishes those changes.
 
-use super::*;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{Enter, Faults, ShadowStack, head};
+use crate::cache::CodeCache;
+use crate::encode::bl;
+use crate::runtime;
+use crate::translate::{self, Site, Stubs};
 
 #[derive(Clone, Copy)]
 pub(super) struct Tier1Unit {

@@ -4,7 +4,11 @@
 //! proven non-faulting: it restores every temporary and flag before any exit.
 use super::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, Src};
 use super::trace::{Edge, Mode, Next, Trace};
-use super::*;
+use super::{
+    Cond, ConditionCode, Label, Lsl, Narrow, RUNTIME, Reg, Translator, VMem, VReg, W, WINDOW, X,
+    X0, X1, X2, X3, X4, X5, X6, X9, X15, X16, X17, add, add_imm, and, cmp, host, ldr, ldr_narrow,
+    ldr_reg, lsr_imm, mov, mrs_nzcv, msr_nzcv, orr, sub, vldr_reg, vst_interleaved,
+};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 const BATCH: u32 = 64;
@@ -209,7 +213,7 @@ impl Translator<'_> {
         self.emit_all(&[
             ldr(X, X3, RUNTIME, crate::runtime::CHANNEL_BATCHES),
             add_imm(X, X3, X3, 1, false),
-            str(X, X3, RUNTIME, crate::runtime::CHANNEL_BATCHES),
+            crate::encode::str(X, X3, RUNTIME, crate::runtime::CHANNEL_BATCHES),
         ]);
         self.asm.bind(scalar);
         self.emit(msr_nzcv(X15));

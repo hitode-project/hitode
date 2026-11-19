@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Asm, COUNT, Cond, Emitter, Extend, Host, IntOp, Label, Lsl, Op, RT, Reg, T, Type, U, VReg,
+    Value, W, X, X0, X1, X2, X3, add, add_ext, add_imm, add_immediate, and_imm, cmp, csel, eor_imm,
+    int_immediate, ldr, loops, lsr_imm, mov, movz, mul, mvn, page_crossing, runtime, sub, sub_imm,
+    subs, subs_imm, udiv,
+};
 use crate::translate::{X4, X5};
 
 use crate::translate::front::tags::ConditionCode as Cc;
@@ -54,6 +59,8 @@ impl Emitter<'_> {
         self.asm.bind(entry);
         #[cfg(test)]
         {
+            use super::{Runtime, offset_of, str};
+
             let entries = offset_of!(Runtime, vector_regions) as u32;
             self.asm.emit_all(&[
                 ldr(X, T, RT, entries),
