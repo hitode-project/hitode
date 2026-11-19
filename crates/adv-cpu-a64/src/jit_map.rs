@@ -298,6 +298,7 @@ pub(crate) fn declined(head: u32, reason: crate::runtime::ResidentCold) {
 #[cfg(test)]
 thread_local! {
     static VECTORIZED: std::cell::RefCell<Option<Vec<(u32, u8)>>> = const { std::cell::RefCell::new(None) };
+    static BATCH_COSTS: std::cell::RefCell<Option<Vec<(u32, u32)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -305,6 +306,25 @@ pub(crate) fn collect_vectorized(run: impl FnOnce()) -> Vec<(u32, u8)> {
     VECTORIZED.with_borrow_mut(|rows| *rows = Some(Vec::new()));
     run();
     VECTORIZED.with_borrow_mut(|rows| rows.take().unwrap())
+}
+
+#[cfg(test)]
+pub(crate) fn collect_batch_costs(run: impl FnOnce()) -> Vec<(u32, u32)> {
+    BATCH_COSTS.with_borrow_mut(|rows| *rows = Some(Vec::new()));
+    run();
+    BATCH_COSTS.with_borrow_mut(|rows| rows.take().unwrap())
+}
+
+pub(crate) fn batch_costs(head: u32, counts: Vec<(u32, u32)>) {
+    if enabled() {
+        optimized(head, format_args!("resident\tbatch-costs\t{counts:?}"));
+    }
+    #[cfg(test)]
+    BATCH_COSTS.with_borrow_mut(|rows| {
+        if let Some(rows) = rows {
+            rows.extend(counts);
+        }
+    });
 }
 
 pub(crate) fn vectorized(head: u32, kernel: &str, lanes: u8, streams: usize) {

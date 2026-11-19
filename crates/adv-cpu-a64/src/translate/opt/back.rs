@@ -10,6 +10,7 @@ mod flags;
 mod inline;
 mod resident;
 
+pub(crate) use resident::BatchCache;
 #[cfg(any(native, test))]
 pub(crate) use resident::access_stub;
 
@@ -61,6 +62,7 @@ pub(crate) struct Lowered {
     pub probation: Vec<usize>,
     /// Two words holding the address of the probation counters, bound at placement.
     pub probation_slot: usize,
+    pub batch_caches: Vec<BatchCache>,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
@@ -116,26 +118,55 @@ fn lower_form(
     count_entries: bool,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let batches = loops::plan(func, &[&loops::vector::Vector]);
-    let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
-    let mut asm = Asm::new();
-    // A bit test whose target lands out of range is emitted wide, and the
-    // form again, as the ordinary translator does.
-    let (mut e, exit, miss, cold) = loop {
-        let (mut e, exit, miss, cold) = emit(
-            func,
-            &allocation,
-            asm,
-            inline,
-            (resident, count_entries),
-            &batches,
-        );
-        if !e.asm.widen_bit_tests() {
-            break (e, exit, miss, cold);
+    let mut batches = loops::plan(func, &[&loops::vector::Vector]);
+    let (mut e, exit, miss, cold, batch_caches, spill_cells) = loop {
+        let batch_caches = if resident {
+            batches
+                .iter()
+                .map(|b| BatchCache::new(b.head, b.spans.len()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
+        let mut asm = Asm::new();
+        // Repeat emission with wide bit tests once their distances are known.
+        let (e, exit, miss, cold) = loop {
+            let (mut e, exit, miss, cold) = emit(
+                func,
+                &allocation,
+                asm,
+                inline,
+                (resident, count_entries),
+                &batches,
+                &batch_caches,
+            );
+            if !e.asm.widen_bit_tests() {
+                break (e, exit, miss, cold);
+            }
+            asm = e.asm;
+            asm.rewind();
+        };
+        if e.slower_batches.is_empty() {
+            break (e, exit, miss, cold, batch_caches, allocation.spill_cells);
         }
-        asm = e.asm;
-        asm.rewind();
+        batches.retain(|batch| {
+            if e.slower_batches.contains(&batch.head) {
+                crate::jit_map::loop_reject(batch.head, format_args!("ClassCost"));
+                false
+            } else {
+                true
+            }
+        });
     };
+    for batch in &batches {
+        crate::jit_map::vectorized(
+            batch.head,
+            batch.plan.name,
+            batch.plan.lanes,
+            batch.spans.len(),
+        );
+    }
     // A host fault leaves through its region's record like a failed check.
     for (offset, site) in &mut e.sites {
         let cold = e.cold[site.opt_record.expect("optimized site") as usize];
@@ -169,6 +200,7 @@ fn lower_form(
         iteration_pcs: e.iteration.pcs,
         probation: e.probation.map_or_else(Vec::new, |p| p.calls),
         probation_slot,
+        batch_caches,
         links: e.links,
         transitions: e.transitions,
         exit,
@@ -177,7 +209,7 @@ fn lower_form(
         marks: e.marks,
         records,
         flags: e.flags,
-        spill_cells: allocation.spill_cells,
+        spill_cells,
     }
 }
 
@@ -205,6 +237,7 @@ fn emit<'a>(
     inline: Option<(&Assumed, &[Source])>,
     (resident, count_entries): (bool, bool),
     batches: &[loops::Batch],
+    batch_caches: &[BatchCache],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -260,6 +293,7 @@ fn emit<'a>(
         page_cross: None,
         page_crossings: Vec::new(),
         batch_backedges,
+        slower_batches: Vec::new(),
         guest_eip: 0,
         locations: allocation.locations.clone(),
         defs: allocation.defs.clone(),
@@ -296,6 +330,7 @@ fn emit<'a>(
     }
     let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
     let mut head_batch = None;
+    let mut batch_cases = Vec::new();
     for (b, data) in func.blocks.iter().enumerate() {
         if e.through(Block(b as u32)).is_some() {
             continue;
@@ -313,12 +348,17 @@ fn emit<'a>(
                 .copied()
                 .unwrap_or(func.records[e.region.0 as usize].eip),
         );
-        if let Some(batch) = batches
+        if let Some((index, batch)) = batches
             .iter()
-            .find(|batch| batch.loop_.head.0 as usize == b)
+            .enumerate()
+            .find(|(_, batch)| batch.loop_.head.0 as usize == b)
         {
             let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
-            let words = e.batch(batch, batch_pages, backedge);
+            let pages = batch_pages.map(|walker| (walker, &batch_caches[index]));
+            let (words, cases) = e.batch(batch, pages, backedge, count_entries || cfg!(test));
+            if let Some(cases) = cases {
+                batch_cases.push((batch.head, cases));
+            }
             if func.head_exit == Some(batch.loop_.head) {
                 head_batch = Some((words, u32::from(batch.plan.lanes)));
             }
@@ -410,6 +450,29 @@ fn emit<'a>(
         costs[block].edges[index] = e.words_since(start);
     }
     if resident {
+        for (head, classes) in batch_cases {
+            let arms = classes
+                .scalar
+                .iter()
+                .map(|path| {
+                    path.iter()
+                        .map(|&(block, edge)| {
+                            let cost = costs[block.0 as usize];
+                            cost.body + cost.edges[edge]
+                        })
+                        .sum::<u32>()
+                })
+                .collect::<Vec<_>>();
+            let counts = arms
+                .iter()
+                .flat_map(|a| arms.iter().map(move |b| a + b))
+                .zip(classes.batch)
+                .collect::<Vec<_>>();
+            if counts.iter().any(|&(scalar, batch)| batch > scalar) {
+                e.slower_batches.push(head);
+            }
+            crate::jit_map::batch_costs(head, counts);
+        }
         e.iteration = cost::iteration(func, &costs);
         if let Some((words, lanes)) = head_batch {
             e.iteration.words = words.div_ceil(lanes);
@@ -514,6 +577,7 @@ struct Emitter<'a> {
     page_cross: Option<RecordId>,
     page_crossings: Vec<resident::PageCrossing>,
     batch_backedges: Vec<Option<(Block, Label)>>,
+    slower_batches: Vec<u32>,
     guest_eip: u32,
     locations: Vec<Host>,
     defs: Vec<Option<Op>>,

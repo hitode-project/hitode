@@ -39,6 +39,7 @@ pub(super) struct Version {
     pub probation: Option<Probation>,
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
+    pub batch_caches: Vec<crate::translate::opt::back::BatchCache>,
 }
 
 impl Version {

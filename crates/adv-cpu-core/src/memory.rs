@@ -452,6 +452,12 @@ impl Memory {
         self.plain_pages.as_ptr().cast()
     }
 
+    /// Changes when an ordinary-page fact can become false. Permission
+    /// grants leave existing facts valid.
+    pub fn page_fact_epoch(&self) -> u64 {
+        (self.identity() << EPOCH_BITS) + self.fast.page_fact_epoch()
+    }
+
     fn blocks_executable_writes(&self, flags: u8) -> bool {
         !self.selective_code_writes() && flags & EXEC != 0
     }
@@ -840,6 +846,7 @@ impl Memory {
     fn update_plain_pages(&self, pages: std::ops::Range<usize>) {
         #[cfg(unix)]
         if self.window.is_some() {
+            let mut revoked = false;
             for page in pages {
                 let mut info = HostRange::EMPTY;
                 self.include_host_page(&mut info, page);
@@ -853,8 +860,17 @@ impl Memory {
                 for (offset, allowed) in grants.into_iter().enumerate() {
                     let word = &self.plain_pages[3 * (page / 64) + offset];
                     let bit = if allowed { mask } else { 0 };
-                    word.set((word.get() & !mask) | bit);
+                    let previous = word.get();
+                    revoked |= if offset < 2 {
+                        previous & mask & !bit != 0
+                    } else {
+                        previous & mask != bit
+                    };
+                    word.set((previous & !mask) | bit);
                 }
+            }
+            if revoked {
+                self.fast.revoke_page_facts();
             }
         }
         #[cfg(not(unix))]

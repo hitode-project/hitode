@@ -264,6 +264,7 @@ impl Native {
         runtime.offer_gate = gate;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;
+        runtime.page_fact_epoch = memory.page_fact_epoch();
         runtime.memory_base = memory.base;
         runtime.memory_pages = (memory.len / adv_cpu_core::memory::PAGE_SIZE) as u32;
         runtime.rep_pending = u32::from(cpu.rep.is_some());

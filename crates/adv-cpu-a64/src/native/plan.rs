@@ -496,6 +496,22 @@ impl std::fmt::Display for Decline {
 }
 
 impl Native {
+    pub(crate) fn resident_batch_counts(&self) -> std::collections::BTreeMap<u32, [u64; 4]> {
+        let mut counts = std::collections::BTreeMap::new();
+        for site in self.plans.sites.values() {
+            if let Some(head) = &site.resident {
+                for version in &head.versions {
+                    for cache in &version.batch_caches {
+                        let total: &mut [u64; 4] = counts.entry(cache.head).or_default();
+                        for (total, count) in total.iter_mut().zip(cache.counts()) {
+                            *total += count;
+                        }
+                    }
+                }
+            }
+        }
+        counts
+    }
     pub(super) fn resident_cold_exit(
         &mut self,
         eip: u32,
@@ -1570,6 +1586,7 @@ impl Native {
             probation,
             accounting,
             iteration_retired: u64::from(lowered.iteration_retired),
+            batch_caches: lowered.batch_caches,
         };
         if index == head.versions.len() {
             head.versions.push(version);

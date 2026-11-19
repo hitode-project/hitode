@@ -346,6 +346,29 @@ pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
     asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
 }
 
+/// The owner keeps these cells with the resident code that references them.
+/// One interval per stream shares the site's epoch. Empty cells are misses.
+pub(crate) struct BatchCache {
+    pub(crate) head: u32,
+    pub(crate) cells: Box<[std::cell::Cell<u64>]>,
+}
+
+impl BatchCache {
+    pub(super) const INTERVALS: u32 = 40;
+
+    pub(super) fn new(head: u32, streams: usize) -> Self {
+        Self {
+            head,
+            cells: vec![std::cell::Cell::new(0); Self::INTERVALS as usize / 8 + 2 * streams]
+                .into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn counts(&self) -> [u64; 4] {
+        std::array::from_fn(|i| self.cells[1 + i].get())
+    }
+}
+
 /// Like the Tier-1 access stub, calls the owner's access helper. The
 /// optimized allocation can use full Q registers and owns its recovery,
 /// so keep those registers and return the refusal bit to the form.

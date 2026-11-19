@@ -1,13 +1,18 @@
+//! A batch retries at its scalar head when its trip, budget or stream facts
+//! cannot cover the strip and its scalar successor. Resident page facts are
+//! cached in page-aligned byte intervals, invalidated by the owner's epoch.
+
 use super::*;
 use crate::translate::{X4, X5};
 
 use iced_x86::ConditionCode as Cc;
-use loops::{Affine, Batch, Span, Trip};
+use loops::{Affine, Batch, BatchClass, ClassCosts, Span, Trip};
 
 /// The kernel can emit instructions and read the checked addresses and
 /// invariant SSA inputs. It cannot change the scalar CFG or recovery records.
 pub(in crate::translate::opt) struct BatchEmitter<'b, 'f> {
     emitter: &'b mut Emitter<'f>,
+    diagnostics: Option<&'b BatchCache>,
 }
 
 impl BatchEmitter<'_, '_> {
@@ -33,16 +38,94 @@ impl BatchEmitter<'_, '_> {
             .emit_all(&[mul(X, U, count, U), add(X, X5, X5, U, Lsl, 0)]);
     }
 
+    pub fn fixed_charge(&mut self, extra: i32) {
+        let amount = u64::from(extra.unsigned_abs());
+        let op = if let Some((imm, shift)) = add_immediate(amount) {
+            if extra < 0 {
+                sub_imm(X, X5, X5, imm, shift)
+            } else {
+                add_imm(X, X5, X5, imm, shift)
+            }
+        } else {
+            self.emitter.imm(U, i64::from(extra) as u64);
+            add(X, X5, X5, U, Lsl, 0)
+        };
+        self.asm().emit(op);
+    }
+
+    pub fn count_class(&mut self, class: BatchClass) {
+        if let Some(cache) = self.diagnostics {
+            let offset = 16 + 8 * class as u32;
+            self.emitter.imm(U, cache.cells.as_ptr() as u64);
+            self.asm().emit_all(&[
+                ldr(X, T, U, offset),
+                add_imm(X, T, T, 1, false),
+                str(X, T, U, offset),
+            ]);
+        }
+    }
+
     pub fn address(&mut self, addr: Affine) -> Reg {
         self.emitter.batch_address(addr, T, U);
         let view = self.emitter.data_view();
         self.asm().emit(add_ext(X, T, view, T, Extend::Uxtw, 0));
         T
     }
+
+    pub fn publish_lane(&mut self, value: Value, lane: u8, src: VReg) {
+        let ty = self.emitter.func.ty(value);
+        let location = self.emitter.locations[value.0 as usize];
+        if ty == Type::I32 {
+            let dst = self.emitter.rd(value);
+            self.asm().emit(vumov(2, dst, src, u32::from(lane)));
+            self.emitter.copy(location, Host::Register(dst), ty);
+        } else {
+            let dst = self.emitter.vd(value);
+            if lane == 1 {
+                self.asm().emit(vext(dst, src, src, 8));
+            }
+            self.asm()
+                .emit(vmov(false, dst, if lane == 0 { src } else { dst }));
+            self.emitter.copy(location, Host::Vector(dst), ty);
+        }
+    }
+
+    pub fn publish_bits(&mut self, value: Value, keep: u32, set: u32) {
+        let loc = self.emitter.locations[value.0 as usize];
+        let dst = self.emitter.rd(value);
+        if keep & !set == 0 {
+            self.emitter.imm(dst, u64::from(set));
+        } else {
+            let mut src = self.emitter.gp_at(loc, T);
+            for (op, mask) in [(IntOp::And, keep | set), (IntOp::Or, set)] {
+                if op == IntOp::And && mask == u32::MAX || op == IntOp::Or && mask == 0 {
+                    continue;
+                }
+                if let Some(word) = int_immediate(op, W, dst, src, u64::from(mask)) {
+                    self.asm().emit(word);
+                } else {
+                    self.emitter.imm(U, u64::from(mask));
+                    self.asm().emit(if op == IntOp::And {
+                        and(W, dst, src, U, Lsl, 0)
+                    } else {
+                        orr(W, dst, src, U, Lsl, 0)
+                    });
+                }
+                src = dst;
+            }
+        }
+        self.emitter.copy(loc, Host::Register(dst), Type::I32);
+    }
 }
 
 impl Emitter<'_> {
-    pub(super) fn batch(&mut self, batch: &Batch, pages: Option<Label>, backedge: Label) -> u32 {
+    pub(super) fn batch(
+        &mut self,
+        batch: &Batch,
+        pages: Option<(Label, &BatchCache)>,
+        backedge: Label,
+        diagnostics: bool,
+    ) -> (u32, Option<ClassCosts>) {
         let entry = self.asm.label();
         let inner = self.asm.label();
         let scalar = self.asm.label();
@@ -77,8 +160,22 @@ impl Emitter<'_> {
         self.batch_trip(batch.loop_.trip, lanes, scalar);
         self.asm.cbz(X, false, X3, scalar);
 
-        for &span in &batch.spans {
-            self.batch_range(span, batch.backwards, pages, scalar);
+        if let Some((_, cache)) = pages {
+            self.batch_cache(cache, batch.spans.len());
+        }
+        for (index, &span) in batch.spans.iter().enumerate() {
+            self.batch_range(
+                span,
+                batch.backwards,
+                pages.map(|(walker, _)| {
+                    (
+                        walker,
+                        BatchCache::INTERVALS + (16 * index) as u32,
+                        diagnostics,
+                    )
+                }),
+                scalar,
+            );
             self.asm.cbz(X, false, X3, scalar);
         }
         for &(a, b, in_place) in &batch.alias {
@@ -117,7 +214,15 @@ impl Emitter<'_> {
         self.asm.emit_all(&[mul(X, X5, X3, T), mov(X, X4, X3)]);
         self.asm.bind(inner);
         let inner_start = self.asm.offset();
-        batch.plan.body.lower(&mut BatchEmitter { emitter: self });
+        let mut emitter = BatchEmitter {
+            emitter: self,
+            diagnostics: pages.filter(|_| diagnostics).map(|(_, cache)| cache),
+        };
+        if !batch.plan.conditional_stores {
+            emitter.count_class(BatchClass::Uniform);
+        }
+        let mut cases = batch.plan.body.lower(&mut emitter);
+        let tail_start = self.asm.offset();
         for iv in &batch.loop_.ivs {
             let loc = self.locations[iv.base.0 as usize];
             let src = self.gp_at(loc, T);
@@ -131,6 +236,15 @@ impl Emitter<'_> {
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
         let words = self.words_since(inner_start);
+        let words = if let Some(cases) = &mut cases {
+            let tail = self.words_since(tail_start);
+            for words in &mut cases.batch {
+                *words += tail;
+            }
+            *cases.batch.iter().max().unwrap()
+        } else {
+            words
+        };
         let recovery_start = self.asm.offset();
         // Publish the last logical latch's recovery operands once per strip.
         for &(param, value) in &batch.recovery {
@@ -156,7 +270,7 @@ impl Emitter<'_> {
         self.asm.bind(scalar);
         self.asm.emit(movz(W, X5, lanes as u16, 0));
         self.asm.bind(body);
-        words
+        (words, cases)
     }
 
     fn batch_gp(&mut self, value: Value, scratch: Reg) -> Reg {
@@ -196,7 +310,34 @@ impl Emitter<'_> {
         }
     }
 
-    fn batch_range(&mut self, span: Span, backwards: bool, pages: Option<Label>, scalar: Label) {
+    fn batch_cache(&mut self, cache: &BatchCache, streams: usize) {
+        self.imm(X4, cache.cells.as_ptr() as u64);
+        self.asm.emit_all(&[
+            ldr(X, X0, RT, offset_of!(Runtime, page_fact_epoch) as u32),
+            ldr(X, T, X4, 0),
+            cmp(X, X0, T, Lsl, 0),
+        ]);
+        let current = self.asm.label();
+        self.asm.b_cond(Cond::Eq, current);
+        self.asm.emit(str(X, X0, X4, 0));
+        for index in 0..streams {
+            store_span(
+                &mut self.asm,
+                Reg::ZR,
+                Reg::ZR,
+                BatchCache::INTERVALS + (16 * index) as u32,
+            );
+        }
+        self.asm.bind(current);
+    }
+
+    fn batch_range(
+        &mut self,
+        span: Span,
+        backwards: bool,
+        pages: Option<(Label, u32, bool)>,
+        scalar: Label,
+    ) {
         const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
         self.batch_span_start(span, backwards, X0);
         if backwards && span.width > 1 {
@@ -205,14 +346,26 @@ impl Emitter<'_> {
             self.asm.emit(cmp(W, X0, T, Lsl, 0));
             self.asm.b_cond(Cond::Hi, scalar);
         }
-        if let Some(pages) = pages {
-            self.imm(T, u64::from(span.step));
+        if let Some((walker, slot, diagnostics)) = pages {
+            let hit = self.asm.label();
+            let miss = self.asm.label();
+            if span.step.is_power_of_two() {
+                self.asm
+                    .emit(add(X, X1, X0, X3, Lsl, span.step.trailing_zeros()));
+            } else if span.step == 0 {
+                self.asm.emit(mov(X, X1, X0));
+            } else {
+                self.imm(T, u64::from(span.step));
+                self.asm
+                    .emit_all(&[mul(X, X1, X3, T), add(X, X1, X1, X0, Lsl, 0)]);
+            }
+            self.asm.emit(add_imm(X, X1, X1, span.width - 1, false));
+            cached_span(&mut self.asm, slot, miss, hit);
+            self.asm.bind(miss);
             self.asm.emit_all(&[
-                mul(X, X1, X3, T),
-                add_imm(X, X1, X1, span.width - 1, false),
-                add(X, X1, X1, X0, Lsl, 0),
                 lsr_imm(X, X1, X1, PAGE_SHIFT),
                 lsr_imm(W, X0, X0, PAGE_SHIFT),
+                stp(X, Index::Pre, X4, X0, SP, -16),
             ]);
             self.imm(
                 X2,
@@ -223,16 +376,52 @@ impl Emitter<'_> {
                 },
             );
             self.imm(X5, if span.write { 8 } else { 0 });
-            self.asm.bl(pages);
+            self.asm.bl(walker);
+            self.asm.emit(ldp(X, Index::Post, X4, X2, SP, 16));
+            if diagnostics {
+                self.asm.emit_all(&[
+                    lsr_imm(X, T, X0, PAGE_SHIFT),
+                    cmp(X, T, X1, Lsl, 0),
+                    cset(X, U, Cond::Ls),
+                    sub(X, T, T, X2, Lsl, 0),
+                    add(X, T, T, U, Lsl, 0),
+                    ldr(X, U, X4, 8),
+                    add(X, T, T, U, Lsl, 0),
+                    str(X, T, X4, 8),
+                ]);
+            }
+            self.asm.emit(lsl_imm(X, X2, X2, PAGE_SHIFT));
+            self.asm.emit(cmp(X, X2, X0, Lsl, 0));
+            let unavailable = self.asm.label();
+            let replace = self.asm.label();
+            self.asm.b_cond(Cond::Eq, unavailable);
+            load_span(&mut self.asm, T, U, slot);
+            self.asm.emit(cmp(X, X2, U, Lsl, 0));
+            self.asm.b_cond(Cond::Hi, replace);
+            self.asm.emit(cmp(X, X0, T, Lsl, 0));
+            self.asm.b_cond(Cond::Lo, replace);
+            self.asm.emit_all(&[
+                cmp(X, U, X0, Lsl, 0),
+                csel(X, U, U, X0, Cond::Hs),
+                cmp(X, X2, T, Lsl, 0),
+                csel(X, X2, X2, T, Cond::Ls),
+            ]);
+            store_span(&mut self.asm, X2, U, slot);
+            self.asm.b(unavailable);
+            self.asm.bind(replace);
+            store_span(&mut self.asm, X2, X0, slot);
+            self.asm.bind(unavailable);
             self.batch_span_start(span, backwards, X1);
             self.asm.emit(sub(X, X2, X0, X1, Lsl, 0));
+            self.batch_span_limit(span, scalar);
+            self.asm.bind(hit);
         } else {
             // The owner admits all scalar accesses of a job. The combined
             // interval must also stay contiguous in the alias.
             self.imm(T, 1 << 32);
             self.asm.emit(sub(X, X2, T, X0, Lsl, 0));
+            self.batch_span_limit(span, scalar);
         }
-        self.batch_span_limit(span, scalar);
     }
 
     fn batch_disjoint(&mut self, a: Span, b: Span, backwards: bool, in_place: bool, scalar: Label) {
@@ -274,8 +463,19 @@ impl Emitter<'_> {
             self.asm
                 .emit(lsr_imm(X, dst, src, divisor.trailing_zeros()));
         } else {
-            self.imm(U, divisor);
-            self.asm.emit(udiv(X, dst, src, U));
+            let (product, shift, adjust) = reciprocal(divisor);
+            self.imm(U, product);
+            if adjust {
+                self.asm.emit_all(&[
+                    umulh(U, src, U),
+                    sub(X, dst, src, U, Lsl, 0),
+                    add(X, dst, U, dst, Lsr, 1),
+                    lsr_imm(X, dst, dst, shift),
+                ]);
+            } else {
+                self.asm
+                    .emit_all(&[umulh(dst, src, U), lsr_imm(X, dst, dst, shift)]);
+            }
         }
     }
 
@@ -355,5 +555,90 @@ impl Emitter<'_> {
             self.batch_div(T, T, u64::from(lanes));
         }
         self.batch_min(T);
+    }
+}
+
+fn load_span(asm: &mut Asm, lo: Reg, hi: Reg, slot: u32) {
+    if slot <= 504 {
+        asm.emit(ldp(X, Index::Offset, lo, hi, X4, slot as i32));
+    } else {
+        asm.emit_all(&[ldr(X, lo, X4, slot), ldr(X, hi, X4, slot + 8)]);
+    }
+}
+
+fn store_span(asm: &mut Asm, lo: Reg, hi: Reg, slot: u32) {
+    if slot <= 504 {
+        asm.emit(stp(X, Index::Offset, lo, hi, X4, slot as i32));
+    } else {
+        asm.emit_all(&[str(X, lo, X4, slot), str(X, hi, X4, slot + 8)]);
+    }
+}
+
+fn cached_span(asm: &mut Asm, slot: u32, miss: Label, hit: Label) {
+    load_span(asm, X2, T, slot);
+    asm.emit(cmp(X, X0, X2, Lsl, 0));
+    asm.b_cond(Cond::Lo, miss);
+    asm.emit(cmp(X, X1, T, Lsl, 0));
+    asm.b_cond(Cond::Lo, hit);
+}
+
+/// Multiplication by the rounded-up reciprocal needs either one shift or
+/// an additional average when that reciprocal needs 65 bits.
+fn reciprocal(divisor: u64) -> (u64, u32, bool) {
+    let shift = 63 - divisor.leading_zeros();
+    let numerator = 1u128 << (64 + shift);
+    let divisor = u128::from(divisor);
+    let quotient = numerator / divisor;
+    let remainder = numerator % divisor;
+    if divisor - remainder < 1 << shift {
+        ((quotient + 1) as u64, shift, false)
+    } else {
+        (
+            (2 * quotient + u128::from(2 * remainder >= divisor) + 1) as u64,
+            shift,
+            true,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: A64-OPT-10
+    #[test]
+    fn a_cached_span_checks_both_bounds_without_calling_the_walker() {
+        let mut asm = Asm::new();
+        let miss = asm.label();
+        let hit = asm.label();
+        cached_span(&mut asm, BatchCache::INTERVALS, miss, hit);
+        assert_eq!(asm.offset() / 4, 5);
+        assert_eq!(asm.words()[0], ldp(X, Index::Offset, X2, T, X4, 40));
+        assert_eq!(asm.words()[1], cmp(X, X0, X2, Lsl, 0));
+        assert_eq!(asm.words()[3], cmp(X, X1, T, Lsl, 0));
+    }
+
+    // spec: A64-OPT-10
+    #[test]
+    fn reciprocal_matches_unsigned_division() {
+        let mut n = 0x8242_8900_faff_0853u64;
+        for divisor in (3..8192)
+            .chain([u32::MAX as u64, u64::MAX / 2, u64::MAX])
+            .filter(|d| !d.is_power_of_two())
+        {
+            let (multiplier, shift, adjust) = reciprocal(divisor);
+            n ^= n << 13;
+            n ^= n >> 7;
+            n ^= n << 17;
+            for value in [0, divisor - 1, divisor, n, u64::MAX] {
+                let high = ((u128::from(value) * u128::from(multiplier)) >> 64) as u64;
+                let adjusted = if adjust {
+                    high + ((value - high) >> 1)
+                } else {
+                    high
+                };
+                assert_eq!(adjusted >> shift, value / divisor);
+            }
+        }
     }
 }

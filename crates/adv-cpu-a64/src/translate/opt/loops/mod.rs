@@ -456,13 +456,26 @@ pub(super) trait LoopKernel {
 }
 
 pub(super) trait BatchBody {
-    fn lower(&self, emitter: &mut BatchEmitter<'_, '_>);
+    fn lower(&self, emitter: &mut BatchEmitter<'_, '_>) -> Option<ClassCosts>;
+}
+
+pub(super) struct ClassCosts {
+    pub scalar: Vec<Vec<(Block, usize)>>,
+    pub batch: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BatchClass {
+    Skip,
+    Uniform,
+    Mixed,
 }
 
 pub(super) struct Plan {
     pub name: &'static str,
     pub lanes: u8,
     pub inputs: Vec<Value>,
+    pub conditional_stores: bool,
     pub body: Box<dyn BatchBody>,
 }
 
@@ -481,6 +494,7 @@ pub(super) struct Frame {
 }
 
 pub(super) struct Batch {
+    pub head: u32,
     pub loop_: Loop,
     pub plan: Plan,
     pub spans: Vec<Span>,
@@ -510,8 +524,30 @@ impl Batch {
             .chain(self.plan.inputs.iter().copied())
     }
 
-    fn new(func: &Func, loop_: Loop, plan: Plan) -> Option<Self> {
-        let groups = loop_.groups();
+    fn new(func: &Func, head: u32, loop_: Loop, plan: Plan) -> Option<Self> {
+        let mut groups = loop_.groups();
+        if plan.conditional_stores {
+            let mut first_store = true;
+            let mut loads = Vec::new();
+            groups.retain(|group| {
+                if group[0].1.write() {
+                    std::mem::take(&mut first_store)
+                } else {
+                    let span = group
+                        .iter()
+                        .map(|&(_, s)| (s.addr, s.stride, s.width))
+                        .collect::<Vec<_>>();
+                    let keep = !loads.contains(&span)
+                        && group
+                            .iter()
+                            .any(|&(_, s)| vector::covered_load(&loop_, s).is_none());
+                    if keep {
+                        loads.push(span);
+                    }
+                    keep
+                }
+            });
+        }
         let backwards = groups
             .iter()
             .find(|g| g[0].1.stride != 0)
@@ -548,7 +584,7 @@ impl Batch {
                 let in_place = reads.len() == writes.len()
                     && reads.iter().zip(writes).all(|(&(r, read), &(w, write))| {
                         !read.write()
-                            && r < w
+                            && (r < w || plan.conditional_stores)
                             && read.stride == write.stride
                             && read.width == write.width
                             && u32::from(read.width) <= read.stride.unsigned_abs()
@@ -623,6 +659,7 @@ impl Batch {
             .map(|target| target.charge.max(0) as u64)
             .sum();
         Some(Self {
+            head,
             loop_,
             plan,
             spans,
@@ -643,19 +680,11 @@ pub(super) fn plan(func: &Func, kernels: &[&dyn LoopKernel]) -> Vec<Batch> {
             let plan = kernels
                 .iter()
                 .find_map(|kernel| kernel.recognize(func, &loop_));
-            plan.and_then(|plan| Batch::new(func, loop_, plan))
+            plan.and_then(|plan| Batch::new(func, head, loop_, plan))
                 .ok_or(Reject::Kernel)
         });
         match batch {
-            Ok(batch) => {
-                crate::jit_map::vectorized(
-                    head,
-                    batch.plan.name,
-                    batch.plan.lanes,
-                    batch.loop_.streams.len(),
-                );
-                batches.push(batch);
-            }
+            Ok(batch) => batches.push(batch),
             Err(reason) => crate::jit_map::loop_reject(head, format_args!("{reason:?}")),
         }
     }

@@ -1972,6 +1972,49 @@ fn vector_sign_latch_guards_an_invariant_load() {
 
 // spec: A64-OPT-10
 #[test]
+fn vector_page_cache_keeps_grants_and_discards_revoked_intervals() {
+    let image = vector_image(4);
+    let boundary = SPECIAL + HOST_PAGE as u32;
+    let mut cpu = initial(59);
+    cpu.regs[6] = boundary - 12;
+    let data = vector_data(788);
+    let mut trial = Trial::new(
+        &image,
+        &cpu,
+        "cached page interval",
+        &[(SPECIAL, HOST_PAGE * 2)],
+        |m| {
+            m.map(SPECIAL, HOST_PAGE * 2, READ | WRITE).unwrap();
+            m.write(cpu.regs[6], &data[..512]).unwrap();
+            m.protect(SPECIAL, HOST_PAGE, READ).unwrap();
+        },
+    );
+    vector_install(&mut trial, cpu.clone(), 4);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let walks = |trial: &Trial<'_>| {
+        trial.live.native.as_ref().unwrap().resident_batch_counts()[&image.head][0]
+    };
+    let first = walks(&trial);
+    assert!(first >= 3);
+
+    for (perms, addr) in [(READ | WRITE, SPECIAL), (0, boundary)] {
+        for executor in [&mut trial.live, &mut trial.reference] {
+            executor.memory.protect(addr, HOST_PAGE, perms).unwrap();
+            executor.state = cpu.clone();
+        }
+        let outcome = trial.compare(4096).0;
+        if perms != 0 {
+            assert_eq!(outcome, RunOutcome::ReachedStop);
+            assert_eq!(walks(&trial), first);
+        } else {
+            assert_ne!(outcome, RunOutcome::ReachedStop);
+            assert!(walks(&trial) > first);
+        }
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
 fn vector_interleaves_packed_integer_streams_with_a_sign_latch() {
     let image = Image::loop_body(|a, head, _| {
         for (offset, reg) in [(0, mm0), (8, mm1), (16, mm2), (24, mm3)] {
@@ -2034,6 +2077,93 @@ fn vector_enters_resident_from_a_deferred_mmx_arrival() {
     vector_install(&mut trial, cpu, 2);
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
     assert!(trial.live.native.as_ref().unwrap().vector_regions() > 0);
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_mmx_store_classes_match_scalar_lanes() {
+    let image = Image::loop_body(|a, head, _| {
+        let mut add = a.create_label();
+        let mut blend = a.create_label();
+        let mut next = a.create_label();
+        a.mov(ebp, dword_ptr(ebx)).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(edx, dword_ptr(esi + 4)).unwrap();
+        a.movq(mm4, qword_ptr(esi)).unwrap();
+        a.or(eax, edx).unwrap();
+        a.je(next).unwrap();
+        a.cmp(eax, 0x00ff_ffff).unwrap();
+        a.jbe(add).unwrap();
+        a.cmp(eax, 0xff00_0000u32).unwrap();
+        a.jb(blend).unwrap();
+        a.movq(qword_ptr(edi), mm4).unwrap();
+        a.jmp(next).unwrap();
+        a.set_label(&mut add).unwrap();
+        a.paddusb(mm4, qword_ptr(edi)).unwrap();
+        a.movq(qword_ptr(edi), mm4).unwrap();
+        a.jmp(next).unwrap();
+        a.set_label(&mut blend).unwrap();
+        a.movq(mm0, qword_ptr(edi)).unwrap();
+        a.movq(mm1, mm0).unwrap();
+        a.shr(eax, 24).unwrap();
+        a.xor(eax, 255).unwrap();
+        a.inc(eax).unwrap();
+        a.movd(mm2, eax).unwrap();
+        a.pshufw(mm2, mm2, 0).unwrap();
+        a.punpcklbw(mm0, mm7).unwrap();
+        a.punpckhbw(mm1, mm7).unwrap();
+        a.pmullw(mm0, mm2).unwrap();
+        a.pmullw(mm1, mm2).unwrap();
+        a.psrlw(mm0, 8).unwrap();
+        a.psrlw(mm1, 8).unwrap();
+        a.packuswb(mm0, mm1).unwrap();
+        a.paddusb(mm0, mm4).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.set_label(&mut next).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut rng = Rng(479);
+    let mut data = Vec::new();
+    let patterns = [0u32, 0x0012_3456, 0xff00_0000, 0x8000_0000];
+    for first in patterns {
+        for second in patterns {
+            for pixel in [first, first, second, second] {
+                let value = pixel
+                    | if pixel == 0 {
+                        0
+                    } else {
+                        rng.next() as u32 & 0x00ff_ffff
+                    };
+                data.extend(value.to_le_bytes());
+            }
+        }
+    }
+    data.extend([0; 8]);
+    for in_place in [false, true] {
+        let mut cpu = initial((data.len() / 4 - 1) as u32);
+        cpu.regs[3] = RESULTS;
+        if in_place {
+            cpu.regs[7] = DATA;
+        }
+        let mut trial = Trial::new(&image, &cpu, format!("MMX classes {in_place}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+            m.write(OUTPUT, &vector_data(921)).unwrap();
+            m.write(RESULTS, &75u32.to_le_bytes()).unwrap();
+        });
+        let costs = crate::jit_map::collect_batch_costs(|| vector_install(&mut trial, cpu, 2));
+        assert_eq!(costs.len(), 16);
+        assert!(
+            costs.iter().all(|&(scalar, batch)| batch <= scalar),
+            "{costs:?}"
+        );
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        let [_, skip, uniform, mixed] =
+            trial.live.native.as_ref().unwrap().resident_batch_counts()[&image.head];
+        assert!(skip > 0 && uniform > 0 && mixed > 0);
+    }
 }
 
 // spec: A64-OPT-10

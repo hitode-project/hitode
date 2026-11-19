@@ -9,7 +9,7 @@
 //! The serial software-checked owner exposes linear COPY reads while retaining
 //! EXEC as a first-store barrier. This never grants guest execute permission.
 use super::{EXEC, LINEAR, READ, SHARED, WRITE};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -28,6 +28,7 @@ pub struct FastPermissions {
     body: Option<Table>,
     /// Counts the snapshots whose bytes differ from the one before.
     version: u64,
+    page_fact_epoch: Cell<u64>,
 }
 
 impl FastPermissions {
@@ -43,6 +44,7 @@ impl FastPermissions {
             native: None,
             body: None,
             version: 0,
+            page_fact_epoch: Cell::new(0),
         }
     }
 
@@ -51,6 +53,14 @@ impl FastPermissions {
     /// remained.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub(super) fn page_fact_epoch(&self) -> u64 {
+        self.page_fact_epoch.get()
+    }
+
+    pub(super) fn revoke_page_facts(&self) {
+        self.page_fact_epoch.set(self.page_fact_epoch.get() + 1);
     }
 
     /// A stable full-address-space view. Partial refreshes update only their pages.
@@ -183,6 +193,7 @@ impl FastPermissions {
         };
         if !self.dirty.is_empty() {
             self.version += 1;
+            let mut revoked = false;
             let bytes = Arc::make_mut(&mut self.bytes);
             for (start, end) in std::mem::take(&mut self.dirty) {
                 let mut pages = start..end;
@@ -196,6 +207,9 @@ impl FastPermissions {
                 let changed = pages.clone();
                 for page in pages {
                     let current = next.take().unwrap_or_else(|| permission(page));
+                    let previous = bytes[page] & 31;
+                    revoked |= previous & (READ | WRITE) & !current != 0
+                        || (previous ^ current) & (EXEC | SHARED | LINEAR) != 0;
                     // Exact checks use the same base as the derived grants.
                     bytes[page] = current
                         | (permissions.get(page + 1).map_or(0, |_| {
@@ -216,6 +230,9 @@ impl FastPermissions {
                             .copy_from_slice(&bytes[changed]);
                     }
                 }
+            }
+            if revoked {
+                self.revoke_page_facts();
             }
         }
         self.bytes.clone()

@@ -356,6 +356,14 @@ impl Executor {
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
         if let Some(native) = &self.native {
+            if crate::jit_map::enabled() {
+                for (head, [walks, skip, uniform, mixed]) in native.resident_batch_counts() {
+                    crate::jit_map::optimized(
+                        head,
+                        format_args!("resident\tbatches\t{walks}\t{skip}\t{uniform}\t{mixed}"),
+                    );
+                }
+            }
             return format!(
                 "{:?} unchecked faults {} checked {}",
                 native.diagnostics,

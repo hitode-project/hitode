@@ -111,7 +111,9 @@ fn candidate(func: &Func) -> Result<Loop, Reject> {
 struct TestKernel;
 
 impl BatchBody for TestKernel {
-    fn lower(&self, _: &mut BatchEmitter<'_, '_>) {}
+    fn lower(&self, _: &mut BatchEmitter<'_, '_>) -> Option<ClassCosts> {
+        None
+    }
 }
 
 impl LoopKernel for TestKernel {
@@ -120,6 +122,7 @@ impl LoopKernel for TestKernel {
             name: "test",
             lanes: 16,
             inputs: vec![],
+            conditional_stores: false,
             body: Box::new(Self),
         })
     }

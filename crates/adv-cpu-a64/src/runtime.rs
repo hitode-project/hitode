@@ -185,6 +185,7 @@ pub struct Runtime {
     pub resident_discover: u64,
     pub resident_entries: u64,
     pub resident_page_crossings: u64,
+    pub page_fact_epoch: u64,
 }
 
 impl Runtime {
@@ -217,6 +218,7 @@ impl Runtime {
             alias: 0,
             alias_classes: 0,
             plain_pages: 0,
+            page_fact_epoch: 0,
             memory_base: 0,
             memory_pages: 0,
             code_lines: 0,
