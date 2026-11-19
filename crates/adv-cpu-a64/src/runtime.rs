@@ -49,7 +49,10 @@
 
 use std::mem::offset_of;
 
-use adv_cpu_core::{CpuState, floating::ValueFrame};
+use adv_cpu_core::{
+    CpuState,
+    floating::{ValueAccess, ValueFrame},
+};
 
 use crate::asm::Asm;
 use crate::encode::Extend::Uxtw;
@@ -188,6 +191,7 @@ pub struct Runtime {
     /// Set at a diagnostic helper call site and consumed by that call.
     pub(crate) helper_cause: u32,
     pub(crate) value: u64,
+    pub(crate) value_access: u64,
     pub(crate) value_frame: ValueFrame,
 }
 
@@ -263,6 +267,7 @@ impl Runtime {
             resident_page_crossings: 0,
             helper_cause: 0,
             value: 0,
+            value_access: 0,
             value_frame: ValueFrame::default(),
         }
     }
@@ -306,12 +311,18 @@ pub struct OptEntryState {
 pub enum Event {
     /// The fault capture and side table identify the instruction to replay.
     Replay,
+    CheckedAccess,
     /// A waiting x87 instruction has an unmasked exception pending.
     PendingX87,
     /// An architectural exception, with any state changes already committed.
     Exception(u8),
+    /// A core semantic gap, with the decoded instruction form.
+    Unsupported(u16),
     /// A software interrupt completed; the owner supplies the trap action.
-    Software { vector: u8, len: u8 },
+    Software {
+        vector: u8,
+        len: u8,
+    },
 }
 
 /// A plan decision that must be applied after leaving generated code.
@@ -362,7 +373,9 @@ impl Exit {
             Self::FirstVisit => 10,
             Self::Event(Event::PendingX87) => 11,
             Self::Plan(PlanEvent::BodyStack) => 12,
+            Self::Event(Event::CheckedAccess) => 13,
             Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
+            Self::Event(Event::Unsupported(code)) => 0x8000 | code,
             Self::Event(Event::Software { vector, len }) => {
                 0x2000 | (len as u16) << 8 | vector as u16
             }
@@ -387,7 +400,9 @@ impl Exit {
             9 => Some(Self::Optimized),
             11 => Some(Self::Event(Event::PendingX87)),
             12 => Some(Self::Plan(PlanEvent::BodyStack)),
+            13 => Some(Self::Event(Event::CheckedAccess)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
+            0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {
                 vector: raw as u8,
                 len: (raw >> 8 & 15) as u8,
@@ -692,8 +707,13 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
     ]);
 }
 
+const VALUE_ACCESS: u32 = field(offset_of!(Runtime, value_access));
+pub(crate) const VALUE_ACCESS_REFUSED: u32 = 1 << 9;
+pub(crate) const VALUE_STORE_READY: u32 = 1 << 8;
+pub(crate) const VALUE_UNSUPPORTED: u32 = 1 << 15;
 const VALUE_CALL: u32 = field(offset_of!(Runtime, value));
 const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
+pub(crate) const VALUE_ADDRESS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, address));
 pub(crate) const VALUE_OPERAND: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, operand));
 pub(crate) const VALUE_XMM: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, xmm));
 pub(crate) const VALUE_MMX: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mmx));
@@ -703,7 +723,13 @@ pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, m
 
 /// Calls the value entry with the prepared instruction index in w1. Preserve
 /// the guest flag representation and any live caller-saved vector lanes.
-pub(crate) fn emit_value_call(asm: &mut Asm, xmm: u8, x87: Option<u8>) {
+pub(crate) fn emit_value_call(
+    asm: &mut Asm,
+    index: u32,
+    xmm: u8,
+    x87: Option<u8>,
+    access: Option<ValueAccess>,
+) {
     let vectors = (0..8)
         .filter(|n| xmm & (1 << n) != 0)
         .map(|n| v(16 + n))
@@ -736,11 +762,31 @@ pub(crate) fn emit_value_call(asm: &mut Asm, xmm: u8, x87: Option<u8>) {
             _ => unreachable!(),
         });
     }
+    let done = access.map(|_| asm.label());
+    if let Some(access) = access {
+        let (width, write) = match access {
+            ValueAccess::Read(width) => (width, false),
+            ValueAccess::Write(width) => (width, true),
+        };
+        value_access(asm, width, u16::from(write));
+        asm.cbz(W, true, r(0), done.unwrap());
+    }
+    asm.emit(movz(W, r(1), index as u16, 0));
+    if index >> 16 != 0 {
+        asm.emit(movk(W, r(1), (index >> 16) as u16, 16));
+    }
     asm.emit_all(&[
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, VALUE_CALL),
         blr(r(16)),
     ]);
+    if let Some(ValueAccess::Write(width)) = access {
+        asm.tbz(false, r(0), 8, done.unwrap());
+        value_access(asm, width, 2);
+    }
+    if let Some(done) = done {
+        asm.bind(done);
+    }
     for (i, chunk) in vectors.chunks(2).enumerate() {
         let at = scalar_bytes + i as i32 * 32;
         asm.emit(match chunk {
@@ -759,6 +805,16 @@ pub(crate) fn emit_value_call(asm: &mut Asm, xmm: u8, x87: Option<u8>) {
         ldp(X, Offset, r(11), r(12), SP, 32),
         ldp(X, Offset, r(9), r(10), SP, 16),
         ldp(X, Post, r(7), r(8), SP, frame),
+    ]);
+}
+
+fn value_access(asm: &mut Asm, width: u16, phase: u16) {
+    asm.emit_all(&[
+        mov(X, r(0), RUNTIME),
+        movz(W, r(1), width, 0),
+        movz(W, r(2), phase, 0),
+        ldr(X, r(16), RUNTIME, VALUE_ACCESS),
+        blr(r(16)),
     ]);
 }
 

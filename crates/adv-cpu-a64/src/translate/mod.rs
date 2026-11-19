@@ -2091,6 +2091,10 @@ impl Translator<'_> {
     }
 
     fn architectural_exception(&mut self, vector: u8) -> Label {
+        self.leave_for_event(crate::runtime::Event::Exception(vector))
+    }
+
+    fn leave_for_event(&mut self, cause: crate::runtime::Event) -> Label {
         let label = self.asm.label();
         let inst = self.trace.insts[self.index];
         self.push_cold(Cold::Leave {
@@ -2098,7 +2102,7 @@ impl Translator<'_> {
             state: self.state,
             simd_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
-            exit: Exit::Event(crate::runtime::Event::Exception(vector)),
+            exit: Exit::Event(cause),
             eip: inst.pc,
             link: false,
             x87: self.x87_leaving(),

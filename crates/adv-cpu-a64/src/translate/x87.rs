@@ -143,7 +143,9 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        self.helper_for(helper, runtime::HelperCause::OperandValue);
+        if !self.x87_value(helper, None) {
+            self.helper_for(helper, runtime::HelperCause::OperandValue);
+        }
         self.asm.bind(done);
         self.vector = super::simd::Vector::default();
     }
@@ -175,7 +177,12 @@ impl Translator<'_> {
             self.emit(bfi(W, super::host(0), X16, 0, 16));
             return;
         }
-        self.flush_simd();
+        let value_path = self.tier1;
+        if value_path {
+            self.publish(0xff);
+        } else {
+            self.flush_simd();
+        }
         self.canonicalize();
         if let Some(mem) = x.mem {
             let address = self.effective(mem);
@@ -213,12 +220,105 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        self.helper_for(x.helper, runtime::HelperCause::OperandValue);
-        self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
+        if !value_path || !self.x87_value(x.helper, None) {
+            self.helper_for(x.helper, runtime::HelperCause::OperandValue);
+            self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
+        }
         self.asm.bind(done);
         // The stack may have changed under the MMX registers.
-        self.vector = super::simd::Vector::default();
+        if value_path {
+            self.invalidate_mmx();
+        } else {
+            self.vector = super::simd::Vector::default();
+        }
         self.vector.cpu = true;
+    }
+
+    /// Evaluate a prepared x87 form, with its memory operand transferred by
+    /// checked access calls and its floating state published independently.
+    pub(super) fn x87_value(&mut self, index: u8, pairs: Option<u8>) -> bool {
+        if !self.tier1 {
+            return false;
+        }
+        let helper = &self.trace.helpers[usize::from(index)];
+        let Some(operation) = &helper.value else {
+            return false;
+        };
+        let Some(operands) = operation.x87_operands() else {
+            return false;
+        };
+        let form = operation.decoded_form();
+        let memory = operands.access.and(helper.value_mem);
+        let flags = operands.flags;
+        self.publish(0xff);
+        self.cpu();
+        if self.index != 0 || self.facts.mmx() != Some(0) {
+            crate::facts::materialize_mmx(self.asm);
+        }
+        if let Some(mem) = memory {
+            if operands.waits {
+                let pending = self.leave_for_event(runtime::Event::PendingX87);
+                self.emit(ldrh(X16, X5, runtime::X87_STATUS));
+                self.asm.tbz(true, X16, 7, pending);
+            }
+            let address = self.effective(mem);
+            if operands.save_fx || operands.restore_fx {
+                let unaligned = self.architectural_exception(13);
+                self.emit(and_imm(W, X17, address, 15));
+                self.asm.cbz(W, true, X17, unaligned);
+            }
+            self.emit(str(W, address, RUNTIME, runtime::VALUE_ADDRESS));
+        }
+        if operands.save_fx {
+            self.publish_fx_image();
+        }
+        if flags.read_gpr & 1 != 0 && memory.is_none() {
+            self.emit(str(W, super::host(0), RUNTIME, runtime::VALUE_REGS));
+        }
+        if flags.read_flags {
+            self.canonicalize();
+            self.cpu();
+            self.emit(mov(X, X0, X5));
+            runtime::emit_read_flags(self.asm);
+            self.emit(str(W, X4, RUNTIME, runtime::VALUE_EFLAGS));
+            self.vector.cpu = false;
+        }
+        if operands.access.is_some() {
+            let refused = self.leave_for_event(runtime::Event::CheckedAccess);
+            self.call_prepared_value(index, operands.access, pairs);
+            self.asm.tbz(
+                true,
+                X0,
+                runtime::VALUE_ACCESS_REFUSED.trailing_zeros(),
+                refused,
+            );
+        } else {
+            self.call_prepared_value(index, None, pairs);
+        }
+        let unsupported = self.leave_for_event(runtime::Event::Unsupported(form));
+        self.asm.tbz(
+            true,
+            X0,
+            runtime::VALUE_UNSUPPORTED.trailing_zeros(),
+            unsupported,
+        );
+        let exception = self.architectural_exception(if operands.restore_fx { 13 } else { 16 });
+        self.asm.cbz(W, true, X0, exception);
+        if flags.write_gpr & 1 != 0 {
+            self.clobber(Operand::Guest(0));
+            self.emit(ldr(W, super::host(0), RUNTIME, runtime::VALUE_REGS));
+        }
+        if flags.write_flags {
+            self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
+            runtime::emit_load_flags(self.asm);
+            self.state = super::State::CANONICAL;
+        }
+        if operands.restore_fx {
+            self.reload_fx_image();
+        }
+        self.invalidate_mmx();
+        self.cpu();
+        true
     }
 
     /// Load canonical state for an instruction outside the cache.

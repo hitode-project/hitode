@@ -275,14 +275,9 @@ fn metadata(tx: &mut Transaction) {
         tx.state.x87.opcode = opcode;
     }
 }
-pub(super) fn execute(
-    i: &Instruction,
-    tx: &mut Transaction,
-    memory: Operands<'_>,
-) -> Result<(), Step> {
-    let m = i.mnemonic();
-    let no_wait = matches!(
-        m,
+pub(super) fn waits(mnemonic: M) -> bool {
+    !matches!(
+        mnemonic,
         M::Fninit
             | M::Fnclex
             | M::Fnstcw
@@ -291,8 +286,16 @@ pub(super) fn execute(
             | M::Fnsave
             | M::Fxsave
             | M::Fxrstor
-    );
-    if !no_wait && tx.state.x87.status & 0x80 != 0 {
+    )
+}
+
+pub(super) fn execute(
+    i: &Instruction,
+    tx: &mut Transaction,
+    memory: Operands<'_>,
+) -> Result<(), Step> {
+    let m = i.mnemonic();
+    if waits(m) && tx.state.x87.status & 0x80 != 0 {
         return Err(Step::Trap {
             pc: tx.pc,
             vector: 16,

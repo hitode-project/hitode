@@ -568,15 +568,6 @@ fn compare_tier_one(
 }
 
 #[cfg(native)]
-fn helper_runs(executor: &crate::Executor, at: u32) -> u64 {
-    executor
-        .slow_path_sites()
-        .into_iter()
-        .find(|&(pc, _)| pc == at)
-        .map_or(0, |(_, counts)| counts[2])
-}
-
-#[cfg(native)]
 fn x87_setup() -> CpuState {
     let mut state = initial();
     state.x87.regs = std::array::from_fn(|slot| {
@@ -657,26 +648,26 @@ fn tier_one_fsqrt_matches_x87_rounding_and_exception_paths() {
             ] {
                 state.x87.regs[top] = value;
                 state.x87.set_physical_tag(top, value.tag());
-                let helpers = helper_runs(&native, CODE);
+                let values = native.value_calls_at(CODE);
                 assert_eq!(
                     compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
                     RunOutcome::ReachedStop
                 );
                 assert_eq!(
-                    helper_runs(&native, CODE) - helpers,
+                    native.value_calls_at(CODE) - values,
                     u64::from(!fast),
                     "precision={p} rounding={r} input={value:?}"
                 );
             }
         }
     }
-    let helpers = helper_runs(&native, CODE);
+    let values = native.value_calls_at(CODE);
     state.x87.set_physical_tag(top, 3);
     assert_eq!(
         compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
         RunOutcome::ReachedStop
     );
-    assert_eq!(helper_runs(&native, CODE) - helpers, 1);
+    assert_eq!(native.value_calls_at(CODE) - values, 1);
     assert!(native.stats.compilations > 0);
 
     // Unmasked exceptions retire FSQRT, then the next waiting
@@ -702,7 +693,7 @@ fn tier_one_fsqrt_matches_x87_rounding_and_exception_paths() {
         state.x87.regs[top] = value;
         state.x87.set_physical_tag(top, tag);
         state.x87.status = (state.x87.status & !0x80ff) | pending;
-        let helpers = helper_runs(&native, CODE);
+        let values = native.value_calls_at(CODE);
         assert_eq!(
             compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
             RunOutcome::Trap {
@@ -711,9 +702,9 @@ fn tier_one_fsqrt_matches_x87_rounding_and_exception_paths() {
             }
         );
         // A pending exception is a version fact: #MF is delivered as an
-        // event at entry, without running the FSQRT helper.
+        // event at entry, without evaluating FSQRT.
         let expected = u64::from(pending == 0);
-        assert_eq!(helper_runs(&native, CODE) - helpers, expected);
+        assert_eq!(native.value_calls_at(CODE) - values, expected);
     }
 }
 
@@ -800,8 +791,8 @@ fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
                 oracle.memory().read_data(DATA, 4096).unwrap().as_ref()
             );
         }
-        assert!(helper_runs(&native, CODE) > 0);
-        assert!(helper_runs(&native, restore_pc) > 0);
+        assert!(native.value_calls_at(CODE) > 0);
+        assert!(native.value_calls_at(restore_pc) > 0);
     }
 }
 

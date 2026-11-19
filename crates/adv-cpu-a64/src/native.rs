@@ -539,14 +539,76 @@ unsafe extern "C" fn value(runtime: *mut Runtime, index: u32) -> u32 {
     let owner = unsafe { &mut *(runtime.owner as *mut Owner) };
     let native = unsafe { &mut *owner.native };
     let helper = &native.code.helpers[index as usize];
+    #[cfg(test)]
+    {
+        *native.code.value_counts.entry(helper.pc).or_default() += 1;
+    }
     if let Some(paths) = &mut native.code.slow_paths {
         *paths.values.entry(helper.pc).or_default() += 1;
     }
     let operation = helper.value.as_ref().expect("a prepared value instruction");
+    let x87 = operation.x87_operands();
+    if let Some(x87) = &x87
+        && !x87.restore_fx
+    {
+        // SAFETY: generated code publishes the x87 sub-state before calling.
+        runtime
+            .value_frame
+            .x87
+            .clone_from(unsafe { &(*runtime.cpu).x87 });
+    }
     match operation.evaluate(&mut runtime.value_frame) {
-        adv_cpu_core::floating::ValueOutcome::Complete => 0,
+        adv_cpu_core::floating::ValueOutcome::Complete => {
+            if let Some(x87) = x87 {
+                // SAFETY: the run owns the CPU through its value call.
+                let cpu = unsafe { &mut *runtime.cpu };
+                cpu.x87.clone_from(&runtime.value_frame.x87);
+                cpu.refresh_mmx();
+                if x87.restore_fx {
+                    cpu.xmm = runtime.value_frame.xmm;
+                    cpu.mxcsr = runtime.value_frame.mxcsr;
+                }
+            }
+            0
+        }
         adv_cpu_core::floating::ValueOutcome::Exception(vector) => u32::from(vector),
-        adv_cpu_core::floating::ValueOutcome::Store { .. } => unreachable!("a SIMD value store"),
+        adv_cpu_core::floating::ValueOutcome::Unsupported => runtime::VALUE_UNSUPPORTED,
+        adv_cpu_core::floating::ValueOutcome::Store { .. } => runtime::VALUE_STORE_READY,
+    }
+}
+
+/// Transfer the staged value operand independently of semantic evaluation.
+unsafe extern "C" fn value_access(runtime: *mut Runtime, width: u32, phase: u32) -> u32 {
+    // SAFETY: the emitted calls run on the memory's owner using its live frame.
+    let runtime = unsafe { &mut *runtime };
+    let owner = unsafe { &mut *(runtime.owner as *mut Owner) };
+    let memory = unsafe { &mut *owner.memory };
+    let at = runtime.value_frame.address;
+    let bytes = &mut runtime.value_frame.operand[..width as usize];
+    let ready = match phase {
+        0 => {
+            adv_cpu_core::floating::check_access(memory, 0, at, bytes.len(), false).is_ok()
+                && memory.read_into(at, bytes).is_ok()
+        }
+        1 => {
+            adv_cpu_core::floating::check_access(memory, 0, at, bytes.len(), true).is_ok()
+                && !memory.stores_code(at, bytes.len())
+        }
+        _ => {
+            if memory.write(at, bytes).is_err() {
+                return runtime::VALUE_ACCESS_REFUSED;
+            }
+            // SAFETY: the write completed before the staged x87 result commits.
+            let cpu = unsafe { &mut *runtime.cpu };
+            cpu.x87.clone_from(&runtime.value_frame.x87);
+            cpu.refresh_mmx();
+            true
+        }
+    };
+    if ready {
+        0
+    } else {
+        runtime::VALUE_ACCESS_REFUSED
     }
 }
 
@@ -805,6 +867,11 @@ impl Native {
         *paths.interpreter.entry((eip, cause)).or_default() += 1;
     }
 
+    #[cfg(test)]
+    pub(crate) fn value_calls_at(&self, pc: u32) -> u64 {
+        self.code.value_counts.get(&pc).copied().unwrap_or_default()
+    }
+
     pub(crate) fn version_diagnostics(&self) -> Option<String> {
         use std::fmt::Write as _;
         let stats = self.code.version_stats.as_ref()?;
@@ -941,6 +1008,8 @@ impl Native {
                 chains: FxHashMap::default(),
                 version_stats: crate::jit_map::enabled().then(FxHashMap::default),
                 slow_paths: crate::jit_map::enabled().then(store::SlowPaths::default),
+                #[cfg(test)]
+                value_counts: FxHashMap::default(),
                 pages: FxHashMap::default(),
                 links: FxHashMap::default(),
                 linked: Vec::new(),

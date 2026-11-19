@@ -235,6 +235,51 @@ impl ValueInstruction {
         })
     }
 
+    /// The state and staged access used by an x87 value instruction.
+    pub fn x87_operands(&self) -> Option<X87Operands> {
+        if self.operation != Operation::X87 {
+            return None;
+        }
+        let i = &self.instruction;
+        let bytes = i.memory_size().size() as u16;
+        let mnemonic = i.mnemonic();
+        let access = if !i.op_kinds().any(|kind| kind == iced_x86::OpKind::Memory) {
+            None
+        } else if matches!(
+            mnemonic,
+            M::Fst
+                | M::Fstp
+                | M::Fist
+                | M::Fistp
+                | M::Fisttp
+                | M::Fbstp
+                | M::Fstcw
+                | M::Fnstcw
+                | M::Fstsw
+                | M::Fnstsw
+                | M::Fstenv
+                | M::Fnstenv
+                | M::Fsave
+                | M::Fnsave
+                | M::Fxsave
+        ) {
+            Some(ValueAccess::Write(bytes))
+        } else {
+            Some(ValueAccess::Read(bytes))
+        };
+        Some(X87Operands {
+            access,
+            flags: x87_effects(i).unwrap_or_default(),
+            waits: x87::waits(mnemonic),
+            save_fx: mnemonic == M::Fxsave,
+            restore_fx: mnemonic == M::Fxrstor,
+        })
+    }
+
+    pub fn decoded_form(&self) -> u16 {
+        self.instruction.code() as u16
+    }
+
     /// Evaluate with canonical x87 aliases and the operands required by this
     /// instruction. The caller commits the returned destinations and store.
     pub fn evaluate(&self, frame: &mut ValueFrame) -> ValueOutcome {
@@ -260,6 +305,7 @@ impl ValueInstruction {
         match tx.execute(&self.instruction, self.operation, operands) {
             Ok(()) => (),
             Err(Step::Trap { vector, .. }) => return ValueOutcome::Exception(vector),
+            Err(Step::Unsupported { .. }) => return ValueOutcome::Unsupported,
             Err(step) => unreachable!("prepared value instruction returned {step:?}"),
         }
         if tx.sse_exception {
@@ -280,6 +326,20 @@ impl ValueInstruction {
         }
         ValueOutcome::Complete
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum ValueAccess {
+    Read(u16),
+    Write(u16),
+}
+
+pub struct X87Operands {
+    pub access: Option<ValueAccess>,
+    pub flags: X87Effects,
+    pub waits: bool,
+    pub save_fx: bool,
+    pub restore_fx: bool,
 }
 
 /// Register operands and a prechecked memory operand. A store returns its
@@ -321,6 +381,7 @@ pub enum ValueOutcome {
     },
     /// Only the committed exception state (MXCSR for #XM) is returned.
     Exception(u8),
+    Unsupported,
 }
 
 fn commit_x87_exception(x87: &mut X87State, pending: &X87State, dp: Option<u32>) {

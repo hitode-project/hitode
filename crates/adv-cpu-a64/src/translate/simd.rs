@@ -575,8 +575,8 @@ impl Translator<'_> {
             link: false,
             x87,
         });
-        self.mov_imm(super::X1, self.helpers + u32::from(simd.helper));
-        runtime::emit_value_call(self.asm, self.vector.xmm, pairs);
+        let index = self.helpers + u32::from(simd.helper);
+        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, None);
         self.emit_all(&[
             ldr(W, X16, RUNTIME, runtime::VALUE_MXCSR),
             str(W, X16, X5, runtime::MXCSR),
@@ -2008,6 +2008,44 @@ impl Translator<'_> {
 
     /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
     /// temporaries. x0/x3/x4 are free at control and observer boundaries.
+    pub(super) fn invalidate_mmx(&mut self) {
+        self.vector.mmx = 0;
+        self.vector.guards.ready = false;
+        self.aliased = 0;
+    }
+
+    pub(super) fn call_prepared_value(
+        &mut self,
+        helper: u8,
+        access: Option<adv_cpu_core::floating::ValueAccess>,
+        pairs: Option<u8>,
+    ) {
+        let index = self.helpers + u32::from(helper);
+        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, access);
+    }
+
+    pub(super) fn publish_fx_image(&mut self) {
+        for n in 0..8 {
+            self.publish_value_simd(Loc::Xmm(n));
+        }
+        self.cpu();
+        self.emit_all(&[
+            ldr(W, X16, X5, runtime::MXCSR),
+            str(W, X16, RUNTIME, runtime::VALUE_MXCSR),
+        ]);
+    }
+
+    pub(super) fn reload_fx_image(&mut self) {
+        for n in 0..8 {
+            if self.vector.xmm & (1 << n) != 0 {
+                let (size, offset) = value_simd_offset(Loc::Xmm(n));
+                self.emit(vldr(size, VReg::new(16 + n), RUNTIME, offset));
+            }
+        }
+        self.vector.dirty = 0;
+        self.vector.guards = Guards::default();
+    }
+
     pub(super) fn flush_simd(&mut self) {
         self.publish(self.vector.dirty);
     }

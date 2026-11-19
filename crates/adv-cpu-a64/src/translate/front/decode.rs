@@ -537,6 +537,7 @@ pub struct Helper {
     pub next: u32,
     pub prepared: Arc<Prepared>,
     pub value: Option<ValueInstruction>,
+    pub value_mem: Option<Mem>,
 }
 
 #[derive(Clone, Copy)]
@@ -755,6 +756,7 @@ impl Fetcher {
             next: ins.next_ip32(),
             prepared: Arc::clone(prepared),
             value: ValueInstruction::new(ins, prepared.x87_opcode()),
+            value_mem: memory_sized(&ins),
         });
         if sample.locked {
             self.locked = Some((memory_sized(&ins)?, ins.memory_size().size() as u8, index));

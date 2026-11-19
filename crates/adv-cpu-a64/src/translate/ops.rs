@@ -44,7 +44,11 @@ impl Translator<'_> {
         }
         match inst.op {
             Op::Nop | Op::Pause | Op::Fence | Op::Jmp(_) => {}
-            Op::Helper(index) => self.helper(index),
+            Op::Helper(index) => {
+                if !self.x87_value(index, None) {
+                    self.helper(index);
+                }
+            }
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
             Op::Timestamp => self.timestamp(),
             Op::Cpuid => self.cpuid(),

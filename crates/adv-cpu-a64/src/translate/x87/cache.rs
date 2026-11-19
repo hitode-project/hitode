@@ -463,7 +463,7 @@ pub(in super::super) struct InstructionCold {
     next: Option<(Label, Label, Need)>,
     done: Label,
     generic: Option<Generic>,
-    dirty: u16,
+    vector: super::super::simd::Vector,
     dispatch: bool,
 }
 
@@ -1743,7 +1743,7 @@ impl Translator<'_> {
             next,
             done,
             generic,
-            dirty: self.vector.dirty,
+            vector: self.vector,
             dispatch: self.x87.model.cyclic || (self.x87.dispatch && index < self.x87.end),
         })));
         if index == self.x87.end && !self.x87.model.cyclic {
@@ -2919,6 +2919,7 @@ impl Translator<'_> {
             _ => None,
         };
         let fallback = leaf.map(|_| self.asm.label());
+        let preserve_vector = self.tier1 && leaf.is_none() && cold.next.is_some() && !cold.dispatch;
         self.asm.bind(cold.bail);
         if let Some(fallback) = fallback {
             // The leaf published its input before calling; its pair registers are dead.
@@ -2926,8 +2927,8 @@ impl Translator<'_> {
         } else {
             self.remark(Part::X87Publish);
             self.x87_publish(cold.before, if cold.saved { X14 } else { X13 });
-            if cold.dirty != 0 {
-                self.vector.dirty = cold.dirty;
+            if !preserve_vector && cold.vector.dirty != 0 {
+                self.vector.dirty = cold.vector.dirty;
                 self.emit(msr_nzcv(X4));
                 self.flush_simd();
                 self.emit(mrs_nzcv(X4));
@@ -2937,7 +2938,11 @@ impl Translator<'_> {
         self.remark(Part::Cold);
         self.index = cold.index;
         self.state = State::CANONICAL;
-        self.vector = super::super::simd::Vector::default();
+        self.vector = if preserve_vector {
+            cold.vector
+        } else {
+            super::super::simd::Vector::default()
+        };
         if let Some((m, x)) = leaf {
             let fallback = fallback.unwrap();
             let resume = self.asm.label();
@@ -2949,11 +2954,15 @@ impl Translator<'_> {
             self.asm.b(resume);
             self.asm.bind(fallback);
             self.emit(msr_nzcv(X4));
-            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
+            if !self.x87_value(cold.helper, Some(cold.before.used())) {
+                self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
+            }
             self.asm.bind(resume);
         } else {
             self.emit(msr_nzcv(X4));
-            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
+            if !self.x87_value(cold.helper, Some(cold.before.used())) {
+                self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
+            }
         }
         if cold.dispatch {
             let inst = self.trace.insts[cold.index];

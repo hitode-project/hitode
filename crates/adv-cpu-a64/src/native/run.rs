@@ -10,7 +10,7 @@ use adv_cpu_core::{CpuState, Memory};
 use super::plan::{self, dispatch};
 use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
-    alias_base, call, interpret, timestamp, value,
+    alias_base, call, interpret, timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
 use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
@@ -122,6 +122,7 @@ impl Native {
             (*runtime).fault_simd = (*faults).capture.simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).value = value as *const () as u64;
+            (*runtime).value_access = value_access as *const () as u64;
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
@@ -146,7 +147,7 @@ impl Native {
         match exit {
             Exit::Optimized => {}
             Exit::Interpret => self.diagnostics.interprets += 1,
-            Exit::Event(Event::Replay) => self.diagnostics.faults += 1,
+            Exit::Event(Event::Replay | Event::CheckedAccess) => self.diagnostics.faults += 1,
             Exit::Event(_) | Exit::Plan(_) => {}
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}

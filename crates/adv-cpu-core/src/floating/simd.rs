@@ -314,7 +314,8 @@ pub(super) fn execute(
         }
         return Ok(());
     }
-    if i.memory_size().size() == 16
+    if matches!(memory, Operands::Guest(_))
+        && i.memory_size().size() == 16
         && !matches!(m, M::Movups | M::Movupd | M::Movdqu)
         && (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
     {

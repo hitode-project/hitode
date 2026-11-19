@@ -102,6 +102,7 @@ The chain keeps up to three versions, from most specific to most general. A join
 | A division that raises #DE |
 | An unmasked SSE exception with the committed MXCSR status (#XM) |
 | INT 0x2e without a host handler |
+| A core semantic gap carrying the decoded operation and EIP. This terminal event returns the unsupported-instruction outcome. |
 
 ## Tier-1 placement
 

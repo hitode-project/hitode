@@ -387,6 +387,28 @@ fn packed_doubles_check_both_lanes_exceptions_and_mxcsr() {
     }
 }
 
+// spec: A64F-FP-2 A64F-FP-3 A64-VER-1
+#[test]
+fn x87_fsqrt_value_preserves_rounded_state() {
+    for input in [4.0f64, 2.0, -2.0] {
+        let mut program = fixture(|a| {
+            a.fld(qword_ptr(ebx)).unwrap();
+            a.fsqrt().unwrap();
+            a.fnstsw(ax).unwrap();
+            a.fstp(qword_ptr(ebx + 8)).unwrap();
+        });
+        program.state.x87.control = 0x037f;
+        program.data[..8].copy_from_slice(&input.to_le_bytes());
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+    }
+}
+
 // spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-VER-1
 #[test]
 fn x87_round_scale_and_examine_match_all_rounding_modes_and_specials() {

@@ -348,6 +348,11 @@ impl Executor {
         String::new()
     }
 
+    #[cfg(all(test, native))]
+    pub(crate) fn value_calls_at(&self, pc: u32) -> u64 {
+        self.native.as_ref().unwrap().value_calls_at(pc)
+    }
+
     /// Slow-path runs by EIP: interpreted after an exit, after a fault, and
     /// run by helpers. Counts only grow, so callers diff two readings.
     pub fn slow_path_sites(&self) -> Vec<(u32, [u64; 3])> {
@@ -722,6 +727,16 @@ impl Executor {
                         };
                         (Execution { step, units: 0 }, 0)
                     }
+                    Exit::Event(Event::Unsupported(code)) => {
+                        interpreted = false;
+                        let code = crate::translate::front::tags::Code::try_from(usize::from(code))
+                            .expect("prepared instruction form");
+                        let step = Step::Unsupported {
+                            pc: self.state.eip,
+                            code,
+                        };
+                        (Execution { step, units: 0 }, 0)
+                    }
                     Exit::Event(Event::Software { vector, len }) => {
                         interpreted = false;
                         let pc = self.state.eip;
@@ -892,7 +907,7 @@ mod speed_tests {
 
     // spec: WINE-UI-8, A64-TR-2, A64-TR-4
     #[test]
-    fn speed_retired_forms_join_native_helpers_first_visits_and_rep() {
+    fn speed_retired_forms_join_native_values_first_visits_and_rep() {
         const CODE: u32 = 0x10000;
         const FIRST: u32 = 0x11000;
         const DATA: u32 = 0x20000;
@@ -901,7 +916,7 @@ mod speed_tests {
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
         a.shrd(eax, edx, cl).unwrap(); // native form
-        a.fnop().unwrap(); // interpret helper
+        a.fnop().unwrap();
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
@@ -938,7 +953,7 @@ mod speed_tests {
                 [0, 0, 0, 21, 15]
             } else {
                 // Native REP elements count as translated work.
-                [28, 0, 3, 2, 0]
+                [31, 0, 0, 2, 0]
             };
             assert_eq!(
                 cpu.retired_forms(),

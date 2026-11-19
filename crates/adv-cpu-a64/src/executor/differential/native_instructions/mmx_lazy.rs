@@ -118,6 +118,40 @@ fn mmx_prefix_is_visible_to_helpers_x87_emms_and_saved_contexts() {
     }
 }
 
+// spec: A64F-FP-2 A64-REG-5 A64-MEM-7 A64-VER-1
+#[test]
+fn x87_value_images_cross_guest_pages_with_live_xmm() {
+    for fx in [false, true] {
+        let at = DATA + 0xff0;
+        let mut program = fixture(|a| {
+            a.pxor(xmm7, xmm1).unwrap();
+            a.fld1().unwrap();
+            if fx {
+                a.fxsave(ptr(at as i32)).unwrap();
+            } else {
+                a.fnsave(ptr(at as i32)).unwrap();
+            }
+            a.fldz().unwrap();
+            if fx {
+                a.fxrstor(ptr(at as i32)).unwrap();
+            } else {
+                a.frstor(ptr(at as i32)).unwrap();
+            }
+            a.fnstsw(ax).unwrap();
+            a.movups(xmmword_ptr((DATA + 0x300) as i32), xmm7).unwrap();
+        });
+        program.state.xmm[1] = [0x29; 16];
+        program.state.xmm[7] = [0x92; 16];
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+    }
+}
+
 // spec: A64F-FP-4, A64-FLAG-4, A64-MEM-5, A64-VER-1
 #[test]
 fn mmx_dirty_subset_recovers_direct_and_checked_faults_and_reexecutes_memory_forms() {

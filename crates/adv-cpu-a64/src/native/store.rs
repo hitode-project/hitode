@@ -98,6 +98,8 @@ pub(super) struct CodeStore {
     pub(super) chains: FxHashMap<u32, Chain>,
     pub(super) version_stats: Option<FxHashMap<u32, Box<VersionStats>>>,
     pub(super) slow_paths: Option<SlowPaths>,
+    #[cfg(test)]
+    pub(super) value_counts: FxHashMap<u32, u64>,
     /// Unit entries by the guest pages their code came from.
     pub(super) pages: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
