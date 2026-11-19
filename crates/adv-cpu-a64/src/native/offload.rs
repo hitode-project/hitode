@@ -21,8 +21,7 @@ use super::{
     ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base, compile,
     record_branch, translate,
 };
-use crate::executor::ExecutionContext;
-use crate::runtime::COMPUTATION_SLICE;
+use crate::runtime::{COMPUTATION_SLICE, ExecutionContext};
 use crate::translate::computation::{Plan, Proof, Range};
 use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
@@ -98,7 +97,7 @@ impl Native {
         pending: (Arc<std::sync::atomic::AtomicU32>, u32),
         wake: Option<adv_sync::WakeEvent>,
         visit: &mut dyn FnMut(
-            &mut dyn adv_cpu_core::backend::Computation<Option<crate::ExecutionContext>>,
+            &mut dyn adv_cpu_core::backend::Computation<Option<ExecutionContext>>,
         ),
     ) {
         if self.plans.baseline_only || self.offload.jobs.is_empty() || memory.attach().is_err() {

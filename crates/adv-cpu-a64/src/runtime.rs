@@ -344,6 +344,35 @@ impl Exit {
     }
 }
 
+/// A saved guest CPU and its continuation between the owner and workers.
+#[derive(Clone)]
+pub struct ExecutionContext {
+    pub(crate) cpu: CpuState,
+    pub(crate) offered: Option<u32>,
+    pub(crate) resume: Option<(u32, Exit)>,
+}
+
+impl ExecutionContext {
+    pub fn cpu(&self) -> &CpuState {
+        &self.cpu
+    }
+
+    pub fn cpu_mut(&mut self) -> &mut CpuState {
+        &mut self.cpu
+    }
+
+    #[cfg(native)]
+    pub(crate) fn has_resume(&self) -> bool {
+        self.resume.is_some_and(|(pc, _)| pc == self.cpu.eip)
+    }
+
+    #[cfg(native)]
+    pub(crate) fn finish_computation(&mut self, exit: Exit) {
+        self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
+        self.resume = matches!(exit, Exit::Interpret | Exit::Fault).then_some((self.cpu.eip, exit));
+    }
+}
+
 /// Byte offsets of the stubs in their code.
 pub struct Stubs {
     pub code: Vec<u32>,

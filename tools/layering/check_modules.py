@@ -56,7 +56,6 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("native/head.rs", "encode"),
     ("native/head.rs", "native::plan"),
     ("native/head.rs", "translate::opt"),
-    ("native/offload.rs", "executor"),
     ("native/offload.rs", "native::compile"),
     ("native/offload.rs", "native::run"),
     ("native/offload.rs", "translate::jit"),

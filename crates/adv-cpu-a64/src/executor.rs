@@ -18,39 +18,11 @@ use adv_cpu_core::tier_verify::{self, Check, Verifier};
 use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 
+pub use crate::runtime::ExecutionContext;
 use crate::runtime::Exit;
 
 /// Interpreted instructions per decoded block, as in the x64 executor.
 const BLOCK_UNITS: u64 = 256;
-
-/// A saved guest CPU, restored into the same executor.
-#[derive(Clone)]
-pub struct ExecutionContext {
-    cpu: CpuState,
-    offered: Option<u32>,
-    resume: Option<(u32, Exit)>,
-}
-
-impl ExecutionContext {
-    pub fn cpu(&self) -> &CpuState {
-        &self.cpu
-    }
-
-    pub fn cpu_mut(&mut self) -> &mut CpuState {
-        &mut self.cpu
-    }
-
-    #[cfg(native)]
-    pub(crate) fn has_resume(&self) -> bool {
-        self.resume.is_some_and(|(pc, _)| pc == self.cpu.eip)
-    }
-
-    #[cfg(native)]
-    pub(crate) fn finish_computation(&mut self, exit: Exit) {
-        self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
-        self.resume = matches!(exit, Exit::Interpret | Exit::Fault).then_some((self.cpu.eip, exit));
-    }
-}
 
 /// Execution counters. Names match the x64 executor where the meaning is
 /// shared; native and translation counters stay zero without translated code.
