@@ -6,13 +6,17 @@
 //! Registers change only after every access, so a fault leaves the
 //! instruction undone, as in the interpreter.
 
-use iced_x86::{Instruction, Mnemonic as M, OpKind};
+#[cfg(test)]
+use super::front::plans::integer as plan;
+use super::front::tags::{ConditionCode, Mnemonic as M};
+#[cfg(test)]
+use iced_x86::Instruction;
 
 use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Mem, Part, ShiftKind, Src, memory, memory_sized};
+use super::decode::{Mem, Part, ShiftKind, Src};
 use super::flags::FlagSet;
 use super::{
     Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
@@ -56,8 +60,8 @@ pub enum Integer {
     Exchange(M, Part, u8, u8),
     Cwd,
     MemoryNeg(Part, u8),
-    Set(iced_x86::ConditionCode, Part),
-    Cmov(iced_x86::ConditionCode, Part, Part, u8),
+    Set(ConditionCode, Part),
+    Cmov(ConditionCode, Part, Part, u8),
     Extend(Part, Part, u8, u8, bool),
     Complement(Part, u8),
     ClearWord(u8),
@@ -128,255 +132,6 @@ impl Integer {
     }
 }
 
-/// The integer instruction `instruction` is, when the translator handles
-/// it; `helper` runs it when a divide faults.
-pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
-    // ESP and EBP are biased in their host registers.
-    let register = |n| {
-        let register = instruction.op_register(n);
-        (instruction.op_kind(n) == OpKind::Register && register.is_gpr32())
-            .then_some(register.number() as u8)
-            .filter(|&index| !biased(index))
-    };
-    let operand = |n| match instruction.op_kind(n) {
-        OpKind::Register => register(n).map(Src::Reg),
-        OpKind::Memory if instruction.memory_size().size() == 4 => {
-            memory(instruction).map(Src::Mem)
-        }
-        _ => None,
-    };
-    let mnemonic = instruction.mnemonic();
-    if mnemonic == M::Lea && instruction.op0_register().is_gpr16() {
-        let mut mem = memory_sized(instruction)?;
-        mem.fs = false;
-        return Some(Integer::Lea16(
-            instruction.op0_register().number() as u8,
-            mem,
-        ));
-    }
-    // Locked exchanges are ordinary ones: guest threads take turns.
-    if instruction.has_lock_prefix()
-        && !(matches!(
-            mnemonic,
-            M::Xadd
-                | M::Xchg
-                | M::Cmpxchg
-                | M::Cmpxchg8b
-                | M::Bts
-                | M::Btr
-                | M::Btc
-                | M::Not
-                | M::Neg
-        ) && instruction.op_kind(0) == OpKind::Memory)
-    {
-        return None;
-    }
-    if mnemonic == M::Cmpxchg8b && instruction.op0_kind() == OpKind::Memory {
-        return Some(Integer::CompareExchange8(memory_sized(instruction)?));
-    }
-    let width = match instruction.op0_kind() {
-        OpKind::Register => instruction.op0_register().size() as u8,
-        OpKind::Memory => instruction.memory_size().size() as u8,
-        _ => 0,
-    };
-    let part = |n| {
-        if instruction.op_kind(n) == OpKind::Memory {
-            memory_sized(instruction).map(Part::Mem)
-        } else {
-            super::decode::part(instruction, n, width)
-        }
-    };
-    if mnemonic == M::Neg && instruction.op0_kind() == OpKind::Memory {
-        return Some(Integer::MemoryNeg(part(0)?, width));
-    }
-    let cc = instruction.condition_code();
-    if cc != iced_x86::ConditionCode::None {
-        return if instruction.op_count() == 1 {
-            Some(Integer::Set(cc, part(0)?))
-        } else {
-            Some(Integer::Cmov(cc, part(0)?, part(1)?, width))
-        };
-    }
-    if matches!(mnemonic, M::Movsx | M::Movzx)
-        && (width == 2
-            || instruction.op1_kind() == OpKind::Memory
-                && memory_sized(instruction).is_some_and(|m| m.address_bits == 16))
-    {
-        let source_width = if instruction.op1_kind() == OpKind::Memory {
-            instruction.memory_size().size() as u8
-        } else {
-            instruction.op1_register().size() as u8
-        };
-        return Some(Integer::Extend(
-            part(0)?,
-            if instruction.op1_kind() == OpKind::Memory {
-                Part::Mem(memory_sized(instruction)?)
-            } else {
-                super::decode::part(instruction, 1, source_width)?
-            },
-            source_width,
-            width,
-            mnemonic == M::Movsx,
-        ));
-    }
-    if mnemonic == M::Not && (width != 4 || instruction.op0_kind() == OpKind::Memory) {
-        return Some(Integer::Complement(part(0)?, width));
-    }
-    if mnemonic == M::Bswap && width == 2 {
-        let Part::Reg(index) = part(0)? else {
-            return None;
-        };
-        return Some(Integer::ClearWord(index));
-    }
-    if mnemonic == M::Clflush {
-        return Some(Integer::Touch(memory_sized(instruction)?));
-    }
-    if mnemonic == M::Xlatb {
-        let mut address = *instruction;
-        address.set_memory_index(iced_x86::Register::None);
-        return Some(Integer::Xlat(memory_sized(&address)?));
-    }
-    if matches!(mnemonic, M::Bt | M::Bts | M::Btr | M::Btc)
-        && matches!(width, 2 | 4)
-        && !(mnemonic == M::Bt
-            && width == 4
-            && instruction.op1_kind() == OpKind::Immediate8
-            && operand(0).is_some())
-    {
-        return Some(Integer::Bit(mnemonic, part(0)?, part(1)?, width));
-    }
-    if matches!(width, 1 | 2)
-        || width == 4
-            && (operand(0).is_none()
-                || matches!(mnemonic, M::Xchg | M::Xadd | M::Cmpxchg) && register(1).is_none()
-                || mnemonic == M::Imul
-                    && instruction.op_count() > 1
-                    && instruction.op1_kind() == OpKind::Memory
-                    && memory_sized(instruction).is_some_and(|m| m.address_bits == 16))
-    {
-        if matches!(mnemonic, M::Mul | M::Imul) {
-            let other = if instruction.op_count() == 1 {
-                None
-            } else {
-                Some((
-                    part(1)?,
-                    (instruction.op_count() == 3).then(|| instruction.immediate(2) as u32),
-                ))
-            };
-            return Some(Integer::Product(
-                part(0)?,
-                other,
-                mnemonic == M::Imul,
-                width,
-            ));
-        }
-        if matches!(mnemonic, M::Div | M::Idiv) {
-            return Some(Integer::Quotient(
-                part(0)?,
-                mnemonic == M::Idiv,
-                width,
-                helper,
-            ));
-        }
-        if matches!(mnemonic, M::Xchg | M::Xadd | M::Cmpxchg) {
-            let Part::Reg(src) = part(1)? else {
-                return None;
-            };
-            return Some(Integer::Exchange(mnemonic, part(0)?, src, width));
-        }
-    }
-    if mnemonic == M::Mov
-        && instruction.op1_kind() == OpKind::Register
-        && instruction.op1_register().is_segment_register()
-    {
-        let width = if instruction.op0_kind() == OpKind::Memory {
-            2
-        } else {
-            instruction.op0_register().size() as u8
-        };
-        return Some(Integer::ReadSegment(
-            super::decode::part(instruction, 0, width)?,
-            width,
-            instruction.op1_register().number() as u8,
-        ));
-    }
-    let dst = instruction.op0_register();
-    if instruction.op0_kind() == OpKind::Register && (dst.is_gpr8() || dst.is_gpr16()) {
-        let width = dst.size() as u8;
-        if mnemonic == M::Neg {
-            return Some(Integer::NarrowNeg(dst.number() as u8, width));
-        }
-        if matches!(mnemonic, M::Shl | M::Sal | M::Shr | M::Sar)
-            && instruction.op1_kind() == OpKind::Immediate8
-        {
-            let kind = match mnemonic {
-                M::Shr => ShiftKind::Shr,
-                M::Sar => ShiftKind::Sar,
-                _ => ShiftKind::Shl,
-            };
-            return Some(Integer::NarrowShift(
-                kind,
-                dst.number() as u8,
-                width,
-                u32::from(instruction.immediate8()) & 31,
-            ));
-        }
-    }
-    Some(match mnemonic {
-        M::Cbw => Integer::Cbw,
-        M::Cwd => Integer::Cwd,
-        M::Clc | M::Stc | M::Cmc => Integer::CarryFlag(mnemonic),
-        M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
-            let dst = instruction.op0_register();
-            let width = if dst.is_gpr16() {
-                2
-            } else if dst.is_gpr32() {
-                4
-            } else {
-                return None;
-            };
-            let src = match instruction.op1_kind() {
-                OpKind::Register => {
-                    let src = instruction.op1_register();
-                    if !(src.is_gpr16() || src.is_gpr32()) || src.size() != width {
-                        return None;
-                    }
-                    Src::Reg(src.number() as u8)
-                }
-                OpKind::Memory if instruction.memory_size().size() == width => {
-                    Src::Mem(memory(instruction)?)
-                }
-                _ => return None,
-            };
-            Integer::Scan(
-                adv_cpu_core::cpu_profile::reverse_scan(mnemonic),
-                dst.number() as u8,
-                src,
-                width as u8,
-            )
-        }
-        M::Rcl | M::Rcr if instruction.op_kind(1) == OpKind::Immediate8 => {
-            match u32::from(instruction.immediate8()) & 31 {
-                0 => return None,
-                count => Integer::Through(mnemonic == M::Rcl, register(0)?, count),
-            }
-        }
-        M::Xadd => Integer::Xadd(operand(0)?, register(1)?),
-        M::Xchg => Integer::Xchg(operand(0)?, register(1)?),
-        M::Cmpxchg => Integer::Exchange(M::Cmpxchg, part(0)?, register(1)?, width),
-        M::Bswap => Integer::Bswap(instruction.op0_register().number() as u8),
-        M::Mul | M::Imul if instruction.op_count() == 1 => {
-            Integer::Multiply(operand(0)?, mnemonic == M::Imul)
-        }
-        M::Div | M::Idiv => Integer::Divide(operand(0)?, mnemonic == M::Idiv, helper),
-        M::Sahf => Integer::Sahf,
-        M::Bt if instruction.op1_kind() == OpKind::Immediate8 => {
-            Integer::TestBit(operand(0)?, instruction.immediate8() & 31)
-        }
-        _ => return None,
-    })
-}
-
 impl Translator<'_> {
     pub(super) fn integer(&mut self, op: Integer) {
         match op {
@@ -411,7 +166,7 @@ impl Translator<'_> {
                 let address = self.part_address(src);
                 self.narrow_read(dst, width, Reg::ZR, X7);
                 self.narrow_read(src, width, address, X8);
-                if matches!(cc, iced_x86::ConditionCode::p | iced_x86::ConditionCode::np) {
+                if matches!(cc, ConditionCode::p | ConditionCode::np) {
                     self.set_value(cc);
                     let done = self.asm.label();
                     self.asm.cbz(W, false, X6, done);
@@ -544,15 +299,15 @@ impl Translator<'_> {
         }
     }
 
-    fn set_value(&mut self, cc: iced_x86::ConditionCode) {
-        if matches!(cc, iced_x86::ConditionCode::p | iced_x86::ConditionCode::np) {
+    fn set_value(&mut self, cc: ConditionCode) {
+        if matches!(cc, ConditionCode::p | ConditionCode::np) {
             self.emit_all(&[
                 eor(W, X6, X10, X10, Lsr, 4),
                 eor(W, X6, X6, X6, Lsr, 2),
                 eor(W, X6, X6, X6, Lsr, 1),
                 ubfx(W, X6, X6, 0, 1),
             ]);
-            if cc == iced_x86::ConditionCode::p {
+            if cc == ConditionCode::p {
                 self.emit(eor_imm(W, X6, X6, 1));
             }
         } else {

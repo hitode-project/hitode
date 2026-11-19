@@ -384,8 +384,14 @@ impl Translator<'_> {
         self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
     }
 
-    fn stack(&mut self, kind: iced_x86::Mnemonic, mut part: Part, width: u8, helper: u8) {
-        use iced_x86::Mnemonic as M;
+    fn stack(
+        &mut self,
+        kind: crate::translate::front::tags::Mnemonic,
+        mut part: Part,
+        width: u8,
+        helper: u8,
+    ) {
+        use crate::translate::front::tags::Mnemonic as M;
         if kind == M::Push {
             self.push_part(part, width, false);
             return;

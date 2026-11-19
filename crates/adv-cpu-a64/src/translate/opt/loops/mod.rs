@@ -2,7 +2,7 @@
 //! proposes a batch for a loop, while the back end owns its guards, charge
 //! and transition to the original scalar body.
 
-use iced_x86::ConditionCode as Cc;
+use crate::translate::front::tags::ConditionCode as Cc;
 
 use super::back::BatchEmitter;
 use super::ir::*;

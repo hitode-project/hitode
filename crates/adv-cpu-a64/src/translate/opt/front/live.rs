@@ -3,7 +3,7 @@
 //! does an instruction that may raise an exception. A block takes a
 //! parameter, and a record a location, only for a live component.
 
-use iced_x86::{InstructionInfoFactory, OpAccess};
+use crate::translate::front::tags::{OpAccess, Register};
 
 use super::facts::{self, Facts};
 use super::{Offsets, frame_offset};
@@ -85,7 +85,6 @@ pub(super) fn analyze(
 ) -> Live {
     let n = unit.trace.len();
     let all = Set::all(frame.len());
-    let mut info = InstructionInfoFactory::new();
     let mut reads = Vec::with_capacity(n);
     let mut defines = Vec::with_capacity(n);
     let mut raising = Vec::with_capacity(n);
@@ -119,9 +118,8 @@ pub(super) fn analyze(
             continue;
         };
         let mut touch = Set::empty(frame.len());
-        let info = info.info(ins);
-        for used in info.used_registers() {
-            let reg = used.register();
+        for used in &ins.registers {
+            let reg = used.register;
             let (bit, full) = if reg.is_gpr() {
                 (reg.full_register32().number(), reg.size() == 4)
             } else if reg.is_xmm() {
@@ -132,7 +130,7 @@ pub(super) fn analyze(
                 continue;
             };
             let bit = 1u32 << bit;
-            match used.access() {
+            match used.access {
                 OpAccess::Read | OpAccess::CondRead => read.regs |= bit,
                 OpAccess::Write if full => {
                     define.regs |= bit;
@@ -145,9 +143,9 @@ pub(super) fn analyze(
                 }
             }
         }
-        for used in info.used_memory() {
-            let base = used.base();
-            if !base.is_gpr() || used.index() != iced_x86::Register::None {
+        for used in &ins.memory {
+            let base = used.base;
+            if !base.is_gpr() || used.index != Register::None {
                 continue;
             }
             let mem = Mem {
@@ -155,18 +153,18 @@ pub(super) fn analyze(
                 index: None,
                 scale: 1,
                 address_bits: 32,
-                disp: used.displacement() as u32,
+                disp: used.displacement,
                 fs: false,
             };
             let Some(start) = frame_offset(mem, &offsets[i]) else {
                 continue;
             };
-            let size = used.memory_size().size() as i32;
+            let size = used.width as i32;
             for pos in start..start + size {
                 let Ok(byte) = frame.binary_search(&pos) else {
                     continue;
                 };
-                match used.access() {
+                match used.access {
                     OpAccess::Write => define.mark(byte),
                     OpAccess::None | OpAccess::NoMemAccess => continue,
                     _ => read.mark(byte),

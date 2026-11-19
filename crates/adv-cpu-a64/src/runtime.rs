@@ -319,6 +319,8 @@ pub enum Exit {
     Budget = 8,
     /// An optimized record and register dump await materialization.
     Optimized = 9,
+    /// Owner dispatch selected a first visit in the core interpreter.
+    FirstVisit = 10,
 }
 
 impl Exit {

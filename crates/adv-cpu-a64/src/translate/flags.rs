@@ -5,7 +5,7 @@
 //! an `inc` or `dec` clobber C for free. PF and AF stay a `Recipe` over such
 //! values until something would overwrite them.
 
-use iced_x86::ConditionCode;
+use crate::translate::front::tags::ConditionCode;
 
 /// A set of x86 arithmetic flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

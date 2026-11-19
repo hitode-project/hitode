@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::translate::front::tags::{ConditionCode, Mnemonic as M};
 use adv_cpu_core::CpuState;
-use iced_x86::{ConditionCode, Mnemonic as M};
 
 use super::ir::*;
 use super::recovery::{IrRecord, Location, Recipe, X87};
@@ -219,10 +219,7 @@ fn build_form(
             Some(i) if i >= unit.trace.primary && cut.get(i) == Some(&false) => cut[i] = true,
             _ => return Err(reject),
         }
-        view = Some(Unit {
-            trace: unit.trace.cut(&cut),
-            ..Unit::default()
-        });
+        view = Some(unit.cut(&cut));
     }
 }
 
@@ -1393,7 +1390,13 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                 | Integer::Extend(Part::Reg(dst), ..)
                 | Integer::NarrowShift(_, dst, _, _),
             ) => regs[dst as usize] = None,
-            D::Parts(p) if matches!(p.kind, iced_x86::Mnemonic::Adc | iced_x86::Mnemonic::Sbb) => {
+            D::Parts(p)
+                if matches!(
+                    p.kind,
+                    crate::translate::front::tags::Mnemonic::Adc
+                        | crate::translate::front::tags::Mnemonic::Sbb
+                ) =>
+            {
                 if let Part::Reg(dst) = p.dst {
                     let dst = if p.width == 1 { dst % 4 } else { dst };
                     regs[dst as usize] = None;
@@ -1442,7 +1445,13 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
             D::NarrowStep(_, width, Part::Mem(mem)) => Some((mem, width)),
             D::Shift(_, Src::Mem(mem), _) => Some((mem, 4)),
             D::Integer(Integer::Set(_, Part::Mem(mem))) => Some((mem, 1)),
-            D::Parts(p) if matches!(p.kind, iced_x86::Mnemonic::Adc | iced_x86::Mnemonic::Sbb) => {
+            D::Parts(p)
+                if matches!(
+                    p.kind,
+                    crate::translate::front::tags::Mnemonic::Adc
+                        | crate::translate::front::tags::Mnemonic::Sbb
+                ) =>
+            {
                 match p.dst {
                     Part::Mem(mem) => Some((mem, p.width)),
                     _ => None,

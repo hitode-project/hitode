@@ -4,9 +4,9 @@
 //! point uses the default FPCR semantics and checks operand and result values
 //! at each operation, recovering to its region start on failure.
 
+use crate::translate::front::tags::Mnemonic as M;
 use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
-use iced_x86::Mnemonic as M;
 
 use super::ir::{
     Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
@@ -1043,7 +1043,7 @@ mod tests {
                 head,
                 Op::Test {
                     flags,
-                    cond: iced_x86::ConditionCode::ne,
+                    cond: crate::translate::front::tags::ConditionCode::ne,
                 },
             )
             .unwrap();

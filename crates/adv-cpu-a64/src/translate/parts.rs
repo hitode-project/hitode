@@ -2,13 +2,12 @@
 //! Operands use the ordinary access emitter. Results and flags commit only
 //! after the last access, including zero-count memory shifts (A64-FLAG-4).
 
-use adv_cpu_core::integer::{self, Operand, Operation};
-use iced_x86::{Instruction, Mnemonic as M, OpKind, Register};
+use super::front::tags::Mnemonic as M;
 
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Alu, Mem, Part, memory_sized};
+use super::decode::{Alu, Mem, Part};
 use super::{State, Translator, X0, X1, X2, X6, X10, X11, X13, X14, host};
 
 const ECX: u8 = 1;
@@ -42,79 +41,6 @@ impl Parts {
                 _ => None,
             })
     }
-}
-
-/// The native plan for `instruction`, if one does.
-pub fn plan(instruction: &Instruction) -> Option<Parts> {
-    if matches!(instruction.mnemonic(), M::Shld | M::Shrd) {
-        return double_shift(instruction);
-    }
-    // Byte registers numbered as `Narrow8or16::Byte` numbers them.
-    let part = |operand: Operand, width: u8| match operand {
-        Operand::Register(r) => Some((Part::Reg(r.index + r.shift / 2), r.width)),
-        Operand::Memory(_, width) => Some((Part::Mem(memory_sized(instruction)?), width)),
-        Operand::Immediate(value) => Some((Part::Imm(value), width)),
-    };
-    let (kind, dst, source, count) = match integer::decode(instruction)? {
-        Operation::Shift(kind, dst, count) => {
-            let count = match count {
-                // A zero count changes nothing but still checks the write:
-                // the interpreter keeps that.
-                Operand::Immediate(count) => Count::Imm((count & 31) as u8),
-                _ => Count::Cl,
-            };
-            (kind, dst, None, Some(count))
-        }
-        Operation::Binary(kind, dst, source) => (kind, dst, Some(source), None),
-        _ => return None,
-    };
-    let (dst, width) = part(dst, 0)?;
-    let source = match source {
-        Some(source) => Some(part(source, width)?),
-        None => None,
-    };
-    matches!(width, 1 | 2 | 4).then_some(Parts {
-        kind,
-        width,
-        dst,
-        source,
-        count,
-    })
-}
-
-/// SHLD or SHRD, which the shared integer decoder leaves out.
-fn double_shift(instruction: &Instruction) -> Option<Parts> {
-    let gpr = |register: Register| {
-        (register.is_gpr16() || register.is_gpr32())
-            .then(|| (register.number() as u8, register.size() as u8))
-    };
-    let (dst, width) = match instruction.op0_kind() {
-        OpKind::Register => {
-            let (number, width) = gpr(instruction.op0_register())?;
-            (Part::Reg(number), width)
-        }
-        OpKind::Memory => (
-            Part::Mem(memory_sized(instruction)?),
-            instruction.memory_size().size() as u8,
-        ),
-        _ => return None,
-    };
-    let (source, size) = gpr(instruction.op1_register())?;
-    if instruction.op1_kind() != OpKind::Register || size != width {
-        return None;
-    }
-    let count = match instruction.op2_kind() {
-        OpKind::Immediate8 => Count::Imm(instruction.immediate8() & 31),
-        OpKind::Register if instruction.op2_register() == Register::CL => Count::Cl,
-        _ => return None,
-    };
-    matches!(width, 2 | 4).then_some(Parts {
-        kind: instruction.mnemonic(),
-        width,
-        dst,
-        source: Some((Part::Reg(source), width)),
-        count: Some(count),
-    })
 }
 
 impl Translator<'_> {
@@ -385,10 +311,11 @@ mod tests {
         memory.protect(0x10000, 4096, 7).unwrap();
         memory.write(0x10000, &code).unwrap();
         let mut fetcher = Fetcher::new();
+        let mut decodes = crate::translate::front::decode::Decodes::default();
         fetcher.helpers = Some(Vec::new());
         let (mut pc, mut ops) = (0x10000, Vec::new());
         while pc < 0x10000 + code.len() as u32 {
-            let (op, len) = fetcher.fetch(&mut memory, pc).unwrap();
+            let (op, len) = fetcher.fetch(&memory, pc, &mut decodes).unwrap();
             ops.push(op);
             pc += len;
         }

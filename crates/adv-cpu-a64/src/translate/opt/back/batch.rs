@@ -1,7 +1,7 @@
 use super::*;
 use crate::translate::{X4, X5};
 
-use iced_x86::ConditionCode as Cc;
+use crate::translate::front::tags::ConditionCode as Cc;
 use loops::{Affine, Batch, Span, Trip};
 
 /// The kernel can emit instructions and read the checked addresses and

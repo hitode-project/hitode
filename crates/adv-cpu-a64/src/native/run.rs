@@ -28,23 +28,10 @@ impl Native {
             Some(entry) => (entry, 0),
             None if !crate::translate::Fetcher::fetchable(memory, cpu.eip) => return Ok(None),
             None if self.first_visit(cpu.eip) => {
-                let visit = translate::first::run(cpu, memory, stop, fuel.min(SLICE));
-                if let Some(forms) = &mut self.retired_forms {
-                    forms[3] += u64::from(visit.retired);
-                }
                 self.diagnostics.first_visits += 1;
-                self.diagnostics.first_declined += u64::from(visit.declined);
-                let exit = if visit.declined {
-                    Exit::Interpret
-                } else {
-                    Exit::Dispatch
-                };
-                if visit.retired != 0 {
-                    self.progressed();
-                }
                 return Ok(Some(Run {
-                    exit,
-                    retired: visit.retired,
+                    exit: Exit::FirstVisit,
+                    retired: 0,
                     translated: 0,
                 }));
             }
@@ -155,6 +142,7 @@ impl Native {
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
+            Exit::FirstVisit => unreachable!("first visits begin in the owner"),
             Exit::Yield => self.runtime.shadow = self.code.shadow.top(),
         }
         // Inline forms may refill the countdown, and a cold exit may leave

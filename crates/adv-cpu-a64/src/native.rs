@@ -38,7 +38,6 @@
 //! typed artifacts. `offload` alone consumes worker jobs.
 //! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
-use iced_x86::Code;
 use plan::dispatch;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
@@ -83,7 +82,7 @@ const CACHE_LEN: usize = 64 << 20;
 
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
-const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
+pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
@@ -355,6 +354,8 @@ fn features() -> Features {
 pub(crate) struct Diagnostics {
     pub first_visits: u64,
     pub first_declined: u64,
+    pub first_quick_decodes: u64,
+    pub first_full_decodes: u64,
     pub empty: u64,
     pub over_fuel: u64,
     pub interprets: u64,
@@ -702,6 +703,8 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 
 pub(crate) struct Native {
     code: store::CodeStore,
+    decodes: translate::front::Decodes,
+    front_units: FxHashMap<u32, translate::front::Site>,
     plans: plan::Arbiter,
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     bridge: *mut std::ffi::c_void,
@@ -815,6 +818,8 @@ impl Native {
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {
+            decodes: translate::front::Decodes::default(),
+            front_units: FxHashMap::default(),
             code: store::CodeStore {
                 rows: FxHashMap::default(),
                 table_sources: FxHashSet::default(),
@@ -911,6 +916,10 @@ impl Native {
 
     pub(crate) fn set_spin_yield(&mut self, enabled: bool) {
         self.runtime.spin_yield = u32::from(enabled);
+    }
+
+    pub(crate) fn translation_decodes(&self) -> translate::front::DecodeCounts {
+        self.decodes.counts
     }
 
     pub(super) fn is_stop(&self, eip: u32) -> bool {
@@ -1118,6 +1127,61 @@ mod tests {
     const OUTPUT: u32 = 0x3_0000;
     // mov [edi],eax; add edi,4; dec ecx; jne HEAD; int3
     const STORE_LOOP: &[u8] = &[0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf8, 0xcc];
+
+    // spec: A64A-ROLE-2, A64A-PLACE-4
+    #[test]
+    fn tier1_and_resident_rebuilds_reuse_the_site_unit() {
+        let (mut memory, mut native, _) = resident_loop(STORE_LOOP);
+        native.translate(&mut memory, HEAD).unwrap();
+        let first = native.translation_decodes();
+        native.plans.mark_checked(HEAD);
+        native.replace_unit(&mut memory, HEAD);
+        assert_eq!(native.translation_decodes(), first);
+
+        native.discover(&mut memory, HEAD, HEAD, resident_cpu(HEAD, 20));
+        native.install_optimized(true);
+        let discovered = native.translation_decodes();
+        assert_eq!(
+            discovered, first,
+            "resident discovery shares the cold prefix"
+        );
+        assert!(!native.plans.resident(HEAD).unwrap().versions.is_empty());
+        native.rebuild_resident_versions(HEAD);
+        native.install_optimized(true);
+        assert_eq!(native.translation_decodes(), discovered);
+
+        native.clear();
+        native.translate(&mut memory, HEAD).unwrap();
+        assert_eq!(native.translation_decodes(), discovered);
+
+        memory.protect(HEAD, 4096, READ | WRITE).unwrap();
+        memory.write(HEAD, &[0x89, 0x17]).unwrap(); // mov [edi],edx
+        memory
+            .protect(HEAD, 4096, READ | adv_cpu_core::EXEC)
+            .unwrap();
+        native.invalidate(&mut memory);
+        assert!(!native.front_units.contains_key(&HEAD));
+        native.translate(&mut memory, HEAD).unwrap();
+        assert!(native.translation_decodes().quick > discovered.quick);
+    }
+
+    // spec: A64A-ROLE-2
+    #[test]
+    fn promotion_decodes_only_the_new_trace_suffix() {
+        let mut body = vec![0x90; translate::MAX_INSTRUCTIONS];
+        body.extend_from_slice(&[0x49, 0x75, (-(body.len() as i32 + 3)) as u8, 0xcc]);
+        let (mut memory, mut native, _) = resident_loop(&body);
+        native.promotion = 1;
+        native.first_visits = true;
+        native.translate(&mut memory, HEAD).unwrap();
+        let cold = native.translation_decodes();
+        assert_eq!(cold.quick, translate::MAX_INSTRUCTIONS as u64);
+        native.sample(&mut memory, HEAD);
+        let hot = native.translation_decodes();
+        assert_eq!(hot.quick - cold.quick, 2);
+        assert_eq!(hot.full, cold.full);
+        assert_eq!(hot.code_reads - cold.code_reads, 2);
+    }
 
     fn resident_cpu(eip: u32, count: u32) -> CpuState {
         let mut state = cpu(eip, 0, count);

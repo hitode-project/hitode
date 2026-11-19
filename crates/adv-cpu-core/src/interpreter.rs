@@ -20,12 +20,17 @@ use crate::integer::{AF, Address, CF, OF, Operand, PF, Reg, SF, ZF, condition_tr
 use crate::memory::SHARED;
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
+mod first_visit;
+#[doc(hidden)]
+pub mod quick;
 mod registers;
 mod scalar;
 mod simd;
 mod strings;
 #[cfg(test)]
 mod window_tests;
+
+pub use first_visit::FirstVisit;
 
 /// Outcome of one instruction. Fuel accounting belongs to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -582,6 +587,8 @@ fn execute_decoded(
             step: result.unwrap_or_else(|step| step),
         };
     }
+    #[cfg(test)]
+    first_visit::tests::count(|work| work.transactions += 1);
     let mut tx = Transaction {
         regs: state.regs,
         flags: state.eflags,
@@ -824,42 +831,36 @@ fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Optio
 
 fn fetch(memory: &mut Memory, pc: u32) -> Cached {
     let (mut entry, denied) = fetch_bytes::<true>(memory, pc);
-    let mut decoder = Decoder::with_ip(
-        32,
-        &entry.bytes[..entry.len as usize],
-        u64::from(pc),
-        DecoderOptions::NONE,
-    );
+    let (decoded, len) = decode_bytes(pc, &entry.bytes[..entry.len as usize], denied);
+    memory.watch_code(pc, len);
+    entry.len = len as u8;
+    entry.decoded = decoded;
+    entry
+}
+
+fn decode_bytes(pc: u32, bytes: &[u8], denied: Option<u32>) -> (Decoded, usize) {
+    let mut decoder = Decoder::with_ip(32, bytes, u64::from(pc), DecoderOptions::NONE);
     let instruction = decoder.decode();
     // A decoded instruction depends on its own bytes; a failed decode on every
     // byte it saw.
-    if !instruction.is_invalid() {
-        entry.len = instruction.len() as u8;
-    }
-    memory.watch_code(pc, entry.len as usize);
-    entry.decoded = if instruction.is_invalid() {
+    if instruction.is_invalid() {
         if decoder.last_error() == DecoderError::NoMoreBytes
             && let Some(address) = denied
         {
-            Decoded::Stop(Step::FetchFault { pc, address })
+            (Decoded::Stop(Step::FetchFault { pc, address }), bytes.len())
         } else {
-            Decoded::Stop(Step::InvalidInstruction { pc })
+            (Decoded::Stop(Step::InvalidInstruction { pc }), bytes.len())
         }
     } else {
-        decode(&instruction, &entry.bytes[..instruction.len()])
-    };
-    entry
+        let len = instruction.len();
+        (decode(&instruction, &bytes[..len]), len)
+    }
 }
 
 /// How the interpreter runs a valid `instruction` encoded as `bytes`.
 fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
     if let Some(action) = predecode(instruction) {
-        let clock = matches!(
-            action,
-            Action::Mov(Operand::Register(_), Operand::Memory(a, _), _)
-                if a.base.is_none() && a.index.is_none() && !a.fs && !a.word
-                    && crate::shared_clock(a.displacement)
-        );
+        let clock = reads_clock(action);
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
@@ -885,6 +886,15 @@ fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
             code: instruction.code(),
         })
     }
+}
+
+fn reads_clock(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Mov(Operand::Register(_), Operand::Memory(a, _), _)
+            if a.base.is_none() && a.index.is_none() && !a.fs && !a.word
+                && crate::shared_clock(a.displacement)
+    )
 }
 
 /// The x87 opcode of an instruction's bytes: the first byte pair whose

@@ -21,8 +21,8 @@
 
 use adv_cpu_core::memory::Memory;
 
-use super::decode::{Effects, Fetcher, Helper, Op, Src};
-use super::flags::FlagSet;
+use super::decode::{Decodes, Effects, Fetcher, Helper, Op, Src};
+use crate::translate::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;
@@ -87,7 +87,7 @@ pub struct Inst {
 }
 
 impl Inst {
-    pub(super) fn resident_backedge(&self, target: u32) -> bool {
+    pub(in crate::translate) fn resident_backedge(&self, target: u32) -> bool {
         if self.spin || target > self.pc {
             return false;
         }
@@ -103,11 +103,11 @@ struct Frame {
 }
 
 /// A trace and its analysis; its buffers are reused from trace to trace.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Trace {
     pub insts: Vec<Inst>,
     /// Decoded instructions supplied for optimized builds.
-    pub x86: Vec<Option<iced_x86::Instruction>>,
+    pub(crate) x86: Vec<Option<std::sync::Arc<super::summary::Summary>>>,
     /// Guest bytes the trace was decoded from, as (address, length).
     pub code: Vec<(u32, u32)>,
     /// End of each instruction's region: the next region start.
@@ -188,6 +188,7 @@ fn forwarded_body(
     mut pc: u32,
     redirect: &dyn Fn(u32) -> Option<Redirect>,
     stops: &Stops<'_>,
+    decodes: &mut Decodes,
 ) -> Option<(Bound, Vec<(u32, u32)>)> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Value {
@@ -237,7 +238,7 @@ fn forwarded_body(
                 ));
             }
         }
-        let (op, size) = fetcher.fetch(memory, pc)?;
+        let (op, size) = fetcher.fetch(memory, pc, decodes)?;
         watched.push((pc, size));
         let next = pc.wrapping_add(size);
         pc = match op {
@@ -283,36 +284,13 @@ fn forwarded_body(
 }
 
 impl Trace {
-    /// A copy for analysis elsewhere, without the helpers that only
-    /// ordinary code runs.
-    pub(crate) fn detached(&self) -> Self {
-        Self {
-            insts: self.insts.clone(),
-            x86: self.x86.clone(),
-            code: self.code.clone(),
-            region_end: self.region_end.clone(),
-            merge: self.merge.clone(),
-            resident_heads: Vec::new(),
-            live_in: self.live_in.clone(),
-            live_out: self.live_out.clone(),
-            observe_in: self.observe_in.clone(),
-            observe_out: self.observe_out.clone(),
-            frames: self.frames.clone(),
-            slots: self.slots.clone(),
-            primary: self.primary,
-            failure: self.failure,
-            helpers: Vec::new(),
-            bodies: self.bodies.clone(),
-            memory_pages: self.memory_pages,
-        }
-    }
-
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry. `redirect` gives, for a function entry whose calls go
     /// elsewhere, the target and the bytes the function must still begin
     /// with; the trace then jumps there instead of decoding the function.
     /// Only `loops` permits the larger loop trace; a cold entry takes one
     /// path of at most `MAX_INSTRUCTIONS`.
+    #[cfg(test)]
     pub fn build(
         &mut self,
         memory: &mut Memory,
@@ -322,8 +300,23 @@ impl Trace {
         redirect: &dyn Fn(u32) -> Option<Redirect>,
         loops: bool,
     ) {
+        let mut decodes = Decodes::default();
+        self.build_cached(memory, entry, stops, host, redirect, loops, &mut decodes);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_cached(
+        &mut self,
+        memory: &mut Memory,
+        entry: u32,
+        stops: &[u32],
+        host: &dyn Fn(u32, u32) -> Option<u32>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
+        loops: bool,
+        decodes: &mut Decodes,
+    ) {
         let limit = if loops { LOOP_LIMIT } else { MAX_INSTRUCTIONS };
-        match self.build_paths(memory, entry, stops, host, redirect, (limit, None)) {
+        match self.build_paths(memory, entry, stops, host, redirect, (limit, None), decodes) {
             Some(end) => {
                 self.build_paths(
                     memory,
@@ -332,6 +325,7 @@ impl Trace {
                     host,
                     redirect,
                     (LOOP_LIMIT, Some(end)),
+                    decodes,
                 );
             }
             None if loops && self.last_backedge(&Stops::new(stops)).is_none() => {
@@ -342,6 +336,7 @@ impl Trace {
                     host,
                     redirect,
                     (MAX_INSTRUCTIONS, None),
+                    decodes,
                 );
             }
             None => {}
@@ -376,11 +371,11 @@ impl Trace {
                 });
             }
         }
-        self.mark_spin_backedges(memory);
+        self.mark_spin_backedges(memory, decodes);
         self.analyze();
     }
 
-    fn mark_spin_backedges(&mut self, memory: &Memory) {
+    fn mark_spin_backedges(&mut self, memory: &Memory, decodes: &Decodes) {
         for from in 0..self.insts.len() {
             let latch = self.insts[from];
             let Some(Edge::Internal(to)) = latch.taken.or(match latch.next {
@@ -408,14 +403,14 @@ impl Trace {
             {
                 continue;
             }
-            self.insts[from].spin = memory
-                .read_data(target, len)
-                .is_ok_and(|bytes| adv_cpu_core::spin::backedge(&bytes, target, latch.pc));
+            self.insts[from].spin = memory.committed(target, len).is_ok()
+                && decodes.spin(&self.insts[to..=from], target, latch.pc);
         }
     }
 
     /// Builds the primary path and, for a loop, the paths that return to it.
     /// Returns the stop for a rebuild when the primary path ran past its latch.
+    #[allow(clippy::too_many_arguments)]
     fn build_paths(
         &mut self,
         memory: &mut Memory,
@@ -424,6 +419,7 @@ impl Trace {
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
         bounds: (usize, Option<(u32, u16)>),
+        decodes: &mut Decodes,
     ) -> Option<(u32, u16)> {
         let (limit, end) = bounds;
         self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
@@ -448,7 +444,7 @@ impl Trace {
         self.path(
             (entry, 0),
             &mut weight,
-            (&mut *memory, &mut fetcher),
+            (&mut *memory, &mut fetcher, decodes),
             bounds,
             host,
             redirect,
@@ -481,7 +477,7 @@ impl Trace {
                     if !self.path(
                         (target, inst.frame),
                         &mut weight,
-                        (&mut *memory, &mut fetcher),
+                        (&mut *memory, &mut fetcher, decodes),
                         bounds,
                         host,
                         redirect,
@@ -518,7 +514,7 @@ impl Trace {
         &mut self,
         (mut pc, mut frame): (u32, u16),
         weight: &mut usize,
-        (memory, fetcher): (&mut Memory, &mut Fetcher),
+        (memory, fetcher, decodes): (&mut Memory, &mut Fetcher, &mut Decodes),
         (limit, stops, stop): (usize, &Stops<'_>, Option<(u32, u16)>),
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
@@ -573,11 +569,14 @@ impl Trace {
                         _ => Some((Op::Jmp(redirect.target), 0)),
                     }
                 }
-                None => fetcher.fetch(memory, pc),
+                None => fetcher.fetch(memory, pc, decodes),
             };
             let Some((op, size)) = fetched else {
                 if start == 0 {
                     self.failure = fetcher.failure;
+                    if let Some(span) = decodes.span(pc) {
+                        self.code.push((pc, span));
+                    }
                 }
                 if len > start {
                     self.insts[len - 1].next = Next::Edge(Edge::Interpret(pc));
@@ -615,7 +614,7 @@ impl Trace {
                 Op::Call(target)
                     if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
                 {
-                    match forwarded_body(memory, target, redirect, stops) {
+                    match forwarded_body(memory, target, redirect, stops, decodes) {
                         Some((bound, dependencies)) => {
                             watched.extend(dependencies);
                             self.bodies.push(bound);
@@ -629,10 +628,10 @@ impl Trace {
             let cost = if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
-                    Op::Simd(super::simd::Simd {
-                        kind: super::simd::Kind::PackedToInt(..)
-                            | super::simd::Kind::MaskMove
-                            | super::simd::Kind::Approximate(..),
+                    Op::Simd(crate::translate::simd::Simd {
+                        kind: crate::translate::simd::Kind::PackedToInt(..)
+                            | crate::translate::simd::Kind::MaskMove
+                            | crate::translate::simd::Kind::Approximate(..),
                         ..
                     })
                 ) {
@@ -868,7 +867,7 @@ impl Trace {
 
     /// The discovery and resident paths of a back edge can observe every
     /// flag even when its Tier-1 path stays internal.
-    pub(super) fn observe_resident_links(&mut self) {
+    pub(in crate::translate) fn observe_resident_links(&mut self) {
         self.resident_heads.clear();
         self.resident_heads.resize(self.len(), false);
         for inst in &self.insts {
@@ -888,7 +887,7 @@ impl Trace {
         while self.liveness(false, true) {}
     }
 
-    pub(super) fn resident_edge(&self, from: usize, to: usize) -> bool {
+    pub(in crate::translate) fn resident_edge(&self, from: usize, to: usize) -> bool {
         let inst = &self.insts[from];
         self.resident_heads.get(to) == Some(&true)
             && !inst.spin

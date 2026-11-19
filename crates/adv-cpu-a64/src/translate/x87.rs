@@ -26,7 +26,11 @@
 //! ones lost bits. Stores to binary64 round the significand in integers.
 
 use adv_cpu_core::floating::fast::{self, Fast, Op as Arith, PE, RANGE, Source};
-use iced_x86::{Instruction, OpKind};
+
+#[cfg(test)]
+use super::front::plans::x87 as plan;
+#[cfg(test)]
+use iced_x86::Instruction;
 
 use crate::asm::Label;
 use crate::encode::Shift::Lsl;
@@ -36,7 +40,7 @@ use crate::jit_map::Part;
 use crate::runtime;
 
 use super::access::{Addr, Dir};
-use super::decode::{Mem, memory};
+use super::decode::Mem;
 use super::flags::Operand;
 use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
 
@@ -69,43 +73,6 @@ pub struct X87 {
     pub helper: u8,
     /// The opcode the instruction records, if it records one.
     pub opcode: Option<u16>,
-}
-
-/// The `X87` for `instruction`, whose interpreter helper is `helper`.
-pub fn plan(instruction: &Instruction, helper: u8, opcode: Option<u16>) -> Option<X87> {
-    let fast = match instruction.mnemonic() {
-        iced_x86::Mnemonic::Fld if instruction.memory_size().size() == 10 => Fast::Load80,
-        iced_x86::Mnemonic::Fstp if instruction.memory_size().size() == 10 => Fast::Store80,
-        m @ (iced_x86::Mnemonic::Fsin
-        | iced_x86::Mnemonic::Fcos
-        | iced_x86::Mnemonic::Fsincos
-        | iced_x86::Mnemonic::Fptan
-        | iced_x86::Mnemonic::Fpatan
-        | iced_x86::Mnemonic::F2xm1
-        | iced_x86::Mnemonic::Fyl2x
-        | iced_x86::Mnemonic::Fyl2xp1
-        | iced_x86::Mnemonic::Fscale
-        | iced_x86::Mnemonic::Fprem
-        | iced_x86::Mnemonic::Fprem1) => Fast::Leaf(m),
-        _ => fast::classify(instruction)?,
-    };
-    let mem = if instruction.op0_kind() == OpKind::Memory {
-        Some(memory(instruction)?)
-    } else {
-        None
-    };
-    if matches!(fast, Fast::StoreControl | Fast::StoreStatus) && mem.is_none() {
-        // Only `fnstsw ax` stores to a register.
-        if instruction.op0_register() != iced_x86::Register::AX {
-            return None;
-        }
-    }
-    Some(X87 {
-        fast,
-        mem,
-        helper,
-        opcode,
-    })
 }
 
 /// How `double` takes an extended value.

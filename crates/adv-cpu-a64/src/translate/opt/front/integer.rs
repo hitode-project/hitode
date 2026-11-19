@@ -1,7 +1,7 @@
 use super::*;
 use crate::translate::decode::{Alu, Narrow8or16, ShiftKind};
+use crate::translate::front::tags::Mnemonic;
 use crate::translate::integer::Integer;
-use iced_x86::Mnemonic;
 
 impl Front<'_> {
     pub(super) fn instruction(&mut self) -> Result<(), Reject> {

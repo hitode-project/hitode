@@ -5,10 +5,11 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
+use super::front::{summary::Summary, tags::ConditionCode as Cond};
 use adv_cpu_core::CpuState;
 use adv_cpu_core::floating::fast::{Fast, Source};
-use iced_x86::ConditionCode as Cond;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use super::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::integer::Integer;
@@ -153,7 +154,7 @@ pub(crate) struct Proof {
     outer: Option<Outer>,
     /// Each trace instruction as decoded once from guest bytes, for the
     /// split proof and the optimizer's component effects.
-    instructions: Vec<Option<iced_x86::Instruction>>,
+    instructions: Vec<Option<Arc<Summary>>>,
 }
 
 /// The loop at the unit entry, whose iterations may run as blocks
@@ -2000,7 +2001,7 @@ impl Proof {
     pub(crate) fn prove_split(
         &mut self,
         trace: &Trace,
-        decode: impl Fn(u32, u32) -> Option<iced_x86::Instruction>,
+        decode: impl Fn(u32, u32) -> Option<Arc<Summary>>,
     ) {
         self.instructions = trace
             .insts
@@ -2168,8 +2169,8 @@ impl Proof {
     }
 
     /// The trace instruction at `index` as decoded for the split proof.
-    pub(crate) fn instruction(&self, index: usize) -> Option<&iced_x86::Instruction> {
-        self.instructions.get(index)?.as_ref()
+    pub(crate) fn instruction(&self, index: usize) -> Option<&Summary> {
+        self.instructions.get(index)?.as_deref()
     }
 
     /// Whether this instruction's non-frame read is invariant in the unit.
@@ -2665,7 +2666,7 @@ pub(crate) mod tests {
         proof.prove_split(&t, |pc, len| {
             let at = usize::try_from(pc - CODE).ok()?;
             let bytes = code.get(at..at + len as usize)?;
-            Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+            crate::translate::front::summary::from_bytes(bytes, pc)
         });
         Some(proof)
     }

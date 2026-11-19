@@ -365,7 +365,7 @@ pub(super) struct ResidentPlan {
     pub code: usize,
     /// The Tier-1 unit containing the back edge that reached the threshold.
     pub source: u32,
-    pub trace: translate::Trace,
+    pub unit: Arc<translate::Unit>,
     pub trampoline: usize,
     pub tier1: usize,
     pub sample: Box<Cell<u32>>,
@@ -394,11 +394,11 @@ struct ColdWindow {
 }
 
 impl ResidentPlan {
-    pub fn new(code: usize, source: u32, trace: translate::Trace) -> Self {
+    pub fn new(code: usize, source: u32, unit: Arc<translate::Unit>) -> Self {
         Self {
             code,
             source,
-            trace,
+            unit,
             trampoline: 0,
             tier1: 0,
             sample: Box::new(SAMPLE.into()),
@@ -440,29 +440,18 @@ impl ResidentPlan {
     }
 
     fn check_stream(&mut self, site: u32) {
-        let stream = |inst: &iced_x86::Instruction| {
-            inst.op_kinds()
-                .any(|kind| kind == iced_x86::OpKind::Memory)
-                .then(|| {
-                    (
-                        inst.memory_segment(),
-                        inst.memory_base(),
-                        inst.memory_index(),
-                        inst.memory_index_scale(),
-                    )
-                })
-        };
-        let sites = self.trace.insts.iter().zip(&self.trace.x86);
+        let trace = &self.unit.trace;
+        let sites = trace.insts.iter().zip(&trace.x86);
         if let Some(key) = sites
             .clone()
             .find(|(inst, _)| inst.pc == site)
-            .and_then(|(_, decoded)| stream(decoded.as_ref()?))
+            .and_then(|(_, summary)| summary.as_ref()?.stream)
         {
-            self.checked.extend(sites.filter_map(|(inst, decoded)| {
+            self.checked.extend(sites.filter_map(|(inst, summary)| {
                 (self
                     .cold_counts
                     .contains_key(&(inst.pc, ResidentCold::HostFault))
-                    && stream(decoded.as_ref()?) == Some(key))
+                    && summary.as_ref()?.stream == Some(key))
                 .then_some(inst.pc)
             }));
         }
@@ -740,7 +729,7 @@ impl Native {
         if slot[0] == u64::from(eip) {
             slot[1] = new.unit as u64;
         }
-        self.resolve_tables(memory, eip, new.unit);
+        self.resolve_tables(eip, new.unit);
         let resident = self.plans.resident(eip);
         let mut next = self.code.links.get(&eip).copied().unwrap_or(u32::MAX);
         while let Some(link) = self.code.linked.get(next as usize).copied() {
@@ -763,26 +752,15 @@ impl Native {
         self.code.cache.sync();
     }
 
-    pub(super) fn resolve_tables(&mut self, memory: &Memory, eip: u32, unit: usize) {
+    pub(super) fn resolve_tables(&mut self, eip: u32, unit: usize) {
         if !self.code.rows.contains_key(&eip)
             || self.is_stop(eip)
-            || !translate::tables::image(&self.images.borrow(), eip, 1)
-        {
-            return;
-        }
-        // Import trampolines and transport thunks remain patch-sensitive.
-        let Ok(bytes) = memory.read(eip, 15) else {
-            return;
-        };
-        let mut decoder =
-            iced_x86::Decoder::with_ip(32, bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
-        let instruction = decoder.decode();
-        if matches!(
-            instruction.flow_control(),
-            iced_x86::FlowControl::UnconditionalBranch
-                | iced_x86::FlowControl::IndirectBranch
-                | iced_x86::FlowControl::Interrupt
-        ) || matches!(instruction.code(), Code::Pushd_imm32 | Code::Pushd_imm8)
+            || !self.front_units.get(&eip).is_some_and(|site| {
+                site.hot
+                    .as_ref()
+                    .or(site.cold.as_ref())
+                    .is_some_and(|unit| unit.table_target)
+            })
         {
             return;
         }
@@ -802,6 +780,7 @@ impl Native {
         }
         let mut dropped = false;
         for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
+            self.decodes.invalidate(page);
             for eip in self.code.pages.remove(&page).unwrap_or_default() {
                 self.plans.site(eip).promoted = false;
                 let unit = self.drop_unit(eip);
@@ -818,6 +797,7 @@ impl Native {
     /// Drops the unit at `eip`, if any, and restores the link points that
     /// branch to it; the caller forgets dynamic targets.
     pub(super) fn drop_unit(&mut self, eip: u32) -> bool {
+        self.front_units.remove(&eip);
         let dropped = self.code.invalidate_unit(eip);
         self.repoint_internal_edges(eip, None);
         self.plans.invalidate(eip);
@@ -873,7 +853,6 @@ impl Native {
         self.code.rows.clear();
         self.code.table_sources.clear();
         self.code.uses_permissions = false;
-        self.code.pages.clear();
         self.code.links.clear();
         self.code.linked.clear();
         self.code.back_points.clear();
@@ -961,9 +940,11 @@ impl Native {
     }
 
     pub(super) fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Tier1Unit> {
+        let loops =
+            self.promotion == 0 || self.plans.sites.get(&eip).is_some_and(|plan| plan.promoted);
+        let unit = self.front_unit(memory, eip, loops, false);
         let at = self.code.cache.next();
         let mut work = std::mem::take(&mut self.code.work);
-        work.unit.images.clone_from(&self.images.borrow());
         let all = self.checks != Checks::Adaptive;
         let (control, pe) = if self.runtime.cpu.is_null() {
             (self.control, self.pe)
@@ -973,60 +954,21 @@ impl Native {
             let x87 = unsafe { &(*self.runtime.cpu).x87 };
             (x87.control, x87.status & 0x20 != 0)
         };
-        work.cold =
-            self.promotion != 0 && !self.plans.sites.get(&eip).is_some_and(|plan| plan.promoted);
-        work.resident_links = !self.plans.baseline_only;
-        translate::translate(
-            &mut work,
-            memory,
+        translate::lower_unit(
+            &mut work.code,
+            &unit,
             eip,
-            &self.stops,
             &|pc| all || self.plans.checked(pc),
             self.code.helpers.len() as u32,
             self.features,
             at,
             self.code.stubs,
-            &|pc, word| {
-                if self.bridge.is_null() {
-                    return None;
-                }
-                // SAFETY: translation occurs only during the bridge's run.
-                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler
-                    .as_ref()
-                    .and_then(|handler| handler.host_thunk(pc, word))
-            },
-            &|pc| {
-                if self.bridge.is_null() {
-                    return None;
-                }
-                // SAFETY: as for `host_thunk`.
-                let handler = unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler
-                    .as_ref()?;
-                let (target, original) = handler.redirect(pc)?;
-                Some(translate::Redirect {
-                    target,
-                    original: original.to_vec(),
-                    checks: handler.redirect_checks(pc).to_vec(),
-                    body: handler.direct_body(pc),
-                })
-            },
-            &|pc, code| {
-                if self.bridge.is_null() {
-                    return Vec::new();
-                }
-                // SAFETY: admission runs synchronously on the execution owner.
-                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler
-                    .as_ref()
-                    .map_or_else(Vec::new, |handler| handler.native_region(pc, code))
-            },
             control,
             pe,
+            !self.plans.baseline_only,
         );
         if work.retired() == 0 {
-            self.diagnostics.empty_units[usize::from(work.unit.trace.failure & 3)] += 1;
+            self.diagnostics.empty_units[usize::from(unit.trace.failure & 3)] += 1;
         }
         let entry = self.code.install_unit(
             eip,
@@ -1037,17 +979,16 @@ impl Native {
         );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
-            if !work.unit.tables.is_empty() {
+            if !unit.tables.is_empty() {
                 self.code.table_sources.insert(eip);
             }
-            for table in &work.unit.tables {
+            for (table, &(offset, stub)) in unit.tables.iter().zip(&work.code.table_positions) {
                 for (index, &target) in table.targets.iter().enumerate() {
-                    let slot = (eip, at + table.offset + index * 8, at + table.stub);
+                    let slot = (eip, at + offset + index * 8, at + stub);
                     self.code.rows.entry(target).or_default().push(slot);
                 }
             }
-            let mut targets: Vec<_> = work
-                .unit
+            let mut targets: Vec<_> = unit
                 .tables
                 .iter()
                 .flat_map(|t| t.targets.iter().copied())
@@ -1056,7 +997,7 @@ impl Native {
             targets.dedup();
             for target in targets {
                 if let Some(entry) = self.code.units.get(&target) {
-                    self.resolve_tables(memory, target, entry.unit);
+                    self.resolve_tables(target, entry.unit);
                 }
             }
             for link in work.links() {
@@ -1094,6 +1035,7 @@ impl Native {
                         && !head.declined()
                         && (edge.back
                             || !head
+                                .unit
                                 .trace
                                 .insts
                                 .iter()
@@ -1117,7 +1059,9 @@ impl Native {
                     .push(edge);
             }
             if self.plans.counter_at(eip).is_some() || !work.internal_links().is_empty() {
-                self.code.tier1_words.insert(eip, store::tier1_words(&work));
+                self.code
+                    .tier1_words
+                    .insert(eip, store::tier1_words(&work, &unit.trace));
             }
             if let Some(head) = self.plans.resident(eip).filter(|head| head.tier1 != 0) {
                 self.code
@@ -1132,8 +1076,7 @@ impl Native {
             {
                 self.code.repoint(gate, entry.unit);
             }
-            self.code.watch_pages(eip, work.code());
-            self.code.helpers.extend(work.helpers());
+            self.code.helpers.extend(unit.helpers().iter().cloned());
             self.code.helper_counts.resize(self.code.helpers.len(), 0);
         }
         self.code.uses_permissions |= entry.is_some() && work.code.uses_permissions;
@@ -1167,26 +1110,9 @@ impl Native {
         if self.plans.baseline_only {
             return;
         }
-        let mut trace = self.loop_trace(memory, eip, &self.stops);
-        trace.x86 = trace
-            .insts
-            .iter()
-            .map(|inst| {
-                let mut bytes = [0; 15];
-                let len = inst.next_pc.wrapping_sub(inst.pc) as usize;
-                let bytes = bytes.get_mut(..len)?;
-                memory.read_into(inst.pc, bytes).ok()?;
-                let decoded = iced_x86::Decoder::with_ip(32, bytes, u64::from(inst.pc), 0).decode();
-                (!decoded.is_invalid() && decoded.len() == len).then_some(decoded)
-            })
-            .collect();
-        for &(start, len) in &trace.code {
-            memory.watch_code(start, len as usize);
-        }
-        self.code.watch_pages(eip, &trace.code);
+        let unit = self.front_unit(memory, eip, true, true);
         let code = self.code.units[&source].unit;
-        self.plans.site(eip).resident =
-            Some(Box::new(ResidentPlan::new(code, source, trace.detached())));
+        self.plans.site(eip).resident = Some(Box::new(ResidentPlan::new(code, source, unit)));
         self.request_resident(eip, compile::Task::Discover, at);
     }
 
@@ -1196,6 +1122,7 @@ impl Native {
             .plans
             .resident(eip)
             .unwrap()
+            .unit
             .trace
             .insts
             .iter()
@@ -1213,7 +1140,7 @@ impl Native {
             generation: self.code.generation,
             code: head.code,
             task,
-            trace: head.trace.detached(),
+            unit: Arc::clone(&head.unit),
             proof: self.offload.proof(eip),
             at,
             checked,
@@ -1342,6 +1269,7 @@ impl Native {
         let head = self.plans.resident_mut(eip).unwrap();
         if head.cuts.insert(site) {
             if head
+                .unit
                 .trace
                 .reaches_latch_without(&|pc| head.cuts.contains(&pc))
             {
@@ -1423,8 +1351,8 @@ impl Native {
             head.pending = None;
             if let Some(job) = done.job {
                 head.has_proof = true;
-                let trace = head.trace.detached();
-                self.place_job(eip, &done.at, trace, job);
+                let unit = Arc::clone(&head.unit);
+                self.place_job(eip, &done.at, unit, job);
                 self.install_offer_link(eip);
             }
             let head = self.plans.resident(eip).unwrap();
@@ -1550,7 +1478,7 @@ impl Native {
             entry.form,
             &lowered.words,
             eip,
-            head.trace.prepaid(0),
+            head.unit.trace.prepaid(0),
             &lowered.marks,
             "a64-resident",
         );
@@ -1652,6 +1580,7 @@ impl Native {
                 edge.back
                     || !head
                         .unwrap()
+                        .unit
                         .trace
                         .insts
                         .iter()
@@ -1749,40 +1678,54 @@ impl Native {
         }
     }
 
-    /// The trace a hot entry at `eip` takes.
-    pub(super) fn loop_trace(
-        &self,
+    fn front_unit(
+        &mut self,
         memory: &mut Memory,
         eip: u32,
-        stops: &[u32],
-    ) -> translate::Trace {
-        let mut trace = translate::Trace::default();
-        let handler = if self.bridge.is_null() {
-            None
-        } else {
-            // SAFETY: preparation stays within this owner's bridge call.
-            unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                .handler
-                .as_ref()
-        };
-        trace.build(
-            memory,
-            eip,
-            stops,
-            &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
-            &|pc| {
-                let handler = handler?;
-                let (target, original) = handler.redirect(pc)?;
-                Some(translate::Redirect {
-                    target,
-                    original: original.to_vec(),
-                    checks: handler.redirect_checks(pc).to_vec(),
-                    body: handler.direct_body(pc),
-                })
-            },
-            true,
-        );
-        trace
+        loops: bool,
+        summarize: bool,
+    ) -> Arc<translate::Unit> {
+        let site = self.front_units.entry(eip).or_default();
+        let shape = if loops { &mut site.hot } else { &mut site.cold };
+        let unit = shape.get_or_insert_with(|| {
+            let handler = if self.bridge.is_null() {
+                None
+            } else {
+                // SAFETY: preparation stays within this owner's bridge call.
+                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()
+            };
+            let mut unit = translate::Unit::default();
+            unit.images.clone_from(&self.images.borrow());
+            unit.build_cached(
+                memory,
+                eip,
+                &self.stops,
+                &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
+                &|pc| {
+                    let handler = handler?;
+                    let (target, original) = handler.redirect(pc)?;
+                    Some(translate::Redirect {
+                        target,
+                        original: original.to_vec(),
+                        checks: handler.redirect_checks(pc).to_vec(),
+                        body: handler.direct_body(pc),
+                    })
+                },
+                loops,
+                &mut self.decodes,
+            );
+            unit.prepare_regions(memory, &|pc, code| {
+                handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
+            });
+            self.code.watch_pages(eip, unit.code());
+            Arc::new(unit)
+        });
+        if summarize && unit.trace.x86.is_empty() {
+            Arc::make_mut(unit).summarize(&mut self.decodes);
+        }
+        Arc::clone(unit)
     }
 }
 
@@ -1825,9 +1768,7 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         native.code.cache.sync();
         return point;
     }
-    if entry.is_none()
-        && (!crate::translate::Fetcher::fetchable(memory, eip) || native.first_visit(eip))
-    {
+    if entry.is_none() && (!crate::translate::Fetcher::fetchable(memory, eip) || !native.ran(eip)) {
         return 0;
     }
     let before = native.code.cache.used();
@@ -1838,7 +1779,7 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
             return 0;
         }
     };
-    native.resolve_tables(memory, eip, native.code.units[&eip].unit);
+    native.resolve_tables(eip, native.code.units[&eip].unit);
     if point == 0 {
         native.code.table[runtime::table_slot(eip)] = [u64::from(eip), unit as u64];
     }

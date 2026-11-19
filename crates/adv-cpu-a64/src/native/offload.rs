@@ -152,14 +152,12 @@ impl Native {
         &mut self,
         eip: u32,
         at: &CpuState,
-        trace: translate::Trace,
+        unit: Arc<translate::Unit>,
         job: compile::Job,
     ) {
-        let mut unit = translate::Unit::default();
-        unit.trace = trace;
         let iterates = unit.trace.returns_at_head();
         if let Some(code) = self.emit_computation(
-            &mut unit,
+            &unit,
             eip,
             (at.x87.control, at.x87.status & 0x20 != 0),
             &job.proof,
@@ -174,7 +172,7 @@ impl Native {
                 WorkerJob {
                     code,
                     proof: job.proof,
-                    trace: unit.trace,
+                    unit,
                     entry_registers,
                 },
             );
@@ -202,7 +200,7 @@ impl Native {
 
     fn emit_computation(
         &mut self,
-        unit: &mut translate::Unit,
+        unit: &translate::Unit,
         eip: u32,
         (control, pe): (u16, bool),
         proof: &translate::computation::Proof,
@@ -248,7 +246,7 @@ impl Native {
             generation: self.code.generation,
             code: prepared.code.entry,
             task: compile::Task::Job,
-            trace: prepared.trace.detached(),
+            unit: Arc::clone(&prepared.unit),
             proof: Some(prepared.proof.clone()),
             at,
             checked: FxHashSet::default(),
@@ -277,7 +275,7 @@ impl Native {
             entry,
             &lowered.words,
             eip,
-            job.trace.prepaid(0),
+            job.unit.trace.prepaid(0),
             &lowered.marks,
             "a64-opt",
         );
@@ -311,7 +309,7 @@ const MXCSR_FLAGS: u32 = 0x3f;
 struct WorkerJob {
     code: Code,
     proof: Proof,
-    trace: translate::Trace,
+    unit: Arc<translate::Unit>,
     entry_registers: u8,
 }
 
@@ -2853,7 +2851,7 @@ mod tests {
         let at = native.code.cache.next();
         let mut scratch = translate::Code::default();
         let emitted = translate::lower_computation(
-            &mut work.unit,
+            &work.unit,
             &mut scratch,
             CODE,
             native.features,

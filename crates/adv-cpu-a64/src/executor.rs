@@ -357,8 +357,9 @@ impl Executor {
         #[cfg(native)]
         if let Some(native) = &self.native {
             return format!(
-                "{:?} unchecked faults {} checked {}",
+                "{:?} translation_decodes {:?} unchecked faults {} checked {}",
                 native.diagnostics,
+                native.translation_decodes(),
                 native.unchecked_faults,
                 native.checked_count()
             );
@@ -389,21 +390,14 @@ impl Executor {
     }
 
     /// The form of the instruction at `eip` as the code there decodes now.
-    pub fn instruction_form(&self, eip: u32) -> Option<iced_x86::Code> {
-        let mut bytes = [0; 15];
-        let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-        if self.memory.read_into(eip, &mut bytes).is_err() {
-            self.memory.read_into(eip, &mut bytes[..page]).ok()?;
-        }
-        let mut decoder =
-            iced_x86::Decoder::with_ip(32, &bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
-        Some(decoder.decode().code())
+    pub fn instruction_form(&self, eip: u32) -> Option<crate::translate::front::tags::Code> {
+        crate::translate::front::instruction_form(&self.memory, eip)
     }
 
     /// Instructions by form, most frequent first, as the code at their
     /// EIPs decodes now: those interpreted after an exit, after a fault, or
     /// (`which` 2) run by helpers.
-    pub fn interpreted_forms(&self, which: u8) -> Vec<(iced_x86::Code, u64)> {
+    pub fn interpreted_forms(&self, which: u8) -> Vec<(crate::translate::front::tags::Code, u64)> {
         let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
         #[cfg(native)]
         let helpers = self
@@ -419,20 +413,9 @@ impl Executor {
             _ => &helpers,
         };
         for (&eip, &count) in histogram {
-            let mut bytes = [0; 15];
-            let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-            if self.memory.read_into(eip, &mut bytes).is_err()
-                && self.memory.read_into(eip, &mut bytes[..page]).is_err()
-            {
-                continue;
+            if let Some(form) = self.instruction_form(eip) {
+                *forms.entry(form).or_default() += count;
             }
-            let mut decoder = iced_x86::Decoder::with_ip(
-                32,
-                &bytes,
-                u64::from(eip),
-                iced_x86::DecoderOptions::NONE,
-            );
-            *forms.entry(decoder.decode().code()).or_default() += count;
         }
         let mut forms: Vec<_> = forms.into_iter().collect();
         forms.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
@@ -578,7 +561,7 @@ impl Executor {
                 std::ptr::null_mut(),
             )?;
             if let Some(run) = &run
-                && run.exit != Exit::Stepped
+                && !matches!(run.exit, Exit::Stepped | Exit::FirstVisit)
             {
                 let check = trace.check_retired(run.retired as usize, &self.state, &self.memory);
                 let strict = verifier.strict;
@@ -701,6 +684,23 @@ impl Executor {
             } {
                 match exit {
                     Exit::Dispatch | Exit::Budget => continue,
+                    #[cfg(native)]
+                    Exit::FirstVisit => {
+                        let fuel = self.state.fuel.min(crate::native::SLICE) as u32;
+                        let visit = self.interpreter.run_first_visit(
+                            &mut self.state,
+                            &mut self.memory,
+                            stop,
+                            fuel,
+                        );
+                        let diagnostics = &mut self.native.as_mut().unwrap().diagnostics;
+                        diagnostics.first_declined += u64::from(visit.slow);
+                        diagnostics.first_quick_decodes += u64::from(visit.quick_decodes);
+                        diagnostics.first_full_decodes += u64::from(visit.full_decodes);
+                        (visit.execution, visit.last_units)
+                    }
+                    #[cfg(not(native))]
+                    Exit::FirstVisit => unreachable!("no native dispatch"),
                     Exit::Computation => {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);

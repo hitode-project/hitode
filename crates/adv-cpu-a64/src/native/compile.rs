@@ -24,7 +24,7 @@ pub(super) struct Request {
     pub generation: u64,
     pub code: usize,
     pub task: Task,
-    pub trace: Trace,
+    pub unit: Arc<Unit>,
     pub proof: Option<Proof>,
     pub at: CpuState,
     pub checked: FxHashSet<u32>,
@@ -83,7 +83,7 @@ fn computation_proof(trace: &Trace) -> Option<Proof> {
     proof.prove_split(trace, |_, _| {
         let i = index.get();
         index.set(i + 1);
-        trace.x86[i]
+        trace.x86[i].clone()
     });
     Some(proof)
 }
@@ -94,7 +94,7 @@ fn compile(request: Request) -> Compiled {
         generation,
         code,
         task,
-        trace,
+        unit,
         proof,
         at,
         checked,
@@ -103,8 +103,6 @@ fn compile(request: Request) -> Compiled {
         cuts,
         count_entries,
     } = request;
-    let mut unit = Unit::default();
-    unit.trace = trace;
     let proof = if task == Task::Discover {
         proof.or_else(|| computation_proof(&unit.trace))
     } else {
@@ -114,9 +112,9 @@ fn compile(request: Request) -> Compiled {
     let resident = if task == Task::Job {
         None
     } else {
-        let mut cut_unit;
+        let cut_unit;
         let unit = if cuts.is_empty() {
-            &unit
+            &*unit
         } else {
             let cut: Vec<_> = unit
                 .trace
@@ -124,8 +122,7 @@ fn compile(request: Request) -> Compiled {
                 .iter()
                 .map(|i| cuts.contains(&i.pc))
                 .collect();
-            cut_unit = Unit::default();
-            cut_unit.trace = unit.trace.cut(&cut);
+            cut_unit = unit.cut(&cut);
             &cut_unit
         };
         match front::build_with(
