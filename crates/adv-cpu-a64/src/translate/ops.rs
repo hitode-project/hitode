@@ -7,7 +7,7 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 
 use super::access::{Addr, Dir};
-use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
+use super::decode::{Alu, ESP, EventOp, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
@@ -50,6 +50,23 @@ impl Translator<'_> {
                 }
             }
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
+            Op::Event(event) => {
+                let (event, refund) = match event {
+                    EventOp::Software(vector) => (
+                        runtime::Event::Software {
+                            vector,
+                            len: inst.next_pc.wrapping_sub(inst.pc) as u8,
+                        },
+                        self.trace.unused(self.index),
+                    ),
+                    EventOp::System => (runtime::Event::System, self.trace.owed(self.index)),
+                    EventOp::Unsupported(form) => (
+                        runtime::Event::Unsupported(form),
+                        self.trace.owed(self.index),
+                    ),
+                };
+                self.follow_exit(Exit::Event(event), inst.pc, refund, false);
+            }
             Op::Timestamp => self.timestamp(),
             Op::Cpuid => self.cpuid(),
             Op::PushFlags(width) => {
@@ -61,7 +78,7 @@ impl Translator<'_> {
                     self.push_part(Part::Reg(0), width, true);
                 }
             }
-            Op::PopFlags(width, helper) => self.pop_flags(width, helper),
+            Op::PopFlags(width) => self.pop_flags(width),
             Op::Stack(kind, part, width, helper) => self.stack(kind, part, width, helper),
             Op::Lahf => {
                 self.read_flags();
@@ -373,13 +390,12 @@ impl Translator<'_> {
         ]);
     }
 
-    fn pop_flags(&mut self, width: u8, helper: u8) {
+    fn pop_flags(&mut self, width: u8) {
         self.flush_simd();
         self.vector = super::simd::Vector::default();
         self.canonicalize();
         self.access(Addr::Window(host(ESP)), width, Dir::Load, X6);
         let (slow, done) = (self.asm.label(), self.asm.label());
-        self.asm.tbz(true, X6, 8, slow);
         self.prepare(Operand::Guest(ESP));
         self.emit_all(&[
             add_imm(W, X16, host(ESP), u32::from(width), false),
@@ -408,11 +424,18 @@ impl Translator<'_> {
             ubfx(W, super::X12, X6, 10, 1),
         ]);
         self.forget(Operand::Guest(ESP));
+        self.state = State::CANONICAL;
+        self.asm.tbz(true, X6, 8, slow);
         self.asm.b(done);
         self.asm.bind(slow);
-        self.helper(helper);
+        let inst = self.trace.insts[self.index];
+        self.follow_exit(
+            Exit::Dispatch,
+            inst.next_pc,
+            self.trace.unused(self.index),
+            false,
+        );
         self.asm.bind(done);
-        self.state = State::CANONICAL;
     }
 
     fn push_part(&mut self, part: Part, width: u8, flags: bool) {

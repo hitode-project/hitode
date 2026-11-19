@@ -65,7 +65,8 @@ pub enum Op {
     Pop(u8),
     PopMemory(Mem),
     PushFlags(u8),
-    PopFlags(u8, u8),
+    PopFlags(u8),
+    Event(EventOp),
     Stack(Mnemonic, Part, u8, u8),
     Lahf,
     Timestamp,
@@ -110,6 +111,14 @@ pub enum Op {
     Helper(u8),
     /// A direct body call, by its index in the trace's bodies (A64-CALL-2).
     Body(u8),
+}
+
+/// Terminal operations selected during decode and delivered by the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventOp {
+    System,
+    Software(u8),
+    Unsupported(u16),
 }
 
 fn gpr32(register: Register) -> Option<u8> {
@@ -403,10 +412,18 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         },
         M::Pushfd => Op::PushFlags(4),
         M::Pushf => Op::PushFlags(2),
+        M::Popfd => Op::PopFlags(4),
+        M::Popf => Op::PopFlags(2),
         M::Lahf => Op::Lahf,
         M::Rdtsc => Op::Timestamp,
         M::Cpuid => Op::Cpuid,
         M::Int if instruction.immediate8() == 0x2e => Op::Syscall,
+        M::Int => Op::Event(EventOp::Software(instruction.immediate8())),
+        M::Int3 => Op::Event(EventOp::Software(3)),
+        M::Sgdt | M::Sidt | M::Sldt | M::Cli | M::Sti => Op::Event(EventOp::System),
+        M::Smsw | M::Str | M::Daa | M::Das | M::Aaa | M::Aas | M::Aam | M::Aad => {
+            Op::Event(EventOp::Unsupported(instruction.code() as u16))
+        }
         M::Jmp => match instruction.op_kind(0) {
             OpKind::NearBranch32 => Op::Jmp(instruction.near_branch32()),
             OpKind::Register | OpKind::Memory => Op::JmpIndirect(operand(instruction, 0)?),
@@ -817,15 +834,6 @@ fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> O
     let instruction = native;
     Some(if let Some(op) = plan(&instruction) {
         op
-    } else if matches!(instruction.mnemonic(), Mnemonic::Popfd | Mnemonic::Popf) {
-        Op::PopFlags(
-            if instruction.mnemonic() == Mnemonic::Popf {
-                2
-            } else {
-                4
-            },
-            index,
-        )
     } else if matches!(
         instruction.mnemonic(),
         Mnemonic::Push
@@ -966,7 +974,7 @@ impl Op {
                 (F::NONE, F::ALL.minus(F::CF), matches!(dst, Part::Mem(_)))
             }
             // The interpreter reads and writes canonical flags.
-            Op::Helper(_) | Op::Syscall | Op::Timestamp => (F::ALL, F::NONE, true),
+            Op::Helper(_) | Op::Event(_) | Op::Syscall | Op::Timestamp => (F::ALL, F::NONE, true),
             Op::Stack(..) => (F::NONE, F::NONE, true),
             Op::PopMemory(_) => (F::NONE, F::NONE, true),
             Op::PushFlags(_) | Op::Lahf => (F::ALL, F::NONE, true),

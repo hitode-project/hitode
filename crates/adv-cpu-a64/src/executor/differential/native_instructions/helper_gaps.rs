@@ -1569,3 +1569,33 @@ fn common_pop_flags_setting_tf_single_steps_the_next_instruction() {
         }
     }
 }
+
+// spec: A64A-FALL-4, A64-VER-1
+#[test]
+fn system_and_software_events_keep_the_core_outcomes() {
+    for (bytes, interpreted) in [
+        (&[0x0f, 0x01, 0x03][..], 1), // SGDT [EBX]
+        (&[0x0f, 0x01, 0x0b][..], 1), // SIDT [EBX]
+        (&[0x0f, 0x00, 0x03][..], 1), // SLDT [EBX]
+        (&[0xfa][..], 1),             // CLI
+        (&[0xfb][..], 1),             // STI
+        (&[0xcc][..], 0),             // INT3
+        (&[0xcd, 0x80][..], 0),       // INT 0x80
+        (&[0x0f, 0x01, 0xe0][..], 0), // SMSW EAX
+        (&[0x0f, 0x00, 0xc8][..], 0), // STR EAX
+        (&[0x27][..], 0),             // DAA
+        (&[0xd4, 0x0a][..], 0),       // AAM
+    ] {
+        let p = fixture(|a| a.db(bytes).unwrap());
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 100), oracle.run(p.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(
+            native.stats.interpreter_entries, interpreted,
+            "{bytes:02x?}"
+        );
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+    }
+}

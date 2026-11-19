@@ -316,6 +316,8 @@ pub enum Event {
     CheckedAccess,
     /// A waiting x87 instruction has an unmasked exception pending.
     PendingX87,
+    /// An event answered by the guest system profile.
+    System,
     /// An architectural exception, with any state changes already committed.
     Exception(u8),
     /// A core semantic gap, with the decoded instruction form.
@@ -385,6 +387,7 @@ impl Exit {
             Self::Event(Event::PendingX87) => 11,
             Self::Plan(PlanEvent::BodyStack) => 12,
             Self::Event(Event::CheckedAccess) => 13,
+            Self::Event(Event::System) => 14,
             Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
             Self::Event(Event::Unsupported(code)) => 0x8000 | code,
             Self::Event(Event::Software { vector, len }) => {
@@ -412,6 +415,7 @@ impl Exit {
             11 => Some(Self::Event(Event::PendingX87)),
             12 => Some(Self::Plan(PlanEvent::BodyStack)),
             13 => Some(Self::Event(Event::CheckedAccess)),
+            14 => Some(Self::Event(Event::System)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
             0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {

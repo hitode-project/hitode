@@ -350,6 +350,7 @@ fn features() -> Features {
 pub(crate) enum InterpreterCause {
     HostFault,
     DebugFlags,
+    System,
     Fetch,
     InvalidEncoding,
     OperandFault,
@@ -898,6 +899,8 @@ impl Native {
             InterpreterCause::DebugFlags
         } else if exit == Exit::Event(crate::runtime::Event::Replay) {
             InterpreterCause::HostFault
+        } else if exit == Exit::Event(crate::runtime::Event::System) {
+            InterpreterCause::System
         } else {
             match step {
                 Step::FetchFault { .. } => InterpreterCause::Fetch,

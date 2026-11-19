@@ -727,7 +727,7 @@ impl Trace {
                     inst.mode = Mode::Inline(ret);
                     Some((ret, parent))
                 }
-                Op::Ret(_) | Op::JmpIndirect(_) | Op::CallIndirect(_) => {
+                Op::Ret(_) | Op::JmpIndirect(_) | Op::CallIndirect(_) | Op::Event(_) => {
                     inst.next = Next::Dynamic;
                     None
                 }

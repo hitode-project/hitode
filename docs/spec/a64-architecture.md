@@ -101,8 +101,9 @@ The chain keeps up to three versions, from most specific to most general. A join
 | A misaligned aligned access or an invalid LDMXCSR value (#GP) |
 | A division that raises #DE |
 | An unmasked SSE exception with the committed MXCSR status (#XM) |
-| INT 0x2e without a host handler |
-| A core semantic gap carrying the decoded operation and EIP. This terminal event returns the unsupported-instruction outcome. |
+| Software interrupt, including INT 0x2e without a host handler |
+| SGDT, SIDT, SLDT, CLI and STI, answered by the core's guest system profile |
+| A core semantic gap carrying the decoded operation and EIP. This terminal event returns the unsupported-instruction outcome for SMSW, STR, DAA, DAS, AAA, AAS, AAM and AAD, as well as unsupported operands. |
 
 ## Tier-1 placement
 

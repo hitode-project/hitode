@@ -999,14 +999,14 @@ mod speed_tests {
         ));
         assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
         cpu.count_tier0(true);
-        cpu.write(0x12000, &[0xcc]).unwrap(); // an exit interpreted by the owner
+        cpu.write(0x12000, &[0xcc]).unwrap(); // an event delivered by the owner
         cpu.state.eip = 0x12000;
         cpu.state.eflags &= !(1 << 8);
         assert!(matches!(
             cpu.run(0x12001, 10).unwrap(),
             RunOutcome::Trap { vector: 3, .. }
         ));
-        assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
+        assert_eq!(cpu.retired_forms(), Some([1, 0, 0, 0, 0]));
     }
 
     // spec: WINE-UI-8, A64-MEM-5
