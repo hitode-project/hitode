@@ -429,11 +429,17 @@ fn report(
     ];
     #[cfg(feature = "gpu")]
     if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
+        let frames = counters.presents.max(1) as f64;
         fields.push(format!(
             concat!(
                 "\"d3d9\": {{\"fixed_draws\": {}, \"fixed_shaders_built\": {}, ",
                 "\"fixed_shader_cache_hits\": {}, \"draw_key_hashes\": {}, ",
                 "\"reused_draws\": {}, \"rested_draws\": {}, ",
+                "\"recorded_commands\": {}, \"uncoalesced_gpu_draws\": {}, \"gpu_draws\": {}, ",
+                "\"fast_path_draws\": {}, \"general_path_draws\": {}, ",
+                "\"recorded_commands_per_frame\": {:.2}, \"uncoalesced_gpu_draws_per_frame\": {:.2}, ",
+                "\"gpu_draws_per_frame\": {:.2}, \"fast_path_draws_per_frame\": {:.2}, ",
+                "\"general_path_draws_per_frame\": {:.2}, ",
                 "\"readback_bytes\": {}, \"readback_bytes_per_frame\": {:.2}}}"
             ),
             counters.fixed_draws,
@@ -442,8 +448,18 @@ fn report(
             counters.draw_key_hashes,
             counters.reused_draws,
             counters.rested_draws,
+            counters.recorded_commands,
+            counters.uncoalesced_gpu_draws,
+            counters.gpu_draws,
+            counters.fast_path_draws,
+            counters.general_path_draws,
+            counters.recorded_commands as f64 / frames,
+            counters.uncoalesced_gpu_draws as f64 / frames,
+            counters.gpu_draws as f64 / frames,
+            counters.fast_path_draws as f64 / frames,
+            counters.general_path_draws as f64 / frames,
             counters.readback_bytes,
-            counters.readback_bytes as f64 / counters.presents.max(1) as f64,
+            counters.readback_bytes as f64 / frames,
         ));
     }
 

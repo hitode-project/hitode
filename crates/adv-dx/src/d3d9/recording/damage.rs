@@ -1,4 +1,6 @@
 //! Ordered write comparison, forward damage and reverse execution demand.
+//! Frame arrays own records and observations. History builds its fallback
+//! indexes when the frame rolls over, so cursor matches need only the entries.
 use super::*;
 use adv_device::{
     gpu::{AttributeFormat, Image},
@@ -128,39 +130,62 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             }
         }
     }
-    let v = d.state.viewport;
-    let mut lo = [f32::INFINITY; 2];
-    let mut hi = [f32::NEG_INFINITY; 2];
-    for p in &positions[..count] {
+    let mut bounds = Bounds::default();
+    for &p in &positions[..count] {
         if p.iter().any(|x| !x.is_finite()) || p[3] <= 0. {
             return None;
         }
-        let screen = [
-            v.x + (p[0] / p[3] + 1.) * v.width * 0.5,
-            v.y + (1. - p[1] / p[3]) * v.height * 0.5,
-        ];
-        for n in 0..2 {
-            if !screen[n].is_finite() {
-                return None;
-            }
-            lo[n] = lo[n].min(screen[n]);
-            hi[n] = hi[n].max(screen[n]);
+        let screen = screen(p, d.state.viewport);
+        if !screen.into_iter().all(f32::is_finite) {
+            return None;
+        }
+        bounds.add(screen);
+    }
+    margin.is_finite().then(|| bounds.rectangle(d, margin))
+}
+
+pub(super) fn screen(p: [f32; 4], v: adv_device::gpu::Viewport) -> [f32; 2] {
+    [
+        v.x + (p[0] / p[3] + 1.) * v.width * 0.5,
+        v.y + (1. - p[1] / p[3]) * v.height * 0.5,
+    ]
+}
+
+pub(super) struct Bounds {
+    lo: [f32; 2],
+    hi: [f32; 2],
+}
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            lo: [f32::INFINITY; 2],
+            hi: [f32::NEG_INFINITY; 2],
         }
     }
-    if !margin.is_finite() {
-        return None;
-    }
-    let x = (lo[0] - margin).floor().max(v.x).max(0.) as u32;
-    let y = (lo[1] - margin).floor().max(v.y).max(0.) as u32;
-    let r = Rect {
-        x,
-        y,
-        w: ((hi[0] + margin).ceil().min(v.x + v.width) as u32).saturating_sub(x),
-        h: ((hi[1] + margin).ceil().min(v.y + v.height) as u32).saturating_sub(y),
-    }
-    .clipped(full(&d.target.image));
-    Some(d.state.scissor.map_or(r, |s| r.clipped(s)))
 }
+impl Bounds {
+    pub fn add(&mut self, screen: [f32; 2]) {
+        for (n, v) in screen.into_iter().enumerate() {
+            self.lo[n] = self.lo[n].min(v);
+            self.hi[n] = self.hi[n].max(v);
+        }
+    }
+
+    pub fn rectangle(self, d: &fixed::Draw, margin: f32) -> Rect {
+        let v = d.state.viewport;
+        let x = (self.lo[0] - margin).floor().max(v.x).max(0.) as u32;
+        let y = (self.lo[1] - margin).floor().max(v.y).max(0.) as u32;
+        let r = Rect {
+            x,
+            y,
+            w: ((self.hi[0] + margin).ceil().min(v.x + v.width) as u32).saturating_sub(x),
+            h: ((self.hi[1] + margin).ceil().min(v.y + v.height) as u32).saturating_sub(y),
+        }
+        .clipped(full(&d.target.image));
+        d.state.scissor.map_or(r, |s| r.clipped(s))
+    }
+}
+
 fn fixed_index(p: &adv_device::gpu::ProgrammableDraw, ordinal: usize) -> usize {
     if let Some(indices) = &p.indices {
         indices[ordinal] as usize
@@ -189,10 +214,16 @@ fn fixed_position(d: &fixed::Draw, ordinal: usize) -> Option<([f32; 4], [f32; 3]
         attribute.offset as usize,
         &mut bytes[..attribute.format.size() as usize],
     )?;
-    let mut raw =
-        std::array::from_fn(|n| f32::from_le_bytes(bytes[n * 4..][..4].try_into().unwrap()));
-    let viewport = d.state.viewport;
-    if let Some([world, view, projection]) = &fixed.transforms {
+    let raw = std::array::from_fn(|n| f32::from_le_bytes(bytes[n * 4..][..4].try_into().unwrap()));
+    fixed_clip(raw, fixed.transforms.as_ref(), d.state.viewport)
+}
+
+pub(super) fn fixed_clip(
+    mut raw: [f32; 4],
+    transforms: Option<&[[f32; 16]; 3]>,
+    viewport: adv_device::gpu::Viewport,
+) -> Option<([f32; 4], [f32; 3])> {
+    if let Some([world, view, projection]) = transforms {
         raw[3] = 1.;
         let eye = fixed::row(fixed::row(raw, world), view);
         let mut clip = fixed::row(eye, projection);
@@ -255,24 +286,25 @@ pub(in crate::d3d9) fn stream_input(
     }
     Some(input)
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Samples {
     base: u128,
-    reads: SmallVec<[Sample; 2]>,
+    reads: SmallVec<[Sample; 4]>,
 }
+#[derive(Clone)]
 struct Sample {
     source: Content,
     mappings: SmallVec<[sampling::Mapping; 2]>,
     version: u128,
 }
 /// The generation and number of writes visible to a read.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Prefix {
     forward: usize,
     len: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Match {
     index: usize,
     inputs: bool,
@@ -285,7 +317,7 @@ struct Generation {
 }
 
 struct Observed {
-    samples: Arc<Samples>,
+    samples: Samples,
     prefixes: SmallVec<[Option<Prefix>; 4]>,
 }
 
@@ -296,8 +328,8 @@ struct Sequence {
     entries: Vec<(u128, Rect)>,
     observed: Vec<Option<Observed>>,
     forward: usize,
-    index: HashMap<u128, SmallVec<[usize; 2]>>,
-    sampled_index: HashMap<u128, SmallVec<[usize; 2]>>,
+    index: Vec<(u128, usize)>,
+    sampled_index: Vec<(u128, usize)>,
     cursor: usize,
     matches: Vec<Option<Match>>,
     different: bool,
@@ -309,6 +341,23 @@ struct Sequence {
     initial: u128,
 }
 impl Sequence {
+    fn index(&mut self) {
+        self.index.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(n, &(key, _))| (key, n)),
+        );
+        self.index.sort_unstable();
+        self.sampled_index.extend(
+            self.observed
+                .iter()
+                .enumerate()
+                .filter_map(|(n, entry)| Some((entry.as_ref()?.samples.base, n))),
+        );
+        self.sampled_index.sort_unstable();
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.observed.clear();
@@ -348,10 +397,14 @@ impl History {
     fn current(&self) -> Option<&Sequence> {
         self.next.last()
     }
-    fn recycle_previous(&mut self) {
+    fn replace_previous(&mut self) {
         for mut seq in self.previous.drain(..) {
             seq.clear();
             self.spare.push(seq);
+        }
+        std::mem::swap(&mut self.previous, &mut self.next);
+        for sequence in &mut self.previous {
+            sequence.index();
         }
     }
     fn recycle_next(&mut self) {
@@ -384,7 +437,7 @@ impl History {
         &mut self,
         key: u128,
         bounds: Rect,
-        samples: Arc<Samples>,
+        samples: Samples,
         prefixes: SmallVec<[Option<Prefix>; 4]>,
     ) {
         let previous = self
@@ -394,15 +447,18 @@ impl History {
             .flatten()
             .map_or(&*EMPTY, |m| &self.previous[m]);
         let s = self.next.last_mut().unwrap();
-        let at = s.entries.len();
-        let candidate = |positions: &SmallVec<[usize; 2]>| {
-            let first = positions.partition_point(|&n| n < s.cursor);
-            positions[first..]
+        let candidate = |key, entries: &[(u128, usize)]| {
+            let first = entries.partition_point(|&v| v < (key, s.cursor));
+            entries[first..]
                 .iter()
-                .copied()
-                .find(|&n| previous.entries[n].1 == bounds)
+                .take_while(|&&(k, _)| k == key)
+                .find_map(|&(_, n)| (previous.entries[n].1 == bounds).then_some(n))
         };
-        let exact = previous.index.get(&key).and_then(candidate);
+        let exact = if previous.entries.get(s.cursor) == Some(&(key, bounds)) {
+            Some(s.cursor)
+        } else {
+            candidate(key, &previous.index)
+        };
         let matched = exact
             .map(|index| Match {
                 index,
@@ -412,14 +468,10 @@ impl History {
                 if samples.reads.is_empty() {
                     return None;
                 }
-                previous
-                    .sampled_index
-                    .get(&samples.base)
-                    .and_then(candidate)
-                    .map(|index| Match {
-                        index,
-                        inputs: true,
-                    })
+                candidate(samples.base, &previous.sampled_index).map(|index| Match {
+                    index,
+                    inputs: true,
+                })
             });
         s.different |= exact != Some(s.cursor);
         if let Some(matched) = matched {
@@ -427,12 +479,10 @@ impl History {
         }
         s.matches.push(matched);
         if !samples.reads.is_empty() {
-            s.sampled_index.entry(samples.base).or_default().push(at);
             s.observed.push(Some(Observed { samples, prefixes }));
         } else {
             s.observed.push(None);
         }
-        s.index.entry(key).or_default().push(at);
         s.entries.push((key, bounds));
     }
     /// After every generation's change: what the final version changed since
@@ -472,8 +522,7 @@ impl History {
                 take_region(pool, size, true)
             }
         };
-        self.recycle_previous();
-        std::mem::swap(&mut self.previous, &mut self.next);
+        self.replace_previous();
         self.matched.clear();
         (changed, redraw)
     }
@@ -489,7 +538,8 @@ impl History {
             && self.stale.get(&next.slot).is_some_and(Region::is_empty)
     }
 }
-type Write = (Content, u128, Rect, Rect, u128, bool, Arc<Samples>);
+type Write = (Content, u128, Rect, Rect, u128, bool);
+#[derive(Clone)]
 pub(super) struct Record {
     writes: SmallVec<[Write; 3]>,
     /// What the write's pixels read from each source: a proven mapping, or
@@ -500,6 +550,11 @@ pub(super) struct Record {
     upload: bool,
     clear: bool,
 }
+pub(super) struct Saved {
+    record: Record,
+    samples: SmallVec<[Samples; 3]>,
+}
+
 /// Scissors per write. A draw spanning several distant changes is submitted
 /// once per scissor it meets; past this many, coarser cells merge them.
 const PARTS: usize = 8;
@@ -548,6 +603,65 @@ pub(super) struct Analysis {
     schedule_scratch: schedule::Scratch,
 }
 impl Analysis {
+    #[cfg(test)]
+    pub fn recorded(&self) -> impl std::fmt::Debug + PartialEq + use<> {
+        let nodes: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.record.bounds,
+                    n.record.writes.clone(),
+                    n.record
+                        .demands
+                        .iter()
+                        .map(|&(source, mapping)| (source, mapping.map(sampling::Mapping::bits)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut histories: Vec<_> = self
+            .histories
+            .iter()
+            .map(|(&k, history)| {
+                let sequences: Vec<_> = history
+                    .next
+                    .iter()
+                    .map(|s| {
+                        let observed: Vec<_> = s
+                            .observed
+                            .iter()
+                            .map(|o| {
+                                o.as_ref().map(|o| {
+                                    let reads: Vec<_> = o
+                                        .samples
+                                        .reads
+                                        .iter()
+                                        .map(|r| {
+                                            (
+                                                r.source,
+                                                r.version,
+                                                r.mappings
+                                                    .iter()
+                                                    .map(|m| m.bits())
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        })
+                                        .collect();
+                                    (o.samples.base, reads, o.prefixes.clone())
+                                })
+                            })
+                            .collect();
+                        (s.entries.clone(), s.matches.clone(), observed)
+                    })
+                    .collect();
+                (k, sequences)
+            })
+            .collect();
+        histories.sort_by_key(|(k, _)| (k.3, k.1, k.2));
+        (nodes, histories)
+    }
+
     pub fn written(&self, content: &Content) -> bool {
         self.histories
             .get(content)
@@ -556,11 +670,12 @@ impl Analysis {
     pub fn record(
         &mut self,
         p: &key::Prepared,
-        command: u128,
-        attachment: u128,
+        [command, attachment]: [u128; 2],
         contents: &Contents,
+        read_versions: &[Option<u128>],
         slot: Option<u128>,
-    ) -> Arc<Record> {
+        retain: bool,
+    ) -> Option<Arc<Saved>> {
         let image = image(&p.operation).unwrap();
         let slot = slot.unwrap_or_else(|| hash(image.id()));
         let mut demands = SmallVec::new();
@@ -595,6 +710,7 @@ impl Analysis {
             upload: matches!(p.operation, Operation::Upload { .. }),
             clear: matches!(p.operation, Operation::Clear { .. }),
         };
+        let mut observations = SmallVec::new();
         for &(k, overwrite) in &p.writes {
             let current = self.histories.get(&k).and_then(History::current);
             let depth = match &p.operation {
@@ -634,14 +750,14 @@ impl Analysis {
                 retained,
             ));
             let ignores_color = p.ignores_sampled_color(k);
-            let sampled = |source: &&Content| source.2 != 0 || !ignores_color;
             let samples = Samples {
                 base: hash((p.key, retained)),
                 reads: p
                     .reads
                     .iter()
-                    .filter(sampled)
-                    .map(|&source| Sample {
+                    .zip(read_versions)
+                    .filter(|(source, _)| source.2 != 0 || !ignores_color)
+                    .map(|(&source, &version)| Sample {
                         source,
                         mappings: p
                             .samples
@@ -649,17 +765,21 @@ impl Analysis {
                             .filter(|r| r.source == source)
                             .map(|r| r.mapping)
                             .collect(),
-                        version: contents.get(&source).copied().unwrap_or(0),
+                        version: version.unwrap_or(0),
                     })
                     .collect(),
             };
-            record
-                .writes
-                .push((k, key, bounds, full, shape, overwrite, Arc::new(samples)));
+            observations.push(samples);
+            record.writes.push((k, key, bounds, full, shape, overwrite));
         }
-        let record = Arc::new(record);
-        self.replay(&record, slot, contents);
-        record
+        let saved = retain.then(|| {
+            Arc::new(Saved {
+                record: record.clone(),
+                samples: observations.clone(),
+            })
+        });
+        self.install(record, observations, slot, contents);
+        saved
     }
     pub fn independent(&self, k: &Content) -> bool {
         self.histories
@@ -667,7 +787,17 @@ impl Analysis {
             .and_then(History::current)
             .is_some_and(|s| s.independent)
     }
-    pub fn replay(&mut self, record: &Arc<Record>, slot: u128, contents: &Contents) {
+    pub fn replay(&mut self, saved: &Saved, slot: u128, contents: &Contents) {
+        self.install(saved.record.clone(), saved.samples.clone(), slot, contents);
+    }
+
+    fn install(
+        &mut self,
+        record: Record,
+        samples: SmallVec<[Samples; 3]>,
+        slot: u128,
+        contents: &Contents,
+    ) {
         let at = self.nodes.len();
         let producers = record
             .demands
@@ -679,21 +809,13 @@ impl Analysis {
             .iter()
             .map(|w| self.last_writer.insert(w.0, at))
             .collect();
-        self.nodes.push(schedule::Node {
-            slot,
-            record: record.clone(),
-            producers,
-            previous,
-            generations: SmallVec::new(),
-            submissions: 0,
-        });
+        let mut generations = SmallVec::new();
         // Reads of all aspects precede this command's writes, including a
         // color write that also updates the depth or stencil it tests.
         let mut prefixes: [SmallVec<[Option<Prefix>; 4]>; 3] =
             [SmallVec::new(), SmallVec::new(), SmallVec::new()];
-        for (write, prefixes) in record.writes.iter().zip(&mut prefixes) {
-            *prefixes = write
-                .6
+        for (samples, prefixes) in samples.iter().zip(&mut prefixes) {
+            *prefixes = samples
                 .reads
                 .iter()
                 .map(|r| {
@@ -705,8 +827,8 @@ impl Analysis {
                 })
                 .collect();
         }
-        for (&(k, key, bounds, full, shape, overwrite, ref samples), prefixes) in
-            record.writes.iter().zip(prefixes)
+        for ((&(k, key, bounds, full, shape, overwrite), prefixes), samples) in
+            record.writes.iter().zip(prefixes).zip(samples)
         {
             let history = self.histories.entry(k).or_default();
             let fresh = overwrite && bounds == full;
@@ -727,9 +849,9 @@ impl Analysis {
                 }
             }
             let forward = s.forward;
-            history.record(key, bounds, samples.clone(), prefixes);
+            history.record(key, bounds, samples, prefixes);
             let generation = history.next.len() - 1;
-            self.nodes[at].generations.push(Generation {
+            generations.push(Generation {
                 index: generation,
                 forward,
             });
@@ -743,6 +865,14 @@ impl Analysis {
                     });
             }
         }
+        self.nodes.push(schedule::Node {
+            slot,
+            record,
+            producers,
+            previous,
+            generations,
+            submissions: 0,
+        });
     }
     /// Plans the frame; returns whole-chain promotions for intermediate
     /// external reads and late demands, respectively.
@@ -975,8 +1105,7 @@ impl Analysis {
     pub fn finish(&mut self) {
         for h in self.histories.values_mut() {
             if !self.planned && !h.next.is_empty() {
-                h.recycle_previous();
-                std::mem::swap(&mut h.previous, &mut h.next);
+                h.replace_previous();
             } else {
                 h.recycle_next();
             }

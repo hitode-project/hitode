@@ -1597,7 +1597,10 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
                     draw.state,
                 )
             };
-            env.ext.get_mut::<State>().frames.gpu_draws += gpu.draw_count() - before;
+            let draws = gpu.draw_count() - before;
+            let frames = &mut env.ext.get_mut::<State>().frames;
+            frames.gpu_draws += draws;
+            frames.uncoalesced_gpu_draws += draws;
             result.map(|()| Completion::Command)
         }
         Operation::Copy {

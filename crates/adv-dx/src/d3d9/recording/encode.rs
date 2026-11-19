@@ -19,8 +19,15 @@ fn draw_at(f: &Recording, n: usize) -> Option<&fixed::Draw> {
     }
 }
 
-fn clip(f: &Recording, n: usize) -> Option<&[Rect]> {
-    f.nodes[n].and_then(|node| f.damage.clip(node))
+fn clips(f: &Recording, n: usize) -> Option<smallvec::SmallVec<[Rect; 8]>> {
+    Some(
+        f.damage
+            .clip(f.nodes[n]?)?
+            .iter()
+            .copied()
+            .filter(|&r| !f.passes.outside_damage(n, r))
+            .collect(),
+    )
 }
 
 fn same_image(a: Option<&adv_device::gpu::Image>, b: Option<&adv_device::gpu::Image>) -> bool {
@@ -122,13 +129,15 @@ fn draw_size(d: &fixed::Draw) -> (usize, usize) {
 
 fn combine<'a>(
     first: &fixed::Draw,
-    draws: impl Iterator<Item = &'a fixed::Draw> + Clone,
+    draws: impl Iterator<Item = (&'a fixed::Draw, Option<&'a [u8]>)> + Clone,
 ) -> fixed::Draw {
     let mut merged = first.clone();
     let topology = first.state.topology;
     merged.state.topology = list(topology);
     if let Some(program) = &first.programmable {
-        let programs = draws.map(|d| d.programmable.as_deref().unwrap());
+        let programs = draws
+            .clone()
+            .map(|(d, _)| d.programmable.as_deref().unwrap());
         let mut program = program.as_ref().clone();
         program.vertex_count = programs.clone().map(|p| p.vertex_count).sum();
         let indexed = list(topology) != topology || programs.clone().any(|p| p.indices.is_some());
@@ -152,8 +161,8 @@ fn combine<'a>(
             }
             let stride = stream.stride as usize;
             let mut bytes = Vec::with_capacity(stride * program.vertex_count as usize);
-            for p in programs.clone() {
-                let source = &p.streams[n].bytes;
+            for (p, (_, capture)) in programs.clone().zip(draws.clone()) {
+                let source = capture.unwrap_or_else(|| p.streams[n].bytes.as_slice());
                 let len = stride * p.vertex_count as usize;
                 let end = bytes.len() + len;
                 bytes.extend_from_slice(&source[..source.len().min(len)]);
@@ -164,7 +173,7 @@ fn combine<'a>(
         merged.programmable = Some(Arc::new(program));
     } else {
         let mut vertices = Vec::new();
-        for d in draws {
+        for (d, _) in draws {
             indices(
                 topology,
                 d.vertices.len(),
@@ -183,10 +192,8 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     let Some(first) = draw_at(f, start) else {
         return Ok(false);
     };
-    let clips = clip(f, start);
-    if clips.is_some_and(|clips| {
-        clips.is_empty() || clips.iter().any(|&r| f.passes.outside_damage(start, r))
-    }) {
+    let scissors = clips(f, start);
+    if scissors.as_ref().is_some_and(|clips| clips.is_empty()) {
         return Ok(false);
     }
     let (mut indices, mut bytes) = draw_size(first);
@@ -201,10 +208,7 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     }
     let mut end = start + 1;
     while let Some(next) = f.commands.get(end).and_then(|_| draw_at(f, end)) {
-        if !f.passes.can_merge(start, end)
-            || clip(f, end) != clips
-            || clips.is_some_and(|clips| clips.iter().any(|&r| f.passes.outside_damage(end, r)))
-            || !compatible(first, next)
+        if !f.passes.can_merge(start, end) || clips(f, end) != scissors || !compatible(first, next)
         {
             break;
         }
@@ -219,12 +223,22 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     if end == start + 1 {
         return Ok(false);
     }
-    let operation = Operation::Draw(combine(first, (start..end).map(|n| draw_at(f, n).unwrap())));
-    let clips = clips.map(schedule_clips);
+    let operation = Operation::Draw(combine(
+        first,
+        (start..end).map(|n| {
+            (
+                draw_at(f, n).unwrap(),
+                f.vertex_ranges[n]
+                    .as_ref()
+                    .map(|range| &f.vertices[range.clone()]),
+            )
+        }),
+    ));
     let mut part = f.part;
-    let count = clips.as_ref().map_or(1, |clips| clips.len());
+    let count = scissors.as_ref().map_or(1, |clips| clips.len());
     while part < count {
-        let clip = clips.as_ref().map(|clips| clips[part]);
+        let clip = scissors.as_ref().map(|clips| clips[part]);
+        let before = env.ext.get::<State>().frames.gpu_draws;
         env.ext
             .get_mut::<State>()
             .gpu
@@ -239,6 +253,8 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
             .unwrap()
             .set_clip(None);
         result?;
+        let counters = &mut env.ext.get_mut::<State>().frames;
+        counters.uncoalesced_gpu_draws += (counters.gpu_draws - before) * (end - start - 1) as u64;
         for n in start..end {
             let f = frame(env, owner);
             let operation = std::mem::replace(&mut f.commands[n], Operation::Consumed);
@@ -266,8 +282,4 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     f.part = 0;
     f.partial = true;
     Ok(true)
-}
-
-fn schedule_clips(clips: &[Rect]) -> smallvec::SmallVec<[Rect; 8]> {
-    smallvec::SmallVec::from_slice(clips)
 }
