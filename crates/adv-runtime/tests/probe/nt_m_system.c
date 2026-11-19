@@ -137,6 +137,7 @@ int main(void)
 
     check("displaced-image-base", displaced_image_base());
     check("restore-unprotected-thunk", restore_unprotected_thunk());
+    check("nx-processor-feature", IsProcessorFeaturePresent(PF_NX_ENABLED) != 0);
     check("hook-five-bytes", hook_five_bytes());
     check("shared-executable-views", shared_executable_views());
     mapping = mapping2(INVALID_HANDLE_VALUE, NULL, SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, 65536, NULL, NULL, 0);

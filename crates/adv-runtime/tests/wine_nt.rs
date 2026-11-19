@@ -313,6 +313,7 @@ fn m_system() {
         &[
             "displaced-image-base",
             "restore-unprotected-thunk",
+            "nx-processor-feature",
             "hook-five-bytes",
             "shared-executable-views",
             "create-section-ex",
