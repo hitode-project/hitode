@@ -84,6 +84,8 @@ struct Wave {
     loop_start: Option<usize>,
     loops: u32,
     tail: u64,
+    tail_origin: u64,
+    tail_frames: u64,
     spans: VecDeque<Span>,
     done: VecDeque<(u64, u32)>,
     played: u64,
@@ -225,6 +227,7 @@ fn result(env: &mut Env<'_>, name: &str, a: &[u32]) -> Result<(u32, Option<Notic
             if let Some(at) = wave.paused.take() {
                 let delta = time.saturating_sub(at);
                 wave.tail += delta;
+                wave.tail_origin += delta;
                 for span in &mut wave.spans {
                     span.start += delta;
                     span.end += delta;
@@ -252,6 +255,8 @@ fn result(env: &mut Env<'_>, name: &str, a: &[u32]) -> Result<(u32, Option<Notic
             wave.loops = 0;
             wave.played = 0;
             wave.tail = time;
+            wave.tail_origin = time;
+            wave.tail_frames = 0;
             wave.paused = None;
             0
         }
@@ -326,6 +331,10 @@ fn result(env: &mut Env<'_>, name: &str, a: &[u32]) -> Result<(u32, Option<Notic
         _ => 8,
     };
     *env.ext.get_mut::<Waves>() = waves;
+    if name == "waveOutWrite" && result == 0 {
+        audio.sync_clock(env.sys.clock.now_us());
+        pump(env)?;
+    }
     Ok((result, None))
 }
 fn complete(env: &mut Env<'_>, callback: Callback, at: u32) -> Result<(), String> {
@@ -372,22 +381,34 @@ pub(super) fn pump(env: &mut Env<'_>) -> Result<Option<u64>, String> {
             wave.headers.clear();
             wave.index = 0;
         }
-        wave.tail = wave.tail.max(now);
+        if wave.tail < now {
+            wave.tail = now;
+            wave.tail_origin = now;
+            wave.tail_frames = 0;
+        }
         let channels = usize::from(wave.format.channels);
-        while wave.tail < now + LEAD && wave.index < wave.headers.len() {
+        while wave.index < wave.headers.len() {
             let header = &wave.headers[wave.index];
+            let lead = if wave.loop_start.is_some() || header.flags & 4 != 0 {
+                LOOP_LEAD
+            } else {
+                LEAD
+            };
+            if wave.tail >= now + lead {
+                break;
+            }
             if wave.offset == 0 && header.flags & 4 != 0 && wave.loop_start.is_none() {
                 wave.loop_start = Some(wave.index);
                 wave.loops = header.loops;
             }
             let remaining = (header.samples.len() - wave.offset) / channels;
             let frames = remaining.min(
-                ((now + LEAD - wave.tail) * u64::from(wave.format.rate) / 1_000_000).max(1)
+                ((now + lead - wave.tail) * u64::from(wave.format.rate) / 1_000_000).max(1)
                     as usize,
             );
             if frames != 0 {
                 let end = wave.offset + frames * channels;
-                audio
+                if audio
                     .push_pcm(adv_device::mixer::PcmBlock {
                         stream_id: source(env, handle),
                         guest_pts_us: guest.saturating_add(wave.tail.saturating_sub(now)),
@@ -395,7 +416,13 @@ pub(super) fn pump(env: &mut Env<'_>) -> Result<Option<u64>, String> {
                         channels: wave.format.channels,
                         samples: header.samples[wave.offset..end].to_vec(),
                     })
-                    .map_err(|_| "waveOut PCM queue limit")?;
+                    .is_err()
+                {
+                    if wave.spans.is_empty() {
+                        return Err("waveOut PCM queue limit".into());
+                    }
+                    break;
+                }
                 audio.set_stereo_gain(
                     source(env, handle),
                     [
@@ -403,13 +430,19 @@ pub(super) fn pump(env: &mut Env<'_>) -> Result<Option<u64>, String> {
                         (wave.volume >> 16) as f32 / 65535.0,
                     ],
                 );
-                let duration = frames as u64 * 1_000_000 / u64::from(wave.format.rate);
+                let (next_frames, next_tail) = advance_tail(
+                    wave.tail_origin,
+                    wave.tail_frames,
+                    frames as u64,
+                    wave.format.rate,
+                );
                 wave.spans.push_back(Span {
                     start: wave.tail,
-                    end: wave.tail + duration,
+                    end: next_tail,
                     frames: frames as u64,
                 });
-                wave.tail += duration;
+                wave.tail_frames = next_frames;
+                wave.tail = next_tail;
                 wave.offset = end;
             }
             if wave.offset < header.samples.len() {
@@ -479,6 +512,8 @@ pub(super) fn play_sound(env: &mut Env<'_>, format: Format, bytes: &[u8], loopin
             loop_start: None,
             loops: 0,
             tail: time,
+            tail_origin: time,
+            tail_frames: 0,
             spans: VecDeque::new(),
             done: VecDeque::new(),
             played: 0,
@@ -547,6 +582,8 @@ fn open(env: &mut Env<'_>, args: Vec<u32>) -> Outcome {
             loop_start: None,
             loops: 0,
             tail: now,
+            tail_origin: now,
+            tail_frames: 0,
             spans: VecDeque::new(),
             done: VecDeque::new(),
             played: 0,
@@ -569,4 +606,31 @@ fn open(env: &mut Env<'_>, args: Vec<u32>) -> Outcome {
 
 pub(super) fn is_native(env: &Env<'_>, handle: u32) -> bool {
     env.ext.get::<Waves>().devices.contains_key(&handle)
+}
+
+fn advance_tail(origin: u64, pushed_frames: u64, frames: u64, rate: u32) -> (u64, u64) {
+    let next_frames = pushed_frames + frames;
+    let next_tail = origin + ((u128::from(next_frames) * 1_000_000) / u128::from(rate)) as u64;
+    (next_frames, next_tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: DEV-AUDIO-1
+    #[test]
+    fn cumulative_wave_tail_avoids_sub_microsecond_drift() {
+        let origin = 1_000_000;
+        let rate = 44_100;
+        let mut pushed = 0;
+        let mut tail = origin;
+        for _ in 0..2_500 {
+            (pushed, tail) = advance_tail(origin, pushed, 2048, rate);
+        }
+        let exact = origin + ((u128::from(2_500u64 * 2048) * 1_000_000) / u128::from(rate)) as u64;
+        assert_eq!(tail, exact);
+        assert!(LEAD >= 100_000);
+        assert!(LOOP_LEAD < LEAD && LOOP_LEAD >= 50_000);
+    }
 }
