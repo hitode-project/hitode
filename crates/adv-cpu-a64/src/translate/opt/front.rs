@@ -394,14 +394,18 @@ fn build_trace(
             complete.push(i == 0 || may_fault || from.iter().any(|&p| unit.trace.net(p, i) > 0));
         }
     }
-    let models = model::analyze(unit, at, &offsets, &[], write_through)?;
-    let live = live::analyze(unit, facts, &offsets, &frame, &models, &complete);
+    let first = model::analyze(unit, at, &offsets, &[], write_through)?;
+    let live = live::analyze(unit, facts, &offsets, &frame, &first.models, &complete);
     let plan = cells::Cells {
         cells: &cells,
         frame: &frame,
     };
     let carried = plan.carried(unit, &arrivals, &live);
-    let models = model::analyze(unit, at, &offsets, &plan.kept(&carried), write_through)?;
+    let model::Analysis {
+        models,
+        reachable: model_reachable,
+        branch: model_branch,
+    } = model::analyze(unit, at, &offsets, &plan.kept(&carried), write_through)?;
     let held = plan.held(unit, &live, &carried, &models);
     let local = Local {
         models: &models,
@@ -658,6 +662,9 @@ fn build_trace(
     let mut frame_guards = std::collections::BTreeSet::new();
     let mut regions: Vec<Option<RecordId>> = vec![None; unit.trace.len()];
     for (i, state) in states.into_iter().enumerate() {
+        if !model_reachable[i] {
+            continue;
+        }
         f.index = i;
         f.block = Block(i as u32 + 1);
         f.state = state;
@@ -728,13 +735,20 @@ fn build_trace(
             Next::Dynamic => return Err(Reject::Dynamic(i)),
         };
         let end = if let decode::Op::Jcc(Cc::Flags(cond), _) = inst.op {
-            let cond = f.value(Op::Test {
-                flags: f.state.flags,
-                cond,
-            });
-            let taken = f.target(inst.taken.expect("trace resolves branches"))?;
-            let fall = f.target(fall)?;
-            End::Branch { cond, taken, fall }
+            let taken_edge = inst.taken.expect("trace resolves branches");
+            match model_branch[i] {
+                Some(true) => End::Jump(f.target(taken_edge)?),
+                Some(false) => End::Jump(f.target(fall)?),
+                None => {
+                    let cond = f.value(Op::Test {
+                        flags: f.state.flags,
+                        cond,
+                    });
+                    let taken = f.target(taken_edge)?;
+                    let fall = f.target(fall)?;
+                    End::Branch { cond, taken, fall }
+                }
+            }
         } else {
             End::Jump(f.target(fall)?)
         };

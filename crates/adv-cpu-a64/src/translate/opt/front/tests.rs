@@ -2233,6 +2233,33 @@ fn an_inlined_call_push_resumes_at_the_callee() {
     assert!(eips.contains(&target), "{eips:x?}");
 }
 
+// spec: A64-OPT-2, A64-OPT-9
+#[test]
+fn a_folded_constant_branch_skips_its_dead_arm_and_unreachable_blocks() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        let mut dead = a.create_label();
+        let mut join = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, 0).unwrap();
+        a.test(eax, eax).unwrap();
+        a.jne(dead).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.jmp(join).unwrap();
+        a.set_label(&mut dead).unwrap();
+        a.nop().unwrap();
+        a.set_label(&mut join).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let unit = resident_unit(&code);
+    let built = resident(&unit, None);
+    assert_eq!(verify::verify(&built.func), Ok(()));
+}
+
 // spec: A64-OPT-9
 #[test]
 fn resident_accepts_unproved_pointer_reads_and_indexed_stores() {

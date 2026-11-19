@@ -54,6 +54,12 @@ fn overwrite(m: &mut Model, p: i32, width: u8) {
     }
 }
 
+pub(super) struct Analysis {
+    pub models: Vec<Model>,
+    pub reachable: Vec<bool>,
+    pub branch: Vec<Option<bool>>,
+}
+
 /// `kept` gives, for a loop head whose arrivals commit frame cells, the
 /// frame bytes that may stay dirty on arrival (A64-OPT-3).
 pub(super) fn analyze(
@@ -62,7 +68,7 @@ pub(super) fn analyze(
     offsets: &[[Option<i32>; 8]],
     kept: &[Option<BTreeSet<i32>>],
     write_through: bool,
-) -> Result<Vec<Model>, Reject> {
+) -> Result<Analysis, Reject> {
     let entry = Model {
         top: at.x87.top() as u8,
         valid: (0..8).fold(0, |v, i| v | (u8::from(at.x87.physical_tag(i) != 3) << i)),
@@ -78,6 +84,7 @@ pub(super) fn analyze(
         flags: None,
     };
     let mut states = vec![None; unit.trace.len()];
+    let mut branches = vec![None; unit.trace.len()];
     states[0] = Some(entry.clone());
     let mut work = vec![0];
     while let Some(i) = work.pop() {
@@ -111,6 +118,7 @@ pub(super) fn analyze(
                 .map(|flags| adv_cpu_core::integer::condition_true(cc, flags)),
             _ => None,
         };
+        branches[i] = branch;
         let fall = match inst.next {
             Next::Fall => Some(Edge::Internal(i + 1)),
             Next::Edge(e) => Some(e),
@@ -166,10 +174,16 @@ pub(super) fn analyze(
             }
         }
     }
-    Ok(states
+    let reachable = states.iter().map(Option::is_some).collect();
+    let models = states
         .into_iter()
         .map(|m| m.unwrap_or_else(|| entry.clone()))
-        .collect())
+        .collect();
+    Ok(Analysis {
+        models,
+        reachable,
+        branch: branches,
+    })
 }
 
 fn merge_c1(a: C1, b: C1, i: usize) -> Result<C1, Reject> {
