@@ -42,40 +42,6 @@ fn initial() -> CpuState {
 // spec: A64A-PLACE-3, A64A-ROLE-2, A64-VER-1
 #[test]
 fn translation_words_match_baseline() {
-    let scalar = bytes(|a| {
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.add(eax, 1).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.ret().unwrap();
-    });
-    let table = bytes(|a| {
-        a.cmp(eax, 1).unwrap();
-        a.ja(u64::from(CODE + 0x100)).unwrap();
-        a.jmp(dword_ptr(eax * 4 + DATA as i32)).unwrap();
-    });
-    let row = bytes(|a| {
-        let mut head = a.create_label();
-        a.set_label(&mut head).unwrap();
-        a.mov(eax, dword_ptr(esi)).unwrap();
-        a.add(eax, 1).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(esi, 4).unwrap();
-        a.add(edi, 4).unwrap();
-        a.dec(ecx).unwrap();
-        a.jne(head).unwrap();
-    });
-    let host = HOST_CODE as usize;
-    let stubs = Stubs {
-        call: host,
-        exit: host,
-        dispatch: host,
-        lookup: host,
-        lookup_slow: host,
-        ret_miss: host,
-        access: host,
-        fault: host,
-        opt_exit: host,
-    };
     let compare = |name: &str, words: &[u32]| {
         let baseline = match name {
             "scalar" => concat!(
@@ -224,6 +190,68 @@ fn translation_words_match_baseline() {
                 "{name}"
             ),
         }
+    };
+    emission_fixture_words(compare);
+}
+
+// spec: A64A-ROLE-4
+#[test]
+fn whole_unit_emission_matches_baseline() {
+    emission_fixture_words(|name, words| {
+        // FNV-1a over the little-endian instruction bytes, including cold paths.
+        let digest = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .fold(0xcbf29ce484222325_u64, |digest, byte| {
+                (digest ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        let baseline = match name {
+            "scalar" => (24, 0x7ced329c2d703d35),
+            "checked" => (104, 0x20f24b50de03f256),
+            "switch" => (48, 0x1b76e4b83d612bcd),
+            "loop" => (119, 0xb8481f7bf0df221c),
+            "worker" => (178, 0x439641c71718cb83),
+            "resident" => (501, 0x5bc5104195d4aef9),
+            _ => unreachable!(),
+        };
+        assert_eq!((words.len(), digest), baseline, "{name}");
+    });
+}
+
+fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
+    let scalar = bytes(|a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, 1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.ret().unwrap();
+    });
+    let table = bytes(|a| {
+        a.cmp(eax, 1).unwrap();
+        a.ja(u64::from(CODE + 0x100)).unwrap();
+        a.jmp(dword_ptr(eax * 4 + DATA as i32)).unwrap();
+    });
+    let row = bytes(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, 1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let host = HOST_CODE as usize;
+    let stubs = Stubs {
+        call: host,
+        exit: host,
+        dispatch: host,
+        lookup: host,
+        lookup_slow: host,
+        ret_miss: host,
+        access: host,
+        fault: host,
+        opt_exit: host,
     };
     for (name, code, cold, checked) in [
         ("scalar", &scalar, true, false),
