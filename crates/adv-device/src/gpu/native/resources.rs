@@ -602,6 +602,14 @@ fn upload_bounds(image: &Image, r: Rect, pitch: u32, length: usize) -> Result<u3
     Ok(row as u32)
 }
 
+pub(super) fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::{pipelines, stream};
@@ -1175,13 +1183,5 @@ pub(super) mod tests {
         gpu.upload(&mip, rectangle, 8, &pixels).unwrap();
         upload_chunk(&mut gpu, &mut queue, &consumer);
         assert_eq!(sample(&mut gpu, &mut queue, &mip), pixels);
-    }
-}
-
-pub(super) fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
-        _ => false,
     }
 }
