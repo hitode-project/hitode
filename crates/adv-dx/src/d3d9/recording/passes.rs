@@ -2,18 +2,21 @@
 //! barriers: their fresh content keys do not prove a full pixel overwrite.
 use super::*;
 use rustc_hash::FxHashSet as HashSet;
+use smallvec::SmallVec;
 
+#[derive(Clone)]
 pub(super) struct Effects {
     pass: u128,
     barrier: bool,
     clear: bool,
     draw_bounds: Option<adv_device::surface::Rect>,
-    reads: Vec<Content>,
-    writes: Vec<(Content, bool)>,
+    reads: SmallVec<[Content; 4]>,
+    read_versions: smallvec::SmallVec<[Option<u128>; 4]>,
+    writes: SmallVec<[(Content, bool); 3]>,
 }
 #[derive(Default)]
 pub(super) struct Plan {
-    effects: Vec<Arc<Effects>>,
+    effects: Vec<Effects>,
     skipped: Vec<bool>,
     clear_masks: Vec<u8>,
     covered: HashSet<Content>,
@@ -22,30 +25,49 @@ impl Plan {
     pub fn record(
         &mut self,
         operation: &Operation,
-        reads: Vec<Content>,
-        writes: Vec<(Content, bool)>,
+        reads: SmallVec<[Content; 4]>,
+        read_versions: smallvec::SmallVec<[Option<u128>; 4]>,
+        writes: SmallVec<[(Content, bool); 3]>,
         bounds: adv_device::surface::Rect,
-    ) -> Arc<Effects> {
-        let effect = Arc::new(Effects {
+        retain: bool,
+    ) -> Option<Effects> {
+        let effect = Effects {
             pass: hash(writes.first().map(|(k, _)| (k.0, k.1))),
             barrier: matches!(operation, Operation::Upload { .. }),
             clear: matches!(operation, Operation::Clear { .. }),
             draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
             reads,
+            read_versions,
             writes,
-        });
-        self.effects.push(effect.clone());
-        effect
+        };
+        let saved = retain.then(|| effect.clone());
+        self.effects.push(effect);
+        saved
     }
-    pub fn replay(&mut self, effect: Arc<Effects>) {
+    pub fn can_merge(&self, first: usize, next: usize) -> bool {
+        let a = &self.effects[first];
+        let b = &self.effects[next];
+        // The run has one read set. Each extension checks the newest preceding
+        // write because older members have already passed the same check.
+        a.reads == b.reads
+            && a.read_versions == b.read_versions
+            && !self.effects[next - 1]
+                .writes
+                .iter()
+                .any(|(k, _)| b.reads.contains(k))
+    }
+
+    pub fn replay(&mut self, effect: Effects) {
         self.effects.push(effect);
     }
     #[cfg(feature = "d3d9-counters")]
-    pub fn bytes(reads: usize, writes: usize) -> usize {
-        std::mem::size_of::<Effects>()
-            + reads * std::mem::size_of::<Content>()
-            + writes * std::mem::size_of::<(Content, bool)>()
-            + 1
+    pub fn bytes(reads: usize) -> usize {
+        let spill = if reads > 4 {
+            reads * (std::mem::size_of::<Content>() + std::mem::size_of::<Option<u128>>())
+        } else {
+            0
+        };
+        std::mem::size_of::<Effects>() + spill + 1
     }
     pub fn truncate(&mut self, len: usize) {
         self.effects.truncate(len);
@@ -161,11 +183,12 @@ mod tests {
         let depth = Content(id, 0, 1, 1);
         let effect = |pass, reads, writes, barrier| Effects {
             pass,
-            reads,
-            writes,
+            reads: SmallVec::from_vec(reads),
+            writes: SmallVec::from_vec(writes),
             barrier,
             clear: false,
             draw_bounds: None,
+            read_versions: Default::default(),
         };
         for (effects, skipped) in [
             (
@@ -225,7 +248,7 @@ mod tests {
             ),
         ] {
             let mut plan = Plan {
-                effects: effects.into_iter().map(Arc::new).collect(),
+                effects,
                 ..Default::default()
             };
             plan.plan();
@@ -243,9 +266,9 @@ mod tests {
         };
         let mut plan = Plan {
             effects: vec![
-                Arc::new(clear(vec![(a, true), (depth, true)])),
-                Arc::new(effect(1, vec![], vec![(a, false)], false)),
-                Arc::new(clear(vec![(depth, true)])),
+                clear(vec![(a, true), (depth, true)]),
+                effect(1, vec![], vec![(a, false)], false),
+                clear(vec![(depth, true)]),
             ],
             ..Default::default()
         };

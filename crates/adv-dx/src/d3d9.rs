@@ -1586,6 +1586,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
         }
         .map(|()| Completion::Command),
         Operation::Draw(draw) => {
+            let before = gpu.draw_count();
             let result = if let Some(program) = &draw.programmable {
                 gpu.draw_programmable(&draw.target, program, &draw.state)
             } else {
@@ -1596,6 +1597,10 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
                     draw.state,
                 )
             };
+            let draws = gpu.draw_count() - before;
+            let frames = &mut env.ext.get_mut::<State>().frames;
+            frames.gpu_draws += draws;
+            frames.uncoalesced_gpu_draws += draws;
             result.map(|()| Completion::Command)
         }
         Operation::Copy {

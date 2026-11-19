@@ -160,6 +160,8 @@ Fixed draws MUST retain their raw vertex streams and index order. Vertex buffer 
 
 Diagnostics count successful submissions and input vertices, including instances, repeated scissors and early flushes; Busy attempts add nothing. Per-present backbuffer areas distinguish changed cells, executed cells and executed cells outside the change. A captured frame reports these areas and submission counts per allocation, generation and attachment aspect. Whole-chain counts distinguish external reads of intermediate retained versions from late demand.
 
+On-demand counters MUST report logical commands, physical draws with and without coalescing, and admissions by recording path per completed frame.
+
 ### GFX-REC-4 Conservative damage and bounds
 
 **Rule**: Each target subresource MUST accumulate recording-time differences, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST be a cell region (DEV-FRAME-5) without promoting bounded damage to the whole target based on coverage alone.
@@ -231,6 +233,15 @@ Readbacks into an unchanged destination baseline MUST transfer only the source d
 **Verification**: Test
 
 Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture. A target whose retained entries are dropped unused, at frame end or by a flush, rests. The first such frame rests for none, later ones for 1, 2, 4… up to 64 frames, while its draws record directly. It then retains entries for one frame and attempts again. Any reuse ends the rest.
+
+Eligible direct fixed-layout captures MUST copy and hash stream bytes and gather bounds and sampling inputs in one visit per vertex. Warmed frame storage MUST admit these draws without allocations.
+
+### GFX-REC-13 Coalesced draw execution
+
+**Rule**: Adjacent commands in the execution plan with equal pipeline state, target and read versions MUST share a GPU draw when none reads an earlier write. Recording, versions and damage MUST stay per command.
+**Verification**: Test
+
+Runs require equal effective scissors and fit within the existing neutral draw limits. Inclusive line endpoints keep their ordered submissions. A run of one retains its original topology and indices.
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 

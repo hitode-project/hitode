@@ -6,6 +6,8 @@
 use super::*;
 use rustc_hash::FxHashMap as HashMap;
 pub(super) mod damage;
+mod encode;
+mod fast;
 mod key;
 mod passes;
 mod reuse;
@@ -50,7 +52,7 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     draw_state_identity(env, pointer).0
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Content(Id, u32, u8, u32);
 #[derive(Default)]
 struct Contents {
@@ -152,6 +154,10 @@ pub struct Counters {
     pub stateblock_items: u64,
     pub eliminated_passes: u64,
     pub recorded_commands: u64,
+    pub gpu_draws: u64,
+    pub uncoalesced_gpu_draws: u64,
+    pub fast_path_draws: u64,
+    pub general_path_draws: u64,
     /// Present, readback, lock, DC, Reset, Release, limit, existing GPU wait.
     pub flushes: [u64; 8],
     pub eliminated_frames: u64,
@@ -218,6 +224,9 @@ struct ReadbackTarget {
     in_flight: Option<u32>,
 }
 
+#[cfg(test)]
+type TestExecutionPlan = Vec<(bool, u8, Option<Vec<adv_device::surface::Rect>>)>;
+
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
@@ -225,6 +234,15 @@ pub(super) struct Recording {
     command_identities: Vec<u128>,
     /// The damage analysis write behind each command, while it knows it.
     nodes: Vec<Option<usize>>,
+    #[cfg(test)]
+    separate_draws: bool,
+    #[cfg(test)]
+    general_draws: bool,
+    #[cfg(test)]
+    test_plan: Option<TestExecutionPlan>,
+    fast: fast::Cache,
+    vertices: Vec<u8>,
+    vertex_ranges: Vec<Option<std::ops::Range<usize>>>,
     /// The content a readback flush observes, and the writes, by content,
     /// that flush executes; the rest wait for presentation.
     observe: Option<Content>,
@@ -272,6 +290,7 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         let f = &mut d.frame;
         let changed = f.contents.forget(pointer);
         f.binding_cache = None;
+        f.fast.clear();
         f.reuse.invalidate();
         f.damage.forget(pointer);
         f.readback_targets
@@ -562,7 +581,7 @@ fn barrier_if_busy(
     }
 }
 fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
-    append(env, owner, &p, None, None)
+    append(env, owner, &p, None, None, None)
 }
 fn append(
     env: &mut Env<'_>,
@@ -570,6 +589,7 @@ fn append(
     p: &key::Prepared,
     target: Option<Target>,
     entry: Option<&reuse::Entry>,
+    vertices: Option<std::ops::Range<usize>>,
 ) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let before = lookups();
@@ -626,31 +646,37 @@ fn append(
             .map(|(k, _)| f.contents.get(k).copied())
             .collect()
     });
+    let read_versions: smallvec::SmallVec<[Option<u128>; 4]> = if shared.is_none() {
+        p.reads.iter().map(|k| f.contents.get(k).copied()).collect()
+    } else {
+        smallvec::SmallVec::new()
+    };
     let mut draw_key_hashes = 0;
     let (command, attachment, damage) = if let Some(saved) = shared {
         let slot = hash(target.as_ref().unwrap().image.id());
         f.damage.replay(&saved.damage, slot, &f.contents);
-        (saved.command, saved.attachment, saved.damage.clone())
+        (saved.command, saved.attachment, None)
     } else {
         draw_key_hashes += 1;
         use std::hash::Hash;
         let mut command = xxhash_rust::xxh3::Xxh3::new();
         p.key.hash(&mut command);
         p.reads.len().hash(&mut command);
-        for k in &p.reads {
-            (*k, f.contents.get(k).copied().unwrap_or(0)).hash(&mut command);
+        for (&k, &version) in p.reads.iter().zip(&read_versions) {
+            (k, version.unwrap_or(0)).hash(&mut command);
         }
         let command = command.digest128();
-        let attachment = p.attachment_command(command, &f.contents);
+        let attachment = p.attachment_command(command, &read_versions);
         (
             command,
             attachment,
             f.damage.record(
                 p,
-                command,
-                attachment,
+                [command, attachment],
                 &f.contents,
+                &read_versions,
                 target.as_ref().map(|t| hash(t.image.id())),
+                destinations.is_some(),
             ),
         )
     };
@@ -692,7 +718,7 @@ fn append(
     }
     #[cfg(feature = "d3d9-counters")]
     let work = (shared.is_none() && matches!(p.operation, Operation::Draw(_))).then_some((
-        (passes::Plan::bytes(p.reads.len(), p.writes.len())
+        (passes::Plan::bytes(p.reads.len())
             + std::mem::size_of::<Operation>()
             + match &p.operation {
                 Operation::Draw(d) => d.programmable.as_ref().map_or(p.bytes, |draw| {
@@ -723,15 +749,20 @@ fn append(
     if let Some(saved) = shared {
         f.passes.replay(saved.pass.clone());
     } else {
-        let pass = f
-            .passes
-            .record(&p.operation, p.reads.clone(), p.writes.clone(), p.bounds);
+        let pass = f.passes.record(
+            &p.operation,
+            p.reads.clone(),
+            read_versions,
+            p.writes.clone(),
+            p.bounds,
+            destinations.is_some(),
+        );
         if let (Some(entry), Some(destinations)) = (entry, destinations) {
             let _ = entry.saved.set(reuse::Saved {
                 command,
                 attachment,
-                damage,
-                pass,
+                damage: damage.unwrap(),
+                pass: pass.unwrap(),
                 destinations,
                 outputs,
             });
@@ -744,15 +775,19 @@ fn append(
     let is_draw = matches!(&operation, Operation::Draw(_));
     let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
     f.commands.push(operation);
+    let captured = vertices.is_some();
+    f.vertex_ranges.push(vertices);
     #[cfg(test)]
     f.command_identities.push(command);
     f.nodes.push(f.damage.len().checked_sub(1));
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     let counters = &mut env.ext.get_mut::<State>().frames;
     counters.recorded_commands += 1;
+    counters.fast_path_draws += u64::from(captured);
+    counters.general_path_draws += u64::from(is_draw && !captured);
     counters.fixed_draws += u64::from(fixed);
     if is_draw {
-        counters.draw_key_hashes += draw_key_hashes;
+        counters.draw_key_hashes += draw_key_hashes + u64::from(captured);
     }
     if limit {
         let outcome = barrier(env, owner, Reason::Limit, |_| Outcome::Return(0));
@@ -763,6 +798,9 @@ fn append(
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             let rejected = f.commands.pop();
+            if let Some(vertices) = f.vertex_ranges.pop().flatten() {
+                f.vertices.truncate(vertices.start);
+            }
             #[cfg(test)]
             f.command_identities.pop();
             f.nodes.pop();
@@ -785,6 +823,8 @@ fn append(
             }
             let counters = &mut env.ext.get_mut::<State>().frames;
             counters.recorded_commands -= 1;
+            counters.fast_path_draws -= u64::from(captured);
+            counters.general_path_draws -= u64::from(is_draw && !captured);
             counters.fixed_draws -= u64::from(fixed);
             #[cfg(feature = "d3d9-counters")]
             if let Some((bytes, lookups)) = work {
@@ -865,6 +905,19 @@ pub(super) fn flush(
             f.head += 1;
             continue;
         }
+        #[cfg(test)]
+        let separate_draws = f.separate_draws;
+        #[cfg(not(test))]
+        let separate_draws = false;
+        if !separate_draws && !env.ext.get::<State>().verify_frames {
+            match encode::run(env, owner) {
+                Ok(true) => continue,
+                Ok(false) => (),
+                Err(Error::Device(_)) => return Ok(lose(env, owner)),
+                Err(error) => return Err(error),
+            }
+        }
+        let f = frame(env, owner);
         let node = f.nodes[f.head];
         let selected = match &f.select {
             Some(select) => match node.map(|n| select.get(&n)) {
@@ -879,6 +932,17 @@ pub(super) fn flush(
             None => None,
         };
         let mut operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
+        // Keep the original template across Busy; the captured bytes still
+        // belong to the frame and may form part of a run on the next attempt.
+        let mut captured = None;
+        if let Some(range) = &f.vertex_ranges[f.head]
+            && let Operation::Draw(draw) = &operation
+        {
+            let mut draw = draw.clone();
+            fast::materialize(&mut draw, &f.vertices[range.clone()]);
+            captured = Some(Operation::Draw(draw));
+        }
+        let execution = captured.as_ref();
         // A clear the observation needs only part of runs that part now and
         // keeps the rest in order.
         let mut original = None;
@@ -958,7 +1022,7 @@ pub(super) fn flush(
                 if !f.passes.outside_damage(f.head, clip) {
                     let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
                     gpu.set_clip(Some(clip));
-                    result = execute_gpu(env, &operation);
+                    result = execute_gpu(env, execution.unwrap_or(&operation));
                     env.ext
                         .get_mut::<State>()
                         .gpu
@@ -974,7 +1038,7 @@ pub(super) fn flush(
             }
             result
         } else {
-            let result = execute_gpu(env, &operation);
+            let result = execute_gpu(env, execution.unwrap_or(&operation));
             if result.is_ok() {
                 submitted(env, owner, node, &operation, None);
             }
@@ -986,20 +1050,7 @@ pub(super) fn flush(
                 f.commands[f.head] = original.unwrap_or(operation);
                 return Err(Error::Busy);
             }
-            Err(Error::Device(_)) => {
-                if let Some(Payload::Device(d)) =
-                    com(env).get_identity_mut(&mut env.sys.objects, owner)
-                {
-                    d.gpu_lost = true;
-                    d.frame.damage.invalidate();
-                    d.frame.commands.clear();
-                    d.frame.nodes.clear();
-                    d.frame.passes.truncate(0);
-                    d.frame.head = 0;
-                    d.frame.part = 0;
-                }
-                return Ok(Completion::Command);
-            }
+            Err(Error::Device(_)) => return Ok(lose(env, owner)),
             result => {
                 if let Operation::Upload {
                     resource, level, ..
@@ -1019,6 +1070,21 @@ pub(super) fn flush(
         }
     }
 }
+fn lose(env: &mut Env<'_>, owner: Id) -> Completion {
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.gpu_lost = true;
+        d.frame.damage.invalidate();
+        d.frame.commands.clear();
+        d.frame.vertex_ranges.clear();
+        d.frame.vertices.clear();
+        d.frame.nodes.clear();
+        d.frame.passes.truncate(0);
+        d.frame.head = 0;
+        d.frame.part = 0;
+    }
+    Completion::Command
+}
+
 fn submitted(
     env: &mut Env<'_>,
     owner: Id,
@@ -1150,12 +1216,18 @@ pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
             n += 1;
             keep[n - 1]
         });
+        let mut n = 0;
+        f.vertex_ranges.retain(|_| {
+            n += 1;
+            keep[n - 1]
+        });
         f.passes.retain(&keep);
         d.queries.scanned = f.commands.len();
         f.head = 0;
         f.part = 0;
         if f.commands.is_empty() {
             f.bytes = 0;
+            f.vertices.clear();
         }
         for (resource, level) in held {
             clear_upload_lock(env, resource, level, true);
@@ -1279,6 +1351,16 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         };
         let slot = hash(image.id());
         let promotions = f.damage.plan(force, slot);
+        #[cfg(test)]
+        if let Some(plan) = &mut f.test_plan {
+            plan.extend(f.nodes.iter().enumerate().map(|(n, node)| {
+                (
+                    f.passes.skip(n),
+                    f.passes.clear_mask(n),
+                    node.and_then(|node| f.damage.clip(node).map(<[_]>::to_vec)),
+                )
+            }));
+        }
         f.rotate = !force && !f.partial && f.damage.rotatable(slot);
         if verify && copy.is_none() {
             f.verify_image = Some(image.clone());
