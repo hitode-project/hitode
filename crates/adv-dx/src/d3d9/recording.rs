@@ -139,6 +139,10 @@ pub struct Counters {
     pub fixed_shaders_built: u64,
     pub fixed_shader_cache_hits: u64,
     pub draw_key_hashes: u64,
+    /// Draws that reused a previous frame's preparation, and draws that
+    /// skipped the attempt while their target rested.
+    pub reused_draws: u64,
+    pub rested_draws: u64,
     pub readback_bytes: u64,
     pub presents: u64,
     pub recorded_draws: u64,

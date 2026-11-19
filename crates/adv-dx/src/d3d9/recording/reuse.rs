@@ -7,8 +7,24 @@ use smallvec::SmallVec;
 #[derive(Default)]
 pub(super) struct Cache {
     targets: HashMap<Id, Sequence>,
+    /// Targets whose retained entries were dropped unused. Their draws record
+    /// directly until `until`; then one frame retains entries for the next.
+    resting: HashMap<Id, Rest>,
+    /// Frames finished, which rests count.
+    frame: u64,
     disabled: bool,
 }
+
+/// The first frame after a rest and its span, which doubles while retained
+/// entries keep going unused. The first waste rests for no frame, so one
+/// unavailable history alone keeps reuse.
+#[derive(Clone, Copy)]
+struct Rest {
+    until: u64,
+    span: u64,
+}
+
+const MAX_REST: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Mode {
@@ -35,6 +51,7 @@ struct Sequence {
     index: HashMap<u128, Vec<usize>>,
     next_index: HashMap<u128, Vec<usize>>,
     cursor: usize,
+    hits: u32,
 }
 pub(super) struct Entry {
     signature: Arc<Signature>,
@@ -54,9 +71,28 @@ pub(super) struct Saved {
     pub outputs: Vec<u128>,
 }
 impl Cache {
+    /// Drops all entries; this frame's draws record directly.
     pub(super) fn invalidate(&mut self) {
-        self.targets.clear();
+        for (target, s) in std::mem::take(&mut self.targets) {
+            if s.hits == 0 {
+                self.waste(target);
+            }
+        }
         self.disabled = true;
+    }
+
+    fn waste(&mut self, target: Id) {
+        let frame = self.frame;
+        let rest = self.resting.entry(target).or_insert(Rest {
+            until: 0,
+            span: u64::MAX,
+        });
+        rest.span = match rest.span {
+            u64::MAX => 0,
+            0 => 1,
+            span => (span * 2).min(MAX_REST),
+        };
+        rest.until = frame + 1 + rest.span;
     }
     /// Whether a retained entry still draws into `image`'s allocation.
     #[cfg(test)]
@@ -69,16 +105,35 @@ impl Cache {
         })
     }
     pub(super) fn finish(&mut self) {
-        if self.disabled {
-            *self = Self::default();
-            return;
+        let wasted: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|(_, s)| !s.previous.is_empty())
+            .map(|(&target, s)| (target, s.hits == 0))
+            .collect();
+        for (target, unused) in wasted {
+            if unused {
+                self.waste(target);
+            } else {
+                self.resting.remove(&target);
+            }
         }
-        self.targets.retain(|_, s| {
+        self.frame += 1;
+        let (frame, resting) = (self.frame, &self.resting);
+        self.targets.retain(|target, s| {
             s.previous = std::mem::take(&mut s.next);
             s.index = std::mem::take(&mut s.next_index);
             s.cursor = 0;
-            !s.previous.is_empty()
+            s.hits = 0;
+            !s.previous.is_empty() && resting.get(target).is_none_or(|r| r.until <= frame)
         });
+        self.disabled = false;
+    }
+
+    fn rests(&self, target: Id) -> bool {
+        self.resting
+            .get(&target)
+            .is_some_and(|r| r.until > self.frame)
     }
 }
 fn signature(
@@ -247,7 +302,20 @@ fn draw(
     up: Option<u32>,
     build: impl FnOnce(&mut Env<'_>) -> Result<fixed::Draw, u32>,
 ) -> Outcome {
-    let (signature, target) = match signature(env, pointer, request) {
+    let rests = device(env, pointer).is_some_and(|d| {
+        d.render_target
+            .or(d.back_buffer)
+            .is_some_and(|target| d.frame.reuse.rests(target))
+    });
+    if rests {
+        env.ext.get_mut::<State>().frames.rested_draws += 1;
+    }
+    let signed = if rests {
+        Err(INVALID)
+    } else {
+        signature(env, pointer, request)
+    };
+    let (signature, target) = match signed {
         Ok(signed) => signed,
         Err(_) => {
             return match build(env) {
@@ -363,9 +431,9 @@ fn draw(
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();
-    if !expected {
-        env.ext.get_mut::<State>().frames.draw_key_hashes += 1;
-    }
+    let counts = &mut env.ext.get_mut::<State>().frames;
+    counts.draw_key_hashes += u64::from(!expected);
+    counts.reused_draws += u64::from(origin.is_some());
     if up.is_some() {
         buffers::clear_up_bindings(env, pointer, false);
     }
@@ -374,6 +442,7 @@ fn draw(
         .targets
         .entry(target_id)
         .or_default();
+    sequence.hits += u32::from(origin.is_some());
     if let Some(positions) = sequence.index.get(&index_key)
         && let Some(&n) = positions.iter().find(|&&n| {
             n >= sequence.cursor

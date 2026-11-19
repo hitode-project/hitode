@@ -433,12 +433,15 @@ fn report(
             concat!(
                 "\"d3d9\": {{\"fixed_draws\": {}, \"fixed_shaders_built\": {}, ",
                 "\"fixed_shader_cache_hits\": {}, \"draw_key_hashes\": {}, ",
+                "\"reused_draws\": {}, \"rested_draws\": {}, ",
                 "\"readback_bytes\": {}, \"readback_bytes_per_frame\": {:.2}}}"
             ),
             counters.fixed_draws,
             counters.fixed_shaders_built,
             counters.fixed_shader_cache_hits,
             counters.draw_key_hashes,
+            counters.reused_draws,
+            counters.rested_draws,
             counters.readback_bytes,
             counters.readback_bytes as f64 / counters.presents.max(1) as f64,
         ));

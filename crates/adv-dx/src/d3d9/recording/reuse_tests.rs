@@ -539,3 +539,82 @@ fn steady_fixed_up_frame_reuses_keys_with_repeated_state_changes() {
     assert!(changed.draw_key_hashes > repeated.draw_key_hashes);
     assert_eq!(changed.eliminated_frames, repeated.eliminated_frames);
 }
+
+/// Draws two distinct UP triangles whose first color is `color`, flushing for
+/// a readback before presenting when `readback` is set; returns the rested
+/// and reused draw counts so far.
+fn up_frame(f: &mut Fixture, address: u32, color: u32, readback: bool) -> (u64, u64) {
+    let device = f.device;
+    f.m.cpu.write_u32(address + 16, color).unwrap();
+    clear(f, 0xff000000);
+    f.okay("IDirect3DDevice9::BeginScene", &[device]);
+    for cull in [1, 2] {
+        f.okay("IDirect3DDevice9::SetRenderState", &[device, 22, cull]);
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[device, 4, 1, address, 20],
+        );
+    }
+    if readback {
+        let outcome = flush(f, Reason::Readback);
+        assert_eq!(f.finish(outcome), 0);
+    }
+    f.okay("IDirect3DDevice9::EndScene", &[device]);
+    present(f);
+    let counts = f.m.ext.get::<State>().frames;
+    (counts.rested_draws, counts.reused_draws)
+}
+
+fn up_frames(colors: impl Iterator<Item = u32>, readback: bool) -> Vec<(u64, u64)> {
+    let mut f = fixture();
+    f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x44]);
+    let vertex = |x: f32, y: f32| [x.to_bits(), y.to_bits(), 0, 1f32.to_bits(), 0xff00ff00];
+    let address = f.packet([vertex(1., 1.), vertex(13., 1.), vertex(1., 9.)]);
+    let mut last = (0, 0);
+    colors
+        .map(|color| {
+            let counts = up_frame(&mut f, address, color, readback);
+            let delta = (counts.0 - last.0, counts.1 - last.1);
+            last = counts;
+            delta
+        })
+        .collect()
+}
+
+#[test]
+// spec: GFX-REC-11
+fn up_targets_without_reuse_rest_with_doubling_spans() {
+    // Changing bytes: record, miss twice, rest 1, record, miss, rest 2;
+    // then steady bytes: record, reuse, reuse.
+    let colors = (0..11u32).map(|n| if n < 7 { 0xff000000 | n } else { 0xff00ff00 });
+    assert_eq!(
+        up_frames(colors, false),
+        [
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (2, 0),
+            (0, 0),
+            (0, 0),
+            (2, 0),
+            (2, 0),
+            (0, 0),
+            (0, 2),
+            (0, 2)
+        ]
+    );
+}
+
+#[test]
+// spec: GFX-REC-11
+fn targets_whose_entries_every_readback_drops_rest() {
+    // Each frame's entries are dropped by its readback flush: the first
+    // waste keeps reuse, later ones rest 1, then 2 frames.
+    assert_eq!(
+        up_frames(std::iter::repeat_n(0xff00ff00, 7), true)
+            .iter()
+            .map(|d| d.0)
+            .collect::<Vec<_>>(),
+        [0, 0, 2, 0, 2, 2, 0]
+    );
+}

@@ -230,7 +230,7 @@ Readbacks into an unchanged destination baseline MUST transfer only the source d
 **Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse previous-frame identities and preparation, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
 **Verification**: Test
 
-Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture.
+Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture. A target whose retained entries are dropped unused, at frame end or by a flush, rests. The first such frame rests for none, later ones for 1, 2, 4… up to 64 frames, while its draws record directly. It then retains entries for one frame and attempts again. Any reuse ends the rest.
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
