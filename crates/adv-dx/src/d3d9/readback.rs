@@ -1,5 +1,7 @@
 //! Explicit guest readback uses the one background worker and Machine waits.
 //! GetRenderTargetData into a plain surface returns early; CPU readers settle it.
+//! Staging holds only damaged regions. The worker maps and converts them before
+//! the owner publishes the checked guest writes and completes the wait.
 use super::*;
 use adv_abi::types::{D3DLOCKED_RECT, D3DSURFACE_DESC};
 use adv_device::{
@@ -16,6 +18,8 @@ pub(super) struct PendingTransfer {
     owner: Id,
     destination: Id,
     image: Image,
+    regions: Vec<Rect>,
+    tracked: Option<adv_device::gpu::ImageId>,
     storage: u32,
     length: u32,
     format: u32,
@@ -222,11 +226,16 @@ pub(super) fn lock_internal(
         ready: !gpu_lock,
     };
     if !gpu_lock {
+        let owner = r.device;
+        let storage = r.storage;
         let value = locked_rect(r, rectangle);
         if output.write(env.cpu, value).is_err() {
             return Outcome::Return(INVALID);
         }
         set_lock(env, id, Some(selected));
+        if flags & 0x10 == 0 {
+            recording::invalidate_readback_destination(env, owner, storage);
+        }
         return Outcome::Return(0);
     }
     let owner = r.device;
@@ -279,6 +288,8 @@ pub(super) fn lock_internal(
             event,
             owner,
             destination: id,
+            regions: vec![full(&image)],
+            tracked: None,
             image,
             storage,
             length,
@@ -547,10 +558,14 @@ fn read_target(
     else {
         return Outcome::Return(INVALID);
     };
+    let source = com(env)
+        .identity::<Payload>(&env.sys.objects, source.addr())
+        .unwrap();
     enqueue_readback(
         env,
         owner,
         image,
+        Some(source),
         destination,
         storage,
         length,
@@ -564,6 +579,7 @@ fn enqueue_readback(
     env: &mut Env<'_>,
     owner: Id,
     image: adv_device::gpu::Image,
+    source: Option<Id>,
     destination: GuestPtr<()>,
     storage: u32,
     length: u32,
@@ -577,6 +593,7 @@ fn enqueue_readback(
     if adv_abi::guest::check_range(env.cpu, storage, length, Prot::WRITE).is_err() {
         return Outcome::Return(INVALID);
     }
+    let pointer = destination.addr();
     let destination = com(env)
         .identity::<Payload>(&env.sys.objects, destination.addr())
         .unwrap();
@@ -585,12 +602,21 @@ fn enqueue_readback(
         Ok(event) => event,
         Err(error) => return Outcome::Return(error),
     };
+    let regions = if let Some(source) = source {
+        recording::readback_regions(env, owner, source, pointer, storage, event, &image)
+    } else {
+        recording::invalidate_readback_destination(env, owner, storage);
+        vec![full(&image)]
+    };
+    let tracked = source.map(|_| image.id());
     let transfer = PendingTransfer {
         context: env.context,
         event,
         owner,
         destination,
         image,
+        regions,
+        tracked,
         storage,
         length,
         format,
@@ -655,13 +681,27 @@ fn retain_transfer(env: &mut Env<'_>, owner: Id, destination: Id) -> Result<u32,
     }
     Ok(event)
 }
+fn full(image: &Image) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        w: image.width(),
+        h: image.height(),
+    }
+}
+
 fn start(env: &mut Env<'_>, mut transfer: PendingTransfer, detach: bool) -> Outcome {
+    if transfer.regions.is_empty() {
+        transfer.result = Some(0);
+        cleanup(env, transfer);
+        return Outcome::Return(0);
+    }
     // Even a blocking call orders its copy before another guest thread runs.
     if advance(env, &mut transfer) {
         env.sys.set_event(transfer.event);
     } else if transfer.ticket.is_none() {
         let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
-        match gpu.snapshot_readback_source(&transfer.image) {
+        match gpu.snapshot_readback_regions(&transfer.image, &transfer.regions) {
             Ok(image) => transfer.image = image,
             Err(_) => {
                 transfer.result = Some(DEVICE_LOST);
@@ -740,6 +780,15 @@ fn cleanup(env: &mut Env<'_>, transfer: PendingTransfer) {
     {
         ticket.cancel();
     }
+    if let Some(slot) = transfer.tracked {
+        recording::complete_readback(
+            env,
+            transfer.owner,
+            slot,
+            transfer.event,
+            transfer.result == Some(0),
+        );
+    }
     release_transfer(
         env,
         transfer.event,
@@ -809,15 +858,23 @@ fn advance(env: &mut Env<'_>, transfer: &mut PendingTransfer) -> bool {
             .gpu
             .take()
             .expect("installed readback GPU");
-        let result = gpu.readback(&transfer.image, wake);
+        let result = gpu.readback_regions(&transfer.image, &transfer.regions, wake);
         env.ext.get_mut::<State>().gpu = Some(gpu);
         match result {
             Ok(mut ticket) => {
-                transfer.job = Some(
-                    Task::new(ticket.take_completion_job().unwrap())
-                        .finish_on_shutdown()
-                        .without_wake(),
-                );
+                env.ext.get_mut::<State>().frames.readback_bytes += transfer
+                    .regions
+                    .iter()
+                    .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+                    .sum::<u64>();
+                let format = transfer.format;
+                let job = ticket
+                    .take_completion_job_with(move |pixels| {
+                        format::readback(format, pixels)
+                            .ok_or_else(|| Error::Invalid("invalid readback pixels".into()))
+                    })
+                    .unwrap();
+                transfer.job = Some(Task::new(job).finish_on_shutdown().without_wake());
                 transfer.ticket = Some(ticket);
             }
             Err(Error::Busy) => {}
@@ -840,38 +897,43 @@ fn advance(env: &mut Env<'_>, transfer: &mut PendingTransfer) -> bool {
         && let Some(result) = ticket.poll()
     {
         transfer.result = Some(match result {
-            Ok(pixels)
-                if pixels.len()
-                    == transfer.image.width() as usize * transfer.image.height() as usize * 4 =>
-            {
-                match format::readback(transfer.format, pixels)
-                    .filter(|pixels| pixels.len() == transfer.length as usize)
-                {
-                    Some(pixels) => {
-                        // A different guest thread can change protection while
-                        // this thread is blocked. Revalidate the complete span
-                        // before committing any bytes on every backend.
-                        if adv_abi::guest::check_range(
-                            env.cpu,
-                            transfer.storage,
-                            transfer.length,
-                            Prot::WRITE,
-                        )
-                        .is_ok()
-                            && env.cpu.write(transfer.storage, &pixels).is_ok()
-                        {
-                            0
-                        } else {
-                            INVALID
-                        }
-                    }
-                    None => DEVICE_LOST,
-                }
-            }
-            _ => DEVICE_LOST,
+            Ok(pixels) => publish_pixels(env, transfer, &pixels),
+            Err(_) => DEVICE_LOST,
         });
     }
     transfer.result.is_some()
+}
+
+fn publish_pixels(env: &mut Env<'_>, transfer: &PendingTransfer, pixels: &[u8]) -> u32 {
+    let bytes = format::bytes(transfer.format).unwrap();
+    let pitch = transfer.image.width() * bytes;
+    let expected: u32 = transfer.regions.iter().map(|r| r.w * r.h * bytes).sum();
+    if pixels.len() != expected as usize {
+        return DEVICE_LOST;
+    }
+    // Another guest context can change protection while the wait is parked.
+    if adv_abi::guest::check_range(env.cpu, transfer.storage, transfer.length, Prot::WRITE).is_err()
+    {
+        return INVALID;
+    }
+    let mut input = pixels;
+    for r in &transfer.regions {
+        let (region, rest) = input.split_at((r.w * r.h * bytes) as usize);
+        input = rest;
+        let start = transfer.storage + r.y * pitch + r.x * bytes;
+        if r.w * bytes == pitch {
+            if env.cpu.write(start, region).is_err() {
+                return INVALID;
+            }
+        } else {
+            for (row, pixels) in region.chunks_exact((r.w * bytes) as usize).enumerate() {
+                if env.cpu.write(start + row as u32 * pitch, pixels).is_err() {
+                    return INVALID;
+                }
+            }
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -958,6 +1020,7 @@ fn read_front(
         env,
         owner,
         image,
+        None,
         destination,
         storage,
         length,

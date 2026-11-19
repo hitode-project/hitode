@@ -231,13 +231,12 @@ fn cpu_multistream_fixed_input_preserves_offsets_indices_uv_pixels_and_rejection
         &[device, 0, texture],
     ));
     let prepared = fixed::prepare_bound(&mut env(&mut m), device, 5, 2, 1, None).unwrap();
-    let repeated = fixed::prepare_bound(&mut env(&mut m), device, 5, 2, 1, None).unwrap();
-    assert!(Arc::ptr_eq(&prepared.vertices, &repeated.vertices));
-    assert!(prepared.vertices.iter().all(|v| v.uv == [0.75, 0.25]));
-    assert_eq!(
-        prepared.vertices[0].position,
-        [-1. + 1. / 16., 1. - 1. / 12., 0.5, 1.]
-    );
+    let streamed = prepared.programmable.as_ref().unwrap();
+    for n in 0..4 {
+        let raw = recording::damage::vertex_input(streamed, n).unwrap().v;
+        assert_eq!(raw[0][..3], positions[n as usize + 1][1..]);
+        assert_eq!(raw[2], [0.75, 0.25, 0., 1.]);
+    }
     drop(prepared);
     clear_frame(&mut m, device);
     okay(invoke(

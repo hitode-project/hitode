@@ -182,9 +182,19 @@ fn set(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, surface: GuestPtr<()>)
         d.render_target = Some(new);
         {
             let mut hot = d.hot.borrow_mut();
-            hot.fixed.target_changed(width, height);
-            hot.touch(3);
-            hot.touch(4);
+            if old.or(d.back_buffer) != Some(new) {
+                hot.target_version += 1;
+            }
+            let [viewport, scissor] = hot.fixed.state_mut().target_changed(width, height);
+            if viewport || scissor {
+                hot.fixed.invalidate_key();
+            }
+            if viewport {
+                hot.touch(3);
+            }
+            if scissor {
+                hot.touch(4);
+            }
         }
     }
     if old != Some(new) {

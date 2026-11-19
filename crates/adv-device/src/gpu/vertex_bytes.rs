@@ -189,6 +189,13 @@ impl VertexBytes {
             } => source.vertex(n / 6, *source_stride, *width, write),
         }
     }
+    pub(super) fn copy_to(&self, mut output: &mut [u8]) {
+        self.visit(&mut |bytes| {
+            let (part, rest) = std::mem::take(&mut output).split_at_mut(bytes.len());
+            part.copy_from_slice(bytes);
+            output = rest;
+        });
+    }
     fn visit(&self, write: &mut impl FnMut(&[u8])) {
         match &*self.0 {
             Source::Raw { bytes: v, .. } => write(v),

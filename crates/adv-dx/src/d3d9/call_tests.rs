@@ -1302,3 +1302,73 @@ fn d3d9_direct_body_loop_keeps_host_calls_flat_on_real_vtable() {
         samples[1]
     );
 }
+
+// spec: GFX-REC-6
+#[test]
+fn direct_unavailable_options_are_reported_once_by_the_full_handler() {
+    const WARM: u32 = 64;
+    const ROUNDS: u32 = 80;
+    #[derive(Default)]
+    struct Options {
+        warm: u32,
+        slots: [u32; 3],
+    }
+    let mut f = fixture(false);
+    let this = f.device;
+    let matrix = f.packet([1f32.to_bits(); 16]);
+    let results = f.packet([0u32; 3]);
+    let counter = f.packet(ROUNDS);
+    // Supported values warm the call sites onto their direct bodies first.
+    let slots = [f.packet(4u32), f.packet(2u32), f.packet(256u32)];
+    f.m.ext.insert(Options { warm: WARM, slots });
+    let registry = f.m.sys.thunks.resolver_mut::<Registry>().unwrap();
+    registry.add("fixture.dll", "flip", Conv::Stdcall { argc: 0 }, |env| {
+        let options = env.ext.get_mut::<Options>();
+        options.warm = options.warm.saturating_sub(1);
+        if options.warm == 0 {
+            // Stage-zero ADDSIGNED, a TEMP argument and a texture matrix are
+            // legal SDK options this device does not implement.
+            let slots = options.slots;
+            for (slot, value) in slots.into_iter().zip([8, 5, 16]) {
+                env.cpu.write_u32(slot, value).unwrap();
+            }
+        }
+        Outcome::Return(0)
+    });
+    let mut code = Asm::new(CODE);
+    let top = code.here();
+    call(&mut f, &mut code, "flip", &[]);
+    for (index, (name, leading)) in [
+        ("SetTextureStageState", vec![this, 0, 1]),
+        ("SetTextureStageState", vec![this, 0, 2]),
+        ("SetTransform", vec![this]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // The last argument comes from its slot: the option, or the matrix
+        // after the transform state.
+        if index == 2 {
+            code.push_imm(matrix);
+        }
+        code.bytes.extend_from_slice(&[0xff, 0x35]); // push dword [slot]
+        code.bytes.extend_from_slice(&slots[index].to_le_bytes());
+        for &arg in leading.iter().rev() {
+            code.push_imm(arg);
+        }
+        call(&mut f, &mut code, &format!("IDirect3DDevice9::{name}"), &[]);
+        code.bytes.push(0xa3); // mov [moffs32], eax
+        code.bytes
+            .extend_from_slice(&(results + index as u32 * 4).to_le_bytes());
+    }
+    code.bytes.extend_from_slice(&[0xff, 0x0d]); // dec dword [counter]
+    code.bytes.extend_from_slice(&counter.to_le_bytes());
+    code.jnz(top);
+    call(&mut f, &mut code, "exit", &[]);
+    run(&mut f, code);
+    let returned: [u32; 3] = GuestPtr::new(results).read(&f.m.cpu).unwrap();
+    assert_eq!(returned, [UNAVAILABLE; 3]);
+    let diagnostics = f.m.ext.get::<adv_abi::ApiDiagnostics>();
+    assert_eq!(diagnostics.warnings.len(), 3);
+    assert_eq!(diagnostics.warnings.values().sum::<u64>(), 3);
+}

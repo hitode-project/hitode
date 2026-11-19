@@ -194,6 +194,7 @@ fn draw(f: &mut Fixture) -> fixed::Draw {
         programmable: None,
         recording_key: 0,
         program_key: 0,
+        fixed_vertex: None,
     }
 }
 fn record_draw(f: &mut Fixture, d: fixed::Draw) {
@@ -1190,7 +1191,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         let mut d = draw(&mut f);
         d.image = Some(f.image(if resource == first { source } else { other }));
         record_draw(&mut f, d);
-        keys.push(frame(&mut env(&mut f), owner).key);
+        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
         present(&mut f);
     }
     assert_ne!(keys[0], keys[1]);

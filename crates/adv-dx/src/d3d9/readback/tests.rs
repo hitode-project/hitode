@@ -90,6 +90,87 @@ fn blocked_readback_keeps_pixels_from_before_a_later_write() {
     }
 }
 
+// spec: GFX-REC-10, GFX-REC-4
+#[test]
+fn readback_transfers_only_damaged_rows_and_columns() {
+    let mut f = super::super::stretch::tests::Fixture::new();
+    let (width, height) = (32, 24);
+    let source = f.render_target(width, height, 21);
+    let device = f.device;
+    let output = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateOffscreenPlainSurface",
+        &[device, width, height, 21, 2, output, 0],
+    );
+    let destination = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[device, 0, source]);
+    f.okay(
+        "IDirect3DDevice9::Clear",
+        &[device, 0, 0, 1, 0xff0000ff, 0, 0],
+    );
+
+    let readback = |f: &mut super::super::stretch::tests::Fixture| {
+        f.okay(
+            "IDirect3DDevice9::GetRenderTargetData",
+            &[device, source, destination],
+        );
+        f.lock(destination, 0, 0x10)
+    };
+    let baseline = readback(&mut f);
+    assert_eq!(baseline.Pitch, (width * 4) as i32);
+    assert_eq!(f.m.cpu.read_u32(baseline.pBits).unwrap(), 0xff0000ff);
+    assert_eq!(
+        f.m.ext.get::<State>().frames.readback_bytes,
+        u64::from(width * height * 4)
+    );
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+
+    for rect in [[8i32, 0, 16, 8], [16, 16, 24, 24]] {
+        let rectangle = f.packet(rect);
+        f.okay(
+            "IDirect3DDevice9::ColorFill",
+            &[device, source, rectangle, 0xff00ff00],
+        );
+    }
+    let bytes = f.m.ext.get::<State>().frames.readback_bytes;
+    let locked = readback(&mut f);
+    let transferred = f.m.ext.get::<State>().frames.readback_bytes - bytes;
+    assert_eq!(transferred, 2 * 8 * 8 * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let changed = (8..16).contains(&x) && y < 8 || (16..24).contains(&x) && y >= 16;
+            let pixel =
+                f.m.cpu
+                    .read_u32(locked.pBits + (y * width + x) * 4)
+                    .unwrap();
+            assert_eq!(
+                pixel,
+                if changed { 0xff00ff00 } else { 0xff0000ff },
+                "({x}, {y})"
+            );
+        }
+    }
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+    readback(&mut f);
+    assert_eq!(
+        f.m.ext.get::<State>().frames.readback_bytes,
+        bytes + transferred
+    );
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+
+    // Exposing writable CPU pixels invalidates the destination baseline.
+    let locked = f.lock(destination, 0, 0);
+    f.m.cpu.write_u32(locked.pBits, 0xffff0000).unwrap();
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+    let locked = readback(&mut f);
+    assert_eq!(f.m.cpu.read_u32(locked.pBits).unwrap(), 0xff0000ff);
+    assert_eq!(
+        f.m.ext.get::<State>().frames.readback_bytes,
+        bytes + transferred + u64::from(width * height * 4)
+    );
+    f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+}
+
 // spec: GFX-COPY-1, GFX-COPY-2
 #[test]
 fn standalone_render_target_locks_read_gpu_pixels_and_upload_writes() {

@@ -1,4 +1,5 @@
-//! Immutable stream capture shared by shader and pretransformed input paths.
+//! Immutable stream capture shared by translated and generated shaders.
+//! A fixed UP record may need padding between vertices for GPU vertex fetch.
 use super::*;
 pub(super) fn capture(
     env: &Env<'_>,
@@ -6,10 +7,11 @@ pub(super) fn capture(
     inputs: &[Input],
     up: Option<(GuestPtr<u8>, u32)>,
     start: u32,
-    first: u32,
-    last: u32,
+    vertices: std::ops::RangeInclusive<u32>,
     instanced: bool,
+    fixed: bool,
 ) -> Result<Vec<VertexStream>, u32> {
+    let (first, last) = vertices.into_inner();
     let d = device(env, pointer).ok_or(INVALID)?;
     let hot = d.hot.borrow();
     let mut streams = Vec::new();
@@ -25,7 +27,7 @@ pub(super) fn capture(
             .max()
             .unwrap();
         let (data, stride, available) = if let Some((data, stride)) = up {
-            if n != 0 {
+            if n != 0 || data.is_null() || stride == 0 {
                 return Err(INVALID);
             }
             (data.addr(), stride, u32::MAX)
@@ -46,7 +48,11 @@ pub(super) fn capture(
                 buffer.len - stream.offset,
             )
         };
-        if stride > 2048 || !stride.is_multiple_of(4) || (stride != 0 && stride < minimum) {
+        let unaligned_up = fixed && up.is_some() && !stride.is_multiple_of(4);
+        if stride > 2048
+            || (!unaligned_up && !stride.is_multiple_of(4))
+            || (stride != 0 && stride < minimum)
+        {
             return Err(INVALID);
         }
         let instance = instanced && hot.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0;
@@ -66,13 +72,22 @@ pub(super) fn capture(
         if offset.checked_add(bytes).is_none_or(|end| end > available) {
             return Err(INVALID);
         }
+        let upload_stride = stride.next_multiple_of(4);
+        let upload_bytes = if unaligned_up {
+            (last - first + 1)
+                .checked_mul(upload_stride)
+                .ok_or(INVALID)?
+        } else {
+            bytes
+        };
         total = total
-            .checked_add(bytes)
+            .checked_add(upload_bytes)
             .filter(|&v| v <= 16 * 1024 * 1024)
             .ok_or(INVALID)?;
         let at = data.checked_add(offset).ok_or(INVALID)?;
         adv_abi::guest::check_range(env.cpu, at, bytes, Prot::READ).map_err(|_| INVALID)?;
-        let mut raw = hot.fixed.capture_stream(env, at, bytes)?;
+        let repack = unaligned_up.then_some((stride as usize, upload_stride as usize));
+        let mut raw = hot.fixed.capture_stream(env, at, bytes, repack)?;
         if instanced && stride != 0 && !bytes.is_multiple_of(stride) {
             // Metal bounds vertex fetches by complete strides, including the
             // final record whose unused trailing bytes need no guest storage.
@@ -81,7 +96,7 @@ pub(super) fn capture(
         streams.push(VertexStream {
             instance,
             bytes: raw,
-            stride,
+            stride: upload_stride,
             attributes: selected
                 .map(|i| Attribute {
                     location: i.register,

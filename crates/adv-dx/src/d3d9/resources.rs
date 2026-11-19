@@ -867,7 +867,9 @@ pub(super) fn texture_lock(
         return INVALID;
     };
     let bytes = format::bytes(selected.desc.Format).unwrap();
-    let bits = r.storage + selected.offset + rect.y * pitch + rect.x * bytes;
+    let owner = r.device;
+    let storage = r.storage + selected.offset;
+    let bits = storage + rect.y * pitch + rect.x * bytes;
     if output
         .write(
             env.cpu,
@@ -900,6 +902,9 @@ pub(super) fn texture_lock(
     }
     if let Some(id) = com(env).identity::<Payload>(&env.sys.objects, this.addr()) {
         invalidate_hot_texture(env, id);
+    }
+    if flags & 0x10 == 0 {
+        recording::invalidate_readback_destination(env, owner, storage);
     }
     0
 }

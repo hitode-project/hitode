@@ -170,6 +170,7 @@ fn set(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     }
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         d.depth_stencil = new;
+        d.hot.borrow_mut().target_version += 1;
     }
     release_binding(env, old);
     0
