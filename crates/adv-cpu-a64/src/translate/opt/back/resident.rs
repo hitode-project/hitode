@@ -293,75 +293,115 @@ impl Emitter<'_> {
     }
 }
 
-/// Walks the candidate pages of one stream. X0 and X1 are the first and
-/// last pages in stream order. XOR with X2 gives the actual guest page.
-/// X5 is the bitmap offset (0 for reads, 8 for writes). Returns the
-/// projected byte boundary of the first unproved page in X0, preserving K
-/// in X3 and all allocated values.
-pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
-    use adv_cpu_core::memory::EXEC;
-    const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
-    let write = asm.label();
-    let next = asm.label();
-    let done = asm.label();
-    asm.bind(entry);
+const SPAN_WORDS: [usize; 4] = adv_cpu_core::memory::WINDOW_SPAN_WORDS;
+const WINDOW_SPAN_TABLES: u32 = offset_of!(Runtime, window_span_tables) as u32;
+
+/// Test a range's first word. A large range follows the summaries to the
+/// first unavailable page, irrespective of the number of eligible pages.
+pub(super) fn window_span(asm: &mut Asm, write: bool, backwards: bool, search: Label, hit: Label) {
+    let across = asm.label();
+    let farther = asm.label();
+    let blocked = asm.label();
+    let table = 2 * u32::from(backwards) + u32::from(write);
     asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(W, U, RT, MEMORY_BASE),
-        sub(W, U, X4, U, Lsr, PAGE_SHIFT),
-        ldr(W, T, RT, MEMORY_PAGES),
-        cmp(W, U, T, Lsl, 0),
+        ldr(X, X5, RT, WINDOW_SPAN_TABLES + 8 * table),
+        lsr_imm(X, T, X0, 12),
+        lsr_imm(X, X2, T, 6),
+        ldr_reg(X, X4, X5, X2, true),
+        shiftv(X, Lsr, X4, X4, T),
+        rbit(X, X4, X4),
+        clz(X, X4, X4),
+        add(X, X4, T, X4, Lsl, 0),
+        lsl_imm(X, X4, X4, 12),
+        cmp(X, X2, X1, Lsr, 18),
     ]);
-    asm.b_cond(Cond::Hs, done);
-    asm.emit_all(&[
-        lsr_imm(W, T, U, 6),
-        add(W, T, T, T, Lsl, 1),
-        ldr(X, X4, RT, PLAIN_PAGES),
-        add_ext(X, T, X4, T, Extend::Uxtw, 3),
-        add(X, X4, T, X5, Lsl, 0),
-        ldr(X, X4, X4, 0),
-        ldr(X, T, T, 16),
-        bic(X, T, X4, T, Lsl, 0),
-        shiftv(X, Lsr, T, T, U),
-    ]);
-    asm.tbz(false, T, 0, done);
-    // The bitmap grants guest permission. The window class also accounts
-    // for the host protection intersection on hosts with larger pages.
-    asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(X, T, RT, runtime::CLASSES),
-        ldr_narrow(Narrow::Byte, T, T, X4),
-    ]);
-    asm.cbz(W, true, X5, write);
-    asm.tbz(false, T, READ.trailing_zeros(), done);
-    asm.tbz(true, T, SHARED.trailing_zeros(), done);
-    asm.b(next);
-    asm.bind(write);
-    asm.tbz(false, T, WRITE.trailing_zeros(), done);
-    asm.tbz(true, T, EXEC.trailing_zeros(), done);
-    asm.bind(next);
-    asm.emit_all(&[add_imm(W, X0, X0, 1, false), cmp(X, X0, X1, Lsl, 0)]);
-    asm.b_cond(Cond::Ls, entry);
-    asm.bind(done);
-    asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
+    asm.b_cond(Cond::Ne, across);
+    asm.emit(cmp(X, X1, X4, Lsl, 0));
+    asm.b_cond(Cond::Lo, hit);
+    asm.b(blocked);
+
+    asm.bind(across);
+    asm.emit_all(&[add_imm(X, X2, X2, 1, false), cmp(X, X4, X2, Lsl, 18)]);
+    asm.b_cond(Cond::Hs, farther);
+    asm.bind(blocked);
+    asm.emit(mov(X, X2, X4));
+    let limited = asm.label();
+    asm.b(limited);
+    asm.bind(farther);
+    asm.bl(search);
+    asm.emit(cmp(X, X1, X2, Lsl, 0));
+    asm.b_cond(Cond::Lo, hit);
+    asm.bind(limited);
 }
 
-/// The owner keeps these cells with the resident code that references them.
-/// One interval per stream shares the site's epoch. Empty cells are misses.
+fn span_word(asm: &mut Asm, level: usize, dst: Reg, index: Reg) {
+    let offset = SPAN_WORDS[..level].iter().sum::<usize>() * 8;
+    let base = if offset == 0 {
+        X5
+    } else {
+        asm.emit(movz(X, U, (offset >> 16) as u16, 16));
+        if offset as u16 != 0 {
+            asm.emit(movk(X, U, offset as u16, 0));
+        }
+        asm.emit(add(X, U, X5, U, Lsl, 0));
+        U
+    };
+    asm.emit(ldr_reg(X, dst, base, index, true));
+}
+
+/// X2 starts at the next word of pages. Ascend past empty suffixes, then
+/// follow the first nonempty child at each level. X2 returns a byte bound.
+pub(super) fn span_search(asm: &mut Asm, entry: Label) {
+    let end = asm.label();
+    let finish = asm.label();
+    let found: [Label; 3] = std::array::from_fn(|_| asm.label());
+    asm.bind(entry);
+    for (level, &found) in (1..SPAN_WORDS.len()).zip(&found) {
+        let (max, shift) = add_immediate(SPAN_WORDS[level - 1] as u64).unwrap();
+        asm.emit(cmp_imm(X, X2, max, shift));
+        asm.b_cond(Cond::Hs, end);
+        asm.emit(lsr_imm(X, T, X2, 6));
+        span_word(asm, level, X4, T);
+        asm.emit(shiftv(X, Lsr, X4, X4, X2));
+        asm.cbz(X, true, X4, found);
+        asm.emit(add_imm(X, X2, T, 1, false));
+    }
+    asm.bind(end);
+    asm.emit(movz(X, X2, 1 << 4, 16));
+    asm.b(finish);
+    for (level, found) in (1..SPAN_WORDS.len()).zip(found) {
+        asm.bind(found);
+        asm.emit_all(&[rbit(X, X4, X4), clz(X, X4, X4), add(X, X2, X2, X4, Lsl, 0)]);
+        // The upper word also denies indices outside the guest address space.
+        if level == SPAN_WORDS.len() - 1 {
+            asm.emit(cmp_imm(X, X2, SPAN_WORDS[level - 1] as u32, false));
+            asm.b_cond(Cond::Hs, end);
+        }
+        for child in (0..level).rev() {
+            span_word(asm, child, T, X2);
+            asm.emit_all(&[rbit(X, T, T), clz(X, T, T), add(X, X2, T, X2, Lsl, 6)]);
+        }
+        asm.b(finish);
+    }
+    asm.bind(finish);
+    asm.emit_all(&[lsl_imm(X, X2, X2, 12), ret(Reg::LR)]);
+}
+
+/// Counters and the threshold word use a stable address for the emitted code.
 pub(crate) struct BatchCache {
     pub(crate) head: u32,
-    pub(crate) cells: Box<[std::cell::Cell<u64>]>,
+    pub(crate) cells: Box<[std::cell::Cell<u64>; 7]>,
     pub(crate) split: Option<Box<SpanSplit>>,
 }
 
 impl BatchCache {
     pub(super) const THRESHOLD: u32 = 40;
-    pub(super) const INTERVALS: u32 = 48;
+    pub(super) const READ_LIMIT: usize = 0;
+    pub(super) const WRITE_LIMIT: usize = 1;
+    pub(super) const WRAP_LIMIT: usize = 6;
 
     pub(super) fn new(batch: &loops::Batch, diagnostics: bool) -> Self {
-        let cells =
-            vec![std::cell::Cell::new(0); Self::INTERVALS as usize / 8 + 2 * batch.spans.len()]
-                .into_boxed_slice();
+        let cells = Box::new([const { std::cell::Cell::new(0) }; 7]);
         let split = (cfg!(native)
             && (batch.loop_.sign_latch || batch.spans.iter().any(|span| span.step == 0)))
         .then(|| {
@@ -412,7 +452,15 @@ impl BatchCache {
     }
 
     pub(crate) fn counts(&self) -> [u64; 4] {
-        std::array::from_fn(|i| self.cells[1 + i].get())
+        [
+            0,
+            self.cells[2].get(),
+            self.cells[3].get(),
+            self.cells[4].get(),
+        ]
+    }
+    pub(crate) fn guard_counts(&self) -> [u64; 3] {
+        [Self::READ_LIMIT, Self::WRITE_LIMIT, Self::WRAP_LIMIT].map(|index| self.cells[index].get())
     }
 }
 
@@ -606,5 +654,151 @@ impl Probation {
         ]);
         asm.bind(self.slot);
         asm.emit_all(&[0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    // spec: A64-OPT-10
+    #[test]
+    fn a_local_window_proof_has_two_loads_two_compares_and_no_call() {
+        let mut asm = Asm::new();
+        let search = asm.label();
+        let hit = asm.label();
+        window_span(&mut asm, false, false, search, hit);
+        asm.bind(hit);
+        let target = asm.offset();
+        asm.emit(ret(Reg::LR));
+        span_search(&mut asm, search);
+        let words = asm.finish();
+        assert_eq!(
+            &words[..13],
+            &[
+                ldr(X, X5, RT, WINDOW_SPAN_TABLES),
+                lsr_imm(X, T, X0, 12),
+                lsr_imm(X, X2, T, 6),
+                ldr_reg(X, X4, X5, X2, true),
+                shiftv(X, Lsr, X4, X4, T),
+                rbit(X, X4, X4),
+                clz(X, X4, X4),
+                add(X, X4, T, X4, Lsl, 0),
+                lsl_imm(X, X4, X4, 12),
+                cmp(X, X2, X1, Lsr, 18),
+                b_cond(Cond::Ne, 16),
+                cmp(X, X1, X4, Lsl, 0),
+                b_cond(Cond::Lo, (target - 12 * 4) as i32),
+            ],
+        );
+    }
+
+    #[cfg(unix)]
+    // spec: A64-OPT-10
+    #[test]
+    fn a_live_window_proof_obeys_revoke_watch_and_class_changes() {
+        use crate::emulator::Emulator;
+        use adv_cpu_core::memory::{Memory, PAGE_SIZE};
+
+        const HOST_PAGE: usize = 16384;
+        const BASE: u32 = 0x40000;
+        const LENGTH: usize = 8192 * PAGE_SIZE;
+        const TABLE: u64 = 0x2000_0000;
+        const RUNTIME: u64 = 0x3000_0000;
+        const SIZE: usize = 8 * (SPAN_WORDS[0] + SPAN_WORDS[1] + SPAN_WORDS[2] + SPAN_WORDS[3]);
+        const STRIDE: u64 = SIZE.div_ceil(PAGE_SIZE) as u64 * PAGE_SIZE as u64;
+
+        let mut memory = Memory::window_at_host_size(BASE, LENGTH, HOST_PAGE).unwrap();
+        memory.map(BASE, LENGTH, READ | WRITE).unwrap();
+        drop(memory.native_permissions());
+        let mut emu = Emulator::new();
+        emu.map(TABLE, 4 * STRIDE);
+        emu.map(RUNTIME, PAGE_SIZE as u64);
+        emu.set_x(RT, RUNTIME);
+        let mut queries = Vec::new();
+        let saved = Reg::new(19);
+        let mut asm = Asm::new();
+        let search = asm.label();
+        for backwards in [false, true] {
+            for write in [false, true] {
+                queries.push(asm.offset());
+                let hit = asm.label();
+                asm.emit(mov(X, saved, Reg::LR));
+                window_span(&mut asm, write, backwards, search, hit);
+                asm.emit(ret(saved));
+                asm.bind(hit);
+                asm.emit_all(&[mov(X, X2, Reg::ZR), ret(saved)]);
+            }
+        }
+        span_search(&mut asm, search);
+        let code = asm.finish();
+
+        let mut check = |memory: &mut Memory, read_first: u32, write_first: u32, write_end: u32| {
+            for (i, table) in memory.window_span_tables(false).into_iter().enumerate() {
+                let at = TABLE + i as u64 * STRIDE;
+                emu.write(
+                    RUNTIME + u64::from(WINDOW_SPAN_TABLES) + 8 * i as u64,
+                    &at.to_le_bytes(),
+                );
+                // SAFETY: these tables are live throughout the owner call.
+                emu.write(at, unsafe {
+                    std::slice::from_raw_parts(table.cast(), SIZE)
+                });
+            }
+            let last = BASE + LENGTH as u32 - 1;
+            for (i, (begin, end, expected)) in [
+                (BASE, last, u64::from(read_first)),
+                (BASE, last, u64::from(write_first)),
+                (!last, !BASE, 0),
+                (
+                    !last,
+                    !BASE,
+                    if write_end == 0 {
+                        0
+                    } else {
+                        (1u64 << 32) - u64::from(write_end)
+                    },
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                emu.set_x(X0, u64::from(begin));
+                emu.set_x(X1, u64::from(end));
+                emu.call_at(&code, queries[i]).unwrap();
+                assert_eq!(emu.x(X2), expected, "query {i}: {begin:#x}..={end:#x}");
+            }
+        };
+
+        check(&mut memory, 0, 0, 0);
+        for offset in [
+            0,
+            63 * PAGE_SIZE,
+            64 * PAGE_SIZE,
+            (4096 - 64) * PAGE_SIZE,
+            LENGTH - PAGE_SIZE,
+        ] {
+            let addr = BASE + offset as u32;
+            let first = addr & !(HOST_PAGE as u32 - 1);
+            memory.protect(addr, PAGE_SIZE, READ).unwrap();
+            drop(memory.native_permissions());
+            check(&mut memory, 0, first, first + HOST_PAGE as u32);
+            memory.protect(addr, PAGE_SIZE, READ | WRITE).unwrap();
+            drop(memory.native_permissions());
+            check(&mut memory, 0, 0, 0);
+        }
+
+        let addr = BASE + (8192 / 2 * PAGE_SIZE) as u32;
+        memory.watch_code(addr, 1);
+        // The observed-code bit denies this page before the next class refresh.
+        let tables = memory.window_span_tables(false);
+        for table in tables.into_iter().take(2) {
+            let page = addr as usize / PAGE_SIZE;
+            // SAFETY: the live table includes the entire guest page space.
+            assert_ne!(
+                unsafe { table.add(page / 64).read() } & (1 << (page % 64)),
+                0
+            );
+        }
     }
 }

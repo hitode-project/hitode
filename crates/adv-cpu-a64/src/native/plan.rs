@@ -540,6 +540,17 @@ impl Native {
         counts
     }
 
+    pub(crate) fn resident_guard_counts(&self) -> std::collections::BTreeMap<u32, [u64; 3]> {
+        let mut counts = std::collections::BTreeMap::new();
+        for cache in self.batch_caches() {
+            let total: &mut [u64; 3] = counts.entry(cache.head).or_default();
+            for (total, count) in total.iter_mut().zip(cache.guard_counts()) {
+                *total += count;
+            }
+        }
+        counts
+    }
+
     pub(crate) fn resident_site_counts(&self) -> impl Iterator<Item = (u32, [u64; 2])> + '_ {
         self.plans.sites.iter().filter_map(|(&entry, site)| {
             let resident = site.resident.as_ref()?;
@@ -932,6 +943,7 @@ impl Native {
         self.code.rows.clear();
         self.code.table_sources.clear();
         self.code.uses_permissions = false;
+        self.code.uses_window_spans = false;
         self.code.pages.clear();
         self.code.links.clear();
         self.code.linked.clear();
@@ -1515,6 +1527,7 @@ impl Native {
         form: compile::ResidentForm,
     ) -> bool {
         let compile::ResidentForm { built, mut lowered } = form;
+        let uses_window_spans = !lowered.batch_caches.is_empty();
         let source = self.plans.resident(eip).unwrap().source;
         let mut probation = None;
         if lowered.iteration_retired != 0
@@ -1666,6 +1679,10 @@ impl Native {
                 .patch(pair[0].next, head::branch(pair[0].next, pair[1].entry));
         }
         self.code.uses_permissions = true;
+        if uses_window_spans && !self.code.uses_window_spans {
+            self.code.uses_window_spans = true;
+            self.classified_epoch = None;
+        }
         self.code.faults.end.set(self.code.cache.next());
         self.repoint_resident_edges(eip, Some(trampoline));
         true

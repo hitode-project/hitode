@@ -265,7 +265,7 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
-    let batch_pages = (resident && !batches.is_empty()).then(|| asm.label());
+    let window_spans = (resident && !batches.is_empty()).then(|| asm.label());
     let mut batch_backedges = vec![None; func.blocks.len()];
     for batch in batches {
         batch_backedges[batch.loop_.latch.0 as usize] = Some((batch.loop_.head, asm.label()));
@@ -362,7 +362,7 @@ fn emit<'a>(
             .find(|(_, batch)| batch.loop_.head.0 as usize == b)
         {
             let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
-            let pages = batch_pages.map(|walker| (walker, &batch_caches[index]));
+            let pages = window_spans.map(|search| (search, &batch_caches[index]));
             let (words, cases) = e.batch(
                 batch,
                 pages,
@@ -532,8 +532,8 @@ fn emit<'a>(
     {
         e.deferred_entry(assumed, entry, pending, miss, cold);
     }
-    if let Some(pages) = batch_pages {
-        resident::batch_pages(&mut e.asm, pages);
+    if let Some(search) = window_spans {
+        resident::span_search(&mut e.asm, search);
     }
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);

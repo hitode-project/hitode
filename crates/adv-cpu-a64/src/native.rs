@@ -857,6 +857,7 @@ impl Native {
                 internal_edges: FxHashMap::default(),
                 tier1_words: FxHashMap::default(),
                 uses_permissions: false,
+                uses_window_spans: false,
                 placed: Vec::new(),
                 work: translate::Workspace::default(),
                 helpers: Vec::new(),
@@ -1013,6 +1014,11 @@ impl Native {
             },
             services: self.runtime.body.services,
         };
+        if self.code.uses_window_spans {
+            self.runtime.window_span_tables = memory
+                .window_span_tables(self.checks == Checks::Slow)
+                .map(|table| table as u64);
+        }
         self.classified_epoch = Some(memory.epoch);
     }
 }

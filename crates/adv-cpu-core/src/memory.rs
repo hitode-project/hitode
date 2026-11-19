@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod fast;
 mod locks;
 mod page_map;
+mod spans;
 
 pub use fast::FastPermissions;
+pub use spans::WINDOW_SPAN_WORDS;
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -376,11 +378,17 @@ impl Memory {
                     watched,
                     &self.private_copy_pages,
                     Some((span, &allows)),
+                    &self.plain_pages,
                 );
             }
         }
-        self.fast
-            .snapshot(&self.perms, watched, &self.private_copy_pages, None)
+        self.fast.snapshot(
+            &self.perms,
+            watched,
+            &self.private_copy_pages,
+            None,
+            &self.plain_pages,
+        )
     }
 
     /// Register sampled code bytes before reading or reusing them. This is
@@ -452,10 +460,14 @@ impl Memory {
         self.plain_pages.as_ptr().cast()
     }
 
-    /// Changes when an ordinary-page fact can become false. Permission
-    /// grants leave existing facts valid.
-    pub fn page_fact_epoch(&self) -> u64 {
-        (self.identity() << EPOCH_BITS) + self.fast.page_fact_epoch()
+    /// Stable denial summaries for native ordinary-window span proofs.
+    pub fn window_span_tables(&mut self, checked_only: bool) -> [*const u64; 4] {
+        if checked_only {
+            spans::denied_tables()
+        } else {
+            self.fast
+                .window_spans((self.base as usize) / PAGE_SIZE, &self.plain_pages)
+        }
     }
 
     fn blocks_executable_writes(&self, flags: u8) -> bool {
@@ -846,7 +858,6 @@ impl Memory {
     fn update_plain_pages(&self, pages: std::ops::Range<usize>) {
         #[cfg(unix)]
         if self.window.is_some() {
-            let mut revoked = false;
             for page in pages {
                 let mut info = HostRange::EMPTY;
                 self.include_host_page(&mut info, page);
@@ -857,20 +868,17 @@ impl Memory {
                     self.observed_code(page, 0..PAGE_SIZE),
                 ];
                 let mask = 1 << (page % 64);
+                let mut changed = false;
                 for (offset, allowed) in grants.into_iter().enumerate() {
                     let word = &self.plain_pages[3 * (page / 64) + offset];
                     let bit = if allowed { mask } else { 0 };
                     let previous = word.get();
-                    revoked |= if offset < 2 {
-                        previous & mask & !bit != 0
-                    } else {
-                        previous & mask != bit
-                    };
+                    changed |= previous & mask != bit;
                     word.set((previous & !mask) | bit);
                 }
-            }
-            if revoked {
-                self.fast.revoke_page_facts();
+                if changed {
+                    self.fast.refresh_window_span(page, &self.plain_pages);
+                }
             }
         }
         #[cfg(not(unix))]

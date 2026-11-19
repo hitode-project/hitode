@@ -2136,7 +2136,7 @@ fn vector_sign_latch_guards_an_invariant_load() {
 
 // spec: A64-OPT-10
 #[test]
-fn vector_page_cache_keeps_grants_and_discards_revoked_intervals() {
+fn vector_window_summary_limits_strips_after_a_revoke() {
     let image = vector_image(4);
     let boundary = SPECIAL + HOST_PAGE as u32;
     let mut cpu = initial(59);
@@ -2145,7 +2145,7 @@ fn vector_page_cache_keeps_grants_and_discards_revoked_intervals() {
     let mut trial = Trial::new(
         &image,
         &cpu,
-        "cached page interval",
+        "window span summary",
         &[(SPECIAL, HOST_PAGE * 2)],
         |m| {
             m.map(SPECIAL, HOST_PAGE * 2, READ | WRITE).unwrap();
@@ -2155,11 +2155,10 @@ fn vector_page_cache_keeps_grants_and_discards_revoked_intervals() {
     );
     vector_install(&mut trial, cpu.clone(), 4);
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
-    let walks = |trial: &Trial<'_>| {
-        trial.live.native.as_ref().unwrap().resident_batch_counts()[&image.head][0]
+    let limits = |trial: &Trial<'_>| {
+        trial.live.native.as_ref().unwrap().resident_guard_counts()[&image.head][0]
     };
-    let first = walks(&trial);
-    assert!(first >= 3);
+    assert_eq!(limits(&trial), 0);
 
     for (perms, addr) in [(READ | WRITE, SPECIAL), (0, boundary)] {
         for executor in [&mut trial.live, &mut trial.reference] {
@@ -2169,10 +2168,10 @@ fn vector_page_cache_keeps_grants_and_discards_revoked_intervals() {
         let outcome = trial.compare(4096).0;
         if perms != 0 {
             assert_eq!(outcome, RunOutcome::ReachedStop);
-            assert_eq!(walks(&trial), first);
+            assert_eq!(limits(&trial), 0);
         } else {
             assert_ne!(outcome, RunOutcome::ReachedStop);
-            assert!(walks(&trial) > first);
+            assert!(limits(&trial) > 0);
         }
     }
 }

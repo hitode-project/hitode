@@ -373,6 +373,12 @@ impl Executor {
                         ),
                     );
                 }
+                for (head, [read, write, wrap]) in native.resident_guard_counts() {
+                    crate::jit_map::optimized(
+                        head,
+                        format_args!("resident\tguard_limits\t{read}\t{write}\t{wrap}"),
+                    );
+                }
             }
             return format!(
                 "{:?} unchecked faults {} checked {}",

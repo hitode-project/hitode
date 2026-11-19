@@ -68,6 +68,7 @@ pub(super) struct CodeStore {
     /// Emitted instruction lengths by entry and guest EIP for probation.
     pub(super) tier1_words: FxHashMap<u32, FxHashMap<u32, u32>>,
     pub(super) uses_permissions: bool,
+    pub(super) uses_window_spans: bool,
     /// Each placed unit's host address and entry, ascending.
     pub(super) placed: Vec<(usize, u32)>,
     /// Buffers of the last translation.

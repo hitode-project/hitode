@@ -8,6 +8,7 @@
 //! through the existing epoch/trap exit and worker quiescence protocol.
 //! The serial software-checked owner exposes linear COPY reads while retaining
 //! EXEC as a first-store barrier. This never grants guest execute permission.
+use super::spans::WindowSpans;
 use super::{EXEC, LINEAR, READ, SHARED, WRITE};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::BTreeMap;
@@ -28,7 +29,7 @@ pub struct FastPermissions {
     body: Option<Table>,
     /// Counts the snapshots whose bytes differ from the one before.
     version: u64,
-    page_fact_epoch: Cell<u64>,
+    spans: Option<WindowSpans>,
 }
 
 impl FastPermissions {
@@ -44,7 +45,7 @@ impl FastPermissions {
             native: None,
             body: None,
             version: 0,
-            page_fact_epoch: Cell::new(0),
+            spans: None,
         }
     }
 
@@ -55,12 +56,16 @@ impl FastPermissions {
         self.version
     }
 
-    pub(super) fn page_fact_epoch(&self) -> u64 {
-        self.page_fact_epoch.get()
+    pub(super) fn window_spans(&mut self, first: usize, plain: &[Cell<u64>]) -> [*const u64; 4] {
+        self.spans
+            .get_or_insert_with(|| WindowSpans::new(first, &self.bytes, plain))
+            .pointers()
     }
 
-    pub(super) fn revoke_page_facts(&self) {
-        self.page_fact_epoch.set(self.page_fact_epoch.get() + 1);
+    pub(super) fn refresh_window_span(&self, page: usize, plain: &[Cell<u64>]) {
+        if let Some(spans) = &self.spans {
+            spans.refresh(page, self.bytes[page], plain);
+        }
     }
 
     /// A stable full-address-space view. Partial refreshes update only their pages.
@@ -125,6 +130,7 @@ impl FastPermissions {
         watched: Option<&[bool]>,
         private_copies: &[Option<bool>],
         window: Option<(usize, &dyn Fn(usize) -> u8)>,
+        plain: &[Cell<u64>],
     ) -> Arc<Vec<u8>> {
         debug_assert_eq!(permissions.len(), self.bytes.len());
         debug_assert!(watched.is_none_or(|pages| pages.len() == permissions.len()));
@@ -193,7 +199,6 @@ impl FastPermissions {
         };
         if !self.dirty.is_empty() {
             self.version += 1;
-            let mut revoked = false;
             let bytes = Arc::make_mut(&mut self.bytes);
             for (start, end) in std::mem::take(&mut self.dirty) {
                 let mut pages = start..end;
@@ -208,8 +213,11 @@ impl FastPermissions {
                 for page in pages {
                     let current = next.take().unwrap_or_else(|| permission(page));
                     let previous = bytes[page] & 31;
-                    revoked |= previous & (READ | WRITE) & !current != 0
-                        || (previous ^ current) & (EXEC | SHARED | LINEAR) != 0;
+                    if previous != current
+                        && let Some(spans) = &self.spans
+                    {
+                        spans.refresh(page, current, plain);
+                    }
                     // Exact checks use the same base as the derived grants.
                     bytes[page] = current
                         | (permissions.get(page + 1).map_or(0, |_| {
@@ -231,9 +239,6 @@ impl FastPermissions {
                     }
                 }
             }
-            if revoked {
-                self.revoke_page_facts();
-            }
         }
         self.bytes.clone()
     }
@@ -250,13 +255,13 @@ mod tests {
         let mut permissions = vec![READ; 4096];
         let mut table = FastPermissions::new(permissions.len());
         let body = table.body_table(0);
-        drop(table.snapshot(&permissions, None, &[], None));
+        drop(table.snapshot(&permissions, None, &[], None, &[]));
         permissions[24] = 0;
         for page in (16..=2048).step_by(16) {
             permissions[page] = READ | WRITE;
             table.invalidate(page..page + 1);
         }
-        let bytes = table.snapshot(&permissions, None, &[], None);
+        let bytes = table.snapshot(&permissions, None, &[], None, &[]);
         assert_eq!(bytes[24] & 31, READ);
         // SAFETY: the body table is retained by table and updates are complete.
         assert_eq!(unsafe { *body.add(24) }, READ);
@@ -268,14 +273,14 @@ mod tests {
         let mut permissions = vec![READ; 4096];
         let mut table = FastPermissions::new(permissions.len());
         table.invalidate(0..permissions.len());
-        table.snapshot(&permissions, None, &[], None);
+        table.snapshot(&permissions, None, &[], None, &[]);
         // A stale middle page shows whether the two changes became one range.
         for page in [8, 2048, 4000] {
             permissions[page] = READ | WRITE;
         }
         table.invalidate(8..9);
         table.invalidate(4000..4001);
-        let snapshot = table.snapshot(&permissions, None, &[], None);
+        let snapshot = table.snapshot(&permissions, None, &[], None, &[]);
         assert_eq!(snapshot[8] & 7, READ | WRITE);
         assert_eq!(snapshot[4000] & 7, READ | WRITE);
         assert_eq!(snapshot[2048] & 7, READ);
@@ -292,7 +297,7 @@ mod tests {
                 let copies = [Some(true), None];
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&permissions, watched, &copies, None);
+                let snapshot = table.snapshot(&permissions, watched, &copies, None, &[]);
                 assert_eq!(snapshot[0] & (READ | WRITE), protection & (READ | WRITE));
                 if watched.is_none() {
                     assert_eq!(snapshot[0], permissions[0]);
@@ -388,7 +393,7 @@ mod tests {
             for second in 0..32 {
                 let mut table = FastPermissions::new(2);
                 table.invalidate(0..2);
-                let snapshot = table.snapshot(&[first, second], None, &[], None);
+                let snapshot = table.snapshot(&[first, second], None, &[], None, &[]);
                 let readable = [first, second].iter().all(|p| p & (READ | SHARED) == READ);
                 let writable = [first, second]
                     .iter()
@@ -411,15 +416,15 @@ mod tests {
         let mut permissions = [READ | WRITE; 4];
         let mut table = FastPermissions::new(4);
         table.invalidate(0..4);
-        let old = table.snapshot(&permissions, None, &[], None);
+        let old = table.snapshot(&permissions, None, &[], None, &[]);
         permissions[2] = READ | SHARED | AUDIO;
         table.invalidate(2..3);
         assert_eq!(&**old, &[99, 99, 99, 3]);
-        let new = table.snapshot(&permissions, None, &[], None);
+        let new = table.snapshot(&permissions, None, &[], None, &[]);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
         permissions[2] = READ;
         table.invalidate(2..3);
-        let promoted = table.snapshot(&permissions, None, &[], None);
+        let promoted = table.snapshot(&permissions, None, &[], None, &[]);
         assert_eq!(&**promoted, &[99, 35, 33, 3]);
         assert_eq!(&**new, &[99, 3, READ | SHARED | AUDIO, 3]);
     }
