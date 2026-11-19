@@ -431,7 +431,8 @@ impl Pipelines {
         ));
     }
     fn open(&mut self, device: &Device, directory: Option<&Path>) {
-        self.flush();
+        // The archive is a best-effort cache; a failed write only costs compiles.
+        let _ = self.flush();
         self.jobs = Default::default();
         self.batch = None;
         self.cache = None;
@@ -523,22 +524,24 @@ impl Pipelines {
             ..Default::default()
         }
     }
-    fn flush(&mut self) {
+    /// The final write supersedes the background one, so only its failure
+    /// leaves the archive without the latest recipes.
+    fn flush(&mut self) -> std::io::Result<()> {
         if let Some(job) = self.save.take()
             && let Ok(count) = job.resolve()
         {
             self.persisted = *count;
         }
-        if let (Some(store), Some(cache)) = (&self.store, &self.cache)
-            && save_archive(&store.path, &store.identity, &store.recipes, cache).is_ok()
-        {
+        if let (Some(store), Some(cache)) = (&self.store, &self.cache) {
+            save_archive(&store.path, &store.identity, &store.recipes, cache)?;
             self.persisted = store.recipes.len() as u64;
         }
+        Ok(())
     }
 }
 impl Drop for Pipelines {
     fn drop(&mut self) {
-        self.flush();
+        let _ = self.flush();
     }
 }
 #[derive(Clone)]
@@ -627,8 +630,8 @@ impl Gpu {
     pub fn set_pipeline_cache_directory(&mut self, directory: Option<&Path>) {
         self.pipelines.open(&self.device, directory);
     }
-    pub fn flush_pipeline_cache(&mut self) {
-        self.pipelines.flush();
+    pub fn flush_pipeline_cache(&mut self) -> std::io::Result<()> {
+        self.pipelines.flush()
     }
 }
 
@@ -1873,7 +1876,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             1
         );
         drop(jobs);
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         let store = gpu.pipelines.store.as_ref().unwrap();
         let (recipes, _) = load_archive(&store.path, &store.identity).unwrap();
         assert_eq!(recipes.len(), 1);
@@ -1925,7 +1928,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                     .collect::<arrayvec::ArrayVec<_, 20>>(),
             )
             .unwrap();
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         let store = gpu.pipelines.store.as_ref().unwrap();
         let (path, identity) = (store.path.clone(), store.identity.clone());
         let (loaded, driver) = load_archive(&path, &identity).unwrap();
@@ -1963,7 +1966,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         worker.join().unwrap();
         assert!(task.ready().unwrap().as_ref().unwrap().is_ok());
         assert_eq!(warmed.hits, 1);
-        warmed.flush();
+        warmed.flush().unwrap();
         drop(warmed);
         let mut bytes = std::fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
@@ -2014,7 +2017,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 0,
             )
             .unwrap();
-        rejected.flush();
+        rejected.flush().unwrap();
         drop(rejected);
         gpu.set_pipeline_cache_directory(None);
         std::fs::remove_dir_all(directory).unwrap();

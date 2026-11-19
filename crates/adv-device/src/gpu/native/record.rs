@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(gpu.stats().prebuild_misses, 2);
         assert_eq!(gpu.stats().compile_waits, 2);
         let stats = gpu.stats();
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         assert_eq!(gpu.stats(), stats);
 
         let texture = gpu.image(1, 1).unwrap();
