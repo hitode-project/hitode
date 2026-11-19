@@ -2134,9 +2134,7 @@ fn inproc_operation_as(
 
 type InprocCompletion = std::rc::Weak<ntsync::Completion>;
 #[derive(Default)]
-struct InprocWaits(
-    std::collections::HashMap<adv_machine::CtxId, (adv_machine::sched::Handle, InprocCompletion)>,
-);
+struct InprocWaits(Vec<(adv_machine::sched::Handle, InprocCompletion, bool)>);
 pub(crate) fn deliver_inproc(env: &mut Env<'_>) -> bool {
     deliver_inproc_as(env, adv_machine::WakePriority::Normal)
 }
@@ -2145,12 +2143,16 @@ fn deliver_inproc_as(env: &mut Env<'_>, priority: adv_machine::WakePriority) -> 
         return false;
     };
     let mut delivered = false;
-    waits.0.retain(|_, (wake, result)| {
+    waits.0.retain_mut(|(wake, result, notified)| {
         let Some(result) = result.upgrade() else {
             return false;
         };
         if let Some(completed) = result.get() {
-            delivered |= env.sys.set_event_from(*wake, priority, completed.signaler);
+            if !*notified {
+                *notified = env.sys.set_event_from(*wake, priority, completed.signaler);
+            }
+            // A family delivery pass still needs to see this ready process.
+            delivered |= *notified;
         }
         true
     });
@@ -2175,7 +2177,7 @@ struct InprocWait {
     count: u32,
     any: bool,
     deadline: Option<u64>,
-    wake: adv_machine::sched::Handle,
+    wake: Option<adv_machine::sched::Handle>,
 }
 fn inproc_wait(
     env: &mut Env<'_>,
@@ -2251,12 +2253,15 @@ fn prepare_inproc_wait(
         let deadline = timeout
             .filter(|&t| t != TIMEOUT_INFINITE)
             .map(|t| deadline_us(env, t));
-        let fds: Vec<_> = objects.iter().map(|o| o.fd.as_raw_fd()).collect();
+        let mut fds = [0; MAXIMUM_WAIT_OBJECTS as usize];
+        for (fd, object) in fds.iter_mut().zip(&objects) {
+            *fd = object.fd.as_raw_fd();
+        }
         let tid = server::current_tid(env)?;
         let args = ntsync::WaitArgs {
             timeout: deadline.map_or(u64::MAX, |d| d.saturating_mul(1000)),
             objs: fds.as_ptr() as u64,
-            count: fds.len() as u32,
+            count: objects.len() as u32,
             owner: tid,
             alert: alert.as_ref().map_or(0, |o| o.fd.as_raw_fd() as u32),
             ..Default::default()
@@ -2269,14 +2274,6 @@ fn prepare_inproc_wait(
         // SAFETY: fds stays live until wait_ioctl has registered the objects.
         let pending = unsafe { ntsync::wait_ioctl(device, command, &args) }
             .map_err(|e| status::Error::from(inproc_status(e, command)))?;
-        let wake = env.sys.objects.insert(adv_machine::sched::Object::Event {
-            manual_reset: false,
-            signaled: false,
-        });
-        env.ext
-            .get_or_default::<InprocWaits>()
-            .0
-            .insert(env.context, (wake, pending.completion()));
         Ok::<_, status::Error>(InprocWait {
             pending,
             _objects: objects,
@@ -2284,11 +2281,11 @@ fn prepare_inproc_wait(
             count: handles.len() as u32,
             any,
             deadline,
-            wake,
+            wake: None,
         })
     })()
 }
-fn run_inproc_wait(env: &mut Env<'_>, wait: InprocWait, then: Then) -> Outcome {
+fn run_inproc_wait(env: &mut Env<'_>, mut wait: InprocWait, then: Then) -> Outcome {
     let result = wait.pending.result().map(|result| {
         result
             .map(|(index, dead)| {
@@ -2306,15 +2303,13 @@ fn run_inproc_wait(env: &mut Env<'_>, wait: InprocWait, then: Then) -> Outcome {
             .map(|_| 0x102)
     });
     if let Some(result) = result {
-        env.ext
-            .get_or_default::<InprocWaits>()
-            .0
-            .remove(&env.context);
-        env.ext
-            .get_or_default::<Timers>()
-            .waits
-            .remove(&env.context);
-        env.sys.objects.close(wait.wake);
+        if let Some(wake) = wait.wake {
+            env.ext
+                .get_or_default::<Timers>()
+                .waits
+                .remove(&env.context);
+            env.sys.objects.close(wake);
+        }
         drop(wait);
         if result == USER_APC {
             let select = new_select(
@@ -2327,6 +2322,17 @@ fn run_inproc_wait(env: &mut Env<'_>, wait: InprocWait, then: Then) -> Outcome {
         }
         return then(env, Ended::Status(result));
     }
+    let wake = *wait.wake.get_or_insert_with(|| {
+        let wake = env.sys.objects.insert(adv_machine::sched::Object::Event {
+            manual_reset: false,
+            signaled: false,
+        });
+        env.ext
+            .get_or_default::<InprocWaits>()
+            .0
+            .push((wake, wait.pending.completion(), false));
+        wake
+    });
     let timer = match timer_deadline(env) {
         Ok(timer) => timer,
         Err(error) => return status::finish(Err(error)),
@@ -2338,10 +2344,10 @@ fn run_inproc_wait(env: &mut Env<'_>, wait: InprocWait, then: Then) -> Outcome {
     env.ext
         .get_or_default::<Timers>()
         .waits
-        .insert(env.context, wait.wake);
+        .insert(env.context, wake);
     Outcome::block(
         Wait::Object {
-            handle: wait.wake,
+            handle: wake,
             deadline,
         },
         move |env, _| {

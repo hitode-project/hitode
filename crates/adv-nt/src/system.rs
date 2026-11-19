@@ -29,21 +29,31 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        // The information, and whether the buffer must be its exact size.
-        let (bytes, exact) = match class {
-            SYSTEM_BASIC_INFORMATION | 62 => (basic_information().to_vec(), true),
-            2 => (performance_information(), false),
-            SYSTEM_CPU_INFORMATION | 63 => (processor_information(env).to_vec(), false),
+        let write = |bytes: &[u8], exact, env: &mut Env<'_>| -> Result<(), Error> {
+            if result_size != 0 {
+                write_u32(env, result_size, bytes.len() as u32)?;
+            }
+            let size = size as usize;
+            if size < bytes.len() || (exact && size != bytes.len()) {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            write_bytes(env, info, bytes)?;
+            Ok(())
+        };
+        match class {
+            SYSTEM_BASIC_INFORMATION | 62 => write(&basic_information(), true, env),
+            2 => write(&performance_information(), false, env),
+            SYSTEM_CPU_INFORMATION | 63 => write(&processor_information(env), false, env),
             SYSTEM_TIME_OF_DAY_INFORMATION => {
                 let mut bytes = [0u8; 48];
-                let system = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x14)?)
-                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x18)?)
-                        << 32);
-                let interrupt = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 8)?)
-                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 12)?) << 32);
-                let bias = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x20)?)
-                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x24)?)
-                        << 32);
+                // InterruptTime, SystemTime and TimeZoneBias are adjacent KSYSTEM_TIME values.
+                let mut clocks = [0u8; 32];
+                env.cpu
+                    .read(crate::kuser::ADDRESS + 8, &mut clocks)
+                    .map_err(|_| status::ACCESS_VIOLATION)?;
+                let interrupt = u64::from_le_bytes(clocks[..8].try_into().unwrap());
+                let system = u64::from_le_bytes(clocks[12..20].try_into().unwrap());
+                let bias = &clocks[24..32];
                 let boot = match env.ext.try_get::<BootTime>() {
                     Some(boot) => boot.0,
                     None => {
@@ -54,7 +64,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 };
                 bytes[..8].copy_from_slice(&boot.to_le_bytes());
                 bytes[8..16].copy_from_slice(&system.to_le_bytes());
-                bytes[16..24].copy_from_slice(&bias.to_le_bytes());
+                bytes[16..24].copy_from_slice(bias);
                 if result_size != 0 {
                     write_u32(env, result_size, if size <= 48 { size } else { 0 })?;
                 }
@@ -65,7 +75,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     return Err(status::ACCESS_VIOLATION.into());
                 }
                 write_bytes(env, info, &bytes[..size as usize])?;
-                return Ok(());
+                Ok(())
             }
             SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
                 let count = (size / 48).min(PROCESSORS);
@@ -75,12 +85,14 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     }
                     return Err(status::INFO_LENGTH_MISMATCH.into());
                 }
-                let bytes = processor_performance(count);
-                (bytes, false)
+                let mut bytes = [0; PROCESSORS as usize * 48];
+                let bytes = &mut bytes[..count as usize * 48];
+                processor_performance(bytes);
+                write(bytes, false, env)
             }
-            88 => return process_image_name(env, info, size, result_size),
-            73 => (logical_processors(false, u32::MAX), false),
-            175 => return Err(status::INVALID_PARAMETER.into()),
+            88 => process_image_name(env, info, size, result_size),
+            73 => write(&logical_processors(false, u32::MAX), false, env),
+            175 => Err(status::INVALID_PARAMETER.into()),
             103 => {
                 if size < 8 {
                     if result_size != 0 {
@@ -92,61 +104,56 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 if result_size != 0 {
                     write_u32(env, result_size, 8)?;
                 }
-                return Ok(());
+                Ok(())
             }
-            16 | 64 => return handle_information(env, class, info, size, result_size),
-            21 => (vec![0; 36], false),
+            16 | 64 => handle_information(env, class, info, size, result_size),
+            21 => write(&[0; 36], false, env),
             28 => {
-                let mut bytes = vec![0; 12];
+                let mut bytes = [0; 12];
                 bytes[..4].copy_from_slice(&156250u32.to_le_bytes());
                 bytes[4..8].copy_from_slice(&156250u32.to_le_bytes());
                 bytes[8] = 1;
-                (bytes, true)
+                write(&bytes, true, env)
             }
-            35 => (vec![0, 1], false),
-            37 => (
-                [0x2000000u32, 0x200000, 0x200000]
-                    .into_iter()
-                    .flat_map(u32::to_le_bytes)
-                    .collect(),
-                false,
-            ),
-            58 => (64u32.to_le_bytes().to_vec(), false),
+            35 => write(&[0, 1], false, env),
+            37 => {
+                let bytes = [0x2000000u32, 0x200000, 0x200000].map(u32::to_le_bytes);
+                write(bytes.as_flattened(), false, env)
+            }
+            58 => write(&64u32.to_le_bytes(), false, env),
             105 => {
                 if info & 3 != 0 {
                     return Err(0x8000_0002.into());
                 }
-                let mut bytes = vec![0; 49];
+                let mut bytes = [0; 49];
                 bytes[..PROCESSOR_IDENTITY.name.len()]
                     .copy_from_slice(PROCESSOR_IDENTITY.name.as_bytes());
-                (bytes, false)
+                write(&bytes, false, env)
             }
-            149 => (vec![0; 3], false),
+            149 => write(&[0; 3], false, env),
             154 => {
-                let mut bytes = vec![0; 32];
+                let mut bytes = [0; 32];
                 bytes[..4].copy_from_slice(&processor_information(env)[8..12]);
-                (bytes, false)
+                write(&bytes, false, env)
             }
-            206 => (vec![1, 0, 0, 0, 0, 0, 0, 0], false),
-            250 => (vec![0; 16], true),
+            206 => write(&[1, 0, 0, 0, 0, 0, 0, 0], false, env),
+            250 => write(&[0; 16], true, env),
             11 | 77 => {
-                let names = [
+                const NAMES: [&str; 3] = [
                     r"\SystemRoot\system32\ntoskrnl.exe",
                     r"\SystemRoot\system32\hal.dll",
                     r"\SystemRoot\system32\drivers\mountmgr.sys",
                 ];
-                let mut bytes = vec![
-                    0;
-                    if class == 11 {
-                        4 + names.len() * 284
-                    } else {
-                        names.len() * 300 + 2
-                    }
-                ];
+                let mut bytes = [0; NAMES.len() * 300 + 2];
+                let bytes = if class == 11 {
+                    &mut bytes[..4 + NAMES.len() * 284]
+                } else {
+                    &mut bytes[..]
+                };
                 if class == 11 {
-                    bytes[..4].copy_from_slice(&(names.len() as u32).to_le_bytes());
+                    bytes[..4].copy_from_slice(&(NAMES.len() as u32).to_le_bytes());
                 }
-                for (index, name) in names.iter().enumerate() {
+                for (index, name) in NAMES.iter().enumerate() {
                     let start = if class == 11 {
                         4 + index * 284
                     } else {
@@ -162,22 +169,26 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                         .copy_from_slice(&((name.rfind('\\').unwrap() + 1) as u16).to_le_bytes());
                     bytes[start + 28..start + 28 + name.len()].copy_from_slice(name.as_bytes());
                 }
-                (bytes, false)
+                write(bytes, false, env)
             }
-            5 | 57 => return process_information(env, class, info, size, result_size),
-            76 => return firmware_table(env, info, size, result_size),
-            83 => (vec![0; PROCESSORS as usize * 8], false),
-            114 => return Err(status::INVALID_INFO_CLASS.into()),
+            5 | 57 => process_information(env, class, info, size, result_size),
+            76 => firmware_table(env, info, size, result_size),
+            83 => write(&[0; PROCESSORS as usize * 8], false, env),
+            114 => Err(status::INVALID_INFO_CLASS.into()),
             SYSTEM_CURRENT_TIME_ZONE_INFORMATION => {
                 let zone = timezone::current(env)?.encode();
-                (zone[..timezone::STATIC_SIZE].to_vec(), false)
+                write(&zone[..timezone::STATIC_SIZE], false, env)
             }
             SYSTEM_DYNAMIC_TIME_ZONE_INFORMATION => {
-                (timezone::current(env)?.encode().to_vec(), false)
+                write(&timezone::current(env)?.encode(), false, env)
             }
             // Wine fills it with random bytes, which RtlGenRandom uses.
-            SYSTEM_INTERRUPT_INFORMATION => (random(PROCESSORS as usize * INTERRUPT_SIZE)?, false),
-            SYSTEM_WINE_VERSION_INFORMATION => (wine_version(), false),
+            SYSTEM_INTERRUPT_INFORMATION => {
+                let mut bytes = [0; PROCESSORS as usize * INTERRUPT_SIZE];
+                random(&mut bytes)?;
+                write(&bytes, false, env)
+            }
+            SYSTEM_WINE_VERSION_INFORMATION => write(&wine_version(), false, env),
             class
                 if !matches!(
                     class,
@@ -203,32 +214,20 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 if result_size != 0 {
                     write_u32(env, result_size, 0)?;
                 }
-                return Err(status::INVALID_INFO_CLASS.into());
+                Err(status::INVALID_INFO_CLASS.into())
             }
-            class => {
-                return Err(Error::Unsupported(format!(
-                    "system information class {class}"
-                )));
-            }
-        };
-        if result_size != 0 {
-            write_u32(env, result_size, bytes.len() as u32)?;
+            class => Err(Error::Unsupported(format!(
+                "system information class {class}"
+            ))),
         }
-        let size = size as usize;
-        if size < bytes.len() || (exact && size != bytes.len()) {
-            return Err(status::INFO_LENGTH_MISMATCH.into());
-        }
-        write_bytes(env, info, &bytes)?;
-        Ok(())
     })())
 }
 
 /// The boot instant stays fixed while the shared clocks advance.
 struct BootTime(u64);
 
-/// `length` bytes from the host's entropy source.
-fn random(length: usize) -> Result<Vec<u8>, Error> {
-    let mut bytes = vec![0u8; length];
+/// Fill the buffer from the host's entropy source.
+fn random(bytes: &mut [u8]) -> Result<(), Error> {
     for chunk in bytes.chunks_mut(256) {
         // SAFETY: the chunk is writable and at most 256 bytes long.
         if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
@@ -238,7 +237,7 @@ fn random(length: usize) -> Result<Vec<u8>, Error> {
             )));
         }
     }
-    Ok(bytes)
+    Ok(())
 }
 
 /// SYSTEM_BASIC_INFORMATION, as Wine's `virtual_get_system_info`: the
@@ -451,8 +450,8 @@ pub fn query_native(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// Wine leaves the unmeasured counters zero and fills host memory and idle time.
 #[allow(deprecated)]
-fn performance_information() -> Vec<u8> {
-    let mut bytes = vec![0; 312];
+fn performance_information() -> [u8; 312] {
+    let mut bytes = [0; 312];
     let total = u64::from(physical_pages()) + 1;
     let mut available = 0u64;
     let mut idle = 0u64;
@@ -1084,8 +1083,7 @@ fn process_image_name(env: &mut Env<'_>, info: u32, size: u32, returned: u32) ->
 
 /// CPU counters from the host, after Wine's SystemProcessorPerformanceInformation.
 #[allow(deprecated)]
-fn processor_performance(count: u32) -> Vec<u8> {
-    let mut bytes = vec![0; count as usize * 48];
+fn processor_performance(bytes: &mut [u8]) {
     #[cfg(target_vendor = "apple")]
     unsafe {
         let host = libc::mach_host_self();
@@ -1152,7 +1150,6 @@ fn processor_performance(count: u32) -> Vec<u8> {
             }
         }
     }
-    bytes
 }
 
 /// Wine ignores system time adjustment requests, leaving the shared clock unchanged.
@@ -1289,4 +1286,72 @@ pub fn set_execution_state(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         }
         Ok(())
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::Cpu;
+    use adv_cpu::backend::{Guest, GuestExt, Prot};
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+
+    #[test]
+    fn time_of_day_returns_the_shared_clocks_and_preserves_partial_outputs() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let main = machine.spawn("main", PARK_ADDR, &[], 0).unwrap();
+        let info = 0x20_0000;
+        let length = info + 48;
+        machine.cpu.map(info, PAGE, Prot::RW).unwrap();
+        crate::kuser::map(&mut machine.cpu, 0, 0).unwrap();
+
+        machine
+            .visit_context(Some(main), |env| {
+                let interrupt = 0x0000_1234_1122_3344u64;
+                let system = 0x0123_4567_89ab_cdefu64;
+                let bias = (-17i64).to_le_bytes();
+                for (offset, value) in [
+                    (8, interrupt.to_le_bytes()),
+                    (20, system.to_le_bytes()),
+                    (32, bias),
+                ] {
+                    env.cpu
+                        .write(crate::kuser::ADDRESS + offset, &value)
+                        .unwrap();
+                }
+
+                let run = |env: &mut Env<'_>, size| {
+                    query(env, &[SYSTEM_TIME_OF_DAY_INFORMATION, info, size, length])
+                };
+                assert!(matches!(run(env, 48), Outcome::Return(status::SUCCESS)));
+                let boot = (system - interrupt).to_le_bytes();
+                let mut bytes = [0; 48];
+                env.cpu.read(info, &mut bytes).unwrap();
+                assert_eq!(bytes[..8], boot);
+                assert_eq!(bytes[8..16], system.to_le_bytes());
+                assert_eq!(bytes[16..24], bias);
+                assert_eq!(bytes[24..], [0; 24]);
+                assert_eq!(env.cpu.read_u32(length).unwrap(), 48);
+
+                env.cpu
+                    .write(crate::kuser::ADDRESS + 20, &(system + 10).to_le_bytes())
+                    .unwrap();
+                assert!(matches!(run(env, 9), Outcome::Return(status::SUCCESS)));
+                assert_eq!(env.cpu.read_u32(length).unwrap(), 9);
+                bytes[8] = (system + 10) as u8;
+                let mut partial = [0; 48];
+                env.cpu.read(info, &mut partial).unwrap();
+                assert_eq!(partial, bytes);
+                assert!(matches!(
+                    run(env, 49),
+                    Outcome::Return(status::INFO_LENGTH_MISMATCH)
+                ));
+                assert_eq!(env.cpu.read_u32(length).unwrap(), 0);
+            })
+            .unwrap();
+    }
 }
