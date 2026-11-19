@@ -256,9 +256,7 @@ impl Emitter<'_> {
         ]);
         self.asm.b_cond(Cond::Hs, miss);
         self.asm.emit(ldr(X, X3, RT, PLAIN_PAGES));
-        if write {
-            self.asm.emit(lsr_imm(W, X0, X0, 12));
-        }
+        self.asm.emit(lsr_imm(W, X0, X0, 12));
 
         self.asm.bind(next);
         self.asm.emit_all(&[
@@ -273,16 +271,21 @@ impl Emitter<'_> {
             self.asm
                 .emit_all(&[ldr(X, X5, X4, 16), shiftv(X, Lsr, X5, X5, X1)]);
             self.asm.tbz(true, X5, 0, miss);
-            // The guest permission bitmap does not include the host
-            // protection intersection when host pages exceed 4 KiB.
-            self.asm.emit_all(&[
-                add(W, X5, X0, X1, Lsl, 0),
-                ldr(X, X4, RT, runtime::CLASSES),
-                ldr_narrow(Narrow::Byte, X5, X4, X5),
-            ]);
+        }
+        // The guest permission bitmap does not include the host
+        // protection intersection when host pages exceed 4 KiB.
+        self.asm.emit_all(&[
+            add(W, X5, X0, X1, Lsl, 0),
+            ldr(X, X4, RT, runtime::CLASSES),
+            ldr_narrow(Narrow::Byte, X5, X4, X5),
+        ]);
+        if write {
             self.asm.tbz(false, X5, WRITE.trailing_zeros(), miss);
             self.asm
                 .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
+        } else {
+            self.asm.tbz(false, X5, READ.trailing_zeros(), miss);
+            self.asm.tbz(true, X5, SHARED.trailing_zeros(), miss);
         }
         self.asm
             .emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);
@@ -331,6 +334,7 @@ pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
     ]);
     asm.cbz(W, true, X5, write);
     asm.tbz(false, T, READ.trailing_zeros(), done);
+    asm.tbz(true, T, SHARED.trailing_zeros(), done);
     asm.b(next);
     asm.bind(write);
     asm.tbz(false, T, WRITE.trailing_zeros(), done);

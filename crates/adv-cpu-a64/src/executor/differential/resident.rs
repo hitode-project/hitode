@@ -1964,3 +1964,28 @@ fn vector_declines_a_loop_carried_reduction() {
     assert!(compiled.is_empty());
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
 }
+
+// spec: A64-OPT-10, A64-MEM-4
+#[test]
+fn vector_read_falls_back_on_unreadable_host_page_neighbor() {
+    let image = vector_image(1);
+    let data = vector_data(1913);
+    let mut cpu = initial(64);
+    cpu.regs[6] = SPECIAL;
+    let mut trial = Trial::new(
+        &image,
+        &cpu,
+        "mixed host page vector read",
+        &[(SPECIAL, PAGE_SIZE)],
+        |m| {
+            m.map(SPECIAL, HOST_PAGE, READ | WRITE).unwrap();
+            m.write(SPECIAL, &data[..64]).unwrap();
+            if HOST_PAGE > PAGE_SIZE {
+                m.protect(SPECIAL + PAGE_SIZE as u32, PAGE_SIZE, 0).unwrap();
+            }
+        },
+    );
+    vector_install(&mut trial, cpu, 16);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    trial.compare_epilogue();
+}
