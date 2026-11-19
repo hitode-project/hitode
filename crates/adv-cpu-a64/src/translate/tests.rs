@@ -263,6 +263,269 @@ fn reference(code: &[u8], data: &[u8], initial: &CpuState) -> CpuState {
     state
 }
 
+// spec: A64-TR-4, A64-VER-1
+#[test]
+fn tier_one_cpuid_uses_the_guest_profile_and_keeps_lazy_flags() {
+    let code = bytes(|a| {
+        a.add(eax, esi).unwrap();
+        a.cpuid().unwrap();
+    });
+    let mut h = Harness::new();
+    for flagm in [false, true] {
+        for leaf in [0u32, 1, 2, 7, 0x8000_0000, 0x8000_0001, u32::MAX] {
+            for subleaf in [0, 3, u32::MAX] {
+                let mut state = initial();
+                state.regs[0] = leaf.wrapping_sub(state.regs[6]);
+                state.regs[1] = subleaf;
+                let (got, exit, _) = h.run(&code, &[], &state, flagm);
+                assert_eq!(exit, Exit::Dispatch);
+                assert_eq!(got, reference(&code, &[], &state));
+            }
+        }
+    }
+}
+
+#[cfg(native)]
+fn tier_one_pair(code: &[u8]) -> (crate::Executor, crate::Executor) {
+    let build = || {
+        let mut exec = crate::Executor::new(CODE, 0x30000).unwrap();
+        exec.protect(CODE, 0x30000, 3).unwrap();
+        exec.write(CODE, code).unwrap();
+        exec.protect(CODE, 4096, 5).unwrap();
+        exec
+    };
+    let mut oracle = build();
+    oracle.interpreter_only = true;
+    (build(), oracle)
+}
+
+#[cfg(native)]
+fn compare_tier_one(
+    native: &mut crate::Executor,
+    oracle: &mut crate::Executor,
+    state: &CpuState,
+    stop: u32,
+    fuel: u64,
+) -> adv_cpu_core::RunOutcome {
+    native.state = state.clone();
+    oracle.state = state.clone();
+    let outcome = oracle.run(stop, fuel).unwrap();
+    assert_eq!(native.run(stop, fuel).unwrap(), outcome, "{state:?}");
+    assert_eq!(native.state, oracle.state, "{state:?}");
+    outcome
+}
+
+#[cfg(native)]
+fn helper_runs(executor: &crate::Executor, at: u32) -> u64 {
+    executor
+        .slow_path_sites()
+        .into_iter()
+        .find(|&(pc, _)| pc == at)
+        .map_or(0, |(_, counts)| counts[2])
+}
+
+#[cfg(native)]
+fn x87_setup() -> CpuState {
+    let mut state = initial();
+    state.x87.regs = std::array::from_fn(|slot| {
+        adv_cpu_core::X87Register::from_parts((1 << 63) | (slot as u64) << 16, 0x3fff)
+    });
+    state.x87.status = 0x4704;
+    state.x87.set_top(5);
+    state.x87.tag = 0x8f7f;
+    state.x87.ip = 0x0123_4567;
+    state.x87.dp = 0x89ab_cdef;
+    state.x87.opcode = 0x567;
+    state.x87.cs = 0x23;
+    state.x87.ds = 0x2b;
+    state
+}
+
+// spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-VER-1
+#[test]
+#[cfg(native)]
+fn tier_one_fsqrt_matches_x87_rounding_and_exception_paths() {
+    use adv_cpu_core::{RunOutcome, X87Register};
+    let code = bytes(|a| {
+        a.fsqrt().unwrap();
+        a.nop().unwrap();
+    });
+    let stop = CODE + code.len() as u32 - 1;
+    let (mut native, mut oracle) = tier_one_pair(&code);
+    let mut state = x87_setup();
+    let top = state.x87.top();
+    let int_bit = 1 << 63;
+    let exact = X87Register::from_parts(int_bit, 0x4001); // 4
+    state.x87.regs[top] = exact;
+    state.x87.set_physical_tag(top, exact.tag());
+    compare_tier_one(&mut native, &mut oracle, &state, stop, 8);
+
+    for p in [0, 2, 3] {
+        for r in 0..4 {
+            state.x87.control = 0x007f | p << 8 | r << 10;
+            for (value, fast) in [
+                (X87Register::from_parts(0, 0), true),
+                (X87Register::from_parts(0, 0x8000), true),
+                (exact, true),
+                (X87Register::from_parts(int_bit, 0x4000), p != 3), // 2
+                (X87Register::from_parts(3 << 62, 0x4000), p != 3), // 3
+                (X87Register::from_parts(u64::MAX << 40, 0x7ffe), p != 3),
+                (X87Register::from_parts(int_bit, 1), true),
+                (X87Register::from_parts(int_bit | 1 << 11, 0x3fff), p == 2),
+                (X87Register::from_parts(int_bit | 1, 0x3fff), false),
+                (X87Register::from_parts(int_bit, 0xbfff), false),
+                (X87Register::from_parts(3 << 62 | 7, 0x7fff), false),
+                (X87Register::from_parts(int_bit | 7, 0x7fff), false),
+                (X87Register::from_parts(1, 0), false),
+                (X87Register::from_parts(int_bit, 0), false),
+            ] {
+                state.x87.regs[top] = value;
+                state.x87.set_physical_tag(top, value.tag());
+                let helpers = helper_runs(&native, CODE);
+                assert_eq!(
+                    compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
+                    RunOutcome::ReachedStop
+                );
+                assert_eq!(
+                    helper_runs(&native, CODE) - helpers,
+                    u64::from(!fast),
+                    "precision={p} rounding={r} input={value:?}"
+                );
+            }
+        }
+    }
+    let helpers = helper_runs(&native, CODE);
+    state.x87.set_physical_tag(top, 3);
+    assert_eq!(
+        compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
+        RunOutcome::ReachedStop
+    );
+    assert_eq!(helper_runs(&native, CODE) - helpers, 1);
+    assert!(native.stats.compilations > 0);
+
+    // Unmasked exceptions retire FSQRT, then the next waiting
+    // instruction raises #MF with the recorded state.
+    let code = bytes(|a| {
+        a.fsqrt().unwrap();
+        a.wait().unwrap();
+        a.nop().unwrap();
+    });
+    let stop = CODE + code.len() as u32 - 1;
+    let (mut native, mut oracle) = tier_one_pair(&code);
+    compare_tier_one(&mut native, &mut oracle, &state, stop, 8);
+    let two = X87Register::from_parts(int_bit, 0x4000);
+    for (value, mask, tag, pending) in [
+        (two, 0x20, 0, 0),
+        (X87Register::from_parts(int_bit, 0xbfff), 1, 0, 0),
+        (X87Register::from_parts(int_bit | 7, 0x7fff), 1, 2, 0),
+        (X87Register::from_parts(1, 0), 2, 2, 0),
+        (two, 1, 3, 0),
+        (two, 1, 0, 0x8081),
+    ] {
+        state.x87.control = 0x027f & !mask;
+        state.x87.regs[top] = value;
+        state.x87.set_physical_tag(top, tag);
+        state.x87.status = (state.x87.status & !0x80ff) | pending;
+        let helpers = helper_runs(&native, CODE);
+        assert_eq!(
+            compare_tier_one(&mut native, &mut oracle, &state, stop, 8),
+            RunOutcome::Trap {
+                pc: if pending == 0 { CODE + 2 } else { CODE },
+                vector: 16,
+            }
+        );
+        assert_eq!(helper_runs(&native, CODE) - helpers, 1);
+    }
+}
+
+// spec: A64-TR-4, A64F-FP-1, EXEC-CORE-8
+#[test]
+#[cfg(native)]
+fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
+    use adv_cpu_core::RunOutcome;
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+
+    for (save, restore) in [
+        (Code::Fnsave_m94byte, Code::Frstor_m94byte),
+        (Code::Fnsave_m108byte, Code::Frstor_m108byte),
+    ] {
+        let code = bytes(|a| {
+            for (op, reg) in [(save, Register::ESI), (restore, Register::EDI)] {
+                a.add_instruction(Instruction::with1(op, MemoryOperand::with_base(reg)).unwrap())
+                    .unwrap();
+            }
+            a.wait().unwrap();
+            a.nop().unwrap();
+        });
+        let stop = CODE + code.len() as u32 - 1;
+        let (mut native, mut oracle) = tier_one_pair(&code);
+        let mut state = x87_setup();
+        state.x87.status |= 0x8081;
+        state.x87.control &= !1;
+
+        for exec in [&mut native, &mut oracle] {
+            exec.protect(DATA + 4096, 4096, 0).unwrap();
+        }
+        let restore_pc = CODE + iced_x86::Decoder::new(32, &code, 0).decode().len() as u32;
+        let fault = DATA + 4096 - 64;
+        for (save_at, restore_at, fuel, outcome) in [
+            (
+                DATA,
+                DATA,
+                8,
+                RunOutcome::Trap {
+                    pc: stop - 1,
+                    vector: 16,
+                },
+            ),
+            (
+                DATA,
+                DATA,
+                8,
+                RunOutcome::Trap {
+                    pc: stop - 1,
+                    vector: 16,
+                },
+            ),
+            (DATA, DATA, 1, RunOutcome::Budget),
+            (
+                fault,
+                DATA,
+                8,
+                RunOutcome::WriteFault {
+                    pc: CODE,
+                    address: DATA + 4096,
+                },
+            ),
+            (
+                DATA,
+                fault,
+                8,
+                RunOutcome::ReadFault {
+                    pc: restore_pc,
+                    address: DATA + 4096,
+                },
+            ),
+        ] {
+            state.regs[6] = save_at;
+            state.regs[7] = restore_at;
+            for exec in [&mut native, &mut oracle] {
+                exec.write(DATA, &[0x5a; 4096]).unwrap();
+            }
+            assert_eq!(
+                compare_tier_one(&mut native, &mut oracle, &state, stop, fuel),
+                outcome
+            );
+            assert_eq!(
+                native.memory().read_data(DATA, 4096).unwrap().as_ref(),
+                oracle.memory().read_data(DATA, 4096).unwrap().as_ref()
+            );
+        }
+        assert!(helper_runs(&native, CODE) > 0);
+        assert!(helper_runs(&native, restore_pc) > 0);
+    }
+}
+
 fn state_bytes(initial: &CpuState) -> Vec<u8> {
     let mut state = vec![0; size_of::<CpuState>()];
     for (n, value) in initial.regs.iter().enumerate() {

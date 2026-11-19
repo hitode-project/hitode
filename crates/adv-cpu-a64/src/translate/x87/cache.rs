@@ -222,7 +222,7 @@ fn effects(fast: Fast) -> (Vec<Effect>, bool) {
             list.extend([Read(0), Write(0)]);
             fresh = true;
         }
-        Fast::Round | Fast::Scale | Fast::Examine => unreachable!("not cached"),
+        Fast::Round | Fast::Sqrt | Fast::Scale | Fast::Examine => unreachable!("not cached"),
     }
     (list, fresh)
 }
@@ -1045,7 +1045,14 @@ impl Translator<'_> {
     fn cacheable(&self, index: usize) -> Option<X87> {
         let inst = self.trace.insts[index];
         match inst.op {
-            Op::X87(x) if !matches!(x.fast, Fast::Examine | Fast::Round | Fast::Scale) => Some(x),
+            Op::X87(x)
+                if !matches!(
+                    x.fast,
+                    Fast::Examine | Fast::Round | Fast::Sqrt | Fast::Scale
+                ) =>
+            {
+                Some(x)
+            }
             _ => None,
         }
     }

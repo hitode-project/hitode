@@ -80,6 +80,7 @@ pub enum Fast {
     StoreStatus,
     /// Forms lowered by a64; the shared fast helper keeps its transactional path.
     Round,
+    Sqrt,
     Scale,
     Examine,
     Load80,
@@ -129,6 +130,7 @@ pub fn classify(i: &Instruction) -> Option<Fast> {
     Some(match m {
         M::Wait => Fast::Wait,
         M::Frndint => Fast::Round,
+        M::Fsqrt => Fast::Sqrt,
         M::Fscale => Fast::Scale,
         M::Fxam => Fast::Examine,
         M::Fld | M::Fild => Fast::Load(source(i, m == M::Fild)?),
@@ -488,7 +490,13 @@ pub fn execute(
     // Classified for a64 only; shared callers keep the path they had before.
     if matches!(
         fast,
-        Fast::Round | Fast::Scale | Fast::Examine | Fast::Load80 | Fast::Store80 | Fast::Leaf(_)
+        Fast::Round
+            | Fast::Sqrt
+            | Fast::Scale
+            | Fast::Examine
+            | Fast::Load80
+            | Fast::Store80
+            | Fast::Leaf(_)
     ) {
         return execute_other(op, state, memory);
     }
@@ -513,6 +521,7 @@ pub fn execute(
         // ES and deferred MMX were checked above. WAIT changes neither C1 nor
         // the last x87 instruction/data metadata, regardless of the control word.
         Fast::Round
+        | Fast::Sqrt
         | Fast::Scale
         | Fast::Examine
         | Fast::Load80

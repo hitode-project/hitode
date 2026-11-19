@@ -891,7 +891,7 @@ mod speed_tests {
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
         a.shrd(eax, edx, cl).unwrap(); // native form
-        a.cpuid().unwrap(); // interpret helper
+        a.fnop().unwrap(); // interpret helper
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
