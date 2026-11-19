@@ -11,13 +11,13 @@ struct DrawParameters { values:array<vec4<u32>,40> }
 @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;
 @group(0) @binding(2) var<uniform> draw_parameters:DrawParameters;
 fn adv_combine(op:u32,c:vec4<f32>,t:vec4<f32>)->vec4<f32> {
-  switch op {case 0u:{return c;}case 1u:{return t;}case 2u:{return c*t;}case 3u:{return clamp(c+t,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return clamp(c-t,vec4<f32>(0.0),vec4<f32>(1.0));}}
+  switch op {case 0u:{return c;}case 1u:{return t;}case 2u:{return c*t;}case 3u:{return clamp(c+t,vec4<f32>(0.0),vec4<f32>(1.0));}case 4u:{return clamp(c-t,vec4<f32>(0.0),vec4<f32>(1.0));}case 5u:{return clamp(c*t*2.0,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return clamp(c*t*4.0,vec4<f32>(0.0),vec4<f32>(1.0));}}
 }
 fn adv_argument(a:u32,diffuse:vec4<f32>,current:vec4<f32>,texel:vec4<f32>)->vec4<f32> {
   switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}
 }
 fn adv_stage(op:u32,a1:vec4<f32>,a2:vec4<f32>,current:vec4<f32>)->vec4<f32> {
-  switch op {case 2u:{return a1;}case 3u:{return a2;}case 4u:{return a1*a2;}case 7u:{return clamp(a1+a2,vec4<f32>(0.0),vec4<f32>(1.0));}case 10u:{return clamp(a1-a2,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return current;}}
+  switch op {case 2u:{return a1;}case 3u:{return a2;}case 4u:{return a1*a2;}case 5u:{return clamp(a1*a2*2.0,vec4<f32>(0.0),vec4<f32>(1.0));}case 6u:{return clamp(a1*a2*4.0,vec4<f32>(0.0),vec4<f32>(1.0));}case 7u:{return clamp(a1+a2,vec4<f32>(0.0),vec4<f32>(1.0));}case 10u:{return clamp(a1-a2,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return current;}}
 }
 fn adv_alpha(a:f32)->bool {
  let r=bitcast<f32>(draw_parameters.values[1].w);

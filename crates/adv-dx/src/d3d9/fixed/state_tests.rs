@@ -1124,6 +1124,32 @@ mod fixed_completion {
             [16, 64, 64, 255],
         );
     }
+    // spec: GFX-FIXED-2
+    #[test]
+    fn scaled_modulate_doubles_or_quadruples_then_saturates() {
+        let (mut m, p, target) = fixture();
+        let mut e = env(&mut m);
+        let this = GuestPtr::new(p);
+        assert_eq!(set_render(&mut e, this, 137, 0), 0);
+        texture(&mut e, p, [128, 255, 64, 255]);
+        // Texture (.251, 1, .502) times half or quarter gray diffuse, scaled
+        // back by 2 or 4: red and blue keep the texel, green saturates.
+        for (op, diffuse) in [(5, 0xff80_8080u32), (6, 0xff40_4040)] {
+            assert_eq!(set_stage(&mut e, this, 0, 1, op), 0);
+            close(
+                pixel(
+                    &mut e,
+                    p,
+                    &target,
+                    0x42,
+                    &[0, 0, 0.5f32.to_bits(), diffuse],
+                    1,
+                    1,
+                ),
+                [128, 255, 64, 255],
+            );
+        }
+    }
     // spec: GFX-FIXED-1
     #[test]
     fn lights_material_and_stateblocks() {

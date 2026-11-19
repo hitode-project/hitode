@@ -24,9 +24,9 @@ mod disabled_stage_tests {
                 assert_eq!(set_stage(&mut env, this, stage, kind, value), 0);
                 assert_eq!(get_stage(&mut env, this, stage, kind, output), 0);
                 assert_eq!(output.read(env.cpu).unwrap(), value);
-                // Stage one combines; MODULATE2X stays unavailable there.
+                // Stage one combines; ADDSIGNED stays unavailable there.
                 let unsupported = match (kind, stage) {
-                    (1 | 4, 1) => 5,
+                    (1 | 4, 1) => 8,
                     (1 | 4, _) => 4,
                     _ => 7,
                 };

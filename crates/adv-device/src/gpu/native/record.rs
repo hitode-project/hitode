@@ -1228,6 +1228,8 @@ fn fixed_parameters(state: &DrawState, image: Option<&Image>) -> [u32; 8] {
         gpu::TextureOp::Multiply => 2,
         gpu::TextureOp::Add => 3,
         gpu::TextureOp::Subtract => 4,
+        gpu::TextureOp::Multiply2x => 5,
+        gpu::TextureOp::Multiply4x => 6,
     };
     let compare = match state.alpha_test {
         gpu::Compare::Never => 0,

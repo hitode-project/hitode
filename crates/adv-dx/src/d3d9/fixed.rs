@@ -802,7 +802,7 @@ pub(super) fn apply_stage_raw(
         let valid = match kind {
             1 | 4 => match value {
                 1 => true,
-                2 | 3 | 4 | 7 | 10 if stage == 1 => true,
+                2..=7 | 10 if stage == 1 => true,
                 2..=26 => return Err(UNAVAILABLE),
                 _ => false,
             },
@@ -824,7 +824,7 @@ pub(super) fn apply_stage_raw(
         ));
     }
     let valid = match kind {
-        1 | 4 => matches!(value, 1 | 2 | 3 | 4 | 7 | 10),
+        1 | 4 => matches!(value, 1..=7 | 10),
         2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 3,
         11 => {
             // Up to eight FVF coordinate sets and the SDK's four automatic
@@ -1258,13 +1258,12 @@ pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
         1 => TextureOp::Color,
         2 => arg(arg1)?,
         3 => arg(arg2)?,
-        4 | 7 if (arg1 == 2) != (arg2 == 2) => {
-            if op == 4 {
-                TextureOp::Multiply
-            } else {
-                TextureOp::Add
-            }
-        }
+        4..=7 if (arg1 == 2) != (arg2 == 2) => match op {
+            4 => TextureOp::Multiply,
+            5 => TextureOp::Multiply2x,
+            6 => TextureOp::Multiply4x,
+            _ => TextureOp::Add,
+        },
         10 if arg1 <= 1 && arg2 == 2 => TextureOp::Subtract,
         _ if arg1 > 2 || arg2 > 2 => TextureOp::Color,
         _ => return None,

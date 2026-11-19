@@ -747,6 +747,8 @@ fn op(o: adv_device::gpu::TextureOp) -> u32 {
         Multiply => 2,
         Add => 3,
         Subtract => 4,
+        Multiply2x => 5,
+        Multiply4x => 6,
     }
 }
 fn compare(o: adv_device::gpu::Compare) -> u32 {
