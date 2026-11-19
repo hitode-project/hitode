@@ -20,7 +20,10 @@ typedef struct {
   th_quant_ranges ranges[2][3];
 } AdvTheoraSetup;
 
-void *adv_theora_create(const unsigned char *info, const AdvTheoraSetup *input) {
+th_dec_ctx *adv_theora_alloc(const th_info *, const th_setup_info *, int);
+
+void *adv_theora_create(const unsigned char *info, const AdvTheoraSetup *input,
+ int refs) {
   th_info parsed;
   th_setup_info setup;
   memcpy(&parsed, info, sizeof(parsed));
@@ -30,7 +33,7 @@ void *adv_theora_create(const unsigned char *info, const AdvTheoraSetup *input) 
   memcpy(setup.qinfo.loop_filter_limits, input->loop_filter_limits,
    sizeof(setup.qinfo.loop_filter_limits));
   memcpy(setup.qinfo.qi_ranges, input->ranges, sizeof(setup.qinfo.qi_ranges));
-  th_dec_ctx *decoder = th_decode_alloc(&parsed, &setup);
+  th_dec_ctx *decoder = adv_theora_alloc(&parsed, &setup, refs);
 #ifdef ADV_THEORA_NEON
   void adv_theora_accel_init(th_dec_ctx *);
   if (decoder != NULL) {
@@ -53,7 +56,8 @@ void adv_theora_destroy(void *decoder) {
 }
 
 int adv_theora_decode(void *opaque, const unsigned char *data, size_t bytes,
- int64_t packetno, int64_t granulepos, int eos, int striped, AdvTheoraState *state) {
+ int64_t packetno, int64_t granulepos, int eos, int striped, unsigned reserved,
+ AdvTheoraState *state) {
   th_dec_ctx *decoder = (th_dec_ctx *)opaque;
   ogg_packet packet;
   int result;
@@ -68,6 +72,7 @@ int adv_theora_decode(void *opaque, const unsigned char *data, size_t bytes,
   decoder->state.granpos = state->granpos;
   decoder->pp_level = state->pp_level;
   decoder->adv_stripe_yield = striped;
+  decoder->adv_reserved = reserved;
   result = th_decode_packetin(decoder, &packet, &state->granpos);
   state->keyframe_num = decoder->state.keyframe_num;
   state->curframe_num = decoder->state.curframe_num;
@@ -78,6 +83,72 @@ int adv_theora_decode(void *opaque, const unsigned char *data, size_t bytes,
 void adv_theora_planes(void *opaque, th_img_plane planes[3]) {
   th_dec_ctx *decoder = (th_dec_ctx *)opaque;
   memcpy(planes, decoder->pp_frame_buf, sizeof(th_ycbcr_buffer));
+}
+
+typedef struct {
+  int refs[3];
+  int frame_type;
+  th_ycbcr_buffer planes;
+} AdvTheoraFrame;
+
+static const int adv_ref_roles[3] = {OC_FRAME_GOLD, OC_FRAME_PREV, OC_FRAME_SELF};
+
+void adv_theora_snapshot(void *opaque, AdvTheoraFrame *frame, int ready) {
+  th_dec_ctx *decoder = opaque;
+  for (int i = 0; i < 3; i++) {
+    frame->refs[i] = decoder->state.ref_frame_idx[adv_ref_roles[i]];
+  }
+  frame->frame_type = decoder->state.frame_type;
+  if (ready) memcpy(frame->planes, decoder->pp_frame_buf, sizeof(frame->planes));
+}
+
+void adv_theora_restore(void *opaque, const AdvTheoraFrame *frame) {
+  th_dec_ctx *decoder = opaque;
+  for (int i = 0; i < 3; i++) {
+    int ref = frame->refs[i];
+    decoder->state.ref_frame_idx[adv_ref_roles[i]] = ref;
+    decoder->state.ref_frame_data[adv_ref_roles[i]] =
+     ref < 0 ? NULL : decoder->state.ref_frame_bufs[ref][0].data;
+  }
+  int self = frame->refs[2];
+  decoder->dc_qis = self < 0 ? NULL : decoder->adv_dc_qis[self];
+  decoder->pp_frame_data = self < 0 ? NULL : decoder->adv_pp_data[self];
+  decoder->pp_frame_state = 0;
+  decoder->state.frame_type = frame->frame_type;
+  memcpy(decoder->pp_frame_buf, frame->planes, sizeof(frame->planes));
+}
+
+int adv_theora_verify_refs(const void *staged, const AdvTheoraFrame *frame,
+ const void *synchronous) {
+  const th_dec_ctx *dec = staged;
+  const th_dec_ctx *sync = synchronous;
+  for (int role = 0; role < 3; role++) {
+    int actual = frame->refs[role];
+    int expected = sync->state.ref_frame_idx[adv_ref_roles[role]];
+    if ((actual < 0) != (expected < 0)) return 0;
+    if (actual < 0) continue;
+    for (int prev = 0; prev < role; prev++) {
+      if ((actual == frame->refs[prev]) !=
+       (expected == sync->state.ref_frame_idx[adv_ref_roles[prev]])) return 0;
+    }
+    for (int plane = 0; plane < 3; plane++) {
+      const th_img_plane *a = dec->state.ref_frame_bufs[actual] + plane;
+      const th_img_plane *b = sync->state.ref_frame_bufs[expected] + plane;
+      if (a->width != b->width || a->height != b->height) return 0;
+      int px = OC_UMV_PADDING >> (plane > 0 && !(dec->state.info.pixel_fmt & 1));
+      int py = OC_UMV_PADDING >> (plane > 0 && !(dec->state.info.pixel_fmt & 2));
+      for (int y = -py; y < a->height + py; y++) {
+        if (memcmp(a->data + (ptrdiff_t)y * a->stride - px,
+                   b->data + (ptrdiff_t)y * b->stride - px,
+                   a->width + 2 * px)) return 0;
+      }
+    }
+  }
+  int self = frame->refs[2];
+  const unsigned char *dc = self < 0 ? NULL : dec->adv_dc_qis[self];
+  return (dc == NULL && sync->dc_qis == NULL) ||
+   (dc != NULL && sync->dc_qis != NULL && dec->state.nfrags == sync->state.nfrags &&
+    !memcmp(dc, sync->dc_qis, dec->state.nfrags));
 }
 
 void adv_theora_stripe(void *opaque, int range[2]) {

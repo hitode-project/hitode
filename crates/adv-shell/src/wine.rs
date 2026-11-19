@@ -452,13 +452,19 @@ fn report(
     }
     if let Some(kernels) = adv_runtime::wine::codec::stats(&session.machine.ext) {
         let theora = kernels.theora;
+        let run_ahead = theora.run_ahead;
         codec.pop();
         codec.push_str(&format!(
             concat!(
                 ", \"mdct\": {{\"installed\": {}, \"native_calls\": {}, \"verify_calls\": {}, ",
                 "\"fallback_calls\": {}, \"last_rejection\": {}}}, ",
-                "\"theora\": {{\"installed\": {}, \"initialized\": {}, \"native_frames\": {}, ",
+                "\"theora\": {{\"installed\": {}, \"initialized\": {}, \"frames\": {}, \"native_frames\": {}, ",
                 "\"compared_bytes\": {}, \"different_bytes\": {}, \"state_mismatches\": {}, ",
+                "\"predicted\": {}, \"committed\": {}, \"mismatched\": {}, ",
+                "\"mismatched_controls\": {}, \"discarded\": {}, ",
+                "\"no_prediction\": {}, \"no_prediction_callback\": {}, \"owner_wait_ns\": {}, ",
+                "\"linked\": {}, \"unlinked_wrote\": {}, \"readahead_packets\": {}, ",
+                "\"wait_not_started_ns\": {}, \"wait_in_flight_ns\": {}, \"lead_packets_sum\": {}, ",
                 "\"reason\": {}}}}}"
             ),
             kernels.installed,
@@ -471,10 +477,25 @@ fn report(
                 .map_or_else(|| "null".into(), json),
             theora.installed,
             theora.initialized,
+            theora.frames,
             theora.native_frames,
             theora.compared_bytes,
             theora.different_bytes,
             theora.state_mismatches,
+            run_ahead.predicted,
+            run_ahead.committed,
+            run_ahead.mismatched,
+            run_ahead.mismatched_controls,
+            run_ahead.discarded,
+            run_ahead.no_prediction,
+            run_ahead.no_prediction_callback,
+            run_ahead.owner_wait_ns,
+            run_ahead.linked,
+            run_ahead.unlinked_wrote,
+            run_ahead.readahead_packets,
+            run_ahead.wait_not_started_ns,
+            run_ahead.wait_in_flight_ns,
+            run_ahead.lead_packets_sum,
             theora.reason.as_deref().map_or_else(|| "null".into(), json),
         ));
     }

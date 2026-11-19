@@ -82,6 +82,18 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         } else {
             None
         };
+        let observed = (reader.is_none()
+            && fd.kind == FD_TYPE_FILE
+            && env.ext.try_get::<RecentReads>().is_some())
+        .then(|| {
+            position.unwrap_or_else(|| {
+                fd.file.as_ref().map_or_else(
+                    // SAFETY: the server descriptor is live.
+                    || unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) },
+                    |file| file.position.get(),
+                )
+            })
+        });
         let mut total = 0;
         let count = loop {
             // SAFETY: a live server descriptor and a writable buffer of length bytes.
@@ -154,6 +166,13 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             }
             return Err(status.into());
         };
+        if let Some(at) = observed.and_then(|at| u64::try_from(at).ok())
+            && count != 0
+        {
+            env.ext
+                .get_mut::<RecentReads>()
+                .record(&fd, buffer, at, count);
+        }
         if let Some(file) = &fd.file {
             if !asynchronous {
                 file.position

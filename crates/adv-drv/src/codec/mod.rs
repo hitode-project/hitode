@@ -10,7 +10,10 @@ use adv_cpu::backend::{Guest, Prot, asm::Asm};
 use adv_machine::{Env, Ext, HostFn, Outcome, Sys, layout::PAGE};
 
 mod mdct;
+mod ogg;
+mod readahead;
 mod rows;
+mod run_ahead;
 mod theora;
 pub mod vorbisfile;
 
@@ -39,6 +42,7 @@ pub fn install(ext: &mut Ext, mode: Mode) {
         mapped: BTreeMap::new(),
     });
     mdct::install(ext, mode);
+    ogg::install(ext);
     theora::install(ext, mode);
     ext.insert(adv_nt::section::ImageBinding {
         mapped: |env, base, pe, path| {
@@ -84,6 +88,7 @@ pub fn stats(ext: &Ext) -> Option<Stats> {
 pub fn host_fn(module: &str, name: &str) -> Option<HostFn> {
     vorbisfile::host_fn(module, name)
         .or_else(|| mdct::host_fn(module, name))
+        .or_else(|| ogg::host_fn(module, name))
         .or_else(|| theora::host_fn(module, name))
 }
 
@@ -99,7 +104,9 @@ fn note_image(env: &mut Env<'_>, base: u32, size: u32, ranges: &[ExecutableRange
         return;
     }
     env.ext.get_mut::<Images>().mapped.insert(base, size);
-    if let Err(error) = mdct::bind(env, base, size, ranges).and_then(|()| theora::bind(env, ranges))
+    if let Err(error) = mdct::bind(env, base, size, ranges)
+        .and_then(|()| ogg::bind(env, ranges))
+        .and_then(|()| theora::bind(env, ranges))
     {
         mdct::rejected(env.ext, error);
     }
@@ -111,6 +118,7 @@ fn forget_image(env: &mut Env<'_>, base: u32) {
             entry < base || u64::from(entry) >= u64::from(base) + u64::from(size)
         });
         mdct::forget(env.ext, base);
+        ogg::forget(env.ext, base, size);
         theora::forget(env.ext, base, size);
     }
 }

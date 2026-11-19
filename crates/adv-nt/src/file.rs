@@ -4,6 +4,7 @@
 mod information;
 mod io;
 mod probes;
+mod recent;
 pub(crate) mod state;
 pub mod volume;
 
@@ -13,6 +14,7 @@ pub use io::{
     device_control, flush, flush_ex, lock, notify_change, read, read_scatter, unlock, write_gather,
 };
 pub(crate) use probes::{invalidate_request, invalidate_syscall};
+pub use recent::{ReadSource, RecentReads};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
