@@ -5,9 +5,10 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{Enter, Faults, ShadowStack, head};
+use super::{Enter, Faults, InterpreterCause, ShadowStack, head};
 use crate::cache::CodeCache;
 use crate::encode::bl;
 use crate::facts::Key;
@@ -74,6 +75,12 @@ pub(super) struct InternalEdge {
     pub(super) back: bool,
 }
 
+#[derive(Default)]
+pub(super) struct SlowPaths {
+    pub(super) interpreter: BTreeMap<(u32, InterpreterCause), u64>,
+    pub(super) helpers: BTreeMap<(u32, runtime::HelperCause), u64>,
+}
+
 pub(super) struct CodeStore {
     /// Switch-table slots by guest target: source entry, host slot and
     /// original shared stub. Dispatch looks targets up on every miss.
@@ -89,6 +96,7 @@ pub(super) struct CodeStore {
     pub(super) units: FxHashMap<u32, Tier1Unit>,
     pub(super) chains: FxHashMap<u32, Chain>,
     pub(super) version_stats: Option<FxHashMap<u32, Box<VersionStats>>>,
+    pub(super) slow_paths: Option<SlowPaths>,
     /// Unit entries by the guest pages their code came from.
     pub(super) pages: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they

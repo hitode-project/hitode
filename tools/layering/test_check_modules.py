@@ -90,6 +90,23 @@ const TEXT: &str = r#"use super::*; iced_x86::Decoder"#;
             "native/run.rs:1: native::run -> iced_x86: disallowed",
         ])
 
+    # spec: A64A-DEP-1
+    def test_interpreter_form_exception_expires_with_the_call(self):
+        allowed = {("translate/simd.rs", "interpreter form sse-mxcsr")}
+        sources = {"translate/simd.rs": """
+fn floating() {
+    self.helper_for(index, cause); // transitional interpreter form: sse-mxcsr
+}
+"""}
+        self.assertEqual(violations(sources, allowed), [])
+        self.assertEqual(violations(sources, set()), [
+            "translate/simd.rs:3: translate::jit -> interpreter form sse-mxcsr: disallowed",
+        ])
+        sources["translate/simd.rs"] = ""
+        self.assertEqual(violations(sources, allowed), [
+            "translate/simd.rs -> interpreter form sse-mxcsr: transitional edge is gone; drop it",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

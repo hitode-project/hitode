@@ -1456,6 +1456,40 @@ fn tier1_x87_versions_handle_live_stack_and_deferred_emms() {
     assert_eq!(actual.native.as_ref().unwrap().tier1_versions(CODE), 3);
 }
 
+// spec: A64A-FALL-2 A64F-FP-7
+#[test]
+fn tier1_x87_wide_loop_handles_a_full_stack_on_entry() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fld(tbyte_ptr(ebx)).unwrap();
+        a.fstp(tbyte_ptr(ebx + 16)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.data[..8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    program.data[8..10].copy_from_slice(&0x3fffu16.to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    assert_eq!(actual.run(program.stop, 50), Ok(RunOutcome::ReachedStop));
+    for _ in 0..8 {
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(1 << 63, 0x3fff));
+    }
+    actual.state = program.state.clone();
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 50),
+        reference.run(program.stop, 50)
+    );
+    same(&actual, &reference);
+    let native = actual.native.as_ref().unwrap();
+    assert_eq!(native.tier1_versions(CODE), 2);
+    assert_eq!(native.diagnostics.interprets, 0);
+}
+
 // spec: A64A-FALL-4 A64F-FP-2
 #[test]
 fn tier1_pending_x87_exception_reports_the_waiting_instruction() {

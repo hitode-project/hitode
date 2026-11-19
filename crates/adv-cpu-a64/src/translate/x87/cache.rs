@@ -2156,6 +2156,30 @@ impl Translator<'_> {
                 }
             }
         }
+        if self.tier1
+            && start == 0
+            && loop_plan.as_ref().is_some_and(|(_, need, _)| {
+                self.facts.pending() != Some(false)
+                    || self.facts.mmx() != Some(0)
+                    || (0..8).any(|slot| {
+                        let bit = 1 << slot;
+                        need.empty & bit != 0 && self.facts.tag(slot) != Some(3)
+                            || need.value & bit != 0 && !matches!(self.facts.tag(slot), Some(0 | 1))
+                    })
+            })
+        {
+            if !matches!(
+                self.trace.insts[start].op,
+                Op::X87(X87 {
+                    fast: Fast::Load80 | Fast::Store80 | Fast::Leaf(_),
+                    ..
+                })
+            ) {
+                return false;
+            }
+            // These forms use the same body for loops and straight-line runs.
+            loop_plan = None;
+        }
         let cyclic = loop_plan.is_some();
         let Some((end, need, merges)) = loop_plan.or_else(|| {
             self.cacheable(start)?;
@@ -2163,19 +2187,6 @@ impl Translator<'_> {
         }) else {
             return false;
         };
-        if self.tier1
-            && cyclic
-            && start == 0
-            && (self.facts.pending() != Some(false)
-                || self.facts.mmx() != Some(0)
-                || (0..8).any(|slot| {
-                    let bit = 1 << slot;
-                    need.empty & bit != 0 && self.facts.tag(slot) != Some(3)
-                        || need.value & bit != 0 && !matches!(self.facts.tag(slot), Some(0 | 1))
-                }))
-        {
-            return false;
-        }
         self.remark(Part::X87Entry);
         self.flush_simd();
         if cyclic {
@@ -2927,11 +2938,11 @@ impl Translator<'_> {
             self.asm.b(resume);
             self.asm.bind(fallback);
             self.emit(msr_nzcv(X4));
-            self.helper(cold.helper);
+            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
             self.asm.bind(resume);
         } else {
             self.emit(msr_nzcv(X4));
-            self.helper(cold.helper);
+            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
         }
         if cold.dispatch {
             let inst = self.trace.insts[cold.index];

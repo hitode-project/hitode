@@ -121,7 +121,7 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("translate/x87.rs", "iced_x86 (tests)"),
 }
 
-INTERPRETER_FORM = re.compile(r"\bself\.helper\([^;]+\); // transitional interpreter form: ([\w-]+)$", re.M)
+INTERPRETER_FORM = re.compile(r"\bself\.helper(?:_for)?\([^;]+\); // transitional interpreter form: ([\w-]+)$", re.M)
 
 TOKEN = re.compile(
     r'(?P<comment>//[^\n]*|/\*)'

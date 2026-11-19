@@ -611,6 +611,7 @@ struct Translator<'a> {
     aliased: u8,
     facts: Key,
     tier1: bool,
+    helper_diagnostics: bool,
     computation: bool,
     resident_links: bool,
     #[cfg(native)]
@@ -832,6 +833,7 @@ impl Jit<'_> {
             aliased: 0,
             facts: self.facts,
             tier1: self.tier1,
+            helper_diagnostics: self.tier1 && crate::jit_map::enabled(),
             computation,
             resident_links: *resident_links && !computation,
             #[cfg(native)]
@@ -2128,6 +2130,14 @@ impl Translator<'_> {
             back,
             direct,
         });
+    }
+
+    fn helper_for(&mut self, index: u8, cause: crate::runtime::HelperCause) {
+        if self.helper_diagnostics {
+            self.mov_imm(X16, cause as u32);
+            self.emit(str(W, X16, RUNTIME, crate::runtime::HELPER_CAUSE));
+        }
+        self.helper(index);
     }
 
     fn mov_address(&mut self, reg: Reg, value: usize) {

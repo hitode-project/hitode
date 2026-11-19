@@ -345,6 +345,19 @@ fn features() -> Features {
     }
 }
 
+/// Observed results of the existing interpreter event path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum InterpreterCause {
+    HostFault,
+    DebugFlags,
+    Fetch,
+    InvalidEncoding,
+    OperandFault,
+    Trap(u8),
+    Timestamp,
+    InstructionForm,
+}
+
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
 #[derive(Clone, Debug, Default)]
@@ -534,6 +547,12 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     cpu.eip = helper.pc;
     native.diagnostics.helpers += 1;
     native.code.helper_counts[index as usize] += 1;
+    if let Some(paths) = &mut native.code.slow_paths {
+        let cause = runtime::HelperCause::from_diagnostic(std::mem::take(unsafe {
+            &mut (*runtime).helper_cause
+        }));
+        *paths.helpers.entry((helper.pc, cause)).or_default() += 1;
+    }
     let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
     let units = countdown.saturating_add(1).min(u64::from(u32::MAX)) as u32;
     let count = cpu.regs[1];
@@ -747,6 +766,27 @@ pub(crate) struct Native {
 }
 
 impl Native {
+    pub(crate) fn note_interpretation(&mut self, eip: u32, exit: Exit, step: Step, debug: bool) {
+        let Some(paths) = &mut self.code.slow_paths else {
+            return;
+        };
+        let cause = if debug {
+            InterpreterCause::DebugFlags
+        } else if exit == Exit::Fault {
+            InterpreterCause::HostFault
+        } else {
+            match step {
+                Step::FetchFault { .. } => InterpreterCause::Fetch,
+                Step::InvalidInstruction { .. } => InterpreterCause::InvalidEncoding,
+                Step::ReadFault { .. } | Step::WriteFault { .. } => InterpreterCause::OperandFault,
+                Step::Trap { vector, .. } => InterpreterCause::Trap(vector),
+                Step::ReadTimestamp { .. } => InterpreterCause::Timestamp,
+                _ => InterpreterCause::InstructionForm,
+            }
+        };
+        *paths.interpreter.entry((eip, cause)).or_default() += 1;
+    }
+
     pub(crate) fn version_diagnostics(&self) -> Option<String> {
         use std::fmt::Write as _;
         let stats = self.code.version_stats.as_ref()?;
@@ -766,6 +806,14 @@ impl Native {
                 " {eip:#010x}=[builds {}, misses {}, joins {}, versions {versions}, arrivals {arrivals:?}]",
                 stats.built, stats.misses, stats.joins,
             );
+        }
+        if let Some(paths) = &self.code.slow_paths {
+            for (&(eip, cause), &count) in &paths.interpreter {
+                let _ = write!(output, " interpreter {eip:#010x} {cause:?}={count}");
+            }
+            for (&(eip, cause), &count) in &paths.helpers {
+                let _ = write!(output, " helper {eip:#010x} {cause:?}={count}");
+            }
         }
         Some(output)
     }
@@ -871,6 +919,7 @@ impl Native {
                 units: FxHashMap::default(),
                 chains: FxHashMap::default(),
                 version_stats: crate::jit_map::enabled().then(FxHashMap::default),
+                slow_paths: crate::jit_map::enabled().then(store::SlowPaths::default),
                 pages: FxHashMap::default(),
                 links: FxHashMap::default(),
                 linked: Vec::new(),

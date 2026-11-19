@@ -452,7 +452,7 @@ impl Translator<'_> {
             });
         }
         if self.tier1 && simd.control_helper(self.facts) {
-            self.helper(simd.helper); // transitional interpreter form: sse-mxcsr
+            self.helper_for(simd.helper, runtime::HelperCause::SseControlClass); // transitional interpreter form: sse-mxcsr
             return;
         }
         let address = if simd.memory() {

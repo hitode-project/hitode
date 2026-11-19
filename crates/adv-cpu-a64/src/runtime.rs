@@ -185,6 +185,8 @@ pub struct Runtime {
     pub resident_discover: u64,
     pub resident_entries: u64,
     pub resident_page_crossings: u64,
+    /// Set at a diagnostic helper call site and consumed by that call.
+    pub(crate) helper_cause: u32,
 }
 
 impl Runtime {
@@ -257,6 +259,7 @@ impl Runtime {
             resident_discover: 0,
             resident_entries: 0,
             resident_page_crossings: 0,
+            helper_cause: 0,
         }
     }
 }
@@ -448,6 +451,26 @@ pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
 pub(crate) const CPU_STATE: u32 = CPU;
+pub(crate) const HELPER_CAUSE: u32 = field(offset_of!(Runtime, helper_cause));
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u32)]
+pub(crate) enum HelperCause {
+    InstructionForm,
+    OperandValue,
+    SseControlClass,
+}
+
+#[cfg(native)]
+impl HelperCause {
+    pub(crate) fn from_diagnostic(value: u32) -> Self {
+        match value {
+            1 => Self::OperandValue,
+            2 => Self::SseControlClass,
+            _ => Self::InstructionForm,
+        }
+    }
+}
 const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;

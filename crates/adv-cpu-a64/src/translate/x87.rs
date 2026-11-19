@@ -143,7 +143,7 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        self.helper(helper);
+        self.helper_for(helper, runtime::HelperCause::OperandValue);
         self.asm.bind(done);
         self.vector = super::simd::Vector::default();
     }
@@ -190,7 +190,7 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        self.helper(x.helper);
+        self.helper_for(x.helper, runtime::HelperCause::OperandValue);
         self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
         self.asm.bind(done);
         // The stack may have changed under the MMX registers.
