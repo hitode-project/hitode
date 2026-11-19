@@ -563,7 +563,7 @@ fn sse_directed_arithmetic_and_conversion_stay_native() {
 
 // spec: A64F-FP-5
 #[test]
-fn sse_directed_arithmetic_leaves_other_exceptions_and_controls_to_the_owner() {
+fn sse_directed_arithmetic_preserves_value_exits_and_versions_control_changes() {
     let config = (Features { flagm: false }, false, Checks::Adaptive);
     for packed in [false, true] {
         let mut program = fixture(|a| {
@@ -577,7 +577,7 @@ fn sse_directed_arithmetic_leaves_other_exceptions_and_controls_to_the_owner() {
         });
         program.state.mxcsr = 0x3fa0;
         for (a, b, mxcsr) in [
-            (f32::MAX, 2.0, 0x3fa0), // Round-down overflow returns finite max.
+            (f32::MAX, 2.0, 0x3fa0u32), // Round-down overflow returns finite max.
             (-f32::MAX, 2.0, 0x5fa0),
             (f32::MIN_POSITIVE, 0.33333334, 0x3fa0),
             (f32::from_bits(1), 2.0, 0x3fe0),                 // DAZ.
@@ -586,7 +586,7 @@ fn sse_directed_arithmetic_leaves_other_exceptions_and_controls_to_the_owner() {
         ] {
             program.state.xmm[0][..4].copy_from_slice(&a.to_bits().to_le_bytes());
             program.state.xmm[1][..4].copy_from_slice(&b.to_bits().to_le_bytes());
-            program.data[..4].copy_from_slice(&(mxcsr as u32).to_le_bytes());
+            program.data[..4].copy_from_slice(&mxcsr.to_le_bytes());
             let mut native = executor(&program, config, false);
             let mut oracle = executor(&program, config, true);
             assert_eq!(
@@ -594,7 +594,18 @@ fn sse_directed_arithmetic_leaves_other_exceptions_and_controls_to_the_owner() {
                 oracle.run(program.stop, 100).unwrap()
             );
             same(&native, &oracle);
-            assert_eq!(native.stats.interpreter_entries, 1, "MXCSR={mxcsr:x}");
+            let diagnostics = &native.native.as_ref().unwrap().diagnostics;
+            let unsupported = !crate::facts::masked_mxcsr(mxcsr);
+            assert_eq!(
+                diagnostics.helpers,
+                u64::from(unsupported),
+                "MXCSR={mxcsr:x}"
+            );
+            assert_eq!(
+                diagnostics.interprets,
+                u64::from(!unsupported),
+                "MXCSR={mxcsr:x}"
+            );
         }
     }
 }

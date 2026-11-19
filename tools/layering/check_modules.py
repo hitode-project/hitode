@@ -48,6 +48,8 @@ ROLES.update({
 # (Current file, disallowed dependency or parent glob). Delete an entry
 # in the same change that removes its last occurrence.
 TRANSITIONAL: set[tuple[str, str]] = {
+    # Unsupported SSE control classes retain the in-place interpreter helper.
+    ("translate/simd.rs", "interpreter form sse-mxcsr"),
     # Module responsibilities still colocated in the implementation.
     ("asm.rs", "encode"),
     ("native/head.rs", "asm"),
@@ -118,6 +120,8 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("translate/tests/opt_back/inline.rs", "adv_cpu_core::interpreter (tests)"),
     ("translate/x87.rs", "iced_x86 (tests)"),
 }
+
+INTERPRETER_FORM = re.compile(r"\bself\.helper\([^;]+\); // transitional interpreter form: ([\w-]+)$", re.M)
 
 TOKEN = re.compile(
     r'(?P<comment>//[^\n]*|/\*)'
@@ -328,6 +332,8 @@ def violations(sources: dict[str, str], transitional=TRANSITIONAL) -> list[str]:
         if source == "test" and not test_file:
             errors.append(f"{file}: no module role in tools/layering/check_modules.py")
             continue
+        for match in INTERPRETER_FORM.finditer(sources[file]):
+            found[(file, f"interpreter form {match[1]}")] = sources[file].count("\n", 0, match.start()) + 1
         for scope, path, line, in_test in imports:
             if dep := disallowed(source, scope, path, modules, in_test or test_file):
                 found.setdefault((file, dep), line)

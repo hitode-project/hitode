@@ -33,10 +33,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 
-use super::store::{self, InternalEdge, Linked, Tier1Unit};
+use super::store::{self, CHAIN_LEN, Chain, InternalEdge, Linked, Tier1Unit, Version};
 use super::{Checks, EMPTY, Native, Owner, compile, head, record_branch};
 use crate::cache::CodeCache;
 use crate::encode::b;
+use crate::facts::{self, Key};
 use crate::runtime::{self, ResidentCold, Runtime};
 use crate::translate;
 
@@ -621,7 +622,7 @@ impl Native {
     /// Counts a fault at an unchecked site of `eip`, at host address `pc`.
     /// From `CHECK_AFTER` on, `eip` is checked and a new unit supersedes
     /// the one holding `pc`.
-    pub(super) fn strike(&mut self, memory: &mut Memory, eip: u32, pc: usize) {
+    pub(super) fn strike(&mut self, memory: &mut Memory, eip: u32, pc: usize, cpu: &CpuState) {
         let site = self.plans.site(eip);
         site.strikes += 1;
         if site.strikes < CHECK_AFTER {
@@ -634,13 +635,19 @@ impl Native {
             return;
         };
         // A unit dropped before stays in `placed`.
-        if self
+        let current = self
             .code
             .units
             .get(&entry)
             .is_some_and(|unit| unit.unit == start)
-        {
-            self.replace_unit(memory, entry);
+            || self.code.chains.get(&entry).is_some_and(|chain| {
+                chain
+                    .versions
+                    .iter()
+                    .any(|version| version.entry.unit == start)
+            });
+        if current {
+            self.replace_unit(memory, entry, Key::read(cpu, facts::ALL));
         }
     }
 
@@ -654,11 +661,12 @@ impl Native {
         point: usize,
         eip: u32,
         entry: Option<Tier1Unit>,
+        observed: Key,
     ) -> Result<usize, String> {
         let generation = self.code.generation;
         let entry = match entry {
             Some(entry) => entry,
-            None => self.translate(memory, eip)?,
+            None => self.translate(memory, eip, observed)?,
         };
         // Translating may have cleared the cache and the link point with it.
         if point != 0 && self.code.generation == generation {
@@ -683,6 +691,7 @@ impl Native {
     /// Makes the link point at `point` branch to the unit at `eip`.
     pub(super) fn patch(&mut self, point: usize, eip: u32, unit: usize) {
         let link = self.code.link(point, eip);
+        let unit = self.code.linked_target(point, eip, unit);
         if link.back {
             let fallback = point + runtime::BACK_UNIT;
             self.code.repoint(fallback, unit);
@@ -733,22 +742,28 @@ impl Native {
     }
 
     /// Tier-1 replacement keeps old continuations and all their watches.
-    pub(super) fn replace_unit(&mut self, memory: &mut Memory, eip: u32) {
-        let Some(new) = self.emit(memory, eip) else {
+    pub(super) fn replace_unit(&mut self, memory: &mut Memory, eip: u32, observed: Key) {
+        let Some(new) = self.emit(memory, eip, observed) else {
             return;
         };
+        self.repoint_tier1(eip, new.unit);
+        self.code.cache.sync();
+    }
+
+    fn repoint_tier1(&mut self, eip: u32, checked: usize) {
         let slot = &mut self.code.table[runtime::table_slot(eip)];
         if slot[0] == u64::from(eip) {
-            slot[1] = new.unit as u64;
+            slot[1] = checked as u64;
         }
-        self.resolve_tables(eip, new.unit);
+        self.resolve_tables(eip, checked);
         let resident = self.plans.resident(eip);
         let mut next = self.code.links.get(&eip).copied().unwrap_or(u32::MAX);
         while let Some(link) = self.code.linked.get(next as usize).copied() {
             next = link.next;
+            let target = self.code.linked_target(link.point, eip, checked);
             if link.back {
                 let fallback = link.point + runtime::BACK_UNIT;
-                self.code.repoint(fallback, new.unit);
+                self.code.repoint(fallback, target);
             }
             if resident.is_some_and(|head| Self::enters_resident(&link, head)) {
                 continue;
@@ -758,10 +773,9 @@ impl Native {
                 &link,
                 resident,
                 self.plans.job(eip),
-                new.unit,
+                target,
             );
         }
-        self.code.cache.sync();
     }
 
     pub(super) fn resolve_tables(&mut self, eip: u32, unit: usize) {
@@ -861,6 +875,7 @@ impl Native {
         self.diagnostics.clears += 1;
         self.code.cache.truncate(self.code.stub_len);
         self.code.units.clear();
+        self.code.chains.clear();
         self.offload.clear();
         self.code.rows.clear();
         self.code.table_sources.clear();
@@ -869,6 +884,7 @@ impl Native {
         self.code.linked.clear();
         self.code.back_points.clear();
         self.code.direct_points.clear();
+        self.code.point_facts.clear();
         self.code.internal_edges.clear();
         self.plans.clear_overlays();
         self.runtime.resident_point = 0;
@@ -910,14 +926,19 @@ impl Native {
     /// path leaves to that have run before, so they share one cache sync
     /// and link directly. Every link point of these units to a unit that
     /// exists is patched.
-    pub(super) fn translate(&mut self, memory: &mut Memory, eip: u32) -> Result<Tier1Unit, String> {
+    pub(super) fn translate(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        observed: Key,
+    ) -> Result<Tier1Unit, String> {
         self.code.points.clear();
-        let entry = match self.emit(memory, eip) {
+        let entry = match self.emit(memory, eip, observed) {
             Some(entry) => entry,
             None => {
                 self.clear();
                 self.code.points.clear();
-                self.emit(memory, eip)
+                self.emit(memory, eip, observed)
                     .ok_or("a64 unit does not fit an empty cache")?
             }
         };
@@ -939,7 +960,7 @@ impl Native {
                     && self.ran(target)
                     && crate::translate::Fetcher::fetchable(memory, target) =>
                 {
-                    match self.emit(memory, target) {
+                    match self.emit(memory, target, observed) {
                         Some(entry) => entry.unit,
                         None => break,
                     }
@@ -951,129 +972,175 @@ impl Native {
         Ok(entry)
     }
 
-    pub(super) fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Tier1Unit> {
+    fn emit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> Option<Tier1Unit> {
         let loops =
             self.promotion == 0 || self.plans.sites.get(&eip).is_some_and(|plan| plan.promoted);
         let unit = self.front_unit(memory, eip, loops, false);
         let at = self.code.cache.next();
         let mut work = std::mem::take(&mut self.code.work);
         let all = self.checks != Checks::Adaptive;
-        let (control, pe) = if self.runtime.cpu.is_null() {
-            (self.control, self.pe)
+        let mask = unit.fact_mask();
+        let key = observed.project(mask);
+        let helpers = self.code.helpers.len() as u32;
+        let arrivals = if mask == 0 {
+            0
         } else {
-            // SAFETY: during a run the runtime points at its live CPU, which
-            // nothing writes while the owner translates.
-            let x87 = unsafe { &(*self.runtime.cpu).x87 };
-            (x87.control, x87.status & 0x20 != 0)
+            self.code.counter(eip, 0)
         };
-        translate::lower_unit(
+        translate::lower_tier1(
             &mut work.code,
             &unit,
             eip,
             &|pc| all || self.plans.checked(pc),
-            self.code.helpers.len() as u32,
+            helpers,
             self.features,
             at,
             self.code.stubs,
-            control,
-            pe,
             !self.plans.baseline_only,
+            key,
+            arrivals,
         );
         if work.retired() == 0 {
             self.diagnostics.empty_units[usize::from(unit.trace.failure & 3)] += 1;
         }
+        let entry = self.place_tier1(memory, eip, &work, &unit, key, true);
+        if let Some(entry) = entry {
+            self.code.helpers.extend(unit.helpers().iter().cloned());
+            self.code.helper_counts.resize(self.code.helpers.len(), 0);
+            if mask == 0 {
+                self.code.chains.remove(&eip);
+            } else {
+                self.code.chains.insert(
+                    eip,
+                    Chain {
+                        unit,
+                        mask,
+                        helpers,
+                        versions: vec![Version { key, entry }],
+                    },
+                );
+                if let Some(stats) = &mut self.code.version_stats {
+                    stats.get_mut(&eip).unwrap().built += 1;
+                }
+            }
+        }
+        self.code.work = work;
+        entry
+    }
+
+    fn place_tier1(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        work: &translate::Workspace,
+        unit: &translate::Unit,
+        key: Key,
+        head: bool,
+    ) -> Option<Tier1Unit> {
         let entry = self.code.install_unit(
             eip,
             work.words(),
             work.sites(),
             work.retired(),
             work.marks(),
-        );
-        if let Some(entry) = entry {
-            debug_assert_eq!(entry.unit, at);
-            if !unit.tables.is_empty() {
-                self.code.table_sources.insert(eip);
+            work.code.version,
+        )?;
+        let at = entry.unit;
+        if head {
+            self.code.units.insert(eip, entry);
+        }
+        if !unit.tables.is_empty() {
+            self.code.table_sources.insert(eip);
+        }
+        for (table, &(offset, stub)) in unit.tables.iter().zip(&work.code.table_positions) {
+            for (index, &target) in table.targets.iter().enumerate() {
+                let slot = (eip, at + offset + index * 8, at + stub);
+                self.code.rows.entry(target).or_default().push(slot);
             }
-            for (table, &(offset, stub)) in unit.tables.iter().zip(&work.code.table_positions) {
-                for (index, &target) in table.targets.iter().enumerate() {
-                    let slot = (eip, at + offset + index * 8, at + stub);
-                    self.code.rows.entry(target).or_default().push(slot);
-                }
+        }
+        let mut targets: Vec<_> = unit
+            .tables
+            .iter()
+            .flat_map(|t| t.targets.iter().copied())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            if let Some(entry) = self.code.units.get(&target) {
+                self.resolve_tables(target, entry.unit);
             }
-            let mut targets: Vec<_> = unit
-                .tables
-                .iter()
-                .flat_map(|t| t.targets.iter().copied())
-                .collect();
-            targets.sort_unstable();
-            targets.dedup();
-            for target in targets {
-                if let Some(entry) = self.code.units.get(&target) {
-                    self.resolve_tables(target, entry.unit);
-                }
+        }
+        let proofs = if key.mask() == 0 {
+            key
+        } else {
+            key.project(unit.preserved_facts())
+        };
+        for link in work.links() {
+            let point = at + link.offset;
+            if proofs.mask() != 0 {
+                self.code.point_facts.insert(point, proofs);
             }
-            for link in work.links() {
-                let point = at + link.offset;
-                self.code.points.push((point, link.eip, link.main));
-                if let Some(transition) = link.direct {
-                    self.code.direct_points.insert(point, at + transition);
-                }
-                if link.back {
-                    self.code.back_points.insert(point);
-                    let (address, _) = self.counter(link.eip);
-                    self.bind_counter(point + runtime::BACK_COUNTER, address);
-                }
+            self.code.points.push((point, link.eip, link.main));
+            if let Some(transition) = link.direct {
+                self.code.direct_points.insert(point, at + transition);
             }
-            for link in work.internal_links() {
-                let edge = InternalEdge {
-                    point: at + link.point,
-                    target: at + link.target,
-                    transition: at + link.transition,
-                    link: at + link.link,
-                    source: eip,
-                    source_pc: link.source_pc,
-                    back: link.counter.is_some(),
-                };
-                let value = if let Some(counter) = link.counter {
-                    let (address, value) = self.counter(link.eip);
-                    self.bind_counter(at + counter, address);
-                    value
-                } else {
-                    u32::MAX
-                };
-                let resident = self.plans.resident(link.eip);
-                if let Some(head) = resident.filter(|head| {
-                    head.trampoline != 0
-                        && !head.declined()
-                        && (edge.back
-                            || !head
-                                .unit
-                                .trace
-                                .insts
-                                .iter()
-                                .any(|inst| inst.pc == edge.source_pc))
-                }) {
-                    self.code
-                        .cache
-                        .patch(edge.link, head::branch(edge.link, head.trampoline));
-                    self.code
-                        .cache
-                        .patch(edge.point, head::branch(edge.point, edge.transition));
-                } else if resident.is_some() || value == u32::MAX {
-                    self.code
-                        .cache
-                        .patch(edge.point, head::branch(edge.point, edge.target));
-                }
+            if link.back {
+                self.code.back_points.insert(point);
+                let (address, _) = self.counter(link.eip);
+                self.bind_counter(point + runtime::BACK_COUNTER, address);
+            }
+        }
+        for link in work.internal_links() {
+            let edge = InternalEdge {
+                point: at + link.point,
+                target: at + link.target,
+                transition: at + link.transition,
+                link: at + link.link,
+                source: eip,
+                source_pc: link.source_pc,
+                back: link.counter.is_some(),
+            };
+            let value = if let Some(counter) = link.counter {
+                let (address, value) = self.counter(link.eip);
+                self.bind_counter(at + counter, address);
+                value
+            } else {
+                u32::MAX
+            };
+            let resident = self.plans.resident(link.eip);
+            if let Some(head) = resident.filter(|head| {
+                head.trampoline != 0
+                    && !head.declined()
+                    && (edge.back
+                        || !head
+                            .unit
+                            .trace
+                            .insts
+                            .iter()
+                            .any(|inst| inst.pc == edge.source_pc))
+            }) {
                 self.code
-                    .internal_edges
-                    .entry(link.eip)
-                    .or_default()
-                    .push(edge);
+                    .cache
+                    .patch(edge.link, head::branch(edge.link, head.trampoline));
+                self.code
+                    .cache
+                    .patch(edge.point, head::branch(edge.point, edge.transition));
+            } else if resident.is_some() || value == u32::MAX {
+                self.code
+                    .cache
+                    .patch(edge.point, head::branch(edge.point, edge.target));
             }
+            self.code
+                .internal_edges
+                .entry(link.eip)
+                .or_default()
+                .push(edge);
+        }
+        if head {
             if self.plans.counter_at(eip).is_some() || !work.internal_links().is_empty() {
                 self.code
                     .tier1_words
-                    .insert(eip, store::tier1_words(&work, &unit.trace));
+                    .insert(eip, store::tier1_words(work, &unit.trace));
             }
             if let Some(head) = self.plans.resident(eip).filter(|head| head.tier1 != 0) {
                 self.code
@@ -1088,17 +1155,86 @@ impl Native {
             {
                 self.code.repoint(gate, entry.unit);
             }
-            self.code.helpers.extend(unit.helpers().iter().cloned());
-            self.code.helper_counts.resize(self.code.helpers.len(), 0);
         }
-        self.code.uses_permissions |= entry.is_some() && work.code.uses_permissions;
-        // Code discovery can protect a host page shared with ordinary data.
-        // Refresh permission snapshots before linked code resumes.
+        self.code.uses_permissions |= work.code.uses_permissions;
         if self.code.uses_permissions {
             self.classify(memory);
         }
+        Some(entry)
+    }
+
+    fn miss_version(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        observed: Key,
+    ) -> Result<usize, String> {
+        let Some(mut chain) = self.code.chains.remove(&eip) else {
+            if let Some(entry) = self.code.units.get(&eip) {
+                return Ok(entry.unit);
+            }
+            return self
+                .translate(memory, eip, observed)
+                .map(|entry| entry.unit);
+        };
+        if let Some(stats) = &mut self.code.version_stats {
+            stats.get_mut(&eip).unwrap().misses += 1;
+        }
+        let input = observed;
+        let observed = observed.project(chain.mask);
+        if let Some(entry) = chain
+            .versions
+            .iter()
+            .find(|v| observed.proves(v.key))
+            .map(|v| v.entry)
+        {
+            self.code.chains.insert(eip, chain);
+            return Ok(entry.unit);
+        }
+
+        let position = chain.versions.len().min(CHAIN_LEN - 1);
+        let previous = chain.versions[position - 1].entry.miss.unwrap();
+        let joining = chain.versions.len() == CHAIN_LEN;
+        let key = if joining {
+            chain.versions[position].key.join(observed)
+        } else {
+            observed
+        };
+        let arrivals = self.code.counter(eip, position);
+        let mut work = std::mem::take(&mut self.code.work);
+        let all = self.checks != Checks::Adaptive;
+        translate::lower_tier1(
+            &mut work.code,
+            &chain.unit,
+            eip,
+            &|pc| all || self.plans.checked(pc),
+            chain.helpers,
+            self.features,
+            self.code.cache.next(),
+            self.code.stubs,
+            !self.plans.baseline_only,
+            key,
+            arrivals,
+        );
+        let entry = self.place_tier1(memory, eip, &work, &chain.unit, key, false);
         self.code.work = work;
-        entry
+        let Some(entry) = entry else {
+            self.clear();
+            return self.translate(memory, eip, input).map(|entry| entry.unit);
+        };
+        chain.versions.truncate(position);
+        chain.versions.push(Version { key, entry });
+        self.code.repoint(previous, entry.unit);
+        self.code.chains.insert(eip, chain);
+        if joining {
+            self.repoint_tier1(eip, self.code.units[&eip].unit);
+        }
+        if let Some(stats) = &mut self.code.version_stats {
+            let stats = stats.get_mut(&eip).unwrap();
+            stats.built += 1;
+            stats.joins += u64::from(joining);
+        }
+        Ok(entry.unit)
     }
 
     pub(super) fn counter(&mut self, eip: u32) -> (u64, u32) {
@@ -1657,7 +1793,8 @@ impl Native {
     }
 
     /// Budget samples select Tier-1 loop traces.
-    pub(super) fn sample(&mut self, memory: &mut Memory, eip: u32) {
+    pub(super) fn sample(&mut self, memory: &mut Memory, cpu: &CpuState) {
+        let eip = cpu.eip;
         if self.promotion == 0 || self.is_stop(eip) {
             return;
         }
@@ -1671,17 +1808,16 @@ impl Native {
             plan.promoted = true;
             self.diagnostics.promotions += 1;
             crate::jit_map::optimized(eip, format_args!("promoted\t-\t-"));
-            self.replace_unit(memory, eip);
+            self.replace_unit(memory, eip, Key::read(cpu, facts::ALL));
         }
     }
 
     #[cfg(test)]
     pub(super) fn prepare_job(&mut self, memory: &mut Memory, stop: u32, at: &CpuState) {
         self.observe_stop(stop);
-        self.control = at.x87.control;
-        self.pe = at.x87.status & 0x20 != 0;
         if !self.code.units.contains_key(&at.eip) {
-            self.translate(memory, at.eip).unwrap();
+            self.translate(memory, at.eip, Key::read(at, facts::ALL))
+                .unwrap();
         }
         self.discover(memory, at.eip, at.eip, at.clone());
         self.install_optimized(true);
@@ -1762,6 +1898,21 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
     if native.is_stop(eip) {
         return 0;
     }
+    if point == usize::MAX {
+        let before = native.code.cache.used();
+        let observed = Key::read(unsafe { &*(*runtime).cpu }, facts::ALL);
+        let entry = match native.miss_version(memory, eip, observed) {
+            Ok(entry) => entry,
+            Err(error) => {
+                owner.error = Some(error);
+                return 0;
+            }
+        };
+        owner.translated += native.code.cache.used().saturating_sub(before);
+        native.code.cache.sync();
+        native.code.faults.end.set(native.code.cache.next());
+        return entry;
+    }
     let back = native.code.back_points.contains(&point);
     if back && native.plans.counter_at(eip).unwrap().get() == 0 {
         native.stop_counting(eip);
@@ -1784,7 +1935,12 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         return 0;
     }
     let before = native.code.cache.used();
-    let unit = match native.link(memory, point, eip, entry) {
+    let observed = if entry.is_none() {
+        Key::read(unsafe { &*(*runtime).cpu }, facts::ALL)
+    } else {
+        Key::default()
+    };
+    let unit = match native.link(memory, point, eip, entry, observed) {
         Ok(unit) => unit,
         Err(error) => {
             owner.error = Some(error);

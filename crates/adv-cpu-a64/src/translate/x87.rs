@@ -37,7 +37,7 @@ use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::jit_map::Part;
-use crate::runtime;
+use crate::runtime::{self, Exit};
 
 use super::access::{Addr, Dir};
 use super::decode::Mem;
@@ -46,6 +46,7 @@ use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16,
 
 mod cache;
 mod pair;
+pub(super) use cache::entry_facts;
 pub(super) use cache::{Arrive, Cache, Cold, Leave, Model, Scratch};
 
 const X7: Reg = Reg::new(7);
@@ -98,13 +99,7 @@ impl Translator<'_> {
         self.cpu();
         let slow = self.asm.label();
         let done = self.asm.label();
-        self.emit_all(&[
-            mrs_nzcv(X4),
-            ldrh(X13, X5, runtime::X87_STATUS),
-            ldr(W, X16, X5, runtime::MMX_MODE),
-        ]);
-        self.asm.tbz(true, X13, 7, slow);
-        self.asm.cbz(W, true, X16, slow);
+        self.x87_state(true, slow);
         self.emit_all(&[ubfx(W, X15, X13, 11, 3), ldrh(X14, X5, runtime::X87_TAG)]);
         if self.checking {
             self.vector_access(VMem::D, V0, X6, false);
@@ -166,13 +161,8 @@ impl Translator<'_> {
         self.cpu();
         let slow = self.asm.label();
         let done = self.asm.label();
-        self.emit_all(&[
-            mrs_nzcv(X4),
-            ldrh(X13, X5, runtime::X87_STATUS),
-            ldr(W, X16, X5, runtime::MMX_MODE),
-        ]);
-        self.asm.tbz(true, X13, 7, slow);
-        self.asm.cbz(W, true, X16, slow);
+        let waits = !matches!(x.fast, Fast::StoreControl | Fast::StoreStatus);
+        self.x87_state(waits, slow);
         if x.fast != Fast::Wait {
             self.emit_all(&[
                 ubfx(W, X15, X13, 11, 3),
@@ -206,6 +196,39 @@ impl Translator<'_> {
         // The stack may have changed under the MMX registers.
         self.vector = super::simd::Vector::default();
         self.vector.cpu = true;
+    }
+
+    /// Load canonical state for an instruction outside the cache.
+    fn x87_state(&mut self, waits: bool, slow: Label) {
+        if self.tier1 && (self.index != 0 || self.facts.mmx() != Some(0)) {
+            crate::facts::materialize_mmx(self.asm);
+        }
+        self.emit_all(&[mrs_nzcv(X4), ldrh(X13, X5, runtime::X87_STATUS)]);
+        if self.tier1 {
+            if waits {
+                let event = self.x87_exception(self.index);
+                self.asm.tbz(true, X13, 7, event);
+            }
+        } else {
+            self.emit(ldr(W, X16, X5, runtime::MMX_MODE));
+            self.asm.tbz(true, X13, 7, slow);
+            self.asm.cbz(W, true, X16, slow);
+        }
+    }
+
+    fn x87_exception(&mut self, index: usize) -> Label {
+        let label = self.asm.label();
+        self.push_cold(super::Cold::Leave {
+            label,
+            state: super::State::CANONICAL,
+            simd_dirty: self.vector.dirty,
+            refund: self.trace.owed(index),
+            exit: Exit::Interpret,
+            eip: self.trace.insts[index].pc,
+            link: false,
+            x87: Some(cache::Leave::Restore(None)),
+        });
+        label
     }
 
     /// What instruction `x` does once its checks have run; whether it

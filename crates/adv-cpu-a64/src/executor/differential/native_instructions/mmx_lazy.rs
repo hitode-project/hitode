@@ -358,3 +358,32 @@ fn write_first_and_appended_mmx_loops_avoid_interpret_and_recover_cuts_and_fault
         }
     }
 }
+
+// spec: A64A-FALL-2 A64F-FP-4 A64-REG-5
+#[test]
+fn tier1_mmx_region_loads_canonical_x87_aliases() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(ebx)).unwrap();
+        a.paddd(mm0, mm2).unwrap();
+        a.movd(dword_ptr(ebx + 4), mm0).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.state.regs[1] = 10;
+    program.state.x87.regs[2] =
+        adv_cpu_core::X87Register::from_parts(0x8000_0000_0000_0001, 0x3fff);
+    program.state.refresh_mmx();
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 100),
+        reference.run(program.stop, 100)
+    );
+    same(&actual, &reference);
+    let native = actual.native.as_ref().unwrap();
+    assert_eq!(native.diagnostics.interprets, 0);
+    assert_eq!(native.diagnostics.helpers, 0);
+}

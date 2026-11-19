@@ -205,6 +205,14 @@ impl Simd {
         )
     }
 
+    pub(super) fn control_helper(self, key: crate::facts::Key) -> bool {
+        self.floating()
+            && !key.mxcsr().is_some_and(|class| {
+                crate::facts::default_mxcsr(class)
+                    || self.directed_rounding() && crate::facts::masked_mxcsr(class)
+            })
+    }
+
     /// Whether a `floating` instruction can be inexact.
     fn inexact(&self) -> bool {
         matches!(
@@ -435,10 +443,17 @@ impl Translator<'_> {
         if mmx && !ready {
             self.as_part(Part::SimdGuard, |t| {
                 t.cpu();
+                if t.tier1 && (t.index != 0 || t.facts.mmx() != Some(0)) {
+                    crate::facts::materialize_mmx(t.asm);
+                }
                 let bail = t.bail();
                 t.emit(ldrh(X16, X5, runtime::X87_STATUS));
                 t.asm.tbz(true, X16, 7, bail);
             });
+        }
+        if self.tier1 && simd.control_helper(self.facts) {
+            self.helper(simd.helper); // transitional interpreter form: sse-mxcsr
+            return;
         }
         let address = if simd.memory() {
             let address = self.effective(simd.mem);
@@ -1150,6 +1165,12 @@ impl Translator<'_> {
         let first_pe = inexact && !self.vector.guards.fp_pe;
         let guards = self.vector.guards;
         let directed = !guards.fp_default && simd.directed_rounding();
+        let admission = if self.tier1 && !guards.fp_default {
+            let inst = self.trace.insts[self.index];
+            self.fact_transfer(inst.pc, self.trace.owed(self.index), self.x87_leaving())
+        } else {
+            bail
+        };
         let rounded = directed.then(|| self.asm.label());
         self.as_part(Part::SimdGuard, |t| {
             if inexact && !guards.fp_pe || !guards.fp_default {
@@ -1162,10 +1183,10 @@ impl Translator<'_> {
                     if directed {
                         t.emit(and_imm(W, X17, X17, u64::from(!0x6000u32)));
                     }
-                    t.asm.cbz(W, true, X17, bail);
+                    t.asm.cbz(W, true, X17, admission);
                 } else if !directed {
                     t.emit(and_imm(W, X17, X13, 0x6000));
-                    t.asm.cbz(W, true, X17, bail);
+                    t.asm.cbz(W, true, X17, admission);
                 }
             }
         });
@@ -1647,6 +1668,10 @@ impl Translator<'_> {
     fn mmx_aliased(&mut self, n: u8) {
         self.aliased |= 1 << n;
         self.cpu();
+        if self.tier1 {
+            crate::facts::refresh_mmx_slot(self.asm, n);
+            return;
+        }
         let leave = match self.unloadable {
             Some(leave) => leave,
             None => self.bail(),
@@ -1728,7 +1753,7 @@ impl Translator<'_> {
     /// check has charged `refund`.
     pub(super) fn enter_simd(&mut self, entry: Entry, refund: u32) {
         let guards = entry.guards;
-        if guards.fp_masked || guards.fp_default {
+        if !self.tier1 && (guards.fp_masked || guards.fp_default) {
             let leave = self.asm.label();
             self.push_cold(Cold::Leave {
                 label: leave,

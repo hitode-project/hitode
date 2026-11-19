@@ -12,6 +12,7 @@ use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
     alias_base, call, interpret, timestamp,
 };
+use crate::facts::{self, Key};
 use crate::runtime::{Exit, ResidentCold, Runtime};
 use crate::translate;
 
@@ -29,8 +30,6 @@ impl Native {
         bridge: *mut std::ffi::c_void,
     ) -> Result<Option<Run>, String> {
         self.bridge = bridge;
-        self.control = cpu.x87.control;
-        self.pe = cpu.x87.status & 0x20 != 0;
         self.invalidate(memory);
         self.observe_stop(stop);
         self.install_optimized(false);
@@ -48,10 +47,7 @@ impl Native {
             None => {
                 let before = self.code.cache.used();
                 let eip = cpu.eip;
-                // Optimized forms take their entry facts from this state.
-                self.runtime.cpu = cpu;
-                let entry = self.translate(memory, eip);
-                self.runtime.cpu = std::ptr::null_mut();
+                let entry = self.translate(memory, eip, Key::read(cpu, facts::ALL));
                 (entry?, self.code.cache.used().saturating_sub(before))
             }
         };
@@ -176,7 +172,7 @@ impl Native {
             retired -= u64::from(site.refund);
             if !site.checked {
                 self.unchecked_faults += 1;
-                self.strike(memory, site.eip, pc);
+                self.strike(memory, site.eip, pc, cpu);
             } else {
                 self.diagnostics.checked_faults += 1;
             }
@@ -197,7 +193,7 @@ impl Native {
             self.resident_cold_exit(self.runtime.opt_head, site, reason, checked, refund);
         }
         if budget_exit {
-            self.sample(memory, cpu.eip);
+            self.sample(memory, cpu);
         }
         self.install_optimized(false);
         if let Some(forms) = &mut self.retired_forms {

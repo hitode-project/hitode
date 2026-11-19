@@ -356,13 +356,18 @@ impl Executor {
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
         if let Some(native) = &self.native {
-            return format!(
+            let mut report = format!(
                 "{:?} translation_decodes {:?} unchecked faults {} checked {}",
                 native.diagnostics,
                 native.translation_decodes(),
                 native.unchecked_faults,
                 native.checked_count()
             );
+            if let Some(versions) = native.version_diagnostics() {
+                report.push_str(" tier1 versions");
+                report.push_str(&versions);
+            }
+            return report;
         }
         #[cfg(native)]
         if let Some(warning) = &self.native_warning {

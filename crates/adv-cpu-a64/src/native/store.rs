@@ -4,17 +4,45 @@
 //! invalidation operations. The arbiter alone publishes those changes.
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
+use std::sync::Arc;
 
 use super::{Enter, Faults, ShadowStack, head};
 use crate::cache::CodeCache;
 use crate::encode::bl;
+use crate::facts::Key;
 use crate::runtime;
 use crate::translate::{self, Site, Stubs};
 
 #[derive(Clone, Copy)]
 pub(super) struct Tier1Unit {
     pub(super) unit: usize,
+    pub(super) body: usize,
+    pub(super) miss: Option<usize>,
     pub(super) retired: u32,
+}
+
+pub(super) const CHAIN_LEN: usize = 3;
+
+pub(super) struct Chain {
+    pub(super) unit: Arc<translate::Unit>,
+    pub(super) mask: u64,
+    pub(super) helpers: u32,
+    pub(super) versions: Vec<Version>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Version {
+    pub(super) key: Key,
+    pub(super) entry: Tier1Unit,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct VersionStats {
+    pub(super) built: u64,
+    pub(super) misses: u64,
+    pub(super) joins: u64,
+    pub(super) arrivals: [Cell<u64>; CHAIN_LEN],
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +87,8 @@ pub(super) struct CodeStore {
     /// Cache bytes the stubs occupy; clearing keeps them.
     pub(super) stub_len: usize,
     pub(super) units: FxHashMap<u32, Tier1Unit>,
+    pub(super) chains: FxHashMap<u32, Chain>,
+    pub(super) version_stats: Option<FxHashMap<u32, Box<VersionStats>>>,
     /// Unit entries by the guest pages their code came from.
     pub(super) pages: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
@@ -70,6 +100,7 @@ pub(super) struct CodeStore {
     pub(super) points: Vec<(usize, u32, bool)>,
     pub(super) back_points: FxHashSet<usize>,
     pub(super) direct_points: FxHashMap<usize, usize>,
+    pub(super) point_facts: FxHashMap<usize, Key>,
     pub(super) internal_edges: FxHashMap<u32, Vec<InternalEdge>>,
     /// Emitted instruction lengths by entry and guest EIP for probation.
     pub(super) tier1_words: FxHashMap<u32, FxHashMap<u32, u32>>,
@@ -112,7 +143,33 @@ impl CodeStore {
         self.cache.patch(point, head::branch(point, target));
     }
 
+    pub(super) fn linked_target(&self, point: usize, eip: u32, checked: usize) -> usize {
+        let Some(proved) = self.point_facts.get(&point) else {
+            return checked;
+        };
+        if self
+            .units
+            .get(&eip)
+            .is_some_and(|entry| entry.unit == checked)
+            && let Some(chain) = self.chains.get(&eip)
+            && let Some(version) = chain
+                .versions
+                .iter()
+                .find(|version| proved.proves(version.key))
+        {
+            return version.entry.body;
+        }
+        checked
+    }
+
+    pub(super) fn counter(&mut self, eip: u32, position: usize) -> usize {
+        self.version_stats.as_mut().map_or(0, |stats| {
+            stats.entry(eip).or_default().arrivals[position].as_ptr() as usize
+        })
+    }
+
     pub(super) fn invalidate_unit(&mut self, eip: u32) -> bool {
+        self.chains.remove(&eip);
         if self.table_sources.remove(&eip) {
             self.rows.retain(|_, slots| {
                 slots.retain(|&(source, _, _)| source != eip);
@@ -153,6 +210,7 @@ impl CodeStore {
         sites: &[(usize, Site)],
         retired: u32,
         marks: &[crate::jit_map::Mark],
+        layout: translate::VersionLayout,
     ) -> Option<Tier1Unit> {
         let unit = self.cache.append(words)?;
         let from = self.faults.sites.len().saturating_sub(1);
@@ -162,9 +220,13 @@ impl CodeStore {
         if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
             self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
         }
-        let entry = Tier1Unit { unit, retired };
+        let entry = Tier1Unit {
+            unit,
+            body: unit + layout.body,
+            miss: layout.miss.map(|offset| unit + offset),
+            retired,
+        };
         crate::jit_map::record(unit, words, eip, retired, marks, "a64");
-        self.units.insert(eip, entry);
         self.placed.push((unit, eip));
         Some(entry)
     }

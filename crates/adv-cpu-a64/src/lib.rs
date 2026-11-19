@@ -15,6 +15,7 @@ pub use cache::{code_pool_state, prepare_code_pool_after_attach, prepare_code_po
 mod cpu;
 pub mod encode;
 mod executor;
+mod facts;
 pub mod jit_map;
 #[cfg(native)]
 mod native;

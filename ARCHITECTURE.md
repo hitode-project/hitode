@@ -131,8 +131,8 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | `translate::lower` in [access emission](crates/adv-cpu-a64/src/translate/access.rs), [body call sites](crates/adv-cpu-a64/src/translate/body.rs) and [`translate`](crates/adv-cpu-a64/src/translate/mod.rs) | Shared AArch64 emission, including memory access, link slots and fault sites | Register allocation |
 | `translate::jit` in [`translate`](crates/adv-cpu-a64/src/translate/mod.rs) | Tier-1 lowering (A64-TR-3) | Executable memory |
 | `translate::opt` in [`opt`](crates/adv-cpu-a64/src/translate/opt/mod.rs) | Resident and worker lowering | Executable memory |
-| `facts` in [x87 checks](crates/adv-cpu-a64/src/translate/x87/cache.rs), [SIMD checks](crates/adv-cpu-a64/src/translate/simd.rs) and [resident guards](crates/adv-cpu-a64/src/native/head.rs) | Guest state assumptions and guard emission | Code placement |
-| [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement, links and page watches, with resident trampolines in [`head`](crates/adv-cpu-a64/src/native/head.rs) | Guest semantics |
+| [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 entry keys and guards. Resident guards are in [`head`](crates/adv-cpu-a64/src/native/head.rs). | Code placement |
+| [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement, Tier-1 version chains, links and page watches, with resident trampolines in [`head`](crates/adv-cpu-a64/src/native/head.rs) | Guest semantics |
 | [`native::compile` module](crates/adv-cpu-a64/src/native/compile.rs) | Compile pool and optimized build requests | Code placement |
 | [`native::plan` module](crates/adv-cpu-a64/src/native/plan.rs) | Site plans, tier decisions and link publication | Host code emission |
 | [`native::offload` module](crates/adv-cpu-a64/src/native/offload.rs) | Admission and execution of worker jobs | Tier selection |
