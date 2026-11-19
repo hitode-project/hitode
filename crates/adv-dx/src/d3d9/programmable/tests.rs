@@ -204,7 +204,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         );
     }
     if let Some(dir) = disk_dir {
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         let files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())

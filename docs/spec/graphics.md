@@ -516,6 +516,8 @@ Withdrawn: GFX-CACHE-6, GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5, GFX-REC-12
 **Rule**: Actual pipeline recipes MUST persist per game, partitioned by backend, driver identity and target format. Recipes MUST include shader content, texture visibility, vertex layouts and immutable render state. Missing, corrupt or incompatible archives MUST fall back to identical demand compilation.
 **Verification**: Test — warm restart, content keys, corruption and version/driver rejection.
 
+Every save writes the current recipes. A driver archive unchanged since its last serialization, or loaded and unextended, repeats that payload.
+
 ### GFX-CACHE-9 Recipe budgets
 
 **Rule**: Versioned, checksum-validated archives MUST retain at most 512 recipes and 8 MiB per partition. Oldest recipes and driver partitions MUST be evicted, retaining at most four partitions.
