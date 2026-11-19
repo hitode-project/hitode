@@ -232,6 +232,11 @@ Readbacks into an unchanged destination baseline MUST transfer only the source d
 
 Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture. A target whose retained entries are dropped unused, at frame end or by a flush, rests. The first such frame rests for none, later ones for 1, 2, 4… up to 64 frames, while its draws record directly. It then retains entries for one frame and attempts again. Any reuse ends the rest.
 
+### GFX-REC-13 Coalesced draw execution
+
+**Rule**: Adjacent commands in the execution plan with equal pipeline state, target and read versions MUST share a GPU draw when none reads an earlier write. Recording, versions and damage MUST stay per command.
+**Verification**: Test
+
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
 **Rule**: Host-paced Present boundaries MUST fall on host vsyncs without repaying missed frames, and guest-timed Presents MUST skip the refresh wait. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.

@@ -210,6 +210,10 @@ impl Gpu {
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
     }
+    pub fn draw_count(&self) -> u64 {
+        self.stats.draws
+    }
+
     pub fn stats(&self) -> Stats {
         let mut stats = self.stats;
         let cache = self.pipelines.stats();

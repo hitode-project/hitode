@@ -231,6 +231,12 @@ pub struct Target {
 }
 
 impl Target {
+    pub fn same_attachments(&self, other: &Self) -> bool {
+        self.image.id() == other.image.id()
+            && self.image.alpha_mode() == other.image.alpha_mode()
+            && same_depth(self.depth.as_ref(), other.depth.as_ref())
+    }
+
     pub fn mip_level(&self, level: u32) -> Result<Self, Error> {
         Self {
             image: self.image.mip_level(level)?,
@@ -1169,5 +1175,13 @@ pub(super) mod tests {
         gpu.upload(&mip, rectangle, 8, &pixels).unwrap();
         upload_chunk(&mut gpu, &mut queue, &consumer);
         assert_eq!(sample(&mut gpu, &mut queue, &mip), pixels);
+    }
+}
+
+pub(super) fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
+        _ => false,
     }
 }

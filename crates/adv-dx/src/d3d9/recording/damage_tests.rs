@@ -2226,3 +2226,139 @@ fn distant_changes_replay_in_separate_scissors_without_losing_unchanged_draws_be
     // The 8x8 top-left and 8x4 bottom-right cells of the 192-pixel target.
     assert!((counts.clipped_area_sum - (1. + 96. / 192.)).abs() < 1e-9);
 }
+
+#[test]
+// spec: GFX-REC-1, GFX-REC-2, GFX-REC-5, GFX-REC-13
+fn coalesced_draws_match_logical_plan_and_pixels() {
+    let mut f = fixture();
+    let d = f.device;
+    let owner = id(&mut f);
+    bind_depth(&mut f, 16, 12);
+    let strip = f.packet([
+        [
+            2f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x204080ff,
+        ],
+        [
+            13f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2040ff40,
+        ],
+        [
+            2f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20ff8040,
+        ],
+        [
+            13f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20ffc080,
+        ],
+    ]);
+    let fan = f.packet([
+        [
+            2f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2010f060,
+        ],
+        [
+            13f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2030d040,
+        ],
+        [
+            13f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2050b020,
+        ],
+        [
+            2f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20709010,
+        ],
+    ]);
+    let mut results = Vec::new();
+    for separate_draws in [true, false] {
+        *frame(&mut env(&mut f), owner) = Recording {
+            separate_draws,
+            ..Default::default()
+        };
+        let before = f.m.ext.get::<State>().frames;
+        for (state, value) in [
+            (7, 0),
+            (9, 1),
+            (22, 1),
+            (27, 1),
+            (19, 5),
+            (20, 6),
+            (52, 0),
+            (55, 1),
+            (56, 8),
+            (57, 0),
+            (59, u32::MAX),
+        ] {
+            f.okay("IDirect3DDevice9::SetRenderState", &[d, state, value]);
+        }
+        f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+        f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[d, 0, 0, 7, 0xff112233, 1f32.to_bits(), 0],
+        );
+        for _ in 0..32 {
+            f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, strip, 20]);
+        }
+        for _ in 0..11 {
+            f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 6, 2, fan, 20]);
+        }
+        let result = flush(&mut f, Reason::Readback);
+        assert_eq!(f.finish(result), 0);
+        let image = f.image(f.back);
+        let early = f.pixels(&image);
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 52, 1]);
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 57, 1]);
+        for _ in 0..4 {
+            for (compare, pass, mask) in [(8, 3, 0xff), (3, 1, 0)] {
+                for (state, value) in [(56, compare), (55, pass), (59, mask)] {
+                    f.okay("IDirect3DDevice9::SetRenderState", &[d, state, value]);
+                }
+                f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, strip, 20]);
+            }
+        }
+        f.okay("IDirect3DDevice9::EndScene", &[d]);
+        let mut e = env(&mut f);
+        let recording = frame(&mut e, owner);
+        let keys = recording.command_identities.clone();
+        let versions: Vec<_> = recording.contents.slots.iter().map(|s| s.1).collect();
+        present(&mut f);
+        let pixels = f.pixels(&image);
+        let after = f.m.ext.get::<State>().frames;
+        let draws = after.gpu_draws - before.gpu_draws;
+        assert!(draws <= after.recorded_commands - before.recorded_commands);
+        results.push(((keys, versions, early, pixels), draws));
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 52, 0]);
+    }
+    assert_eq!(results[0].0.0, results[1].0.0, "command keys");
+    assert_eq!(results[0].0.1, results[1].0.1, "versions");
+    assert!(results[0].0.2 == results[1].0.2, "readback pixels");
+    assert!(results[0].0.3 == results[1].0.3, "presented pixels");
+    assert_eq!(results[0].1, 51);
+    assert_eq!(results[1].1, 10);
+}

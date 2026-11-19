@@ -9,6 +9,7 @@ pub(super) struct Effects {
     clear: bool,
     draw_bounds: Option<adv_device::surface::Rect>,
     reads: Vec<Content>,
+    read_versions: smallvec::SmallVec<[Option<u128>; 4]>,
     writes: Vec<(Content, bool)>,
 }
 #[derive(Default)]
@@ -23,6 +24,7 @@ impl Plan {
         &mut self,
         operation: &Operation,
         reads: Vec<Content>,
+        read_versions: smallvec::SmallVec<[Option<u128>; 4]>,
         writes: Vec<(Content, bool)>,
         bounds: adv_device::surface::Rect,
     ) -> Arc<Effects> {
@@ -32,11 +34,23 @@ impl Plan {
             clear: matches!(operation, Operation::Clear { .. }),
             draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
             reads,
+            read_versions,
             writes,
         });
         self.effects.push(effect.clone());
         effect
     }
+    pub fn can_merge(&self, first: usize, next: usize) -> bool {
+        let a = &self.effects[first];
+        let b = &self.effects[next];
+        a.reads == b.reads
+            && a.read_versions == b.read_versions
+            && !self.effects[next - 1]
+                .writes
+                .iter()
+                .any(|(k, _)| b.reads.contains(k))
+    }
+
     pub fn replay(&mut self, effect: Arc<Effects>) {
         self.effects.push(effect);
     }
@@ -166,6 +180,7 @@ mod tests {
             barrier,
             clear: false,
             draw_bounds: None,
+            read_versions: Default::default(),
         };
         for (effects, skipped) in [
             (

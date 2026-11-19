@@ -193,7 +193,7 @@ pub enum TextureOp {
     /// D3DTOP_MODULATE4X: the product quadrupled, then saturated.
     Multiply4x,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
@@ -202,7 +202,7 @@ pub struct Viewport {
     pub minimum_depth: f32,
     pub maximum_depth: f32,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawState {
     pub topology: Topology,
     /// Include the terminal pixel of aliased line segments. Other topologies ignore it.

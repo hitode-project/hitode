@@ -6,6 +6,7 @@
 use super::*;
 use rustc_hash::FxHashMap as HashMap;
 pub(super) mod damage;
+mod encode;
 mod key;
 mod passes;
 mod reuse;
@@ -152,6 +153,7 @@ pub struct Counters {
     pub stateblock_items: u64,
     pub eliminated_passes: u64,
     pub recorded_commands: u64,
+    pub gpu_draws: u64,
     /// Present, readback, lock, DC, Reset, Release, limit, existing GPU wait.
     pub flushes: [u64; 8],
     pub eliminated_frames: u64,
@@ -225,6 +227,8 @@ pub(super) struct Recording {
     command_identities: Vec<u128>,
     /// The damage analysis write behind each command, while it knows it.
     nodes: Vec<Option<usize>>,
+    #[cfg(test)]
+    separate_draws: bool,
     /// The content a readback flush observes, and the writes, by content,
     /// that flush executes; the rest wait for presentation.
     observe: Option<Content>,
@@ -654,6 +658,11 @@ fn append(
             ),
         )
     };
+    let read_versions = if shared.is_none() && matches!(p.operation, Operation::Draw(_)) {
+        p.reads.iter().map(|k| f.contents.get(k).copied()).collect()
+    } else {
+        Default::default()
+    };
     let mut outputs = Vec::new();
     for (n, &(k, overwrite)) in p.writes.iter().enumerate() {
         let command = p.write_key(k, if k.2 == 0 { command } else { attachment });
@@ -723,9 +732,13 @@ fn append(
     if let Some(saved) = shared {
         f.passes.replay(saved.pass.clone());
     } else {
-        let pass = f
-            .passes
-            .record(&p.operation, p.reads.clone(), p.writes.clone(), p.bounds);
+        let pass = f.passes.record(
+            &p.operation,
+            p.reads.clone(),
+            read_versions,
+            p.writes.clone(),
+            p.bounds,
+        );
         if let (Some(entry), Some(destinations)) = (entry, destinations) {
             let _ = entry.saved.set(reuse::Saved {
                 command,
@@ -865,6 +878,19 @@ pub(super) fn flush(
             f.head += 1;
             continue;
         }
+        #[cfg(test)]
+        let separate_draws = f.separate_draws;
+        #[cfg(not(test))]
+        let separate_draws = false;
+        if !separate_draws && !env.ext.get::<State>().verify_frames {
+            match encode::run(env, owner) {
+                Ok(true) => continue,
+                Ok(false) => (),
+                Err(Error::Device(_)) => return Ok(lose(env, owner)),
+                Err(error) => return Err(error),
+            }
+        }
+        let f = frame(env, owner);
         let node = f.nodes[f.head];
         let selected = match &f.select {
             Some(select) => match node.map(|n| select.get(&n)) {
@@ -986,20 +1012,7 @@ pub(super) fn flush(
                 f.commands[f.head] = original.unwrap_or(operation);
                 return Err(Error::Busy);
             }
-            Err(Error::Device(_)) => {
-                if let Some(Payload::Device(d)) =
-                    com(env).get_identity_mut(&mut env.sys.objects, owner)
-                {
-                    d.gpu_lost = true;
-                    d.frame.damage.invalidate();
-                    d.frame.commands.clear();
-                    d.frame.nodes.clear();
-                    d.frame.passes.truncate(0);
-                    d.frame.head = 0;
-                    d.frame.part = 0;
-                }
-                return Ok(Completion::Command);
-            }
+            Err(Error::Device(_)) => return Ok(lose(env, owner)),
             result => {
                 if let Operation::Upload {
                     resource, level, ..
@@ -1019,6 +1032,19 @@ pub(super) fn flush(
         }
     }
 }
+fn lose(env: &mut Env<'_>, owner: Id) -> Completion {
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.gpu_lost = true;
+        d.frame.damage.invalidate();
+        d.frame.commands.clear();
+        d.frame.nodes.clear();
+        d.frame.passes.truncate(0);
+        d.frame.head = 0;
+        d.frame.part = 0;
+    }
+    Completion::Command
+}
+
 fn submitted(
     env: &mut Env<'_>,
     owner: Id,
