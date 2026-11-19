@@ -872,6 +872,8 @@ impl Session {
             return Stop::Exited(code);
         }
         let frame = self.presented_frames();
+        let mut check_children = true;
+        let mut check_delivery = true;
         loop {
             // A new delivery after clearing the interrupt either shows up
             // here or interrupts the machine or the retained wait below.
@@ -879,7 +881,15 @@ impl Session {
             if self.wake.frontend_pending() || Instant::now() >= until {
                 return Stop::Paused;
             }
-            if let Err(error) = self.spawn_children().and_then(|_| self.deliver()) {
+            // A frame pause can leave a child request pending across a process switch.
+            if std::mem::take(&mut check_children)
+                && let Err(error) = self.spawn_children()
+            {
+                return Stop::Failed(error);
+            }
+            if std::mem::replace(&mut check_delivery, true)
+                && let Err(error) = self.deliver()
+            {
                 return Stop::Failed(error);
             }
             let before = self.presented_frames();
@@ -952,6 +962,7 @@ impl Session {
                             .merge(&adv_nt::counters::Boundaries::of(&retired.ext));
                         debug::merge_api_diagnostics(&retired, &mut self.stub_gaps.borrow_mut());
                         self.idle.remove(&id);
+                        check_children = true;
                     } else {
                         self.finished = Some(code);
                         project::stopped(&mut self.machine.ext);
@@ -972,11 +983,22 @@ impl Session {
             if stop_frame && self.presented_frames() != frame {
                 return Stop::Paused;
             }
-            if let Err(error) = self.spawn_children() {
+            // Process creation returns the execution lease to start its child.
+            if (std::mem::take(&mut check_children)
+                || matches!(result, SliceResult::Complete(RunResult::HostRequest)))
+                && let Err(error) = self.spawn_children()
+            {
                 return Stop::Failed(error);
             }
             // Server pipes wake waiting clients; parked clients do no guest work.
-            let ids: Vec<_> = self.shared.driver.borrow().parked.keys().copied().collect();
+            let ids: Vec<_> = {
+                let driver = self.shared.driver.borrow();
+                if driver.parked.is_empty() {
+                    Vec::new()
+                } else {
+                    driver.parked.keys().copied().collect()
+                }
+            };
             for pid in &ids {
                 let mut machine = self.shared.driver.borrow_mut().parked.remove(pid).unwrap();
                 if machine
@@ -989,25 +1011,31 @@ impl Session {
             }
             let now = self.machine.sys.clock.now_us();
             let ready = ids.into_iter().find(|pid| {
-                !self.idle.contains_key(pid)
-                    || self.idle[pid].is_some_and(|deadline| deadline <= now)
+                self.idle
+                    .get(pid)
+                    .is_none_or(|deadline| deadline.is_some_and(|deadline| deadline <= now))
             });
             if let Some(pid) = ready {
                 if let Err(error) = self.select(pid) {
                     return Stop::Failed(error);
                 }
+                check_children = true;
                 continue;
             }
             if !self.idle.contains_key(&self.shared.id.get()) {
                 continue;
             }
             // Let server timers fire even when every client is waiting.
-            let mut wait = until.saturating_duration_since(Instant::now());
-            for deadline in self.idle.values().flatten() {
+            let guest_deadline = self.idle.values().flatten().min();
+            let host_deadline = self
+                .shared
+                .driver
+                .borrow()
+                .deadline
+                .map_or(until, |deadline| deadline.min(until));
+            let mut wait = host_deadline.saturating_duration_since(Instant::now());
+            if let Some(deadline) = guest_deadline {
                 wait = wait.min(Duration::from_micros(deadline.saturating_sub(now)));
-            }
-            if let Some(deadline) = self.shared.driver.borrow().deadline {
-                wait = wait.min(deadline.saturating_duration_since(Instant::now()));
             }
             self.machine
                 .sys
@@ -1042,20 +1070,26 @@ impl Session {
                 budget.wait(Some(wait), waited, !signaled);
             }
             let _ = self.machine.visit_context(None, adv_nt::server::run);
-            if let Err(error) = self.deliver() {
-                return Stop::Failed(error);
-            }
+            // Only the execution owner steps the server. A settled delivery
+            // pass can carry through to the next slice.
+            check_delivery = match self.deliver() {
+                Ok(check) => check,
+                Err(error) => return Stop::Failed(error),
+            };
             self.idle.clear();
         }
     }
 
-    fn deliver(&mut self) -> Result<(), String> {
-        let generation = self.shared.driver.borrow().generation;
-        if generation == self.delivered {
-            return Ok(());
-        }
-        self.delivered = generation;
-        let signals = std::mem::take(&mut self.shared.driver.borrow_mut().signals);
+    /// Deliver this server generation. True keeps the next delivery check.
+    fn deliver(&mut self) -> Result<bool, String> {
+        let signals = {
+            let mut driver = self.shared.driver.borrow_mut();
+            if driver.generation == self.delivered {
+                return Ok(false);
+            }
+            self.delivered = driver.generation;
+            std::mem::take(&mut driver.signals)
+        };
         for (pid, tid, sig) in signals {
             if pid == self.shared.id.get() {
                 process::signals::deliver(&mut self.machine, tid, sig)?;
@@ -1072,7 +1106,13 @@ impl Session {
         if process::signals::wake(&mut self.machine)? {
             self.idle.remove(&self.shared.id.get());
         }
-        let ids: Vec<_> = self.shared.driver.borrow().parked.keys().copied().collect();
+        let ids = {
+            let driver = self.shared.driver.borrow();
+            if driver.parked.is_empty() {
+                return Ok(driver.generation != self.delivered);
+            }
+            driver.parked.keys().copied().collect::<Vec<_>>()
+        };
         for pid in ids {
             let mut machine = self.shared.driver.borrow_mut().parked.remove(&pid).unwrap();
             if process::signals::wake(&mut machine)? {
@@ -1080,7 +1120,7 @@ impl Session {
             }
             self.shared.driver.borrow_mut().parked.insert(pid, machine);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn set_foreground(&mut self, id: i32) -> Result<(), String> {
@@ -1126,8 +1166,11 @@ impl Session {
     }
 
     fn spawn_children(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.machine.ext.get_mut::<process::Children>().pending);
-        for child in pending {
+        let pending = &mut self.machine.ext.get_mut::<process::Children>().pending;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for child in std::mem::take(pending) {
             // spec: PROC-CLOCK-2
             // This family stays in real time even after its children exit.
             self.machine.set_time_skip_source(None);
