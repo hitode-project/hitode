@@ -2989,6 +2989,28 @@ pub(in crate::translate) mod opt_back {
             assert_eq!(word(&h, SLOT + 8), 1);
         }
 
+        // spec: A64-OPT-8, A64A-PLACE-3
+        #[test]
+        fn probation_prices_the_settled_exit() {
+            let (mut f, block, values) = start(&[Source::Reg(0)]);
+            let eip = CODE + 8;
+            let exit = f.record(state_at(&f, eip, values[0]));
+            f.end(block, End::Exit(exit));
+            let form = lower(&f, &initial());
+            let start = form
+                .marks
+                .iter()
+                .find(|mark| mark.eip == eip)
+                .unwrap()
+                .offset
+                / 4;
+            let sensors = &form.probation_sensor.as_ref().unwrap().0;
+            let [sensor] = sensors.as_slice() else {
+                panic!("one normal exit");
+            };
+            assert_eq!(form.exit_words, *sensor as u32 - start + 1);
+        }
+
         // spec: A64-OPT-9
         #[test]
         fn probation_accounts_for_a_refill_before_a_normal_exit() {

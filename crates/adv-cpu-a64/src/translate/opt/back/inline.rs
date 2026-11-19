@@ -431,10 +431,12 @@ impl Emitter<'_> {
         runtime::emit_load_flags(&mut self.asm);
         self.charge(-i64::from(record.refund), RecordId(0), false);
         self.stack_frame(bytes, false);
+        let settled_exit_words = self.words_since(start) + 1;
         if let Some(probation) = &mut self.probation {
+            // A settled exit branches over both the sensor and the tally call.
+            self.exit_words = self.exit_words.max(settled_exit_words);
             probation.sensor(&mut self.asm, record.eip);
             probation.call(&mut self.asm, false);
-            self.exit_words = self.exit_words.max(self.words_since(start));
         }
         let point = self.asm.offset();
         self.links.push((point, record.eip));
