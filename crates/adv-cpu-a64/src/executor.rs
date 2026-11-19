@@ -356,13 +356,18 @@ impl Executor {
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
         if let Some(native) = &self.native {
-            return format!(
+            let mut report = format!(
                 "{:?} translation_decodes {:?} unchecked faults {} checked {}",
                 native.diagnostics,
                 native.translation_decodes(),
                 native.unchecked_faults,
                 native.checked_count()
             );
+            if let Some(versions) = native.version_diagnostics() {
+                report.push_str(" tier1 versions");
+                report.push_str(&versions);
+            }
+            return report;
         }
         #[cfg(native)]
         if let Some(warning) = &self.native_warning {
@@ -674,9 +679,18 @@ impl Executor {
                 *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Fault)
             });
             let (execution, last_units) = if precise_flags || observed.is_some() {
+                #[cfg(native)]
+                let pc = self.state.eip;
                 let execution = self
                     .interpreter
                     .run_chunk(&mut self.state, &mut self.memory, 1);
+                #[cfg(native)]
+                if precise_flags
+                    && !self.interpreter_only
+                    && let Some(native) = &mut self.native
+                {
+                    native.note_interpretation(pc, Exit::Interpret, execution.step, true);
+                }
                 (execution, execution.units)
             } else if let Some(exit) = match resume {
                 Some((_, exit)) => Some(exit),
@@ -734,10 +748,15 @@ impl Executor {
                         } else {
                             &mut self.faults
                         };
-                        *histogram.entry(self.state.eip).or_default() += 1;
+                        let pc = self.state.eip;
+                        *histogram.entry(pc).or_default() += 1;
                         let execution =
                             self.interpreter
                                 .run_chunk(&mut self.state, &mut self.memory, 1);
+                        #[cfg(native)]
+                        if let Some(native) = &mut self.native {
+                            native.note_interpretation(pc, exit, execution.step, false);
+                        }
                         (execution, execution.units)
                     }
                 }

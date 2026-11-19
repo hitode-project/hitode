@@ -38,12 +38,10 @@
 //! typed artifacts. `offload` alone consumes worker jobs.
 //! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
-use plan::dispatch;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use store::{InternalEdge, Linked, Tier1Unit};
 
 use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
@@ -52,7 +50,6 @@ use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
-use crate::encode::{b, bl};
 use crate::runtime::{self, Exit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
@@ -348,6 +345,19 @@ fn features() -> Features {
     }
 }
 
+/// Observed results of the existing interpreter event path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum InterpreterCause {
+    HostFault,
+    DebugFlags,
+    Fetch,
+    InvalidEncoding,
+    OperandFault,
+    Trap(u8),
+    Timestamp,
+    InstructionForm,
+}
+
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
 #[derive(Clone, Debug, Default)]
@@ -537,6 +547,12 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     cpu.eip = helper.pc;
     native.diagnostics.helpers += 1;
     native.code.helper_counts[index as usize] += 1;
+    if let Some(paths) = &mut native.code.slow_paths {
+        let cause = runtime::HelperCause::from_diagnostic(std::mem::take(unsafe {
+            &mut (*runtime).helper_cause
+        }));
+        *paths.helpers.entry((helper.pc, cause)).or_default() += 1;
+    }
     let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
     let units = countdown.saturating_add(1).min(u64::from(u32::MAX)) as u32;
     let count = cpu.regs[1];
@@ -747,9 +763,60 @@ pub(crate) struct Native {
     runtime: Box<Runtime>,
     /// Live timestamp bridge, including runs without a trap handler.
     pub(crate) clock: *mut std::ffi::c_void,
-    /// The x87 control word of the CPU a run starts on.
-    control: u16,
-    pe: bool,
+}
+
+impl Native {
+    pub(crate) fn note_interpretation(&mut self, eip: u32, exit: Exit, step: Step, debug: bool) {
+        let Some(paths) = &mut self.code.slow_paths else {
+            return;
+        };
+        let cause = if debug {
+            InterpreterCause::DebugFlags
+        } else if exit == Exit::Fault {
+            InterpreterCause::HostFault
+        } else {
+            match step {
+                Step::FetchFault { .. } => InterpreterCause::Fetch,
+                Step::InvalidInstruction { .. } => InterpreterCause::InvalidEncoding,
+                Step::ReadFault { .. } | Step::WriteFault { .. } => InterpreterCause::OperandFault,
+                Step::Trap { vector, .. } => InterpreterCause::Trap(vector),
+                Step::ReadTimestamp { .. } => InterpreterCause::Timestamp,
+                _ => InterpreterCause::InstructionForm,
+            }
+        };
+        *paths.interpreter.entry((eip, cause)).or_default() += 1;
+    }
+
+    pub(crate) fn version_diagnostics(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let stats = self.code.version_stats.as_ref()?;
+        let mut entries: Vec<_> = stats.iter().collect();
+        entries.sort_unstable_by_key(|(eip, _)| **eip);
+        let mut output = String::new();
+        for (&eip, stats) in entries {
+            let versions = self
+                .code
+                .chains
+                .get(&eip)
+                .map_or(0, |chain| chain.versions.len());
+            let arrivals =
+                std::array::from_fn::<_, { store::CHAIN_LEN }, _>(|n| stats.arrivals[n].get());
+            let _ = write!(
+                output,
+                " {eip:#010x}=[builds {}, misses {}, joins {}, versions {versions}, arrivals {arrivals:?}]",
+                stats.built, stats.misses, stats.joins,
+            );
+        }
+        if let Some(paths) = &self.code.slow_paths {
+            for (&(eip, cause), &count) in &paths.interpreter {
+                let _ = write!(output, " interpreter {eip:#010x} {cause:?}={count}");
+            }
+            for (&(eip, cause), &count) in &paths.helpers {
+                let _ = write!(output, " helper {eip:#010x} {cause:?}={count}");
+            }
+        }
+        Some(output)
+    }
 }
 
 impl Native {
@@ -850,12 +917,16 @@ impl Native {
                     opt_exit: base + stubs.opt_exit,
                 },
                 units: FxHashMap::default(),
+                chains: FxHashMap::default(),
+                version_stats: crate::jit_map::enabled().then(FxHashMap::default),
+                slow_paths: crate::jit_map::enabled().then(store::SlowPaths::default),
                 pages: FxHashMap::default(),
                 links: FxHashMap::default(),
                 linked: Vec::new(),
                 points: Vec::new(),
                 back_points: FxHashSet::default(),
                 direct_points: FxHashMap::default(),
+                point_facts: FxHashMap::default(),
                 internal_edges: FxHashMap::default(),
                 tier1_words: FxHashMap::default(),
                 uses_permissions: false,
@@ -898,8 +969,6 @@ impl Native {
             features: features(),
             runtime,
             clock: std::ptr::null_mut(),
-            control: 0,
-            pe: false,
         })
     }
 
@@ -1058,9 +1127,10 @@ fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
 mod tests {
     use adv_cpu_core::memory::Memory;
 
+    use super::store::Linked;
     use super::*;
     use crate::encode::Size::{W, X};
-    use crate::encode::{Reg, ldr, ldr_reg, ldur, movk, movz, sub_imm};
+    use crate::encode::{Reg, b, ldr, ldr_reg, ldur, movk, movz, sub_imm};
     use crate::translate::{Carry, Recipe};
 
     const X19: Reg = Reg::new(19);
@@ -1103,10 +1173,103 @@ mod tests {
             movk(W, Reg::new(1), (next >> 16) as u16, 16),
             b((native.code.stubs.exit as i64 - (at + 20) as i64) as i32),
         ];
-        native
+        let unit = native
             .code
-            .install_unit(eip, &words, &[(0, site)], 1, &[])
+            .install_unit(eip, &words, &[(0, site)], 1, &[], Default::default())
             .unwrap();
+        native.code.units.insert(eip, unit);
+    }
+
+    // spec: A64A-PLACE-2 A64A-ROLE-5
+    #[test]
+    fn proved_link_enters_past_the_guards() {
+        use super::store::{Chain, Version};
+        use crate::facts::Key;
+
+        let (_, mut native) = native();
+        let point = native.code.cache.append(&[b(4)]).unwrap();
+        let eip = 0x1010;
+        let key = Key::x87(0x027f, false);
+        let version = native
+            .code
+            .install_unit(
+                eip,
+                &[b(4), b(4), b(4)],
+                &[],
+                1,
+                &[],
+                translate::VersionLayout {
+                    body: 4,
+                    miss: Some(8),
+                },
+            )
+            .unwrap();
+        native.code.units.insert(eip, version);
+        native.code.chains.insert(
+            eip,
+            Chain {
+                unit: Arc::default(),
+                mask: key.mask(),
+                helpers: 0,
+                versions: vec![Version {
+                    key,
+                    entry: version,
+                }],
+            },
+        );
+        native.code.point_facts.insert(point, key);
+        native.patch(point, eip, version.unit);
+        assert_eq!(
+            native.code.cache.word(point),
+            head::branch(point, version.body)
+        );
+        assert!(native.code.invalidate_unit(eip));
+        assert!(!native.code.chains.contains_key(&eip));
+        assert_eq!(native.code.cache.word(point), b(4));
+    }
+
+    // spec: A64A-PLACE-2
+    #[test]
+    fn empty_fact_key_emits_the_original_integer_unit() {
+        use crate::facts::Key;
+
+        let (mut memory, native, stop) = resident_loop(&[0x31, 0xc0, 0x40]);
+        let mut work = translate::Workspace::default();
+        let at = native.code.cache.next();
+        translate::translate(
+            &mut work,
+            &mut memory,
+            HEAD,
+            &[stop],
+            &|_| false,
+            0,
+            Features::default(),
+            at,
+            native.code.stubs,
+            &|_, _| None,
+            &|_| None,
+            &|_, _| Vec::new(),
+            0x027f,
+            false,
+        );
+        let original = work.words().to_vec();
+        assert_eq!(work.unit.fact_mask(), 0);
+        translate::lower_tier1(
+            &mut work.code,
+            &work.unit,
+            HEAD,
+            &|_| false,
+            0,
+            Features::default(),
+            at,
+            native.code.stubs,
+            work.resident_links,
+            Key::default(),
+            0,
+        );
+        assert_eq!(work.words(), original);
+        assert_eq!(work.code.version.body, 0);
+        assert_eq!(work.code.version.miss, None);
     }
 
     fn cpu(eip: u32, esp: u32, ecx: u32) -> CpuState {
@@ -1132,10 +1295,12 @@ mod tests {
     #[test]
     fn tier1_and_resident_rebuilds_reuse_the_site_unit() {
         let (mut memory, mut native, _) = resident_loop(STORE_LOOP);
-        native.translate(&mut memory, HEAD).unwrap();
+        native
+            .translate(&mut memory, HEAD, crate::facts::Key::default())
+            .unwrap();
         let first = native.translation_decodes();
         native.plans.mark_checked(HEAD);
-        native.replace_unit(&mut memory, HEAD);
+        native.replace_unit(&mut memory, HEAD, crate::facts::Key::default());
         assert_eq!(native.translation_decodes(), first);
 
         native.discover(&mut memory, HEAD, HEAD, resident_cpu(HEAD, 20));
@@ -1151,7 +1316,9 @@ mod tests {
         assert_eq!(native.translation_decodes(), discovered);
 
         native.clear();
-        native.translate(&mut memory, HEAD).unwrap();
+        native
+            .translate(&mut memory, HEAD, crate::facts::Key::default())
+            .unwrap();
         assert_eq!(native.translation_decodes(), discovered);
 
         memory.protect(HEAD, 4096, READ | WRITE).unwrap();
@@ -1161,7 +1328,9 @@ mod tests {
             .unwrap();
         native.invalidate(&mut memory);
         assert!(!native.front_units.contains_key(&HEAD));
-        native.translate(&mut memory, HEAD).unwrap();
+        native
+            .translate(&mut memory, HEAD, crate::facts::Key::default())
+            .unwrap();
         assert!(native.translation_decodes().quick > discovered.quick);
     }
 
@@ -1173,10 +1342,12 @@ mod tests {
         let (mut memory, mut native, _) = resident_loop(&body);
         native.promotion = 1;
         native.first_visits = true;
-        native.translate(&mut memory, HEAD).unwrap();
+        native
+            .translate(&mut memory, HEAD, crate::facts::Key::default())
+            .unwrap();
         let cold = native.translation_decodes();
         assert_eq!(cold.quick, translate::MAX_INSTRUCTIONS as u64);
-        native.sample(&mut memory, HEAD);
+        native.sample(&mut memory, &resident_cpu(HEAD, 20));
         let hot = native.translation_decodes();
         assert_eq!(hot.quick - cold.quick, 2);
         assert_eq!(hot.full, cold.full);
@@ -1332,7 +1503,13 @@ mod tests {
         assert_eq!(native.code.table[table][1], unit as u64);
 
         native.promotion = 1;
-        native.sample(&mut memory, HEAD);
+        native.sample(
+            &mut memory,
+            &CpuState {
+                eip: HEAD,
+                ..CpuState::default()
+            },
+        );
         let new = native.code.units[&HEAD].unit;
         assert_ne!(new, unit);
         assert_eq!(native.diagnostics.promotions, 1);
@@ -1654,7 +1831,13 @@ mod tests {
         }
         native.compiler = compile::Compiler::background();
         for entry in [HEAD, other, stale] {
-            native.translate(&mut memory, entry).unwrap();
+            native
+                .translate(
+                    &mut memory,
+                    entry,
+                    crate::facts::Key::read(&CpuState::default(), crate::facts::ALL),
+                )
+                .unwrap();
             native.discover(&mut memory, entry, entry, resident_cpu(entry, 4));
         }
         memory.protect(stale, 0x4000, READ | WRITE).unwrap();
@@ -1988,7 +2171,13 @@ mod tests {
         let latch = body.len() - 2;
         body[latch] = (-(latch as i32 + 1)) as u8;
         let (mut memory, mut native, stop) = resident_loop(&body);
-        native.translate(&mut memory, HEAD).unwrap();
+        native
+            .translate(
+                &mut memory,
+                HEAD,
+                crate::facts::Key::read(&CpuState::default(), crate::facts::ALL),
+            )
+            .unwrap();
         native.discover(&mut memory, HEAD, HEAD, resident_cpu(HEAD, trips));
         native.install_optimized(true);
         (memory, native, stop)

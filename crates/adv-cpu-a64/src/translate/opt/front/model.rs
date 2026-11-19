@@ -1,5 +1,8 @@
 //! Constants proven on every arrival, independently of SSA identities.
-use super::*;
+use super::{
+    BTreeMap, Cc, CpuState, EBP, ESP, Edge, FpOp, M, Mem, Next, Part, Reject, Src, Unit, decode,
+    frame_offset,
+};
 use adv_cpu_core::floating::fast::{Fast, Op as Arithmetic};
 use std::collections::BTreeSet;
 use std::rc::Rc;

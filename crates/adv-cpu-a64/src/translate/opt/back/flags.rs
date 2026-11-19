@@ -1,5 +1,10 @@
 //! Tests read lazy producers; only recovery constructs a guest EFLAGS word.
-use super::*;
+use super::{
+    A, Asr, B, C, Cond, Emitter, FlagKind, FlagRecipe, Host, Lsl, Lsr, Reg, T, U, W, X, adcs,
+    add_imm, add_immediate, adds, adds_imm, and_imm, ands, cmp, cmp_imm, cset, eor, eor_imm,
+    fmov_from_v, fmov_to_v, lsl_imm, lsr_imm, movz, mul, mvn, orr, orr_imm, sbcs, sbfx, shiftv,
+    sub, sub_imm, subs, subs_imm, ubfx,
+};
 use crate::translate::front::tags::ConditionCode as CC;
 
 // Positive conditions: O, B, E, BE, S, P, L, LE; their partners invert.

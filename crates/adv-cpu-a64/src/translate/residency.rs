@@ -134,9 +134,18 @@ pub(super) fn can_drop_after(
 }
 
 /// The entry of each instruction; only merges' are used.
-pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry> {
+pub(super) fn entries(
+    trace: &Trace,
+    checked: &dyn Fn(u32) -> bool,
+    key: Option<crate::facts::Key>,
+) -> Vec<Entry> {
     let len = trace.len();
-    let footprints: Vec<_> = (0..len).map(|n| footprint(trace, n, checked)).collect();
+    let footprints: Vec<_> = (0..len)
+        .map(|n| match trace.insts[n].op {
+            Op::Simd(simd) if key.is_some_and(|key| simd.control_helper(key)) => None,
+            _ => footprint(trace, n, checked),
+        })
+        .collect();
     // Backward: registers every path reads first. Exits and backward
     // edges need nothing, so loops need no fixed point here.
     let mut need = vec![0u16; len];
@@ -261,38 +270,52 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             break;
         }
     }
-    // Dirty: what some arrival brings dirty, widening until arrivals agree.
-    // An internal jcc publishes, on both paths, what its target does not
-    // count dirty.
+    // XMM can publish a previously clean value. For canonical MMX arrivals a
+    // clean preload may still hold an x87 exponent, so every arrival must
+    // have written an MMX register before the merge can publish it as dirty.
+    let mmx = if key.is_some() { 0xff } else { 0 };
+    for (index, entry) in entry.iter_mut().enumerate() {
+        if trace.merge[index] && !trace.head(index) {
+            entry.dirty = entry.regs & mmx;
+        }
+    }
+    let arrivals = |held: &mut u16, dirty: u16| {
+        *held = ((*held | dirty) & !mmx) | (*held & dirty & mmx);
+    };
     loop {
-        let mut arrived = vec![0u16; len];
+        let mut arrived = vec![mmx; len];
         let mut dirty = 0;
         for index in 0..len {
             if trace.head(index) {
                 dirty = entry[index].dirty;
+                arrived[index] &= !mmx;
             } else if trace.merge[index] {
                 if trace.insts[index - 1].next == Next::Fall {
-                    arrived[index] |= dirty;
+                    arrivals(&mut arrived[index], dirty);
                 }
                 dirty = entry[index].dirty;
             }
             let inst = trace.insts[index];
             dirty = footprints[index].map_or(0, |(_, writes)| dirty | writes);
+            if matches!(inst.op, Op::Simd(simd) if simd.kind == super::simd::Kind::Emms) {
+                dirty &= !mmx;
+            }
             if let Some(Edge::Internal(to)) = inst.taken {
-                arrived[to] |= dirty;
+                arrivals(&mut arrived[to], dirty);
                 if to < trace.primary || to <= index {
                     dirty &= entry[to].dirty;
                 }
             }
             if let Next::Edge(Edge::Internal(to)) = inst.next {
-                arrived[to] |= dirty;
+                arrivals(&mut arrived[to], dirty);
             }
         }
         let mut changed = false;
         for (entry, arrived) in entry.iter_mut().zip(arrived) {
-            let widened = entry.dirty | (arrived & entry.regs);
-            changed |= widened != entry.dirty;
-            entry.dirty = widened;
+            let dirty =
+                ((entry.dirty | (arrived & entry.regs)) & !mmx) | (entry.dirty & arrived & mmx);
+            changed |= dirty != entry.dirty;
+            entry.dirty = dirty;
         }
         if !changed {
             return entry;
@@ -352,7 +375,7 @@ mod tests {
         );
         let head = 2 + usize::from(matches!(variant, 3 | 6));
         assert!(trace.merge[head]);
-        entries(&trace, &|_| false)[head]
+        entries(&trace, &|_| false, None)[head]
     }
 
     // spec: A64-REG-5, A64-ISA-6
@@ -416,7 +439,7 @@ mod tests {
         );
         let (head, skip) = (1, 5);
         assert!(trace.merge[head] && trace.merge[skip]);
-        let entries = entries(&trace, &|_| false);
+        let entries = entries(&trace, &|_| false, None);
         // The head holds mm0-mm2; the skipped arm's merge holds them too, so
         // the jz publishes nothing and the backedge keeps the head's entry.
         assert_eq!(entries[head].regs, 0b111);

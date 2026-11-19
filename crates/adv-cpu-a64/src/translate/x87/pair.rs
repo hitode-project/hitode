@@ -463,8 +463,10 @@ impl Translator<'_> {
     /// Caches whether w8's control word matches in its unused bit 16.
     /// Generic arithmetic reloads w8 and refreshes the bit before rejoining.
     pub(super) fn pair_control(&mut self) {
+        let Some(control) = self.facts.control().map(u32::from) else {
+            return;
+        };
         self.x87.guarded = true;
-        let control = u32::from(self.control);
         if control >> 12 != 0 {
             self.emit(sub_imm(W, X16, X8, control >> 12, true));
             self.emit(sub_imm(W, X16, X16, control & 0xfff, false));
@@ -481,7 +483,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn pair_precision(&self) -> bool {
-        precision(self.control).is_some()
+        self.facts.control().and_then(precision).is_some()
     }
 
     fn pair_guard(&mut self, to: Label) {
@@ -520,7 +522,7 @@ impl Translator<'_> {
         let to = self.x87_alloc();
         let (label, join) = (self.asm.label(), self.asm.label());
         let (a, b) = if reverse { (s, d) } else { (d, s) };
-        let precision = precision(self.control);
+        let precision = self.facts.control().and_then(precision);
         match precision {
             Some(Precision::Single) => self.pair_double(op, a, b, to, label, c1_dead, true),
             Some(Precision::Double) => self.pair_double(op, a, b, to, label, c1_dead, false),

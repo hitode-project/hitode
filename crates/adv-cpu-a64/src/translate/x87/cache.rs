@@ -144,6 +144,82 @@ impl Model {
     }
 }
 
+pub(in super::super) fn entry_facts(trace: &Trace) -> u64 {
+    use crate::facts;
+    let mut mask = 0;
+    let mut slots = 0u8;
+    let mut written = 0u8;
+    let mut top = 0u8;
+    for (index, inst) in trace.insts.iter().enumerate() {
+        if trace.head(index) || trace.merge[index] {
+            written = 0;
+            top = 0;
+        }
+        let Op::X87(x) = inst.op else { continue };
+        mask |= facts::MMX | facts::ES;
+        if matches!(
+            x.fast,
+            Fast::Arith { .. } | Fast::StoreControl | Fast::LoadControl
+        ) {
+            mask |= facts::CONTROL;
+        }
+        if matches!(x.fast, Fast::Arith { .. } | Fast::Store { .. })
+            && trace.insts.get(index + 1).is_some_and(|next| {
+                matches!(
+                    next.op,
+                    Op::X87(X87 {
+                        fast: Fast::Exchange(_)
+                            | Fast::Compare {
+                                source: Source::St(_),
+                                ..
+                            }
+                            | Fast::Load(Source::St(_))
+                            | Fast::StoreSt { .. }
+                            | Fast::Negate
+                            | Fast::Absolute
+                            | Fast::Constant(_),
+                        ..
+                    })
+                )
+            })
+        {
+            mask |= facts::PE;
+        }
+        match x.fast {
+            Fast::Round | Fast::Examine => {
+                slots |= (1 << top) & !written;
+                continue;
+            }
+            Fast::Scale => {
+                slots |= ((1 << top) | (1 << ((top + 1) & 7))) & !written;
+                continue;
+            }
+            _ => {}
+        }
+        for effect in effects(x.fast).0 {
+            let bit = |relative: u8| 1 << (top.wrapping_add(relative) & 7);
+            match effect {
+                Effect::Read(slot) => slots |= bit(slot) & !written,
+                Effect::Write(slot) | Effect::Free(slot) => written |= bit(slot),
+                Effect::Push => {
+                    top = top.wrapping_sub(1) & 7;
+                    let slot = 1 << top;
+                    slots |= slot & !written;
+                    written |= slot;
+                }
+                Effect::Pop => {
+                    written |= 1 << top;
+                    top = (top + 1) & 7;
+                }
+            }
+        }
+    }
+    if slots != 0 {
+        mask |= facts::TOP | facts::tags(slots);
+    }
+    mask
+}
+
 /// Tags a run needs at entry, by distance from TOP: a zero or a normal, or
 /// empty.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1059,7 +1135,7 @@ impl Translator<'_> {
         match inst.op {
             Op::Ret(_) => matches!(inst.mode, Mode::Inline(_)),
             Op::Simd(simd) => {
-                !simd.mmx()
+                !(simd.mmx() || self.tier1 && simd.control_helper(self.facts))
                     && !((self.checked)(inst.pc)
                         && simd.memory()
                         && matches!(simd.kind, Kind::InsertWord))
@@ -1545,7 +1621,7 @@ impl Translator<'_> {
     }
 
     fn pe_candidate(&self, index: usize, fast: Fast, slots: [Known; 8], delta: u8) -> bool {
-        self.pe
+        self.facts.pe()
             && (matches!(fast, Fast::Store { .. })
                 || matches!(fast, Fast::Arith { .. }) && self.pair_precision())
             && self.c1_dead_after(index, slots, delta)
@@ -1643,7 +1719,7 @@ impl Translator<'_> {
         if matches!(x.fast, Fast::Leaf(_))
             && let Some((_, help, need)) = next
         {
-            self.x87_checks(model, need, help);
+            self.x87_checks(model, need, help, help);
         }
         self.push_cold(UnitCold::X87(Cold::Instruction(InstructionCold {
             index,
@@ -2019,6 +2095,17 @@ impl Translator<'_> {
     /// The prologue of a run from the current instruction.
     fn x87_open(&mut self) -> bool {
         let start = self.index;
+        if self.tier1
+            && matches!(
+                self.trace.insts[start].op,
+                Op::X87(X87 {
+                    fast: Fast::StoreControl | Fast::StoreStatus,
+                    ..
+                })
+            )
+        {
+            return false;
+        }
         if let Some(owner) = self.x87.owners[start] {
             let run = self.x87.runs[owner].clone();
             let position = run.models.iter().position(|m| m.0 == start).unwrap();
@@ -2068,6 +2155,30 @@ impl Translator<'_> {
                     break;
                 }
             }
+        }
+        if self.tier1
+            && start == 0
+            && loop_plan.as_ref().is_some_and(|(_, need, _)| {
+                self.facts.pending() != Some(false)
+                    || self.facts.mmx() != Some(0)
+                    || (0..8).any(|slot| {
+                        let bit = 1 << slot;
+                        need.empty & bit != 0 && self.facts.tag(slot) != Some(3)
+                            || need.value & bit != 0 && !matches!(self.facts.tag(slot), Some(0 | 1))
+                    })
+            })
+        {
+            if !matches!(
+                self.trace.insts[start].op,
+                Op::X87(X87 {
+                    fast: Fast::Load80 | Fast::Store80 | Fast::Leaf(_),
+                    ..
+                })
+            ) {
+                return false;
+            }
+            // These forms use the same body for loops and straight-line runs.
+            loop_plan = None;
         }
         let cyclic = loop_plan.is_some();
         let Some((end, need, merges)) = loop_plan.or_else(|| {
@@ -2174,10 +2285,33 @@ impl Translator<'_> {
         self.emit(mrs_nzcv(X4));
         let help = self.x87.help[0];
         self.x87.end = end;
-        self.x87_checks(self.x87.model, need, help);
+        let state_miss = if self.tier1 && cyclic && start != 0 {
+            self.fact_transfer(
+                self.trace.insts[start].pc,
+                self.trace.owed(start),
+                Some(Leave::Restore(None)),
+            )
+        } else {
+            help
+        };
+        let pending = if self.tier1 && self.cacheable(start).is_some() {
+            self.x87_exception(start)
+        } else {
+            state_miss
+        };
+        self.x87_checks(self.x87.model, need, state_miss, pending);
         self.x87.end = segment_end;
         if self.x87.control_stable {
-            self.x87_require_bit(X8, 16, help);
+            if !self.tier1 {
+                self.x87_require_bit(X8, 16, help);
+            } else if start != 0 {
+                let miss = self.fact_transfer(
+                    self.trace.insts[start].pc,
+                    self.trace.owed(start),
+                    Some(Leave::Restore(None)),
+                );
+                self.x87_require_bit(X8, 16, miss);
+            }
         }
         if cyclic {
             self.emit_all(&[
@@ -2282,17 +2416,27 @@ impl Translator<'_> {
 
     /// Loads w13, w15 and w8 for entering a run in state `model`,
     /// branching to `fail` unless the run may go on.
-    fn x87_checks(&mut self, model: Model, need: Need, fail: Label) {
+    fn x87_checks(&mut self, model: Model, need: Need, fail: Label, pending: Label) {
+        if self.tier1 && (self.index != 0 || self.facts.mmx() != Some(0)) {
+            crate::facts::materialize_mmx(self.asm);
+        }
         self.x87_reload(model.delta);
         if need.pe {
             self.x87_require_bit(X13, 5, fail);
         }
-        self.emit_all(&[
-            ldr(W, X16, X5, runtime::MMX_MODE),
-            and_imm(W, X17, X13, 0x80),
-            orr(W, X16, X16, X17, Lsl, 0),
-        ]);
-        self.asm.cbz(W, true, X16, fail);
+        if self.tier1 {
+            let no_pending = self.asm.label();
+            self.asm.tbz(false, X13, 7, no_pending);
+            self.asm.b(pending);
+            self.asm.bind(no_pending);
+        } else {
+            self.emit_all(&[
+                ldr(W, X16, X5, runtime::MMX_MODE),
+                and_imm(W, X17, X13, 0x80),
+                orr(W, X16, X16, X17, Lsl, 0),
+            ]);
+            self.asm.cbz(W, true, X16, fail);
+        }
         if need.value | need.empty == 0 {
             return;
         }
@@ -2706,10 +2850,28 @@ impl Translator<'_> {
                     x87: Some(Leave::Restore(None)),
                 });
                 let end = std::mem::replace(&mut self.x87.end, *run.end());
-                self.x87_checks(model, need, fail);
+                let state_miss = if self.tier1 {
+                    self.fact_transfer(
+                        self.trace.insts[index].pc,
+                        self.trace.owed(index),
+                        Some(Leave::Restore(None)),
+                    )
+                } else {
+                    fail
+                };
+                self.x87_checks(model, need, state_miss, state_miss);
                 self.x87.end = end;
                 if model.cyclic && self.stable_control(*run.start(), *run.end()) {
-                    self.x87_require_bit(X8, 16, fail);
+                    let miss = if self.tier1 {
+                        self.fact_transfer(
+                            self.trace.insts[index].pc,
+                            self.trace.owed(index),
+                            Some(Leave::Restore(None)),
+                        )
+                    } else {
+                        fail
+                    };
+                    self.x87_require_bit(X8, 16, miss);
                 }
                 for (r, slot) in model.slots.iter().enumerate() {
                     if let Slot::Dirty(n) | Slot::Freed(Some(n)) = *slot {
@@ -2770,17 +2932,17 @@ impl Translator<'_> {
             let resume = self.asm.label();
             // A preceding helper may have left values outside the pair format.
             // The arithmetic leaf reads their canonical raw80 image directly.
-            self.x87_checks(Model::default(), Need::default(), fallback);
+            self.x87_checks(Model::default(), Need::default(), fallback, fallback);
             self.x87_leaf_call(m, x, fallback);
             self.emit(msr_nzcv(X4));
             self.asm.b(resume);
             self.asm.bind(fallback);
             self.emit(msr_nzcv(X4));
-            self.helper(cold.helper);
+            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
             self.asm.bind(resume);
         } else {
             self.emit(msr_nzcv(X4));
-            self.helper(cold.helper);
+            self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
         }
         if cold.dispatch {
             let inst = self.trace.insts[cold.index];
@@ -2800,7 +2962,17 @@ impl Translator<'_> {
             return;
         };
         self.emit(mrs_nzcv(X4));
-        self.x87_checks(cold.after, need, help);
+        let state_miss = if self.tier1 {
+            let index = cold.index + 1;
+            self.fact_transfer(
+                self.trace.insts[index].pc,
+                self.trace.owed(index),
+                Some(Leave::Restore(None)),
+            )
+        } else {
+            help
+        };
+        self.x87_checks(cold.after, need, state_miss, state_miss);
         // The helper may have changed any register, and need not have left
         // equal the ones the run shares a host register between: what the
         // run holds comes again from CpuState, live values first, as values

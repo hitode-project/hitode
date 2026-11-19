@@ -1,4 +1,4 @@
-use super::*;
+use super::{FlagKind, FpOp, Front, IntOp, Op, Reject, Type, Value, VecOp, VecToInt, VecUnary};
 use crate::encode::{Float, Logic};
 use crate::translate::simd::{Kind, Loc, Simd};
 

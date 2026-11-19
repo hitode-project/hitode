@@ -1,6 +1,7 @@
 //! Switch-table lowering (A64-CTL-6).
 use super::decode::{Op, Src};
-use super::*;
+use super::{Cold, Label, NOP, State, Translator, X, X17, biased, br, host, ldr_reg, simd};
+use adv_cpu_core::IndirectBranchKind;
 
 impl Translator<'_> {
     pub(super) fn table_jump(&mut self, source: Src) -> bool {

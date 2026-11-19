@@ -2,9 +2,12 @@
 //! Compute only the low bits observed by stores. All architectural state is
 //! established by the original scalar iteration following the batch region.
 
+use super::{
+    Access, BatchBody, BatchEmitter, Cc, Defs, End, FlagKind, Func, IntOp, IntUnary, Loop,
+    LoopKernel, Op, Plan, Stream, Target, Type, Value, VecOp, VecUnary, invert,
+};
 use std::collections::BTreeMap;
 
-use super::*;
 use crate::encode::*;
 
 pub(in crate::translate::opt) struct Vector;

@@ -22,7 +22,12 @@ impl Native {
         let head = at.eip;
         self.invalidate(memory);
         if !self.code.units.contains_key(&head) {
-            self.translate(memory, head).unwrap();
+            self.translate(
+                memory,
+                head,
+                crate::facts::Key::read(&at, crate::facts::ALL),
+            )
+            .unwrap();
         }
         // Exercise resident execution independently of its profitability.
         self.code.tier1_words.remove(&head);
@@ -33,6 +38,13 @@ impl Native {
         self.plans
             .resident(head)
             .is_some_and(|head| !head.versions.is_empty())
+    }
+
+    pub(crate) fn tier1_versions(&self, eip: u32) -> usize {
+        self.code
+            .chains
+            .get(&eip)
+            .map_or(0, |chain| chain.versions.len())
     }
 
     pub(crate) fn resident_arrivals(&self, head: u32) -> Option<u32> {

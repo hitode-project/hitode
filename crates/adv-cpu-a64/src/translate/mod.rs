@@ -84,6 +84,7 @@ use crate::encode::Extend::Uxtw;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::facts::{self, Key};
 use crate::jit_map::{Mark, Part};
 use crate::runtime::Exit;
 use decode::{EBP, ESP};
@@ -125,6 +126,57 @@ pub struct Site {
     pub opt_record: Option<u32>,
 }
 
+impl Unit {
+    pub(crate) fn fact_mask(&self) -> u64 {
+        let mut mask = x87::entry_facts(&self.trace);
+        for inst in &self.trace.insts {
+            match inst.op {
+                decode::Op::Simd(simd) => {
+                    if simd.floating() {
+                        mask |= facts::MXCSR;
+                    }
+                    if simd.mmx() {
+                        mask |= facts::MMX | facts::ES;
+                    }
+                }
+                decode::Op::Fild64(..) => mask |= facts::MMX | facts::ES,
+                _ => {}
+            }
+        }
+        mask
+    }
+
+    /// Exit proofs conservatively keep only fields no instruction can write.
+    pub(crate) fn preserved_facts(&self) -> u64 {
+        use adv_cpu_core::floating::fast::Fast;
+        let mut mask = facts::ALL;
+        for inst in &self.trace.insts {
+            if inst.call.is_some() || inst.mode == trace::Mode::Real {
+                return 0;
+            }
+            match inst.op {
+                decode::Op::X87(x) => match x.fast {
+                    Fast::StoreControl | Fast::StoreStatus | Fast::Wait => {}
+                    Fast::LoadControl => mask &= facts::MXCSR,
+                    _ => mask &= facts::CONTROL | facts::MXCSR,
+                },
+                decode::Op::Fild64(..) => mask &= facts::CONTROL | facts::MXCSR,
+                decode::Op::Simd(simd) => {
+                    if simd.kind == simd::Kind::LoadControl {
+                        mask &= !facts::MXCSR;
+                    }
+                    if simd.mmx() {
+                        mask &= facts::CONTROL | facts::MXCSR;
+                    }
+                }
+                decode::Op::Helper(_) | decode::Op::Body(_) | decode::Op::Syscall => return 0,
+                _ => {}
+            }
+        }
+        mask
+    }
+}
+
 /// The last unit translated, in buffers the next translation reuses.
 #[derive(Default)]
 pub struct Workspace {
@@ -152,6 +204,14 @@ pub struct Code {
     pub(crate) uses_permissions: bool,
     resident_links: bool,
     pub(crate) table_positions: Vec<(usize, usize)>,
+    pub(crate) version: VersionLayout,
+}
+
+/// Offsets of the body and the patchable miss branch in a checked unit.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VersionLayout {
+    pub body: usize,
+    pub miss: Option<usize>,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -345,7 +405,22 @@ enum Cold {
     },
     /// A short branch's way to distant cold code: x87 arithmetic to its
     /// generic path, or a parity jcc to an exit that publishes a run.
-    Bridge { label: Label, to: Label },
+    Bridge {
+        label: Label,
+        to: Label,
+    },
+    VersionMiss {
+        label: Label,
+        eip: u32,
+    },
+    FactTransfer {
+        label: Label,
+        state: State,
+        simd_dirty: u16,
+        eip: u32,
+        refund: u32,
+        x87: Option<x87::Leave>,
+    },
     Table {
         index: usize,
         table: Label,
@@ -469,7 +544,10 @@ enum Cold {
     },
     /// The `interpret` helper asked to leave with the exit + 1 in w0, at
     /// the EIP in `CpuState`, after refunding the countdown.
-    Helper { label: Label, refund: u32 },
+    Helper {
+        label: Label,
+        refund: u32,
+    },
     /// The slow path of an SSE floating instruction.
     Floating(simd::Slow),
     /// The cold paths of a cached x87 instruction.
@@ -531,9 +609,9 @@ struct Translator<'a> {
     unloadable: Option<Label>,
     /// MMX registers checked for loading (`simd::Translator::register`).
     aliased: u8,
-    /// The x87 control word when translating, which runs specialize for.
-    control: u16,
-    pe: bool,
+    facts: Key,
+    tier1: bool,
+    helper_diagnostics: bool,
     computation: bool,
     resident_links: bool,
     #[cfg(native)]
@@ -603,9 +681,41 @@ pub(crate) fn lower_unit(
         stubs,
         checked,
         helpers,
-        control,
-        pe,
+        facts: Key::x87(control, pe),
+        tier1: false,
+        arrivals: 0,
         #[cfg(native)]
+        proof: None,
+    }
+    .lower_form(unit, eip, false);
+}
+
+#[cfg(native)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_tier1(
+    code: &mut Code,
+    unit: &Unit,
+    eip: u32,
+    checked: &dyn Fn(u32) -> bool,
+    helpers: u32,
+    features: Features,
+    at: usize,
+    stubs: Stubs,
+    resident_links: bool,
+    facts: Key,
+    arrivals: usize,
+) {
+    code.resident_links = resident_links;
+    Jit {
+        code,
+        features,
+        at,
+        stubs,
+        checked,
+        helpers,
+        facts,
+        tier1: true,
+        arrivals,
         proof: None,
     }
     .lower_form(unit, eip, false);
@@ -620,8 +730,9 @@ pub struct Jit<'a> {
     pub stubs: Stubs,
     pub checked: &'a dyn Fn(u32) -> bool,
     pub helpers: u32,
-    pub control: u16,
-    pub pe: bool,
+    facts: Key,
+    tier1: bool,
+    arrivals: usize,
     #[cfg(native)]
     proof: Option<&'a computation::Proof>,
 }
@@ -651,6 +762,7 @@ impl Jit<'_> {
             uses_permissions,
             resident_links,
             table_positions,
+            version,
         } = &mut *self.code;
         let trace = unit.jit_trace(*resident_links && !computation);
         let tables = if computation { &[][..] } else { &unit.tables };
@@ -666,6 +778,28 @@ impl Jit<'_> {
         links.clear();
         internal_links.clear();
         marks.clear();
+        let miss = (self.tier1 && self.facts.mask() != 0).then(|| asm.label());
+        if let Some(miss) = miss {
+            self.facts.guard(asm, miss);
+        }
+        let body = asm.offset();
+        let mut entries = residency::entries(trace, self.checked, self.tier1.then_some(self.facts));
+        if self.tier1 {
+            let mxcsr = self.facts.mxcsr();
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if trace.head(index) {
+                    let masked = mxcsr.is_some_and(facts::masked_mxcsr);
+                    let default = mxcsr.is_some_and(facts::default_mxcsr);
+                    if trace.merge[index] {
+                        entry.guards.fp_masked &= masked;
+                        entry.guards.fp_default &= default;
+                    } else {
+                        entry.guards.fp_masked = masked;
+                        entry.guards.fp_default = default;
+                    }
+                }
+            }
+        }
         let mut t = Translator {
             asm,
             features: self.features,
@@ -690,20 +824,33 @@ impl Jit<'_> {
             out: FlagSet::ALL,
             keep: FlagSet::ALL,
             vector: simd::Vector::default(),
-            entry: residency::entries(trace, self.checked),
+            entry: entries,
             uses_permissions,
             x87: x87::Cache::for_trace(trace),
             x87_scratch,
             x87_sites: Vec::new(),
             unloadable: None,
             aliased: 0,
-            control: self.control,
-            pe: self.pe,
+            facts: self.facts,
+            tier1: self.tier1,
+            helper_diagnostics: self.tier1 && crate::jit_map::enabled(),
             computation,
             resident_links: *resident_links && !computation,
             #[cfg(native)]
             proof: self.proof,
         };
+        if self.arrivals != 0 {
+            // A proved link enters past the guards and still counts the arrival.
+            t.mov_address(X16, self.arrivals);
+            t.emit_all(&[
+                ldr(X, X17, X16, 0),
+                add_imm(X, X17, X17, 1, false),
+                str(X, X17, X16, 0),
+            ]);
+        }
+        if let Some(label) = miss {
+            t.push_cold(Cold::VersionMiss { label, eip });
+        }
         t.x87_prepare();
         if trace.len() == 0 {
             // Nothing to translate: other units may still link here.
@@ -722,7 +869,12 @@ impl Jit<'_> {
             }
             *retired = trace.prepaid(0);
         }
-        t.finish(self.at)
+        let again = t.finish(self.at);
+        *version = VersionLayout {
+            body,
+            miss: miss.map(|label| asm.position(label)),
+        };
+        again
     }
 }
 
@@ -750,8 +902,9 @@ pub(crate) fn lower_computation<'a>(
         stubs,
         checked: &|_| false,
         helpers: 0,
-        control,
-        pe,
+        facts: Key::x87(control, pe),
+        tier1: false,
+        arrivals: 0,
         proof,
     }
     .lower_form(unit, eip, true);
@@ -904,6 +1057,11 @@ impl Translator<'_> {
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
+            self.state = State::CANONICAL;
+            if self.tier1 && index != 0 && self.facts.mask() != 0 {
+                let miss = self.fact_transfer(inst.pc, 0, None);
+                self.facts.guard(self.asm, miss);
+            }
             let leave = self.asm.label();
             let resume = self.computation.then(|| self.asm.label());
             let refuse = self.checkpoint(leave, resume, prepaid, prepaid);
@@ -922,7 +1080,6 @@ impl Translator<'_> {
                 link: false,
                 x87: None,
             });
-            self.state = State::CANONICAL;
             self.enter_simd(self.entry[index], prepaid);
         } else if trace.merge[index] {
             self.convert(trace.live_in[index]);
@@ -999,7 +1156,7 @@ impl Translator<'_> {
             read_before_write |= reads & !written;
             written |= writes;
             if let decode::Op::Simd(s) = insts[i].op {
-                if s.kind == simd::Kind::Emms {
+                if s.kind == simd::Kind::Emms || self.tier1 && s.control_helper(self.facts) {
                     return None;
                 }
                 has_mmx |= s.mmx();
@@ -1975,6 +2132,44 @@ impl Translator<'_> {
         });
     }
 
+    fn helper_for(&mut self, index: u8, cause: crate::runtime::HelperCause) {
+        if self.helper_diagnostics {
+            self.mov_imm(X16, cause as u32);
+            self.emit(str(W, X16, RUNTIME, crate::runtime::HELPER_CAUSE));
+        }
+        self.helper(index);
+    }
+
+    fn mov_address(&mut self, reg: Reg, value: usize) {
+        let value = value as u64;
+        self.emit(movz(X, reg, value as u16, 0));
+        for shift in [16, 32, 48] {
+            let part = (value >> shift) as u16;
+            if part != 0 {
+                self.emit(movk(X, reg, part, shift));
+            }
+        }
+    }
+
+    fn fact_transfer(&mut self, eip: u32, refund: u32, x87: Option<x87::Leave>) -> Label {
+        let label = self.asm.label();
+        self.push_cold(Cold::FactTransfer {
+            label,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            eip,
+            refund,
+            x87,
+        });
+        label
+    }
+
+    fn version_miss(&mut self, eip: u32) {
+        self.target(eip);
+        self.emit(mvn(X, X2, Reg::ZR));
+        self.far(self.stubs.dispatch);
+    }
+
     fn target(&mut self, eip: u32) {
         emit_target(self.asm, eip);
     }
@@ -2056,6 +2251,32 @@ impl Translator<'_> {
             Cold::Bridge { label, to } => {
                 self.asm.bind(label);
                 self.asm.b(to);
+            }
+            Cold::VersionMiss { label, eip } => {
+                self.asm.bind(label);
+                self.emit(b(4));
+                self.version_miss(eip);
+            }
+            Cold::FactTransfer {
+                label,
+                state,
+                simd_dirty,
+                eip,
+                refund,
+                x87,
+            } => {
+                self.asm.bind(label);
+                self.state = state;
+                self.vector.dirty = simd_dirty;
+                if let Some(x87) = x87 {
+                    self.x87_leave(x87);
+                }
+                self.flush_simd();
+                self.canonicalize();
+                if refund != 0 {
+                    self.emit(add_imm(X, X9, X9, refund, false));
+                }
+                self.version_miss(eip);
             }
             Cold::Table { index, table, stub } => self.table_cold(index, table, stub, at),
             Cold::Leave {

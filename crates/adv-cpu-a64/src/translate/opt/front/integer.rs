@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Cc, ConditionCode, EBP, ESP, FlagKind, Front, IntOp, IntUnary, M, Mem, Mode, Op, Part, Reject,
+    Src, Type, Value, decode,
+};
 use crate::translate::decode::{Alu, Narrow8or16, ShiftKind};
 use crate::translate::front::tags::Mnemonic;
 use crate::translate::integer::Integer;

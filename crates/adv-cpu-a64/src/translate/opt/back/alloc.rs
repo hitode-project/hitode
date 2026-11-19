@@ -8,7 +8,10 @@
 //! that stays free for its whole life, or is rebuilt at its uses. Spill
 //! cells are reused once their values are dead.
 
-use super::*;
+use super::{
+    D, E, End, F, Func, Host, Op, RecordId, Reg, T, Type, VReg, Value, VecOp, W, X, int_immediate,
+    loops,
+};
 use std::collections::BTreeSet;
 
 pub(super) struct Allocation {
