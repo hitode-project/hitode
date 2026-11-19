@@ -942,13 +942,6 @@ impl Trace {
         false
     }
 
-    pub fn has_loop(&self) -> bool {
-        self.insts.iter().enumerate().any(|(index, inst)| {
-            matches!(inst.taken, Some(Edge::Internal(to)) if to <= index)
-                || matches!(inst.next, Next::Edge(Edge::Internal(to)) if to <= index)
-        })
-    }
-
     pub fn len(&self) -> usize {
         self.insts.len()
     }

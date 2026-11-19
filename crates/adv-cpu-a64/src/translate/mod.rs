@@ -2699,7 +2699,9 @@ impl Translator<'_> {
             self.mark(pc, Part::Cold);
             self.cold(cold, at, source);
         }
-        if (self.computation || self.trace.has_loop()) && self.asm.widen_bit_tests() {
+        // Any unit can reach past a bit test's 32 KiB range: long
+        // straight-line traces and their cold paths as well as loops.
+        if self.asm.widen_bit_tests() {
             return true;
         }
         for &(index, label) in &self.x87_sites {

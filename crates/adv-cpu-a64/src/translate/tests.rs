@@ -593,6 +593,30 @@ fn x87_setup() -> CpuState {
     state
 }
 
+// spec: A64-TR-1
+#[test]
+#[cfg(native)]
+fn tier_one_widens_bit_tests_in_large_straight_line_units() {
+    // Each FSQRT has an early bit test to its cold slow path, which is
+    // laid out after the whole body.
+    let code = bytes(|a| {
+        for _ in 0..96 {
+            a.fsqrt().unwrap();
+        }
+        a.nop().unwrap();
+    });
+    let stop = CODE + code.len() as u32 - 1;
+    let (mut native, mut oracle) = tier_one_pair(&code);
+    let mut state = x87_setup();
+    state.x87.control = 0x027f;
+    state.x87.regs[state.x87.top()] = adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff + 64);
+    state.x87.set_physical_tag(state.x87.top(), 0);
+    for _ in 0..3 {
+        compare_tier_one(&mut native, &mut oracle, &state, stop, 200);
+    }
+    assert!(native.stats.native_code_bytes > 32 * 1024);
+}
+
 // spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-VER-1
 #[test]
 #[cfg(native)]
