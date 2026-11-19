@@ -7,7 +7,7 @@ use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::trap::Bridge;
 use adv_cpu_core::{CpuState, Memory};
 
-use super::plan::{self, dispatch};
+use super::plan::{self, dispatch, lookup_miss};
 use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
     alias_base, call, locked_access, timestamp, value, value_access,
@@ -70,7 +70,7 @@ impl Native {
         }
         let offer = match self.plans.arrival(cpu.eip) {
             plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
-                job.offer_due(self.published_gate())
+                job.sample_offer() && job.offer_due(self.published_gate())
             }
             _ => false,
         };
@@ -125,7 +125,6 @@ impl Native {
             bridge,
             translated,
             error: None,
-            discovered: None,
             internal_discovered: Vec::new(),
         };
         // SAFETY: until `enter` returns, `self` is reached only through
@@ -135,6 +134,7 @@ impl Native {
             (*runtime).countdown = budget;
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
+            (*runtime).lookup_miss = lookup_miss as *const () as u64;
             (*runtime).access = access as *const () as u64;
             (*runtime).value = value as *const () as u64;
             (*runtime).value_access = value_access as *const () as u64;
@@ -156,8 +156,6 @@ impl Native {
             return Err(error);
         }
         let translated = owner.translated;
-        self.diagnostics.resident_entries += self.runtime.resident_entries;
-        self.diagnostics.resident_page_crossings += self.runtime.resident_page_crossings;
         let mut exit = Exit::from_raw(returned.reason as u32)
             .ok_or_else(|| format!("unknown a64 exit {}", returned.reason))?;
         if self.code.slow_paths.is_some() {
@@ -167,6 +165,9 @@ impl Native {
             {
                 self.diagnostics.x87_value_dispatches += 1;
             }
+        }
+        if let Exit::Plan(event) = exit {
+            self.count_plan_event(event.name());
         }
         let budget_exit = exit == Exit::Budget;
         if budget_exit {
@@ -185,11 +186,13 @@ impl Native {
         // Inline forms may refill the countdown, and a cold exit may leave
         // it negative.
         let mut retired = budget.wrapping_sub(returned.remaining);
-        let resident_cold = if exit == Exit::Optimized {
+        let resident_cold = if exit == Exit::Plan(PlanEvent::ResidentRecovery) {
+            let recovery = &self.runtime.recovery;
+            let identity = (recovery.head, recovery.version as usize);
             let (refund, site, reason, checked) = self.materialize_inline(cpu, memory);
             retired -= u64::from(refund);
             exit = Exit::Dispatch;
-            Some((site, reason, checked, refund))
+            Some((identity, site, reason, checked, refund))
         } else {
             None
         };
@@ -214,21 +217,9 @@ impl Native {
             cpu.rep = Some(rep);
             cpu.eflags = visible_flags;
         }
-        if let Some(head) = owner.discovered {
-            self.discover(memory, head, head, cpu.clone());
-        }
-        for (head, source, at) in owner.internal_discovered {
-            if self.code.units.contains_key(&source) && !self.plans.resident(head).is_some() {
-                self.discover(memory, head, source, at);
-            }
-        }
-        self.resident_arrival(cpu);
-        self.environment_miss();
-        self.finish_probation();
-        if let Some((site, reason, checked, refund)) = resident_cold {
-            // A rebuild may replace versions named by this run's entry events.
+        if let Some((identity, site, reason, checked, refund)) = resident_cold {
             self.resident_cold_exit(
-                self.runtime.opt_head,
+                identity,
                 site,
                 reason,
                 checked,
@@ -236,9 +227,31 @@ impl Native {
                 returned.remaining.wrapping_neg(),
             );
         }
-        if exit == Exit::Plan(PlanEvent::BodyStack) {
-            self.refuse_body_stack(memory, cpu);
-            exit = Exit::Dispatch;
+        if let Exit::Plan(event) = exit {
+            let payload = (returned.reason >> 32) as u32;
+            match event {
+                PlanEvent::BodyStack => self.refuse_body_stack(memory, cpu),
+                PlanEvent::DiscoverBackEdge => {
+                    let head = cpu.eip;
+                    self.stop_counting(head);
+                    self.discover(memory, head, head, cpu.clone());
+                }
+                PlanEvent::ContextRetry => self.retry_resident(cpu, payload as usize),
+                PlanEvent::EnvironmentMiss => {
+                    self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
+                }
+                PlanEvent::OfferReady => exit = Exit::Computation,
+                PlanEvent::Probation(version) => {
+                    self.finish_probation(payload, usize::from(version))
+                }
+                PlanEvent::ResidentRecovery | PlanEvent::WorkerBranch(_) => unreachable!(),
+            }
+            if exit != Exit::Computation {
+                exit = Exit::Dispatch;
+            }
+        }
+        for sample in owner.internal_discovered {
+            self.apply_back_edge_sample(memory, sample);
         }
         if budget_exit {
             self.sample(memory, cpu);
@@ -264,7 +277,7 @@ impl Native {
         }))
     }
 
-    fn published_gate(&self) -> &OfferGate {
+    pub(super) fn published_gate(&self) -> &OfferGate {
         if !self.offload.enabled || self.plans.baseline_only {
             &CLEAR_GATE
         } else if self.bridge.is_null() {
@@ -296,13 +309,11 @@ impl Native {
         });
         self.code.faults.capture.pc.set(0);
         let runtime = &mut *self.runtime;
-        runtime.resident_point = 0;
-        runtime.resident_env = 0;
-        runtime.resident_probation = 0;
-        runtime.resident_site = u32::MAX;
-        runtime.resident_cold = ResidentCold::Other;
-        runtime.resident_entries = 0;
-        runtime.resident_page_crossings = 0;
+        if self.count_resident_entries {
+            runtime.resident_entry_counter = (&raw mut self.diagnostics.resident_entries) as u64;
+            runtime.resident_crossing_counter =
+                (&raw mut self.diagnostics.resident_page_crossings) as u64;
+        }
         runtime.offer_gate = gate;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;
@@ -317,8 +328,7 @@ impl Native {
         runtime.deferred = 0;
         runtime.completed = 0;
         runtime.completed_limit = fuel.min(u64::from(u32::MAX)) - budget;
-        runtime.opt_recalled = 0;
-        runtime.opt_save = self.inline_saved.as_mut_ptr() as u64;
+        runtime.recovery.saved = self.inline_saved.as_mut_ptr() as u64;
     }
 
     /// Rebuilds the guest state at a cold inline exit from the entry
@@ -328,17 +338,18 @@ impl Native {
         cpu: &mut CpuState,
         memory: &Memory,
     ) -> (u32, u32, ResidentCold, bool) {
-        let eip = self.runtime.opt_head;
-        let index = self.runtime.resident_version as usize;
+        let recovery = &self.runtime.recovery;
+        let eip = recovery.head;
+        let index = recovery.version as usize;
         let head = self.plans.resident(eip).unwrap();
         let version = &head.versions[index];
-        let record = &version.records[self.runtime.opt_record as usize];
-        translate::opt::recovery::restore_inline_entry(&self.runtime.opt_entry, cpu);
+        let record = &version.records[recovery.record as usize];
+        translate::opt::recovery::restore_inline_entry(&recovery.entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
-        self.runtime.shadow = self.runtime.opt_dump.x[28];
+        self.runtime.shadow = recovery.dump.x[28];
         let refund = translate::opt::recovery::materialize(
             record,
-            &self.runtime.opt_dump,
+            &recovery.dump,
             &self.inline_saved,
             &version.flags,
             cpu,
@@ -352,13 +363,8 @@ impl Native {
             cpu.refresh_mmx();
         }
         let fault = self.code.faults.site(self.code.faults.capture.pc.get());
-        if self.runtime.resident_cold != ResidentCold::Other {
-            (
-                refund,
-                self.runtime.resident_site,
-                self.runtime.resident_cold,
-                false,
-            )
+        if let Some((site, reason)) = recovery.cold() {
+            (refund, site, reason, false)
         } else if let Some(site) = fault {
             (refund, site.eip, ResidentCold::HostFault, site.checked)
         } else {

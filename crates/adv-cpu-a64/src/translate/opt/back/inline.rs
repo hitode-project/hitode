@@ -24,7 +24,7 @@ const ESP: Reg = Reg::new(23);
 const PF: Reg = Reg::new(10);
 const AF: Reg = Reg::new(11);
 const DF: Reg = Reg::new(12);
-const ENTRY: u32 = offset_of!(Runtime, opt_entry) as u32;
+const ENTRY: u32 = offset_of!(Runtime, recovery.entry) as u32;
 const ENTRY_REGS: u32 = offset_of!(runtime::OptEntryState, regs) as u32;
 const ENTRY_NZCV: i32 = offset_of!(runtime::OptEntryState, nzcv) as i32;
 const ENTRY_AF: i32 = offset_of!(runtime::OptEntryState, af) as i32;
@@ -157,20 +157,33 @@ impl Emitter<'_> {
     }
 
     /// Leave an entry whose page facts failed in the Tier-1 assignment.
-    pub(super) fn environment_misses(&mut self, bytes: u64, miss: Label) {
+    pub(super) fn environment_misses(&mut self, bytes: u64, miss: Label, fallback: Label) {
         let facts = std::mem::take(&mut self.fact_misses);
         if facts.is_empty() {
             return;
         }
         let restore = self.asm.label();
+        let triggered = self.asm.label();
         for (ordinal, label) in facts.into_iter().enumerate() {
+            let counter = self.asm.label();
+            let report = self.asm.label();
             self.asm.bind(label);
-            self.imm(T, ordinal as u64);
-            self.asm
-                .emit(str(W, T, RT, offset_of!(Runtime, resident_fact) as u32));
+            self.environment.push((self.asm.offset(), counter));
+            runtime::emit_sensor(&mut self.asm, counter, S2, S3, report);
             self.asm.b(restore);
+            self.asm.bind(report);
+            self.imm(S3, ordinal as u64);
+            self.asm.b(triggered);
+            self.asm.bind(counter);
+            self.asm.emit_all(&[0, 0]);
         }
+        self.asm.bind(triggered);
+        self.restore_environment(bytes, miss);
         self.asm.bind(restore);
+        self.restore_environment(bytes, fallback);
+    }
+
+    fn restore_environment(&mut self, bytes: u64, target: Label) {
         self.asm.emit(add_imm(X, S4, RT, ENTRY, false));
         for i in (0..8).step_by(2) {
             self.asm.emit(ldp(
@@ -189,7 +202,7 @@ impl Emitter<'_> {
         ]);
         self.bias_stack();
         self.stack_frame(bytes, false);
-        self.asm.b(miss);
+        self.asm.b(target);
     }
 
     fn entry_facts(&mut self, assumed: &Assumed, miss: Label) {
@@ -419,6 +432,7 @@ impl Emitter<'_> {
         self.charge(-i64::from(record.refund), RecordId(0), false);
         self.stack_frame(bytes, false);
         if let Some(probation) = &mut self.probation {
+            probation.sensor(&mut self.asm, record.eip);
             probation.call(&mut self.asm, false);
             self.exit_words = self.exit_words.max(self.words_since(start));
         }

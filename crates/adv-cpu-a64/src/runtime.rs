@@ -94,9 +94,8 @@ pub struct Runtime {
     pub memory_pages: u32,
     /// Read the owning bridge's timestamp without publishing guest state.
     pub timestamp: u64,
-    /// The indirect branch that last missed the table: source EIP in the
-    /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
-    pub branch: u64,
+    /// `lookup_miss(runtime, eip, branch) -> unit or 0`.
+    pub lookup_miss: u64,
     /// `call(runtime, site, countdown) -> status`, called by `call` for
     /// a host call whose site packs EIP, thunk, INT length and recognition:
     /// zero resumes and nonzero carries an exit plus one.
@@ -132,39 +131,18 @@ pub struct Runtime {
     pub deferred: u32,
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
-    /// Where `opt_exit` saves the form's `opt_cells` spill cells before it
-    /// discards their stack frame.
-    pub opt_save: u64,
-    pub opt_cells: u64,
-    pub opt_record: u32,
-    /// Nonzero when an optimized form left at a checkpoint for a recall.
-    pub opt_recalled: u32,
-    pub opt_dump: RegisterDump,
+    /// Fixed-offset scratch that belongs to this generated invocation.
+    pub recovery: Recovery,
     /// Nonzero while the owner has a REP continuation.
     pub rep_pending: u32,
-    /// Tier-1 state at the last admitted inline entry.
-    pub opt_entry: OptEntryState,
     /// The machine's `OfferGate` that head entry blocks read (A64-OPT-8).
     pub offer_gate: u64,
-    /// The head EIP of the inline form whose cold exit reached `opt_exit`.
-    pub opt_head: u32,
-    /// Ordinal of the resident entry fact that failed.
-    pub resident_fact: u32,
-    /// Guest EIP and reason for an explicit resident cold branch.
-    pub resident_site: u32,
-    pub(crate) resident_cold: ResidentCold,
     /// Owner access stub entry that preserves optimized register values.
     pub resident_access: u64,
-    /// Version whose cold exit reached the owner.
-    pub resident_version: u32,
-    /// Back edge sampled at a resident entry.
-    pub resident_point: usize,
-    /// Head and version with an environment miss due for a rebuild.
-    pub resident_env: u64,
-    pub resident_probation: u64,
-    pub resident_discover: u64,
-    pub resident_entries: u64,
-    pub resident_page_crossings: u64,
+    /// An observation or a stable patch that returns to the live unit.
+    pub plan_observation: u64,
+    pub resident_entry_counter: u64,
+    pub resident_crossing_counter: u64,
     pub(crate) value: u64,
     pub(crate) value_access: u64,
     pub(crate) locked_access: u64,
@@ -203,7 +181,7 @@ impl Runtime {
             memory_base: 0,
             memory_pages: 0,
             code_lines: 0,
-            branch: 0,
+            lookup_miss: 0,
             body: adv_cpu_core::body::BodyContext::default(),
             body_value: 0,
             body_stack: 0,
@@ -217,26 +195,13 @@ impl Runtime {
             head_exit: 0,
             deferred: 0,
             opt_params: 0,
-            opt_save: 0,
-            opt_cells: 0,
-            opt_record: 0,
-            opt_recalled: 0,
-            opt_dump: RegisterDump::default(),
+            recovery: Recovery::default(),
             rep_pending: 0,
-            opt_entry: OptEntryState::default(),
             offer_gate: 0,
-            opt_head: 0,
-            resident_fact: 0,
-            resident_site: u32::MAX,
-            resident_cold: ResidentCold::Other,
             resident_access: 0,
-            resident_version: 0,
-            resident_point: 0,
-            resident_env: 0,
-            resident_probation: 0,
-            resident_discover: 0,
-            resident_entries: 0,
-            resident_page_crossings: 0,
+            plan_observation: 0,
+            resident_entry_counter: 0,
+            resident_crossing_counter: 0,
             value: 0,
             value_access: 0,
             locked_access: 0,
@@ -295,6 +260,38 @@ pub(crate) struct AccessResult {
     pub recovery: *mut FaultRegisters,
 }
 
+/// Optimized recovery payload. Generated code copies spills out before
+/// unwinding its stack. Only a recovery exit exposes this data to Rust.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct Recovery {
+    pub entry: OptEntryState,
+    pub dump: RegisterDump,
+    pub saved: u64,
+    pub cells: u64,
+    pub record: u32,
+    pub recalled: u32,
+    pub head: u32,
+    pub version: u32,
+    pub detail: u64,
+}
+
+#[cfg(native)]
+impl Recovery {
+    pub(crate) fn cold(&self) -> Option<(u32, ResidentCold)> {
+        let reason = match self.detail >> 32 {
+            0 => return None,
+            n if n == ResidentCold::Validation as u64 => ResidentCold::Validation,
+            n if n == ResidentCold::BlockedAccess as u64 => ResidentCold::BlockedAccess,
+            n if n == ResidentCold::PageCross as u64 => ResidentCold::PageCross,
+            n if n == ResidentCold::FrameDisjoint as u64 => ResidentCold::FrameDisjoint,
+            n if n == ResidentCold::Division as u64 => ResidentCold::Division,
+            _ => unreachable!("resident cold reason"),
+        };
+        Some((self.detail as u32, reason))
+    }
+}
+
 /// An event at a precise guest instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -324,7 +321,37 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanEvent {
     BodyStack,
+    ResidentRecovery,
+    DiscoverBackEdge,
+    ContextRetry,
+    EnvironmentMiss,
+    OfferReady,
+    /// The high word names the resident head, independently of the exit EIP.
+    Probation(u8),
+    /// A detached computation transferred indirectly. The high word holds the source EIP.
+    WorkerBranch(u8),
 }
+
+#[cfg(native)]
+impl PlanEvent {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::BodyStack => "body_stack",
+            Self::ResidentRecovery => "resident_recovery",
+            Self::DiscoverBackEdge => "external_discovery",
+            Self::ContextRetry => "context_retry",
+            Self::EnvironmentMiss => "environment_miss",
+            Self::OfferReady => "offer_ready",
+            Self::Probation(_) => "probation",
+            Self::WorkerBranch(_) => "worker_branch",
+        }
+    }
+}
+
+pub(crate) const DISCOVER_INTERNAL: u16 = 0;
+pub(crate) const RESIDENT_LINK_SAMPLE: u16 = 1;
+#[cfg(native)]
+pub(crate) const CHECK_OFFER: u16 = 2;
 
 /// The generated entry point's return registers, x0 through x3.
 #[cfg(native)]
@@ -424,6 +451,13 @@ impl Exit {
             Self::Untracked => 15,
             Self::Event(Event::PendingX87) => 11,
             Self::Plan(PlanEvent::BodyStack) => 12,
+            Self::Plan(PlanEvent::ResidentRecovery) => 15,
+            Self::Plan(PlanEvent::DiscoverBackEdge) => 16,
+            Self::Plan(PlanEvent::ContextRetry) => 17,
+            Self::Plan(PlanEvent::EnvironmentMiss) => 18,
+            Self::Plan(PlanEvent::OfferReady) => 19,
+            Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
+            Self::Plan(PlanEvent::WorkerBranch(kind)) => 0x4000 | kind as u16,
             Self::Event(Event::CheckedAccess) => 13,
             Self::Event(Event::System) => 14,
             Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
@@ -454,6 +488,11 @@ impl Exit {
             12 => Some(Self::Plan(PlanEvent::BodyStack)),
             13 => Some(Self::Event(Event::CheckedAccess)),
             14 => Some(Self::Event(Event::System)),
+            15 => Some(Self::Plan(PlanEvent::ResidentRecovery)),
+            16 => Some(Self::Plan(PlanEvent::DiscoverBackEdge)),
+            17 => Some(Self::Plan(PlanEvent::ContextRetry)),
+            18 => Some(Self::Plan(PlanEvent::EnvironmentMiss)),
+            19 => Some(Self::Plan(PlanEvent::OfferReady)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
             0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {
@@ -461,6 +500,8 @@ impl Exit {
                 len: (raw >> 8 & 15) as u8,
             })),
             0x3000..=0x30ff => Some(Self::Budget),
+            0x4001..=0x4003 => Some(Self::Plan(PlanEvent::WorkerBranch(raw as u8))),
+            0x4100..=0x41ff => Some(Self::Plan(PlanEvent::Probation(raw as u8))),
             _ => None,
         }
     }
@@ -502,6 +543,7 @@ pub struct Stubs {
     pub enter: usize,
     pub opt_enter: usize,
     pub opt_exit: usize,
+    pub resident_exit: usize,
     pub exit: usize,
     /// Where the fault handler resumes a faulting site.
     pub fault: usize,
@@ -581,21 +623,20 @@ pub(crate) const COMPUTATION_PENDING_MASK: u32 =
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
-pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
-pub(crate) const OPT_CELLS: u32 = field(offset_of!(Runtime, opt_cells));
-pub(crate) const OPT_HEAD: u32 = field(offset_of!(Runtime, opt_head));
+pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));
+pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells));
+pub(crate) const RECOVERY_HEAD: u32 = field(offset_of!(Runtime, recovery.head));
 pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
 pub(crate) const RECALL_GRACE: u32 = 64;
 pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
-pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
 pub(crate) const CPU_STATE: u32 = CPU;
-const BRANCH: u32 = field(offset_of!(Runtime, branch));
+const LOOKUP_MISS: u32 = field(offset_of!(Runtime, lookup_miss));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 pub(crate) const CLOCK_READ: u32 = field(offset_of!(CpuState, clock_read));
@@ -649,19 +690,15 @@ pub fn stubs() -> Stubs {
     let dispatch_label = asm.label();
     asm.bind(dispatch_label);
     let dispatch = asm.offset();
-    emit_dispatch(&mut asm, exit_label);
+    emit_dispatch(&mut asm, HELPER, exit_label);
     let (lookup_label, slow_label) = (asm.label(), asm.label());
     asm.bind(lookup_label);
     let lookup = asm.offset();
     emit_probe(&mut asm, slow_label);
     asm.bind(slow_label);
     let lookup_slow = asm.offset();
-    asm.emit_all(&[
-        str(X, r(4), RUNTIME, BRANCH),
-        mov(W, r(1), r(16)),
-        movz(X, r(2), 0, 0),
-    ]);
-    asm.b(dispatch_label);
+    asm.emit_all(&[mov(W, r(1), r(16)), mov(X, r(2), r(4))]);
+    emit_dispatch(&mut asm, LOOKUP_MISS, exit_label);
     let ret_miss = asm.offset();
     emit_ret_miss(&mut asm, lookup_label);
     let shadow_reset = asm.offset();
@@ -675,13 +712,16 @@ pub fn stubs() -> Stubs {
     let call = asm.offset();
     emit_call(&mut asm);
     let opt_exit = asm.offset();
-    emit_opt_exit(&mut asm);
+    emit_opt_exit(&mut asm, Exit::Optimized);
+    let resident_exit = asm.offset();
+    emit_opt_exit(&mut asm, Exit::Plan(PlanEvent::ResidentRecovery));
     Stubs {
         call,
         code: asm.finish(),
         enter,
         opt_enter,
         opt_exit,
+        resident_exit,
         exit,
         fault,
         dispatch,
@@ -996,7 +1036,7 @@ fn emit_ret_miss(asm: &mut Asm, lookup: crate::asm::Label) {
 /// `dispatch`: w1 the guest EIP, x2 a link point or 0. Calls the helper with
 /// the runtime, and continues at the unit it returns or leaves with
 /// `Exit::Dispatch` when it returns 0.
-fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
+fn emit_dispatch(asm: &mut Asm, helper: u32, exit: crate::asm::Label) {
     asm.emit_all(&[
         // The helper may empty the shadow stack.
         str(X, r(28), RUNTIME, SHADOW),
@@ -1007,7 +1047,7 @@ fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
         mrs_nzcv(r(17)),
         stp(X, Offset, r(17), Reg::LR, SP, 64),
         mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, HELPER),
+        ldr(X, r(16), RUNTIME, helper),
         blr(r(16)),
         ldp(X, Offset, r(17), Reg::LR, SP, 64),
         msr_nzcv(r(17)),
@@ -1126,8 +1166,8 @@ fn emit_exit(asm: &mut Asm) {
 }
 
 // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
-fn emit_opt_exit(asm: &mut Asm) {
-    let dump = offset_of!(Runtime, opt_dump) as u32;
+fn emit_opt_exit(asm: &mut Asm, exit: Exit) {
+    let dump = offset_of!(Runtime, recovery.dump) as u32;
     // Capture before borrowing any allocatable register. x16/x17 are emission scratch.
     for n in 0..31 {
         asm.emit(str(X, r(n), RUNTIME, dump + 8 * u32::from(n)));
@@ -1147,8 +1187,13 @@ fn emit_opt_exit(asm: &mut Asm) {
             RUNTIME,
             dump + offset_of!(RegisterDump, sp) as u32,
         ),
-        ldr(X, r(15), RUNTIME, offset_of!(Runtime, opt_save) as u32),
-        ldr(X, r(17), RUNTIME, offset_of!(Runtime, opt_cells) as u32),
+        ldr(
+            X,
+            r(15),
+            RUNTIME,
+            offset_of!(Runtime, recovery.saved) as u32,
+        ),
+        ldr(X, r(17), RUNTIME, RECOVERY_CELLS),
     ]);
     asm.bind(copy);
     asm.cbz(X, false, r(17), done);
@@ -1160,7 +1205,7 @@ fn emit_opt_exit(asm: &mut Asm) {
     asm.b(copy);
     asm.bind(done);
     asm.emit_all(&[
-        movz(W, r(0), Exit::Optimized.word(), 0),
+        movz(W, r(0), exit.word(), 0),
         ldr(X, r(1), RUNTIME, COMPLETED),
         sub(X, r(1), r(9), r(1), Lsl, 0),
         mov(X, r(2), r(28)),
@@ -1458,17 +1503,8 @@ mod tests {
 }
 
 #[cfg(native)]
-pub(crate) const RESIDENT_VERSION: u32 = field(offset_of!(Runtime, resident_version));
-#[cfg(native)]
-pub(crate) const RESIDENT_POINT: u32 = field(offset_of!(Runtime, resident_point));
-#[cfg(native)]
-pub(crate) const RESIDENT_ENV: u32 = field(offset_of!(Runtime, resident_env));
-#[cfg(native)]
-pub(crate) const RESIDENT_FACT: u32 = field(offset_of!(Runtime, resident_fact));
-
-#[cfg(native)]
-pub(crate) const RESIDENT_PROBATION: u32 = field(offset_of!(Runtime, resident_probation));
-pub(crate) const RESIDENT_DISCOVER: u32 = field(offset_of!(Runtime, resident_discover));
+pub(crate) const RECOVERY_VERSION: u32 = field(offset_of!(Runtime, recovery.version));
+pub(crate) const PLAN_OBSERVATION: u32 = field(offset_of!(Runtime, plan_observation));
 
 /// The backward link's patch word precedes the ordinary dispatch prefix.
 /// x14 identifies the edge on the resident trampoline's sampled path.
@@ -1490,19 +1526,35 @@ pub(crate) fn emit_link_point(asm: &mut crate::asm::Asm, eip: u32, back: bool) -
 
 /// Byte offsets from a backward link's patch word.
 pub(crate) const BACK_COUNT: usize = 20;
-pub(crate) const BACK_UNIT: usize = 40;
-pub(crate) const BACK_COUNTER: usize = 44;
+pub(crate) const SENSOR_BYTES: usize = 5 * 4;
+pub(crate) const BACK_UNIT: usize = BACK_COUNT + SENSOR_BYTES;
+pub(crate) const BACK_COUNTER: usize = BACK_UNIT + 4;
+pub(crate) const BACK_END: usize = BACK_COUNTER + 8 + 16;
 
-pub(crate) fn emit_back_count(asm: &mut crate::asm::Asm) {
+/// A64A-PLACE-3. Only scratch registers are live here. Neither the active
+/// countdown nor its one-word replacement changes the guest NZCV image.
+pub(crate) fn emit_sensor(
+    asm: &mut Asm,
+    counter: crate::asm::Label,
+    address: Reg,
+    value: Reg,
+    trigger: crate::asm::Label,
+) {
+    asm.ldr_literal(address, counter);
     asm.emit_all(&[
-        // LDR x3, #24, the literal at BACK_COUNTER.
-        0x5800_00c3,
-        ldr(W, r(4), r(3), 0),
-        sub_imm(W, r(4), r(4), 1, false),
-        str(W, r(4), r(3), 0),
-        cbz(W, false, r(4), -32),
-        b(0),
-        0,
-        0,
+        ldr(W, value, address, 0),
+        sub_imm(W, value, value, 1, false),
+        str(W, value, address, 0),
     ]);
+    asm.cbz(W, false, value, trigger);
+}
+
+pub(crate) fn emit_back_count(asm: &mut Asm) {
+    let counter = asm.label();
+    let trigger = asm.label();
+    emit_sensor(asm, counter, r(3), r(4), trigger);
+    asm.emit(b(0));
+    asm.bind(counter);
+    asm.emit_all(&[0, 0]);
+    asm.bind(trigger);
 }

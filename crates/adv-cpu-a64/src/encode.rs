@@ -753,6 +753,11 @@ pub const fn adr(rd: Reg, offset: i32) -> u32 {
     0x1000_0000 | (imm & 3) << 29 | (imm >> 2 & 0x7ffff) << 5 | rd.number()
 }
 
+/// `ldr Xt, label` with a PC-relative literal.
+pub const fn ldr_literal(rt: Reg, offset: i32) -> u32 {
+    0x5800_0000 | displacement(offset, 19) << 5 | rt.number()
+}
+
 /// `csinc rd, rn, rm, cond`.
 pub const fn csinc(size: Size, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
     0x1A80_0400

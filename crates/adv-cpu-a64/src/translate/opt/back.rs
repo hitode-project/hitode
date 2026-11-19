@@ -42,7 +42,8 @@ const A: VReg = VReg::new(29);
 const B: VReg = VReg::new(30);
 const C: VReg = VReg::new(31);
 const PARAMS: u32 = offset_of!(Runtime, opt_params) as u32;
-const RECORD: u32 = offset_of!(Runtime, opt_record) as u32;
+const RECORD: u32 = offset_of!(Runtime, recovery.record) as u32;
+const DETAIL: u32 = offset_of!(Runtime, recovery.detail) as u32;
 
 pub(crate) struct Lowered {
     /// The inline entry, miss and cold branch words.
@@ -50,6 +51,7 @@ pub(crate) struct Lowered {
     pub miss: usize,
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
+    pub environment: Vec<(usize, usize)>,
     pub cold: usize,
     /// Static costs of the resident entry, longest normal exit, and a loop iteration.
     pub entry_words: u32,
@@ -61,6 +63,7 @@ pub(crate) struct Lowered {
     pub probation: Vec<usize>,
     /// Two words holding the address of the probation counters, bound at placement.
     pub probation_slot: usize,
+    pub probation_sensor: Option<(Vec<usize>, usize, usize)>,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
@@ -150,10 +153,22 @@ fn lower_form(
     let miss = miss.map_or(0, |label| e.asm.position(label) / 4);
     let cold = cold.map_or(0, |label| e.asm.position(label) / 4);
     let env_miss = e.env_miss.map_or(miss, |label| e.asm.position(label) / 4);
+    let environment = e
+        .environment
+        .iter()
+        .map(|&(sensor, counter)| (sensor, e.asm.position(counter) / 4))
+        .collect();
     let probation_slot = e
         .probation
         .as_ref()
         .map_or(0, |p| e.asm.position(p.slot) / 4);
+    let probation_sensor = e.probation.as_ref().map(|p| {
+        (
+            p.sensors.clone(),
+            e.asm.position(p.counter) / 4,
+            e.asm.position(p.leave) / 4,
+        )
+    });
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -161,6 +176,7 @@ fn lower_form(
         entry: 0,
         miss,
         env_miss,
+        environment,
         cold,
         entry_words: e.entry_words,
         exit_words: e.exit_words,
@@ -169,6 +185,7 @@ fn lower_form(
         iteration_pcs: e.iteration.pcs,
         probation: e.probation.map_or_else(Vec::new, |p| p.calls),
         probation_slot,
+        probation_sensor,
         links: e.links,
         transitions: e.transitions,
         exit,
@@ -209,6 +226,7 @@ fn emit<'a>(
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let cold = func.records.iter().map(|_| asm.label()).collect();
+    let cold_detail = resident.then(|| func.records.iter().map(|_| asm.label()).collect());
     let mut branch_only = vec![true; func.types.len()];
     for v in func
         .blocks
@@ -243,6 +261,7 @@ fn emit<'a>(
         asm,
         blocks,
         cold,
+        cold_detail,
         failures: Vec::new(),
         normal: if inline.is_some() {
             vec![[None; 2]; func.records.len()]
@@ -256,6 +275,7 @@ fn emit<'a>(
         exit_words: 0,
         iteration: cost::Iteration::default(),
         fact_misses: Vec::new(),
+        environment: Vec::new(),
         checked_accesses: Vec::new(),
         page_cross: None,
         page_crossings: Vec::new(),
@@ -443,27 +463,31 @@ fn emit<'a>(
         e.asm.b(resume);
     }
     e.checked_accesses();
-    e.page_crossings();
+    e.page_crossings(count_entries);
     if let Some(pages) = batch_pages {
         resident::batch_pages(&mut e.asm, pages);
     }
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);
         e.mark(Part::Cold, pc);
-        e.record_cold(reason, pc);
-        e.asm.b(e.cold[record.0 as usize]);
+        e.cold_exit(record, reason, pc);
     }
     if let Some(probation) = &e.probation {
         probation.emit(&mut e.asm);
     }
     if let Some(miss) = env_miss {
-        e.environment_misses(bytes, miss);
+        e.environment_misses(bytes, miss, cold.unwrap());
     }
     // spec: A64-OPT-6
     let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
         e.asm.bind(e.cold[i]);
         e.mark(Part::Cold, record.eip);
+        if let Some(detail) = &e.cold_detail {
+            e.asm.emit(movz(X, U, 0, 0));
+            e.asm.bind(detail[i]);
+            e.asm.emit(str(X, U, RT, DETAIL));
+        }
         e.imm(T, i as u64);
         e.asm.emit(str(W, T, RT, RECORD));
         e.asm.b(exit);
@@ -496,6 +520,7 @@ struct Emitter<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     cold: Vec<Label>,
+    cold_detail: Option<Vec<Label>>,
     failures: Vec<(Label, RecordId, ResidentCold, u32)>,
     normal: Vec<[Option<Label>; 2]>,
     resident: bool,
@@ -505,6 +530,7 @@ struct Emitter<'a> {
     exit_words: u32,
     iteration: cost::Iteration,
     fact_misses: Vec<Label>,
+    environment: Vec<(usize, Label)>,
     checked_accesses: Vec<resident::CheckedAccess>,
     page_cross: Option<RecordId>,
     page_crossings: Vec<resident::PageCrossing>,
@@ -552,11 +578,12 @@ impl<'a> Emitter<'a> {
     fn begin_body(&mut self, record: RecordId, count_entries: bool) {
         let start = self.asm.offset();
         if count_entries {
-            let entries = offset_of!(Runtime, resident_entries) as u32;
+            let entries = offset_of!(Runtime, resident_entry_counter) as u32;
             self.asm.emit_all(&[
-                ldr(X, T, RT, entries),
+                ldr(X, U, RT, entries),
+                ldr(X, T, U, 0),
                 add_imm(X, T, T, 1, false),
-                str(X, T, RT, entries),
+                str(X, T, U, 0),
             ]);
         }
         let diagnostic_words = self.words_since(start);
@@ -837,14 +864,16 @@ impl<'a> Emitter<'a> {
         self.failure(self.region, ResidentCold::Validation)
     }
 
-    fn record_cold(&mut self, reason: ResidentCold, pc: u32) {
-        self.imm(T, u64::from(pc));
-        self.asm
-            .emit(str(W, T, RT, offset_of!(Runtime, resident_site) as u32));
-        self.asm.emit_all(&[
-            movz(W, T, reason as u16, 0),
-            str(W, T, RT, offset_of!(Runtime, resident_cold) as u32),
-        ]);
+    fn cold_exit(&mut self, record: RecordId, reason: ResidentCold, pc: u32) {
+        let index = record.0 as usize;
+        let target = if let Some(detail) = &self.cold_detail {
+            let target = detail[index];
+            self.imm(U, (reason as u64) << 32 | u64::from(pc));
+            target
+        } else {
+            self.cold[index]
+        };
+        self.asm.b(target);
     }
 
     fn charge(&mut self, charge: i64, record: RecordId, head_exit: bool) {
@@ -949,7 +978,7 @@ impl<'a> Emitter<'a> {
                 self.asm.b(exit);
             } else {
                 self.asm
-                    .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::OPT_RECALLED)]);
+                    .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::RECOVERY_RECALLED)]);
                 self.asm.b(self.cold[record.0 as usize]);
             }
         }

@@ -1308,6 +1308,7 @@ fn a_read_modify_write_crossing_plain_pages_stays_in_the_form() {
             },
         );
         trial.live.native.as_mut().unwrap().checks = checks;
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
         trial.install();
         assert_eq!(trial.compare(128), (RunOutcome::ReachedStop, 33));
         let diagnostics = &trial.live.native.as_ref().unwrap().diagnostics;

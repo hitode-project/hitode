@@ -322,7 +322,7 @@ fn opt_inline_exit_equivalence() {
 }
 
 fn read_entry(h: &Harness) -> runtime::OptEntryState {
-    let addr = CONTEXT + offset_of!(runtime::Runtime, opt_entry) as u64;
+    let addr = CONTEXT + offset_of!(runtime::Runtime, recovery.entry) as u64;
     let data = h.emu.read(addr, size_of::<runtime::OptEntryState>());
     let word = |at| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
     let wide = |at| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
@@ -335,7 +335,7 @@ fn read_entry(h: &Harness) -> runtime::OptEntryState {
     }
 }
 
-// spec: A64-OPT-6, A64-OPT-7, A64-REG-1
+// spec: A64A-ROLE-8, A64-OPT-6, A64-OPT-7, A64-REG-1
 #[test]
 fn opt_inline_entry_equivalence() {
     let mut h = test_harness();
@@ -413,6 +413,23 @@ fn opt_inline_entry_equivalence() {
         assumed.x87 = x87;
         assumed.mmx = mmx;
         let lowered = back::lower_inline(&f, &assumed, &f.entry);
+        let save = [
+            add_imm(
+                X,
+                X4,
+                Reg::new(29),
+                offset_of!(runtime::Runtime, recovery.entry) as u32,
+                false,
+            ),
+            stp(W, Index::Offset, Reg::new(19), Reg::new(20), X4, 0),
+            stp(W, Index::Offset, Reg::new(21), Reg::new(22), X4, 8),
+            stp(W, Index::Offset, Reg::new(23), Reg::new(24), X4, 16),
+            stp(W, Index::Offset, Reg::new(25), Reg::new(26), X4, 24),
+            mrs_nzcv(X16),
+            stp(X, Index::Offset, X16, Reg::new(10), X4, 32),
+            stp(X, Index::Offset, Reg::new(11), Reg::new(12), X4, 48),
+        ];
+        assert!(lowered.words.windows(save.len()).any(|words| words == save));
         let run = InlineRun::new(&h, &lowered, &[]).with_stale_integer_state();
         for iteration in 0..192 {
             let mut cpu = cpu.clone();

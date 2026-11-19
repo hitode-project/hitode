@@ -72,6 +72,14 @@ The build key projects live facts onto the unit's trace mask. An empty mask assu
 
 Each version has guards, a body and a miss slot. The slot branches to the next checked entry or to the version-miss stub. A return continuation checks facts its callee may change.
 
+### A64A-ROLE-8 Plan events
+
+**Rule**: Generated code MUST deliver each plan event through an in-place stub call or an exit payload. `Runtime` MUST NOT hold event fields that the owner polls after each run. Generated diagnostic counts MUST be written into diagnostic storage only when enabled.
+**Applies to**: AArch64
+**Verification**: Test
+
+Events that may invalidate an active continuation MUST leave with their identity and recovery data. The owner MUST resolve recovery before changing the cache. Observations and stable link patches MAY continue through the stub. A deferred observation MUST retain the identity and generation of the source unit.
+
 ## Leaving a Tier-1 fast path
 
 ### A64A-FALL-2 No interpreter for state
@@ -141,6 +149,14 @@ Dispatch, version misses, value calls and host calls use stubs that continue in 
 **Rule**: An entry guard MUST cost a bounded number of loads and compares. A static edge that proves the target key MUST enter its body. An empty-key unit MUST emit its original instruction sequence when diagnostics are off.
 **Applies to**: AArch64
 **Verification**: Test
+
+### A64A-PLACE-3 Policy sensors
+
+**Rule**: An active sensor MUST use at most five words and preserve NZCV. A settled sensor MUST execute one unconditional branch past the countdown. Profitability and worth decisions MUST run on plan events or at owner safe points.
+**Applies to**: AArch64
+**Verification**: Test
+
+The countdown uses a literal address or a fixed runtime slot, followed by a load, SUB, store, and a compare-and-branch to cold code. A sensor MUST NOT use a reserved register or LSE. Dynamic offers MUST recur at an owner-rearmed sampling period. A point that reads a single owner-published decision MAY use a load, test and branch when that path costs no more than a countdown.
 
 ### A64A-PLACE-4 Build location
 

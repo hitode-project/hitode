@@ -134,12 +134,12 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 entry keys and guards. Resident guards are in [`head`](crates/adv-cpu-a64/src/native/head.rs). | Code placement |
 | [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement, Tier-1 version chains, links and page watches, with resident trampolines in [`head`](crates/adv-cpu-a64/src/native/head.rs) | Guest semantics |
 | [`native::compile` module](crates/adv-cpu-a64/src/native/compile.rs) | Compile pool and optimized build requests | Code placement |
-| [`native::plan` module](crates/adv-cpu-a64/src/native/plan.rs) | Site plans, tier decisions and link publication | Host code emission |
+| [`native::plan` module](crates/adv-cpu-a64/src/native/plan.rs) | Site plans, tier decisions on plan events, and publication of sensor and link patches (A64A-PLACE-3) | Host code emission |
 | [`native::offload` module](crates/adv-cpu-a64/src/native/offload.rs) | Admission and execution of worker jobs using core CPU state and the runtime handoff | Tier selection |
 | [`native::run` module](crates/adv-cpu-a64/src/native/run.rs) and [`native`](crates/adv-cpu-a64/src/native.rs) | Native entry, host calls and fault recovery | Choosing guest instructions |
 | [`executor`](crates/adv-cpu-a64/src/executor.rs) | The engine's execution owner: core interpreter runs, exits, traps, fuel and deadlines. The arbiter selects first visits (A64-TR-2). | Code generation |
 | [`cpu`](crates/adv-cpu-a64/src/cpu.rs) | `Backend` and `Engine` over the executor, as the machine layer drives them | Scheduling |
-| [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1). Native entries return the reason, remaining countdown, shadow pointer and recall deferrals in registers |  |
+| [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1). Native entries return the reason, remaining countdown, shadow pointer and recall deferrals in registers. Plan events arrive in stub arguments or exit payloads (A64A-ROLE-8). |  |
 | [`cache`](crates/adv-cpu-a64/src/cache.rs) | Executable storage leased from the process code pool, never writable and executable through one mapping (A64-CTL-1, A64-CTL-2) | What code goes into it |
 | [`asm`](crates/adv-cpu-a64/src/asm.rs), [`encode`](crates/adv-cpu-a64/src/encode.rs) | An instruction buffer with labels; `const fn` AArch64 encoders checked against clang vectors | Instruction selection |
 | [`jit_map`](crates/adv-cpu-a64/src/jit_map.rs) | Opt-in maps of placed units for samplers | Changing translation |

@@ -409,6 +409,8 @@ pub(crate) struct Diagnostics {
     pub resident_refusals_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
     pub resident_demotions_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
     pub resident_page_crossings: u64,
+    pub plan_events: std::collections::BTreeMap<&'static str, u64>,
+    pub sensor_decisions: std::collections::BTreeMap<&'static str, u64>,
     /// Fills of the whole indirect table, which also reset the shadow stack.
     pub global_invalidations: u64,
 }
@@ -429,28 +431,52 @@ struct Owner {
     bridge: *mut std::ffi::c_void,
     translated: usize,
     error: Option<String>,
-    discovered: Option<u32>,
-    internal_discovered: Vec<(u32, u32, CpuState)>,
+    internal_discovered: Vec<BackEdgeSample>,
 }
 
-unsafe extern "C" fn discover_internal(runtime: *mut Runtime, eip: u32, point: usize) {
+struct BackEdgeSample {
+    generation: u64,
+    source: u32,
+    unit: usize,
+    at: CpuState,
+}
+
+unsafe extern "C" fn plan_observation(
+    runtime: *mut Runtime,
+    eip: u32,
+    point: usize,
+    kind: u16,
+) -> u32 {
     // SAFETY: the threshold stub publishes the head's state and keeps the
     // live Tier-1 registers on its stack while the owner records the sample.
-    let (owner, mut at) = unsafe {
-        (
-            &mut *((*runtime).owner as *mut Owner),
-            (*(*runtime).cpu).clone(),
-        )
-    };
+    let (owner, cpu) = unsafe { (&mut *((*runtime).owner as *mut Owner), &*(*runtime).cpu) };
     let native = unsafe { &mut *owner.native };
-    let source = native.code.internal_edges[&eip]
+    if kind == runtime::CHECK_OFFER {
+        native.count_plan_event("offer_check");
+        let job = native.plans.job(eip).unwrap();
+        job.defer_offer();
+        return u32::from(job.offer_due(native.published_gate()));
+    }
+    if kind == runtime::RESIDENT_LINK_SAMPLE {
+        native.count_plan_event("resident_link_sample");
+        native.sample_resident_link(cpu, eip, point);
+        return 0;
+    }
+    native.count_plan_event("internal_discovery");
+    let mut at = cpu.clone();
+    let edge = native.code.internal_edges[&eip]
         .iter()
         .find(|edge| edge.point == point)
-        .unwrap()
-        .source;
+        .unwrap();
     at.eip = eip;
-    owner.internal_discovered.push((eip, source, at));
+    owner.internal_discovered.push(BackEdgeSample {
+        generation: native.code.generation,
+        source: edge.source,
+        unit: edge.unit,
+        at,
+    });
     native.stop_counting(eip);
+    0
 }
 
 fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
@@ -795,7 +821,7 @@ pub(crate) struct Native {
     /// Budget exits an entry needs before it is promoted; zero translates
     /// every entry with loop traces.
     pub(crate) promotion: u8,
-    count_resident_entries: bool,
+    pub(crate) count_resident_entries: bool,
     /// The frame's pace when the owner last reached a loop whose blocks
     /// split (A64-TR-9).
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
@@ -935,6 +961,7 @@ impl Native {
                 (stubs.enter, "enter"),
                 (stubs.opt_enter, "opt_enter"),
                 (stubs.exit, "exit"),
+                (stubs.resident_exit, "resident_exit"),
                 (stubs.fault, "fault"),
                 (stubs.dispatch, "dispatch"),
                 (stubs.lookup, "lookup"),
@@ -955,13 +982,14 @@ impl Native {
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
         runtime.table = table.as_mut_ptr() as u64;
         runtime.resident_access = (base + access_entry) as u64;
-        runtime.resident_discover = discover_internal as *const () as u64;
+        runtime.plan_observation = plan_observation as *const () as u64;
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {
             decodes: translate::front::Decodes::default(),
             front_units: FxHashMap::default(),
             code: store::CodeStore {
+                resident_exit: base + stubs.resident_exit,
                 rows: FxHashMap::default(),
                 table_sources: FxHashSet::default(),
                 stub_len: cache.used(),
@@ -1478,8 +1506,8 @@ mod tests {
         native.set_computation_offer(true, None);
         let gate = native.plans.job(HEAD).unwrap().gate_entry;
         assert!(native.plans.resident(HEAD).unwrap().declined());
-        native.plans.job(HEAD).unwrap().reoffer.set(2);
-        for left in [1, 0] {
+        native.plans.job(HEAD).unwrap().reoffer.set(3);
+        for left in [2, 1] {
             let mut state = resident_cpu(OUTSIDE, 20);
             let result = enter(&mut native, &mut memory, stop, &mut state);
             assert_eq!((result.exit, state.eip), (Exit::Dispatch, stop));
@@ -1488,6 +1516,7 @@ mod tests {
         let mut state = resident_cpu(OUTSIDE, 20);
         let result = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((result.exit, state.eip), (Exit::Computation, HEAD));
+        assert_eq!(native.plans.job(HEAD).unwrap().reoffer.get(), plan::REOFFER);
         let link = outside_link(&native, HEAD);
         assert_eq!(native.code.cache.word(link.point), link.branch(gate));
         assert_eq!(native.diagnostics.optimized_runs, 0);
@@ -1778,7 +1807,7 @@ mod tests {
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 16));
         let head = native.plans.resident(HEAD).unwrap();
         assert_eq!(head.sample.get(), plan::SAMPLE - 1);
-        assert_eq!(head.versions[0].slot.misses.get(), 0);
+        assert_eq!(head.versions[0].slot.retry.get(), plan::MISSES);
         assert_eq!(
             (state.eip, state.regs[0], state.regs[2]),
             (stop, 0xff, 0xff)
@@ -1816,13 +1845,17 @@ mod tests {
                 native.code.cache.word(previous.next),
                 head::branch(previous.next, versions[mode as usize].entry)
             );
-            assert!(previous.slot.misses.get() >= plan::MISSES);
+            let (point, _) = previous.retry;
+            assert_eq!(
+                native.code.cache.word(point),
+                head::branch(point, previous.next)
+            );
         }
         let resident = native.plans.resident(HEAD).unwrap();
         let before: Vec<_> = resident
             .versions
             .iter()
-            .map(|v| v.slot.misses.get())
+            .map(|v| v.slot.retry.get())
             .collect();
         resident.sample.set(8);
         let mut state = resident_cpu(OUTSIDE, 2);
@@ -1836,7 +1869,7 @@ mod tests {
                 .versions
                 .iter()
                 .zip(before)
-                .all(|(v, before)| v.slot.misses.get() == before + 2)
+                .all(|(v, before)| v.slot.retry.get() == before)
         );
         let last = resident.versions.last().unwrap();
         assert_eq!(
@@ -2292,7 +2325,7 @@ mod tests {
         );
     }
 
-    // spec: A64-OPT-8
+    // spec: A64A-ROLE-8, A64A-PLACE-3, A64-OPT-8
     #[test]
     fn resident_probation_keeps_long_invocations() {
         let (mut memory, mut native, stop) = probation_loop(100);
@@ -2300,6 +2333,7 @@ mod tests {
         let version = &native.plans.resident(HEAD).unwrap().versions[0];
         assert!(version.probation.is_some());
         let patches = version.accounting.clone();
+        let sensors = version.probation_sensors.clone();
         for _ in 0..300 {
             let mut state = resident_cpu(OUTSIDE, 100);
             while state.eip != stop {
@@ -2313,27 +2347,44 @@ mod tests {
                 .into_iter()
                 .all(|(point, _)| native.code.cache.word(point) == crate::encode::NOP)
         );
+        assert!(
+            sensors
+                .into_iter()
+                .all(|point| native.code.cache.word(point)
+                    == crate::encode::b((runtime::SENSOR_BYTES + 4) as i32))
+        );
     }
 
-    // spec: A64-CTL-1, A64-OPT-8
+    // spec: A64A-ROLE-8, A64A-PLACE-3
+    #[test]
+    fn cold_recoveries_finish_probation_without_a_normal_completion() {
+        let (_memory, mut native, _) = probation_loop(2);
+        let head = native.plans.resident_mut(HEAD).unwrap();
+        head.checked.insert(HEAD);
+        assert!(head.versions[0].probation.is_some());
+        for _ in 0..plan::PROBATION {
+            native.resident_cold_exit((HEAD, 0), HEAD, ResidentCold::HostFault, false, 0, 0);
+        }
+        assert!(native.plans.resident(HEAD).unwrap().declined());
+    }
+
+    // spec: A64A-ROLE-8, A64-CTL-1, A64-OPT-8
     #[test]
     fn cache_clear_discards_pending_resident_events() {
-        let (_memory, mut native, _stop) = probation_loop(100);
-        let state = resident_cpu(HEAD, 100);
-        native.runtime.resident_point = 1;
-        native.runtime.resident_env = (u64::from(HEAD) << 32) | (1 << 8);
-        native.runtime.resident_probation = (u64::from(HEAD) << 32) | 1;
+        let (mut memory, mut native, _stop) = probation_loop(100);
+        let sample = BackEdgeSample {
+            generation: native.code.generation,
+            source: HEAD,
+            unit: native.code.units[&HEAD].unit,
+            at: resident_cpu(HEAD, 100),
+        };
         native.clear();
-        assert_eq!(native.runtime.resident_point, 0);
-        assert_eq!(native.runtime.resident_env, 0);
-        assert_eq!(native.runtime.resident_probation, 0);
-
-        native.runtime.resident_point = 1;
-        native.runtime.resident_env = (u64::from(HEAD) << 32) | (1 << 8);
-        native.runtime.resident_probation = (u64::from(HEAD) << 32) | 1;
-        native.resident_arrival(&state);
-        native.environment_miss();
-        native.finish_probation();
+        native
+            .translate(&mut memory, HEAD, crate::facts::Key::default())
+            .unwrap();
+        assert_eq!(native.code.units[&HEAD].unit, sample.unit);
+        native.apply_back_edge_sample(&mut memory, sample);
+        assert!(native.plans.resident(HEAD).is_none());
     }
 
     // spec: A64-REG-6, A64-MEM-1

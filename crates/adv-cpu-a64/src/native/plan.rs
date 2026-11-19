@@ -114,7 +114,7 @@ impl JobPlan {
             misses: Cell::new(0),
             forms: Cell::new(0),
             building: Cell::new(false),
-            reoffer: Cell::new(0),
+            reoffer: Cell::new(1),
             mode: Cell::new(mode),
             per_iteration: Cell::new(None),
             cost: Cell::new(0),
@@ -153,8 +153,8 @@ impl JobPlan {
 
     pub fn gate(&self) -> head::OfferEntry {
         head::OfferEntry {
-            reoffer: self.reoffer.as_ptr() as u64,
-            split_ticks: self.splits.then_some(self.split_ticks.as_ptr() as u64),
+            counter: self.reoffer.as_ptr() as u64,
+            split: self.splits,
         }
     }
 
@@ -162,11 +162,10 @@ impl JobPlan {
         use std::sync::atomic::Ordering::Relaxed;
 
         let ticks = self.split_ticks.get();
-        let due = gate.stale.load(Relaxed) != 0
+        gate.stale.load(Relaxed) != 0
             || ticks != 0
                 && (gate.split_over.load(Relaxed) != 0
-                    || super::ticks().wrapping_add(ticks) > gate.split_deadline.load(Relaxed));
-        due && self.worth_offering()
+                    || super::ticks().wrapping_add(ticks) > gate.split_deadline.load(Relaxed))
     }
 
     pub fn iteration(&self) -> bool {
@@ -182,12 +181,13 @@ impl JobPlan {
         self.reoffer.set(REOFFER);
     }
 
-    pub fn worth_offering(&self) -> bool {
-        let skip = self.reoffer.get();
-        if skip == 0 {
+    pub fn sample_offer(&self) -> bool {
+        let remaining = self.reoffer.get() - 1;
+        if remaining == 0 {
+            self.defer_offer();
             true
         } else {
-            self.reoffer.set(skip - 1);
+            self.reoffer.set(remaining);
             false
         }
     }
@@ -229,7 +229,7 @@ impl JobPlan {
             && deadline_recall
         {
             self.mode.set(if recalls >= 1 {
-                self.reoffer.set(0);
+                self.reoffer.set(1);
                 Mode::Trial
             } else {
                 Mode::Whole(recalls + 1)
@@ -243,9 +243,9 @@ impl JobPlan {
         let skip = if completion.elapsed < SHORT_JOB {
             (u64::from(runtime::COMPUTATION_SLICE) / completion.retired.max(1)).max(1) as u32
         } else {
-            0
+            REOFFER
         };
-        self.reoffer.set(skip);
+        self.reoffer.set(skip.max(REOFFER));
     }
 }
 
@@ -403,6 +403,7 @@ struct ColdWindow {
     start_entries: u64,
     start_iterations: u64,
     cold_iterations: u64,
+    cold_entries: u64,
     exits: FxHashMap<(u32, ResidentCold), u64>,
 }
 
@@ -498,9 +499,38 @@ impl std::fmt::Display for Decline {
 }
 
 impl Native {
+    pub(super) fn count_plan_event(&mut self, event: &'static str) {
+        if self.count_resident_entries {
+            *self.diagnostics.plan_events.entry(event).or_default() += 1;
+        }
+    }
+
+    fn count_sensor_decision(&mut self, decision: &'static str) {
+        if self.count_resident_entries {
+            *self
+                .diagnostics
+                .sensor_decisions
+                .entry(decision)
+                .or_default() += 1;
+        }
+    }
+
+    pub(super) fn apply_back_edge_sample(
+        &mut self,
+        memory: &mut Memory,
+        sample: super::BackEdgeSample,
+    ) {
+        if self.code.generation == sample.generation
+            && self.code.contains_unit(sample.source, sample.unit)
+            && self.plans.resident(sample.at.eip).is_none()
+        {
+            self.discover(memory, sample.at.eip, sample.source, sample.at);
+        }
+    }
+
     pub(super) fn resident_cold_exit(
         &mut self,
-        eip: u32,
+        (eip, version_index): (u32, usize),
         site: u32,
         reason: ResidentCold,
         checked: bool,
@@ -527,6 +557,19 @@ impl Native {
         }
         if head.declined() {
             return;
+        }
+        let version = &mut head.versions[version_index];
+        let measured = version.probation.is_some() || head.cold_window.is_some();
+        let retired = elapsed
+            .wrapping_sub(version.slot.countdown[0].get())
+            .wrapping_sub(u64::from(refund));
+        if let Some(probation) = &mut version.probation {
+            probation.cold_entries += 1;
+            probation.cold_retired += retired;
+            if probation.cold_entries == u64::from(PROBATION) {
+                self.finish_probation(eip, version_index);
+                return;
+            }
         }
         if reason == ResidentCold::HostFault && !checked {
             if count >= CHECKED_FAULTS && !head.checked.contains(&site) {
@@ -556,17 +599,14 @@ impl Native {
             });
         }
         let (entries, iterations) = head.accounted();
-        let version = &head.versions[self.runtime.resident_version as usize];
+        let version = &head.versions[version_index];
         let window = head.cold_window.as_mut().unwrap();
-        if entries > window.start_entries {
-            let retired = elapsed
-                .wrapping_sub(version.slot.countdown[0].get())
-                .wrapping_sub(u64::from(refund));
+        if measured {
             window.cold_iterations += version.iterations(retired);
         }
-        let visits = 1
-            + (entries - window.start_entries)
-                .max(iterations - window.start_iterations + window.cold_iterations);
+        window.cold_entries += 1;
+        let visits = (entries - window.start_entries + window.cold_entries)
+            .max(iterations - window.start_iterations + window.cold_iterations);
         if visits > u64::from(PROBATION) {
             *window = ColdWindow {
                 start_entries: entries,
@@ -633,18 +673,7 @@ impl Native {
             return;
         };
         // A unit dropped before stays in `placed`.
-        let current = self
-            .code
-            .units
-            .get(&entry)
-            .is_some_and(|unit| unit.unit == start)
-            || self.code.chains.get(&entry).is_some_and(|chain| {
-                chain
-                    .versions
-                    .iter()
-                    .any(|version| version.entry.unit == start)
-            });
-        if current {
+        if self.code.contains_unit(entry, start) {
             self.replace_unit(memory, entry, Key::read(cpu, facts::ALL));
         }
     }
@@ -693,6 +722,12 @@ impl Native {
         if link.back {
             let fallback = point + runtime::BACK_UNIT;
             self.code.repoint(fallback, unit);
+            if self.plans.counter_at(eip).unwrap().get() == u32::MAX {
+                let sensor = point + runtime::BACK_COUNT;
+                self.code
+                    .cache
+                    .patch(sensor, head::branch(sensor, fallback));
+            }
         }
         Self::route_link(
             &mut self.code.cache,
@@ -896,9 +931,6 @@ impl Native {
         self.code.point_facts.clear();
         self.code.internal_edges.clear();
         self.plans.clear_overlays();
-        self.runtime.resident_point = 0;
-        self.runtime.resident_env = 0;
-        self.runtime.resident_probation = 0;
         self.code.tier1_words.clear();
         self.code.placed.clear();
         self.code.helpers.clear();
@@ -1083,8 +1115,13 @@ impl Native {
             }
             if link.back {
                 self.code.back_points.insert(point);
-                let (address, _) = self.counter(link.eip);
+                let (address, count) = self.counter(link.eip);
                 self.bind_counter(point + runtime::BACK_COUNTER, address);
+                if count == u32::MAX {
+                    self.code
+                        .cache
+                        .patch(point + runtime::BACK_COUNT, b(runtime::SENSOR_BYTES as i32));
+                }
             }
         }
         for link in work.internal_links() {
@@ -1094,8 +1131,10 @@ impl Native {
                 transition: at + link.transition,
                 link: at + link.link,
                 source: eip,
+                unit: at,
                 source_pc: link.source_pc,
                 back: link.counter.is_some(),
+                sensor: link.sensor.map(|offset| at + offset),
             };
             let value = if let Some(counter) = link.counter {
                 let (address, value) = self.counter(link.eip);
@@ -1126,6 +1165,13 @@ impl Native {
                 self.code
                     .cache
                     .patch(edge.point, head::branch(edge.point, edge.target));
+            }
+            if value == u32::MAX
+                && let Some(sensor) = edge.sensor
+            {
+                self.code
+                    .cache
+                    .patch(sensor, head::branch(sensor, edge.target));
             }
             self.code
                 .internal_edges
@@ -1247,7 +1293,25 @@ impl Native {
     }
 
     pub(super) fn stop_counting(&mut self, eip: u32) {
+        self.count_sensor_decision("back_edge_discovery");
         self.plans.counter_at(eip).unwrap().set(u32::MAX);
+        let mut link = self.code.links.get(&eip).copied().unwrap_or(u32::MAX);
+        while let Some(edge) = self.code.linked.get(link as usize) {
+            if edge.back {
+                let sensor = edge.point + runtime::BACK_COUNT;
+                self.code
+                    .cache
+                    .patch(sensor, b(runtime::SENSOR_BYTES as i32));
+            }
+            link = edge.next;
+        }
+        for edge in self.code.internal_edges.get(&eip).into_iter().flatten() {
+            if let Some(sensor) = edge.sensor {
+                self.code
+                    .cache
+                    .patch(sensor, head::branch(sensor, edge.target));
+            }
+        }
         self.repoint_resident_edges(eip, None);
     }
 
@@ -1276,7 +1340,7 @@ impl Native {
         let head = self.plans.resident_mut(eip).unwrap();
         head.pending = Some(task);
         if let Some(last) = head.versions.last() {
-            last.slot.limit.set(0);
+            last.set_retry(&mut self.code.cache, None);
         }
         let mut checked = checked;
         checked.extend(&head.checked);
@@ -1296,25 +1360,23 @@ impl Native {
         });
     }
 
-    pub(super) fn resident_arrival(&mut self, cpu: &CpuState) {
-        let point = self.runtime.resident_point;
-        if point == 0 {
-            return;
-        }
+    pub(super) fn retry_resident(&mut self, cpu: &CpuState, version: usize) {
         let eip = cpu.eip;
-        let Some(head) = self.plans.resident_mut(eip) else {
-            return;
-        };
+        let head = self.plans.resident(eip).unwrap();
+        if head.rebuilds == 0
+            && head.pending.is_none()
+            && head.versions.len() == version + 1
+            && head.versions.len() < VERSIONS
+        {
+            self.count_sensor_decision("context_retry");
+            self.request_resident(eip, compile::Task::Append, cpu.clone());
+        }
+    }
+
+    pub(super) fn sample_resident_link(&mut self, cpu: &CpuState, eip: u32, point: usize) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        head.sample.set(SAMPLE);
         if head.rebuilds != 0 || matches!(head.pending, Some(compile::Task::Replace(_))) {
-            return;
-        }
-        if point == 1 {
-            if head.pending.is_none() && head.versions.len() < VERSIONS {
-                self.request_resident(eip, compile::Task::Append, cpu.clone());
-            }
-            return;
-        }
-        if head.versions.is_empty() {
             return;
         }
         self.diagnostics.rust_decisions_on_decided_sites += u64::from(head.probes == 0);
@@ -1363,6 +1425,10 @@ impl Native {
         }
         head.probes -= 1;
         if head.probes == 0 {
+            let version = &head.versions[0];
+            self.code
+                .cache
+                .patch(version.probe, head::branch(version.probe, version.entry));
             self.code.cache.patch(
                 head.trampoline,
                 head::branch(head.trampoline, head.versions[0].entry),
@@ -1372,29 +1438,18 @@ impl Native {
         if patched {
             self.code.cache.sync();
         }
+        if head.probes == 0 {
+            self.count_sensor_decision("resident_links_settled");
+        }
     }
 
-    pub(super) fn environment_miss(&mut self) {
-        let event = self.runtime.resident_env;
-        if event == 0 {
-            return;
-        }
-        let eip = (event >> 32) as u32;
-        let index = ((event >> 8) & 0xff) as usize - 1;
-        let Some(head) = self.plans.resident_mut(eip) else {
-            return;
-        };
-        let Some(version) = head.versions.get(index) else {
-            return;
-        };
-        let fact = event as u8 as usize;
-        let Some(env) = version.slot.env.get(fact) else {
-            return;
-        };
-        let Some(&site) = version.plain_sites.get(fact) else {
-            return;
-        };
-        env.set(0);
+    pub(super) fn environment_miss(&mut self, eip: u32, index: usize, fact: usize) {
+        let version = &self.plans.resident(eip).unwrap().versions[index];
+        let site = version.plain_sites[fact];
+        self.code
+            .cache
+            .patch(version.environment[fact], b(runtime::SENSOR_BYTES as i32));
+        self.count_sensor_decision("environment_rebuild");
         self.refuse_resident_fact(eip, site);
     }
 
@@ -1478,9 +1533,7 @@ impl Native {
                     if head.versions.len() < VERSIONS
                         && let Some(last) = head.versions.last()
                     {
-                        last.slot
-                            .limit
-                            .set(last.slot.misses.get().wrapping_add(MISSES));
+                        last.set_retry(&mut self.code.cache, Some(MISSES));
                     }
                     self.rebuild_resident(eip);
                 }
@@ -1547,6 +1600,8 @@ impl Native {
                 iteration_retired: u64::from(lowered.iteration_retired),
                 saved_words: u64::from(tier1 - lowered.iteration_words),
                 entry_exit_words: u64::from(lowered.entry_words + lowered.exit_words),
+                cold_entries: 0,
+                cold_retired: 0,
             });
         }
         let gate = self.plans.job(eip).map(JobPlan::gate);
@@ -1573,6 +1628,10 @@ impl Native {
             _ => head.versions.len(),
         };
         let slot = Box::<head::Slot>::default();
+        slot.probation.set(PROBATION);
+        for counter in &slot.env {
+            counter.set(MISSES);
+        }
         let mut entry = head::emit(
             (eip, index),
             &head.sample,
@@ -1584,9 +1643,12 @@ impl Native {
                 tier1,
                 exit: self.code.stubs.exit,
                 dispatch: self.code.stubs.dispatch,
-                opt_exit: self.code.stubs.opt_exit,
+                resident_exit: self.code.resident_exit,
             },
         );
+        let base = self.code.cache.next();
+        let probe_word = entry.words[(entry.probe - base) / 4];
+        let retry = (entry.retry, entry.words[(entry.retry - base) / 4]);
         let accounting = lowered
             .probation
             .iter()
@@ -1598,6 +1660,20 @@ impl Native {
                     entry.words[placed] = crate::encode::NOP;
                 }
                 (point, call)
+            })
+            .collect();
+        let probation_sensors = lowered
+            .probation_sensor
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .map(|&word| {
+                let point = entry.form + word * 4;
+                if probation.is_none() {
+                    entry.words[(point - base) / 4] = b((runtime::SENSOR_BYTES + 4) as i32);
+                }
+                point
             })
             .collect();
         if self.code.cache.append(&entry.words).is_none() {
@@ -1633,7 +1709,14 @@ impl Native {
         let version = head::Version {
             entry: entry.entry,
             probe: entry.probe,
+            probe_word,
             next: entry.next,
+            retry,
+            environment: lowered
+                .environment
+                .iter()
+                .map(|&(sensor, _)| entry.form + sensor)
+                .collect(),
             at,
             assumed: built.assumed,
             sources: built.func.entry,
@@ -1642,6 +1725,7 @@ impl Native {
             flags: lowered.flags,
             slot,
             probation,
+            probation_sensors,
             accounting,
             iteration_retired: u64::from(lowered.iteration_retired),
         };
@@ -1655,14 +1739,16 @@ impl Native {
         head.tier1 = tier1;
         head.probes = PROBES;
         head.sample.set(SAMPLE);
-        head.versions
-            .iter()
-            .for_each(|version| version.slot.limit.set(0));
-        if head.versions.len() < VERSIONS {
-            let last = &head.versions.last().unwrap().slot;
-            last.limit.set(last.misses.get().wrapping_add(MISSES));
+        let tail = head.versions.len() - 1;
+        for (index, version) in head.versions.iter().enumerate() {
+            version.set_retry(
+                &mut self.code.cache,
+                (index == tail && tail + 1 < VERSIONS).then_some(MISSES),
+            );
         }
         if head.rebuilds == 0 {
+            let first = &head.versions[0];
+            self.code.cache.patch(first.probe, first.probe_word);
             self.code
                 .cache
                 .patch(trampoline, head::branch(trampoline, head.versions[0].probe));
@@ -1744,27 +1830,14 @@ impl Native {
         }
     }
 
-    pub(super) fn finish_probation(&mut self) {
-        let event = self.runtime.resident_probation;
-        if event == 0 {
-            return;
-        }
-        let eip = (event >> 32) as u32;
-        let index = event as u32 as usize - 1;
-        let Some(head) = self.plans.resident_mut(eip) else {
-            return;
-        };
-        if index >= head.versions.len() {
-            return;
-        }
+    pub(super) fn finish_probation(&mut self, eip: u32, index: usize) {
         self.stop_cold_window(eip);
         let version = &mut self.plans.resident_mut(eip).unwrap().versions[index];
-        let Some(probation) = version.probation.take() else {
-            return;
-        };
+        let probation = version.probation.take().unwrap();
+        version.account(&mut self.code.cache, false);
         if probation.profitable(&version.slot) {
-            version.account(&mut self.code.cache, false);
             self.code.cache.sync();
+            self.count_sensor_decision("probation_kept");
         } else {
             crate::jit_map::demoted(
                 eip,
@@ -1772,6 +1845,7 @@ impl Native {
                 version.slot.entries.get(),
                 version.slot.countdown[1].get() / probation.iteration_retired,
             );
+            self.count_sensor_decision("probation_declined");
             self.decline_resident(eip, Decline::Unprofitable);
         }
     }
@@ -1876,19 +1950,21 @@ impl Native {
 
 /// Called by the `dispatch` stub with the guest EIP and the link point to
 /// patch, or 0. Returns the unit to continue at, or 0 to leave.
+pub(super) unsafe extern "C" fn lookup_miss(runtime: *mut Runtime, eip: u32, branch: u64) -> usize {
+    // SAFETY: the current run owns the CPU and the dispatch context.
+    unsafe {
+        record_branch(&mut *(*runtime).cpu, branch, eip);
+        let owner = &*((*runtime).owner as *const Owner);
+        (*owner.native).count_plan_event("lookup_miss");
+    }
+    unsafe { dispatch(runtime, eip, 0) }
+}
+
 pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> usize {
     // SAFETY: `run` points `owner` at a live `Owner` whose pointees it does
     // not touch while translated code runs.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
-    // An indirect transfer missed the table: record it as the interpreter
-    // would, so a jump to nowhere names its source.
-    let branch = std::mem::take(unsafe { &mut (*runtime).branch });
-    if branch != 0 {
-        // SAFETY: the runtime's CPU is live while units run.
-        let cpu = unsafe { &mut *(*runtime).cpu };
-        record_branch(cpu, branch, eip);
-    }
     if owner.error.is_some() {
         return 0;
     }
@@ -1909,12 +1985,6 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         native.code.cache.sync();
         native.code.faults.end.set(native.code.cache.next());
         return entry;
-    }
-    let back = native.code.back_points.contains(&point);
-    if back && native.plans.counter_at(eip).unwrap().get() == 0 {
-        native.stop_counting(eip);
-        owner.discovered = Some(eip);
-        return 0;
     }
     // A first visit runs in the owner; the point links on the next one.
     let entry = native.code.units.get(&eip).copied();

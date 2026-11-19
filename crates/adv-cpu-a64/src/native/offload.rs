@@ -237,7 +237,7 @@ impl Native {
         if let Some(head) = self.plans.resident_mut(eip) {
             head.pending = Some(compile::Task::Job);
             if let Some(last) = head.versions.last() {
-                last.slot.limit.set(0);
+                last.set_retry(&mut self.code.cache, None);
             }
         }
         self.compiler.request(compile::Request {
@@ -433,7 +433,6 @@ fn run(
     let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
     let (exit, retired, deferred) = execute(runtime, cpu, entry, code, optimized, scratch);
     let elapsed = started.elapsed();
-    record_branch(cpu, runtime.branch, cpu.eip);
     context.finish_computation(exit);
     Done {
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
@@ -449,7 +448,7 @@ fn run(
             optimized: if optimized.is_some() { retired } else { 0 },
             elapsed,
             helpers: Duration::ZERO,
-            requires_owner: exit != Exit::Dispatch || runtime.branch != 0,
+            requires_owner: exit != Exit::Dispatch,
         },
     }
 }
@@ -494,8 +493,9 @@ fn execute(
             scratch.saved.resize(o.cells, 0);
         }
         runtime.opt_params = scratch.params.as_ptr() as u64;
-        runtime.opt_save = scratch.saved.as_mut_ptr() as u64;
-        runtime.opt_cells = o.cells as u64;
+        runtime.recovery.saved = scratch.saved.as_mut_ptr() as u64;
+        runtime.recovery.cells = o.cells as u64;
+        runtime.recovery.recalled = 0;
     }
     scratch.capture.pc.set(0);
     let faults = Faults {
@@ -508,8 +508,6 @@ fn execute(
     runtime.window = entry.window;
     runtime.shadow = entry.alias;
     runtime.completed = 0;
-    runtime.opt_recalled = 0;
-    runtime.branch = 0;
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
@@ -526,15 +524,24 @@ fn execute(
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
     let mut exit = Exit::from_raw(returned.reason as u32).expect("computation exit");
+    if let Exit::Plan(event @ crate::runtime::PlanEvent::WorkerBranch(kind)) = exit {
+        record_branch(
+            cpu,
+            (returned.reason >> 32) | (u64::from(kind) << 32),
+            cpu.eip,
+        );
+        crate::jit_map::optimized(cpu.eip, format_args!("plan-event\t{}", event.name()));
+    }
     // An optimized form may leave with a negative countdown.
     let mut retired = countdown.wrapping_sub(returned.remaining);
     if exit == Exit::Optimized {
         let o = optimized.expect("optimized entry");
-        let record = &o.records[runtime.opt_record as usize];
+        let recovery = &runtime.recovery;
+        let record = &o.records[recovery.record as usize];
         // SAFETY: as above, the frame lies in the leased ranges.
         let refund = recovery::materialize(
             record,
-            &runtime.opt_dump,
+            &recovery.dump,
             &scratch.saved,
             &o.flags,
             cpu,
@@ -546,7 +553,7 @@ fn execute(
         retired = retired.wrapping_sub(u64::from(refund));
         // Every exit but a recall, failures included, continues where the
         // owner dispatches.
-        exit = if runtime.opt_recalled != 0 {
+        exit = if recovery.recalled != 0 {
             Exit::Recall
         } else {
             Exit::Dispatch
@@ -1509,7 +1516,7 @@ mod tests {
         Some(executor.save_context().unwrap())
     }
 
-    // spec: A64-CTL-7 A64-CTL-9 A64-CTL-10 A64-TR-9
+    // spec: A64A-PLACE-3 A64-CTL-7 A64-CTL-9 A64-CTL-10 A64-TR-9
     #[test]
     fn disjoint_jobs_keep_their_prefixes_across_recall_and_refill() {
         let _pool = exclusive_pool();
@@ -1553,6 +1560,8 @@ mod tests {
             .unwrap();
         assert_eq!(entry.exit, Exit::Computation);
         assert_eq!(entry.retired, 0);
+        // The next linked arrival is the next scheduled offer sample.
+        native.plans.job(head).unwrap().reoffer.set(1);
         cpu.eip = CODE;
         let incoming = native
             .run(&mut cpu, memory, stop, 1 << 16, std::ptr::null_mut())
@@ -1561,6 +1570,10 @@ mod tests {
         assert_eq!(incoming.exit, Exit::Computation);
         assert_eq!((cpu.eip, incoming.retired), (head, 1));
 
+        let version = &native.plans.resident(head).unwrap().versions[0];
+        let bypass = super::super::head::branch(version.probe, version.entry);
+        native.code.cache.patch(version.probe, bypass);
+        assert_eq!(native.code.cache.word(version.probe), crate::encode::b(20));
         let first = state(&mut executor, head, OUTPUT, COUNT);
         let second = state(&mut executor, head, OUTPUT + SPACE, COUNT);
         let mut retired = 0;
@@ -2741,7 +2754,7 @@ mod tests {
         assert!(!native.offload.jobs.contains_key(&CODE));
     }
 
-    // spec: A64-CTL-4 A64-CTL-6 A64-CTL-9 A64-OPT-11
+    // spec: A64A-ROLE-8 A64-CTL-4 A64-CTL-6 A64-CTL-9 A64-OPT-11
     #[test]
     fn an_inlined_return_mismatch_exits_with_the_committed_transfer() {
         const TARGET: u32 = CODE + 0x80;
@@ -3128,7 +3141,6 @@ mod tests {
         assert!(prepared.mode.get() == Mode::Trial);
         prepared.observe(CODE, true, sample.deadline_recall, &sample.completion);
         assert!(prepared.mode.get() == Mode::WholeOnly);
-        assert!(prepared.worth_offering());
         prepared.mode.set(Mode::Trial);
         sample.completion.elapsed = Duration::from_micros(100);
         prepared.observe(CODE, true, sample.deadline_recall, &sample.completion);

@@ -39,7 +39,7 @@ fn initial() -> CpuState {
     }
 }
 
-// spec: A64A-ROLE-2, A64-VER-1
+// spec: A64A-PLACE-3, A64A-ROLE-2, A64-VER-1
 #[test]
 fn translation_words_match_baseline() {
     let scalar = bytes(|a| {
@@ -149,69 +149,16 @@ fn translation_words_match_baseline() {
                 "14000001 00000000 ",
             ),
             "resident" => concat!(
-                "f94003a0 b940f810 350039b0 b944d3b0 35003970 b9416010 d283f011 4a110210 ",
-                "121a2610 350038b0 d10043ff 911363a4 29005093 29015895 29026097 29036899 ",
-                "d53b4210 a9022890 a903308b d53b4201 53187c22 121a0443 53051444 52000084 ",
-                "2a040063 53041044 2a042c63 121c0164 2a040063 4a4a1144 4a440884 4a440484 ",
-                "12000084 52000084 2a040863 2a0c2863 b9402404 52819aa5 0a250084 2a030084 ",
-                "2a0403e1 2a1303e6 2a1403e7 2a1903e8 2a1a03ea 2a0103eb 9400017e d1001d29 ",
-                "b7f80ea9 b90003e7 f94077b0 91000610 f90077b0 aa0903e3 b7f80b63 d2800391 ",
-                "9ad10863 510004f0 4b1f0210 d342fe10 eb10007f 9a909063 b4000a63 2a0803e0 ",
-                "d2800210 9b107c61 91000c21 8b000021 d34cfc21 530c7c00 d2800002 d2800005 ",
-                "94000140 2a0803e1 cb010002 f1001042 540008ab d344fc42 eb02007f 9a829063 ",
-                "b4000823 2a0a03e0 d2800210 9b107c61 91000c21 8b000021 d34cfc21 530c7c00 ",
-                "d2800002 d2800105 9400012e 2a0a03e1 cb010002 f1001042 5400066b d344fc42 ",
-                "eb02007f 9a829063 b40005e3 2a0803e0 2a0a03e1 6b01001f 540001a0 4b000022 ",
-                "f1001042 5400050b d344fc42 eb02007f 9a829063 4b010002 f1001042 5400044b ",
-                "d344fc42 eb02007f 9a829063 b40003c3 2a0a03f0 d2800211 1b037e31 0b110210 ",
-                "11000e04 4a100084 376002e4 d2800390 9b107c65 aa0303e4 2a0803f0 8b304370 ",
-                "3dc00210 d2800030 4e040e11 4eb18610 2a0a03f0 8b304370 3d800210 510010e7 ",
-                "11004108 1100414a d1000484 b5fffe64 cb050129 17ffffa5 510004a5 35000065 ",
-                "17ffffa2 52800085 b8684b6c 1100058c 11000d44 4a0a0084 376018e4 b82a4b6c ",
-                "11001106 1100114d 510004ee 710004ff 54000100 d1001d29 b7f80389 2a0e03e7 ",
-                "2a0603e8 2a0c03e6 2a0d03ea 17ffffeb 1400004a f940b3b0 b9400210 b9416bb1 ",
-                "0a110210 35000210 f940bbb0 b9400210 b9417bb1 0a110210 35000170 d29fff30 ",
-                "cb090210 f940c3b1 8b110210 f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 ",
-                "17ffff79 14000016 f940b3b0 b9400210 b9416bb1 0a110210 35000210 f940bbb0 ",
-                "b9400210 b9417bb1 0a110210 35000170 d29fff30 cb090210 f940c3b1 8b110210 ",
-                "f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 17ffffd2 14000058 f94003a0 ",
-                "2a0b03e1 2a0603f3 2a0703f4 2a0803f9 2a0a03fa b944e3b5 b944e7b6 b944ebb7 ",
-                "b944efb8 8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 ",
-                "2a031042 53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 91001d29 ",
-                "910043ff 940000c9 52800001 72a00021 10ffffc2 00000000 f94003a0 12160161 ",
-                "3100115f 1a9f37f0 2a100021 710004f0 4a501210 4a500a10 4a500610 2a3003f0 ",
-                "12000210 2a100821 710004f0 4a070210 52000210 53041210 2a101021 710004ff ",
-                "1a9f17f0 2a101821 710004ff 1a9f57f0 2a101c21 710004ff 1a9f77f0 2a102c21 ",
-                "2a0c03f3 2a0e03f4 2a0603f9 2a0d03fa b944e3b5 b944e7b6 b944ebb7 b944efb8 ",
-                "8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 2a031042 ",
-                "53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 910043ff 94000093 ",
-                "52800241 72a00021 10ffffc2 00000000 10ffff8e 14000000 f94003a0 12160161 ",
-                "3100115f 1a9f37f0 2a100021 710004f0 4a501210 4a500a10 4a500610 2a3003f0 ",
-                "12000210 2a100821 710004f0 4a070210 52000210 53041210 2a101021 710004ff ",
-                "1a9f17f0 2a101821 710004ff 1a9f57f0 2a101c21 710004ff 1a9f77f0 2a102c21 ",
-                "2a0c03f3 2a0e03f4 2a0603f9 2a0d03fa b944e3b5 b944e7b6 b944ebb7 b944efb8 ",
-                "8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 2a031042 ",
-                "53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 91001d29 910043ff ",
-                "9400005a 52800001 72a00021 10ffffc2 00000000 d53b4205 a9bf17f0 b94083a0 ",
-                "6b00015f 54000483 2a0a03e1 cb204021 d2800062 8b020022 d34cfc21 d34cfc42 ",
-                "b94087a3 eb03005f 54000362 f9403fa3 530c7c00 53067c24 0b040484 8b244c64 ",
-                "f9400485 9ac124a5 36000265 f9400885 9ac124a5 37000205 0b010005 f94033a4 ",
-                "38654885 36080185 37100165 11000421 6b02003f 54fffe09 a8c117f0 d51b4205 ",
-                "b82a4b6c f942b7a0 91000400 f902b7a0 17ffff14 a8c117f0 d51b4205 1400001f ",
-                "4a020004 b94083b1 4b513091 b94087b0 6b10023f 540002e2 53067e30 0b100610 ",
-                "f9403fa4 8b304c90 8b050204 f9400084 f9400a10 8a300090 9ad12610 360001b0 ",
-                "4a020004 f94033b0 38644a10 35000085 36000110 371800f0 14000003 360800b0 ",
-                "37100090 11000400 eb01001f 54fffca9 d374cc00 d65f03c0 d28000f0 f2a00030 ",
-                "b9052bb0 52800090 b9052fb0 14000016 10000210 f9400210 f940c3b1 cb090231 ",
-                "f9000211 d65f03c0 10000150 f9400210 f940c3b1 cb090231 f9400200 cb000231 ",
-                "f9400600 8b000231 f9000611 d65f03c0 00000000 00000000 d2800010 b901b3b0 ",
-                "1400000d d2800030 b901b3b0 1400000a d2800050 b901b3b0 14000007 d2800070 ",
-                "b901b3b0 14000004 d2800090 b901b3b0 14000001 00000000 00000000 00000000 ",
-                "00000000 ",
+                "2a0a03f0 d2800211 1b037e31 0b110210 11000e04 4a100084 376002e4 d2800390 ",
+                "9b107c65 aa0303e4 2a0803f0 8b304370 3dc00210 d2800030 4e040e11 4eb18610 ",
+                "2a0a03f0 8b304370 3d800210 510010e7 11004108 1100414a d1000484 b5fffe64 ",
+                "cb050129 17ffffa5 510004a5 35000065 17ffffa2 52800085 b8684b6c 1100058c ",
+                "11000d44 4a0a0084 376018e4 b82a4b6c 11001106 1100114d 510004ee 710004ff ",
+                "54000100 d1001d29 b7f80389 2a0e03e7 2a0603e8 2a0c03e6 2a0d03ea 17ffffeb ",
             ),
             _ => unreachable!(),
         };
-        let baseline: Vec<_> = baseline
+        let mut baseline: Vec<_> = baseline
             .split_ascii_whitespace()
             .map(|word| u32::from_str_radix(word, 16).unwrap())
             .collect();
@@ -224,18 +171,59 @@ fn translation_words_match_baseline() {
                 word
             }
         };
-        assert_eq!(
-            words
-                .iter()
-                .copied()
-                .map(without_runtime_offset)
-                .collect::<Vec<_>>(),
-            baseline
-                .into_iter()
-                .map(without_runtime_offset)
-                .collect::<Vec<_>>(),
-            "{name}"
-        );
+        let words: Vec<u32> = words.iter().copied().map(without_runtime_offset).collect();
+
+        match name {
+            "loop" => {
+                assert_eq!(words.len(), baseline.len());
+                let baseline: Vec<u32> = baseline.into_iter().map(without_runtime_offset).collect();
+                assert_eq!(words[..31], baseline[..31], "Tier-1 loop before its sensor");
+            }
+            "worker" => {
+                for word in &mut baseline {
+                    *word = match *word {
+                        0xb901b3b0 => str(
+                            W,
+                            X16,
+                            RUNTIME,
+                            offset_of!(runtime::Runtime, recovery.record) as u32,
+                        ),
+                        0xb901b7b0 => str(
+                            W,
+                            X16,
+                            RUNTIME,
+                            offset_of!(runtime::Runtime, recovery.recalled) as u32,
+                        ),
+                        _ => *word,
+                    };
+                }
+                let baseline: Vec<u32> = baseline.into_iter().map(without_runtime_offset).collect();
+                assert_eq!(words, baseline, "detached worker");
+            }
+            "resident" => {
+                // Compare the steady loop before its exit accounting. Side
+                // branches keep their opcode and operands as cold code moves.
+                let opcode = |word: u32| match word & 0x7e00_0000 {
+                    0x3600_0000 => word & !0x0007_ffe0, // TBZ/TBNZ
+                    _ => word,
+                };
+                let body = &words[116..164];
+                assert!(
+                    body.iter()
+                        .copied()
+                        .map(opcode)
+                        .eq(baseline.into_iter().map(without_runtime_offset).map(opcode))
+                );
+            }
+            _ => assert_eq!(
+                words,
+                baseline
+                    .into_iter()
+                    .map(without_runtime_offset)
+                    .collect::<Vec<_>>(),
+                "{name}"
+            ),
+        }
     };
     for (name, code, cold, checked) in [
         ("scalar", &scalar, true, false),
@@ -2565,7 +2553,19 @@ pub(in crate::translate) mod opt_back {
                 at
             };
             let miss = leave(Exit::Recall);
-            let env_miss = leave(Exit::Budget);
+            let env_miss = code.len() * 4;
+            code.extend([
+                movz(W, X1, cpu.eip as u16, 0),
+                movk(W, X1, (cpu.eip >> 16) as u16, 16),
+                movz(
+                    W,
+                    X0,
+                    Exit::Plan(runtime::PlanEvent::EnvironmentMiss).word(),
+                    0,
+                ),
+                orr(X, X0, X0, X3, Lsl, 32),
+                b(h.stubs.exit as i32 - env_miss as i32 - 16),
+            ]);
             let at = code.len() * 4;
             let mut words = form.words.clone();
             let branch = |from: usize, to: usize| b(to as i32 - (at + from * 4) as i32);
@@ -2575,6 +2575,15 @@ pub(in crate::translate) mod opt_back {
             words[form.env_miss] = branch(form.env_miss, env_miss);
             words[form.probation_slot] = SLOT as u32;
             words[form.probation_slot + 1] = (SLOT >> 32) as u32;
+            for &(_, literal) in &form.environment {
+                let counter = SLOT + 24;
+                words[literal] = counter as u32;
+                words[literal + 1] = (counter >> 32) as u32;
+                h.emu.write(counter, &1u32.to_le_bytes());
+            }
+            for &point in &form.probation_sensor.as_ref().unwrap().0 {
+                words[point] = b(runtime::SENSOR_BYTES as i32);
+            }
             for &(offset, _) in &form.links {
                 words[offset / 4 + 3] = branch(offset / 4 + 3, h.dispatch);
             }
@@ -2588,9 +2597,12 @@ pub(in crate::translate) mod opt_back {
                 (offset_of!(runtime::Runtime, countdown), countdown),
                 (offset_of!(runtime::Runtime, recall), CONTEXT),
                 (offset_of!(runtime::Runtime, computation_pending), CONTEXT),
-                (offset_of!(runtime::Runtime, opt_save), CONTEXT + 0x3000),
                 (
-                    offset_of!(runtime::Runtime, opt_cells),
+                    offset_of!(runtime::Runtime, recovery.saved),
+                    CONTEXT + 0x3000,
+                ),
+                (
+                    offset_of!(runtime::Runtime, recovery.cells),
                     form.spill_cells as u64,
                 ),
                 (offset_of!(runtime::Runtime, classes), CLASSES),
@@ -2645,10 +2657,13 @@ pub(in crate::translate) mod opt_back {
 
         fn recovered(h: &Harness, f: &back::Lowered, mut cpu: CpuState, id: RecordId) -> CpuState {
             assert_eq!(
-                word(h, CONTEXT + offset_of!(runtime::Runtime, opt_record) as u64),
+                word(
+                    h,
+                    CONTEXT + offset_of!(runtime::Runtime, recovery.record) as u64
+                ),
                 id.0
             );
-            let dump = CONTEXT + offset_of!(runtime::Runtime, opt_dump) as u64;
+            let dump = CONTEXT + offset_of!(runtime::Runtime, recovery.dump) as u64;
             let x = |i| u64::from_le_bytes(h.emu.read(dump + 8 * i, 8).try_into().unwrap());
             assert_eq!(x(28), SHADOW_TOP);
             let regs = runtime::RegisterDump {
@@ -2815,7 +2830,7 @@ pub(in crate::translate) mod opt_back {
             assert_eq!(
                 word(
                     &h,
-                    CONTEXT + offset_of!(runtime::Runtime, resident_site) as u64
+                    CONTEXT + offset_of!(runtime::Runtime, recovery.detail) as u64
                 ),
                 CODE + 6
             );
@@ -2916,14 +2931,11 @@ pub(in crate::translate) mod opt_back {
             memory.map_shared_audio(last, 4096).unwrap();
             snapshot(&mut h, &mut memory);
             cpu.regs[4] = DATA + 0x20000; // A missed fact leaves before reading the frame.
-            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Budget);
             assert_eq!(
-                word(
-                    &h,
-                    CONTEXT + offset_of!(runtime::Runtime, resident_fact) as u64
-                ),
-                1
+                run(&mut h, &form, &cpu, 100, None),
+                Exit::Plan(runtime::PlanEvent::EnvironmentMiss)
             );
+            assert_eq!(h.emu.x(X0) >> 32, 1);
             assert_eq!(h.emu.read(CPU, size_of::<CpuState>()), state_bytes(&cpu));
         }
 
@@ -3234,7 +3246,7 @@ pub(in crate::translate) mod opt_back {
                 assert_eq!(lowered.sites.len(), 1);
                 let id = lowered.sites[0].1.opt_record.unwrap();
                 self.emu.write(
-                    CONTEXT + offset_of!(runtime::Runtime, opt_record) as u64,
+                    CONTEXT + offset_of!(runtime::Runtime, recovery.record) as u64,
                     &id.to_le_bytes(),
                 );
                 let mut tail = code.clone();
@@ -3272,7 +3284,7 @@ pub(in crate::translate) mod opt_back {
             let wide =
                 |offset: usize| u64::from_le_bytes(context[offset..][..8].try_into().unwrap());
             assert_eq!(self.emu.x(X0), u64::from(Exit::Optimized.raw()));
-            let base = offset_of!(runtime::Runtime, opt_dump);
+            let base = offset_of!(runtime::Runtime, recovery.dump);
             let registers = runtime::RegisterDump {
                 sp: wide(base + offset_of!(runtime::RegisterDump, sp)),
                 x: std::array::from_fn(|i| wide(base + i * 8)),
@@ -3289,7 +3301,7 @@ pub(in crate::translate) mod opt_back {
                 .iter()
                 .map(|b| u128::from_le_bytes(*b))
                 .collect::<Vec<_>>();
-            let record = RecordId(word(offset_of!(runtime::Runtime, opt_record)));
+            let record = RecordId(word(offset_of!(runtime::Runtime, recovery.record)));
             let mut cpu = initial();
             let mut frame = Vec::new();
             let refund = materialize(

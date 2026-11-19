@@ -98,8 +98,8 @@ impl Emitter<'_> {
         }
     }
 
-    pub(super) fn page_crossings(&mut self) {
-        let counter = offset_of!(Runtime, resident_page_crossings) as u32;
+    pub(super) fn page_crossings(&mut self, count: bool) {
+        let counter = offset_of!(Runtime, resident_crossing_counter) as u32;
         for cross in std::mem::take(&mut self.page_crossings) {
             self.asm.bind(cross.crossing);
             self.mark(Part::Cold, cross.eip);
@@ -111,12 +111,15 @@ impl Emitter<'_> {
             self.asm
                 .emit_all(&[ldp(X, Index::Post, T, X5, SP, 16), msr_nzcv(X5)]);
             self.sites.push((self.asm.offset(), cross.fault));
-            self.asm.emit_all(&[
-                cross.direct,
-                ldr(X, X0, RT, counter),
-                add_imm(X, X0, X0, 1, false),
-                str(X, X0, RT, counter),
-            ]);
+            self.asm.emit(cross.direct);
+            if count {
+                self.asm.emit_all(&[
+                    ldr(X, X1, RT, counter),
+                    ldr(X, X0, X1, 0),
+                    add_imm(X, X0, X0, 1, false),
+                    str(X, X0, X1, 0),
+                ]);
+            }
             self.asm.b(cross.resume);
             self.asm.bind(blocked);
             self.asm
@@ -194,8 +197,7 @@ impl Emitter<'_> {
             self.asm.b(resume);
 
             self.asm.bind(blocked);
-            self.record_cold(ResidentCold::BlockedAccess, eip);
-            self.asm.b(self.cold[region.0 as usize]);
+            self.cold_exit(region, ResidentCold::BlockedAccess, eip);
         }
     }
 
@@ -433,6 +435,10 @@ pub(super) fn preserve_call(asm: &mut Asm, helper: u64) {
 pub(super) struct Probation {
     pub slot: Label,
     pub calls: Vec<usize>,
+    pub counter: Label,
+    pub leave: Label,
+    pub sensors: Vec<usize>,
+    exits: Vec<(Label, u32)>,
     snapshot: Label,
     account: Label,
 }
@@ -442,6 +448,10 @@ impl Probation {
         Self {
             slot: asm.label(),
             calls: Vec::new(),
+            counter: asm.label(),
+            leave: asm.label(),
+            sensors: Vec::new(),
+            exits: Vec::new(),
             snapshot: asm.label(),
             account: asm.label(),
         }
@@ -452,21 +462,26 @@ impl Probation {
         asm.bl(if entry { self.snapshot } else { self.account });
     }
 
+    pub fn sensor(&mut self, asm: &mut Asm, eip: u32) {
+        let trigger = asm.label();
+        self.sensors.push(asm.offset() / 4);
+        self.exits.push((trigger, eip));
+        runtime::emit_sensor(asm, self.counter, T, U, trigger);
+    }
+
     pub fn emit(&self, asm: &mut Asm) {
         asm.bind(self.snapshot);
-        asm.adr(T, self.slot);
+        asm.ldr_literal(T, self.slot);
         // A refill adds the same amount to completed and the countdown.
         asm.emit_all(&[
-            ldr(X, T, T, 0),
             ldr(X, U, RT, runtime::COMPLETED),
             sub(X, U, U, COUNT, Lsl, 0),
             str(X, U, T, 0),
             ret(Reg::LR),
         ]);
         asm.bind(self.account);
-        asm.adr(T, self.slot);
+        asm.ldr_literal(T, self.slot);
         asm.emit_all(&[
-            ldr(X, T, T, 0),
             ldr(X, U, RT, runtime::COMPLETED),
             sub(X, U, U, COUNT, Lsl, 0),
             ldr(X, X0, T, 0),
@@ -474,9 +489,22 @@ impl Probation {
             ldr(X, X0, T, 8),
             add(X, U, U, X0, Lsl, 0),
             str(X, U, T, 8),
+            ldr(X, U, T, 16),
+            add_imm(X, U, U, 1, false),
+            str(X, U, T, 16),
             ret(Reg::LR),
         ]);
+        for &(trigger, eip) in &self.exits {
+            asm.bind(trigger);
+            asm.bl(self.account);
+            crate::translate::emit_target(asm, eip);
+            asm.b(self.leave);
+        }
+        asm.bind(self.leave);
+        asm.emit(0);
         asm.bind(self.slot);
+        asm.emit_all(&[0, 0]);
+        asm.bind(self.counter);
         asm.emit_all(&[0, 0]);
     }
 }

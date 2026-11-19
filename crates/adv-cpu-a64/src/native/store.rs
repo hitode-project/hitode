@@ -71,8 +71,10 @@ pub(super) struct InternalEdge {
     pub(super) transition: usize,
     pub(super) link: usize,
     pub(super) source: u32,
+    pub(super) unit: usize,
     pub(super) source_pc: u32,
     pub(super) back: bool,
+    pub(super) sensor: Option<usize>,
 }
 
 #[derive(Default)]
@@ -82,6 +84,7 @@ pub(super) struct SlowPaths {
 }
 
 pub(super) struct CodeStore {
+    pub(super) resident_exit: usize,
     /// Switch-table slots by guest target: source entry, host slot and
     /// original shared stub. Dispatch looks targets up on every miss.
     pub(super) rows: FxHashMap<u32, Vec<(u32, usize, usize)>>,
@@ -130,6 +133,18 @@ pub(super) struct CodeStore {
 }
 
 impl CodeStore {
+    pub(super) fn contains_unit(&self, entry: u32, address: usize) -> bool {
+        self.units
+            .get(&entry)
+            .is_some_and(|unit| unit.unit == address)
+            || self.chains.get(&entry).is_some_and(|chain| {
+                chain
+                    .versions
+                    .iter()
+                    .any(|version| version.entry.unit == address)
+            })
+    }
+
     pub(super) fn link(&mut self, point: usize, eip: u32) -> Linked {
         let link = Linked {
             point,
@@ -269,7 +284,7 @@ pub(super) fn tier1_words(
             *words.entry(start.eip).or_default() +=
                 ((link.offset + 4 - start.offset as usize) / 4) as u32;
         } else if let Some(mark) = marks.get(at - 1) {
-            *words.entry(mark.eip).or_default() -= ((runtime::BACK_COUNTER + 4) / 4) as u32;
+            *words.entry(mark.eip).or_default() -= (runtime::BACK_END / 4) as u32;
         }
     }
     words

@@ -235,6 +235,7 @@ pub(crate) struct InternalLink {
     pub transition: usize,
     pub link: usize,
     pub counter: Option<usize>,
+    pub sensor: Option<usize>,
     pub source_pc: u32,
 }
 
@@ -2148,6 +2149,7 @@ impl Translator<'_> {
         self.far(self.stubs.dispatch);
         let direct = if back {
             crate::runtime::emit_back_count(self.asm);
+            self.exit(Exit::Plan(crate::runtime::PlanEvent::DiscoverBackEdge), eip);
             None
         } else if self.resident_links {
             Some(emit_link_transition(self.asm, offset))
@@ -2218,7 +2220,7 @@ impl Translator<'_> {
         self.push_cold(Cold::Miss { label, to, branch });
     }
 
-    /// `Runtime::branch` for an indirect transfer of `kind` from here.
+    /// Descriptor for an indirect transfer of `kind` from here.
     fn indirect(&self, kind: IndirectBranchKind) -> u64 {
         u64::from(self.trace.insts[self.index].pc) | (kind as u64) << 32
     }
@@ -2231,11 +2233,13 @@ impl Translator<'_> {
 
     /// Leaves after a completed transfer whose guest target is in w16.
     fn computation_transfer(&mut self, branch: u64) {
-        self.mov_branch(branch);
+        let kind = (branch >> 32) as u8;
+        let reason = Exit::Plan(crate::runtime::PlanEvent::WorkerBranch(kind));
         self.emit_all(&[
-            str(X, X4, RUNTIME, crate::runtime::INDIRECT_BRANCH),
+            movz(X, X0, reason.word(), 0),
+            movk(X, X0, branch as u16, 32),
+            movk(X, X0, (branch >> 16) as u16, 48),
             mov(W, X1, X16),
-            movz(W, X0, Exit::Dispatch.word(), 0),
         ]);
         self.far(self.stubs.exit);
     }
@@ -2374,14 +2378,7 @@ impl Translator<'_> {
                     let counter = self.asm.label();
                     let hot = self.asm.label();
                     self.asm.bind(count);
-                    self.asm.adr(X0, counter);
-                    self.emit_all(&[
-                        ldr(X, X0, X0, 0),
-                        ldr(W, X1, X0, 0),
-                        sub_imm(W, X1, X1, 1, false),
-                        str(W, X1, X0, 0),
-                    ]);
-                    self.asm.cbz(W, false, X1, hot);
+                    crate::runtime::emit_sensor(self.asm, counter, X0, X1, hot);
                     self.asm.b(target);
                     self.asm.bind(hot);
                     crate::runtime::emit_save_light(self.asm);
@@ -2416,7 +2413,8 @@ impl Translator<'_> {
                     self.asm.adr(X2, point);
                     self.emit_all(&[
                         mov(X, X0, RUNTIME),
-                        ldr(X, X16, RUNTIME, crate::runtime::RESIDENT_DISCOVER),
+                        movz(W, X3, crate::runtime::DISCOVER_INTERNAL, 0),
+                        ldr(X, X16, RUNTIME, crate::runtime::PLAN_OBSERVATION),
                         blr(X16),
                     ]);
                     for i in (1..4).rev() {
@@ -2466,6 +2464,7 @@ impl Translator<'_> {
                     transition,
                     link,
                     counter,
+                    sensor: count.map(|sensor| self.asm.position(sensor)),
                     source_pc,
                 });
                 self.internal_targets.push(target);
