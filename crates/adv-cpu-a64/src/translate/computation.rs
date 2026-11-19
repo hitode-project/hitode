@@ -1146,7 +1146,7 @@ impl Builder<'_> {
                     Fast::StoreControl | Fast::StoreStatus => (2, true),
                     Fast::Load80 => (10, false),
                     Fast::Store80 => (10, true),
-                    Fast::Leaf(_) => return None,
+                    Fast::Sqrt | Fast::Leaf(_) => return None,
                     _ => (0, false),
                 };
                 if let Some(mem) = x.mem {

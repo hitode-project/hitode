@@ -314,6 +314,7 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         | Op::Stack(..)
         | Op::Lahf
         | Op::Timestamp
+        | Op::Cpuid
         | Op::Syscall
         | Op::Helper(_)
         | Op::Body(_)
