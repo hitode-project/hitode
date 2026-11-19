@@ -692,6 +692,7 @@ impl Executor {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);
                     }
+                    Exit::Plan(_) => unreachable!("plan events complete at the native boundary"),
                     Exit::Optimized => {
                         unreachable!("optimized forms run only on computation workers")
                     }

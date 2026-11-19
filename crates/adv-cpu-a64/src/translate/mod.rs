@@ -395,6 +395,13 @@ enum Cold {
         vector: simd::Vector,
         pushes: Vec<decode::Src>,
     },
+    BodyFallback {
+        label: Label,
+        state: State,
+        vector: simd::Vector,
+        pushes: Vec<decode::Src>,
+        thunk: u32,
+    },
     BodyYield {
         label: Label,
         vector: simd::Vector,
@@ -2250,6 +2257,18 @@ impl Translator<'_> {
                 self.mov_imm(X3, len);
                 self.body_call(body);
                 self.asm.b(resume);
+            }
+            Cold::BodyFallback {
+                label,
+                state,
+                vector,
+                pushes,
+                thunk,
+            } => {
+                self.asm.bind(label);
+                self.state = state;
+                self.vector = vector;
+                self.body_fallback(source, &pushes, thunk);
             }
             Cold::BodyYield {
                 label,

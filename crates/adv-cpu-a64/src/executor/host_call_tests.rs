@@ -947,6 +947,32 @@ fn forwarded_body_arguments_materialize_on_stops_and_budget_cuts() {
     }
 }
 
+// spec: A64-CALL-4 A64-CALL-5
+#[test]
+fn crossing_body_stack_uses_checked_generated_pushes() {
+    use crate::body::Inline;
+
+    let host_size = adv_cpu_core::virtual_memory::host_page_size().unwrap();
+    let (mut cpu, mut calls, stop) = small_fixture(
+        host_size,
+        Inline::Move,
+        [DATA + 0x100, DATA + 0x200, 16],
+        3,
+        false,
+    );
+    let stack = STACK + 0x3008;
+    cpu.state.regs[4] = stack;
+    cpu.write(DATA + 0x200, &[0x71; 16]).unwrap();
+    assert_eq!(
+        cpu.run_with_traps(stop, 1000, &mut calls, false).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    assert_eq!(cpu.state.regs[4], stack);
+    assert_eq!(cpu.memory.read(DATA + 0x100, 16).unwrap(), &[0x71; 16]);
+    assert_eq!(cpu.stats.interpreter_entries, 0);
+    assert_eq!(calls.full, 1);
+}
+
 // spec: A64-CALL-2, A64-CALL-4, A64-CALL-8
 #[test]
 fn forwarded_body_stack_aliases_retry_before_access() {

@@ -539,9 +539,8 @@ impl Translator<'_> {
     /// Calls direct body `bound` (A64-CALL-2): at a call, whose arguments
     /// start at ESP and whose return address is never stored, or at the
     /// entry, returning as the function does. A body that stops leaves for
-    /// the full path before anything changed: a call runs again in the
-    /// interpreter, whose transfer reaches the thunk, and an entry continues
-    /// at the thunk.
+    /// the full path. A call materializes its return address before transferring
+    /// to the thunk. An entry already has its caller's return address.
     fn body(&mut self, inst: Inst, bound: super::Bound) {
         use adv_cpu_core::body::{EAX, ECX, EDX, Input};
         // AAPCS64 keeps x19-x29 and d8-d15: the guest map survives; the
@@ -555,8 +554,8 @@ impl Translator<'_> {
             self.prepare(Operand::Guest(ESP));
             if self.body_stack_span().is_none() {
                 let retry = self.asm.label();
-                // Check the complete stack input span before committing any omitted
-                // push. A blocked or crossing stack runs those pushes in Tier 0.
+                // Check the complete stack input span before omitting any
+                // push. The cold path performs the original checked stores.
                 let count = body
                     .inputs
                     .iter()
@@ -572,15 +571,12 @@ impl Translator<'_> {
                     .unwrap();
                 self.emit(sub_imm(W, X16, host(ESP), pushes.len() as u32 * 4, false));
                 self.body_page(X16, count * 4, true, retry);
-                self.push_cold(Cold::Leave {
+                self.push_cold(Cold::BodyFallback {
                     label: retry,
                     state: self.state,
-                    simd_dirty: self.vector.dirty,
-                    refund: self.trace.owed(self.index - pushes.len()),
-                    exit: Exit::Interpret,
-                    eip: self.trace.insts[self.index - pushes.len()].pc,
-                    link: false,
-                    x87: None,
+                    vector: self.vector,
+                    pushes: pushes.clone(),
+                    thunk: bound.thunk,
                 });
             }
             self.emit(sub_imm(
@@ -686,20 +682,26 @@ impl Translator<'_> {
         self.state = State::CANONICAL;
         let slow = self.asm.label();
         self.asm.tbz(true, X1, 32, slow);
-        self.push_cold(Cold::Leave {
-            label: slow,
-            state: State::CANONICAL,
-            simd_dirty: self.vector.dirty,
-            refund: self.trace.owed(self.index),
-            exit: if bound.entry {
-                Exit::Dispatch
-            } else {
-                Exit::Interpret
-            },
-            eip: if bound.entry { bound.thunk } else { inst.pc },
-            link: bound.entry,
-            x87: None,
-        });
+        if bound.entry {
+            self.push_cold(Cold::Leave {
+                label: slow,
+                state: State::CANONICAL,
+                simd_dirty: self.vector.dirty,
+                refund: self.trace.owed(self.index),
+                exit: Exit::Dispatch,
+                eip: bound.thunk,
+                link: true,
+                x87: None,
+            });
+        } else {
+            self.push_cold(Cold::BodyFallback {
+                label: slow,
+                state: self.state,
+                vector: self.vector,
+                pushes: Vec::new(),
+                thunk: bound.thunk,
+            });
+        }
         if body.outputs & EAX != 0 {
             self.clobber(Operand::Guest(0));
             self.emit(mov(W, host(0), X0));
@@ -731,6 +733,37 @@ impl Translator<'_> {
         if bound.entry {
             self.ret(inst, body.pop);
         }
+    }
+
+    /// Recreate only the omitted stores and the CALL's return address.
+    /// Each store retains the original guest instruction as its fault site.
+    pub(super) fn body_fallback(&mut self, call: usize, pushes: &[Src], thunk: u32) {
+        let checked = self.checking;
+        self.checking = true;
+        for (index, source) in (call - pushes.len()..call).zip(pushes.iter().rev()) {
+            self.index = index;
+            let value = match *source {
+                Src::Reg(ESP) | Src::Mem(_) => {
+                    self.emit(ldr(W, X6, RUNTIME, runtime::BODY_VALUE));
+                    X6
+                }
+                Src::Reg(index) => host(index),
+                Src::Imm(value) => self.imm(value, X6),
+            };
+            self.push(value);
+        }
+        self.index = call;
+        self.mov_imm(X6, self.trace.insts[call].next_pc);
+        self.push(X6);
+        self.checking = checked;
+        self.leave(
+            Exit::Dispatch,
+            thunk,
+            self.trace.unused(call),
+            true,
+            false,
+            false,
+        );
     }
 
     /// Complete an entry return before handing the committed call to its owner.

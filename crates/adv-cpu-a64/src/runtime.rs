@@ -314,6 +314,12 @@ pub enum Event {
     Software { vector: u8, len: u8 },
 }
 
+/// A plan decision that must be applied after leaving generated code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanEvent {
+    BodyStack,
+}
+
 /// Why translated code returned to the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -321,6 +327,7 @@ pub enum Exit {
     Interpret,
     /// Look up or translate the unit at EIP.
     Dispatch,
+    Plan(PlanEvent),
     Event(Event),
     /// The `interpret` helper left a step for the owner to complete.
     Stepped,
@@ -354,6 +361,7 @@ impl Exit {
             Self::Optimized => 9,
             Self::FirstVisit => 10,
             Self::Event(Event::PendingX87) => 11,
+            Self::Plan(PlanEvent::BodyStack) => 12,
             Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
             Self::Event(Event::Software { vector, len }) => {
                 0x2000 | (len as u16) << 8 | vector as u16
@@ -378,6 +386,7 @@ impl Exit {
             8 => Some(Self::Budget),
             9 => Some(Self::Optimized),
             11 => Some(Self::Event(Event::PendingX87)),
+            12 => Some(Self::Plan(PlanEvent::BodyStack)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {
                 vector: raw as u8,

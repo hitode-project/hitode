@@ -13,7 +13,7 @@ use super::{
     alias_base, call, interpret, timestamp, value,
 };
 use crate::facts::{self, Key};
-use crate::runtime::{Event, Exit, ResidentCold, Runtime};
+use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
 use crate::translate;
 
 impl Native {
@@ -147,7 +147,7 @@ impl Native {
             Exit::Optimized => {}
             Exit::Interpret => self.diagnostics.interprets += 1,
             Exit::Event(Event::Replay) => self.diagnostics.faults += 1,
-            Exit::Event(_) => {}
+            Exit::Event(_) | Exit::Plan(_) => {}
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
             Exit::FirstVisit => unreachable!("first visits begin in the owner"),
@@ -193,6 +193,10 @@ impl Native {
         if let Some((site, reason, checked, refund)) = resident_cold {
             // A rebuild may replace versions named by this run's entry events.
             self.resident_cold_exit(self.runtime.opt_head, site, reason, checked, refund);
+        }
+        if exit == Exit::Plan(PlanEvent::BodyStack) {
+            self.refuse_body_stack(memory, cpu);
+            exit = Exit::Dispatch;
         }
         if budget_exit {
             self.sample(memory, cpu);

@@ -218,6 +218,9 @@ impl Translator<'_> {
     /// loop labels. Backedges then reuse that grant until the next dispatch.
     pub(super) fn body_stack_span(&self) -> Option<(i32, u32)> {
         use super::trace::{Edge, Next};
+        if (self.checked)(self.trace.insts[0].pc) {
+            return None;
+        }
         let mut offsets = Vec::new();
         let (mut delta, mut low, mut high) = (0i32, 0i32, 0i32);
         let mut found = false;
@@ -355,7 +358,7 @@ impl Translator<'_> {
                 state: self.state,
                 simd_dirty: self.vector.dirty,
                 refund: self.trace.prepaid(0),
-                exit: Exit::Interpret,
+                exit: Exit::Plan(crate::runtime::PlanEvent::BodyStack),
                 eip: self.trace.insts[0].pc,
                 link: false,
                 x87: None,

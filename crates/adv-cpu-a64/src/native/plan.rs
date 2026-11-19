@@ -741,13 +741,24 @@ impl Native {
         cache.patch(point, link.branch(target));
     }
 
+    /// Rebuild with checked argument stores at each site after the entry's
+    /// hoisted stack guard refused the span.
+    pub(super) fn refuse_body_stack(&mut self, memory: &mut Memory, cpu: &CpuState) {
+        let eip = cpu.eip;
+        self.plans.mark_checked(eip);
+        if !self.replace_unit(memory, eip, Key::read(cpu, facts::ALL)) {
+            self.clear();
+        }
+    }
+
     /// Tier-1 replacement keeps old continuations and all their watches.
-    pub(super) fn replace_unit(&mut self, memory: &mut Memory, eip: u32, observed: Key) {
+    pub(super) fn replace_unit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> bool {
         let Some(new) = self.emit(memory, eip, observed) else {
-            return;
+            return false;
         };
         self.repoint_tier1(eip, new.unit);
         self.code.cache.sync();
+        true
     }
 
     fn repoint_tier1(&mut self, eip: u32, checked: usize) {
