@@ -1409,10 +1409,11 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
         }
         let overwritten = match inst.op {
             decode::Op::X87(x) => {
-                if let adv_cpu_core::floating::fast::Fast::Store { width, .. } = x.fast {
-                    x.mem.map(|m| (m, width))
-                } else {
-                    None
+                use adv_cpu_core::floating::fast::Fast;
+                match x.fast {
+                    Fast::Store { width, .. } => x.mem.map(|m| (m, width)),
+                    Fast::StoreControl => x.mem.map(|m| (m, 2)),
+                    _ => None,
                 }
             }
             decode::Op::Simd(s) if s.dst == crate::translate::simd::Loc::Mem => {

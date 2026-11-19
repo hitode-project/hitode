@@ -77,6 +77,48 @@ fn initial(count: u32) -> CpuState {
     }
 }
 
+// spec: A64-OPT-2, A64-OPT-9
+#[test]
+fn resident_reads_esp_after_a_push_with_a_known_stack_pointer() {
+    let image = Image::loop_body(|a, head, _| {
+        a.mov(esp, FRAME).unwrap();
+        a.push(edx).unwrap();
+        a.mov(eax, esp).unwrap();
+        a.pop(edx).unwrap();
+        latch(a, head);
+    });
+    let state = initial(8);
+    let mut trial = Trial::new(&image, &state, "known ESP after push", &[], |_| {});
+    trial.install();
+    assert_eq!(trial.compare(128).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.live.state.regs[0], FRAME - 4);
+}
+
+// spec: A64-OPT-2, A64-OPT-3
+#[test]
+fn resident_reloads_a_saved_frame_pointer_after_a_control_word_store() {
+    let image = Image::loop_body(|a, head, _| {
+        a.push(esp).unwrap();
+        a.fnstcw(word_ptr(esp)).unwrap();
+        a.pop(ebp).unwrap();
+        a.mov(eax, dword_ptr(ebp)).unwrap();
+        a.mov(ebp, esp).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(8);
+    state.regs[5] = FRAME;
+    state.x87.status |= 0x20;
+    let restored = (FRAME & 0xffff_0000) | u32::from(state.x87.control);
+    let mut trial = Trial::new(&image, &state, "modified saved frame pointer", &[], |m| {
+        m.map(restored & !0x3fff, HOST_PAGE, READ | WRITE).unwrap();
+        m.write(restored, &42u32.to_le_bytes()).unwrap();
+        m.write(FRAME, &17u32.to_le_bytes()).unwrap();
+    });
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(128).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.live.state.regs[0], 42);
+}
+
 struct Trial<'a> {
     live: Executor,
     reference: Executor,

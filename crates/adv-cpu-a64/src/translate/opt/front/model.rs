@@ -444,9 +444,13 @@ impl Model {
                     4,
                     offsets,
                 );
+                self.regs[ESP as usize] = (0, 0);
                 self.write(Part::Reg(r), 4, v, offsets);
             }
-            D::Leave => self.regs[EBP as usize] = (0, 0),
+            D::Leave => {
+                self.regs[ESP as usize] = (0, 0);
+                self.regs[EBP as usize] = (0, 0);
+            }
             D::Extend(dst, src, signed) => {
                 let (src, width) = match src {
                     decode::Narrow8or16::Byte(r) => (Part::Reg(r), 1),
@@ -500,8 +504,9 @@ impl Model {
                     value,
                     offsets,
                 );
+                self.regs[ESP as usize] = (0, 0);
             }
-            D::Call(_) => {}
+            D::Call(_) | D::Ret(_) => self.regs[ESP as usize] = (0, 0),
             _ => {}
         }
         Ok(())
