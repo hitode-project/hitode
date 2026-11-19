@@ -514,7 +514,7 @@ fn execute(
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
-    unsafe {
+    let returned = unsafe {
         // The publisher's ISB does not synchronize the worker's instruction stream.
         std::arch::asm!("isb", options(nostack, preserves_flags));
         let target_enter = if optimized.is_some() {
@@ -522,13 +522,13 @@ fn execute(
         } else {
             entry.enter
         };
-        target_enter(runtime, code.entry);
-    }
+        target_enter(runtime, code.entry)
+    };
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
-    let mut exit = Exit::from_raw(runtime.exit).expect("computation exit");
+    let mut exit = Exit::from_raw(returned.reason as u32).expect("computation exit");
     // An optimized form may leave with a negative countdown.
-    let mut retired = (runtime.completed + countdown).wrapping_sub(runtime.countdown);
+    let mut retired = countdown.wrapping_sub(returned.remaining);
     if exit == Exit::Optimized {
         let o = optimized.expect("optimized entry");
         let record = &o.records[runtime.opt_record as usize];

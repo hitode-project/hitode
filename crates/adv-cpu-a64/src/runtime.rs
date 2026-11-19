@@ -61,8 +61,9 @@ use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-/// What `x29` points at while translated code runs.
-#[repr(C)]
+/// What `x29` points at while translated code runs. The fixed entry inputs
+/// and the saved host SP occupy the first cache line.
+#[repr(C, align(64))]
 #[derive(Debug)]
 pub struct Runtime {
     pub cpu: *mut CpuState,
@@ -70,7 +71,7 @@ pub struct Runtime {
     pub window: u64,
     /// Owner shadow return stack or admitted data alias: `x28`.
     pub shadow: u64,
-    /// Safepoint countdown: `x9`.
+    /// Initial safepoint countdown: `x9`.
     pub countdown: u64,
     /// Host stack pointer inside `enter`'s frame, for helpers and `exit`.
     pub host_sp: u64,
@@ -108,8 +109,8 @@ pub struct Runtime {
     pub interpret: u64,
     /// Read the owning bridge's timestamp without publishing guest state.
     pub timestamp: u64,
-    /// The `Exit` that left translated code.
-    pub exit: u32,
+    /// Set at a diagnostic helper call site and consumed by that call.
+    pub(crate) helper_cause: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
     pub temps: [u64; 2],
     /// The indirect branch that last missed the table: source EIP in the
@@ -188,12 +189,12 @@ pub struct Runtime {
     pub resident_discover: u64,
     pub resident_entries: u64,
     pub resident_page_crossings: u64,
-    /// Set at a diagnostic helper call site and consumed by that call.
-    pub(crate) helper_cause: u32,
     pub(crate) value: u64,
     pub(crate) value_access: u64,
     pub(crate) value_frame: ValueFrame,
 }
+
+const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
 
 impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
@@ -229,7 +230,6 @@ impl Runtime {
             memory_pages: 0,
             code_lines: 0,
             interpret: 0,
-            exit: 0,
             temps: [0; 2],
             branch: 0,
             body: adv_cpu_core::body::BodyContext::default(),
@@ -329,6 +329,15 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanEvent {
     BodyStack,
+}
+
+/// Return registers x0 and x1 of the generated entry point.
+#[cfg(native)]
+#[repr(C)]
+pub(crate) struct RawExit {
+    pub reason: u64,
+    /// The countdown minus completed refills, which can wrap below zero.
+    pub remaining: u64,
 }
 
 /// Why translated code returned to the owner.
@@ -503,7 +512,6 @@ const WINDOW_BASE: u32 = field(offset_of!(Runtime, window));
 const SHADOW: u32 = field(offset_of!(Runtime, shadow));
 const COUNTDOWN: u32 = field(offset_of!(Runtime, countdown));
 const HOST_SP: u32 = field(offset_of!(Runtime, host_sp));
-const EXIT: u32 = field(offset_of!(Runtime, exit));
 const HELPER: u32 = field(offset_of!(Runtime, helper));
 pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
@@ -682,7 +690,7 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
         mov(X, r(6), r(1)),
         ldr(X, r(0), RUNTIME, CPU),
     ]);
-    emit_store_guest(asm);
+    emit_store_guest(asm, r(0));
     asm.emit_all(&[
         mov(X, r(0), RUNTIME),
         mov(X, r(1), r(6)),
@@ -1059,14 +1067,14 @@ pub(crate) fn emit_load_flags(asm: &mut Asm) {
 /// Translated code arrives with the `Exit` in w0 and the guest EIP in w1.
 fn emit_exit(asm: &mut Asm) {
     asm.emit_all(&[
-        str(W, r(0), RUNTIME, EXIT),
         stp(X, Offset, r(7), r(8), RUNTIME, TEMPS),
-        ldr(X, r(0), RUNTIME, CPU),
-        str(W, r(1), r(0), EIP),
+        ldr(X, r(16), RUNTIME, CPU),
+        str(W, r(1), r(16), EIP),
     ]);
-    emit_store_guest(asm);
+    emit_store_guest(asm, r(16));
     asm.emit_all(&[
-        str(X, r(9), RUNTIME, COUNTDOWN),
+        ldr(X, r(1), RUNTIME, COMPLETED),
+        sub(X, r(1), r(9), r(1), Lsl, 0),
         str(X, r(28), RUNTIME, SHADOW),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
@@ -1115,9 +1123,9 @@ fn emit_opt_exit(asm: &mut Asm) {
     asm.b(copy);
     asm.bind(done);
     asm.emit_all(&[
-        movz(W, r(16), Exit::Optimized.word(), 0),
-        str(W, r(16), RUNTIME, EXIT),
-        str(X, r(9), RUNTIME, COUNTDOWN),
+        movz(W, r(0), Exit::Optimized.word(), 0),
+        ldr(X, r(1), RUNTIME, COMPLETED),
+        sub(X, r(1), r(9), r(1), Lsl, 0),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
     ]);
@@ -1130,19 +1138,18 @@ fn emit_opt_exit(asm: &mut Asm) {
     asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
 }
 
-/// Stores the guest registers and flags to the `CpuState` at x0; uses x1
-/// to x5.
-pub(crate) fn emit_store_guest(asm: &mut Asm) {
+/// Stores the guest registers and flags to `cpu`; uses x1 to x5.
+pub(crate) fn emit_store_guest(asm: &mut Asm, cpu: Reg) {
     for (i, (a, b)) in GUEST.into_iter().enumerate() {
         // The low halves of x23 and x24 are ESP and EBP themselves.
-        asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
+        asm.emit(stp(W, Offset, r(a), r(b), cpu, REGS + 8 * i as i32));
     }
-    emit_read_flags(asm);
-    asm.emit(str(W, r(4), r(0), EFLAGS));
+    emit_read_flags(asm, cpu);
+    asm.emit(str(W, r(4), cpu, EFLAGS));
 }
 
-/// Assemble EFLAGS in w4 using the unmapped bits in the CpuState at x0.
-pub(crate) fn emit_read_flags(asm: &mut Asm) {
+/// Assemble EFLAGS in w4 using the unmapped bits in `cpu`.
+pub(crate) fn emit_read_flags(asm: &mut Asm, cpu: Reg) {
     asm.emit_all(&[
         mrs_nzcv(r(1)),
         // N and Z land on SF and ZF; C is !CF and V is OF.
@@ -1163,7 +1170,7 @@ pub(crate) fn emit_read_flags(asm: &mut Asm) {
         eor_imm(W, r(4), r(4), 1),
         orr(W, r(3), r(3), r(4), Lsl, 2),
         orr(W, r(3), r(3), r(12), Lsl, 10),
-        ldr(W, r(4), r(0), EFLAGS),
+        ldr(W, r(4), cpu, EFLAGS),
         movz(W, r(5), MAPPED_FLAGS as u16, 0),
         bic(W, r(4), r(4), r(5), Lsl, 0),
         orr(W, r(4), r(4), r(3), Lsl, 0),
@@ -1176,7 +1183,7 @@ mod tests {
     use crate::emulator::{CODE, Emulator};
 
     const DATA: u64 = 0x2000_0000;
-    const STATE: u64 = DATA + 0x100;
+    const STATE: u64 = DATA + 0x1000;
     const STACK_TOP: u64 = 0x3001_0000;
     const BASE: u64 = 7 << 32;
     const XMM: u32 = field(offset_of!(CpuState, xmm));
@@ -1228,7 +1235,7 @@ mod tests {
         let code = asm.finish();
 
         let mut emu = Emulator::new();
-        emu.map(DATA, 0x1000);
+        emu.map(DATA, 0x2000);
         emu.map(STACK_TOP - 0x1_0000, 0x1_0000);
         emu.write(DATA, &runtime_bytes());
         emu.write(STATE, &state_bytes(cpu));
@@ -1270,14 +1277,13 @@ mod tests {
         for (i, lane) in xmm.iter_mut().enumerate() {
             lane.copy_from_slice(&state[XMM as usize + 16 * i..][..16]);
         }
-        let runtime = emu.read(DATA, size_of::<Runtime>());
         let run = Run {
             regs,
             eip: word(EIP as usize),
             eflags: word(EFLAGS as usize),
             xmm,
-            exit: u32::from_le_bytes(runtime[EXIT as usize..][..4].try_into().unwrap()),
-            countdown: u64::from_le_bytes(runtime[COUNTDOWN as usize..][..8].try_into().unwrap()),
+            exit: emu.x(r(0)) as u32,
+            countdown: emu.x(r(1)),
         };
         (emu, run)
     }

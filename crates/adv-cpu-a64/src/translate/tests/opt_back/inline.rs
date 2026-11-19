@@ -216,10 +216,7 @@ impl InlineRun {
         for n in 8..16 {
             assert_eq!(h.emu.q(n) as u64, 0xbeef_0000 + u64::from(n));
         }
-        let exit = h
-            .emu
-            .read(CONTEXT + offset_of!(runtime::Runtime, exit) as u64, 4);
-        Exit::from_raw(u32::from_le_bytes(exit.try_into().unwrap())).unwrap()
+        Exit::from_raw(h.emu.x(X0) as u32).unwrap()
     }
 
     fn link(&self, h: &Harness) -> (usize, u32) {
@@ -235,7 +232,10 @@ fn read64(h: &Harness, addr: u64) -> u64 {
 }
 
 fn countdown(h: &Harness) -> u64 {
-    read64(h, CONTEXT + offset_of!(runtime::Runtime, countdown) as u64)
+    h.emu.x(X1).wrapping_add(read64(
+        h,
+        CONTEXT + offset_of!(runtime::Runtime, completed) as u64,
+    ))
 }
 
 fn assert_state(h: &Harness, expected: &CpuState) {

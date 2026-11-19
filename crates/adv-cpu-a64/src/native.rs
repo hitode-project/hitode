@@ -50,7 +50,7 @@ use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
-use crate::runtime::{self, Exit, ResidentCold, Runtime};
+use crate::runtime::{self, Exit, RawExit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
@@ -82,7 +82,7 @@ const CACHE_LEN: usize = 64 << 20;
 pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
 
-type Enter = unsafe extern "C" fn(*mut Runtime, usize);
+type Enter = unsafe extern "C" fn(*mut Runtime, usize) -> RawExit;
 
 fn alias_base(memory: &Memory) -> u64 {
     (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64

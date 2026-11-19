@@ -1068,12 +1068,8 @@ impl Harness {
         x87.opcode = read16(offset_of!(X87State, opcode));
         x87.ip = read32(at_x87 + offset_of!(X87State, ip));
         x87.dp = read32(at_x87 + offset_of!(X87State, dp));
-        let context = self.emu.read(CONTEXT, size_of::<runtime::Runtime>());
-        let at = offset_of!(runtime::Runtime, exit);
-        let exit =
-            Exit::from_raw(u32::from_le_bytes(context[at..at + 4].try_into().unwrap())).unwrap();
-        let at = offset_of!(runtime::Runtime, countdown);
-        let left = u64::from_le_bytes(context[at..at + 8].try_into().unwrap());
+        let exit = Exit::from_raw(self.emu.x(X0) as u32).unwrap();
+        let left = self.emu.x(X1);
         (actual, exit, left)
     }
 }
@@ -2573,7 +2569,7 @@ pub(in crate::translate) mod opt_back {
                     .read(CONTEXT + offset_of!(runtime::Runtime, shadow) as u64, 8),
                 SHADOW_TOP.to_le_bytes(),
             );
-            Exit::from_raw(word(h, CONTEXT + offset_of!(runtime::Runtime, exit) as u64)).unwrap()
+            Exit::from_raw(h.emu.x(X0) as u32).unwrap()
         }
 
         fn recovered(h: &Harness, f: &back::Lowered, mut cpu: CpuState, id: RecordId) -> CpuState {
@@ -3204,10 +3200,7 @@ pub(in crate::translate) mod opt_back {
                 |offset: usize| u32::from_le_bytes(context[offset..][..4].try_into().unwrap());
             let wide =
                 |offset: usize| u64::from_le_bytes(context[offset..][..8].try_into().unwrap());
-            assert_eq!(
-                word(offset_of!(runtime::Runtime, exit)),
-                Exit::Optimized.raw()
-            );
+            assert_eq!(self.emu.x(X0), u64::from(Exit::Optimized.raw()));
             let base = offset_of!(runtime::Runtime, opt_dump);
             let registers = runtime::RegisterDump {
                 sp: wide(base + offset_of!(runtime::RegisterDump, sp)),
@@ -3240,7 +3233,10 @@ pub(in crate::translate) mod opt_back {
                 cpu,
                 frame,
                 record,
-                countdown: wide(offset_of!(runtime::Runtime, countdown))
+                countdown: self
+                    .emu
+                    .x(X1)
+                    .wrapping_add(wide(offset_of!(runtime::Runtime, completed)))
                     .wrapping_add(u64::from(refund)),
                 completed: wide(offset_of!(runtime::Runtime, completed)),
                 registers,

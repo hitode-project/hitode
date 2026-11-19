@@ -279,7 +279,7 @@ impl Translator<'_> {
             self.canonicalize();
             self.cpu();
             self.emit(mov(X, X0, X5));
-            runtime::emit_read_flags(self.asm);
+            runtime::emit_read_flags(self.asm, X0);
             self.emit(str(W, X4, RUNTIME, runtime::VALUE_EFLAGS));
             self.vector.cpu = false;
         }

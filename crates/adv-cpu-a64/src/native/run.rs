@@ -114,7 +114,7 @@ impl Native {
         // SAFETY: until `enter` returns, `self` is reached only through
         // `owner`, by `dispatch`. `unit` is translated code ending at the
         // stubs, and the runtime points at a live CPU for the call.
-        unsafe {
+        let returned = unsafe {
             (*runtime).countdown = budget;
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
@@ -127,9 +127,10 @@ impl Native {
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(Active::Owner(faults));
-            enter(runtime, entry.unit);
+            let returned = enter(runtime, entry.unit);
             ACTIVE.set(previous);
-        }
+            returned
+        };
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
         if let Some(error) = owner.error {
@@ -138,8 +139,8 @@ impl Native {
         let translated = owner.translated;
         self.diagnostics.resident_entries += self.runtime.resident_entries;
         self.diagnostics.resident_page_crossings += self.runtime.resident_page_crossings;
-        let mut exit = Exit::from_raw(self.runtime.exit)
-            .ok_or_else(|| format!("unknown a64 exit {}", self.runtime.exit))?;
+        let mut exit = Exit::from_raw(returned.reason as u32)
+            .ok_or_else(|| format!("unknown a64 exit {}", returned.reason))?;
         let budget_exit = exit == Exit::Budget;
         if budget_exit {
             exit = Exit::Dispatch;
@@ -156,7 +157,7 @@ impl Native {
         }
         // Inline forms may refill the countdown, and a cold exit may leave
         // it negative.
-        let mut retired = (budget + self.runtime.completed).wrapping_sub(self.runtime.countdown);
+        let mut retired = budget.wrapping_sub(returned.remaining);
         let resident_cold = if exit == Exit::Optimized {
             let (refund, site, reason, checked) = self.materialize_inline(cpu, memory);
             retired -= u64::from(refund);
@@ -193,7 +194,14 @@ impl Native {
         self.finish_probation();
         if let Some((site, reason, checked, refund)) = resident_cold {
             // A rebuild may replace versions named by this run's entry events.
-            self.resident_cold_exit(self.runtime.opt_head, site, reason, checked, refund);
+            self.resident_cold_exit(
+                self.runtime.opt_head,
+                site,
+                reason,
+                checked,
+                refund,
+                returned.remaining.wrapping_neg(),
+            );
         }
         if exit == Exit::Plan(PlanEvent::BodyStack) {
             self.refuse_body_stack(memory, cpu);

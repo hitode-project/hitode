@@ -505,6 +505,7 @@ impl Native {
         reason: ResidentCold,
         checked: bool,
         refund: u32,
+        elapsed: u64,
     ) {
         self.diagnostics.resident_cold_exits += 1;
         *self
@@ -558,10 +559,7 @@ impl Native {
         let version = &head.versions[self.runtime.resident_version as usize];
         let window = head.cold_window.as_mut().unwrap();
         if entries > window.start_entries {
-            let retired = self
-                .runtime
-                .completed
-                .wrapping_sub(self.runtime.countdown)
+            let retired = elapsed
                 .wrapping_sub(version.slot.countdown[0].get())
                 .wrapping_sub(u64::from(refund));
             window.cold_iterations += version.iterations(retired);

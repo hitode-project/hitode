@@ -76,7 +76,7 @@ impl Emitter<'_> {
 
         self.save_entry_state();
         if entry.contains(&Source::Eflags) {
-            runtime::emit_read_flags(&mut self.asm);
+            runtime::emit_read_flags(&mut self.asm, Reg::new(0));
             self.asm.emit(mov(W, FLAGS, S4));
         }
         if !self.resident {

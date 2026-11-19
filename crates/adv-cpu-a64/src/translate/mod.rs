@@ -2415,7 +2415,7 @@ impl Translator<'_> {
                     self.flush_simd();
                     self.canonicalize();
                     self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
-                    crate::runtime::emit_store_guest(self.asm);
+                    crate::runtime::emit_store_guest(self.asm, X0);
                     self.target(eip);
                     self.asm.adr(X2, point);
                     self.emit_all(&[
