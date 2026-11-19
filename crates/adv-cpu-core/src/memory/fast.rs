@@ -62,6 +62,12 @@ impl FastPermissions {
             .pointers()
     }
 
+    pub(super) fn window_span_allows(&self, start: u32, end: u64, write: bool) -> bool {
+        self.spans
+            .as_ref()
+            .is_some_and(|spans| spans.allows(start, end, write))
+    }
+
     pub(super) fn refresh_window_span(&self, page: usize, plain: &[Cell<u64>]) {
         if let Some(spans) = &self.spans {
             spans.refresh(page, self.bytes[page], plain);

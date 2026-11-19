@@ -32,6 +32,66 @@ unsafe extern "C" fn refresh_mmx(cpu: *mut adv_cpu_core::CpuState) {
 }
 
 impl Emitter<'_> {
+    #[cfg(native)]
+    pub(super) fn row_targets(&mut self, scope: &RowScope, search: Label, cold: Label) {
+        if let Some(reg) = scope.proof.row_count_register() {
+            self.asm.emit(eor_imm(W, T, guest(reg), 1));
+            self.asm.cbz(W, false, T, cold);
+        }
+        let mut alignment = scope.proof.row_alignment().peekable();
+        if alignment.peek().is_some() {
+            let mismatch = if scope.diagnostics {
+                self.asm.label()
+            } else {
+                cold
+            };
+            for (reg, mask, nonzero) in alignment {
+                self.asm.emit(and_imm(W, T, guest(reg), u64::from(mask)));
+                self.asm.cbz(W, !nonzero, T, mismatch);
+            }
+            if scope.diagnostics {
+                let done = self.asm.label();
+                self.asm.b(done);
+                self.asm.bind(mismatch);
+                self.count_cell(&scope.alignment_misses);
+                self.asm.b(cold);
+                self.asm.bind(done);
+            }
+        }
+        if scope.targets.is_empty() {
+            return;
+        }
+        let fail = self.asm.label();
+        let done = self.asm.label();
+        self.asm.emit(mrs_nzcv(X3));
+        for &(base, offset, expected) in &scope.targets {
+            if let Some((imm, shift)) = add_immediate(u64::from(offset)) {
+                self.asm.emit(add_imm(W, X0, guest(base), imm, shift));
+            } else {
+                self.imm(T, u64::from(offset));
+                self.asm.emit(add(W, X0, guest(base), T, Lsl, 0));
+            }
+            self.asm.emit(add_imm(X, X1, X0, 3, false));
+            let readable = self.asm.label();
+            resident::window_span(&mut self.asm, false, false, search, readable);
+            self.asm.b(fail);
+            self.asm.bind(readable);
+            self.asm.emit(ldr_reg(W, X0, WINDOW, X0, false));
+            self.imm(T, u64::from(expected));
+            self.asm.emit(cmp(W, X0, T, Lsl, 0));
+            self.asm.b_cond(Cond::Ne, fail);
+        }
+        self.asm.emit(msr_nzcv(X3));
+        self.asm.b(done);
+        self.asm.bind(fail);
+        if scope.diagnostics {
+            self.count_cell(&scope.guard_misses);
+        }
+        self.asm.emit(msr_nzcv(X3));
+        self.asm.b(cold);
+        self.asm.bind(done);
+    }
+
     pub(super) fn inline_entry(
         &mut self,
         assumed: &Assumed,
@@ -230,6 +290,10 @@ impl Emitter<'_> {
             self.asm.b(restore);
         }
         self.asm.bind(restore);
+        self.restore_entry(bytes, miss);
+    }
+
+    pub(super) fn restore_entry(&mut self, bytes: u64, miss: Label) {
         self.asm.emit(add_imm(X, S4, RT, ENTRY, false));
         for i in (0..8).step_by(2) {
             self.asm.emit(ldp(

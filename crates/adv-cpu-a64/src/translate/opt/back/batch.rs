@@ -167,6 +167,7 @@ impl Emitter<'_> {
         backedge: Label,
         diagnostics: bool,
         spill_cells: usize,
+        scoped: bool,
     ) -> (u32, Option<ClassCosts>) {
         let entry = self.asm.label();
         let inner = self.asm.label();
@@ -202,9 +203,11 @@ impl Emitter<'_> {
         self.batch_trip(batch.loop_.trip, lanes, scalar);
         self.asm.cbz(X, false, X3, scalar);
 
-        for &span in &batch.spans {
-            self.batch_range(span, batch.backwards, pages, diagnostics, scalar);
-            self.asm.cbz(X, false, X3, scalar);
+        if !scoped {
+            for &span in &batch.spans {
+                self.batch_range(span, batch.backwards, pages, diagnostics, scalar);
+                self.asm.cbz(X, false, X3, scalar);
+            }
         }
         for &(a, b, in_place) in &batch.alias {
             self.batch_disjoint(
@@ -239,6 +242,7 @@ impl Emitter<'_> {
         }
         #[cfg(native)]
         let split = pages
+            .filter(|_| !scoped)
             .and_then(|(_, cache)| cache.split.as_deref().map(|site| (site, cache)))
             .map(|(site, cache)| {
                 let offer = self.asm.label();

@@ -60,6 +60,7 @@ use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 mod compile;
 mod head;
 mod offload;
+pub(crate) use offload::admit_rows;
 #[cfg(test)]
 pub(crate) use offload::exclusive_pool;
 pub(crate) use offload::offer_span;

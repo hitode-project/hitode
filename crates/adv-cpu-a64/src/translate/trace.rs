@@ -21,7 +21,7 @@
 
 use adv_cpu_core::memory::Memory;
 
-use super::decode::{Effects, Fetcher, Helper, Op, Src};
+use super::decode::{Alu, Cc, Effects, Fetcher, Helper, Mem, Op, Src};
 use super::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
@@ -73,6 +73,9 @@ pub enum Mode {
 pub struct Inst {
     /// The thunk of a recognized host call (A64-CTL-12).
     pub call: Option<u32>,
+    /// The runtime slot of a call specialized for an outer window proof.
+    pub(crate) guarded_call: Option<Mem>,
+    pub(crate) guarded_alignment: Option<(u8, u32, bool)>,
     pub locked: Option<(super::decode::Mem, u8, u8)>,
     pub pc: u32,
     pub next_pc: u32,
@@ -87,6 +90,29 @@ pub struct Inst {
 }
 
 impl Inst {
+    pub(crate) fn observed_callee_slot(&self) -> Option<Mem> {
+        Self::observed_slot(self.op)
+    }
+
+    pub(crate) fn alignment_test(&self) -> Option<(u8, u32)> {
+        let Op::Alu(Alu::Test, Src::Reg(reg), Src::Imm(mask)) = self.op else {
+            return None;
+        };
+        (mask == 15).then_some((reg, mask))
+    }
+
+    pub(crate) fn aligned_memory(&self) -> bool {
+        matches!(self.op, Op::Simd(simd) if simd.aligned && simd.memory())
+    }
+
+    fn observed_slot(op: Op) -> Option<Mem> {
+        let Op::CallIndirect(Src::Mem(slot)) = op else {
+            return None;
+        };
+        (slot.base.is_some() && slot.index.is_none() && !slot.fs && slot.address_bits == 32)
+            .then_some(slot)
+    }
+
     pub(super) fn resident_backedge(&self, target: u32) -> bool {
         if self.spin || target > self.pc {
             return false;
@@ -156,6 +182,11 @@ pub struct Bound {
     /// call that pushes nothing.
     pub entry: bool,
 }
+
+type ObservedRegisters<'a> = Option<&'a [u32; 8]>;
+type PathEnd = Option<(u32, u16)>;
+type BuildBounds<'a> = (usize, PathEnd, ObservedRegisters<'a>);
+type PathBounds<'a> = (usize, &'a Stops<'a>, PathEnd, ObservedRegisters<'a>);
 
 /// The stops, behind a one-word filter: most EIPs are not stops.
 struct Stops<'s> {
@@ -322,8 +353,27 @@ impl Trace {
         redirect: &dyn Fn(u32) -> Option<Redirect>,
         loops: bool,
     ) {
+        self.build_with(memory, entry, stops, host, redirect, (loops, None));
+    }
+
+    pub(crate) fn build_with(
+        &mut self,
+        memory: &mut Memory,
+        entry: u32,
+        stops: &[u32],
+        host: &dyn Fn(u32, u32) -> Option<u32>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
+        (loops, observed): (bool, Option<&[u32; 8]>),
+    ) {
         let limit = if loops { LOOP_LIMIT } else { MAX_INSTRUCTIONS };
-        match self.build_paths(memory, entry, stops, host, redirect, (limit, None)) {
+        match self.build_paths(
+            memory,
+            entry,
+            stops,
+            host,
+            redirect,
+            (limit, None, observed),
+        ) {
             Some(end) => {
                 self.build_paths(
                     memory,
@@ -331,7 +381,7 @@ impl Trace {
                     stops,
                     host,
                     redirect,
-                    (LOOP_LIMIT, Some(end)),
+                    (LOOP_LIMIT, Some(end), observed),
                 );
             }
             None if loops && self.last_backedge(&Stops::new(stops)).is_none() => {
@@ -341,7 +391,7 @@ impl Trace {
                     stops,
                     host,
                     redirect,
-                    (MAX_INSTRUCTIONS, None),
+                    (MAX_INSTRUCTIONS, None, observed),
                 );
             }
             None => {}
@@ -423,9 +473,9 @@ impl Trace {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
-        bounds: (usize, Option<(u32, u16)>),
+        bounds: BuildBounds<'_>,
     ) -> Option<(u32, u16)> {
-        let (limit, end) = bounds;
+        let (limit, end, observed) = bounds;
         self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
         self.x86.clear();
@@ -444,7 +494,7 @@ impl Trace {
         fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
         let mut weight = 0;
-        let bounds = (limit, &stops, end);
+        let bounds = (limit, &stops, end, observed);
         self.path(
             (entry, 0),
             &mut weight,
@@ -519,7 +569,7 @@ impl Trace {
         (mut pc, mut frame): (u32, u16),
         weight: &mut usize,
         (memory, fetcher): (&mut Memory, &mut Fetcher),
-        (limit, stops, stop): (usize, &Stops<'_>, Option<(u32, u16)>),
+        (limit, stops, stop, observed): PathBounds<'_>,
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) -> bool {
@@ -588,6 +638,7 @@ impl Trace {
             // Import slots and the entries calls reach are watched like code,
             // so a transfer through them is static (A64-CALL-1).
             let mut watched = Vec::new();
+            let mut guarded_call = None;
             let op = match op {
                 Op::CallIndirect(Src::Mem(slot)) | Op::JmpIndirect(Src::Mem(slot))
                     if slot.base.is_none()
@@ -609,11 +660,28 @@ impl Trace {
                         Err(_) => op,
                     }
                 }
+                op if observed.is_some() && Inst::observed_slot(op).is_some() => {
+                    let slot = Inst::observed_slot(op).unwrap();
+                    let target = observed.zip(slot.base).and_then(|(regs, base)| {
+                        let addr = regs[usize::from(base)].wrapping_add(slot.disp);
+                        let mut bytes = [0; 4];
+                        memory.read_into(addr, &mut bytes).ok()?;
+                        Some(u32::from_le_bytes(bytes))
+                    });
+                    if let Some(target) = target {
+                        guarded_call = Some(slot);
+                        Op::Call(target)
+                    } else {
+                        op
+                    }
+                }
                 _ => op,
             };
             let op = match op {
                 Op::Call(target)
-                    if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
+                    if target != next_pc
+                        && guarded_call.is_none()
+                        && self.bodies.len() <= usize::from(u8::MAX) =>
                 {
                     match forwarded_body(memory, target, redirect, stops) {
                         Some((bound, dependencies)) => {
@@ -625,6 +693,27 @@ impl Trace {
                     }
                 }
                 _ => op,
+            };
+            let mut guarded_alignment = None;
+            let op = if let Op::Jcc(Cc::Flags(cond), target) = op
+                && matches!(
+                    cond,
+                    iced_x86::ConditionCode::e | iced_x86::ConditionCode::ne
+                )
+                && frame == 0
+                && let Some(regs) = observed
+                && let Some(previous) = self.insts.last().filter(|inst| inst.next_pc == pc)
+                && let Some((reg, mask)) = previous.alignment_test()
+            {
+                let nonzero = regs[usize::from(reg)] & mask != 0;
+                guarded_alignment = Some((reg, mask, nonzero));
+                if nonzero == (cond == iced_x86::ConditionCode::ne) {
+                    Op::Jmp(target)
+                } else {
+                    Op::Nop
+                }
+            } else {
+                op
             };
             let cost = if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
@@ -655,6 +744,8 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
+                guarded_call,
+                guarded_alignment,
                 locked: fetcher.locked,
                 call: if matches!(op, Op::Syscall) && size == 2 {
                     let mut bytes = [0; 7];
@@ -801,6 +892,8 @@ impl Trace {
         for (inst, _) in insts.iter_mut().zip(cut).filter(|(_, cut)| **cut) {
             *inst = Inst {
                 call: None,
+                guarded_call: None,
+                guarded_alignment: None,
                 locked: None,
                 op: Op::Nop,
                 effects: Op::Nop.effects(),
@@ -825,6 +918,46 @@ impl Trace {
         };
         trace.analyze();
         trace
+    }
+
+    /// Give row pretests and the returning latch separate flag recipes.
+    /// The duplicate is reached only from the body and retires the original
+    /// conditional branch at the same guest EIP.
+    pub(crate) fn separate_row_latches(&mut self) {
+        let len = self.insts.len();
+        for tail in 0..len {
+            let previous = self.insts[tail];
+            let Next::Edge(Edge::Internal(test)) = previous.next else {
+                continue;
+            };
+            let mut latch = self.insts[test];
+            let (Op::Jcc(Cc::Flags(cond), _), Some(Edge::Internal(body))) = (latch.op, latch.taken)
+            else {
+                continue;
+            };
+            if previous.frame != latch.frame
+                || previous.next_pc != latch.pc
+                || !(self.insts[body].pc..latch.pc).contains(&previous.pc)
+                || !matches!(
+                    cond,
+                    iced_x86::ConditionCode::s
+                        | iced_x86::ConditionCode::ns
+                        | iced_x86::ConditionCode::e
+                        | iced_x86::ConditionCode::ne
+                )
+            {
+                continue;
+            }
+            if latch.next == Next::Fall {
+                latch.next = Next::Edge(Edge::Internal(test + 1));
+            }
+            self.insts[tail].next = Next::Edge(Edge::Internal(self.insts.len()));
+            self.insts.push(latch);
+            self.x86.push(self.x86[test]);
+        }
+        if self.insts.len() != len {
+            self.analyze();
+        }
     }
 
     fn analyze(&mut self) {

@@ -470,6 +470,11 @@ impl Memory {
         }
     }
 
+    /// Checks ordinary window access from the resident span summary.
+    pub fn window_span_allows(&self, start: u32, end: u64, write: bool) -> bool {
+        u64::from(start) < end && end <= 1 << 32 && self.fast.window_span_allows(start, end, write)
+    }
+
     fn blocks_executable_writes(&self, flags: u8) -> bool {
         !self.selective_code_writes() && flags & EXEC != 0
     }

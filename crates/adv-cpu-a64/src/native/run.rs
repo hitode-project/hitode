@@ -59,7 +59,9 @@ impl Native {
             }
         };
         let offer = match self.plans.arrival(cpu.eip) {
-            plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
+            plan::Arrival::Offerable(job)
+                if !job.scoped_rows && self.plans.offer_resume != Some(cpu.eip) =>
+            {
                 job.offer_due(self.published_gate())
             }
             _ => false,

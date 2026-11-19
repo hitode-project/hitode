@@ -14,6 +14,8 @@ mod resident;
 
 pub(crate) use resident::BatchCache;
 #[cfg(native)]
+pub(crate) use resident::RowScope;
+#[cfg(native)]
 pub(crate) use resident::SpanSplit;
 #[cfg(any(native, test))]
 pub(crate) use resident::access_stub;
@@ -67,6 +69,10 @@ pub(crate) struct Lowered {
     /// Two words holding the address of the probation counters, bound at placement.
     pub probation_slot: usize,
     pub batch_caches: Vec<BatchCache>,
+    #[cfg(native)]
+    pub row_scope: Option<Box<RowScope>>,
+    #[cfg(native)]
+    pub row_offer: Option<usize>,
     pub site_counts: Option<Box<[std::cell::Cell<u64>; 2]>>,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
@@ -95,13 +101,27 @@ impl Lowered {
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None, false, false)
+    lower_form(
+        func,
+        None,
+        false,
+        false,
+        #[cfg(native)]
+        None,
+    )
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), false, false)
+    lower_form(
+        func,
+        Some((assumed, entry)),
+        false,
+        false,
+        #[cfg(native)]
+        None,
+    )
 }
 
 /// A resident form entered from patchable links, accessing guest memory
@@ -113,7 +133,32 @@ pub(crate) fn lower_resident(
     count_entries: bool,
 ) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), true, count_entries)
+    lower_form(
+        func,
+        Some((assumed, entry)),
+        true,
+        count_entries,
+        #[cfg(native)]
+        None,
+    )
+}
+
+#[cfg(native)]
+pub(crate) fn lower_rows(
+    func: &Func,
+    assumed: &Assumed,
+    count_entries: bool,
+    proof: std::sync::Arc<crate::translate::computation::Proof>,
+) -> Lowered {
+    let head = func.records[func.blocks[0].head.unwrap().record.0 as usize].eip;
+    let scope = Box::new(RowScope::new(head, proof, count_entries || cfg!(test)));
+    lower_form(
+        func,
+        Some((assumed, &func.entry)),
+        true,
+        count_entries,
+        Some(scope),
+    )
 }
 
 fn lower_form(
@@ -121,11 +166,16 @@ fn lower_form(
     inline: Option<(&Assumed, &[Source])>,
     resident: bool,
     count_entries: bool,
+    #[cfg(native)] mut row_scope: Option<Box<RowScope>>,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let site_counts = count_entries.then(|| Box::new([const { std::cell::Cell::new(0) }; 2]));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
     let (mut e, exit, miss, cold, batch_caches, spill_cells) = loop {
+        #[cfg(native)]
+        if batches.is_empty() {
+            row_scope = None;
+        }
         let batch_caches = if resident {
             batches
                 .iter()
@@ -145,7 +195,11 @@ fn lower_form(
                 inline,
                 (resident, site_counts.as_deref()),
                 &batches,
-                &batch_caches,
+                BatchStorage {
+                    caches: &batch_caches,
+                    #[cfg(native)]
+                    scope: row_scope.as_deref(),
+                },
             );
             if !e.asm.widen_bit_tests() {
                 break (e, exit, miss, cold);
@@ -191,6 +245,8 @@ fn lower_form(
         .probation
         .as_ref()
         .map_or(0, |p| e.asm.position(p.slot) / 4);
+    #[cfg(native)]
+    let row_offer = e.row_offer.map(|label| e.asm.position(label) / 4);
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -207,6 +263,10 @@ fn lower_form(
         probation: e.probation.map_or_else(Vec::new, |p| p.calls),
         probation_slot,
         batch_caches,
+        #[cfg(native)]
+        row_scope,
+        #[cfg(native)]
+        row_offer,
         site_counts,
         links: e.links,
         transitions: e.transitions,
@@ -237,6 +297,12 @@ pub(in crate::translate) fn assert_no_fp_state(words: &[u32]) {
 }
 
 /// Emits the form into `asm`, returning its emitter and exit label.
+struct BatchStorage<'a> {
+    caches: &'a [BatchCache],
+    #[cfg(native)]
+    scope: Option<&'a RowScope>,
+}
+
 fn emit<'a>(
     func: &'a Func,
     allocation: &alloc::Allocation,
@@ -244,8 +310,11 @@ fn emit<'a>(
     inline: Option<(&Assumed, &[Source])>,
     (resident, site_counts): (bool, Option<&[std::cell::Cell<u64>; 2]>),
     batches: &[loops::Batch],
-    batch_caches: &[BatchCache],
+    storage: BatchStorage<'_>,
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
+    let batch_caches = storage.caches;
+    #[cfg(native)]
+    let row_scope = storage.scope;
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let count_entries = site_counts.is_some();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -302,6 +371,8 @@ fn emit<'a>(
         page_crossings: Vec::new(),
         batch_backedges,
         slower_batches: Vec::new(),
+        #[cfg(native)]
+        row_offer: None,
         guest_eip: 0,
         locations: allocation.locations.clone(),
         defs: allocation.defs.clone(),
@@ -326,6 +397,10 @@ fn emit<'a>(
     let (miss, cold, pending) = if let Some((assumed, entry)) = inline {
         let miss = e.asm.label();
         let cold = e.asm.label();
+        #[cfg(native)]
+        if let Some(scope) = row_scope {
+            e.row_targets(scope, window_spans.unwrap(), cold);
+        }
         let pending = e.inline_entry(assumed, entry, bytes, miss, cold, last_fact.is_some());
         (Some(miss), Some(cold), pending)
     } else {
@@ -333,6 +408,12 @@ fn emit<'a>(
         e.job_entry();
         (None, None, None)
     };
+    #[cfg(native)]
+    let scope_miss = row_scope.map(|scope| e.row_scope(scope));
+    #[cfg(native)]
+    let scoped = row_scope.is_some();
+    #[cfg(not(native))]
+    let scoped = false;
     if last_fact.is_none() {
         e.begin_body(first, site_counts);
     }
@@ -369,6 +450,7 @@ fn emit<'a>(
                 backedge,
                 count_entries || cfg!(test),
                 allocation.spill_cells,
+                scoped,
             );
             if let Some(cases) = cases {
                 batch_cases.push((batch.head, cases));
@@ -544,6 +626,23 @@ fn emit<'a>(
     if let Some(probation) = &e.probation {
         probation.emit(&mut e.asm);
     }
+    #[cfg(native)]
+    if let Some((failed, offer)) = scope_miss {
+        e.asm.bind(failed);
+        e.restore_entry(bytes, cold.unwrap());
+        if let Some(offer) = offer {
+            e.asm.bind(offer);
+            let scope = row_scope.unwrap();
+            if scope.diagnostics {
+                e.count_cell(&scope.offers);
+            }
+            let exit = e.asm.label();
+            e.restore_entry(bytes, exit);
+            e.asm.bind(exit);
+            e.asm.emit(0);
+            e.row_offer = Some(exit);
+        }
+    }
     if let Some(miss) = env_miss {
         e.environment_misses(bytes, miss);
     }
@@ -598,6 +697,8 @@ struct Emitter<'a> {
     page_crossings: Vec<resident::PageCrossing>,
     batch_backedges: Vec<Option<(Block, Label)>>,
     slower_batches: Vec<u32>,
+    #[cfg(native)]
+    row_offer: Option<Label>,
     guest_eip: u32,
     locations: Vec<Host>,
     defs: Vec<Option<Op>>,

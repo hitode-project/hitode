@@ -373,6 +373,27 @@ impl Executor {
                         ),
                     );
                 }
+                for (
+                    head,
+                    [
+                        entries,
+                        misses,
+                        mismatch,
+                        rows,
+                        offers,
+                        declines,
+                        splits,
+                        alignment,
+                    ],
+                ) in native.resident_row_counts()
+                {
+                    crate::jit_map::optimized(
+                        head,
+                        format_args!(
+                            "resident\trow_scope\t{entries}\t{misses}\t{mismatch}\t{rows}\t{offers}\t{declines}\t{splits}\t{alignment}"
+                        ),
+                    );
+                }
                 for (head, [read, write, wrap]) in native.resident_guard_counts() {
                     crate::jit_map::optimized(
                         head,

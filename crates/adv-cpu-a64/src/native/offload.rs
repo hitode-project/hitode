@@ -133,7 +133,11 @@ impl Native {
     /// An offer event is separate from ordinary owner dispatch.
     pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
         let job = self.plans.job(cpu.eip).unwrap();
-        let cost = job.cost();
+        let cost = if job.scoped_rows && job.cost() == 0 {
+            (9.0 * WAKE_NS) as u64
+        } else {
+            job.cost()
+        };
         let split = job.splits && cost > 0;
         let peer = self.offer_computation();
         let paced = split && self.offer_split(cost);
@@ -158,6 +162,7 @@ impl Native {
         at: &CpuState,
         trace: translate::Trace,
         job: compile::Job,
+        scoped_rows: bool,
     ) {
         let mut unit = translate::Unit::default();
         unit.trace = trace;
@@ -171,6 +176,8 @@ impl Native {
             self.diagnostics.split_proofs += u64::from(job.proof.splits());
             let entry_registers = job.proof.entry_registers();
             let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            policy.scoped_rows = scoped_rows;
+            policy.row_diagnostics = self.count_resident_entries || cfg!(test);
             policy.requested();
             policy.built();
             self.offload.jobs.insert(
@@ -1127,6 +1134,71 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
     })
 }
 
+/// Checks the complete row domain before the generated form runs any row.
+pub(crate) unsafe extern "C" fn admit_rows(
+    runtime: *const Runtime,
+    scope: *const crate::translate::opt::back::RowScope,
+) -> u64 {
+    // SAFETY: a resident entry owns these live records and is suspended here.
+    let (runtime, scope) = unsafe { (&*runtime, &*scope) };
+    let owner = unsafe { &*(runtime.owner as *const super::Owner) };
+    let memory = unsafe { &*owner.memory };
+    let native = unsafe { &*owner.native };
+    let cpu = CpuState {
+        regs: runtime.opt_entry.regs,
+        ..CpuState::default()
+    };
+    let mut evaluation = scope.evaluation.borrow_mut();
+    let admitted = native.checks != crate::native::Checks::Slow
+        && scope
+            .proof
+            .evaluate(&cpu, &mut evaluation, |addr| {
+                let end = u64::from(addr) + 4;
+                memory
+                    .window_span_allows(addr, end, false)
+                    .then(|| {
+                        let mut bytes = [0; 4];
+                        memory.read_into(addr, &mut bytes).ok()?;
+                        Some(u32::from_le_bytes(bytes))
+                    })
+                    .flatten()
+            })
+            .is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .all(|range| memory.window_span_allows(range.start, range.end, range.write))
+            });
+    if scope.diagnostics {
+        let count = if admitted {
+            &scope.entries
+        } else {
+            &scope.misses
+        };
+        count.set(count.get() + 1);
+    }
+    if !admitted {
+        return 0;
+    }
+    let rows = native
+        .plans
+        .job(scope.head)
+        .filter(|job| {
+            job.scoped_rows
+                && job.splits
+                && native.offload.enabled
+                && native.plans.offer_resume != Some(scope.head)
+        })
+        .and_then(|job| {
+            let threshold = job.row_threshold.get();
+            if scope.threshold.get() != threshold {
+                scope.threshold.set(threshold);
+            }
+            scope.proof.row_count(&evaluation)
+        })
+        .unwrap_or(0);
+    (u64::from(rows) << 1) | 1
+}
+
 /// The emitted span guards establish independence. The ordinary job lease
 /// still controls memory ownership, including each worker submission.
 pub(crate) unsafe extern "C" fn offer_span(
@@ -1418,10 +1490,7 @@ impl<'a> Session<'a> {
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
         let counts = &*self.counts;
-        let wake = match counts.wakes - counts.idle_wakes {
-            0 => WAKE_NS,
-            claimed => counts.claim_ns as f64 / claimed as f64,
-        };
+        let wake = wake_cost(counts);
         let need = pace.need(serial as u64) as f64;
         let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
         if helpers == 0 {
@@ -1473,13 +1542,39 @@ impl<'a> Session<'a> {
             submitted: started,
         });
         let (send, recv) = sync_channel(helpers);
+        let job = self.plans.job(context.cpu().eip).unwrap();
         let submitted = (0..helpers)
-            .take_while(|_| self.pool.submit(Job::Blocks(blocks.clone(), send.clone())))
+            .take_while(|_| {
+                if job.scoped_rows {
+                    self.admission.sync_generation(self.memory);
+                    if !job.admission.evaluation.admitted().iter().all(|range| {
+                        !conflicts(range, &self.active)
+                            && self.admission.grants.allows(
+                                self.memory,
+                                range.start,
+                                range.end,
+                                range.write,
+                            )
+                    }) {
+                        return false;
+                    }
+                }
+                self.pool.submit(Job::Blocks(blocks.clone(), send.clone()))
+            })
             .count();
+        if job.scoped_rows && submitted == 0 {
+            return None;
+        }
         let mut total = blocks.drain(&mut self.runtime, &mut ExecuteScratch::default());
         let mut helped = Duration::ZERO;
         self.counts.splits += 1;
         self.counts.wakes += submitted as u64;
+        if submitted != 0 {
+            let job = self.plans.job(context.cpu().eip).unwrap();
+            if job.row_diagnostics && job.scoped_rows {
+                job.row_splits.set(job.row_splits.get() + 1);
+            }
+        }
         for _ in 0..submitted {
             let drained = recv.recv().expect("block helper");
             if drained.blocks == 0 {
@@ -1532,6 +1627,7 @@ impl<'a> Session<'a> {
             self.plans.job(context.cpu().eip).unwrap(),
             &completion,
             iterations,
+            wake_cost(self.counts),
         );
         Some(completion)
     }
@@ -1571,6 +1667,13 @@ impl<'a> Session<'a> {
 /// that are worth waking, given the `wake` latency and the most a `slice`
 /// block takes. One is worth waking only if its part of the loop exceeds
 /// four wake latencies.
+fn wake_cost(counts: &SplitCounts) -> f64 {
+    match counts.wakes - counts.idle_wakes {
+        0 => WAKE_NS,
+        claimed => counts.claim_ns as f64 / claimed as f64,
+    }
+}
+
 fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> usize {
     if need <= 0.0 {
         return 0;
@@ -1588,13 +1691,23 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
 
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
-fn learn(prepared: &JobPlan, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+fn learn(
+    prepared: &JobPlan,
+    done: &Completion<Option<ExecutionContext>>,
+    iterations: u32,
+    wake: f64,
+) {
     if iterations == 0 || done.requires_owner {
         return;
     }
     let n = u64::from(iterations);
     let ns = (done.elapsed + done.helpers).as_nanos() as f64;
     prepared.set_cost(ns as u64);
+    if prepared.scoped_rows && ns > 0.0 {
+        prepared
+            .row_threshold
+            .set((9.0 * wake * n as f64 / ns).ceil().max(2.0) as u64);
+    }
     prepared
         .per_iteration
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
@@ -1674,6 +1787,10 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
             };
             return Some(self.account(guest_entry, false, done));
         }
+        let job = self.plans.job(guest_entry).unwrap();
+        if job.scoped_rows && (plan.is_none() || job.per_iteration.get().is_some()) {
+            return None;
+        }
         let mut scratch = ExecuteScratch::default();
         let done = run(
             &mut self.runtime,
@@ -1697,6 +1814,7 @@ impl Computation<Option<ExecutionContext>> for Session<'_> {
                 self.plans.job(guest_entry).unwrap(),
                 &done.completion,
                 iterations,
+                wake_cost(self.counts),
             );
         }
         Some(self.account(guest_entry, iteration, done))

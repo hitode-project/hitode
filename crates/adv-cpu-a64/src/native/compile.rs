@@ -78,7 +78,21 @@ fn computation_proof(trace: &Trace) -> Option<Proof> {
     }) {
         return None;
     }
-    let mut proof = Proof::build(trace).ok()?;
+    let mut proof = Proof::build(trace)
+        .inspect_err(|refusal| {
+            if crate::jit_map::enabled()
+                && trace
+                    .insts
+                    .iter()
+                    .any(|inst| inst.guarded_call.is_some() || inst.guarded_alignment.is_some())
+            {
+                crate::jit_map::optimized(
+                    trace.insts[0].pc,
+                    format_args!("row proof\t{}\t{}", refusal.why, trace.insts[refusal.at].pc),
+                );
+            }
+        })
+        .ok()?;
     let index = std::cell::Cell::new(0);
     proof.prove_split(trace, |_, _| {
         let i = index.get();
@@ -110,6 +124,15 @@ fn compile(request: Request) -> Compiled {
     } else {
         proof
     };
+    let guarded = unit
+        .trace
+        .insts
+        .iter()
+        .position(|inst| inst.guarded_call.is_some() || inst.guarded_alignment.is_some());
+    let rows = proof.as_ref().filter(|proof| proof.covers_rows());
+    if rows.is_some() {
+        unit.trace.separate_row_latches();
+    }
     let started = std::time::Instant::now();
     let resident = if task == Task::Job {
         None
@@ -128,20 +151,45 @@ fn compile(request: Request) -> Compiled {
             cut_unit.trace = unit.trace.cut(&cut);
             &cut_unit
         };
-        match front::build_with(
-            unit,
-            proof.as_ref(),
-            &at,
-            &|pc| all_checked || checked.contains(&pc),
-            &|pc| refused.contains(&pc),
-        ) {
+        let built = if let Some(index) = guarded.filter(|_| rows.is_none() || !cuts.is_empty()) {
+            Err(front::Reject::Unsupported(index))
+        } else {
+            front::build_with(
+                unit,
+                proof.as_ref(),
+                &at,
+                &|pc| all_checked || checked.contains(&pc),
+                &|pc| refused.contains(&pc),
+            )
+        };
+        match built {
             Ok(built) => {
-                let lowered = back::lower_resident(
-                    &built.func,
-                    &built.assumed,
-                    &built.func.entry,
-                    count_entries,
-                );
+                let lowered = if let Some(proof) = rows.filter(|_| cuts.is_empty()) {
+                    back::lower_rows(
+                        &built.func,
+                        &built.assumed,
+                        count_entries,
+                        Arc::new(proof.clone()),
+                    )
+                } else {
+                    back::lower_resident(
+                        &built.func,
+                        &built.assumed,
+                        &built.func.entry,
+                        count_entries,
+                    )
+                };
+                if let Some(index) = guarded.filter(|_| lowered.row_scope.is_none()) {
+                    return Compiled {
+                        eip,
+                        generation,
+                        code,
+                        task,
+                        at,
+                        resident: Some(Err(front::Reject::Unsupported(index))),
+                        job: None,
+                    };
+                }
                 let (cuts, us) = (built.cuts + cuts.len(), started.elapsed().as_micros());
                 crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
                 Some(Ok(ResidentForm { built, lowered }))

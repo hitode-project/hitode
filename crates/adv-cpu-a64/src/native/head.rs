@@ -40,6 +40,7 @@ pub(super) struct Version {
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
     pub batch_caches: Vec<crate::translate::opt::back::BatchCache>,
+    pub row_scope: Option<Box<crate::translate::opt::back::RowScope>>,
     pub site_counts: Option<Box<[Cell<u64>; 2]>>,
 }
 
@@ -122,7 +123,7 @@ pub(super) fn emit(
     let exit = asm.label();
     let opt_exit = asm.label();
 
-    if gate.is_some() {
+    if gate.is_some() || form.row_offer.is_some() {
         asm.bind(offer_exit);
         guest_exit(&mut asm, head, Exit::Computation);
         asm.b(exit);
@@ -246,6 +247,9 @@ pub(super) fn emit(
     ];
     form.place(form_at, address(tail));
     form.words[form.miss] = branch(form_at + form.miss * 4, address(miss));
+    if let Some(offer) = form.row_offer {
+        form.words[offer] = branch(form_at + offer * 4, address(offer_exit));
+    }
     // On the frozen back end the two labels share a word.
     if form.env_miss != form.miss {
         form.words[form.env_miss] = branch(form_at + form.env_miss * 4, address(env));

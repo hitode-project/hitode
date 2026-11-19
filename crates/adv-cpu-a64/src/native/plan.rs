@@ -61,6 +61,10 @@ pub(super) struct JobPlan {
     /// The serial cost of a split loop in host ticks.
     pub split_ticks: Cell<u64>,
     pub splits: bool,
+    pub scoped_rows: bool,
+    pub row_threshold: Cell<u64>,
+    pub row_splits: Cell<u64>,
+    pub row_diagnostics: bool,
     pub gate_entry: usize,
     pub gate_fallback: usize,
     pub admission: AdmissionCache,
@@ -94,6 +98,10 @@ impl JobPlan {
         };
         Self {
             splits,
+            scoped_rows: false,
+            row_threshold: Cell::new(2),
+            row_splits: Cell::new(0),
+            row_diagnostics: false,
             split_ticks: Cell::new(0),
             gate_entry: 0,
             gate_fallback: 0,
@@ -138,11 +146,11 @@ impl JobPlan {
         self.building.set(false);
     }
 
-    pub fn gate(&self) -> head::OfferEntry {
-        head::OfferEntry {
+    pub fn gate(&self) -> Option<head::OfferEntry> {
+        (!self.scoped_rows).then(|| head::OfferEntry {
             reoffer: self.reoffer.as_ptr() as u64,
             split_ticks: self.splits.then_some(self.split_ticks.as_ptr() as u64),
-        }
+        })
     }
 
     pub fn offer_due(&self, gate: &OfferGate) -> bool {
@@ -321,7 +329,7 @@ impl Arbiter {
         self.sites.get_mut(&eip)?.resident.as_deref_mut()
     }
 
-    pub(super) fn add_job(&mut self, eip: u32, iterates: bool, splits: bool) -> &JobPlan {
+    pub(super) fn add_job(&mut self, eip: u32, iterates: bool, splits: bool) -> &mut JobPlan {
         self.site(eip)
             .job
             .insert(Box::new(JobPlan::new(iterates, splits)))
@@ -524,6 +532,17 @@ impl Native {
         self.set_computation_offer(true, None);
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_row_cost(&mut self, head: u32, ns: f64) {
+        let job = self.plans.job(head).unwrap();
+        assert!(job.scoped_rows && job.splits);
+        job.per_iteration.set(Some((128, ns)));
+        job.set_cost((8.0 * ns) as u64);
+        job.row_threshold.set(2);
+        self.pace.set(Some(adv_cpu_core::backend::Pace::default()));
+        self.set_computation_offer(true, None);
+    }
+
     pub(crate) fn resident_batch_counts(&self) -> std::collections::BTreeMap<u32, [u64; 7]> {
         let mut counts = std::collections::BTreeMap::new();
         for cache in self.batch_caches() {
@@ -549,6 +568,31 @@ impl Native {
             }
         }
         counts
+    }
+
+    pub(crate) fn resident_row_counts(&self) -> impl Iterator<Item = (u32, [u64; 8])> + '_ {
+        self.plans.sites.iter().filter_map(|(&head, site)| {
+            let resident = site.resident.as_ref()?;
+            let mut counts = [0; 8];
+            let mut exists = false;
+            for version in &resident.versions {
+                if let Some(scope) = &version.row_scope {
+                    exists = true;
+                    counts[0] += scope.entries.get();
+                    counts[1] += scope.misses.get();
+                    counts[2] += scope.guard_misses.get();
+                    counts[3] += version
+                        .site_counts
+                        .as_ref()
+                        .map_or(0, |counts| counts[1].get());
+                    counts[4] += scope.offers.get();
+                    counts[5] += scope.declines.get();
+                    counts[7] += scope.alignment_misses.get();
+                }
+            }
+            counts[6] = site.job.as_ref().map_or(0, |job| job.row_splits.get());
+            exists.then_some((head, counts))
+        })
     }
 
     pub(crate) fn resident_site_counts(&self) -> impl Iterator<Item = (u32, [u64; 2])> + '_ {
@@ -1238,7 +1282,39 @@ impl Native {
         if self.plans.baseline_only {
             return;
         }
-        let mut trace = self.loop_trace(memory, eip, &self.stops);
+        let mut trace = self.loop_trace(memory, eip, &self.stops, None);
+        if trace.returns_at_head()
+            && trace.insts.iter().any(|inst| {
+                inst.observed_callee_slot().is_some() || inst.alignment_test().is_some()
+            })
+        {
+            let mut observed = self.loop_trace(memory, eip, &self.stops, Some(&at.regs));
+            if observed.insts.iter().any(|inst| inst.aligned_memory())
+                && let Some((reg, _, false)) = observed
+                    .insts
+                    .iter()
+                    .find_map(|inst| inst.guarded_alignment)
+            {
+                // An aligned instruction cannot be lowered in this form.
+                // Select the other guarded path when it has a usable body.
+                let mut regs = at.regs;
+                regs[usize::from(reg)] |= 1;
+                let alternate = self.loop_trace(memory, eip, &self.stops, Some(&regs));
+                if alternate.returns_at_head()
+                    && !alternate.insts.iter().any(|inst| inst.aligned_memory())
+                {
+                    observed = alternate;
+                }
+            }
+            if observed.returns_at_head()
+                && observed
+                    .insts
+                    .iter()
+                    .any(|inst| inst.guarded_call.is_some() || inst.guarded_alignment.is_some())
+            {
+                trace = observed;
+            }
+        }
         trace.x86 = trace
             .insts
             .iter()
@@ -1492,9 +1568,14 @@ impl Native {
             };
             head.pending = None;
             if let Some(job) = done.job {
+                let scoped_rows = done
+                    .resident
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .is_some_and(|r| r.lowered.row_scope.is_some());
                 head.has_proof = true;
                 let trace = head.trace.detached();
-                self.place_job(eip, &done.at, trace, job);
+                self.place_job(eip, &done.at, trace, job, scoped_rows);
                 self.install_offer_link(eip);
             }
             let head = self.plans.resident(eip).unwrap();
@@ -1547,7 +1628,7 @@ impl Native {
                 entry_exit_words: u64::from(lowered.entry_words + lowered.exit_words),
             });
         }
-        let gate = self.plans.job(eip).map(JobPlan::gate);
+        let gate = self.plans.job(eip).and_then(JobPlan::gate);
         self.stop_cold_window(eip);
         let head = self.plans.resident_mut(eip).unwrap();
         let (trampoline, tier1) = if head.trampoline == 0 {
@@ -1649,6 +1730,7 @@ impl Native {
             accounting,
             iteration_retired: u64::from(lowered.iteration_retired),
             batch_caches: lowered.batch_caches,
+            row_scope: lowered.row_scope,
             site_counts: lowered.site_counts,
         };
         if index == head.versions.len() {
@@ -1692,9 +1774,12 @@ impl Native {
         let Some(job) = self.plans.job_mut(eip) else {
             return;
         };
+        let Some(gate) = job.gate() else {
+            return;
+        };
         let at = self.code.cache.next();
         let unit = self.code.units.get(&eip).map(|entry| entry.unit);
-        let (words, fallback) = head::offer_link(eip, at, self.code.stubs.exit, unit, job.gate());
+        let (words, fallback) = head::offer_link(eip, at, self.code.stubs.exit, unit, gate);
         if self.code.cache.append(&words).is_some() {
             job.gate_entry = at;
             job.gate_fallback = fallback;
@@ -1838,6 +1923,7 @@ impl Native {
         memory: &mut Memory,
         eip: u32,
         stops: &[u32],
+        observed: Option<&[u32; 8]>,
     ) -> translate::Trace {
         let mut trace = translate::Trace::default();
         let handler = if self.bridge.is_null() {
@@ -1848,7 +1934,7 @@ impl Native {
                 .handler
                 .as_ref()
         };
-        trace.build(
+        trace.build_with(
             memory,
             eip,
             stops,
@@ -1863,7 +1949,7 @@ impl Native {
                     body: handler.direct_body(pc),
                 })
             },
-            true,
+            (true, observed),
         );
         trace
     }

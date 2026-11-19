@@ -36,6 +36,32 @@ impl WindowSpans {
         self.tables.each_ref().map(|table| table.as_ptr().cast())
     }
 
+    pub fn allows(&self, start: u32, end: u64, write: bool) -> bool {
+        let mut first = start as usize / super::PAGE_SIZE;
+        let mut last = (end - 1) as usize / super::PAGE_SIZE;
+        let mut offset = 0;
+        let table = &self.tables[usize::from(write)];
+        for size in WINDOW_SPAN_WORDS {
+            let lo = first / 64;
+            let hi = last / 64;
+            let left = u64::MAX << (first % 64);
+            let right = u64::MAX >> (63 - last % 64);
+            if lo == hi {
+                return table[offset + lo].get() & left & right == 0;
+            }
+            if table[offset + lo].get() & left != 0 || table[offset + hi].get() & right != 0 {
+                return false;
+            }
+            first = lo + 1;
+            last = hi - 1;
+            if first > last {
+                return true;
+            }
+            offset += size;
+        }
+        unreachable!("the root covers every guest page")
+    }
+
     pub fn refresh(&self, page: usize, class: u8, plain: &[Cell<u64>]) {
         let group = page / 64 * 3;
         let bit = 1 << (page % 64);

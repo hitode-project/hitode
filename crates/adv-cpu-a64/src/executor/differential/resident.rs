@@ -2454,3 +2454,169 @@ fn vector_read_falls_back_on_unreadable_host_page_neighbor() {
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
     trial.compare_epilogue();
 }
+
+// spec: A64-OPT-9, A64-OPT-10
+#[test]
+fn resident_row_scope_hoists_window_access_and_guards_alignment_and_calls() {
+    for indirect in [false, true] {
+        let image = Image::loop_body(|a, row, stop| {
+            let mut leaf = a.create_label();
+            let mut pixel = a.create_label();
+            let mut test = a.create_label();
+            if !indirect {
+                a.test(esi, 15).unwrap();
+                a.jne(stop).unwrap();
+            }
+            a.mov(edx, 16).unwrap();
+            if indirect {
+                a.call(dword_ptr(ebx)).unwrap();
+            } else {
+                a.call(leaf).unwrap();
+            }
+            a.add(esi, 32).unwrap();
+            a.add(edi, 32).unwrap();
+            latch(a, row);
+            a.jmp(stop).unwrap();
+            a.set_label(&mut leaf).unwrap();
+            a.sub(edx, 1).unwrap();
+            a.jmp(test).unwrap();
+            a.set_label(&mut pixel).unwrap();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.or(eax, 0xff00_0000u32).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(edx).unwrap();
+            a.set_label(&mut test).unwrap();
+            a.jns(pixel).unwrap();
+            a.ret().unwrap();
+        });
+        let leaf = CODE
+            + image
+                .code
+                .windows(3)
+                .position(|w| w == [0x83, 0xea, 0x01])
+                .unwrap() as u32;
+        let ret = CODE + image.code.iter().rposition(|&b| b == 0xc3).unwrap() as u32;
+        let mut cpu = initial(8);
+        cpu.regs[3] = RESULTS;
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("row scope indirect={indirect}"),
+            &[],
+            |m| {
+                m.write(DATA, &vector_data(719)).unwrap();
+                m.write(RESULTS, &leaf.to_le_bytes()).unwrap();
+            },
+        );
+        assert!(trial.try_install_at(cpu.clone()), "{indirect}");
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        let counts = |trial: &Trial<'_>| {
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .resident_row_counts()
+                .find(|&(head, _)| head == image.head)
+                .unwrap()
+                .1
+        };
+        let [entries, misses, mismatches, .., misaligned] = counts(&trial);
+        assert!(entries > 0);
+        assert_eq!((misses, mismatches, misaligned), (0, 0, 0));
+        for executor in [&mut trial.live, &mut trial.reference] {
+            executor.state = cpu.clone();
+            if indirect {
+                executor.memory.write(RESULTS, &ret.to_le_bytes()).unwrap();
+            } else {
+                executor.state.regs[6] += 4;
+            }
+        }
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        let [still, misses, mismatches, .., misaligned] = counts(&trial);
+        assert_eq!(still, entries);
+        assert_eq!(misses, 0);
+        assert_eq!((mismatches > 0, misaligned > 0), (indirect, !indirect));
+    }
+}
+
+// spec: A64-OPT-9, A64-OPT-10, A64-TR-9
+#[test]
+fn a_resident_row_offer_splits_the_affine_rectangle() {
+    let _pool = crate::native::exclusive_pool();
+    if std::thread::available_parallelism().unwrap().get() < 2 {
+        return;
+    }
+
+    let image = Image::loop_body(|a, row, _| {
+        let mut pixel = a.create_label();
+        a.mov(edx, 16).unwrap();
+        a.set_label(&mut pixel).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.or(eax, 0xff00_0000u32).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(edx).unwrap();
+        a.jne(pixel).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, row);
+    });
+    let cpu = initial(8);
+    let before = vector_data(1025);
+    let mut trial = Trial::new(&image, &cpu, "row split", &[], |memory| {
+        memory.write(DATA, &vector_data(541)).unwrap();
+        memory.write(OUTPUT, &before).unwrap();
+    });
+    assert!(trial.try_install_at(cpu.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let expected = trial
+        .live
+        .memory
+        .read(OUTPUT, before.len())
+        .unwrap()
+        .to_vec();
+    trial.live.memory.write(OUTPUT, &before).unwrap();
+    trial.live.state = cpu;
+    trial
+        .live
+        .native
+        .as_mut()
+        .unwrap()
+        .seed_row_cost(image.head, 2_000_000.0);
+    let mut offered = false;
+    for _ in 0..16 {
+        let run = trial.run_native(4096).unwrap();
+        if run.exit == Exit::Computation {
+            offered = true;
+            break;
+        }
+        assert!(matches!(run.exit, Exit::Dispatch | Exit::Budget));
+    }
+    assert!(offered);
+    assert_eq!(trial.live.state.eip, image.head);
+    let context = Some(trial.live.save_context().unwrap());
+    let mut completion = None;
+    trial
+        .live
+        .with_computation(&mut 0, None, None, &mut |scope| {
+            completion = scope.run_local(1, &context);
+        });
+    let done = completion.unwrap();
+    assert!(!done.requires_owner);
+    trial.live.restore_context(&done.context.unwrap()).unwrap();
+    trial.same_state();
+    assert_eq!(
+        trial.live.memory.read(OUTPUT, before.len()).unwrap(),
+        expected
+    );
+    let native = trial.live.native.as_ref().unwrap();
+    let (_, [_, _, _, _, offers, _, splits, _]) = native
+        .resident_row_counts()
+        .find(|&(head, _)| head == image.head)
+        .unwrap();
+    assert_eq!((offers, splits), (1, 1));
+}

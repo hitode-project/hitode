@@ -33,6 +33,36 @@ pub(super) struct PageCrossing {
 }
 
 impl Emitter<'_> {
+    #[cfg(native)]
+    pub(super) fn row_scope(&mut self, scope: &RowScope) -> (Label, Option<Label>) {
+        let check = self.asm.label();
+        let done = self.asm.label();
+        let failed = self.asm.label();
+        self.asm.emit(mov(X, X0, RT));
+        self.imm(X1, std::ptr::from_ref(scope) as u64);
+        self.asm.bl(check);
+        self.asm.cbz(X, false, X0, failed);
+        let offer = scope.proof.splits().then(|| {
+            let offer = self.asm.label();
+            self.imm(T, scope.threshold.as_ptr() as u64);
+            self.asm.emit_all(&[
+                lsr_imm(X, X0, X0, 1),
+                ldr(X, T, T, 0),
+                cmp(X, X0, T, Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Hs, offer);
+            if scope.diagnostics {
+                self.count_cell(&scope.declines);
+            }
+            offer
+        });
+        self.asm.b(done);
+        self.asm.bind(check);
+        preserve_call(&mut self.asm, crate::native::admit_rows as *const () as u64);
+        self.asm.bind(done);
+        (failed, offer)
+    }
+
     pub(super) fn memory_access(
         &mut self,
         address: Reg,
@@ -290,6 +320,48 @@ impl Emitter<'_> {
         self.asm
             .emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);
         self.asm.b_cond(Cond::Ls, next);
+    }
+}
+
+/// An enclosing resident form proved before entering any row. The same
+/// trace supplies its scalar continuations and the ranges of its kernels.
+#[cfg(native)]
+pub(crate) struct RowScope {
+    pub(crate) proof: std::sync::Arc<crate::translate::computation::Proof>,
+    pub(crate) evaluation: std::cell::RefCell<crate::translate::computation::Evaluation>,
+    pub(crate) entries: std::cell::Cell<u64>,
+    pub(crate) misses: std::cell::Cell<u64>,
+    pub(crate) guard_misses: std::cell::Cell<u64>,
+    pub(crate) alignment_misses: std::cell::Cell<u64>,
+    pub(crate) head: u32,
+    pub(crate) threshold: std::cell::Cell<u64>,
+    pub(crate) offers: std::cell::Cell<u64>,
+    pub(crate) declines: std::cell::Cell<u64>,
+    pub(super) targets: Vec<(u8, u32, u32)>,
+    pub(crate) diagnostics: bool,
+}
+
+#[cfg(native)]
+impl RowScope {
+    pub(super) fn new(
+        head: u32,
+        proof: std::sync::Arc<crate::translate::computation::Proof>,
+        diagnostics: bool,
+    ) -> Self {
+        Self {
+            targets: proof.guarded_targets().unwrap(),
+            head,
+            threshold: std::cell::Cell::new(u64::MAX),
+            offers: Default::default(),
+            declines: Default::default(),
+            proof,
+            evaluation: Default::default(),
+            entries: Default::default(),
+            misses: Default::default(),
+            guard_misses: Default::default(),
+            alignment_misses: Default::default(),
+            diagnostics,
+        }
     }
 }
 
@@ -691,6 +763,55 @@ mod span_tests {
                 b_cond(Cond::Lo, (target - 12 * 4) as i32),
             ],
         );
+    }
+
+    // spec: A64-OPT-10
+    #[test]
+    fn the_long_window_proof_has_no_page_iteration() {
+        fn branch_target(at: usize, bits: u32, width: u32) -> usize {
+            let shift = 32 - width;
+            let displacement = ((bits << shift) as i32 >> shift) as isize;
+            at.checked_add_signed(displacement).unwrap()
+        }
+
+        fn paths(words: &[u32], at: usize, active: &mut [bool]) -> (u32, u32) {
+            assert!(!std::mem::replace(&mut active[at], true), "cyclic proof");
+            let word = words[at];
+            let (loads, compares) = if word == ret(Reg::LR) {
+                (0, 0)
+            } else if word & 0xfc00_0000 == 0x1400_0000 {
+                paths(words, branch_target(at, word & 0x03ff_ffff, 26), active)
+            } else if word & 0xff00_0010 == 0x5400_0000 || word & 0x7e00_0000 == 0x3400_0000 {
+                let (taken_loads, taken_compares) =
+                    paths(words, branch_target(at, (word >> 5) & 0x7ffff, 19), active);
+                let (fall_loads, fall_compares) = paths(words, at + 1, active);
+                (
+                    taken_loads.max(fall_loads),
+                    taken_compares.max(fall_compares),
+                )
+            } else {
+                let (loads, compares) = paths(words, at + 1, active);
+                let summary_load = [
+                    ldr_reg(X, X4, U, T, true),
+                    ldr_reg(X, T, U, X2, true),
+                    ldr_reg(X, T, X5, X2, true),
+                ]
+                .contains(&word);
+                let compare = word & 0xff80_001f == 0xf100_001f;
+                (
+                    loads + u32::from(summary_load),
+                    compares + u32::from(compare),
+                )
+            };
+            active[at] = false;
+            (loads, compares)
+        }
+
+        let mut asm = Asm::new();
+        let search = asm.label();
+        span_search(&mut asm, search);
+        let words = asm.finish();
+        assert_eq!(paths(&words, 0, &mut vec![false; words.len()]), (6, 4));
     }
 
     #[cfg(unix)]

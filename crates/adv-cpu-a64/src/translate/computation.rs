@@ -1,6 +1,7 @@
-//! Memory effects of detached translated computation. Expressions model only
-//! address-bearing integer values. Native instruction lowering still owns all
-//! results, flags, exceptional exits and floating-point state.
+//! Memory effects of detached computation and enclosing resident row loops.
+//! Row forms reuse the affine effect proof to check a whole domain before
+//! entering its first row. Expressions model only address-bearing integer
+//! values. Native lowering still owns results, flags and exceptional exits.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -33,6 +34,7 @@ enum Expr {
     Add(ExprId, ExprId),
     Mul(ExprId, ExprId),
     Neg(ExprId),
+    SignTrip(ExprId, u32, bool),
 }
 
 // An affine sum in the guest's modulo-2^32 address arithmetic. Coefficients
@@ -97,6 +99,8 @@ struct Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Check {
     Equal(ExprId, ExprId),
+    Target(ExprId, u32),
+    Mask(ExprId, u32, bool),
     Positive(ExprId, u32),
     StackAlignment(u32),
 }
@@ -151,6 +155,8 @@ pub(crate) struct Proof {
     divisions: Vec<Option<Division>>,
     frame_cache: Option<FrameCache>,
     outer: Option<Outer>,
+    rows: bool,
+    based: u8,
     /// Each trace instruction as decoded once from guest bytes, for the
     /// split proof and the optimizer's component effects.
     instructions: Vec<Option<iced_x86::Instruction>>,
@@ -195,7 +201,7 @@ pub(crate) struct FrameCache {
 
 impl FrameCache {
     pub(crate) fn read(&self, index: usize) -> Option<u8> {
-        self.reads[index]
+        self.reads.get(index).copied().flatten()
     }
 }
 
@@ -331,7 +337,14 @@ impl Graph {
             {
                 return refuse("graph: side entry", i);
             }
-            let mut test = tail;
+            let test_at_head = matches!(trace.insts[head].op, Op::Jcc(Cc::Flags(_), _))
+                && edges[head]
+                    .map(|edge| edge.is_some_and(|to| inside[to]))
+                    .into_iter()
+                    .filter(|&edge| edge)
+                    .count()
+                    == 1;
+            let mut test = if test_at_head { head } else { tail };
             let (condition, taken, exit) = loop {
                 let inst = trace.insts[test];
                 if let Op::Jcc(Cc::Flags(condition), _) = inst.op {
@@ -345,10 +358,13 @@ impl Graph {
                         _ => {}
                     }
                 }
+                if test == head {
+                    return refuse("graph: no test", tail);
+                }
                 let [prev] = incoming[test].as_slice() else {
                     return refuse("graph: no test", tail);
                 };
-                if *prev == head || !inside[*prev] {
+                if !inside[*prev] {
                     return refuse("graph: no test", tail);
                 }
                 test = *prev;
@@ -460,6 +476,8 @@ struct Builder<'a> {
     remaining: usize,
     states: Vec<Vec<Option<State>>>,
     outer: Option<Outer>,
+    based: u8,
+    rows: bool,
 }
 
 impl Builder<'_> {
@@ -680,7 +698,7 @@ impl Builder<'_> {
     fn slot_of(&self, form: &Form) -> Option<Slot> {
         let id = form.invariant()?;
         let base = |id: ExprId| match self.exprs[id] {
-            Expr::Register(r @ (ESP | EBP)) => Some(r),
+            Expr::Register(r) if r == ESP || r == self.based => Some(r),
             _ => None,
         };
         match self.exprs[id] {
@@ -907,6 +925,13 @@ impl Builder<'_> {
         if inst.locked.is_some() || inst.call.is_some() || inst.spin {
             return None;
         }
+        if let Some((reg, mask, nonzero)) = inst.guarded_alignment {
+            let address = self.register(state, reg)?;
+            self.check(Check::Mask(address.base, mask, nonzero));
+            for &(_, stride) in &address.terms {
+                self.check(Check::Mask(stride, mask, false));
+            }
+        }
         if inst.effects.writes != super::flags::FlagSet::NONE {
             state.test = None;
         }
@@ -1094,6 +1119,13 @@ impl Builder<'_> {
             Op::Call(target) if inst.mode != Mode::Real => {
                 if self.graph.edges[at][0].is_none() && target != inst.next_pc {
                     return None;
+                }
+                if let Some(slot) = inst.guarded_call {
+                    let addr = self.address(state, slot)?;
+                    let invariant = addr.invariant()?;
+                    self.read(state, addr, 4, record);
+                    let word = self.expr(Expr::Word(invariant));
+                    self.check(Check::Target(word, target));
                 }
                 let ret = self.imm(inst.next_pc);
                 self.push(state, Some(ret), record)?;
@@ -1410,17 +1442,35 @@ impl Builder<'_> {
 
     fn trip(&mut self, lp: usize, test: Test, var: VarId) -> Option<ExprId> {
         let lp = &self.graph.loops[lp];
+        let pretest = lp.test == lp.head;
         let coefficient = |a: &Form, c| a.terms.as_slice() == [(var, c)];
         let signed = matches!(lp.condition, Cond::l | Cond::ge | Cond::le | Cond::g);
         let count = match (test, lp.condition, lp.taken) {
             (Test::Zero(a), Cond::ne, true) | (Test::Zero(a), Cond::e, false)
                 if coefficient(&a, *self.interned.get(&Expr::Constant(u32::MAX))?) =>
             {
-                self.add(a.base, self.one)
+                if pretest {
+                    a.base
+                } else {
+                    self.add(a.base, self.one)
+                }
+            }
+            (Test::Zero(a), Cond::ns, true) | (Test::Zero(a), Cond::s, false) if self.rows => {
+                let [(counter, scale)] = a.terms.as_slice() else {
+                    return None;
+                };
+                let Expr::Constant(scale) = self.exprs[*scale] else {
+                    return None;
+                };
+                let step = scale.wrapping_neg();
+                if *counter != var || !step.is_power_of_two() || step > i32::MAX as u32 {
+                    return None;
+                }
+                self.expr(Expr::SignTrip(a.base, step.trailing_zeros(), pretest))
             }
             (Test::Compare(a, b), Cond::l | Cond::b | Cond::le, true)
             | (Test::Compare(a, b), Cond::ge | Cond::ae | Cond::g, false)
-                if coefficient(&a, self.one) && (signed || a.base == self.one) =>
+                if !pretest && coefficient(&a, self.one) && (signed || a.base == self.one) =>
             {
                 // The counter runs from its start to the bound, or one past
                 // an inclusive bound that admission keeps below i32::MAX.
@@ -1441,7 +1491,9 @@ impl Builder<'_> {
         // Only a signed compare limits the count to a signed dword, which
         // also keeps a count from a nonzero start exact.
         let max = if signed { i32::MAX as u32 } else { u32::MAX };
-        self.check(Check::Positive(count, max));
+        if !pretest {
+            self.check(Check::Positive(count, max));
+        }
         Some(count)
     }
 
@@ -1500,6 +1552,25 @@ impl Builder<'_> {
 
     fn loop_body(&mut self, lp: usize, mut initial: State, record: bool) -> Option<State> {
         let head = self.graph.loops[lp].head;
+        let pretest = self.graph.loops[lp].test == head;
+        let test_reg = if pretest {
+            if !self.rows || head == 0 {
+                return self.refuse("outer pretest", head);
+            }
+            let value = match initial.test.as_ref()? {
+                Test::Zero(value) => value,
+                Test::Compare(value, bound) if bound.invariant() == Some(self.zero) => value,
+                _ => return self.refuse("pretest", head),
+            };
+            Some(
+                initial
+                    .regs
+                    .iter()
+                    .position(|reg| reg.as_ref() == Some(value))?,
+            )
+        } else {
+            None
+        };
         let mut used = 0;
         let first = loop {
             let mut seed = initial.clone();
@@ -1565,7 +1636,13 @@ impl Builder<'_> {
         let divisions = self.divisions.len();
         let frame_heads = self.frame_heads.len();
         let mut after = loop {
+            before.test = test_reg.and_then(|reg| before.regs[reg].clone().map(Test::Zero));
             let (back, after) = self.walk(head, before.clone(), Some(lp), record)??;
+            if let Some(reg) = test_reg
+                && back.test != back.regs[reg].clone().map(Test::Zero)
+            {
+                return self.refuse("pretest flags", head);
+            }
             let mut changed = false;
             for (r, recurrence) in recurring.iter_mut().enumerate() {
                 if recurrence
@@ -1636,6 +1713,11 @@ impl Builder<'_> {
                 frame: false,
             });
         }
+        let count = if pretest {
+            self.add(count, self.one)
+        } else {
+            count
+        };
         for r in &mut after.regs {
             *r = self.final_value(r.take(), var, count);
         }
@@ -1842,6 +1924,52 @@ impl Proof {
                 return None;
             }
         };
+        for (at, inst) in trace.insts.iter().enumerate() {
+            if inst.guarded_alignment.is_some()
+                && graph
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .any(|(from, edges)| from + 1 != at && edges.contains(&Some(at)))
+            {
+                refused.set(Some(Refusal {
+                    why: "alignment merge",
+                    at,
+                }));
+                return None;
+            }
+        }
+        let rows = graph.heads[0].is_some_and(|outer| {
+            graph
+                .loops
+                .iter()
+                .enumerate()
+                .any(|(i, child)| i != outer && graph.loops[outer].inside[child.head])
+        });
+        // An enclosing loop can save its row starts through a fixed context
+        // base. Follow that base like EBP, keeping its alias exclusion.
+        let guarded = trace
+            .insts
+            .iter()
+            .any(|inst| inst.guarded_call.is_some() || inst.guarded_alignment.is_some());
+        let based = (rows && guarded)
+            .then(|| {
+                trace.insts.iter().find_map(|inst| match inst.op {
+                    Op::Mov(
+                        Src::Mem(Mem {
+                            base: Some(base),
+                            index: None,
+                            fs: false,
+                            address_bits: 32,
+                            ..
+                        }),
+                        Src::Reg(_),
+                    ) if base != ESP => Some(base),
+                    _ => None,
+                })
+            })
+            .flatten()
+            .unwrap_or(EBP);
         let mut b = Builder {
             trace,
             graph: &graph,
@@ -1859,6 +1987,8 @@ impl Proof {
             remaining: PROOF_STEPS,
             states: Vec::new(),
             outer: None,
+            based,
+            rows,
         };
         b.zero = b.constant(0);
         b.one = b.constant(1);
@@ -1964,7 +2094,7 @@ impl Proof {
                         continue;
                     }
                 }
-                Check::Equal(..) => {}
+                Check::Equal(..) | Check::Target(..) | Check::Mask(..) => {}
             }
             checks.push(check);
         }
@@ -1990,8 +2120,44 @@ impl Proof {
                 outer.counter = outer.counter.and_then(|var| ids.get(&var).copied());
                 outer
             }),
+            rows,
+            based,
             instructions: Vec::new(),
         })
+    }
+
+    pub(crate) fn covers_rows(&self) -> bool {
+        self.rows
+            && self.effects.iter().all(|effect| effect.limits.is_empty())
+            && self.guarded_targets().is_some()
+            && self.vars.iter().all(|var| matches!(var, Var::Counter(_)))
+    }
+
+    /// Returns the entry-relative slots whose target can be tested before
+    /// materializing the resident frame.
+    pub(crate) fn guarded_targets(&self) -> Option<Vec<(u8, u32, u32)>> {
+        self.checks
+            .iter()
+            .filter_map(|check| match *check {
+                Check::Target(word, target) => Some((word, target)),
+                _ => None,
+            })
+            .map(|(word, target)| {
+                let Expr::Word(addr) = self.exprs[word] else {
+                    return None;
+                };
+                let (base, offset) = match self.exprs[addr] {
+                    Expr::Register(base) => (base, 0),
+                    Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
+                        (Expr::Register(base), Expr::Constant(offset))
+                        | (Expr::Constant(offset), Expr::Register(base)) => (base, offset),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                Some((base, offset, target))
+            })
+            .collect()
     }
 
     /// Decodes the trace's instructions, then proves that the head loop's
@@ -2033,7 +2199,42 @@ impl Proof {
     }
 
     pub(crate) fn splits(&self) -> bool {
-        self.outer.is_some_and(|outer| outer.split)
+        self.outer.is_some_and(|outer| {
+            outer.split
+                && (!self.rows
+                    || self.effects.iter().all(|effect| {
+                        effect.access != Access::Write
+                            || effect.tail
+                            || effect
+                                .addr
+                                .terms
+                                .iter()
+                                .any(|&(counter, _)| Some(counter) == outer.counter)
+                    }))
+        })
+    }
+
+    pub(crate) fn row_count_register(&self) -> Option<u8> {
+        match self.exprs[self.outer?.count] {
+            Expr::Register(reg) => Some(reg),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn row_alignment(&self) -> impl Iterator<Item = (u8, u32, bool)> + '_ {
+        self.checks.iter().filter_map(|&check| {
+            let Check::Mask(expr, mask, nonzero) = check else {
+                return None;
+            };
+            let Expr::Register(reg) = self.exprs[expr] else {
+                return None;
+            };
+            Some((reg, mask, nonzero))
+        })
+    }
+
+    pub(crate) fn row_count(&self, scratch: &Evaluation) -> Option<u32> {
+        scratch.values[self.outer?.count]
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every
@@ -2285,7 +2486,7 @@ impl Proof {
     }
 
     pub(crate) fn division(&self, index: usize) -> Option<Division> {
-        self.divisions[index]
+        self.divisions.get(index).copied().flatten()
     }
 
     pub(crate) fn entry_registers(&self) -> u8 {
@@ -2358,6 +2559,25 @@ impl Proof {
                     if !(1..=max).contains(&self.value(expr, cpu, scratch, read)?) {
                         return None;
                     }
+                }
+                Check::Mask(expr, mask, nonzero) => {
+                    if (self.value(expr, cpu, scratch, read)? & mask != 0) != nonzero {
+                        return None;
+                    }
+                }
+                Check::Target(word, target) => {
+                    if self.value(word, cpu, scratch, read)? != target {
+                        return None;
+                    }
+                    let Expr::Word(addr) = self.exprs[word] else {
+                        unreachable!()
+                    };
+                    let start = self.value(addr, cpu, scratch, read)?;
+                    scratch.parameters.push(Range {
+                        start,
+                        end: u64::from(start) + 4,
+                        write: false,
+                    });
                 }
                 Check::Equal(a, b) => {
                     if self.value(a, cpu, scratch, read)? != self.value(b, cpu, scratch, read)? {
@@ -2597,6 +2817,14 @@ impl Proof {
                 .value(a, cpu, scratch, read)?
                 .wrapping_mul(self.value(b, cpu, scratch, read)?),
             Expr::Neg(a) => self.value(a, cpu, scratch, read)?.wrapping_neg(),
+            Expr::SignTrip(result, shift, pretest) => {
+                let result = self.value(result, cpu, scratch, read)?;
+                if (result as i32) < 0 {
+                    u32::from(!pretest)
+                } else {
+                    (result >> shift) + 1 + u32::from(!pretest)
+                }
+            }
         };
         scratch.values[id] = Some(value);
         Some(value)
@@ -2608,10 +2836,14 @@ impl Proof {
 
     fn based_offset(&self, id: ExprId) -> Option<i64> {
         match self.exprs[id] {
-            Expr::Register(EBP) => Some(0),
+            Expr::Register(base) if base == self.based => Some(0),
             Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
-                (Expr::Register(EBP), Expr::Constant(c))
-                | (Expr::Constant(c), Expr::Register(EBP)) => Some(i64::from(c as i32)),
+                (Expr::Register(base), Expr::Constant(c))
+                | (Expr::Constant(c), Expr::Register(base))
+                    if base == self.based =>
+                {
+                    Some(i64::from(c as i32))
+                }
                 _ => None,
             },
             _ => None,
