@@ -889,8 +889,9 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
         .into_iter()
         .filter(|host| host % unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize == 0)
     {
-        for form in 0..6 {
+        for form in 0..8 {
             let mut p = fixture(|a| {
+                a.pxor(xmm7, xmm1).unwrap();
                 a.add(edx, ecx).unwrap();
                 match form {
                     0 => a.lock().cmpxchg(dword_ptr(ebx), ecx),
@@ -898,10 +899,13 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
                     2 => a.lock().xadd(dword_ptr(ebx), ecx),
                     3 => a.lock().adc(dword_ptr(ebx), ecx),
                     4 => a.lock().inc(byte_ptr(ebx)),
-                    _ => a.lock().bts(dword_ptr(ebx), ecx),
+                    5 => a.lock().bts(dword_ptr(ebx), ecx),
+                    6 => a.lock().xadd(dword_ptr(ebx + 3), ecx),
+                    _ => a.lock().cmpxchg8b(qword_ptr(ebx + 4093)),
                 }
                 .unwrap();
                 a.adc(edi, 0).unwrap();
+                a.pxor(xmm7, xmm2).unwrap();
             });
             p.data[..8].copy_from_slice(&0x8765432181234567u64.to_le_bytes());
             if form == 5 {
@@ -935,7 +939,8 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
                         assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
                     }
                     if !config.1 && shared {
-                        assert!(a.native.as_ref().unwrap().diagnostics.helpers > 0);
+                        assert_eq!(a.stats.interpreter_entries, 0);
+                        assert_eq!(a.value_calls_at(CODE + 6), 1);
                     }
                 }
             }

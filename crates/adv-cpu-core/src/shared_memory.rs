@@ -75,6 +75,23 @@ pub(crate) unsafe fn atomic_store(mut destination: *mut u8, mut input: &[u8]) {
     }
 }
 
+/// Update an operand contained in one aligned shared word.
+pub(crate) unsafe fn atomic_update(
+    destination: *mut u8,
+    width: usize,
+    mut update: impl FnMut(u32) -> u32,
+) {
+    let edge = destination as usize % 4;
+    let shift = edge * 8;
+    let mask = u32::MAX >> (32 - width * 8);
+    // SAFETY: as for atomic_store; the operand is within this word.
+    let atom = unsafe { &*destination.sub(edge).cast::<AtomicU32>() };
+    let _ = atom.try_update(Ordering::SeqCst, Ordering::Relaxed, |word| {
+        let value = update((word >> shift) & mask) & mask;
+        Some((word & !(mask << shift)) | (value << shift))
+    });
+}
+
 pub type FileIdentity = (libc::dev_t, libc::ino_t);
 pub(crate) type FilePageIdentity = (FileIdentity, u64);
 
@@ -195,6 +212,11 @@ impl SharedAllocation {
     /// Whether host stores may reach the storage.
     pub fn writable(&self) -> bool {
         self.writable
+    }
+
+    pub(crate) fn update_word(&self, offset: usize, width: usize, update: impl FnMut(u32) -> u32) {
+        // SAFETY: Memory supplies a checked, writable span in one shared word.
+        unsafe { atomic_update(self.mapping.write.as_ptr().add(offset), width, update) };
     }
 
     /// The host pages of the storage's own writable (or, for a read-only

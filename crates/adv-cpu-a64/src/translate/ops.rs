@@ -253,8 +253,15 @@ impl Translator<'_> {
     }
 
     fn locked(&mut self, mut inst: Inst, mem: Mem, width: u8, helper: u8) {
-        self.flush_simd();
-        self.vector = super::simd::Vector::default();
+        let operation = self
+            .tier1
+            .then(|| self.trace.helpers[usize::from(helper)].locked_value)
+            .flatten();
+        if operation.is_none() {
+            self.flush_simd();
+            self.vector = super::simd::Vector::default();
+        }
+        self.vector.cpu = false;
         self.canonicalize();
         *self.uses_permissions = true;
         let (slow, done) = (self.asm.label(), self.asm.label());
@@ -281,7 +288,38 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.state = State::CANONICAL;
-        self.helper(helper);
+        if let Some(operation) = operation {
+            let refused = self.leave_for_event(runtime::Event::CheckedAccess);
+            self.emit(str(W, address, RUNTIME, runtime::VALUE_ADDRESS));
+            let (reads, writes) = operation.registers();
+            for n in 0..8 {
+                if reads & (1 << n) != 0 {
+                    self.emit(str(
+                        W,
+                        host(n),
+                        RUNTIME,
+                        runtime::VALUE_REGS + 4 * u32::from(n),
+                    ));
+                }
+            }
+            self.call_prepared_value(helper, runtime::ValueTarget::Locked, self.x87_live_pairs());
+            self.asm.cbz(W, true, X0, refused);
+            for n in 0..8 {
+                if writes & (1 << n) != 0 {
+                    self.emit(ldr(
+                        W,
+                        result(n),
+                        RUNTIME,
+                        runtime::VALUE_REGS + 4 * u32::from(n),
+                    ));
+                    self.commit(n);
+                }
+            }
+            self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
+            runtime::emit_load_flags(self.asm);
+        } else {
+            self.helper(helper);
+        }
         self.asm.bind(done);
     }
 

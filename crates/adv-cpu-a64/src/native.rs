@@ -538,14 +538,8 @@ unsafe extern "C" fn value(runtime: *mut Runtime, index: u32) -> u32 {
     let runtime = unsafe { &mut *runtime };
     let owner = unsafe { &mut *(runtime.owner as *mut Owner) };
     let native = unsafe { &mut *owner.native };
+    native.note_value_call(index);
     let helper = &native.code.helpers[index as usize];
-    #[cfg(test)]
-    {
-        *native.code.value_counts.entry(helper.pc).or_default() += 1;
-    }
-    if let Some(paths) = &mut native.code.slow_paths {
-        *paths.values.entry(helper.pc).or_default() += 1;
-    }
     let operation = helper.value.as_ref().expect("a prepared value instruction");
     let x87 = operation.x87_operands();
     if let Some(x87) = &x87
@@ -574,6 +568,56 @@ unsafe extern "C" fn value(runtime: *mut Runtime, index: u32) -> u32 {
         adv_cpu_core::floating::ValueOutcome::Exception(vector) => u32::from(vector),
         adv_cpu_core::floating::ValueOutcome::Unsupported => runtime::VALUE_UNSUPPORTED,
         adv_cpu_core::floating::ValueOutcome::Store { .. } => runtime::VALUE_STORE_READY,
+    }
+}
+
+/// Access stub for a LOCK read-modify-write in shared storage.
+unsafe extern "C" fn locked_access(
+    runtime: *mut Runtime,
+    index: u32,
+    nzcv: u32,
+    parity: u32,
+    adjust: u32,
+    direction: u32,
+) -> u32 {
+    // SAFETY: the call is made by the current owner against its live frame.
+    let runtime = unsafe { &mut *runtime };
+    let owner = unsafe { &mut *(runtime.owner as *mut Owner) };
+    let native = unsafe { &mut *owner.native };
+    native.note_value_call(index);
+    let operation = native.code.helpers[index as usize]
+        .locked_value
+        .expect("prepared locked operation");
+    let frame = &mut runtime.value_frame;
+    frame.eflags = (nzcv >> 24 & 0xc0)
+        | (!nzcv >> 29 & 1)
+        | (nzcv >> 17 & 0x800)
+        | (u32::from((parity as u8).count_ones().is_multiple_of(2)) << 2)
+        | (adjust & 0x10)
+        | (direction << 10);
+    u32::from(
+        operation
+            .update(
+                unsafe { &mut *owner.memory },
+                frame.address,
+                &mut frame.regs,
+                &mut frame.eflags,
+            )
+            .is_err(),
+    )
+}
+
+impl Native {
+    fn note_value_call(&mut self, index: u32) {
+        #[cfg(test)]
+        {
+            let pc = self.code.helpers[index as usize].pc;
+            *self.code.value_counts.entry(pc).or_default() += 1;
+        }
+        if let Some(paths) = &mut self.code.slow_paths {
+            let pc = self.code.helpers[index as usize].pc;
+            *paths.values.entry(pc).or_default() += 1;
+        }
     }
 }
 

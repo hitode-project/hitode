@@ -538,6 +538,7 @@ pub struct Helper {
     pub prepared: Arc<Prepared>,
     pub value: Option<ValueInstruction>,
     pub value_mem: Option<Mem>,
+    pub locked_value: Option<adv_cpu_core::integer::LockedOperation>,
 }
 
 #[derive(Clone, Copy)]
@@ -757,6 +758,10 @@ impl Fetcher {
             prepared: Arc::clone(prepared),
             value: ValueInstruction::new(ins, prepared.x87_opcode()),
             value_mem: memory_sized(&ins),
+            locked_value: sample
+                .locked
+                .then(|| adv_cpu_core::integer::LockedOperation::new(&ins))
+                .flatten(),
         });
         if sample.locked {
             self.locked = Some((memory_sized(&ins)?, ins.memory_size().size() as u8, index));

@@ -10,7 +10,7 @@ use adv_cpu_core::{CpuState, Memory};
 use super::plan::{self, dispatch};
 use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
-    alias_base, call, interpret, timestamp, value, value_access,
+    alias_base, call, interpret, locked_access, timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
 use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
@@ -123,6 +123,7 @@ impl Native {
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).value = value as *const () as u64;
             (*runtime).value_access = value_access as *const () as u64;
+            (*runtime).locked_access = locked_access as *const () as u64;
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;

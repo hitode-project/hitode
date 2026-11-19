@@ -1617,6 +1617,78 @@ fn register_value_call_preserves_cache_within_the_helper_path_count() {
     }
 }
 
+// spec: A64-ISA-6, A64-REG-5
+#[cfg(native)]
+#[test]
+fn shared_lock_value_calls_fit_the_helper_path_count_with_live_xmm() {
+    for wide in [false, true] {
+        let guest = bytes(|a| {
+            for dst in [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7] {
+                a.pxor(dst, dst).unwrap();
+            }
+            if wide {
+                a.lock().cmpxchg8b(qword_ptr(ebx + 4093)).unwrap();
+            } else {
+                a.lock().cmpxchg(dword_ptr(ebx), ecx).unwrap();
+            }
+            a.pxor(xmm7, xmm0).unwrap();
+        });
+        let work = j1_unit(&guest);
+        let mut code = Code::default();
+        let at = HOST_CODE as usize;
+        lower_tier1(
+            &mut code,
+            &work.unit,
+            CODE,
+            &|_| false,
+            0,
+            Features { flagm: false },
+            at,
+            Stubs {
+                call: at,
+                exit: at,
+                dispatch: at,
+                lookup: at,
+                lookup_slow: at,
+                ret_miss: at,
+                access: at,
+                interpret: at,
+                fault: at,
+                opt_exit: at,
+            },
+            false,
+            Key::read(&CpuState::default(), work.unit.fact_mask()),
+            0,
+        );
+        let end = code.asm.position(code.labels[9]) / 4;
+        let at = code.asm.words()[..end]
+            .iter()
+            .rposition(|word| word & !31 == str(W, Reg::new(0), RUNTIME, runtime::VALUE_ADDRESS))
+            .expect("access stub operand");
+        let shared = &code.asm.words()[at..end];
+        assert_eq!(shared.iter().filter(|&&word| word == blr(X16)).count(), 1);
+        assert!(
+            shared.len() <= 3 + 64,
+            "shared LOCK path: {} words",
+            shared.len()
+        );
+        for n in [16, 18, 20, 22] {
+            let saves = shared.iter().filter(|&&word| {
+                word & !(0x7f << 15)
+                    == stp_v(
+                        VSize::Q,
+                        Index::Offset,
+                        VReg::new(n),
+                        VReg::new(n + 1),
+                        Reg::ZR,
+                        0,
+                    )
+            });
+            assert_eq!(saves.count(), 1, "XMM pair {} remains cached", n - 16);
+        }
+    }
+}
+
 #[cfg(native)]
 fn proved_division_code(memory_divisor: bool, simd: bool) -> Vec<u8> {
     bytes(|a| {

@@ -1891,6 +1891,50 @@ impl Memory {
         Ok(())
     }
 
+    /// Locked scalar access. Device and coherent storage use their existing
+    /// aligned word atomics. Wider accesses keep the guest's single-owner
+    /// semantics and the ordinary shared-copy sequence.
+    pub(crate) fn update_locked(
+        &mut self,
+        addr: u32,
+        width: usize,
+        mut update: impl FnMut(u64) -> u64,
+    ) -> Result<(), String> {
+        let range = self.committed(addr, width)?;
+        let info = self.host_range(&range);
+        if info.protection & (READ | WRITE) != READ | WRITE || self.stores_code(addr, width) {
+            return Err("locked guest access requires owner replay".into());
+        }
+        if info.flags & SHARED != 0 && range.start % 4 + width <= 4 {
+            if let Some((storage, offset)) = self.storage_run(&range, info) {
+                if !storage.writable() {
+                    return Err("locked write to a read-only shared view".into());
+                }
+                storage.update_word(offset, width, |old| update(u64::from(old)) as u32);
+                self.count_read(width);
+                self.count_write(width);
+                return Ok(());
+            }
+            if info.flags & AUDIO != 0 {
+                // SAFETY: this checked PCM span lies inside one word of the live alias.
+                unsafe {
+                    crate::shared_memory::atomic_update(
+                        self.ptr.as_ptr().add(range.start),
+                        width,
+                        |old| update(u64::from(old)) as u32,
+                    );
+                }
+                self.count_read(width);
+                self.count_write(width);
+                return Ok(());
+            }
+        }
+        let mut bytes = [0; 8];
+        self.read_into(addr, &mut bytes[..width])?;
+        let value = update(u64::from_le_bytes(bytes)).to_le_bytes();
+        self.write(addr, &value[..width])
+    }
+
     /// Host-side initialization or patch write. Bypasses guest permissions but
     /// validates mappings and updates executable-page versions. Guest stores
     /// must validate WRITE permission before using this operation.

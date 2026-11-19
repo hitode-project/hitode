@@ -559,22 +559,14 @@ fn execute_decoded(
                 .read_data(address, 8)
                 .map_err(|_| Step::ReadFault { pc, address })?;
             let old = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
-            let equal = old == u64::from(state.regs[0]) | (u64::from(state.regs[2]) << 32);
-            let value = if equal {
-                u64::from(state.regs[3]) | (u64::from(state.regs[1]) << 32)
-            } else {
-                old
-            };
+            let (mut regs, mut flags) = (state.regs, state.eflags);
+            let value = crate::integer::compare_exchange8(&mut regs, &mut flags, old);
             // The failed comparison is still a write access. Commit all eight
             // bytes before publishing registers or ZF, including COW failures.
             memory
                 .write(address, &value.to_le_bytes())
                 .map_err(|_| Step::WriteFault { pc, address })?;
-            if !equal {
-                state.regs[0] = old as u32;
-                state.regs[2] = (old >> 32) as u32;
-            }
-            state.eflags = (state.eflags & !ZF) | if equal { ZF } else { 0 };
+            (state.regs, state.eflags) = (regs, flags);
             state.eip = instruction.next;
             Ok(if debug {
                 Step::Trap { pc, vector: 1 }
@@ -2091,21 +2083,16 @@ impl Transaction {
                 let source = self.read(memory, src)?;
                 let dst = freeze(dst, self);
                 self.check_write(memory, dst)?;
-                let width = dst.width().unwrap();
-                let accumulator = Reg {
-                    index: 0,
-                    shift: 0,
-                    width,
-                };
-                let old = accumulator.read(&self.regs);
-                self.arithmetic(old, value, 0, width, true);
-                if old == value {
+                if let Some(source) = crate::integer::compare_exchange(
+                    &mut self.regs,
+                    &mut self.flags,
+                    dst.width().unwrap(),
+                    value,
+                    source,
+                ) {
                     self.store(memory, dst, source)?;
-                } else {
-                    if matches!(dst, Operand::Memory(..)) {
-                        self.store(memory, dst, value)?;
-                    }
-                    accumulator.write(&mut self.regs, value);
+                } else if matches!(dst, Operand::Memory(..)) {
+                    self.store(memory, dst, value)?;
                 }
             }
             Action::Multiply(dst, src, immediate, signed) => {

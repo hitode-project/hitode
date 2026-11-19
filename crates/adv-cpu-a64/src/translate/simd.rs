@@ -575,8 +575,7 @@ impl Translator<'_> {
             link: false,
             x87,
         });
-        let index = self.helpers + u32::from(simd.helper);
-        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, None);
+        self.call_prepared_value(simd.helper, runtime::ValueTarget::Float(None), pairs);
         self.emit_all(&[
             ldr(W, X16, RUNTIME, runtime::VALUE_MXCSR),
             str(W, X16, X5, runtime::MXCSR),
@@ -2017,11 +2016,11 @@ impl Translator<'_> {
     pub(super) fn call_prepared_value(
         &mut self,
         helper: u8,
-        access: Option<adv_cpu_core::floating::ValueAccess>,
+        target: runtime::ValueTarget,
         pairs: Option<u8>,
     ) {
         let index = self.helpers + u32::from(helper);
-        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, access);
+        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, target);
     }
 
     pub(super) fn publish_fx_image(&mut self) {

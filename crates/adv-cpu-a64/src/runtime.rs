@@ -191,6 +191,7 @@ pub struct Runtime {
     pub resident_page_crossings: u64,
     pub(crate) value: u64,
     pub(crate) value_access: u64,
+    pub(crate) locked_access: u64,
     pub(crate) value_frame: ValueFrame,
 }
 
@@ -268,6 +269,7 @@ impl Runtime {
             helper_cause: 0,
             value: 0,
             value_access: 0,
+            locked_access: 0,
             value_frame: ValueFrame::default(),
         }
     }
@@ -720,6 +722,7 @@ pub(crate) const VALUE_ACCESS_REFUSED: u32 = 1 << 9;
 pub(crate) const VALUE_STORE_READY: u32 = 1 << 8;
 pub(crate) const VALUE_UNSUPPORTED: u32 = 1 << 15;
 const VALUE_CALL: u32 = field(offset_of!(Runtime, value));
+const LOCKED_ACCESS: u32 = field(offset_of!(Runtime, locked_access));
 const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
 pub(crate) const VALUE_ADDRESS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, address));
 pub(crate) const VALUE_OPERAND: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, operand));
@@ -731,13 +734,22 @@ pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, m
 
 /// Calls the value entry with the prepared instruction index in w1. Preserve
 /// the guest flag representation and any live caller-saved vector lanes.
+pub(crate) enum ValueTarget {
+    Float(Option<ValueAccess>),
+    Locked,
+}
+
 pub(crate) fn emit_value_call(
     asm: &mut Asm,
     index: u32,
     xmm: u8,
     x87: Option<u8>,
-    access: Option<ValueAccess>,
+    target: ValueTarget,
 ) {
+    let (callback, access) = match target {
+        ValueTarget::Float(access) => (VALUE_CALL, access),
+        ValueTarget::Locked => (LOCKED_ACCESS, None),
+    };
     let vectors = (0..8)
         .filter(|n| xmm & (1 << n) != 0)
         .map(|n| v(16 + n))
@@ -783,9 +795,17 @@ pub(crate) fn emit_value_call(
     if index >> 16 != 0 {
         asm.emit(movk(W, r(1), (index >> 16) as u16, 16));
     }
+    if matches!(target, ValueTarget::Locked) {
+        asm.emit_all(&[
+            mov(W, r(2), r(16)),
+            mov(W, r(3), r(10)),
+            mov(W, r(4), r(11)),
+            mov(W, r(5), r(12)),
+        ]);
+    }
     asm.emit_all(&[
         mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, VALUE_CALL),
+        ldr(X, r(16), RUNTIME, callback),
         blr(r(16)),
     ]);
     if let Some(ValueAccess::Write(width)) = access {

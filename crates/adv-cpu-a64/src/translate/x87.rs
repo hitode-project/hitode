@@ -285,7 +285,7 @@ impl Translator<'_> {
         }
         if operands.access.is_some() {
             let refused = self.leave_for_event(runtime::Event::CheckedAccess);
-            self.call_prepared_value(index, operands.access, pairs);
+            self.call_prepared_value(index, runtime::ValueTarget::Float(operands.access), pairs);
             self.asm.tbz(
                 true,
                 X0,
@@ -293,7 +293,7 @@ impl Translator<'_> {
                 refused,
             );
         } else {
-            self.call_prepared_value(index, None, pairs);
+            self.call_prepared_value(index, runtime::ValueTarget::Float(None), pairs);
         }
         let unsupported = self.leave_for_event(runtime::Event::Unsupported(form));
         self.asm.tbz(
