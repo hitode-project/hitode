@@ -48,13 +48,16 @@ const NX_SUPPORT_POLICY_OPTIN: u8 = 2;
 const MACHINE_I386: u16 = 0x014c;
 
 /// PF_* indices and the CPUID leaf 1 EDX bits that grant them, as Wine's
-/// `init_shared_data_cpuinfo` reads them.
+/// `init_shared_data_cpuinfo` reads them. `PF_NX_ENABLED` reflects the
+/// platform's hardware-enforced DEP (`NX_SUPPORT_POLICY_OPTIN`), matching
+/// `SYSTEM_CPU_INFORMATION`.
 const PF_COMPARE_EXCHANGE_DOUBLE: u32 = 2;
 const PF_MMX_INSTRUCTIONS_AVAILABLE: u32 = 3;
 const PF_XMMI_INSTRUCTIONS_AVAILABLE: u32 = 6;
 const PF_RDTSC_INSTRUCTION_AVAILABLE: u32 = 8;
 const PF_PAE_ENABLED: u32 = 9;
 const PF_XMMI64_INSTRUCTIONS_AVAILABLE: u32 = 10;
+const PF_NX_ENABLED: u32 = 12;
 const PF_FASTFAIL_AVAILABLE: u32 = 23;
 
 /// Maps the page with its fixed fields; `features` is the guest CPU's
@@ -96,6 +99,7 @@ pub fn map(cpu: &mut dyn Guest, features: u32, physical_pages: u32) -> Result<()
     for (feature, value) in [
         (PF_FASTFAIL_AVAILABLE, 1),
         (PF_COMPARE_EXCHANGE_DOUBLE, 1),
+        (PF_NX_ENABLED, 1),
         (PF_RDTSC_INSTRUCTION_AVAILABLE, has(4)),
         (PF_PAE_ENABLED, has(6)),
         (PF_MMX_INSTRUCTIONS_AVAILABLE, has(23)),
@@ -163,4 +167,47 @@ pub fn is_processor_feature_present(env: &mut Env<'_>, args: &[u32]) -> adv_mach
             .read(ADDRESS + PROCESSOR_FEATURES + feature, &mut present);
     }
     adv_machine::Outcome::Return(u32::from(present[0] != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::Cpu;
+    use adv_machine::{Clock, Machine, Outcome, layout::PARK_ADDR};
+
+    #[test]
+    fn shared_data_reports_nx_enabled_matching_optin_dep_policy() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let main = machine.spawn("main", PARK_ADDR, &[], 0).unwrap();
+        let features = machine.cpu.cpuid_features();
+        map(&mut machine.cpu, features, 0x10_0000).unwrap();
+
+        let mut policy = [0u8];
+        machine
+            .cpu
+            .read(ADDRESS + NX_SUPPORT_POLICY, &mut policy)
+            .unwrap();
+        assert_eq!(policy[0], NX_SUPPORT_POLICY_OPTIN);
+
+        let mut nx = [0u8];
+        machine
+            .cpu
+            .read(ADDRESS + PROCESSOR_FEATURES + PF_NX_ENABLED, &mut nx)
+            .unwrap();
+        assert_eq!(nx[0], 1);
+
+        machine
+            .visit_context(Some(main), |env| {
+                assert!(matches!(
+                    is_processor_feature_present(env, &[PF_NX_ENABLED]),
+                    Outcome::Return(1)
+                ));
+            })
+            .unwrap();
+    }
 }
