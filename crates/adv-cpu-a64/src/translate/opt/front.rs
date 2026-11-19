@@ -683,7 +683,12 @@ fn build_trace(
         }
         f.instruction()?;
         if let Some((width, addr, value)) = f.pending_store.take() {
-            let after = f.record(inst.next_pc, unit.trace.unused(i), Start::After(i));
+            // An inlined call's push resumes at its callee, not its return.
+            let resume = match inst.op {
+                decode::Op::Call(target) => target,
+                _ => inst.next_pc,
+            };
+            let after = f.record(resume, unit.trace.unused(i), Start::After(i));
             let r = &mut f.func.records[after.0 as usize];
             if unit.trace.observe_out[i] == crate::translate::flags::FlagSet::NONE {
                 r.eflags = None;

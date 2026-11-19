@@ -2202,6 +2202,37 @@ fn resident(unit: &Unit, proof: Option<&Proof>) -> Built {
     build_with(unit, proof, &initial(), &|_| false, &|_| false).unwrap()
 }
 
+// spec: A64-OPT-3, A64-OPT-9
+#[test]
+fn an_inlined_call_push_resumes_at_the_callee() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        let mut callee = a.create_label();
+        let mut done = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.call(callee).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.jmp(done).unwrap();
+        a.set_label(&mut callee).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+    });
+    let unit = resident_unit(&code);
+    let call = unit.trace.insts[0];
+    let decode::Op::Call(target) = call.op else {
+        panic!("{:?}", call.op)
+    };
+    let built = resident(&unit, None);
+    let eips: Vec<_> = built.func.records.iter().map(|r| r.eip).collect();
+    // The push's record is the only one at the callee entry, which
+    // continues the push's region.
+    assert!(eips.contains(&target), "{eips:x?}");
+}
+
 // spec: A64-OPT-9
 #[test]
 fn resident_accepts_unproved_pointer_reads_and_indexed_stores() {
