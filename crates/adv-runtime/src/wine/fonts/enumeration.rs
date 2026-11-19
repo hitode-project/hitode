@@ -3,7 +3,7 @@
 use super::*;
 use adv_cpu::backend::{Prot, Reg};
 use adv_device::text::{EnumeratedFont, FontEnumeration, FontKind};
-use std::collections::VecDeque;
+use std::sync::Arc;
 
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -219,7 +219,9 @@ fn listed(codec: &adv_os::nls::Codec, face: &str) -> bool {
 const SCRATCH: u32 = 512;
 const METRICS_OFFSET: u32 = 352;
 struct Enumeration {
-    fonts: VecDeque<EnumeratedFont>,
+    fonts: Arc<[EnumeratedFont]>,
+    index: usize,
+    listed_only: bool,
     callback: u32,
     param: u32,
     scratch: u32,
@@ -253,7 +255,7 @@ pub(super) fn start(
         (FontEnumeration::FamiliesEx(_), false) => "gdi32.dll!EnumFontFamiliesExA",
         (FontEnumeration::FamiliesEx(_), true) => "gdi32.dll!EnumFontFamiliesExW",
     };
-    let fonts = match text.enumerate(face.as_deref(), mode) {
+    let fonts = match text.enumeration_snapshot(face.as_deref(), mode) {
         Ok(fonts) => fonts,
         Err(error) => {
             adv_abi::warn_unavailable(env, api, &error.to_string());
@@ -268,25 +270,23 @@ pub(super) fn start(
             return Outcome::Return(0);
         }
     };
-    let mut fonts = fonts;
-    if face.as_deref().is_none_or(str::is_empty) {
-        // GDI names fit LF_FACESIZE even in the ANSI code page, and engines
-        // copy them into fixed buffers. Longer host names stay selectable but
-        // are not listed.
-        let codec = &env.ext.get::<Fonts>().codec;
-        fonts.retain(|font| listed(codec, &font.font.face));
-    }
-    if fonts.is_empty() {
+    // Full GDI lists fit LF_FACESIZE in the guest ACP as well as UTF-16.
+    let listed_only = face.as_deref().is_none_or(str::is_empty);
+    let codec = &env.ext.get::<Fonts>().codec;
+    let Some(index) = fonts
+        .iter()
+        .position(|font| !listed_only || listed(codec, &font.font.face))
+    else {
         return Outcome::Return(1);
-    }
-    if fonts[0].substitute {
+    };
+    if fonts[index].substitute {
         adv_abi::warn_unavailable(
             env,
             api,
             &format!(
                 "{:?} is not installed; enumerating its substitute {:?} under that name",
                 face.as_deref().unwrap_or_default(),
-                fonts[0].full_name
+                fonts[index].full_name
             ),
         );
     }
@@ -306,22 +306,21 @@ pub(super) fn start(
     next(
         env,
         Enumeration {
-            fonts: fonts.into(),
+            fonts,
+            index,
+            listed_only,
             callback,
             param,
             scratch,
             wide,
             mode,
         },
-        1,
     )
 }
 
-fn next(env: &mut Env<'_>, mut enumeration: Enumeration, previous: u32) -> Outcome {
-    let Some(font) = enumeration.fonts.pop_front() else {
-        return Outcome::Return(previous);
-    };
-    let bytes = pack(env, &font, enumeration.wide, enumeration.mode);
+fn next(env: &mut Env<'_>, mut enumeration: Enumeration) -> Outcome {
+    let font = &enumeration.fonts[enumeration.index];
+    let bytes = pack(env, font, enumeration.wide, enumeration.mode);
     if let Err(error) = env.cpu.write(enumeration.scratch, &bytes) {
         return Outcome::Fail(error.to_string());
     }
@@ -342,30 +341,45 @@ fn next(env: &mut Env<'_>, mut enumeration: Enumeration, previous: u32) -> Outco
         move |env, result| {
             let value = result.value();
             if value == 0 {
-                Outcome::Return(0)
-            } else {
-                next(env, enumeration, value)
+                return Outcome::Return(0);
             }
+            let start = enumeration.index + 1;
+            let codec = &env.ext.get::<Fonts>().codec;
+            let Some(offset) = enumeration.fonts[start..]
+                .iter()
+                .position(|font| !enumeration.listed_only || listed(codec, &font.font.face))
+            else {
+                return Outcome::Return(value);
+            };
+            enumeration.index = start + offset;
+            next(env, enumeration)
         },
     )
 }
 pub(super) fn put_string(codec: adv_os::nls::Codec, bytes: &mut [u8], text: &str, wide: bool) {
-    let mut at = 0;
-    for character in text.chars() {
-        let encoded = if wide {
-            character
-                .encode_utf16(&mut [0; 2])
-                .iter()
-                .flat_map(|unit| unit.to_le_bytes())
-                .collect::<Vec<_>>()
-        } else {
-            codec.encode(&character.to_string())
-        };
-        if at + encoded.len() + (if wide { 2 } else { 1 }) > bytes.len() {
-            break;
+    if wide {
+        let mut at = 0;
+        for character in text.chars() {
+            let mut buffer = [0; 2];
+            let encoded = character.encode_utf16(&mut buffer);
+            if at + encoded.len() * 2 + 2 > bytes.len() {
+                break;
+            }
+            for &mut unit in encoded {
+                bytes[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+                at += 2;
+            }
         }
-        bytes[at..at + encoded.len()].copy_from_slice(&encoded);
-        at += encoded.len();
+    } else {
+        let mut at = 0;
+        for character in text.chars() {
+            let encoded = codec.encode(character.encode_utf8(&mut [0; 4]));
+            if at + encoded.len() + 1 > bytes.len() {
+                break;
+            }
+            bytes[at..at + encoded.len()].copy_from_slice(&encoded);
+            at += encoded.len();
+        }
     }
 }
 pub(super) fn pack_logfont(env: &Env<'_>, request: &FontRequest, wide: bool) -> [u8; 92] {
@@ -540,28 +554,30 @@ pub(super) fn driver(env: &mut Env<'_>, _dc: u32, a: &[u32]) -> Outcome {
     let language = language(env.ext.get::<Fonts>().locale);
     let text = &mut env.ext.get_mut::<Fonts>().text;
     text.set_language(language);
-    let Ok(fonts) = text.enumerate((!face.is_empty()).then_some(face.as_str()), mode) else {
+    let Ok(fonts) = text.enumeration_snapshot((!face.is_empty()).then_some(face.as_str()), mode)
+    else {
         return Outcome::Return(0);
     };
     let allocator = super::super::allocator();
     let Some(scratch) = (allocator.allocate)(env, SCRATCH) else {
         return Outcome::Return(0);
     };
-    driver_next(env, fonts.into(), a[2], a[3], scratch, mode)
+    driver_next(env, fonts, 0, a[2], a[3], scratch, mode)
 }
 fn driver_next(
     env: &mut Env<'_>,
-    mut fonts: VecDeque<EnumeratedFont>,
+    fonts: Arc<[EnumeratedFont]>,
+    index: usize,
     callback: u32,
     param: u32,
     scratch: u32,
     mode: FontEnumeration,
 ) -> Outcome {
-    let Some(font) = fonts.pop_front() else {
+    let Some(font) = fonts.get(index) else {
         (super::super::allocator().free)(env, scratch);
         return Outcome::Return(1);
     };
-    let bytes = pack(env, &font, true, mode);
+    let bytes = pack(env, font, true, mode);
     env.cpu.write(scratch, &bytes).unwrap();
     Outcome::call_aligned(
         env,
@@ -572,7 +588,7 @@ fn driver_next(
                 (super::super::allocator().free)(env, scratch);
                 Outcome::Return(0)
             } else {
-                driver_next(env, fonts, callback, param, scratch, mode)
+                driver_next(env, fonts, index + 1, callback, param, scratch, mode)
             }
         },
     )

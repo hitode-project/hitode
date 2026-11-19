@@ -3,7 +3,9 @@
 //! never WGSL text hashed again for every draw.
 use super::*;
 use adv_device::gpu::{DrawState, Image};
+use smallvec::SmallVec;
 use std::hash::Hash;
+type Hasher = xxhash_rust::xxh3::Xxh3;
 
 pub(in crate::d3d9) fn hash(value: impl Hash) -> u128 {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -224,9 +226,9 @@ pub(super) struct Prepared {
     pub lookups: u64,
     pub operation: Operation,
     pub key: u128,
-    pub reads: Vec<Content>,
-    pub samples: Vec<damage::sampling::Read>,
-    pub writes: Vec<(Content, bool)>,
+    pub reads: SmallVec<[Content; 4]>,
+    pub samples: SmallVec<[damage::sampling::Read; 2]>,
+    pub writes: SmallVec<[(Content, bool); 3]>,
     pub bytes: usize,
     pub bounds: adv_device::surface::Rect,
 }
@@ -240,7 +242,7 @@ impl Prepared {
                     && d.state.alpha_test == adv_device::gpu::Compare::Always)
     }
 
-    pub(super) fn attachment_command(&self, command: u128, contents: &Contents) -> u128 {
+    pub(super) fn attachment_command(&self, command: u128, versions: &[Option<u128>]) -> u128 {
         if !self
             .writes
             .iter()
@@ -251,8 +253,8 @@ impl Prepared {
         }
         let mut key = xxhash_rust::xxh3::Xxh3::new();
         self.key.hash(&mut key);
-        for k in self.reads.iter().filter(|k| k.2 != 0) {
-            (*k, contents.get(k).copied().unwrap_or(0)).hash(&mut key);
+        for (&k, &version) in self.reads.iter().zip(versions).filter(|(k, _)| k.2 != 0) {
+            (k, version.unwrap_or(0)).hash(&mut key);
         }
         key.digest128()
     }
@@ -306,7 +308,7 @@ fn prepare_checked(
     let bindings = d.frame.binding_cache.as_ref().unwrap();
     validate(&operation)?;
     let mut h = xxhash_rust::xxh3::Xxh3::new();
-    let (mut reads, mut writes, mut bytes) = (Vec::new(), Vec::new(), 0);
+    let (mut reads, mut writes, mut bytes) = (SmallVec::new(), SmallVec::new(), 0);
     let mut write = |c: Content, overwrite| {
         c.hash(&mut h);
         writes.push((c, overwrite));
@@ -416,8 +418,6 @@ fn prepare_checked(
                 texcoords,
                 state,
                 programmable,
-                recording_key,
-                program_key,
                 ..
             } = draw;
             if texture
@@ -449,15 +449,7 @@ fn prepare_checked(
                 }
             }
             reads.extend_from_slice(&bindings.samples);
-            (
-                3u8,
-                target_key(t),
-                texture.as_ref().map(image),
-                raster(*state),
-                recording_key,
-                program_key,
-            )
-                .hash(&mut h);
+            draw_state(draw, &mut h);
             if programmable.is_none() {
                 bytemuck::cast_slice::<_, u8>(vertices).hash(&mut h);
                 bytes = std::mem::size_of_val(vertices.as_slice());
@@ -473,14 +465,11 @@ fn prepare_checked(
                     program,
                     streams,
                     indices,
-                    vertex_count,
-                    textures,
                     ..
                 } = p.as_ref();
                 program.textures.hash(&mut h);
                 for s in streams {
-                    (s.stride, &s.attributes, s.instance).hash(&mut h);
-                    s.bytes.content_key().is_some().hash(&mut h);
+                    stream_prefix(s, s.bytes.content_key().is_some(), &mut h);
                     if let Some(key) = s.bytes.content_key() {
                         key.hash(&mut h);
                     } else {
@@ -488,16 +477,10 @@ fn prepare_checked(
                     }
                     bytes += s.bytes.len();
                 }
-                (indices, vertex_count, p.instance_count).hash(&mut h);
                 bytes += indices
                     .as_ref()
                     .map_or(0, |i| std::mem::size_of_val(i.as_slice()));
-                for (offset, bytes) in p.constant_ranges() {
-                    (offset, bytes).hash(&mut h);
-                }
-                for t in textures {
-                    (t.sampler, t.image.as_ref().map(image)).hash(&mut h);
-                }
+                program_suffix(p, &mut h);
             }
         }
         _ => return Err(INVALID),
@@ -523,6 +506,72 @@ fn prepare_checked(
         writes,
         bytes,
     })
+}
+
+fn draw_state(draw: &fixed::Draw, h: &mut Hasher) {
+    (
+        3u8,
+        target_key(&draw.target),
+        draw.image.as_ref().map(image),
+        raster(draw.state),
+        &draw.recording_key,
+        &draw.program_key,
+    )
+        .hash(h);
+}
+
+fn stream_prefix(s: &adv_device::gpu::VertexStream, captured: bool, h: &mut Hasher) {
+    (s.stride, &s.attributes, s.instance).hash(h);
+    captured.hash(h);
+}
+
+fn program_suffix(p: &adv_device::gpu::ProgrammableDraw, h: &mut impl std::hash::Hasher) {
+    (&p.indices, &p.vertex_count, p.instance_count).hash(h);
+    for (offset, bytes) in p.constant_ranges() {
+        (offset, bytes).hash(h);
+    }
+    for t in &p.textures {
+        (t.sampler, t.image.as_ref().map(image)).hash(h);
+    }
+}
+
+pub(super) fn fixed_prefix(draw: &fixed::Draw, writes: &[(Content, bool)]) -> Hasher {
+    let mut h = Hasher::new();
+    for &(content, _) in writes {
+        content.hash(&mut h);
+    }
+    draw_state(draw, &mut h);
+    true.hash(&mut h);
+    let program = draw.programmable.as_ref().unwrap();
+    program.program.textures.hash(&mut h);
+    stream_prefix(&program.streams[0], true, &mut h);
+    h
+}
+
+/// Store the exact bytes written by Hash for the immutable suffix following
+/// the stream digest. Xxh3 and this sink both use Hasher's default encodings.
+#[derive(Default)]
+struct HashBytes(Vec<u8>);
+impl std::hash::Hasher for HashBytes {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        unreachable!("the suffix is a byte sequence")
+    }
+}
+
+pub(super) fn fixed_suffix(draw: &fixed::Draw) -> Vec<u8> {
+    let mut bytes = HashBytes::default();
+    program_suffix(draw.programmable.as_ref().unwrap(), &mut bytes);
+    bytes.0
+}
+
+pub(super) fn fixed_key(mut prefix: Hasher, geometry: u128, suffix: &[u8]) -> u128 {
+    geometry.hash(&mut prefix);
+    prefix.update(suffix);
+    prefix.digest128()
 }
 
 // Validation remains synchronous even when queue capacity or image ownership
@@ -628,7 +677,7 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                         .as_ref()
                         .and_then(|i| i.iter().max().copied())
                         .unwrap_or(p.vertex_count.saturating_sub(1));
-                    let mut locations = std::collections::HashSet::new();
+                    let mut locations = 0u16;
                     n <= 0x300000
                         && count(s.topology, n)
                         && last < p.vertex_count
@@ -642,9 +691,11 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                                 && !s.attributes.is_empty()
                                 && s.attributes.iter().all(|a| {
                                     a.offset.checked_add(a.format.size()).is_some_and(|end| {
+                                        if a.location >= 16 || locations & (1 << a.location) != 0 {
+                                            return false;
+                                        }
+                                        locations |= 1 << a.location;
                                         a.offset.is_multiple_of(4)
-                                            && a.location < 16
-                                            && locations.insert(a.location)
                                             && (s.stride == 0 || end <= s.stride)
                                             && u64::from(if s.instance {
                                                 p.instance_count - 1

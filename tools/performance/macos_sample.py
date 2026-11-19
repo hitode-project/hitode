@@ -41,7 +41,8 @@ backward branch closes, innermost first, with its host instructions split into
 stack accesses (spills and reloads), other memory, branches and the rest. Two
 forms of the same loop compare by these static counts.
 coverage joins the JIT samples with the loop steps of opt-<pid>.tsv. Per hot
-region it gives the share of its samples in optimized forms, and for the rest
+region it gives the share of its samples in optimized forms (a64-opt computations
+and a64-resident forms), and for the rest
 the loop that encloses it and the furthest step that loop reached: installed
 (the form exists but runs were not admitted), a proof or form refusal with the
 instruction, only promoted, or no loop at all. Several run directories also get
@@ -193,7 +194,7 @@ def coverage(directories, thread, top):
         for found, count in jit_samples(directory, thread, jit):
             region = found["region"] if found else None
             regions[region] += count
-            if found and found["mode"] == "a64-opt":
+            if found and found["mode"] in ("a64-opt", "a64-resident"):
                 optimized[region] += count
         total = sum(regions.values())
         if not total:

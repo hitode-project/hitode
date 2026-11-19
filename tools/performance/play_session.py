@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Replay normal/held-key play through the production frontend.
 
-The JSON schedule is an adv-scene-v1 document or a list of {"at": seconds, "command": "key-down 17"},
+The JSON schedule is an adv-scene-v1 document, a .jsonl input recording from
+adv-run --record-input (or ADV_RECORD_INPUT), or a list of {"at": seconds, "command": "key-down 17"},
 {"at": seconds, "checkpoint": "normal", "reset_metrics": true} or {"at": seconds, "wait": {...}} entries.
 A wait polls the runner until a visible top-level window's text contains (or class equals)
 {"window": TEXT}, a click at {"hit": [X, Y]} reaches a window whose text contains "text",
@@ -78,7 +79,10 @@ from scene_schedule import load_scene, await_command, assert_report, valid_ackno
 
 
 def load_schedule(path: Path) -> list[dict]:
-    steps = json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # A .jsonl schedule is an --record-input recording: one step per line.
+    steps = ([json.loads(line) for line in text.splitlines() if line.strip()]
+             if path.suffix == ".jsonl" else json.loads(text))
     if not isinstance(steps, list) or not steps:
         raise ValueError("schedule must be a nonempty list")
     previous = 0.0
@@ -182,7 +186,7 @@ def pin_runner(executable: Path, bin_dir: Path) -> Path:
 
 
 def run(args: argparse.Namespace) -> None:
-    scene = load_scene(args.schedule)
+    scene = None if args.schedule.suffix == ".jsonl" else load_scene(args.schedule)
     steps = scene["steps"] if scene else load_schedule(args.schedule)
     output = args.output.resolve()
     environment, removed = launch_environment(args, output)

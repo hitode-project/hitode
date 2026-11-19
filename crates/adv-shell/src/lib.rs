@@ -34,6 +34,7 @@ pub use adv_display::plan::Placement as Scaling;
 pub use scaling::Scaling;
 pub mod overlay;
 mod performance;
+mod record;
 #[cfg(host_view)]
 mod session;
 
@@ -102,6 +103,8 @@ pub struct Options {
     auto_dialog_ms: Option<u32>,
     profile: bool,
     control_stdin: bool,
+    /// Record the player's input as a replay schedule; also `ADV_RECORD_INPUT=PATH`.
+    record_input: Option<PathBuf>,
     /// Serve `tools/debug/hitode_debug.py`; also `ADV_DEBUG=1`.
     pub debug: bool,
     frame_budget: bool,
@@ -297,6 +300,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
   --frame-budget          opt-in bounded per-frame accounting (headless, one worker)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
+  --record-input PATH     record the player's input as a play_session.py schedule\n\
   --debug                 serve the interactive debugger (tools/debug/hitode_debug.py)\n\
   --help                  show this help\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
@@ -342,6 +346,7 @@ impl Options {
             auto_dialog_ms: None,
             profile: false,
             control_stdin: false,
+            record_input: None,
             debug: false,
             frame_budget: false,
             audio: false,
@@ -431,6 +436,7 @@ impl Options {
                 "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
+                "--record-input" => options.record_input = Some(value()?.into()),
                 "--debug" => options.debug = true,
                 "--frame-budget" => options.frame_budget = true,
                 "--audio" => options.audio = true,

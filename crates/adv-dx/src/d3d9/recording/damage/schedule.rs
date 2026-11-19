@@ -15,7 +15,7 @@ use adv_device::surface::{PartsScratch, for_each_part, for_each_rect};
 
 pub(super) struct Node {
     pub slot: u128,
-    pub record: Arc<Record>,
+    pub record: Record,
     /// For each demand, the write that produced the version it reads.
     pub producers: SmallVec<[Option<usize>; 4]>,
     /// For each write, the write before it to the same content.

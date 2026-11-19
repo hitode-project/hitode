@@ -15,7 +15,9 @@ use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
 use adv_sync::input::KeyState;
 
-use super::{Finished, Options, control, frontend, json, save_frame, window, window_json};
+use super::{
+    Finished, Options, control, frontend, json, record::Recorder, save_frame, window, window_json,
+};
 
 /// How long the guest runs between looks at the host's events.
 const SLICE: Duration = Duration::from_millis(20);
@@ -429,11 +431,17 @@ fn report(
     ];
     #[cfg(feature = "gpu")]
     if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
+        let frames = counters.presents.max(1) as f64;
         fields.push(format!(
             concat!(
                 "\"d3d9\": {{\"fixed_draws\": {}, \"fixed_shaders_built\": {}, ",
                 "\"fixed_shader_cache_hits\": {}, \"draw_key_hashes\": {}, ",
                 "\"reused_draws\": {}, \"rested_draws\": {}, ",
+                "\"recorded_commands\": {}, \"uncoalesced_gpu_draws\": {}, \"gpu_draws\": {}, ",
+                "\"fast_path_draws\": {}, \"general_path_draws\": {}, ",
+                "\"recorded_commands_per_frame\": {:.2}, \"uncoalesced_gpu_draws_per_frame\": {:.2}, ",
+                "\"gpu_draws_per_frame\": {:.2}, \"fast_path_draws_per_frame\": {:.2}, ",
+                "\"general_path_draws_per_frame\": {:.2}, ",
                 "\"readback_bytes\": {}, \"readback_bytes_per_frame\": {:.2}}}"
             ),
             counters.fixed_draws,
@@ -442,8 +450,18 @@ fn report(
             counters.draw_key_hashes,
             counters.reused_draws,
             counters.rested_draws,
+            counters.recorded_commands,
+            counters.uncoalesced_gpu_draws,
+            counters.gpu_draws,
+            counters.fast_path_draws,
+            counters.general_path_draws,
+            counters.recorded_commands as f64 / frames,
+            counters.uncoalesced_gpu_draws as f64 / frames,
+            counters.gpu_draws as f64 / frames,
+            counters.fast_path_draws as f64 / frames,
+            counters.general_path_draws as f64 / frames,
             counters.readback_bytes,
-            counters.readback_bytes as f64 / counters.presents.max(1) as f64,
+            counters.readback_bytes as f64 / frames,
         ));
     }
 
@@ -623,6 +641,7 @@ fn drive(
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
         .transpose()?;
+    let mut recorder = Recorder::open(options.record_input.as_deref(), started)?;
     let auto_delay = options
         .auto_dialog_ms
         .map(|ms| Duration::from_millis(u64::from(ms)));
@@ -662,6 +681,10 @@ fn drive(
                             });
                             continue;
                         }
+                        Recorder::record(
+                            &mut recorder,
+                            format_args!("input {message:#x} {wparam:#x} {lparam:#x}"),
+                        );
                         session.input_at(adv_runtime::Pointer::Frame, message, wparam, lparam)?;
                     }
                     window::Event::WindowInput {
@@ -670,6 +693,12 @@ fn drive(
                         wparam,
                         lparam,
                     } => {
+                        Recorder::record(
+                            &mut recorder,
+                            format_args!(
+                                "window-input {window:#x} {message:#x} {wparam:#x} {lparam:#x}"
+                            ),
+                        );
                         session.input_at(
                             adv_runtime::Pointer::Window(window),
                             message,
@@ -679,9 +708,11 @@ fn drive(
                     }
 
                     window::Event::Text(text, reply) => {
+                        Recorder::record(&mut recorder, format_args!("text {text}"));
                         let _ = reply.send(session.text(&text));
                     }
                     window::Event::Close => {
+                        Recorder::record(&mut recorder, format_args!("close"));
                         suspension.apply(&mut metrics.audio, None, Some(false), |paused| {
                             session.set_suspended(paused);
                         });
@@ -1105,6 +1136,17 @@ fn answer(session: &mut Session, command: control::Command) -> Result<String, St
                 Err("key has no guest target window".into())
             }
         }
+        Command::Input(message, wparam, lparam) => session
+            .input_at(adv_runtime::Pointer::Frame, message, wparam, lparam)
+            .map(|()| format!("input {message:#x}")),
+        Command::WindowInput(window, message, wparam, lparam) => session
+            .input_at(
+                adv_runtime::Pointer::Window(window),
+                message,
+                wparam,
+                lparam,
+            )
+            .map(|()| format!("window-input {window:#x} {message:#x}")),
         Command::Text(text) => {
             let typed = session.text(&text);
             let total = text.chars().count();

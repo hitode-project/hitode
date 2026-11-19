@@ -346,7 +346,7 @@ mod tests {
                 a.dec(ebx).unwrap();
                 a.jz(done).unwrap();
             }
-            2 => a.cpuid().unwrap(),
+            2 => a.fnop().unwrap(),
             5 => a.lock().add(dword_ptr(esi), 1).unwrap(),
             _ => {}
         }

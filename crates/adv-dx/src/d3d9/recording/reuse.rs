@@ -27,7 +27,7 @@ struct Rest {
 const MAX_REST: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Mode {
+pub(super) enum Mode {
     Indexed,
     Up(u32),
     Bound(u32),
@@ -65,8 +65,8 @@ pub(super) struct Entry {
 pub(super) struct Saved {
     pub command: u128,
     pub attachment: u128,
-    pub damage: Arc<damage::Record>,
-    pub pass: Arc<passes::Effects>,
+    pub damage: Arc<damage::Saved>,
+    pub pass: passes::Effects,
     pub destinations: Vec<Option<u128>>,
     pub outputs: Vec<u128>,
 }
@@ -310,6 +310,20 @@ fn draw(
     if rests {
         env.ext.get_mut::<State>().frames.rested_draws += 1;
     }
+    let owner = com(env).identity::<Payload>(&env.sys.objects, pointer);
+    let fast_input = owner
+        .filter(|_| {
+            rests || device(env, pointer).is_some_and(|d| d.frame.reuse.disabled || d.frame.partial)
+        })
+        .and_then(|owner| fast::input(env, pointer, owner, request, up));
+    if let (Some(owner), Some(input)) = (owner, &fast_input)
+        && let Some((prepared, vertices)) = fast::capture(env, owner, input)
+    {
+        if up.is_some() {
+            buffers::clear_up_bindings(env, pointer, false);
+        }
+        return append(env, owner, &prepared, None, None, Some(vertices));
+    }
     let signed = if rests {
         Err(INVALID)
     } else {
@@ -326,6 +340,17 @@ fn draw(
                     let owner = com(env)
                         .identity::<Payload>(&env.sys.objects, pointer)
                         .unwrap();
+                    if let Some(input) = fast_input {
+                        if env.ext.get::<State>().gpu.is_none() {
+                            return Outcome::Return(UNAVAILABLE);
+                        }
+                        let p = match key::prepare(env, owner, Operation::Draw(draw)) {
+                            Ok(p) => p,
+                            Err(code) => return Outcome::Return(code),
+                        };
+                        fast::remember(env, owner, pointer, input, &p);
+                        return accept(env, owner, p);
+                    }
                     record(env, owner, Operation::Draw(draw))
                 }
                 Err(code) => Outcome::Return(code),
@@ -465,6 +490,13 @@ fn draw(
         return Outcome::Return(UNAVAILABLE);
     }
     barrier_if_busy(env, owner, move |env| {
-        append(env, owner, &entry.prepared, Some(target), Some(&entry))
+        append(
+            env,
+            owner,
+            &entry.prepared,
+            Some(target),
+            Some(&entry),
+            None,
+        )
     })
 }

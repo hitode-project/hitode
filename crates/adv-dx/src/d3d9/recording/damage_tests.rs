@@ -2226,3 +2226,359 @@ fn distant_changes_replay_in_separate_scissors_without_losing_unchanged_draws_be
     // The 8x8 top-left and 8x4 bottom-right cells of the 192-pixel target.
     assert!((counts.clipped_area_sum - (1. + 96. / 192.)).abs() < 1e-9);
 }
+
+#[test]
+// spec: GFX-REC-1, GFX-REC-2, GFX-REC-5, GFX-REC-13
+fn coalesced_draws_match_logical_plan_and_pixels() {
+    let mut f = fixture();
+    let d = f.device;
+    let owner = id(&mut f);
+    bind_depth(&mut f, 16, 12);
+    let strip = f.packet([
+        [
+            2f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x204080ff,
+        ],
+        [
+            13f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2040ff40,
+        ],
+        [
+            2f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20ff8040,
+        ],
+        [
+            13f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20ffc080,
+        ],
+    ]);
+    let fan = f.packet([
+        [
+            2f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2010f060,
+        ],
+        [
+            13f32.to_bits(),
+            2f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2030d040,
+        ],
+        [
+            13f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x2050b020,
+        ],
+        [
+            2f32.to_bits(),
+            10f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0x20709010,
+        ],
+    ]);
+    let mut results = Vec::new();
+    for separate_draws in [true, false] {
+        *frame(&mut env(&mut f), owner) = Recording {
+            separate_draws,
+            general_draws: separate_draws,
+            ..Default::default()
+        };
+        let before = f.m.ext.get::<State>().frames;
+        for (state, value) in [
+            (7, 0),
+            (9, 1),
+            (22, 1),
+            (27, 1),
+            (19, 5),
+            (20, 6),
+            (52, 0),
+            (55, 1),
+            (56, 8),
+            (57, 0),
+            (59, u32::MAX),
+        ] {
+            f.okay("IDirect3DDevice9::SetRenderState", &[d, state, value]);
+        }
+        f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+        f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[d, 0, 0, 7, 0xff112233, 1f32.to_bits(), 0],
+        );
+        for _ in 0..32 {
+            f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, strip, 20]);
+        }
+        for _ in 0..11 {
+            f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 6, 2, fan, 20]);
+        }
+        let result = flush(&mut f, Reason::Readback);
+        assert_eq!(f.finish(result), 0);
+        let image = f.image(f.back);
+        let early = f.pixels(&image);
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 52, 1]);
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 57, 1]);
+        for _ in 0..4 {
+            for (compare, pass, mask) in [(8, 3, 0xff), (3, 1, 0)] {
+                for (state, value) in [(56, compare), (55, pass), (59, mask)] {
+                    f.okay("IDirect3DDevice9::SetRenderState", &[d, state, value]);
+                }
+                f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, strip, 20]);
+            }
+        }
+        f.okay("IDirect3DDevice9::EndScene", &[d]);
+        let mut e = env(&mut f);
+        let recording = frame(&mut e, owner);
+        let keys = recording.command_identities.clone();
+        let versions: Vec<_> = recording.contents.slots.iter().map(|s| s.1).collect();
+        present(&mut f);
+        let pixels = f.pixels(&image);
+        let after = f.m.ext.get::<State>().frames;
+        let draws = after.gpu_draws - before.gpu_draws;
+        assert_eq!(
+            after.uncoalesced_gpu_draws - before.uncoalesced_gpu_draws,
+            51
+        );
+        assert_eq!(after.recorded_commands - before.recorded_commands, 52);
+        assert_eq!(
+            after.fast_path_draws - before.fast_path_draws,
+            if separate_draws { 0 } else { 6 }
+        );
+        results.push(((keys, versions, early, pixels), draws));
+        f.okay("IDirect3DDevice9::SetRenderState", &[d, 52, 0]);
+    }
+    assert_eq!(results[0].0.0, results[1].0.0, "command keys");
+    assert_eq!(results[0].0.1, results[1].0.1, "versions");
+    assert!(results[0].0.2 == results[1].0.2, "readback pixels");
+    assert!(results[0].0.3 == results[1].0.3, "presented pixels");
+    assert_eq!(results[0].1, 51);
+    assert_eq!(results[1].1, 10);
+}
+
+#[test]
+// spec: GFX-REC-2 GFX-REC-3 GFX-REC-4 GFX-REC-5 GFX-REC-7 GFX-REC-11 GFX-REC-13
+fn fixed_draw_runs_match_general_recording_across_frames() {
+    let (mut f, _) = composite_fixture(false);
+    let (texture, source) = layer(&mut f);
+    let d = f.device;
+    let owner = id(&mut f);
+    let quad = f.packet(
+        [
+            (8f32, 8f32, 0f32, 0f32),
+            (56., 8., 1., 0.),
+            (8., 40., 0., 1.),
+            (56., 40., 1., 1.),
+        ]
+        .map(|(x, y, u, v)| {
+            [
+                x.to_bits(),
+                y.to_bits(),
+                0,
+                1f32.to_bits(),
+                u.to_bits(),
+                v.to_bits(),
+            ]
+        }),
+    );
+    let offscreen = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateOffscreenPlainSurface",
+        &[d, 64, 48, 22, 2, offscreen, 0],
+    );
+    let offscreen = f.m.cpu.read_u32(offscreen).unwrap();
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x104]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 7, 0]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 1]);
+    let mut reference = Vec::new();
+    for general in [true, false] {
+        *frame(&mut env(&mut f), owner) = Recording {
+            separate_draws: general,
+            general_draws: general,
+            ..Default::default()
+        };
+        let start = f.m.ext.get::<State>().frames;
+        for n in 0..6 {
+            let before = f.m.ext.get::<State>().frames;
+            let x = if n < 2 { 2. } else { 2. + n as f32 };
+            paint(&mut f, source, x, [0.4, 0.5, 0.6, 1.]);
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[d, 0, f.back]);
+            clear(&mut f, 0xff000000);
+            // Frames with unused retained preparation go directly through the
+            // fixed-layout recorder. Include clipped presentations without an early flush.
+            if n >= 2 {
+                frame(&mut env(&mut f), owner).reuse.invalidate();
+            }
+            f.okay("IDirect3DDevice9::SetTexture", &[d, 0, texture]);
+            f.okay("IDirect3DDevice9::BeginScene", &[d]);
+            for _ in 0..24 {
+                f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, quad, 24]);
+            }
+            if n == 3 {
+                f.okay(
+                    "IDirect3DDevice9::GetRenderTargetData",
+                    &[d, f.back, offscreen],
+                );
+                for _ in 0..5 {
+                    f.okay("IDirect3DDevice9::DrawPrimitiveUP", &[d, 5, 2, quad, 24]);
+                }
+            }
+            f.okay("IDirect3DDevice9::EndScene", &[d]);
+            f.okay("IDirect3DDevice9::SetTexture", &[d, 0, 0]);
+            let mut e = env(&mut f);
+            let recorded = frame(&mut e, owner);
+            let keys = recorded.command_identities.clone();
+            let records = recorded.damage.recorded();
+            let versions: Vec<_> = recorded.contents.slots.iter().map(|s| s.1).collect();
+            recorded.test_plan = Some(Vec::new());
+            let published = f.m.ext.get::<Presents>().damage.len();
+            present(&mut f);
+            let plan = frame(&mut env(&mut f), owner).test_plan.take();
+            let damage = f.m.ext.get::<Presents>().damage.get(published).cloned();
+            let pixels = latest(&mut f);
+            let after = f.m.ext.get::<State>().frames;
+            let draws = after.gpu_draws - before.gpu_draws;
+            let uncoalesced = after.uncoalesced_gpu_draws - before.uncoalesced_gpu_draws;
+            let commands = after.recorded_commands - before.recorded_commands;
+            let data = (keys, records, versions, plan, damage, pixels);
+            if general {
+                assert_eq!(draws, uncoalesced);
+                reference.push((data, draws, commands));
+            } else {
+                let (expected, physical, logical) = &reference[n];
+                assert!(data.0 == expected.0, "command keys in frame {n}");
+                assert!(data.1 == expected.1, "damage records in frame {n}");
+                assert!(data.2 == expected.2, "content versions in frame {n}");
+                assert!(data.3 == expected.3, "execution plan in frame {n}");
+                assert!(data.4 == expected.4, "published damage in frame {n}");
+                assert!(data.5 == expected.5, "pixels in frame {n}");
+                assert_eq!(commands, *logical);
+                assert_eq!(uncoalesced, *physical);
+                assert!(draws <= *physical);
+            }
+        }
+        let finish = f.m.ext.get::<State>().frames;
+        assert!(finish.reused_draws > start.reused_draws);
+        assert!(finish.rested_draws > start.rested_draws);
+        assert!(finish.clipped_executions > start.clipped_executions);
+        assert_eq!(finish.fast_path_draws == start.fast_path_draws, general);
+        if !general {
+            assert!(finish.gpu_draws - start.gpu_draws < reference.iter().map(|r| r.1).sum());
+        }
+    }
+}
+
+thread_local! {
+    static DRAW_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct DrawAllocator;
+#[global_allocator]
+static DRAW_ALLOCATOR: DrawAllocator = DrawAllocator;
+
+fn draw_allocation() {
+    let _ = DRAW_ALLOCATIONS.try_with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
+
+// SAFETY: All allocations and frees delegate to System with their original arguments.
+unsafe impl std::alloc::GlobalAlloc for DrawAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        draw_allocation();
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        draw_allocation();
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        draw_allocation();
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[test]
+// spec: GFX-REC-3 GFX-REC-8 GFX-REC-11
+fn warmed_fixed_draw_runs_allocate_nothing_on_admission() {
+    let mut f = fixture();
+    let d = f.device;
+    let owner = id(&mut f);
+    let vertices = [(1f32, 1f32), (12., 1.), (1., 9.)]
+        .map(|(x, y)| [x.to_bits(), y.to_bits(), 0, 1f32.to_bits(), 0xff123456]);
+    let data = f.packet(vertices);
+    let output = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateVertexBuffer",
+        &[d, 80, 0, 0x44, 2, output, 0],
+    );
+    let buffer = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DVertexBuffer9::Lock", &[buffer, 0, 0, output, 0]);
+    let storage = f.m.cpu.read_u32(output).unwrap();
+    f.m.cpu
+        .write(storage + 20, bytemuck::cast_slice(&vertices))
+        .unwrap();
+    f.okay("IDirect3DVertexBuffer9::Unlock", &[buffer]);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 7, 0]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 1]);
+    let admit = |f: &mut Fixture, bound_stream| {
+        let mut e = env(f);
+        let result = if bound_stream {
+            bound(&mut e, d, 4, 1, 1, |e| {
+                fixed::prepare_bound(e, d, 4, 1, 1, None)
+            })
+        } else {
+            up(&mut e, d, 4, 1, data, 20, |e| {
+                fixed::prepare(e, d, 4, 1, GuestPtr::new(data), 20, None)
+            })
+        };
+        assert!(matches!(result, Outcome::Return(0)));
+    };
+    for n in 0..5 {
+        let bound_stream = n == 4;
+        if bound_stream {
+            f.okay("IDirect3DDevice9::SetStreamSource", &[d, 0, buffer, 0, 20]);
+        }
+        f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        clear(&mut f, 0xff000000);
+        frame(&mut env(&mut f), owner).reuse.invalidate();
+        let before = f.m.ext.get::<State>().frames.fast_path_draws;
+        if n >= 3 {
+            DRAW_ALLOCATIONS.set(Some(0));
+        }
+        for _ in 0..96 {
+            admit(&mut f, bound_stream);
+        }
+        if n >= 3 {
+            assert_eq!(DRAW_ALLOCATIONS.replace(None), Some(0));
+            assert_eq!(f.m.ext.get::<State>().frames.fast_path_draws - before, 96);
+        }
+        f.okay("IDirect3DDevice9::EndScene", &[d]);
+        present(&mut f);
+    }
+}

@@ -195,8 +195,8 @@ pub(super) fn run(env: &mut Env<'_>, name: &'static str) -> Outcome {
             .ext
             .get_mut::<Fonts>()
             .text
-            .logical_font(&request)
-            .map_or(request.quality, |font| font.quality);
+            .font_quality(&request)
+            .unwrap_or(request.quality);
         let flags = if quality == Quality::Monochrome { 1 } else { 6 };
         let _ = env.cpu.write_u32(a[2], flags);
         env.ext

@@ -231,6 +231,12 @@ pub struct Target {
 }
 
 impl Target {
+    pub fn same_attachments(&self, other: &Self) -> bool {
+        self.image.id() == other.image.id()
+            && self.image.alpha_mode() == other.image.alpha_mode()
+            && same_depth(self.depth.as_ref(), other.depth.as_ref())
+    }
+
     pub fn mip_level(&self, level: u32) -> Result<Self, Error> {
         Self {
             image: self.image.mip_level(level)?,
@@ -594,6 +600,14 @@ fn upload_bounds(image: &Image, r: Rect, pitch: u32, length: usize) -> Result<u3
         ));
     }
     Ok(row as u32)
+}
+
+pub(super) fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

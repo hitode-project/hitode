@@ -531,14 +531,21 @@ impl Debugger {
         let full = now.full_executions - base.full_executions;
         let area = (now.clipped_area_sum - base.clipped_area_sum) / (clipped + full).max(1) as f64;
         let presents = flushes[0].max(1);
+        let frames = (now.presents - base.presents).max(1) as f64;
         format!(
             "executions: clipped {clipped}, full {full}, mean area {area:.3}; repeated frames {}\n\
+             per frame: commands {:.1}, GPU draws {:.1}, uncoalesced draws {:.1}, fast path {:.1}, general path {:.1}\n\
              per present: submissions {:.1}, pixels {:.0}, vertices {:.0}, repeated vertices {:.0}\n\
              backbuffer per present: delta {:.0} px, E {:.0} px, E\\delta {:.0} px\n\
              chains run whole: intermediate read {}, late demand {}\n\
              whole changes: content flush {}, presentation {}, copy {}, analysis {}\n\
              flushes: present {}, readback {}, lock {}, dc {}, reset {}, release {}, limit {}, wait {}",
             now.eliminated_frames - base.eliminated_frames,
+            (now.recorded_commands - base.recorded_commands) as f64 / frames,
+            (now.gpu_draws - base.gpu_draws) as f64 / frames,
+            (now.uncoalesced_gpu_draws - base.uncoalesced_gpu_draws) as f64 / frames,
+            (now.fast_path_draws - base.fast_path_draws) as f64 / frames,
+            (now.general_path_draws - base.general_path_draws) as f64 / frames,
             (now.submissions - base.submissions) as f64 / presents as f64,
             (now.submitted_pixels - base.submitted_pixels) as f64 / presents as f64,
             (now.submitted_vertices - base.submitted_vertices) as f64 / presents as f64,

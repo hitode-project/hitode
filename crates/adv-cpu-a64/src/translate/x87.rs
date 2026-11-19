@@ -239,6 +239,7 @@ impl Translator<'_> {
             Fast::Load80 | Fast::Store80 | Fast::Leaf(_) => unreachable!("cached forms"),
             Fast::Wait => metadata = false,
             Fast::Round => self.x87_round(slow),
+            Fast::Sqrt => self.x87_sqrt(slow),
             Fast::Scale => self.x87_scale(slow),
             Fast::Examine => {
                 self.x87_examine();
@@ -362,6 +363,91 @@ impl Translator<'_> {
         self.extended(V1, X0, X1);
         self.st_write(0, X0, X1);
         self.emit_all(&[orr(W, X13, X13, X3, Lsl, 5), bfi(W, X13, X7, 9, 1)]);
+    }
+
+    fn x87_sqrt(&mut self, slow: Label) {
+        let [zero, single, residual, rounded, encode, write] =
+            std::array::from_fn(|_| self.asm.label());
+        self.read(0, X0, X1, slow);
+        self.clear_c1();
+        self.asm.cbz(X, false, X0, zero);
+        // A positive normal with at most 53 significand bits.
+        self.emit_all(&[
+            sub_imm(W, X16, X1, 1, false),
+            movz(W, X17, 0x7ffd, 0),
+            cmp(W, X16, X17, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Hi, slow);
+        self.asm.tbz(false, X0, 63, slow);
+        self.emit(tst_imm(X, X0, 0x7ff));
+        self.asm.b_cond(Cond::Ne, slow);
+        self.emit_all(&[ubfx(W, X2, X8, 8, 2), cmp_imm(W, X2, 1, false)]);
+        self.asm.b_cond(Cond::Eq, slow);
+        // Scale by a power of four before FSQRT. The normalized input is
+        // in [1, 4), and w1 holds the rebased exponent of its unscaled root.
+        self.emit_all(&[
+            eor_imm(W, X16, X1, 1),
+            and_imm(W, X16, X16, 1),
+            movz(X, X17, 0x3ff0, 48),
+            add(X, X17, X17, X16, Lsl, 52),
+            ubfx(X, X16, X0, 11, 52),
+            orr(X, X17, X17, X16, Lsl, 0),
+            fmov_to_v(X, V0, X17),
+            add_imm(W, X1, X1, 3, true),
+            add_imm(W, X1, X1, 0xfff, false),
+            lsr_imm(W, X1, X1, 1),
+        ]);
+        self.asm.tbz(false, X8, 9, single);
+        self.emit(fsqrt(true, true, V1, V0));
+        self.asm.b(residual);
+        self.asm.bind(single);
+        // Use single-precision FSQRT only when its input is exact.
+        self.emit(tst_imm(X, X0, (1 << 40) - 1));
+        self.asm.b_cond(Cond::Ne, slow);
+        self.emit_all(&[
+            unary(Unary::Narrow, V1, V0),
+            fsqrt(true, false, V1, V1),
+            unary(Unary::Widen, V1, V1),
+        ]);
+        self.asm.bind(residual);
+        // The fused residual cannot underflow after normalization. Its
+        // sign distinguishes exact roots from rounding in either direction.
+        self.emit_all(&[fmsub(V2, V1, V1, V0), fcmp_zero(V2), fmov_from_v(X, X0, V1)]);
+        self.asm.b_cond(Cond::Eq, encode);
+        self.asm.tbz(false, X8, 5, slow);
+        self.asm.tbz(true, X8, 8, slow); // Inexact extended-precision result.
+        self.emit_all(&[cset(W, X7, Cond::Lt), ubfx(W, X3, X8, 10, 2)]);
+        self.asm.cbz(W, false, X3, rounded);
+        // Only RC=2 rounds positive results up among the directed modes.
+        // Move one destination ULP if nearest chose the other direction.
+        self.emit_all(&[
+            cmp_imm(W, X3, 2, false),
+            cset(W, X3, Cond::Eq),
+            sub(X, X7, X3, X7, Lsl, 0),
+            lsl_imm(X, X16, X7, 29),
+            cmp_imm(W, X2, 0, false),
+            csel(X, X7, X16, X7, Cond::Eq),
+            add(X, X0, X0, X7, Lsl, 0),
+            mov(W, X7, X3),
+        ]);
+        self.asm.bind(rounded);
+        self.emit_all(&[orr_imm(W, X13, X13, u64::from(PE)), bfi(W, X13, X7, 9, 1)]);
+        self.asm.bind(encode);
+        // A root rounded to 2 carries into the unscaled exponent.
+        self.emit_all(&[
+            ubfx(X, X16, X0, 52, 11),
+            add(W, X1, X1, X16, Lsl, 0),
+            sub_imm(W, X1, X1, 1023, false),
+            ubfx(X, X0, X0, 0, 52),
+            lsl_imm(X, X0, X0, 11),
+            orr_imm(X, X0, X0, 1 << 63),
+        ]);
+        self.asm.b(write);
+        self.asm.bind(zero);
+        self.emit(and_imm(W, X16, X1, 0x7fff));
+        self.asm.cbz(W, true, X16, slow);
+        self.asm.bind(write);
+        self.st_write(0, X0, X1);
     }
 
     fn x87_scale(&mut self, slow: Label) {
@@ -1532,6 +1618,9 @@ mod tests {
         let gs_load = plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).unwrap();
         assert_eq!(gs_load.fast, Fast::Load(Source::F32));
         assert_eq!(gs_load.mem, load80.mem);
-        assert!(plan(&decode(|a| a.fsqrt().unwrap()), 0, None).is_none());
+        assert_eq!(
+            plan(&decode(|a| a.fsqrt().unwrap()), 0, None).unwrap().fast,
+            Fast::Sqrt
+        );
     }
 }

@@ -146,17 +146,17 @@ pub fn deliver(machine: &mut Machine<adv_cpu::Cpu>, tid: i32, sig: i32) -> Resul
 }
 
 pub fn wake(machine: &mut Machine<adv_cpu::Cpu>) -> Result<bool, String> {
-    let pending = std::mem::take(&mut machine.ext.get_or_default::<Pending>().0);
-    for id in pending {
-        machine
-            .visit_context(Some(id), suspend)?
-            .map_err(|e| format!("initial suspend: {e:?}"))?;
+    if let Some(pending) = machine.ext.try_get_mut::<Pending>() {
+        for id in std::mem::take(&mut pending.0) {
+            machine
+                .visit_context(Some(id), suspend)?
+                .map_err(|e| format!("initial suspend: {e:?}"))?;
+        }
     }
-    let ids: Vec<_> = machine
-        .ext
-        .try_get::<Signals>()
-        .map(|s| s.0.keys().copied().collect())
-        .unwrap_or_default();
+    let Some(signals) = machine.ext.try_get::<Signals>().filter(|s| !s.0.is_empty()) else {
+        return Ok(false);
+    };
+    let ids: Vec<_> = signals.0.keys().copied().collect();
     let mut changed = false;
     for id in ids {
         changed |= machine

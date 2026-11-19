@@ -219,7 +219,7 @@ impl Translator<'_> {
                 self.x87_set(0, to, narrow);
                 self.clear_c1();
             }
-            Fast::Round | Fast::Scale | Fast::Examine => unreachable!("not cached"),
+            Fast::Round | Fast::Sqrt | Fast::Scale | Fast::Examine => unreachable!("not cached"),
         }
         (true, generic)
     }

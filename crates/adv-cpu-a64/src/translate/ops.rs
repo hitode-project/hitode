@@ -47,6 +47,7 @@ impl Translator<'_> {
             Op::Helper(index) => self.helper(index),
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
             Op::Timestamp => self.timestamp(),
+            Op::Cpuid => self.cpuid(),
             Op::PushFlags(width) => {
                 self.read_flags();
                 self.emit(and_imm(W, X6, X6, !0x30000u32 as u64));
@@ -937,6 +938,34 @@ impl Translator<'_> {
                 X16
             }
         }
+    }
+
+    fn cpuid(&mut self) {
+        use adv_cpu_core::cpu_profile::cpuid;
+        let outputs = [0, 3, 1, 2];
+        for reg in outputs {
+            self.clobber(Operand::Guest(reg));
+        }
+        let done = self.asm.label();
+        for leaf in [0, 1, 0x8000_0000] {
+            let next = self.asm.label();
+            let test = if leaf == 0 {
+                host(0)
+            } else {
+                self.emit(eor_imm(W, X6, host(0), u64::from(leaf)));
+                X6
+            };
+            self.asm.cbz(W, true, test, next);
+            for (reg, value) in outputs.into_iter().zip(cpuid(leaf, 0)) {
+                self.mov_imm(host(reg), value);
+            }
+            self.asm.b(done);
+            self.asm.bind(next);
+        }
+        for reg in outputs {
+            self.mov_imm(host(reg), 0);
+        }
+        self.asm.bind(done);
     }
 
     /// Has the interpreter run the instruction at helper `index` of the

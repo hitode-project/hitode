@@ -169,7 +169,8 @@ impl Gpu {
             .target
             .as_ref()
             .is_some_and(|(image, depth)| {
-                *image == target.image.id() && same_depth(depth.as_ref(), target.depth.as_ref())
+                *image == target.image.id()
+                    && super::resources::same_depth(depth.as_ref(), target.depth.as_ref())
             });
         if !same {
             self.stream.push(Command::Target {
@@ -1075,13 +1076,6 @@ fn rectangle_in(image: &Image, r: Rect) -> Result<(), Error> {
         return Err(invalid("rectangle is outside image"));
     }
     Ok(())
-}
-fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => Arc::ptr_eq(&a.0, &b.0),
-        _ => false,
-    }
 }
 pub(super) fn color_format(image: &Image) -> adv_gpu::Format {
     match &image.storage {

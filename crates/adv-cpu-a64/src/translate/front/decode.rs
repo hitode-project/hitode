@@ -68,6 +68,7 @@ pub enum Op {
     Stack(Mnemonic, Part, u8, u8),
     Lahf,
     Timestamp,
+    Cpuid,
     Syscall,
     Leave,
     Jmp(u32),
@@ -403,6 +404,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         M::Pushf => Op::PushFlags(2),
         M::Lahf => Op::Lahf,
         M::Rdtsc => Op::Timestamp,
+        M::Cpuid => Op::Cpuid,
         M::Int if instruction.immediate8() == 0x2e => Op::Syscall,
         M::Jmp => match instruction.op_kind(0) {
             OpKind::NearBranch32 => Op::Jmp(instruction.near_branch32()),
@@ -885,6 +887,7 @@ impl Op {
             | Op::Lea(..)
             | Op::Not(_)
             | Op::Cdq
+            | Op::Cpuid
             | Op::Jmp(_)
             | Op::Direction(_) => (F::NONE, F::NONE, false),
             // MMX and floating-point instructions may leave for the
@@ -1262,8 +1265,7 @@ mod whitelist_audit {
                             || word_string
                             || matches!(
                                 i.mnemonic(),
-                                Mnemonic::Cpuid
-                                    | Mnemonic::Cli
+                                Mnemonic::Cli
                                     | Mnemonic::Sti
                                     | Mnemonic::Sgdt
                                     | Mnemonic::Sidt

@@ -16,6 +16,17 @@ pub(in crate::d3d9::recording) struct Mapping {
     repeat: [bool; 2],
 }
 impl Mapping {
+    #[cfg(test)]
+    pub(in crate::d3d9::recording) fn bits(self) -> ([u64; 2], [u64; 2], u64, Rect, [bool; 2]) {
+        (
+            self.scale.map(f64::to_bits),
+            self.offset.map(f64::to_bits),
+            self.radius.to_bits(),
+            self.source,
+            self.repeat,
+        )
+    }
+
     fn new(scale: [f64; 2], offset: [f64; 2], radius: f64, image: &Image) -> Option<Self> {
         (scale.iter().all(|v| v.is_finite() && *v != 0.) && offset.iter().all(|v| v.is_finite()))
             .then_some(Self {
@@ -163,9 +174,9 @@ pub(in crate::d3d9::recording) fn prepare(
     device: &Device,
     operation: &Operation,
     reads: &[Content],
-) -> Vec<Read> {
+) -> smallvec::SmallVec<[Read; 2]> {
     if !reads.iter().any(|k| device.frame.damage.written(k)) {
-        return Vec::new();
+        return smallvec::SmallVec::new();
     }
     let result = match operation {
         Operation::Copy {
@@ -189,7 +200,7 @@ pub(in crate::d3d9::recording) fn prepare(
             source,
         )
         .map(|mapping| {
-            vec![Read {
+            smallvec::smallvec![Read {
                 source: reads[0],
                 mapping,
             }]
@@ -447,7 +458,7 @@ fn draw_reads(
     env: &Env<'_>,
     device: &Device,
     draw: &fixed::Draw,
-) -> Result<Vec<Read>, &'static str> {
+) -> Result<smallvec::SmallVec<[Read; 2]>, &'static str> {
     if draw
         .programmable
         .as_ref()
@@ -513,7 +524,7 @@ fn draw_reads(
         pixel.map(|p| p.parsed.as_ref()),
     )
     .ok_or("vertices are not 3 to 64 with one positive w")?;
-    let mut result = Vec::new();
+    let mut result = smallvec::SmallVec::new();
     for (slot, coordinates) in samples {
         let binding = if let Some(p) = &draw.programmable {
             let ordinal = if let Some(pixel) = pixel {
@@ -747,6 +758,20 @@ fn mapping(
     image: &Image,
     sampler: Sampler,
 ) -> Option<Mapping> {
+    let vertices = vertices.iter().map(|v| {
+        (
+            v.position,
+            coordinates.map(|c| f64::from(v.varyings[c.varying][c.component]) * c.scale + c.offset),
+        )
+    });
+    fit(vertices, image, sampler)
+}
+
+pub(in crate::d3d9::recording) fn fit(
+    vertices: impl Iterator<Item = ([f64; 2], [f64; 2])> + Clone,
+    image: &Image,
+    sampler: Sampler,
+) -> Option<Mapping> {
     let address = [sampler.u, sampler.v];
     if sampler.first_level != 0 || sampler.mip.is_some() || address.contains(&Address::Border) {
         return None;
@@ -755,22 +780,17 @@ fn mapping(
     let mut offset = [0.; 2];
     let mut residual = 0.0f64;
     for axis in 0..2 {
-        let low = vertices
-            .iter()
-            .min_by(|a, b| a.position[axis].total_cmp(&b.position[axis]))?;
-        let high = vertices
-            .iter()
-            .max_by(|a, b| a.position[axis].total_cmp(&b.position[axis]))?;
-        if low.position[axis] == high.position[axis] {
+        let (low, a) = vertices
+            .clone()
+            .min_by(|a, b| a.0[axis].total_cmp(&b.0[axis]))?;
+        let (high, b) = vertices
+            .clone()
+            .max_by(|a, b| a.0[axis].total_cmp(&b.0[axis]))?;
+        if low[axis] == high[axis] {
             return None;
         }
-        let coordinate = coordinates[axis];
-        let value = |v: &Vertex| {
-            f64::from(v.varyings[coordinate.varying][coordinate.component]) * coordinate.scale
-                + coordinate.offset
-        };
-        let a = value(low);
-        let b = value(high);
+        let a = a[axis];
+        let b = b[axis];
         let size = f64::from(if axis == 0 {
             image.width()
         } else {
@@ -782,13 +802,13 @@ fn mapping(
         {
             return None;
         }
-        scale[axis] = (b - a) * size / (high.position[axis] - low.position[axis]);
-        offset[axis] = a * size - low.position[axis] * scale[axis];
+        scale[axis] = (b - a) * size / (high[axis] - low[axis]);
+        offset[axis] = a * size - low[axis] * scale[axis];
         // Equal homogeneous w makes the interpolation error no larger than
         // its largest vertex error. Allow rounding in tessellated rectangles.
-        for v in vertices {
-            let texel = value(v) * size;
-            let error = (texel - (v.position[axis] * scale[axis] + offset[axis])).abs();
+        for (position, value) in vertices.clone() {
+            let texel = value[axis] * size;
+            let error = (texel - (position[axis] * scale[axis] + offset[axis])).abs();
             if !(0. ..=1. / 256.).contains(&error) || !(-1. ..=size + 1.).contains(&texel) {
                 return None;
             }
