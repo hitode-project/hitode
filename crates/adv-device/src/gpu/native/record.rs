@@ -64,10 +64,38 @@ impl Recording {
 }
 
 struct Completion {
-    result: Mutex<Option<Result<Vec<u8>, Error>>>,
+    result: Mutex<Option<Result<ReadPixels, Error>>>,
     ready: Condvar,
     cancelled: AtomicBool,
     finished: AtomicBool,
+}
+enum ReadPixels {
+    Bytes(Vec<u8>),
+    Mapping(MappedPixels),
+}
+struct MappedPixels {
+    buffer: adv_gpu::Buffer,
+    format: adv_gpu::Format,
+    opaque: bool,
+    reservation: Option<Reservation>,
+}
+impl MappedPixels {
+    fn copy(self) -> Vec<u8> {
+        // The driver-owned mapping is read only after its copy completed.
+        let mapping = self.buffer.mapped().expect("readback mapping");
+        let mut pixels = unsafe { mapping.as_ref() }.to_vec();
+        if self.format == adv_gpu::Format::Rgba8Unorm {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        if self.opaque {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
+        }
+        pixels
+    }
 }
 /// An explicitly requested image transfer. Completion owns the mapped buffer
 /// until its submission finishes, independently of the guest's handle.
@@ -76,23 +104,52 @@ pub struct Readback {
     pub height: u32,
     completion: Arc<Completion>,
     job_taken: bool,
+    worker_wake: Option<Arc<adv_sync::WakeEvent>>,
 }
 impl Readback {
     pub fn cancel(&self) {
         self.completion.cancelled.store(true, Ordering::Release);
     }
     pub fn poll(&mut self) -> Option<Result<Vec<u8>, Error>> {
-        self.completion.result.lock().unwrap().take()
+        let mut result = self.completion.result.lock().unwrap();
+        if matches!(*result, Some(Ok(ReadPixels::Mapping(_)))) {
+            return None;
+        }
+        result.take().map(|r| {
+            r.map(|pixels| match pixels {
+                ReadPixels::Bytes(bytes) => bytes,
+                ReadPixels::Mapping(_) => unreachable!(),
+            })
+        })
     }
     pub fn take_completion_job(&mut self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        self.take_completion_job_with(Ok)
+    }
+    /// Convert completed regions on the worker before publishing the bytes.
+    pub fn take_completion_job_with(
+        &mut self,
+        transform: impl FnOnce(Vec<u8>) -> Result<Vec<u8>, Error> + Send + 'static,
+    ) -> Option<Box<dyn FnOnce() + Send + 'static>> {
         if std::mem::replace(&mut self.job_taken, true) {
             return None;
         }
         let completion = self.completion.clone();
+        let wake = self.worker_wake.take();
         Some(Box::new(move || {
             let mut result = completion.result.lock().unwrap();
             while !completion.finished.load(Ordering::Acquire) {
                 result = completion.ready.wait(result).unwrap();
+            }
+            if matches!(*result, Some(Ok(ReadPixels::Mapping(_)))) {
+                let Some(Ok(ReadPixels::Mapping(mapping))) = result.take() else {
+                    unreachable!()
+                };
+                drop(result);
+                let bytes = transform(mapping.copy()).map(ReadPixels::Bytes);
+                *completion.result.lock().unwrap() = Some(bytes);
+                if let Some(wake) = wake {
+                    wake.signal();
+                }
             }
         }))
     }
@@ -475,26 +532,10 @@ impl Gpu {
             bytes[parameters_offset..parameters_offset + 640]
                 .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
             for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                // Copy recipes directly, avoiding their deferred Vec payload.
-                let width = if stream.stride == 0 {
-                    stream
-                        .attributes
-                        .iter()
-                        .map(|a| a.offset + a.format.size())
-                        .max()
-                        .unwrap() as usize
-                } else {
-                    stream.stride as usize
-                };
-                for (n, out) in bytes[offset as usize..offset as usize + stream.bytes.len()]
-                    .chunks_mut(width)
-                    .enumerate()
-                {
-                    stream
-                        .bytes
-                        .read_vertex(n, stream.stride as usize, 0, out)
-                        .expect("validated vertex range");
-                }
+                let offset = offset as usize;
+                stream
+                    .bytes
+                    .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
             }
             if let Some(indices) = &draw.indices {
                 bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
@@ -762,6 +803,28 @@ impl Gpu {
         image: &Image,
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
+        self.readback_inner(image, &[whole(image)], wake, false)
+    }
+
+    pub fn readback_regions(
+        &mut self,
+        image: &Image,
+        regions: &[Rect],
+        wake: Option<Arc<adv_sync::WakeEvent>>,
+    ) -> Result<Readback, Error> {
+        self.readback_inner(image, regions, wake, true)
+    }
+
+    fn readback_inner(
+        &mut self,
+        image: &Image,
+        regions: &[Rect],
+        wake: Option<Arc<adv_sync::WakeEvent>>,
+        worker: bool,
+    ) -> Result<Readback, Error> {
+        for &rect in regions {
+            rectangle_in(image, rect)?;
+        }
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.check()?;
@@ -776,20 +839,28 @@ impl Gpu {
         let image = if readback_copyable(image) {
             image
         } else {
-            scratch = self.snapshot_readback_source(image)?;
+            scratch = self.snapshot_readback_regions(image, regions)?;
             &scratch
         };
-        let format = color_format(image);
-        let opaque = image.alpha_mode() == gpu::AlphaMode::Opaque;
+        let size = regions
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+            .sum();
         let buffer = self
             .device
             .create_buffer(&BufferDesc {
-                size: u64::from(image.width()) * u64::from(image.height()) * 4,
+                size,
                 usage: BufferUsage::COPY_DST,
                 memory: Memory::Readback,
                 label: "guest readback",
             })
             .map_err(gpu_error)?;
+        let mut mapping = MappedPixels {
+            buffer: buffer.clone(),
+            format: color_format(image),
+            opaque: image.alpha_mode() == gpu::AlphaMode::Opaque,
+            reservation: None,
+        };
         let completion = Arc::new(Completion {
             result: Mutex::new(None),
             ready: Condvar::new(),
@@ -799,35 +870,24 @@ impl Gpu {
         let mut transfer = Transfer {
             completion: completion.clone(),
             reservation: Some(reservation),
-            wake,
+            wake: wake.clone(),
             device: self.device.clone(),
         };
         let device = self.device.clone();
         self.stream.push(Command::Readback {
             image: image.clone(),
-            rect: native_rect(whole(image)),
-            into: buffer.clone(),
+            regions: regions.iter().copied().map(native_rect).collect(),
+            into: buffer,
             done: Box::new(move || {
                 let result = if let Some(lost) = device.lost() {
                     Err(Error::Device(lost))
                 } else if transfer.completion.cancelled.load(Ordering::Acquire) {
                     Err(Error::Device("GPU readback cancelled".into()))
+                } else if worker {
+                    mapping.reservation = transfer.reservation.take();
+                    Ok(ReadPixels::Mapping(mapping))
                 } else {
-                    // Driver-owned persistent readback mapping, accessed only
-                    // after this copy's completion token signals.
-                    let mapping = buffer.mapped().expect("readback mapping");
-                    let mut pixels = unsafe { mapping.as_ref() }.to_vec();
-                    if format == adv_gpu::Format::Rgba8Unorm {
-                        for pixel in pixels.as_chunks_mut::<4>().0 {
-                            pixel.swap(0, 2);
-                        }
-                    }
-                    if opaque {
-                        for pixel in pixels.as_chunks_mut::<4>().0 {
-                            pixel[3] = 255;
-                        }
-                    }
-                    Ok(pixels)
+                    Ok(ReadPixels::Bytes(mapping.copy()))
                 };
                 transfer.finish(result);
             }),
@@ -838,20 +898,26 @@ impl Gpu {
             height: image.height(),
             completion,
             job_taken: false,
+            worker_wake: wake.filter(|_| worker),
         })
     }
-    /// Preserve the pixels at this point in the stream when CPU staging is busy.
-    pub fn snapshot_readback_source(&mut self, image: &Image) -> Result<Image, Error> {
+    /// Preserve the regions at this point in the stream when CPU staging is busy.
+    pub fn snapshot_readback_regions(
+        &mut self,
+        image: &Image,
+        regions: &[Rect],
+    ) -> Result<Image, Error> {
         let scratch = self
             .target(image.width(), image.height(), false)?
             .with_alpha_mode(image.alpha_mode())
             .image;
-        let area = whole(image);
-        if readback_copyable(image) && color_format(image) == color_format(&scratch) {
-            self.copy_validated(image, area, &scratch, area)?;
-        } else {
-            // Sampling expands the stored format to BGRA, as a draw sees it.
-            self.blit_validated(image, area, &scratch, area, Filter::Nearest)?;
+        for &area in regions {
+            if readback_copyable(image) && color_format(image) == color_format(&scratch) {
+                self.copy_validated(image, area, &scratch, area)?;
+            } else {
+                // Sampling expands the stored format to BGRA, as a draw sees it.
+                self.blit_validated(image, area, &scratch, area, Filter::Nearest)?;
+            }
         }
         Ok(scratch)
     }
@@ -952,7 +1018,7 @@ struct Transfer {
     device: adv_gpu::Device,
 }
 impl Transfer {
-    fn finish(&mut self, result: Result<Vec<u8>, Error>) {
+    fn finish(&mut self, result: Result<ReadPixels, Error>) {
         let mut output = self.completion.result.lock().unwrap();
         *output = Some(result);
         self.reservation.take();
@@ -1162,6 +1228,8 @@ fn fixed_parameters(state: &DrawState, image: Option<&Image>) -> [u32; 8] {
         gpu::TextureOp::Multiply => 2,
         gpu::TextureOp::Add => 3,
         gpu::TextureOp::Subtract => 4,
+        gpu::TextureOp::Multiply2x => 5,
+        gpu::TextureOp::Multiply4x => 6,
     };
     let compare = match state.alpha_test {
         gpu::Compare::Never => 0,
@@ -1347,7 +1415,7 @@ mod tests {
         assert_eq!(gpu.stats().prebuild_misses, 2);
         assert_eq!(gpu.stats().compile_waits, 2);
         let stats = gpu.stats();
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         assert_eq!(gpu.stats(), stats);
 
         let texture = gpu.image(1, 1).unwrap();

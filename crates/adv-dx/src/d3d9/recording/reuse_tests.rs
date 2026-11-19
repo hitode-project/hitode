@@ -82,7 +82,7 @@ fn d3d9_reuse_sequence_matches_uncached_commands_keys_and_pixels() {
             }
             reuse_draw(&mut f, &[0, 1, 2], &builds);
         }
-        keys.push(frame(&mut env(&mut f), owner).key);
+        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
         assert_eq!(frame(&mut env(&mut f), owner).commands.len(), 4);
         f.okay("IDirect3DDevice9::EndScene", &[f.device]);
         present(&mut f);
@@ -386,7 +386,7 @@ fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_statebloc
                 assert_eq!(f.finish(outcome), 0);
             }
             let owner = id(&mut f);
-            let key = frame(&mut env(&mut f), owner).key;
+            let key = frame(&mut env(&mut f), owner).command_identities.clone();
             let published = f.m.ext.get::<Presents>().damage.len();
             f.okay("IDirect3DDevice9::EndScene", &[d]);
             present(&mut f);
@@ -479,4 +479,142 @@ fn d3d9_reuse_signature_prefix_rechecks_target_shape() {
     replace(e.ext, surface, target).unwrap();
     reuse_draw(&mut f, &[0, 1, 2], &builds);
     assert_eq!(builds.get(), 2);
+}
+
+// spec: GFX-REC-2, GFX-REC-4, GFX-REC-5, GFX-REC-11
+#[test]
+fn steady_fixed_up_frame_reuses_keys_with_repeated_state_changes() {
+    let mut f = fixture();
+    let device = f.device;
+    f.okay("IDirect3DDevice9::SetFVF", &[device, 0x44]);
+    let vertices = [
+        [
+            1f32.to_bits(),
+            1f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+        [
+            13f32.to_bits(),
+            1f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+        [
+            1f32.to_bits(),
+            9f32.to_bits(),
+            0,
+            1f32.to_bits(),
+            0xff00ff00,
+        ],
+    ];
+    let addresses = [f.packet(vertices), f.packet(vertices)];
+    let frame = |f: &mut Fixture, address| {
+        clear(f, 0xff000000);
+        f.okay("IDirect3DDevice9::BeginScene", &[device]);
+        for cull in [1, 2, 1] {
+            f.okay("IDirect3DDevice9::SetRenderState", &[device, 22, cull]);
+            f.okay(
+                "IDirect3DDevice9::DrawPrimitiveUP",
+                &[device, 4, 1, address, 20],
+            );
+        }
+        f.okay("IDirect3DDevice9::EndScene", &[device]);
+        present(f);
+    };
+    frame(&mut f, addresses[0]);
+    let counts = f.m.ext.get::<State>().frames;
+    assert!(counts.draw_key_hashes > 0);
+    frame(&mut f, addresses[1]);
+    let repeated = f.m.ext.get::<State>().frames;
+    assert_eq!(repeated.fixed_draws - counts.fixed_draws, 3);
+    assert_eq!(repeated.draw_key_hashes, counts.draw_key_hashes);
+    assert_eq!(repeated.eliminated_frames - counts.eliminated_frames, 1);
+
+    f.m.cpu.write_u32(addresses[1] + 16, 0xffff0000).unwrap();
+    frame(&mut f, addresses[1]);
+    let changed = f.m.ext.get::<State>().frames;
+    assert!(changed.draw_key_hashes > repeated.draw_key_hashes);
+    assert_eq!(changed.eliminated_frames, repeated.eliminated_frames);
+}
+
+/// Draws two distinct UP triangles whose first color is `color`, flushing for
+/// a readback before presenting when `readback` is set; returns the rested
+/// and reused draw counts so far.
+fn up_frame(f: &mut Fixture, address: u32, color: u32, readback: bool) -> (u64, u64) {
+    let device = f.device;
+    f.m.cpu.write_u32(address + 16, color).unwrap();
+    clear(f, 0xff000000);
+    f.okay("IDirect3DDevice9::BeginScene", &[device]);
+    for cull in [1, 2] {
+        f.okay("IDirect3DDevice9::SetRenderState", &[device, 22, cull]);
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[device, 4, 1, address, 20],
+        );
+    }
+    if readback {
+        let outcome = flush(f, Reason::Readback);
+        assert_eq!(f.finish(outcome), 0);
+    }
+    f.okay("IDirect3DDevice9::EndScene", &[device]);
+    present(f);
+    let counts = f.m.ext.get::<State>().frames;
+    (counts.rested_draws, counts.reused_draws)
+}
+
+fn up_frames(colors: impl Iterator<Item = u32>, readback: bool) -> Vec<(u64, u64)> {
+    let mut f = fixture();
+    f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x44]);
+    let vertex = |x: f32, y: f32| [x.to_bits(), y.to_bits(), 0, 1f32.to_bits(), 0xff00ff00];
+    let address = f.packet([vertex(1., 1.), vertex(13., 1.), vertex(1., 9.)]);
+    let mut last = (0, 0);
+    colors
+        .map(|color| {
+            let counts = up_frame(&mut f, address, color, readback);
+            let delta = (counts.0 - last.0, counts.1 - last.1);
+            last = counts;
+            delta
+        })
+        .collect()
+}
+
+#[test]
+// spec: GFX-REC-11
+fn up_targets_without_reuse_rest_with_doubling_spans() {
+    // Changing bytes: record, miss twice, rest 1, record, miss, rest 2;
+    // then steady bytes: record, reuse, reuse.
+    let colors = (0..11u32).map(|n| if n < 7 { 0xff000000 | n } else { 0xff00ff00 });
+    assert_eq!(
+        up_frames(colors, false),
+        [
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (2, 0),
+            (0, 0),
+            (0, 0),
+            (2, 0),
+            (2, 0),
+            (0, 0),
+            (0, 2),
+            (0, 2)
+        ]
+    );
+}
+
+#[test]
+// spec: GFX-REC-11
+fn targets_whose_entries_every_readback_drops_rest() {
+    // Each frame's entries are dropped by its readback flush: the first
+    // waste keeps reuse, later ones rest 1, then 2 frames.
+    assert_eq!(
+        up_frames(std::iter::repeat_n(0xff00ff00, 7), true)
+            .iter()
+            .map(|d| d.0)
+            .collect::<Vec<_>>(),
+        [0, 0, 2, 0, 2, 2, 0]
+    );
 }

@@ -204,7 +204,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         );
     }
     if let Some(dir) = disk_dir {
-        gpu.flush_pipeline_cache();
+        gpu.flush_pipeline_cache().unwrap();
         let files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -337,6 +337,7 @@ fn fixed_completion_unlit_pipeline_identity() {
         second: false,
         features: (0, false),
         fixed: 0,
+        fixed_vertex: None,
     };
     assert_eq!(
         recording::hash(&key),
@@ -354,7 +355,7 @@ fn fixed_completion_unlit_pipeline_identity() {
     .unwrap();
     assert_eq!(
         xxhash_rust::xxh3::xxh3_128(source.as_bytes()),
-        12730266951233098795822423985951590738
+        190094167268719864932161249157478235325
     );
     for fixed in [1, 2, 4, 8, 32] {
         let changed = ProgramKey {

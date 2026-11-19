@@ -427,6 +427,26 @@ fn report(
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
+    #[cfg(feature = "gpu")]
+    if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
+        fields.push(format!(
+            concat!(
+                "\"d3d9\": {{\"fixed_draws\": {}, \"fixed_shaders_built\": {}, ",
+                "\"fixed_shader_cache_hits\": {}, \"draw_key_hashes\": {}, ",
+                "\"reused_draws\": {}, \"rested_draws\": {}, ",
+                "\"readback_bytes\": {}, \"readback_bytes_per_frame\": {:.2}}}"
+            ),
+            counters.fixed_draws,
+            counters.fixed_shaders_built,
+            counters.fixed_shader_cache_hits,
+            counters.draw_key_hashes,
+            counters.reused_draws,
+            counters.rested_draws,
+            counters.readback_bytes,
+            counters.readback_bytes as f64 / counters.presents.max(1) as f64,
+        ));
+    }
+
     let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),
         |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",
@@ -452,13 +472,19 @@ fn report(
     }
     if let Some(kernels) = adv_runtime::wine::codec::stats(&session.machine.ext) {
         let theora = kernels.theora;
+        let run_ahead = theora.run_ahead;
         codec.pop();
         codec.push_str(&format!(
             concat!(
                 ", \"mdct\": {{\"installed\": {}, \"native_calls\": {}, \"verify_calls\": {}, ",
                 "\"fallback_calls\": {}, \"last_rejection\": {}}}, ",
-                "\"theora\": {{\"installed\": {}, \"initialized\": {}, \"native_frames\": {}, ",
+                "\"theora\": {{\"installed\": {}, \"initialized\": {}, \"frames\": {}, \"native_frames\": {}, ",
                 "\"compared_bytes\": {}, \"different_bytes\": {}, \"state_mismatches\": {}, ",
+                "\"predicted\": {}, \"committed\": {}, \"mismatched\": {}, ",
+                "\"mismatched_controls\": {}, \"discarded\": {}, ",
+                "\"no_prediction\": {}, \"no_prediction_callback\": {}, \"owner_wait_ns\": {}, ",
+                "\"linked\": {}, \"unlinked_wrote\": {}, \"readahead_packets\": {}, ",
+                "\"wait_not_started_ns\": {}, \"wait_in_flight_ns\": {}, \"lead_packets_sum\": {}, ",
                 "\"reason\": {}}}}}"
             ),
             kernels.installed,
@@ -471,10 +497,25 @@ fn report(
                 .map_or_else(|| "null".into(), json),
             theora.installed,
             theora.initialized,
+            theora.frames,
             theora.native_frames,
             theora.compared_bytes,
             theora.different_bytes,
             theora.state_mismatches,
+            run_ahead.predicted,
+            run_ahead.committed,
+            run_ahead.mismatched,
+            run_ahead.mismatched_controls,
+            run_ahead.discarded,
+            run_ahead.no_prediction,
+            run_ahead.no_prediction_callback,
+            run_ahead.owner_wait_ns,
+            run_ahead.linked,
+            run_ahead.unlinked_wrote,
+            run_ahead.readahead_packets,
+            run_ahead.wait_not_started_ns,
+            run_ahead.wait_in_flight_ns,
+            run_ahead.lead_packets_sum,
             theora.reason.as_deref().map_or_else(|| "null".into(), json),
         ));
     }

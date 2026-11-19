@@ -1228,7 +1228,13 @@ fn pipeline_cache_round_trips_and_rejects_garbage() {
         .create_render_pipeline(&desc, Some(&cache))
         .expect("pipeline with empty cache");
     let data = cache.serialize().expect("serialize");
+    // Serializing again without a new pipeline returns the same archive.
+    gpu.device
+        .create_render_pipeline(&desc, Some(&cache))
+        .expect("repeated pipeline");
+    assert_eq!(cache.serialize().expect("serialize unchanged"), data);
     let reloaded = PipelineCache::load(&data);
+    assert_eq!(reloaded.serialize().expect("serialize reloaded"), data);
     gpu.device
         .create_render_pipeline(&desc, Some(&reloaded))
         .expect("pipeline with reloaded cache");

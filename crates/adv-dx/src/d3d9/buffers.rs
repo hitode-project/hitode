@@ -352,11 +352,6 @@ fn lock(
         return INVALID;
     };
     b.locks = locks;
-    // A retained signature prefix has already checked its stream locks.
-    let owner = b.device;
-    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
-        d.frame.invalidate_streams();
-    }
     0
 }
 fn unlock(env: &mut Env<'_>, this: u32, kind: Kind) -> u32 {
@@ -691,28 +686,6 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     }
 }
 
-pub(super) fn stream_data(env: &Env<'_>, this: u32, number: u16) -> Result<(u32, u32, u32), u32> {
-    let d = device(env, this).ok_or(INVALID)?;
-    let stream = *d
-        .hot
-        .borrow()
-        .buffers
-        .streams
-        .get(number as usize)
-        .ok_or(INVALID)?;
-    let id = stream.buffer.ok_or(INVALID)?;
-    let Some(Payload::Buffer(b)) = com(env).get_identity(&env.sys.objects, id) else {
-        return Err(INVALID);
-    };
-    if b.kind != Kind::Vertex || b.locks != 0 || stream.offset > b.len {
-        return Err(INVALID);
-    }
-    Ok((
-        b.storage.checked_add(stream.offset).ok_or(INVALID)?,
-        stream.stride,
-        b.len - stream.offset,
-    ))
-}
 fn submit(env: &mut Env<'_>, this: u32, draw: fixed::Draw, up: Option<bool>) -> Outcome {
     let id = com(env)
         .identity::<Payload>(&env.sys.objects, this)
@@ -729,18 +702,9 @@ fn draw(env: &mut Env<'_>, this: GuestPtr<()>, kind: i32, start: u32, count: u32
             fixed::empty_draw(env, this.addr(), kind).map_or_else(|e| e, |()| 0),
         );
     }
-    if super::programmable::active(env, this.addr()) {
-        return match super::programmable::prepare(env, this.addr(), kind, count, None, None, start)
-        {
-            Ok(draw) => submit(env, this.addr(), draw, None),
-            Err(e) => Outcome::Return(e),
-        };
-    }
-    let result = fixed::prepare_bound(env, this.addr(), kind, count, start, None);
-    match result {
-        Ok(draw) => submit(env, this.addr(), draw, None),
-        Err(error) => Outcome::Return(error),
-    }
+    recording::bound(env, this.addr(), kind, count, start, |env| {
+        fixed::prepare_bound(env, this.addr(), kind, count, start, None)
+    })
 }
 fn decode_indices(
     env: &Env<'_>,
@@ -874,19 +838,7 @@ fn draw_indexed_up(
         }
         let length = fixed::primitive_length(kind, count)?;
         let indices = decode_indices(env, indices.addr(), format, length, minimum, vertices, 0)?;
-        if super::programmable::active(env, this.addr()) {
-            super::programmable::prepare(
-                env,
-                this.addr(),
-                kind,
-                count,
-                Some((data, stride)),
-                Some(&indices),
-                0,
-            )
-        } else {
-            fixed::prepare(env, this.addr(), kind, count, data, stride, Some(&indices))
-        }
+        fixed::prepare(env, this.addr(), kind, count, data, stride, Some(&indices))
     })();
     match result {
         Ok(draw) => submit(env, this.addr(), draw, Some(true)),

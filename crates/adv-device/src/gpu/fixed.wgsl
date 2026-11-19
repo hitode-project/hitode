@@ -31,7 +31,9 @@ fn combine(op: u32, color: vec4<f32>, texel: vec4<f32>) -> vec4<f32> {
         case 1u: { return texel; }
         case 2u: { return color * texel; }
         case 3u: { return clamp(color + texel, vec4(0.0), vec4(1.0)); }
-        default: { return clamp(color - texel, vec4(0.0), vec4(1.0)); }
+        case 4u: { return clamp(color - texel, vec4(0.0), vec4(1.0)); }
+        case 5u: { return clamp(color * texel * 2.0, vec4(0.0), vec4(1.0)); }
+        default: { return clamp(color * texel * 4.0, vec4(0.0), vec4(1.0)); }
     }
 }
 fn compare_alpha(alpha: f32) -> bool {

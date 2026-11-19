@@ -52,6 +52,7 @@ fn schedule(
         second: false,
         features: (hot.fixed.render[&152], hot.fixed.render[&28] != 0),
         fixed: fixed_features(&hot.fixed, None),
+        fixed_vertex: None,
     };
     let streams_meta = hot.buffers.streams;
     let frequencies = hot.buffers.frequencies;

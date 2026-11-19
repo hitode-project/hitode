@@ -11,13 +11,13 @@ struct DrawParameters { values:array<vec4<u32>,40> }
 @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;
 @group(0) @binding(2) var<uniform> draw_parameters:DrawParameters;
 fn adv_combine(op:u32,c:vec4<f32>,t:vec4<f32>)->vec4<f32> {
-  switch op {case 0u:{return c;}case 1u:{return t;}case 2u:{return c*t;}case 3u:{return clamp(c+t,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return clamp(c-t,vec4<f32>(0.0),vec4<f32>(1.0));}}
+  switch op {case 0u:{return c;}case 1u:{return t;}case 2u:{return c*t;}case 3u:{return clamp(c+t,vec4<f32>(0.0),vec4<f32>(1.0));}case 4u:{return clamp(c-t,vec4<f32>(0.0),vec4<f32>(1.0));}case 5u:{return clamp(c*t*2.0,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return clamp(c*t*4.0,vec4<f32>(0.0),vec4<f32>(1.0));}}
 }
 fn adv_argument(a:u32,diffuse:vec4<f32>,current:vec4<f32>,texel:vec4<f32>)->vec4<f32> {
   switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}
 }
 fn adv_stage(op:u32,a1:vec4<f32>,a2:vec4<f32>,current:vec4<f32>)->vec4<f32> {
-  switch op {case 2u:{return a1;}case 3u:{return a2;}case 4u:{return a1*a2;}case 7u:{return clamp(a1+a2,vec4<f32>(0.0),vec4<f32>(1.0));}case 10u:{return clamp(a1-a2,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return current;}}
+  switch op {case 2u:{return a1;}case 3u:{return a2;}case 4u:{return a1*a2;}case 5u:{return clamp(a1*a2*2.0,vec4<f32>(0.0),vec4<f32>(1.0));}case 6u:{return clamp(a1*a2*4.0,vec4<f32>(0.0),vec4<f32>(1.0));}case 7u:{return clamp(a1+a2,vec4<f32>(0.0),vec4<f32>(1.0));}case 10u:{return clamp(a1-a2,vec4<f32>(0.0),vec4<f32>(1.0));}default:{return current;}}
 }
 fn adv_alpha(a:f32)->bool {
  let r=bitcast<f32>(draw_parameters.values[1].w);
@@ -41,6 +41,19 @@ pub(super) fn build(
     inputs: &[Input],
     slots: &[(bool, u8)],
     features: (bool, u32, bool, u32),
+) -> Result<String, u32> {
+    build_with_fixed(vs, ps, vt, pt, inputs, slots, features, None)
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_with_fixed(
+    vs: Option<&Shader>,
+    ps: Option<&Shader>,
+    vt: Option<&Translation>,
+    pt: Option<&Translation>,
+    inputs: &[Input],
+    slots: &[(bool, u8)],
+    features: (bool, u32, bool, u32),
+    fixed_vertex: Option<&fixed_vertex::Variant>,
 ) -> Result<String, u32> {
     let (second, clip, fog, fixed) = features;
     let specular = ps.is_none() && fixed & 2 != 0;
@@ -103,6 +116,9 @@ pub(super) fn build(
     }
     if let Some(t) = pt {
         s.push_str(&t.source);
+    }
+    if fixed_vertex.is_some() {
+        s.push_str(fixed_vertex::HELPERS);
     }
     s.push_str("@vertex fn vertex_main(@builtin(vertex_index) ordinal:u32,");
     let transformed = vs.is_none() && inputs.iter().any(|i| i.register == 0);
@@ -180,6 +196,8 @@ pub(super) fn build(
                 .unwrap();
             }
         }
+    } else if let Some(vertex) = fixed_vertex {
+        vertex.emit(&mut s, inputs);
     } else if transformed {
         s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);\n");
         if inputs[0].format == AttributeFormat::Float3 {
@@ -233,8 +251,8 @@ pub(super) fn build(
     s.push_str("if draw_parameters.values[2].w!=0u {\nlet corners=array<vec2<f32>,6>(vec2<f32>(-1.0,1.0),vec2<f32>(-1.0,-1.0),vec2<f32>(1.0,1.0),vec2<f32>(1.0,1.0),vec2<f32>(-1.0,-1.0),vec2<f32>(1.0,-1.0));let corner=corners[ordinal%6u];\n");
     if vt.is_some_and(|t| t.writes_point_size) {
         s.push_str("var size=result.point_size;\n");
-    } else if fixed & 256 != 0 {
-        s.push_str("var size=a11.x;\n");
+    } else if fixed_vertex.is_some_and(|v| v.scaled) {
+        s.push_str("var size=fixed_point_size;\n");
     } else {
         s.push_str("var size=bitcast<f32>(draw_parameters.values[11].w);\n");
     }

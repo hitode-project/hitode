@@ -2,7 +2,9 @@
 //! inherited handles, including clients that have not admitted a descriptor.
 
 use std::cell::{Cell, RefCell};
+use std::fs::File;
 use std::rc::Rc;
+use std::sync::Weak;
 
 #[derive(Default)]
 pub(crate) struct States(RefCell<Vec<Option<Entry>>>);
@@ -13,6 +15,7 @@ pub(crate) struct Entry {
     pub kind: i32,
     pub position: Rc<Cell<i64>>,
     pub immutable: Option<[u8; 22]>,
+    pub(super) read_source: Rc<RefCell<Weak<File>>>,
 }
 
 impl States {
@@ -46,6 +49,7 @@ impl States {
             kind,
             position,
             immutable,
+            read_source: Rc::default(),
         });
     }
 }

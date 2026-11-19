@@ -149,10 +149,9 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Whole-image upload snapshots are identified by their texels and replace previous pixel dependencies. Partial uploads receive fresh identities and preserve earlier writes. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
-Fixed-state draw keys may be cached between changes; unchanged setters preserve the key, and mutations invalidate it. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
+Unchanged setters MUST preserve their state category generations and keys. State changes MUST advance the affected generations and maintain history-independent category identities. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
 Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
-Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
-Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
+Fixed draws MUST retain their raw vertex streams and index order. Vertex buffer draws MUST see guest-writable stream contents when they are admitted.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
@@ -166,7 +165,7 @@ Diagnostics count successful submissions and input vertices, including instances
 **Rule**: Each target subresource MUST accumulate recording-time differences, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST be a cell region (DEV-FRAME-5) without promoting bounded damage to the whole target based on coverage alone.
 **Verification**: Test
 
-Bounds use decoded XYZRHW or CPU world/view/projection positions, or the scalar vertex shader interpreter for at most 64 float-input vertices. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clears, copies and uploads use their destination rectangles. Size/format changes and Reset invalidate history. Reads of targets written in the frame, including targets uploaded after an earlier read, extend their producers' execution instead (GFX-REC-5).
+At most 64 vertices supply bounds. Fixed draws read XYZRHW positions or apply world, view and projection to the position alone. Programmable draws use the scalar vertex shader interpreter with float inputs. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clears, copies and uploads use their destination rectangles. Size/format changes and Reset invalidate history. Reads of targets written in the frame, including targets uploaded after an earlier read, extend their producers' execution instead (GFX-REC-5).
 Clears and copies MUST compare their written region independently of its old destination values, including partial clears of padded depth/stencil attachments. Attachment histories MUST use their own extent; execution clips MUST remain inside the logical color view. Depth and stencil changes MUST contribute to required execution and tested draws without directly enlarging published color damage. A proven attachment read MUST propagate the changes of the version it reads at the same pixel coordinates.
 Sampled writes with unchanged command inputs MAY realign past removed writes and compare their source changes, while retaining the removed writes' bounds.
 
@@ -192,7 +191,7 @@ COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse ov
 | SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF | The incoming object identity, and any offset, stride or FVF, equal the bound state. |
 | StateBlock Capture, Apply | Every captured value equals the device state. |
 
-Hot state setters, getters, scene boundaries, and unchanged bindings or state blocks may run as direct bodies over shared state. Recording, invalid objects, binding changes, and managed-texture flushes fall back to the full handler.
+Hot state setters, getters, scene boundaries, and unchanged bindings or state blocks may run as direct bodies over shared state. Recording, invalid objects, binding changes, managed-texture flushes, and the first unavailable rejection of each option fall back to the full handler, which reports it; repeated rejections return directly.
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 
@@ -224,10 +223,14 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 Blocking readbacks MUST preserve the source pixels before another guest context can write them.
 **Verification**: Test
 
-### GFX-REC-11 Differential frame recording
+Readbacks into an unchanged destination baseline MUST transfer only the source damage since that baseline. Unknown damage MUST transfer the whole target. The background worker MUST copy and convert mapped staging pixels before the owner publishes them to guest memory. Execution reports MUST include GPU readback bytes and bytes per completed frame.
 
-**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse shared previous-frame entries, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
+### GFX-REC-11 Versioned frame recording
+
+**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse previous-frame identities and preparation, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
 **Verification**: Test
+
+Steady draws MUST reuse state, command and output-version identities without rehashing draw keys. DrawPrimitiveUP MUST compare the referenced bytes before reusing their immutable capture. A target whose retained entries are dropped unused, at frame end or by a flush, rests. The first such frame rests for none, later ones for 1, 2, 4… up to 64 frames, while its draws record directly. It then retains entries for one frame and attempts again. Any reuse ends the rest.
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
@@ -348,17 +351,19 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-INPUT-3 Pretransformed vertices
 
-**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. Programmable pretransformed draws MUST capture stream bytes and indices and map positions in the vertex stage, interpolating only the varyings the pixel stage reads.
+**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. The generated vertex stage MUST map XYZRHW from raw streams and interpolate only the varyings the pixel stage reads.
+
+Pretransformed draws MUST retain index order.
 **Verification**: Test
 
 ### GFX-INPUT-4 Fixed texture coordinates
 
-**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading. Fixed vertex processing for FVF UP draws MUST omit trailing texture coordinates starting outside the uploaded stride.
+**Rule**: FVF and equivalent declarations MUST preserve eight FLOAT1–4 texture-coordinate sets and D3D default components through mixed pixel shading. Fixed vertex processing for FVF UP draws MUST omit trailing texture coordinates starting outside the guest stride. Fixed UP draws MUST preserve unaligned guest strides by padding captured records for GPU fetch.
 **Verification**: Test
 
 ### GFX-INPUT-5 Fixed raster limits
 
-**Rule**: Fixed drawing MUST reject active fog, user clipping, or unsupported point-size effects instead of silently ignoring them.
+**Rule**: Fixed drawing MUST reject unsupported user clipping or point-size effects instead of silently ignoring them.
 **Verification**: Test
 
 ### GFX-INPUT-6 Expanded upload bound
@@ -489,7 +494,7 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 
 ### GFX-FIXED-2 Fog, texture factor and shading
 
-**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed pipeline variants MUST preserve existing unlit pipeline recipes and cache identities.
+**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed vertex stages MUST run on the shared GPU shader path and specialize on layout, lighting, fog and point-scaling inputs.
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
 
@@ -515,6 +520,8 @@ Withdrawn: GFX-CACHE-6, GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5, GFX-REC-12
 
 **Rule**: Actual pipeline recipes MUST persist per game, partitioned by backend, driver identity and target format. Recipes MUST include shader content, texture visibility, vertex layouts and immutable render state. Missing, corrupt or incompatible archives MUST fall back to identical demand compilation.
 **Verification**: Test — warm restart, content keys, corruption and version/driver rejection.
+
+Every save writes the current recipes. A driver archive unchanged since its last serialization, or loaded and unextended, repeats that payload.
 
 ### GFX-CACHE-9 Recipe budgets
 

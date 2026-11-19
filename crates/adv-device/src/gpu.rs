@@ -188,6 +188,10 @@ pub enum TextureOp {
     Multiply,
     Add,
     Subtract,
+    /// D3DTOP_MODULATE2X: the product doubled, then saturated.
+    Multiply2x,
+    /// D3DTOP_MODULATE4X: the product quadrupled, then saturated.
+    Multiply4x,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {

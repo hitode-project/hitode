@@ -748,7 +748,7 @@ Every presenter's frames carry only that content, while the host shows caption, 
 
 ## Static codec kernels
 
-Static Vorbis and Theora bindings run on the Wine stack.
+Static Vorbis, Theora, and Ogg bindings run on the Wine stack.
 Device decoding follows [device.md](device.md).
 
 ### CODEC-MAP-1 Image binding
@@ -766,6 +766,18 @@ Unmapping MUST retire bindings and their decoder state.
 ### CODEC-CALL-2 Theora packets
 
 **Rule**: Theora bindings MUST retain complete library-family admission and preserve pixels, state, guest allocation lifetime, return values, and callbacks. Calls without admitted decoder state MUST resume guest code before changing guest memory. Verify mode MUST compare native results while publishing guest results.
+**Verification**: Test
+
+### CODEC-CALL-3 Packet run-ahead
+
+**Rule**: A predictor MUST read only complete packets from a stream paired by an observed packet output and decoder input.
+File prediction MUST follow accepted pages linked to contiguous ranges of observed file reads.
+Workers MUST use positioned reads and validate Ogg page CRCs before staging file packets of the paired stream.
+Each decoder MUST stage at most three packets. Each file predictor MUST bound its page buffer and release it with the decoder.
+Workers MUST stage results in host storage without changing committed decoder state.
+The owner MUST match packet bytes, metadata, and decoding controls before committing a staged result.
+Seeks, resets, callable controls, and clear MUST invalidate staged results.
+Verify mode MUST compare staged output and state with synchronous decoding.
 **Verification**: Test
 
 ### CODEC-MODULE-1 Shipped Vorbisfile modules

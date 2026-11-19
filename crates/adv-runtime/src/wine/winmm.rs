@@ -20,7 +20,12 @@ mod wave;
 
 const MODULE: &str = "winmm.dll";
 const ORIGINAL: &str = "winewinmm.dll";
-const LEAD: u64 = 30_000;
+// Keep enough queued PCM ahead of the playback clock to cover device callback
+// delay, one host audio callback, sinc resampler prefetch, and guest slice
+// jitter without starving the mixer. Looping headers keep a shorter lead so
+// waveOutBreakLoop stays responsive.
+const LEAD: u64 = 200_000;
+const LOOP_LEAD: u64 = 60_000;
 
 /// Native work completed by this front, available to the session's tests.
 #[derive(Default, Clone, Copy)]

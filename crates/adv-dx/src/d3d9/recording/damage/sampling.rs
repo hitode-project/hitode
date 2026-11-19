@@ -448,9 +448,11 @@ fn draw_reads(
     device: &Device,
     draw: &fixed::Draw,
 ) -> Result<Vec<Read>, &'static str> {
-    if draw.programmable.as_ref().is_some_and(|p| {
-        p.instance_count != 1 || p.parameters[15][0] == 2 || p.streams.iter().any(|s| s.instance)
-    }) {
+    if draw
+        .programmable
+        .as_ref()
+        .is_some_and(|p| p.instance_count != 1 || p.streams.iter().any(|s| s.instance))
+    {
         return Err("instanced draw");
     }
     if !matches!(
@@ -625,7 +627,10 @@ fn vertices(
         .programmable
         .as_ref()
         .is_some_and(|p| p.parameters[15][0] != 0);
-    let count = if vertex.is_none() && !transformed {
+    let count = if let Some(fixed) = &draw.fixed_vertex {
+        let p = draw.programmable.as_ref()?;
+        p.indices.as_ref().map_or(fixed.count as usize, |i| i.len())
+    } else if vertex.is_none() && !transformed {
         draw.vertices.len()
     } else {
         draw.programmable
@@ -649,9 +654,19 @@ fn vertices(
             .ok()?
         } else if transformed {
             let p = draw.programmable.as_ref()?;
-            let input = vertex_input(p, n as u32)?;
+            let index = if draw.fixed_vertex.is_some() {
+                super::fixed_index(p, n)
+            } else {
+                n
+            };
+            let input = vertex_input(p, index as u32)?;
+            let position = if draw.fixed_vertex.is_some() {
+                super::fixed_position(draw, n)?.0
+            } else {
+                programmable::transformed::position(input.v[0], draw.state.viewport)?
+            };
             let mut output = Outputs {
-                position: programmable::transformed::position(input.v[0], draw.state.viewport)?,
+                position,
                 colors: [[1.; 4], [0.; 4]],
                 ..Default::default()
             };

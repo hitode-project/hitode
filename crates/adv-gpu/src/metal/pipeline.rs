@@ -407,6 +407,10 @@ pub(crate) struct PipelineCache(Arc<Mutex<Option<Archive>>>);
 struct Archive {
     raw: Object<dyn MTLBinaryArchive>,
     header: Vec<u8>,
+    /// The archive's latest serialized payload. Metal declines to serialize
+    /// again until a new pipeline is added, and this file then still holds the
+    /// current contents. A loaded archive starts from its source file.
+    last: Option<TemporaryFile>,
 }
 const MAGIC: &[u8; 8] = b"ADVMTL\0\x01";
 fn header(device: &ProtocolObject<dyn MTLDevice>) -> Vec<u8> {
@@ -442,31 +446,41 @@ impl PipelineCache {
                 desc.setUrl(Some(&file.url()));
                 Some(file)
             });
-            let raw = device
-                .newBinaryArchiveWithDescriptor_error(&desc)
-                .or_else(|_| {
-                    // A malformed driver payload is an empty cache, like a bad header.
-                    device.newBinaryArchiveWithDescriptor_error(&MTLBinaryArchiveDescriptor::new())
-                })
-                .ok()?;
-            drop(file);
-            Some(Archive { raw, header })
+            let (raw, backing) = match device.newBinaryArchiveWithDescriptor_error(&desc) {
+                Ok(raw) => (raw, file),
+                // A malformed driver payload is an empty cache, like a bad header.
+                Err(_) => (
+                    device
+                        .newBinaryArchiveWithDescriptor_error(&MTLBinaryArchiveDescriptor::new())
+                        .ok()?,
+                    None,
+                ),
+            };
+            Some(Archive {
+                raw,
+                header,
+                last: backing,
+            })
         });
         crate::pipeline::PipelineCache {
             inner: Self(Arc::new(Mutex::new(archive))),
         }
     }
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        let archive = self.0.lock().unwrap();
-        let Some(archive) = &*archive else {
+        let mut archive = self.0.lock().unwrap();
+        let Some(archive) = &mut *archive else {
             return Ok(Vec::new());
         };
         let file = TemporaryFile::new()?;
-        archive
-            .raw
-            .serializeToURL_error(&file.url())
-            .map_err(|e| shader::compile_error("Metal archive", e))?;
-        let bytes = std::fs::read(&file.0).map_err(io_error)?;
+        match archive.raw.serializeToURL_error(&file.url()) {
+            Ok(()) => archive.last = Some(file),
+            Err(e) if archive.last.is_none() => {
+                return Err(shader::compile_error("Metal archive", e));
+            }
+            Err(_) => {}
+        }
+        let last = archive.last.as_ref().unwrap();
+        let bytes = std::fs::read(&last.0).map_err(io_error)?;
         let mut data = archive.header.clone();
         data.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         data.extend_from_slice(&bytes);

@@ -164,6 +164,13 @@ python3 tools/macos/package_launcher.py android --install   # build and install 
 
 For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. Preserve a separate dSYM when needed, and run `strip -x` on the bundled executable before its final signature to remove local symbols. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
 
+## Native GPU tests
+
+Run `python3 tools/gpu_test.py host` for the Metal or Vulkan conformance suites.
+Run `python3 tools/gpu_test.py android --suite adv-dx:adv_dx generated_fixed_shader_matches_cpu_pixels_and_damage`
+for the fixed-function shader comparison on the selected Android device. Set
+`ANDROID_NDK_HOME` to the NDK and use `ANDROID_SERIAL` when selecting among devices.
+
 ## macOS release package
 
 The release links a decode-only FFmpeg statically, so the app bundle carries no third-party dylibs.

@@ -3,9 +3,9 @@
 use super::*;
 use crate::shader::{SamplerDimension, Shader, Translation};
 use adv_device::gpu::{
-    Attribute, AttributeFormat, IndexBytes, Program, ProgramTexture, ProgrammableDraw, VertexBytes,
-    VertexStream,
+    Attribute, AttributeFormat, IndexBytes, Program, ProgramTexture, ProgrammableDraw, VertexStream,
 };
+mod fixed_vertex;
 mod source;
 mod streams;
 pub(in crate::d3d9) mod transformed;
@@ -24,6 +24,7 @@ struct ProgramKey {
     second: bool,
     features: (u32, bool),
     fixed: u32,
+    fixed_vertex: Option<fixed_vertex::Variant>,
 }
 impl std::hash::Hash for ProgramKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -35,11 +36,14 @@ impl std::hash::Hash for ProgramKey {
         if self.fixed != 0 {
             self.fixed.hash(state);
         }
+        if let Some(vertex) = &self.fixed_vertex {
+            vertex.hash(state);
+        }
     }
 }
 #[derive(Default)]
 pub(super) struct ProgramCache {
-    entries: std::collections::HashMap<ProgramKey, Program>,
+    entries: std::collections::HashMap<ProgramKey, (Program, u128)>,
     bytes: usize,
     order: std::collections::VecDeque<ProgramKey>,
     warming: std::collections::HashMap<ProgramKey, adv_device::gpu::compile::Compile<Program>>,
@@ -340,6 +344,9 @@ fn prepare_checked(
     if !hot.scene || needs_reset {
         return Err(INVALID);
     }
+    if vs_id.is_none() && ps_id.is_none() && hot.fixed.render[&152] != 0 {
+        return Err(UNAVAILABLE);
+    }
     // POSITIONT/FVF XYZRHW bypasses vertex processing even while a vertex
     // shader remains bound. Getter/state-block identity remains unchanged.
     let vs = stage(
@@ -365,180 +372,95 @@ fn prepare_checked(
     } else {
         1
     };
-    let fixed_raw = instanced && vs.is_none();
-    let fixed_layout = if fixed_raw {
-        Some(fixed::layout(env, pointer).map_err(|e| e.code)?)
+    let fixed_layout = if vs.is_none() {
+        let mut layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
+        if let Some((_, stride)) = up
+            && hot.buffers.declaration.is_none()
+        {
+            // A trailing FVF input outside the UP record has the default
+            // components. A partial input is still an invalid stride.
+            for coordinate in &mut layout.texcoords {
+                if coordinate.is_some_and(|(_, offset, _)| offset >= stride) {
+                    *coordinate = None;
+                }
+            }
+        }
+        Some(layout)
     } else {
         None
     };
-    if let Some(layout) = fixed_layout {
-        // Instanced fixed draws take the raw path, which has none of the
-        // fixed-function effects.
-        if (!layout.transformed && hot.fixed.render[&137] != 0)
-            || fixed_features(&hot.fixed, Some(layout.transformed)) != 0
-            || layout.specular.is_some()
-        {
-            return Err(UNAVAILABLE);
-        }
-        if hot.shaders.vertex.is_none()
-            && hot.shaders.pixel.is_none()
-            && (hot.fixed.render[&28] != 0 || hot.fixed.render[&152] != 0)
-        {
-            return Err(UNAVAILABLE);
-        }
-    }
-    let mut vertex_count;
-    let mut output_indices = indices.map(|v| v.iter().copied().collect::<IndexBytes>());
-    let (mut draw, mut streams, input_spec) = if let Some(vs) = &vs {
-        let inputs = inputs(env, pointer, &vs.parsed)?;
-        let first = indices.and_then(|i| i.iter().min().copied()).unwrap_or(0);
-        let last = output_indices
-            .as_ref()
-            .and_then(IndexBytes::maximum)
-            .unwrap_or(length - 1);
-        vertex_count = last
-            .checked_sub(first)
-            .and_then(|v| v.checked_add(1))
-            .ok_or(INVALID)?;
-        if let Some(i) = &mut output_indices {
-            i.rebase(first);
-        }
-        let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
-        let (target, image, state) =
-            fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
-        drop(hot);
-        env.ext.get_mut::<State>().programs.last_draw = Some((kind, up.map(|(_, stride)| stride)));
-        (
-            fixed::Draw {
-                target,
-                image,
-                state,
-                vertices: Arc::default(),
-                texcoords: None,
-                programmable: None,
-                recording_key: recording::draw_key(env, pointer),
-                program_key: 0,
-            },
-            streams,
-            inputs,
-        )
-    } else if fixed_raw
-        || (pretransformed(env, pointer)?
-            && fixed_features(&hot.fixed, Some(true)) == 0
-            && fixed::layout(env, pointer).is_ok_and(|l| l.specular.is_none()))
+    let features = fixed_features(&hot.fixed, fixed_layout.map(|layout| layout.transformed));
+    if instanced
+        && let Some(layout) = fixed_layout
+        && (features != 0 || layout.specular.is_some())
     {
-        drop(hot);
-        let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
-        let inputs = transformed::inputs(layout);
-        let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
-        let last = output_indices
-            .as_ref()
-            .and_then(IndexBytes::maximum)
-            .unwrap_or(length - 1);
-        vertex_count = last
-            .checked_sub(first)
-            .and_then(|n| n.checked_add(1))
-            .ok_or(INVALID)?;
-        if let Some(indices) = &mut output_indices {
-            indices.rebase(first);
-        }
-        let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
-        let (target, image, state) =
-            fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
-        if layout.transformed {
-            transformed::validate(
-                &streams,
-                state.viewport,
-                output_indices.as_ref().map(|v| v.as_slice()),
-                vertex_count,
-            )?;
-        }
-        (
-            fixed::Draw {
-                target,
-                image,
-                state,
-                vertices: Arc::default(),
-                texcoords: None,
-                programmable: None,
-                recording_key: recording::draw_key(env, pointer),
-                program_key: 0,
-            },
-            streams,
-            inputs,
-        )
+        return Err(UNAVAILABLE);
+    }
+    let variant = fixed_layout
+        .map(|layout| fixed_vertex::Variant::new(layout, &hot.fixed, kind))
+        .transpose()
+        .map_err(|e| e.code)?;
+    let mut output_indices = indices.map(|v| v.iter().copied().collect::<IndexBytes>());
+    let first = indices.and_then(|i| i.iter().min().copied()).unwrap_or(0);
+    let last = output_indices
+        .as_ref()
+        .and_then(IndexBytes::maximum)
+        .unwrap_or(length - 1);
+    let mut vertex_count = last
+        .checked_sub(first)
+        .and_then(|v| v.checked_add(1))
+        .ok_or(INVALID)?;
+    if let Some(i) = &mut output_indices {
+        i.rebase(first);
+    }
+    let input_spec = if let Some(layout) = fixed_layout {
+        fixed_vertex::inputs(layout)
     } else {
-        drop(hot);
-        // The shared fixed decoder validates all declaration streams and expands
-        // indices/fans before assembling the neutral programmable stream.
-        let draw = if let Some((data, stride)) = up {
-            fixed::prepare(env, pointer, kind, count, data, stride, indices)?
-        } else {
-            fixed::prepare_bound(env, pointer, kind, count, start, indices)?
-        };
-        vertex_count = draw.vertices.len() as u32;
-        output_indices = None;
-        let count = draw.texcoords.as_ref().map(|(count, _)| *count);
-        let mut stream = VertexStream {
-            instance: false,
-            bytes: VertexBytes::fixed(
-                draw.vertices.clone(),
-                draw.texcoords.clone(),
-                Some(draw.recording_key),
-            ),
-            stride: count.map_or(40, |n| 32 + n as u32 * 16),
-            attributes: vec![
-                Attribute {
-                    location: 0,
-                    offset: 0,
-                    format: AttributeFormat::Float4,
-                },
-                Attribute {
-                    location: 1,
-                    offset: 16,
-                    format: AttributeFormat::Float4,
-                },
-            ],
-        };
-        let mut inputs = Vec::new();
-        if let Some(count) = count {
-            let hot = hot_cell.borrow();
-            let f = &hot.fixed;
-            let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
-            let effects = f.render[&29] != 0 || f.render[&28] != 0 || layout.specular.is_some();
-            let scaled = kind == 1 && !layout.transformed && f.render[&157] != 0;
-            for n in 0..count {
-                let location = if effects && n == layout.coordinate_count().max(1) {
-                    10
-                } else if scaled && n == count - 1 {
-                    11
-                } else {
-                    2 + n as u32
-                };
-                let offset = 32 + n as u32 * 16;
-                stream.attributes.push(Attribute {
-                    location,
-                    offset,
-                    format: AttributeFormat::Float4,
-                });
-                inputs.push(Input {
-                    stream: 0,
-                    offset,
-                    format: AttributeFormat::Float4,
-                    register: location,
-                });
-            }
-        } else {
-            stream.attributes.push(Attribute {
-                location: 2,
-                offset: 32,
-                format: AttributeFormat::Float2,
-            });
-        }
-        (draw, vec![stream], inputs)
+        inputs(env, pointer, &vs.as_ref().unwrap().parsed)?
     };
-    let transformed = vs.is_none() && input_spec.iter().any(|i| i.register == 0);
-    if (vs.is_some() || transformed) && kind == 6 {
+    if up.is_some() && fixed_layout.is_some() && input_spec.iter().any(|i| i.stream != 0) {
+        return Err(UNAVAILABLE);
+    }
+    let mut streams = streams::capture(
+        env,
+        pointer,
+        &input_spec,
+        up,
+        start,
+        first..=last,
+        instanced,
+        fixed_layout.is_some(),
+    )?;
+    let (target, image, state) = fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+    let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
+    env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);
+    let mut draw = fixed::Draw {
+        target,
+        image,
+        state,
+        vertices: Arc::default(),
+        texcoords: None,
+        programmable: None,
+        recording_key,
+        program_key: 0,
+        fixed_vertex: variant
+            .as_ref()
+            .map(|v| v.bounds(&hot.fixed, length, ps.is_none())),
+    };
+    let simple_fixed = vs_id.is_none()
+        && ps_id.is_none()
+        && features == 0
+        && !instanced
+        && fixed::second_stage(&hot.fixed).is_ok_and(|s| s.is_none());
+    if simple_fixed && matches!(kind, 2 | 3) {
+        fixed::prepare_lines(&mut draw, &streams, output_indices.as_ref(), length)?;
+        return Ok(draw);
+    }
+    let expand_points = kind == 1 && !simple_fixed;
+    if vs.is_some() {
+        env.ext.get_mut::<State>().programs.last_draw = Some((kind, up.map(|(_, stride)| stride)));
+    }
+    if kind == 6 {
         let original = output_indices
             .take()
             .unwrap_or_else(|| (0..length).collect::<IndexBytes>());
@@ -548,7 +470,7 @@ fn prepare_checked(
         }
         output_indices = Some(fan.into());
     }
-    if kind == 1 {
+    if expand_points {
         let mut budget = 0usize;
         for stream in &mut streams {
             let width = stream
@@ -582,7 +504,6 @@ fn prepare_checked(
         draw.state.topology = adv_device::gpu::Topology::Triangles;
         draw.state.cull = adv_device::gpu::Cull::None;
     }
-    let hot = hot_cell.borrow();
     let mut bindings = Vec::new();
     let mut slots = Vec::new();
     for (vertex, t) in [(true, vt), (false, pt)] {
@@ -636,7 +557,7 @@ fn prepare_checked(
             .as_ref()
             .is_some_and(|i| i.alpha_mode() == adv_device::gpu::AlphaMode::Opaque),
     );
-    parameters[2][3] = u32::from(kind == 1);
+    parameters[2][3] = u32::from(expand_points);
     parameters[13] = second.unwrap_or_default();
     parameters[36] = fixed::lighting::color(hot.fixed.render[&60]).map(f32::to_bits);
     parameters[37] = [
@@ -647,21 +568,7 @@ fn prepare_checked(
     ];
 
     parameters[38] = [hot.fixed.render[&195], hot.fixed.render[&175], 0, 0];
-    parameters[15][0] = u32::from(transformed);
-    if fixed_layout.is_some_and(|layout| !layout.transformed) {
-        parameters[15][0] = 2;
-        let mut matrix = hot.fixed.transforms[0];
-        for next in &hot.fixed.transforms[1..] {
-            matrix = std::array::from_fn(|i| {
-                (0..4)
-                    .map(|k| matrix[(i / 4) * 4 + k] * next[k * 4 + i % 4])
-                    .sum()
-            });
-        }
-        for n in 0..4 {
-            parameters[36 + n] = std::array::from_fn(|k| matrix[n * 4 + k].to_bits());
-        }
-    }
+    parameters[15][0] = fixed_layout.map_or(0, |l| if l.transformed { 1 } else { 2 });
     parameters[3] = [
         hot.fixed.render[&152],
         hot.fixed.render[&28],
@@ -701,7 +608,7 @@ fn prepare_checked(
             parameters[14][0] |= 1 << ordinal;
         }
     }
-    let usage = [vt, pt].map(|t| t.map_or(Default::default(), |t| t.constants));
+    let mut usage = [vt, pt].map(|t| t.map_or(Default::default(), |t| t.constants));
     let mut extra = Vec::new();
     for (n, stage) in hot.fixed.stage_slots.iter().enumerate() {
         if usage[1].registers[4] & (1 << (32 + n)) != 0 {
@@ -712,26 +619,28 @@ fn prepare_checked(
         }
     }
     let pixel_constants = hot.shaders.pixel_constants.snapshot(usage[1], &extra);
-    let vertex_constants = hot.shaders.vertex_constants.snapshot(usage[0], &[]);
+    let vertex_constants = if let Some(variant) = &variant {
+        let (snapshot, registers) = variant.constants(&hot.fixed).map_err(|e| e.code)?;
+        usage[0] = registers;
+        snapshot
+    } else {
+        hot.shaders.vertex_constants.snapshot(usage[0], &[])
+    };
     let key = ProgramKey {
         vertex: vs.as_ref().map(|s| s.id),
         pixel: ps.as_ref().map(|s| s.id),
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
         second: second.is_some(),
         features: (hot.fixed.render[&152], hot.fixed.render[&28] != 0),
-        fixed: fixed_features(
-            &hot.fixed,
-            if vs.is_none() {
-                Some(pretransformed(env, pointer)?)
-            } else {
-                None
-            },
-        ) & if kind == 1 { u32::MAX } else { !256 },
+        fixed: features,
+        fixed_vertex: variant,
     };
-    draw.program_key = recording::hash(&key);
     drop(hot);
-    let cache = &mut env.ext.get_mut::<State>().programs;
-    let program = if let Some(program) = cache.entries.get(&key) {
+    let report = env.ext.get_mut::<State>();
+    let cache = &mut report.programs;
+    let generated = u64::from(key.fixed_vertex.is_some());
+    let (program, program_key) = if let Some(program) = cache.entries.get(&key) {
+        report.frames.fixed_shader_cache_hits += generated;
         program.clone()
     } else {
         let prepared = cache.warming.remove(&key).and_then(|job| {
@@ -746,7 +655,7 @@ fn prepare_checked(
         let program = if let Some(program) = prepared {
             program
         } else {
-            let source = source::build(
+            let source = source::build_with_fixed(
                 vs.as_ref().map(|s| s.parsed.as_ref()),
                 ps.as_ref().map(|s| s.parsed.as_ref()),
                 vt,
@@ -754,23 +663,28 @@ fn prepare_checked(
                 &input_spec,
                 &slots,
                 (second.is_some(), key.features.0, key.features.1, key.fixed),
+                key.fixed_vertex.as_ref(),
             )?;
             let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
             program.constants = usage;
+            report.frames.fixed_shaders_built += generated;
             program
         };
+        let program_key = recording::hash(&key);
+        report.frames.draw_key_hashes += 1;
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if program.source().len() <= MAX_BYTES {
             while cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {
                 let oldest = cache.order.pop_front().unwrap();
-                cache.bytes -= cache.entries.remove(&oldest).unwrap().source().len();
+                cache.bytes -= cache.entries.remove(&oldest).unwrap().0.source().len();
             }
             cache.order.push_back(key.clone());
             cache.bytes += program.source().len();
-            cache.entries.insert(key, program.clone());
+            cache.entries.insert(key, (program.clone(), program_key));
         }
-        program
+        (program, program_key)
     };
+    draw.program_key = program_key;
     draw.programmable = Some(Arc::new(ProgrammableDraw {
         instance_count,
         program,
@@ -833,6 +747,8 @@ fn op(o: adv_device::gpu::TextureOp) -> u32 {
         Multiply => 2,
         Add => 3,
         Subtract => 4,
+        Multiply2x => 5,
+        Multiply4x => 6,
     }
 }
 fn compare(o: adv_device::gpu::Compare) -> u32 {

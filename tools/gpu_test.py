@@ -35,10 +35,16 @@ def android_env(env, ndk):
                 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=str(clang))
 
 
-def tests(root, env, target=None):
+def tests(root, env, target=None, suite=None):
     """Build every suite and return (name, executable) for each test binary."""
     found = []
     for package, features, targets in SUITES:
+        if suite:
+            selected_package, selected_target = suite.split(":", 1)
+            if package != selected_package:
+                continue
+            targets = (["--lib"] if selected_target == package.replace("-", "_")
+                       else ["--test", selected_target])
         command = ["cargo", "test", "--no-run", "--message-format=json", "-p", package, *targets]
         if target:
             command += ["--target", target]
@@ -50,7 +56,8 @@ def tests(root, env, target=None):
             message = json.loads(line)
             if message.get("reason") == "compiler-artifact" and message.get("executable"):
                 name = f"{package}:{message['target']['name']}"
-                found.append((name, Path(message["executable"])))
+                if suite is None or name == suite:
+                    found.append((name, Path(message["executable"])))
     return found
 
 
@@ -74,15 +81,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("where", choices=["host", "android"])
     parser.add_argument("filters", nargs="*")
-    args = parser.parse_args()
+    parser.add_argument("--suite", metavar="PACKAGE:TARGET", help="run one test binary")
+    args = parser.parse_intermixed_args()
+    if args.suite and ":" not in args.suite:
+        parser.error("--suite requires PACKAGE:TARGET")
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ, ADV_GPU_REQUIRE_BACKEND="1")
     if args.where == "host":
-        binaries = tests(root, env)
+        binaries = tests(root, env, suite=args.suite)
         results = [run(name, [str(path), *args.filters]) for name, path in binaries]
     else:
         env = android_env(env, Path(os.environ["ANDROID_NDK_HOME"]))
-        binaries = tests(root, env, "aarch64-linux-android")
+        binaries = tests(root, env, "aarch64-linux-android", args.suite)
         subprocess.run(["adb", "shell", "mkdir", "-p", REMOTE], check=True)
         results = []
         for name, path in binaries:
@@ -91,6 +101,8 @@ def main():
             filters = " ".join(args.filters)
             results.append(run(name, ["adb", "shell",
                                       f"cd {REMOTE} && ADV_GPU_REQUIRE_BACKEND=1 ./{path.name} {filters}"]))
+    if not results:
+        parser.error("no matching GPU test binary")
     failed = results.count(False)
     print(f"{len(results) - failed} of {len(results)} test binaries passed")
     sys.exit(1 if failed else 0)

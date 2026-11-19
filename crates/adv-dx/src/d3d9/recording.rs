@@ -5,7 +5,7 @@
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
 use rustc_hash::FxHashMap as HashMap;
-mod damage;
+pub(super) mod damage;
 mod key;
 mod passes;
 mod reuse;
@@ -13,25 +13,41 @@ pub mod trace;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
-pub(super) use reuse::indexed;
-pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
+pub(super) use reuse::{bound, indexed, up};
+pub(super) type DrawStateIdentity = (u128, Option<Id>, Option<Id>, Option<Id>, u128, u128);
+
+pub(super) fn draw_state_identity(env: &Env<'_>, pointer: u32) -> (u128, bool) {
     let d = device(env, pointer).unwrap();
     let hot = d.hot.borrow();
-    let constants = |id: Option<Id>, c: &shaders::Constants| {
-        c.key(
-            id.and_then(|id| shaders::bound(env, id))
-                .and_then(|s| s.translation.as_ref().ok())
-                .map_or(Default::default(), |t| t.constants),
-        )
-    };
-    hash((
+    let identity = (
         hot.fixed.key(),
         hot.shaders.vertex,
         hot.shaders.pixel,
         hot.buffers.declaration,
-        constants(hot.shaders.vertex, &hot.shaders.vertex_constants),
-        constants(hot.shaders.pixel, &hot.shaders.pixel_constants),
-    ))
+        constant_key(env, hot.shaders.vertex, &hot.shaders.vertex_constants),
+        constant_key(env, hot.shaders.pixel, &hot.shaders.pixel_constants),
+    );
+    if let Some((last, key)) = hot.draw_key.get()
+        && last == identity
+    {
+        return (key, false);
+    }
+    let key = hash(identity);
+    hot.draw_key.set(Some((identity, key)));
+    (key, true)
+}
+
+fn constant_key(env: &Env<'_>, id: Option<Id>, constants: &shaders::Constants) -> u128 {
+    constants.key(
+        id.and_then(|id| shaders::bound(env, id))
+            .and_then(|s| s.translation.as_ref().ok())
+            .map_or(Default::default(), |t| t.constants),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
+    draw_state_identity(env, pointer).0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,6 +135,16 @@ pub(super) enum Reason {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
+    pub fixed_draws: u64,
+    pub fixed_shaders_built: u64,
+    pub fixed_shader_cache_hits: u64,
+    pub draw_key_hashes: u64,
+    /// Draws that reused a previous frame's preparation, and draws that
+    /// skipped the attempt while their target rested.
+    pub reused_draws: u64,
+    pub rested_draws: u64,
+    pub readback_bytes: u64,
+    pub presents: u64,
     pub recorded_draws: u64,
     pub recorded_draw_bytes: u64,
     pub recording_lookups: u64,
@@ -183,9 +209,20 @@ fn lookup(count: u64) {
 fn lookups() -> u64 {
     LOOKUPS.get()
 }
+struct ReadbackTarget {
+    source: Content,
+    destination: u32,
+    storage: u32,
+    version: Option<u128>,
+    damage: adv_device::surface::Region,
+    in_flight: Option<u32>,
+}
+
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    #[cfg(test)]
+    command_identities: Vec<u128>,
     /// The damage analysis write behind each command, while it knows it.
     nodes: Vec<Option<usize>>,
     /// The content a readback flush observes, and the writes, by content,
@@ -193,6 +230,7 @@ pub(super) struct Recording {
     observe: Option<Content>,
     select: Option<HashMap<usize, Vec<Content>>>,
     reuse: reuse::Cache,
+    readback_targets: HashMap<adv_device::gpu::ImageId, ReadbackTarget>,
     passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Region>,
@@ -206,7 +244,6 @@ pub(super) struct Recording {
     /// Scissors the operation at `head` finished before it was busy.
     part: usize,
     bytes: usize,
-    key: u128,
     contents: Contents,
     binding_cache: Option<key::Bindings>,
     upload: u128,
@@ -223,12 +260,10 @@ pub(super) struct Recording {
     job: Option<adv_sync::background::Task>,
 }
 impl Recording {
-    pub(super) fn invalidate_streams(&mut self) {
-        self.reuse.invalidate_streams();
-    }
     /// Drops the damage analysis; pending commands then run whole.
     fn forget_damage(&mut self) {
         self.damage.invalidate();
+        self.readback_targets.clear();
         self.nodes.fill(None);
     }
 }
@@ -239,12 +274,89 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         f.binding_cache = None;
         f.reuse.invalidate();
         f.damage.forget(pointer);
+        f.readback_targets
+            .retain(|_, r| r.source.3 != pointer && r.destination != pointer);
         if changed {
             f.partial = true;
             f.last = None;
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
+pub(super) fn readback_regions(
+    env: &mut Env<'_>,
+    owner: Id,
+    source: Id,
+    destination: u32,
+    storage: u32,
+    event: u32,
+    image: &adv_device::gpu::Image,
+) -> Vec<adv_device::surface::Rect> {
+    use adv_device::surface::{Region, rects};
+    let source = key::content(env, source, None, 0);
+    let f = frame(env, owner);
+    let version = f.contents.get(&source).copied();
+    let size = (image.width(), image.height());
+    let regions = if let Some(r) = f.readback_targets.get(&image.id()).filter(|r| {
+        r.source == source
+            && r.destination == destination
+            && r.storage == storage
+            && r.in_flight.is_none()
+    }) {
+        if r.version.is_some() && r.version == version {
+            Vec::new()
+        } else {
+            rects(&r.damage)
+        }
+    } else {
+        vec![adv_device::surface::Rect {
+            x: 0,
+            y: 0,
+            w: size.0,
+            h: size.1,
+        }]
+    };
+    invalidate_readback_destination(env, owner, storage);
+    frame(env, owner).readback_targets.insert(
+        image.id(),
+        ReadbackTarget {
+            source,
+            destination,
+            storage,
+            version,
+            damage: Region::empty(size),
+            in_flight: Some(event),
+        },
+    );
+    regions
+}
+
+pub(super) fn invalidate_readback_destination(env: &mut Env<'_>, owner: Id, storage: u32) {
+    frame(env, owner)
+        .readback_targets
+        .retain(|_, r| r.storage != storage);
+}
+
+pub(super) fn complete_readback(
+    env: &mut Env<'_>,
+    owner: Id,
+    slot: adv_device::gpu::ImageId,
+    event: u32,
+    success: bool,
+) {
+    let targets = &mut frame(env, owner).readback_targets;
+    if let Some(r) = targets
+        .get_mut(&slot)
+        .filter(|r| r.in_flight == Some(event))
+    {
+        if success {
+            r.in_flight = None;
+        } else {
+            targets.remove(&slot);
+        }
+    }
+}
+
 /// What the frame being presented changed since the previous presentation, when known.
 pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Region> {
     f.verify_region.clone()
@@ -501,7 +613,6 @@ fn append(
     trace::command(index, p, shared.is_some(), &f.contents);
     let previous = limit.then(|| {
         (
-            f.key,
             bytes,
             p.writes
                 .iter()
@@ -515,11 +626,13 @@ fn append(
             .map(|(k, _)| f.contents.get(k).copied())
             .collect()
     });
+    let mut draw_key_hashes = 0;
     let (command, attachment, damage) = if let Some(saved) = shared {
         let slot = hash(target.as_ref().unwrap().image.id());
         f.damage.replay(&saved.damage, slot, &f.contents);
         (saved.command, saved.attachment, saved.damage.clone())
     } else {
+        draw_key_hashes += 1;
         use std::hash::Hash;
         let mut command = xxhash_rust::xxh3::Xxh3::new();
         p.key.hash(&mut command);
@@ -541,7 +654,8 @@ fn append(
             ),
         )
     };
-    for &(k, overwrite) in &p.writes {
+    let mut outputs = Vec::new();
+    for (n, &(k, overwrite)) in p.writes.iter().enumerate() {
         let command = p.write_key(k, if k.2 == 0 { command } else { attachment });
         let slot = f.contents.resolve(k);
         let old = f.contents.slots[slot].1.unwrap_or(0);
@@ -553,12 +667,21 @@ fn append(
         {
             f.upload = f.upload.checked_add(1).expect("upload content exhausted");
             f.upload
-        } else if overwrite {
-            hash((k, command))
+        } else if let Some(saved) = shared.filter(|saved| saved.destinations[n].unwrap_or(0) == old)
+        {
+            saved.outputs[n]
         } else {
-            hash((old, command))
+            draw_key_hashes += 1;
+            if overwrite {
+                hash((k, command))
+            } else {
+                hash((old, command))
+            }
         };
         f.contents.slots[slot].1 = Some(next);
+        if destinations.is_some() {
+            outputs.push(next);
+        }
     }
     if limit
         && let Operation::Upload {
@@ -567,7 +690,6 @@ fn append(
     {
         f.held_uploads.push((*resource, *level));
     }
-    f.key = hash((f.key, command));
     #[cfg(feature = "d3d9-counters")]
     let work = (shared.is_none() && matches!(p.operation, Operation::Draw(_))).then_some((
         (passes::Plan::bytes(p.reads.len(), p.writes.len())
@@ -611,6 +733,7 @@ fn append(
                 damage,
                 pass,
                 destinations,
+                outputs,
             });
         }
     }
@@ -618,25 +741,35 @@ fn append(
     if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
         draw.target = target;
     }
+    let is_draw = matches!(&operation, Operation::Draw(_));
+    let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
     f.commands.push(operation);
+    #[cfg(test)]
+    f.command_identities.push(command);
     f.nodes.push(f.damage.len().checked_sub(1));
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
-    env.ext.get_mut::<State>().frames.recorded_commands += 1;
+    let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.recorded_commands += 1;
+    counters.fixed_draws += u64::from(fixed);
+    if is_draw {
+        counters.draw_key_hashes += draw_key_hashes;
+    }
     if limit {
         let outcome = barrier(env, owner, Reason::Limit, |_| Outcome::Return(0));
         // Parking allocation failure rejects the incoming command. Successful
         // prefixes stay committed; older accepted commands retain their order.
         if matches!(outcome, Outcome::Return(OUT_OF_MEMORY)) {
-            let (key, bytes, contents) = previous.unwrap();
+            let (bytes, contents) = previous.unwrap();
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             let rejected = f.commands.pop();
+            #[cfg(test)]
+            f.command_identities.pop();
             f.nodes.pop();
             let len = f.commands.len();
             f.passes.truncate(f.commands.len());
             f.forget_damage();
             f.bytes -= bytes;
-            f.key = key;
             for (k, old, had_base) in contents {
                 f.contents.restore(k, old, had_base);
             }
@@ -650,7 +783,9 @@ fn append(
                 }
                 d.queries.scanned = len;
             }
-            env.ext.get_mut::<State>().frames.recorded_commands -= 1;
+            let counters = &mut env.ext.get_mut::<State>().frames;
+            counters.recorded_commands -= 1;
+            counters.fixed_draws -= u64::from(fixed);
             #[cfg(feature = "d3d9-counters")]
             if let Some((bytes, lookups)) = work {
                 let count = &mut env.ext.get_mut::<State>().frames;
@@ -709,7 +844,10 @@ pub(super) fn flush(
         && let Some(operation) = restore_operation(env, owner)
     {
         execute_gpu(env, &operation)?;
-        frame(env, owner).baseline = Some(damage::image(&operation).unwrap().clone());
+        let image = damage::image(&operation).unwrap();
+        let f = frame(env, owner);
+        f.baseline = Some(image.clone());
+        f.readback_targets.remove(&image.id());
     }
     loop {
         let f = frame(env, owner);
@@ -931,6 +1069,20 @@ fn submitted(
         }
         _ => 7,
     };
+    let color = match operation {
+        Operation::Draw(d) => d.state.color_write != 0,
+        Operation::Clear { color, .. } => color.is_some(),
+        _ => true,
+    };
+    if color {
+        let f = frame(env, owner);
+        if let Some(readback) = f.readback_targets.get_mut(&image.id()) {
+            let area = node
+                .and_then(|n| f.damage.write_bounds(n))
+                .map_or(area, |r| area.clipped(r));
+            readback.damage.add(area.into());
+        }
+    }
     let repeated = node.is_some_and(|n| {
         frame(env, owner)
             .damage
@@ -1244,6 +1396,7 @@ fn finish(
     };
     trace::work(&f.damage.work, f.damage.planned);
     let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.presents += 1;
     counters.changed_pixels += changed;
     counters.executed_pixels += execution_area;
     counters.extra_pixels += extra;
@@ -1260,13 +1413,11 @@ fn finish(
     f.last_copy = copy;
     f.last_serial = serial;
     f.contents.reset();
-    f.key = 0;
+    #[cfg(test)]
+    f.command_identities.clear();
     f.reuse.finish();
     f.partial = false;
     f.verdict = None;
-    if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {
-        d.hot.borrow().fixed.finish_inputs();
-    }
 }
 fn verify_pixels(
     env: &mut Env<'_>,

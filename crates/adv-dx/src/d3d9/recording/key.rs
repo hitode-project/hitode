@@ -171,7 +171,7 @@ fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
     out.extend((0..resource.levels).map(|n| resource.content(Some(n), 0)));
 }
 pub(super) struct Bindings {
-    signature: (Option<Id>, Option<Id>, u64),
+    signature: (Option<Id>, Option<Id>, u64, u64),
     pub(super) output: [Option<Content>; 3],
     pub(super) samples: Vec<Content>,
 }
@@ -186,6 +186,7 @@ pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
         d.render_target.or(d.back_buffer),
         d.depth_stencil,
         hot.versions[12],
+        hot.target_version,
     );
     if d.frame
         .binding_cache
@@ -235,7 +236,8 @@ impl Prepared {
     pub(super) fn ignores_sampled_color(&self, content: Content) -> bool {
         content.2 != 0
             && matches!(&self.operation, Operation::Draw(d)
-                if d.programmable.is_none() && d.state.alpha_test == adv_device::gpu::Compare::Always)
+                if (d.programmable.is_none() || d.fixed_vertex.as_ref().is_some_and(|v| v.fixed_pixel))
+                    && d.state.alpha_test == adv_device::gpu::Compare::Always)
     }
 
     pub(super) fn attachment_command(&self, command: u128, contents: &Contents) -> u128 {
@@ -280,7 +282,14 @@ impl Prepared {
         hash((content, rect(*rectangle), component))
     }
 }
-pub(super) fn prepare(
+pub(super) fn prepare(env: &mut Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {
+    if matches!(operation, Operation::Draw(_)) {
+        env.ext.get_mut::<State>().frames.draw_key_hashes += 1;
+    }
+    prepare_checked(env, owner, operation)
+}
+
+fn prepare_checked(
     env: &mut Env<'_>,
     owner: Id,
     mut operation: Operation,
@@ -409,6 +418,7 @@ pub(super) fn prepare(
                 programmable,
                 recording_key,
                 program_key,
+                ..
             } = draw;
             if texture
                 .iter()
