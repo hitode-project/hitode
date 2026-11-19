@@ -1100,7 +1100,7 @@ impl Front<'_> {
                     charge: 0,
                 })
             }
-            Edge::Interpret(_) => Err(Reject::Interpret(self.index)),
+            Edge::Event(_) => Err(Reject::Interpret(self.index)),
             Edge::Exit(eip) => {
                 if self.state.c1.is_none() {
                     return Err(Reject::StaticX87(self.index));

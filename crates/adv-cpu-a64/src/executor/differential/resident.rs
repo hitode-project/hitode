@@ -292,12 +292,12 @@ impl<'a> Trial<'a> {
                 self.same_position_and_memory(retired, self.live.state.eip == stop);
                 match run.exit {
                     Exit::Dispatch | Exit::Budget => continue,
-                    Exit::Interpret | Exit::Event(crate::runtime::Event::Replay)
+                    Exit::Event(crate::runtime::Event::Replay | crate::runtime::Event::Fetch)
                         if retired >= fuel =>
                     {
                         continue;
                     }
-                    Exit::Interpret | Exit::Event(crate::runtime::Event::Replay) => {}
+                    Exit::Event(crate::runtime::Event::Replay | crate::runtime::Event::Fetch) => {}
                     exit => panic!("{}: unexpected native exit {exit:?}", self.context),
                 }
             }

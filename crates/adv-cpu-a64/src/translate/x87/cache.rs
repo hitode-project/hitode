@@ -42,7 +42,7 @@ use super::super::{
     Cold as UnitCold, RUNTIME, State, Translator, X0, X1, X2, X3, X13, X14, X15, X16, X17,
 };
 use super::pair::Generic;
-use super::{V0, X4, X5, X6, X8, X87};
+use super::{V0, X4, X5, X6, X7, X8, X87};
 use crate::runtime::Exit;
 
 /// Lane 0 carries suspended status and entry TOP, lane 1 control, and
@@ -454,9 +454,11 @@ pub(in super::super) struct InstructionCold {
     before: Model,
     saved: bool,
     after: Model,
-    /// Publishes `before`, then runs the helper.
+    /// Physical payloads the value operation can replace.
+    writes: u8,
+    /// Publishes `before`, then calls the core value operation.
     bail: Label,
-    /// Runs the helper.
+    /// Calls the core value operation from the published image.
     help: Label,
     /// Where the run continues after the instruction, its next helper and
     /// what entering there needs; `None` after the last one.
@@ -469,6 +471,11 @@ pub(in super::super) struct InstructionCold {
 
 /// Cold continuations of an instruction or a canonical merge arrival.
 pub(in super::super) enum Cold {
+    Prefix {
+        label: Label,
+        index: usize,
+        vector: super::super::simd::Vector,
+    },
     Instruction(InstructionCold),
     Tags {
         label: Label,
@@ -1155,7 +1162,8 @@ impl Translator<'_> {
             | Op::CallIndirect(_)
             | Op::JmpIndirect(_)
             | Op::Syscall
-            | Op::Helper(_)
+            | Op::Event(_)
+            | Op::Value(_)
             | Op::X87(_)
             | Op::Fild64(..)
             | Op::Timestamp => false,
@@ -1699,6 +1707,18 @@ impl Translator<'_> {
         // Values read come into host registers before any other branch.
         let bail = self.asm.label();
         let (list, _) = effects(x.fast);
+        let (mut top, mut writes) = (self.x87.before.delta, 0);
+        for effect in &list {
+            match *effect {
+                Effect::Write(slot) => writes |= 1 << ((top + slot) & 7),
+                Effect::Push => {
+                    top = (top + 7) & 7;
+                    writes |= 1 << top;
+                }
+                Effect::Pop => top = (top + 1) & 7,
+                Effect::Read(_) | Effect::Free(_) => (),
+            }
+        }
         for effect in list {
             match effect {
                 Effect::Read(i) => self.x87_materialize(i, bail),
@@ -1717,16 +1737,19 @@ impl Translator<'_> {
         }
         self.x87.model = model;
         let done = self.x87.done.expect("an open run");
-        let next = (!self.x87.dispatch && index < self.x87.end).then(|| {
-            // A merge next reconciles from this state first.
-            let merges = std::mem::take(&mut self.x87.merges);
-            let (_, mut need, _) = self
-                .plan(index + 1, model, Some(&merges))
-                .expect("a planned run");
-            self.x87.merges = merges;
-            need.pe = self.x87.pe;
-            (self.x87.hot[offset + 1], self.x87.help[offset + 1], need)
-        });
+        let next = ((!self.x87.dispatch || model.cyclic)
+            && index < self.x87.end
+            && self.trace.insts[index].next == Next::Fall)
+            .then(|| {
+                // A merge next reconciles from this state first.
+                let merges = std::mem::take(&mut self.x87.merges);
+                let (_, mut need, _) = self
+                    .plan(index + 1, model, Some(&merges))
+                    .expect("a planned run");
+                self.x87.merges = merges;
+                need.pe = self.x87.pe;
+                (self.x87.hot[offset + 1], self.x87.help[offset + 1], need)
+            });
         if matches!(x.fast, Fast::Leaf(_))
             && let Some((_, help, need)) = next
         {
@@ -1738,13 +1761,14 @@ impl Translator<'_> {
             before: self.x87.before,
             saved: self.x87.saved,
             after: model,
+            writes,
             bail,
             help: self.x87.help[offset],
             next,
             done,
             generic,
             vector: self.vector,
-            dispatch: self.x87.model.cyclic || (self.x87.dispatch && index < self.x87.end),
+            dispatch: next.is_none() && (model.cyclic || self.x87.dispatch && index < self.x87.end),
         })));
         if index == self.x87.end && !self.x87.model.cyclic {
             self.x87_close();
@@ -2347,16 +2371,11 @@ impl Translator<'_> {
                 }
             }
             if self.cacheable(start).is_none() {
-                self.push_cold(UnitCold::Leave {
+                self.push_cold(UnitCold::X87(Cold::Prefix {
                     label: help,
-                    state: State::CANONICAL,
-                    simd_dirty: 0,
-                    refund: self.trace.owed(start),
-                    exit: Exit::Interpret,
-                    eip: self.trace.insts[start].pc,
-                    link: false,
-                    x87: Some(Leave::Restore(None)),
-                });
+                    index: start,
+                    vector: self.vector,
+                }));
             }
         }
         if sparse {
@@ -2806,6 +2825,44 @@ impl Translator<'_> {
     pub(in super::super) fn x87_cold(&mut self, cold: Cold) {
         let cold = match cold {
             Cold::Instruction(cold) => cold,
+            Cold::Prefix {
+                label,
+                index,
+                vector,
+            } => {
+                // The x87 entry guards can refuse without changing any key
+                // facts. Execute the ordinary prefix before dispatching again.
+                self.asm.bind(label);
+                self.emit(msr_nzcv(X4));
+                let inst = self.trace.insts[index];
+                self.index = index;
+                self.vector = vector;
+                self.vector.cpu = false;
+                self.state = State::CANONICAL;
+                self.out = super::super::FlagSet::ALL;
+                self.keep = self.out.minus(inst.effects.writes);
+                self.checking = (self.checked)(inst.pc);
+                if let Op::Jcc(cc, target) = inst.op {
+                    self.branch(cc, Edge::Exit(target));
+                } else {
+                    self.op(inst);
+                }
+                let next = match inst.next {
+                    Next::Fall => self.trace.insts[index + 1].pc,
+                    Next::Edge(Edge::Internal(to)) => self.trace.insts[to].pc,
+                    Next::Edge(Edge::Exit(pc) | Edge::Event(pc)) => pc,
+                    Next::Dynamic => unreachable!("an x87 prefix has an ordinary continuation"),
+                };
+                self.leave(
+                    Exit::Dispatch,
+                    next,
+                    self.trace.unused(index),
+                    false,
+                    false,
+                    false,
+                );
+                return;
+            }
             Cold::Tags {
                 label,
                 done,
@@ -2920,7 +2977,8 @@ impl Translator<'_> {
             _ => None,
         };
         let fallback = leaf.map(|_| self.asm.label());
-        let preserve_vector = self.tier1 && leaf.is_none() && cold.next.is_some() && !cold.dispatch;
+        let preserve_vector = self.tier1 && leaf.is_none();
+        let reuse = (preserve_vector && cold.next.is_some()).then(|| self.asm.label());
         self.asm.bind(cold.bail);
         if let Some(fallback) = fallback {
             // The leaf published its input before calling; its pair registers are dead.
@@ -2935,7 +2993,15 @@ impl Translator<'_> {
                 self.emit(mrs_nzcv(X4));
             }
         }
+        if let Some(reuse) = reuse {
+            self.emit(movz(W, X7, 1, 0));
+            self.asm.b(reuse);
+        }
         self.asm.bind(cold.help);
+        if let Some(reuse) = reuse {
+            self.emit(movz(W, X7, 0, 0));
+            self.asm.bind(reuse);
+        }
         self.remark(Part::Cold);
         self.index = cold.index;
         self.state = State::CANONICAL;
@@ -2951,53 +3017,50 @@ impl Translator<'_> {
             // The arithmetic leaf reads their canonical raw80 image directly.
             self.x87_checks(Model::default(), Need::default(), fallback, fallback);
             self.x87_leaf_call(m, x, fallback);
+            if crate::jit_map::enabled() {
+                self.emit(movz(W, X7, 0, 0));
+            }
             self.emit(msr_nzcv(X4));
             self.asm.b(resume);
             self.asm.bind(fallback);
             self.emit(msr_nzcv(X4));
-            if !self.x87_value(cold.helper, Some(cold.before.used())) {
-                self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
+            self.x87_value(cold.helper, Some(cold.before.used()));
+            if crate::jit_map::enabled() {
+                self.emit(movz(W, X7, 1, 0));
             }
             self.asm.bind(resume);
         } else {
             self.emit(msr_nzcv(X4));
-            if !self.x87_value(cold.helper, Some(cold.before.used())) {
-                self.helper_for(cold.helper, runtime::HelperCause::OperandValue);
-            }
+            self.x87_value(cold.helper, Some(cold.before.used()));
         }
         if cold.dispatch {
-            let inst = self.trace.insts[cold.index];
-            self.leave(
-                Exit::Dispatch,
-                inst.next_pc,
-                self.trace.unused(cold.index),
-                false,
-                false,
-                false,
-            );
+            self.x87_value_dispatch(cold.index, leaf.is_some());
             return;
         }
         self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
-        let Some((hot, help, need)) = cold.next else {
+        let Some((hot, _, need)) = cold.next else {
+            self.flush_simd();
             self.asm.b(cold.done);
             return;
         };
         self.emit(mrs_nzcv(X4));
-        let state_miss = if self.tier1 {
-            let index = cold.index + 1;
-            self.fact_transfer(
-                self.trace.insts[index].pc,
-                self.trace.owed(index),
-                Some(Leave::Restore(None)),
-            )
-        } else {
-            help
-        };
+        let state_miss = self.asm.label();
+        if reuse.is_some() {
+            let check = self.asm.label();
+            self.asm.cbz(W, false, X7, check);
+            self.emit_all(&[
+                ldrh(X16, X5, runtime::X87_STATUS),
+                ubfx(W, X16, X16, 11, 3),
+                sub_imm(W, X16, X16, u32::from(cold.after.delta), false),
+                eor(W, X16, X16, X15, Lsl, 0),
+                and_imm(W, X16, X16, 7),
+            ]);
+            self.asm.cbz(W, true, X16, state_miss);
+            self.asm.bind(check);
+        }
         self.x87_checks(cold.after, need, state_miss, state_miss);
-        // The helper may have changed any register, and need not have left
-        // equal the ones the run shares a host register between: what the
-        // run holds comes again from CpuState, live values first, as values
-        // a run can hold, and a shared one must match in every register.
+        // Reload only replacements and slots that were absent on the
+        // arriving path. A shared host pair must match each of its slots.
         let mut loaded = 0u8;
         for live in [true, false] {
             for (r, slot) in cold.after.slots.iter().enumerate() {
@@ -3007,14 +3070,66 @@ impl Translator<'_> {
                     _ => continue,
                 };
                 if loaded & (1 << n) != 0 {
-                    self.x87_match(r, n, help);
+                    self.x87_match(r, n, state_miss);
                 } else {
+                    let previous = match cold.before.slots[r] {
+                        Slot::Clean(n) | Slot::Dirty(n) | Slot::Freed(Some(n)) => Some(n),
+                        _ => None,
+                    };
+                    let retained = reuse.is_some()
+                        && previous == Some(n)
+                        && cold.writes & (1 << r) == 0
+                        && (cold.before.narrow ^ cold.after.narrow) & (1 << n) == 0;
+                    let ready = self.asm.label();
+                    if retained {
+                        self.asm.cbz(W, true, X7, ready);
+                    }
                     let narrow = cold.after.narrow & (1 << n) != 0;
-                    self.x87_fetch(r, n, narrow, help);
+                    self.x87_fetch(r, n, narrow, state_miss);
+                    self.asm.bind(ready);
                 }
                 loaded |= 1 << n;
             }
         }
+        if cold.after.cyclic {
+            self.emit_all(&[
+                ldr(W, X16, X5, runtime::X87_IP),
+                vins_general(2, RUN, 2, X16),
+                ldrh(X16, X5, runtime::X87_OPCODE),
+                vins_general(2, RUN, 3, X16),
+            ]);
+        }
         self.asm.b(hot);
+        self.asm.bind(state_miss);
+        self.emit(msr_nzcv(X4));
+        self.x87_value_dispatch(cold.index, leaf.is_some());
+    }
+
+    /// Leaves from a committed value result the cache cannot represent.
+    fn x87_value_dispatch(&mut self, index: usize, leaf: bool) {
+        let pc = self.trace.insts[index].next_pc;
+        self.flush_simd();
+        self.canonicalize();
+        let refund = self.trace.unused(index);
+        if refund != 0 {
+            self.emit(add_imm(
+                X,
+                super::super::X9,
+                super::super::X9,
+                refund,
+                false,
+            ));
+        }
+        self.emit(movz(W, X0, Exit::Dispatch.word(), 0));
+        if crate::jit_map::enabled() {
+            let target = self.asm.label();
+            if leaf {
+                self.asm.cbz(W, false, X7, target);
+            }
+            self.emit(movk(X, X0, runtime::VALUE_MODEL_DISPATCH, 32));
+            self.asm.bind(target);
+        }
+        self.target(pc);
+        self.far(self.stubs.exit);
     }
 }

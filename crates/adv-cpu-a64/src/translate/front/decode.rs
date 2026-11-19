@@ -7,12 +7,9 @@
 
 use super::{quick_form, summary::Summary};
 use adv_cpu_core::floating::ValueInstruction;
-pub use adv_cpu_core::interpreter::quick::{Alu, Mem, Narrow8or16, ShiftKind, Src};
-use adv_cpu_core::interpreter::{
-    Prepared,
-    quick::{QuickOp, Window},
-};
 use adv_cpu_core::memory::Memory;
+pub use adv_cpu_core::quick::{Alu, Mem, Narrow8or16, ShiftKind, Src};
+use adv_cpu_core::quick::{QuickOp, Window, x87_opcode};
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
     Register,
@@ -67,7 +64,7 @@ pub enum Op {
     PushFlags(u8),
     PopFlags(u8),
     Event(EventOp),
-    Stack(Mnemonic, Part, u8, u8),
+    Stack(Mnemonic, Part, u8),
     Lahf,
     Timestamp,
     Cpuid,
@@ -106,9 +103,8 @@ pub enum Op {
     Fild64(Mem, u8, Option<u16>),
     /// A native integer instruction over partial operands (A64-TR-4).
     Parts(crate::translate::parts::Parts),
-    /// Anything else the interpreter runs without transferring control:
-    /// the `interpret` stub runs it, by its index in the trace's helpers.
-    Helper(u8),
+    /// A prepared floating-point value operation, indexed in the trace.
+    Value(u8),
     /// A direct body call, by its index in the trace's bodies (A64-CALL-2).
     Body(u8),
 }
@@ -118,6 +114,7 @@ pub enum Op {
 pub enum EventOp {
     System,
     Software(u8),
+    Exception(u8),
     Unsupported(u16),
 }
 
@@ -420,6 +417,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         M::Int if instruction.immediate8() == 0x2e => Op::Syscall,
         M::Int => Op::Event(EventOp::Software(instruction.immediate8())),
         M::Int3 => Op::Event(EventOp::Software(3)),
+        M::Ud2 => Op::Event(EventOp::Exception(6)),
         M::Sgdt | M::Sidt | M::Sldt | M::Cli | M::Sti => Op::Event(EventOp::System),
         M::Smsw | M::Str | M::Daa | M::Das | M::Aaa | M::Aas | M::Aam | M::Aad => {
             Op::Event(EventOp::Unsupported(instruction.code() as u16))
@@ -513,7 +511,7 @@ fn mov(dst: Src, src: Src) -> Op {
 /// The planned operation and length for a common instruction.
 #[cfg(test)]
 pub fn quick(bytes: &[u8], pc: u32) -> Option<(Op, u32)> {
-    let (op, len) = adv_cpu_core::interpreter::quick::quick(bytes, pc)?;
+    let (op, len) = adv_cpu_core::quick::quick(bytes, pc)?;
     Some((plan_quick(op), len))
 }
 
@@ -551,8 +549,6 @@ fn plan_quick(op: QuickOp) -> Op {
 #[derive(Clone)]
 pub struct Helper {
     pub pc: u32,
-    pub next: u32,
-    pub prepared: Arc<Prepared>,
     pub value: Option<ValueInstruction>,
     pub value_mem: Option<Mem>,
     pub locked_value: Option<adv_cpu_core::integer::LockedOperation>,
@@ -568,7 +564,7 @@ struct Sample {
     form: Form,
     len: u32,
     op: Option<Op>,
-    prepared: Option<Arc<Prepared>>,
+    opcode: Option<u16>,
     locked: bool,
     summary: Option<Arc<Summary>>,
 }
@@ -765,37 +761,50 @@ impl Fetcher {
         };
         let helpers = self.helpers.as_mut()?;
         if helpers.len() > usize::from(u8::MAX) {
+            self.failure = 2;
             return None;
         }
-        let prepared = sample.prepared.as_ref()?;
         let index = helpers.len() as u8;
+        let value = ValueInstruction::new(ins, sample.opcode);
+        let locked_value = sample
+            .locked
+            .then(|| adv_cpu_core::integer::LockedOperation::new(&ins))
+            .flatten();
+        let value_mem = memory_sized(&ins);
+        let unsupported = Op::Event(EventOp::Unsupported(ins.code() as u16));
+        if sample.locked {
+            match (value_mem, locked_value) {
+                (Some(mem), Some(_)) => {
+                    self.locked = Some((mem, ins.memory_size().size() as u8, index));
+                }
+                _ => return Some((unsupported, sample.len)),
+            }
+        }
+        let op = deferred_plan(&ins, index, sample.opcode).unwrap_or_else(|| {
+            if value.as_ref().is_some_and(|op| op.x87_operands().is_some()) {
+                Op::Value(index)
+            } else {
+                unsupported
+            }
+        });
         helpers.push(Helper {
             pc,
-            next: ins.next_ip32(),
-            prepared: Arc::clone(prepared),
-            value: ValueInstruction::new(ins, prepared.x87_opcode()),
-            value_mem: memory_sized(&ins),
-            locked_value: sample
-                .locked
-                .then(|| adv_cpu_core::integer::LockedOperation::new(&ins))
-                .flatten(),
+            value,
+            value_mem,
+            locked_value,
         });
-        if sample.locked {
-            self.locked = Some((memory_sized(&ins)?, ins.memory_size().size() as u8, index));
-        }
-        let op = deferred_plan(&ins, index, prepared.x87_opcode()).unwrap_or(Op::Helper(index));
         Some((op, sample.len))
     }
 }
 
 fn sample(bytes: &[u8], pc: u32, counts: &mut DecodeCounts) -> Option<Sample> {
-    if let Some((op, len)) = adv_cpu_core::interpreter::quick::quick(bytes, pc) {
+    if let Some((op, len)) = adv_cpu_core::quick::quick(bytes, pc) {
         counts.quick += 1;
         return Some(Sample {
             form: Form::Quick(op),
             len,
             op: Some(plan_quick(op)),
-            prepared: None,
+            opcode: None,
             locked: false,
             summary: None,
         });
@@ -809,19 +818,11 @@ fn sample(bytes: &[u8], pc: u32, counts: &mut DecodeCounts) -> Option<Sample> {
     let locked = instruction.has_lock_prefix()
         || instruction.mnemonic() == Mnemonic::Xchg && instruction.op0_kind() == OpKind::Memory;
     let op = (!locked).then(|| plan(&instruction)).flatten();
-    // Software interrupts are host calls, which mostly return to the next instruction.
-    let prepared = if op.is_none()
-        && (instruction.flow_control() == FlowControl::Next || instruction.code() == Code::Int_imm8)
-    {
-        Prepared::new(&instruction, &bytes[..len]).map(Arc::new)
-    } else {
-        None
-    };
     Some(Sample {
         form: Form::Full(instruction),
         len: len as u32,
         op,
-        prepared,
+        opcode: x87_opcode(&bytes[..len]),
         locked,
         summary: None,
     })
@@ -855,7 +856,7 @@ fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> O
         } else {
             Part::Reg(5)
         };
-        Op::Stack(m, part, width, index)
+        Op::Stack(m, part, width)
     } else if let Some(simd) = super::plans::simd(&instruction, index) {
         Op::Simd(simd)
     } else if let Some(integer) = super::plans::integer(&instruction, index) {
@@ -972,7 +973,7 @@ impl Op {
                 (F::NONE, F::ALL.minus(F::CF), matches!(dst, Part::Mem(_)))
             }
             // The interpreter reads and writes canonical flags.
-            Op::Helper(_) | Op::Event(_) | Op::Syscall | Op::Timestamp => (F::ALL, F::NONE, true),
+            Op::Value(_) | Op::Event(_) | Op::Syscall | Op::Timestamp => (F::ALL, F::NONE, true),
             Op::Stack(..) => (F::NONE, F::NONE, true),
             Op::PopMemory(_) => (F::NONE, F::NONE, true),
             Op::PushFlags(_) | Op::Lahf => (F::ALL, F::NONE, true),
@@ -1164,7 +1165,7 @@ pub(in crate::translate) mod tests {
                 bytes[..opcode.len()].copy_from_slice(opcode);
             }
             let pc = rng.next() as u32;
-            let Some((op, len)) = adv_cpu_core::interpreter::quick::quick(&bytes, pc) else {
+            let Some((op, len)) = adv_cpu_core::quick::quick(&bytes, pc) else {
                 continue;
             };
             let actual = quick_form::instruction(op, pc);
@@ -1264,7 +1265,7 @@ mod whitelist_audit {
                             Decoder::with_ip(32, &bytes, 0x10000, DecoderOptions::NONE).decode();
                         if i.is_invalid()
                             || i.flow_control() != FlowControl::Next
-                            || Prepared::new(&i, &bytes[..i.len()]).is_none()
+                            || !adv_cpu_core::interpreter::supports(&i)
                         {
                             continue;
                         }

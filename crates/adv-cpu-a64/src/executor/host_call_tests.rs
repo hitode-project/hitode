@@ -358,7 +358,7 @@ fn syscall_microbenchmark() {
         RunOutcome::Budget
     );
     cpu.state.eip = CODE;
-    let helpers = cpu.native.as_ref().unwrap().diagnostics.helpers;
+    let helpers = cpu.native.as_ref().unwrap().diagnostics.interprets;
     let now = Instant::now();
     assert_eq!(
         cpu.run_with_traps(stop, 40_000_000, &mut Return, false)
@@ -368,7 +368,7 @@ fn syscall_microbenchmark() {
     println!(
         "W11 int ns/instruction={:.3} helpers={}",
         now.elapsed().as_nanos() as f64 / 10_000_000.0,
-        cpu.native.as_ref().unwrap().diagnostics.helpers - helpers
+        cpu.native.as_ref().unwrap().diagnostics.interprets - helpers
     );
 }
 
@@ -441,7 +441,7 @@ fn common_raw_syscalls_and_timestamp_reads_use_native_calls() {
                 );
                 assert_eq!(ca.calls, cb.calls);
                 if !first {
-                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                 }
             }
         }
@@ -500,7 +500,7 @@ fn common_prefixed_syscalls_continue_at_the_decoded_next_instruction() {
                     b.state.clone().capture_architecture()
                 );
                 if !first {
-                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                 }
             }
         }
@@ -558,7 +558,7 @@ fn common_standalone_rdtsc_uses_the_owner_counter_without_a_trap_handler() {
             assert!(second_ticks > first_ticks);
             assert_eq!(cpu.state.eflags, flags);
             if !first {
-                assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+                assert_eq!(cpu.native.as_ref().unwrap().diagnostics.interprets, 0);
                 assert_eq!(cpu.stats.interpreter_entries, 0);
             }
         }
@@ -581,7 +581,7 @@ fn common_unhandled_syscalls_refund_the_int_and_preserve_its_fault_pc() {
             }
         );
         assert_eq!(cpu.state.eip, CODE + code.len() as u32 - 1);
-        assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+        assert_eq!(cpu.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 

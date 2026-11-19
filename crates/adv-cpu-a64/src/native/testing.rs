@@ -54,7 +54,7 @@ impl Native {
 }
 
 impl Diagnostics {
-    pub(crate) fn tier1_counts(&self) -> [u64; 18] {
+    pub(crate) fn tier1_counts(&self) -> [u64; 17] {
         [
             self.first_visits,
             self.first_declined,
@@ -72,7 +72,6 @@ impl Diagnostics {
             self.accesses,
             self.refused,
             self.checked_faults,
-            self.helpers,
             self.helper_exits,
         ]
     }

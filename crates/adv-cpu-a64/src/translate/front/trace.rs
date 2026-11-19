@@ -45,8 +45,8 @@ pub enum Edge {
     Internal(usize),
     /// Dispatch to a static guest EIP.
     Exit(u32),
-    /// Leave the instruction at the EIP to the interpreter.
-    Interpret(u32),
+    /// Leave at the untranslatable encoding.
+    Event(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +130,7 @@ pub struct Trace {
     pub primary: usize,
     /// `Fetcher::failure` of the fetch that ended the trace.
     pub failure: u8,
-    /// What each `Op::Helper` runs.
+    /// What each `Op::Value` runs.
     pub helpers: Vec<Helper>,
     /// What each `Op::Body` calls.
     pub bodies: Vec<Bound>,
@@ -579,7 +579,11 @@ impl Trace {
                     }
                 }
                 if len > start {
-                    self.insts[len - 1].next = Next::Edge(Edge::Interpret(pc));
+                    self.insts[len - 1].next = Next::Edge(if fetcher.failure == 2 {
+                        Edge::Exit(pc)
+                    } else {
+                        Edge::Event(pc)
+                    });
                 }
                 return false;
             };
@@ -987,7 +991,7 @@ impl Trace {
                     self.live_in[to]
                 }
             }
-            Edge::Exit(_) | Edge::Interpret(_) => FlagSet::ALL,
+            Edge::Exit(_) | Edge::Event(_) => FlagSet::ALL,
         }
     }
 

@@ -209,7 +209,7 @@ impl Front<'_> {
                     divisor,
                 });
             }
-            D::Helper(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
+            D::Value(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
             D::Simd(s) => self.simd(s)?,
             _ => return Err(Reject::Unsupported(self.index)),
         }

@@ -90,20 +90,49 @@ The chain keeps up to three versions, from most specific to most general. A join
 
 ### A64A-FALL-4 Events
 
-**Rule**: An x87 instruction raising pending #MF MUST deliver it through the interpreter at the faulting instruction. Generated exceptions MUST carry the committed state to the owner.
+**Rule**: Generated events MUST name a cause in the table. Only the events marked for interpreter execution MAY run through the interpreter.
 **Applies to**: AArch64
 **Verification**: Test
 
-| Event |
-|---|
-| An x87 instruction that raises #MF from a pending unmasked exception |
-| A host fault or a precise checked-access refusal |
-| A misaligned aligned access or an invalid LDMXCSR value (#GP) |
-| A division that raises #DE |
-| An unmasked SSE exception with the committed MXCSR status (#XM) |
-| Software interrupt, including INT 0x2e without a host handler |
-| SGDT, SIDT, SLDT, CLI and STI, answered by the core's guest system profile |
-| A core semantic gap carrying the decoded operation and EIP. This terminal event returns the unsupported-instruction outcome for SMSW, STR, DAA, DAS, AAA, AAS, AAM and AAD, as well as unsupported operands. |
+| Event | Owner action |
+|---|---|
+| A host fault or a precise checked-access refusal | Replay one instruction with the recovered state (A64-MEM-5) |
+| A fetch failure or invalid encoding | Resolve the outcome through the interpreter at the original EIP |
+| TF or RF in EFLAGS | Execute one instruction through the interpreter |
+| A waiting x87 instruction with a pending unmasked exception | Deliver #MF through the interpreter at the faulting instruction |
+| A misaligned aligned access or invalid LDMXCSR value (#GP), division (#DE), UD2 (#UD), or an unmasked SSE exception (#XM) | Deliver the architectural exception with any committed state |
+| A software interrupt, including INT 0x2e without a host handler | Complete the owner trap action |
+| SGDT, SIDT, SLDT, CLI and STI | Execute through the interpreter using the core guest system profile |
+| A core semantic gap carrying the decoded form and EIP | Report the terminal unsupported-instruction outcome. This includes SMSW, STR, DAA, DAS, AAA, AAS, AAM and AAD, and unsupported operands. |
+
+### A64A-FALL-5 Value calls
+
+**Rule**: Value calls MUST evaluate prepared core semantics on operands supplied by generated code. They MUST retain unaffected cache entries and publish and reload only the architectural sub-state the operation uses. A representable result MUST continue in the same unit.
+**Applies to**: AArch64
+**Verification**: Test
+
+An exception raised by a value call MUST deliver the committed state through an event without replay. Generated access paths transfer memory operands before core evaluation and commit store results before publishing their architectural effects. A result outside the x87 run's model, including incompatible TOP or tags, dispatches with the committed state. Opt-in JIT diagnostics count value calls by site.
+
+## Exits
+
+### A64A-EXIT-1 Exit kinds
+
+**Rule**: Generated code MUST leave with a kind in the table. Each kind MUST have one handler.
+**Applies to**: AArch64
+**Verification**: Test
+
+| Kind | Handler |
+|---|---|
+| Dispatch | Continue at the guest EIP through the code store or select a first visit |
+| Event | Complete the named cause in the execution owner (A64A-FALL-4) |
+| Budget | Account for retirement and dispatch, preserving any REP continuation |
+| Yield and Reschedule | Apply the execution owner's scheduling action |
+| Computation | Offer the job through `native::offload` |
+| Optimized | Materialize the recovery record at the native boundary |
+| Recall | Return a worker's exact prefix to the execution owner |
+| Plan | Apply the plan action after leaving generated code |
+
+Dispatch, version misses, value calls and host calls use stubs that continue in generated code when possible.
 
 ## Tier-1 placement
 

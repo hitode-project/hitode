@@ -2,29 +2,21 @@
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it.
-//! Writes mark it dirty; exits, helpers, host calls and x87/EMMS entries
-//! publish dirty MMX to MMX and the aliased x87 significand and exponent
-//! (0xffff), and dirty XMM to XMM. Direct faults record the dirty mask and
-//! recover that prefix from the signal context before re-executing the
-//! interrupted instruction. A merge holds its entry (`translate::residency`):
-//! internal edges publish what it does not count dirty and load what they
-//! lack of it. A region head's own code checks its entry's MXCSR guards for
-//! arrivals from outside, leaving for the interpreter where one fails, and
-//! loads its registers. Loading an MMX register an instruction only reads,
-//! or one a merge holds, leaves for the interpreter unless its x87 alias is
-//! MMX data: a merge may count it dirty, and publishing sets the exponent.
-//! A helper may change any register, so the cache is forgotten after one;
-//! d8-d15 survive the Rust calls between, and the `access`
-//! stubs keep v0-v7 and v16-v23.
+//! Writes mark registers dirty. Exits and host calls publish dirty SIMD,
+//! and x87 and EMMS publish the MMX aliases they observe. Faults recover the
+//! dirty subset from the captured register state before replay. A merge
+//! holds the registers and facts its arrivals agree on; incoming edges
+//! publish or reload the differences. Tier-1 entries check MXCSR through
+//! their version chain. MMX loads refresh the x87 alias as needed.
 //!
-//! An MMX instruction without the x87 guard (`Guards::ready`) leaves for
-//! the interpreter if an x87 exception is pending, and once it completes
-//! sets TOP and every tag to 0, as each MMX instruction does. Guards hold
-//! until a helper, x87 instruction or EMMS, and survive a merge every
-//! arrival of which passed them. `movaps`-style
-//! accesses that are not 16-byte aligned leave for the interpreter too,
-//! which raises the fault. The cpu pointer stays in x5 across a run of
-//! SIMD instructions.
+//! Value calls keep unaffected cache registers live. Checked accesses
+//! preserve v0-v7, v16-v23 and the x87 pair registers; the host ABI
+//! preserves the MMX halves.
+//!
+//! An MMX instruction without the readiness fact checks for pending #MF,
+//! then clears TOP and tags as part of completing the instruction. An
+//! unaligned `movaps`-class access raises #GP before touching memory.
+//! The CPU pointer stays in x5 across a run of SIMD instructions.
 //! Checked SIMD accesses share scalar window/alias permission checks and
 //! complete soft and crossing accesses through the owner without publishing
 //! or dropping the cache, including memory `pinsrw` and `stmxcsr`.
@@ -46,13 +38,12 @@
 //! min normal binade, which rounding up may have reached from a tiny value,
 //! no NaN compared or widened, no saturated integer. Anything else takes a
 //! slow path that redoes the instruction between a cleared and a read FPSR:
-//! invalid, divide by zero, overflow and underflow leave for the
-//! interpreter before the destination changes, which also settles x86's
-//! negative default NaN and its tininess after rounding; inexact sets PE,
+//! invalid, divide by zero, overflow and underflow use core value semantics
+//! for x86's default NaN, rounding and exceptions. Inexact sets PE,
 //! and a denormal operand, which A64 does not report without FZ, sets DE
 //! from a check of the bits. A false alarm only costs the slow path. Scalar
 //! forms ignore upper lanes; NaN signaling follows each x86 predicate.
-//! EFLAGS comparisons leave for the interpreter on any NaN.
+//! EFLAGS comparisons use the value entry on a NaN.
 
 use super::fp_class;
 
@@ -147,7 +138,7 @@ pub enum Kind {
     /// Scalar double to single precision.
     Narrow(bool),
     Approximate(bool, bool),
-    /// COMIS/UCOMIS, using the interpreter for NaNs: double precision,
+    /// COMIS/UCOMIS, using core value semantics for NaNs: double precision,
     /// and whether a quiet NaN also raises invalid (COMIS).
     FlagCompare(bool, bool),
     /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
@@ -187,7 +178,7 @@ impl Simd {
             || self.kind == Kind::Emms
     }
 
-    /// Whether it may leave for the interpreter on its values.
+    /// Whether it can require a value call.
     pub fn floating(&self) -> bool {
         matches!(
             self.kind,
@@ -469,7 +460,7 @@ impl Translator<'_> {
                 if t.tier1 && (t.index != 0 || t.facts.mmx() != Some(0)) {
                     crate::facts::materialize_mmx(t.asm);
                 }
-                let bail = t.bail();
+                let bail = t.leave_for_event(runtime::Event::PendingX87);
                 t.emit(ldrh(X16, X5, runtime::X87_STATUS));
                 t.asm.tbz(true, X16, 7, bail);
             });
@@ -1256,7 +1247,7 @@ impl Translator<'_> {
         self.canonicalize();
         let data = self.register(simd.dst);
         let mask = self.register(simd.src);
-        let slow = self.bail();
+        let slow = self.leave_for_event(runtime::Event::CheckedAccess);
         let guest = Reg::new(7);
         self.emit(mov(W, guest, address));
         *self.uses_permissions = true;
@@ -1290,8 +1281,8 @@ impl Translator<'_> {
     /// never touches FPSR: it runs once PE is set, or
     /// for operations that cannot be inexact, with no denormal operand, and
     /// sends values that could raise anything else to the slow path, which
-    /// redoes the operation between a cleared and a read FPSR and leaves
-    /// for the interpreter on any exception but inexact. Uses x13, x14 and
+    /// retries between a cleared and a read FPSR and uses a value call on
+    /// any exception but inexact. Uses x13, x14 and
     /// v0-v6.
     fn floating(&mut self, simd: Simd, address: Reg) {
         self.cpu();
@@ -1836,8 +1827,8 @@ impl Translator<'_> {
     }
 
     /// Before the cache loads MMX register `n`, while x16 and x17 are free:
-    /// leaves for the interpreter unless the register is already MMX data,
-    /// its x87 exponent 0xffff or a pending MMX write's. A merge may count a
+    /// refreshes the x87 alias for Tier-1 and refuses inadmissible worker
+    /// state. A merge may count a
     /// loaded register dirty, and publishing sets that exponent.
     fn mmx_aliased(&mut self, n: u8) {
         self.aliased |= 1 << n;
@@ -1922,8 +1913,8 @@ impl Translator<'_> {
     }
 
     /// Establishes a region head's entry for arrivals from outside the unit:
-    /// checks its MXCSR guards, leaving for the interpreter (a job for its
-    /// owner) where one fails, and loads its registers. The head's countdown
+    /// checks the worker's MXCSR guards and loads its registers.
+    /// A failed worker guard returns to the owner. The head's countdown
     /// check has charged `refund`.
     pub(super) fn enter_simd(&mut self, entry: Entry, refund: u32) {
         let guards = entry.guards;
@@ -1938,7 +1929,7 @@ impl Translator<'_> {
                 exit: if self.computation {
                     Exit::Recall
                 } else {
-                    Exit::Interpret
+                    Exit::Dispatch
                 },
                 eip: self.trace.insts[self.index].pc,
                 link: false,
@@ -2112,7 +2103,7 @@ impl Translator<'_> {
         self.emit(if load { word } else { word & !(1 << 22) });
     }
 
-    /// A label that leaves for the interpreter to run the instruction.
+    /// A label that returns an inadmissible form to the owner.
     fn bail(&mut self) -> crate::asm::Label {
         let label = self.asm.label();
         let inst = self.trace.insts[self.index];
@@ -2121,7 +2112,11 @@ impl Translator<'_> {
             state: self.state,
             simd_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
-            exit: Exit::Interpret,
+            exit: if self.computation {
+                Exit::Recall
+            } else {
+                Exit::Dispatch
+            },
             eip: inst.pc,
             link: false,
             x87: self.x87_leaving(),
@@ -2190,7 +2185,6 @@ mod tests {
                 lookup_slow: 0,
                 ret_miss: 0,
                 access: 0,
-                interpret: 0,
                 fault: 0,
                 opt_exit: 0,
             },
@@ -2210,7 +2204,7 @@ mod tests {
                 .trace
                 .insts
                 .iter()
-                .all(|i| !matches!(i.op, super::super::decode::Op::Helper(_)))
+                .all(|i| !matches!(i.op, super::super::decode::Op::Value(_)))
         );
         // Samples can tell the residency code from the body.
         let parts: Vec<_> = work.marks().iter().map(|mark| mark.part).collect();

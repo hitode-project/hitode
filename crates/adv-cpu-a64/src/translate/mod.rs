@@ -27,17 +27,16 @@
 //! emitter (`access`), and a refused access faults like a host fault, so
 //! dirty SIMD registers stay in place.
 //!
-//! The exceptional cases in A64-TR-4 use the `interpret` stub with
-//! canonical flags; ordinary instructions remain in generated code.
+//! Value cases pass prepared operands to core semantics. Architectural
+//! events return to the execution owner at their precise guest boundary.
 //!
-//! Host registers beyond the guest map of A64-REG-1: x16 and x17 address and exit
-//! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
-//! exit stub saves for fault recovery, x13 and x14 flag scratch without
-//! FlagM, and x15 the lazy-carry scratch. Checked accesses also use x3 to
-//! x5, which are free inside units; a run of SIMD instructions keeps the
-//! `CpuState` pointer in x5, MMX registers in d8-d15 and XMM registers in
-//! v16-v23, with v0-v6 as scratch; an x87 run keeps its stack values in
-//! v24-v31.
+//! Beyond the guest map of A64-REG-1, x16 and x17 hold address and exit
+//! scratch, x6 holds value scratch, and x7 and x8 hold flag recipe
+//! temporaries captured for fault recovery. Without FlagM, x13 and x14
+//! are flag scratch and x15 is lazy-carry scratch. Checked accesses also
+//! use x3 to x5. The SIMD cache keeps the `CpuState` pointer in x5, MMX
+//! values in d8-d15 and XMM values in v16-v23, with v0-v6 as scratch.
+//! An x87 run keeps its stack values in v24-v31.
 
 mod access;
 mod body;
@@ -169,7 +168,7 @@ impl Unit {
                         mask &= facts::CONTROL | facts::MXCSR;
                     }
                 }
-                decode::Op::Helper(_) | decode::Op::Body(_) | decode::Op::Syscall => return 0,
+                decode::Op::Value(_) | decode::Op::Body(_) | decode::Op::Syscall => return 0,
                 _ => {}
             }
         }
@@ -288,8 +287,6 @@ pub struct Stubs {
     pub ret_miss: usize,
     /// A checked access the window cannot take.
     pub access: usize,
-    /// An instruction the interpreter runs.
-    pub interpret: usize,
     /// An INT 0x2e handler call.
     pub call: usize,
     /// Where a faulting site leaves.
@@ -549,9 +546,9 @@ enum Cold {
         value: access::Value,
         kind: u32,
     },
-    /// The `interpret` helper asked to leave with the exit + 1 in w0, at
+    /// The host call asked to leave with the exit + 1 in w0, at
     /// the EIP in `CpuState`, after refunding the countdown.
-    Helper {
+    HostCall {
         label: Label,
         refund: u32,
     },
@@ -618,7 +615,6 @@ struct Translator<'a> {
     aliased: u8,
     facts: Key,
     tier1: bool,
-    helper_diagnostics: bool,
     computation: bool,
     resident_links: bool,
     #[cfg(native)]
@@ -840,7 +836,6 @@ impl Jit<'_> {
             aliased: 0,
             facts: self.facts,
             tier1: self.tier1,
-            helper_diagnostics: self.tier1 && crate::jit_map::enabled(),
             computation,
             resident_links: *resident_links && !computation,
             #[cfg(native)]
@@ -861,7 +856,7 @@ impl Jit<'_> {
         t.x87_prepare();
         if trace.len() == 0 {
             // Nothing to translate: other units may still link here.
-            t.exit(Exit::Interpret, eip);
+            t.exit(Exit::Event(crate::runtime::Event::Fetch), eip);
             *retired = 0;
         } else {
             let mut index = 0;
@@ -1302,7 +1297,12 @@ impl Translator<'_> {
                 self.jump(to, self.x87_arriving(to));
             }
             Edge::Exit(eip) => self.follow_exit(Exit::Dispatch, eip, unused, true),
-            Edge::Interpret(eip) => self.follow_exit(Exit::Interpret, eip, unused, false),
+            Edge::Event(eip) => self.follow_exit(
+                Exit::Event(crate::runtime::Event::Fetch),
+                eip,
+                unused,
+                false,
+            ),
         }
     }
 
@@ -1469,7 +1469,7 @@ impl Translator<'_> {
                         state: self.state,
                         simd_dirty: self.vector.dirty,
                         refund: self.trace.owed(to),
-                        exit: Exit::Interpret,
+                        exit: Exit::Dispatch,
                         eip: self.trace.insts[to].pc,
                         link: false,
                         x87: self.x87_leaving(),
@@ -1603,7 +1603,7 @@ impl Translator<'_> {
                     x87,
                 });
             }
-            Edge::Interpret(_) => unreachable!("a jcc target dispatches"),
+            Edge::Event(_) => unreachable!("a jcc target dispatches"),
         }
     }
 
@@ -2163,14 +2163,6 @@ impl Translator<'_> {
         });
     }
 
-    fn helper_for(&mut self, index: u8, cause: crate::runtime::HelperCause) {
-        if self.helper_diagnostics {
-            self.mov_imm(X16, cause as u32);
-            self.emit(str(W, X16, RUNTIME, crate::runtime::HELPER_CAUSE));
-        }
-        self.helper(index);
-    }
-
     fn mov_address(&mut self, reg: Reg, value: usize) {
         let value = value as u64;
         self.emit(movz(X, reg, value as u16, 0));
@@ -2677,7 +2669,7 @@ impl Translator<'_> {
                         access::Value::Scalar(reg) => mov(W, X3, reg),
                         access::Value::Vector(VMem::S, reg) => fmov_from_v(W, X3, reg),
                         access::Value::Vector(size, reg) => {
-                            vstr(size, reg, RUNTIME, crate::runtime::ACCESS_VECTOR)
+                            vstr(size, reg, RUNTIME, crate::runtime::VALUE_OPERAND)
                         }
                     });
                 }
@@ -2688,7 +2680,7 @@ impl Translator<'_> {
                         access::Value::Scalar(reg) => mov(W, reg, X0),
                         access::Value::Vector(VMem::S, reg) => fmov_to_v(W, reg, X0),
                         access::Value::Vector(size, reg) => {
-                            vldr(size, reg, RUNTIME, crate::runtime::ACCESS_VECTOR)
+                            vldr(size, reg, RUNTIME, crate::runtime::VALUE_OPERAND)
                         }
                     });
                 }
@@ -2706,7 +2698,7 @@ impl Translator<'_> {
                 suspended,
                 checked,
             } => self.x87_fault(label, model, saved, suspended, checked),
-            Cold::Helper { label, refund } => {
+            Cold::HostCall { label, refund } => {
                 self.asm.bind(label);
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));

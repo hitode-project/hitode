@@ -137,7 +137,7 @@ fn bit_scans_biased_cl_shifts_and_comparisons_run_without_helpers_and_resume_at_
                 if budget > instructions {
                     assert!(native.stats.native_entries > 0);
                     assert_eq!(native.stats.interpreter_entries, 0);
-                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                     assert_eq!(native.state.fuel, budget - instructions);
                 } else {
                     assert_eq!(
@@ -209,15 +209,8 @@ fn cl_shifts_and_rotates_match_flags_memory_and_budget_cuts_without_helpers() {
                                 oracle.run(p.stop, 10).unwrap()
                             );
                             same(&native, &oracle);
-                            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
-                            assert!(
-                                native
-                                    .native
-                                    .as_ref()
-                                    .unwrap()
-                                    .helper_histogram()
-                                    .is_empty()
-                            );
+                            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
+                            assert!(native.native.as_ref().unwrap().value_histogram().is_empty());
                             if !config.1 && budget == 10 {
                                 assert!(native.stats.native_entries > 0);
                                 assert_eq!(native.stats.interpreter_entries, 0);
@@ -311,7 +304,7 @@ fn cl_shift_zero_count_does_not_write_watched_memory() {
             );
             same(&native, &oracle);
             assert_eq!(native.native.as_ref().unwrap().unchecked_faults, 0);
-            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
             assert_eq!(native.native.as_ref().unwrap().diagnostics.refused, 0);
             if !config.1 {
                 assert_eq!(native.stats.interpreter_entries, 0);
@@ -504,7 +497,7 @@ fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
                     if scenario == 0 && budget == 100 {
                         assert_eq!(native.stats.interpreter_entries, 0, "form={form}");
                         assert_eq!(
-                            native.native.as_ref().unwrap().diagnostics.helpers,
+                            native.native.as_ref().unwrap().diagnostics.interprets,
                             0,
                             "form={form}, helpers={:?}",
                             native.interpreted_forms(2)
@@ -602,7 +595,6 @@ fn sse_directed_arithmetic_preserves_value_exits_and_versions_control_changes() 
             );
             same(&native, &oracle);
             let diagnostics = &native.native.as_ref().unwrap().diagnostics;
-            assert_eq!(diagnostics.helpers, 0, "MXCSR={mxcsr:x}");
             assert_eq!(diagnostics.interprets, 0, "MXCSR={mxcsr:x}");
             assert_eq!(native.stats.interpreter_entries, 0, "MXCSR={mxcsr:x}");
         }
@@ -631,7 +623,7 @@ fn sse_value_calls_keep_x87_pairs_and_dirty_xmm() {
     assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
     same(&native, &oracle);
     assert_eq!(native.stats.interpreter_entries, 0);
-    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+    assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
 }
 
 // spec: A64F-FP-5
@@ -693,7 +685,7 @@ fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {
                             assert_eq!(outcome, RunOutcome::ReachedStop);
                             assert_eq!(native.state.mxcsr, 0x1f80);
                             assert_eq!(native.stats.interpreter_entries, 0);
-                            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                         }
                         if scenario == 5 && !scalar {
                             assert!(matches!(outcome, RunOutcome::Trap { vector: 13, .. }));
@@ -784,7 +776,7 @@ fn rewritten_bit_scan_and_comparison_forms_invalidate_the_old_native_unit() {
             );
             same(&native, &oracle);
             assert_eq!(native.stats.interpreter_entries, 0);
-            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
         }
         assert!(native.stats.invalidations >= 3);
     }
@@ -827,7 +819,7 @@ fn scalar_moves_word_extraction_bit_tests_and_leave_match_at_budget_cuts() {
                     );
                     same(&native, &oracle);
                     if !first && checks == Checks::Adaptive && budget > instructions {
-                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                     }
                 }
             }
@@ -938,7 +930,7 @@ fn checked_strings_cross_ordinary_blocked_and_alias_pages_at_element_boundaries(
                                         assert!(native.stats.native_entries > 0);
                                         let blocked = !alias && (!rep || count > prefix);
                                         assert_eq!(
-                                            native.native.as_ref().unwrap().diagnostics.helpers,
+                                            native.native.as_ref().unwrap().diagnostics.interprets,
                                             0
                                         );
                                         assert_eq!(
@@ -1089,7 +1081,7 @@ fn scalar_integer_conversions_preserve_flags_upper_lanes_and_fault_boundaries() 
                     );
                     same(&native, &oracle);
                     if scenario == 0 && budget == 100 {
-                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                         assert_eq!(native.stats.interpreter_entries, 0);
                     }
                 }
@@ -1133,7 +1125,7 @@ fn narrow_shifts_and_negation_keep_undefined_flags_and_register_halves() {
                             oracle.run(program.stop, 100).unwrap()
                         );
                         same(&native, &oracle);
-                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                     }
                 }
             }
@@ -1175,7 +1167,7 @@ fn simd_lane_insertion_byte_shifts_and_control_stores_match_the_owner() {
                 );
                 same(&native, &oracle);
                 if budget == 10 && checks == Checks::Adaptive {
-                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                 }
             }
         }
@@ -1235,7 +1227,7 @@ fn x87_single_precision_rounding_keeps_extended_exponents_and_exception_state() 
                     same(&native, &oracle);
                     if control == 0x007f && case < 8 {
                         assert_eq!(
-                            native.native.as_ref().unwrap().diagnostics.helpers,
+                            native.native.as_ref().unwrap().diagnostics.interprets,
                             0,
                             "form={form}, case={case}"
                         );
@@ -1278,7 +1270,7 @@ fn cmpxchg8b_matches_interpreter_flags_faults_and_native_commits() {
                     same(&native, &oracle);
                     if writable && offset == 0 {
                         assert_eq!(native.stats.interpreter_entries, 0);
-                        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
                     }
                 }
             }

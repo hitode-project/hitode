@@ -2919,7 +2919,7 @@ fn first_divergence() {
     println!("no divergence");
 }
 
-// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13, A64-CTL-10
+// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13, A64-CTL-10, A64-TR-2
 #[cfg(native)]
 #[test]
 fn shared_code_executes_rewrites_and_non_fetchable_entries_use_blocks() {
@@ -3001,6 +3001,7 @@ fn shared_code_executes_rewrites_and_non_fetchable_entries_use_blocks() {
             );
         }
         assert_eq!(interpreted, if coherent { 0 } else { rounds });
+        assert_eq!(native.diagnostics.untracked, u64::from(interpreted));
         assert!(
             executor.stats.native_entries > 0,
             "translated code or patch"

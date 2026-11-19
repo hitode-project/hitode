@@ -2125,6 +2125,17 @@ impl Drop for Memory {
     }
 }
 
+/// Whether every page of the committed span permits the operation.
+pub fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
+    memory
+        .committed(address, width as usize)
+        .is_ok_and(|range| {
+            memory.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
+                .iter()
+                .all(|p| p & permission != 0)
+        })
+}
+
 #[cfg(test)]
 mod file_page_tests {
     use super::*;

@@ -153,7 +153,7 @@ impl Unit {
             if body.iter().enumerate().any(|(n, i)| {
                 i.mode != Mode::Plain
                     || i.call.is_some()
-                    || matches!(i.op, decode::Op::Helper(_) | decode::Op::Parts(_))
+                    || matches!(i.op, decode::Op::Value(_) | decode::Op::Parts(_))
                     || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))
                     || (n + 1 != body.len()
                         && (i.next != Next::Fall

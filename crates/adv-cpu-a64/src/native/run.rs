@@ -10,7 +10,7 @@ use adv_cpu_core::{CpuState, Memory};
 use super::plan::{self, dispatch};
 use super::{
     ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
-    alias_base, call, interpret, locked_access, timestamp, value, value_access,
+    alias_base, call, locked_access, timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
 use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
@@ -35,7 +35,21 @@ impl Native {
         self.install_optimized(false);
         let (entry, translated) = match self.code.units.get(&cpu.eip).copied() {
             Some(entry) => (entry, 0),
-            None if !crate::translate::Fetcher::fetchable(memory, cpu.eip) => return Ok(None),
+            None if !memory.executable(cpu.eip, 1) => {
+                return Ok(Some(Run {
+                    exit: Exit::Event(Event::Fetch),
+                    retired: 0,
+                    translated: 0,
+                }));
+            }
+            None if !crate::translate::Fetcher::fetchable(memory, cpu.eip) => {
+                self.diagnostics.untracked += 1;
+                return Ok(Some(Run {
+                    exit: Exit::Untracked,
+                    retired: 0,
+                    translated: 0,
+                }));
+            }
             None if self.first_visit(cpu.eip) => {
                 self.diagnostics.first_visits += 1;
                 return Ok(Some(Run {
@@ -71,13 +85,12 @@ impl Native {
             self.diagnostics.empty += 1;
             // The first instruction is not translated: skip the round trip.
             return Ok(Some(Run {
-                exit: Exit::Interpret,
+                exit: Exit::Event(Event::Fetch),
                 retired: 0,
                 translated,
             }));
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
-        self.helper_units = 0;
         let budget = fuel.min(SLICE).max(u64::from(entry.retired));
         if self.code.uses_permissions
             || self.checks != Checks::Adaptive
@@ -123,8 +136,6 @@ impl Native {
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
-            (*runtime).fault_simd = (*faults).capture.simd.as_ptr() as u64;
-            (*runtime).interpret = interpret as *const () as u64;
             (*runtime).value = value as *const () as u64;
             (*runtime).value_access = value_access as *const () as u64;
             (*runtime).locked_access = locked_access as *const () as u64;
@@ -132,12 +143,15 @@ impl Native {
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(Active::Owner(faults));
-            let returned = enter(runtime, entry.unit);
+            let returned = enter.run(runtime, entry.unit);
             ACTIVE.set(previous);
             returned
         };
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
+        if returned.reason as u32 != Exit::Optimized.raw() {
+            self.runtime.shadow = returned.shadow;
+        }
         if let Some(error) = owner.error {
             return Err(error);
         }
@@ -146,18 +160,26 @@ impl Native {
         self.diagnostics.resident_page_crossings += self.runtime.resident_page_crossings;
         let mut exit = Exit::from_raw(returned.reason as u32)
             .ok_or_else(|| format!("unknown a64 exit {}", returned.reason))?;
+        if self.code.slow_paths.is_some() {
+            *self.diagnostics.exit_counts.entry(exit.word()).or_default() += 1;
+            if exit == Exit::Dispatch
+                && returned.reason >> 32 == u64::from(crate::runtime::VALUE_MODEL_DISPATCH)
+            {
+                self.diagnostics.x87_value_dispatches += 1;
+            }
+        }
         let budget_exit = exit == Exit::Budget;
         if budget_exit {
             exit = Exit::Dispatch;
         }
         match exit {
             Exit::Optimized => {}
-            Exit::Interpret => self.diagnostics.interprets += 1,
+            Exit::Event(Event::Fetch) => self.diagnostics.interprets += 1,
             Exit::Event(Event::Replay | Event::CheckedAccess) => self.diagnostics.faults += 1,
             Exit::Event(_) | Exit::Plan(_) => {}
             Exit::Dispatch => self.diagnostics.dispatches += 1,
-            Exit::Stepped | Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
-            Exit::FirstVisit => unreachable!("first visits begin in the owner"),
+            Exit::Reschedule | Exit::Computation | Exit::Recall | Exit::Budget => {}
+            Exit::FirstVisit | Exit::Untracked => unreachable!("owner dispatch actions"),
             Exit::Yield => self.runtime.shadow = self.code.shadow.top(),
         }
         // Inline forms may refill the countdown, and a cold exit may leave
@@ -174,10 +196,7 @@ impl Native {
         if exit == Exit::Event(Event::Replay) {
             let pc = self.code.faults.capture.pc.get();
             let site = self.code.faults.site(pc).expect("faulting site");
-            self.code
-                .faults
-                .capture
-                .recover(cpu, site, self.runtime.temps);
+            self.code.faults.capture.recover(cpu, site);
             retired -= u64::from(site.refund);
             if !site.checked {
                 self.unchecked_faults += 1;
@@ -228,7 +247,7 @@ impl Native {
         if let Some(forms) = &mut self.retired_forms {
             // Native REP elements stay in translated fuel: telling them
             // apart would cost emitted code in every REP loop.
-            forms[0] += retired - self.helper_units;
+            forms[0] += retired;
         }
         if retired != 0 {
             self.progressed();

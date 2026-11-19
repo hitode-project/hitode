@@ -166,10 +166,10 @@ impl Emitter<'_> {
             self.asm.emit(mov(W, X1, address));
             if store {
                 self.asm.emit(match (value, width) {
-                    (AccessReg::Scalar(src), 8) => str(X, src, RT, runtime::ACCESS_VECTOR),
+                    (AccessReg::Scalar(src), 8) => str(X, src, RT, runtime::VALUE_OPERAND),
                     (AccessReg::Scalar(src), _) => mov(W, X3, src),
                     (AccessReg::Vector(size, src), 8 | 16) => {
-                        vstr(size, src, RT, runtime::ACCESS_VECTOR)
+                        vstr(size, src, RT, runtime::VALUE_OPERAND)
                     }
                     (AccessReg::Vector(_, src), _) => vumov(2, X3, src, 0),
                 });
@@ -183,10 +183,10 @@ impl Emitter<'_> {
             self.asm.tbz(true, X0, 32, blocked);
             if !store {
                 self.asm.emit(match (value, width) {
-                    (AccessReg::Scalar(dst), 8) => ldr(X, dst, RT, runtime::ACCESS_VECTOR),
+                    (AccessReg::Scalar(dst), 8) => ldr(X, dst, RT, runtime::VALUE_OPERAND),
                     (AccessReg::Scalar(dst), _) => mov(W, dst, X0),
                     (AccessReg::Vector(size, dst), 8 | 16) => {
-                        vldr(size, dst, RT, runtime::ACCESS_VECTOR)
+                        vldr(size, dst, RT, runtime::VALUE_OPERAND)
                     }
                     (AccessReg::Vector(_, dst), _) => fmov_to_v(W, dst, X0),
                 });

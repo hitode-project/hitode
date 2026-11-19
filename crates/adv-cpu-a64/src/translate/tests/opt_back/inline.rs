@@ -8,7 +8,7 @@ const X7: Reg = Reg::new(7);
 const X8: Reg = Reg::new(8);
 const SHADOW: u64 = 0x5000_1230;
 const NORMAL: Exit = Exit::Dispatch;
-const MISS: Exit = Exit::Interpret;
+const MISS: Exit = Exit::Budget;
 const COLD: Exit = Exit::Recall;
 
 fn test_harness() -> Harness {
@@ -109,7 +109,6 @@ impl InlineRun {
             lookup_slow: addr(h.forbidden),
             ret_miss: addr(h.forbidden),
             access: addr(h.forbidden),
-            interpret: addr(h.forbidden),
             fault: addr(h.forbidden),
             opt_exit: addr(h.forbidden),
         };

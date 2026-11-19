@@ -901,21 +901,10 @@ impl Native {
         self.runtime.resident_probation = 0;
         self.code.tier1_words.clear();
         self.code.placed.clear();
-        self.code.helper_eips = self.helper_histogram();
         self.code.helpers.clear();
-        self.code.helper_counts.clear();
         self.code.generation += 1;
         self.code.faults.sites.clear();
         self.forget_dynamic();
-    }
-
-    /// Helper runs by EIP.
-    pub(crate) fn helper_histogram(&self) -> FxHashMap<u32, u64> {
-        let mut eips = self.code.helper_eips.clone();
-        for (helper, &count) in self.code.helpers.iter().zip(&self.code.helper_counts) {
-            *eips.entry(helper.pc).or_default() += count;
-        }
-        eips
     }
 
     /// Whether code at `eip` is known to run, so translating it pays.
@@ -1015,7 +1004,6 @@ impl Native {
         let entry = self.place_tier1(memory, eip, &work, &unit, key, true);
         if let Some(entry) = entry {
             self.code.helpers.extend(unit.helpers().iter().cloned());
-            self.code.helper_counts.resize(self.code.helpers.len(), 0);
             if mask == 0 {
                 self.code.chains.remove(&eip);
             } else {

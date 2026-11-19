@@ -359,12 +359,12 @@ impl Executor {
     }
 
     /// Slow-path runs by EIP: interpreted after an exit, after a fault, and
-    /// run by helpers. Counts only grow, so callers diff two readings.
+    /// run by value calls. Counts only grow, so callers diff two readings.
     pub fn slow_path_sites(&self) -> Vec<(u32, [u64; 3])> {
         let mut sites = rustc_hash::FxHashMap::<u32, [u64; 3]>::default();
         #[cfg(native)]
         if let Some(native) = &self.native {
-            for (eip, count) in native.helper_histogram() {
+            for (eip, count) in native.value_histogram() {
                 sites.entry(eip).or_default()[2] += count;
             }
         }
@@ -383,14 +383,14 @@ impl Executor {
 
     /// Instructions by form, most frequent first, as the code at their
     /// EIPs decodes now: those interpreted after an exit, after a fault, or
-    /// (`which` 2) run by helpers.
+    /// (`which` 2) run by value calls.
     pub fn interpreted_forms(&self, which: u8) -> Vec<(crate::translate::front::tags::Code, u64)> {
         let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
         #[cfg(native)]
         let helpers = self
             .native
             .as_ref()
-            .map(crate::native::Native::helper_histogram)
+            .map(crate::native::Native::value_histogram)
             .unwrap_or_default();
         #[cfg(not(native))]
         let helpers = rustc_hash::FxHashMap::default();
@@ -548,7 +548,7 @@ impl Executor {
                 std::ptr::null_mut(),
             )?;
             if let Some(run) = &run
-                && !matches!(run.exit, Exit::Stepped | Exit::FirstVisit)
+                && !matches!(run.exit, Exit::FirstVisit | Exit::Untracked)
             {
                 let check = trace.check_retired(run.retired as usize, &self.state, &self.memory);
                 let strict = verifier.strict;
@@ -564,7 +564,9 @@ impl Executor {
         let Some(run) = run? else {
             return Ok(None);
         };
-        self.stats.native_entries += 1;
+        if run.exit != Exit::Untracked {
+            self.stats.native_entries += 1;
+        }
         if run.translated != 0 {
             self.stats.compilations += 1;
             self.stats.native_code_bytes += run.translated as u64;
@@ -665,25 +667,18 @@ impl Executor {
             let (units, observed) = trace.as_deref_mut().map_or((units, None), |trace| {
                 trace.prepare(units, &self.state, &self.memory)
             });
-            let resume = self.computation_resume.take().filter(|(pc, exit)| {
-                *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Event(_))
-            });
+            let resume = self
+                .computation_resume
+                .take()
+                .filter(|(pc, exit)| *pc == self.state.eip && matches!(exit, Exit::Event(_)));
             let mut interpreted = true;
-            let (execution, last_units) = if precise_flags || observed.is_some() {
-                #[cfg(native)]
-                let pc = self.state.eip;
+            let (execution, last_units) = if observed.is_some() {
                 let execution = self
                     .interpreter
                     .run_chunk(&mut self.state, &mut self.memory, 1);
-                #[cfg(native)]
-                if precise_flags
-                    && !self.interpreter_only
-                    && let Some(native) = &mut self.native
-                {
-                    native.note_interpretation(pc, Exit::Interpret, execution.step, true);
-                }
                 (execution, execution.units)
             } else if let Some(exit) = match resume {
+                _ if precise_flags => Some(Exit::Event(Event::DebugFlags)),
                 Some((_, exit)) => Some(exit),
                 None => self.run_native(stop, bridge)?,
             } {
@@ -706,6 +701,13 @@ impl Executor {
                     }
                     #[cfg(not(native))]
                     Exit::FirstVisit => unreachable!("no native dispatch"),
+                    Exit::Untracked => self.interpreter.run_block(
+                        &mut self.state,
+                        &mut self.memory,
+                        units,
+                        stop,
+                        None,
+                    ),
                     Exit::Computation => {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);
@@ -723,15 +725,6 @@ impl Executor {
                         }
                         continue;
                     }
-                    // The helper ran the instruction; the owner completes it.
-                    #[cfg(native)]
-                    Exit::Stepped => {
-                        let execution = self.native.as_mut().and_then(|n| n.pending.take());
-                        let execution = execution.expect("a pending step");
-                        (execution, execution.units)
-                    }
-                    #[cfg(not(native))]
-                    Exit::Stepped => unreachable!("no translated code"),
                     Exit::Event(Event::Exception(vector)) => {
                         interpreted = false;
                         let step = Step::Trap {
@@ -757,21 +750,23 @@ impl Executor {
                         let step = Step::Trap { pc, vector };
                         (Execution { step, units: 0 }, 1)
                     }
-                    Exit::Interpret if self.state.fuel == 0 => continue,
-                    Exit::Interpret | Exit::Event(_) => {
-                        let histogram = if exit == Exit::Event(Event::Replay) {
-                            &mut self.faults
-                        } else {
-                            &mut self.histogram
-                        };
+                    Exit::Event(event) => {
                         let pc = self.state.eip;
-                        *histogram.entry(pc).or_default() += 1;
+                        match event {
+                            Event::Replay => *self.faults.entry(pc).or_default() += 1,
+                            Event::DebugFlags => (),
+                            _ => *self.histogram.entry(pc).or_default() += 1,
+                        }
                         let execution =
                             self.interpreter
                                 .run_chunk(&mut self.state, &mut self.memory, 1);
                         #[cfg(native)]
                         if let Some(native) = &mut self.native {
-                            native.note_interpretation(pc, exit, execution.step, false);
+                            native.note_interpretation(
+                                pc,
+                                event,
+                                matches!(execution.step, Step::InvalidInstruction { .. }),
+                            );
                         }
                         (execution, execution.units)
                     }

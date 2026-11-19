@@ -639,7 +639,6 @@ mod tests {
                     ret_miss: 0,
                     access: 0,
                     call: 0,
-                    interpret: 0,
                     fault: 0,
                     opt_exit: 0,
                 },

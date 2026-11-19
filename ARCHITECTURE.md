@@ -139,7 +139,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | [`native::run` module](crates/adv-cpu-a64/src/native/run.rs) and [`native`](crates/adv-cpu-a64/src/native.rs) | Native entry, host calls and fault recovery | Choosing guest instructions |
 | [`executor`](crates/adv-cpu-a64/src/executor.rs) | The engine's execution owner: core interpreter runs, exits, traps, fuel and deadlines. The arbiter selects first visits (A64-TR-2). | Code generation |
 | [`cpu`](crates/adv-cpu-a64/src/cpu.rs) | `Backend` and `Engine` over the executor, as the machine layer drives them | Scheduling |
-| [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1). Native entries return the exit reason and remaining budget in registers |  |
+| [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1). Native entries return the reason, remaining countdown, shadow pointer and recall deferrals in registers |  |
 | [`cache`](crates/adv-cpu-a64/src/cache.rs) | Executable storage leased from the process code pool, never writable and executable through one mapping (A64-CTL-1, A64-CTL-2) | What code goes into it |
 | [`asm`](crates/adv-cpu-a64/src/asm.rs), [`encode`](crates/adv-cpu-a64/src/encode.rs) | An instruction buffer with labels; `const fn` AArch64 encoders checked against clang vectors | Instruction selection |
 | [`jit_map`](crates/adv-cpu-a64/src/jit_map.rs) | Opt-in maps of placed units for samplers | Changing translation |
@@ -149,6 +149,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | Modules | Responsible for | Not responsible for |
 |---|---|---|
 | [`backend`](crates/adv-cpu-core/src/backend/mod.rs) | The guest CPU interface the machine drives: `Backend::run`, `TrapHandler` and its body and service hooks | Scheduling; anything about Win32 |
+| [`quick`](crates/adv-cpu-core/src/quick.rs) | Common instruction decoding and the fetch window used by first visits and the AArch64 front end | Executing decoded instructions |
 | [`interpreter`](crates/adv-cpu-core/src/interpreter.rs) | Tier 0: predecoded integer execution with restartable faults, also the oracle for differential tests | x87 and SSE arithmetic |
 | [`spin`](crates/adv-cpu-core/src/spin.rs) | Proof of spin backedges shared by Tier 0 and a64 | Scheduling |
 | [`floating`](crates/adv-cpu-core/src/floating.rs), [`state`](crates/adv-cpu-core/src/state.rs) | Exact, transactional x87, SSE and packed-integer execution; executor-independent floating state |  |
@@ -200,7 +201,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 
 The `adv-cpu` facade exposes the AArch64 engine:
 
-- **Tier 0** is a predecoding interpreter shared with the translator. It runs cold code, single steps and every instruction without a native form, and it is the oracle for differential tests.
+- **Tier 0** is a predecoding interpreter shared with the translator. It runs first visits and the events that call for interpreter execution under A64A-FALL-4. It is the oracle for differential tests.
 - **a64** runs on every AArch64 host. An entry runs once in a first-visit executor, and a second visit translates a trace. Guest registers live in fixed host registers, and guest memory is accessed directly through a guarded 4 GiB window. Faults recover from side tables. See [docs/spec/a64.md](docs/spec/a64.md).
 
 The supported product hosts are macOS on Apple silicon, iOS/iPadOS and Android on AArch64.

@@ -114,7 +114,7 @@ fn x87_arithmetic_and_compares_take_full_significands_under_every_control() {
                 same(&native, &oracle);
                 if control & 0x20 != 0 && divisor != 0 {
                     assert_eq!(
-                        native.native.as_ref().unwrap().diagnostics.helpers,
+                        native.native.as_ref().unwrap().diagnostics.interprets,
                         0,
                         "form={form}, case={case}, control={control:#x}, a={a:x?}, b={b:x?}"
                     );
@@ -177,7 +177,7 @@ fn checked_x87_accesses_complete_and_refuse_without_instruction_helpers() {
                 same(&native, &oracle);
                 let diagnostics = &native.native.as_ref().unwrap().diagnostics;
                 assert!(diagnostics.accesses > 0, "form {n} uses access");
-                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.interprets, 0, "form {n} avoids interpret");
                 assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
             }
         }
@@ -234,7 +234,7 @@ fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
                 );
                 same(&native, &oracle);
                 let engine = native.native.as_ref().unwrap();
-                assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+                assert_eq!(engine.diagnostics.interprets, 0, "avoids interpret");
                 assert_eq!(engine.diagnostics.refused, u64::from(fault.is_some()));
                 if checks == Checks::Slow {
                     assert!(engine.diagnostics.accesses > 0, "owner completes accesses");
@@ -308,7 +308,7 @@ fn cached_x87_runs_publish_at_inlined_returns() {
             );
             same(&native, &oracle);
             let engine = native.native.as_ref().unwrap();
-            assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+            assert_eq!(engine.diagnostics.interprets, 0, "avoids interpret");
             let base = engine.unit_address(CODE).unwrap();
             let (_, marks) = units_of(CODE)
                 .into_iter()
@@ -515,7 +515,7 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
         );
         same(&native, &oracle);
         let engine = native.native.as_ref().unwrap();
-        assert_eq!(engine.diagnostics.helpers, 0);
+        assert_eq!(engine.diagnostics.interprets, 0);
         if fault.is_none() {
             assert_eq!(outcome, RunOutcome::ReachedStop);
         } else {
@@ -652,7 +652,7 @@ fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
         same(&native, &oracle);
         assert_ne!(native.state.x87.status & 0x20, 0);
         let engine = native.native.as_ref().unwrap();
-        assert_eq!(engine.diagnostics.helpers, 0);
+        assert_eq!(engine.diagnostics.interprets, 0);
         assert_eq!(
             engine.tier1_versions(CODE),
             1 + usize::from(translate_with_pe)
@@ -937,7 +937,7 @@ fn x87_run_break_nest_keeps_the_steady_path_resident() {
     let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
     let inline = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
     assert_eq!(native.stats.compilations, 1);
-    assert_eq!(engine.diagnostics.helpers, 0);
+    assert_eq!(engine.diagnostics.interprets, 0);
     assert_eq!(
         inline.iter().filter(|m| m.part == Part::X87Entry).count(),
         1
@@ -979,7 +979,7 @@ fn x87_run_break_nest_preserves_middle_iteration_exits() {
                 same(&native, &oracle);
                 if budget == 10000 {
                     let diagnostics = &native.native.as_ref().unwrap().diagnostics;
-                    assert_eq!(diagnostics.helpers, 0);
+                    assert_eq!(diagnostics.interprets, 0);
                     if checks == Checks::Slow {
                         assert!(diagnostics.accesses > 0);
                         assert_eq!(diagnostics.refused, u64::from(fault));
@@ -1194,7 +1194,7 @@ fn x87_outside_helper_arrivals_enter_the_merge_cold() {
                 if budget == 500 && !config.1 {
                     assert_eq!(native.stats.compilations, 1);
                     let engine = native.native.as_ref().unwrap();
-                    assert_eq!(engine.diagnostics.helpers, 0);
+                    assert_eq!(engine.diagnostics.interprets, 0);
                     let base = engine.unit_address(CODE).unwrap();
                     let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
                     let hot: Vec<_> = marks
@@ -1401,7 +1401,6 @@ fn tier1_x87_control_versions_join_and_keep_budget() {
         let native = actual.native.as_ref().unwrap();
         assert_eq!(native.tier1_versions(CODE), versions);
         assert_eq!(native.diagnostics.interprets, 0);
-        assert_eq!(native.diagnostics.helpers, 0);
     }
     actual.memory_mut().protect(CODE, 0x1000, 7).unwrap();
     actual.memory_mut().write(CODE, &program.code[..1]).unwrap();
@@ -1465,7 +1464,6 @@ fn tier1_x87_versions_handle_live_stack_and_deferred_emms() {
         same(&actual, &reference);
         let native = actual.native.as_ref().unwrap();
         assert_eq!(native.diagnostics.interprets, 0);
-        assert_eq!(native.diagnostics.helpers, 0);
     }
     assert_eq!(actual.native.as_ref().unwrap().tier1_versions(CODE), 3);
 }
@@ -1528,7 +1526,7 @@ fn tier1_pending_x87_exception_reports_the_waiting_instruction() {
         reference.run(program.stop, 50)
     );
     same(&actual, &reference);
-    assert_eq!(actual.native.as_ref().unwrap().diagnostics.helpers, 0);
+    assert_eq!(actual.native.as_ref().unwrap().diagnostics.interprets, 0);
 }
 
 // spec: A64A-FALL-2 A64F-FP-5 A64-REG-5
@@ -1558,6 +1556,5 @@ fn tier1_region_mxcsr_uses_another_version() {
         let native = actual.native.as_ref().unwrap();
         assert_eq!(native.tier1_versions(CODE), versions);
         assert_eq!(native.diagnostics.interprets, 0);
-        assert_eq!(native.diagnostics.helpers, 0);
     }
 }

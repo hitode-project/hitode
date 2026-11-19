@@ -1,7 +1,7 @@
 //! Access analysis of quick-decoded operands uses canonical instruction
 //! forms. Only operand fields are needed here, so no guest bytes are decoded.
 
-use adv_cpu_core::interpreter::quick::{Alu, Mem, Narrow8or16, QuickOp, ShiftKind, Src};
+use adv_cpu_core::quick::{Alu, Mem, Narrow8or16, QuickOp, ShiftKind, Src};
 use iced_x86::{Code, CodeSize, ConditionCode, Instruction, OpKind, Register};
 
 fn gpr(index: u8, width: u8) -> Register {

@@ -82,13 +82,10 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("translate/opt/front/simd.rs", "translate::jit"),
     ("translate/opt/front/x87.rs", "translate::jit"),
     # Decoder and interpreter references awaiting their module moves.
-    ("native.rs", "adv_cpu_core::interpreter"),
     ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
     ("translate/front/decode.rs", "translate::jit"),
-    ("translate/front/decode.rs", "adv_cpu_core::interpreter"),
     ("translate/front/plans.rs", "encode"),
     ("translate/front/plans.rs", "translate::jit"),
-    ("translate/front/quick_form.rs", "adv_cpu_core::interpreter"),
     ("translate/front/trace.rs", "translate::jit"),
     # Existing test assemblies and reference interpreters.
     ("executor.rs", "iced_x86 (tests)"),

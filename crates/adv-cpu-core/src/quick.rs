@@ -472,3 +472,12 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<QuickOp> {
         _ => return None,
     })
 }
+
+/// The x87 opcode of an instruction's bytes: the first byte pair whose
+/// first byte is D8 to DF.
+pub fn x87_opcode(bytes: &[u8]) -> Option<u16> {
+    bytes
+        .windows(2)
+        .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
+        .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16)
+}

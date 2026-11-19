@@ -431,13 +431,13 @@ fn run(
         cpu.refresh_mmx();
     }
     let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
-    let (exit, retired) = execute(runtime, cpu, entry, code, optimized, scratch);
+    let (exit, retired, deferred) = execute(runtime, cpu, entry, code, optimized, scratch);
     let elapsed = started.elapsed();
     record_branch(cpu, runtime.branch, cpu.eip);
     context.finish_computation(exit);
     Done {
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
-        deadline_recall: (exit == Exit::Recall || runtime.deferred != 0)
+        deadline_recall: (exit == Exit::Recall || deferred)
             && signals.pending.0.load(Ordering::Acquire)
                 & signals.pending.1
                 & adv_sync::pending::DEADLINE
@@ -485,7 +485,7 @@ fn execute(
     code: &Code,
     optimized: Option<&Optimized>,
     scratch: &mut ExecuteScratch,
-) -> (Exit, u64) {
+) -> (Exit, u64, bool) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
     let code = optimized.map_or(code, |o| &o.code);
@@ -510,7 +510,6 @@ fn execute(
     runtime.completed = 0;
     runtime.opt_recalled = 0;
     runtime.branch = 0;
-    runtime.fault_simd = faults.capture.simd.as_ptr() as u64;
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
@@ -522,7 +521,7 @@ fn execute(
         } else {
             entry.enter
         };
-        target_enter(runtime, code.entry)
+        target_enter.run(runtime, code.entry)
     };
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
@@ -555,14 +554,14 @@ fn execute(
     }
     if exit == Exit::Event(crate::runtime::Event::Replay) {
         let site = super::site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
-        faults.capture.recover(cpu, site, runtime.temps);
+        faults.capture.recover(cpu, site);
         retired -= u64::from(site.refund);
     }
     returned.commit_repeat(cpu);
     if optimized.is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
         cpu.refresh_mmx();
     }
-    (exit, retired)
+    (exit, retired, returned.deferred != 0)
 }
 
 /// How split loops ran, for reports.
@@ -2174,7 +2173,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (fallback.exit, fallback.retired, owner_cpu.eip),
-            (Exit::Interpret, 0, CODE)
+            (Exit::Event(crate::runtime::Event::PendingX87), 0, CODE)
         );
         let mut native_exec = Executor::address_space().unwrap();
         let mut interp_exec = Executor::interpreted_address_space().unwrap();

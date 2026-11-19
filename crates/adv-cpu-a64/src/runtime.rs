@@ -26,15 +26,9 @@
 //! Checked accesses (A64-MEM-7) call `access` when the page class table rules
 //! out the window: it saves every register translated code may keep live,
 //! has the owner's `access` helper perform the access, and returns the
-//! loaded scalar in w0 or vector in `Runtime::access_vector`; refusal
-//! captures v8-v23 as the fault handler does and leaves as for a host fault
-//! at the access, whose site the helper recorded, through its x87 publish
+//! loaded scalar in w0 or the vector in the operand frame. Refusal
+//! captures the register state and leaves through the x87 publication
 //! continuation when present. The stub also preserves the x87 run in v24-v31.
-//!
-//! Instructions the translator leaves to the interpreter call `interpret`
-//! with canonical flags: it stores the guest as `exit` does, has the
-//! owner's `interpret` helper run the instruction, loads the guest back as
-//! `enter` does and returns the helper's status, 0 to continue.
 //!
 //! Units cache SIMD in d8-d15 and v16-v23 (`translate::simd`). They publish
 //! dirty registers before stubs other than `access`, which preserves the
@@ -69,7 +63,7 @@ pub struct Runtime {
     pub cpu: *mut CpuState,
     /// Guest window base, 4 GiB aligned: `x27`.
     pub window: u64,
-    /// Owner shadow return stack or admitted data alias: `x28`.
+    /// Entry shadow stack (also used during dispatch) or worker data alias.
     pub shadow: u64,
     /// Initial safepoint countdown: `x9`.
     pub countdown: u64,
@@ -85,13 +79,9 @@ pub struct Runtime {
     pub shadow_top: u64,
     /// Where `shadow_reset` resumes.
     pub resume: u64,
-    /// `access(runtime, address, site, value, kind) -> value`, called by
-    /// `access`; vectors use `access_vector`, and bit 32 set refuses with
-    /// the publication continuation in `access_resume`.
+    /// Performs checked scalar accesses and transfers vectors through the
+    /// operand frame. A refusal returns the recovery registers and continuation.
     pub access: u64,
-    /// Where a refused access stores v8-v23, as the fault handler captures
-    /// them from a host fault.
-    pub fault_simd: u64,
     /// The page class table: a byte per guest page, its permissions as
     /// `Memory::native_permissions` has them.
     pub classes: u64,
@@ -102,27 +92,15 @@ pub struct Runtime {
     pub plain_pages: u64,
     pub memory_base: u32,
     pub memory_pages: u32,
-    /// `interpret(runtime, helper, countdown) -> status`, called by
-    /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
-    /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
-    /// beyond the one prepaid, signed.
-    pub interpret: u64,
     /// Read the owning bridge's timestamp without publishing guest state.
     pub timestamp: u64,
-    /// Set at a diagnostic helper call site and consumed by that call.
-    pub(crate) helper_cause: u32,
-    /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
-    pub temps: [u64; 2],
     /// The indirect branch that last missed the table: source EIP in the
     /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
     pub branch: u64,
     /// `call(runtime, site, countdown) -> status`, called by `call` for
     /// a host call whose site packs EIP, thunk, INT length and recognition:
-    /// statuses and charges as for `interpret`.
+    /// zero resumes and nonzero carries an exit plus one.
     pub call: u64,
-    /// Values of 8- and 16-byte checked accesses, shared with the owner;
-    /// 16-byte aligned for `ldr q`.
-    pub access_vector: [u8; 16],
     /// `Memory::code_lines`, biased to guest zero: which 64-byte lines of
     /// each page hold watched code.
     pub code_lines: u64,
@@ -132,8 +110,6 @@ pub struct Runtime {
     pub native_batches: u64,
     #[cfg(test)]
     pub vector_regions: u64,
-    /// A refused access's x87 publish continuation, or zero for `fault`.
-    pub access_resume: u64,
     /// What direct bodies receive in x0: the window and `classes`.
     pub body: adv_cpu_core::body::BodyContext,
     pub body_value: u32,
@@ -211,7 +187,6 @@ impl Runtime {
             vector_regions: 0,
             cpu,
             window,
-            access_vector: [0; 16],
             shadow: 0,
             countdown: u64::MAX >> 1,
             host_sp: 0,
@@ -221,8 +196,6 @@ impl Runtime {
             shadow_top: 0,
             resume: 0,
             access: 0,
-            access_resume: 0,
-            fault_simd: 0,
             classes: 0,
             alias: 0,
             alias_classes: 0,
@@ -230,8 +203,6 @@ impl Runtime {
             memory_base: 0,
             memory_pages: 0,
             code_lines: 0,
-            interpret: 0,
-            temps: [0; 2],
             branch: 0,
             body: adv_cpu_core::body::BodyContext::default(),
             body_value: 0,
@@ -266,7 +237,6 @@ impl Runtime {
             resident_discover: 0,
             resident_entries: 0,
             resident_page_crossings: 0,
-            helper_cause: 0,
             value: 0,
             value_access: 0,
             locked_access: 0,
@@ -308,9 +278,30 @@ pub struct OptEntryState {
     pub df: u64,
 }
 
+/// Registers used by a precise fault's side-table recipe.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FaultRegisters {
+    pub simd: [[u8; 16]; 16],
+    pub temps: [u64; 2],
+}
+
+#[cfg(native)]
+#[repr(C)]
+pub(crate) struct AccessResult {
+    /// The loaded scalar, or the x87 publication continuation on refusal.
+    pub value: u64,
+    /// Null on success. On refusal the checked-access stub captures registers here.
+    pub recovery: *mut FaultRegisters,
+}
+
 /// An event at a precise guest instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Instruction fetch failed or the encoding was invalid.
+    Fetch,
+    /// TF or RF requires an exact instruction boundary.
+    DebugFlags,
     /// The fault capture and side table identify the instruction to replay.
     Replay,
     CheckedAccess,
@@ -335,16 +326,49 @@ pub enum PlanEvent {
     BodyStack,
 }
 
-/// Return registers x0 and x1 of the generated entry point.
+/// The generated entry point's return registers, x0 through x3.
 #[cfg(native)]
-#[repr(C)]
 pub(crate) struct RawExit {
     pub reason: u64,
     /// The countdown minus completed refills, which can wrap below zero.
     pub remaining: u64,
+    pub shadow: u64,
+    pub deferred: u64,
+}
+
+#[cfg(native)]
+#[derive(Clone, Copy)]
+pub(crate) struct Enter(pub usize);
+
+#[cfg(native)]
+impl Enter {
+    /// Enters a published stub and unit with the platform call-preserved map.
+    pub(crate) unsafe fn run(self, runtime: *mut Runtime, unit: usize) -> RawExit {
+        let (reason, remaining, shadow, deferred);
+        // SAFETY: the caller keeps the generated code and runtime live. Both
+        // entry stubs preserve the C ABI and return four caller-saved words.
+        unsafe {
+            std::arch::asm!(
+                "blr x16",
+                in("x16") self.0,
+                inlateout("x0") runtime => reason,
+                inlateout("x1") unit => remaining,
+                lateout("x2") shadow,
+                lateout("x3") deferred,
+                clobber_abi("C"),
+            );
+        }
+        RawExit {
+            reason,
+            remaining,
+            shadow,
+            deferred,
+        }
+    }
 }
 
 pub(crate) const REP_BUDGET: u16 = 0x3000;
+pub(crate) const VALUE_MODEL_DISPATCH: u16 = 1;
 
 #[cfg(native)]
 impl RawExit {
@@ -362,14 +386,10 @@ impl RawExit {
 /// Why translated code returned to the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
-    /// Interpret the instruction at EIP, then dispatch.
-    Interpret,
     /// Look up or translate the unit at EIP.
     Dispatch,
     Plan(PlanEvent),
     Event(Event),
-    /// The `interpret` helper left a step for the owner to complete.
-    Stepped,
     /// A completed service call requests an execution-owner yield.
     Yield,
     /// A completed spin backedge requests a productive handoff.
@@ -383,15 +403,17 @@ pub enum Exit {
     Optimized,
     /// Owner dispatch selected a first visit in the core interpreter.
     FirstVisit,
+    /// Owner dispatch selected a mapping whose writes cannot invalidate code.
+    Untracked,
 }
 
 impl Exit {
     pub const fn word(self) -> u16 {
         match self {
-            Self::Interpret => 0,
+            Self::Event(Event::Fetch) => 0,
             Self::Dispatch => 1,
             Self::Event(Event::Replay) => 2,
-            Self::Stepped => 3,
+            Self::Event(Event::DebugFlags) => 3,
             Self::Yield => 4,
             Self::Reschedule => 5,
             Self::Recall => 6,
@@ -399,6 +421,7 @@ impl Exit {
             Self::Budget => 8,
             Self::Optimized => 9,
             Self::FirstVisit => 10,
+            Self::Untracked => 15,
             Self::Event(Event::PendingX87) => 11,
             Self::Plan(PlanEvent::BodyStack) => 12,
             Self::Event(Event::CheckedAccess) => 13,
@@ -417,10 +440,10 @@ impl Exit {
 
     pub fn from_raw(raw: u32) -> Option<Self> {
         match raw {
-            0 => Some(Self::Interpret),
+            0 => Some(Self::Event(Event::Fetch)),
+            3 => Some(Self::Event(Event::DebugFlags)),
             1 => Some(Self::Dispatch),
             2 => Some(Self::Event(Event::Replay)),
-            3 => Some(Self::Stepped),
             4 => Some(Self::Yield),
             5 => Some(Self::Reschedule),
             6 => Some(Self::Recall),
@@ -469,8 +492,7 @@ impl ExecutionContext {
     #[cfg(native)]
     pub(crate) fn finish_computation(&mut self, exit: Exit) {
         self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
-        self.resume =
-            matches!(exit, Exit::Interpret | Exit::Event(_)).then_some((self.cpu.eip, exit));
+        self.resume = matches!(exit, Exit::Event(_)).then_some((self.cpu.eip, exit));
     }
 }
 
@@ -492,8 +514,6 @@ pub struct Stubs {
     pub shadow_reset: usize,
     /// Where a checked access the window cannot take calls the owner.
     pub access: usize,
-    /// Where translated code has the owner interpret an instruction.
-    pub interpret: usize,
     /// Where translated code calls an INT 0x2e handler.
     pub call: usize,
 }
@@ -540,11 +560,6 @@ pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
-const ACCESS_RESUME: u32 = field(offset_of!(Runtime, access_resume));
-pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
-const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
-const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
-const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 const CALL: u32 = field(offset_of!(Runtime, call));
 pub(crate) const TIMESTAMP: u32 = field(offset_of!(Runtime, timestamp));
 #[cfg(test)]
@@ -580,27 +595,6 @@ pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
 pub(crate) const CPU_STATE: u32 = CPU;
-pub(crate) const HELPER_CAUSE: u32 = field(offset_of!(Runtime, helper_cause));
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(u32)]
-pub(crate) enum HelperCause {
-    InstructionForm,
-    OperandValue,
-    SseControlClass,
-}
-
-#[cfg(native)]
-impl HelperCause {
-    pub(crate) fn from_diagnostic(value: u32) -> Self {
-        match value {
-            1 => Self::OperandValue,
-            2 => Self::SseControlClass,
-            _ => Self::InstructionForm,
-        }
-    }
-}
-const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
 const BRANCH: u32 = field(offset_of!(Runtime, branch));
 const REGS: i32 = offset_of!(CpuState, regs) as i32;
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
@@ -678,10 +672,8 @@ pub fn stubs() -> Stubs {
     ]);
     let access = asm.offset();
     emit_access(&mut asm, fault_label);
-    let interpret = asm.offset();
-    emit_interpret(&mut asm, INTERPRET);
     let call = asm.offset();
-    emit_interpret(&mut asm, CALL);
+    emit_call(&mut asm);
     let opt_exit = asm.offset();
     emit_opt_exit(&mut asm);
     Stubs {
@@ -698,15 +690,14 @@ pub fn stubs() -> Stubs {
         ret_miss,
         shadow_reset,
         access,
-        interpret,
     }
 }
 
-/// `interpret` or `call`, by the runtime function at `slot`, called with
+/// The full host-call stub, entered with
 /// x1 its argument and canonical flags. Keeps x7-x9 and x27-x29; the guest
 /// registers and flags are what the owner left in `CpuState`, x0-x6 and
 /// x13-x17 are free.
-fn emit_interpret(asm: &mut Asm, slot: u32) {
+fn emit_call(asm: &mut Asm) {
     asm.emit_all(&[
         stp(X, Pre, r(7), r(8), SP, -32),
         stp(X, Offset, r(9), Reg::LR, SP, 16),
@@ -718,7 +709,7 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
         mov(X, r(0), RUNTIME),
         mov(X, r(1), r(6)),
         mov(X, r(2), r(9)),
-        ldr(X, r(16), RUNTIME, slot),
+        ldr(X, r(16), RUNTIME, CALL),
         // The frame chain records the guest return address for samplers.
         stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
         add_imm(X, RUNTIME, SP, 0, false),
@@ -747,6 +738,7 @@ const LOCKED_ACCESS: u32 = field(offset_of!(Runtime, locked_access));
 const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
 pub(crate) const VALUE_ADDRESS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, address));
 pub(crate) const VALUE_OPERAND: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, operand));
+const _: () = assert!(VALUE_OPERAND.is_multiple_of(16));
 pub(crate) const VALUE_XMM: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, xmm));
 pub(crate) const VALUE_MMX: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mmx));
 pub(crate) const VALUE_REGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, regs));
@@ -758,6 +750,7 @@ pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, m
 pub(crate) enum ValueTarget {
     Float(Option<ValueAccess>),
     Locked,
+    StackSpan { width: u16, push: bool },
 }
 
 pub(crate) fn emit_value_call(
@@ -768,8 +761,9 @@ pub(crate) fn emit_value_call(
     target: ValueTarget,
 ) {
     let (callback, access) = match target {
-        ValueTarget::Float(access) => (VALUE_CALL, access),
-        ValueTarget::Locked => (LOCKED_ACCESS, None),
+        ValueTarget::Float(access) => (Some(VALUE_CALL), access),
+        ValueTarget::Locked => (Some(LOCKED_ACCESS), None),
+        ValueTarget::StackSpan { .. } => (None, None),
     };
     let vectors = (0..8)
         .filter(|n| xmm & (1 << n) != 0)
@@ -812,23 +806,27 @@ pub(crate) fn emit_value_call(
         value_access(asm, width, u16::from(write));
         asm.cbz(W, true, r(0), done.unwrap());
     }
-    asm.emit(movz(W, r(1), index as u16, 0));
-    if index >> 16 != 0 {
-        asm.emit(movk(W, r(1), (index >> 16) as u16, 16));
-    }
-    if matches!(target, ValueTarget::Locked) {
+    if let ValueTarget::StackSpan { width, push } = target {
+        value_access(asm, width, if push { 3 } else { 0 });
+    } else {
+        asm.emit(movz(W, r(1), index as u16, 0));
+        if index >> 16 != 0 {
+            asm.emit(movk(W, r(1), (index >> 16) as u16, 16));
+        }
+        if matches!(target, ValueTarget::Locked) {
+            asm.emit_all(&[
+                mov(W, r(2), r(16)),
+                mov(W, r(3), r(10)),
+                mov(W, r(4), r(11)),
+                mov(W, r(5), r(12)),
+            ]);
+        }
         asm.emit_all(&[
-            mov(W, r(2), r(16)),
-            mov(W, r(3), r(10)),
-            mov(W, r(4), r(11)),
-            mov(W, r(5), r(12)),
+            mov(X, r(0), RUNTIME),
+            ldr(X, r(16), RUNTIME, callback.unwrap()),
+            blr(r(16)),
         ]);
     }
-    asm.emit_all(&[
-        mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, callback),
-        blr(r(16)),
-    ]);
     if let Some(ValueAccess::Write(width)) = access {
         asm.tbz(false, r(0), 8, done.unwrap());
         value_access(asm, width, 2);
@@ -928,6 +926,7 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
         add_imm(X, RUNTIME, SP, 0, false),
         blr(r(16)),
+        mov(X, r(2), r(1)),
         ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
         ldp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
         ldp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
@@ -940,17 +939,17 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
     ]);
     emit_restore_light(asm);
     let refused = asm.label();
-    asm.tbz(true, r(0), 32, refused);
+    asm.cbz(X, true, r(2), refused);
     asm.emit(ret(Reg::LR));
     // Refused: the site faults, with the state exactly that before it,
     // dirty SIMD registers included.
     asm.bind(refused);
-    asm.emit(ldr(X, r(16), RUNTIME, FAULT_SIMD));
+    let temps = offset_of!(FaultRegisters, temps) as i32;
+    asm.emit(stp(X, Offset, r(7), r(8), r(2), temps));
     for n in 0..8u8 {
         let (low, high) = (v(8 + 2 * n), v(9 + 2 * n));
-        asm.emit(stp_v(VSize::Q, Offset, low, high, r(16), 32 * i32::from(n)));
+        asm.emit(stp_v(VSize::Q, Offset, low, high, r(2), 32 * i32::from(n)));
     }
-    asm.emit(ldr(X, r(0), RUNTIME, ACCESS_RESUME));
     asm.cbz(X, false, r(0), fault);
     asm.emit(br(r(0)));
 }
@@ -1107,16 +1106,13 @@ pub(crate) fn emit_load_flags(asm: &mut Asm) {
 
 /// Translated code arrives with the `Exit` in w0 and the guest EIP in w1.
 fn emit_exit(asm: &mut Asm) {
-    asm.emit_all(&[
-        stp(X, Offset, r(7), r(8), RUNTIME, TEMPS),
-        ldr(X, r(16), RUNTIME, CPU),
-        str(W, r(1), r(16), EIP),
-    ]);
+    asm.emit_all(&[ldr(X, r(16), RUNTIME, CPU), str(W, r(1), r(16), EIP)]);
     emit_store_guest(asm, r(16));
     asm.emit_all(&[
         ldr(X, r(1), RUNTIME, COMPLETED),
         sub(X, r(1), r(9), r(1), Lsl, 0),
-        str(X, r(28), RUNTIME, SHADOW),
+        mov(X, r(2), r(28)),
+        ldr(W, r(3), RUNTIME, DEFERRED),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
     ]);
@@ -1167,6 +1163,8 @@ fn emit_opt_exit(asm: &mut Asm) {
         movz(W, r(0), Exit::Optimized.word(), 0),
         ldr(X, r(1), RUNTIME, COMPLETED),
         sub(X, r(1), r(9), r(1), Lsl, 0),
+        mov(X, r(2), r(28)),
+        ldr(W, r(3), RUNTIME, DEFERRED),
         ldr(X, r(16), RUNTIME, HOST_SP),
         mov_sp(SP, r(16)),
     ]);
@@ -1398,7 +1396,7 @@ mod tests {
                 add_imm(W, r(19), r(19), 1, false),
                 sub_imm(X, r(9), r(9), 1, false),
             ]);
-            leave(asm, exit, Exit::Interpret, 0x40_1003);
+            leave(asm, exit, Exit::Event(Event::Fetch), 0x40_1003);
         });
         assert_eq!(emu.x(r(6)), BASE + 0x0012_ff80);
         assert_eq!(emu.x(r(7)), BASE + 0xffff_fffc);
@@ -1408,7 +1406,7 @@ mod tests {
         expected[0] += 1;
         expected[4] -= 4;
         assert_eq!(run.regs, expected);
-        assert_eq!(run.exit, Exit::Interpret.raw());
+        assert_eq!(run.exit, Exit::Event(Event::Fetch).raw());
         assert_eq!(run.countdown, (u64::MAX >> 1) - 1);
     }
 

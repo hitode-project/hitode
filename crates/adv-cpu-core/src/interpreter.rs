@@ -22,7 +22,8 @@ use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod first_visit;
 #[doc(hidden)]
-pub mod quick;
+use crate::memory::accessible;
+use crate::quick::{self, x87_opcode};
 mod registers;
 mod scalar;
 mod simd;
@@ -909,81 +910,10 @@ fn reads_clock(action: Action) -> bool {
     )
 }
 
-/// The x87 opcode of an instruction's bytes: the first byte pair whose
-/// first byte is D8 to DF.
-fn x87_opcode(bytes: &[u8]) -> Option<u16> {
-    bytes
-        .windows(2)
-        .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
-        .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16)
-}
-
-/// One instruction translated code runs through the interpreter without
-/// leaving, decoded when it is translated.
-pub struct Prepared {
-    decoded: Decoded,
-    /// The host-double path of an x87 instruction.
-    x87: Option<crate::floating::NativeX87>,
-}
-
-impl Prepared {
-    /// `instruction`, encoded as `bytes`, unless the interpreter would stop
-    /// at it.
-    pub fn new(instruction: &Instruction, bytes: &[u8]) -> Option<Self> {
-        let decoded = decode(instruction, bytes);
-        let x87 = match decoded {
-            Decoded::Stop(_) => return None,
-            Decoded::Extended(i, crate::floating::Operation::X87, opcode) => {
-                Some(crate::floating::NativeX87 {
-                    instruction: i,
-                    opcode,
-                    fast: crate::floating::fast::classify(&i),
-                })
-            }
-            _ => None,
-        };
-        Some(Self { decoded, x87 })
-    }
-
-    /// Completed instructions and REP elements for diagnostic accounting.
-    pub fn retirement(
-        &self,
-        execution: Execution,
-        state: &CpuState,
-        pc: u32,
-        count: u32,
-    ) -> (u64, u64) {
-        (
-            retired_instruction(&self.decoded, execution, state, pc),
-            rep_elements(&self.decoded, count, state),
-        )
-    }
-
-    /// The x87 opcode (FOP) the instruction records, if it records one.
-    pub fn x87_opcode(&self) -> Option<u16> {
-        self.x87.as_ref().and_then(|op| op.opcode)
-    }
-
-    /// Runs the instruction at `state.eip` as `Interpreter::run_chunk`
-    /// would, a REP for at most `max_units` elements.
-    pub fn execute(&self, state: &mut CpuState, memory: &mut Memory, max_units: u32) -> Execution {
-        if let Some(op) = &self.x87
-            && state.eflags & (1 << 8) == 0
-        {
-            let result = match op.fast {
-                Some(fast) => crate::floating::fast::execute(op, fast, state, memory),
-                None => crate::floating::fast::execute_other(op, state, memory),
-            };
-            if result.is_some() {
-                state.eflags &= !(1 << 16);
-                return Execution {
-                    step: Step::Executed,
-                    units: 1,
-                };
-            }
-        }
-        execute_decoded(&self.decoded, state, memory, max_units, None)
-    }
+/// Whether the interpreter has a semantic implementation of this decoded form.
+#[doc(hidden)]
+pub fn supports(instruction: &Instruction) -> bool {
+    !matches!(decode(instruction, &[]), Decoded::Stop(_))
 }
 
 const BLOCK_INSTRUCTIONS: usize = 64;
@@ -1830,16 +1760,6 @@ pub fn fault_address(memory: &Memory, start: u32, permission: u8) -> u32 {
     } else {
         start
     }
-}
-
-pub fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
-    memory
-        .committed(address, width as usize)
-        .is_ok_and(|range| {
-            memory.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-                .iter()
-                .all(|p| p & permission != 0)
-        })
 }
 
 impl Transaction {

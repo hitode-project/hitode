@@ -154,7 +154,7 @@ fn x87_value_images_cross_guest_pages_with_live_xmm() {
         assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
         same(&native, &oracle);
         assert_eq!(native.stats.interpreter_entries, 0);
-        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 
@@ -291,7 +291,7 @@ fn checked_simd_accesses_complete_and_refuse_without_instruction_helpers() {
                 same(&native, &oracle);
                 let diagnostics = &native.native.as_ref().unwrap().diagnostics;
                 assert!(diagnostics.accesses > 0, "form {n} uses access");
-                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.interprets, 0, "form {n} avoids interpret");
                 assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
                 assert_eq!(
                     matches!(
@@ -427,5 +427,4 @@ fn tier1_mmx_region_loads_canonical_x87_aliases() {
     same(&actual, &reference);
     let native = actual.native.as_ref().unwrap();
     assert_eq!(native.diagnostics.interprets, 0);
-    assert_eq!(native.diagnostics.helpers, 0);
 }

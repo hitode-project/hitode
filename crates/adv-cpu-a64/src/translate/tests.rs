@@ -53,11 +53,6 @@ fn translation_words_match_baseline() {
         a.ja(u64::from(CODE + 0x100)).unwrap();
         a.jmp(dword_ptr(eax * 4 + DATA as i32)).unwrap();
     });
-    let helper = bytes(|a| {
-        a.fxtract().unwrap();
-        a.movzx(ecx, al).unwrap();
-        a.ret().unwrap();
-    });
     let row = bytes(|a| {
         let mut head = a.create_label();
         a.set_label(&mut head).unwrap();
@@ -78,7 +73,6 @@ fn translation_words_match_baseline() {
         lookup_slow: host,
         ret_miss: host,
         access: host,
-        interpret: host,
         fault: host,
         opt_exit: host,
     };
@@ -111,12 +105,6 @@ fn translation_words_match_baseline() {
                 "17ffffe8 10ffff8e 14000000 531e7670 52a00051 0b110210 b8704b70 f9401fb1 ",
                 "4a504206 53003cc6 8b061231 a9404626 cb1000c6 b50000e6 d61f0220 d503201f ",
                 "1000006c 00000000 1000006c 00000000 52800164 72a00024 f2c00044 17ffffd1 ",
-            ),
-            "helper" => concat!(
-                "d1000d29 b7f80169 52800061 97fffffd 350001a0 53001e74 b84046f0 a940479e ",
-                "cb100231 b50001b1 9100439c d65f03c0 91000d29 52800100 52800001 72a00021 ",
-                "17fffff0 91000929 51000400 f94003b1 b9402221 17ffffeb 528000a4 72a00024 ",
-                "f2c00064 17ffffe7 ",
             ),
             "loop" => concat!(
                 "d1001d29 b7f80329 b8794b73 31000673 b83a4b73 31001339 3100135a 51000694 ",
@@ -227,13 +215,32 @@ fn translation_words_match_baseline() {
             .split_ascii_whitespace()
             .map(|word| u32::from_str_radix(word, 16).unwrap())
             .collect();
-        assert_eq!(words, baseline, "{name}");
+        // Runtime field removals relocate field addresses without changing
+        // the instructions that the path executes.
+        let without_runtime_offset = |word: u32| {
+            if word >> 5 & 31 == 29 && matches!(word >> 22, 0x244 | 0x2e4 | 0x2e5 | 0x3e4 | 0x3e5) {
+                word & !(0xfff << 10)
+            } else {
+                word
+            }
+        };
+        assert_eq!(
+            words
+                .iter()
+                .copied()
+                .map(without_runtime_offset)
+                .collect::<Vec<_>>(),
+            baseline
+                .into_iter()
+                .map(without_runtime_offset)
+                .collect::<Vec<_>>(),
+            "{name}"
+        );
     };
     for (name, code, cold, checked) in [
         ("scalar", &scalar, true, false),
         ("checked", &scalar, true, true),
         ("switch", &table, true, false),
-        ("helper", &helper, true, false),
         ("loop", &row, false, false),
     ] {
         let mut mem = memory(code, &CODE.to_le_bytes().repeat(2));
@@ -323,7 +330,6 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             lookup_slow: host,
             ret_miss: host,
             access: host,
-            interpret: host,
             fault: host,
             opt_exit: host,
         };
@@ -377,7 +383,6 @@ fn bytecode_vm_dispatch_instruction_gate() {
         lookup_slow: HOST_CODE as usize,
         ret_miss: HOST_CODE as usize,
         access: HOST_CODE as usize,
-        interpret: HOST_CODE as usize,
         fault: HOST_CODE as usize,
         opt_exit: HOST_CODE as usize,
     };
@@ -905,7 +910,6 @@ impl Harness {
             lookup_slow: addr(self.forbidden),
             ret_miss: addr(self.forbidden),
             access: addr(self.forbidden),
-            interpret: addr(self.forbidden),
             fault: addr(self.forbidden),
             opt_exit: addr(self.forbidden),
         };
@@ -931,7 +935,7 @@ impl Harness {
                 .trace
                 .insts
                 .iter()
-                .any(|i| matches!(i.op, decode::Op::Helper(_))),
+                .any(|i| matches!(i.op, decode::Op::Value(_))),
             "form has no native plan"
         );
         let mut host_code = self.prefix.clone();
@@ -1364,10 +1368,10 @@ fn floating_comparison_masks_cover_predicates_lanes_nan_and_denormal_inputs() {
                         let data = state.xmm[1];
                         let (got, exit, left) = h.run(&code, &data, &state, false);
                         if invalid {
-                            // The owner will interpret the current instruction.
+                            // The owner receives the state before this instruction.
                             let prefix = bytes(|a| a.add(eax, ecx).unwrap());
                             let want = reference(&prefix, &data, &state);
-                            assert_eq!(exit, Exit::Interpret);
+                            assert_eq!(exit, Exit::Dispatch);
                             assert_eq!(left, 99);
                             assert_eq!(got, want);
                         } else {
@@ -1406,7 +1410,7 @@ fn floating_guard_and_snan_bail_before_destination_or_mxcsr_commit() {
                 let prefix = bytes(|a| a.add(eax, ecx).unwrap());
                 let want = reference(&prefix, &[], &state);
                 let (got, exit, left) = h.run(&code, &[], &state, false);
-                assert_eq!(exit, Exit::Interpret);
+                assert_eq!(exit, Exit::Dispatch);
                 assert_eq!(left, 99);
                 assert_eq!(got, want);
             }
@@ -1457,7 +1461,6 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
             lookup_slow: HOST_CODE as usize,
             ret_miss: HOST_CODE as usize,
             access: HOST_CODE as usize,
-            interpret: HOST_CODE as usize,
             fault: HOST_CODE as usize,
             opt_exit: HOST_CODE as usize,
         };
@@ -1552,7 +1555,6 @@ fn j1_unit(code: &[u8]) -> Workspace {
             lookup_slow: at,
             ret_miss: at,
             access: at,
-            interpret: at,
             fault: at,
             opt_exit: at,
         },
@@ -1565,7 +1567,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
     work
 }
 
-// spec: A64F-FP-5 A64-REG-4 A64-REG-5
+// spec: A64A-FALL-5, A64F-FP-5 A64-REG-4 A64-REG-5
 #[cfg(native)]
 #[test]
 fn register_value_call_preserves_cache_within_the_helper_path_count() {
@@ -1597,7 +1599,6 @@ fn register_value_call_preserves_cache_within_the_helper_path_count() {
             lookup_slow: at,
             ret_miss: at,
             access: at,
-            interpret: at,
             fault: at,
             opt_exit: at,
         },
@@ -1652,7 +1653,6 @@ fn shared_lock_value_calls_fit_the_helper_path_count_with_live_xmm() {
                 lookup_slow: at,
                 ret_miss: at,
                 access: at,
-                interpret: at,
                 fault: at,
                 opt_exit: at,
             },
@@ -1858,7 +1858,6 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
             lookup_slow: at,
             ret_miss: at,
             access: at,
-            interpret: at,
             fault: at,
             opt_exit: at,
         };
@@ -2566,7 +2565,7 @@ pub(in crate::translate) mod opt_back {
                 at
             };
             let miss = leave(Exit::Recall);
-            let env_miss = leave(Exit::Interpret);
+            let env_miss = leave(Exit::Budget);
             let at = code.len() * 4;
             let mut words = form.words.clone();
             let branch = |from: usize, to: usize| b(to as i32 - (at + from * 4) as i32);
@@ -2917,7 +2916,7 @@ pub(in crate::translate) mod opt_back {
             memory.map_shared_audio(last, 4096).unwrap();
             snapshot(&mut h, &mut memory);
             cpu.regs[4] = DATA + 0x20000; // A missed fact leaves before reading the frame.
-            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Interpret);
+            assert_eq!(run(&mut h, &form, &cpu, 100, None), Exit::Budget);
             assert_eq!(
                 word(
                     &h,

@@ -44,13 +44,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use adv_cpu_core::backend::OfferGate;
-use adv_cpu_core::interpreter::{Execution, Step, accessible};
+use adv_cpu_core::memory::accessible;
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
-use crate::runtime::{self, Exit, RawExit, ResidentCold, Runtime};
+use crate::runtime::{self, Enter, Exit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
 mod compile;
@@ -81,8 +81,6 @@ const CACHE_LEN: usize = 64 << 20;
 /// deadlines and interrupts while linked units loop.
 pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
-
-type Enter = unsafe extern "C" fn(*mut Runtime, usize) -> RawExit;
 
 fn alias_base(memory: &Memory) -> u64 {
     (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64
@@ -143,7 +141,7 @@ struct FaultCapture {
     /// The site that faulted, written in signal context.
     pc: Cell<usize>,
     /// v8-v23 captured before the fault stub restores host SIMD.
-    simd: Cell<[[u8; 16]; 16]>,
+    registers: Cell<runtime::FaultRegisters>,
 }
 
 fn site_at(sites: &[(usize, Site)], pc: usize) -> Option<Site> {
@@ -177,7 +175,10 @@ impl FaultCapture {
         stub: usize,
         snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
     ) -> usize {
-        self.simd.set(std::array::from_fn(|n| snapshot.simd[8 + n]));
+        self.registers.set(runtime::FaultRegisters {
+            simd: std::array::from_fn(|n| snapshot.simd[8 + n]),
+            temps: [snapshot.gpr[7], snapshot.gpr[8]],
+        });
         self.pc.set(pc);
         if site.resume != 0 {
             // The unit publishes its cached x87 state, then faults.
@@ -187,9 +188,10 @@ impl FaultCapture {
         }
     }
 
-    fn recover(&self, cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
-        recover(cpu, site, temps);
-        for (n, bytes) in self.simd.get().into_iter().enumerate() {
+    fn recover(&self, cpu: &mut CpuState, site: Site) {
+        let registers = self.registers.get();
+        recover(cpu, site, registers.temps);
+        for (n, bytes) in registers.simd.into_iter().enumerate() {
             if site.simd_dirty & (1 << n) == 0 {
                 continue;
             }
@@ -223,7 +225,7 @@ unsafe fn on_fault(
                 Active::Owner(faults) => faults,
             };
             // SAFETY: `run` keeps the pointee alive and unmodified, apart
-            // from the `pc` and `simd` cells, until it clears the slot.
+            // from the fault capture cells, until it clears the slot.
             let faults = unsafe { &*faults };
             if !(faults.start..faults.end.get()).contains(&pc) {
                 return 0;
@@ -355,8 +357,6 @@ pub(crate) enum InterpreterCause {
     InvalidEncoding,
     OperandFault,
     Trap(u8),
-    Timestamp,
-    InstructionForm,
 }
 
 /// One trip through translated code.
@@ -364,6 +364,7 @@ pub(crate) enum InterpreterCause {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Diagnostics {
     pub first_visits: u64,
+    pub untracked: u64,
     pub first_declined: u64,
     pub first_quick_decodes: u64,
     pub first_full_decodes: u64,
@@ -382,9 +383,11 @@ pub(crate) struct Diagnostics {
     pub refused: u64,
     /// Faults at checked sites, refusals included.
     pub checked_faults: u64,
-    /// Instructions `interpret` ran, and the runs it left.
-    pub helpers: u64,
     pub helper_exits: u64,
+    /// Generated exits by raw reason when the JIT map is enabled.
+    pub exit_counts: std::collections::BTreeMap<u16, u64>,
+    pub x87_value_completions: u64,
+    pub x87_value_dispatches: u64,
     /// Proofs whose head loop splits, and how its blocks ran.
     pub split_proofs: u64,
     pub split: offload::SplitCounts,
@@ -464,26 +467,23 @@ fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
     }
 }
 
-/// Called by the `access` stub for a checked access of `kind` the window
-/// cannot take: performs it as the interpreter would, returning a scalar
-/// or transferring a vector through `Runtime::access_vector`. Refusal records
-/// `site` as faulting, supplies its publication continuation in
-/// `Runtime::access_resume` and sets bit 32. Stores to
-/// code are refused too, so the interpreter invalidates the code.
+/// Performs the checked access. Refusal records the fault site and returns
+/// its publication continuation and register capture. Code stores replay
+/// at the owner so the write can invalidate affected units.
 unsafe extern "C" fn access(
     runtime: *mut Runtime,
     address: u32,
     site: usize,
     value: u32,
     kind: u32,
-) -> u64 {
+) -> runtime::AccessResult {
     // SAFETY: as in `dispatch`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
     native.diagnostics.accesses += 1;
     let width = (kind & 31) as usize;
     // SAFETY: the runtime is live; the cold path shares this transfer field.
-    let vector = unsafe { &mut (*runtime).access_vector };
+    let vector = unsafe { &mut (*runtime).value_frame.operand };
     let done = if kind & runtime::ACCESS_STORE != 0 {
         let scalar = value.to_le_bytes();
         let bytes = if width > 4 {
@@ -514,20 +514,23 @@ unsafe extern "C" fn access(
         })
     };
     match done {
-        Some(value) => u64::from(value),
+        Some(value) => runtime::AccessResult {
+            value: u64::from(value),
+            recovery: std::ptr::null_mut(),
+        },
         None => {
             native.diagnostics.refused += 1;
-            native.code.faults.capture.pc.set(site);
-            let resume = native.code.faults.site(site).map_or(0, |site| site.resume);
-            // SAFETY: the runtime is live and translated code is in this helper.
-            unsafe {
-                (*runtime).access_resume = if resume != 0 {
+            let faults = &native.code.faults;
+            faults.capture.pc.set(site);
+            let resume = faults.site(site).map_or(0, |site| site.resume);
+            runtime::AccessResult {
+                value: if resume != 0 {
                     site.wrapping_add_signed(resume as isize) as u64
                 } else {
                     0
-                };
+                },
+                recovery: faults.capture.registers.as_ptr(),
             }
-            1 << 32
         }
     }
 }
@@ -554,6 +557,9 @@ unsafe extern "C" fn value(runtime: *mut Runtime, index: u32) -> u32 {
     match operation.evaluate(&mut runtime.value_frame) {
         adv_cpu_core::floating::ValueOutcome::Complete => {
             if let Some(x87) = x87 {
+                if native.code.slow_paths.is_some() {
+                    native.diagnostics.x87_value_completions += 1;
+                }
                 // SAFETY: the run owns the CPU through its value call.
                 let cpu = unsafe { &mut *runtime.cpu };
                 cpu.x87.clone_from(&runtime.value_frame.x87);
@@ -638,6 +644,7 @@ unsafe extern "C" fn value_access(runtime: *mut Runtime, width: u32, phase: u32)
             adv_cpu_core::floating::check_access(memory, 0, at, bytes.len(), true).is_ok()
                 && !memory.stores_code(at, bytes.len())
         }
+        3 => !memory.stores_code(at, bytes.len()) && memory.write(at, bytes).is_ok(),
         _ => {
             if memory.write(at, bytes).is_err() {
                 return runtime::VALUE_ACCESS_REFUSED;
@@ -646,6 +653,10 @@ unsafe extern "C" fn value_access(runtime: *mut Runtime, width: u32, phase: u32)
             let cpu = unsafe { &mut *runtime.cpu };
             cpu.x87.clone_from(&runtime.value_frame.x87);
             cpu.refresh_mmx();
+            let native = unsafe { &mut *owner.native };
+            if native.code.slow_paths.is_some() {
+                native.diagnostics.x87_value_completions += 1;
+            }
             true
         }
     };
@@ -656,97 +667,11 @@ unsafe extern "C" fn value_access(runtime: *mut Runtime, width: u32, phase: u32)
     }
 }
 
-/// Called by the `interpret` stub: runs helper `index` with the guest in
-/// `CpuState`, a REP for at most the countdown left and the instruction
-/// prepaid. Continues if it completed and changed no code or mapping;
-/// otherwise leaves to dispatch where it went, or with the step for the
-/// owner to complete, refunding the instruction (`Runtime::interpret`).
-unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64) -> u64 {
-    const LEAVE: u32 = Exit::Dispatch.raw() + 1;
-    // SAFETY: as in `dispatch`; the runtime's CPU is live while units run.
-    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
-    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
-    let cpu = unsafe { &mut *(*runtime).cpu };
-    let helper = &native.code.helpers[index as usize];
-    cpu.eip = helper.pc;
-    native.diagnostics.helpers += 1;
-    native.code.helper_counts[index as usize] += 1;
-    if let Some(paths) = &mut native.code.slow_paths {
-        let cause = runtime::HelperCause::from_diagnostic(std::mem::take(unsafe {
-            &mut (*runtime).helper_cause
-        }));
-        *paths.helpers.entry((helper.pc, cause)).or_default() += 1;
-    }
-    let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
-    let units = countdown.saturating_add(1).min(u64::from(u32::MAX)) as u32;
-    let count = cpu.regs[1];
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        helper.prepared.execute(cpu, memory, units)
-    }));
-    if let (Some(forms), Ok(execution)) = (&mut native.retired_forms, &run) {
-        let (retired, elements) = helper
-            .prepared
-            .retirement(*execution, cpu, helper.pc, count);
-        forms[2] += retired;
-        forms[4] += elements;
-    }
-    let (status, charge) = match run {
-        Ok(Execution {
-            step: Step::Executed,
-            units,
-        }) => {
-            let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            let status = if same && cpu.eip == helper.next && cpu.eflags & 0x100 == 0 {
-                0
-            } else {
-                LEAVE
-            };
-            (status, i64::from(units) - 1)
-        }
-        // A host call returns here unless it moved the guest elsewhere,
-        // changed memory, parked or failed (`call_trap`).
-        Ok(Execution {
-            step: Step::Trap { vector, .. },
-            units,
-        }) if !owner.bridge.is_null() => {
-            // SAFETY: the executor's bridge outlives the run and nothing
-            // else uses it while translated code runs.
-            let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
-            let resumes = host(
-                native,
-                memory,
-                bridge,
-                cpu,
-                (epoch, dirty),
-                helper.next,
-                |b, c| call_trap(b, c, u32::from(vector)),
-            );
-            let status = if resumes { 0 } else { LEAVE };
-            (status, i64::from(units) - 1)
-        }
-        Ok(execution) => {
-            native.pending = Some(execution);
-            (Exit::Stepped.raw() + 1, -1)
-        }
-        Err(_) => {
-            owner.error = Some(format!("the interpreter panicked at {:#x}", helper.pc));
-            (LEAVE, -1)
-        }
-    };
-    if native.retired_forms.is_some() {
-        native.helper_units += (charge + 1) as u64;
-    }
-    if status != 0 {
-        native.diagnostics.helper_exits += 1;
-    }
-    (charge as u64) << 32 | u64::from(status)
-}
-
 /// Called by the `call` stub: EIP in bits 0-31, thunk in 32-47, INT length
 /// in 48-51, and bit 63 for an unrecognized INT (A64-CTL-12).
 unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
     const LEAVE: u32 = Exit::Dispatch.raw() + 1;
-    // SAFETY: as in `interpret`.
+    // SAFETY: as in `dispatch`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
     let cpu = unsafe { &mut *(*runtime).cpu };
@@ -760,7 +685,7 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
         cpu.eip = pc;
         return (-1i64 as u64) << 32 | u64::from(LEAVE);
     }
-    // SAFETY: as in `interpret`.
+    // SAFETY: as in `dispatch`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
     // The INT has committed its next PC.
     let next = pc.wrapping_add(u32::from(len));
@@ -860,14 +785,11 @@ pub(crate) struct Native {
     /// Diagnostic counts of how runs end; see `Diagnostics`.
     pub(crate) diagnostics: Diagnostics,
     pub(crate) retired_forms: Option<[u64; 5]>,
-    helper_units: u64,
     /// The memory epoch last classified, and the all-slow test table.
     classified_epoch: Option<u64>,
     classes: Option<Arc<Vec<u8>>>,
     #[cfg(test)]
     classifications: u64,
-    /// The step an `Exit::Stepped` leaves the owner.
-    pub(crate) pending: Option<Execution>,
     /// Stop addresses seen so far; units end before all of them.
     stops: Vec<u32>,
     /// Budget exits an entry needs before it is promoted; zero translates
@@ -890,25 +812,38 @@ pub(crate) struct Native {
 }
 
 impl Native {
-    pub(crate) fn note_interpretation(&mut self, eip: u32, exit: Exit, step: Step, debug: bool) {
+    pub(crate) fn value_histogram(&self) -> FxHashMap<u32, u64> {
+        self.code
+            .slow_paths
+            .as_ref()
+            .map_or_else(FxHashMap::default, |paths| {
+                paths
+                    .values
+                    .iter()
+                    .map(|(&eip, &count)| (eip, count))
+                    .collect()
+            })
+    }
+
+    pub(crate) fn note_interpretation(
+        &mut self,
+        eip: u32,
+        event: runtime::Event,
+        invalid_encoding: bool,
+    ) {
+        use runtime::Event;
         let Some(paths) = &mut self.code.slow_paths else {
             return;
         };
-        let cause = if debug {
-            InterpreterCause::DebugFlags
-        } else if exit == Exit::Event(crate::runtime::Event::Replay) {
-            InterpreterCause::HostFault
-        } else if exit == Exit::Event(crate::runtime::Event::System) {
-            InterpreterCause::System
-        } else {
-            match step {
-                Step::FetchFault { .. } => InterpreterCause::Fetch,
-                Step::InvalidInstruction { .. } => InterpreterCause::InvalidEncoding,
-                Step::ReadFault { .. } | Step::WriteFault { .. } => InterpreterCause::OperandFault,
-                Step::Trap { vector, .. } => InterpreterCause::Trap(vector),
-                Step::ReadTimestamp { .. } => InterpreterCause::Timestamp,
-                _ => InterpreterCause::InstructionForm,
-            }
+        let cause = match event {
+            Event::Replay => InterpreterCause::HostFault,
+            Event::CheckedAccess => InterpreterCause::OperandFault,
+            Event::DebugFlags => InterpreterCause::DebugFlags,
+            Event::PendingX87 => InterpreterCause::Trap(16),
+            Event::System => InterpreterCause::System,
+            Event::Fetch if invalid_encoding => InterpreterCause::InvalidEncoding,
+            Event::Fetch => InterpreterCause::Fetch,
+            _ => unreachable!("completed event"),
         };
         *paths.interpreter.entry((eip, cause)).or_default() += 1;
     }
@@ -938,12 +873,13 @@ impl Native {
                 stats.built, stats.misses, stats.joins,
             );
         }
+        for (&reason, &count) in &self.diagnostics.exit_counts {
+            let exit = Exit::from_raw(u32::from(reason)).expect("recorded exit");
+            let _ = write!(output, " exit {exit:?}={count}");
+        }
         if let Some(paths) = &self.code.slow_paths {
             for (&(eip, cause), &count) in &paths.interpreter {
                 let _ = write!(output, " interpreter {eip:#010x} {cause:?}={count}");
-            }
-            for (&(eip, cause), &count) in &paths.helpers {
-                let _ = write!(output, " helper {eip:#010x} {cause:?}={count}");
             }
             for (&eip, &count) in &paths.values {
                 let _ = write!(output, " value {eip:#010x}={count}");
@@ -978,7 +914,12 @@ impl Native {
                 }
             }
             // SAFETY: same owner and arguments as the Tier-1 stub.
-            unsafe { access(runtime, address, site, value, kind) }
+            let result = unsafe { access(runtime, address, site, value, kind) };
+            if result.recovery.is_null() {
+                result.value
+            } else {
+                1 << 32
+            }
         }
 
         let mut stubs = runtime::stubs();
@@ -1002,14 +943,13 @@ impl Native {
                 (stubs.shadow_reset, "shadow_reset"),
                 (stubs.access, "access"),
                 (access_entry, "resident_access"),
-                (stubs.interpret, "interpret"),
                 (stubs.call, "call"),
             ],
         );
         // SAFETY: `enter` and `opt_enter` follow the C calling convention with
         // the signature of `Enter`; see `runtime::emit_enter` and `emit_opt_enter`.
-        let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
-        let opt_enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.opt_enter) };
+        let enter = Enter(base + stubs.enter);
+        let opt_enter = Enter(base + stubs.opt_enter);
         let mut table = empty_table();
         let shadow = ShadowStack::new()?;
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
@@ -1045,7 +985,6 @@ impl Native {
                     lookup_slow: base + stubs.lookup_slow,
                     ret_miss: base + stubs.ret_miss,
                     access: base + stubs.access,
-                    interpret: base + stubs.interpret,
                     call: base + stubs.call,
                     fault: base + stubs.fault,
                     opt_exit: base + stubs.opt_exit,
@@ -1069,8 +1008,6 @@ impl Native {
                 placed: Vec::new(),
                 work: translate::Workspace::default(),
                 helpers: Vec::new(),
-                helper_counts: Vec::new(),
-                helper_eips: FxHashMap::default(),
                 generation: 0,
                 table,
                 shadow,
@@ -1092,8 +1029,6 @@ impl Native {
             classifications: 0,
             classes: None,
             retired_forms: None,
-            helper_units: 0,
-            pending: None,
             stops: Vec::new(),
             promotion: PROMOTION,
             count_resident_entries: crate::jit_map::enabled(),

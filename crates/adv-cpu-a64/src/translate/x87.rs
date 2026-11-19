@@ -143,9 +143,7 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        if !self.x87_value(helper, None) {
-            self.helper_for(helper, runtime::HelperCause::OperandValue);
-        }
+        self.x87_value(helper, None);
         self.asm.bind(done);
         self.vector = super::simd::Vector::default();
     }
@@ -220,8 +218,8 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
-        if !value_path || !self.x87_value(x.helper, None) {
-            self.helper_for(x.helper, runtime::HelperCause::OperandValue);
+        self.x87_value(x.helper, None);
+        if !value_path {
             self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
         }
         self.asm.bind(done);
@@ -236,17 +234,15 @@ impl Translator<'_> {
 
     /// Evaluate a prepared x87 form, with its memory operand transferred by
     /// checked access calls and its floating state published independently.
-    pub(super) fn x87_value(&mut self, index: u8, pairs: Option<u8>) -> bool {
-        if !self.tier1 {
-            return false;
+    pub(super) fn x87_value(&mut self, index: u8, pairs: Option<u8>) {
+        if self.computation {
+            let inst = self.trace.insts[self.index];
+            self.follow_exit(Exit::Recall, inst.pc, self.trace.owed(self.index), false);
+            return;
         }
         let helper = &self.trace.helpers[usize::from(index)];
-        let Some(operation) = &helper.value else {
-            return false;
-        };
-        let Some(operands) = operation.x87_operands() else {
-            return false;
-        };
+        let operation = helper.value.as_ref().expect("prepared x87 value");
+        let operands = operation.x87_operands().expect("x87 operands");
         let form = operation.decoded_form();
         let memory = operands.access.and(helper.value_mem);
         let flags = operands.flags;
@@ -318,7 +314,6 @@ impl Translator<'_> {
         }
         self.invalidate_mmx();
         self.cpu();
-        true
     }
 
     /// Load canonical state for an instruction outside the cache.

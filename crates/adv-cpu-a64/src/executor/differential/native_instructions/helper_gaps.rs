@@ -145,7 +145,7 @@ fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
                     cpu.protect(DATA, 4096, permissions).unwrap();
                     cpu.state = p.state.clone();
                 }
-                let before = native.native.as_ref().unwrap().diagnostics.helpers;
+                let before = native.native.as_ref().unwrap().diagnostics.interprets;
                 let interpreted = native.stats.interpreter_entries;
                 assert_eq!(
                     native.run(p.stop, 100).unwrap(),
@@ -153,7 +153,10 @@ fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
                 );
                 same(&native, &oracle);
                 if permissions == 3 && checks != Checks::Slow {
-                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, before);
+                    assert_eq!(
+                        native.native.as_ref().unwrap().diagnostics.interprets,
+                        before
+                    );
                     assert_eq!(native.stats.interpreter_entries, interpreted);
                 }
             }
@@ -203,7 +206,7 @@ fn check(program: &Program, config: Config, budget: u64, native_only: bool) {
         if native_only && !config.1 && actual == RunOutcome::ReachedStop {
             assert!(native.stats.native_entries > 0);
             assert_eq!(native.stats.interpreter_entries, 0);
-            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
         }
         if actual == RunOutcome::Budget {
             assert_eq!(
@@ -413,7 +416,7 @@ fn x87_fsqrt_value_preserves_rounded_state() {
         assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
         same(&native, &oracle);
         assert_eq!(native.stats.interpreter_entries, 0);
-        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 
@@ -560,7 +563,7 @@ fn common_forms_microbenchmark() {
         // Compile before measuring.
         assert_eq!(cpu.run(p.stop, 100).unwrap(), RunOutcome::Budget);
         cpu.state = p.state.clone();
-        let helpers = cpu.native.as_ref().unwrap().diagnostics.helpers;
+        let helpers = cpu.native.as_ref().unwrap().diagnostics.interprets;
         let now = Instant::now();
         assert_eq!(
             cpu.run(p.stop, 50_000_000).unwrap(),
@@ -569,7 +572,7 @@ fn common_forms_microbenchmark() {
         println!(
             "W11 form={form} ns/roundtrip={:.3} helpers={}",
             now.elapsed().as_nanos() as f64 / 10_000_000.0,
-            cpu.native.as_ref().unwrap().diagnostics.helpers - helpers
+            cpu.native.as_ref().unwrap().diagnostics.interprets - helpers
         );
     }
 }
@@ -944,7 +947,7 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
                     );
                     same(&a, &b);
                     if !config.1 && !shared && config.2 != Checks::Slow {
-                        assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                     }
                     if !config.1 && shared {
                         assert_eq!(a.stats.interpreter_entries, 0);
@@ -1578,7 +1581,7 @@ fn common_pop_flags_setting_tf_single_steps_the_next_instruction() {
     }
 }
 
-// spec: A64A-FALL-4, A64-VER-1
+// spec: A64A-EXIT-1, A64A-FALL-4, A64-VER-1
 #[test]
 fn system_and_software_events_keep_the_core_outcomes() {
     for (bytes, interpreted) in [
@@ -1604,7 +1607,7 @@ fn system_and_software_events_keep_the_core_outcomes() {
             native.stats.interpreter_entries, interpreted,
             "{bytes:02x?}"
         );
-        assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 

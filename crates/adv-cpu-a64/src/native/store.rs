@@ -78,7 +78,6 @@ pub(super) struct InternalEdge {
 #[derive(Default)]
 pub(super) struct SlowPaths {
     pub(super) interpreter: BTreeMap<(u32, InterpreterCause), u64>,
-    pub(super) helpers: BTreeMap<(u32, runtime::HelperCause), u64>,
     pub(super) values: BTreeMap<u32, u64>,
 }
 
@@ -120,12 +119,8 @@ pub(super) struct CodeStore {
     pub(super) placed: Vec<(usize, u32)>,
     /// Buffers of the last translation.
     pub(super) work: translate::Workspace,
-    /// What the units' `interpret` calls run, until the cache clears,
-    /// and how often each ran.
+    /// Prepared operand operations, indexed by generated value calls.
     pub(super) helpers: Vec<translate::Helper>,
-    pub(super) helper_counts: Vec<u64>,
-    /// Helper runs by EIP from before the last clear.
-    pub(super) helper_eips: FxHashMap<u32, u64>,
     /// Counts cache clears, which invalidate link points.
     pub(super) generation: u64,
     /// The indirect table the runtime points at.

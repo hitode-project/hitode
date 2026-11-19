@@ -68,7 +68,7 @@ pub(super) fn footprint(
         | Op::Timestamp
         | Op::PopFlags(..)
         | Op::Stack(..)
-        | Op::Helper(_)
+        | Op::Value(_)
         | Op::Strings(_)
         | Op::Integer(_)
         | Op::X87(_)

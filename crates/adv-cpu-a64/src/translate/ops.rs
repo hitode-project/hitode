@@ -44,11 +44,7 @@ impl Translator<'_> {
         }
         match inst.op {
             Op::Nop | Op::Pause | Op::Fence | Op::Jmp(_) => {}
-            Op::Helper(index) => {
-                if !self.x87_value(index, None) {
-                    self.helper(index);
-                }
-            }
+            Op::Value(index) => self.x87_value(index, None),
             Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
             Op::Event(event) => {
                 let (event, refund) = match event {
@@ -58,6 +54,10 @@ impl Translator<'_> {
                             len: inst.next_pc.wrapping_sub(inst.pc) as u8,
                         },
                         self.trace.unused(self.index),
+                    ),
+                    EventOp::Exception(vector) => (
+                        runtime::Event::Exception(vector),
+                        self.trace.owed(self.index),
                     ),
                     EventOp::System => (runtime::Event::System, self.trace.owed(self.index)),
                     EventOp::Unsupported(form) => (
@@ -79,7 +79,7 @@ impl Translator<'_> {
                 }
             }
             Op::PopFlags(width) => self.pop_flags(width),
-            Op::Stack(kind, part, width, helper) => self.stack(kind, part, width, helper),
+            Op::Stack(kind, part, width) => self.stack(kind, part, width),
             Op::Lahf => {
                 self.read_flags();
                 self.emit(orr_imm(W, X6, X6, 2));
@@ -270,14 +270,9 @@ impl Translator<'_> {
     }
 
     fn locked(&mut self, mut inst: Inst, mem: Mem, width: u8, helper: u8) {
-        let operation = self
-            .tier1
-            .then(|| self.trace.helpers[usize::from(helper)].locked_value)
-            .flatten();
-        if operation.is_none() {
-            self.flush_simd();
-            self.vector = super::simd::Vector::default();
-        }
+        let operation = self.trace.helpers[usize::from(helper)]
+            .locked_value
+            .expect("prepared locked operation");
         self.vector.cpu = false;
         self.canonicalize();
         *self.uses_permissions = true;
@@ -305,7 +300,7 @@ impl Translator<'_> {
         self.asm.b(done);
         self.asm.bind(slow);
         self.state = State::CANONICAL;
-        if let Some(operation) = operation {
+        {
             let refused = self.leave_for_event(runtime::Event::CheckedAccess);
             self.emit(str(W, address, RUNTIME, runtime::VALUE_ADDRESS));
             let (reads, writes) = operation.registers();
@@ -334,8 +329,6 @@ impl Translator<'_> {
             }
             self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
             runtime::emit_load_flags(self.asm);
-        } else {
-            self.helper(helper);
         }
         self.asm.bind(done);
     }
@@ -450,13 +443,7 @@ impl Translator<'_> {
         self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
     }
 
-    fn stack(
-        &mut self,
-        kind: crate::translate::front::tags::Mnemonic,
-        mut part: Part,
-        width: u8,
-        helper: u8,
-    ) {
+    fn stack(&mut self, kind: crate::translate::front::tags::Mnemonic, mut part: Part, width: u8) {
         use crate::translate::front::tags::Mnemonic as M;
         if kind == M::Push {
             self.push_part(part, width, false);
@@ -537,7 +524,43 @@ impl Translator<'_> {
         }
         self.asm.b(done);
         self.asm.bind(slow);
-        self.helper(helper);
+        self.emit(str(W, X5, RUNTIME, runtime::VALUE_ADDRESS));
+        let slot = |index: u8| runtime::VALUE_OPERAND + u32::from(7 - index) * u32::from(width);
+        if push {
+            for index in 0..8 {
+                self.emit(if width == 4 {
+                    str(W, host(index), RUNTIME, slot(index))
+                } else {
+                    strh(host(index), RUNTIME, slot(index))
+                });
+            }
+        }
+        runtime::emit_value_call(
+            self.asm,
+            0,
+            0,
+            self.x87_live_pairs(),
+            runtime::ValueTarget::StackSpan {
+                width: span as u16,
+                push,
+            },
+        );
+        let refused = self.leave_for_event(runtime::Event::CheckedAccess);
+        self.asm.cbz(W, true, X0, refused);
+        if push {
+            self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
+        } else {
+            for index in [7, 6, 5, 3, 2, 1, 0] {
+                self.emit(if width == 4 {
+                    ldr(W, X6, RUNTIME, slot(index))
+                } else {
+                    ldrh(X6, RUNTIME, slot(index))
+                });
+                self.narrow_write(Part::Reg(index), width, Reg::ZR, X6);
+            }
+            self.emit(add_imm(W, X5, X5, span, false));
+            self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
+        }
         self.asm.bind(done);
     }
 
@@ -1066,24 +1089,6 @@ impl Translator<'_> {
         self.asm.bind(done);
     }
 
-    /// Has the interpreter run the instruction at helper `index` of the
-    /// unit, with canonical flags; leaves when it asks to. Conditional callers
-    /// must also flush before the fork, so their fast path publishes the prefix.
-    pub(super) fn helper(&mut self, index: u8) {
-        if self.computation || self.x87_leaving().is_some() {
-            self.follow_exit(
-                Exit::Interpret,
-                self.trace.insts[self.index].pc,
-                self.trace.owed(self.index),
-                false,
-            );
-            return;
-        }
-        let index = self.helpers + u32::from(index);
-        self.mov_imm(X1, index);
-        self.owner_call(self.stubs.interpret);
-    }
-
     /// Makes the host call through `thunk` whose INT is `inst`, with the
     /// guest synchronized as for a helper (A64-CTL-12).
     fn host_call(&mut self, inst: Inst, thunk: u32) {
@@ -1107,7 +1112,7 @@ impl Translator<'_> {
         self.state = State::CANONICAL;
         let leave = self.asm.label();
         self.asm.cbz(W, true, X0, leave);
-        self.push_cold(Cold::Helper {
+        self.push_cold(Cold::HostCall {
             label: leave,
             refund: self.trace.unused(self.index),
         });
@@ -1887,7 +1892,7 @@ impl Translator<'_> {
                 state: State::CANONICAL,
                 simd_dirty: self.vector.dirty,
                 refund: self.trace.owed(self.index),
-                exit: super::Exit::Interpret,
+                exit: Exit::Event(runtime::Event::CheckedAccess),
                 eip: self.trace.insts[self.index].pc,
                 link: false,
                 x87,
