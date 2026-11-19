@@ -6,8 +6,12 @@
 //! from the entry context with its affine components advanced. Components
 //! are registers, flags, SIMD registers and frame bytes relative to ESP.
 
-use iced_x86::{CpuidFeature, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind};
-use iced_x86::{Register, RflagsBits};
+use std::sync::Arc;
+
+use crate::translate::front::{
+    summary::Summary,
+    tags::{OpAccess, Register, RflagsBits},
+};
 
 use super::super::decode::Op;
 use super::super::integer::Integer;
@@ -75,51 +79,10 @@ fn register(reg: Register) -> Option<(u64, bool)> {
     }
 }
 
-/// How `ins` moves ESP, and whether by an immediate adjustment, or `None`
-/// if it lets a stack address escape. ESP may move only by pushes, pops and
-/// immediate adjustments, and may be read only as a memory base: a block's
-/// frame is a private copy at another address.
-fn stack(ins: &Instruction) -> Option<(i32, bool)> {
-    let adjust = matches!(ins.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
-        && ins.op0_kind() == OpKind::Register
-        && ins.op0_register() == Register::ESP
-        && ins.op1_kind() != OpKind::Register
-        && ins.op1_kind() != OpKind::Memory;
-    let named = (0..ins.op_count())
-        .any(|i| ins.op_kind(i) == OpKind::Register && ins.op_register(i) == Register::ESP);
-    let indexed = (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory)
-        && (ins.memory_index() == Register::ESP
-            || ins.memory_base() == Register::ESP
-                && (ins.memory_index() != Register::None || ins.mnemonic() == Mnemonic::Lea));
-    if named && !adjust || indexed || matches!(ins.mnemonic(), Mnemonic::Leave | Mnemonic::Enter) {
-        return None;
-    }
-    let mut stack = ins.stack_pointer_increment();
-    if adjust {
-        let imm = ins.immediate(1) as i32;
-        stack += if ins.mnemonic() == Mnemonic::Add {
-            imm
-        } else {
-            -imm
-        };
-    }
-    Some((stack, adjust))
-}
-
-/// What `ins` reads and writes, or `None` for state a block cannot
-/// reproduce: x87, MXCSR, segments, system flags, or an escaping stack
-/// address.
-fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decoded> {
-    if ins.cpuid_features().contains(&CpuidFeature::FPU)
-        || matches!(
-            ins.mnemonic(),
-            Mnemonic::Ldmxcsr | Mnemonic::Stmxcsr | Mnemonic::Fxrstor | Mnemonic::Fxsave
-        )
-    {
-        return None;
-    }
-    let (stack, _) = stack(ins)?;
-    let info = info.info(ins);
+/// Effects of one instruction on the components a split block can reproduce.
+fn decoded(ins: &Summary) -> Option<Decoded> {
+    let carried = ins.carried?;
+    let stack = ins.stack?;
     let mut out = Decoded {
         reads: 0,
         defines: 0,
@@ -127,17 +90,17 @@ fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decod
         stack,
         frame: Vec::new(),
     };
-    for used in info.used_memory() {
-        if used.base() == Register::ESP {
-            let size = u32::try_from(used.memory_size().size()).ok()?;
+    for used in &ins.memory {
+        if used.base == Register::ESP {
+            let size = used.width;
             out.frame
-                .push((used.displacement() as i32, size, used.access()));
+                .push((used.displacement as i32, size, used.access));
         }
     }
     let mut mmx = false;
-    for used in info.used_registers() {
-        let reg = used.register();
-        if reg.is_segment_register() && used.access() == OpAccess::Read {
+    for used in &ins.registers {
+        let reg = used.register;
+        if reg.is_segment_register() && used.access == OpAccess::Read {
             continue;
         }
         // ESP is tracked as the frame offset.
@@ -146,7 +109,7 @@ fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decod
         }
         let (bit, full) = register(reg)?;
         mmx |= bit >> MM & 0xff != 0;
-        match used.access() {
+        match used.access {
             OpAccess::Read | OpAccess::CondRead => out.reads |= bit,
             OpAccess::Write if full => {
                 out.defines |= bit;
@@ -162,27 +125,9 @@ fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decod
             OpAccess::None | OpAccess::NoMemAccess => {}
         }
     }
-    out.reads |= flags(ins.rflags_read())?;
-    let modified = flags(ins.rflags_modified())?;
-    // A shift or rotate by a zero count keeps every flag.
-    let counted = matches!(
-        ins.mnemonic(),
-        Mnemonic::Shl
-            | Mnemonic::Sal
-            | Mnemonic::Shr
-            | Mnemonic::Sar
-            | Mnemonic::Rol
-            | Mnemonic::Ror
-            | Mnemonic::Rcl
-            | Mnemonic::Rcr
-            | Mnemonic::Shld
-            | Mnemonic::Shrd
-    );
-    let by_count = counted && {
-        let last = ins.op_count() - 1;
-        ins.op_kind(last) != OpKind::Immediate8 || ins.immediate8() & 31 == 0
-    };
-    if by_count {
+    out.reads |= flags(carried.flags_read)?;
+    let modified = flags(carried.flags_modified)?;
+    if carried.conditional_flags {
         out.reads |= modified;
     } else {
         out.defines |= modified;
@@ -191,7 +136,7 @@ fn decoded(ins: &Instruction, info: &mut InstructionInfoFactory) -> Option<Decod
     if mmx {
         out.defines |= ENV;
         out.writes |= ENV;
-    } else if ins.mnemonic() == Mnemonic::Emms {
+    } else if carried.emms {
         out.writes |= ENV;
     }
     Some(out)
@@ -220,12 +165,11 @@ pub(super) fn independent(
     (affine, still): (u8, u8),
     slots: &[(i32, bool)],
     divisions: &[Option<Division>],
-    instructions: &[Option<Instruction>],
+    instructions: &[Option<Arc<Summary>>],
 ) -> Option<Option<(i32, i32)>> {
     let graph = Graph::build(trace).ok()?;
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
-    let mut info = InstructionInfoFactory::new();
     let mut decoded_at: Vec<Option<Decoded>> = (0..n).map(|_| None).collect();
     for at in (0..n).filter(|&at| lp.inside[at]) {
         let inst = &trace.insts[at];
@@ -247,7 +191,7 @@ pub(super) fn independent(
         {
             return None;
         }
-        decoded_at[at] = Some(decoded(instructions[at].as_ref()?, &mut info)?);
+        decoded_at[at] = Some(decoded(instructions[at].as_deref()?)?);
     }
     // ESP relative to the head on entry to each instruction: every path
     // agrees, and the loop returns to the head with it unchanged.
@@ -329,7 +273,7 @@ pub(super) fn independent(
     // The last block runs the tail on its private frame too.
     if frame_written {
         for at in (0..n).filter(|&at| !lp.inside[at]) {
-            stack(instructions[at].as_ref()?)?;
+            instructions[at].as_ref()?.stack?;
         }
     }
     // Components the loop never writes keep their entry value.

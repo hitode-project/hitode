@@ -225,7 +225,7 @@ impl Translator<'_> {
     }
 
     /// Publish the run's x87 image around its arithmetic leaf, keeping the run open.
-    fn pair_leaf(&mut self, m: iced_x86::Mnemonic, x: X87, bail: Label) {
+    fn pair_leaf(&mut self, m: crate::translate::front::tags::Mnemonic, x: X87, bail: Label) {
         self.x87_publish(self.x87.model, X13);
         if self.vector.dirty != 0 {
             self.emit(msr_nzcv(super::X4));
@@ -235,20 +235,45 @@ impl Translator<'_> {
         self.x87_leaf_call(m, x, bail);
     }
 
-    pub(super) fn x87_leaf_call(&mut self, m: iced_x86::Mnemonic, x: X87, bail: Label) {
+    pub(super) fn x87_leaf_call(
+        &mut self,
+        m: crate::translate::front::tags::Mnemonic,
+        x: X87,
+        bail: Label,
+    ) {
         use crate::encode::Index::{Offset, Post, Pre};
         let code = match m {
-            iced_x86::Mnemonic::Fsin => iced_x86::Code::Fsin,
-            iced_x86::Mnemonic::Fcos => iced_x86::Code::Fcos,
-            iced_x86::Mnemonic::Fsincos => iced_x86::Code::Fsincos,
-            iced_x86::Mnemonic::Fptan => iced_x86::Code::Fptan,
-            iced_x86::Mnemonic::Fpatan => iced_x86::Code::Fpatan,
-            iced_x86::Mnemonic::F2xm1 => iced_x86::Code::F2xm1,
-            iced_x86::Mnemonic::Fyl2x => iced_x86::Code::Fyl2x,
-            iced_x86::Mnemonic::Fyl2xp1 => iced_x86::Code::Fyl2xp1,
-            iced_x86::Mnemonic::Fscale => iced_x86::Code::Fscale,
-            iced_x86::Mnemonic::Fprem => iced_x86::Code::Fprem,
-            _ => iced_x86::Code::Fprem1,
+            crate::translate::front::tags::Mnemonic::Fsin => {
+                crate::translate::front::tags::Code::Fsin
+            }
+            crate::translate::front::tags::Mnemonic::Fcos => {
+                crate::translate::front::tags::Code::Fcos
+            }
+            crate::translate::front::tags::Mnemonic::Fsincos => {
+                crate::translate::front::tags::Code::Fsincos
+            }
+            crate::translate::front::tags::Mnemonic::Fptan => {
+                crate::translate::front::tags::Code::Fptan
+            }
+            crate::translate::front::tags::Mnemonic::Fpatan => {
+                crate::translate::front::tags::Code::Fpatan
+            }
+            crate::translate::front::tags::Mnemonic::F2xm1 => {
+                crate::translate::front::tags::Code::F2xm1
+            }
+            crate::translate::front::tags::Mnemonic::Fyl2x => {
+                crate::translate::front::tags::Code::Fyl2x
+            }
+            crate::translate::front::tags::Mnemonic::Fyl2xp1 => {
+                crate::translate::front::tags::Code::Fyl2xp1
+            }
+            crate::translate::front::tags::Mnemonic::Fscale => {
+                crate::translate::front::tags::Code::Fscale
+            }
+            crate::translate::front::tags::Mnemonic::Fprem => {
+                crate::translate::front::tags::Code::Fprem
+            }
+            _ => crate::translate::front::tags::Code::Fprem1,
         };
         let sp = Reg::new(31);
         self.emit_all(&[

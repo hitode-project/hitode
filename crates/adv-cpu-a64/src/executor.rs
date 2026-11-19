@@ -357,8 +357,9 @@ impl Executor {
         #[cfg(native)]
         if let Some(native) = &self.native {
             return format!(
-                "{:?} unchecked faults {} checked {}",
+                "{:?} translation_decodes {:?} unchecked faults {} checked {}",
                 native.diagnostics,
+                native.translation_decodes(),
                 native.unchecked_faults,
                 native.checked_count()
             );
@@ -389,21 +390,14 @@ impl Executor {
     }
 
     /// The form of the instruction at `eip` as the code there decodes now.
-    pub fn instruction_form(&self, eip: u32) -> Option<iced_x86::Code> {
-        let mut bytes = [0; 15];
-        let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-        if self.memory.read_into(eip, &mut bytes).is_err() {
-            self.memory.read_into(eip, &mut bytes[..page]).ok()?;
-        }
-        let mut decoder =
-            iced_x86::Decoder::with_ip(32, &bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
-        Some(decoder.decode().code())
+    pub fn instruction_form(&self, eip: u32) -> Option<crate::translate::front::tags::Code> {
+        crate::translate::front::instruction_form(&self.memory, eip)
     }
 
     /// Instructions by form, most frequent first, as the code at their
     /// EIPs decodes now: those interpreted after an exit, after a fault, or
     /// (`which` 2) run by helpers.
-    pub fn interpreted_forms(&self, which: u8) -> Vec<(iced_x86::Code, u64)> {
+    pub fn interpreted_forms(&self, which: u8) -> Vec<(crate::translate::front::tags::Code, u64)> {
         let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
         #[cfg(native)]
         let helpers = self
@@ -419,20 +413,9 @@ impl Executor {
             _ => &helpers,
         };
         for (&eip, &count) in histogram {
-            let mut bytes = [0; 15];
-            let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-            if self.memory.read_into(eip, &mut bytes).is_err()
-                && self.memory.read_into(eip, &mut bytes[..page]).is_err()
-            {
-                continue;
+            if let Some(form) = self.instruction_form(eip) {
+                *forms.entry(form).or_default() += count;
             }
-            let mut decoder = iced_x86::Decoder::with_ip(
-                32,
-                &bytes,
-                u64::from(eip),
-                iced_x86::DecoderOptions::NONE,
-            );
-            *forms.entry(decoder.decode().code()).or_default() += count;
         }
         let mut forms: Vec<_> = forms.into_iter().collect();
         forms.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));

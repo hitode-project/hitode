@@ -21,7 +21,10 @@
 //! state to the interpreter. Source overrides use FS's thread base or the
 //! flat segment base. Word address-size overrides stay with the interpreter.
 
-use iced_x86::{Code, Instruction, Register};
+#[cfg(test)]
+use super::front::plans::strings as plan;
+#[cfg(test)]
+use iced_x86::Instruction;
 
 use crate::asm::Label;
 use crate::encode::Shift::Lsl;
@@ -76,54 +79,6 @@ const EAX: u8 = 0;
 const ECX: u8 = 1;
 const ESI: u8 = 6;
 const EDI: u8 = 7;
-
-/// The string instruction `instruction` is, when the loop handles it.
-pub fn plan(instruction: &Instruction, helper: u8) -> Option<Strings> {
-    use Code::*;
-    let (kind, width) = match instruction.code() {
-        Movsb_m8_m8 => (Kind::Movs, 1),
-        Movsw_m16_m16 => (Kind::Movs, 2),
-        Movsd_m32_m32 => (Kind::Movs, 4),
-        Stosb_m8_AL => (Kind::Stos, 1),
-        Stosw_m16_AX => (Kind::Stos, 2),
-        Stosd_m32_EAX => (Kind::Stos, 4),
-        Lodsb_AL_m8 => (Kind::Lods, 1),
-        Lodsw_AX_m16 => (Kind::Lods, 2),
-        Lodsd_EAX_m32 => (Kind::Lods, 4),
-        Scasb_AL_m8 => (Kind::Scas, 1),
-        Scasw_AX_m16 => (Kind::Scas, 2),
-        Scasd_EAX_m32 => (Kind::Scas, 4),
-        Cmpsb_m8_m8 => (Kind::Cmps, 1),
-        Cmpsw_m16_m16 => (Kind::Cmps, 2),
-        Cmpsd_m32_m32 => (Kind::Cmps, 4),
-        _ => return None,
-    };
-    // ESI in its default segment, and 32-bit addresses.
-    use iced_x86::OpKind::{MemoryESDI, MemorySegDI, MemorySegSI};
-    let short = (0..instruction.op_count()).any(|n| {
-        matches!(
-            instruction.op_kind(n),
-            MemorySegSI | MemorySegDI | MemoryESDI
-        )
-    });
-    if short || instruction.has_lock_prefix() {
-        return None;
-    }
-    let rep = match (instruction.has_rep_prefix(), instruction.has_repne_prefix()) {
-        (false, false) => Rep::None,
-        (true, false) => Rep::Rep,
-        (false, true) => Rep::Repne,
-        _ => return None,
-    };
-    Some(Strings {
-        kind,
-        width,
-        rep,
-        helper,
-        fs: matches!(kind, Kind::Movs | Kind::Lods | Kind::Cmps)
-            && instruction.segment_prefix() == Register::FS,
-    })
-}
 
 impl Translator<'_> {
     pub(super) fn strings(&mut self, op: Strings) {

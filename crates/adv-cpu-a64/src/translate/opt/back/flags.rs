@@ -1,6 +1,6 @@
 //! Tests read lazy producers; only recovery constructs a guest EFLAGS word.
 use super::*;
-use iced_x86::ConditionCode as CC;
+use crate::translate::front::tags::ConditionCode as CC;
 
 // Positive conditions: O, B, E, BE, S, P, L, LE; their partners invert.
 // A cleared mask bit selects a recipe over just the needed guest status bits.

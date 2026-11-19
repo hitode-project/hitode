@@ -39,7 +39,7 @@ fn initial() -> CpuState {
     }
 }
 
-// spec: A64-VER-1
+// spec: A64A-ROLE-2, A64-VER-1
 #[test]
 fn translation_words_match_baseline() {
     let scalar = bytes(|a| {
@@ -244,42 +244,38 @@ fn translation_words_match_baseline() {
             ..Workspace::default()
         };
         work.unit.images.push((CODE, 0x30000));
-        translate(
-            &mut work,
+        let mut decodes = front::Decodes::default();
+        work.unit.build_cached(
             &mut mem,
             CODE,
             &[CODE + code.len() as u32],
+            &|_, _| None,
+            &|_| None,
+            !cold,
+            &mut decodes,
+        );
+        lower_unit(
+            &mut work.code,
+            &work.unit,
+            CODE,
             &|_| checked,
             3,
             Features { flagm: true },
             host,
             stubs,
-            &|_, _| None,
-            &|_| None,
-            &|_, _| Vec::new(),
             0x037f,
             false,
+            true,
         );
         compare(name, work.words());
 
         #[cfg(native)]
         if name == "loop" {
-            work.unit.trace.x86 = work
-                .unit
-                .trace
-                .insts
-                .iter()
-                .map(|inst| {
-                    let offset = (inst.pc - CODE) as usize;
-                    Some(
-                        iced_x86::Decoder::with_ip(32, &code[offset..], inst.pc.into(), 0).decode(),
-                    )
-                })
-                .collect();
+            work.unit.summarize(&mut decodes);
             let trace = &work.unit.trace;
             let mut proof = computation::Proof::build(trace).unwrap();
             proof.prove_split(trace, |pc, _| {
-                trace.x86[trace.insts.iter().position(|i| i.pc == pc)?]
+                trace.x86[trace.insts.iter().position(|i| i.pc == pc)?].clone()
             });
             let at = initial();
             let built = opt::front::build(&work.unit, &proof, &at).unwrap();
@@ -675,7 +671,7 @@ impl Harness {
                     "entry satisfies proof"
                 );
                 let lowered = lower_computation(
-                    &mut work.unit,
+                    &work.unit,
                     &mut computation_code,
                     CODE,
                     Features { flagm },
@@ -1450,7 +1446,7 @@ fn proved_divisions_leave_unadmitted_values_to_the_ordinary_form() {
 fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites() {
     for (memory_divisor, simd) in [(false, false), (true, true)] {
         let guest = proved_division_code(memory_divisor, simd);
-        let mut work = j1_unit(&guest);
+        let work = j1_unit(&guest);
         let proof = computation::Proof::build(&work.unit.trace).unwrap();
         let at = HOST_CODE as usize;
         let stubs = Stubs {
@@ -1469,7 +1465,7 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
         for facts in [None, Some(&proof)] {
             let mut code = Code::default();
             lower_computation(
-                &mut work.unit,
+                &work.unit,
                 &mut code,
                 CODE,
                 Features { flagm: false },
@@ -3018,7 +3014,7 @@ pub(in crate::translate) mod opt_back {
         proof.prove_split(&unit.trace, |pc, len| {
             let start = (pc - CODE) as usize;
             let bytes = &code[start..start + len as usize];
-            Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+            crate::translate::front::summary::from_bytes(bytes, pc)
         });
         let built = opt::front::build(&unit, &proof, at).unwrap();
         inline::check_guest_snapshots(&built.func, &built.assumed, at);

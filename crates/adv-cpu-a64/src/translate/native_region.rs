@@ -4,7 +4,6 @@
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 use adv_cpu_core::native_region::{Affine, Aliasing, NativeRegion};
 
-use super::trace::{Edge, Mode, Next};
 use super::*;
 
 const MINIMUM: u32 = 128;
@@ -12,55 +11,6 @@ const MAXIMUM: u32 = 1024;
 const SP: Reg = Reg::new(31);
 const ADDRESS: Reg = Reg::new(7);
 const FRAME: Reg = Reg::new(8);
-
-impl Unit {
-    pub(super) fn prepare_regions(
-        &mut self,
-        memory: &adv_cpu_core::Memory,
-        admit: &dyn Fn(u32, &[u8]) -> Vec<NativeRegion>,
-        checked: &dyn Fn(u32) -> bool,
-    ) {
-        for start in 0..self.trace.primary {
-            if !self.trace.merge[start] {
-                continue;
-            }
-            let Some(end) = (start..self.trace.primary)
-                .find(|&n| self.trace.insts[n].taken == Some(Edge::Internal(start)))
-            else {
-                continue;
-            };
-            let body = &self.trace.insts[start..=end];
-            if body.iter().enumerate().any(|(n, i)| {
-                i.mode != Mode::Plain
-                    || i.call.is_some()
-                    || matches!(
-                        i.op,
-                        super::decode::Op::Helper(_) | super::decode::Op::Parts(_)
-                    )
-                    || checked(i.pc)
-                    || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))
-                    || (n + 1 != body.len()
-                        && (i.next != Next::Fall
-                            || i.taken.is_some()
-                            || i.next_pc != body[n + 1].pc))
-            }) {
-                continue;
-            }
-            let pc = body[0].pc;
-            let Some(len) = body.last().unwrap().next_pc.checked_sub(pc) else {
-                continue;
-            };
-            let Ok(bytes) = memory.read(pc, len as usize) else {
-                continue;
-            };
-            for region in admit(pc, bytes) {
-                if region.instructions() as usize == body.len() {
-                    self.regions.push((start, region));
-                }
-            }
-        }
-    }
-}
 
 impl Translator<'_> {
     fn region_address(&mut self, address: Affine, region: NativeRegion) -> Reg {
@@ -91,7 +41,13 @@ impl Translator<'_> {
         let regions: Vec<_> = self
             .regions
             .iter()
-            .filter_map(|&(at, region)| (at == index).then_some(region))
+            .filter_map(|&(at, region)| {
+                (at == index
+                    && !self.trace.insts[at..at + region.instructions() as usize]
+                        .iter()
+                        .any(|inst| (self.checked)(inst.pc)))
+                .then_some(region)
+            })
             .collect();
         if regions.is_empty() {
             return;

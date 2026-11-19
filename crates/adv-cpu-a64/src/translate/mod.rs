@@ -2,7 +2,7 @@
 //!
 //! The front end builds a [`Unit`]: `trace` picks the guest instructions
 //! and analyses them, and `tables` finds the switch tables they index. A
-//! [`Backend`] lowers it (A64-TR-7). The JIT back end, [`Jit`], emits the
+//! [`Jit`] lowers the front end's unit (A64A-ROLE-2). It emits the
 //! instructions in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
@@ -44,7 +44,8 @@ mod body;
 mod channels;
 #[cfg(native)]
 pub(crate) mod computation;
-mod decode;
+pub(crate) mod front;
+use front::{decode, trace};
 mod flags;
 mod fp_class;
 mod integer;
@@ -57,13 +58,13 @@ pub(crate) mod parts;
 mod residency;
 mod simd;
 mod strings;
-pub(crate) mod tables;
+mod tables;
 #[cfg(all(test, emulator))]
 mod tests;
-mod trace;
 mod x87;
 
-use iced_x86::ConditionCode;
+pub use front::Unit;
+use front::tags::ConditionCode;
 
 pub(crate) use decode::Fetcher;
 pub use decode::Helper;
@@ -124,60 +125,6 @@ pub struct Site {
     pub opt_record: Option<u32>,
 }
 
-/// A unit as the front end leaves it, for a back end to lower (A64-TR-7):
-/// its trace with the analysis back ends share, and the switch tables it
-/// may index directly.
-#[derive(Default)]
-pub struct Unit {
-    /// The executable images, whose read-only tables may be indexed.
-    pub(crate) images: Vec<(u32, u32)>,
-    pub(crate) tables: Vec<tables::Table>,
-    pub(crate) trace: Trace,
-    regions: Vec<(usize, adv_cpu_core::native_region::NativeRegion)>,
-}
-
-impl Unit {
-    /// Traces the unit at `eip`, ending before any of `stops`. Each byte
-    /// the unit depends on is registered with `watch_code`, so a store to
-    /// it reaches the owner. `host`, `redirect` and `loops` are as for
-    /// [`Trace::build`].
-    pub fn build(
-        &mut self,
-        memory: &mut adv_cpu_core::memory::Memory,
-        eip: u32,
-        stops: &[u32],
-        host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<Redirect>,
-        loops: bool,
-    ) {
-        self.regions.clear();
-        self.trace.build(memory, eip, stops, host, redirect, loops);
-        tables::prepare(self, memory);
-        for &(start, len) in &self.trace.code {
-            memory.watch_code(start, len as usize);
-        }
-    }
-
-    /// Guest bytes the unit depends on, as sorted
-    /// (address, length) spans.
-    pub fn code(&self) -> &[(u32, u32)] {
-        &self.trace.code
-    }
-
-    /// What the unit's `interpret` calls run, from the base index its
-    /// back end was given.
-    pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
-        self.trace.helpers.drain(..)
-    }
-}
-
-/// A translator back end (A64-TR-7).
-pub trait Backend {
-    /// Lowers `unit`, traced from `eip`. A back end records where it put
-    /// the unit's tables in them.
-    fn lower(&mut self, unit: &mut Unit, eip: u32);
-}
-
 /// The last unit translated, in buffers the next translation reuses.
 #[derive(Default)]
 pub struct Workspace {
@@ -204,6 +151,7 @@ pub struct Code {
     retired: u32,
     pub(crate) uses_permissions: bool,
     resident_links: bool,
+    pub(crate) table_positions: Vec<(usize, usize)>,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -264,12 +212,6 @@ impl Workspace {
     /// Where each stretch of the unit starts, for samplers.
     pub fn marks(&self) -> &[Mark] {
         &self.code.marks
-    }
-
-    /// What the unit's `interpret` calls run, from the base index
-    /// `translate` was given on.
-    pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
-        self.unit.helpers()
     }
 }
 
@@ -558,7 +500,8 @@ struct Translator<'a> {
     links: &'a mut Vec<Link>,
     internal_links: &'a mut Vec<InternalLink>,
     internal_targets: Vec<Label>,
-    tables: &'a mut Vec<tables::Table>,
+    tables: &'a [front::tables::Table],
+    table_positions: &'a mut [(usize, usize)],
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
     checked: &'a dyn Fn(u32) -> bool,
@@ -622,13 +565,39 @@ pub fn translate(
 ) {
     work.unit
         .build(memory, eip, stops, host, redirect, !work.cold);
-    work.unit.prepare_regions(memory, admit, checked);
-    work.code.resident_links = work.resident_links;
-    if work.resident_links {
-        work.unit.trace.observe_resident_links();
-    }
+    work.unit.prepare_regions(memory, admit);
+    lower_unit(
+        &mut work.code,
+        &work.unit,
+        eip,
+        checked,
+        helpers,
+        features,
+        at,
+        stubs,
+        control,
+        pe,
+        work.resident_links,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_unit(
+    code: &mut Code,
+    unit: &Unit,
+    eip: u32,
+    checked: &dyn Fn(u32) -> bool,
+    helpers: u32,
+    features: Features,
+    at: usize,
+    stubs: Stubs,
+    control: u16,
+    pe: bool,
+    resident_links: bool,
+) {
+    code.resident_links = resident_links;
     Jit {
-        code: &mut work.code,
+        code,
         features,
         at,
         stubs,
@@ -639,7 +608,7 @@ pub fn translate(
         #[cfg(native)]
         proof: None,
     }
-    .lower(&mut work.unit, eip);
+    .lower_form(unit, eip, false);
 }
 
 /// The JIT back end: A64 code for host address `at`, with the parameters
@@ -657,14 +626,8 @@ pub struct Jit<'a> {
     proof: Option<&'a computation::Proof>,
 }
 
-impl Backend for Jit<'_> {
-    fn lower(&mut self, unit: &mut Unit, eip: u32) {
-        self.lower_form(unit, eip, false);
-    }
-}
-
 impl Jit<'_> {
-    fn lower_form(&mut self, unit: &mut Unit, eip: u32, computation: bool) {
+    fn lower_form(&mut self, unit: &Unit, eip: u32, computation: bool) {
         self.code.asm.reset();
         self.code.x87.reset(unit.trace.len());
         while self.emit_unit(unit, eip, computation) {
@@ -673,7 +636,7 @@ impl Jit<'_> {
     }
 
     /// Emits the unit, reporting whether a wider branch requires a new layout.
-    fn emit_unit(&mut self, unit: &mut Unit, eip: u32, computation: bool) -> bool {
+    fn emit_unit(&mut self, unit: &Unit, eip: u32, computation: bool) -> bool {
         let Code {
             asm,
             x87: x87_scratch,
@@ -687,13 +650,13 @@ impl Jit<'_> {
             retired,
             uses_permissions,
             resident_links,
+            table_positions,
         } = &mut *self.code;
-        let Unit {
-            trace,
-            tables,
-            regions,
-            ..
-        } = unit;
+        let trace = unit.jit_trace(*resident_links && !computation);
+        let tables = if computation { &[][..] } else { &unit.tables };
+        let regions = if computation { &[][..] } else { &unit.regions };
+        table_positions.clear();
+        table_positions.resize(tables.len(), (0, 0));
         *uses_permissions = false;
         labels.clear();
         labels.extend((0..trace.len()).map(|_| asm.label()));
@@ -716,6 +679,7 @@ impl Jit<'_> {
             internal_links,
             internal_targets: Vec::new(),
             tables,
+            table_positions,
             stubs: self.stubs,
             checked: self.checked,
             regions,
@@ -771,7 +735,7 @@ pub(crate) struct ComputationCode<'a> {
 
 #[cfg(native)]
 pub(crate) fn lower_computation<'a>(
-    unit: &mut Unit,
+    unit: &Unit,
     code: &'a mut Code,
     eip: u32,
     features: Features,

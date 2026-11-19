@@ -5,15 +5,21 @@
 //! and `plan`. Whatever `quick` accepts, iced and `plan` decode to the same
 //! `Op` and length (`quick_agrees_with_iced`).
 
+use super::{quick_form, summary::Summary};
 pub use adv_cpu_core::interpreter::quick::{Alu, Mem, Narrow8or16, ShiftKind, Src};
-use adv_cpu_core::interpreter::{Prepared, quick::QuickOp};
+use adv_cpu_core::interpreter::{
+    Prepared,
+    quick::{QuickOp, Window},
+};
 use adv_cpu_core::memory::Memory;
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
     Register,
 };
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
-use super::flags::FlagSet;
+use crate::translate::flags::FlagSet;
 
 pub const ESP: u8 = 4;
 pub const EBP: u8 = 5;
@@ -87,16 +93,16 @@ pub enum Op {
     /// `cld` (false) or `std`.
     Direction(bool),
     /// An MMX or SSE instruction.
-    Simd(super::simd::Simd),
+    Simd(crate::translate::simd::Simd),
     /// A string instruction, perhaps repeated.
-    Strings(super::strings::Strings),
-    Integer(super::integer::Integer),
+    Strings(crate::translate::strings::Strings),
+    Integer(crate::translate::integer::Integer),
     /// An x87 instruction `fast::classify` accepts.
-    X87(super::x87::X87),
+    X87(crate::translate::x87::X87),
     /// An exact signed 64-bit integer load into the extended x87 stack.
     Fild64(Mem, u8, Option<u16>),
     /// A native integer instruction over partial operands (A64-TR-4).
-    Parts(super::parts::Parts),
+    Parts(crate::translate::parts::Parts),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -108,7 +114,7 @@ fn gpr32(register: Register) -> Option<u8> {
     register.is_gpr32().then(|| register.number() as u8)
 }
 
-pub(super) fn memory(instruction: &Instruction) -> Option<Mem> {
+pub(in crate::translate) fn memory(instruction: &Instruction) -> Option<Mem> {
     // The flat execution profile gives every segment except FS a zero base.
     let fs = match instruction.segment_prefix() {
         Register::FS => true,
@@ -139,7 +145,7 @@ pub(super) fn memory(instruction: &Instruction) -> Option<Mem> {
 
 /// The same address model, also accepting word address registers. Wrapping
 /// precedes the segment base, as in the interpreter's `Address::resolve_regs`.
-pub(super) fn memory_sized(instruction: &Instruction) -> Option<Mem> {
+pub(in crate::translate) fn memory_sized(instruction: &Instruction) -> Option<Mem> {
     let mut normalized = *instruction;
     let word = instruction.memory_base().is_gpr16() || instruction.memory_index().is_gpr16();
     if instruction.memory_base().is_gpr16() {
@@ -166,7 +172,7 @@ fn narrow_width(instruction: &Instruction) -> Option<u8> {
 }
 
 /// Operand `n` of an integer instruction of `width` bytes.
-pub(super) fn part(instruction: &Instruction, n: u32, width: u8) -> Option<Part> {
+pub(in crate::translate) fn part(instruction: &Instruction, n: u32, width: u8) -> Option<Part> {
     let mask = match width {
         1 => 0xff,
         2 => 0xffff,
@@ -485,12 +491,17 @@ fn mov(dst: Src, src: Src) -> Op {
 }
 
 /// The planned operation and length for a common instruction.
+#[cfg(test)]
 pub fn quick(bytes: &[u8], pc: u32) -> Option<(Op, u32)> {
     let (op, len) = adv_cpu_core::interpreter::quick::quick(bytes, pc)?;
-    let op = match op {
-        QuickOp::Nop => Op::Nop,
+    Some((plan_quick(op), len))
+}
+
+fn plan_quick(op: QuickOp) -> Op {
+    match op {
+        QuickOp::Nop | QuickOp::NopOperand(..) => Op::Nop,
         QuickOp::Pause => Op::Pause,
-        QuickOp::Mov(a, b) => Op::Mov(a, b),
+        QuickOp::Mov(dst, src) => mov(dst, src),
         QuickOp::Lea(a, b) => Op::Lea(a, b),
         QuickOp::Alu(a, b, c) => Op::Alu(a, b, c),
         QuickOp::Step(a, b) => Op::Step(a, b),
@@ -504,154 +515,287 @@ pub fn quick(bytes: &[u8], pc: u32) -> Option<(Op, u32)> {
         QuickOp::Jmp(a) => Op::Jmp(a),
         QuickOp::Call(a) => Op::Call(a),
         QuickOp::Jcc(condition, target) => Op::Jcc(Cc::Flags(condition), target),
-        QuickOp::Ret(a) => Op::Ret(a),
+        QuickOp::Ret(bytes) => Op::Ret(bytes.unwrap_or(0)),
         QuickOp::JmpIndirect(a) => Op::JmpIndirect(a),
         QuickOp::CallIndirect(a) => Op::CallIndirect(a),
         QuickOp::Setcc(condition, dst) => Op::Setcc(condition, dst),
         QuickOp::Cmov(condition, dst, src) => Op::Cmov(condition, dst, src),
-        QuickOp::Shift(a, b, c) => Op::Shift(a, b, c),
+        QuickOp::Shift(_, Src::Reg(_), Some(0)) => Op::Nop,
+        QuickOp::Shift(kind, dst, count) => Op::Shift(kind, dst, count),
         QuickOp::Imul(a, b, c) => Op::Imul(a, b, c),
         QuickOp::Carry(a, b, c) => Op::Carry(a, b, c),
-    };
-    Some((op, len))
+    }
 }
 
 /// An instruction the interpreter runs for translated code.
+#[derive(Clone)]
 pub struct Helper {
     pub pc: u32,
     pub next: u32,
-    pub prepared: Prepared,
+    pub prepared: Arc<Prepared>,
 }
 
-/// Decodes guest instructions a page at a time, over the page and, when it
-/// is executable too, the start of the next one; iced only sees a page
-/// when `quick` declines an instruction on it.
-pub struct Fetcher {
-    page: Option<u32>,
-    buffer: Option<Box<[u8; 0x1000 + 15]>>,
-    len: usize,
-    copied: bool,
-    /// Why the last fetch failed: 1 not executable, 2 unreadable, 3 not
-    /// handled.
+#[derive(Clone, Copy)]
+enum Form {
+    Quick(QuickOp),
+    Full(Instruction),
+}
+
+struct Sample {
+    form: Form,
+    len: u32,
+    op: Option<Op>,
+    prepared: Option<Arc<Prepared>>,
+    locked: bool,
+    summary: Option<Arc<Summary>>,
+}
+
+struct Entry {
+    sample: Result<Sample, u8>,
+    span: u32,
+}
+
+impl Sample {
+    fn instruction(&self, pc: u32) -> Instruction {
+        match self.form {
+            Form::Quick(op) => quick_form::instruction(op, pc),
+            Form::Full(ins) => ins,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DecodeCounts {
+    pub quick: u64,
+    pub full: u64,
+    pub code_reads: u64,
+}
+
+/// Instruction snapshots live until a watched source page changes.
+#[derive(Default)]
+pub(crate) struct Decodes {
+    pages: FxHashMap<u32, FxHashMap<u32, Entry>>,
+    pending: Vec<(u32, u32)>,
+    pub counts: DecodeCounts,
+}
+
+impl Decodes {
+    pub(crate) fn invalidate(&mut self, page: u32) {
+        self.pages.remove(&page);
+        if let Some(previous) = page.checked_sub(4096)
+            && let Some(entries) = self.pages.get_mut(&previous)
+        {
+            entries.retain(|&pc, entry| pc + entry.span <= page);
+        }
+    }
+
+    pub(super) fn watch(&mut self, memory: &mut Memory, spans: &[(u32, u32)]) {
+        self.pending.extend_from_slice(spans);
+        self.pending.sort_unstable();
+        let mut span: Option<(u32, u64)> = None;
+        for (pc, len) in self.pending.drain(..) {
+            let limit = u64::from(pc) + u64::from(len);
+            match &mut span {
+                Some((_, end)) if u64::from(pc) <= *end => *end = (*end).max(limit),
+                _ => {
+                    if let Some((start, end)) = span {
+                        memory.watch_code(start, (end - u64::from(start)) as usize);
+                    }
+                    span = Some((pc, limit));
+                }
+            }
+        }
+        if let Some((start, end)) = span {
+            memory.watch_code(start, (end - u64::from(start)) as usize);
+        }
+    }
+
+    fn get(&self, pc: u32) -> Option<&Sample> {
+        self.pages
+            .get(&(pc & !0xfff))?
+            .get(&pc)?
+            .sample
+            .as_ref()
+            .ok()
+    }
+
+    pub(super) fn span(&self, pc: u32) -> Option<u32> {
+        Some(self.pages.get(&(pc & !0xfff))?.get(&pc)?.span)
+    }
+
+    pub(super) fn summaries(&mut self, trace: &super::trace::Trace) -> Vec<Option<Arc<Summary>>> {
+        let mut factory = iced_x86::InstructionInfoFactory::new();
+        trace
+            .insts
+            .iter()
+            .map(|inst| {
+                let pc = inst.pc;
+                let sample = self
+                    .pages
+                    .get_mut(&(pc & !0xfff))?
+                    .get_mut(&pc)?
+                    .sample
+                    .as_mut()
+                    .ok()?;
+                if inst.next_pc.wrapping_sub(pc) != sample.len {
+                    return None;
+                }
+                let summary = if let Some(summary) = &sample.summary {
+                    summary
+                } else {
+                    let instruction = sample.instruction(pc);
+                    sample
+                        .summary
+                        .insert(Arc::new(Summary::new(&instruction, &mut factory)))
+                };
+                Some(Arc::clone(summary))
+            })
+            .collect()
+    }
+
+    pub(super) fn spin(&self, insts: &[super::trace::Inst], target: u32, latch: u32) -> bool {
+        if insts.iter().any(|inst| self.get(inst.pc).is_none()) {
+            return false;
+        }
+        adv_cpu_core::spin::decoded_backedge(
+            insts
+                .iter()
+                .map(|inst| self.get(inst.pc).unwrap().instruction(inst.pc)),
+            target,
+            latch,
+        )
+    }
+
+    pub(super) fn table_target(&self, pc: u32) -> bool {
+        let Some(sample) = self.get(pc) else {
+            return true;
+        };
+        match sample.form {
+            Form::Quick(op) => !matches!(
+                op,
+                QuickOp::Jmp(_) | QuickOp::JmpIndirect(_) | QuickOp::Push(Src::Imm(_))
+            ),
+            Form::Full(ins) => {
+                !matches!(
+                    ins.flow_control(),
+                    FlowControl::UnconditionalBranch
+                        | FlowControl::IndirectBranch
+                        | FlowControl::Interrupt
+                ) && !matches!(ins.code(), Code::Pushd_imm32 | Code::Pushd_imm8)
+            }
+        }
+    }
+}
+
+/// Samples unseen PCs in the current code window. Helpers are numbered in
+/// trace order so a cached instruction can participate in either trace shape.
+#[derive(Default)]
+pub(crate) struct Fetcher {
+    window: Window,
     pub failure: u8,
-    /// Whether instructions `plan` declines become `Op::Helper`, kept
-    /// here.
     pub helpers: Option<Vec<Helper>>,
     pub locked: Option<(Mem, u8, u8)>,
 }
 
-impl Default for Fetcher {
-    fn default() -> Self {
-        Self::new()
+impl Fetcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn fetchable(memory: &Memory, pc: u32) -> bool {
+        Window::fetchable(memory, pc)
+    }
+
+    pub fn fetch(&mut self, memory: &Memory, pc: u32, decodes: &mut Decodes) -> Option<(Op, u32)> {
+        self.locked = None;
+        self.failure = 3;
+        let entry = decodes
+            .pages
+            .entry(pc & !0xfff)
+            .or_default()
+            .entry(pc)
+            .or_insert_with(|| {
+                decodes.counts.code_reads += 1;
+                let (sample, span) = match self.window.fetch(memory, pc) {
+                    Ok(bytes) => {
+                        let sample = sample(bytes, pc, &mut decodes.counts).ok_or(3);
+                        let span = sample.as_ref().map_or(15, |sample| sample.len);
+                        (sample, span)
+                    }
+                    Err(reason) => (Err(reason), 1),
+                };
+                decodes.pending.push((pc, span));
+                Entry { sample, span }
+            });
+        let sample = match &entry.sample {
+            Ok(sample) => sample,
+            &Err(reason) => {
+                self.failure = reason;
+                return None;
+            }
+        };
+        if let Some(op) = sample.op {
+            return Some((op, sample.len));
+        }
+        let Form::Full(ins) = sample.form else {
+            unreachable!("quick instruction has its plan")
+        };
+        let helpers = self.helpers.as_mut()?;
+        if helpers.len() > usize::from(u8::MAX) {
+            return None;
+        }
+        let prepared = sample.prepared.as_ref()?;
+        let index = helpers.len() as u8;
+        helpers.push(Helper {
+            pc,
+            next: ins.next_ip32(),
+            prepared: Arc::clone(prepared),
+        });
+        if sample.locked {
+            self.locked = Some((memory_sized(&ins)?, ins.memory_size().size() as u8, index));
+        }
+        let op = deferred_plan(&ins, index, prepared.x87_opcode()).unwrap_or(Op::Helper(index));
+        Some((op, sample.len))
     }
 }
 
-impl Fetcher {
-    pub fn new() -> Self {
-        Self {
-            page: None,
-            buffer: None,
-            len: 0,
-            copied: false,
-            failure: 0,
-            helpers: None,
-            locked: None,
-        }
-    }
-
-    /// Permission/page lookup shared with native entry selection.
-    pub fn fetchable(memory: &Memory, pc: u32) -> bool {
-        let page = pc & !0xfff;
-        memory.executable(page, 0x1000)
-            && memory.code_tracked(page)
-            && memory.committed(page, 0x1000).is_ok()
-            && page
-                .checked_add(0x1000)
-                .is_none_or(|next| !memory.executable(next, 15) || memory.code_tracked(next))
-    }
-
-    /// The `Op` and length of the instruction at `pc`, if it is entirely in
-    /// executable memory and handled.
-    pub fn fetch(&mut self, memory: &mut Memory, pc: u32) -> Option<(Op, u32)> {
-        self.locked = None;
-        const PAGE: u32 = 0x1000;
-        let page = pc & !(PAGE - 1);
-        if self.page != Some(page) {
-            self.page = None;
-            if !memory.executable(page, PAGE as usize) {
-                self.failure = 1;
-                return None;
-            }
-            // An instruction may run up to 14 bytes into the next page.
-            let more = page
-                .checked_add(PAGE)
-                .is_some_and(|next| memory.executable(next, 15));
-            let len = PAGE as usize + if more { 15 } else { 0 };
-            self.failure = 2;
-            if !Self::fetchable(memory, pc) {
-                return None;
-            }
-            self.copied = memory.read_linear(page, len).is_err();
-            if self.copied {
-                let buffer = self
-                    .buffer
-                    .get_or_insert_with(|| Box::new([0; 0x1000 + 15]));
-                memory.read_into(page, &mut buffer[..len]).ok()?;
-            }
-            self.len = len;
-            self.page = Some(page);
-        }
-        self.failure = 3;
-        let at = (pc - page) as usize;
-        let bytes = if self.copied {
-            &self.buffer.as_ref().unwrap()[..self.len]
-        } else {
-            memory.read_linear(page, self.len).ok()?
-        };
-        if let Some(quick) = quick(&bytes[at..], pc) {
-            return Some(quick);
-        }
-        // The decoder borrows only for this instruction, including owned copies.
-        let mut decoder =
-            Decoder::try_with_ip(32, bytes, u64::from(page), DecoderOptions::NONE).ok()?;
-        decoder.set_position(at).ok()?;
-        decoder.set_ip(u64::from(pc));
-        let instruction = decoder.decode();
-        if instruction.is_invalid() {
-            return None;
-        }
-        let len = instruction.len();
-        let locked = instruction.has_lock_prefix()
-            || instruction.mnemonic() == Mnemonic::Xchg && instruction.op0_kind() == OpKind::Memory;
-        if !locked && let Some(op) = plan(&instruction) {
-            return Some((op, len as u32));
-        }
-        let helpers = self.helpers.as_mut()?;
-        // A software interrupt is a host call, which mostly returns to the
-        // next instruction.
-        let next = instruction.flow_control() == FlowControl::Next
-            || instruction.code() == iced_x86::Code::Int_imm8;
-        if !next || helpers.len() > usize::from(u8::MAX) {
-            return None;
-        }
-        helpers.push(Helper {
-            pc,
-            next: instruction.next_ip32(),
-            prepared: Prepared::new(&instruction, bytes.get(at..at + len)?)?,
+fn sample(bytes: &[u8], pc: u32, counts: &mut DecodeCounts) -> Option<Sample> {
+    if let Some((op, len)) = adv_cpu_core::interpreter::quick::quick(bytes, pc) {
+        counts.quick += 1;
+        return Some(Sample {
+            form: Form::Quick(op),
+            len,
+            op: Some(plan_quick(op)),
+            prepared: None,
+            locked: false,
+            summary: None,
         });
-        // SIMD instructions keep their helper for when they are checked.
-        let index = (helpers.len() - 1) as u8;
-        if locked {
-            self.locked = Some((
-                memory_sized(&instruction)?,
-                instruction.memory_size().size() as u8,
-                index,
-            ));
-        }
-        let opcode = helpers.last().and_then(|h| h.prepared.x87_opcode());
-        let op = deferred_plan(&instruction, index, opcode).unwrap_or(Op::Helper(index));
-        Some((op, len as u32))
     }
+    counts.full += 1;
+    let instruction = Decoder::with_ip(32, bytes, u64::from(pc), DecoderOptions::NONE).decode();
+    if instruction.is_invalid() {
+        return None;
+    }
+    let len = instruction.len();
+    let locked = instruction.has_lock_prefix()
+        || instruction.mnemonic() == Mnemonic::Xchg && instruction.op0_kind() == OpKind::Memory;
+    let op = (!locked).then(|| plan(&instruction)).flatten();
+    // Software interrupts are host calls, which mostly return to the next instruction.
+    let prepared = if op.is_none()
+        && (instruction.flow_control() == FlowControl::Next || instruction.code() == Code::Int_imm8)
+    {
+        Prepared::new(&instruction, &bytes[..len]).map(Arc::new)
+    } else {
+        None
+    };
+    Some(Sample {
+        form: Form::Full(instruction),
+        len: len as u32,
+        op,
+        prepared,
+        locked,
+        summary: None,
+    })
 }
 
 /// Native forms selected after preparing their exceptional interpreter case.
@@ -692,18 +836,18 @@ fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> O
             Part::Reg(5)
         };
         Op::Stack(m, part, width, index)
-    } else if let Some(simd) = super::simd::plan(&instruction, index) {
+    } else if let Some(simd) = super::plans::simd(&instruction, index) {
         Op::Simd(simd)
-    } else if let Some(strings) = super::strings::plan(&instruction, index) {
+    } else if let Some(strings) = super::plans::strings(&instruction, index) {
         Op::Strings(strings)
-    } else if let Some(integer) = super::integer::plan(&instruction, index) {
+    } else if let Some(integer) = super::plans::integer(&instruction, index) {
         Op::Integer(integer)
-    } else if let Some(parts) = super::parts::plan(&instruction) {
+    } else if let Some(parts) = super::plans::parts(&instruction) {
         Op::Parts(parts)
     } else if instruction.code() == iced_x86::Code::Fild_m64int {
         Op::Fild64(memory(&instruction)?, index, opcode)
     } else {
-        Op::X87(super::x87::plan(&instruction, index, opcode)?)
+        Op::X87(super::plans::x87(&instruction, index, opcode)?)
     })
 }
 
@@ -747,7 +891,7 @@ impl Op {
             // interpreter.
             Op::Simd(simd) => (
                 F::NONE,
-                if matches!(simd.kind, super::simd::Kind::FlagCompare(..)) {
+                if matches!(simd.kind, crate::translate::simd::Kind::FlagCompare(..)) {
                     F::ALL
                 } else {
                     F::NONE
@@ -756,7 +900,7 @@ impl Op {
             ),
             // A REP compare of no elements keeps the flags.
             Op::Strings(strings) if strings.compares() => {
-                let reads = if strings.rep == super::strings::Rep::None {
+                let reads = if strings.rep == crate::translate::strings::Rep::None {
                     F::NONE
                 } else {
                     F::ALL
@@ -827,7 +971,7 @@ impl Op {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(in crate::translate) mod tests {
     use super::*;
 
     pub struct Rng(pub u64);
@@ -985,6 +1129,36 @@ pub(super) mod tests {
             Some((Op::Mov(Src::Reg(7), Src::Reg(6)), 2))
         );
         assert_eq!(iced(&other, 0), quick(&other, 0));
+    }
+
+    // spec: A64-TR-1
+    #[test]
+    fn quick_access_summaries_match_iced() {
+        use super::super::{quick_form, summary::Summary};
+        let mut factory = iced_x86::InstructionInfoFactory::new();
+        let mut rng = Rng(0xf605_93e1_b71d_e1a3);
+        for round in 0..200_000 {
+            let mut bytes = [0; 16];
+            bytes.fill_with(|| rng.byte());
+            if round % 8 != 0 {
+                let opcode = OPCODES[round % OPCODES.len()];
+                bytes[..opcode.len()].copy_from_slice(opcode);
+            }
+            let pc = rng.next() as u32;
+            let Some((op, len)) = adv_cpu_core::interpreter::quick::quick(&bytes, pc) else {
+                continue;
+            };
+            let actual = quick_form::instruction(op, pc);
+            let expected =
+                Decoder::with_ip(32, &bytes, u64::from(pc), DecoderOptions::NONE).decode();
+            assert_eq!(len as usize, expected.len());
+            assert_eq!(
+                Summary::new(&actual, &mut factory),
+                Summary::new(&expected, &mut factory),
+                "{:02x?} {actual:?} {expected:?}",
+                &bytes[..len as usize]
+            );
+        }
     }
 
     // spec: A64-TR-1, A64-FLAG-2

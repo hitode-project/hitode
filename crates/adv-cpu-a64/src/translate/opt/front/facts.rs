@@ -1,6 +1,11 @@
 //! Facts used by the front end and memory passes.
 
-use iced_x86::{CodeSize, Instruction, InstructionInfoFactory, OpAccess, Register};
+use std::sync::Arc;
+
+use crate::translate::front::{
+    summary::Summary,
+    tags::{OpAccess, Register},
+};
 
 use super::{Mem, Offsets, Proof, Unit, decode, frame_offset, model::Model, part};
 use crate::translate::{integer::Integer, trace::Inst};
@@ -12,7 +17,7 @@ pub(crate) trait Facts {
     /// Non-frame accesses never reach the frame (A64-OPT-3 cells need no write-through).
     fn frame_private(&self) -> bool;
     /// Decoding retained by the legacy split proof.
-    fn instruction(&self, _index: usize) -> Option<&Instruction> {
+    fn instruction(&self, _index: usize) -> Option<&Summary> {
         None
     }
 }
@@ -30,7 +35,7 @@ impl Facts for Proof {
     fn frame_private(&self) -> bool {
         true
     }
-    fn instruction(&self, index: usize) -> Option<&Instruction> {
+    fn instruction(&self, index: usize) -> Option<&Summary> {
         self.instruction(index)
     }
 }
@@ -45,7 +50,6 @@ pub(super) struct Access {
 
 /// Memory uses of each decoded instruction, or unknown when unavailable.
 pub(super) fn accesses(unit: &Unit, facts: &dyn Facts) -> Vec<Option<Vec<Access>>> {
-    let mut info = InstructionInfoFactory::new();
     unit.trace
         .insts
         .iter()
@@ -56,31 +60,26 @@ pub(super) fn accesses(unit: &Unit, facts: &dyn Facts) -> Vec<Option<Vec<Access>
             }
             let ins = instruction(unit, facts, i)?;
             Some(
-                info.info(ins)
-                    .used_memory()
+                ins.memory
                     .iter()
                     .filter_map(|used| {
                         use OpAccess::*;
                         let read =
-                            matches!(used.access(), Read | CondRead | ReadWrite | ReadCondWrite);
+                            matches!(used.access, Read | CondRead | ReadWrite | ReadCondWrite);
                         let write =
-                            matches!(used.access(), Write | CondWrite | ReadWrite | ReadCondWrite);
+                            matches!(used.access, Write | CondWrite | ReadWrite | ReadCondWrite);
                         let reg =
                             |r: Register| r.is_gpr().then(|| r.full_register32().number() as u8);
                         (read || write).then(|| Access {
                             mem: Mem {
-                                base: reg(used.base()),
-                                index: reg(used.index()),
-                                scale: used.scale(),
-                                disp: used.displacement() as u32,
-                                address_bits: if used.address_size() == CodeSize::Code16 {
-                                    16
-                                } else {
-                                    32
-                                },
-                                fs: used.segment() == Register::FS,
+                                base: reg(used.base),
+                                index: reg(used.index),
+                                scale: used.scale,
+                                disp: used.displacement,
+                                address_bits: used.address_bits,
+                                fs: used.segment == Register::FS,
                             },
-                            width: used.memory_size().size() as u8,
+                            width: used.width as u8,
                             read,
                             write,
                         })
@@ -95,11 +94,11 @@ pub(super) fn instruction<'a>(
     unit: &'a Unit,
     facts: &'a dyn Facts,
     i: usize,
-) -> Option<&'a Instruction> {
+) -> Option<&'a Summary> {
     if unit.trace.x86.is_empty() {
         facts.instruction(i)
     } else {
-        unit.trace.x86.get(i)?.as_ref()
+        unit.trace.x86.get(i)?.as_deref()
     }
 }
 
@@ -110,7 +109,7 @@ pub(super) fn disjoint(a: u32, aw: u8, b: u32, bw: u8) -> bool {
 #[derive(Default)]
 pub(super) struct Local<'a> {
     pub insts: &'a [Inst],
-    pub x86: &'a [Option<Instruction>],
+    pub x86: &'a [Option<Arc<Summary>>],
     pub accesses: &'a [Option<Vec<Access>>],
     pub offsets: &'a [Offsets],
     pub models: &'a [Model],
@@ -165,7 +164,6 @@ impl Facts for Local<'_> {
         {
             return false;
         }
-        let mut info = InstructionInfoFactory::new();
         let mut seen = vec![false; self.insts.len()];
         let mut work = vec![i];
         while let Some(next) = work.pop() {
@@ -179,12 +177,12 @@ impl Facts for Local<'_> {
                 let Some(Some(ins)) = self.x86.get(p) else {
                     return false;
                 };
-                if info.info(ins).used_registers().iter().any(|reg| {
+                if ins.registers.iter().any(|reg| {
                     matches!(
-                        reg.register().full_register32(),
+                        reg.register.full_register32(),
                         Register::EAX | Register::EDX
                     ) && matches!(
-                        reg.access(),
+                        reg.access,
                         OpAccess::Write
                             | OpAccess::CondWrite
                             | OpAccess::ReadWrite

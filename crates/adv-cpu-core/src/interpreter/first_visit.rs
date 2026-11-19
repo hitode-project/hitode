@@ -143,7 +143,7 @@ fn action(op: QuickOp) -> Action {
     use Operand::{Immediate, Register};
     let dword = |r| Register(reg(r, 4));
     match op {
-        QuickOp::Nop => Action::Nop,
+        QuickOp::Nop | QuickOp::NopOperand(..) => Action::Nop,
         QuickOp::Pause => Action::Pause,
         QuickOp::Mov(dst, src) => Action::Mov(operand(dst), operand(src), false),
         QuickOp::Lea(dst, mem) => Action::Lea(reg(dst, 4), address(mem)),
@@ -179,7 +179,7 @@ fn action(op: QuickOp) -> Action {
         QuickOp::Jmp(to) => Action::Branch(Immediate(to), ConditionCode::None),
         QuickOp::Call(to) => Action::Call(Immediate(to)),
         QuickOp::Jcc(condition, to) => Action::Branch(Immediate(to), condition),
-        QuickOp::Ret(bytes) => Action::Ret(bytes),
+        QuickOp::Ret(bytes) => Action::Ret(bytes.unwrap_or(0)),
         QuickOp::JmpIndirect(src) => Action::Branch(operand(src), ConditionCode::None),
         QuickOp::CallIndirect(src) => Action::Call(operand(src)),
         QuickOp::Setcc(condition, dst) => Action::Set(Register(reg(dst, 1)), condition),
@@ -235,13 +235,14 @@ pub(super) mod tests {
 
     const CODE: u32 = 0x10000;
     const DATA: u32 = 0x20000;
+    const SHARED_DATA: u32 = 0x28000;
 
     fn memory(code: &[u8]) -> Memory {
-        let mut memory = Memory::new(CODE, 0x30000).unwrap();
-        memory.protect(CODE, PAGE_SIZE, READ | WRITE).unwrap();
+        let mut memory = Memory::reserve(CODE, 0x30000).unwrap();
+        memory.map(CODE, PAGE_SIZE, READ | WRITE).unwrap();
         memory.write(CODE, code).unwrap();
         memory.protect(CODE, PAGE_SIZE, READ | EXEC).unwrap();
-        memory.protect(DATA, 2 * PAGE_SIZE, READ | WRITE).unwrap();
+        memory.map(DATA, 2 * PAGE_SIZE, READ | WRITE).unwrap();
         memory
     }
 
@@ -250,7 +251,7 @@ pub(super) mod tests {
     fn first_visit_work_stays_within_baseline() {
         let registers = [0xb8, 3, 0, 0, 0, 0x83, 0xc0, 1, 0x85, 0xc0, 0x75, 1];
         let stack = [
-            0x50, 0x8b, 0x0c, 0x24, 0x01, 0x04, 0x24, 0x0f, 0x44, 0x14, 0x24, 0x5b, 0xc3,
+            0x50, 0x8b, 0x0c, 0x24, 0x01, 0x04, 0x24, 0x0f, 0x44, 0x14, 0x24, 0x5b, 0xc9, 0xc3,
         ];
         let read = [0x8b, 0x06, 0xeb, 0];
         let write = [0x89, 0x06];
@@ -258,7 +259,7 @@ pub(super) mod tests {
         for (code, eflags, source, retired, baseline) in [
             (&registers[..], 2, DATA, 4, [4, 0, 0, 0, 2, 0]),
             (&registers[..], 2, DATA, 3, [3, 0, 0, 0, 2, 0]),
-            (&stack[..], 2, DATA, 6, [6, 0, 5, 2, 1, 0]),
+            (&stack[..], 2, DATA, 7, [7, 0, 6, 2, 1, 0]),
             (
                 &read[..],
                 2,
@@ -267,18 +268,23 @@ pub(super) mod tests {
                 [2, 1, 2, 0, 0, 1],
             ),
             (&write[..], 2, 0x30000, 0, [1, 1, 0, 2, 0, 1]),
+            (&read[..], 2, SHARED_DATA, 2, [2, 1, 2, 0, 0, 1]),
             (&narrow[..], 2, DATA, 2, [2, 2, 0, 0, 0, 0]),
         ] {
             let mut memory = memory(code);
+            if source == SHARED_DATA {
+                memory.map_shared_audio(SHARED_DATA, PAGE_SIZE).unwrap();
+            }
             let mut state = CpuState {
                 eip: CODE,
                 eflags,
                 ..CpuState::default()
             };
             state.regs[4] = DATA + 16;
+            state.regs[5] = DATA + 16;
             state.regs[6] = source;
             memory
-                .write(DATA + 16, &(CODE + 0x80).to_le_bytes())
+                .write(DATA + 20, &(CODE + 0x80).to_le_bytes())
                 .unwrap();
             let generation = memory.map_generation();
             let mut interpreter = Interpreter::new();

@@ -10,12 +10,20 @@ pub fn backedge(bytes: &[u8], target: u32, latch: u32) -> bool {
     if bytes.len() > MAX_BYTES {
         return false;
     }
-    let mut decoder = Decoder::with_ip(32, bytes, u64::from(target), DecoderOptions::NONE);
+    let decoder = Decoder::with_ip(32, bytes, u64::from(target), DecoderOptions::NONE);
+    decoded_backedge(decoder, target, latch)
+}
+
+/// The same proof over a previously decoded contiguous instruction sequence.
+pub fn decoded_backedge(
+    instructions: impl IntoIterator<Item = Instruction>,
+    target: u32,
+    latch: u32,
+) -> bool {
     let mut pause = false;
     let mut loaded = None;
     let mut compared = false;
-    while decoder.can_decode() {
-        let i = decoder.decode();
+    for i in instructions {
         if i.ip32() == latch {
             return i.op0_kind() == OpKind::NearBranch32
                 && i.near_branch32() == target

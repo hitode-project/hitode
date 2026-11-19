@@ -67,7 +67,7 @@ fn prove(proof: &mut Proof, unit: &Unit, code: &[u8]) {
         let bytes = code
             .get(usize::try_from(pc - CODE).ok()?..)?
             .get(..len as usize)?;
-        Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+        crate::translate::front::summary::from_bytes(bytes, pc)
     });
 }
 
@@ -1546,7 +1546,7 @@ fn probe_an_image_unit() {
         let mut bytes = [0; 15];
         let bytes = bytes.get_mut(..len as usize)?;
         memory.read_into(pc, bytes).ok()?;
-        Some(iced_x86::Decoder::with_ip(32, bytes, u64::from(pc), 0).decode())
+        crate::translate::front::summary::from_bytes(bytes, pc)
     });
     let mut at = initial();
     at.x87.control = 0x27f;
@@ -2182,7 +2182,7 @@ fn resident_unit(code: &[u8]) -> Unit {
         .map(|inst| {
             let from = (inst.pc - CODE) as usize;
             let to = (inst.next_pc - CODE) as usize;
-            Some(iced_x86::Decoder::with_ip(32, &code[from..to], u64::from(inst.pc), 0).decode())
+            crate::translate::front::summary::from_bytes(&code[from..to], inst.pc)
         })
         .collect();
     unit

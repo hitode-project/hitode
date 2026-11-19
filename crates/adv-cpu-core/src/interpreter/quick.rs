@@ -116,6 +116,7 @@ pub enum Narrow8or16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuickOp {
     Nop,
+    NopOperand(Src, bool),
     Pause,
     Mov(Src, Src),
     Lea(u8, Mem),
@@ -131,7 +132,7 @@ pub enum QuickOp {
     Jmp(u32),
     Call(u32),
     Jcc(ConditionCode, u32),
-    Ret(u16),
+    Ret(Option<u16>),
     JmpIndirect(Src),
     CallIndirect(Src),
     Setcc(ConditionCode, u8),
@@ -253,15 +254,6 @@ fn register(src: Src) -> Option<u8> {
     }
 }
 
-/// A move of a register to itself, such as the hot-patch prologue's
-/// `mov edi, edi`, changes nothing, flags included.
-fn mov(dst: Src, src: Src) -> QuickOp {
-    match (dst, src) {
-        (Src::Reg(dst), Src::Reg(src)) if dst == src => QuickOp::Nop,
-        _ => QuickOp::Mov(dst, src),
-    }
-}
-
 /// The decoded form and its byte length, for the common unprefixed forms.
 pub fn quick(bytes: &[u8], pc: u32) -> Option<(QuickOp, u32)> {
     let mut b = Bytes { bytes, at: 0 };
@@ -341,11 +333,11 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<QuickOp> {
         }
         0x89 => {
             let (reg, rm) = b.modrm()?;
-            mov(rm, Src::Reg(reg))
+            QuickOp::Mov(rm, Src::Reg(reg))
         }
         0x8b => {
             let (reg, rm) = b.modrm()?;
-            mov(Src::Reg(reg), rm)
+            QuickOp::Mov(Src::Reg(reg), rm)
         }
         0x8d => match b.modrm()? {
             (reg, Src::Mem(mem)) => QuickOp::Lea(reg, mem),
@@ -384,27 +376,26 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<QuickOp> {
                 _ => return None,
             };
             match (rm, count) {
-                (Src::Reg(_), Some(0)) => QuickOp::Nop,
                 (Src::Reg(_), _) | (Src::Mem(_), None) => QuickOp::Shift(kind, rm, count),
                 _ => return None,
             }
         }
         0xc2 => match b.u16()? {
-            bytes if bytes < 4096 => QuickOp::Ret(bytes),
+            bytes if bytes < 4096 => QuickOp::Ret(Some(bytes)),
             _ => return None,
         },
-        0xc3 => QuickOp::Ret(0),
+        0xc3 => QuickOp::Ret(None),
         // PAUSE and `rep ret`, which older compilers emit after a branch.
         0xf3 => match b.u8()? {
             0x90 => QuickOp::Pause,
-            0xc3 => QuickOp::Ret(0),
+            0xc3 => QuickOp::Ret(None),
             _ => return None,
         },
         // QuickOperand-size padding: `xchg ax, ax` and `nop r/m16`.
         0x66 => match b.u8()? {
             0x90 => QuickOp::Nop,
             0x0f if b.u8()? == 0x1f => match b.modrm()? {
-                (0, _) => QuickOp::Nop,
+                (0, op) => QuickOp::NopOperand(op, true),
                 _ => return None,
             },
             _ => return None,
@@ -461,7 +452,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<QuickOp> {
                     QuickOp::Imul(reg, rm, None)
                 }
                 0x1f => match b.modrm()? {
-                    (0, _) => QuickOp::Nop,
+                    (0, op) => QuickOp::NopOperand(op, false),
                     _ => return None,
                 },
                 0xb6 | 0xb7 | 0xbe | 0xbf => {

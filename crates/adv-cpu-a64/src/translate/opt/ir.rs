@@ -5,7 +5,7 @@
 //! only through `Load` and `Store`. Guest addresses are 32-bit values that
 //! emission offsets by the private alias base.
 
-use iced_x86::ConditionCode;
+use crate::translate::front::tags::ConditionCode;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::recovery::IrRecord;

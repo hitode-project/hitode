@@ -167,16 +167,13 @@ impl CodeStore {
 /// Counts the Tier-1 body words for each guest instruction. A taken
 /// back edge adds its canonical publication and patch word, excluding
 /// the unlinked dispatch and discovery counter.
-pub(super) fn tier1_words(work: &translate::Workspace) -> FxHashMap<u32, u32> {
+pub(super) fn tier1_words(
+    work: &translate::Workspace,
+    trace: &translate::Trace,
+) -> FxHashMap<u32, u32> {
     use crate::jit_map::Part;
 
-    let mut words: FxHashMap<_, _> = work
-        .unit
-        .trace
-        .insts
-        .iter()
-        .map(|inst| (inst.pc, 0))
-        .collect();
+    let mut words: FxHashMap<_, _> = trace.insts.iter().map(|inst| (inst.pc, 0)).collect();
     let marks = work.marks();
     let cold = marks
         .iter()
