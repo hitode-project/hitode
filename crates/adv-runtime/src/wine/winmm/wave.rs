@@ -630,7 +630,9 @@ mod tests {
         }
         let exact = origin + ((u128::from(2_500u64 * 2048) * 1_000_000) / u128::from(rate)) as u64;
         assert_eq!(tail, exact);
-        assert!(LEAD >= 100_000);
-        assert!(LOOP_LEAD < LEAD && LOOP_LEAD >= 50_000);
+        const {
+            assert!(LEAD >= 100_000);
+            assert!(LOOP_LEAD < LEAD && LOOP_LEAD >= 50_000);
+        }
     }
 }
