@@ -83,7 +83,7 @@ const CACHE_LEN: usize = 64 << 20;
 
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
-const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
+pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
 
 type Enter = unsafe extern "C" fn(*mut Runtime, usize);
@@ -355,6 +355,8 @@ fn features() -> Features {
 pub(crate) struct Diagnostics {
     pub first_visits: u64,
     pub first_declined: u64,
+    pub first_quick_decodes: u64,
+    pub first_full_decodes: u64,
     pub empty: u64,
     pub over_fuel: u64,
     pub interprets: u64,

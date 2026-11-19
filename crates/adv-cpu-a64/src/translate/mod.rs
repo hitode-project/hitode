@@ -45,7 +45,6 @@ mod channels;
 #[cfg(native)]
 pub(crate) mod computation;
 mod decode;
-pub mod first;
 mod flags;
 mod fp_class;
 mod integer;

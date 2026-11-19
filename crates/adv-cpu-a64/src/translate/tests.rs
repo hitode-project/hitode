@@ -39,6 +39,262 @@ fn initial() -> CpuState {
     }
 }
 
+// spec: A64-VER-1
+#[test]
+fn translation_words_match_baseline() {
+    let scalar = bytes(|a| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, 1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.ret().unwrap();
+    });
+    let table = bytes(|a| {
+        a.cmp(eax, 1).unwrap();
+        a.ja(u64::from(CODE + 0x100)).unwrap();
+        a.jmp(dword_ptr(eax * 4 + DATA as i32)).unwrap();
+    });
+    let helper = bytes(|a| {
+        a.cpuid().unwrap();
+        a.movzx(ecx, al).unwrap();
+        a.ret().unwrap();
+    });
+    let row = bytes(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.add(eax, 1).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let host = HOST_CODE as usize;
+    let stubs = Stubs {
+        call: host,
+        exit: host,
+        dispatch: host,
+        lookup: host,
+        lookup_slow: host,
+        ret_miss: host,
+        access: host,
+        interpret: host,
+        fault: host,
+        opt_exit: host,
+    };
+    let compare = |name: &str, words: &[u32]| {
+        let baseline = match name {
+            "scalar" => concat!(
+                "d1001129 b7f801c9 b8794b73 31000673 b83a4b73 b84046f0 d500401f 2a1303ea ",
+                "5100066b 4a13016b a940479e cb100231 b5000111 9100439c d65f03c0 91001129 ",
+                "52800100 52800001 72a00021 17ffffed 52800124 72a00024 f2c00064 17ffffe9 ",
+            ),
+            "checked" => concat!(
+                "d1001129 b7f80989 11000f24 4a190084 376009c4 f94033a3 530c7f24 38644864 ",
+                "36000944 37180064 b8794b73 14000008 f9403ba3 530c7f24 38644864 36000864 ",
+                "37180844 f94037a3 b8794873 31000673 11000f44 4a1a0084 37600844 f94033a3 ",
+                "530c7f44 38644864 360807c4 37100084 37180064 b83a4b73 14000014 f9403ba3 ",
+                "530c7f44 38644864 360806c4 371806a4 371000a4 f94087a3 530c7f44 38644864 ",
+                "36100104 f9406ba3 530c7f44 f8645863 53067f44 9ac42463 92400463 b5000523 ",
+                "f94037a3 b83a4873 11000ee4 4a170084 37600544 f94033a3 530c7ee4 38644864 ",
+                "360004c4 37180064 b8774b70 14000008 f9403ba3 530c7ee4 38644864 360003e4 ",
+                "371803c4 f94037a3 b8774870 910012f7 d500401f 2a1303ea 5100066b 4a13016b ",
+                "a940479e cb100231 b5000351 9100439c d65f03c0 91001129 52800100 52800001 ",
+                "72a00021 17ffffaf 2a1903e1 10fff6e2 52800084 97ffffab 2a0003f3 17ffffbc ",
+                "2a1a03e1 10fff882 2a1303e3 52800484 97ffffa4 17ffffd5 2a1703e1 10fffb62 ",
+                "52800084 97ffff9f 2a0003f0 17ffffe0 52800124 72a00024 f2c00064 17ffff99 ",
+            ),
+            "switch" => concat!(
+                "d1000d29 b7f80149 7100067f 540001a8 52800031 4b11026a 4a11026b 4a0a016b ",
+                "10000411 f8737a31 d61f0220 91000d29 52800100 52800001 72a00021 17fffff1 ",
+                "52800031 4b11026a 4a11026b 4a0a016b 91000529 52802001 72a00021 10ffffc2 ",
+                "17ffffe8 10ffff8e 14000000 531e7670 52a00051 0b110210 b8704b70 f9401fb1 ",
+                "4a504206 53003cc6 8b061231 a9404626 cb1000c6 b50000e6 d61f0220 d503201f ",
+                "1000006c 00000000 1000006c 00000000 52800164 72a00024 f2c00044 17ffffd1 ",
+            ),
+            "helper" => concat!(
+                "d1000d29 b7f80169 52800061 97fffffd 350001a0 53001e74 b84046f0 a940479e ",
+                "cb100231 b50001b1 9100439c d65f03c0 91000d29 52800100 52800001 72a00021 ",
+                "17fffff0 91000929 51000400 f94003b1 b9402221 17ffffeb 528000a4 72a00024 ",
+                "f2c00064 17ffffe7 ",
+            ),
+            "loop" => concat!(
+                "d1001d29 b7f80329 b8794b73 31000673 b83a4b73 31001339 3100135a 51000694 ",
+                "1a9f37ed 1100068e 710005df ba1f85a2 d500401f 2a1403ea 1100068b 4a14016b ",
+                "d1001d29 b7f80be9 540001a1 91001d29 52800241 72a00021 10ffffc2 17ffffe9 ",
+                "10ffff8e 14000000 91001d29 52800100 52800001 72a00021 17ffffe2 14000001 ",
+                "100009c0 f9400000 b9400001 51000421 b9000001 34000041 17ffffdc a9b81be5 ",
+                "a90123e7 a9022be9 a90333eb a9043bed a90543ef d53b4210 a90643f1 f9003bfe ",
+                "adbc47f0 ad014ff2 ad0257f4 ad035ff6 adbc67f8 ad016ffa ad0277fc ad037ffe ",
+                "f94003a0 29005013 29015815 29026017 29036819 d53b4201 53187c22 121a0443 ",
+                "53051444 52000084 2a040063 53041044 2a042c63 121c0164 2a040063 4a4a1144 ",
+                "4a440884 4a440484 12000084 52000084 2a040863 2a0c2863 b9402404 52819aa5 ",
+                "0a250084 2a030084 b9002404 52800001 72a00021 10fff942 aa1d03e0 f942afb0 ",
+                "d63f0200 ad437ffe ad4277fc ad416ffa acc467f8 ad435ff6 ad4257f4 ad414ff2 ",
+                "acc447f0 f9403bfe a94607f1 d51b4201 a94543ef a9443bed a94333eb a9422be9 ",
+                "a94123e7 a8c81be5 17ffff98 91001d29 10fff66e 14000000 00000000 00000000 ",
+                "91001d29 54000041 17ffffa2 52800100 52800001 72a00021 17ffff8a ",
+            ),
+            "worker" => concat!(
+                "f940cfb1 b9400226 b9401227 b9402228 b940322a d1001d29 b7f80bc9 f94077b0 ",
+                "91000610 f90077b0 b94193b0 35000890 aa0903e3 b7f80843 d2800391 9ad10863 ",
+                "510004d0 4b1f0210 d342fe10 eb10007f 9a909063 b4000743 2a0703e0 d2c00030 ",
+                "cb000202 f1001042 540006ab d344fc42 eb02007f 9a829063 b4000623 2a0803e0 ",
+                "d2c00030 cb000202 f1001042 5400058b d344fc42 eb02007f 9a829063 b4000503 ",
+                "2a0703e0 2a0803e1 6b01001f 540001a0 4b000022 f1001042 5400042b d344fc42 ",
+                "eb02007f 9a829063 4b010002 f1001042 5400036b d344fc42 eb02007f 9a829063 ",
+                "b40002e3 d2800390 9b107c65 aa0303e4 2a0703f0 8b304390 3dc00210 d2800030 ",
+                "4e040e11 4eb18610 2a0803f0 8b304390 3d800210 510010c6 110040e7 11004108 ",
+                "d1000484 b5fffe64 cb050129 17ffffbc 510004a5 35000065 17ffffb9 52800085 ",
+                "b8674b8b 1100056b 110010ec 1100110d 510004ce b8284b8b 710004df 54000180 ",
+                "d1001d29 b94193b0 34000090 51000610 b90193b0 34000a30 b7f804a9 2a0e03e6 ",
+                "2a0c03e7 2a0d03e8 17ffffea 14000048 f940b3b0 b9400210 b9416bb1 0a110210 ",
+                "350000f0 f940bbb0 b9400210 b9417bb1 0a110210 35000050 14000008 52800030 ",
+                "b90193b0 b94197b0 11000610 b90197b0 121a0210 35000170 d29fff30 cb090210 ",
+                "f940c3b1 8b110210 f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 17ffff88 ",
+                "52800030 b901b7b0 14000020 f940b3b0 b9400210 b9416bb1 0a110210 350000f0 ",
+                "f940bbb0 b9400210 b9417bb1 0a110210 35000050 14000008 52800030 b90193b0 ",
+                "b94197b0 11000610 b90197b0 121a0210 35000170 d29fff30 cb090210 f940c3b1 ",
+                "8b110210 f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 17ffffc1 52800030 ",
+                "b901b7b0 1400000d d2800010 b901b3b0 1400000d d2800030 b901b3b0 1400000a ",
+                "d2800050 b901b3b0 14000007 d2800070 b901b3b0 14000004 d2800090 b901b3b0 ",
+                "14000001 00000000 ",
+            ),
+            "resident" => concat!(
+                "f94003a0 b940f810 350039b0 b944d3b0 35003970 b9416010 d283f011 4a110210 ",
+                "121a2610 350038b0 d10043ff 911363a4 29005093 29015895 29026097 29036899 ",
+                "d53b4210 a9022890 a903308b d53b4201 53187c22 121a0443 53051444 52000084 ",
+                "2a040063 53041044 2a042c63 121c0164 2a040063 4a4a1144 4a440884 4a440484 ",
+                "12000084 52000084 2a040863 2a0c2863 b9402404 52819aa5 0a250084 2a030084 ",
+                "2a0403e1 2a1303e6 2a1403e7 2a1903e8 2a1a03ea 2a0103eb 9400017e d1001d29 ",
+                "b7f80ea9 b90003e7 f94077b0 91000610 f90077b0 aa0903e3 b7f80b63 d2800391 ",
+                "9ad10863 510004f0 4b1f0210 d342fe10 eb10007f 9a909063 b4000a63 2a0803e0 ",
+                "d2800210 9b107c61 91000c21 8b000021 d34cfc21 530c7c00 d2800002 d2800005 ",
+                "94000140 2a0803e1 cb010002 f1001042 540008ab d344fc42 eb02007f 9a829063 ",
+                "b4000823 2a0a03e0 d2800210 9b107c61 91000c21 8b000021 d34cfc21 530c7c00 ",
+                "d2800002 d2800105 9400012e 2a0a03e1 cb010002 f1001042 5400066b d344fc42 ",
+                "eb02007f 9a829063 b40005e3 2a0803e0 2a0a03e1 6b01001f 540001a0 4b000022 ",
+                "f1001042 5400050b d344fc42 eb02007f 9a829063 4b010002 f1001042 5400044b ",
+                "d344fc42 eb02007f 9a829063 b40003c3 2a0a03f0 d2800211 1b037e31 0b110210 ",
+                "11000e04 4a100084 376002e4 d2800390 9b107c65 aa0303e4 2a0803f0 8b304370 ",
+                "3dc00210 d2800030 4e040e11 4eb18610 2a0a03f0 8b304370 3d800210 510010e7 ",
+                "11004108 1100414a d1000484 b5fffe64 cb050129 17ffffa5 510004a5 35000065 ",
+                "17ffffa2 52800085 b8684b6c 1100058c 11000d44 4a0a0084 376018e4 b82a4b6c ",
+                "11001106 1100114d 510004ee 710004ff 54000100 d1001d29 b7f80389 2a0e03e7 ",
+                "2a0603e8 2a0c03e6 2a0d03ea 17ffffeb 1400004a f940b3b0 b9400210 b9416bb1 ",
+                "0a110210 35000210 f940bbb0 b9400210 b9417bb1 0a110210 35000170 d29fff30 ",
+                "cb090210 f940c3b1 8b110210 f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 ",
+                "17ffff79 14000016 f940b3b0 b9400210 b9416bb1 0a110210 35000210 f940bbb0 ",
+                "b9400210 b9417bb1 0a110210 35000170 d29fff30 cb090210 f940c3b1 8b110210 ",
+                "f940c7b1 eb11021f 54000088 f900c3b0 d29fff29 17ffffd2 14000058 f94003a0 ",
+                "2a0b03e1 2a0603f3 2a0703f4 2a0803f9 2a0a03fa b944e3b5 b944e7b6 b944ebb7 ",
+                "b944efb8 8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 ",
+                "2a031042 53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 91001d29 ",
+                "910043ff 940000c9 52800001 72a00021 10ffffc2 00000000 f94003a0 12160161 ",
+                "3100115f 1a9f37f0 2a100021 710004f0 4a501210 4a500a10 4a500610 2a3003f0 ",
+                "12000210 2a100821 710004f0 4a070210 52000210 53041210 2a101021 710004ff ",
+                "1a9f17f0 2a101821 710004ff 1a9f57f0 2a101c21 710004ff 1a9f77f0 2a102c21 ",
+                "2a0c03f3 2a0e03f4 2a0603f9 2a0d03fa b944e3b5 b944e7b6 b944ebb7 b944efb8 ",
+                "8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 2a031042 ",
+                "53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 910043ff 94000093 ",
+                "52800241 72a00021 10ffffc2 00000000 10ffff8e 14000000 f94003a0 12160161 ",
+                "3100115f 1a9f37f0 2a100021 710004f0 4a501210 4a500a10 4a500610 2a3003f0 ",
+                "12000210 2a100821 710004f0 4a070210 52000210 53041210 2a101021 710004ff ",
+                "1a9f17f0 2a101821 710004ff 1a9f57f0 2a101c21 710004ff 1a9f77f0 2a102c21 ",
+                "2a0c03f3 2a0e03f4 2a0603f9 2a0d03fa b944e3b5 b944e7b6 b944ebb7 b944efb8 ",
+                "8b374377 8b384378 121a0422 53000023 52000063 2a031442 530b2c23 2a031042 ",
+                "53081c42 d51b4202 5302082a 5200014a 121c002b 530a282c 91001d29 910043ff ",
+                "9400005a 52800001 72a00021 10ffffc2 00000000 d53b4205 a9bf17f0 b94083a0 ",
+                "6b00015f 54000483 2a0a03e1 cb204021 d2800062 8b020022 d34cfc21 d34cfc42 ",
+                "b94087a3 eb03005f 54000362 f9403fa3 530c7c00 53067c24 0b040484 8b244c64 ",
+                "f9400485 9ac124a5 36000265 f9400885 9ac124a5 37000205 0b010005 f94033a4 ",
+                "38654885 36080185 37100165 11000421 6b02003f 54fffe09 a8c117f0 d51b4205 ",
+                "b82a4b6c f942b7a0 91000400 f902b7a0 17ffff14 a8c117f0 d51b4205 1400001f ",
+                "4a020004 b94083b1 4b513091 b94087b0 6b10023f 540002e2 53067e30 0b100610 ",
+                "f9403fa4 8b304c90 8b050204 f9400084 f9400a10 8a300090 9ad12610 360001b0 ",
+                "4a020004 f94033b0 38644a10 35000085 36000110 371800f0 14000003 360800b0 ",
+                "37100090 11000400 eb01001f 54fffca9 d374cc00 d65f03c0 d28000f0 f2a00030 ",
+                "b9052bb0 52800090 b9052fb0 14000016 10000210 f9400210 f940c3b1 cb090231 ",
+                "f9000211 d65f03c0 10000150 f9400210 f940c3b1 cb090231 f9400200 cb000231 ",
+                "f9400600 8b000231 f9000611 d65f03c0 00000000 00000000 d2800010 b901b3b0 ",
+                "1400000d d2800030 b901b3b0 1400000a d2800050 b901b3b0 14000007 d2800070 ",
+                "b901b3b0 14000004 d2800090 b901b3b0 14000001 00000000 00000000 00000000 ",
+                "00000000 ",
+            ),
+            _ => unreachable!(),
+        };
+        let baseline: Vec<_> = baseline
+            .split_ascii_whitespace()
+            .map(|word| u32::from_str_radix(word, 16).unwrap())
+            .collect();
+        assert_eq!(words, baseline, "{name}");
+    };
+    for (name, code, cold, checked) in [
+        ("scalar", &scalar, true, false),
+        ("checked", &scalar, true, true),
+        ("switch", &table, true, false),
+        ("helper", &helper, true, false),
+        ("loop", &row, false, false),
+    ] {
+        let mut mem = memory(code, &CODE.to_le_bytes().repeat(2));
+        mem.protect(DATA, 4096, 1).unwrap();
+        let mut work = Workspace {
+            cold,
+            resident_links: true,
+            ..Workspace::default()
+        };
+        work.unit.images.push((CODE, 0x30000));
+        translate(
+            &mut work,
+            &mut mem,
+            CODE,
+            &[CODE + code.len() as u32],
+            &|_| checked,
+            3,
+            Features { flagm: true },
+            host,
+            stubs,
+            &|_, _| None,
+            &|_| None,
+            &|_, _| Vec::new(),
+            0x037f,
+            false,
+        );
+        compare(name, work.words());
+
+        #[cfg(native)]
+        if name == "loop" {
+            work.unit.trace.x86 = work
+                .unit
+                .trace
+                .insts
+                .iter()
+                .map(|inst| {
+                    let offset = (inst.pc - CODE) as usize;
+                    Some(
+                        iced_x86::Decoder::with_ip(32, &code[offset..], inst.pc.into(), 0).decode(),
+                    )
+                })
+                .collect();
+            let trace = &work.unit.trace;
+            let mut proof = computation::Proof::build(trace).unwrap();
+            proof.prove_split(trace, |pc, _| {
+                trace.x86[trace.insts.iter().position(|i| i.pc == pc)?]
+            });
+            let at = initial();
+            let built = opt::front::build(&work.unit, &proof, &at).unwrap();
+            compare("worker", &opt::back::lower(&built.func).words);
+            let built =
+                opt::front::build_with(&work.unit, None, &at, &|_| false, &|_| false).unwrap();
+            compare(
+                "resident",
+                &opt::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false)
+                    .words,
+            );
+        }
+    }
+}
+
 // spec: A64F-FP-7
 #[test]
 fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {

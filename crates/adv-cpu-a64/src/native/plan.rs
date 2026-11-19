@@ -1825,9 +1825,7 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         native.code.cache.sync();
         return point;
     }
-    if entry.is_none()
-        && (!crate::translate::Fetcher::fetchable(memory, eip) || native.first_visit(eip))
-    {
+    if entry.is_none() && (!crate::translate::Fetcher::fetchable(memory, eip) || !native.ran(eip)) {
         return 0;
     }
     let before = native.code.cache.used();

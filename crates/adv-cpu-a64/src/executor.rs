@@ -578,7 +578,7 @@ impl Executor {
                 std::ptr::null_mut(),
             )?;
             if let Some(run) = &run
-                && run.exit != Exit::Stepped
+                && !matches!(run.exit, Exit::Stepped | Exit::FirstVisit)
             {
                 let check = trace.check_retired(run.retired as usize, &self.state, &self.memory);
                 let strict = verifier.strict;
@@ -701,6 +701,23 @@ impl Executor {
             } {
                 match exit {
                     Exit::Dispatch | Exit::Budget => continue,
+                    #[cfg(native)]
+                    Exit::FirstVisit => {
+                        let fuel = self.state.fuel.min(crate::native::SLICE) as u32;
+                        let visit = self.interpreter.run_first_visit(
+                            &mut self.state,
+                            &mut self.memory,
+                            stop,
+                            fuel,
+                        );
+                        let diagnostics = &mut self.native.as_mut().unwrap().diagnostics;
+                        diagnostics.first_declined += u64::from(visit.slow);
+                        diagnostics.first_quick_decodes += u64::from(visit.quick_decodes);
+                        diagnostics.first_full_decodes += u64::from(visit.full_decodes);
+                        (visit.execution, visit.last_units)
+                    }
+                    #[cfg(not(native))]
+                    Exit::FirstVisit => unreachable!("no native dispatch"),
                     Exit::Computation => {
                         self.offered = Some(self.state.eip);
                         return Ok(RunOutcome::Computation);

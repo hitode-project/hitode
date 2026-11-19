@@ -129,7 +129,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 |---|---|---|
 | [`translate`](crates/adv-cpu-a64/src/translate/mod.rs) | Translation units: trace selection and analysis, switch tables, and the JIT back end that lowers a unit to AArch64 code, including body call sites (A64-TR-3, A64-TR-7) | Executable memory; running units |
 | [`native`](crates/adv-cpu-a64/src/native.rs) | Translated host calls and fault recovery, the owner [run loop](crates/adv-cpu-a64/src/native/run.rs), native code placement and watches in the [code store](crates/adv-cpu-a64/src/native/store.rs), site decisions and link publication in the [arbiter](crates/adv-cpu-a64/src/native/plan.rs), and worker jobs in the [offload service](crates/adv-cpu-a64/src/native/offload.rs) | Choosing guest instructions |
-| [`executor`](crates/adv-cpu-a64/src/executor.rs) | The engine's execution owner: first visits, when an entry is translated (A64-TR-2), exits, traps, fuel and deadlines, interpreter-only runs | Code generation |
+| [`executor`](crates/adv-cpu-a64/src/executor.rs) | The engine's execution owner: core interpreter runs, exits, traps, fuel and deadlines. The arbiter selects first visits (A64-TR-2). | Code generation |
 | [`cpu`](crates/adv-cpu-a64/src/cpu.rs) | `Backend` and `Engine` over the executor, as the machine layer drives them | Scheduling |
 | [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1) |  |
 | [`cache`](crates/adv-cpu-a64/src/cache.rs) | Executable storage leased from the process code pool, never writable and executable through one mapping (A64-CTL-1, A64-CTL-2) | What code goes into it |

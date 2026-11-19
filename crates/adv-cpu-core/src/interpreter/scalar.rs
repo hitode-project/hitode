@@ -18,6 +18,8 @@ impl Destination {
     }
 
     fn memory(address: u32, width: u8, memory: &Memory) -> Option<Self> {
+        #[cfg(test)]
+        first_visit::tests::count(|work| work.stores += 1);
         Some(Self::Memory(
             memory.direct(address, width as usize, true)?,
             width,
@@ -45,7 +47,9 @@ impl Destination {
 }
 
 fn read_memory(address: u32, width: u8, memory: &Memory) -> Option<u32> {
-    let p = memory.direct(address, width as usize, false)?;
+    #[cfg(test)]
+    first_visit::tests::count(|work| work.loads += 1);
+    let p = memory.direct_read(address, width as usize)?;
     // SAFETY: direct checked the full ordinary readable range and the Memory
     // borrow prevents concurrent guest writes or remapping during this read.
     Some(unsafe {
@@ -77,11 +81,13 @@ pub(super) fn eligible(action: Action) -> bool {
             | Action::Shift(..)
             | Action::Multiply(Operand::Register(_), Some(_), _, _)
             | Action::Set(..)
+            | Action::Cmov(Operand::Register(_), ..)
             | Action::Branch(..)
             | Action::Push(..)
             | Action::Pop(Operand::Register(_), _)
             | Action::Call(..)
             | Action::Ret(..)
+            | Action::Leave(..)
     )
 }
 
@@ -89,8 +95,25 @@ pub(super) fn eligible(action: Action) -> bool {
 /// cross-page and denied ranges retain the full checked transaction, including
 /// its fault priority. Every successful arm validates before its first commit.
 pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory) -> Option<()> {
-    let mut next = i.next;
-    match i.action {
+    execute_action(i.action, i.next, state, memory)
+}
+
+pub(super) fn execute_action(
+    action: Action,
+    fallthrough: u32,
+    state: &mut CpuState,
+    memory: &Memory,
+) -> Option<()> {
+    let mut next = fallthrough;
+    match action {
+        Action::Nop | Action::Pause => {}
+        Action::Lea(dst, address) => {
+            let value = address.resolve_regs(&state.regs, state.fs_base);
+            dst.write(&mut state.regs, value);
+        }
+        Action::Sign(M::Cdq) => {
+            state.regs[2] = (state.regs[0] as i32 >> 31) as u32;
+        }
         Action::Mov(dst, src, extend) => {
             let value = read(src, state, memory)?;
             let destination = Destination::prepare(dst, state, memory)?;
@@ -110,6 +133,8 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
                 Some(Destination::prepare(dst, state, memory)?)
             };
             let result = registers::binary(&mut state.eflags, kind, a, b, dst.width()?);
+            #[cfg(test)]
+            first_visit::tests::count(|work| work.flag_updates += 1);
             if let Some(destination) = destination {
                 destination.commit(result, state);
             }
@@ -118,6 +143,10 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
             let value = read(dst, state, memory)?;
             let destination = Destination::prepare(dst, state, memory)?;
             let result = registers::unary(&mut state.eflags, kind, value, dst.width()?);
+            #[cfg(test)]
+            if kind != M::Not {
+                first_visit::tests::count(|work| work.flag_updates += 1);
+            }
             destination.commit(result, state);
         }
         Action::Shift(kind, dst, count) => {
@@ -127,6 +156,8 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
             let destination = Destination::prepare(dst, state, memory)?;
             if count != 0 {
                 let result = registers::shift(&mut state.eflags, kind, value, count, dst.width()?);
+                #[cfg(test)]
+                first_visit::tests::count(|work| work.flag_updates += 1);
                 destination.commit(result, state);
             }
         }
@@ -137,11 +168,19 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
                 (dst.read(&state.regs), read(src, state, memory)?)
             };
             let product = registers::product(&mut state.eflags, a, b, dst.width, signed);
+            #[cfg(test)]
+            first_visit::tests::count(|work| work.flag_updates += 1);
             dst.write(&mut state.regs, product as u32);
         }
         Action::Set(dst, condition) => {
             let destination = Destination::prepare(dst, state, memory)?;
             destination.commit(u32::from(condition_true(condition, state.eflags)), state);
+        }
+        Action::Cmov(Operand::Register(dst), src, condition) => {
+            let value = read(src, state, memory)?;
+            if condition_true(condition, state.eflags) {
+                dst.write(&mut state.regs, value);
+            }
         }
         Action::Branch(target, condition) => {
             if condition == ConditionCode::None || condition_true(condition, state.eflags) {
@@ -171,7 +210,7 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
             next = read(target, state, memory)?;
             let address = state.regs[4].wrapping_sub(4);
             let destination = Destination::memory(address, 4, memory)?;
-            destination.commit(i.next, state);
+            destination.commit(fallthrough, state);
             state.regs[4] = address;
             if !matches!(target, Operand::Immediate(_)) {
                 state.last_indirect_branch = crate::IndirectBranch {
@@ -189,6 +228,17 @@ pub(super) fn execute(i: &Predecoded, state: &mut CpuState, memory: &mut Memory)
                 target: next,
                 kind: crate::IndirectBranchKind::Return,
             };
+        }
+        Action::Leave(width) => {
+            let address = state.regs[5];
+            let frame = read_memory(address, width, memory)?;
+            state.regs[4] = address.wrapping_add(u32::from(width));
+            Reg {
+                index: 5,
+                shift: 0,
+                width,
+            }
+            .write(&mut state.regs, frame);
         }
         _ => return None,
     }
