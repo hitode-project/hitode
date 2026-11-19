@@ -158,6 +158,7 @@ device loss; builds without it omit the executor hooks.
 | `--profile` | Diagnostic | Off |
 | `--frame-budget` | Diagnostic | Off; headless with one guest worker only |
 | `--control-stdin` | Diagnostic | Off |
+| `--record-input` | Diagnostic | No recording; also `ADV_RECORD_INPUT=PATH` |
 | `--help`, `-h` | Diagnostic | Help not shown |
 
 The default-off features above conflict with the default-on rule; each must become default or be removed.

@@ -137,6 +137,14 @@ class PlaySessionTests(unittest.TestCase):
             schedule.write_text(json.dumps([{"at": 0, "wait": {"window": "Title"}}, {"at": 1, "command": "close"}]))
             self.assertEqual(len(play_session.load_schedule(schedule)), 2)
 
+    def test_input_recording_loads_one_step_per_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recording = Path(directory) / "play.jsonl"
+            recording.write_text('{"at": 1.5, "command": "input 0x201 0x1 0x2a0130"}\n'
+                                 '{"at": 2.0, "command": "close"}\n')
+            steps = play_session.load_schedule(recording)
+            self.assertEqual([step["at"] for step in steps], [1.5, 2.0])
+
     def test_code_page_defaults_to_detection(self):
         args = play_session.build_parser().parse_args(
             ["--wine", "w", "--binary", "b", "--exe", "e", "--schedule", "s", "--output", "o"])

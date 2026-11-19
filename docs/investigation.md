@@ -127,12 +127,14 @@ addresses and omit process-specific instruction forms and code sizes.
 
 **Control commands.** `--control-stdin` takes one command per line:
 
-- Input: `click X Y`, `move X Y`, `mouse-down X Y`, `mouse-up X Y`, `right-mouse-down X Y`, `right-mouse-up X Y`, `key VK`, `key-down VK`, `key-up VK` and `text STRING`.
+- Input: `input MESSAGE WPARAM LPARAM` and `window-input WINDOW MESSAGE WPARAM LPARAM` (raw window messages, as recordings carry them), `click X Y`, `move X Y`, `mouse-down X Y`, `mouse-up X Y`, `right-mouse-down X Y`, `right-mouse-up X Y`, `key VK`, `key-down VK`, `key-up VK` and `text STRING`.
 - Menus and dialogs: `menus`, `menu ID`, `dialogs`, `dialog ID`, `dialog-track ID VALUE` and `dialog-close`.
 - App activation: `activate 0` and `activate 1`, as a frontend reports switching away and back.
 - State: `windows` (presented frames, the displayed top-level window, focus, active and capture windows, and each top-level window's class and text) and `hit X Y` (the window a click there reaches, or `null`). Poll them to wait for a screen instead of sleeping a fixed time; `play_session.py` steps do this with `wait`.
 - Records: `capture PATH`, `report PATH` and `memory ADDR LEN`.
 - Measurement and flow: `reset-metrics`, `await-frame HASH TIMEOUT_MS ...`, `resume` and `close`.
+
+**Recording play.** `--record-input PATH`, or `ADV_RECORD_INPUT=PATH` for the launcher, writes the player's window input as a `.jsonl` schedule, one `{"at", "command"}` step per line, timed from process start. `play_session.py --schedule PATH.jsonl` replays it headless; add `checkpoint` steps by hand where captures are wanted. Steps run at their recorded time, so a build that runs slower may reach a screen later than the recorded click.
 
 Coordinates are guest canvas coordinates, so they change with the guest resolution and the game's window or full screen setting.
 
