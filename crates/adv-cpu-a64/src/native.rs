@@ -1991,6 +1991,27 @@ mod tests {
         );
     }
 
+    // spec: A64-CTL-1, A64-OPT-8
+    #[test]
+    fn cache_clear_discards_pending_resident_events() {
+        let (_memory, mut native, _stop) = probation_loop(100);
+        let state = resident_cpu(HEAD, 100);
+        native.runtime.resident_point = 1;
+        native.runtime.resident_env = (u64::from(HEAD) << 32) | (1 << 8);
+        native.runtime.resident_probation = (u64::from(HEAD) << 32) | 1;
+        native.clear();
+        assert_eq!(native.runtime.resident_point, 0);
+        assert_eq!(native.runtime.resident_env, 0);
+        assert_eq!(native.runtime.resident_probation, 0);
+
+        native.runtime.resident_point = 1;
+        native.runtime.resident_env = (u64::from(HEAD) << 32) | (1 << 8);
+        native.runtime.resident_probation = (u64::from(HEAD) << 32) | 1;
+        native.resident_arrival(&state);
+        native.environment_miss();
+        native.finish_probation();
+    }
+
     // spec: A64-REG-6, A64-MEM-1
     #[test]
     fn the_window_is_aligned_and_biases_the_stack_registers() {

@@ -510,7 +510,9 @@ impl Native {
             .resident_cold_exits_by_reason
             .entry(reason)
             .or_default() += 1;
-        let head = self.plans.resident_mut(eip).unwrap();
+        let Some(head) = self.plans.resident_mut(eip) else {
+            return;
+        };
         let count = head.cold_counts.entry((site, reason)).or_default();
         *count += 1;
         let count = *count;
@@ -878,6 +880,9 @@ impl Native {
         self.code.direct_points.clear();
         self.code.internal_edges.clear();
         self.plans.clear_overlays();
+        self.runtime.resident_point = 0;
+        self.runtime.resident_env = 0;
+        self.runtime.resident_probation = 0;
         self.code.tier1_words.clear();
         self.code.placed.clear();
         self.code.helper_eips = self.helper_histogram();
@@ -1225,7 +1230,9 @@ impl Native {
             return;
         }
         let eip = cpu.eip;
-        let head = self.plans.resident_mut(eip).unwrap();
+        let Some(head) = self.plans.resident_mut(eip) else {
+            return;
+        };
         if head.rebuilds != 0 || matches!(head.pending, Some(compile::Task::Replace(_))) {
             return;
         }
@@ -1233,6 +1240,9 @@ impl Native {
             if head.pending.is_none() && head.versions.len() < plan::VERSIONS {
                 self.request_resident(eip, compile::Task::Append, cpu.clone());
             }
+            return;
+        }
+        if head.versions.is_empty() {
             return;
         }
         self.diagnostics.rust_decisions_on_decided_sites += u64::from(head.probes == 0);
@@ -1299,11 +1309,20 @@ impl Native {
         }
         let eip = (event >> 32) as u32;
         let index = ((event >> 8) & 0xff) as usize - 1;
-        let head = self.plans.resident_mut(eip).unwrap();
-        let version = &head.versions[index];
+        let Some(head) = self.plans.resident_mut(eip) else {
+            return;
+        };
+        let Some(version) = head.versions.get(index) else {
+            return;
+        };
         let fact = event as u8 as usize;
-        version.slot.env[fact].set(0);
-        let site = version.plain_sites[fact];
+        let Some(env) = version.slot.env.get(fact) else {
+            return;
+        };
+        let Some(&site) = version.plain_sites.get(fact) else {
+            return;
+        };
+        env.set(0);
         self.refuse_resident_fact(eip, site);
     }
 
@@ -1658,6 +1677,12 @@ impl Native {
         }
         let eip = (event >> 32) as u32;
         let index = event as u32 as usize - 1;
+        let Some(head) = self.plans.resident_mut(eip) else {
+            return;
+        };
+        if index >= head.versions.len() {
+            return;
+        }
         self.stop_cold_window(eip);
         let version = &mut self.plans.resident_mut(eip).unwrap().versions[index];
         let Some(probation) = version.probation.take() else {
