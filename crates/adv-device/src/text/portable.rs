@@ -37,6 +37,7 @@ struct FaceStore {
     file_order: VecDeque<PathBuf>,
     file_bytes: usize,
     legacy_families: BTreeMap<ID, Vec<String>>,
+    enumeration_spans: BTreeMap<ID, (u16, u16)>,
     #[cfg(target_vendor = "apple")]
     core_descriptors: BTreeMap<ID, Option<apple::CoreDescriptor>>,
 }
@@ -167,6 +168,75 @@ pub(super) fn prefetch_system_fonts() {
 struct Discovery {
     database: Arc<Database>,
     profile: Option<Arc<profile::Loaded>>,
+    families: OnceLock<FamilyIndex>,
+}
+
+#[derive(Default)]
+struct FamilyIndex {
+    families: BTreeMap<String, Vec<ID>>,
+    postscript: BTreeMap<String, Vec<ID>>,
+    prefix_lengths: BTreeSet<usize>,
+}
+impl FamilyIndex {
+    fn new(db: &Database) -> Self {
+        let mut index = Self::default();
+        for face in db.faces() {
+            for (name, _) in &face.families {
+                let name = name.to_lowercase();
+                if !name.is_empty() {
+                    index.prefix_lengths.insert(name.len());
+                }
+                index.families.entry(name).or_default().push(face.id);
+            }
+            index
+                .postscript
+                .entry(face.post_script_name.to_lowercase())
+                .or_default()
+                .push(face.id);
+        }
+        index
+    }
+
+    fn matching_faces(&self, db: &Database, store: &Mutex<FaceStore>, name: &str) -> BTreeSet<ID> {
+        let mut matches: BTreeSet<_> = self
+            .families
+            .get(name)
+            .into_iter()
+            .flatten()
+            .chain(self.postscript.get(name).into_iter().flatten())
+            .copied()
+            .collect();
+        // GDI also accepts legacy family names starting with the typographic
+        // family. Read only the name tables of faces with a matching prefix.
+        for prefix in self
+            .prefix_lengths
+            .range(..name.len())
+            .filter_map(|&at| name.get(..at))
+        {
+            for &id in self.families.get(prefix).into_iter().flatten() {
+                if !matches.contains(&id) && legacy_matches(db, store, db.face(id).unwrap(), name) {
+                    matches.insert(id);
+                }
+            }
+        }
+        matches
+    }
+}
+
+impl Discovery {
+    fn new(database: Arc<Database>, profile: Option<Arc<profile::Loaded>>) -> Self {
+        Self {
+            database,
+            profile,
+            families: OnceLock::new(),
+        }
+    }
+
+    fn matching_faces(&self, store: &Mutex<FaceStore>, name: &str) -> BTreeSet<ID> {
+        self.families
+            .get_or_init(|| FamilyIndex::new(&self.database))
+            .matching_faces(&self.database, store, name)
+    }
 }
 impl Backend {
     pub(super) fn with_directories(directories: &[PathBuf]) -> Self {
@@ -179,6 +249,7 @@ impl Backend {
         debug_assert!(self.resources.is_empty());
         self.windows = Some(directory.to_owned());
         self.database = OnceLock::new();
+        self.store = Arc::default();
     }
     pub(super) fn with_profile(path: &std::path::Path) -> Result<Self, TextError> {
         let backend = Self {
@@ -213,10 +284,7 @@ impl Backend {
                     if let Some(windows) = &self.windows {
                         database = fill_gaps(&database, &directory_fonts(&mut catalogs, windows));
                     }
-                    return Ok(Discovery {
-                        database: Arc::new(database),
-                        profile: None,
-                    });
+                    return Ok(Discovery::new(Arc::new(database), None));
                 } else if let Some(windows) = &self.windows {
                     let fonts = directory_fonts(
                         &mut *DIRECTORY_FONTS.lock().map_err(|e| e.to_string())?,
@@ -227,20 +295,11 @@ impl Backend {
                         .entry(windows.clone())
                         .or_insert_with(|| Arc::new(fill_gaps(&system_fonts(), &fonts)))
                         .clone();
-                    return Ok(Discovery {
-                        database,
-                        profile: None,
-                    });
+                    return Ok(Discovery::new(database, None));
                 } else {
-                    return Ok(Discovery {
-                        database: system_fonts(),
-                        profile: None,
-                    });
+                    return Ok(Discovery::new(system_fonts(), None));
                 };
-                Ok(Discovery {
-                    database: Arc::new(db),
-                    profile,
-                })
+                Ok(Discovery::new(Arc::new(db), profile))
             })
             .as_ref()
             .map_err(|error| TextError::Font(error.clone()))
@@ -282,7 +341,9 @@ impl Backend {
             return Err(TextError::Font("invalid OpenType font resource".into()));
         }
         self.discovery()?;
-        let db = Arc::make_mut(&mut self.database.get_mut().unwrap().as_mut().unwrap().database);
+        let discovery = self.database.get_mut().unwrap().as_mut().unwrap();
+        discovery.families.take();
+        let db = Arc::make_mut(&mut discovery.database);
         let faces: Vec<_> = probe
             .faces()
             .cloned()
@@ -307,7 +368,9 @@ impl Backend {
         let Some(resource) = self.resources.remove(&id) else {
             return false;
         };
-        let db = Arc::make_mut(&mut self.database.get_mut().unwrap().as_mut().unwrap().database);
+        let discovery = self.database.get_mut().unwrap().as_mut().unwrap();
+        discovery.families.take();
+        let db = Arc::make_mut(&mut discovery.database);
         for face in resource.faces {
             db.remove_face(face);
         }
@@ -333,14 +396,15 @@ impl Backend {
             .flat_map(|resource| resource.faces.iter().copied())
             .collect();
         if let Some(profile) = &profile {
-            let mut guests: Vec<_> = db
-                .faces()
-                .filter(|face| {
-                    resources.contains(&face.id)
-                        && request.default.is_none()
-                        && family_matches(&db, &self.store, face, &request.face)
-                })
-                .collect();
+            let mut guests = Vec::new();
+            if !resources.is_empty() && request.default.is_none() {
+                let name = normalized_name(&request.face);
+                let matches = discovery.matching_faces(&self.store, &name);
+                guests.extend(
+                    db.faces()
+                        .filter(|face| resources.contains(&face.id) && matches.contains(&face.id)),
+                );
+            }
             guests.sort_by_key(|face| {
                 (
                     usize::from((face.style != Style::Normal) != request.italic),
@@ -367,7 +431,7 @@ impl Backend {
                 None,
             );
         }
-        let name = request.face.trim_start_matches('@').to_lowercase();
+        let name = normalized_name(&request.face);
         let replacement = self
             .replacements
             .get(&name)
@@ -376,13 +440,20 @@ impl Backend {
         if let Some(replacement) = replacement {
             names.insert(1, replacement.clone());
         }
+        let mut ranks = BTreeMap::new();
+        for (rank, family) in names.iter().enumerate() {
+            for id in discovery.matching_faces(&self.store, &normalized_name(family)) {
+                ranks.entry(id).or_insert(rank);
+            }
+        }
         let mut candidates: Vec<_> = db.faces().collect();
         let weight = normalized_weight(request);
+        let fixed_pitch = fixed(request);
         candidates.sort_by_cached_key(|face| {
-            let rank = names
-                .iter()
-                .position(|name| family_matches(&db, &self.store, face, name))
-                .unwrap_or(names.len() + usize::from(!face.monospaced && fixed(request)));
+            let rank = ranks
+                .get(&face.id)
+                .copied()
+                .unwrap_or(names.len() + usize::from(!face.monospaced && fixed_pitch));
             (
                 rank,
                 !resources.contains(&face.id),
@@ -395,8 +466,10 @@ impl Backend {
             TextError::Font("no OpenType fonts found; install fonts or set ADV_FONT_DIR".into())
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
-        let substitute =
-            request.default.is_none() && !family_matches(&db, &self.store, &face.info, &name);
+        let substitute = request.default.is_none()
+            && !discovery
+                .matching_faces(&self.store, &name)
+                .contains(&primary);
         let cell = if substitute && !name.is_empty() {
             ideographic_ascent(&face.font()?)
         } else {
@@ -485,8 +558,9 @@ impl Backend {
             .collect();
         let named = face.filter(|name| !name.is_empty());
         let present = |name: &str| {
-            db.faces()
-                .any(|info| family_matches(db, &self.store, info, name))
+            !discovery
+                .matching_faces(&self.store, &normalized_name(name))
+                .is_empty()
         };
         // A family the host lacks enumerates as the face that draws it, under
         // the requested name, so a presence check agrees with drawing.
@@ -500,15 +574,20 @@ impl Backend {
             let id = self.font(&request).ok()?.primary.info.id;
             Some((db.face(id)?, Some(name.to_owned())))
         };
-        let faces: Vec<_> = match named {
-            Some(name) if !present(name) => substitute(name).into_iter().collect(),
-            Some(name) => {
-                // A family's faces come in Wine's style order, not file order:
-                // win32u takes the first face's full name as the real face
-                // name, so a bold file listed first renames the regular font.
+        let named_matches = named.map(|name| {
+            (
+                name,
+                discovery.matching_faces(&self.store, &normalized_name(name)),
+            )
+        });
+        let faces: Vec<_> = match named_matches {
+            Some((name, matches)) if matches.is_empty() => substitute(name).into_iter().collect(),
+            Some((_, matches)) => {
+                // win32u takes the first full name as the real face name, so
+                // preserve Wine's style order, with regular before bold.
                 let mut faces: Vec<_> = db
                     .faces()
-                    .filter(|info| family_matches(db, &self.store, info, name))
+                    .filter(|info| matches.contains(&info.id))
                     .map(|info| (info, None))
                     .collect();
                 faces.sort_by_key(|(info, _)| {
@@ -529,6 +608,7 @@ impl Backend {
                 )
                 .collect(),
         };
+        let requested_name = named.map(str::to_lowercase);
         for (info, forced) in faces
             .into_iter()
             .filter(|(info, _)| !hidden.contains(&info.id))
@@ -549,9 +629,8 @@ impl Backend {
                     // Report the legacy family GDI uses: the requested spelling
                     // when it names one, else the guest UI language, else English.
                     let requested = forced.clone().or_else(|| {
-                        let name = named?;
-                        legacy_families(&font)
-                            .find(|family| family.to_lowercase() == name.to_lowercase())
+                        let name = requested_name.as_deref()?;
+                        legacy_families(&font).find(|family| family.to_lowercase() == name)
                     });
                     let localized = self.language.and_then(|tag| {
                         font.localized_strings(skrifa::string::StringId::FAMILY_NAME)
@@ -592,17 +671,7 @@ impl Backend {
                     let (_, _, metrics) = font_metrics(&font, &request, cell)?;
                     let unscaled = font.metrics(Size::unscaled(), LocationRef::default());
                     let (asc, desc) = cell_units(&font, f32::from(unscaled.units_per_em), cell);
-                    let charmap = font.charmap();
-                    let first = charmap
-                        .mappings()
-                        .next()
-                        .map(|(c, _)| c.min(65535) as u16)
-                        .unwrap_or(0);
-                    let last = charmap
-                        .mappings()
-                        .last()
-                        .map(|(c, _)| c.min(65535) as u16)
-                        .unwrap_or(0);
+                    let (first, last) = self.enumeration_span(info.id, &font)?;
                     let string = |id| {
                         font.localized_strings(id)
                             .english_or_first()
@@ -672,6 +741,19 @@ impl Backend {
             }
         }
         Ok(output)
+    }
+
+    fn enumeration_span(&self, id: ID, font: &FontRef<'_>) -> Result<(u16, u16), TextError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| TextError::Font("font cache lock poisoned".into()))?;
+        Ok(*store.enumeration_spans.entry(id).or_insert_with(|| {
+            let charmap = font.charmap();
+            let mut codes = charmap.mappings().map(|(code, _)| code.min(65535) as u16);
+            let first = codes.next().unwrap_or(0);
+            (first, codes.last().unwrap_or(first))
+        }))
     }
 }
 
@@ -897,30 +979,14 @@ fn validate_font(request: &FontRequest) -> Result<(), TextError> {
     }
     Ok(())
 }
-fn family_matches(db: &Database, store: &Mutex<FaceStore>, face: &FaceInfo, name: &str) -> bool {
-    let name = name.trim_start_matches('@').to_lowercase();
-    if face
-        .families
-        .iter()
-        .any(|family| family.0.to_lowercase() == name)
-        || face.post_script_name.to_lowercase() == name
-    {
-        return true;
-    }
-    // fontdb keeps only the typographic family when one exists; GDI names
-    // faces by their legacy family. Only faces whose typographic family
-    // prefixes the request are read again (name table only, cached by face).
-    if !face
-        .families
-        .iter()
-        .any(|family| !family.0.is_empty() && name.starts_with(&family.0.to_lowercase()))
-    {
-        return false;
-    }
+fn normalized_name(name: &str) -> String {
+    name.trim_start_matches('@').to_lowercase()
+}
+fn legacy_matches(db: &Database, store: &Mutex<FaceStore>, face: &FaceInfo, name: &str) -> bool {
     if let Ok(guard) = store.lock()
         && let Some(cached) = guard.legacy_families.get(&face.id)
     {
-        return cached.iter().any(|family| family == &name);
+        return cached.iter().any(|family| family == name);
     }
     let names: Vec<String> = match &face.source {
         Source::File(path) => discovery::face_metadata(path, face.index, false)
@@ -940,7 +1006,7 @@ fn family_matches(db: &Database, store: &Mutex<FaceStore>, face: &FaceInfo, name
             })
             .unwrap_or_default(),
     };
-    let matched = names.iter().any(|family| family == &name);
+    let matched = names.iter().any(|family| family == name);
     if let Ok(mut guard) = store.lock() {
         guard.legacy_families.insert(face.id, names);
     }
@@ -1576,6 +1642,9 @@ impl Font {
                 name(skrifa::string::StringId::UNIQUE_ID),
             ],
         })
+    }
+    pub(super) fn quality(&self) -> Quality {
+        self.request.quality
     }
     pub(super) fn logical_font(&self) -> FontRequest {
         let mut logical = self.request.clone();
@@ -2571,6 +2640,66 @@ fn blend(pixels: &mut Pixels<'_>, x: i64, y: i64, color: [u8; 3], coverage: u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: DEV-FONT-1 DEV-FONT-4 DEV-FONT-5
+    #[test]
+    fn enumeration_snapshots_and_matching_follow_resource_changes() {
+        let single = include_bytes!("../../tests/fixtures/font-resource.ttf");
+        let collection = include_bytes!("../../tests/fixtures/font-resource.ttc");
+        let mut text = Text::with_font_directories(&[]);
+        text.add_file_resource(single, true).unwrap();
+        let name = "adv collection two";
+        let request = font(name);
+        let mode = FontEnumeration::FamiliesEx(Encoding::Automatic);
+        let snapshot = |text: &Text| text.enumeration_snapshot(Some(name), mode).unwrap();
+        let full = |text: &Text| text.enumeration_snapshot(None, mode).unwrap();
+        let contains_family = |rows: &[EnumeratedFont]| {
+            rows.iter()
+                .any(|row| row.font.face.eq_ignore_ascii_case(name))
+        };
+
+        let all = full(&text);
+        assert!(Arc::ptr_eq(&all, &full(&text)));
+        assert!(!contains_family(&all));
+        let missing = snapshot(&text);
+        assert!(missing[0].substitute);
+        assert!(Arc::ptr_eq(&missing, &snapshot(&text)));
+        assert_eq!(
+            text.resolved_character(&request, 66).unwrap().family,
+            "ADV Resource Fixture"
+        );
+
+        let (id, _) = text.add_file_resource(collection, true).unwrap();
+        let visible = snapshot(&text);
+        assert!(!visible.is_empty());
+        assert!(visible.iter().all(|row| !row.substitute));
+        assert!(Arc::ptr_eq(&visible, &snapshot(&text)));
+        assert!(contains_family(&full(&text)));
+        assert_eq!(
+            text.resolved_character(&request, 66).unwrap().family,
+            "ADV Collection Two"
+        );
+        assert!(text.remove_resource(id).unwrap());
+        assert!(!contains_family(&full(&text)));
+        let removed = snapshot(&text);
+        assert!(removed[0].substitute);
+        assert!(!Arc::ptr_eq(&missing, &removed));
+        assert!(!visible[0].substitute);
+        assert_eq!(
+            text.resolved_character(&request, 66).unwrap().family,
+            "ADV Resource Fixture"
+        );
+
+        let (id, _) = text.add_file_resource(collection, false).unwrap();
+        assert!(snapshot(&text).is_empty());
+        assert!(!contains_family(&full(&text)));
+        assert_eq!(
+            text.resolved_character(&request, 66).unwrap().family,
+            "ADV Collection Two"
+        );
+        assert!(text.remove_resource(id).unwrap());
+        assert!(snapshot(&text)[0].substitute);
+    }
+
     // spec: DEV-FONT-2
     #[test]
     #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
