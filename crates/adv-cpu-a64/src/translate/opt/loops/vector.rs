@@ -1,6 +1,7 @@
 //! Replace an independent integer data path with a vector of guest iterations.
 //! Compute only the low bits observed by stores. All architectural state is
 //! established by the original scalar iteration following the batch region.
+//! A read shared by every lane still participates in the span guards.
 
 use std::collections::BTreeMap;
 
@@ -138,7 +139,9 @@ impl LoopKernel for Vector {
         let groups = loop_.groups();
         for group in &groups {
             let s = group[0].1;
-            if group.len() > 4 || s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
+            if group.len() > 4
+                || s.stride != 0
+                    && s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
             {
                 return None;
             }
@@ -151,7 +154,9 @@ impl LoopKernel for Vector {
         if width >= 8 {
             if !paths.selects.is_empty()
                 || !matches!(width, 8 | 16)
-                || groups.iter().any(|g| g.len() != 1 || g[0].1.width != width)
+                || groups
+                    .iter()
+                    .any(|g| g[0].1.width != width || width == 16 && g.len() != 1)
             {
                 return None;
             }
@@ -742,6 +747,9 @@ impl Builder<'_> {
         else {
             return None;
         };
+        if matches!(cond, Cc::s | Cc::ns) {
+            return None;
+        }
         invert(cond)?;
         let signed = matches!(cond, Cc::l | Cc::le | Cc::g | Cc::ge);
         let arr = self.shape.arr();
@@ -976,6 +984,22 @@ impl Builder<'_> {
         let s = memory.stream;
         let write = s.write();
         let mut log = s.width.trailing_zeros();
+        if s.stride == 0 {
+            let size = match s.width {
+                1 => VMem::B,
+                2 => VMem::H,
+                4 => VMem::S,
+                8 => VMem::D,
+                16 => VMem::Q,
+                _ => unreachable!(),
+            };
+            let dst = regs[0];
+            code.push(Step::Address(s, vldr(size, dst, ADDRESS, 0)));
+            if size != VMem::Q {
+                code.push(Step::Word(vdup_lane(self.shape.arr(), dst, dst, 0)));
+            }
+            return;
+        }
         let (work, bytes) = match self.shape {
             Shape::Scalar(w) => (w.trailing_zeros(), s.width * self.shape.lanes()),
             Shape::Packed(_) => (log, 16),

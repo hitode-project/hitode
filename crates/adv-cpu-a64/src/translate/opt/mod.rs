@@ -76,7 +76,7 @@ use ir::Source;
 
 /// Fills `out` with the entry cells of an optimized form when `cpu` meets the
 /// facts it assumes, returning whether it admitted. `frame` reads `width` guest
-/// bytes at an address.
+/// bytes at an address. A deferred MMX state is read as if refreshed.
 pub(crate) fn admit_into(
     entry: &[Source],
     assumed: &Assumed,
@@ -87,12 +87,17 @@ pub(crate) fn admit_into(
     out.clear();
     let x87 = &cpu.x87;
     let esp = cpu.regs[4];
+    let pending = cpu.mmx_mode != 0;
+    let (status, tags) = cpu.deferred_mmx_status_tags();
+    let register = |i: u8| {
+        let i = usize::from(i);
+        cpu.deferred_mmx_write(i).unwrap_or(x87.regs[i])
+    };
     let holds = (!assumed.x87
         || x87.control == assumed.control
-            && x87.status & !0x3800 == assumed.status
-            && x87.top() as u8 == assumed.top
-            && x87.tag == assumed.tags)
-        && (!assumed.mmx || x87.status & 0x80 == 0)
+            && status == assumed.status | u16::from(assumed.top) << 11
+            && tags == assumed.tags)
+        && (!assumed.mmx || status & 0x80 == 0)
         && (cpu.mxcsr ^ assumed.mxcsr) & assumed.mxcsr_mask == 0
         && assumed.esp_low.is_none_or(|low| (esp & 15) as u8 == low);
     if !holds {
@@ -104,9 +109,13 @@ pub(crate) fn admit_into(
             Source::FsBase => u128::from(cpu.fs_base),
             Source::Eflags => u128::from(cpu.eflags),
             Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
-            Source::Mmx(i) => u128::from(cpu.mmx[usize::from(i)]),
+            Source::Mmx(i) => u128::from(if pending {
+                register(i).significand()
+            } else {
+                cpu.mmx[usize::from(i)]
+            }),
             Source::X87(i) => {
-                let Some(value) = recovery::binary64(x87.regs[usize::from(i)]) else {
+                let Some(value) = recovery::binary64(register(i)) else {
                     return false;
                 };
                 u128::from(value)
@@ -133,4 +142,51 @@ pub(crate) fn admit(
 ) -> Option<Vec<u128>> {
     let mut out = Vec::with_capacity(entry.len());
     admit_into(entry, assumed, cpu, &mut out, frame).then_some(out)
+}
+
+// spec: A64-OPT-9
+#[test]
+fn deferred_mmx_admission_matches_refresh_for_every_mode() {
+    let mut cpu = CpuState::default();
+    cpu.x87.status = 0x2120;
+    cpu.x87.tag = 0x954a;
+    cpu.x87.regs = [adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff); 8];
+    cpu.mmx = std::array::from_fn(|slot| (1 << 63) | (slot % 2) as u64);
+    for controls in 0..8 {
+        for mask in 0..=255 {
+            let mode = controls | (mask << 8);
+            cpu.mmx_mode = mode;
+            let mut refreshed = cpu.clone();
+            refreshed.refresh_mmx();
+            let (status, tags) = cpu.deferred_mmx_status_tags();
+            assert_eq!((status, tags), (refreshed.x87.status, refreshed.x87.tag));
+            let mut facts = Assumed {
+                control: refreshed.x87.control,
+                status: status & !0x3800,
+                mxcsr: cpu.mxcsr,
+                top: refreshed.x87.top() as u8,
+                tags,
+                esp_low: None,
+                ebp: None,
+                denormal: false,
+                x87: true,
+                mmx: true,
+                mxcsr_mask: u32::MAX,
+            };
+            for slot in 0..8 {
+                for source in [Source::Mmx(slot), Source::X87(slot)] {
+                    // With no pending MMX change, a native entry reads the
+                    // already refreshed cache.
+                    let arriving = if mode == 0 { &refreshed } else { &cpu };
+                    assert_eq!(
+                        admit(&[source], &facts, arriving, |_, _| 0),
+                        admit(&[source], &facts, &refreshed, |_, _| 0),
+                        "mode {mode:x}, slot {slot}"
+                    );
+                }
+            }
+            facts.tags ^= 1;
+            assert_eq!(admit(&[], &facts, &cpu, |_, _| 0), None);
+        }
+    }
 }

@@ -1263,7 +1263,6 @@ impl Native {
         };
         let version = head.versions.iter().position(|version| {
             cpu.rep.is_none()
-                && cpu.mmx_mode == 0
                 && translate::opt::admit_into(
                     &version.sources,
                     &version.assumed,

@@ -1946,6 +1946,98 @@ fn vector_signed_bound_in_a_frame_cell() {
 
 // spec: A64-OPT-10
 #[test]
+fn vector_sign_latch_guards_an_invariant_load() {
+    let image = Image::loop_body(|a, head, _| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.or(eax, dword_ptr(ebx)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jns(head).unwrap();
+    });
+    for alias in [false, true] {
+        let mut cpu = initial(63);
+        cpu.regs[3] = if alias { OUTPUT } else { RESULTS };
+        let data = vector_data(498);
+        let mut trial = Trial::new(&image, &cpu, format!("invariant alias {alias}"), &[], |m| {
+            m.write(DATA, &data).unwrap();
+            m.write(OUTPUT, &0x8543_2100u32.to_le_bytes()).unwrap();
+            m.write(RESULTS, &0xff00_0000u32.to_le_bytes()).unwrap();
+        });
+        vector_install(&mut trial, cpu, 4);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_interleaves_packed_integer_streams_with_a_sign_latch() {
+    let image = Image::loop_body(|a, head, _| {
+        for (offset, reg) in [(0, mm0), (8, mm1), (16, mm2), (24, mm3)] {
+            a.movq(reg, qword_ptr(esi + offset)).unwrap();
+            a.por(reg, mm7).unwrap();
+        }
+        for (offset, reg) in [(0, mm0), (8, mm1), (16, mm2), (24, mm3)] {
+            a.movntq(qword_ptr(edi + offset), reg).unwrap();
+        }
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        a.sub(ecx, 8).unwrap();
+        a.jns(head).unwrap();
+    });
+    for in_place in [false, true] {
+        let mut cpu = initial(191);
+        if in_place {
+            cpu.regs[7] = cpu.regs[6];
+        }
+        cpu.x87.regs[7] = adv_cpu_core::X87Register::from_parts(0xff00_0000_ff00_0000, 0xffff);
+        cpu.refresh_mmx();
+        let data = vector_data(592);
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("interleave in place {in_place}"),
+            &[],
+            |m| {
+                m.write(DATA, &data).unwrap();
+            },
+        );
+        vector_install(&mut trial, cpu, 2);
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+}
+
+// spec: A64-OPT-9, A64-OPT-10
+#[test]
+fn vector_enters_resident_from_a_deferred_mmx_arrival() {
+    let image = Image::with_prelude(
+        |a, _| a.movq(mm7, qword_ptr(ebx)).unwrap(),
+        |a, head, _| {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.por(mm0, mm7).unwrap();
+            a.movq(qword_ptr(edi), mm0).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            latch(a, head);
+        },
+        |_| {},
+    );
+    let mut cpu = initial(128);
+    cpu.regs[3] = RESULTS;
+    cpu.x87.set_top(3);
+    let mut trial = Trial::new(&image, &cpu, "deferred MMX", &[], |m| {
+        m.write(DATA, &vector_data(172)).unwrap();
+        m.write(RESULTS, &0xff00_0000_ff00_0000u64.to_le_bytes())
+            .unwrap();
+    });
+    vector_install(&mut trial, cpu, 2);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert!(trial.live.native.as_ref().unwrap().vector_regions() > 0);
+}
+
+// spec: A64-OPT-10
+#[test]
 fn vector_declines_a_loop_carried_reduction() {
     let image = Image::loop_body(|a, head, _| {
         a.movzx(eax, byte_ptr(esi)).unwrap();

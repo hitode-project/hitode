@@ -281,15 +281,15 @@ fn emit<'a>(
     // spec: A64-OPT-7
     e.mark(Part::Body, func.records[first.0 as usize].eip);
     let bytes = allocation.spill_cells as u64 * 16;
-    let (miss, cold) = if let Some((assumed, entry)) = inline {
+    let (miss, cold, pending) = if let Some((assumed, entry)) = inline {
         let miss = e.asm.label();
         let cold = e.asm.label();
-        e.inline_entry(assumed, entry, bytes, miss, cold, last_fact.is_some());
-        (Some(miss), Some(cold))
+        let pending = e.inline_entry(assumed, entry, bytes, miss, cold, last_fact.is_some());
+        (Some(miss), Some(cold), pending)
     } else {
         e.stack_frame(bytes, true);
         e.job_entry();
-        (None, None)
+        (None, None, None)
     };
     if last_fact.is_none() {
         e.begin_body(first, count_entries);
@@ -444,6 +444,11 @@ fn emit<'a>(
     }
     e.checked_accesses();
     e.page_crossings();
+    if let (Some((assumed, entry)), Some(pending), Some(miss), Some(cold)) =
+        (inline, pending, miss, cold)
+    {
+        e.deferred_entry(assumed, entry, pending, miss, cold);
+    }
     if let Some(pages) = batch_pages {
         resident::batch_pages(&mut e.asm, pages);
     }

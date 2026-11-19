@@ -1,6 +1,8 @@
 //! Natural loops and affine streams in the optimized SSA form. A kernel
 //! proposes a batch for a loop, while the back end owns its guards, charge
 //! and transition to the original scalar body.
+//! Sign-only latches count from the wrapped result, without the overflow
+//! flag used by a signed comparison of the original operands.
 
 use iced_x86::ConditionCode as Cc;
 
@@ -324,9 +326,17 @@ fn classify(
     else {
         return Err(Reject::Latch);
     };
+    let sign = matches!(cond, Cc::s | Cc::ns);
+    if sign {
+        cond = if cond == Cc::s { Cc::l } else { Cc::ge };
+    }
     let (mut value, mut bound) = match kind {
+        FlagKind::Sub if sign => {
+            let n = defs.constant(b).ok_or(Reject::Latch)? as u32;
+            (defs.affine(a).shifted(n.wrapping_neg()), None)
+        }
         FlagKind::Sub => (defs.affine(a), Some(b)),
-        FlagKind::Increment | FlagKind::Decrement if matches!(cond, Cc::e | Cc::ne) => {
+        FlagKind::Increment | FlagKind::Decrement if sign || matches!(cond, Cc::e | Cc::ne) => {
             let offset = if kind == FlagKind::Increment {
                 1
             } else {
@@ -337,7 +347,7 @@ fn classify(
         FlagKind::Logic if matches!(cond, Cc::e | Cc::ne | Cc::l | Cc::le | Cc::g | Cc::ge) => {
             (defs.affine(a), None)
         }
-        FlagKind::Add if matches!(cond, Cc::e | Cc::ne) => {
+        FlagKind::Add if sign || matches!(cond, Cc::e | Cc::ne) => {
             let n = defs.constant(b).ok_or(Reject::Latch)? as u32;
             (defs.affine(a).shifted(n), None)
         }
@@ -374,9 +384,19 @@ fn classify(
                 _ => continue,
             };
             let addr = defs.affine(addr);
+            let stride = match stride(addr.base) {
+                Some(stride) => stride,
+                None if matches!(access, Access::Load(_))
+                    && (defs.invariant(&blocks, addr.base)
+                        || carried.contains(&(addr.base, addr.base))) =>
+                {
+                    0
+                }
+                None => return Err(Reject::Address),
+            };
             streams.push(Stream {
                 addr,
-                stride: stride(addr.base).ok_or(Reject::Address)?,
+                stride,
                 width,
                 access,
             });
@@ -408,6 +428,8 @@ pub(super) fn invert(cc: Cc) -> Option<Cc> {
         Cc::ge => Cc::l,
         Cc::le => Cc::g,
         Cc::g => Cc::le,
+        Cc::s => Cc::ns,
+        Cc::ns => Cc::s,
         _ => return None,
     })
 }
@@ -479,19 +501,29 @@ impl Batch {
             .chain(self.recovery.iter().map(|(_, a)| a.base))
             .chain(self.loop_.trip.bound)
             .chain(self.frame.iter().map(|f| f.start.base))
+            .chain(
+                self.spans
+                    .iter()
+                    .filter(|s| s.step == 0)
+                    .map(|s| s.start.base),
+            )
             .chain(self.plan.inputs.iter().copied())
     }
 
     fn new(func: &Func, loop_: Loop, plan: Plan) -> Option<Self> {
         let groups = loop_.groups();
-        let backwards = groups.first().is_some_and(|g| g[0].1.stride < 0);
+        let backwards = groups
+            .iter()
+            .find(|g| g[0].1.stride != 0)
+            .is_some_and(|g| g[0].1.stride < 0);
         let spans = groups
             .iter()
             .map(|group| {
                 let (_, s) = group[0];
                 let width = u32::from(s.width) * group.len() as u32;
                 let stride = s.stride.unsigned_abs();
-                if (s.stride < 0) != backwards || !func.resident && width != stride {
+                if stride != 0 && ((s.stride < 0) != backwards || !func.resident && width != stride)
+                {
                     return None;
                 }
                 Some(Span {

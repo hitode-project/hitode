@@ -178,23 +178,41 @@ impl CpuState {
         // Exits keep CF exact in eflags itself.
         self.eflags = old & !0x8d4 | partial | overflow;
     }
+    /// Status and tags after publishing the deferred native MMX state.
+    pub fn deferred_mmx_status_tags(&self) -> (u16, u16) {
+        let mode = self.mmx_mode;
+        let mut status = self.x87.status;
+        let mut tag = self.x87.tag;
+        if mode & 1 != 0 {
+            status &= !0x3800;
+            tag = 0;
+        }
+        if mode & 2 != 0 {
+            tag = 0xffff;
+        }
+        (status, tag)
+    }
+
+    /// A physical x87 register overwritten by the deferred MMX state.
+    pub fn deferred_mmx_write(&self, slot: usize) -> Option<X87Register> {
+        let mode = self.mmx_mode;
+        // Mode 1 can seed all MMX aliases without an explicit write mask.
+        (mode & 1 != 0 && (mode & 4 == 0 || mode & (1 << (8 + slot)) != 0))
+            .then(|| X87Register::from_parts(self.mmx[slot], 0xffff))
+    }
+
     /// Materialize deferred native MMX changes at an executor/context boundary.
     /// Integer/SSE native region dispatch does not copy any floating registers.
     pub fn commit_mmx(&mut self) {
-        let mode = self.mmx_mode;
-        if mode & 1 != 0 {
-            let written = (mode >> 8) & 0xff;
-            for (slot, bits) in self.mmx.iter().copied().enumerate() {
-                // mode=1 remains a supported way to seed all MMX aliases externally.
-                if mode & 4 == 0 || written & (1 << slot) != 0 {
-                    self.x87.regs[slot] = X87Register::from_parts(bits, 0xffff);
+        if self.mmx_mode & 1 != 0 {
+            for slot in 0..8 {
+                if let Some(register) = self.deferred_mmx_write(slot) {
+                    self.x87.regs[slot] = register;
                 }
             }
-            self.x87.set_top(0);
-            self.x87.tag = 0;
         }
-        if mode & 2 != 0 {
-            self.x87.tag = 0xffff;
+        if self.mmx_mode & 3 != 0 {
+            (self.x87.status, self.x87.tag) = self.deferred_mmx_status_tags();
         }
         self.mmx_mode = 0;
     }

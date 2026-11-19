@@ -1,4 +1,6 @@
 //! Canonical Tier-1 edges for register-allocated forms.
+//! Deferred MMX arrivals validate the state they will publish before touching
+//! it, so context misses can still follow a different version or Tier-1.
 
 use super::super::recovery::{
     self, FlagExpr, FlagGroup, FlagSelect, IrRecord, Location, Recipe, X87,
@@ -25,6 +27,10 @@ const CPU_PTR: u32 = offset_of!(Runtime, cpu) as u32;
 const SHADOW: u32 = offset_of!(Runtime, shadow) as u32;
 const WINDOW_BASE: u32 = offset_of!(Runtime, window) as u32;
 
+unsafe extern "C" fn refresh_mmx(cpu: *mut adv_cpu_core::CpuState) {
+    unsafe { (&mut *cpu).refresh_mmx() };
+}
+
 impl Emitter<'_> {
     pub(super) fn inline_entry(
         &mut self,
@@ -34,14 +40,19 @@ impl Emitter<'_> {
         miss: Label,
         cold: Label,
         delay_frames: bool,
-    ) {
+    ) -> Option<(Label, Label)> {
+        let pending = self.resident.then(|| (self.asm.label(), self.asm.label()));
         self.asm
             .emit_all(&[ldr(X, CPU, RT, CPU_PTR), ldr(W, T, CPU, runtime::MMX_MODE)]);
-        self.asm.cbz(W, true, T, cold);
+        self.asm
+            .cbz(W, true, T, pending.map_or(cold, |(deferred, _)| deferred));
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
-        self.entry_facts(assumed, miss);
+        self.entry_facts(assumed, miss, false);
 
+        if let Some((_, admitted)) = pending {
+            self.asm.bind(admitted);
+        }
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {
             let inexact = self.asm.label();
@@ -132,6 +143,62 @@ impl Emitter<'_> {
         if !delay_frames {
             self.entry_frames(entry);
         }
+        pending
+    }
+
+    pub(super) fn deferred_entry(
+        &mut self,
+        assumed: &Assumed,
+        entry: &[Source],
+        (deferred, admitted): (Label, Label),
+        miss: Label,
+        cold: Label,
+    ) {
+        self.asm.bind(deferred);
+        self.asm
+            .emit_all(&[mov(W, FLAGS, T), ldr(W, T, RT, REP_PENDING)]);
+        self.asm.cbz(W, true, T, cold);
+        self.entry_facts(assumed, miss, true);
+
+        if entry.iter().any(|s| matches!(s, Source::X87(_))) {
+            let inexact = self.asm.label();
+            let exact = self.asm.label();
+            self.asm.emit(mrs_nzcv(S5));
+            for &source in entry {
+                let Source::X87(i) = source else { continue };
+                let unchanged = self.asm.label();
+                let written = self.asm.label();
+                let next = self.asm.label();
+                self.asm.tbz(false, FLAGS, 0, unchanged);
+                self.asm.tbz(false, FLAGS, 2, written);
+                self.asm.tbz(false, FLAGS, 8 + u32::from(i), unchanged);
+                self.asm.bind(written);
+                // The deferred write has exponent 0xffff. Infinity is its
+                // only exact binary64 representation.
+                self.asm.emit_all(&[
+                    ldr(X, T, CPU, runtime::MMX + 8 * u32::from(i)),
+                    eor_imm(X, T, T, 1 << 63),
+                ]);
+                self.asm.cbz(X, true, T, inexact);
+                self.asm.b(next);
+                self.asm.bind(unchanged);
+                self.binary64(i, inexact);
+                self.asm.bind(next);
+            }
+            self.asm.b(exact);
+            self.asm.bind(inexact);
+            self.asm.emit(msr_nzcv(S5));
+            self.asm.b(miss);
+            self.asm.bind(exact);
+            self.asm.emit(msr_nzcv(S5));
+        }
+
+        let publish = self.asm.label();
+        self.asm.bl(publish);
+        self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        self.asm.b(admitted);
+        self.asm.bind(publish);
+        super::resident::preserve_call(&mut self.asm, refresh_mmx as *const () as u64);
     }
 
     pub(super) fn entry_frames(&mut self, entry: &[Source]) {
@@ -184,7 +251,7 @@ impl Emitter<'_> {
         self.asm.b(miss);
     }
 
-    fn entry_facts(&mut self, assumed: &Assumed, miss: Label) {
+    fn entry_facts(&mut self, assumed: &Assumed, miss: Label, deferred: bool) {
         if assumed.x87 {
             for (field, value) in [
                 (runtime::X87_CONTROL, assumed.control),
@@ -195,6 +262,23 @@ impl Emitter<'_> {
                 (runtime::X87_TAG, assumed.tags),
             ] {
                 self.asm.emit(ldrh(T, CPU, field));
+                if deferred && field == runtime::X87_STATUS {
+                    let keep_top = self.asm.label();
+                    self.asm.tbz(false, FLAGS, 0, keep_top);
+                    self.asm.emit(and_imm(W, T, T, u64::from(!0x3800u32)));
+                    self.asm.bind(keep_top);
+                }
+                if deferred && field == runtime::X87_TAG {
+                    let active = self.asm.label();
+                    let done = self.asm.label();
+                    self.asm.tbz(false, FLAGS, 1, active);
+                    self.asm.emit(movz(W, T, 0xffff, 0));
+                    self.asm.b(done);
+                    self.asm.bind(active);
+                    self.asm.tbz(false, FLAGS, 0, done);
+                    self.asm.emit(mov(W, T, Reg::ZR));
+                    self.asm.bind(done);
+                }
                 self.imm(U, u64::from(value));
                 self.asm.emit(eor(W, T, T, U, Lsl, 0));
                 self.asm.cbz(W, true, T, miss);
