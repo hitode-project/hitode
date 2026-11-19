@@ -495,9 +495,9 @@ pub struct Text {
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
     bytes: usize,
     hits: u64,
-    /// Enumerations by face, mode and language: each reads every font, and
-    /// engines repeat them. Dropped with the fonts.
-    enumerations: std::sync::Mutex<Vec<(Enumerated, Vec<EnumeratedFont>)>>,
+    /// Snapshots by requested face, mode and language. Cleared with realized
+    /// fonts while any callbacks in progress retain their snapshot.
+    enumerations: std::sync::Mutex<Vec<(Enumerated, Arc<[EnumeratedFont]>)>>,
 }
 type Enumerated = (Option<String>, FontEnumeration, Option<&'static str>);
 
@@ -674,16 +674,34 @@ impl Text {
         face: Option<&str>,
         mode: FontEnumeration,
     ) -> Result<Vec<EnumeratedFont>, TextError> {
-        let key = (face.map(str::to_owned), mode, self.backend.language);
+        Ok(self.enumeration_snapshot(face, mode)?.to_vec())
+    }
+
+    /// A shared snapshot for consumers that enumerate across callbacks.
+    pub fn enumeration_snapshot(
+        &self,
+        face: Option<&str>,
+        mode: FontEnumeration,
+    ) -> Result<Arc<[EnumeratedFont]>, TextError> {
         let mut cache = self
             .enumerations
             .lock()
             .map_err(|_| TextError::Font("font cache lock poisoned".into()))?;
-        if let Some((_, fonts)) = cache.iter().find(|(known, _)| *known == key) {
-            return Ok(fonts.clone());
+        let language = self.backend.language;
+        if let Some((_, fonts)) =
+            cache
+                .iter()
+                .find(|((known_face, known_mode, known_language), _)| {
+                    known_face.as_deref() == face
+                        && *known_mode == mode
+                        && *known_language == language
+                })
+        {
+            return Ok(Arc::clone(fonts));
         }
-        let fonts = self.enumerate_fonts(face, mode)?;
-        cache.push((key, fonts.clone()));
+        let fonts: Arc<[_]> = self.enumerate_fonts(face, mode)?.into();
+        let key = (face.map(str::to_owned), mode, language);
+        cache.push((key, Arc::clone(&fonts)));
         Ok(fonts)
     }
     fn enumerate_fonts(
@@ -910,6 +928,10 @@ impl Text {
     /// requests use the same selected face/profile as measurement and drawing.
     pub fn logical_font(&mut self, request: &FontRequest) -> Result<FontRequest, TextError> {
         Ok(self.font(request)?.logical_font())
+    }
+    /// Realize the font as for metrics or drawing and return its paint quality.
+    pub fn font_quality(&mut self, request: &FontRequest) -> Result<Quality, TextError> {
+        Ok(self.font(request)?.quality())
     }
     pub fn metrics(&mut self, request: &FontRequest) -> Result<TextMetrics, TextError> {
         Ok(self.font(request)?.metrics())

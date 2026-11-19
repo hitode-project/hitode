@@ -195,8 +195,8 @@ pub(super) fn render(
         .ext
         .get_mut::<Fonts>()
         .text
-        .logical_font(&request)
-        .map_or(request.quality, |f| f.quality);
+        .font_quality(&request)
+        .unwrap_or(request.quality);
     let target = physdev(env, dc);
     let monochrome = target.is_some_and(|(dev, _)| {
         env.cpu.read_u32(dev).ok() == data(env, |l| l.dib_driver) && palette_dib(env, dev)
