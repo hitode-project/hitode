@@ -71,7 +71,10 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             }
             return Err(status::INVALID_PARAMETER.into());
         }
-        let reader = volume::mounts(env).reader(fd.fd);
+        let reader = env
+            .ext
+            .try_get::<volume::Mounts>()
+            .and_then(|mounts| mounts.reader(fd.fd));
         let mut fallback = None;
         let bytes = match env.cpu.writable_bytes(buffer, length as usize) {
             Some(bytes) => bytes,
@@ -82,10 +85,12 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         } else {
             None
         };
-        let observed = (reader.is_none()
-            && fd.kind == FD_TYPE_FILE
-            && env.ext.try_get::<RecentReads>().is_some())
-        .then(|| {
+        let recent = if reader.is_none() && fd.kind == FD_TYPE_FILE {
+            env.ext.try_get_mut::<RecentReads>()
+        } else {
+            None
+        };
+        let observed = recent.as_ref().map(|_| {
             position.unwrap_or_else(|| {
                 fd.file.as_ref().map_or_else(
                     // SAFETY: the server descriptor is live.
@@ -166,12 +171,10 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             }
             return Err(status.into());
         };
-        if let Some(at) = observed.and_then(|at| u64::try_from(at).ok())
+        if let Some((recent, at)) = recent.zip(observed.and_then(|at| u64::try_from(at).ok()))
             && count != 0
         {
-            env.ext
-                .get_mut::<RecentReads>()
-                .record(&fd, buffer, at, count);
+            recent.record(&fd, buffer, at, count);
         }
         if let Some(file) = &fd.file {
             if !asynchronous {
