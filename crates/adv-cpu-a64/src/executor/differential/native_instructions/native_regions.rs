@@ -90,9 +90,15 @@ fn compare(a: &mut Executor, b: &mut Executor, p: &Program, budget: u64) {
     assert_eq!(
         a.run_with_traps(p.stop, budget, &mut Admission(body.clone()), false)
             .unwrap(),
-        b.run_with_traps(p.stop, budget, &mut Admission(body), true)
-            .unwrap()
+        b.run_with_traps(
+            p.stop,
+            budget.saturating_add(a.fuel_debt),
+            &mut Admission(body),
+            true,
+        )
+        .unwrap()
     );
+    b.fuel_debt = a.fuel_debt;
     same(a, b);
 }
 

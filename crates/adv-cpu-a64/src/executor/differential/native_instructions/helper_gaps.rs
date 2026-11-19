@@ -190,7 +190,15 @@ fn check(program: &Program, config: Config, budget: u64, native_only: bool) {
         let mut native = executor_on_host(program, config, false, host);
         let mut oracle = executor_on_host(program, config, true, host);
         let actual = native.run(program.stop, budget).unwrap();
-        assert_eq!(actual, oracle.run(program.stop, budget).unwrap());
+        assert_eq!(
+            actual,
+            oracle
+                .run(
+                    program.stop,
+                    reference_budget(budget, native.fuel_debt, &actual)
+                )
+                .unwrap()
+        );
         same(&native, &oracle);
         if native_only && !config.1 && actual == RunOutcome::ReachedStop {
             assert!(native.stats.native_entries > 0);
@@ -975,7 +983,7 @@ fn common_partial_stacks_and_segment_reads_match_on_both_host_sizes() {
                 let mut b = make(true);
                 assert_eq!(
                     a.run(p.stop, budget).unwrap(),
-                    b.run(p.stop, budget).unwrap()
+                    b.run(p.stop, budget.saturating_add(a.fuel_debt)).unwrap()
                 );
                 assert_eq!(
                     a.state.regs, b.state.regs,
@@ -1261,7 +1269,7 @@ fn common_strings_preserve_partial_state_at_blocked_pages() {
                             }
                             assert_eq!(
                                 a.run(p.stop, budget).unwrap(),
-                                b.run(p.stop, budget).unwrap()
+                                b.run(p.stop, budget.saturating_add(a.fuel_debt)).unwrap()
                             );
                             same(&a, &b);
                             for cpu in [&mut a, &mut b] {

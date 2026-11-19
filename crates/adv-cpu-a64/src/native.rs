@@ -368,7 +368,6 @@ pub(crate) struct Diagnostics {
     pub first_quick_decodes: u64,
     pub first_full_decodes: u64,
     pub empty: u64,
-    pub over_fuel: u64,
     pub interprets: u64,
     pub faults: u64,
     pub dispatches: u64,

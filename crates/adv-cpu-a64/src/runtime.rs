@@ -449,6 +449,7 @@ pub struct ExecutionContext {
     pub(crate) cpu: CpuState,
     pub(crate) offered: Option<u32>,
     pub(crate) resume: Option<(u32, Exit)>,
+    pub(crate) fuel_debt: u64,
 }
 
 impl ExecutionContext {

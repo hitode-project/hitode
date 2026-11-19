@@ -1890,6 +1890,7 @@ fn translated(
     Vec<u8>,
     u64,
     crate::native::Diagnostics,
+    u64,
 ) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     let native = executor.native.as_mut().unwrap();
@@ -1907,12 +1908,29 @@ fn translated(
         snapshot(executor.memory()),
         native,
         executor.native.as_ref().unwrap().diagnostics.clone(),
+        executor.fuel_debt,
     )
 }
 
 /// Host features, first visits, and which accesses check their page.
 #[cfg(native)]
 type Config = (Features, bool, Checks);
+
+#[cfg(native)]
+fn reference_budget(budget: u64, debt: u64, outcome: &RunOutcome) -> u64 {
+    // An admitted unit can attempt a faulting instruction after its last
+    // retired unit. Give the reference room to observe the same event.
+    let event = matches!(
+        outcome,
+        RunOutcome::Trap { .. }
+            | RunOutcome::UnsupportedInstruction { .. }
+            | RunOutcome::InvalidInstruction { .. }
+            | RunOutcome::FetchFault { .. }
+            | RunOutcome::ReadFault { .. }
+            | RunOutcome::WriteFault { .. }
+    );
+    budget.saturating_add(debt).saturating_add(u64::from(event))
+}
 
 #[cfg(native)]
 mod native_instructions;
@@ -1923,11 +1941,12 @@ mod resident;
 #[cfg(native)]
 fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     let program = program(seed);
-    let (outcome, state, memory) = reference(&program, budget);
     let mut native = 0;
     for baseline_only in [false, true] {
-        let (a64_outcome, a64_state, a64_memory, entries, _) =
+        let (a64_outcome, a64_state, a64_memory, entries, _, debt) =
             translated(&program, budget, config, baseline_only);
+        let (outcome, state, memory) =
+            reference(&program, reference_budget(budget, debt, &a64_outcome));
         let context = format!("seed {seed} budget {budget} {config:?} baseline {baseline_only}");
         assert_eq!(a64_outcome, outcome, "{context}: outcome");
         assert_eq!(a64_state.regs, state.regs, "{context}: registers");
@@ -1984,10 +2003,10 @@ fn baseline_switch_matches_tier0_and_common_tier1_path_counts() {
         let program = program(seed);
         for budget in [13, 40, 120, 400, u64::MAX >> 1] {
             let config = (Features { flagm: true }, true, Checks::Adaptive);
-            let expected = reference(&program, budget);
             let enabled = translated(&program, budget, config, false);
             let baseline = translated(&program, budget, config, true);
-            for (outcome, state, memory, _, _) in [&baseline, &enabled] {
+            for (outcome, state, memory, _, _, debt) in [&baseline, &enabled] {
+                let expected = reference(&program, reference_budget(budget, *debt, outcome));
                 assert_eq!(*outcome, expected.0);
                 assert_eq!(state.eip, expected.1.eip);
                 assert_eq!(state.regs, expected.1.regs);
@@ -2871,8 +2890,8 @@ fn first_divergence() {
     let program = program(seed);
     let config = (Features { flagm: true }, false, Checks::Adaptive);
     for budget in 1..5000 {
-        let (outcome, state, memory) = reference(&program, budget);
-        let (a, b, m, _, _) = translated(&program, budget, config, false);
+        let (a, b, m, _, _, debt) = translated(&program, budget, config, false);
+        let (outcome, state, memory) = reference(&program, reference_budget(budget, debt, &a));
         if a != outcome
             || b.regs != state.regs
             || b.eflags != state.eflags

@@ -84,7 +84,9 @@ fn channel_batches_preserve_pixels_registers_flags_and_budget_cuts() {
                     let (mut native, mut oracle) = pair(&p, config, 130, channels);
                     assert_eq!(
                         native.run(p.stop, budget).unwrap(),
-                        oracle.run(p.stop, budget).unwrap()
+                        oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap()
                     );
                     same(&native, &oracle);
                     if config.2 == Checks::Adaptive && !config.1 && budget >= size * 65 {

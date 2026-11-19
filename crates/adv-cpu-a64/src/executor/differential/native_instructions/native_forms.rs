@@ -571,7 +571,9 @@ fn native_forms_resume_at_budget_cuts_and_crossing_accesses() {
             let mut oracle = executor(&p, config, true);
             assert_eq!(
                 native.run(p.stop, budget).unwrap(),
-                oracle.run(p.stop, budget).unwrap()
+                oracle
+                    .run(p.stop, budget.saturating_add(native.fuel_debt))
+                    .unwrap()
             );
             same(&native, &oracle);
             assert_eq!(

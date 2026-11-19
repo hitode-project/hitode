@@ -10,7 +10,12 @@ fn pc(p: &Program, index: usize) -> u32 {
 
 fn compare(native: &mut Executor, oracle: &mut Executor, p: &Program, budget: u64) -> RunOutcome {
     let outcome = native.run(p.stop, budget).unwrap();
-    assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+    assert_eq!(
+        outcome,
+        oracle
+            .run(p.stop, reference_budget(budget, native.fuel_debt, &outcome))
+            .unwrap()
+    );
     same(native, oracle);
     outcome
 }
@@ -56,15 +61,19 @@ fn spin_backedges_publish_the_exact_taken_prefix() {
             for budget in [prefix - 1, prefix, prefix + 20] {
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
-                let expect = if budget < prefix {
-                    RunOutcome::Budget
+                let (stop, expect) = if budget < prefix {
+                    let latch = iced_x86::Decoder::with_ip(32, &p.code, u64::from(CODE), 0)
+                        .into_iter()
+                        .nth(budget as usize)
+                        .unwrap()
+                        .ip32();
+                    (latch, RunOutcome::ReachedStop)
                 } else {
-                    RunOutcome::Reschedule
+                    (p.stop, RunOutcome::Reschedule)
                 };
                 for cpu in [&mut native, &mut oracle] {
                     assert_eq!(
-                        cpu.run_with_traps(p.stop, budget, &mut Spin, false)
-                            .unwrap(),
+                        cpu.run_with_traps(stop, budget, &mut Spin, false).unwrap(),
                         expect
                     );
                 }
@@ -284,11 +293,14 @@ fn loop_units_recover_faults_and_budget_cuts_in_an_appended_arm() {
         for budget in [1, 753, 754, 756, 757, 758, 2000] {
             let mut native = executor(&p, config, false);
             let mut oracle = executor(&p, config, true);
-            let outcome = compare(&mut native, &mut oracle, &p, budget);
             if budget == 757 {
-                assert_eq!(outcome, RunOutcome::Budget);
-                assert_eq!(native.state.eip, fault);
+                for cpu in [&mut native, &mut oracle] {
+                    assert_eq!(cpu.run(fault, budget).unwrap(), RunOutcome::ReachedStop);
+                }
+                same(&native, &oracle);
+                continue;
             }
+            let outcome = compare(&mut native, &mut oracle, &p, budget);
             if budget == 2000 && !config.1 {
                 assert_eq!(
                     outcome,

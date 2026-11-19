@@ -485,7 +485,12 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
             let mut native = executor(&p, config, false);
             let mut oracle = executor(&p, config, true);
             let outcome = native.run(p.stop, budget).unwrap();
-            assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+            assert_eq!(
+                outcome,
+                oracle
+                    .run(p.stop, budget.saturating_add(native.fuel_debt))
+                    .unwrap()
+            );
             same(&native, &oracle);
         }
     }
@@ -965,7 +970,12 @@ fn x87_run_break_nest_preserves_middle_iteration_exits() {
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
                 let outcome = native.run(p.stop, budget).unwrap();
-                assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+                assert_eq!(
+                    outcome,
+                    oracle
+                        .run(p.stop, budget.saturating_add(native.fuel_debt))
+                        .unwrap()
+                );
                 same(&native, &oracle);
                 if budget == 10000 {
                     let diagnostics = &native.native.as_ref().unwrap().diagnostics;
@@ -1176,7 +1186,9 @@ fn x87_outside_helper_arrivals_enter_the_merge_cold() {
                 let mut oracle = executor(&p, config, true);
                 assert_eq!(
                     native.run(p.stop, budget).unwrap(),
-                    oracle.run(p.stop, budget).unwrap()
+                    oracle
+                        .run(p.stop, budget.saturating_add(native.fuel_debt))
+                        .unwrap()
                 );
                 same(&native, &oracle);
                 if budget == 500 && !config.1 {
@@ -1278,7 +1290,9 @@ fn x87_inner_integer_loop_keeps_the_model_at_every_arrival() {
                     let mut oracle = executor(&p, config, true);
                     assert_eq!(
                         native.run(p.stop, budget).unwrap(),
-                        oracle.run(p.stop, budget).unwrap()
+                        oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap()
                     );
                     same(&native, &oracle);
                     if budget == 1000 {

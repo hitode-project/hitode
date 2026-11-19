@@ -994,6 +994,7 @@ impl Trace {
     /// Recovery observations constrain merges; recipes serve other sites.
     fn liveness(&mut self, observe: bool, resident: bool) -> bool {
         let mut changed = false;
+        let x87 = observe && self.insts.iter().any(|inst| matches!(inst.op, Op::X87(_)));
         for index in (0..self.len()).rev() {
             let inst = &self.insts[index];
             let mut out = match inst.next {
@@ -1011,7 +1012,9 @@ impl Trace {
             }
             let effects = inst.effects;
             let mut live = effects.reads.or(out.minus(effects.writes));
-            if observe && effects.site {
+            // A merge can enter an x87 run and transfer to a different
+            // version before the instruction overwrites any flags.
+            if observe && (effects.site || x87 && self.merge[index]) {
                 live = FlagSet::ALL;
             } else if !observe && self.merge[index] {
                 live = live.or(self.observe_in[index]);

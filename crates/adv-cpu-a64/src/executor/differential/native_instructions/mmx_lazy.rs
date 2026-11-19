@@ -35,9 +35,15 @@ fn cuts(program: &Program, budgets: &[u64]) {
         for &budget in budgets {
             let mut native = executor(program, config, false);
             let mut oracle = executor(program, config, true);
+            let outcome = native.run(program.stop, budget).unwrap();
             assert_eq!(
-                native.run(program.stop, budget).unwrap(),
-                oracle.run(program.stop, budget).unwrap()
+                outcome,
+                oracle
+                    .run(
+                        program.stop,
+                        reference_budget(budget, native.fuel_debt, &outcome)
+                    )
+                    .unwrap()
             );
             same(&native, &oracle);
             assert_eq!(
@@ -366,7 +372,9 @@ fn write_first_and_appended_mmx_loops_avoid_interpret_and_recover_cuts_and_fault
                         let mut native = executor(&p, config, false);
                         let mut oracle = executor(&p, config, true);
                         let got = native.run(p.stop, budget).unwrap();
-                        let expected = oracle.run(p.stop, budget).unwrap();
+                        let expected = oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap();
                         assert_eq!(
                             got, expected,
                             "appended={appended} fault={fault} acc={accumulator} budget={budget}"

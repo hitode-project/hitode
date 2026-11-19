@@ -238,8 +238,14 @@ impl Translator<'_> {
             if let Some(left) = left {
                 self.emit(ldr(X, X0, super::RUNTIME, runtime::CPU_STATE));
                 runtime::emit_read_flags(self.asm, X0);
-                self.emit(mov(W, temp(1), X4));
                 self.compare(left, temp(0), op.width);
+                let saved_flags = if let Some(x87) = self.x87_leaving() {
+                    self.emit(mov(W, temp(0), X4));
+                    self.x87_leave(x87);
+                    temp(0)
+                } else {
+                    X4
+                };
                 if refund != 0 {
                     self.emit(add_imm(X, X9, X9, refund, false));
                 }
@@ -251,7 +257,7 @@ impl Translator<'_> {
                     + 64 * u16::from(op.fs);
                 self.emit_all(&[
                     movz(W, X0, runtime::REP_BUDGET | descriptor, 0),
-                    orr(X, X0, X0, temp(1), Lsl, 32),
+                    orr(X, X0, X0, saved_flags, Lsl, 32),
                 ]);
                 self.target(inst.pc);
                 self.far(self.stubs.exit);

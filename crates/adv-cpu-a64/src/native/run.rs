@@ -17,8 +17,8 @@ use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
 use crate::translate;
 
 impl Native {
-    /// Runs the unit at `cpu.eip` if it completes at most `fuel` guest
-    /// instructions; `None` leaves them to the interpreter. A fault returns
+    /// Runs the unit at `cpu.eip` on positive fuel, allowing that unit's
+    /// first prepaid region to finish. A fault returns
     /// `Exit::Event(Event::Replay)` with EIP at the faulting instruction and the guest state
     /// exactly that before it.
     pub fn run(
@@ -51,6 +51,9 @@ impl Native {
                 (entry?, self.code.cache.used().saturating_sub(before))
             }
         };
+        if fuel == 0 {
+            return Ok(None);
+        }
         let offer = match self.plans.arrival(cpu.eip) {
             plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
                 job.offer_due(self.published_gate())
@@ -64,10 +67,6 @@ impl Native {
                 translated,
             }));
         }
-        if u64::from(entry.retired) > fuel {
-            self.diagnostics.over_fuel += 1;
-            return Ok(None);
-        }
         if entry.retired == 0 {
             self.diagnostics.empty += 1;
             // The first instruction is not translated: skip the round trip.
@@ -79,7 +78,7 @@ impl Native {
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         self.helper_units = 0;
-        let budget = fuel.min(SLICE);
+        let budget = fuel.min(SLICE).max(u64::from(entry.retired));
         if self.code.uses_permissions
             || self.checks != Checks::Adaptive
             || self.plans.checked_count() != 0
@@ -98,7 +97,7 @@ impl Native {
         }
         self.code.cache.sync();
         self.code.faults.end.set(self.code.cache.next());
-        self.prepare_inline(cpu, memory, fuel, budget);
+        self.prepare_inline(cpu, memory, fuel.max(budget), budget);
         let resumed_repeat = cpu.rep.take().map(|rep| {
             let visible_flags = cpu.eflags;
             cpu.eflags = rep.native_input_flags(cpu);

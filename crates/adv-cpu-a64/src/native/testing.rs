@@ -54,12 +54,11 @@ impl Native {
 }
 
 impl Diagnostics {
-    pub(crate) fn tier1_counts(&self) -> [u64; 19] {
+    pub(crate) fn tier1_counts(&self) -> [u64; 18] {
         [
             self.first_visits,
             self.first_declined,
             self.empty,
-            self.over_fuel,
             self.interprets,
             self.faults,
             self.dispatches,

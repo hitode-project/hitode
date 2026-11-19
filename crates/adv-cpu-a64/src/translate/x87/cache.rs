@@ -2726,6 +2726,7 @@ impl Translator<'_> {
         }
         if self.trace.insts[self.index].next == Next::Fall {
             self.x87_suspend();
+            self.canonicalize();
             let label = self.asm.label();
             self.asm.b(label);
             self.push_cold(UnitCold::X87End {

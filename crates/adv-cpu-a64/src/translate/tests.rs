@@ -738,11 +738,11 @@ fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
         }
         let restore_pc = CODE + iced_x86::Decoder::new(32, &code, 0).decode().len() as u32;
         let fault = DATA + 4096 - 64;
-        for (save_at, restore_at, fuel, outcome) in [
+        for (save_at, restore_at, cut, outcome) in [
             (
                 DATA,
                 DATA,
-                8,
+                stop,
                 RunOutcome::Trap {
                     pc: stop - 1,
                     vector: 16,
@@ -751,17 +751,17 @@ fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
             (
                 DATA,
                 DATA,
-                8,
+                stop,
                 RunOutcome::Trap {
                     pc: stop - 1,
                     vector: 16,
                 },
             ),
-            (DATA, DATA, 1, RunOutcome::Budget),
+            (DATA, DATA, restore_pc, RunOutcome::ReachedStop),
             (
                 fault,
                 DATA,
-                8,
+                stop,
                 RunOutcome::WriteFault {
                     pc: CODE,
                     address: DATA + 4096,
@@ -770,7 +770,7 @@ fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
             (
                 DATA,
                 fault,
-                8,
+                stop,
                 RunOutcome::ReadFault {
                     pc: restore_pc,
                     address: DATA + 4096,
@@ -783,7 +783,7 @@ fn tier_one_fnsave_frstor_match_environment_images_and_faults() {
                 exec.write(DATA, &[0x5a; 4096]).unwrap();
             }
             assert_eq!(
-                compare_tier_one(&mut native, &mut oracle, &state, stop, fuel),
+                compare_tier_one(&mut native, &mut oracle, &state, cut, 8),
                 outcome
             );
             assert_eq!(

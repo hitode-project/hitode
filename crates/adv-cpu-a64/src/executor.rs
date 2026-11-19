@@ -64,6 +64,8 @@ pub struct Executor {
     deadline: Option<Instant>,
     offered: Option<u32>,
     computation_resume: Option<(u32, Exit)>,
+    /// Retirement past the preceding slice, paid before another unit enters.
+    fuel_debt: u64,
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
     /// `ADV_JIT_VERIFY` checks, and how often each entry has been checked.
@@ -148,6 +150,7 @@ impl Executor {
             deadline: None,
             offered: None,
             computation_resume: None,
+            fuel_debt: 0,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
             #[cfg(native)]
             verifier: translate.then(Verifier::from_env).flatten(),
@@ -237,6 +240,7 @@ impl Executor {
             cpu,
             offered: self.offered,
             resume: self.computation_resume,
+            fuel_debt: self.fuel_debt,
         })
     }
 
@@ -245,6 +249,7 @@ impl Executor {
         self.state.refresh_mmx();
         self.offered = context.offered;
         self.computation_resume = context.resume;
+        self.fuel_debt = context.fuel_debt;
         Ok(())
     }
 
@@ -565,8 +570,14 @@ impl Executor {
             self.stats.native_code_bytes += run.translated as u64;
         }
         self.stats.invalidations = native.diagnostics.dropped_units;
-        self.state.fuel -= u64::from(run.retired);
+        self.charge(run.retired);
         Ok(Some(run.exit))
+    }
+
+    fn charge(&mut self, retired: u32) {
+        let retired = u64::from(retired);
+        self.fuel_debt += retired.saturating_sub(self.state.fuel);
+        self.state.fuel = self.state.fuel.saturating_sub(retired);
     }
 
     /// Whether the wall deadline has passed. Translated runs compare the
@@ -597,7 +608,9 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         self.interpreter.observe_transfers = trace.is_some();
         self.state.refresh_mmx();
-        self.state.fuel = budget;
+        let paid = self.fuel_debt.min(budget);
+        self.fuel_debt -= paid;
+        self.state.fuel = budget - paid;
         let mut polls = 0u32;
         loop {
             if bridge.parked {
@@ -744,8 +757,7 @@ impl Executor {
                         let step = Step::Trap { pc, vector };
                         (Execution { step, units: 0 }, 1)
                     }
-                    // The unit spent the budget; the instruction waits.
-                    Exit::Interpret | Exit::Event(_) if self.state.fuel == 0 => continue,
+                    Exit::Interpret if self.state.fuel == 0 => continue,
                     Exit::Interpret | Exit::Event(_) => {
                         let histogram = if exit == Exit::Event(Event::Replay) {
                             &mut self.faults
@@ -781,7 +793,7 @@ impl Executor {
             {
                 native.progressed();
             }
-            self.state.fuel -= u64::from(execution.units);
+            self.charge(execution.units);
             let step = match execution.step {
                 Step::ReadTimestamp { pc, next } => {
                     let ticks = bridge.read_timestamp();
@@ -903,6 +915,31 @@ mod host_call_tests;
 #[cfg(all(test, native))]
 mod speed_tests {
     use super::*;
+
+    // spec: A64-CTL-7 A64-CTL-9
+    #[test]
+    fn slice_debt_follows_the_saved_execution_context() {
+        let mut cpu = Executor::address_space().unwrap();
+        let code = 0x10000;
+        cpu.map(code, 0x4000, 7).unwrap();
+        cpu.write(code, &[0x40; 8]).unwrap(); // INC EAX
+        cpu.native.as_mut().unwrap().first_visits = false;
+        cpu.state.eip = code;
+        assert_eq!(cpu.run(code + 4, 1).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(cpu.state.regs[0], 4);
+        assert_eq!(cpu.fuel_debt, 3);
+
+        let context = cpu.save_context().unwrap();
+        for _ in 0..2 {
+            cpu.restore_context(&context).unwrap();
+            assert_eq!(cpu.run(code + 8, 2).unwrap(), RunOutcome::Budget);
+            assert_eq!(cpu.state.eip, code + 4);
+            assert_eq!(cpu.state.regs[0], 4);
+            assert_eq!(cpu.run(code + 8, 2).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(cpu.state.regs[0], 8);
+        }
+        assert_eq!(cpu.stats.interpreter_entries, 0);
+    }
     use iced_x86::code_asm::*;
 
     // spec: WINE-UI-8, A64-TR-2, A64-TR-4
