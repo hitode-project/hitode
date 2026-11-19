@@ -121,7 +121,7 @@ impl Front<'_> {
                 self.sse_input(dst, Some(src), true, false);
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
-            Kind::Double(op, true) | Kind::Float(op, true) => {
+            Kind::Double(op, scalar) | Kind::Float(op, scalar) if scalar || self.func.resident => {
                 let op = match op {
                     Float::Fadd => FpOp::Add,
                     Float::Fsub => FpOp::Sub,
@@ -130,8 +130,10 @@ impl Front<'_> {
                     _ => return Err(Reject::Unsupported(self.index)),
                 };
                 let single = matches!(s.kind, Kind::Float(..));
-                self.sse_input(dst, Some(src), false, single);
-                if single {
+                self.sse_input(dst, Some(src), !scalar, single);
+                if !scalar {
+                    self.value(Op::Vec(VecOp::PackedFp(op, !single), dst, src))
+                } else if single {
                     let result = self.value(Op::Fp32(op, dst, src));
                     self.value(Op::Vec(VecOp::MoveLow32, dst, result))
                 } else {
@@ -160,6 +162,28 @@ impl Front<'_> {
                     wide: false,
                     sse: true,
                 })
+            }
+            Kind::FromInt(double) if self.func.resident && !s.mmx() => self.value(Op::VecUnary(
+                VecUnary::Convert(PackedConvert::FromDwords { double }),
+                src,
+            )),
+            Kind::Widen(false) if self.func.resident => {
+                if self.assumed.mxcsr & 2 == 0 {
+                    let low = self.value(Op::VecUnary(VecUnary::Low64, src));
+                    self.sse_input(low, None, true, true);
+                }
+                self.value(Op::VecUnary(VecUnary::Convert(PackedConvert::Widen), src))
+            }
+            Kind::Narrow(false) if self.func.resident => {
+                self.sse_input(src, None, true, false);
+                self.value(Op::VecUnary(VecUnary::Convert(PackedConvert::Narrow), src))
+            }
+            Kind::PackedToInt(truncate, double) if self.func.resident && !s.mmx() => {
+                self.sse_input(src, None, true, !double);
+                self.value(Op::VecUnary(
+                    VecUnary::Convert(PackedConvert::ToDwords { double, truncate }),
+                    src,
+                ))
             }
             Kind::FlagCompare(true, ordered) => {
                 self.sse_input(dst, Some(src), false, false);

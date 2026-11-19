@@ -264,6 +264,7 @@ impl LoopKernel for Vector {
                     lanes: shape.lanes(),
                     inputs,
                     conditional_stores: false,
+                    published: Vec::new(),
                     body: Box::new(Program { shape, code }),
                 });
             }
@@ -651,6 +652,7 @@ fn conditional(
         lanes: 2,
         inputs,
         conditional_stores: true,
+        published: values.published.iter().map(|&(value, ..)| value).collect(),
         body: Box::new(ConditionalProgram {
             tree,
             tests,

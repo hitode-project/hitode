@@ -13,6 +13,8 @@ use loops::{Affine, Batch, BatchClass, ClassCosts, Span, Trip};
 pub(in crate::translate::opt) struct BatchEmitter<'b, 'f> {
     emitter: &'b mut Emitter<'f>,
     diagnostics: Option<&'b BatchCache>,
+    #[cfg(native)]
+    worker: Option<(&'b SpanSplit, u32)>,
 }
 
 impl BatchEmitter<'_, '_> {
@@ -63,6 +65,18 @@ impl BatchEmitter<'_, '_> {
                 str(X, T, U, offset),
             ]);
         }
+        #[cfg(native)]
+        if let Some((site, slot)) = self.worker
+            && site.diagnostics()
+        {
+            let offset = site.published.len() as u32 * 32 + 8 * class as u32;
+            self.asm().emit_all(&[
+                ldr(X, U, SP, slot),
+                ldr(X, T, U, offset),
+                add_imm(X, T, T, 1, false),
+                str(X, T, U, offset),
+            ]);
+        }
     }
 
     pub fn address(&mut self, addr: Affine) -> Reg {
@@ -87,6 +101,19 @@ impl BatchEmitter<'_, '_> {
             self.asm()
                 .emit(vmov(false, dst, if lane == 0 { src } else { dst }));
             self.emitter.copy(location, Host::Vector(dst), ty);
+        }
+        #[cfg(native)]
+        if let Some((site, slot)) = self.worker {
+            let i = site
+                .published
+                .iter()
+                .position(|&(v, _)| v == value)
+                .unwrap();
+            self.asm().emit_all(&[
+                ldr(X, U, SP, slot),
+                str(X, Reg::ZR, U, i as u32 * 32 + 16),
+                str(X, Reg::ZR, U, i as u32 * 32 + 24),
+            ]);
         }
     }
 
@@ -115,6 +142,20 @@ impl BatchEmitter<'_, '_> {
             }
         }
         self.emitter.copy(loc, Host::Register(dst), Type::I32);
+        #[cfg(native)]
+        if let Some((site, slot)) = self.worker {
+            let i = site
+                .published
+                .iter()
+                .position(|&(v, _)| v == value)
+                .unwrap();
+            let offset = i as u32 * 32 + 16;
+            self.asm()
+                .emit_all(&[ldr(X, X0, SP, slot), ldr(W, T, X0, offset)]);
+            self.emitter.imm(U, u64::from(keep & !set));
+            self.asm()
+                .emit_all(&[and(W, T, T, U, Lsl, 0), str(W, T, X0, offset)]);
+        }
     }
 }
 
@@ -125,6 +166,7 @@ impl Emitter<'_> {
         pages: Option<(Label, &BatchCache)>,
         backedge: Label,
         diagnostics: bool,
+        spill_cells: usize,
     ) -> (u32, Option<ClassCosts>) {
         let entry = self.asm.label();
         let inner = self.asm.label();
@@ -209,6 +251,25 @@ impl Emitter<'_> {
                 .emit_all(&[mul(W, U, U, X3), add(W, T, T, U, Lsl, 0)]);
             page_crossing(&mut self.asm, T, u32::from(stream.width), scalar);
         }
+        #[cfg(native)]
+        let split = pages
+            .and_then(|(_, cache)| cache.split.as_deref().map(|site| (site, cache)))
+            .map(|(site, cache)| {
+                let offer = self.asm.label();
+                let serial = self.asm.label();
+                let finish = self.asm.label();
+                if !batch.crossings.is_empty() {
+                    self.imm(X4, cache.cells.as_ptr() as u64);
+                }
+                self.asm
+                    .emit_all(&[ldr(X, T, X4, BatchCache::THRESHOLD), cmp(X, X3, T, Lsl, 0)]);
+                self.asm.b_cond(Cond::Hs, offer);
+                if diagnostics {
+                    self.count_cell(&site.counts[1]);
+                }
+                self.asm.bind(serial);
+                (site, offer, serial, finish)
+            });
 
         self.imm(T, charge);
         self.asm.emit_all(&[mul(X, X5, X3, T), mov(X, X4, X3)]);
@@ -217,22 +278,15 @@ impl Emitter<'_> {
         let mut emitter = BatchEmitter {
             emitter: self,
             diagnostics: pages.filter(|_| diagnostics).map(|(_, cache)| cache),
+            #[cfg(native)]
+            worker: None,
         };
         if !batch.plan.conditional_stores {
             emitter.count_class(BatchClass::Uniform);
         }
         let mut cases = batch.plan.body.lower(&mut emitter);
         let tail_start = self.asm.offset();
-        for iv in &batch.loop_.ivs {
-            let loc = self.locations[iv.base.0 as usize];
-            let src = self.gp_at(loc, T);
-            let dst = match loc {
-                Host::Register(r) => r,
-                _ => T,
-            };
-            self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes), U);
-            self.copy(loc, Host::Register(dst), Type::I32);
-        }
+        self.advance_ivs(batch, None);
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
         let words = self.words_since(inner_start);
@@ -245,6 +299,10 @@ impl Emitter<'_> {
         } else {
             words
         };
+        #[cfg(native)]
+        if let Some((_, _, _, finish)) = split {
+            self.asm.bind(finish);
+        }
         let recovery_start = self.asm.offset();
         // Publish the last logical latch's recovery operands once per strip.
         for &(param, value) in &batch.recovery {
@@ -260,6 +318,16 @@ impl Emitter<'_> {
         self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
         self.asm.b(entry);
 
+        #[cfg(native)]
+        if let Some((site, offer, serial, finish)) = split {
+            self.asm.bind(offer);
+            self.span_offer(site, batch, serial, finish);
+            site.entry.set(self.asm.offset());
+            self.span_worker(site, batch, spill_cells as u64 * 16);
+        }
+        #[cfg(not(native))]
+        let _ = spill_cells;
+
         // The scalar latch still charges and checkpoints before reaching
         // this edge. Retry the guards after one strip, unless the loop has
         // already ended in its scalar tail.
@@ -271,6 +339,207 @@ impl Emitter<'_> {
         self.asm.emit(movz(W, X5, lanes as u16, 0));
         self.asm.bind(body);
         (words, cases)
+    }
+
+    fn advance_ivs(&mut self, batch: &Batch, count: Option<Reg>) {
+        for iv in &batch.loop_.ivs {
+            let loc = self.locations[iv.base.0 as usize];
+            let src = self.gp_at(loc, T);
+            let dst = match loc {
+                Host::Register(r) => r,
+                _ => T,
+            };
+            let step = (iv.stride as u32).wrapping_mul(u32::from(batch.plan.lanes));
+            if let Some(count) = count {
+                self.imm(U, u64::from(step));
+                self.asm
+                    .emit_all(&[mul(W, U, U, count), add(W, dst, src, U, Lsl, 0)]);
+            } else {
+                self.batch_add(dst, src, step, U);
+            }
+            self.copy(loc, Host::Register(dst), Type::I32);
+        }
+    }
+
+    #[cfg(native)]
+    fn span_offer(&mut self, site: &SpanSplit, batch: &Batch, serial: Label, finish: Label) {
+        let outputs = site.inputs.len() as u32 * 16;
+        let count_slot = outputs + site.published.len() as u32 * 16;
+        let args = count_slot + 16;
+        self.stack_frame(u64::from(args), true);
+        self.asm.emit(str(X, X3, SP, count_slot));
+        for (i, &input) in site.inputs.iter().enumerate() {
+            let offset = 16 * i as u32;
+            let loc = self.locations[input.0 as usize];
+            match loc {
+                Host::Register(r) => self
+                    .asm
+                    .emit_all(&[str(X, r, SP, offset), str(X, Reg::ZR, SP, offset + 8)]),
+                Host::Vector(r) => self.asm.emit(vstr(VMem::Q, r, SP, offset)),
+                Host::Spill(slot, ty) => {
+                    if ty == Type::V128 {
+                        self.asm.emit_all(&[
+                            vldr(VMem::Q, A, SP, args + slot * 16),
+                            vstr(VMem::Q, A, SP, offset),
+                        ]);
+                    } else {
+                        self.asm.emit_all(&[
+                            ldr(W, T, SP, args + slot * 16),
+                            str(X, T, SP, offset),
+                            str(X, Reg::ZR, SP, offset + 8),
+                        ]);
+                    }
+                }
+                Host::Constant(bits) => {
+                    for (offset, bits) in [(offset, bits as u64), (offset + 8, (bits >> 64) as u64)]
+                    {
+                        self.imm(T, bits);
+                        self.asm.emit(str(X, T, SP, offset));
+                    }
+                }
+                Host::Flags(_) => unreachable!("span inputs are values"),
+            }
+        }
+        self.asm.emit(mov(X, X0, RT));
+        self.imm(X1, std::ptr::from_ref(site) as u64);
+        self.asm.emit(add_imm(X, X2, SP, 0, false));
+        self.asm.emit(add_imm(X, X4, SP, outputs, false));
+        let call = self.asm.label();
+        self.asm.bl(call);
+        self.asm.emit(ldr(X, X3, SP, count_slot));
+        let declined = self.asm.label();
+        self.asm.cbz(X, false, X0, declined);
+        for (i, &(value, _)) in site.published.iter().enumerate() {
+            let offset = outputs + i as u32 * 16;
+            match self.locations[value.0 as usize] {
+                Host::Register(r) => self.asm.emit(ldr(W, r, SP, offset)),
+                Host::Vector(r) => self.asm.emit(vldr(VMem::Q, r, SP, offset)),
+                Host::Spill(n, Type::V128) => self.asm.emit_all(&[
+                    vldr(VMem::Q, A, SP, offset),
+                    vstr(VMem::Q, A, SP, args + n * 16),
+                ]),
+                Host::Spill(n, _) => self
+                    .asm
+                    .emit_all(&[ldr(W, T, SP, offset), str(W, T, SP, args + n * 16)]),
+                _ => unreachable!("published value has a location"),
+            }
+        }
+        self.stack_frame(u64::from(args), false);
+        self.asm.emit(mov(X, X5, X0));
+        self.advance_ivs(batch, Some(X3));
+        self.asm.b(finish);
+        self.asm.bind(declined);
+        self.stack_frame(u64::from(args), false);
+        self.asm.b(serial);
+        self.asm.bind(call);
+        super::resident::preserve_call(
+            &mut self.asm,
+            crate::native::offer_span as *const () as u64,
+        );
+    }
+
+    #[cfg(native)]
+    fn span_worker(&mut self, site: &SpanSplit, batch: &Batch, spills: u64) {
+        // The detached entry uses the same allocation and batch body as the
+        // resident strip. It saves AAPCS64 state and reads through the alias.
+        const SAVED: u32 = 160;
+        self.stack_frame(u64::from(SAVED), true);
+        for n in (19..30).step_by(2) {
+            self.asm.emit(stp(
+                X,
+                Index::Offset,
+                Reg::new(n),
+                Reg::new(n + 1),
+                SP,
+                i32::from(n - 19) * 8,
+            ));
+        }
+        for n in (8..16).step_by(2) {
+            self.asm.emit(stp_v(
+                VSize::D,
+                Index::Offset,
+                VReg::new(n),
+                VReg::new(n + 1),
+                SP,
+                96 + i32::from(n - 8) * 8,
+            ));
+        }
+        self.stack_frame(spills + 16, true);
+        self.asm.emit(str(X, X4, SP, spills as u32));
+        self.asm
+            .emit_all(&[mov(X, WINDOW, X1), mov(X, X4, X3), mov(X, X5, Reg::ZR)]);
+        for (i, &input) in site.inputs.iter().enumerate() {
+            let offset = i as u32 * 16;
+            let loc = self.locations[input.0 as usize];
+            if matches!(loc, Host::Constant(_)) {
+                continue;
+            }
+            let ty = self.func.ty(input);
+            if ty == Type::V128 {
+                self.asm.emit(vldr(VMem::Q, A, X0, offset));
+                self.copy(loc, Host::Vector(A), ty);
+            } else {
+                self.asm.emit(ldr(W, T, X0, offset));
+                if let Some(iv) = batch.loop_.ivs.iter().find(|iv| iv.base == input) {
+                    let step = (iv.stride as u32).wrapping_mul(u32::from(batch.plan.lanes));
+                    self.imm(U, u64::from(step));
+                    self.asm
+                        .emit_all(&[mul(W, U, U, X2), add(W, T, T, U, Lsl, 0)]);
+                }
+                self.copy(loc, Host::Register(T), ty);
+            }
+        }
+        let inner = self.asm.label();
+        self.asm.bind(inner);
+        let mut emitter = BatchEmitter {
+            emitter: self,
+            diagnostics: None,
+            worker: Some((site, spills as u32)),
+        };
+        if !batch.plan.conditional_stores {
+            emitter.count_class(BatchClass::Uniform);
+        }
+        batch.plan.body.lower(&mut emitter);
+        self.advance_ivs(batch, None);
+        self.asm.emit(sub_imm(X, X4, X4, 1, false));
+        self.asm.cbz(X, true, X4, inner);
+        if !site.published.is_empty() {
+            self.asm.emit(ldr(X, X1, SP, spills as u32));
+            for (i, &(value, _)) in site.published.iter().enumerate() {
+                let offset = i as u32 * 32;
+                if self.func.ty(value) == Type::V128 {
+                    let reg = self.vr(value, A);
+                    self.asm.emit(vstr(VMem::Q, reg, X1, offset));
+                } else {
+                    let reg = self.gp(value, T);
+                    self.asm.emit(str(W, reg, X1, offset));
+                }
+            }
+        }
+        self.asm.emit(mov(X, X0, X5));
+        self.stack_frame(spills + 16, false);
+        for n in (8..16).step_by(2) {
+            self.asm.emit(ldp_v(
+                VSize::D,
+                Index::Offset,
+                VReg::new(n),
+                VReg::new(n + 1),
+                SP,
+                96 + i32::from(n - 8) * 8,
+            ));
+        }
+        for n in (19..30).step_by(2) {
+            self.asm.emit(ldp(
+                X,
+                Index::Offset,
+                Reg::new(n),
+                Reg::new(n + 1),
+                SP,
+                i32::from(n - 19) * 8,
+            ));
+        }
+        self.stack_frame(u64::from(SAVED), false);
+        self.asm.emit(ret(Reg::LR));
     }
 
     fn batch_gp(&mut self, value: Value, scratch: Reg) -> Reg {
@@ -613,7 +882,10 @@ mod tests {
         let hit = asm.label();
         cached_span(&mut asm, BatchCache::INTERVALS, miss, hit);
         assert_eq!(asm.offset() / 4, 5);
-        assert_eq!(asm.words()[0], ldp(X, Index::Offset, X2, T, X4, 40));
+        assert_eq!(
+            asm.words()[0],
+            ldp(X, Index::Offset, X2, T, X4, BatchCache::INTERVALS as i32)
+        );
         assert_eq!(asm.words()[1], cmp(X, X0, X2, Lsl, 0));
         assert_eq!(asm.words()[3], cmp(X, X1, T, Lsl, 0));
     }

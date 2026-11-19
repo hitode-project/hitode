@@ -496,21 +496,64 @@ impl std::fmt::Display for Decline {
 }
 
 impl Native {
-    pub(crate) fn resident_batch_counts(&self) -> std::collections::BTreeMap<u32, [u64; 4]> {
+    fn batch_caches(&self) -> impl Iterator<Item = &crate::translate::opt::back::BatchCache> {
+        self.plans
+            .sites
+            .values()
+            .filter_map(|site| site.resident.as_ref())
+            .flat_map(|head| &head.versions)
+            .flat_map(|version| &version.batch_caches)
+    }
+
+    pub(super) fn enable_span_splits(&self, enabled: bool) {
+        for cache in self.batch_caches() {
+            if let Some(split) = &cache.split {
+                split.enable(enabled);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_span_cost(&mut self, head: u32, ns: f64) {
+        for cache in self.batch_caches().filter(|cache| cache.head == head) {
+            let split = cache.split.as_ref().unwrap();
+            split.ns.set(ns);
+            split.trigger.set(2);
+        }
+        self.pace.set(Some(adv_cpu_core::backend::Pace::default()));
+        self.set_computation_offer(true, None);
+    }
+
+    pub(crate) fn resident_batch_counts(&self) -> std::collections::BTreeMap<u32, [u64; 7]> {
         let mut counts = std::collections::BTreeMap::new();
-        for site in self.plans.sites.values() {
-            if let Some(head) = &site.resident {
-                for version in &head.versions {
-                    for cache in &version.batch_caches {
-                        let total: &mut [u64; 4] = counts.entry(cache.head).or_default();
-                        for (total, count) in total.iter_mut().zip(cache.counts()) {
-                            *total += count;
-                        }
-                    }
+        for cache in self.batch_caches() {
+            let total: &mut [u64; 7] = counts.entry(cache.head).or_default();
+            for (total, count) in total.iter_mut().zip(cache.counts()) {
+                *total += count;
+            }
+            if let Some(split) = &cache.split {
+                for (total, count) in total[4..].iter_mut().zip(&split.counts) {
+                    *total += count.get();
                 }
             }
         }
         counts
+    }
+
+    pub(crate) fn resident_site_counts(&self) -> impl Iterator<Item = (u32, [u64; 2])> + '_ {
+        self.plans.sites.iter().filter_map(|(&entry, site)| {
+            let resident = site.resident.as_ref()?;
+            Some((
+                entry,
+                resident
+                    .versions
+                    .iter()
+                    .filter_map(|v| v.site_counts.as_deref())
+                    .fold([0, 0], |[entries, scalar], counts| {
+                        [entries + counts[0].get(), scalar + counts[1].get()]
+                    }),
+            ))
+        })
     }
     pub(super) fn resident_cold_exit(
         &mut self,
@@ -1545,6 +1588,12 @@ impl Native {
         if self.code.cache.append(&entry.words).is_none() {
             return false;
         }
+        for cache in &lowered.batch_caches {
+            if let Some(split) = &cache.split {
+                split.entry.set(entry.form + split.entry.get());
+                split.enable(self.offload.enabled);
+            }
+        }
         for &(point, transition) in &lowered.transitions {
             self.code
                 .direct_points
@@ -1587,6 +1636,7 @@ impl Native {
             accounting,
             iteration_retired: u64::from(lowered.iteration_retired),
             batch_caches: lowered.batch_caches,
+            site_counts: lowered.site_counts,
         };
         if index == head.versions.len() {
             head.versions.push(version);

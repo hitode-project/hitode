@@ -44,6 +44,7 @@ pub(super) fn allocate(
             match op {
                 Op::SseInput { packed: true, .. } => vectors = vectors.min(F.number() as u8),
                 Op::Vec(VecOp::LessF64, ..) => vectors = vectors.min(D.number() as u8),
+                Op::Vec(VecOp::PackedFp(..), ..) => vectors = vectors.min(23),
                 _ => {}
             }
             if let Some(v) = result {

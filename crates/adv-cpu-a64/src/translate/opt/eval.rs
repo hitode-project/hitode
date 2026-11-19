@@ -9,8 +9,8 @@ use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
 use iced_x86::Mnemonic as M;
 
 use super::ir::{
-    Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
-    VecToInt, VecUnary,
+    Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, PackedConvert, RecordId, Type,
+    Value, VecOp, VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -562,6 +562,41 @@ fn vec_shift(op: crate::encode::ShiftImm, log2: u8, full: bool, a: u128, count: 
 
 fn vector_unary(op: VecUnary, a: u128) -> u128 {
     match op {
+        VecUnary::Convert(op) => {
+            use PackedConvert::*;
+            let (lanes, from, to) = match op {
+                FromDwords { double: false } | ToDwords { double: false, .. } => (4, 32, 32),
+                FromDwords { double: true } | Widen => (2, 32, 64),
+                ToDwords { double: true, .. } | Narrow => (2, 64, 32),
+            };
+            (0..lanes).fold(0, |out, lane| {
+                let raw = a >> (lane * from);
+                let bits = match op {
+                    FromDwords { double: true } => (raw as i32 as f64).to_bits(),
+                    FromDwords { double: false } => u64::from((raw as i32 as f32).to_bits()),
+                    Widen => (f32::from_bits(raw as u32) as f64).to_bits(),
+                    Narrow => u64::from((f64::from_bits(raw as u64) as f32).to_bits()),
+                    ToDwords { double, truncate } => {
+                        let value = if double {
+                            f64::from_bits(raw as u64)
+                        } else {
+                            f32::from_bits(raw as u32) as f64
+                        };
+                        let rounded = if truncate {
+                            value.trunc()
+                        } else {
+                            value.round_ties_even()
+                        };
+                        u64::from(if (-2147483648.0..2147483648.0).contains(&rounded) {
+                            rounded as i32 as u32
+                        } else {
+                            0x8000_0000
+                        })
+                    }
+                };
+                out | (u128::from(bits) << (lane * to))
+            })
+        }
         VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
         VecUnary::NarrowScalar => u128::from((f64::from_bits(a as u64) as f32).to_bits()),
         VecUnary::Low64 => a & u128::from(u64::MAX),
@@ -824,6 +859,28 @@ fn vector(op: VecOp, a: u128, b: u128) -> u128 {
             let shift = usize::from(lane) * 16;
             let out = (a & !(0xffffu128 << shift)) | (word << shift);
             mask_full(out, full)
+        }
+        VecOp::PackedFp(op, double) => {
+            macro_rules! apply {
+                ($a:expr, $b:expr) => {
+                    match op {
+                        FpOp::Add => $a + $b,
+                        FpOp::Sub => $a - $b,
+                        FpOp::Mul => $a * $b,
+                        FpOp::Div => $a / $b,
+                    }
+                };
+            }
+            let lane = if double { 64 } else { 32 };
+            (0..128).step_by(lane).fold(0, |value, shift| {
+                let [a, b] = [a >> shift, b >> shift];
+                let bits = if double {
+                    apply!(f64::from_bits(a as u64), f64::from_bits(b as u64)).to_bits()
+                } else {
+                    u64::from(apply!(f32::from_bits(a as u32), f32::from_bits(b as u32)).to_bits())
+                };
+                value | u128::from(bits) << shift
+            })
         }
         VecOp::LessF64 => unreachable!("handled by step"),
     }

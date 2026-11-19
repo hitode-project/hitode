@@ -3,6 +3,8 @@
 //! admit canonical Tier-1 state and publish normal exits at Tier-1 links.
 //! Floating point runs under the canonical FPCR and validates by value
 //! (A64-OPT-4).
+//! Packed conversions use the resident MXCSR facts for ordinary inputs.
+//! Operand and range checks recover before publishing an uncovered result.
 mod alloc;
 mod batch;
 mod cost;
@@ -11,6 +13,8 @@ mod inline;
 mod resident;
 
 pub(crate) use resident::BatchCache;
+#[cfg(native)]
+pub(crate) use resident::SpanSplit;
 #[cfg(any(native, test))]
 pub(crate) use resident::access_stub;
 
@@ -63,6 +67,7 @@ pub(crate) struct Lowered {
     /// Two words holding the address of the probation counters, bound at placement.
     pub probation_slot: usize,
     pub batch_caches: Vec<BatchCache>,
+    pub site_counts: Option<Box<[std::cell::Cell<u64>; 2]>>,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
@@ -118,12 +123,13 @@ fn lower_form(
     count_entries: bool,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
+    let site_counts = count_entries.then(|| Box::new([const { std::cell::Cell::new(0) }; 2]));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
     let (mut e, exit, miss, cold, batch_caches, spill_cells) = loop {
         let batch_caches = if resident {
             batches
                 .iter()
-                .map(|b| BatchCache::new(b.head, b.spans.len()))
+                .map(|b| BatchCache::new(b, count_entries || cfg!(test)))
                 .collect()
         } else {
             Vec::new()
@@ -137,7 +143,7 @@ fn lower_form(
                 &allocation,
                 asm,
                 inline,
-                (resident, count_entries),
+                (resident, site_counts.as_deref()),
                 &batches,
                 &batch_caches,
             );
@@ -201,6 +207,7 @@ fn lower_form(
         probation: e.probation.map_or_else(Vec::new, |p| p.calls),
         probation_slot,
         batch_caches,
+        site_counts,
         links: e.links,
         transitions: e.transitions,
         exit,
@@ -235,11 +242,12 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
-    (resident, count_entries): (bool, bool),
+    (resident, site_counts): (bool, Option<&[std::cell::Cell<u64>; 2]>),
     batches: &[loops::Batch],
     batch_caches: &[BatchCache],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
+    let count_entries = site_counts.is_some();
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let cold = func.records.iter().map(|_| asm.label()).collect();
     let mut branch_only = vec![true; func.types.len()];
@@ -326,7 +334,7 @@ fn emit<'a>(
         (None, None, None)
     };
     if last_fact.is_none() {
-        e.begin_body(first, count_entries);
+        e.begin_body(first, site_counts);
     }
     let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
     let mut head_batch = None;
@@ -355,13 +363,25 @@ fn emit<'a>(
         {
             let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
             let pages = batch_pages.map(|walker| (walker, &batch_caches[index]));
-            let (words, cases) = e.batch(batch, pages, backedge, count_entries || cfg!(test));
+            let (words, cases) = e.batch(
+                batch,
+                pages,
+                backedge,
+                count_entries || cfg!(test),
+                allocation.spill_cells,
+            );
             if let Some(cases) = cases {
                 batch_cases.push((batch.head, cases));
             }
             if func.head_exit == Some(batch.loop_.head) {
                 head_batch = Some((words, u32::from(batch.plan.lanes)));
             }
+            start = e.asm.offset();
+        }
+        if func.head_exit == Some(Block(b as u32))
+            && let Some(counts) = site_counts
+        {
+            e.count_cell(&counts[1]);
             start = e.asm.offset();
         }
         for (i, &(result, op)) in data.insts.iter().enumerate() {
@@ -385,7 +405,7 @@ fn emit<'a>(
             e.op(result, op);
             if b == 0 && last_fact == Some(i) {
                 e.entry_frames(&func.entry);
-                e.begin_body(first, count_entries);
+                e.begin_body(first, site_counts);
                 e.asm.bind(e.blocks[b]);
                 start = e.asm.offset();
             }
@@ -618,9 +638,16 @@ impl<'a> Emitter<'a> {
         ((self.asm.offset() - start) / 4) as u32
     }
 
-    fn begin_body(&mut self, record: RecordId, count_entries: bool) {
+    fn count_cell(&mut self, cell: &std::cell::Cell<u64>) {
+        self.imm(U, cell.as_ptr() as u64);
+        self.asm
+            .emit_all(&[ldr(X, T, U, 0), add_imm(X, T, T, 1, false), str(X, T, U, 0)]);
+    }
+
+    fn begin_body(&mut self, record: RecordId, site_counts: Option<&[std::cell::Cell<u64>; 2]>) {
         let start = self.asm.offset();
-        if count_entries {
+        if let Some(counts) = site_counts {
+            self.count_cell(&counts[0]);
             let entries = offset_of!(Runtime, resident_entries) as u32;
             self.asm.emit_all(&[
                 ldr(X, T, RT, entries),
@@ -1092,6 +1119,122 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn packed_convert(&mut self, op: PackedConvert, dst: VReg, src: VReg) {
+        match op {
+            PackedConvert::FromDwords { double: false } => self.asm.emit(vfromint(dst, src)),
+            PackedConvert::FromDwords { double: true } => {
+                // SSHLL .2D, .2S, #0 followed by SCVTF .2D.
+                self.asm.emit_all(&[
+                    0x0F20_A400 | src.number() << 5 | dst.number(),
+                    vfromint(dst, dst) | 1 << 22,
+                ]);
+            }
+            PackedConvert::Widen => {
+                let fail = self.fail();
+                fp_class::nan_low_pair(&mut self.asm, src, C, T, fail);
+                self.asm.emit(vwiden(dst, src));
+            }
+            PackedConvert::Narrow => {
+                let fail = self.fail();
+                self.imm(T, i64::MAX as u64);
+                self.asm
+                    .emit_all(&[vdup(Arr::D2, D, T), vlogic(Logic::And, true, D, src, D)]);
+                self.imm(T, f64::from(f32::MIN_POSITIVE).to_bits() - 1);
+                self.asm.emit_all(&[
+                    vdup(Arr::D2, C, T),
+                    vcompare(Float::Fcmgt, false, true, C, D, C),
+                ]);
+                self.imm(T, f64::from(f32::MAX).to_bits() + 1);
+                self.asm.emit_all(&[
+                    vdup(Arr::D2, B, T),
+                    vcompare(Float::Fcmgt, false, true, B, B, D),
+                    vlogic(Logic::And, true, C, B, C),
+                    vzero(true, B),
+                    vcompare(Float::Fcmeq, false, true, B, D, B),
+                    vlogic(Logic::Orr, true, C, C, B),
+                    vnot(true, C, C),
+                ]);
+                fp_class::any_lane(&mut self.asm, C, T, fail);
+                // FCVTN .2S, .2D clears the upper half.
+                self.asm
+                    .emit(0x0E61_6800 | src.number() << 5 | dst.number());
+            }
+            PackedConvert::ToDwords { double, truncate } => {
+                let fail = self.fail();
+                let (arr, lower, upper) = if double {
+                    let (lo, hi) = if truncate {
+                        ((-2147483649.0f64).to_bits(), 2147483648.0f64.to_bits())
+                    } else {
+                        ((-2147483648.5f64).to_bits() + 1, 2147483647.5f64.to_bits())
+                    };
+                    (Arr::D2, lo, hi)
+                } else {
+                    (
+                        Arr::S4,
+                        u64::from((-2147483648.0f32).to_bits() + 1),
+                        u64::from(2147483648.0f32.to_bits()),
+                    )
+                };
+                self.imm(T, lower);
+                self.asm.emit_all(&[
+                    vdup(arr, C, T),
+                    vcompare(Float::Fcmgt, false, double, C, src, C),
+                ]);
+                self.imm(T, upper);
+                self.asm.emit_all(&[
+                    vdup(arr, B, T),
+                    vcompare(Float::Fcmgt, false, double, B, B, src),
+                    vlogic(Logic::And, true, C, C, B),
+                    vnot(true, C, C),
+                ]);
+                fp_class::any_lane(&mut self.asm, C, T, fail);
+                self.asm
+                    .emit(vtoint(truncate, true, dst, src) | (u32::from(double) << 22));
+                if double {
+                    self.asm.emit(vnarrow(Narrowing::Xtn, Arr::S2, dst, dst));
+                }
+            }
+        }
+    }
+
+    fn packed_fp(&mut self, op: FpOp, double: bool, dst: VReg, a: VReg, b: VReg) {
+        let result = if dst == a || dst == b { D } else { dst };
+        let float = match op {
+            FpOp::Add => Float::Fadd,
+            FpOp::Sub => Float::Fsub,
+            FpOp::Mul => Float::Fmul,
+            FpOp::Div => Float::Fdiv,
+        };
+        self.asm
+            .emit(vfloat(float, true, result, a, b) | (u32::from(double) << 22));
+        let fail = self.fail();
+        let [zero, v3, v4, v5, mask] = [23, 24, 25, 26, 27].map(VReg::new);
+        fp_class::packed_arithmetic_mask(
+            &mut self.asm,
+            double,
+            float,
+            false,
+            [result, a, b],
+            T,
+            [zero, v3, v4, v5, mask],
+        );
+        fp_class::any_lane(&mut self.asm, mask, T, fail);
+        if matches!(op, FpOp::Add | FpOp::Sub) {
+            fp_class::packed_denormals(
+                &mut self.asm,
+                if double { Arr::D2 } else { Arr::S4 },
+                double,
+                [Some(result), None],
+                T,
+                [v3, v4, mask, v5],
+            );
+            fp_class::any_lane(&mut self.asm, mask, T, fail);
+        }
+        if dst != result {
+            self.asm.emit(vmov(true, dst, result));
+        }
+    }
+
     fn fp_checks(&mut self) {
         let exact = self.asm.label();
         let mut uses_exact = false;
@@ -1515,6 +1658,7 @@ impl<'a> Emitter<'a> {
             Op::VecUnary(op, a) => {
                 let a = self.vr(a, A);
                 match op {
+                    VecUnary::Convert(op) => self.packed_convert(op, q, a),
                     VecUnary::NarrowScalar => self.asm.emit(unary(Unary::Narrow, q, a)),
                     VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
                     VecUnary::High64 => {
@@ -1806,6 +1950,7 @@ impl<'a> Emitter<'a> {
                         }
                         self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a));
                     }
+                    VecOp::PackedFp(op, double) => self.packed_fp(op, double, q, a, b),
                 }
             }
             Op::Load {
@@ -1951,8 +2096,8 @@ impl<'a> Emitter<'a> {
                 if packed {
                     fp_class::packed_denormals(
                         &mut self.asm,
-                        Arr::D2,
-                        true,
+                        if single { Arr::S4 } else { Arr::D2 },
+                        !single,
                         [Some(a), b],
                         T,
                         [D, E, C, F],

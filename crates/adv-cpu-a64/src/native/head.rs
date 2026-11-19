@@ -40,6 +40,7 @@ pub(super) struct Version {
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
     pub batch_caches: Vec<crate::translate::opt::back::BatchCache>,
+    pub site_counts: Option<Box<[Cell<u64>; 2]>>,
 }
 
 impl Version {

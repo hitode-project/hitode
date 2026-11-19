@@ -110,11 +110,13 @@ pub(crate) enum VecOp {
     InsertWord(u8, bool),
     /// `cmpltpd`: all ones in each lane where the first is less.
     LessF64,
+    PackedFp(FpOp, bool),
 }
 
 /// Unary vector lane shifts, half extracts, and immediate shuffles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecUnary {
+    Convert(PackedConvert),
     ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
     /// Narrows a binary64 scalar to binary32.
     NarrowScalar,
@@ -125,6 +127,14 @@ pub(crate) enum VecUnary {
     Shuffle(u8, u8, bool),
     ShuffleWords(bool, u8),
     ShiftBytes(bool, u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PackedConvert {
+    FromDwords { double: bool },
+    ToDwords { double: bool, truncate: bool },
+    Widen,
+    Narrow,
 }
 
 /// Vector-to-I32 extractions and sign/byte masks (`pextrw`, `pmovmskb`, `movmskps`/`pd`).
@@ -386,7 +396,8 @@ impl Op {
             | Op::Fp32(..)
             | Op::SseFp64(..)
             | Op::ToInt { .. }
-            | Op::Vec(VecOp::LessF64, ..) => true,
+            | Op::Vec(VecOp::LessF64 | VecOp::PackedFp(..), ..)
+            | Op::VecUnary(VecUnary::Convert(_), _) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
         }

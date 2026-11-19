@@ -351,21 +351,133 @@ pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
 pub(crate) struct BatchCache {
     pub(crate) head: u32,
     pub(crate) cells: Box<[std::cell::Cell<u64>]>,
+    pub(crate) split: Option<Box<SpanSplit>>,
 }
 
 impl BatchCache {
-    pub(super) const INTERVALS: u32 = 40;
+    pub(super) const THRESHOLD: u32 = 40;
+    pub(super) const INTERVALS: u32 = 48;
 
-    pub(super) fn new(head: u32, streams: usize) -> Self {
+    pub(super) fn new(batch: &loops::Batch, diagnostics: bool) -> Self {
+        let cells =
+            vec![std::cell::Cell::new(0); Self::INTERVALS as usize / 8 + 2 * batch.spans.len()]
+                .into_boxed_slice();
+        let split = (cfg!(native)
+            && (batch.loop_.sign_latch || batch.spans.iter().any(|span| span.step == 0)))
+        .then(|| {
+            let mut inputs = batch.inputs().collect::<Vec<_>>();
+            inputs.sort_unstable();
+            inputs.dedup();
+            let streams = batch
+                .spans
+                .iter()
+                .map(|span| {
+                    let step = i64::from(span.step) * if batch.backwards { -1 } else { 1 };
+                    SplitSpan {
+                        input: inputs.binary_search(&span.start.base).unwrap(),
+                        offset: span.start.offset,
+                        width: span.width,
+                        step,
+                        write: span.write,
+                    }
+                })
+                .collect();
+            let published = batch
+                .plan
+                .published
+                .iter()
+                .map(|&value| (value, inputs.binary_search(&value).unwrap()))
+                .collect();
+            Box::new(SpanSplit {
+                inputs,
+                streams,
+                published,
+                lanes: u64::from(batch.plan.lanes),
+                charge: u64::from(batch.loop_.charge) * u64::from(batch.plan.lanes),
+                entry: std::cell::Cell::new(0),
+                ns: std::cell::Cell::new(0.0),
+                threshold: cells[Self::THRESHOLD as usize / 8].as_ptr(),
+                classes: cells[2].as_ptr(),
+                trigger: std::cell::Cell::new(256),
+                diagnostics,
+                counts: [const { std::cell::Cell::new(0) }; 3],
+            })
+        });
+        cells[Self::THRESHOLD as usize / 8].set(u64::MAX);
         Self {
-            head,
-            cells: vec![std::cell::Cell::new(0); Self::INTERVALS as usize / 8 + 2 * streams]
-                .into_boxed_slice(),
+            head: batch.head,
+            cells,
+            split,
         }
     }
 
     pub(crate) fn counts(&self) -> [u64; 4] {
         std::array::from_fn(|i| self.cells[1 + i].get())
+    }
+}
+
+pub(crate) struct SplitSpan {
+    pub input: usize,
+    pub offset: u32,
+    pub width: u32,
+    pub step: i64,
+    pub write: bool,
+}
+
+/// The generated worker entry takes only inputs of the guarded batch.
+pub(crate) struct SpanSplit {
+    pub(crate) inputs: Vec<Value>,
+    pub(crate) streams: Vec<SplitSpan>,
+    pub(crate) published: Vec<(Value, usize)>,
+    pub(crate) lanes: u64,
+    pub(crate) charge: u64,
+    pub(crate) entry: std::cell::Cell<usize>,
+    pub(crate) ns: std::cell::Cell<f64>,
+    threshold: *mut u64,
+    classes: *mut u64,
+    pub(crate) trigger: std::cell::Cell<u64>,
+    diagnostics: bool,
+    pub(crate) counts: [std::cell::Cell<u64>; 3],
+}
+
+// SAFETY: lowering hands the whole site's allocation to one owner before use.
+// The threshold pointer refers to the stable allocation owned by the site.
+unsafe impl Send for SpanSplit {}
+
+impl SpanSplit {
+    pub(crate) fn enable(&self, enabled: bool) {
+        // SAFETY: the owner owns this site's stable cells and updates them
+        // between generated reads.
+        unsafe {
+            self.threshold.write(if enabled {
+                self.trigger.get()
+            } else {
+                u64::MAX
+            })
+        };
+    }
+
+    pub(crate) fn count(&self, index: usize) {
+        if self.diagnostics {
+            let count = &self.counts[index];
+            count.set(count.get() + 1);
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> bool {
+        self.diagnostics
+    }
+
+    pub(crate) fn add_classes(&self, classes: [u64; 3]) {
+        if self.diagnostics {
+            for (index, count) in classes.into_iter().enumerate() {
+                // SAFETY: only the owner updates these counters after joining the workers.
+                unsafe {
+                    let cell = self.classes.add(index);
+                    cell.write(cell.read() + count);
+                }
+            }
+        }
     }
 }
 

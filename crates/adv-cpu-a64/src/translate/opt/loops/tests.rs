@@ -123,6 +123,7 @@ impl LoopKernel for TestKernel {
             lanes: 16,
             inputs: vec![],
             conditional_stores: false,
+            published: Vec::new(),
             body: Box::new(Self),
         })
     }

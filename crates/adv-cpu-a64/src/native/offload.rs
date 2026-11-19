@@ -24,6 +24,7 @@ use super::{
 use crate::executor::ExecutionContext;
 use crate::runtime::COMPUTATION_SLICE;
 use crate::translate::computation::{Plan, Proof, Range};
+use crate::translate::opt::back::SpanSplit;
 use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
 use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
@@ -57,6 +58,9 @@ impl Offload {
 
 impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        if self.offload.enabled != enabled {
+            self.enable_span_splits(enabled);
+        }
         self.offload.enabled = enabled;
         self.plans.offer_resume = skip;
     }
@@ -582,6 +586,56 @@ pub(crate) struct SplitCounts {
 enum Job {
     Whole(Box<Task>),
     Blocks(Arc<Blocks>, SyncSender<Drained>),
+    Span(SpanWork, SyncSender<SpanDone>),
+}
+
+struct SpanWork {
+    entry: usize,
+    alias: u64,
+    inputs: Arc<[u128]>,
+    first: u64,
+    count: u64,
+    submitted: Instant,
+    published: usize,
+    diagnostics: bool,
+}
+
+struct SpanDone {
+    first: u64,
+    extra: u64,
+    wake: Duration,
+    elapsed: Duration,
+    outputs: Vec<[u128; 2]>,
+}
+
+impl SpanWork {
+    fn run(self) -> SpanDone {
+        let start = Instant::now();
+        // SAFETY: the owner retains the JIT artifact, inputs and memory
+        // lease until every submitted span has returned.
+        let entry: unsafe extern "C" fn(*const u128, u64, u64, u64, *mut [u128; 2]) -> u64 =
+            unsafe { std::mem::transmute(self.entry) };
+        let mut outputs = vec![[0, u128::MAX]; self.published];
+        if self.diagnostics {
+            outputs.push([0, 0]);
+        }
+        let extra = unsafe {
+            entry(
+                self.inputs.as_ptr(),
+                self.alias,
+                self.first,
+                self.count,
+                outputs.as_mut_ptr(),
+            )
+        };
+        SpanDone {
+            first: self.first,
+            extra,
+            wake: start - self.submitted,
+            elapsed: start.elapsed(),
+            outputs,
+        }
+    }
 }
 
 /// An admitted head loop split into blocks of consecutive iterations
@@ -788,6 +842,12 @@ impl Pool {
                         let job = recv.lock().unwrap().recv();
                         let task = match job {
                             Ok(Job::Whole(task)) => *task,
+                            Ok(Job::Span(work, done)) => {
+                                let result = work.run();
+                                active.fetch_sub(1, Ordering::Release);
+                                let _ = done.send(result);
+                                continue;
+                            }
                             Ok(Job::Blocks(blocks, done)) => {
                                 let drained = blocks.drain(&mut runtime, &mut scratch);
                                 active.fetch_sub(1, Ordering::Release);
@@ -852,6 +912,13 @@ impl Pool {
 }
 
 const PAGE_GRANTS: usize = 256;
+
+/// The pool is process-wide, so tests that need its workers take turns.
+#[cfg(test)]
+pub(crate) fn exclusive_pool() -> std::sync::MutexGuard<'static, ()> {
+    static POOL: Mutex<()> = Mutex::new(());
+    POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct PageGrants {
     slots: [u64; PAGE_GRANTS],
@@ -1058,6 +1125,206 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
             && u64::from(range.start) < other.end
             && u64::from(other.start) < range.end
     })
+}
+
+/// The emitted span guards establish independence. The ordinary job lease
+/// still controls memory ownership, including each worker submission.
+pub(crate) unsafe extern "C" fn offer_span(
+    runtime: *mut Runtime,
+    site: *const SpanSplit,
+    inputs: *const u128,
+    count: u64,
+    outputs: *mut u128,
+) -> u64 {
+    // SAFETY: the resident call frame suspends this owner with its live
+    // Runtime, site allocation and initialized input cells.
+    let (owner, site) = unsafe { (&mut *((*runtime).owner as *mut super::Owner), &*site) };
+    let (native, memory) = unsafe { (&mut *owner.native, &*owner.memory) };
+    let inputs = unsafe { std::slice::from_raw_parts(inputs, site.inputs.len()) };
+    site.count(0);
+    let mut merged = site
+        .published
+        .iter()
+        .map(|&(_, i)| inputs[i])
+        .collect::<Vec<_>>();
+    let Some(charge) = split_span(native, memory, site, inputs, count, &mut merged) else {
+        site.count(1);
+        return 0;
+    };
+    // SAFETY: the owner reserved one initialized output slot per published value.
+    unsafe { std::ptr::copy_nonoverlapping(merged.as_ptr(), outputs, merged.len()) };
+    charge
+}
+
+fn span_ranges(site: &SpanSplit, inputs: &[u128], first: u64, count: u64) -> Vec<Range> {
+    site.streams
+        .iter()
+        .map(|span| {
+            let begin = i64::from((inputs[span.input] as u32).wrapping_add(span.offset))
+                + span.step * first as i64;
+            let last = begin + span.step / site.lanes as i64 * (count * site.lanes - 1) as i64;
+            Range {
+                start: begin.min(last) as u32,
+                end: begin.max(last) as u64 + u64::from(span.width),
+                write: span.write,
+            }
+        })
+        .collect()
+}
+
+fn split_span(
+    native: &mut Native,
+    memory: &Memory,
+    site: &SpanSplit,
+    inputs: &[u128],
+    count: u64,
+    outputs: &mut [u128],
+) -> Option<u64> {
+    let pool = Pool::get()?;
+    let most = pool.idle().min(count as usize - 1);
+    if most == 0 {
+        return None;
+    }
+    let counts = &native.diagnostics.split;
+    let wake = match counts.wakes - counts.idle_wakes {
+        0 => WAKE_NS,
+        claimed => counts.claim_ns as f64 / claimed as f64,
+    };
+    let measured = site.ns.get();
+    let serial = if measured > 0.0 {
+        measured * count as f64
+    } else {
+        wake * 9.0
+    };
+    if !native.offer_split(serial as u64) {
+        return None;
+    }
+    let pace = native.pace.get().unwrap();
+    let helper_count = if measured > 0.0 {
+        let slice = (u64::from(COMPUTATION_SLICE) / site.charge).max(1);
+        helpers(
+            serial,
+            (wake, measured * slice as f64),
+            pace.need(serial as u64) as f64,
+            most,
+        )
+    } else {
+        0
+    };
+    if measured > 0.0 && helper_count == 0 {
+        return None;
+    }
+    let admission = &mut native.offload.admission;
+    admission.sync_generation(memory);
+    let admitted = |admission: &mut Admission, ranges: &[Range], active: &[ActiveTask]| {
+        ranges.iter().all(|range| {
+            !conflicts(range, active)
+                && admission
+                    .grants
+                    .allows(memory, range.start, range.end, range.write)
+        })
+    };
+    // Resident execution holds no concurrent jobs. Scope this lease before
+    // any worker starts, then retain each narrower lease until it returns.
+    if !admitted(admission, &span_ranges(site, inputs, 0, count), &[]) {
+        return None;
+    }
+    let inputs: Arc<[u128]> = inputs.into();
+    let run = |first, count| SpanWork {
+        entry: site.entry.get(),
+        alias: alias_base(memory),
+        inputs: inputs.clone(),
+        first,
+        count,
+        submitted: Instant::now(),
+        published: site.published.len(),
+        diagnostics: site.diagnostics(),
+    };
+    let (send, recv) = sync_channel(helper_count);
+    let mut active = Vec::new();
+    let blocks = helper_count as u64 + 1;
+    let mut first = 0;
+    for helper in 0..helper_count {
+        let end = (helper as u64 + 1) * count / blocks;
+        let ranges = span_ranges(site, &inputs, first, end - first);
+        if !admitted(admission, &ranges, &active)
+            || !pool.submit(Job::Span(run(first, end - first), send.clone()))
+        {
+            break;
+        }
+        active.push(ActiveTask {
+            id: helper as u32,
+            entry: 0,
+            iteration: true,
+            ranges,
+        });
+        first = end;
+    }
+    let mut extra = 0u64;
+    let mut elapsed = Duration::ZERO;
+    let mut claim = Duration::ZERO;
+    let mut results = Vec::new();
+    let mut drain = || {
+        for _ in 0..active.len() {
+            let result = recv.recv().expect("resident span helper");
+            extra = extra.wrapping_add(result.extra);
+            elapsed += result.elapsed;
+            claim += result.wake;
+            results.push(result);
+        }
+    };
+    let remaining = span_ranges(site, &inputs, first, count - first);
+    let local = if admitted(admission, &remaining, &active) {
+        let local = run(first, count - first).run();
+        drain();
+        local
+    } else {
+        drain();
+        run(first, count - first).run()
+    };
+    elapsed += local.elapsed;
+    extra = extra.wrapping_add(local.extra);
+    results.push(local);
+    results.sort_unstable_by_key(|result| result.first);
+    // Each helper supplies the bits it replaced, so a skipped write cannot
+    // overwrite an earlier block's last value. Apply blocks in guest order.
+    for result in results {
+        if site.diagnostics() {
+            let [low, high] = result.outputs[outputs.len()];
+            site.add_classes([low as u64, (low >> 64) as u64, high as u64]);
+        }
+        for (value, [next, keep]) in outputs.iter_mut().zip(result.outputs) {
+            *value = (*value & keep) | (next & !keep);
+        }
+    }
+    let workers = active.len() as u64;
+    if workers > 0 {
+        site.count(2);
+        let counts = &mut native.diagnostics.split;
+        counts.splits += 1;
+        counts.blocks += workers + 1;
+        counts.wakes += workers;
+        counts.claim_ns += claim.as_nanos() as u64;
+    } else {
+        site.count(1);
+    }
+    let sample = (elapsed.as_nanos() as f64 / count as f64).max(1.0);
+    let learned = if measured > 0.0 {
+        (measured * 3.0 + sample) * 0.25
+    } else {
+        sample
+    };
+    site.ns.set(learned);
+    // One worker first becomes worthwhile at nine measured wakes.
+    let updated_wake = if workers == 0 {
+        wake
+    } else {
+        claim.as_nanos() as f64 / workers as f64
+    };
+    site.trigger
+        .set((9.0 * updated_wake / learned).ceil().max(2.0) as u64);
+    site.enable(true);
+    Some((site.charge * count).wrapping_add(extra))
 }
 
 struct Session<'a> {
@@ -1479,13 +1746,6 @@ mod tests {
     const OUTPUT: u32 = 0x4_0000;
     const COUNT: u32 = 40_000;
     const SPACE: u32 = 0x4_0000;
-
-    /// The pool is process-wide: tests that need its workers take turns,
-    /// or a parallel test's blocks can fill it.
-    fn exclusive_pool() -> std::sync::MutexGuard<'static, ()> {
-        static POOL: Mutex<()> = Mutex::new(());
-        POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn fixture(a: &mut CodeAssembler) -> (Executor, Native) {
         let words = a.assemble(u64::from(CODE)).unwrap();

@@ -357,10 +357,20 @@ impl Executor {
         #[cfg(native)]
         if let Some(native) = &self.native {
             if crate::jit_map::enabled() {
-                for (head, [walks, skip, uniform, mixed]) in native.resident_batch_counts() {
+                for (head, [entries, scalar]) in native.resident_site_counts() {
                     crate::jit_map::optimized(
                         head,
-                        format_args!("resident\tbatches\t{walks}\t{skip}\t{uniform}\t{mixed}"),
+                        format_args!("resident\tentries\t{entries}\t{scalar}"),
+                    );
+                }
+                for (head, [walks, skip, uniform, mixed, offers, declines, splits]) in
+                    native.resident_batch_counts()
+                {
+                    crate::jit_map::optimized(
+                        head,
+                        format_args!(
+                            "resident\tbatches\t{walks}\t{skip}\t{uniform}\t{mixed}\t{offers}\t{declines}\t{splits}"
+                        ),
                     );
                 }
             }

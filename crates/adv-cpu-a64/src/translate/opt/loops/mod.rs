@@ -3,6 +3,8 @@
 //! and transition to the original scalar body.
 //! Sign-only latches count from the wrapped result, without the overflow
 //! flag used by a signed comparison of the original operands.
+//! A guarded sign-latched strip can batch checked sites. The page proof
+//! covers its unchecked accesses, while the scalar tail keeps its checks.
 
 use iced_x86::ConditionCode as Cc;
 
@@ -93,6 +95,7 @@ pub(super) struct Loop {
     pub head: Block,
     pub latch: Block,
     pub latch_taken: bool,
+    pub sign_latch: bool,
     pub blocks: Vec<Block>,
     /// Header parameters and their returning edge arguments.
     pub carried: Vec<(Value, Value)>,
@@ -373,10 +376,12 @@ fn classify(
     for &b in &blocks {
         for &(result, op) in &func.blocks[b.0 as usize].insts {
             let (addr, width, access) = match op {
-                Op::Load { checked: true, .. }
-                | Op::Store { checked: true, .. }
-                | Op::Load { clock: true, .. }
-                | Op::FrameStore { .. } => return Err(Reject::Access),
+                Op::Load { checked: true, .. } | Op::Store { checked: true, .. }
+                    if !func.resident || !sign =>
+                {
+                    return Err(Reject::Access);
+                }
+                Op::Load { clock: true, .. } | Op::FrameStore { .. } => return Err(Reject::Access),
                 Op::Load { addr, width, .. } => (addr, width, Access::Load(result.unwrap())),
                 Op::Store {
                     addr, width, value, ..
@@ -406,6 +411,7 @@ fn classify(
         head: Block(head as u32),
         latch: Block(latch as u32),
         latch_taken,
+        sign_latch: sign,
         blocks,
         carried,
         flag_carried,
@@ -476,6 +482,7 @@ pub(super) struct Plan {
     pub lanes: u8,
     pub inputs: Vec<Value>,
     pub conditional_stores: bool,
+    pub published: Vec<Value>,
     pub body: Box<dyn BatchBody>,
 }
 
@@ -522,6 +529,7 @@ impl Batch {
                     .map(|s| s.start.base),
             )
             .chain(self.plan.inputs.iter().copied())
+            .chain(self.plan.published.iter().copied())
     }
 
     fn new(func: &Func, head: u32, loop_: Loop, plan: Plan) -> Option<Self> {

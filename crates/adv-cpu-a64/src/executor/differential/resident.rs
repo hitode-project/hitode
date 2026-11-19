@@ -265,6 +265,14 @@ impl<'a> Trial<'a> {
     /// reference to a different instruction or a different loop iteration.
     /// Dead registers at checkpoints are tested by resuming from both states.
     fn compare(&mut self, fuel: u64) -> (RunOutcome, u64) {
+        self.compare_with(fuel, |_| {})
+    }
+
+    fn compare_with(
+        &mut self,
+        fuel: u64,
+        mut before_native: impl FnMut(&mut crate::native::Native),
+    ) -> (RunOutcome, u64) {
         let mut retired = 0;
         for _ in 0..=fuel {
             let stop = self.stop;
@@ -275,6 +283,7 @@ impl<'a> Trial<'a> {
             if retired == fuel {
                 return (RunOutcome::Budget, retired);
             }
+            before_native(self.live.native.as_mut().unwrap());
             if let Some(run) = self.run_native(fuel - retired) {
                 let units = u64::from(run.retired);
                 assert!(
@@ -916,6 +925,158 @@ fn sse_invalid_results_resume_when_mxcsr_invalid_is_already_set() {
     let native = trial.live.native.as_ref().unwrap();
     assert!(native.resident_arrivals(image.head).unwrap() > 0);
     assert_eq!(native.diagnostics.resident_cold_exits, 0);
+}
+
+// spec: A64-OPT-4, A64-OPT-6
+#[test]
+fn resident_packed_conversions_keep_x86_values_and_status() {
+    for conversion in 0..8 {
+        let image = Image::assemble(
+            |a, head, _| {
+                a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+                match conversion {
+                    0 => a.cvtdq2ps(xmm0, xmm0),
+                    1 => a.cvtdq2pd(xmm0, xmm0),
+                    2 => a.cvtps2pd(xmm0, xmm0),
+                    3 => a.cvtpd2ps(xmm0, xmm0),
+                    4 => a.cvtps2dq(xmm0, xmm0),
+                    5 => a.cvttps2dq(xmm0, xmm0),
+                    6 => a.cvtpd2dq(xmm0, xmm0),
+                    _ => a.cvttpd2dq(xmm0, xmm0),
+                }
+                .unwrap();
+                a.movups(xmmword_ptr(edi), xmm0).unwrap();
+                a.add(esi, 16).unwrap();
+                a.add(edi, 16).unwrap();
+                latch(a, head);
+            },
+            |a| a.stmxcsr(dword_ptr(edx)).unwrap(),
+        );
+        let dwords = |lanes: [u32; 4]| -> [u8; 16] {
+            std::array::from_fn(|i| lanes[i / 4].to_le_bytes()[i % 4])
+        };
+        let doubles = |lanes: [f64; 2]| -> [u8; 16] {
+            std::array::from_fn(|i| lanes[i / 8].to_le_bytes()[i % 8])
+        };
+        let (ordinary, exceptional) = match conversion {
+            0 | 1 => (
+                dwords([i32::MIN as u32, i32::MAX as u32, 1, u32::MAX]),
+                [0x99; 16],
+            ),
+            2 | 4 | 5 => (
+                dwords([
+                    (-1.5f32).to_bits(),
+                    2147483520.0f32.to_bits(),
+                    1.5f32.to_bits(),
+                    0x80000000,
+                ]),
+                dwords([
+                    0x7fc00001,
+                    1,
+                    f32::INFINITY.to_bits(),
+                    2147483648.0f32.to_bits(),
+                ]),
+            ),
+            3 => (
+                doubles([1.75, -0.0]),
+                doubles([f64::from_bits(1), f64::MAX]),
+            ),
+            _ => (
+                doubles([-2147483648.5, 2147483647.25]),
+                doubles([f64::NAN, 2147483647.5]),
+            ),
+        };
+        for (mxcsr, data) in [
+            (0x1fa0, ordinary),
+            (0x1fa0, exceptional),
+            (0x3f80, ordinary),
+        ] {
+            let mut cpu = initial(7);
+            cpu.regs[2] = RESULTS;
+            cpu.mxcsr = mxcsr;
+            let mut at = cpu.clone();
+            at.mxcsr = 0x1fa0;
+            let mut trial = Trial::new(
+                &image,
+                &cpu,
+                format!("packed conversion {conversion}, MXCSR {mxcsr:x}"),
+                &[],
+                |m| {
+                    m.write(DATA, &data.repeat(7)).unwrap();
+                },
+            );
+            assert!(trial.try_install_at(at), "{}", trial.context);
+            let (outcome, _) = trial.compare(4096);
+            assert_eq!(outcome, RunOutcome::ReachedStop);
+        }
+    }
+}
+
+// spec: A64-OPT-4, A64-OPT-6
+#[test]
+fn resident_packed_arithmetic_checks_every_lane() {
+    for operation in 0..8 {
+        let double = operation >= 4;
+        let image = Image::loop_body(|a, head, _| {
+            a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+            match operation {
+                0 => a.addps(xmm0, xmm1),
+                1 => a.subps(xmm0, xmm1),
+                2 => a.mulps(xmm0, xmm1),
+                3 => a.divps(xmm0, xmm1),
+                4 => a.addpd(xmm0, xmm1),
+                5 => a.subpd(xmm0, xmm1),
+                6 => a.mulpd(xmm0, xmm1),
+                _ => a.divpd(xmm0, xmm1),
+            }
+            .unwrap();
+            a.movups(xmmword_ptr(edi), xmm0).unwrap();
+            a.add(esi, 16).unwrap();
+            a.add(edi, 16).unwrap();
+            latch(a, head);
+        });
+        for exceptional in [false, true] {
+            let mut cpu = initial(11);
+            cpu.mxcsr = 0x1fa0;
+            let (width, rest, scale, special) = if double {
+                (
+                    8,
+                    3.5f64.to_bits(),
+                    0.5f64.to_bits(),
+                    f64::INFINITY.to_bits(),
+                )
+            } else {
+                (
+                    4,
+                    u64::from(3.5f32.to_bits()),
+                    u64::from(0.5f32.to_bits()),
+                    u64::from(f32::INFINITY.to_bits()),
+                )
+            };
+            for lane in cpu.xmm[1].chunks_exact_mut(width) {
+                lane.copy_from_slice(&scale.to_le_bytes()[..width]);
+            }
+            let data: [u8; 16] = std::array::from_fn(|i| {
+                let bits = if exceptional && i / width == 1 {
+                    special
+                } else {
+                    rest
+                };
+                bits.to_le_bytes()[i % width]
+            });
+            let mut trial = Trial::new(
+                &image,
+                &cpu,
+                format!("packed arithmetic {operation}/{exceptional}"),
+                &[],
+                |m| {
+                    m.write(DATA, &data.repeat(11)).unwrap();
+                },
+            );
+            assert!(trial.try_install_at(cpu), "{}", trial.context);
+            assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        }
+    }
 }
 
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
@@ -1965,6 +2126,9 @@ fn vector_sign_latch_guards_an_invariant_load() {
             m.write(OUTPUT, &0x8543_2100u32.to_le_bytes()).unwrap();
             m.write(RESULTS, &0xff00_0000u32.to_le_bytes()).unwrap();
         });
+        if !alias {
+            trial.live.native.as_mut().unwrap().checks = Checks::All;
+        }
         vector_install(&mut trial, cpu, 4);
         assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
     }
@@ -2082,6 +2246,7 @@ fn vector_enters_resident_from_a_deferred_mmx_arrival() {
 // spec: A64-OPT-10
 #[test]
 fn vector_mmx_store_classes_match_scalar_lanes() {
+    let _pool = crate::native::exclusive_pool();
     let image = Image::loop_body(|a, head, _| {
         let mut add = a.create_label();
         let mut blend = a.create_label();
@@ -2153,17 +2318,96 @@ fn vector_mmx_store_classes_match_scalar_lanes() {
             m.write(OUTPUT, &vector_data(921)).unwrap();
             m.write(RESULTS, &75u32.to_le_bytes()).unwrap();
         });
-        let costs = crate::jit_map::collect_batch_costs(|| vector_install(&mut trial, cpu, 2));
+        let costs =
+            crate::jit_map::collect_batch_costs(|| vector_install(&mut trial, cpu.clone(), 2));
         assert_eq!(costs.len(), 16);
         assert!(
             costs.iter().all(|&(scalar, batch)| batch <= scalar),
             "{costs:?}"
         );
         assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
-        let [_, skip, uniform, mixed] =
+        let [_, skip, uniform, mixed, ..] =
             trial.live.native.as_ref().unwrap().resident_batch_counts()[&image.head];
         assert!(skip > 0 && uniform > 0 && mixed > 0);
+        if std::thread::available_parallelism().unwrap().get() >= 2 {
+            let dest = cpu.regs[7];
+            let serial = trial.live.memory.read(dest, data.len()).unwrap().to_vec();
+            for executor in [&mut trial.live, &mut trial.reference] {
+                executor.state = cpu.clone();
+                executor.memory.write(DATA, &data).unwrap();
+                executor.memory.write(OUTPUT, &vector_data(921)).unwrap();
+            }
+            let after = trial.compare_with(4096, |native| {
+                native.seed_span_cost(image.head, 2_000_000.0)
+            });
+            assert_eq!(after.0, RunOutcome::ReachedStop);
+            let counts = trial.live.native.as_ref().unwrap().resident_batch_counts();
+            assert!(counts[&image.head][6] > 0, "{in_place}: {counts:?}");
+            assert_eq!(trial.live.memory.read(dest, data.len()).unwrap(), serial);
+        }
     }
+}
+
+// spec: A64-OPT-9, A64-OPT-10, A64-TR-9
+#[test]
+fn resident_span_split_matches_the_serial_store_stream() {
+    let _pool = crate::native::exclusive_pool();
+    if std::thread::available_parallelism().unwrap().get() < 2 {
+        return;
+    }
+    let image = Image::loop_body(|a, head, _| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.or(eax, 0xff00_0000u32).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut cpu = initial(8191);
+    cpu.regs[6] = SPECIAL;
+    cpu.regs[7] = SPECIAL + HOST_PAGE as u32;
+    let data = vector_data(571).repeat(4);
+    let mut trial = Trial::new(
+        &image,
+        &cpu,
+        "scoped span split",
+        &[(SPECIAL, HOST_PAGE * 2)],
+        |m| {
+            m.map(SPECIAL, HOST_PAGE * 2, READ | WRITE).unwrap();
+            m.write(SPECIAL, &data).unwrap();
+        },
+    );
+    vector_install(&mut trial, cpu.clone(), 4);
+    assert_eq!(trial.compare(65_536).0, RunOutcome::ReachedStop);
+    let serial = trial
+        .live
+        .memory
+        .read(cpu.regs[7], HOST_PAGE)
+        .unwrap()
+        .to_vec();
+
+    for executor in [&mut trial.live, &mut trial.reference] {
+        executor.state = cpu.clone();
+        executor
+            .memory
+            .write(cpu.regs[7], &vec![0; HOST_PAGE])
+            .unwrap();
+    }
+    trial
+        .live
+        .native
+        .as_mut()
+        .unwrap()
+        .seed_span_cost(image.head, 8_000.0);
+    assert_eq!(trial.compare(65_536).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    let [_, _, _, _, offers, _, splits] = native.resident_batch_counts()[&image.head];
+    assert!(offers > 0 && splits > 0);
+    assert_eq!(
+        trial.live.memory.read(cpu.regs[7], HOST_PAGE).unwrap(),
+        serial
+    );
 }
 
 // spec: A64-OPT-10
