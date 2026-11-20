@@ -203,7 +203,7 @@ jobs:
           args=(--locked --lib --tests "${packages[@]}")
           if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
           if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then args+=(--features adv-device/slow-tests); fi
-          cargo test "${args[@]}" --no-run --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
+          cargo build "${args[@]}" --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
       - name: Execute tests
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 15
