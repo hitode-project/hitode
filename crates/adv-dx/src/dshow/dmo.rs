@@ -419,8 +419,8 @@ pub(crate) fn disconnected(env: &mut Env<'_>, pin: u32) {
     }
 }
 
-/// Release blocked streaming calls before upstream guest sources are asked to stop.
-pub(crate) fn begin_stop(env: &mut Env<'_>, graph: u32) {
+/// Wake host waits and return guest input pins that may hold upstream calls.
+pub(crate) fn begin_stop(env: &mut Env<'_>, graph: u32) -> Vec<u32> {
     let wakes: Vec<Handle> = state(env)
         .filters
         .values_mut()
@@ -434,6 +434,21 @@ pub(crate) fn begin_stop(env: &mut Env<'_>, graph: u32) {
     for wake in wakes {
         env.sys.set_event(wake);
     }
+    let s = env.ext.get::<State>();
+    s.filters
+        .values()
+        .filter(|f| {
+            f.graph == graph
+                && f.dmo
+                    .as_ref()
+                    .is_some_and(|d| d.upstream_filter != 0 && !d.flushing)
+        })
+        .flat_map(|f| &f.pins)
+        .filter_map(|pin| s.pins.get(pin))
+        .filter(|p| p.dir == OUTPUT && p.mem != 0 && p.peer != 0)
+        .map(|p| p.peer)
+        .filter(|&peer| filter::host_pin(env, peer).is_none())
+        .collect()
 }
 
 /// Whether a DMO input in `graph` is flushing, stopping, or has a decommitted allocator.

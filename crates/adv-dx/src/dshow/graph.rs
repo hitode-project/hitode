@@ -357,12 +357,21 @@ pub(crate) fn release_method(env: &mut Env<'_>, this: u32) -> Outcome {
 
 fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     Transition::begin(env, graph);
-    super::dmo::begin_stop(env, graph);
+    let outputs = super::dmo::begin_stop(env, graph);
     super::vmr::begin_stop(env, graph);
     stop_sessions(env, graph);
     video::detach(env, graph);
     g(env, graph).state = STOPPED;
     g(env, graph).stopping = true;
+    chain(
+        env,
+        outputs.iter().map(|&pin| Call(pin, 15, vec![])).collect(),
+        Vec::new(),
+        Box::new(move |env, _| detach_members(env, graph, outputs, then)),
+    )
+}
+
+fn detach_members(env: &mut Env<'_>, graph: u32, outputs: Vec<u32>, then: Then) -> Outcome {
     let members: Vec<(u32, Option<u32>)> = state(env).graphs[&graph]
         .members
         .iter()
@@ -380,6 +389,7 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             calls.push_back(Call(filter, 4, vec![]));
         }
     }
+    calls.extend(outputs.into_iter().map(|pin| Call(pin, 16, vec![])));
     for &(_, host) in &members {
         if let Some(host) = host {
             calls.extend(filter::disconnect_filter(env, host));
@@ -1499,10 +1509,19 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         graph_state.state = STOPPED;
         graph_state.stopping = true;
     }
-    // Wake blocked host stages first, then stop upstream guest sources before
-    // the other members, downstream first (MEDIA-DMO-4).
-    super::dmo::begin_stop(env, graph);
+    // A guest source can wait for a DMO output's downstream Receive to
+    // return. Flush that sink before joining the source (MEDIA-DMO-4).
+    let outputs = super::dmo::begin_stop(env, graph);
     super::vmr::begin_stop(env, graph);
+    chain(
+        env,
+        outputs.iter().map(|&pin| Call(pin, 15, vec![])).collect(),
+        Vec::new(),
+        Box::new(move |env, _| stop_members(env, graph, outputs, then)),
+    )
+}
+
+fn stop_members(env: &mut Env<'_>, graph: u32, outputs: Vec<u32>, then: Then) -> Outcome {
     let mut feeding = super::dmo::upstream_filters(env, graph);
     feeding.extend(super::vmr::upstream_filters(env, graph));
     order::members(
@@ -1525,16 +1544,31 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                     let finish: Then = Box::new(move |env, more| {
                         let mut results = results;
                         results.extend(more);
-                        join(
+                        chain(
                             env,
-                            graph,
+                            outputs
+                                .into_iter()
+                                .map(|pin| Call(pin, 16, vec![]))
+                                .collect(),
+                            Vec::new(),
                             Box::new(move |env, _| {
-                                let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
-                                    return then(env, results);
-                                };
-                                graph_state.stopping = false;
-                                // Quartz re-seeks every stream to the kept position.
-                                seeking::rewind(env, graph, Box::new(move |env| then(env, results)))
+                                join(
+                                    env,
+                                    graph,
+                                    Box::new(move |env, _| {
+                                        let Some(graph_state) = state(env).graphs.get_mut(&graph)
+                                        else {
+                                            return then(env, results);
+                                        };
+                                        graph_state.stopping = false;
+                                        // Quartz re-seeks every stream to the kept position.
+                                        seeking::rewind(
+                                            env,
+                                            graph,
+                                            Box::new(move |env| then(env, results)),
+                                        )
+                                    }),
+                                )
                             }),
                         )
                     });

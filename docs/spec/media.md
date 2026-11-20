@@ -248,6 +248,8 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 **Rule**: Connected DMO graphs MUST derive duration from upstream IMediaSeeking and forward seeks to that source. Pause and Run MUST invoke the upstream source last, and Stop MUST invoke it first.
 **Verification**: Test
 
+Before stopping a guest source that feeds a DMO, wake the host waits and begin flushing connected guest outputs so any blocked Receive can return. End this flush after the members stop.
+
 ### MEDIA-DMO-5 Wrapper identity and state
 
 **Rule**: DMO wrappers MUST validate aggregation requests but retain their own controlling identity, exposing additional interfaces through the aggregated media object. Leaving Stopped MUST allocate streaming resources and commit connected output allocators, preserving Stopped when allocation fails. Stop MUST wait for active reception, decommit outputs, flush the media object, and free streaming resources.
