@@ -743,9 +743,22 @@ impl Native {
         }
     }
 
-    /// Whether code at `eip` is known to run, so translating it pays.
+    /// Whether code at `eip` is known to run, so translating it pays. A
+    /// direct-body entry has no guest code for a first visit: the host call
+    /// runs before any unit would, so it counts as run.
     pub(super) fn ran(&self, eip: u32) -> bool {
-        self.plans.ran(eip, self.first_visits)
+        self.plans.ran(eip, self.first_visits) || self.direct_entry(eip)
+    }
+
+    fn direct_entry(&self, eip: u32) -> bool {
+        if self.bridge.is_null() {
+            return false;
+        }
+        // SAFETY: `run` sets the bridge for the owner call that reaches here.
+        unsafe { &*self.bridge.cast::<adv_cpu_core::trap::Bridge<'_>>() }
+            .handler
+            .as_ref()
+            .is_some_and(|handler| handler.direct_body(eip).is_some())
     }
 
     /// Whether `eip`, which has no unit, runs for the first time; it will
