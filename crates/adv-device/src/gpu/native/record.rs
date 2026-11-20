@@ -1,27 +1,32 @@
-//! Guest operations as command chunks. Validation lives here; the owner
-//! assumes admitted commands and ring ranges are valid.
+//! Guest operations as command chunks, lowered on the dedicated `"adv-gfx-worker"`
+//! CSMT thread. Parameter and bounds validation stay synchronous on the execution
+//! thread; pipeline demand, ring packing, vertex recipe expansion, sampler lookup,
+//! and multi-scissor deduplication run on `"adv-gfx-worker"`.
 
 use super::super::{self as gpu, DrawState, Error, Filter, ProgrammableDraw, Rect, Vertex};
-use super::pipelines::{fixed_sampling_flags, program_sampling_flags, slot};
+use super::pipelines::{Pipelines, fixed_sampling_flags, program_sampling_flags, slot};
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Command, Draw, Producer};
-use super::{Depth, Gpu, Image, ImageId, Target, backing};
+use super::{Depth, Gpu, Image, ImageId, Stats, Target, backing};
 use crate::frame::Region;
 use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 const MAX_UPLOAD: usize = 16 << 20;
 const MAX_READBACKS: usize = 8;
 const CONSTANT_SIZE: usize = std::mem::size_of::<gpu::ConstantBlock>();
+const MAX_QUEUED_CMDS: usize = 4096;
+const MAX_QUEUED_BYTES: usize = 64 << 20;
+const MAX_IN_FLIGHT_FRAMES: usize = 3;
+const WORKER_BATCH: usize = 64;
+const MAX_RECYCLED_BYTES: usize = 8 << 20;
 
 pub(super) struct Recording {
-    target: Option<(ImageId, Option<Depth>)>,
     white: Image,
     samplers: HashMap<gpu::Sampler, adv_gpu::Sampler>,
-    readbacks: Arc<AtomicUsize>,
-    pub readback_limit: usize,
 }
 impl Recording {
     pub fn new(device: &adv_gpu::Device, stream: &mut Producer) -> Result<Self, Error> {
@@ -54,13 +59,1558 @@ impl Recording {
             },
         });
         Ok(Self {
-            target: None,
             white,
             samplers: HashMap::new(),
-            readbacks: Arc::new(AtomicUsize::new(0)),
-            readback_limit: MAX_READBACKS,
         })
     }
+}
+
+pub(super) enum VertexPayload {
+    Owned(Vec<Vertex>),
+    Shared(Arc<Vec<Vertex>>),
+}
+impl VertexPayload {
+    fn as_slice(&self) -> &[Vertex] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+pub(super) enum UploadPayload {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+impl UploadPayload {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum Clips {
+    None,
+    One(Rect),
+    Inline(arrayvec::ArrayVec<Rect, 8>),
+    Heap(Vec<Rect>),
+}
+#[allow(clippy::large_enum_variant)]
+enum Areas {
+    Inline(arrayvec::ArrayVec<(adv_gpu::Rect, Option<adv_gpu::Rect>), 8>),
+    Heap(Vec<(adv_gpu::Rect, Option<adv_gpu::Rect>)>),
+}
+impl Areas {
+    fn as_slice(&self) -> &[(adv_gpu::Rect, Option<adv_gpu::Rect>)] {
+        match self {
+            Self::Inline(v) => v,
+            Self::Heap(v) => v,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    fn without_opaque(&self) -> Self {
+        match self {
+            Self::Inline(v) => Self::Inline(v.iter().map(|&(a, _)| (a, None)).collect()),
+            Self::Heap(v) => Self::Heap(v.iter().map(|&(a, _)| (a, None)).collect()),
+        }
+    }
+}
+impl Clips {
+    fn from_slice(clips: Option<&[Rect]>, fallback: Option<Rect>) -> Self {
+        match clips {
+            Some([]) => Self::None,
+            Some([one]) => Self::One(*one),
+            Some(many) if many.len() <= 8 => Self::Inline(many.iter().copied().collect()),
+            Some(many) => Self::Heap(many.to_vec()),
+            None => match fallback {
+                Some(clip) => Self::One(clip),
+                None => Self::None,
+            },
+        }
+    }
+    fn areas(&self, target: &Target, state: &DrawState, vertices: Option<&[Vertex]>) -> Areas {
+        let make = |clip: Option<Rect>| {
+            let area = draw_area(target, state, clip);
+            (area.w > 0 && area.h > 0)
+                .then(|| (area, vertices.and_then(|v| opaque_quad(v, state, area))))
+        };
+        match self {
+            Self::None => {
+                let mut out = arrayvec::ArrayVec::new();
+                if let Some(entry) = make(None) {
+                    out.push(entry);
+                }
+                Areas::Inline(out)
+            }
+            Self::One(clip) => {
+                let mut out = arrayvec::ArrayVec::new();
+                if let Some(entry) = make(Some(*clip)) {
+                    out.push(entry);
+                }
+                Areas::Inline(out)
+            }
+            Self::Inline(clips) => {
+                let mut out = arrayvec::ArrayVec::new();
+                for &clip in clips {
+                    if let Some(entry) = make(Some(clip)) {
+                        out.push(entry);
+                    }
+                }
+                Areas::Inline(out)
+            }
+            Self::Heap(clips) => {
+                let mut out = Vec::with_capacity(clips.len());
+                for &clip in clips {
+                    if let Some(entry) = make(Some(clip)) {
+                        out.push(entry);
+                    }
+                }
+                Areas::Heap(out)
+            }
+        }
+    }
+}
+
+pub(super) type PipelineJobs = Arc<Mutex<HashMap<[u8; 32], super::pipelines::PipelineJob>>>;
+#[cfg(test)]
+type PipelineInspector = Box<dyn FnOnce(&mut Pipelines, &adv_gpu::Device) + Send>;
+type FacadeInitReply = Result<(PipelineJobs, gpu::compile::CompileCounters), Error>;
+
+pub(super) enum WorkerItem {
+    CreateFacade {
+        id: u64,
+        failure: Arc<OnceLock<String>>,
+        reply: mpsc::SyncSender<FacadeInitReply>,
+    },
+    DropFacade(u64),
+    Clear {
+        facade: u64,
+        target: Target,
+        area: Rect,
+        color: Option<[f64; 4]>,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    },
+    DrawFixed {
+        facade: u64,
+        target: Target,
+        vertices: VertexPayload,
+        image: Option<Image>,
+        state: DrawState,
+        inclusive: Option<gpu::line::Inclusive>,
+        clips: Clips,
+    },
+    DrawProgrammable {
+        facade: u64,
+        target: Target,
+        draw: Arc<ProgrammableDraw>,
+        state: DrawState,
+        clips: Clips,
+    },
+    Blit {
+        facade: u64,
+        source: Image,
+        rectangle: Rect,
+        destination: Image,
+        region: Rect,
+        filter: Filter,
+        clip: Option<Rect>,
+    },
+    Copy {
+        facade: u64,
+        source: Image,
+        rectangle: Rect,
+        destination: Image,
+        region: Rect,
+        clip: Option<Rect>,
+    },
+    UploadBytes {
+        image: Image,
+        rectangle: Rect,
+        pitch: u32,
+        bytes: UploadPayload,
+    },
+    UploadStaged {
+        image: Image,
+        rectangle: Rect,
+        staged: super::Staged,
+    },
+    DiscardDepth(Depth),
+    PresentSwap {
+        image: Image,
+        damage: Region,
+        serial: u64,
+        video: Arc<[crate::frame::VideoPlane]>,
+        windows: Arc<[crate::frame::WindowLayer]>,
+    },
+    PresentSoftware {
+        base: crate::frame::Base,
+        video: Arc<[crate::frame::VideoPlane]>,
+        windows: Arc<[crate::frame::WindowLayer]>,
+        serial: u64,
+    },
+    Flush,
+    Readback {
+        facade: u64,
+        image: Image,
+        regions: Vec<Rect>,
+        worker: bool,
+        transfer: Transfer,
+    },
+    SnapshotCopy {
+        facade: u64,
+        source: Image,
+        destination: Image,
+        regions: Vec<Rect>,
+    },
+    Capture(crate::frame::CaptureReply),
+    SetPipelineCacheDir {
+        facade: u64,
+        directory: Option<std::path::PathBuf>,
+        reply: mpsc::SyncSender<PipelineJobs>,
+    },
+    FlushPipelineCache {
+        facade: u64,
+        reply: mpsc::SyncSender<std::io::Result<()>>,
+    },
+    Stats {
+        facade: u64,
+        reply: mpsc::SyncSender<Stats>,
+    },
+    Drain {
+        reply: mpsc::SyncSender<()>,
+    },
+    #[cfg(test)]
+    InspectPipelines {
+        facade: u64,
+        f: PipelineInspector,
+        reply: mpsc::SyncSender<()>,
+    },
+}
+
+struct WorkerItemEntry {
+    item: WorkerItem,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct WorkerQueue {
+    full: VecDeque<Vec<WorkerItemEntry>>,
+    free_batches: Vec<Vec<WorkerItemEntry>>,
+    free_bytes: Vec<Vec<u8>>,
+    free_bytes_total: usize,
+    free_verts: Vec<Vec<Vertex>>,
+    free_verts_total: usize,
+    idle: bool,
+    closed: bool,
+}
+
+pub(super) struct WorkerShared {
+    queue: Mutex<WorkerQueue>,
+    work_cv: Condvar,
+    space_cv: Condvar,
+    queued_cmds: AtomicUsize,
+    queued_bytes: AtomicUsize,
+    in_flight_frames: AtomicUsize,
+    wake: Mutex<Option<Arc<adv_sync::WakeEvent>>>,
+}
+
+impl WorkerShared {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(WorkerQueue::default()),
+            work_cv: Condvar::new(),
+            space_cv: Condvar::new(),
+            queued_cmds: AtomicUsize::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            in_flight_frames: AtomicUsize::new(0),
+            wake: Mutex::new(None),
+        }
+    }
+
+    fn signal_wake(&self) {
+        if let Some(wake) = self.wake.lock().unwrap().as_ref() {
+            wake.signal();
+        }
+    }
+
+    fn has_wake(&self) -> bool {
+        self.wake.lock().unwrap().is_some()
+    }
+
+    pub(super) fn push_capture(&self, tx: crate::frame::CaptureReply) {
+        let mut q = self.queue.lock().unwrap();
+        if q.closed {
+            return;
+        }
+        self.queued_cmds.fetch_add(1, Ordering::AcqRel);
+        let mut batch = q.free_batches.pop().unwrap_or_default();
+        batch.push(WorkerItemEntry {
+            item: WorkerItem::Capture(tx),
+            bytes: 0,
+        });
+        q.full.push_back(batch);
+        if q.idle {
+            self.work_cv.notify_one();
+        }
+    }
+
+    fn recycle_bytes(&self, mut buf: Vec<u8>) {
+        let cap = buf.capacity();
+        if cap == 0 || cap > MAX_RECYCLED_BYTES / 2 {
+            return;
+        }
+        buf.clear();
+        let mut q = self.queue.lock().unwrap();
+        if q.free_bytes_total + cap <= MAX_RECYCLED_BYTES && q.free_bytes.len() < 16 {
+            q.free_bytes_total += cap;
+            q.free_bytes.push(buf);
+        }
+    }
+
+    fn recycle_verts(&self, mut buf: Vec<Vertex>) {
+        let cap = buf.capacity() * std::mem::size_of::<Vertex>();
+        if cap == 0 || cap > MAX_RECYCLED_BYTES / 2 {
+            return;
+        }
+        buf.clear();
+        let mut q = self.queue.lock().unwrap();
+        if q.free_verts_total + cap <= MAX_RECYCLED_BYTES && q.free_verts.len() < 16 {
+            q.free_verts_total += cap;
+            q.free_verts.push(buf);
+        }
+    }
+}
+
+pub(super) struct WorkerHandle {
+    shared: Arc<WorkerShared>,
+    batch: RefCell<Vec<WorkerItemEntry>>,
+    next_facade: AtomicU64,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    pub(super) fn start(
+        device: adv_gpu::Device,
+        producer: Producer,
+        owner_waker: Option<super::stream::Waker>,
+    ) -> Result<Self, Error> {
+        let shared = Arc::new(WorkerShared::new());
+        let worker_shared = shared.clone();
+        let join = std::thread::Builder::new()
+            .name("adv-gfx-worker".into())
+            .spawn(move || {
+                worker_loop(device, producer, worker_shared, owner_waker);
+            })
+            .map_err(|error| Error::Unavailable(error.to_string()))?;
+        Ok(Self {
+            shared,
+            batch: RefCell::new(Vec::with_capacity(WORKER_BATCH)),
+            next_facade: AtomicU64::new(1),
+            join: Some(join),
+        })
+    }
+
+    pub(super) fn shared(&self) -> Arc<WorkerShared> {
+        self.shared.clone()
+    }
+
+    pub(super) fn set_wake(&self, wake: Option<Arc<adv_sync::WakeEvent>>) {
+        *self.shared.wake.lock().unwrap() = wake;
+    }
+
+    pub(super) fn create_facade(
+        &self,
+        failure: Arc<OnceLock<String>>,
+    ) -> Result<(u64, PipelineJobs, gpu::compile::CompileCounters), Error> {
+        let id = self.next_facade.fetch_add(1, Ordering::Relaxed);
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(WorkerItem::CreateFacade { id, failure, reply }, 0);
+        let (jobs, counters) = rx
+            .recv()
+            .map_err(|_| Error::Device("adv-gfx-worker stopped".into()))??;
+        Ok((id, jobs, counters))
+    }
+
+    pub(super) fn drop_facade(&self, id: u64) {
+        self.push_boundary(WorkerItem::DropFacade(id), 0);
+    }
+
+    pub(super) fn take_bytes_buf(&self, len: usize) -> Vec<u8> {
+        let mut q = self.shared.queue.lock().unwrap();
+        if let Some(pos) = q.free_bytes.iter().position(|b| b.capacity() >= len) {
+            let buf = q.free_bytes.swap_remove(pos);
+            q.free_bytes_total -= buf.capacity();
+            return buf;
+        }
+        drop(q);
+        Vec::with_capacity(len)
+    }
+
+    pub(super) fn take_verts_buf(&self, len: usize) -> Vec<Vertex> {
+        let mut q = self.shared.queue.lock().unwrap();
+        if let Some(pos) = q.free_verts.iter().position(|b| b.capacity() >= len) {
+            let buf = q.free_verts.swap_remove(pos);
+            q.free_verts_total -= buf.capacity() * std::mem::size_of::<Vertex>();
+            return buf;
+        }
+        drop(q);
+        Vec::with_capacity(len)
+    }
+
+    pub(super) fn admit_cmd(&self, bytes: usize) -> Result<(), Error> {
+        let within_budget = || {
+            let cmds = self.shared.queued_cmds.load(Ordering::Acquire);
+            let queued_bytes = self.shared.queued_bytes.load(Ordering::Acquire);
+            cmds < MAX_QUEUED_CMDS
+                && (queued_bytes == 0 || queued_bytes.saturating_add(bytes) <= MAX_QUEUED_BYTES)
+        };
+        loop {
+            if within_budget() {
+                return Ok(());
+            }
+            self.flush_batch();
+            if within_budget() {
+                return Ok(());
+            }
+            if self.shared.has_wake() {
+                if self.shared.queue.lock().unwrap().closed {
+                    return Err(Error::Device("adv-gfx-worker stopped".into()));
+                }
+                return Err(Error::Busy);
+            }
+            let q = self.shared.queue.lock().unwrap();
+            if q.closed {
+                return Err(Error::Device("adv-gfx-worker stopped".into()));
+            }
+            if within_budget() {
+                return Ok(());
+            }
+            drop(
+                self.shared
+                    .space_cv
+                    .wait_timeout(q, std::time::Duration::from_millis(1))
+                    .unwrap(),
+            );
+        }
+    }
+
+    pub(super) fn admit_present(&self) -> Result<(), Error> {
+        loop {
+            if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
+                return Ok(());
+            }
+            self.flush_batch();
+            if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
+                return Ok(());
+            }
+            if self.shared.has_wake() {
+                if self.shared.queue.lock().unwrap().closed {
+                    return Err(Error::Device("adv-gfx-worker stopped".into()));
+                }
+                return Err(Error::Busy);
+            }
+            let q = self.shared.queue.lock().unwrap();
+            if q.closed {
+                return Err(Error::Device("adv-gfx-worker stopped".into()));
+            }
+            if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
+                return Ok(());
+            }
+            drop(
+                self.shared
+                    .space_cv
+                    .wait_timeout(q, std::time::Duration::from_millis(1))
+                    .unwrap(),
+            );
+        }
+    }
+
+    pub(super) fn push(&self, item: WorkerItem, bytes: usize) {
+        self.shared.queued_cmds.fetch_add(1, Ordering::AcqRel);
+        self.shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let mut batch = self.batch.borrow_mut();
+        batch.push(WorkerItemEntry { item, bytes });
+        if batch.len() >= WORKER_BATCH {
+            drop(batch);
+            self.flush_batch();
+        }
+    }
+
+    pub(super) fn push_present(&self, item: WorkerItem) {
+        self.shared.in_flight_frames.fetch_add(1, Ordering::AcqRel);
+        self.push_boundary(item, 0);
+    }
+
+    pub(super) fn push_boundary(&self, item: WorkerItem, bytes: usize) {
+        self.shared.queued_cmds.fetch_add(1, Ordering::AcqRel);
+        self.shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.batch
+            .borrow_mut()
+            .push(WorkerItemEntry { item, bytes });
+        self.flush_batch();
+    }
+
+    pub(super) fn flush_batch(&self) {
+        let mut batch = self.batch.borrow_mut();
+        if batch.is_empty() {
+            return;
+        }
+        let mut q = self.shared.queue.lock().unwrap();
+        if q.closed {
+            batch.clear();
+            return;
+        }
+        let next = q
+            .free_batches
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(WORKER_BATCH));
+        let full = std::mem::replace(&mut *batch, next);
+        q.full.push_back(full);
+        if q.idle {
+            self.shared.work_cv.notify_one();
+        }
+    }
+
+    pub(super) fn set_pipeline_cache_directory(
+        &self,
+        facade: u64,
+        directory: Option<std::path::PathBuf>,
+    ) -> Arc<Mutex<HashMap<[u8; 32], super::pipelines::PipelineJob>>> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(
+            WorkerItem::SetPipelineCacheDir {
+                facade,
+                directory,
+                reply,
+            },
+            0,
+        );
+        rx.recv().unwrap_or_default()
+    }
+
+    pub(super) fn flush_pipeline_cache(&self, facade: u64) -> std::io::Result<()> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(WorkerItem::FlushPipelineCache { facade, reply }, 0);
+        rx.recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("adv-gfx-worker stopped")))
+    }
+
+    pub(super) fn stats(&self, facade: u64) -> Stats {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(WorkerItem::Stats { facade, reply }, 0);
+        rx.recv().unwrap_or_default()
+    }
+
+    pub(super) fn drain(&self) {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(WorkerItem::Drain { reply }, 0);
+        let _ = rx.recv();
+    }
+
+    #[cfg(test)]
+    pub(super) fn inspect_pipelines(
+        &self,
+        facade: u64,
+        f: impl FnOnce(&mut Pipelines, &adv_gpu::Device) + Send + 'static,
+    ) {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.push_boundary(
+            WorkerItem::InspectPipelines {
+                facade,
+                f: Box::new(f),
+                reply,
+            },
+            0,
+        );
+        rx.recv().expect("adv-gfx-worker stopped");
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.flush_batch();
+        {
+            let mut q = self.shared.queue.lock().unwrap();
+            q.closed = true;
+            self.shared.work_cv.notify_one();
+            self.shared.space_cv.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            join.join().expect("adv-gfx-worker panicked");
+        }
+    }
+}
+
+struct FacadeState {
+    failure: Arc<OnceLock<String>>,
+    pipelines: Pipelines,
+    recording: Recording,
+    stats: Stats,
+}
+
+struct WorkerState {
+    device: adv_gpu::Device,
+    stream: Producer,
+    target: Option<(ImageId, Option<Depth>)>,
+    facades: HashMap<u64, FacadeState>,
+    shared: Arc<WorkerShared>,
+    owner_waker: Option<super::stream::Waker>,
+}
+
+fn worker_loop(
+    device: adv_gpu::Device,
+    stream: Producer,
+    shared: Arc<WorkerShared>,
+    owner_waker: Option<super::stream::Waker>,
+) {
+    let mut state = WorkerState {
+        device,
+        stream,
+        target: None,
+        facades: HashMap::new(),
+        shared: shared.clone(),
+        owner_waker,
+    };
+    loop {
+        let batch = {
+            let mut q = shared.queue.lock().unwrap();
+            loop {
+                if let Some(batch) = q.full.pop_front() {
+                    q.idle = false;
+                    break Some(batch);
+                }
+                if q.closed {
+                    break None;
+                }
+                q.idle = true;
+                q = shared.work_cv.wait(q).unwrap();
+            }
+        };
+        let Some(mut batch) = batch else {
+            break;
+        };
+        #[cfg(target_vendor = "apple")]
+        objc2::rc::autoreleasepool(|_| state.process_batch(&mut batch));
+        #[cfg(not(target_vendor = "apple"))]
+        state.process_batch(&mut batch);
+
+        batch.clear();
+        {
+            let mut q = shared.queue.lock().unwrap();
+            if q.free_batches.len() < 16 {
+                q.free_batches.push(batch);
+            }
+        }
+        shared.space_cv.notify_all();
+        shared.signal_wake();
+    }
+    // Drop facades (flushing pipeline disk archives) before Producer closes.
+    state.facades.clear();
+    drop(state.stream);
+}
+
+impl WorkerState {
+    fn process_batch(&mut self, batch: &mut Vec<WorkerItemEntry>) {
+        let mut drained_cmds = 0usize;
+        let mut drained_bytes = 0usize;
+        for entry in batch.drain(..) {
+            drained_cmds += 1;
+            drained_bytes += entry.bytes;
+            if let Err((facade, error)) = self.execute(entry.item) {
+                let _ = self.facades[&facade].failure.set(error.to_string());
+            }
+        }
+        self.shared
+            .queued_cmds
+            .fetch_sub(drained_cmds, Ordering::AcqRel);
+        self.shared
+            .queued_bytes
+            .fetch_sub(drained_bytes, Ordering::AcqRel);
+    }
+
+    fn execute(&mut self, item: WorkerItem) -> Result<(), (u64, Error)> {
+        match item {
+            WorkerItem::CreateFacade { id, failure, reply } => {
+                let result = Recording::new(&self.device, &mut self.stream).map(|recording| {
+                    let pipelines = Pipelines::default();
+                    let jobs = pipelines.jobs();
+                    let counters = pipelines.counters();
+                    self.facades.insert(
+                        id,
+                        FacadeState {
+                            failure,
+                            pipelines,
+                            recording,
+                            stats: Stats::default(),
+                        },
+                    );
+                    (jobs, counters)
+                });
+                let _ = reply.send(result);
+            }
+            WorkerItem::DropFacade(id) => {
+                self.facades.remove(&id);
+            }
+            WorkerItem::Clear {
+                facade,
+                target,
+                area,
+                color,
+                depth,
+                stencil,
+            } => {
+                self.select(facade, &target);
+                self.stream.push(Command::Clear {
+                    area: native_rect(area),
+                    color,
+                    depth,
+                    stencil,
+                });
+            }
+            WorkerItem::DrawFixed {
+                facade,
+                target,
+                vertices,
+                image,
+                state,
+                inclusive,
+                clips,
+            } => {
+                let result = self.execute_draw_fixed(
+                    facade,
+                    &target,
+                    vertices.as_slice(),
+                    image.as_ref(),
+                    &state,
+                    inclusive,
+                    &clips,
+                );
+                if let VertexPayload::Owned(buf) = vertices {
+                    self.shared.recycle_verts(buf);
+                }
+                result.map_err(|error| (facade, error))?;
+            }
+            WorkerItem::DrawProgrammable {
+                facade,
+                target,
+                draw,
+                state,
+                clips,
+            } => {
+                self.execute_draw_programmable(facade, &target, &draw, &state, &clips)
+                    .map_err(|error| (facade, error))?;
+            }
+            WorkerItem::Blit {
+                facade,
+                source,
+                rectangle,
+                destination,
+                region,
+                filter,
+                clip,
+            } => {
+                self.blit_validated(
+                    facade,
+                    &source,
+                    rectangle,
+                    &destination,
+                    region,
+                    filter,
+                    clip,
+                )
+                .map_err(|error| (facade, error))?;
+            }
+            WorkerItem::Copy {
+                facade,
+                source,
+                rectangle,
+                destination,
+                region,
+                clip,
+            } => {
+                self.copy_validated(facade, &source, rectangle, &destination, region, clip);
+            }
+            WorkerItem::UploadBytes {
+                image,
+                rectangle,
+                pitch,
+                bytes,
+            } => {
+                let row = upload_row_bytes(&image, rectangle);
+                let src = bytes.as_slice();
+                let ring_bytes = self.stream.bytes(row * rectangle.h, 256, |out| {
+                    if pitch == row && src.len() >= (row * rectangle.h) as usize {
+                        out.copy_from_slice(&src[..(row * rectangle.h) as usize]);
+                    } else {
+                        for y in 0..rectangle.h {
+                            let s = y as usize * pitch as usize;
+                            let d = y as usize * row as usize;
+                            out[d..d + row as usize].copy_from_slice(&src[s..s + row as usize]);
+                        }
+                    }
+                });
+                if let UploadPayload::Owned(buf) = bytes {
+                    self.shared.recycle_bytes(buf);
+                }
+                self.record_upload(
+                    &image,
+                    rectangle,
+                    row,
+                    super::stream::UploadSource::Ring(ring_bytes),
+                );
+            }
+            WorkerItem::UploadStaged {
+                image,
+                rectangle,
+                staged,
+            } => {
+                let pitch = staged.pitch();
+                self.record_upload(
+                    &image,
+                    rectangle,
+                    pitch,
+                    super::stream::UploadSource::Staged(staged),
+                );
+            }
+            WorkerItem::DiscardDepth(depth) => {
+                self.stream.push(Command::DiscardDepth(depth));
+            }
+            WorkerItem::PresentSwap {
+                image,
+                damage,
+                serial,
+                video,
+                windows,
+            } => {
+                self.stream.push(Command::PresentSwap {
+                    image,
+                    damage,
+                    serial,
+                    video,
+                    windows,
+                });
+                self.shared.in_flight_frames.fetch_sub(1, Ordering::AcqRel);
+                self.shared.space_cv.notify_all();
+                self.shared.signal_wake();
+            }
+            WorkerItem::PresentSoftware {
+                base,
+                video,
+                windows,
+                serial,
+            } => {
+                self.stream.push(Command::Present {
+                    base,
+                    video,
+                    windows,
+                    serial,
+                });
+                self.shared.in_flight_frames.fetch_sub(1, Ordering::AcqRel);
+                self.shared.space_cv.notify_all();
+                self.shared.signal_wake();
+            }
+            WorkerItem::Flush => {
+                self.stream.push(Command::Submit);
+            }
+            WorkerItem::Readback {
+                facade,
+                image,
+                regions,
+                worker,
+                transfer,
+            } => {
+                self.execute_readback(facade, &image, &regions, worker, transfer);
+            }
+            WorkerItem::SnapshotCopy {
+                facade,
+                source,
+                destination,
+                regions,
+            } => {
+                for &area in &regions {
+                    if readback_copyable(&source)
+                        && color_format(&source) == color_format(&destination)
+                    {
+                        self.copy_validated(facade, &source, area, &destination, area, None);
+                    } else {
+                        self.blit_validated(
+                            facade,
+                            &source,
+                            area,
+                            &destination,
+                            area,
+                            Filter::Nearest,
+                            None,
+                        )
+                        .map_err(|error| (facade, error))?;
+                    }
+                }
+            }
+            WorkerItem::Capture(tx) => {
+                self.stream.flush_chunk();
+                if let Some(waker) = &self.owner_waker {
+                    waker.enqueue_capture(tx);
+                }
+            }
+            WorkerItem::SetPipelineCacheDir {
+                facade,
+                directory,
+                reply,
+            } => {
+                let jobs = self
+                    .facades
+                    .get_mut(&facade)
+                    .map(|f| f.pipelines.open_cache(&self.device, directory.as_deref()))
+                    .unwrap_or_default();
+                let _ = reply.send(jobs);
+            }
+            WorkerItem::FlushPipelineCache { facade, reply } => {
+                let result = if let Some(f) = self.facades.get_mut(&facade) {
+                    f.pipelines.flush_cache()
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            WorkerItem::Stats { facade, reply } => {
+                let stats = self.facades.get(&facade).map_or(Stats::default(), |f| {
+                    let mut stats = f.stats;
+                    let cache = f.pipelines.stats();
+                    stats.pipeline_cache_hits += cache.pipeline_cache_hits;
+                    stats.anticipated_pipeline_draws += cache.anticipated_pipeline_draws;
+                    stats.compile_waits += cache.compile_waits;
+                    stats.compile_wait_ns += cache.compile_wait_ns;
+                    stats.prebuild_hits += cache.prebuild_hits;
+                    stats.prebuild_misses += cache.prebuild_misses;
+                    stats.persisted_pipelines = cache.persisted_pipelines;
+                    stats.discarded_pipelines = cache.discarded_pipelines;
+                    stats
+                });
+                let _ = reply.send(stats);
+            }
+            WorkerItem::Drain { reply } => {
+                self.stream.flush_chunk();
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
+            WorkerItem::InspectPipelines { facade, f, reply } => {
+                if let Some(state) = self.facades.get_mut(&facade) {
+                    f(&mut state.pipelines, &self.device);
+                }
+                let _ = reply.send(());
+            }
+        }
+        Ok(())
+    }
+
+    fn data_alignment(&self) -> u32 {
+        self.device
+            .caps()
+            .limits
+            .uniform_offset_alignment
+            .max(self.device.caps().limits.storage_offset_alignment)
+            .max(4)
+    }
+
+    fn select(&mut self, _facade: u64, target: &Target) {
+        let same = self.target.as_ref().is_some_and(|(image, depth)| {
+            *image == target.image.id()
+                && super::resources::same_depth(depth.as_ref(), target.depth.as_ref())
+        });
+        if !same {
+            self.stream.push(Command::Target {
+                color: target.image.clone(),
+                depth: target.depth.clone(),
+            });
+            self.target = Some((target.image.id(), target.depth.clone()));
+        }
+    }
+
+    fn sampler(&mut self, facade: u64, mut spec: gpu::Sampler) -> Result<adv_gpu::Sampler, Error> {
+        if spec.u == gpu::Address::Border {
+            spec.u = gpu::Address::Clamp;
+        }
+        if spec.v == gpu::Address::Border {
+            spec.v = gpu::Address::Clamp;
+        }
+        let f = self.facades.get_mut(&facade).unwrap();
+        if let Some(sampler) = f.recording.samplers.get(&spec) {
+            return Ok(sampler.clone());
+        }
+        let filter = |f| {
+            if f == Filter::Linear {
+                adv_gpu::resource::Filter::Linear
+            } else {
+                adv_gpu::resource::Filter::Nearest
+            }
+        };
+        let address = |a| match a {
+            gpu::Address::Clamp | gpu::Address::Border => adv_gpu::resource::Address::Clamp,
+            gpu::Address::Repeat => adv_gpu::resource::Address::Repeat,
+            gpu::Address::Mirror => adv_gpu::resource::Address::Mirror,
+        };
+        let sampler = self
+            .device
+            .sampler(&adv_gpu::resource::SamplerDesc {
+                min: filter(spec.min),
+                mag: filter(spec.mag),
+                mip: filter(spec.mip.unwrap_or(Filter::Nearest)),
+                address: [
+                    address(spec.u),
+                    address(spec.v),
+                    adv_gpu::resource::Address::Clamp,
+                ],
+                border: adv_gpu::resource::BorderColor::TransparentBlack,
+                lod_bias: 0,
+                lod_min: (spec.first_level.min(255) * 256) as u16,
+                lod_max: if spec.mip.is_some() {
+                    u16::MAX
+                } else {
+                    (spec.first_level.min(255) * 256) as u16
+                },
+                anisotropy: 1,
+                compare: None,
+            })
+            .map_err(gpu_error)?;
+        f.recording.samplers.insert(spec, sampler.clone());
+        Ok(sampler)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_draw_fixed(
+        &mut self,
+        facade: u64,
+        target: &Target,
+        vertices: &[Vertex],
+        image: Option<&Image>,
+        state: &DrawState,
+        inclusive: Option<gpu::line::Inclusive>,
+        clips: &Clips,
+    ) -> Result<(), Error> {
+        let areas = clips.areas(target, state, Some(vertices));
+        if areas.is_empty() {
+            return Ok(());
+        }
+        self.select(facade, target);
+        let colors = [color_format(&target.image)];
+        let depth = target
+            .depth
+            .as_ref()
+            .map(|d| backing::depth_format(d.format()));
+        let f = self.facades.get_mut(&facade).unwrap();
+        let pipeline = f.pipelines.fixed(
+            &self.device,
+            state,
+            &colors,
+            depth,
+            fixed_sampling_flags(image),
+        )?;
+        let endpoint = if inclusive.is_some() {
+            let mut point = *state;
+            point.topology = gpu::Topology::Points;
+            Some(f.pipelines.fixed(
+                &self.device,
+                &point,
+                &colors,
+                depth,
+                fixed_sampling_flags(image),
+            )?)
+        } else {
+            None
+        };
+        match inclusive {
+            None => {
+                self.fixed_draw_clips(facade, vertices, image, state, pipeline, areas.as_slice())
+            }
+            Some(gpu::line::Inclusive::Strip { terminal }) => {
+                self.fixed_draw_clips(facade, vertices, image, state, pipeline, areas.as_slice())?;
+                if terminal {
+                    let mut point = *state;
+                    point.topology = gpu::Topology::Points;
+                    let point_areas = areas.without_opaque();
+                    self.fixed_draw_clips(
+                        facade,
+                        &vertices[vertices.len() - 1..],
+                        image,
+                        &point,
+                        endpoint.unwrap(),
+                        point_areas.as_slice(),
+                    )?;
+                }
+                Ok(())
+            }
+            Some(gpu::line::Inclusive::List) => {
+                let point_areas = areas.without_opaque();
+                for pair in vertices.as_chunks::<2>().0 {
+                    self.fixed_draw_clips(
+                        facade,
+                        pair,
+                        image,
+                        state,
+                        pipeline.clone(),
+                        point_areas.as_slice(),
+                    )?;
+                    if !gpu::line::degenerate(&pair[0], &pair[1], state.viewport) {
+                        let mut point = *state;
+                        point.topology = gpu::Topology::Points;
+                        self.fixed_draw_clips(
+                            facade,
+                            &pair[1..],
+                            image,
+                            &point,
+                            endpoint.as_ref().unwrap().clone(),
+                            point_areas.as_slice(),
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn fixed_draw_clips(
+        &mut self,
+        facade: u64,
+        vertices: &[Vertex],
+        image: Option<&Image>,
+        state: &DrawState,
+        pipeline: adv_gpu::RenderPipeline,
+        areas: &[(adv_gpu::Rect, Option<adv_gpu::Rect>)],
+    ) -> Result<(), Error> {
+        let texture = image
+            .unwrap_or(&self.facades[&facade].recording.white)
+            .clone();
+        let sampler = self.sampler(facade, state.sampler)?;
+        let parameters = fixed_parameters(state, image);
+        let alignment = self.data_alignment();
+        let vertex_offset = 32usize.next_multiple_of(alignment as usize);
+        let len = vertex_offset + std::mem::size_of_val(vertices);
+        self.stream.ensure_room(areas.len());
+        let data = self.stream.bytes(len as u32, alignment, |bytes| {
+            bytes[..32].copy_from_slice(bytemuck::cast_slice(&parameters));
+            bytes[vertex_offset..].copy_from_slice(bytemuck::cast_slice(vertices));
+            #[cfg(target_vendor = "apple")]
+            if matches!(
+                state.topology,
+                gpu::Topology::Lines | gpu::Topology::LineStrip
+            ) {
+                for (bytes, vertex) in bytes[vertex_offset..]
+                    .as_chunks_mut::<40>()
+                    .0
+                    .iter_mut()
+                    .zip(vertices)
+                {
+                    let y = vertex.position[1] + vertex.position[3] / (64. * state.viewport.height);
+                    bytes[4..8].copy_from_slice(&y.to_ne_bytes());
+                }
+            }
+        });
+        let base = summary(state, pipeline, areas[0].0, 0..vertices.len() as u32);
+        self.stream.draw_clips(
+            base,
+            [
+                (slot::FRAGMENT_UNIFORMS, Binding::Uniform(part(data, 0, 32))),
+                (
+                    slot::STREAMS,
+                    Binding::Storage(part(
+                        data,
+                        vertex_offset as u32,
+                        (len - vertex_offset) as u32,
+                    )),
+                ),
+                (slot::TEXTURES, Binding::Sampled(texture)),
+                (slot::SAMPLERS, Binding::Sampler(sampler)),
+            ],
+            areas,
+        );
+        let f = self.facades.get_mut(&facade).unwrap();
+        f.stats.draws += areas.len() as u64;
+        f.stats.vertices += vertices.len() as u64 * areas.len() as u64;
+        Ok(())
+    }
+
+    fn execute_draw_programmable(
+        &mut self,
+        facade: u64,
+        target: &Target,
+        draw: &ProgrammableDraw,
+        state: &DrawState,
+        clips: &Clips,
+    ) -> Result<(), Error> {
+        let areas = clips.areas(target, state, None);
+        let areas = areas.as_slice();
+        if areas.is_empty() {
+            return Ok(());
+        }
+        let count = draw
+            .indices
+            .as_ref()
+            .map_or(draw.vertex_count as usize, |i| i.len());
+        self.select(facade, target);
+        let sampling: arrayvec::ArrayVec<_, 20> =
+            draw.textures.iter().map(program_sampling_flags).collect();
+        let pipeline = self
+            .facades
+            .get_mut(&facade)
+            .unwrap()
+            .pipelines
+            .programmable(
+                &self.device,
+                draw,
+                state,
+                &[color_format(&target.image)],
+                target
+                    .depth
+                    .as_ref()
+                    .map(|d| backing::depth_format(d.format())),
+                &sampling,
+            )?;
+        let alignment = self.data_alignment() as usize;
+        let parameters_offset = CONSTANT_SIZE;
+        let pixel_offset = (CONSTANT_SIZE + 640).next_multiple_of(alignment);
+        let mut cursor = (pixel_offset + CONSTANT_SIZE).next_multiple_of(alignment);
+        let mut stream_ranges = arrayvec::ArrayVec::<(u32, u32), 16>::new();
+        for stream in &draw.streams {
+            stream_ranges.push((cursor as u32, stream.bytes.len().next_multiple_of(4) as u32));
+            cursor = (cursor + stream.bytes.len().next_multiple_of(4)).next_multiple_of(alignment);
+        }
+        let index_offset = cursor;
+        cursor += draw.indices.as_ref().map_or(0, |i| i.len() * 4);
+        // Ensure all K clip draws stay in the same chunk as their shared ring span.
+        self.stream.ensure_room(areas.len());
+        let data = self.stream.bytes(cursor as u32, alignment as u32, |bytes| {
+            bytes.fill(0);
+            for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
+                .into_iter()
+                .enumerate()
+            {
+                let base = if stage == 0 { 0 } else { pixel_offset };
+                for register in draw.program.constants[stage]
+                    .ranges()
+                    .flat_map(|range| range.start / 16..range.end / 16)
+                {
+                    bytes[base + register * 16..base + (register + 1) * 16]
+                        .copy_from_slice(bytemuck::bytes_of(&constants.register(register)));
+                }
+            }
+            bytes[parameters_offset..parameters_offset + 640]
+                .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
+            for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
+                let offset = offset as usize;
+                stream
+                    .bytes
+                    .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
+            }
+            if let Some(indices) = &draw.indices {
+                bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
+            }
+        });
+        let mut bindings = arrayvec::ArrayVec::<(u32, Binding), 58>::new();
+        bindings.push((
+            slot::VERTEX_UNIFORMS,
+            Binding::Uniform(part(data, 0, (CONSTANT_SIZE + 640) as u32)),
+        ));
+        bindings.push((
+            slot::FRAGMENT_UNIFORMS,
+            Binding::Uniform(part(data, pixel_offset as u32, CONSTANT_SIZE as u32)),
+        ));
+        for (i, &(offset, len)) in stream_ranges.iter().enumerate() {
+            bindings.push((
+                slot::STREAMS + i as u32,
+                Binding::Storage(part(data, offset, len)),
+            ));
+        }
+        let mut pixel = 0;
+        let mut vertex = 16;
+        for (texture, &vertex_stage) in draw.textures.iter().zip(&draw.program.textures) {
+            let ordinal = if vertex_stage {
+                let n = vertex;
+                vertex += 1;
+                n
+            } else {
+                let n = pixel;
+                pixel += 1;
+                n
+            };
+            let image = texture
+                .image
+                .as_ref()
+                .unwrap_or(&self.facades[&facade].recording.white)
+                .clone();
+            let sampler = self.sampler(facade, texture.sampler)?;
+            bindings.push((slot::TEXTURES + ordinal, Binding::Sampled(image)));
+            bindings.push((slot::SAMPLERS + ordinal, Binding::Sampler(sampler)));
+        }
+        let mut command = summary(state, pipeline, areas[0].0, 0..count as u32);
+        command.instances = 0..draw.instance_count;
+        command.uses_depth |= draw.program.writes_depth;
+        command.writes_depth |= draw.program.writes_depth;
+        command.index = draw.indices.as_ref().map(|i| {
+            (
+                Binding::Storage(part(data, index_offset as u32, (i.len() * 4) as u32)),
+                adv_gpu::encode::IndexFormat::U32,
+            )
+        });
+        self.stream.draw_clips(command, bindings, areas);
+        let f = self.facades.get_mut(&facade).unwrap();
+        f.stats.draws += areas.len() as u64;
+        f.stats.vertices += count as u64 * areas.len() as u64;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blit_validated(
+        &mut self,
+        facade: u64,
+        source: &Image,
+        rectangle: Rect,
+        destination: &Image,
+        region: Rect,
+        filter: Filter,
+        clip: Option<Rect>,
+    ) -> Result<(), Error> {
+        let coordinates = |src: u32, dst: u32| {
+            if dst <= src {
+                (0., 1.)
+            } else if src == 1 {
+                (0.5, 0.5)
+            } else {
+                (
+                    0.,
+                    dst as f32 * (src - 1) as f32 / (src as f32 * (dst - 1) as f32),
+                )
+            }
+        };
+        let (u0, u1) = if rectangle.w == region.w {
+            (
+                rectangle.x as f32 / source.width() as f32,
+                (rectangle.x + rectangle.w) as f32 / source.width() as f32,
+            )
+        } else {
+            coordinates(rectangle.w, region.w)
+        };
+        let (v0, v1) = if rectangle.h == region.h {
+            (
+                rectangle.y as f32 / source.height() as f32,
+                (rectangle.y + rectangle.h) as f32 / source.height() as f32,
+            )
+        } else {
+            coordinates(rectangle.h, region.h)
+        };
+        let x0 = region.x as f32 * 2. / destination.width() as f32 - 1.;
+        let x1 = (region.x + region.w) as f32 * 2. / destination.width() as f32 - 1.;
+        let y0 = 1. - region.y as f32 * 2. / destination.height() as f32;
+        let y1 = 1. - (region.y + region.h) as f32 * 2. / destination.height() as f32;
+        let v = |x, y, u, v| Vertex {
+            position: [x, y, 0., 1.],
+            color: [1.; 4],
+            uv: [u, v],
+        };
+        let vertices = [
+            v(x0, y0, u0, v0),
+            v(x1, y0, u1, v0),
+            v(x1, y1, u1, v1),
+            v(x0, y0, u0, v0),
+            v(x1, y1, u1, v1),
+            v(x0, y1, u0, v1),
+        ];
+        let target = Target {
+            image: destination.clone(),
+            depth: None,
+        };
+        let mut state = DrawState::new(destination.width(), destination.height());
+        state.scissor = Some(region);
+        state.sampler.min = filter;
+        state.sampler.mag = filter;
+        state.texture_op = gpu::TextureOp::Texture;
+        state.alpha_texture_op = gpu::TextureOp::Texture;
+        let area = draw_area(&target, &state, clip);
+        if area.w == 0 || area.h == 0 {
+            return Ok(());
+        }
+        let pipeline = self.facades.get_mut(&facade).unwrap().pipelines.blit(
+            &self.device,
+            filter,
+            color_format(destination),
+            fixed_sampling_flags(Some(source)),
+        )?;
+        self.select(facade, &target);
+        let opaque = opaque_quad(&vertices, &state, area);
+        self.fixed_draw_clips(
+            facade,
+            &vertices,
+            Some(source),
+            &state,
+            pipeline,
+            &[(area, opaque)],
+        )
+    }
+
+    fn copy_validated(
+        &mut self,
+        facade: u64,
+        source: &Image,
+        mut rectangle: Rect,
+        destination: &Image,
+        mut region: Rect,
+        clip: Option<Rect>,
+    ) {
+        if let Some(clip) = clip {
+            let clipped = region.clipped(clip);
+            if clipped.empty() {
+                return;
+            }
+            rectangle.x += clipped.x - region.x;
+            rectangle.y += clipped.y - region.y;
+            rectangle.w = clipped.w;
+            rectangle.h = clipped.h;
+            region = clipped;
+        }
+        self.stream.push(Command::Copy {
+            source: source.clone(),
+            rect: native_rect(rectangle),
+            destination: destination.clone(),
+            at: (region.x, region.y),
+        });
+        if let Some(f) = self.facades.get_mut(&facade) {
+            f.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
+        }
+    }
+
+    fn record_upload(
+        &mut self,
+        image: &Image,
+        rectangle: Rect,
+        pitch: u32,
+        source: super::stream::UploadSource,
+    ) {
+        let mip = match &image.storage {
+            Storage::Fixed { level, .. } => level.unwrap_or(0),
+            Storage::Swap(_) => 0,
+        };
+        self.stream.push(Command::Upload {
+            source,
+            pitch,
+            image: image.clone(),
+            mip,
+            rect: adv_gpu::Rect {
+                x: rectangle.x,
+                y: rectangle.y,
+                w: rectangle.w,
+                h: rectangle.h,
+            },
+        });
+    }
+
+    fn execute_readback(
+        &mut self,
+        facade: u64,
+        image: &Image,
+        regions: &[Rect],
+        worker: bool,
+        mut transfer: Transfer,
+    ) {
+        let scratch;
+        let image = if readback_copyable(image) {
+            image
+        } else {
+            let desc = backing::image_desc(
+                (image.width(), image.height()),
+                adv_gpu::Format::Bgra8Unorm,
+                adv_gpu::resource::Usage::SAMPLED
+                    | adv_gpu::resource::Usage::COPY_DST
+                    | adv_gpu::resource::Usage::COLOR
+                    | adv_gpu::resource::Usage::COPY_SRC,
+            );
+            let raw = match self.device.create_image(&desc) {
+                Ok(img) => img,
+                Err(error) => {
+                    transfer.finish(Err(gpu_error(error)));
+                    return;
+                }
+            };
+            scratch = Image {
+                storage: Storage::Fixed {
+                    view: raw.view().clone(),
+                    image: raw,
+                    level: None,
+                },
+                alpha: image.alpha_mode(),
+            };
+            for &area in regions {
+                if let Err(error) =
+                    self.blit_validated(facade, image, area, &scratch, area, Filter::Nearest, None)
+                {
+                    transfer.finish(Err(error));
+                    return;
+                }
+            }
+            &scratch
+        };
+        let size = regions
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+            .sum();
+        let buffer = match self.device.create_buffer(&BufferDesc {
+            size,
+            usage: BufferUsage::COPY_DST,
+            memory: Memory::Readback,
+            label: "guest readback",
+        }) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                transfer.finish(Err(gpu_error(error)));
+                return;
+            }
+        };
+        let mut mapping = MappedPixels {
+            buffer: buffer.clone(),
+            format: color_format(image),
+            opaque: image.alpha_mode() == gpu::AlphaMode::Opaque,
+            reservation: None,
+        };
+        let device = self.device.clone();
+        self.stream.push(Command::Readback {
+            image: image.clone(),
+            regions: regions.iter().copied().map(native_rect).collect(),
+            into: buffer,
+            done: Box::new(move || {
+                let result = if let Some(lost) = device.lost() {
+                    Err(Error::Device(lost))
+                } else if transfer.completion.cancelled.load(Ordering::Acquire) {
+                    Err(Error::Device("GPU readback cancelled".into()))
+                } else if worker {
+                    mapping.reservation = transfer.reservation.take();
+                    Ok(ReadPixels::Mapping(mapping))
+                } else {
+                    Ok(ReadPixels::Bytes(mapping.copy()))
+                };
+                transfer.finish(result);
+            }),
+        });
+        if let Some(f) = self.facades.get_mut(&facade) {
+            f.stats.readbacks += 1;
+        }
+    }
+}
+
+fn upload_row_bytes(image: &Image, r: Rect) -> u32 {
+    let bpp = match &image.storage {
+        Storage::Fixed { image, .. } => match image.desc().format {
+            adv_gpu::Format::R8Unorm => 1,
+            adv_gpu::Format::B5g6r5Unorm | adv_gpu::Format::Bgra4Unorm => 2,
+            adv_gpu::Format::Bgra8Unorm => 4,
+            _ => unreachable!("executor image format"),
+        },
+        Storage::Swap(_) => 4,
+    };
+    r.w * bpp
 }
 
 struct Completion {
@@ -163,23 +1713,6 @@ impl Gpu {
         }
         self.check()
     }
-    fn select(&mut self, target: &Target) {
-        let same = self
-            .recording
-            .target
-            .as_ref()
-            .is_some_and(|(image, depth)| {
-                *image == target.image.id()
-                    && super::resources::same_depth(depth.as_ref(), target.depth.as_ref())
-            });
-        if !same {
-            self.stream.push(Command::Target {
-                color: target.image.clone(),
-                depth: target.depth.clone(),
-            });
-            self.recording.target = Some((target.image.id(), target.depth.clone()));
-        }
-    }
     pub fn clear(
         &mut self,
         target: &Target,
@@ -220,14 +1753,20 @@ impl Gpu {
         {
             color[3] = 1.;
         }
-        self.select(target);
-        self.stream.push(Command::Clear {
-            area: native_rect(area),
-            color,
-            depth,
-            stencil: stencil.map(|s| s & 255),
-        });
-        self.check()
+        self.check()?;
+        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.push(
+            WorkerItem::Clear {
+                facade: self.facade_id,
+                target: target.clone(),
+                area,
+                color,
+                depth,
+                stencil: stencil.map(|s| s & 255),
+            },
+            0,
+        );
+        Ok(())
     }
     pub fn clear_with_stencil(
         &mut self,
@@ -243,13 +1782,38 @@ impl Gpu {
         target: &Target,
         vertices: &[Vertex],
         image: Option<&Image>,
+        state: DrawState,
+    ) -> Result<(), Error> {
+        self.draw_inner(target, vertices, None, image, state, None)
+    }
+    /// Fixed-function draw taking a shared immutable vertex buffer and optional
+    /// disjoint damage clips (deduplicating ring packing across all clips).
+    pub fn draw_arc_clips(
+        &mut self,
+        target: &Target,
+        vertices: Arc<Vec<Vertex>>,
+        image: Option<&Image>,
+        state: DrawState,
+        clips: Option<&[Rect]>,
+    ) -> Result<(), Error> {
+        let slice_ref = vertices.clone();
+        self.draw_inner(target, &slice_ref, Some(vertices), image, state, clips)
+    }
+    fn draw_inner(
+        &mut self,
+        target: &Target,
+        vertices: &[Vertex],
+        shared: Option<Arc<Vec<Vertex>>>,
+        image: Option<&Image>,
         mut state: DrawState,
+        clips: Option<&[Rect]>,
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         validate_state(target, &state)?;
         validate_count(vertices.len(), state.topology)?;
-        if std::mem::size_of_val(vertices) > MAX_UPLOAD
+        let byte_len = std::mem::size_of_val(vertices);
+        if byte_len > MAX_UPLOAD
             || vertices.iter().any(|v| {
                 v.position
                     .iter()
@@ -265,127 +1829,50 @@ impl Gpu {
         }
         normalize(target, &mut state);
         let inclusive = gpu::line::prepare(vertices, image, &state)?;
-        let area = draw_area(target, &state, self.clip);
-        if area.w == 0 || area.h == 0 {
+        let clips = Clips::from_slice(clips, self.clip);
+        let clip_count = clips.areas(target, &state, None).as_slice().len() as u64;
+        if clip_count == 0 {
             return Ok(());
         }
-        self.select(target);
-        let colors = [color_format(&target.image)];
-        let depth = target
-            .depth
-            .as_ref()
-            .map(|d| backing::depth_format(d.format()));
-        let pipeline = self.pipelines.fixed(
-            &self.device,
-            &state,
-            &colors,
-            depth,
-            fixed_sampling_flags(image),
-        )?;
-        let endpoint = if inclusive.is_some() {
-            let mut point = state;
-            point.topology = gpu::Topology::Points;
-            Some(self.pipelines.fixed(
-                &self.device,
-                &point,
-                &colors,
-                depth,
-                fixed_sampling_flags(image),
-            )?)
-        } else {
-            None
-        };
-        match inclusive {
-            None => self.fixed_draw(vertices, image, &state, pipeline, area),
+        let draw_count = match inclusive {
+            None => clip_count,
             Some(gpu::line::Inclusive::Strip { terminal }) => {
-                self.fixed_draw(vertices, image, &state, pipeline, area)?;
-                if terminal {
-                    let mut state = state;
-                    state.topology = gpu::Topology::Points;
-                    self.fixed_draw(
-                        &vertices[vertices.len() - 1..],
-                        image,
-                        &state,
-                        endpoint.unwrap(),
-                        area,
-                    )?;
-                }
-                Ok(())
+                clip_count * (1 + u64::from(terminal))
             }
             Some(gpu::line::Inclusive::List) => {
+                let mut total = 0u64;
                 for pair in vertices.as_chunks::<2>().0 {
-                    self.fixed_draw(pair, image, &state, pipeline.clone(), area)?;
+                    total += clip_count;
                     if !gpu::line::degenerate(&pair[0], &pair[1], state.viewport) {
-                        let mut point = state;
-                        point.topology = gpu::Topology::Points;
-                        self.fixed_draw(
-                            &pair[1..],
-                            image,
-                            &point,
-                            endpoint.as_ref().unwrap().clone(),
-                            area,
-                        )?;
+                        total += clip_count;
                     }
                 }
-                Ok(())
+                total
             }
-        }
-    }
-
-    fn fixed_draw(
-        &mut self,
-        vertices: &[Vertex],
-        image: Option<&Image>,
-        state: &DrawState,
-        pipeline: adv_gpu::RenderPipeline,
-        area: adv_gpu::Rect,
-    ) -> Result<(), Error> {
-        let texture = image.unwrap_or(&self.recording.white).clone();
-        let sampler = self.sampler(state.sampler)?;
-        let parameters = fixed_parameters(state, image);
-        let alignment = self.data_alignment();
-        let vertex_offset = 32usize.next_multiple_of(alignment as usize);
-        let len = vertex_offset + std::mem::size_of_val(vertices);
-        let data = self.stream.bytes(len as u32, alignment, |bytes| {
-            bytes[..32].copy_from_slice(bytemuck::cast_slice(&parameters));
-            bytes[vertex_offset..].copy_from_slice(bytemuck::cast_slice(vertices));
-            #[cfg(target_vendor = "apple")]
-            if matches!(
-                state.topology,
-                gpu::Topology::Lines | gpu::Topology::LineStrip
-            ) {
-                for (bytes, vertex) in bytes[vertex_offset..]
-                    .as_chunks_mut::<40>()
-                    .0
-                    .iter_mut()
-                    .zip(vertices)
-                {
-                    let y = vertex.position[1] + vertex.position[3] / (64. * state.viewport.height);
-                    bytes[4..8].copy_from_slice(&y.to_ne_bytes());
-                }
-            }
-        });
-        let mut draw = summary(state, pipeline, area, 0..vertices.len() as u32);
-        draw.opaque = opaque_quad(vertices, state, area);
-        self.stream.draw(
-            draw,
-            [
-                (slot::FRAGMENT_UNIFORMS, Binding::Uniform(part(data, 0, 32))),
-                (
-                    slot::STREAMS,
-                    Binding::Storage(part(
-                        data,
-                        vertex_offset as u32,
-                        (len - vertex_offset) as u32,
-                    )),
-                ),
-                (slot::TEXTURES, Binding::Sampled(texture)),
-                (slot::SAMPLERS, Binding::Sampler(sampler)),
-            ],
+        };
+        self.check()?;
+        self.execution.worker.admit_cmd(byte_len)?;
+        let payload = if let Some(shared) = shared {
+            VertexPayload::Shared(shared)
+        } else {
+            let mut buf = self.execution.worker.take_verts_buf(vertices.len());
+            buf.extend_from_slice(vertices);
+            VertexPayload::Owned(buf)
+        };
+        self.execution.worker.push(
+            WorkerItem::DrawFixed {
+                facade: self.facade_id,
+                target: target.clone(),
+                vertices: payload,
+                image: image.cloned(),
+                state,
+                inclusive,
+                clips,
+            },
+            byte_len,
         );
-        self.stats.draws += 1;
-        self.stats.vertices += vertices.len() as u64;
-        self.check()
+        self.draws += draw_count;
+        Ok(())
     }
 
     pub fn draw_programmable(
@@ -393,6 +1880,28 @@ impl Gpu {
         target: &Target,
         draw: &ProgrammableDraw,
         state: &DrawState,
+    ) -> Result<(), Error> {
+        self.draw_programmable_inner(target, draw, None, state, None)
+    }
+    /// Programmable draw taking a shared `Arc<ProgrammableDraw>` and optional
+    /// disjoint damage clips (deduplicating ring packing & bindings across all clips).
+    pub fn draw_programmable_arc_clips(
+        &mut self,
+        target: &Target,
+        draw: Arc<ProgrammableDraw>,
+        state: &DrawState,
+        clips: Option<&[Rect]>,
+    ) -> Result<(), Error> {
+        let draw_ref = draw.clone();
+        self.draw_programmable_inner(target, &draw_ref, Some(draw), state, clips)
+    }
+    fn draw_programmable_inner(
+        &mut self,
+        target: &Target,
+        draw: &ProgrammableDraw,
+        shared: Option<Arc<ProgrammableDraw>>,
+        state: &DrawState,
+        clips: Option<&[Rect]>,
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
@@ -486,112 +1995,28 @@ impl Gpu {
         }
         let mut state = *state;
         normalize(target, &mut state);
-        let area = draw_area(target, &state, self.clip);
-        if area.w == 0 || area.h == 0 {
+        let clips = Clips::from_slice(clips, self.clip);
+        let clip_count = clips.areas(target, &state, None).as_slice().len() as u64;
+        if clip_count == 0 {
             return Ok(());
         }
-        self.select(target);
-        let sampling: arrayvec::ArrayVec<_, 20> =
-            draw.textures.iter().map(program_sampling_flags).collect();
-        let pipeline = self.pipelines.programmable(
-            &self.device,
-            draw,
-            &state,
-            &[color_format(&target.image)],
-            target
-                .depth
-                .as_ref()
-                .map(|d| backing::depth_format(d.format())),
-            &sampling,
-        )?;
-        let alignment = self.data_alignment() as usize;
-        let parameters_offset = CONSTANT_SIZE;
-        let pixel_offset = (CONSTANT_SIZE + 640).next_multiple_of(alignment);
-        let mut cursor = (pixel_offset + CONSTANT_SIZE).next_multiple_of(alignment);
-        let mut stream_ranges = arrayvec::ArrayVec::<(u32, u32), 16>::new();
-        for stream in &draw.streams {
-            stream_ranges.push((cursor as u32, stream.bytes.len().next_multiple_of(4) as u32));
-            cursor = (cursor + stream.bytes.len().next_multiple_of(4)).next_multiple_of(alignment);
-        }
-        let index_offset = cursor;
-        cursor += draw.indices.as_ref().map_or(0, |i| i.len() * 4);
-        let data = self.stream.bytes(cursor as u32, alignment as u32, |bytes| {
-            bytes.fill(0);
-            for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
-                .into_iter()
-                .enumerate()
-            {
-                let base = if stage == 0 { 0 } else { pixel_offset };
-                for register in draw.program.constants[stage]
-                    .ranges()
-                    .flat_map(|range| range.start / 16..range.end / 16)
-                {
-                    bytes[base + register * 16..base + (register + 1) * 16]
-                        .copy_from_slice(bytemuck::bytes_of(&constants.register(register)));
-                }
-            }
-            bytes[parameters_offset..parameters_offset + 640]
-                .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
-            for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                let offset = offset as usize;
-                stream
-                    .bytes
-                    .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
-            }
-            if let Some(indices) = &draw.indices {
-                bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
-            }
-        });
-        let mut bindings = arrayvec::ArrayVec::<(u32, Binding), 58>::new();
-        bindings.push((
-            slot::VERTEX_UNIFORMS,
-            Binding::Uniform(part(data, 0, (CONSTANT_SIZE + 640) as u32)),
-        ));
-        bindings.push((
-            slot::FRAGMENT_UNIFORMS,
-            Binding::Uniform(part(data, pixel_offset as u32, CONSTANT_SIZE as u32)),
-        ));
-        for (i, &(offset, len)) in stream_ranges.iter().enumerate() {
-            bindings.push((
-                slot::STREAMS + i as u32,
-                Binding::Storage(part(data, offset, len)),
-            ));
-        }
-        let mut pixel = 0;
-        let mut vertex = 16;
-        for (texture, &vertex_stage) in draw.textures.iter().zip(&draw.program.textures) {
-            let ordinal = if vertex_stage {
-                let n = vertex;
-                vertex += 1;
-                n
-            } else {
-                let n = pixel;
-                pixel += 1;
-                n
-            };
-            let image = texture
-                .image
-                .as_ref()
-                .unwrap_or(&self.recording.white)
-                .clone();
-            let sampler = self.sampler(texture.sampler)?;
-            bindings.push((slot::TEXTURES + ordinal, Binding::Sampled(image)));
-            bindings.push((slot::SAMPLERS + ordinal, Binding::Sampler(sampler)));
-        }
-        let mut command = summary(&state, pipeline, area, 0..count as u32);
-        command.instances = 0..draw.instance_count;
-        command.uses_depth |= draw.program.writes_depth;
-        command.writes_depth |= draw.program.writes_depth;
-        command.index = draw.indices.as_ref().map(|i| {
-            (
-                Binding::Storage(part(data, index_offset as u32, (i.len() * 4) as u32)),
-                adv_gpu::encode::IndexFormat::U32,
-            )
-        });
-        self.stream.draw(command, bindings);
-        self.stats.draws += 1;
-        self.stats.vertices += count as u64;
-        self.check()
+        gpu::validate_program(&draw.program)?;
+        self.check()?;
+        let payload_bytes = total + draw.indices.as_ref().map_or(0, |i| i.len() * 4);
+        self.execution.worker.admit_cmd(payload_bytes)?;
+        let draw = shared.unwrap_or_else(|| Arc::new(draw.clone()));
+        self.execution.worker.push(
+            WorkerItem::DrawProgrammable {
+                facade: self.facade_id,
+                target: target.clone(),
+                draw,
+                state,
+                clips,
+            },
+            payload_bytes,
+        );
+        self.draws += clip_count;
+        Ok(())
     }
 
     pub fn blit(
@@ -622,9 +2047,9 @@ impl Gpu {
                 && !(source.alpha_mode() == gpu::AlphaMode::Opaque
                     && destination.alpha_mode() == gpu::AlphaMode::Stored)
             {
-                self.copy_validated(source, rectangle, destination, region)
+                self.enqueue_copy(source, rectangle, destination, region)
             } else {
-                self.blit_validated(source, rectangle, destination, region, Filter::Nearest)
+                self.enqueue_blit(source, rectangle, destination, region, Filter::Nearest)
             };
         }
         if rectangle != whole(source) || filter != Filter::Linear {
@@ -632,9 +2057,9 @@ impl Gpu {
                 "scaled blits require full-source LINEAR filtering".into(),
             ));
         }
-        self.blit_validated(source, rectangle, destination, region, filter)
+        self.enqueue_blit(source, rectangle, destination, region, filter)
     }
-    fn blit_validated(
+    fn enqueue_blit(
         &mut self,
         source: &Image,
         rectangle: Rect,
@@ -642,73 +2067,21 @@ impl Gpu {
         region: Rect,
         filter: Filter,
     ) -> Result<(), Error> {
-        let coordinates = |src: u32, dst: u32| {
-            if dst <= src {
-                (0., 1.)
-            } else if src == 1 {
-                (0.5, 0.5)
-            } else {
-                (
-                    0.,
-                    dst as f32 * (src - 1) as f32 / (src as f32 * (dst - 1) as f32),
-                )
-            }
-        };
-        let (u0, u1) = if rectangle.w == region.w {
-            (
-                rectangle.x as f32 / source.width() as f32,
-                (rectangle.x + rectangle.w) as f32 / source.width() as f32,
-            )
-        } else {
-            coordinates(rectangle.w, region.w)
-        };
-        let (v0, v1) = if rectangle.h == region.h {
-            (
-                rectangle.y as f32 / source.height() as f32,
-                (rectangle.y + rectangle.h) as f32 / source.height() as f32,
-            )
-        } else {
-            coordinates(rectangle.h, region.h)
-        };
-        let x0 = region.x as f32 * 2. / destination.width() as f32 - 1.;
-        let x1 = (region.x + region.w) as f32 * 2. / destination.width() as f32 - 1.;
-        let y0 = 1. - region.y as f32 * 2. / destination.height() as f32;
-        let y1 = 1. - (region.y + region.h) as f32 * 2. / destination.height() as f32;
-        let v = |x, y, u, v| Vertex {
-            position: [x, y, 0., 1.],
-            color: [1.; 4],
-            uv: [u, v],
-        };
-        let vertices = [
-            v(x0, y0, u0, v0),
-            v(x1, y0, u1, v0),
-            v(x1, y1, u1, v1),
-            v(x0, y0, u0, v0),
-            v(x1, y1, u1, v1),
-            v(x0, y1, u0, v1),
-        ];
-        let target = Target {
-            image: destination.clone(),
-            depth: None,
-        };
-        let mut state = DrawState::new(destination.width(), destination.height());
-        state.scissor = Some(region);
-        state.sampler.min = filter;
-        state.sampler.mag = filter;
-        state.texture_op = gpu::TextureOp::Texture;
-        state.alpha_texture_op = gpu::TextureOp::Texture;
-        let area = draw_area(&target, &state, self.clip);
-        if area.w == 0 || area.h == 0 {
-            return Ok(());
-        }
-        let pipeline = self.pipelines.blit(
-            &self.device,
-            filter,
-            color_format(destination),
-            fixed_sampling_flags(Some(source)),
-        )?;
-        self.select(&target);
-        self.fixed_draw(&vertices, Some(source), &state, pipeline, area)
+        self.check()?;
+        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.push(
+            WorkerItem::Blit {
+                facade: self.facade_id,
+                source: source.clone(),
+                rectangle,
+                destination: destination.clone(),
+                region,
+                filter,
+                clip: self.clip,
+            },
+            0,
+        );
+        Ok(())
     }
     pub fn copy(
         &mut self,
@@ -739,36 +2112,31 @@ impl Gpu {
             ) {
                 return Err(invalid("copy formats differ"));
             }
-            return self.blit_validated(source, rectangle, destination, region, Filter::Nearest);
+            return self.enqueue_blit(source, rectangle, destination, region, Filter::Nearest);
         }
-        self.copy_validated(source, rectangle, destination, region)
+        self.enqueue_copy(source, rectangle, destination, region)
     }
-    fn copy_validated(
+    fn enqueue_copy(
         &mut self,
         source: &Image,
-        mut rectangle: Rect,
+        rectangle: Rect,
         destination: &Image,
-        mut region: Rect,
+        region: Rect,
     ) -> Result<(), Error> {
-        if let Some(clip) = self.clip {
-            let clipped = region.clipped(clip);
-            if clipped.empty() {
-                return Ok(());
-            }
-            rectangle.x += clipped.x - region.x;
-            rectangle.y += clipped.y - region.y;
-            rectangle.w = clipped.w;
-            rectangle.h = clipped.h;
-            region = clipped;
-        }
-        self.stream.push(Command::Copy {
-            source: source.clone(),
-            rect: native_rect(rectangle),
-            destination: destination.clone(),
-            at: (region.x, region.y),
-        });
-        self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
-        self.check()
+        self.check()?;
+        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.push(
+            WorkerItem::Copy {
+                facade: self.facade_id,
+                source: source.clone(),
+                rectangle,
+                destination: destination.clone(),
+                region,
+                clip: self.clip,
+            },
+            0,
+        );
+        Ok(())
     }
     pub fn present(
         &mut self,
@@ -780,24 +2148,31 @@ impl Gpu {
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
-        self.stream.push(Command::PresentSwap {
+        self.check()?;
+        if !self.execution.worker.shared.has_wake() {
+            self.execution.worker.admit_present()?;
+        }
+        self.execution.worker.push_present(WorkerItem::PresentSwap {
             image: image.clone(),
             damage,
             serial,
             video,
             windows,
         });
-        self.check()
+        Ok(())
     }
     /// D3D9 D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL ends the depth contents.
     pub fn discard_depth(&mut self, depth: &Depth) {
-        self.stream.push(Command::DiscardDepth(depth.clone()));
+        self.execution
+            .worker
+            .push(WorkerItem::DiscardDepth(depth.clone()), 0);
     }
     pub fn flush(&mut self) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
-        self.stream.push(Command::Submit);
-        self.check()
+        self.check()?;
+        self.execution.worker.push_boundary(WorkerItem::Flush, 0);
+        Ok(())
     }
     pub fn readback(
         &mut self,
@@ -829,71 +2204,34 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.check()?;
-        self.recording
-            .readbacks
+        self.readbacks
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.recording.readback_limit).then_some(n + 1)
+                (n < self.readback_limit).then_some(n + 1)
             })
             .map_err(|_| Error::Busy)?;
-        let reservation = Reservation(self.recording.readbacks.clone());
-        let scratch;
-        let image = if readback_copyable(image) {
-            image
-        } else {
-            scratch = self.snapshot_readback_regions(image, regions)?;
-            &scratch
-        };
-        let size = regions
-            .iter()
-            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
-            .sum();
-        let buffer = self
-            .device
-            .create_buffer(&BufferDesc {
-                size,
-                usage: BufferUsage::COPY_DST,
-                memory: Memory::Readback,
-                label: "guest readback",
-            })
-            .map_err(gpu_error)?;
-        let mut mapping = MappedPixels {
-            buffer: buffer.clone(),
-            format: color_format(image),
-            opaque: image.alpha_mode() == gpu::AlphaMode::Opaque,
-            reservation: None,
-        };
+        let reservation = Reservation(self.readbacks.clone());
         let completion = Arc::new(Completion {
             result: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });
-        let mut transfer = Transfer {
+        let transfer = Transfer {
             completion: completion.clone(),
             reservation: Some(reservation),
             wake: wake.clone(),
             device: self.device.clone(),
         };
-        let device = self.device.clone();
-        self.stream.push(Command::Readback {
-            image: image.clone(),
-            regions: regions.iter().copied().map(native_rect).collect(),
-            into: buffer,
-            done: Box::new(move || {
-                let result = if let Some(lost) = device.lost() {
-                    Err(Error::Device(lost))
-                } else if transfer.completion.cancelled.load(Ordering::Acquire) {
-                    Err(Error::Device("GPU readback cancelled".into()))
-                } else if worker {
-                    mapping.reservation = transfer.reservation.take();
-                    Ok(ReadPixels::Mapping(mapping))
-                } else {
-                    Ok(ReadPixels::Bytes(mapping.copy()))
-                };
-                transfer.finish(result);
-            }),
-        });
-        self.stats.readbacks += 1;
+        self.execution.worker.push_boundary(
+            WorkerItem::Readback {
+                facade: self.facade_id,
+                image: image.clone(),
+                regions: regions.to_vec(),
+                worker,
+                transfer,
+            },
+            0,
+        );
         Ok(Readback {
             width: image.width(),
             height: image.height(),
@@ -912,86 +2250,29 @@ impl Gpu {
             .target(image.width(), image.height(), false)?
             .with_alpha_mode(image.alpha_mode())
             .image;
-        for &area in regions {
-            if readback_copyable(image) && color_format(image) == color_format(&scratch) {
-                self.copy_validated(image, area, &scratch, area)?;
-            } else {
-                // Sampling expands the stored format to BGRA, as a draw sees it.
-                self.blit_validated(image, area, &scratch, area, Filter::Nearest)?;
-            }
-        }
+        self.execution.worker.push(
+            WorkerItem::SnapshotCopy {
+                facade: self.facade_id,
+                source: image.clone(),
+                destination: scratch.clone(),
+                regions: regions.to_vec(),
+            },
+            0,
+        );
         Ok(scratch)
     }
     pub fn set_readback_limit(&mut self, limit: usize) -> Result<(), Error> {
         if limit == 0 || limit > MAX_READBACKS {
             return Err(invalid("invalid readback budget"));
         }
-        if self.recording.readbacks.load(Ordering::Acquire) > limit {
+        if self.readbacks.load(Ordering::Acquire) > limit {
             return Err(Error::Busy);
         }
-        self.recording.readback_limit = limit;
+        self.readback_limit = limit;
         Ok(())
     }
     pub fn poll(&self) -> Result<(), Error> {
         self.check()
-    }
-
-    fn data_alignment(&self) -> u32 {
-        self.device
-            .caps()
-            .limits
-            .uniform_offset_alignment
-            .max(self.device.caps().limits.storage_offset_alignment)
-            .max(4)
-    }
-    fn sampler(&mut self, mut spec: gpu::Sampler) -> Result<adv_gpu::Sampler, Error> {
-        // Border sampling is shader code, as in the reference renderer.
-        if spec.u == gpu::Address::Border {
-            spec.u = gpu::Address::Clamp;
-        }
-        if spec.v == gpu::Address::Border {
-            spec.v = gpu::Address::Clamp;
-        }
-        if let Some(sampler) = self.recording.samplers.get(&spec) {
-            return Ok(sampler.clone());
-        }
-        let filter = |f| {
-            if f == Filter::Linear {
-                adv_gpu::resource::Filter::Linear
-            } else {
-                adv_gpu::resource::Filter::Nearest
-            }
-        };
-        let address = |a| match a {
-            gpu::Address::Clamp | gpu::Address::Border => adv_gpu::resource::Address::Clamp,
-            gpu::Address::Repeat => adv_gpu::resource::Address::Repeat,
-            gpu::Address::Mirror => adv_gpu::resource::Address::Mirror,
-        };
-        let sampler = self
-            .device
-            .sampler(&adv_gpu::resource::SamplerDesc {
-                min: filter(spec.min),
-                mag: filter(spec.mag),
-                mip: filter(spec.mip.unwrap_or(Filter::Nearest)),
-                address: [
-                    address(spec.u),
-                    address(spec.v),
-                    adv_gpu::resource::Address::Clamp,
-                ],
-                border: adv_gpu::resource::BorderColor::TransparentBlack,
-                lod_bias: 0,
-                lod_min: (spec.first_level.min(255) * 256) as u16,
-                lod_max: if spec.mip.is_some() {
-                    u16::MAX
-                } else {
-                    (spec.first_level.min(255) * 256) as u16
-                },
-                anisotropy: 1,
-                compare: None,
-            })
-            .map_err(gpu_error)?;
-        self.recording.samplers.insert(spec, sampler.clone());
-        Ok(sampler)
     }
 }
 struct Reservation(Arc<AtomicUsize>);
@@ -1012,7 +2293,7 @@ impl Drop for Reservation {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
-struct Transfer {
+pub(super) struct Transfer {
     completion: Arc<Completion>,
     reservation: Option<Reservation>,
     wake: Option<Arc<adv_sync::WakeEvent>>,
@@ -1371,6 +2652,23 @@ mod tests {
             vertex_constants: Default::default(), pixel_constants: Default::default(),
             textures: vec![], parameters: [[0; 4]; 40],
         }
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn invalid_program_is_rejected_before_reaching_the_worker() {
+        let Some(mut gpu) = executor() else { return };
+        let peer = gpu.fork().unwrap();
+        let target = gpu.target(4, 4, false).unwrap();
+        let mut draw = program();
+        draw.program = gpu::Program::new("invalid WGSL".into(), vec![]);
+        assert!(matches!(
+            gpu.draw_programmable(&target, &draw, &DrawState::new(4, 4)),
+            Err(Error::Invalid(_))
+        ));
+        gpu.drain_worker();
+        assert!(gpu.check().is_ok());
+        assert!(peer.check().is_ok());
     }
 
     // Same scene and exact pixels as renderer/program/tests.rs.
@@ -1815,5 +3113,369 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
         vertices[5].position[0] = 0.;
         assert_eq!(opaque_quad(&vertices, &state, area), None);
         assert!(validate_count(2, gpu::Topology::Triangles).is_err());
+    }
+
+    // spec: GFX-REC-5
+    #[test]
+    fn multi_clip_draws_share_ring_data_and_render_exact_disjoint_regions() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let target = gpu.target(4, 4, false).unwrap();
+        gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+        let clips = [
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Rect {
+                x: 2,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Rect {
+                x: 1,
+                y: 2,
+                w: 1,
+                h: 1,
+            },
+            Rect {
+                x: 3,
+                y: 3,
+                w: 1,
+                h: 1,
+            },
+        ];
+        // Fixed-function multi-clip draw (red)
+        let verts = Arc::new(quad([1., 0., 0., 1.]).to_vec());
+        let state = DrawState::new(4, 4);
+        gpu.draw_arc_clips(&target, verts, None, state, Some(&clips))
+            .unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let at = ((y * 4 + x) * 4) as usize;
+                let hit = clips.iter().any(|c| c.x == x && c.y == y);
+                let expected = if hit {
+                    [0, 0, 255, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(&pixels[at..at + 4], &expected, "fixed pixel ({x},{y})");
+            }
+        }
+        assert_eq!(gpu.stats().draws, 4);
+
+        // Programmable multi-clip draw (green)
+        gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+        let mut draw = program();
+        draw.pixel_constants = gpu::ConstantSnapshot::capture(draw.program.constants[1], |reg| {
+            if reg == 0 {
+                [0.0f32, 1.0, 0.0, 1.0].map(f32::to_bits)
+            } else {
+                [0; 4]
+            }
+        });
+        gpu.draw_programmable_arc_clips(&target, Arc::new(draw), &state, Some(&clips))
+            .unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let at = ((y * 4 + x) * 4) as usize;
+                let hit = clips.iter().any(|c| c.x == x && c.y == y);
+                let expected = if hit {
+                    [0, 255, 0, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(
+                    &pixels[at..at + 4],
+                    &expected,
+                    "programmable pixel ({x},{y})"
+                );
+            }
+        }
+        assert_eq!(gpu.stats().draws, 8);
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn vertex_and_upload_slices_snapshot_before_caller_mutation() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let target = gpu.target(2, 2, false).unwrap();
+        let image = gpu.image(2, 2).unwrap();
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        // Immediately mutate caller upload bytes after upload() returns.
+        let mut texels = [10u8, 20, 30, 255].repeat(4);
+        gpu.upload(&image, whole, 8, &texels).unwrap();
+        texels.fill(0xee);
+        // Immediately mutate caller vertex slice after draw() returns.
+        let mut verts = quad([1., 1., 1., 1.]);
+        let mut state = DrawState::new(2, 2);
+        state.texture_op = gpu::TextureOp::Texture;
+        state.alpha_texture_op = gpu::TextureOp::Texture;
+        gpu.draw(&target, &verts, Some(&image), state).unwrap();
+        for v in &mut verts {
+            v.position = [0.; 4];
+            v.color = [0.; 4];
+        }
+        let pixels = read(&mut gpu, &target.image);
+        assert_eq!(pixels, [10, 20, 30, 255].repeat(4));
+    }
+
+    // spec: DEV-FRAME-1, GFX-REC-1
+    #[test]
+    fn rapid_present_burst_preserves_monotonic_order_and_backpressure_signals_wake() {
+        struct OrderedPresenter {
+            serials: mpsc::Sender<u64>,
+        }
+        impl crate::frame::Presenter for OrderedPresenter {
+            fn presentable(&self, _: u32, _: u32) -> bool {
+                false
+            }
+            fn present(&mut self, _: &mut adv_gpu::Queue, frame: crate::frame::Frame) {
+                let _ = self.serials.send(frame.serial);
+            }
+            fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
+        }
+        let (device, queue) = match adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            ..Default::default()
+        }) {
+            Ok(opened) => opened,
+            Err(adv_gpu::Error::Unavailable(_))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("open device: {error}"),
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut gpu =
+            Gpu::request_with_presenter(device, queue, Box::new(OrderedPresenter { serials: tx }))
+                .unwrap();
+        let target = gpu.presentation_target(2, 2, false).unwrap();
+        let damage = Region::whole((2, 2));
+        for serial in 1..=50u64 {
+            gpu.clear(&target, Some([0., 0., 1., 1.]), None).unwrap();
+            gpu.present(
+                &target.image,
+                damage.clone(),
+                serial,
+                Arc::from([]),
+                Arc::from([]),
+            )
+            .unwrap();
+        }
+        let mut received = Vec::with_capacity(50);
+        for _ in 0..50 {
+            received.push(rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap());
+        }
+        assert_eq!(received, (1..=50).collect::<Vec<_>>());
+
+        // Verify backpressure with WakeEvent: artificially saturate in_flight_frames,
+        // verify admit_present returns Error::Busy without blocking, and wake signals on drain.
+        let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+        gpu.set_wake(Some(wake.clone()));
+        gpu.execution
+            .worker
+            .shared
+            .in_flight_frames
+            .store(MAX_IN_FLIGHT_FRAMES, Ordering::Release);
+        assert!(matches!(gpu.admit_present(), Err(Error::Busy)));
+        gpu.execution
+            .worker
+            .shared
+            .in_flight_frames
+            .store(0, Ordering::Release);
+        gpu.admit_present().unwrap();
+        gpu.present(&target.image, damage, 51, Arc::from([]), Arc::from([]))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap(),
+            51
+        );
+        gpu.set_wake(None);
+    }
+
+    // spec: DEV-FRAME-1
+    #[test]
+    fn cross_api_native_and_software_presents_preserve_order_and_capture_barrier() {
+        struct CaptureOrderPresenter {
+            events: mpsc::Sender<&'static str>,
+            serials: mpsc::Sender<u64>,
+        }
+        impl crate::frame::Presenter for CaptureOrderPresenter {
+            fn presentable(&self, _: u32, _: u32) -> bool {
+                false
+            }
+            fn present(&mut self, _: &mut adv_gpu::Queue, frame: crate::frame::Frame) {
+                let _ = self.serials.send(frame.serial);
+                let _ = self.events.send("present");
+            }
+            fn service(&mut self, _: &mut adv_gpu::Queue, wake: Option<&crate::frame::Waker>) {
+                if let Some(wake) = wake {
+                    for reply in wake.captures() {
+                        let _ = self.events.send("capture");
+                        let _ = reply.send(Ok(crate::frame::Captured {
+                            width: 1,
+                            height: 1,
+                            bgra: vec![0, 0, 0, 255],
+                            serial: 6,
+                        }));
+                    }
+                }
+            }
+        }
+        let (device, queue) = match adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            ..Default::default()
+        }) {
+            Ok(opened) => opened,
+            Err(adv_gpu::Error::Unavailable(_))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("open device: {error}"),
+        };
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let (ser_tx, ser_rx) = mpsc::channel();
+        let mut gpu = Gpu::request_with_presenter(
+            device.clone(),
+            queue,
+            Box::new(CaptureOrderPresenter {
+                events: ev_tx,
+                serials: ser_tx,
+            }),
+        )
+        .unwrap();
+        let target = gpu.presentation_target(1, 1, false).unwrap();
+        let damage = Region::whole((1, 1));
+        for i in 1..=6u64 {
+            if i % 2 == 1 {
+                gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+                gpu.present(
+                    &target.image,
+                    damage.clone(),
+                    i,
+                    Arc::from([]),
+                    Arc::from([]),
+                )
+                .unwrap();
+            } else {
+                let slot =
+                    crate::frame::Slot::new(&device, 1, 1, 4, crate::surface::PixelFormat::Bgra32)
+                        .unwrap();
+                gpu.execution
+                    .worker
+                    .push_present(WorkerItem::PresentSoftware {
+                        base: crate::frame::Base::Software {
+                            slot,
+                            format: crate::surface::PixelFormat::Bgra32,
+                            palette: None,
+                            damage: damage.clone(),
+                        },
+                        video: Arc::from([]),
+                        windows: Arc::from([]),
+                        serial: i,
+                    });
+            }
+        }
+        // Issue capture right after presenting serial 6: capture MUST arrive AFTER all 6 presents.
+        let capture_rx = gpu.waker().capture();
+        let captured = capture_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap()
+            .unwrap();
+        assert_eq!((captured.width, captured.height), (1, 1));
+        let mut serials = Vec::new();
+        for _ in 0..6 {
+            serials.push(
+                ser_rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(serials, vec![1, 2, 3, 4, 5, 6]);
+        let mut events = Vec::new();
+        for _ in 0..7 {
+            events.push(
+                ev_rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            events,
+            vec![
+                "present", "present", "present", "present", "present", "present", "capture"
+            ]
+        );
+        // Verify subsequent commands work after waker().capture() completes (no queued_cmds underflow).
+        gpu.drain_worker();
+        assert_eq!(
+            gpu.execution
+                .worker
+                .shared
+                .queued_cmds
+                .load(Ordering::Acquire),
+            0
+        );
+        let read_target = gpu.target(2, 2, false).unwrap();
+        gpu.clear(&read_target, Some([0., 1., 0., 1.]), None)
+            .unwrap();
+        let verts = Arc::new(quad([0., 0., 1., 1.]).to_vec());
+        gpu.draw_arc_clips(&read_target, verts, None, DrawState::new(2, 2), None)
+            .unwrap();
+        assert_eq!(
+            read(&mut gpu, &read_target.image),
+            [255, 0, 0, 255].repeat(4)
+        );
+    }
+
+    // spec: GFX-REC-5
+    #[test]
+    fn multi_clip_draws_handle_more_than_eight_clips() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let target = gpu.target(8, 8, false).unwrap();
+        gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+        // 16 disjoint 1x1 clips in a checkerboard pattern (> 8 inline SmallVec capacity).
+        let mut clips = Vec::new();
+        for y in (0..8u32).step_by(2) {
+            for x in (0..8u32).step_by(2) {
+                clips.push(Rect { x, y, w: 1, h: 1 });
+            }
+        }
+        assert_eq!(clips.len(), 16);
+        let state = DrawState::new(8, 8);
+        let verts = Arc::new(quad([1., 0., 0., 1.]).to_vec());
+        gpu.draw_arc_clips(&target, verts, None, state, Some(&clips))
+            .unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let at = ((y * 8 + x) * 4) as usize;
+                let expected = if x % 2 == 0 && y % 2 == 0 {
+                    [0, 0, 255, 255]
+                } else {
+                    [0, 0, 0, 255]
+                };
+                assert_eq!(&pixels[at..at + 4], &expected, "fixed 16-clip ({x},{y})");
+            }
+        }
+        assert_eq!(gpu.stats().draws, 16);
     }
 }
