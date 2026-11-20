@@ -88,6 +88,7 @@ pub(crate) struct Lowered {
     pub exit: usize,
     pub counters: Vec<(u32, Counter, usize)>,
     rows: bool,
+    pub split: Option<crate::translate::lower::resident::SplitPoint>,
 }
 
 impl Lowered {
@@ -132,13 +133,14 @@ pub(crate) fn lower_rows(
     assumed: &Assumed,
     domain: &Domain,
     count_entries: bool,
+    offer: bool,
 ) -> Option<Lowered> {
     let lowered = lower_form(
         func,
         Some((assumed, &func.entry)),
         true,
         count_entries,
-        Some(domain),
+        Some((domain, offer)),
     );
     lowered.rows.then_some(lowered)
 }
@@ -156,7 +158,7 @@ fn lower_form(
     inline: Option<(&Assumed, &[Source])>,
     resident: bool,
     count_entries: bool,
-    domain: Option<&Domain>,
+    domain: Option<(&Domain, bool)>,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
@@ -240,6 +242,14 @@ fn lower_form(
         .map(|&(head, kind, label)| (head, kind, e.asm.position(label) / 4))
         .collect();
     let rows = e.row_budget.is_some();
+    let split =
+        e.split.map(
+            |(sensor, threshold, leave)| crate::translate::lower::resident::SplitPoint {
+                sensor: e.asm.position(sensor) / 4,
+                threshold: e.asm.position(threshold) / 4,
+                leave: e.asm.position(leave) / 4,
+            },
+        );
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -270,6 +280,7 @@ fn lower_form(
         spill_cells,
         counters,
         rows,
+        split,
     }
 }
 
@@ -295,7 +306,7 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
-    (resident, count_entries, domain): (bool, bool, Option<&'a Domain>),
+    (resident, count_entries, domain): (bool, bool, Option<(&'a Domain, bool)>),
     batches: &[loops::Batch],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
@@ -385,6 +396,7 @@ fn emit<'a>(
         mmx_miss,
         domain,
         row_budget: None,
+        split: None,
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
@@ -661,6 +673,10 @@ fn emit<'a>(
         e.asm.bind(inner);
         e.asm.emit_all(&[min_inner, 0]);
     }
+    if let Some((_, threshold, _)) = e.split {
+        e.asm.bind(threshold);
+        e.asm.emit_all(&[u32::MAX, u32::MAX]);
+    }
     for (value, label) in std::mem::take(&mut e.reciprocals) {
         e.asm.bind(label);
         e.asm.emit_all(&[value as u32, (value >> 32) as u32]);
@@ -723,8 +739,9 @@ struct Emitter<'a> {
     counters: Vec<(u32, Counter, Label)>,
     count_entries: bool,
     mmx_miss: Option<Label>,
-    domain: Option<&'a Domain>,
+    domain: Option<(&'a Domain, bool)>,
     row_budget: Option<((Label, Label), u32)>,
+    split: Option<(Label, Label, Label)>,
 }
 
 impl CheckedEmitter for Emitter<'_> {

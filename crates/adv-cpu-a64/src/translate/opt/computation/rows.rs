@@ -35,7 +35,7 @@ struct Span {
 }
 
 impl Domain {
-    pub(crate) fn build(trace: &crate::translate::front::trace::Trace) -> Option<Self> {
+    pub(crate) fn build(trace: &crate::translate::front::trace::Trace) -> Option<(Self, Proof)> {
         let head = trace.insts.first()?.pc;
         let graph = Graph::build(trace)
             .inspect_err(|why| {
@@ -167,16 +167,17 @@ impl Domain {
         if frame >= 4096 {
             return None;
         }
-        Some(Self {
-            exprs: proof.exprs,
-            checks: proof.checks,
+        let domain = Self {
+            exprs: proof.exprs.clone(),
+            checks: proof.checks.clone(),
             spans,
             aliases,
             rows,
             inner,
             slots_read,
             frame: frame as u32,
-        })
+        };
+        Some((domain, proof))
     }
 
     /// Entry code owns its scratch. A failed guard leaves with the original
@@ -187,6 +188,7 @@ impl Domain {
         minimum: (Label, Label),
         miss: Label,
         target_miss: Label,
+        offer: Option<Label>,
     ) -> u32 {
         let start = asm.offset();
         let fail = asm.label();
@@ -207,9 +209,10 @@ impl Domain {
         let frame = self.frame;
         emit.asm.emit(mrs_nzcv(FLAGS));
         emit.asm.emit(sub_imm(X, SP, SP, frame, false));
-        emit.expression(self.rows, A);
+        let rows = if offer.is_some() { ROWS } else { A };
+        emit.expression(self.rows, rows);
         emit.asm.ldr_literal(B, minimum.0);
-        emit.asm.emit(cmp(W, A, B, Lsl, 0));
+        emit.asm.emit(cmp(W, rows, B, Lsl, 0));
         emit.asm.b_cond(Cond::Lo, fail);
         for &inner in &self.inner {
             emit.expression(inner, A);
@@ -321,6 +324,12 @@ impl Domain {
             emit.asm.b(target_miss);
         }
         crate::facts::batch_span_search(emit.asm, search, false);
+        // Keep the offer target in reach of the decision's bit test even
+        // when the emitted loop body is large. Search exits always return.
+        if let Some(leave) = offer {
+            emit.asm.bind(leave);
+            emit.asm.emit(0);
+        }
         emit.asm.bind(success);
         emit.asm
             .emit_all(&[add_imm(X, SP, SP, frame, false), msr_nzcv(FLAGS)]);
@@ -371,7 +380,7 @@ impl Span {
 const SP: Reg = Reg::new(31);
 const WINDOW: Reg = Reg::new(27);
 const FLAGS: Reg = Reg::new(6);
-const PARAM: Reg = Reg::new(7);
+const ROWS: Reg = Reg::new(7);
 const A: Reg = Reg::new(0);
 const B: Reg = Reg::new(1);
 const C: Reg = Reg::new(2);
@@ -442,12 +451,12 @@ impl RangeEmitter<'_> {
                 ]);
             }
             Expr::Word(address) => {
-                self.expression(address, PARAM);
+                self.expression(address, TEMP);
                 self.asm
-                    .emit_all(&[mov(W, A, PARAM), add_imm(X, B, A, 3, false)]);
+                    .emit_all(&[mov(W, A, TEMP), add_imm(X, B, A, 3, false)]);
                 self.range(false);
                 self.asm
-                    .emit(add_ext(X, TEMP, WINDOW, PARAM, Extend::Uxtw, 0));
+                    .emit(add_ext(X, TEMP, WINDOW, TEMP, Extend::Uxtw, 0));
                 self.asm.emit(ldr(W, dst, TEMP, 0));
             }
         }

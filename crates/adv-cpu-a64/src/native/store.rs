@@ -159,6 +159,14 @@ pub(super) struct ResidentVersion<R> {
     pub probation_sensors: Vec<usize>,
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
+    split: Option<PlacedSplit>,
+}
+
+struct PlacedSplit {
+    sensor: usize,
+    active: u32,
+    threshold: usize,
+    published: Option<u64>,
 }
 
 impl<R> ResidentVersion<R> {
@@ -286,6 +294,43 @@ impl<R> CodeStore<R> {
         });
     }
 
+    pub(super) fn publish_split(&mut self, eip: u32, threshold: Option<u64>) {
+        let Some(site) = self
+            .chains
+            .get_mut(&eip)
+            .and_then(|site| site.resident.as_mut())
+        else {
+            return;
+        };
+        for split in site
+            .versions
+            .iter_mut()
+            .filter_map(|version| version.split.as_mut())
+        {
+            if split.published == threshold {
+                continue;
+            }
+            split.published = threshold;
+            let sensor = if let Some(threshold) = threshold {
+                self.cache.patch(split.threshold, threshold as u32);
+                self.cache
+                    .patch(split.threshold + 4, (threshold >> 32) as u32);
+                split.active
+            } else {
+                b(12)
+            };
+            self.cache.patch(split.sensor, sensor);
+        }
+    }
+
+    pub(super) fn offers_split(&self, eip: u32, version: usize) -> bool {
+        self.resident(eip)
+            .filter(|site| !site.suspended)
+            .and_then(|site| site.versions.get(version))
+            .and_then(|version| version.split.as_ref())
+            .is_some_and(|split| split.published.is_some())
+    }
+
     pub(super) fn resident_fallback(&self, eip: u32) -> Option<usize> {
         self.tier1(eip).map(|entry| entry.unit).or_else(|| {
             self.resident(eip)
@@ -340,6 +385,7 @@ impl<R> CodeStore<R> {
                 tier1: fallback,
                 exit: self.stubs.exit,
                 resident_exit: self.resident_exit,
+                split: layout.split.is_some(),
             },
         );
         let probe_word = (index == 0).then(|| entry.words[(entry.probe - base) / 4]);
@@ -370,6 +416,18 @@ impl<R> CodeStore<R> {
         ] {
             words[offset] = branch(entry.form + offset * 4, target);
         }
+        let split = layout.split.zip(entry.split).map(|(split, target)| {
+            let leave = entry.form + split.leave * 4;
+            words[split.leave] = branch(leave, target);
+            let active = words[split.sensor];
+            words[split.sensor] = b(12);
+            PlacedSplit {
+                sensor: entry.form + split.sensor * 4,
+                active,
+                threshold: entry.form + split.threshold * 4,
+                published: None,
+            }
+        });
         for &(offset, _) in layout.links {
             let word = offset / 4 + 3;
             words[word] = branch(entry.form + word * 4, self.stubs.dispatch);
@@ -449,6 +507,7 @@ impl<R> CodeStore<R> {
             probation_sensors,
             accounting,
             iteration_retired: u64::from(iteration_retired),
+            split,
         };
         let versions = &mut self.resident_mut(eip).unwrap().versions;
         if index == versions.len() {

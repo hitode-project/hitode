@@ -238,6 +238,8 @@ impl Native {
                 returned.remaining.wrapping_neg(),
             );
         }
+        let mut scoped = false;
+        let mut scope_declined = false;
         if let Exit::Plan(event) = exit {
             let payload = (returned.reason >> 32) as u32;
             match event {
@@ -251,6 +253,18 @@ impl Native {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
                 PlanEvent::OfferReady => exit = Exit::Computation,
+                PlanEvent::ResidentSplitOffer(version) => {
+                    let head = cpu.eip;
+                    if self.code.offers_split(head, usize::from(version))
+                        && let Some(job) = self.plans.job(head).filter(|job| job.scoped)
+                        && self.offer_split(job.scope_cost(payload))
+                    {
+                        exit = Exit::Computation;
+                        scoped = true;
+                    } else {
+                        scope_declined = true;
+                    }
+                }
                 PlanEvent::Probation(version) => {
                     self.finish_probation(payload, usize::from(version))
                 }
@@ -275,8 +289,8 @@ impl Native {
         if retired != 0 {
             self.progressed();
         }
-        if exit == Exit::Computation && !self.offer_job(cpu) {
-            self.plans.offer_resume = Some(cpu.eip);
+        if scope_declined || (exit == Exit::Computation && !scoped && !self.offer_job(cpu)) {
+            self.set_computation_offer(self.offload.enabled, Some(cpu.eip));
             exit = Exit::Dispatch;
         }
         let retired = retired as u32;
@@ -407,6 +421,7 @@ impl Native {
             alias: alias_base(memory),
             fault: self.code.stubs.fault,
         };
+        let mut updates = Vec::new();
         if let Some(mut session) = Session::new(
             entry,
             (&self.worker_jobs, &mut self.plans),
@@ -417,6 +432,10 @@ impl Native {
             (self.pace.get(), &mut self.diagnostics.split),
         ) {
             visit(&mut session);
+            updates = session.take_scope_updates();
+        }
+        for eip in updates {
+            self.publish_scope(eip);
         }
     }
 }
@@ -1205,7 +1224,11 @@ impl Native {
             compile::Task::Replace(i) => i,
             _ => self.code.resident(eip).unwrap().versions.len(),
         };
-        let gate = self.plans.job(eip).map(JobPlan::gate);
+        let gate = self
+            .plans
+            .job(eip)
+            .filter(|job| !job.scoped)
+            .map(JobPlan::gate);
         self.stop_cold_window(eip);
         let recovery = compile::ResidentRecovery {
             records: std::mem::take(&mut form.lowered.records),
@@ -1237,11 +1260,12 @@ impl Native {
         self.code.start_link_sampling(eip, SAMPLE);
         self.code.publish_resident(eip, period);
         self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
+        self.publish_scope(eip);
         true
     }
 
     fn install_offer_link(&mut self, eip: u32) {
-        if let Some(job) = self.plans.job(eip) {
+        if let Some(job) = self.plans.job(eip).filter(|job| !job.scoped) {
             self.code.install_offer(eip, job.gate());
         }
     }
@@ -1377,16 +1401,50 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
 
 impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        let changed = self.offload.enabled != enabled;
         self.offload.enabled = enabled;
-        self.plans.offer_resume = skip;
+        let before = std::mem::replace(&mut self.plans.offer_resume, skip);
+        if changed {
+            self.publish_scopes();
+        } else if before != skip {
+            for head in [before, skip].into_iter().flatten() {
+                self.publish_scope(head);
+            }
+        }
+    }
+
+    fn publish_scope(&mut self, eip: u32) {
+        if let Some(job) = self.plans.job(eip).filter(|job| job.scoped) {
+            let enabled = self.offload.enabled && self.plans.offer_resume != Some(eip);
+            self.code.publish_split(eip, job.scope_threshold(enabled));
+            self.code.sync();
+        }
+    }
+
+    fn publish_scopes(&mut self) {
+        let scoped: Vec<_> = self
+            .worker_jobs
+            .keys()
+            .copied()
+            .filter(|&eip| self.plans.job(eip).is_some_and(|job| job.scoped))
+            .collect();
+        for eip in scoped {
+            self.publish_scope(eip);
+        }
     }
 
     pub(crate) fn progressed(&mut self) {
-        self.plans.offer_resume = None;
+        if let Some(head) = self.plans.offer_resume.take() {
+            self.publish_scope(head);
+        }
     }
 
     pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
-        self.plans.offer_resume.take()
+        let skip = self.plans.offer_resume.take();
+        if let Some(head) = skip {
+            self.publish_scope(head);
+        }
+        skip
     }
 
     /// Whether the computation reached at EIP goes to the job layer
@@ -1434,6 +1492,8 @@ impl Native {
     }
 
     fn place_job(&mut self, eip: u32, at: &CpuState, unit: Arc<Unit>, job: compile::Job) {
+        let scoped = job.scoped.is_some();
+        let unit = job.scoped.unwrap_or(unit);
         let iterates = unit.trace.returns_at_head();
         if let Some(code) = self.emit_computation(
             &unit,
@@ -1443,7 +1503,9 @@ impl Native {
         ) {
             self.diagnostics.split_proofs += u64::from(job.proof.splits());
             let entry_registers = job.proof.entry_registers();
-            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            self.plans.add_job(eip, iterates, job.proof.splits());
+            let policy = self.plans.job_mut(eip).unwrap();
+            policy.scoped = scoped;
             policy.requested();
             policy.built();
             self.worker_jobs.insert(

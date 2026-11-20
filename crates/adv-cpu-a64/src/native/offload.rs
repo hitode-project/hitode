@@ -336,6 +336,7 @@ fn execute(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SplitCounts {
     pub splits: u64,
+    pub scoped: u64,
     pub blocks: u64,
     pub wakes: u64,
     /// Helpers that found no block left to claim.
@@ -366,6 +367,7 @@ struct Blocks {
     code: Code,
     signals: Signals,
     submitted: Instant,
+    scoped: bool,
 }
 
 #[derive(Default)]
@@ -378,7 +380,7 @@ struct Drained {
     /// From submission to its first claim.
     claimed_after: Duration,
     /// The last block's completion and its thread.
-    last: Option<(Completion<Option<ExecutionContext>>, u32)>,
+    last: Option<(u32, Completion<Option<ExecutionContext>>, u32)>,
 }
 
 pub(super) const ESP: usize = 4;
@@ -498,8 +500,8 @@ impl Blocks {
             out.retired += done.retired;
             out.optimized += done.optimized;
             out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
-            if last {
-                out.last = Some((done, thread));
+            if last || self.scoped {
+                out.last = Some((index, done, thread));
             }
         }
         out.elapsed = started.elapsed();
@@ -689,6 +691,16 @@ impl Admission {
         self.sites.clear();
     }
 
+    fn recheck(&mut self, eip: u32, memory: &Memory, active: &[ActiveTask]) -> bool {
+        self.sync_generation(memory);
+        self.sites[&eip].evaluation.admitted().iter().all(|range| {
+            !conflicts(range, active)
+                && self
+                    .grants
+                    .allows(memory, range.start, range.end, range.write)
+        })
+    }
+
     fn sync_generation(&mut self, memory: &Memory) {
         let generation = (memory.identity(), memory.map_generation());
         if self.generation != generation {
@@ -852,6 +864,7 @@ pub(super) struct Session<'a, U> {
     runtime: Runtime,
     pace: Option<Pace>,
     counts: &'a mut SplitCounts,
+    scope_updates: Vec<u32>,
 }
 
 impl<'a, U> Session<'a, U> {
@@ -886,7 +899,12 @@ impl<'a, U> Session<'a, U> {
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
             pace,
             counts,
+            scope_updates: Vec::new(),
         })
+    }
+
+    pub(super) fn take_scope_updates(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.scope_updates)
     }
 
     fn prepare(&mut self, id: u32, context: &ExecutionContext) -> Option<(&Code, &[Range], bool)> {
@@ -923,10 +941,7 @@ impl<'a, U> Session<'a, U> {
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
         let counts = &*self.counts;
-        let wake = match counts.wakes - counts.idle_wakes {
-            0 => WAKE_NS,
-            claimed => counts.claim_ns as f64 / claimed as f64,
-        };
+        let wake = wake_cost(counts);
         let need = pace.need(serial as u64) as f64;
         let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
         if helpers == 0 {
@@ -955,6 +970,8 @@ impl<'a, U> Session<'a, U> {
             }
         }
         let started = Instant::now();
+        let eip = context.cpu().eip;
+        let scoped = self.plans.job(eip).unwrap().scoped;
         let mut start = context.clone();
         start.cpu_mut().settle_flags();
         let blocks = Arc::new(Blocks {
@@ -969,14 +986,22 @@ impl<'a, U> Session<'a, U> {
             code: code.clone(),
             signals: self.signals.clone(),
             submitted: started,
+            scoped,
         });
         let (send, recv) = sync_channel(helpers);
         let submitted = (0..helpers)
-            .take_while(|_| self.pool.submit(Job::Blocks(blocks.clone(), send.clone())))
+            .take_while(|_| {
+                (!scoped || self.admission.recheck(eip, self.memory, &self.active))
+                    && self.pool.submit(Job::Blocks(blocks.clone(), send.clone()))
+            })
             .count();
+        if scoped && submitted == 0 {
+            return None;
+        }
         let mut total = blocks.drain(&mut self.runtime, &mut ExecuteScratch::default());
         let mut helped = Duration::ZERO;
         self.counts.splits += 1;
+        self.counts.scoped += u64::from(scoped);
         self.counts.wakes += submitted as u64;
         for _ in 0..submitted {
             let drained = recv.recv().expect("block helper");
@@ -989,7 +1014,14 @@ impl<'a, U> Session<'a, U> {
             total.retired += drained.retired;
             total.optimized += drained.optimized;
             total.sticky |= drained.sticky;
-            total.last = total.last.or(drained.last);
+            if let Some(last) = drained.last
+                && total
+                    .last
+                    .as_ref()
+                    .is_none_or(|previous| previous.0 < last.0)
+            {
+                total.last = Some(last);
+            }
             helped += drained.elapsed;
         }
         // A recall stops claims: the completed prefix returns at the head.
@@ -1000,7 +1032,7 @@ impl<'a, U> Session<'a, U> {
             claimed * size
         };
         let (mut completion, last) = match total.last.take() {
-            Some((done, thread)) => (done, Some(thread)),
+            Some((_, done, thread)) => (done, Some(thread)),
             None => (
                 Completion {
                     id,
@@ -1030,6 +1062,7 @@ impl<'a, U> Session<'a, U> {
             self.plans.job(context.cpu().eip).unwrap(),
             &completion,
             iterations,
+            wake_cost(self.counts),
         );
         Some(completion)
     }
@@ -1090,15 +1123,32 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
         .unwrap_or(most)
 }
 
+fn wake_cost(counts: &SplitCounts) -> f64 {
+    match counts.wakes - counts.idle_wakes {
+        0 => WAKE_NS,
+        claimed => (counts.claim_ns as f64 / claimed as f64).max(1.0),
+    }
+}
+
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
-fn learn(prepared: &JobPlan, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+fn learn(
+    prepared: &JobPlan,
+    done: &Completion<Option<ExecutionContext>>,
+    iterations: u32,
+    wake: f64,
+) {
     if iterations == 0 || done.requires_owner {
         return;
     }
     let n = u64::from(iterations);
     let ns = (done.elapsed + done.helpers).as_nanos() as f64;
     prepared.set_cost(ns as u64);
+    if prepared.scoped && ns > 0.0 {
+        prepared
+            .split_minimum
+            .set((9.0 * wake * n as f64 / ns).ceil().max(2.0) as u64);
+    }
     prepared
         .per_iteration
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
@@ -1110,7 +1160,9 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             return false;
         };
         let guest_entry = context.cpu().eip;
-        if self.active.len() == self.pool.limit {
+        if self.plans.job(guest_entry).is_some_and(|job| job.scoped)
+            || self.active.len() == self.pool.limit
+        {
             return false;
         }
         let mut grant = self.admission.spare.pop().unwrap_or_default();
@@ -1160,6 +1212,10 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
         } else {
             None
         };
+        let scoped = self.plans.job(guest_entry).unwrap().scoped;
+        if scoped {
+            self.scope_updates.push(guest_entry);
+        }
         if let Some(plan) = plan
             && let Some(pace) = self.pace
             && let Some(per_iteration) = self.plans.job(guest_entry).unwrap().per_iteration.get()
@@ -1172,13 +1228,17 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             };
             return Some(self.account(guest_entry, false, done));
         }
+        let job = self.plans.job(guest_entry).unwrap();
+        if scoped && (plan.is_none() || job.per_iteration.get().is_some()) {
+            return None;
+        }
         let mut scratch = ExecuteScratch::default();
         let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
-            (&code, u32::from(iteration)),
+            (&code, u32::from(iteration || scoped)),
             (&self.signals, LOCAL),
             &mut scratch,
         );
@@ -1186,7 +1246,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             && !done.completion.requires_owner
         {
             let eip = done.completion.context.as_ref().unwrap().cpu().eip;
-            let iterations = match (eip == guest_entry, iteration) {
+            let iterations = match (eip == guest_entry, iteration || scoped) {
                 (false, _) => plan.iterations,
                 (true, true) => 1,
                 (true, false) => 0,
@@ -1195,6 +1255,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
                 self.plans.job(guest_entry).unwrap(),
                 &done.completion,
                 iterations,
+                wake_cost(self.counts),
             );
         }
         Some(self.account(guest_entry, iteration, done))
@@ -1419,6 +1480,154 @@ mod tests {
         assert!(!native.worker_jobs.contains_key(&head));
     }
 
+    // spec: A64-OPT-9, A64-TR-9
+    #[test]
+    fn scoped_rows_split_under_the_lease_and_match_serial() {
+        let _pool = exclusive_pool();
+        const ROWS: u32 = 128;
+        const WIDTH: u32 = 8;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut row = a.create_label();
+        a.set_label(&mut row).unwrap();
+        a.mov(ecx, WIDTH).unwrap();
+        let mut pixel = a.create_label();
+        a.set_label(&mut pixel).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.por(mm0, mm7).unwrap();
+        a.movntq(qword_ptr(edi), mm0).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(pixel).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(row).unwrap();
+        a.int3().unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let head = CODE + 1;
+        let len = (ROWS * WIDTH * 8) as usize;
+        let input: Vec<u8> = (0..len as u32).map(|n| n.wrapping_mul(37) as u8).collect();
+        {
+            let memory = executor.memory_mut();
+            memory
+                .map(INPUT, len.next_multiple_of(0x4000), READ | WRITE)
+                .unwrap();
+            memory
+                .map(OUTPUT, len.next_multiple_of(0x4000), READ | WRITE)
+                .unwrap();
+            memory.write(INPUT, &input).unwrap();
+        }
+        let mut cpu = CpuState {
+            eip: head,
+            regs: [0, 0, ROWS, 0, 0, 0, INPUT, OUTPUT],
+            ..CpuState::default()
+        };
+        cpu.mmx[7] = 0xff00_0000_ff00_0000;
+        executor.memory_mut().attach().unwrap();
+        native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                0,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        assert!(native.force_resident_at(executor.memory_mut(), cpu.clone()));
+        let job = native.plans.job(head).expect("scoped worker artifact");
+        assert!(job.scoped);
+        job.per_iteration
+            .set(Some((u64::from(WIDTH) * 7 + 3, 20_000.0)));
+        native.pace.set(Some(Pace::default()));
+        native.set_computation_offer(true, None);
+        let start = cpu.clone();
+        let first = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.exit, Exit::Computation);
+        let context = Some(ExecutionContext {
+            cpu,
+            offered: None,
+            resume: None,
+            fuel_debt: 0,
+        });
+        let map_bytes = len.next_multiple_of(0x4000);
+        executor
+            .memory_mut()
+            .protect(OUTPUT, map_bytes, READ)
+            .unwrap();
+        let mut denied_retired = 0;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut denied_retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |session| assert!(session.run_local(1, &context).is_none()),
+        );
+        assert_eq!(denied_retired, 0);
+        executor
+            .memory_mut()
+            .protect(OUTPUT, map_bytes, READ | WRITE)
+            .unwrap();
+        let mut split = None;
+        let mut retired = 0;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |session| {
+                assert!(!session.submit(1, &context));
+                split = session.run_local(1, &context);
+            },
+        );
+        let split = split.expect("leased split");
+        assert_eq!(native.diagnostics.split.scoped, 1);
+        assert_eq!(split.retired, retired);
+        let split_memory = executor.memory().read(OUTPUT, len).unwrap().to_vec();
+        executor.memory_mut().write(OUTPUT, &vec![0; len]).unwrap();
+        native.set_computation_offer(false, None);
+        let mut serial = start;
+        let mut serial_retired = 0;
+        for _ in 0..64 {
+            if serial.eip == stop {
+                break;
+            }
+            let run = native
+                .run(
+                    &mut serial,
+                    executor.memory_mut(),
+                    stop,
+                    1 << 16,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            serial_retired += u64::from(run.retired);
+        }
+        let mut parallel = split.context.unwrap().cpu;
+        for state in [&mut serial, &mut parallel] {
+            state.settle_flags();
+            state.refresh_mmx();
+        }
+        assert_eq!(serial.eip, stop);
+        assert_eq!(parallel.eip, serial.eip);
+        assert_eq!(serial.regs, parallel.regs);
+        assert_eq!(serial.eflags, parallel.eflags);
+        assert_eq!(serial.mmx, parallel.mmx);
+        assert_eq!(serial.x87, parallel.x87);
+        assert_eq!(serial_retired, u64::from(first.retired) + retired);
+        assert_eq!(executor.memory().read(OUTPUT, len).unwrap(), split_memory);
+    }
+
     // spec: A64-TR-9
     #[test]
     fn helpers_save_the_share_past_their_wake() {
@@ -1549,6 +1758,7 @@ mod tests {
                 pending: (Arc::new(AtomicU32::new(0)), 0),
             },
             submitted: Instant::now(),
+            scoped: false,
         }
     }
 

@@ -53,7 +53,15 @@ pub(crate) struct Layout<'a> {
     pub transitions: &'a [(usize, usize)],
     pub sites: &'a [(usize, super::super::Site)],
     pub marks: &'a [crate::jit_map::Mark],
+    pub split: Option<SplitPoint>,
     pub counters: &'a [(u32, super::Counter, usize)],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SplitPoint {
+    pub sensor: usize,
+    pub threshold: usize,
+    pub leave: usize,
 }
 
 pub(crate) struct Targets {
@@ -62,6 +70,7 @@ pub(crate) struct Targets {
     pub tier1: usize,
     pub exit: usize,
     pub resident_exit: usize,
+    pub split: bool,
 }
 
 pub(crate) struct MissCounter {
@@ -82,6 +91,7 @@ pub(crate) struct Entry {
     pub tail: usize,
     pub environment: usize,
     pub probation: usize,
+    pub split: Option<usize>,
     pub miss_counter: Option<MissCounter>,
 }
 
@@ -196,6 +206,18 @@ pub(crate) fn emit(
     ]);
     asm.b(exit);
 
+    let split = targets.split.then(|| {
+        let at = at + asm.offset();
+        guest_exit(
+            &mut asm,
+            head,
+            Exit::Plan(PlanEvent::ResidentSplitOffer(version as u8)),
+        );
+        asm.emit(orr(X, r(0), r(0), r(7), Lsl, 32));
+        asm.b(exit);
+        at
+    });
+
     if version == 0 {
         asm.bind(sampled);
         observe(&mut asm, head, 0, runtime::RESIDENT_LINK_SAMPLE);
@@ -258,6 +280,7 @@ pub(crate) fn emit(
         tail,
         environment,
         probation,
+        split,
         miss_counter,
     }
 }
@@ -279,6 +302,14 @@ fn observe(asm: &mut Asm, head: u32, version: usize, kind: u16) {
         blr(r(16)),
     ]);
     stubs::emit_restore_light(asm);
+}
+
+/// An active decision reads one owner-published limit. A settled sensor
+/// replaces the first word with a branch over the other two words.
+pub(crate) fn split_sensor(asm: &mut Asm, count: Reg, threshold: Label, accepted: Label) {
+    asm.ldr_literal(r(16), threshold);
+    asm.emit(sub(X, r(17), count, r(16), Lsl, 0));
+    asm.tbz(false, r(17), 63, accepted);
 }
 
 fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
@@ -433,6 +464,23 @@ mod tests {
             assert_eq!(cache.word(at + index * 4), word);
         }
         assert_eq!((enter(), counter.get()), (0, 1));
+    }
+
+    // spec: A64A-PLACE-3, A64-OPT-9
+    #[test]
+    fn a_split_decline_reads_one_limit_and_preserves_nzcv() {
+        let mut asm = Asm::new();
+        let threshold = asm.label();
+        let accept = asm.label();
+        split_sensor(&mut asm, r(7), threshold, accept);
+        assert_eq!(asm.offset(), 12);
+        asm.bind(accept);
+        asm.bind(threshold);
+        asm.emit_all(&[0, 0]);
+        let words = asm.finish();
+        assert_eq!(words[1], sub(X, r(17), r(7), r(16), Lsl, 0));
+        assert_eq!(words[2], tbz(false, r(17), 63, 4));
+        assert_eq!(b(12), 0x14000003);
     }
 
     // spec: A64A-PLACE-3

@@ -258,6 +258,8 @@ pub enum PlanEvent {
     DiscoverBackEdge,
     EnvironmentMiss,
     OfferReady,
+    /// A proved row domain at its canonical resident entry.
+    ResidentSplitOffer(u8),
     /// The high word names the resident head, independently of the exit EIP.
     Probation(u8),
     /// A detached computation transferred indirectly. The high word holds the source EIP.
@@ -273,6 +275,7 @@ impl PlanEvent {
             Self::DiscoverBackEdge => "external_discovery",
             Self::EnvironmentMiss => "environment_miss",
             Self::OfferReady => "offer_ready",
+            Self::ResidentSplitOffer(_) => "resident_split_offer",
             Self::Probation(_) => "probation",
             Self::WorkerBranch(_) => "worker_branch",
         }
@@ -388,6 +391,7 @@ impl Exit {
             Self::Plan(PlanEvent::DiscoverBackEdge) => 16,
             Self::Plan(PlanEvent::EnvironmentMiss) => 18,
             Self::Plan(PlanEvent::OfferReady) => 19,
+            Self::Plan(PlanEvent::ResidentSplitOffer(version)) => 0x4200 | version as u16,
             Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
             Self::Plan(PlanEvent::WorkerBranch(kind)) => 0x4000 | kind as u16,
             Self::Event(Event::CheckedAccess) => 13,
@@ -433,6 +437,7 @@ impl Exit {
             0x3000..=0x30ff => Some(Self::Budget),
             0x4001..=0x4003 => Some(Self::Plan(PlanEvent::WorkerBranch(raw as u8))),
             0x4100..=0x41ff => Some(Self::Plan(PlanEvent::Probation(raw as u8))),
+            0x4200..=0x42ff => Some(Self::Plan(PlanEvent::ResidentSplitOffer(raw as u8))),
             _ => None,
         }
     }

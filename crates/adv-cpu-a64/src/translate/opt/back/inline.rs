@@ -59,7 +59,7 @@ impl Emitter<'_> {
         self.asm.cbz(W, true, T, cold);
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
-        if let Some(domain) = self.domain {
+        if let Some((domain, offer)) = self.domain {
             let minimum = (self.asm.label(), self.asm.label());
             let head = self.func.records[0].eip;
             let (miss, target_miss) = if self.count_entries {
@@ -78,7 +78,20 @@ impl Emitter<'_> {
             } else {
                 (cold, cold)
             };
-            let words = domain.emit(&mut self.asm, minimum, miss, target_miss);
+            let leave = offer.then(|| self.asm.label());
+            let mut words = domain.emit(&mut self.asm, minimum, miss, target_miss, leave);
+            if let Some(leave) = leave {
+                let (sensor, threshold) = (self.asm.label(), self.asm.label());
+                self.asm.bind(sensor);
+                crate::translate::lower::resident::split_sensor(
+                    &mut self.asm,
+                    Reg::new(7),
+                    threshold,
+                    leave,
+                );
+                self.split = Some((sensor, threshold, leave));
+                words += 3;
+            }
             self.count(head, super::Counter::RowEntry);
             self.row_budget = Some((minimum, words));
             self.asm.emit(ldr(X, CPU, RT, CPU_PTR));

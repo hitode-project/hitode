@@ -53,6 +53,8 @@ pub(super) struct JobPlan {
     /// The serial cost of a split loop in host ticks.
     pub split_ticks: Cell<u64>,
     pub splits: bool,
+    pub scoped: bool,
+    pub split_minimum: Cell<u64>,
     misses: Cell<u32>,
     /// Optimized forms requested, and whether one is being built.
     forms: Cell<u8>,
@@ -83,6 +85,8 @@ impl JobPlan {
         };
         Self {
             splits,
+            scoped: false,
+            split_minimum: Cell::new(2),
             split_ticks: Cell::new(0),
             misses: Cell::new(0),
             forms: Cell::new(0),
@@ -122,6 +126,16 @@ impl JobPlan {
 
     pub fn built(&self) {
         self.building.set(false);
+    }
+
+    pub fn scope_cost(&self, count: u32) -> u64 {
+        self.per_iteration
+            .get()
+            .map_or(450_000, |(_, ns)| (f64::from(count) * ns) as u64)
+    }
+
+    pub fn scope_threshold(&self, enabled: bool) -> Option<u64> {
+        (self.scoped && enabled).then(|| self.split_minimum.get())
     }
 
     pub fn gate(&self) -> store::OfferEntry {
@@ -271,7 +285,9 @@ impl Arbiter {
         let Some(site) = self.sites.get(&eip) else {
             return Arrival::Baseline;
         };
-        if let Some(job) = &site.job {
+        if let Some(job) = &site.job
+            && !job.scoped
+        {
             return Arrival::Offerable(job);
         }
         match site.resident.as_ref().map(|head| &head.state) {

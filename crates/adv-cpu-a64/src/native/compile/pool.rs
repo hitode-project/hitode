@@ -75,6 +75,7 @@ impl ResidentForm {
             transitions: &lowered.transitions,
             sites: &lowered.sites,
             marks: &lowered.marks,
+            split: lowered.split,
             counters: &lowered.counters,
         }
     }
@@ -90,6 +91,7 @@ pub(in crate::native) struct ResidentRecovery {
 pub(in crate::native) struct Job {
     pub proof: Proof,
     pub form: Option<JobForm>,
+    pub scoped: Option<Arc<Unit>>,
 }
 
 pub(in crate::native) struct JobForm {
@@ -117,13 +119,17 @@ fn computation_proof(trace: &Trace) -> Option<Proof> {
         return None;
     }
     let mut proof = Proof::build(trace).ok()?;
+    specialize_split(&mut proof, trace);
+    Some(proof)
+}
+
+fn specialize_split(proof: &mut Proof, trace: &Trace) {
     let index = std::cell::Cell::new(0);
     proof.prove_split(trace, |_, _| {
         let i = index.get();
         index.set(i + 1);
         trace.x86[i].clone()
     });
-    Some(proof)
 }
 
 fn compile(request: Request) -> Compiled {
@@ -147,6 +153,7 @@ fn compile(request: Request) -> Compiled {
         proof
     };
     let started = std::time::Instant::now();
+    let mut scoped_job = None;
     let resident = if task == Task::Job {
         None
     } else {
@@ -191,14 +198,32 @@ fn compile(request: Request) -> Compiled {
             )
         };
         let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace).and_then(
-            |domain| {
+            |(domain, mut proof)| {
                 let built = build(rows, None)
                     .inspect_err(|rejection| {
                         crate::jit_map::optimized(eip, format_args!("row lowering {rejection:?}"));
                     })
                     .ok()?;
+                if built.cuts != 0 {
+                    return None;
+                }
+                if task == Task::Discover {
+                    specialize_split(&mut proof, &rows.trace);
+                }
+                let offer = proof.scoped_splits();
                 let lowered =
-                    back::lower_rows(&built.func, &built.assumed, &domain, count_entries)?;
+                    back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
+                if offer {
+                    let form = front::build(rows, &proof, &at).ok().map(|built| JobForm {
+                        lowered: back::lower(&built.func),
+                        built,
+                    });
+                    scoped_job = Some(Job {
+                        proof,
+                        form,
+                        scoped: Some(Arc::new(rows.clone())),
+                    });
+                }
                 Some(ResidentForm { built, lowered })
             },
         );
@@ -233,13 +258,17 @@ fn compile(request: Request) -> Compiled {
         }
         Some(result)
     };
-    let job = if matches!(task, Task::Discover | Task::Job) {
+    let job = if scoped_job.is_none() && matches!(task, Task::Discover | Task::Job) {
         proof.map(|proof| {
             let form = front::build(&unit, &proof, &at).ok().map(|built| JobForm {
                 lowered: back::lower(&built.func),
                 built,
             });
-            Job { proof, form }
+            Job {
+                proof,
+                form,
+                scoped: None,
+            }
         })
     } else {
         None
@@ -251,7 +280,7 @@ fn compile(request: Request) -> Compiled {
         task,
         at,
         resident,
-        job,
+        job: scoped_job.or(job),
     }
 }
 

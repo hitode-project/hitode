@@ -2115,6 +2115,10 @@ impl Proof {
         self.outer.is_some_and(|outer| outer.split)
     }
 
+    pub(crate) fn scoped_splits(&self) -> bool {
+        self.outer.is_some_and(|outer| outer.split && !outer.frame)
+    }
+
     /// After a successful `evaluate`, the head loop's iterations if every
     /// one writes only bytes no other iteration reads or writes. A write
     /// needs a nonzero stride, and an effect it meets the same stride and a
@@ -2709,10 +2713,14 @@ impl Proof {
 
     fn based_offset(&self, id: ExprId) -> Option<i64> {
         match self.exprs[id] {
-            Expr::Register(EBP) => Some(0),
+            Expr::Register(base) if base == EBP || base == self.based => Some(0),
             Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
-                (Expr::Register(EBP), Expr::Constant(c))
-                | (Expr::Constant(c), Expr::Register(EBP)) => Some(i64::from(c as i32)),
+                (Expr::Register(base), Expr::Constant(c))
+                | (Expr::Constant(c), Expr::Register(base))
+                    if base == EBP || base == self.based =>
+                {
+                    Some(i64::from(c as i32))
+                }
                 _ => None,
             },
             _ => None,
