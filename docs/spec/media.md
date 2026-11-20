@@ -233,8 +233,8 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-DMO-2 Push ownership and preroll
 
-**Rule**: Built-in DMO decoders MUST accept only host samples, while registered media objects MUST receive buffers wrapping upstream samples. Decoded video MUST follow graph time with one paused preroll frame, while decoded audio MUST use the shared mixer.
-**Verification**: Review — unit tests do not exercise built-in decoder scheduling, audio mixing, and paused video preroll.
+**Rule**: Built-in DMO decoders MUST accept only host samples, while registered media objects MUST receive buffers wrapping upstream samples. Decoded video MUST follow graph time with one paused preroll frame. Decoded audio MUST reach connected guest renderers during preroll and playback, or use the shared mixer for host renderers.
+**Verification**: Test
 
 ### MEDIA-DMO-3 End-of-stream ordering
 
