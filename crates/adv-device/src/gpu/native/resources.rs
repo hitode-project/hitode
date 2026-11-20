@@ -507,37 +507,17 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         upload_bounds(image, rectangle, staged.pitch, staged.len())?;
-        self.record_upload(
-            image,
-            rectangle,
-            staged.pitch,
-            super::stream::UploadSource::Staged(staged.clone()),
+        self.check()?;
+        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.push(
+            super::record::WorkerItem::UploadStaged {
+                image: image.clone(),
+                rectangle,
+                staged: staged.clone(),
+            },
+            0,
         );
         Ok(())
-    }
-    fn record_upload(
-        &mut self,
-        image: &Image,
-        rectangle: Rect,
-        pitch: u32,
-        source: super::stream::UploadSource,
-    ) {
-        let mip = match &image.storage {
-            Storage::Fixed { level, .. } => level.unwrap_or(0),
-            Storage::Swap(_) => 0,
-        };
-        self.stream.push(super::stream::Command::Upload {
-            source,
-            pitch,
-            image: image.clone(),
-            mip,
-            rect: adv_gpu::Rect {
-                x: rectangle.x,
-                y: rectangle.y,
-                w: rectangle.w,
-                h: rectangle.h,
-            },
-        });
     }
     pub fn upload(
         &mut self,
@@ -549,19 +529,52 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         let row = upload_bounds(image, rectangle, pitch, bgra.len())?;
-        let bytes = self.stream.bytes(row * rectangle.h, 256, |bytes| {
+        self.check()?;
+        let len = (row * rectangle.h) as usize;
+        self.execution.worker.admit_cmd(len)?;
+        let mut buf = self.execution.worker.take_bytes_buf(len);
+        if pitch == row && bgra.len() >= len {
+            buf.extend_from_slice(&bgra[..len]);
+        } else {
             for y in 0..rectangle.h {
                 let source = y as usize * pitch as usize;
-                let destination = y as usize * row as usize;
-                bytes[destination..destination + row as usize]
-                    .copy_from_slice(&bgra[source..source + row as usize]);
+                buf.extend_from_slice(&bgra[source..source + row as usize]);
             }
-        });
-        self.record_upload(
-            image,
-            rectangle,
-            row,
-            super::stream::UploadSource::Ring(bytes),
+        }
+        self.execution.worker.push(
+            super::record::WorkerItem::UploadBytes {
+                image: image.clone(),
+                rectangle,
+                pitch: row,
+                bytes: super::record::UploadPayload::Owned(buf),
+            },
+            len,
+        );
+        Ok(())
+    }
+    /// Upload an already-snapshotted shared host pixel buffer without copying
+    /// on the execution thread.
+    pub fn upload_arc(
+        &mut self,
+        image: &Image,
+        rectangle: Rect,
+        pitch: u32,
+        pixels: Arc<Vec<u8>>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
+        let row = upload_bounds(image, rectangle, pitch, pixels.len())?;
+        self.check()?;
+        let len = (row * rectangle.h) as usize;
+        self.execution.worker.admit_cmd(len)?;
+        self.execution.worker.push(
+            super::record::WorkerItem::UploadBytes {
+                image: image.clone(),
+                rectangle,
+                pitch,
+                bytes: super::record::UploadPayload::Shared(pixels),
+            },
+            len,
         );
         Ok(())
     }
@@ -637,37 +650,29 @@ pub(super) mod tests {
             }
             Err(error) => panic!("open native device: {error}"),
         };
-        let (mut producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
-        let recording = super::super::record::Recording::new(&device, &mut producer).unwrap();
-        let stream = stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(producer)));
+        let (producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
+        let gate = producer.gate();
+        let owner = super::super::owner::Owner::unstarted();
+        let worker =
+            super::super::record::WorkerHandle::start(device.clone(), producer, None).unwrap();
+        let stream = stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(gate)));
         let execution = std::rc::Rc::new(super::super::Execution {
             device: device.clone(),
             stream: stream.clone(),
-            owner: super::super::owner::Owner::unstarted(),
+            worker,
+            owner,
             #[cfg(feature = "test-support")]
             capture: Default::default(),
         });
-        Some((
-            Gpu {
-                device,
-                stream,
-                pipelines: pipelines::Pipelines::default(),
-                clip: None,
-                stats: Default::default(),
-                execution,
-                recording,
-                staging: Default::default(),
-            },
-            queue,
-            consumer,
-        ))
+        let gpu = Gpu::facade(execution).unwrap();
+        Some((gpu, queue, consumer))
     }
     pub(in crate::gpu::native) fn upload_chunk(
         gpu: &mut Gpu,
         queue: &mut adv_gpu::Queue,
         consumer: &stream::Consumer,
     ) {
-        gpu.stream.push(stream::Command::Submit);
+        gpu.flush().unwrap();
         let crate::gpu::native::stream::Next::Chunk(mut chunk) = consumer.next() else {
             panic!("upload chunk");
         };
@@ -729,16 +734,18 @@ pub(super) mod tests {
         image: &Image,
     ) -> Vec<u8> {
         let target = gpu.target_levels(image.width(), image.height(), 1).unwrap();
-        let pipeline = gpu
-            .pipelines
-            .fixed(
-                &gpu.device,
-                &gpu::DrawState::new(image.width(), image.height()),
-                &[adv_gpu::Format::Bgra8Unorm],
-                None,
-                pipelines::fixed_sampling_flags(Some(image)),
-            )
-            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let state = gpu::DrawState::new(image.width(), image.height());
+        let flags = pipelines::fixed_sampling_flags(Some(image));
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |pipelines, device| {
+                let p = pipelines
+                    .fixed(device, &state, &[adv_gpu::Format::Bgra8Unorm], None, flags)
+                    .unwrap();
+                tx.send(p).unwrap();
+            });
+        let pipeline = rx.recv().unwrap();
         let params: [u32; 8] = [1, 1, 7, 0, 0, 0, 0, 0];
         render(
             gpu,

@@ -1013,30 +1013,57 @@ pub(super) fn flush(
             .then(|| node.and_then(|n| frame(env, owner).damage.clip(n).map(<[_]>::len)))
             .flatten();
         let result = if let Some(parts) = parts {
-            let mut result = Ok(Completion::Command);
-            // A write meeting several scissors resumes after the ones it
-            // finished when it was busy, so no blend applies twice.
-            while result.is_ok() && frame(env, owner).part < parts {
-                let f = frame(env, owner);
-                let clip = f.damage.clip(node.unwrap()).unwrap()[f.part];
-                if !f.passes.outside_damage(f.head, clip) {
-                    let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
-                    gpu.set_clip(Some(clip));
-                    result = execute_gpu(env, execution.unwrap_or(&operation));
-                    env.ext
-                        .get_mut::<State>()
-                        .gpu
-                        .as_mut()
-                        .unwrap()
-                        .set_clip(None);
-                    if result.is_err() {
-                        break;
+            let effective = execution.unwrap_or(&operation);
+            if let Operation::Draw(draw) = effective {
+                let mut clips = smallvec::SmallVec::<[adv_device::surface::Rect; 8]>::new();
+                {
+                    let f = frame(env, owner);
+                    let all_clips = f.damage.clip(node.unwrap()).unwrap();
+                    for &clip in &all_clips[f.part..parts] {
+                        if !f.passes.outside_damage(f.head, clip) {
+                            clips.push(clip);
+                        }
                     }
-                    submitted(env, owner, node, &operation, Some(clip));
                 }
-                frame(env, owner).part += 1;
+                if clips.is_empty() {
+                    frame(env, owner).part = parts;
+                    Ok(Completion::Command)
+                } else {
+                    let result = execute_draw_clips(env, draw, &clips);
+                    if result.is_ok() {
+                        for clip in clips {
+                            submitted(env, owner, node, &operation, Some(clip));
+                        }
+                        frame(env, owner).part = parts;
+                    }
+                    result
+                }
+            } else {
+                let mut result = Ok(Completion::Command);
+                // A write meeting several scissors resumes after the ones it
+                // finished when it was busy, so no blend applies twice.
+                while result.is_ok() && frame(env, owner).part < parts {
+                    let f = frame(env, owner);
+                    let clip = f.damage.clip(node.unwrap()).unwrap()[f.part];
+                    if !f.passes.outside_damage(f.head, clip) {
+                        let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
+                        gpu.set_clip(Some(clip));
+                        result = execute_gpu(env, effective);
+                        env.ext
+                            .get_mut::<State>()
+                            .gpu
+                            .as_mut()
+                            .unwrap()
+                            .set_clip(None);
+                        if result.is_err() {
+                            break;
+                        }
+                        submitted(env, owner, node, &operation, Some(clip));
+                    }
+                    frame(env, owner).part += 1;
+                }
+                result
             }
-            result
         } else {
             let result = execute_gpu(env, execution.unwrap_or(&operation));
             if result.is_ok() {
@@ -1440,6 +1467,12 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         return Err(Error::Device("recorded D3D9 device lost".into()));
     }
     if frame(env, *owner).presented.is_none() {
+        env.ext
+            .get::<State>()
+            .gpu
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("D3D9 GPU is absent".into()))?
+            .admit_present()?;
         let completion = execute_gpu(env, operation)?;
         window_presented(env, *owner);
         let Completion::Presented(serial, _) = completion else {
