@@ -21,8 +21,8 @@ use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 pub use crate::runtime::ExecutionContext;
 use crate::runtime::{Event, Exit};
 
-/// Interpreted instructions per decoded block, as in the x64 executor.
-const BLOCK_UNITS: u64 = 256;
+// Interpreted instructions per decoded block, as in the x64 executor.
+use crate::policy::tier1::BLOCK_UNITS;
 
 /// Execution counters. Names match the x64 executor where the meaning is
 /// shared; native and translation counters stay zero without translated code.
@@ -363,6 +363,10 @@ impl Executor {
             if let Some(versions) = native.version_diagnostics() {
                 report.push_str(" tier1 versions");
                 report.push_str(&versions);
+            }
+            if let Some(policy) = native.policy_diagnostics() {
+                report.push_str(" optimization policy");
+                report.push_str(&policy);
             }
             return report;
         }

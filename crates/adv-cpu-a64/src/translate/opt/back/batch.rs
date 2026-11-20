@@ -255,7 +255,9 @@ impl Emitter<'_> {
         self.reciprocal_division = false;
         // Include the bounded long-range search and the scalar tail transfer.
         let prefix = ((inner_start - admission) / 4) as u32 + 3;
-        let pages = pages.map_or(0, |_| 84 * batch.spans.len() as u32);
+        let pages = pages.map_or(0, |_| {
+            crate::policy::proved::SPAN_SEARCH_WORDS * batch.spans.len() as u32
+        });
         let classes = std::mem::take(&mut self.class_prices);
         let common = if classes.is_empty() {
             words

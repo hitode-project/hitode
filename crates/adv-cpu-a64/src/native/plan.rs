@@ -13,41 +13,97 @@
 //! | Declined | Code invalidation | Reset discovery |
 //! | Offerable | Admission failure or job completion | Cache, back off, or re-offer |
 //!
-//! The policy constants below govern discovery, probation, faults, version
-//! limits and re-offers. A settled decline adds no work to the baseline loop.
-//! A cut rejoins Tier-1 and loses resident work on each affected iteration.
-//! Budget about 32 host instructions for that transfer and lost work, versus
-//! about 256 for a cold exit's state dump, Rust recovery and re-entry. The
-//! break-even rate is 32/256. Each cold window uses admitted entries or the
-//! retirement-based iteration estimate, whichever is larger. It ends after
-//! 256 entries or probation end. A cold exit beyond 256 estimated iterations
-//! starts a fresh sample, as does a change to the version chain. Windows reuse
-//! the probation calls, which are patched out on settled forms between windows.
+//! The arbiter applies the shared prices to owner and worker observations.
 
-use adv_cpu_core::backend::OfferGate;
+use crate::ExecutionContext;
+use crate::policy::worker::COMPUTATION_SLICE;
+use adv_cpu_core::backend::{Completion, OfferGate, Pace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
+use std::time::Duration;
 
 use super::compile::{self, ResidentCold};
-use super::store::{self, CHAIN_LEN, Tier1Chain};
+use super::store::{self, Tier1Chain};
 use crate::facts::Key;
-
-pub(super) const HOT: u32 = 64;
-pub(super) const VERSIONS: usize = 3;
-pub(super) const SAMPLE: u32 = 8;
-pub(super) const PROBES: u8 = 8;
-pub(super) const MISSES: u32 = 4;
-pub(super) const CHECKED_FAULTS: u64 = 2;
-const COLD_MIN_EXITS: u64 = 2;
-const COLD_ITERATIONS_PER_EXIT: u64 = 8;
-pub(crate) const CHECK_AFTER: u32 = 8;
-pub(crate) const PROMOTION: u8 = 4;
-pub(super) const RESPECIALIZE: u8 = 2;
-pub(super) const REOFFER: u32 = 64;
-pub(super) const PROBATION: u32 = 256;
+use crate::policy::proved::{ROW_PROBE_WORDS, RowPrice};
+pub(super) use crate::policy::resident::{
+    CHECKED_FAULTS, HOT, MISSES, PROBATION, PROBES, SAMPLE, VERSIONS,
+};
+use crate::policy::tier1::{CHAIN_LEN, CHECK_AFTER};
+pub(super) use crate::policy::worker::REOFFER;
+use crate::policy::worker::RESPECIALIZE;
 
 const NO_LIMIT: u32 = i32::MAX as u32;
-const SHORT_JOB: std::time::Duration = std::time::Duration::from_micros(50);
+const SHORT_JOB: Duration = Duration::from_nanos(WAKE_NS);
+
+/// Accumulated AArch64 instruction words. Settled row forms keep their
+/// measured credit while successful-work sampling is patched out.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Ledger {
+    pub saved: u128,
+    pub wasted: u128,
+}
+
+impl Ledger {
+    pub fn record(&mut self, saved: u32, units: u64, cost: u32, attempts: u64) {
+        self.saved += u128::from(saved) * u128::from(units);
+        self.wasted += u128::from(cost) * u128::from(attempts);
+    }
+
+    pub fn over_budget(self, words: u64) -> bool {
+        self.wasted > self.saved + u128::from(words)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct RowLedger {
+    pub total: Ledger,
+    pub failures: [u64; 6],
+    pub rows: u64,
+    pub entries: u64,
+}
+
+impl RowLedger {
+    pub fn priced(
+        price: RowPrice,
+        (entries, rows, work): (u64, u64, u64),
+        failures: [u64; 6],
+    ) -> Self {
+        let mut total = Ledger::default();
+        let rejected = failures.iter().sum::<u64>();
+        total.record(price.saved, work, price.guard, entries + rejected);
+        total.record(price.row_savings, rows, 0, 0);
+        Self {
+            total,
+            failures,
+            rows,
+            entries,
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.total.saved += other.total.saved;
+        self.total.wasted += other.total.wasted;
+        self.rows += other.rows;
+        self.entries += other.entries;
+        for (failures, added) in self.failures.iter_mut().zip(other.failures) {
+            *failures += added;
+        }
+    }
+
+    pub fn router(&mut self, words: u32, failures: [u64; 6]) {
+        self.total.record(0, 0, words, failures.iter().sum());
+        for (count, additional) in self.failures.iter_mut().zip(failures) {
+            *count += additional;
+        }
+    }
+}
+
+pub(super) enum RowAction {
+    Keep,
+    Sample(bool),
+    Withdraw,
+}
 
 pub(super) struct JobPlan {
     /// The serial cost of a split loop in host ticks.
@@ -78,6 +134,33 @@ pub(super) enum Mode {
 }
 
 impl JobPlan {
+    /// Records the instructions and time per outer iteration of a job that ran
+    /// `iterations` of them.
+    pub fn learn(
+        prepared: &JobPlan,
+        done: &Completion<Option<ExecutionContext>>,
+        iterations: u32,
+        execution: Duration,
+        wake: f64,
+    ) {
+        if iterations == 0 || done.requires_owner {
+            return;
+        }
+        let n = u64::from(iterations);
+        let ns = execution.as_nanos() as f64;
+        prepared.set_cost(ns as u64);
+        if prepared.scoped && ns > 0.0 {
+            prepared.split_minimum.set(
+                ((1.0 + 2.0 * BLOCKS_PER_THREAD) * wake * n as f64 / ns)
+                    .ceil()
+                    .max(2.0) as u64,
+            );
+        }
+        prepared
+            .per_iteration
+            .set(Some(((done.retired / n).max(1), ns / n as f64)));
+    }
+
     /// `iterates` when the code can stop after one outer iteration.
     pub fn new(iterates: bool, splits: bool) -> Self {
         let mode = if iterates {
@@ -135,7 +218,9 @@ impl JobPlan {
     pub fn scope_cost(&self, count: u32) -> u64 {
         self.per_iteration
             .get()
-            .map_or(450_000, |(_, ns)| (f64::from(count) * ns) as u64)
+            .map_or(WAKE_NS * (1 + 2 * BLOCKS_PER_THREAD as u64), |(_, ns)| {
+                (f64::from(count) * ns) as u64
+            })
     }
 
     pub fn scope_threshold(&self, enabled: bool) -> Option<u64> {
@@ -239,6 +324,82 @@ impl JobPlan {
         };
         self.reoffer.set(skip.max(REOFFER));
     }
+}
+
+/// A helper's wake latency until helpers have shown theirs: it starts
+/// claiming this long after the owner.
+pub(super) const WAKE_NS: u64 = 50_000;
+/// Blocks per thread, so the last block to finish leaves the others idle
+/// for about a quarter of a thread's part. A block is at most one slice.
+const BLOCKS_PER_THREAD: f64 = 4.0;
+/// The owner's fixed work in a split besides its blocks: admission and merge.
+const ROUND_NS: f64 = 10_000.0;
+/// Rolling median of three claimed wakes, seeded with the startup estimate.
+pub(super) struct WakeEstimate {
+    recent: [u64; 2],
+    pub ns: u64,
+}
+
+impl Default for WakeEstimate {
+    fn default() -> Self {
+        Self {
+            recent: [WAKE_NS; 2],
+            ns: WAKE_NS,
+        }
+    }
+}
+
+impl WakeEstimate {
+    pub fn record(&mut self, ns: u64) {
+        let [older, newer] = self.recent;
+        let ns = ns.max(1);
+        self.ns = ns.clamp(older.min(newer), older.max(newer));
+        self.recent = [newer, ns];
+    }
+}
+
+pub(super) fn rows_per_slice(retired: u64) -> u32 {
+    (u64::from(COMPUTATION_SLICE) / retired).max(1) as u32
+}
+
+/// The fewest helpers whose blocks cut `serial` ns by `need` ns, or all
+/// that are worth waking, given the `wake` latency and the most a `slice`
+/// block takes. One is worth waking only if its part of the loop exceeds
+/// four wake latencies.
+pub(super) fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> usize {
+    if need <= 0.0 {
+        return 0;
+    }
+    let worth = ((serial - wake) / (BLOCKS_PER_THREAD * wake) - 1.0).max(0.0) as usize;
+    let most = most.min(worth);
+    let target = serial - need;
+    (1..=most)
+        .find(|&h| {
+            let part = (serial - wake) / (h + 1) as f64;
+            wake + part + (part / BLOCKS_PER_THREAD).min(slice) + ROUND_NS <= target
+        })
+        .unwrap_or(most)
+}
+
+pub(super) fn split_work(
+    iterations: u32,
+    (retired, ns): (u64, f64),
+    wake: u64,
+    pace: Pace,
+    most: usize,
+) -> Option<(usize, u32)> {
+    let slice = rows_per_slice(retired);
+    let serial = f64::from(iterations) * ns;
+    let need = pace.need(serial as u64) as f64;
+    let helpers = helpers(serial, (wake as f64, f64::from(slice) * ns), need, most);
+    if helpers == 0 {
+        return None;
+    }
+    let blocks = (helpers + 1) as f64 * BLOCKS_PER_THREAD;
+    Some((
+        helpers,
+        slice.min((f64::from(iterations) / blocks).ceil() as u32),
+    ))
 }
 
 #[derive(Default)]
@@ -376,6 +537,12 @@ impl Arbiter {
         self.sites.get(&eip)?.resident.as_deref()
     }
 
+    pub(super) fn residents(&self) -> impl Iterator<Item = (u32, &ResidentPlan)> {
+        self.sites
+            .iter()
+            .filter_map(|(&eip, site)| Some((eip, site.resident.as_deref()?)))
+    }
+
     pub(super) fn resident_mut(&mut self, eip: u32) -> Option<&mut ResidentPlan> {
         self.sites.get_mut(&eip)?.resident.as_deref_mut()
     }
@@ -508,7 +675,9 @@ pub(super) struct ResidentPlan {
     pub(super) has_proof: bool,
     recorded_gap: bool,
     pub(super) row_targets: Vec<u32>,
-    row_window: Option<(u64, u64, u64)>,
+    pub row: RowLedger,
+    // Prices change on rebuild. Keep credits already measured at their old price.
+    row_history: Vec<RowLedger>,
 }
 
 #[derive(Default)]
@@ -539,7 +708,8 @@ impl ResidentPlan {
             has_proof: false,
             recorded_gap: false,
             row_targets: Vec::new(),
-            row_window: None,
+            row: RowLedger::default(),
+            row_history: Vec::new(),
         }
     }
     pub(super) fn declined(&self) -> bool {
@@ -585,28 +755,37 @@ impl ResidentPlan {
         (link, self.probes == 0)
     }
 
-    pub(super) fn row_accounting(&self) -> bool {
-        self.row_window.is_some()
+    pub(super) fn row_version(&self, index: usize, mut measured: RowLedger) -> RowLedger {
+        if let Some(history) = self.row_history.get(index) {
+            measured.add(*history);
+        }
+        measured
     }
 
-    pub(super) fn reset_row_accounting(&mut self) {
-        self.row_window = None;
+    pub(super) fn archive_row(&mut self, index: usize, measured: RowLedger) {
+        if self.row_history.len() <= index {
+            self.row_history.resize(index + 1, RowLedger::default());
+        }
+        self.row_history[index].add(measured);
     }
 
-    pub(super) fn row_failures_exceed_savings(
-        &mut self,
-        failures: u64,
-        (entries, iterations): (u64, u64),
-        (guard, saved): (u32, u32),
-    ) -> bool {
-        let snapshot = (failures, entries, iterations);
-        let Some((before, entered, completed)) = self.row_window.replace(snapshot) else {
-            return false;
-        };
-        let misses = failures - before;
-        let admitted = entries - entered;
-        let rows = iterations - completed;
-        misses >= 32 && (misses + admitted) * u64::from(guard) > rows * u64::from(saved)
+    pub(super) fn observe_row(
+        &self,
+        ledger: RowLedger,
+        measuring: bool,
+        probation: bool,
+    ) -> RowAction {
+        if ledger.total.over_budget(ROW_PROBE_WORDS) {
+            if measuring {
+                RowAction::Withdraw
+            } else {
+                RowAction::Sample(true)
+            }
+        } else if measuring && !probation && self.cold_window.is_none() {
+            RowAction::Sample(false)
+        } else {
+            RowAction::Keep
+        }
     }
 
     pub(super) fn record_cold(&mut self, site: u32, reason: ResidentCold) -> u64 {
@@ -667,7 +846,7 @@ impl ResidentPlan {
         }
         let exits = window.exits.entry((site, reason)).or_default();
         *exits += 1;
-        *exits >= COLD_MIN_EXITS && *exits * COLD_ITERATIONS_PER_EXIT > visits
+        crate::policy::resident::cut_pays(*exits, visits)
     }
 
     pub(super) fn refuse(&mut self, site: u32, affected: impl Iterator<Item = usize>) -> bool {

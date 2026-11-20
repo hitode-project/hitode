@@ -23,6 +23,7 @@ mod native;
 mod native {
     pub(crate) mod compile;
 }
+mod policy;
 pub mod runtime;
 pub mod translate;
 

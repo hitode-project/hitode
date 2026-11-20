@@ -6,6 +6,7 @@ use crate::asm::{Asm, Label};
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::policy::proved::RowPrice;
 use crate::runtime::{self, Exit, PlanEvent};
 use crate::translate::lower::stubs;
 
@@ -18,6 +19,8 @@ pub(crate) struct Slot {
     /// Snapshot followed by total retirement, as read by the lowered calls.
     pub countdown: [Cell<u64>; 2],
     pub entries: Cell<u64>,
+    pub rows: Cell<u64>,
+    pub row_work: Cell<u64>,
     pub probation: Cell<u32>,
 }
 
@@ -46,22 +49,9 @@ impl Default for RowFeedback {
     fn default() -> Self {
         Self {
             failures: Default::default(),
-            next: Cell::new(32),
+            next: Cell::new(1),
             target_next: Cell::new(1),
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct RowPrice {
-    pub guard: u32,
-    pub saved: u32,
-    pub count_register: Option<u8>,
-}
-
-impl RowPrice {
-    pub(crate) fn minimum(self) -> u32 {
-        self.guard.div_ceil(self.saved)
     }
 }
 
@@ -84,6 +74,7 @@ pub(crate) struct Layout<'a> {
     pub marks: &'a [crate::jit_map::Mark],
     pub split: Option<SplitPoint>,
     pub row_price: Option<RowPrice>,
+    pub row_sample: Option<(usize, usize)>,
     pub row_failures: &'a [(super::RowFailure, usize)],
     pub counters: &'a [(u32, super::Counter, usize)],
 }
@@ -358,7 +349,7 @@ pub(crate) fn row_entry(
     cases: &[(u32, Option<usize>)],
     (at, fallback, exit): (usize, usize, usize),
     feedback: &RowFeedback,
-    minimum: Option<(u8, u32)>,
+    row_counter: Option<u8>,
     counters: Option<[u64; 2]>,
 ) -> (Vec<u32>, [usize; 2]) {
     let mut asm = Asm::new();
@@ -370,19 +361,13 @@ pub(crate) fn row_entry(
     let bad = asm.label();
     let failed = asm.label();
     let mut destinations = Vec::new();
-    let short = minimum.map(|_| asm.label());
+    let short = row_counter.map(|_| asm.label());
     let counters = counters.map(|counters| counters.map(|address| (asm.label(), address)));
     if let Some([(arrivals, _), _]) = counters {
         increment_row_counter(&mut asm, arrivals);
     }
-    if let Some((reg, minimum)) = minimum {
-        if minimum < 4096 {
-            asm.emit(sub_imm(W, r(0), r(19 + reg), minimum, false));
-        } else {
-            constant(&mut asm, r(0), u64::from(minimum));
-            asm.emit(sub(W, r(0), r(19 + reg), r(0), Lsl, 0));
-        }
-        asm.tbz(true, r(0), 31, short.unwrap());
+    if let Some((reg, short)) = row_counter.zip(short) {
+        asm.cbz(W, false, r(19 + reg), short);
     }
     asm.emit(mrs_nzcv(r(6)));
     constant(&mut asm, r(7), u64::from(offset));
@@ -433,9 +418,12 @@ pub(crate) fn row_entry(
     let parameter = row_feedback(
         &mut asm,
         head,
-        super::RowFailure::Parameter,
         (at, fallback, exit),
-        feedback,
+        (
+            &feedback.failures[super::RowFailure::Parameter as usize],
+            &feedback.next,
+        ),
+        super::RowFailure::Parameter,
     );
     asm.bind(failed);
     asm.emit(msr_nzcv(r(6)));
@@ -475,22 +463,26 @@ fn increment_row_counter(asm: &mut Asm, counter: Label) {
 
 pub(crate) fn row_failure(
     head: u32,
-    reason: super::RowFailure,
     addresses: (usize, usize, usize),
-    feedback: &RowFeedback,
+    counts: (&Cell<u64>, &Cell<u32>),
+    reason: super::RowFailure,
 ) -> Vec<u32> {
     let mut asm = Asm::new();
-    row_feedback(&mut asm, head, reason, addresses, feedback);
+    row_feedback(&mut asm, head, addresses, counts, reason);
     asm.finish()
 }
 
 fn row_feedback(
     asm: &mut Asm,
     head: u32,
-    reason: super::RowFailure,
     (at, fallback, exit): (usize, usize, usize),
-    feedback: &RowFeedback,
+    (failures, next): (&Cell<u64>, &Cell<u32>),
+    reason: super::RowFailure,
 ) -> usize {
+    if reason.defer_backedge() {
+        constant(asm, r(0), u64::from(head) + 1);
+        asm.emit(str(X, r(0), RT, runtime::ROW_SUPPRESSED));
+    }
     let count = asm.label();
     let poll = asm.label();
     let sample = asm.label();
@@ -506,13 +498,26 @@ fn row_feedback(
     asm.bind(sample);
     guest_exit(asm, head, Exit::Plan(PlanEvent::RowGuardMiss));
     asm.emit(branch(at + asm.offset(), exit));
-    literal(
-        asm,
-        count,
-        feedback.failures[reason as usize].as_ptr() as u64,
-    );
-    literal(asm, poll, feedback.next.as_ptr() as u64);
+    literal(asm, count, failures.as_ptr() as u64);
+    literal(asm, poll, next.as_ptr() as u64);
     point
+}
+
+/// Repeated Tier-1 backedges can bypass a failed invariant guard in
+/// the same owner run. NZCV and the preserved guest registers stay live.
+pub(crate) fn row_retry(head: u32, at: usize, fallback: usize) -> (Vec<u32>, [usize; 2]) {
+    let mut asm = Asm::new();
+    let probe = asm.label();
+    asm.emit(ldr(X, r(0), RT, runtime::ROW_SUPPRESSED));
+    constant(&mut asm, r(1), u64::from(head) + 1);
+    asm.emit(eor(X, r(0), r(0), r(1), Lsl, 0));
+    asm.cbz(X, true, r(0), probe);
+    let declined = at + asm.offset();
+    asm.emit(branch(declined, fallback));
+    asm.bind(probe);
+    let point = at + asm.offset();
+    asm.emit(0);
+    (asm.finish(), [point, declined])
 }
 
 pub(crate) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
@@ -615,7 +620,7 @@ mod tests {
 
     // spec: A64-OPT-8, A64-OPT-9
     #[test]
-    fn short_row_router_skips_the_slot_in_three_words() {
+    fn empty_row_router_skips_the_slot() {
         let at = 0x8000;
         let fallback = 0x9000;
         let (words, _) = row_entry(
@@ -624,12 +629,11 @@ mod tests {
             &[(0x1234, Some(at + 0x400)), (0x2345, None)],
             (at, fallback, at + 0x800),
             &RowFeedback::default(),
-            Some((2, 128)),
+            Some(2),
             None,
         );
-        assert_eq!(words[0], sub_imm(W, r(0), r(21), 128, false));
-        let short = ((words[1] >> 5) & 0x3fff) as usize * 4 + 4;
-        assert_eq!(words[1], tbz(true, r(0), 31, short as i32 - 4));
+        let short = ((words[0] >> 5) & 0x7ffff) as usize * 4;
+        assert_eq!(words[0], cbz(W, false, r(21), short as i32));
         assert_eq!(words[short / 4], branch(at + short, fallback));
     }
 

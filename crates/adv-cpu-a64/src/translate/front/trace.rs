@@ -25,17 +25,8 @@ use super::decode::{Decodes, Effects, Fetcher, Helper, Op, Src};
 use crate::translate::front::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
-pub const MAX_INSTRUCTIONS: usize = 96;
-/// Longest trace with a loop, at a hot entry.
-const LOOP_LIMIT: usize = 1024;
-/// What a wide x87 or packed conversion counts toward either limit.
-const WIDE_WEIGHT: usize = 4;
-/// Deepest inlined call.
-const MAX_DEPTH: u8 = 8;
-/// Room an inlined callee should still have.
-const INLINE_ROOM: usize = 24;
-/// Slots of the (EIP, frame) index: a power of two well above the longest
-/// trace.
+pub use crate::policy::tier1::MAX_INSTRUCTIONS;
+use crate::policy::tier1::{INLINE_ROOM, LOOP_LIMIT, MAX_DEPTH, WIDE_WEIGHT};
 const SLOTS: usize = 2 * LOOP_LIMIT;
 
 /// Where control goes from an instruction.

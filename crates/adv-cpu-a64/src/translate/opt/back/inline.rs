@@ -60,7 +60,7 @@ impl Emitter<'_> {
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
         if let Some((domain, offer)) = self.domain {
-            let minimum = (self.asm.label(), self.asm.label());
+            let prices = (self.asm.label(), self.asm.label());
             let head = self.func.records[0].eip;
             if domain.target().is_none() {
                 self.count(head, super::Counter::RowArrival);
@@ -81,8 +81,19 @@ impl Emitter<'_> {
             .map(|kind| (kind, self.asm.label()));
             self.row_failures.extend(failures);
             let leave = offer.then(|| self.asm.label());
-            let count = self.row_strip.unwrap().count;
-            let mut words = domain.emit(&mut self.asm, (minimum, count), short, failures, leave);
+            let strip = self.row_strip.unwrap();
+            let (mut words, bias, sample) = domain.emit(
+                &mut self.asm,
+                (
+                    prices,
+                    strip.count,
+                    strip.shift,
+                    strip.shift == 0 && domain.call_savings() >= strip.saved,
+                ),
+                short,
+                failures,
+                leave,
+            );
             if self.count_entries {
                 let hit = self.asm.label();
                 self.asm.b(hit);
@@ -107,7 +118,8 @@ impl Emitter<'_> {
             if let Some(target) = domain.target() {
                 self.count(target.value, super::Counter::RowEntry);
             }
-            self.row_budget = Some((minimum, words));
+            self.row_budget = Some((prices, bias, words));
+            self.row_sample = Some(sample);
             self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
         }
 
@@ -388,8 +400,14 @@ impl Emitter<'_> {
         if let Some(probation) = &mut self.probation {
             // A settled exit branches over both the sensor and the tally call.
             self.exit_words = self.exit_words.max(settled_exit_words);
-            probation.sensor(&mut self.asm, record.eip);
-            probation.call(&mut self.asm, false);
+            let rows = self.domain.and_then(|(domain, _)| {
+                if record.eip == self.func.records[0].eip {
+                    Some(true)
+                } else {
+                    domain.completes_rows_at(record.eip).then_some(false)
+                }
+            });
+            probation.exit(&mut self.asm, record.eip, rows);
         }
         let point = self.asm.offset();
         self.links.push((point, record.eip));
@@ -724,7 +742,7 @@ impl Emitter<'_> {
     }
 }
 
-fn guest(i: u8) -> Reg {
+pub(super) fn guest(i: u8) -> Reg {
     Reg::new(19 + i)
 }
 

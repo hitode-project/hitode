@@ -105,3 +105,34 @@ pub(super) fn cheapest(func: &Func, costs: &[BlockCost], lp: &super::loops::Loop
     }
     work[lp.head.0 as usize]
 }
+
+pub(super) fn batch_savings(
+    func: &Func,
+    costs: &[BlockCost],
+    batch: &super::loops::Batch,
+    words: u32,
+    price: Option<&super::batch::Price>,
+) -> u32 {
+    if let Some(price) = price.filter(|price| !price.classes.is_empty()) {
+        price
+            .classes
+            .iter()
+            .map(|class| {
+                let scalar = class
+                    .first
+                    .iter()
+                    .chain(&class.second)
+                    .map(|(block, edge)| {
+                        let cost = costs[block.0 as usize];
+                        cost.body + cost.edges[*edge]
+                    })
+                    .sum::<u32>();
+                scalar.saturating_sub(price.common + class.words)
+            })
+            .min()
+            .unwrap()
+    } else {
+        let scalar = cheapest(func, costs, &batch.loop_) * u32::from(batch.plan.lanes);
+        scalar.saturating_sub(words)
+    }
+}

@@ -113,6 +113,9 @@ pub struct Runtime {
     pub scope_written: u32,
     /// Bytes actually written in the scoped chunk, four bits per GPR.
     pub scope_gpr_written: u32,
+    pub row_work: u32,
+    pub row_count: u32,
+    pub row_suppressed: u64,
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -176,6 +179,9 @@ impl Runtime {
             scope_frame: [0; SCOPE_CELLS],
             scope_written: 0,
             scope_gpr_written: 0,
+            row_work: 0,
+            row_count: 0,
+            row_suppressed: 0,
         }
     }
 }
@@ -465,6 +471,7 @@ impl Exit {
 #[derive(Clone, Copy)]
 pub(crate) struct ScopedOffer {
     pub(crate) version: u8,
+    pub(crate) row_work: u32,
     pub(crate) entry: usize,
     pub(crate) generation: u64,
 }
@@ -547,6 +554,10 @@ pub(crate) const SCOPE_CELLS: usize = 8;
 pub(crate) const SCOPE_FRAME: u32 = field(offset_of!(Runtime, scope_frame));
 pub(crate) const SCOPE_GPR_WRITTEN: u32 = field(offset_of!(Runtime, scope_gpr_written));
 pub(crate) const SCOPE_WRITTEN: u32 = field(offset_of!(Runtime, scope_written));
+pub(crate) const ROW_WORK: u32 = field(offset_of!(Runtime, row_work));
+pub(crate) const ROW_COUNT: u32 = field(offset_of!(Runtime, row_count));
+#[cfg(native)]
+pub(crate) const ROW_SUPPRESSED: u32 = field(offset_of!(Runtime, row_suppressed));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));
 pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells));
@@ -555,8 +566,7 @@ pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
-pub(crate) const RECALL_GRACE: u32 = 64;
-pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
+pub(crate) use crate::policy::worker::{COMPUTATION_SLICE, RECALL_GRACE};
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));

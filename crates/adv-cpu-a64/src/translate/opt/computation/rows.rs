@@ -6,13 +6,16 @@
 use super::{Access, Check, Effect, Expr, ExprId, Graph, Proof, Var, observe_expr};
 use crate::asm::{Asm, Label};
 use crate::encode::{
-    Cond, Extend, Reg,
+    Cond, Extend, Index, Reg,
     Shift::Lsl,
     Size::{W, X},
-    add, add_ext, add_imm, and_imm, cmp, csel, ldr, lsr_imm, mov, movk, movz, mrs_nzcv, msr_nzcv,
-    mul, mvn, sbfx, str, sub, sub_imm, udiv,
+    add, add_ext, add_imm, and_imm, asr_imm, cmp, csel, ldp, ldr, lsr_imm, mov, movk, movz,
+    mrs_nzcv, msr_nzcv, mul, mvn, sbfx, str, sub, sub_imm, udiv,
 };
-use crate::translate::front::{decode::Op, trace::Trace};
+use crate::translate::front::{
+    decode::Op,
+    trace::{Edge, Next, Trace},
+};
 use crate::translate::lower::resident::RowFailure;
 use std::cell::Cell;
 
@@ -23,6 +26,8 @@ pub(crate) struct Domain {
     spans: Vec<Span>,
     aliases: Vec<(usize, usize)>,
     rows: ExprId,
+    row_counter: Option<u8>,
+    row_exits: Vec<u32>,
     inner: Vec<(u32, ExprId)>,
     aligned: Vec<usize>,
     alignment_strip: Option<(u32, ExprId, u32, u32)>,
@@ -72,6 +77,40 @@ impl Domain {
         })?;
         let outer = proof.outer?;
         let rows = outer.count;
+        let row_counter = outer.regs.iter().enumerate().find_map(|(reg, pair)| {
+            let (start, step) = (*pair)?;
+            (start == rows
+                && proof.exprs[start] == Expr::Register(reg as u8)
+                && proof.exprs[step] == Expr::Constant(u32::MAX))
+            .then_some(reg as u8)
+        });
+        let mut row_exits = Vec::new();
+        {
+            let outer = &graph.loops[outer_index];
+            let mut interior = Vec::new();
+            for (at, inst) in trace.insts.iter().enumerate() {
+                let inside = outer.inside[at];
+                if inside {
+                    interior.push(inst.pc);
+                } else {
+                    row_exits.push(inst.pc);
+                }
+                let next = match inst.next {
+                    Next::Edge(edge) => Some(edge),
+                    _ => None,
+                };
+                for edge in [next, inst.taken].into_iter().flatten() {
+                    if let Edge::Exit(pc) | Edge::Event(pc) = edge {
+                        if inside && at != outer.test {
+                            interior.push(pc);
+                        } else {
+                            row_exits.push(pc);
+                        }
+                    }
+                }
+            }
+            row_exits.retain(|pc| !interior.contains(pc));
+        }
         let inner: Vec<_> = proof
             .vars
             .iter()
@@ -213,7 +252,7 @@ impl Domain {
                 }
             }
         }
-        let frame = (proof.exprs.len() * 4 + spans.len() * 8 + 4).next_multiple_of(16);
+        let frame = (proof.exprs.len() * 4 + spans.len() * 8).next_multiple_of(16);
         if frame >= 4096 {
             return None;
         }
@@ -256,6 +295,8 @@ impl Domain {
             spans,
             aliases,
             rows,
+            row_counter,
+            row_exits,
             inner,
             aligned,
             alignment_strip,
@@ -308,7 +349,7 @@ impl Domain {
     /// A guarded inline call still pushes its return address. The checked
     /// indirect table probe and shadow call/return transfers are eliminated.
     pub(crate) fn call_savings(&self) -> u32 {
-        self.direct_calls * 8
+        self.direct_calls * crate::policy::proved::INDIRECT_CALL_WORDS
     }
 
     pub(crate) fn count_register(&self) -> Option<u8> {
@@ -316,6 +357,14 @@ impl Domain {
             Expr::Register(reg) => Some(reg),
             _ => None,
         }
+    }
+
+    pub(crate) fn row_counter(&self) -> Option<u8> {
+        self.row_counter
+    }
+
+    pub(crate) fn completes_rows_at(&self, eip: u32) -> bool {
+        self.row_exits.contains(&eip)
     }
 
     pub(crate) fn strip_count(&self, head: u32) -> Option<usize> {
@@ -333,11 +382,11 @@ impl Domain {
     pub(crate) fn emit(
         &self,
         asm: &mut Asm,
-        (minimum, strip): ((Label, Label), usize),
+        ((minimum, exact), strip, shift, extra): ((Label, Label), ExprId, u32, bool),
         short: Label,
         failures: [(RowFailure, Label); 5],
         offer: Option<Label>,
-    ) -> u32 {
+    ) -> (u32, Option<usize>, (usize, Label)) {
         let start = asm.offset();
         let small = asm.label();
         let drops = failures.map(|(kind, target)| (kind, target, asm.label()));
@@ -354,31 +403,27 @@ impl Domain {
             range_cold: 0,
         };
         let frame = self.frame;
-        let count_register = self.count_register().map(guest);
-        if let Some(reg) = count_register {
-            emit.asm.ldr_literal(B, minimum.0);
-            emit.asm.emit(mov(W, A, reg));
-            emit.asm.emit(sub(X, B, A, B, Lsl, 0));
-            emit.asm.tbz(true, B, 63, short);
-        }
         emit.asm.emit(mrs_nzcv(FLAGS));
         emit.asm.emit(sub_imm(X, SP, SP, frame, false));
-        if count_register.is_some() {
-            emit.slots[self.rows] = true;
-            emit.asm.emit(str(W, A, SP, self.rows as u32 * 4));
-        } else {
-            emit.expression(self.rows, A);
-            emit.asm.ldr_literal(B, minimum.0);
-            emit.asm.emit(cmp(W, A, B, Lsl, 0));
-            emit.asm.b_cond(Cond::Lo, small);
-        }
+        emit.expression(self.rows, ROWS);
         let ranges = self.exprs.len() as u32 * 4;
-        let limit = ranges + self.spans.len() as u32 * 8;
-        emit.asm.emit(str(W, A, SP, limit));
+        emit.asm.emit(mov(W, LIMIT, ROWS));
         emit.expression(strip, A);
-        emit.asm.ldr_literal(B, minimum.1);
-        emit.asm.emit(cmp(W, A, B, Lsl, 0));
-        emit.asm.b_cond(Cond::Lo, small);
+        if extra {
+            emit.asm.cbz(W, false, A, small);
+        }
+        let bias = (shift != 0 || extra).then(|| {
+            let at = emit.asm.offset() / 4;
+            emit.asm.emit(0);
+            at
+        });
+        if shift != 0 {
+            emit.asm.emit(asr_imm(X, A, A, shift));
+        }
+        let (near_price, priced) = (emit.asm.label(), emit.asm.label());
+        emit.price(minimum, ROWS, shift, near_price);
+        emit.asm.bind(priced);
+        emit.asm.emit(mov(W, WORK, A));
         for &check in &self.checks {
             match check {
                 Check::Equal(a, b) => {
@@ -453,15 +498,7 @@ impl Domain {
             // Parameter ranges were already checked before their entry load.
             if !stream.parameter {
                 if let Some(step) = stream.row_step {
-                    emit.row_range(
-                        stream.writes(),
-                        offset,
-                        step,
-                        self.rows,
-                        limit,
-                        reverse,
-                        range,
-                    );
+                    emit.row_range(stream.writes(), offset, step, self.rows, reverse, range);
                 } else {
                     emit.range(stream.writes(), range);
                 }
@@ -469,17 +506,16 @@ impl Domain {
         }
         let complete = emit.asm.label();
         let bounded = emit.asm.label();
-        emit.load(self.rows, ROWS);
-        emit.asm.emit(ldr(W, A, SP, limit));
-        emit.asm.emit(cmp(W, A, ROWS, Lsl, 0));
+        emit.asm.emit(cmp(W, LIMIT, ROWS, Lsl, 0));
         emit.asm.b_cond(Cond::Eq, complete);
-        emit.asm.ldr_literal(B, minimum.0);
-        emit.asm.emit(cmp(W, A, B, Lsl, 0));
-        emit.asm.b_cond(Cond::Lo, range);
         let clip_start = emit.asm.offset();
+        emit.asm.emit(mov(W, A, WORK));
+        let (near_clip_price, clip_priced) = (emit.asm.label(), emit.asm.label());
+        emit.price(minimum, LIMIT, 0, near_clip_price);
+        emit.asm.bind(clip_priced);
         // Reproject the stored bounds against the minimum over all streams.
         // Their entry expressions and row pitches have already been loaded.
-        emit.asm.emit(sub(W, ROWS, ROWS, A, Lsl, 0));
+        emit.asm.emit(sub(W, ROWS, ROWS, LIMIT, Lsl, 0));
         for (i, stream) in self.spans.iter().enumerate() {
             let Some(step) = stream.row_step else {
                 continue;
@@ -499,7 +535,7 @@ impl Domain {
                 str(W, B, SP, offset + 4),
             ]);
         }
-        emit.asm.emit(ldr(W, A, SP, limit));
+        emit.asm.emit(mov(W, A, LIMIT));
         emit.asm.emit(movz(W, ROWS, 0, 0));
         emit.asm.b(bounded);
         let clip_words = (emit.asm.offset() - clip_start) as u32 / 4;
@@ -520,6 +556,7 @@ impl Domain {
             emit.asm.b_cond(Cond::Hs, alias);
             emit.asm.bind(apart);
         }
+        let sample = (emit.asm.offset() / 4, emit.asm.label());
         emit.asm.b(success);
         let proof_words = ((emit.asm.offset() - start) / 4) as u32;
         for (label, target) in
@@ -536,16 +573,39 @@ impl Domain {
         // when the emitted loop body is large. Search exits always return.
         if let Some(leave) = offer {
             emit.asm.bind(leave);
+            emit.asm.emit(str(W, WORK, RT, crate::runtime::ROW_WORK));
             emit.asm.emit(0);
         }
+        emit.asm.bind(sample.1);
+        emit.load(self.rows, A);
+        emit.asm.emit_all(&[
+            str(W, WORK, RT, crate::runtime::ROW_WORK),
+            str(W, A, RT, crate::runtime::ROW_COUNT),
+        ]);
+        emit.asm.b(success);
+        emit.asm.bind(near_price);
+        if shift == 0 {
+            emit.asm.cbz(W, false, A, small);
+        } else {
+            emit.asm.tbz(true, B, 63, small);
+        }
+        emit.exact_price(exact, ROWS, small);
+        emit.asm.b(priced);
+        emit.asm.bind(near_clip_price);
+        emit.exact_price(exact, LIMIT, range);
+        emit.asm.b(clip_priced);
         emit.asm.bind(success);
         emit.asm
             .emit_all(&[add_imm(X, SP, SP, frame, false), msr_nzcv(FLAGS)]);
-        // Account for the bounded shared search at each range query.
-        proof_words - clip_words - emit.range_cold
-            + 2
-            + 84 * (self.spans.iter().filter(|span| !span.parameter).count() + self.slots_read)
-                as u32
+        (
+            proof_words - clip_words - emit.range_cold
+                + 2
+                + crate::policy::proved::SPAN_SEARCH_WORDS
+                    * (self.spans.iter().filter(|span| !span.parameter).count() + self.slots_read)
+                        as u32,
+            bias,
+            sample,
+        )
     }
 }
 
@@ -615,6 +675,8 @@ const B: Reg = Reg::new(1);
 const C: Reg = Reg::new(2);
 const D: Reg = Reg::new(3);
 const TEMP: Reg = Reg::new(8);
+const LIMIT: Reg = Reg::new(13);
+const WORK: Reg = Reg::new(14);
 
 const fn guest(reg: u8) -> Reg {
     Reg::new(19 + reg)
@@ -630,6 +692,29 @@ struct RangeEmitter<'a> {
 }
 
 impl RangeEmitter<'_> {
+    fn price(&mut self, minimum: Label, rows: Reg, shift: u32, short: Label) {
+        self.asm.ldr_literal(C, minimum);
+        self.asm.emit(mul(X, B, rows, A));
+        self.asm.emit(cmp(X, B, C, Lsl, 0));
+        self.asm
+            .b_cond(if shift == 0 { Cond::Lo } else { Cond::Lt }, short);
+    }
+
+    /// The rounded test already rejected a nonnegative product in B.
+    /// Add back the per-row savings left after rounding setup to whole batches.
+    fn exact_price(&mut self, price: Label, rows: Reg, short: Label) {
+        self.asm.adr(D, price);
+        self.asm.emit_all(&[
+            ldp(W, Index::Offset, C, TEMP, D, 0),
+            ldr(W, D, D, 8),
+            mul(X, B, B, C),
+            mul(X, C, rows, TEMP),
+            add(X, B, B, C, Lsl, 0),
+            cmp(X, B, D, Lsl, 0),
+        ]);
+        self.asm.b_cond(Cond::Lo, short);
+    }
+
     fn constant(&mut self, register: Reg, value: u32) {
         self.asm.emit(movz(W, register, value as u16, 0));
         if value >> 16 != 0 {
@@ -650,14 +735,12 @@ impl RangeEmitter<'_> {
 
     /// Bound a row-varying stream in row order. A denial supplies the
     /// first inaccessible byte in the projected direction.
-    #[allow(clippy::too_many_arguments)]
     fn row_range(
         &mut self,
         write: bool,
         offset: u32,
         step: ExprId,
         rows: ExprId,
-        limit: u32,
         reverse: Label,
         miss: Label,
     ) {
@@ -701,10 +784,8 @@ impl RangeEmitter<'_> {
             sub_imm(X, A, A, 1, false),
             udiv(X, A, A, TEMP),
             add_imm(X, A, A, 1, false),
-            ldr(W, B, SP, limit),
-            cmp(W, A, B, Lsl, 0),
-            csel(W, A, A, B, Cond::Lo),
-            str(W, A, SP, limit),
+            cmp(W, A, LIMIT, Lsl, 0),
+            csel(W, LIMIT, A, LIMIT, Cond::Lo),
         ]);
         self.asm.bind(done);
         // The backward setup adds four words to the forward path.

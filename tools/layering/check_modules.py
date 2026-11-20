@@ -18,6 +18,7 @@ RULES = {
     "asm": {"encode"},
     "cache": set(),
     "jit_map": set(),
+    "policy": set(),
     "runtime": {"asm", "encode"},
     "facts": EMIT,
     "translate::front": {"encode"},
@@ -274,7 +275,7 @@ def disallowed(source: str, scope: tuple[str, ...], path: tuple[str, ...],
     for length in range(len(target), 0, -1):
         if target[:length] in modules:
             dest = role(target[:length])
-            if dest and dest != source and dest != "jit_map" and dest not in RULES[source]:
+            if dest and dest != source and dest not in {"jit_map", "policy"} and dest not in RULES[source]:
                 return dest
             break
     return None
