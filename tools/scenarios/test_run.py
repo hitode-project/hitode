@@ -11,9 +11,9 @@ def scenario(spec, digest="d"):
     return {"spec": spec, "digest": digest}
 
 
-def result(passed=True, outputs=None, steady=None):
+def result(passed=True, outputs=None, steady=None, levels=None):
     return {"passed": passed, "exit": 0 if passed else 64, "stop": "guest_exit",
-            "outputs": outputs or {"out.bin": "a"}, "steady": steady or {}}
+            "outputs": outputs or {"out.bin": "a"}, "steady": steady or {}, "levels": levels or {}}
 
 
 def judge(base, head, base_on_base, base_on_head, changed_on_base=None, changed_on_head=None, again=None):
@@ -98,6 +98,15 @@ class Judge(unittest.TestCase):
         base = {"s": scenario(["A64-1"])}
         self.assertEqual(judge(base, base, {"s": result(steady={"accesses": 3.0})},
                                {"s": result(steady={"accesses": 0.0})}), [])
+
+    def test_levels_never_rise_beyond_their_slack(self):
+        base = {"s": scenario(["A64-1"])}
+        mib = 1 << 20
+        self.assertEqual(judge(base, base, {"s": result(levels={"peak_rss": 335 * mib})},
+                               {"s": result(levels={"peak_rss": 340 * mib})}), [])
+        failures = judge(base, base, {"s": result(levels={"peak_rss": 335 * mib})},
+                         {"s": result(levels={"peak_rss": 565 * mib})})
+        self.assertIn("levels peak_rss rose", failures[0])
 
     def test_a_nondeterministic_scenario_cannot_enter(self):
         head = {"t": scenario(["GFX-1"])}

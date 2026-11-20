@@ -1,0 +1,7 @@
+{
+  "spec": ["A64-OPT-8"],
+  "exe": "generated_code_rounds.exe",
+  "seconds": 120,
+  "outputs": ["generated-code-rounds.bin"],
+  "levels": ["peak_rss"]
+}

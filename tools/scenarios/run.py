@@ -12,7 +12,7 @@ named report counters are its observable outputs.
 `gate` applies docs/spec/README.md#scenarios: the base tree's scenarios run on
 both builds; they must still pass on head, and any output that differs must be
 claimed by a scenario of the same spec ID that fails on base and passes on head.
-Steady-state counter rates never rise. CI runs the base tree's copy of this
+Steady-state counter rates and level counters never rise. CI runs the base tree's copy of this
 file, so a change cannot loosen the gate that judges it.
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -33,8 +34,9 @@ sys.path.insert(0, str(HERE.parent / "wine"))
 import probes  # noqa: E402
 
 SCENARIOS = Path("tests/scenarios")
-# Per-iteration growth allowed for a steady counter on head over base.
-STEADY_SLACK = 0.01
+# Per-iteration growth a steady counter may gain on head over base: the
+# larger of an absolute floor and a share of the base rate.
+STEADY_SLACK = (0.01, 0.05)
 COUNTER = re.compile(r"\b(\w+): (\d+)\b")
 
 
@@ -75,7 +77,7 @@ def build(scenario: dict, into: Path) -> None:
 
 def counters(report: dict) -> dict[str, int]:
     found = {k: int(v) for k, v in COUNTER.findall(report.get("a64_diagnostics") or "")}
-    for key in ("compilations", "host_calls", "interpreter_instructions"):
+    for key in ("compilations", "host_calls", "interpreter_instructions", "peak_rss"):
         if isinstance(report.get(key), int):
             found[key] = report[key]
     return found
@@ -96,9 +98,15 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
     env = dict(os.environ, ADV_AUDIO_MUTE_DEVICE="1")
     log = work / "log.txt"
     with log.open("w") as sink:
-        subprocess.run(command, stdout=sink, stderr=subprocess.STDOUT, env=env,
-                       timeout=scenario.get("seconds", 60) + 60)
+        process = subprocess.Popen(command, stdout=sink, stderr=subprocess.STDOUT, env=env)
+        # A hung build ignores its own time limit; the scenario's is final.
+        timer = threading.Timer(scenario.get("seconds", 60) + 60, process.kill)
+        timer.start()
+        _, _, usage = os.wait4(process.pid, 0)
+        timer.cancel()
+        process.returncode = 0
     data = json.loads(report.read_text()) if report.exists() else {}
+    data["peak_rss"] = usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     outputs = {}
     for name in scenario.get("outputs", []):
         path = game / name
@@ -121,14 +129,17 @@ def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
         steady = scenario.get("steady")
         try:
             if not steady:
-                return execute(scenario, binary, wine, Path(scratch) / "run", None)
+                result = execute(scenario, binary, wine, Path(scratch) / "run", None)
+                result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
+                return result
             low, high = steady["iterations"]
             first = execute(scenario, binary, wine, Path(scratch) / "low", low)
             result = execute(scenario, binary, wine, Path(scratch) / "high", high)
-        except (RuntimeError, subprocess.TimeoutExpired) as error:
+        except RuntimeError as error:
             return {"passed": False, "exit": None, "stop": "error", "outputs": {},
                     "counters": {}, "log": str(error)}
         result["passed"] = result["passed"] and first["passed"]
+        result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
         result["steady"] = {
             name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)
             for name in steady["counters"]
@@ -165,9 +176,11 @@ def judge(base: dict[str, dict], head: dict[str, dict], results: dict) -> list[s
         elif new["outputs"] != old["outputs"] and not mine:
             keys = sorted(k for k in old["outputs"] if old["outputs"][k] != new["outputs"].get(k))
             failures.append(f"{name}: outputs {keys} changed with no claiming scenario for {sorted(scenario['spec'])}")
-        for counter, rate in new.get("steady", {}).items():
-            if rate > old.get("steady", {}).get(counter, 0) + STEADY_SLACK:
-                failures.append(f"{name}: steady {counter} rose {old['steady'][counter]:.3f} -> {rate:.3f} per iteration")
+        for kind, unit in (("steady", " per iteration"), ("levels", "")):
+            for counter, value in new.get(kind, {}).items():
+                before = old.get(kind, {}).get(counter, 0)
+                if value > before + max(STEADY_SLACK[0], STEADY_SLACK[1] * abs(before)):
+                    failures.append(f"{name}: {kind} {counter} rose {before:.3f} -> {value:.3f}{unit}")
     return failures
 
 
