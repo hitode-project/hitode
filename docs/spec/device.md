@@ -122,6 +122,7 @@ With live output, the mixer MUST stage up to 30 ms or half the buffer, and write
 
 **Rule**: Audio command queues MUST be bounded without losing stop or release requests. Notifications MUST return through machine-owned events.
 Device reconnection MUST retain refill notifications crossed while reanchoring a playing PCM ring.
+An explicit stop MUST discard that source's pending samples. A running source MUST NOT delay the start of another source at the same sample rate.
 **Verification**: Test
 
 ### DEV-AUDIO-3 Vorbis callbacks

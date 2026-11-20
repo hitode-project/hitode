@@ -39,33 +39,36 @@ impl SharedReadView for View {
     }
 }
 
-fn voice(control: &AudioControl) {
+fn voices(control: &AudioControl, count: usize) {
+    let amplitude = if count > 1 { 1_000.0 } else { 12_000.0 };
     let view = Arc::new(View(
         (0..48_000)
             .flat_map(|frame| {
-                (((frame as f64 * std::f64::consts::TAU * 997.0 / 48_000.0).sin() * 12_000.0)
+                (((frame as f64 * std::f64::consts::TAU * 997.0 / 48_000.0).sin() * amplitude)
                     .round() as i16)
                     .to_le_bytes()
             })
             .map(AtomicU8::new)
             .collect(),
     ));
-    control
-        .add_ring(
-            1,
-            RingConfig {
-                bytes: view.len() as u32,
-                view,
-                channels: 1,
-                bits: 16,
-                float: false,
-                frequency: 48_000,
-                output_rate: 44_100,
-                notifications: vec![],
-            },
-        )
-        .unwrap();
-    assert!(control.play_ring(1, true, 1));
+    for id in 1..=count as u64 {
+        control
+            .add_ring(
+                id,
+                RingConfig {
+                    bytes: view.len() as u32,
+                    view: view.clone(),
+                    channels: 1,
+                    bits: 16,
+                    float: false,
+                    frequency: 48_000,
+                    output_rate: 44_100,
+                    notifications: vec![],
+                },
+            )
+            .unwrap();
+        assert!(control.play_ring(id, true, 1));
+    }
 }
 
 fn counts() -> (u64, u64) {
@@ -96,10 +99,10 @@ fn report(rate: u32, name: &str, mut samples: Vec<u64>, allocations: u64, deallo
     );
 }
 
-fn run(rate: u32, name: &str, native_epoch: bool, reopen: bool, idle: bool) {
+fn run(rate: u32, name: &str, native_epoch: bool, reopen: bool, voice_count: usize) {
     let control = AudioControl::new(native_epoch);
-    if !idle {
-        voice(&control);
+    if voice_count > 0 {
+        voices(&control, voice_count);
     }
     let stream = control.stream();
     let mut reader = Some(stream.device_reader(rate, 2).unwrap());
@@ -136,9 +139,10 @@ fn main() {
     assert_eq!(std::env::var("ADV_AUDIO_MUTE_DEVICE").as_deref(), Ok("1"));
     println!("rate,operation,samples,median_us,p99_us,allocations,deallocations");
     for rate in [44_100, 48_000, 96_000, 192_000] {
-        run(rate, "active_10ms_callback", false, false, false);
-        run(rate, "idle_10ms_callback", false, false, true);
-        run(rate, "continuous_virtual_prepare", false, true, false);
-        run(rate, "new_native_epoch_prepare", true, true, false);
+        run(rate, "active_10ms_callback", false, false, 1);
+        run(rate, "active_16voice_10ms_callback", false, false, 16);
+        run(rate, "idle_10ms_callback", false, false, 0);
+        run(rate, "continuous_virtual_prepare", false, true, 1);
+        run(rate, "new_native_epoch_prepare", true, true, 1);
     }
 }

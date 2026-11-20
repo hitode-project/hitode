@@ -1217,3 +1217,322 @@ fn headroom_callback_is_allocation_free_and_tracks_each_stream() {
     assert_eq!(stream.metrics().missing_stream_frames, 202);
     assert_eq!(stream.metrics().min_lead_ratio_permille, 0);
 }
+
+#[test]
+fn same_rate_ring_and_owned_match_linear_sum() {
+    for out_rate in [48_000, 96_000] {
+        let frames = out_rate as usize / 20;
+        let ring_view = sine(44_100, 997.0, 44_100);
+        let owned_samples: Vec<f32> = (0..44_100)
+            .flat_map(|i| {
+                let s = (i as f64 * std::f64::consts::TAU * 503.0 / 44_100.0).sin() as f32 * 0.25;
+                [s, -s]
+            })
+            .collect();
+
+        let render_case = |with_ring: bool, with_owned: bool| {
+            let control = AudioControl::new(false);
+            if with_ring {
+                add(&control, 1, ring_view.clone(), 44_100, vec![]);
+                assert!(control.set_stereo_gain(1, [0.4, 0.7]));
+                assert!(control.play_ring(1, true, 1));
+            }
+            if with_owned {
+                control
+                    .push_pcm(adv_device::mixer::PcmBlock {
+                        stream_id: 2,
+                        guest_pts_us: 0,
+                        sample_rate: 44_100,
+                        channels: 2,
+                        samples: owned_samples.clone(),
+                    })
+                    .unwrap_or_else(|_| panic!("owned rejected"));
+                assert!(control.set_stereo_gain(2, [0.6, 0.3]));
+            }
+            let mut reader = control.stream().device_reader(out_rate, 2).unwrap();
+            let mut out = vec![0.0; frames * 2];
+            no_alloc(|| {
+                reader.read(&mut out, 0);
+            });
+            assert_eq!(control.stream().metrics().missing_output_frames, 0);
+            out
+        };
+
+        let combined = render_case(true, true);
+        let ring_only = render_case(true, false);
+        let owned_only = render_case(false, true);
+        let max_err = combined
+            .iter()
+            .zip(ring_only.iter().zip(&owned_only))
+            .map(|(c, (r, o))| (c - (r + o)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-5,
+            "mix differed from linear sum at {out_rate} Hz: {max_err}"
+        );
+    }
+}
+
+// spec: DEV-AUDIO-2
+#[test]
+fn short_sources_start_without_waiting_for_an_existing_voice() {
+    for owned in [false, true] {
+        let render = |with_peer: bool| {
+            let control = AudioControl::new(false);
+            if with_peer {
+                let silent = Arc::new(View((0..2048).map(|_| AtomicU8::new(0)).collect()));
+                add(&control, 1, silent, 44_100, vec![]);
+                assert!(control.play_ring(1, true, 1));
+            }
+            let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+            let mut first = [0.0; 32 * 2];
+            no_alloc(|| {
+                reader.read(&mut first, 0);
+            });
+
+            if owned {
+                control
+                    .push_pcm(adv_device::mixer::PcmBlock {
+                        stream_id: 2,
+                        guest_pts_us: 32 * 1_000_000 / 48_000,
+                        sample_rate: 44_100,
+                        channels: 1,
+                        samples: vec![0.5; 44],
+                    })
+                    .unwrap_or_else(|_| panic!("short owned source rejected"));
+                assert!(control.end_pcm(2));
+            } else {
+                let sfx = Arc::new(View(
+                    (0..44)
+                        .flat_map(|_| 16_000i16.to_le_bytes())
+                        .map(AtomicU8::new)
+                        .collect(),
+                ));
+                add(&control, 2, sfx, 44_100, vec![]);
+                assert!(control.play_ring(2, false, 1));
+            }
+            let mut out = [0.0; 2048 * 2];
+            for chunk in out.chunks_mut(32 * 2) {
+                no_alloc(|| {
+                    reader.read(chunk, 0);
+                });
+            }
+            if with_peer {
+                assert!(control.stop_ring(1));
+                reader.read(&mut first, 0);
+            }
+            assert!(!control.active());
+            assert_eq!(control.stream().metrics().missing_output_frames, 0);
+            out
+        };
+
+        let alone = render(false);
+        assert!(alone[..64].iter().any(|sample| sample.abs() > 0.1));
+        assert_eq!(
+            render(true),
+            alone,
+            "delayed onset or changed tail, owned={owned}"
+        );
+    }
+}
+
+// spec: DEV-AUDIO-2
+#[test]
+fn mid_block_stop_remove_and_retune_clear_cached_samples() {
+    // Stop a short voice whose samples were already prefetched.
+    let render_peer = |stop_other: bool| {
+        let control = AudioControl::new(false);
+        let peer = sine(44_100, 997.0, 44_100);
+        add(&control, 1, peer, 44_100, vec![]);
+        assert!(control.play_ring(1, true, 1));
+        if stop_other {
+            let short = Arc::new(View(
+                (0..96)
+                    .flat_map(|_| 16_000i16.to_le_bytes())
+                    .map(AtomicU8::new)
+                    .collect(),
+            ));
+            add(&control, 2, short, 44_100, vec![]);
+            assert!(control.play_ring(2, false, 1));
+        }
+        let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+        let mut out = vec![0.0f32; 512 * 2];
+        reader.read(&mut out[..32 * 2], 0);
+        if stop_other {
+            assert!(control.stop_ring(2));
+        }
+        reader.read(&mut out[32 * 2..], 0);
+        out
+    };
+    assert_eq!(render_peer(false)[64..], render_peer(true)[64..]);
+
+    // A lone voice also discards its pending samples on Stop, Remove, or Retune.
+    for action in 0..3 {
+        let control = AudioControl::new(false);
+        let loud = Arc::new(View(
+            (0..96)
+                .flat_map(|_| 20_000i16.to_le_bytes())
+                .map(AtomicU8::new)
+                .collect(),
+        ));
+        add(&control, 1, loud, 44_100, vec![]);
+        assert!(control.play_ring(1, false, 1));
+        let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+        let mut mid = [0.0f32; 32 * 2];
+        reader.read(&mut mid, 0);
+        match action {
+            0 => assert!(control.stop_ring(1)),
+            1 => assert!(control.remove_pcm(1)),
+            _ => control.set_frequency(1, 22_050).unwrap(),
+        }
+        let mut after = [0.0f32; 256 * 2];
+        no_alloc(|| {
+            reader.read(&mut after, 0);
+        });
+        if action < 2 {
+            assert!(
+                after.iter().all(|&s| s == 0.0),
+                "stopping or removing via action={action} must not leak sinc tail"
+            );
+            assert!(!control.active());
+        } else {
+            assert!(after.iter().any(|&s| s.abs() > 0.1));
+        }
+        control.maintain();
+    }
+}
+
+#[test]
+fn rapid_doppler_frequency_sweep_retires_converters_off_callback() {
+    let control = AudioControl::new(false);
+    let view = sine(44_100, 997.0, 44_100);
+    add(&control, 1, view, 44_100, vec![]);
+    assert!(control.play_ring(1, true, 1));
+    let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+    let mut out = [0.0f32; 64 * 2];
+
+    // Queue >300 distinct frequencies in batches and render with zero callback allocations.
+    for step in 0..320u32 {
+        let freq = 40_000 + step * 37;
+        control.set_frequency(1, freq).unwrap();
+        if step % 16 == 15 {
+            no_alloc(|| {
+                reader.read(&mut out, 0);
+            });
+            control.maintain();
+        }
+    }
+    let mut final_out = vec![0.0f32; 480 * 2];
+    no_alloc(|| {
+        reader.read(&mut final_out, 0);
+    });
+    control.maintain();
+    assert!(final_out.iter().all(|s| s.is_finite()));
+    assert!(final_out.iter().any(|s| s.abs() > 0.05));
+    assert_eq!(control.stream().metrics().missing_output_frames, 0);
+}
+
+#[test]
+fn backlogged_voice_uses_new_dac_rate() {
+    let control = AudioControl::new(false);
+    let view = sine(44_100, 997.0, 44_100);
+    // Open at 44_100 Hz so shared.rate == 44_100.
+    let reader = control.stream().device_reader(44_100, 2).unwrap();
+    // Fill the 2048-slot SPSC ring so subsequent commands land in local.backlog.
+    for _ in 0..2048 {
+        assert!(control.set_gain(999, 1.0));
+    }
+    // Queue a native-rate voice before switching to a different DAC rate.
+    add(&control, 1, view, 44_100, vec![]);
+    assert!(control.play_ring(1, true, 1));
+    drop(reader);
+
+    // Switch DAC to 96_000 Hz before backlog drains, then maintain and render.
+    let mut reader = control.stream().device_reader(96_000, 2).unwrap();
+    control.maintain();
+    let mut out = vec![0.0f32; 960 * 2];
+    for _ in 0..4 {
+        no_alloc(|| {
+            reader.read(&mut out, 0);
+        });
+        control.maintain();
+    }
+    let energy: f64 = out.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    assert!(
+        energy > 5.0,
+        "voice queued against old DAC rate must not stay permanently silent (energy={energy})"
+    );
+    assert_eq!(control.stream().metrics().missing_output_frames, 0);
+}
+
+#[test]
+fn mid_block_seek_and_restart_clear_cached_samples_without_disturbing_peers() {
+    // First half loud (+16_000), second half silent (0).
+    let half_frames = 22_050usize;
+    let mut bytes = Vec::with_capacity(half_frames * 4);
+    for _ in 0..half_frames {
+        bytes.extend_from_slice(&16_000i16.to_le_bytes());
+    }
+    for _ in 0..half_frames {
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+    }
+    let half_byte_offset = (half_frames * 2) as u32;
+    let split_view = Arc::new(View(bytes.into_iter().map(AtomicU8::new).collect()));
+
+    // (a) Sole voice: mid-block seek and restart to silent half must leak zero pre-seek samples.
+    for restart in [false, true] {
+        let control = AudioControl::new(false);
+        add(&control, 1, split_view.clone(), 44_100, vec![]);
+        assert!(control.play_ring(1, true, 1));
+        let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+
+        // Leave loud samples buffered in the converter.
+        let mut mid = [0.0f32; 32 * 2];
+        no_alloc(|| {
+            reader.read(&mut mid, 0);
+        });
+        assert!(mid.iter().any(|&s| s.abs() > 0.05));
+
+        if restart {
+            assert!(control.play_ring_at(1, true, 2, Some(half_byte_offset)));
+        } else {
+            assert!(control.set_position(1, half_byte_offset));
+        }
+
+        let mut after = [0.0f32; 256 * 2];
+        no_alloc(|| {
+            reader.read(&mut after, 0);
+        });
+        assert!(
+            after.iter().all(|&s| s == 0.0),
+            "sole-voice mid-block seek/restart (restart={restart}) leaked pre-seek samples"
+        );
+    }
+
+    // Seeking a silent voice preserves the active peer's samples.
+    let render_with_seek = |with_seeker: bool| {
+        let control = AudioControl::new(false);
+        let peer = sine(44_100, 997.0, 44_100);
+        add(&control, 1, peer, 44_100, vec![]);
+        assert!(control.play_ring(1, true, 1));
+        if with_seeker {
+            let silent = Arc::new(View(
+                vec![0u8; 44_100 * 2]
+                    .into_iter()
+                    .map(AtomicU8::new)
+                    .collect(),
+            ));
+            add(&control, 2, silent, 44_100, vec![]);
+            assert!(control.play_ring(2, true, 1));
+        }
+        let mut reader = control.stream().device_reader(48_000, 2).unwrap();
+        let mut out = vec![0.0f32; 512 * 2];
+        reader.read(&mut out[..32 * 2], 0);
+        if with_seeker {
+            assert!(control.set_position(2, 4410 * 2));
+        }
+        reader.read(&mut out[32 * 2..], 0);
+        out
+    };
+    assert_eq!(render_with_seek(false), render_with_seek(true));
+}

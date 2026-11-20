@@ -515,3 +515,64 @@ fn queued_new_loop_does_not_report_the_previous_turn_before_it_becomes_audible()
         assert_eq!(state.cursor(1_990_000, 1), Some(expected * 4));
     }
 }
+
+#[test]
+fn hot_dac_rate_switches_across_native_and_resampled_preserve_ring_and_owned() {
+    let control = AudioControl::new(false);
+    let _state = source(&control, 48_000, 2);
+    let push_half_sec = |chunk_idx: usize| {
+        let start = chunk_idx * 24_000;
+        let samples: Vec<f32> = (start..start + 24_000)
+            .flat_map(|frame| {
+                let s =
+                    (frame as f64 * std::f64::consts::TAU * 701.0 / 48_000.0).sin() as f32 * 0.2;
+                [s, s]
+            })
+            .collect();
+        control
+            .push_pcm(adv_device::mixer::PcmBlock {
+                stream_id: 2,
+                guest_pts_us: (chunk_idx as u64) * 500_000,
+                sample_rate: 48_000,
+                channels: 2,
+                samples,
+            })
+            .unwrap_or_else(|_| panic!("owned chunk {chunk_idx} rejected"));
+    };
+    push_half_sec(0);
+    push_half_sec(1);
+
+    for (idx, rate) in [48_000, 96_000, 48_000, 44_100, 48_000]
+        .into_iter()
+        .enumerate()
+    {
+        let mut reader = control.stream().device_reader(rate, 2).unwrap();
+        let frames = rate as usize / 2;
+        let output = render(&mut reader, frames, 2);
+        assert!(
+            output.iter().all(|s| s.is_finite() && s.abs() < 0.8),
+            "invalid output after hot switch to {rate}"
+        );
+        let stable = &output[(rate as usize / 25) * 2..];
+        let rms = (stable
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f64::from(f[0]).powi(2))
+            .sum::<f64>()
+            / (stable.len() / 2) as f64)
+            .sqrt();
+        // Sum of two orthogonal sines: sqrt((AMPLITUDE^2 + 0.2^2) / 2) ~= 0.258.
+        let expected_rms = ((AMPLITUDE * AMPLITUDE + 0.2 * 0.2) / 2.0).sqrt();
+        assert!(
+            (rms - expected_rms).abs() < 0.01,
+            "hot switch {rate} RMS {rms} vs {expected_rms}"
+        );
+        assert_eq!(control.stream().metrics().missing_output_frames, 0);
+        drop(reader);
+        control.maintain();
+        if idx + 2 < 6 {
+            push_half_sec(idx + 2);
+        }
+    }
+}

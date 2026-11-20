@@ -383,6 +383,7 @@ impl RingVoice {
     pub(crate) fn retune(&mut self, frequency: u32, converter: Converter) -> Converter {
         self.frequency = frequency;
         self.converter_frame = self.phase >> 32;
+        self.draining = 0;
         let old = std::mem::replace(&mut self.converter, converter);
         self.stage_ahead();
         old
@@ -697,6 +698,129 @@ impl RingVoice {
         };
         (stereo, false)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn read_source(
+        staged: &[[f32; 2]],
+        range: std::ops::Range<u64>,
+        valid: &[u64],
+        view: &dyn SharedReadView,
+        bytes: u32,
+        channels: u16,
+        bits: u16,
+        float: bool,
+        looping: bool,
+        streaming: bool,
+        generation: u64,
+        written: &[Coverage],
+        source_frame: u64,
+        total_frames: u64,
+    ) -> [f32; 2] {
+        let index = (source_frame as usize) & staged.len().wrapping_sub(1);
+        if !staged.is_empty()
+            && range.contains(&source_frame)
+            && (valid[index / 64] >> (index % 64)) & 1 != 0
+        {
+            if streaming {
+                let pos = source_frame % total_frames;
+                if !written[pos as usize / 64].covers(
+                    generation as u32,
+                    (source_frame / total_frames) as u32,
+                    (pos % 64) as u32,
+                ) {
+                    return [0.0; 2];
+                }
+            }
+            return staged[index];
+        }
+        Self::read_checked(
+            view,
+            bytes,
+            channels,
+            bits,
+            float,
+            looping,
+            streaming,
+            generation,
+            written,
+            source_frame,
+        )
+        .0
+    }
+    fn render_native(&mut self, out: &mut [f32], channels: u16, missing: &mut [u64]) -> usize {
+        self.audible = false;
+        if !self.playing || channels == 0 {
+            if !self.playing {
+                self.draining = 0;
+            }
+            return 0;
+        }
+        self.stage_ahead();
+        let first = self.phase >> 32;
+        let total = self.frames();
+        let mut played_frames = 0;
+        for (index, output) in out.chunks_exact_mut(usize::from(channels)).enumerate() {
+            let frame = self.phase >> 32;
+            if !self.looping && frame >= total {
+                self.playing = false;
+                for (i, &(offset, _)) in self.notifications.iter().enumerate() {
+                    if offset == u32::MAX {
+                        self.pending_notices[i / 64] |= 1 << (i % 64);
+                    }
+                }
+                break;
+            }
+            if self.streaming {
+                let position = frame % total;
+                let cell = self.written[position as usize / 64];
+                let covered = cell.covers(
+                    self.generation as u32,
+                    (frame / total) as u32,
+                    (position % 64) as u32,
+                );
+                let absent = !covered || self.is_staged_missing(frame);
+                self.missing_frames += u64::from(absent);
+                if absent {
+                    missing[index / 64] |= 1 << (index % 64);
+                }
+            }
+            let sample = Self::read_source(
+                &self.staged,
+                self.staged_start..self.staged_end,
+                &self.staged_valid,
+                self.view.as_ref(),
+                self.bytes,
+                self.channels,
+                self.bits,
+                self.float,
+                self.looping,
+                self.streaming,
+                self.generation,
+                &self.written,
+                frame,
+                total,
+            );
+            if self.gain_frames != 0 {
+                for (gain, target) in self.gain.iter_mut().zip(self.target_gain) {
+                    *gain += (target - *gain) / self.gain_frames as f32;
+                }
+                self.gain_frames -= 1;
+            }
+            let sample = [sample[0] * self.gain[0], sample[1] * self.gain[1]];
+            self.audible |= sample[0].abs() > 0.00001 || sample[1].abs() > 0.00001;
+            if channels == 1 {
+                output[0] += (sample[0] + sample[1]) * 0.5;
+            } else {
+                output[0] += sample[0];
+                output[1] += sample[1];
+            }
+            played_frames += 1;
+            self.phase = self.phase.wrapping_add(1u64 << 32);
+            self.converter_frame = self.phase >> 32;
+        }
+        self.stage_ahead();
+        self.crossed_notifications(first, self.phase >> 32);
+        played_frames
+    }
     pub fn render(
         &mut self,
         out: &mut [f32],
@@ -704,6 +828,9 @@ impl RingVoice {
         rate: u32,
         missing: &mut [u64],
     ) -> usize {
+        if rate == self.frequency && rate == self.converter.rate {
+            return self.render_native(out, channels, missing);
+        }
         self.audible = false;
         if !self.active() || channels == 0 || rate != self.converter.rate {
             return 0;
@@ -711,10 +838,11 @@ impl RingVoice {
         self.stage_ahead();
         let first = self.phase >> 32;
         let step = (u64::from(self.frequency) << 32) / u64::from(rate);
+        let total = self.frames();
         let mut played_frames = 0;
         for (index, output) in out.chunks_exact_mut(usize::from(channels)).enumerate() {
             let frame = self.phase >> 32;
-            if self.playing && !self.looping && frame >= self.frames() {
+            if self.playing && !self.looping && frame >= total {
                 self.playing = false;
                 self.draining = self.converter.tail_frames();
                 for (i, &(offset, _)) in self.notifications.iter().enumerate() {
@@ -727,11 +855,11 @@ impl RingVoice {
                 break;
             }
             self.stage_ahead();
-            let position = frame % self.frames();
+            let position = frame % total;
             let cell = self.written[position as usize / 64];
             let covered = cell.covers(
                 self.generation as u32,
-                (frame / self.frames()) as u32,
+                (frame / total) as u32,
                 (position % 64) as u32,
             );
             let absent =
@@ -740,46 +868,25 @@ impl RingVoice {
             if absent {
                 missing[index / 64] |= 1 << (index % 64);
             }
-            let total_frames = self.frames();
             let sample = self.converter.next(|| {
                 let source_frame = self.converter_frame;
                 self.converter_frame += 1;
-                let staged_valid = !self.staged.is_empty()
-                    && source_frame >= self.staged_start
-                    && source_frame < self.staged_end
-                    && {
-                        let idx = (source_frame as usize) & (self.staged.len() - 1);
-                        (self.staged_valid[idx / 64] >> (idx % 64)) & 1 != 0
-                    };
-                if staged_valid {
-                    if self.streaming {
-                        let pos = source_frame % total_frames;
-                        let ok = self.written[pos as usize / 64].covers(
-                            self.generation as u32,
-                            (source_frame / total_frames) as u32,
-                            (pos % 64) as u32,
-                        );
-                        if !ok {
-                            return [0.0; 2];
-                        }
-                    }
-                    let idx = (source_frame as usize) & (self.staged.len() - 1);
-                    self.staged[idx]
-                } else {
-                    Self::read_checked(
-                        self.view.as_ref(),
-                        self.bytes,
-                        self.channels,
-                        self.bits,
-                        self.float,
-                        self.looping,
-                        self.streaming,
-                        self.generation,
-                        &self.written,
-                        source_frame,
-                    )
-                    .0
-                }
+                Self::read_source(
+                    &self.staged,
+                    self.staged_start..self.staged_end,
+                    &self.staged_valid,
+                    self.view.as_ref(),
+                    self.bytes,
+                    self.channels,
+                    self.bits,
+                    self.float,
+                    self.looping,
+                    self.streaming,
+                    self.generation,
+                    &self.written,
+                    source_frame,
+                    total,
+                )
             });
             for (gain, target) in self.gain.iter_mut().zip(self.target_gain) {
                 if self.gain_frames != 0 {
