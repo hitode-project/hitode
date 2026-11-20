@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run behavior scenarios and judge a head build by its merge base.
+"""Run behavior scenarios and judge a head build by a base build.
 
   run.py run  --adv-run BIN --wine DIST [--tree DIR] [--out FILE] [NAME ...]
   run.py gate --base-tree DIR --base-bin BIN --head-tree DIR --head-bin BIN --wine DIST
@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
 
@@ -148,7 +149,17 @@ def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
 
 
 def run_all(scenarios: dict[str, dict], binary: Path, wine: Path) -> dict[str, dict]:
-    return {name: run_one(scenario, binary, wine) for name, scenario in scenarios.items()}
+    return run_sets({"run": (scenarios, binary)}, wine)["run"]
+
+
+def run_sets(sets: dict[str, tuple[dict[str, dict], Path]], wine: Path) -> dict[str, dict[str, dict]]:
+    """Runs every scenario of every set at once, one process per core."""
+    with ThreadPoolExecutor(os.cpu_count()) as pool:
+        futures = {key: {name: pool.submit(run_one, scenario, binary, wine)
+                         for name, scenario in scenarios.items()}
+                   for key, (scenarios, binary) in sets.items()}
+    return {key: {name: future.result() for name, future in runs.items()}
+            for key, runs in futures.items()}
 
 
 def judge(base: dict[str, dict], head: dict[str, dict], results: dict) -> list[str]:
@@ -200,13 +211,13 @@ def gate(args: argparse.Namespace) -> int:
             print(f"FAIL  {error}")
         return 1
     changed = {n: s for n, s in head.items() if n not in base or base[n]["digest"] != s["digest"]}
-    results = {
-        "base_on_base": run_all(base, args.base_bin, args.wine),
-        "base_on_head": run_all(base, args.head_bin, args.wine),
-        "changed_on_head": run_all(changed, args.head_bin, args.wine),
-        "changed_again": run_all(changed, args.head_bin, args.wine),
-        "changed_on_base": run_all(changed, args.base_bin, args.wine),
-    }
+    results = run_sets({
+        "base_on_base": (base, args.base_bin),
+        "base_on_head": (base, args.head_bin),
+        "changed_on_head": (changed, args.head_bin),
+        "changed_again": (changed, args.head_bin),
+        "changed_on_base": (changed, args.base_bin),
+    }, args.wine)
     if args.out:
         args.out.write_text(json.dumps(results, indent=1, default=str))
     failures = judge(base, head, results)

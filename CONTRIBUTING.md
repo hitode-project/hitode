@@ -38,7 +38,7 @@ Bring your own games and keep them anywhere outside the repository. Tools find t
 
 - Run `python3 tools/check.py --ci` before pushing code; it is the lint CI requires, and passing it locally saves a round trip.
 - Test the paths your change affects. Reuse a passing result when neither the code nor the conditions changed.
-- Existing behavior does not change by accident. CI judges every change by its merge base's [scenarios](docs/spec/README.md#scenarios). A change that means to alter pinned behavior ships a scenario that fails on master and passes with the change. `python3 tools/scenarios/run.py run --adv-run BIN --wine DIST` shows what a build keeps.
+- Existing behavior does not change by accident. The merge queue judges every change by the latest master build's [scenarios](docs/spec/README.md#scenarios). A change that means to alter pinned behavior ships a scenario that fails on master and passes with the change. `python3 tools/scenarios/run.py run --adv-run BIN --wine DIST` shows what a build keeps.
 - When a regression slips through, add a scenario that catches it, so the same kind cannot pass again.
 - The full workspace suite (`cargo test-full`) and the full sample matrix are for batched changes and baseline updates.
 - Headless checks are yours to run. The felt experience in a window, such as stutter, audio and input response, is confirmed by a person.

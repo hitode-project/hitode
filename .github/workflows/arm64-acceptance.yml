@@ -1,15 +1,17 @@
 name: ARM64 hardware acceptance
 
 # Real ARM64 hardware for the parts QEMU cannot model: instruction cache
-# coherence, weak memory ordering and (on Apple Silicon) native 16 KiB pages.
-# Synthetic fixtures only; no samples are available or referenced here.
-# Android sigchain/ART coexistence still needs a device and is not covered.
+# coherence and weak memory ordering. Apple Silicon's native 16 KiB pages are
+# covered by the core-system macOS job of core-performance.yml, which runs the
+# same execution-layer tests. Synthetic fixtures only; no samples are
+# available or referenced here. Android sigchain/ART coexistence still needs
+# a device and is not covered.
 
 on:
   pull_request:
+  merge_group:
   push:
     branches:
-      - master
       - 'ci/arm64**'
   workflow_dispatch:
 
@@ -85,44 +87,5 @@ jobs:
             ${{ runner.temp }}/strict.txt
             ${{ runner.temp }}/direct.txt
             ${{ runner.temp }}/direct-strict.txt
-          if-no-files-found: ignore
-          retention-days: 14
-
-  macos-arm64:
-    # Release execution on Apple Silicon also covers native 16 KiB pages.
-    runs-on: macos-15
-    timeout-minutes: 15
-    env:
-      CARGO_BUILD_JOBS: '3'
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Record source and environment
-        run: |
-          rustup update stable --no-self-update
-          { git rev-parse HEAD; rustc -Vv; cargo --version; uname -a; sw_vers; echo "page size: $(sysctl -n hw.pagesize)"; sysctl -n machdep.cpu.brand_string; } > "$RUNNER_TEMP/environment.txt"
-          cat "$RUNNER_TEMP/environment.txt"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          cache-workspace-crates: true
-      - name: Build execution layer and tests
-        run: |
-          set -o pipefail
-          cargo test --release --locked -p adv-cpu --no-run 2>&1 | tee "$RUNNER_TEMP/build.txt"
-      - name: Test execution layer
-        run: |
-          set -o pipefail
-          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.txt"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: arm64-macos-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/environment.txt
-            ${{ runner.temp }}/build.txt
-            ${{ runner.temp }}/tests.txt
           if-no-files-found: ignore
           retention-days: 14
