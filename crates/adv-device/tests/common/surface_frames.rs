@@ -488,6 +488,14 @@ mod native {
             let serial = self.inner.set_video_layer(id, video, m)?;
             self.collect();
             if serial != before {
+                // The layer update follows any flushed software frames and has
+                // its own capture outside the software publication count.
+                let captured = self
+                    .execution
+                    .frames
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+                assert_eq!(captured.pixels.frames, serial);
                 let metadata = self.inner.latest_frame().unwrap();
                 let mut frame = self.latest.clone().unwrap_or_else(|| {
                     let (width, height) = metadata.extent();
