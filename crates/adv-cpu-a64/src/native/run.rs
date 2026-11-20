@@ -269,7 +269,8 @@ impl Native {
                                 .set(job.policy.scope_offers.get() + 1);
                         }
                         if self.code.offers_split(head, usize::from(version))
-                            && self.offer_split(job.policy.scope_cost(payload))
+                            && (self.offer_computation()
+                                || self.offer_split(job.policy.scope_cost(payload)))
                         {
                             exit = Exit::Computation;
                             scoped = true;
@@ -1626,9 +1627,10 @@ impl Native {
     pub(super) fn offer_computation(&self) -> bool {
         self.offload.enabled
             && (self.bridge.is_null()
-                // SAFETY: this query occurs only within the owning run.
-                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
-                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
+                || self.published_gate().stale.load(std::sync::atomic::Ordering::Relaxed) != 0
+                    // SAFETY: this query occurs only within the owning run.
+                    && unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                        .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
     }
 
     /// A single context may offer a loop whose blocks split when the

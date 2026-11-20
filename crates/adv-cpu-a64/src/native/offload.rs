@@ -171,6 +171,7 @@ struct Task {
     entry: Entry,
     code: Code,
     once: bool,
+    scoped: Option<ScopedBatch>,
     signals: Signals,
     done: SyncSender<Done>,
     wake: Option<WakeEvent>,
@@ -180,8 +181,36 @@ struct Done {
     completion: Completion<Option<ExecutionContext>>,
     deadline_recall: bool,
     rows: u32,
+    scope: Option<Scope>,
     /// Whether the optimized form admitted the entry state, if there is one.
     admitted: Option<bool>,
+}
+
+struct Scope {
+    frame: [u32; SCOPE_CELLS],
+    mmx: u16,
+    gpr: u32,
+    execution: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct ScopedBatch {
+    rows: u32,
+    size: Option<u32>,
+    sample: bool,
+}
+
+impl ScopedBatch {
+    fn new(rows: u32, policy: &JobPlan, sample: bool) -> Self {
+        Self {
+            rows,
+            size: policy
+                .per_iteration
+                .get()
+                .map(|(retired, _)| rows_per_slice(retired)),
+            sample,
+        }
+    }
 }
 
 const RECALL: u32 = 1;
@@ -252,6 +281,7 @@ fn run(
     context.finish_computation(exit);
     Done {
         rows: 0,
+        scope: None,
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
         deadline_recall: (exit == Exit::Recall || deferred)
             && signals.pending.0.load(Ordering::Acquire)
@@ -267,6 +297,63 @@ fn run(
             helpers: Duration::ZERO,
             requires_owner: exit != Exit::Dispatch,
         },
+    }
+}
+
+/// A submitted scoped batch uses the same latch boundary as a split block.
+/// Recall stops the next admission, after the current batch's frame is complete.
+fn run_scoped(
+    runtime: &mut Runtime,
+    id: u32,
+    mut context: ExecutionContext,
+    entry: Entry,
+    (code, batch): (&Code, ScopedBatch),
+    signals: &Signals,
+    scratch: &mut ExecuteScratch,
+) -> Done {
+    let quiet = Signals {
+        recall: signals.recall.clone(),
+        pending: (signals.pending.0.clone(), 0),
+    };
+    let started = Instant::now();
+    let mut execution = Duration::ZERO;
+    let (mut retired, mut optimized, mut rows, mut mmx, mut gpr) = (0, 0, 0, 0, 0);
+    let mut size = batch.size.unwrap_or(1);
+    loop {
+        let left = batch.rows - rows;
+        let count = size.min(left);
+        let head_exit = if count == left { 0 } else { count };
+        let mut done = run(
+            runtime,
+            id,
+            context,
+            entry,
+            (code, head_exit),
+            (&quiet, 0),
+            (scratch, Timing::Block(&mut execution)),
+        );
+        retired += done.completion.retired;
+        optimized += done.completion.optimized;
+        rows += count;
+        mmx |= runtime.scope_written as u16;
+        gpr |= runtime.scope_gpr_written;
+        if rows == batch.rows || batch.sample || signals.requested() {
+            done.completion.retired = retired;
+            done.completion.optimized = optimized;
+            done.completion.elapsed = started.elapsed();
+            done.rows = rows;
+            done.scope = Some(Scope {
+                frame: runtime.scope_frame,
+                mmx,
+                gpr,
+                execution,
+            });
+            return done;
+        }
+        if rows == 1 && batch.size.is_none() {
+            size = rows_per_slice(retired.max(1));
+        }
+        context = done.completion.context.unwrap();
     }
 }
 
@@ -473,6 +560,36 @@ impl Drained {
                 .is_none_or(|prior| prior.index < last.index)
         {
             self.last = Some(last);
+        }
+    }
+
+    fn record_scope(&mut self, index: u32, code: &Code, (mmx, gpr): (u16, u32), cpu: &CpuState) {
+        if code.scoped_mmx != 0 {
+            self.mmx.record(index, code.scoped_mmx & mmx, cpu);
+        }
+        if code.scoped_gpr != 0 {
+            self.gpr
+                .get_or_insert_with(Box::default)
+                .record(index, gpr, cpu);
+        }
+    }
+
+    fn publish_scope(
+        self,
+        code: &Code,
+        frame: Option<&[u32; SCOPE_CELLS]>,
+        start: &CpuState,
+        cpu: &mut CpuState,
+        alias: u64,
+    ) {
+        if let Some(frame) = frame {
+            publish_frame(&code.frame, frame, start, alias);
+        }
+        if code.scoped_mmx != 0 {
+            self.mmx.publish(code.scoped_mmx, start, cpu);
+        }
+        if let Some(gpr) = self.gpr {
+            gpr.publish(code.scoped_gpr, start, cpu);
         }
     }
 }
@@ -702,18 +819,12 @@ impl Blocks {
         out.retired += done.retired;
         out.optimized += done.optimized;
         out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
-        if self.code.scoped_mmx != 0 {
-            out.mmx.record(
-                index,
-                self.code.scoped_mmx & runtime.scope_written as u16,
-                cpu,
-            );
-        }
-        if self.code.scoped_gpr != 0 {
-            out.gpr
-                .get_or_insert_with(Box::default)
-                .record(index, runtime.scope_gpr_written, cpu);
-        }
+        out.record_scope(
+            index,
+            &self.code,
+            (runtime.scope_written as u16, runtime.scope_gpr_written),
+            cpu,
+        );
         if last || self.scoped {
             out.last = Some(LastBlock {
                 index,
@@ -726,23 +837,15 @@ impl Blocks {
 
     /// Once all claims have drained, publish either the final row or the
     /// prefix that completed before recall, before the owner runs guest code.
-    fn finish(&self, id: u32, total: Drained) -> (Completion<Option<ExecutionContext>>, u32) {
+    fn finish(&self, id: u32, mut total: Drained) -> (Completion<Option<ExecutionContext>>, u32) {
         let claimed = self.next.load(Ordering::Acquire).min(self.count);
         let iterations = if claimed == self.count {
             self.plan.iterations
         } else {
             claimed * self.size
         };
-        let (mut completion, last) = match total.last {
-            Some(last) => {
-                publish_frame(
-                    &self.code.frame,
-                    &last.frame,
-                    self.start.cpu(),
-                    self.entry.alias,
-                );
-                (last.done, Some(last.thread))
-            }
+        let (mut completion, last, frame) = match total.last.take() {
+            Some(last) => (last.done, Some(last.thread), Some(last.frame)),
             None => (
                 Completion {
                     id,
@@ -754,22 +857,22 @@ impl Blocks {
                     requires_owner: false,
                 },
                 None,
+                None,
             ),
         };
         let cpu = completion.context.as_mut().unwrap().cpu_mut();
         self.settle(cpu, last, iterations);
-        if self.code.scoped_mmx != 0 {
-            total
-                .mmx
-                .publish(self.code.scoped_mmx, self.start.cpu(), cpu);
-        }
-        if let Some(gpr) = total.gpr {
-            gpr.publish(self.code.scoped_gpr, self.start.cpu(), cpu);
-        }
         cpu.mxcsr |= total.sticky;
         completion.id = id;
         completion.retired = total.retired;
         completion.optimized = total.optimized;
+        total.publish_scope(
+            &self.code,
+            frame.as_ref(),
+            self.start.cpu(),
+            cpu,
+            self.entry.alias,
+        );
         (completion, iterations)
     }
 }
@@ -828,15 +931,27 @@ impl Pool {
                             }
                             Err(_) => break,
                         };
-                        let result = run(
-                            &mut runtime,
-                            task.id,
-                            task.context,
-                            task.entry,
-                            (&task.code, u32::from(task.once)),
-                            (&task.signals, RECALL),
-                            (&mut scratch, Timing::Whole),
-                        );
+                        let result = if let Some(batch) = task.scoped {
+                            run_scoped(
+                                &mut runtime,
+                                task.id,
+                                task.context,
+                                task.entry,
+                                (&task.code, batch),
+                                &task.signals,
+                                &mut scratch,
+                            )
+                        } else {
+                            run(
+                                &mut runtime,
+                                task.id,
+                                task.context,
+                                task.entry,
+                                (&task.code, u32::from(task.once)),
+                                (&task.signals, RECALL),
+                                (&mut scratch, Timing::Whole),
+                            )
+                        };
                         if result.completion.requires_owner {
                             task.signals
                                 .recall
@@ -1100,6 +1215,7 @@ struct ActiveTask {
     entry: JobKey,
     iteration: bool,
     ranges: Vec<Range>,
+    start: Option<Box<CpuState>>,
 }
 
 fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
@@ -1192,6 +1308,21 @@ impl<'a, U, R> Session<'a, U, R> {
         }
     }
 
+    fn offer_key(&self, context: &ExecutionContext) -> Option<JobKey> {
+        let eip = context.cpu().eip;
+        let offer = context.scoped_offer();
+        if let Some(offer) = offer {
+            let job = self.scoped.get(&(eip, offer.version))?;
+            if offer.generation != self.code.generation
+                || offer.entry != job.worker.code.placed.entry
+                || !self.code.offers_split(eip, usize::from(offer.version))
+            {
+                return None;
+            }
+        }
+        Some((eip, offer.map(|offer| offer.version)))
+    }
+
     fn prepare(
         &mut self,
         id: u32,
@@ -1229,7 +1360,7 @@ impl<'a, U, R> Session<'a, U, R> {
         (retired, ns): (u64, f64),
         pace: Pace,
     ) -> Option<Done> {
-        let slice = (u64::from(COMPUTATION_SLICE) / retired).clamp(1, u64::from(u32::MAX)) as u32;
+        let slice = rows_per_slice(retired);
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
         let wake = self.wake_estimate.ns as f64;
@@ -1328,6 +1459,7 @@ impl<'a, U, R> Session<'a, U, R> {
             deadline_recall: false,
             admitted: None,
             rows: if scoped { iterations } else { 0 },
+            scope: None,
         })
     }
 
@@ -1360,16 +1492,41 @@ impl<'a, U, R> Session<'a, U, R> {
         done.completion
     }
 
-    fn accept(&mut self, done: Done) -> Completion<Option<ExecutionContext>> {
+    fn finish_scope(&mut self, key: JobKey, start: &CpuState, done: &mut Done) {
+        let (job, policy) = self.job(key).unwrap();
+        let scope = done.scope.take().unwrap();
+        let cpu = done.completion.context.as_mut().unwrap().cpu_mut();
+        let mut total = Drained::default();
+        total.record_scope(0, &job.code, (scope.mmx, scope.gpr), cpu);
+        total.publish_scope(&job.code, Some(&scope.frame), start, cpu, self.entry.alias);
+        learn(
+            policy,
+            &done.completion,
+            done.rows,
+            scope.execution,
+            self.wake_estimate.ns as f64,
+        );
+        self.scope_updates.push(key.0);
+    }
+
+    fn accept(&mut self, mut done: Done) -> Completion<Option<ExecutionContext>> {
         let index = self
             .active
             .iter()
             .position(|job| job.id == done.completion.id)
             .expect("active computation");
+        let (key, start) = (self.active[index].entry, self.active[index].start.take());
+        if let Some(start) = start {
+            self.finish_scope(key, &start, &mut done);
+        }
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
         self.account(job.entry, job.iteration, done)
     }
+}
+
+fn rows_per_slice(retired: u64) -> u32 {
+    (u64::from(COMPUTATION_SLICE) / retired).max(1) as u32
 }
 
 fn publish_frame(cells: &[ScopeCell], values: &[u32; SCOPE_CELLS], start: &CpuState, alias: u64) {
@@ -1429,23 +1586,38 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
         let Some(context) = context.as_ref() else {
             return false;
         };
-        let key = (context.cpu().eip, None);
-        if context.scoped_offer().is_some() || self.active.len() == self.pool.limit {
+        if self.active.len() == self.pool.limit {
             return false;
         }
+        let Some(key) = self.offer_key(context) else {
+            return false;
+        };
         let mut grant = self.admission.spare.pop().unwrap_or_default();
         grant.clear();
-        let Some((job, _, ranges, iteration)) = self.prepare(id, context, key) else {
+        let Some((job, policy, ranges, iteration)) = self.prepare(id, context, key) else {
             self.admission.spare.push(grant);
             return false;
         };
         grant.extend_from_slice(ranges);
+        let scoped = if policy.scoped {
+            let Some(plan) =
+                self.admission
+                    .plan((key, &job.proof), context.cpu(), self.memory, &self.active)
+            else {
+                self.admission.spare.push(grant);
+                return false;
+            };
+            Some(ScopedBatch::new(plan.iterations, policy, false))
+        } else {
+            None
+        };
         let code = job.code.clone();
         if self.pool.submit(Job::Whole(Box::new(Task {
             id,
             context: context.clone(),
             code,
             once: iteration,
+            scoped,
             entry: self.entry,
             signals: self.signals.clone(),
             done: self.send.clone(),
@@ -1456,6 +1628,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                 entry: key,
                 iteration,
                 ranges: grant,
+                start: scoped.map(|_| Box::new(context.cpu().clone())),
             });
             true
         } else {
@@ -1470,20 +1643,8 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
         context: &Option<ExecutionContext>,
     ) -> Option<Completion<Option<ExecutionContext>>> {
         let context = context.as_ref()?;
-        let guest_entry = context.cpu().eip;
-        let offer = context.scoped_offer();
-        let key = (guest_entry, offer.map(|offer| offer.version));
-        if let Some(offer) = offer {
-            let job = self.scoped.get(&(guest_entry, offer.version))?;
-            if offer.generation != self.code.generation
-                || offer.entry != job.worker.code.placed.entry
-                || !self
-                    .code
-                    .offers_split(guest_entry, usize::from(offer.version))
-            {
-                return None;
-            }
-        }
+        let key = self.offer_key(context)?;
+        let guest_entry = key.0;
         let (job, policy, _, iteration) = self.prepare(id, context, key)?;
         let code = &job.code;
         let plan = if job.proof.splits() {
@@ -1492,9 +1653,24 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
         } else {
             None
         };
-        let scoped = policy.scoped;
-        if scoped {
-            self.scope_updates.push(guest_entry);
+        if policy.scoped {
+            let plan = plan?;
+            if !self.active.is_empty() || policy.per_iteration.get().is_none() {
+                let mut done = run_scoped(
+                    &mut self.runtime,
+                    id,
+                    context.clone(),
+                    self.entry,
+                    (
+                        code,
+                        ScopedBatch::new(plan.iterations, policy, self.active.is_empty()),
+                    ),
+                    &self.signals,
+                    &mut ExecuteScratch::default(),
+                );
+                self.finish_scope(key, context.cpu(), &mut done);
+                return Some(self.account(key, false, done));
+            }
         }
         if let Some(plan) = plan
             && let Some(pace) = self.pace
@@ -1502,49 +1678,35 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
             && let Some(done) =
                 self.split(id, context, (key, code, policy), plan, per_iteration, pace)
         {
+            if policy.scoped {
+                self.scope_updates.push(guest_entry);
+            }
             return Some(self.account(key, false, done));
         }
-        if scoped && (plan.is_none() || policy.per_iteration.get().is_some()) {
+        if policy.scoped {
             return None;
         }
         let mut scratch = ExecuteScratch::default();
-        let quiet = Signals {
-            recall: self.signals.recall.clone(),
-            pending: (self.signals.pending.0.clone(), 0),
-        };
-        let signals = if code.frame.is_empty() {
-            (&self.signals, LOCAL)
-        } else {
-            (&quiet, 0)
-        };
         let mut execution = Duration::ZERO;
         let timing = if plan.is_some() {
             Timing::Sample(&mut execution)
         } else {
             Timing::Whole
         };
-        let mut done = run(
+        let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
-            (code, u32::from(iteration || scoped)),
-            signals,
+            (code, u32::from(iteration)),
+            (&self.signals, LOCAL),
             (&mut scratch, timing),
         );
-        if !code.frame.is_empty() {
-            publish_frame(
-                &code.frame,
-                &self.runtime.scope_frame,
-                context.cpu(),
-                self.entry.alias,
-            );
-        }
         if let Some(plan) = plan
             && !done.completion.requires_owner
         {
             let eip = done.completion.context.as_ref().unwrap().cpu().eip;
-            let iterations = match (eip == guest_entry, iteration || scoped) {
+            let iterations = match (eip == guest_entry, iteration) {
                 (false, _) => plan.iterations,
                 (true, true) => 1,
                 (true, false) => 0,
@@ -1557,7 +1719,6 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                 self.wake_estimate.ns as f64,
             );
         }
-        done.rows = u32::from(scoped && !done.completion.requires_owner);
         Some(self.account(key, iteration, done))
     }
 
@@ -1966,6 +2127,58 @@ mod tests {
         assert!(native.scoped_jobs.is_empty());
     }
 
+    // spec: A64-OPT-9 A64-OPT-14
+    #[test]
+    fn a_declined_scoped_offer_leaves_guest_state_at_the_head() {
+        use adv_cpu_core::trap::Bridge;
+
+        let (mut executor, mut native, start, stop, [_, priced, _]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &priced.to_le_bytes()).unwrap();
+        native.code.version_stats = Some(FxHashMap::default());
+        assert!(native.force_resident_at(memory, start.clone()));
+        native.set_computation_offer(true, None);
+        let snapshot = |memory: &Memory| {
+            [OUTPUT, ROW_STACK].map(|at| memory.read(at, 0x4000).unwrap().to_vec())
+        };
+        let mut checkpoint = start.clone();
+        let offered = row_run(&mut native, memory, &mut checkpoint, stop);
+        assert_eq!(offered.exit, Exit::Computation);
+        assert!(native.scoped_offer.take().is_some());
+        let offered_memory = snapshot(memory);
+        for at in [OUTPUT, ROW_STACK] {
+            memory.write(at, &[0; 0x4000]).unwrap();
+        }
+        let mut bridge = Bridge {
+            timestamp: Default::default(),
+            memory,
+            error: None,
+            trap: None,
+            calls: 0,
+            handler: None,
+            parked: false,
+            deadline: None,
+            clock_due: true,
+            unclocked_bytes: 0,
+            bulk_calls: 0,
+            bulk_bytes: 0,
+            cliffs: Default::default(),
+            scratch: Default::default(),
+        };
+        let mut cpu = start.clone();
+        let run = native
+            .run(&mut cpu, memory, stop, 1 << 16, (&raw mut bridge).cast())
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.scoped_jobs[&(CODE, 0)].policy.scope_offers.get(), 2);
+        assert_eq!((run.exit, run.retired), (Exit::Dispatch, offered.retired));
+        assert!(native.scoped_offer.is_none());
+        // Only the first indirect call records routing feedback.
+        cpu.last_indirect_branch = checkpoint.last_indirect_branch;
+        assert_eq!(cpu, checkpoint);
+        assert_eq!(snapshot(memory), offered_memory);
+    }
+
     // spec: A64-OPT-9
     #[test]
     fn split_heavy_row_ledger_keeps_the_driver() {
@@ -2221,7 +2434,6 @@ mod tests {
             (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
             None,
             &mut |session| {
-                assert!(!session.submit(1, &context));
                 split = session.run_local(1, &context);
             },
         );
@@ -3918,6 +4130,7 @@ mod tests {
             entry,
             code: code.clone(),
             once: false,
+            scoped: None,
             signals: signals.clone(),
             done: send,
             wake: None,
@@ -4152,6 +4365,7 @@ mod tests {
             deadline_recall: false,
             admitted: None,
             rows: 0,
+            scope: None,
         };
         prepared.observe(
             CODE,

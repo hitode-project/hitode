@@ -798,4 +798,135 @@ mod tests {
         assert!(done.iter().any(|line| line.ends_with("\t0")), "{trace}");
         assert!(done.iter().any(|line| line.ends_with("\t1")), "{trace}");
     }
+
+    // spec: PROC-MACH-1 A64-OPT-9 A64-TR-9
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn scoped_drivers_complete_together_and_match_serial_execution() {
+        if !std::thread::available_parallelism().is_ok_and(|n| n.get() > 1) {
+            return;
+        }
+        const ROWS: u32 = 1024;
+        const WIDTH: u32 = 16;
+        const BYTES: u32 = ROWS * WIDTH * 16;
+        const INPUT: u32 = 0x0050_0000;
+        const OUTPUT: u32 = 0x0060_0000;
+        const FRAME: u32 = 0x0070_0000;
+        const TARGET: u32 = CODE + 0x100;
+
+        let mut driver = Asm::new(CODE);
+        driver.bytes.push(0x90);
+        let row = driver.here();
+        driver.bytes.extend_from_slice(&[
+            0x89, 0x73, 4, // mov [ebx+4],esi
+            0x81, 0xfa, 0, 2, 0, 0, // cmp edx,512
+            0x76, 5, // jbe call
+            0x8b, 0x06, // mov eax,[esi]
+            0x0f, 0x6f, 0x0e, // movq mm1,[esi]
+            0xff, 0x13, // call [ebx]
+            0x4a, // dec edx
+        ]);
+        driver.jnz(row);
+        driver.bytes.extend_from_slice(&[
+            0x89, 0x43, 8, // mov [ebx+8],eax
+            0x0f, 0x7f, 0x4b, 12, // movq [ebx+12],mm1
+        ]);
+        driver.ret();
+        let mut strip = Asm::new(TARGET);
+        strip.mov_ecx_imm(WIDTH);
+        let pixel = strip.here();
+        strip.bytes.extend_from_slice(&[
+            0xf3, 0x0f, 0x6f, 0x06, // movdqu xmm0,[esi]
+            0xf3, 0x0f, 0x7f, 0x07, // movdqu [edi],xmm0
+            0x83, 0xc6, 16, // add esi,16
+            0x83, 0xc7, 16, // add edi,16
+        ]);
+        strip.dec_ecx().jnz(pixel).ret();
+
+        let run = |jit| {
+            let mut m = machine(jit);
+            m.cpu.set_async_compilation(false);
+            m.cpu.map(CODE, 0x4000, Prot::RX).unwrap();
+            m.cpu.map(INPUT, BYTES * 2, Prot::RW).unwrap();
+            m.cpu.map(OUTPUT, BYTES * 2, Prot::RW).unwrap();
+            m.cpu.map(FRAME, 0x4000, Prot::RW).unwrap();
+            m.cpu.write(CODE, &driver.bytes).unwrap();
+            m.cpu.write(TARGET, &strip.bytes).unwrap();
+            let input: Vec<_> = (0..BYTES * 2)
+                .map(|i| (i ^ (i >> 7) ^ (i / BYTES * 37)) as u8)
+                .collect();
+            m.cpu.write(INPUT, &input).unwrap();
+            let regs = |id| {
+                [
+                    (Reg::Edx, ROWS),
+                    (Reg::Ebx, FRAME + 0x100 * id),
+                    (Reg::Esi, INPUT + BYTES * id),
+                    (Reg::Edi, OUTPUT + BYTES * id),
+                ]
+            };
+            for id in 0..2 {
+                m.cpu.write_u32(FRAME + 0x100 * id, TARGET).unwrap();
+            }
+            if jit {
+                // Discover the routed version before either guest offers it.
+                let stack = FRAME + 0x1000;
+                m.cpu.write_u32(stack, PARK_ADDR).unwrap();
+                for (reg, value) in regs(0)
+                    .into_iter()
+                    .chain([(Reg::Eip, CODE), (Reg::Esp, stack)])
+                {
+                    m.cpu.set_reg(reg, value);
+                }
+                assert_eq!(
+                    m.cpu.executor_mut().run(PARK_ADDR, 1 << 20).unwrap(),
+                    adv_cpu::RunOutcome::ReachedStop
+                );
+                m.cpu.write(OUTPUT, &vec![0; BYTES as usize]).unwrap();
+                m.cpu.write(FRAME + 4, &[0; 16]).unwrap();
+            }
+            let trace = Trace::default();
+            m.sys.schedule_trace = ScheduleTrace::to_writer(Box::new(trace.clone())).unwrap();
+            for id in 0..2 {
+                let context = m.spawn("strip", CODE, &[], 0x1_0000).unwrap();
+                assert!(m.sys.set_initial_registers(context, &regs(id)));
+                m.sys.contexts[context as usize].computed = Some(m.sys.completed_frames);
+            }
+            assert!(matches!(m.run(), RunResult::Exited(_)));
+            let state = std::array::from_fn::<_, 2, _>(|id| {
+                let mut output = vec![0; BYTES as usize];
+                let mut frame = [0; 16];
+                m.cpu.read(OUTPUT + BYTES * id as u32, &mut output).unwrap();
+                m.cpu
+                    .read(FRAME + 0x100 * id as u32 + 4, &mut frame)
+                    .unwrap();
+                (m.sys.context(id as u32).exit_code(), output, frame)
+            });
+            let trace = String::from_utf8(trace.0.borrow().clone()).unwrap();
+            (state, trace)
+        };
+        let (serial, _) = run(false);
+        let (parallel, trace) = run(true);
+        assert!(trace.contains("\tcompute_submit\t"), "{trace}");
+        let (round, summary) = trace
+            .split_once("\tcompute_round\t")
+            .expect("computation round");
+        assert!(summary.lines().next().unwrap().ends_with("\t2"), "{trace}");
+        let retired = ROWS * (9 + 6 * WIDTH);
+        let mut flags = Vec::new();
+        for id in 0..2 {
+            assert!(
+                round.contains(&format!("\tcompute_offer\t{id}\t{row}\t")),
+                "{trace}"
+            );
+            let completion = format!("\tcompute_done\t{id}\t{retired}\t");
+            let done = round
+                .lines()
+                .find(|line| line.contains(&completion))
+                .expect(&trace);
+            flags.push(done.rsplit('\t').next().unwrap());
+        }
+        flags.sort_unstable();
+        assert_eq!(flags, ["0", "1"]);
+        assert_eq!(parallel, serial);
+    }
 }
