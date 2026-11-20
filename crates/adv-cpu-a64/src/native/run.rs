@@ -891,34 +891,34 @@ impl Native {
         Some(entry)
     }
 
-    fn miss_version(
+    pub(super) fn miss_version(
         &mut self,
         memory: &mut Memory,
         eip: u32,
         observed: Key,
     ) -> Result<usize, String> {
-        let Some(chain) = self.code.take_tier1(eip) else {
-            if let Some(entry) = self.code.tier1(eip) {
-                return Ok(entry.unit);
-            }
+        let Some(chain) = self.code.tier1_chain(eip) else {
             return self
                 .translate(memory, eip, observed)
                 .map(|entry| entry.unit);
         };
+        // A fact transfer can reach an entry whose standalone unit has no facts.
+        if chain.mask == 0 {
+            return Ok(chain.versions[0].entry.unit);
+        }
+        let action = plan::tier1_miss(chain, observed);
         if let Some(stats) = &mut self.code.version_stats {
             stats.get_mut(&eip).unwrap().misses += 1;
         }
-        let (key, position, joining) = match plan::tier1_miss(&chain, observed) {
-            Tier1Miss::Match(entry) => {
-                self.code.set_tier1(eip, chain);
-                return Ok(entry);
-            }
+        let (key, position, joining) = match action {
+            Tier1Miss::Match(entry) => return Ok(entry),
             Tier1Miss::Build {
                 key,
                 position,
                 joining,
             } => (key, position, joining),
         };
+        let chain = self.code.take_tier1(eip).unwrap();
         let arrivals = self.code.counter(eip, position);
         let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;

@@ -1201,6 +1201,23 @@ mod tests {
     // mov [edi],eax; add edi,4; dec ecx; jne HEAD; int3
     const STORE_LOOP: &[u8] = &[0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf8, 0xcc];
 
+    // spec: A64A-FALL-3
+    #[test]
+    fn fact_transfer_at_an_unkeyed_entry_reuses_the_tier1_body() {
+        use crate::facts::{self, Key};
+
+        let (mut memory, mut native, _) = resident_loop(STORE_LOOP);
+        native.code.version_stats = Some(FxHashMap::default());
+        let ordinary = native.translate(&mut memory, HEAD, Key::default()).unwrap();
+        assert_eq!(ordinary.unit, ordinary.body);
+        let observed = Key::read(&resident_cpu(HEAD, 1), facts::ALL);
+        assert_eq!(
+            native.miss_version(&mut memory, HEAD, observed).unwrap(),
+            ordinary.body,
+        );
+        assert!(native.code.version_stats.as_ref().unwrap().is_empty());
+    }
+
     // spec: A64A-ROLE-2, A64A-PLACE-4
     #[test]
     fn tier1_and_resident_rebuilds_reuse_the_site_unit() {
