@@ -23,9 +23,10 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::jit_map::{Mark, Part};
 use crate::runtime::{self, ResidentCold, Runtime};
-use crate::translate::access::{CheckedEmitter, Value as AccessReg, page_crossing};
-use crate::translate::{Carry, Overflow, Sense, Site, WINDOW, fp_class};
-use crate::translate::{X0, X1, X2, X3};
+use crate::translate::lower::access::{CheckedEmitter, Value as AccessReg, page_crossing};
+use crate::translate::lower::flags::{Carry, Overflow, Sense};
+use crate::translate::lower::fp_class;
+use crate::translate::lower::{Site, WINDOW, X0, X1, X2, X3};
 pub(super) use batch::BatchEmitter;
 use std::mem::offset_of;
 
@@ -1175,7 +1176,7 @@ impl<'a> Emitter<'a> {
                 refund: record.refund,
                 sense: Sense::Subtraction,
                 carry: Carry::Host,
-                recipe: crate::translate::Recipe::Canonical,
+                recipe: crate::translate::lower::flags::Recipe::Canonical,
                 nz: None,
                 overflow: Overflow::Host,
                 checked,

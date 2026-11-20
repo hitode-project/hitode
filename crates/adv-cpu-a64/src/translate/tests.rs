@@ -2,6 +2,7 @@
 use super::*;
 use crate::emulator::{CODE as HOST_CODE, Emulator};
 use crate::runtime;
+use crate::translate::lower::stubs;
 use adv_cpu_core::{CpuState, Memory, X87State, interpreter::Interpreter};
 use iced_x86::code_asm::*;
 use std::mem::{offset_of, size_of};
@@ -864,7 +865,7 @@ fn state_bytes(initial: &CpuState) -> Vec<u8> {
 struct Harness {
     emu: Emulator,
     loaded: Vec<u32>,
-    stubs: runtime::Stubs,
+    stubs: stubs::Stubs,
     prefix: Vec<u32>,
     dispatch: usize,
     forbidden: usize,
@@ -872,7 +873,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let stubs = runtime::stubs();
+        let stubs = stubs::stubs();
         let mut prefix = stubs.code.clone();
         // Dispatch returns to this test instead of invoking a Rust owner. An
         // unexpected helper must trap, so a semantic match cannot hide fallback.
@@ -3419,7 +3420,7 @@ pub(in crate::translate) mod opt_back {
     fn opt_back_fp_state_is_never_accessed() {
         // Lowering checks every form built by the back-end and front-end
         // tests. The entry and optimized exit stubs complete that path.
-        let stubs = runtime::stubs();
+        let stubs = stubs::stubs();
         back::assert_no_fp_state(&stubs.code[stubs.enter / 4..stubs.exit / 4]);
         back::assert_no_fp_state(&stubs.code[stubs.opt_exit / 4..]);
     }
@@ -4754,7 +4755,7 @@ pub(in crate::translate) mod opt_back {
     // spec: A64-OPT-7
     #[test]
     fn opt_back_loop_values_keep_registers_under_pressure() {
-        let stubs = runtime::stubs();
+        let stubs = stubs::stubs();
         let mut h = harness();
         // Entry values live across the loop, more than there are registers.
         let (mut f, b, p, _) = start(&[Type::I64; 36]);
@@ -5154,7 +5155,7 @@ pub(in crate::translate) mod opt_back {
     // spec: A64-OPT-4, A64-OPT-7
     #[test]
     fn opt_back_emitted_word_counts_keep_common_operations_lean() {
-        let stubs = runtime::stubs();
+        let stubs = stubs::stubs();
         let (mut f, b, p, _) = start(&[Type::I32]);
         let k = f.push(b, Op::Constant(Type::I32, 7)).unwrap();
         let v = f.push(b, Op::Int(IntOp::Add, p[0], k)).unwrap();
@@ -5315,7 +5316,7 @@ pub(in crate::translate) mod opt_back {
             );
             finish(&mut f, done, total);
             let mut lower = checked_lower(&f);
-            lower.place(0, runtime::stubs().opt_exit);
+            lower.place(0, stubs::stubs().opt_exit);
             let head_code = body(&lower, 1);
             assert_eq!(
                 head_code[0],

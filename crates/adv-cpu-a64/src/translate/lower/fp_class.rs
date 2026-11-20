@@ -6,7 +6,7 @@ use crate::encode::*;
 
 /// Extracts the bits and biased exponent + 1 of a scalar result. If requested,
 /// also masks the exponent so zero, subnormal, infinite and NaN results give zero.
-pub(super) fn result_bits(
+pub(in crate::translate) fn result_bits(
     asm: &mut Asm,
     double: bool,
     v: VReg,
@@ -26,7 +26,7 @@ pub(super) fn result_bits(
 }
 
 /// Branches to `to`, or sets DE in `flags` without one, for a nonzero subnormal.
-pub(super) fn scalar_denormal(
+pub(in crate::translate) fn scalar_denormal(
     asm: &mut Asm,
     double: bool,
     input: VReg,
@@ -56,7 +56,7 @@ pub(super) fn scalar_denormal(
 }
 
 /// Leaves a nonzero mask for subnormal lanes in `v6`.
-pub(super) fn packed_denormals(
+pub(in crate::translate) fn packed_denormals(
     asm: &mut Asm,
     arr: Arr,
     double: bool,
@@ -92,7 +92,7 @@ pub(super) fn packed_denormals(
     }
 }
 
-pub(super) fn finish_denormals(
+pub(in crate::translate) fn finish_denormals(
     asm: &mut Asm,
     double: bool,
     mask: VReg,
@@ -120,7 +120,7 @@ pub(super) fn finish_denormals(
     }
 }
 
-pub(super) fn packed_arithmetic_mask(
+pub(in crate::translate) fn packed_arithmetic_mask(
     asm: &mut Asm,
     double: bool,
     op: Float,
@@ -177,7 +177,7 @@ pub(super) fn packed_arithmetic_mask(
     }
 }
 
-pub(super) fn nan_operands(
+pub(in crate::translate) fn nan_operands(
     asm: &mut Asm,
     scalar: bool,
     double: bool,
@@ -202,7 +202,13 @@ pub(super) fn nan_operands(
     }
 }
 
-pub(super) fn nan_low_pair(asm: &mut Asm, input: VReg, mask: VReg, temp: Reg, slow: Label) {
+pub(in crate::translate) fn nan_low_pair(
+    asm: &mut Asm,
+    input: VReg,
+    mask: VReg,
+    temp: Reg,
+    slow: Label,
+) {
     // Two binary32 lanes in the low half.
     asm.emit_all(&[
         vfloat(Float::Fcmeq, false, mask, input, input),
@@ -212,7 +218,7 @@ pub(super) fn nan_low_pair(asm: &mut Asm, input: VReg, mask: VReg, temp: Reg, sl
     asm.cbz(X, true, temp, slow);
 }
 
-pub(super) fn nan_result(
+pub(in crate::translate) fn nan_result(
     asm: &mut Asm,
     scalar: bool,
     double: bool,
@@ -232,14 +238,14 @@ pub(super) fn nan_result(
 }
 
 /// Branches if any byte of the lane mask is nonzero.
-pub(super) fn any_lane(asm: &mut Asm, mask: VReg, temp: Reg, slow: Label) {
+pub(in crate::translate) fn any_lane(asm: &mut Asm, mask: VReg, temp: Reg, slow: Label) {
     asm.emit_all(&[umaxv(mask, mask), fmov_from_v(W, temp, mask)]);
     asm.cbz(W, true, temp, slow);
 }
 
 /// Branches on a binary64 signaling NaN. Its floating comparison is unordered
 /// and its quiet bit is clear.
-pub(super) fn snan(asm: &mut Asm, input: VReg, bits: Reg, fail: Label) {
+pub(in crate::translate) fn snan(asm: &mut Asm, input: VReg, bits: Reg, fail: Label) {
     let clean = asm.label();
     asm.emit(fcmp(input, input));
     asm.b_cond(Cond::Vc, clean);

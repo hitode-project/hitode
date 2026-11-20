@@ -14,16 +14,17 @@ Instruction-level contracts are in [a64.md](a64.md). The shared execution contra
 
 | Module | May use |
 |---|---|
-| `encode`, `asm`, `cache`, `jit_map` | none |
+| `encode`, `cache`, `jit_map` | none |
+| `asm` | `encode` |
 | `runtime` | `asm`, `encode` |
 | `facts` | `runtime`, `asm`, `encode` |
-| `translate::front` | none |
+| `translate::front` | `encode` operation types |
 | `translate::lower` | `translate::front`, `facts`, `runtime`, `asm`, `encode` |
 | `translate::jit`, `translate::opt` | `translate::lower`, `translate::front`, `facts`, `runtime`, `asm`, `encode` |
-| `native::store` | `cache`, `facts`, `runtime` |
+| `native::store` | `cache`, `encode`, `facts`, `runtime`, `translate::front`, `translate::lower` |
 | `native::compile` | `translate::jit`, `translate::opt`, `translate::front`, `facts` |
 | `native::plan` | `native::store`, `native::compile`, `facts` |
-| `native::offload` | `native::store`, `native::plan`, `runtime` |
+| `native::offload` | `native::store`, `native::plan`, `runtime`, `translate::opt` |
 | `native::run`, `executor` | every row above |
 | `cpu` | `executor` |
 
@@ -33,7 +34,7 @@ Every module MAY use `jit_map` behind its enable switch. Only `translate::front`
 
 ### A64A-ROLE-2 Front end
 
-**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST decode each guest instruction at most once until its code is invalidated. It MUST NOT emit host code.
+**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST decode each guest instruction at most once until its code is invalidated. The front end MAY name encoder operation types but MUST NOT call encoders or emit host code.
 **Applies to**: AArch64
 **Verification**: Test
 

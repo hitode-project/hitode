@@ -4,7 +4,7 @@ use super::{
     int_immediate, ldr, loops, lsr_imm, mov, movz, mul, mvn, page_crossing, runtime, sub, sub_imm,
     subs, subs_imm, udiv,
 };
-use crate::translate::{X4, X5};
+use crate::translate::lower::{X4, X5};
 
 use crate::translate::front::tags::ConditionCode as Cc;
 use loops::{Affine, Batch, Span, Trip};
@@ -204,7 +204,7 @@ impl Emitter<'_> {
     }
 
     fn batch_range(&mut self, span: Span, backwards: bool, pages: Option<Label>, scalar: Label) {
-        const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
+        const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
         self.batch_span_start(span, backwards, X0);
         if backwards && span.width > 1 {
             // A first scalar access that straddles guest zero has no interval.

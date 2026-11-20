@@ -12,7 +12,8 @@ use super::{
     orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, tst_imm, ubfx,
     vfneg2d, vldr, vldur, vstur,
 };
-use crate::translate::{emit_link_point, emit_link_transition};
+use crate::translate::lower::stubs;
+use crate::translate::lower::{emit_link_point, emit_link_transition};
 
 const CPU: Reg = Reg::new(0);
 const FLAGS: Reg = Reg::new(1);
@@ -76,7 +77,7 @@ impl Emitter<'_> {
 
         self.save_entry_state();
         if entry.contains(&Source::Eflags) {
-            runtime::emit_read_flags(&mut self.asm, Reg::new(0));
+            stubs::emit_read_flags(&mut self.asm, Reg::new(0));
             self.asm.emit(mov(W, FLAGS, S4));
         }
         if !self.resident {
@@ -428,7 +429,7 @@ impl Emitter<'_> {
                 .emit_all(&[ldr(X, ALIAS, RT, SHADOW), ldr(X, WINDOW, RT, WINDOW_BASE)]);
         }
         self.bias_stack();
-        runtime::emit_load_flags(&mut self.asm);
+        stubs::emit_load_flags(&mut self.asm);
         self.charge(-i64::from(record.refund), RecordId(0), false);
         self.stack_frame(bytes, false);
         let settled_exit_words = self.words_since(start) + 1;
@@ -440,7 +441,7 @@ impl Emitter<'_> {
         }
         let point = self.asm.offset();
         self.links.push((point, record.eip));
-        emit_link_point(&mut self.asm, record.eip);
+        emit_link_point(&mut self.asm, record.eip, false);
         self.asm.emit(0); // Bound to the Tier-1 dispatch stub on placement.
         if arrival {
             let transition = emit_link_transition(&mut self.asm, point);

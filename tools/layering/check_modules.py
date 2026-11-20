@@ -12,21 +12,22 @@ SRCDIR = Path(__file__).resolve().parents[2] / "crates/adv-cpu-a64/src"
 
 EMIT = {"runtime", "asm", "encode"}
 LOWER = EMIT | {"translate::front", "facts"}
+FRONT_ENCODER_TYPES = {"Float", "Logic", "Narrowing", "Permute", "Same", "ShiftImm"}
 RULES = {
     "encode": set(),
-    "asm": set(),
+    "asm": {"encode"},
     "cache": set(),
     "jit_map": set(),
     "runtime": {"asm", "encode"},
     "facts": EMIT,
-    "translate::front": set(),
+    "translate::front": {"encode"},
     "translate::lower": LOWER,
     "translate::jit": LOWER | {"translate::lower"},
     "translate::opt": LOWER | {"translate::lower"},
-    "native::store": {"cache", "facts", "runtime"},
+    "native::store": {"cache", "encode", "facts", "runtime", "translate::front", "translate::lower"},
     "native::compile": {"translate::jit", "translate::opt", "translate::front", "facts"},
     "native::plan": {"native::store", "native::compile", "facts"},
-    "native::offload": {"native::store", "native::plan", "runtime"},
+    "native::offload": {"native::store", "native::plan", "runtime", "translate::opt"},
     "cpu": {"executor"},
 }
 RULES["native::run"] = set(RULES) - {"cpu"}
@@ -41,7 +42,6 @@ ROLES.update({
     ("native",): "native::run",
     ("native", "head"): "native::store",
     ("translate",): "translate::jit",
-    ("translate", "access"): "translate::lower",
     ("translate", "body"): "translate::lower",
 })
 
@@ -49,43 +49,30 @@ ROLES.update({
 # in the same change that removes its last occurrence.
 TRANSITIONAL: set[tuple[str, str]] = {
     # Module responsibilities still colocated in the implementation.
-    ("asm.rs", "encode"),
     ("native/head.rs", "asm"),
-    ("native/head.rs", "encode"),
     ("native/head.rs", "translate::opt"),
     ("native/offload.rs", "native::compile"),
     ("native/offload.rs", "native::run"),
     ("native/offload.rs", "translate::jit"),
-    ("native/offload.rs", "translate::opt"),
     ("native/plan.rs", "cache"),
     ("native/plan.rs", "encode"),
     ("native/plan.rs", "native::run"),
     ("native/plan.rs", "runtime"),
     ("native/plan.rs", "translate::jit"),
-    ("native/store.rs", "encode"),
     ("native/store.rs", "native::run"),
     ("native/store.rs", "translate::jit"),
-    ("translate/access.rs", "translate::jit"),
     ("translate/body.rs", "translate::jit"),
-    ("translate/opt/back.rs", "translate::jit"),
-    ("translate/opt/back/batch.rs", "translate::jit"),
-    ("translate/opt/back/inline.rs", "translate::jit"),
-    ("translate/opt/back/resident.rs", "translate::jit"),
     ("translate/opt/front.rs", "translate::jit"),
     ("translate/opt/front/cells.rs", "translate::jit"),
     ("translate/opt/front/facts.rs", "translate::jit"),
     ("translate/opt/front/integer.rs", "translate::jit"),
     ("translate/opt/front/live.rs", "translate::jit"),
     ("translate/opt/front/model.rs", "translate::jit"),
-    ("translate/opt/front/passes.rs", "translate::jit"),
     ("translate/opt/front/simd.rs", "translate::jit"),
     ("translate/opt/front/x87.rs", "translate::jit"),
     # Decoder and interpreter references awaiting their module moves.
     ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
-    ("translate/front/decode.rs", "translate::jit"),
-    ("translate/front/plans.rs", "encode"),
     ("translate/front/plans.rs", "translate::jit"),
-    ("translate/front/trace.rs", "translate::jit"),
     # Existing test assemblies and reference interpreters.
     ("executor.rs", "iced_x86 (tests)"),
     ("executor/differential.rs", "iced_x86 (tests)"),
@@ -256,6 +243,9 @@ def inspect(source: str, module: tuple[str, ...]):
                 only_test = False
             elif token in {";", ","}:
                 only_test = False
+            elif tokens[i:i + 4] == ["crate", "::", "encode", "::"]:
+                if role(module) == "translate::front":
+                    imports.append((scope, ("crate", "encode", tokens[i + 4]), lines[i], in_test))
             elif tokens[i + 1:i + 2] == ["::"]:
                 if dep := external(tuple(tokens[i:i + 3:2])):
                     external_paths.append((dep, lines[i], in_test or only_test))
@@ -301,6 +291,9 @@ def disallowed(source: str, scope: tuple[str, ...], path: tuple[str, ...],
     if in_test:
         return None
     target = import_path(scope, path)
+    if source == "translate::front" and target[:1] == ("encode",):
+        if len(target) != 2 or target[1] not in FRONT_ENCODER_TYPES:
+            return "encode (operation types only)"
     if path[-1] == "*" and len(target) <= len(scope) and scope[:len(target) - 1] == target[:-1]:
         return f"parent glob {'::'.join(('crate', *target))}"
     for length in range(len(target), 0, -1):

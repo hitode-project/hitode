@@ -17,11 +17,11 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 
 use super::decode::{Mem, Part, ShiftKind, Src};
-use super::flags::FlagSet;
 use super::{
     Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
     biased, host, temp,
 };
+use crate::translate::front::flags::FlagSet;
 
 // Partial-width forms canonicalize before borrowing the recipe temporaries.
 const X7: Reg = Reg::new(7);
@@ -205,9 +205,9 @@ impl Translator<'_> {
                 ]);
                 let address = self.finish_address(mem, X16);
                 self.access(
-                    super::access::Addr::Window(address),
+                    crate::translate::lower::access::Addr::Window(address),
                     1,
-                    super::access::Dir::Load,
+                    crate::translate::lower::access::Dir::Load,
                     X6,
                 );
                 self.narrow_write(Part::Reg(EAX), 1, Reg::ZR, X6);
@@ -215,9 +215,9 @@ impl Translator<'_> {
             Integer::Touch(mem) => {
                 let address = self.effective(mem);
                 self.access(
-                    super::access::Addr::Window(address),
+                    crate::translate::lower::access::Addr::Window(address),
                     1,
-                    super::access::Dir::Load,
+                    crate::translate::lower::access::Dir::Load,
                     X6,
                 );
             }

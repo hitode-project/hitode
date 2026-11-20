@@ -17,7 +17,7 @@ use iced_x86::{
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use crate::translate::flags::FlagSet;
+use crate::translate::front::flags::FlagSet;
 
 pub const ESP: u8 = 4;
 pub const EBP: u8 = 5;

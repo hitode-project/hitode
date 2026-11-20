@@ -38,6 +38,7 @@
 //! typed artifacts. `offload` alone consumes worker jobs.
 //! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
+use crate::translate::lower::stubs;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -948,7 +949,7 @@ impl Native {
             }
         }
 
-        let mut stubs = runtime::stubs();
+        let mut stubs = stubs::stubs();
         let access_entry = stubs.code.len() * 4;
         stubs.code.extend(translate::opt::back::access_stub(
             resident_access as *const () as u64,
@@ -1297,7 +1298,7 @@ mod tests {
                 &[],
                 1,
                 &[],
-                translate::VersionLayout {
+                crate::translate::lower::VersionLayout {
                     body: 4,
                     miss: Some(8),
                 },

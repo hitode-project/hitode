@@ -6,6 +6,7 @@
 //! separately, so a rebuild can reuse the layout and its watches.
 
 pub(crate) mod decode;
+pub(crate) mod flags;
 pub(super) mod plans;
 mod quick_form;
 pub(crate) mod summary;

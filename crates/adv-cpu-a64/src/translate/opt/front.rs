@@ -694,7 +694,7 @@ fn build_trace(
             };
             let after = f.record(resume, unit.trace.unused(i), Start::After(i));
             let r = &mut f.func.records[after.0 as usize];
-            if unit.trace.observe_out[i] == crate::translate::flags::FlagSet::NONE {
+            if unit.trace.observe_out[i] == crate::translate::front::flags::FlagSet::NONE {
                 r.eflags = None;
             }
             if !metadata_live(unit, i + 1) {

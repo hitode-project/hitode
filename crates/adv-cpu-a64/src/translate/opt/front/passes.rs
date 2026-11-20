@@ -6,7 +6,7 @@ use super::{
     MAX_PLAIN_FACTS, Op, Recipe, RecordId, Source, Target, Type, Value, VecOp, VecUnary,
     disjoint_ranges, facts,
 };
-use crate::translate::flags::FlagSet;
+use crate::translate::front::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 use adv_cpu_core::memory::PAGE_SIZE;
 

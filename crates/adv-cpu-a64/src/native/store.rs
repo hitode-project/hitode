@@ -8,9 +8,9 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{Enter, Faults, InterpreterCause, ShadowStack, head};
+use super::{Enter, Faults, InterpreterCause, ShadowStack};
 use crate::cache::CodeCache;
-use crate::encode::bl;
+use crate::encode::{b, bl};
 use crate::facts::Key;
 use crate::runtime;
 use crate::translate::{self, Site, Stubs};
@@ -60,7 +60,7 @@ impl Linked {
         if self.original & 0xFC00_0000 == 0x9400_0000 {
             bl((target as i64 - self.point as i64) as i32)
         } else {
-            head::branch(self.point, target)
+            b((target as i64 - self.point as i64) as i32)
         }
     }
 }
@@ -161,7 +161,8 @@ impl CodeStore {
     }
 
     pub(super) fn repoint(&mut self, point: usize, target: usize) {
-        self.cache.patch(point, head::branch(point, target));
+        self.cache
+            .patch(point, b((target as i64 - point as i64) as i32));
     }
 
     pub(super) fn linked_target(&self, point: usize, eip: u32, checked: usize) -> usize {
@@ -231,7 +232,7 @@ impl CodeStore {
         sites: &[(usize, Site)],
         retired: u32,
         marks: &[crate::jit_map::Mark],
-        layout: translate::VersionLayout,
+        layout: crate::translate::lower::VersionLayout,
     ) -> Option<Tier1Unit> {
         let unit = self.cache.append(words)?;
         let from = self.faults.sites.len().saturating_sub(1);

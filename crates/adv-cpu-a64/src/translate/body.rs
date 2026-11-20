@@ -1,28 +1,18 @@
 //! Argument forwarding, register saves and constant memory-call expansions.
 
 use super::decode::{Alu, ESP, Op, Src};
-use super::{Cold, RUNTIME, Translator, WINDOW, X0, X1, X3, X4, X6, X9, X16, X17, host};
+use super::{Cold, RUNTIME, Translator, WINDOW, X0, X1, X3, X4, X6, X16, X17, host};
 use crate::encode::Extend::Uxtw;
-use crate::encode::Index::{Post, Pre};
+use crate::encode::Index::Post;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit};
 
-const SP: Reg = Reg::new(31);
-
 impl Translator<'_> {
     pub(super) fn body_call(&mut self, body: adv_cpu_core::body::DirectBody) {
-        let call = body.call as usize as u64;
         self.body_simd(false);
-        self.emit(stp(X, Pre, X9, super::X12, SP, -16));
-        self.emit(add_imm(X, X0, RUNTIME, runtime::BODY, false));
-        self.emit(movz(X, X16, call as u16, 0));
-        for shift in [16, 32, 48] {
-            self.emit(movk(X, X16, (call >> shift) as u16, shift));
-        }
-        self.emit(blr(X16));
-        self.emit(ldp(X, Post, X9, super::X12, SP, 16));
+        super::lower::body::emit_call(self.asm, body);
         self.body_simd(true);
     }
 

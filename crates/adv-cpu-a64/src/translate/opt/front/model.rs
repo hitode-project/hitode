@@ -93,7 +93,7 @@ pub(super) fn analyze(
     while let Some(i) = work.pop() {
         let mut m = states[i].clone().unwrap();
         let inst = unit.trace.insts[i];
-        if inst.effects.writes != crate::translate::flags::FlagSet::NONE {
+        if inst.effects.writes != crate::translate::front::flags::FlagSet::NONE {
             m.flags = None;
         }
         m.step(inst.op, &offsets[i], i)?;

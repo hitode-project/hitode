@@ -38,15 +38,17 @@
 //! values in d8-d15 and XMM values in v16-v23, with v0-v6 as scratch.
 //! An x87 run keeps its stack values in v24-v31.
 
-mod access;
+mod memory;
+use crate::translate::lower::stubs;
+use lower::access;
 mod body;
 mod channels;
 #[cfg(native)]
 pub(crate) mod computation;
 pub(crate) mod front;
+pub(crate) mod lower;
 use front::{decode, trace};
-mod flags;
-mod fp_class;
+
 mod integer;
 mod native_region;
 mod ops;
@@ -69,8 +71,14 @@ pub(crate) use decode::Fetcher;
 pub use decode::Helper;
 #[cfg(native)]
 pub(crate) use decode::Op;
-pub(crate) use flags::Overflow;
-pub use flags::{Carry, Operand, Recipe, Sense};
+pub(crate) use lower::flags::Overflow;
+pub use lower::flags::{Carry, Operand, Recipe, Sense};
+use lower::{InternalLink, RUNTIME, VersionLayout, WINDOW, X0, X1, X2, X3, X4, X5, X9, X12, X16};
+pub use lower::{Link, Site, Stubs};
+use lower::{
+    emit_back_count, emit_exit, emit_far, emit_link_point, emit_link_transition, emit_miss_slot,
+    emit_target, emit_version_miss, emit_version_prologue, finish_version,
+};
 #[cfg(native)]
 pub(crate) use trace::Mode;
 pub(crate) use trace::Trace;
@@ -87,7 +95,7 @@ use crate::facts::{self, Key};
 use crate::jit_map::{Mark, Part};
 use crate::runtime::Exit;
 use decode::{EBP, ESP};
-use flags::FlagSet;
+use front::flags::FlagSet;
 use std::collections::VecDeque;
 use trace::{Edge, Next};
 
@@ -95,34 +103,6 @@ use trace::{Edge, Next};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     pub flagm: bool,
-}
-
-/// What the owner needs at a host instruction that may fault.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Site {
-    /// The guest instruction, which has committed nothing (A64-FLAG-4).
-    pub eip: u32,
-    /// Instructions the countdown prepaid that the unit has not completed,
-    /// this one included.
-    pub refund: u32,
-    pub sense: Sense,
-    pub carry: Carry,
-    pub recipe: Recipe,
-    /// A pending result supplies SF and ZF; otherwise NZCV holds them.
-    pub(crate) nz: Option<Operand>,
-    /// OF as hardware V or a recipe over recoverable operands.
-    pub(crate) overflow: Overflow,
-    /// Whether the access checks its page first, so a fault here is not
-    /// a reason to check it.
-    pub checked: bool,
-    /// Unpublished MMX (bits 0–7) and XMM (bits 8–15) values in host SIMD.
-    pub simd_dirty: u16,
-    /// Where a fault here resumes, relative to the site, when x87 values
-    /// cached in host registers must be published first; 0 for the fault
-    /// stub itself.
-    pub resume: i32,
-    /// Optimized region record, when this access belongs to an optimized form.
-    pub opt_record: Option<u32>,
 }
 
 impl Unit {
@@ -206,39 +186,6 @@ pub struct Code {
     pub(crate) version: VersionLayout,
 }
 
-/// Offsets of the body and the patchable miss branch in a checked unit.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct VersionLayout {
-    pub body: usize,
-    pub miss: Option<usize>,
-}
-
-/// A link point of a unit: a branch to the owner's helper that may become
-/// a direct branch to the unit at `eip`.
-#[derive(Clone, Copy, Debug)]
-pub struct Link {
-    /// Byte offset of the point in the unit.
-    pub offset: usize,
-    pub eip: u32,
-    /// Whether the trace's main path leaves through it: a real call, or
-    /// the end of the trace, rather than a side exit.
-    pub main: bool,
-    pub back: bool,
-    pub direct: Option<usize>,
-}
-
-/// A patchable internal edge and its out-of-line paths, in byte offsets.
-pub(crate) struct InternalLink {
-    pub eip: u32,
-    pub point: usize,
-    pub target: usize,
-    pub transition: usize,
-    pub link: usize,
-    pub counter: Option<usize>,
-    pub sensor: Option<usize>,
-    pub source_pc: u32,
-}
-
 impl Workspace {
     pub fn words(&self) -> &[u32] {
         self.code.asm.words()
@@ -275,46 +222,14 @@ impl Workspace {
     }
 }
 
-/// Host addresses of the `runtime` stubs units branch to.
-#[derive(Clone, Copy, Debug)]
-pub struct Stubs {
-    pub exit: usize,
-    pub dispatch: usize,
-    /// Continues at the guest EIP in w16 through the indirect table.
-    pub lookup: usize,
-    /// `lookup` after its probe missed.
-    pub lookup_slow: usize,
-    /// A return whose shadow entry did not match.
-    pub ret_miss: usize,
-    /// A checked access the window cannot take.
-    pub access: usize,
-    /// An INT 0x2e handler call.
-    pub call: usize,
-    /// Where a faulting site leaves.
-    pub fault: usize,
-    /// Where an optimized form leaves through a record.
-    pub opt_exit: usize,
-}
-
-const X0: Reg = Reg::new(0);
-const X1: Reg = Reg::new(1);
-const X2: Reg = Reg::new(2);
-const X3: Reg = Reg::new(3);
-const X4: Reg = Reg::new(4);
-const X5: Reg = Reg::new(5);
 const X6: Reg = Reg::new(6);
-const X9: Reg = Reg::new(9);
 const X10: Reg = Reg::new(10);
 const X11: Reg = Reg::new(11);
-const X12: Reg = Reg::new(12);
 const X13: Reg = Reg::new(13);
 const X14: Reg = Reg::new(14);
 const X15: Reg = Reg::new(15);
-const X16: Reg = Reg::new(16);
 const X17: Reg = Reg::new(17);
-const WINDOW: Reg = Reg::new(27);
 const SHADOW: Reg = Reg::new(28);
-const RUNTIME: Reg = Reg::new(29);
 
 /// The host register of guest register `index`; ESP and EBP are biased.
 const fn host(index: u8) -> Reg {
@@ -782,11 +697,7 @@ impl Jit<'_> {
         links.clear();
         internal_links.clear();
         marks.clear();
-        let miss = (self.tier1 && self.facts.mask() != 0).then(|| asm.label());
-        if let Some(miss) = miss {
-            self.facts.guard(asm, miss);
-        }
-        let body = asm.offset();
+        let (body, miss) = emit_version_prologue(asm, self.tier1.then_some(self.facts));
         let mut entries = residency::entries(trace, self.checked, self.tier1.then_some(self.facts));
         if self.tier1 {
             let mxcsr = self.facts.mxcsr();
@@ -873,10 +784,7 @@ impl Jit<'_> {
             *retired = trace.prepaid(0);
         }
         let again = t.finish(self.at);
-        *version = VersionLayout {
-            body,
-            miss: miss.map(|label| asm.position(label)),
-        };
+        *version = finish_version(asm, body, miss);
         again
     }
 }
@@ -922,25 +830,6 @@ pub(crate) fn lower_computation<'a>(
         sites: &code.sites,
         marks: &code.marks,
     })
-}
-
-// Optimized normal exits use the ordinary four-word link layout.
-fn emit_link_point(asm: &mut Asm, eip: u32) {
-    crate::runtime::emit_link_point(asm, eip, false);
-}
-
-fn emit_link_transition(asm: &mut Asm, point: usize) -> usize {
-    let transition = asm.offset();
-    asm.emit(adr(X14, point as i32 - transition as i32));
-    asm.emit(b(0));
-    transition
-}
-
-fn emit_target(asm: &mut Asm, eip: u32) {
-    asm.emit_all(&[
-        movz(W, Reg::new(1), eip as u16, 0),
-        movk(W, Reg::new(1), (eip >> 16) as u16, 16),
-    ]);
 }
 
 impl Translator<'_> {
@@ -2132,9 +2021,7 @@ impl Translator<'_> {
 
     /// Leaves translated code: w0 the exit, w1 the EIP.
     fn exit(&mut self, exit: Exit, eip: u32) {
-        self.emit(movz(W, Reg::new(0), exit.word(), 0));
-        self.target(eip);
-        self.far(self.stubs.exit);
+        emit_exit(self.asm, self.far, exit, eip, self.stubs.exit);
     }
 
     /// Continues at `eip` through the owner's helper: w1 the EIP and x2
@@ -2145,10 +2032,10 @@ impl Translator<'_> {
             self.exit(Exit::Dispatch, eip);
             return;
         }
-        let offset = crate::runtime::emit_link_point(self.asm, eip, back);
+        let offset = emit_link_point(self.asm, eip, back);
         self.far(self.stubs.dispatch);
         let direct = if back {
-            crate::runtime::emit_back_count(self.asm);
+            emit_back_count(self.asm);
             self.exit(Exit::Plan(crate::runtime::PlanEvent::DiscoverBackEdge), eip);
             None
         } else if self.resident_links {
@@ -2190,9 +2077,7 @@ impl Translator<'_> {
     }
 
     fn version_miss(&mut self, eip: u32) {
-        self.target(eip);
-        self.emit(mvn(X, X2, Reg::ZR));
-        self.far(self.stubs.dispatch);
+        emit_version_miss(self.asm, self.far, eip, self.stubs.dispatch);
     }
 
     fn target(&mut self, eip: u32) {
@@ -2201,14 +2086,12 @@ impl Translator<'_> {
 
     /// A branch to the stub at host address `to`, placed by `finish`.
     fn far(&mut self, to: usize) {
-        self.far.push((self.asm.offset() / 4, to));
-        self.emit(b(0));
+        emit_far(self.asm, self.far, to, b(0));
     }
 
     /// A call to the stub at host address `to`, placed by `finish`.
     fn far_call(&mut self, to: usize) {
-        self.far.push((self.asm.offset() / 4, to));
-        self.emit(bl(0));
+        emit_far(self.asm, self.far, to, bl(0));
     }
 
     /// A `cbnz` to the miss stub at `to` for an indirect transfer of
@@ -2292,8 +2175,7 @@ impl Translator<'_> {
                 self.asm.b(to);
             }
             Cold::VersionMiss { label, eip } => {
-                self.asm.bind(label);
-                self.emit(b(4));
+                emit_miss_slot(self.asm, label);
                 self.version_miss(eip);
             }
             Cold::FactTransfer {
@@ -2381,7 +2263,7 @@ impl Translator<'_> {
                     crate::runtime::emit_sensor(self.asm, counter, X0, X1, hot);
                     self.asm.b(target);
                     self.asm.bind(hot);
-                    crate::runtime::emit_save_light(self.asm);
+                    stubs::emit_save_light(self.asm);
                     self.emit(stp_v(
                         VSize::Q,
                         Index::Pre,
@@ -2408,7 +2290,7 @@ impl Translator<'_> {
                     self.flush_simd();
                     self.canonicalize();
                     self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
-                    crate::runtime::emit_store_guest(self.asm, X0);
+                    stubs::emit_store_guest(self.asm, X0);
                     self.target(eip);
                     self.asm.adr(X2, point);
                     self.emit_all(&[
@@ -2435,7 +2317,7 @@ impl Translator<'_> {
                         SP,
                         128,
                     ));
-                    crate::runtime::emit_restore_light(self.asm);
+                    stubs::emit_restore_light(self.asm);
                     self.asm.b(target);
                     counter
                 });

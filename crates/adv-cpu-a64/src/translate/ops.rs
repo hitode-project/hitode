@@ -5,16 +5,18 @@ use crate::encode::Index::{Post, Pre};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::translate::lower::stubs;
 
-use super::access::{Addr, Dir};
 use super::decode::{Alu, ESP, EventOp, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
-use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
     Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X9, X10, X11, X13,
     X14, X15, X16, X17, biased, host, temp,
 };
 use crate::runtime::{self, Exit};
+use crate::translate::front::flags::FlagSet;
+use crate::translate::lower::access::{Addr, Dir};
+use crate::translate::lower::flags::{Carry, Operand, Recipe, Sense};
 use adv_cpu_core::IndirectBranchKind;
 use adv_cpu_core::memory::WRITE;
 
@@ -314,7 +316,7 @@ impl Translator<'_> {
                     ));
                 }
             }
-            self.call_prepared_value(helper, runtime::ValueTarget::Locked, self.x87_live_pairs());
+            self.call_prepared_value(helper, stubs::ValueTarget::Locked, self.x87_live_pairs());
             self.asm.cbz(W, true, X0, refused);
             for n in 0..8 {
                 if writes & (1 << n) != 0 {
@@ -328,7 +330,7 @@ impl Translator<'_> {
                 }
             }
             self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
-            runtime::emit_load_flags(self.asm);
+            stubs::emit_load_flags(self.asm);
         }
         self.asm.bind(done);
     }
@@ -535,12 +537,12 @@ impl Translator<'_> {
                 });
             }
         }
-        runtime::emit_value_call(
+        stubs::emit_value_call(
             self.asm,
             0,
             0,
             self.x87_live_pairs(),
-            runtime::ValueTarget::StackSpan {
+            stubs::ValueTarget::StackSpan {
                 width: span as u16,
                 push,
             },

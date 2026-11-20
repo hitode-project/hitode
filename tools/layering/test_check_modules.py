@@ -19,6 +19,26 @@ class ModuleDependenciesTest(unittest.TestCase):
         ])
 
     # spec: A64A-DEP-1
+    def test_assembler_and_store_may_encode_branches(self):
+        self.assertEqual(violations({
+            "asm.rs": "use crate::encode::{b, bl};",
+            "native/store.rs": "use crate::encode::{b, bl};",
+            "encode.rs": "",
+        }, set()), [])
+
+    # spec: A64A-DEP-1, A64A-ROLE-2
+    def test_front_may_name_encoder_operation_types_only(self):
+        self.assertEqual(violations({
+            "encode.rs": "",
+            "translate/front/plans.rs": "use crate::encode::{Float, Same, b};",
+            "translate/front/trace.rs": "fn emit() { crate::encode::b(0); }",
+            "translate/front/types.rs": "use crate::encode::Logic;",
+        }, set()), [
+            "translate/front/plans.rs:1: translate::front -> encode (operation types only): disallowed",
+            "translate/front/trace.rs:1: translate::front -> encode (operation types only): disallowed",
+        ])
+
+    # spec: A64A-DEP-1
     def test_optimized_and_tier1_lowerings_cannot_use_each_other(self):
         self.assertEqual(violations({
             "translate/mod.rs": "use self::opt::analyze;",

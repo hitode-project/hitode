@@ -45,7 +45,8 @@
 //! forms ignore upper lanes; NaN signaling follows each x86 predicate.
 //! EFLAGS comparisons use the value entry on a NaN.
 
-use super::fp_class;
+use crate::translate::lower::fp_class;
+use crate::translate::lower::stubs;
 
 #[cfg(test)]
 use super::front::plans::simd as plan;
@@ -57,10 +58,10 @@ use crate::encode::*;
 use crate::runtime::{self, Exit};
 
 use super::decode::Mem;
-use super::flags::Operand;
 use super::residency::Entry;
 use crate::asm::Label;
 use crate::jit_map::Part;
+use crate::translate::lower::flags::Operand;
 
 use super::{Cold, RUNTIME, Translator, X5, X6, X13, X14, X16, X17, host};
 
@@ -566,7 +567,7 @@ impl Translator<'_> {
             link: false,
             x87,
         });
-        self.call_prepared_value(simd.helper, runtime::ValueTarget::Float(None), pairs);
+        self.call_prepared_value(simd.helper, stubs::ValueTarget::Float(None), pairs);
         self.emit_all(&[
             ldr(W, X16, RUNTIME, runtime::VALUE_MXCSR),
             str(W, X16, X5, runtime::MXCSR),
@@ -688,9 +689,9 @@ impl Translator<'_> {
                 } else {
                     self.emit(vumov(1, X6, s, lane));
                     self.access(
-                        super::access::Addr::Window(address),
+                        crate::translate::lower::access::Addr::Window(address),
                         2,
-                        super::access::Dir::Store,
+                        crate::translate::lower::access::Dir::Store,
                         X6,
                     );
                 }
@@ -734,9 +735,9 @@ impl Translator<'_> {
                     Loc::Gpr(index) => host(index),
                     Loc::Mem => {
                         self.access(
-                            super::access::Addr::Window(address),
+                            crate::translate::lower::access::Addr::Window(address),
                             2,
-                            super::access::Dir::Load,
+                            crate::translate::lower::access::Dir::Load,
                             X17,
                         );
                         X17
@@ -765,9 +766,9 @@ impl Translator<'_> {
             }
             Kind::LoadControl => {
                 self.access(
-                    super::access::Addr::Window(address),
+                    crate::translate::lower::access::Addr::Window(address),
                     4,
-                    super::access::Dir::Load,
+                    crate::translate::lower::access::Dir::Load,
                     X13,
                 );
                 let bail = self.architectural_exception(13);
@@ -784,9 +785,9 @@ impl Translator<'_> {
                 self.cpu();
                 self.emit(ldr(W, X13, X5, runtime::MXCSR));
                 self.access(
-                    super::access::Addr::Window(address),
+                    crate::translate::lower::access::Addr::Window(address),
                     4,
-                    super::access::Dir::Store,
+                    crate::translate::lower::access::Dir::Store,
                     X13,
                 );
                 return;
@@ -2007,11 +2008,11 @@ impl Translator<'_> {
     pub(super) fn call_prepared_value(
         &mut self,
         helper: u8,
-        target: runtime::ValueTarget,
+        target: stubs::ValueTarget,
         pairs: Option<u8>,
     ) {
         let index = self.helpers + u32::from(helper);
-        runtime::emit_value_call(self.asm, index, self.vector.xmm, pairs, target);
+        stubs::emit_value_call(self.asm, index, self.vector.xmm, pairs, target);
     }
 
     pub(super) fn publish_fx_image(&mut self) {

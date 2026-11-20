@@ -8,7 +8,7 @@ use super::{
     offset_of, page_crossing, ret, runtime, shiftv, stp, stp_v, str, sub, sub_ext, sub_imm, vldr,
     vstr, vumov,
 };
-use crate::translate::{X0, X1, X2, X3, X4, X5};
+use crate::translate::lower::{X0, X1, X2, X3, X4, X5};
 use adv_cpu_core::memory::{LINEAR, READ, SHARED, WRITE};
 
 const MEMORY_BASE: u32 = offset_of!(Runtime, memory_base) as u32;
@@ -129,7 +129,7 @@ impl Emitter<'_> {
     }
 
     pub(super) fn checked_accesses(&mut self) {
-        const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
+        const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
         for access in std::mem::take(&mut self.checked_accesses) {
             let CheckedAccess {
                 address,
@@ -309,7 +309,7 @@ impl Emitter<'_> {
 /// in X3 and all allocated values.
 pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
     use adv_cpu_core::memory::EXEC;
-    const PAGE_SHIFT: u32 = crate::translate::access::PAGE_SHIFT;
+    const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
     let write = asm.label();
     let next = asm.label();
     let done = asm.label();
@@ -497,7 +497,7 @@ impl Probation {
         for &(trigger, eip) in &self.exits {
             asm.bind(trigger);
             asm.bl(self.account);
-            crate::translate::emit_target(asm, eip);
+            crate::translate::lower::emit_target(asm, eip);
             asm.b(self.leave);
         }
         asm.bind(self.leave);

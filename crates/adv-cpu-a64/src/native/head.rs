@@ -5,6 +5,7 @@
 //! owner changes the version chain. Detached jobs have their own entry
 //! code and retain no pointers to these cells.
 
+use crate::translate::lower::stubs;
 use std::cell::Cell;
 
 use adv_cpu_core::CpuState;
@@ -223,9 +224,9 @@ pub(super) fn emit(
 
     if version == 0 {
         asm.bind(sampled);
-        runtime::emit_save_light(&mut asm);
+        stubs::emit_save_light(&mut asm);
         asm.emit(ldr(X, r(0), RT, runtime::CPU_STATE));
-        runtime::emit_store_guest(&mut asm, r(0));
+        stubs::emit_store_guest(&mut asm, r(0));
         constant(&mut asm, r(1), u64::from(head));
         asm.emit_all(&[
             mov(X, r(0), RT),
@@ -234,7 +235,7 @@ pub(super) fn emit(
             ldr(X, r(16), RT, runtime::PLAN_OBSERVATION),
             blr(r(16)),
         ]);
-        runtime::emit_restore_light(&mut asm);
+        stubs::emit_restore_light(&mut asm);
         asm.b(entry);
     }
     asm.bind(probe);
@@ -359,7 +360,7 @@ fn offer(asm: &mut Asm, gate: OfferEntry, counter: Label, leave: Label) {
 }
 
 fn sample_offer(asm: &mut Asm, head: u32, fallback: Label) {
-    runtime::emit_save_light(asm);
+    stubs::emit_save_light(asm);
     constant(asm, r(1), u64::from(head));
     asm.emit_all(&[
         mov(X, r(0), RT),
@@ -367,7 +368,7 @@ fn sample_offer(asm: &mut Asm, head: u32, fallback: Label) {
         ldr(X, r(16), RT, runtime::PLAN_OBSERVATION),
         blr(r(16)),
     ]);
-    runtime::emit_restore_light(asm);
+    stubs::emit_restore_light(asm);
     asm.cbz(W, false, r(0), fallback);
     guest_exit(asm, head, Exit::Plan(PlanEvent::OfferReady));
 }

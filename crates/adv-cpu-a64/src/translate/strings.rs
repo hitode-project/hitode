@@ -23,6 +23,7 @@
 
 #[cfg(test)]
 use super::front::plans::strings as plan;
+use crate::translate::lower::stubs;
 #[cfg(test)]
 use iced_x86::Instruction;
 
@@ -32,11 +33,11 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Event, Exit};
 
-use super::access::PAGE_SHIFT;
 use super::{
     State, Translator, WINDOW, X0, X1, X2, X4, X5, X6, X9, X10, X11, X12, X13, X14, X15, X16, X17,
     host, temp,
 };
+use crate::translate::lower::access::PAGE_SHIFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -237,7 +238,7 @@ impl Translator<'_> {
             self.asm.bind(exhausted);
             if let Some(left) = left {
                 self.emit(ldr(X, X0, super::RUNTIME, runtime::CPU_STATE));
-                runtime::emit_read_flags(self.asm, X0);
+                stubs::emit_read_flags(self.asm, X0);
                 self.compare(left, temp(0), op.width);
                 let saved_flags = if let Some(x87) = self.x87_leaving() {
                     self.emit(mov(W, temp(0), X4));

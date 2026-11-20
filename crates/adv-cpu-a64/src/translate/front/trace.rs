@@ -22,7 +22,7 @@
 use adv_cpu_core::memory::Memory;
 
 use super::decode::{Decodes, Effects, Fetcher, Helper, Op, Src};
-use crate::translate::flags::FlagSet;
+use crate::translate::front::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;

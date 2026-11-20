@@ -25,6 +25,7 @@
 //! 2^51 rounds the value, and it orders values as they do unless two equal
 //! ones lost bits. Stores to binary64 round the significand in integers.
 
+use crate::translate::lower::stubs;
 use adv_cpu_core::floating::fast::{self, Fast, Op as Arith, PE, RANGE, Source};
 
 #[cfg(test)]
@@ -39,10 +40,10 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime::{self, Exit};
 
-use super::access::{Addr, Dir};
 use super::decode::Mem;
-use super::flags::Operand;
 use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+use crate::translate::lower::access::{Addr, Dir};
+use crate::translate::lower::flags::Operand;
 
 mod cache;
 mod pair;
@@ -275,13 +276,13 @@ impl Translator<'_> {
             self.canonicalize();
             self.cpu();
             self.emit(mov(X, X0, X5));
-            runtime::emit_read_flags(self.asm, X0);
+            stubs::emit_read_flags(self.asm, X0);
             self.emit(str(W, X4, RUNTIME, runtime::VALUE_EFLAGS));
             self.vector.cpu = false;
         }
         if operands.access.is_some() {
             let refused = self.leave_for_event(runtime::Event::CheckedAccess);
-            self.call_prepared_value(index, runtime::ValueTarget::Float(operands.access), pairs);
+            self.call_prepared_value(index, stubs::ValueTarget::Float(operands.access), pairs);
             self.asm.tbz(
                 true,
                 X0,
@@ -289,7 +290,7 @@ impl Translator<'_> {
                 refused,
             );
         } else {
-            self.call_prepared_value(index, runtime::ValueTarget::Float(None), pairs);
+            self.call_prepared_value(index, stubs::ValueTarget::Float(None), pairs);
         }
         let unsupported = self.leave_for_event(runtime::Event::Unsupported(form));
         self.asm.tbz(
@@ -306,7 +307,7 @@ impl Translator<'_> {
         }
         if flags.write_flags {
             self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
-            runtime::emit_load_flags(self.asm);
+            stubs::emit_load_flags(self.asm);
             self.state = super::State::CANONICAL;
         }
         if operands.restore_fx {

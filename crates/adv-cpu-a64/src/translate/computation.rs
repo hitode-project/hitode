@@ -908,7 +908,7 @@ impl Builder<'_> {
         if inst.locked.is_some() || inst.call.is_some() || inst.spin {
             return None;
         }
-        if inst.effects.writes != super::flags::FlagSet::NONE {
+        if inst.effects.writes != crate::translate::front::flags::FlagSet::NONE {
             state.test = None;
         }
         match inst.op {
