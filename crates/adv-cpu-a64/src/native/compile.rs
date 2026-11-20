@@ -3,7 +3,9 @@
 #[cfg(native)]
 mod pool;
 #[cfg(native)]
-pub(super) use pool::{Compiler, Job, JobForm, Request, ResidentForm, ResidentRecovery, Task};
+pub(super) use pool::{
+    Compiler, Job, JobForm, PreparedRow, Request, ResidentForm, ResidentRecovery, Task,
+};
 
 use crate::jit_map::Mark;
 use crate::translate::jit::{self, Code};

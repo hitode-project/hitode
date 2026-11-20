@@ -642,7 +642,15 @@ fn span_word(asm: &mut Asm, level: usize, backwards: bool, index: Reg, dst: Reg)
 
 /// Tests the projected inclusive byte range in X0..=X1. On a miss, X2
 /// contains the first denied byte. X3 holds the batch count.
-pub(crate) fn batch_span(asm: &mut Asm, write: bool, backwards: bool, search: Label, hit: Label) {
+/// Returns the number of words executed for a same-leaf hit.
+pub(crate) fn batch_span(
+    asm: &mut Asm,
+    write: bool,
+    backwards: bool,
+    search: Label,
+    hit: Label,
+) -> u32 {
+    let start = asm.offset();
     let denied = asm.label();
     let check = asm.label();
     asm.emit_all(&[
@@ -655,6 +663,7 @@ pub(crate) fn batch_span(asm: &mut Asm, write: bool, backwards: bool, search: La
     asm.cbz(X, true, X4, denied);
     asm.emit(cmp(X, X2, X1, Lsr, LEAF_SHIFT));
     asm.b_cond(Cond::Eq, hit);
+    let leaf_words = (asm.offset() - start) as u32 / 4;
 
     // Test the next leaf directly before asking the hierarchy for a bound.
     let farther = asm.label();
@@ -682,6 +691,7 @@ pub(crate) fn batch_span(asm: &mut Asm, write: bool, backwards: bool, search: La
     asm.bind(check);
     asm.emit(cmp(X, X2, X1, Lsl, 0));
     asm.b_cond(Cond::Hi, hit);
+    leaf_words
 }
 
 /// Finds the first denied page at or beyond leaf X2 in projected order.
@@ -744,7 +754,7 @@ mod tests {
             let mut asm = Asm::new();
             let search = asm.label();
             let hit = asm.label();
-            batch_span(&mut asm, false, backwards, search, hit);
+            let price = batch_span(&mut asm, false, backwards, search, hit);
             asm.bind(search);
             asm.bind(hit);
             let words = asm.finish();
@@ -754,6 +764,7 @@ mod tests {
             let imm = (words[branch] >> 5) & 0x7ffff;
             assert_eq!(words[branch] & 0xff00_0000, 0xb500_0000);
             let short = branch + 3;
+            assert_eq!(price as usize, short);
             let bounded = branch + 7;
             assert!(short <= 10 && bounded <= 14);
             assert!(branch + imm as usize + 6 <= words.len());

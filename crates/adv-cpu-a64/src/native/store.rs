@@ -122,7 +122,7 @@ pub(super) struct ResidentSite<R> {
 }
 
 pub(super) struct RowEntry {
-    pub(super) slot: (u8, u32),
+    pub(super) slot: Option<(u8, u32)>,
     address: usize,
     fallback: Option<[usize; 2]>,
 }
@@ -378,6 +378,7 @@ impl<R> CodeStore<R> {
         layout: ingress::Layout<'_>,
         unit: Arc<Unit>,
         row_target: Option<crate::translate::lower::resident::RowTarget>,
+        alignment: Option<(&crate::translate::lower::resident::RowAlignment, bool)>,
     ) -> bool {
         let Some(fallback) = self.ensure_resident_fallback(eip) else {
             return false;
@@ -395,7 +396,7 @@ impl<R> CodeStore<R> {
             counter.set(misses);
         }
         let base = self.cache.next();
-        let mut entry = ingress::emit(
+        let Some(mut entry) = ingress::emit(
             (eip, index),
             &site.sample,
             &slot,
@@ -404,14 +405,20 @@ impl<R> CodeStore<R> {
             self.version_stats.is_some(),
             ingress::Targets {
                 at: base,
-                proved_body: (row_target.is_none() && !key.uses_resident_context())
-                    .then_some(layout.body),
+                proved_body: (alignment.is_none()
+                    && row_target.is_none()
+                    && !key.uses_resident_context())
+                .then_some(layout.body),
                 tier1: fallback,
                 exit: self.stubs.exit,
                 resident_exit: self.resident_exit,
                 split: layout.split.is_some(),
+                alignment: alignment
+                    .and_then(|(route, other)| other.then(|| (route, site.versions[0].entry))),
             },
-        );
+        ) else {
+            return false;
+        };
         let probe_word = (index == 0).then(|| entry.words[(entry.probe - base) / 4]);
         let words = layout.words;
         let literal = |words: &mut [u32], at: usize, pointer: u64| {
@@ -553,7 +560,15 @@ impl<R> CodeStore<R> {
             split,
             offloaded: Cell::new((0, 0)),
         };
-        let versions = &mut self.resident_mut(eip).unwrap().versions;
+        let site = self.resident_mut(eip).unwrap();
+        if let Some(address) = entry.alignment {
+            site.row_entry = Some(RowEntry {
+                slot: None,
+                address,
+                fallback: None,
+            });
+        }
+        let versions = &mut site.versions;
         if index == versions.len() {
             versions.push(version);
         } else {
@@ -638,7 +653,7 @@ impl<R> CodeStore<R> {
             return false;
         };
         self.resident_mut(eip).unwrap().row_entry = Some(RowEntry {
-            slot,
+            slot: Some(slot),
             address,
             fallback: first.is_none().then_some(points),
         });
@@ -669,8 +684,9 @@ impl<R> CodeStore<R> {
                 .each_ref()
                 .map(|c| c.as_ptr() as u64)
         });
+        let routed = site.row_entry.is_some();
         for (index, version) in site.versions.iter().enumerate() {
-            let tail = index + 1 == site.versions.len() || version.row_target.is_some();
+            let tail = routed || index + 1 == site.versions.len();
             let next = if tail {
                 fallback
             } else {
@@ -679,13 +695,12 @@ impl<R> CodeStore<R> {
             self.cache.patch(version.next, branch(version.next, next));
             self.cache
                 .patch(version.cold, branch(version.cold, fallback));
-            let target =
-                if let Some(period) = period.filter(|_| tail && version.row_target.is_none()) {
-                    version.slot.retry.set(period);
-                    version.retry
-                } else {
-                    next
-                };
+            let target = if let Some(period) = period.filter(|_| tail && !routed) {
+                version.slot.retry.set(period);
+                version.retry
+            } else {
+                next
+            };
             if let Some(counter) = &version.miss_counter {
                 let address = counters.unwrap()[usize::from(tail)];
                 self.cache.patch(counter.literal, address as u32);
@@ -716,20 +731,21 @@ impl<R> CodeStore<R> {
                 self.cache.patch(point, branch(point, target));
             }
         }
-        for version in &site.versions {
+        let last = site.versions.len().saturating_sub(1);
+        for (index, version) in site.versions.iter().enumerate() {
             self.cache.patch(version.cold, branch(version.cold, target));
             if let Some(point) = version.proved_cold {
                 self.cache.patch(point, branch(point, target));
             }
-        }
-        if let Some(tail) = site.versions.last() {
-            self.cache.patch(tail.next, branch(tail.next, target));
-            let point = tail
-                .miss_counter
-                .as_ref()
-                .map_or(tail.miss, |counter| counter.next);
-            if self.cache.word(point) != branch(point, tail.retry) {
-                self.cache.patch(point, branch(point, target));
+            if site.row_entry.is_some() || index == last {
+                self.cache.patch(version.next, branch(version.next, target));
+                let point = version
+                    .miss_counter
+                    .as_ref()
+                    .map_or(version.miss, |counter| counter.next);
+                if self.cache.word(point) != branch(point, version.retry) {
+                    self.cache.patch(point, branch(point, target));
+                }
             }
         }
     }
