@@ -38,7 +38,7 @@ Every module MAY use `jit_map` behind its enable switch. Only `translate::front`
 **Applies to**: AArch64
 **Verification**: Test
 
-A site's immutable unit holds decoded operations, control flow, inlined frames, switch tables, addressing streams, access summaries and watched code spans. The first build prepares the cold shape. Promotion or resident discovery MAY extend the unit with previously undecoded instructions. First visits execute in the core interpreter under A64-TR-2.
+A site's immutable unit holds decoded operations, control flow, inlined frames, switch tables, addressing streams, access summaries and watched code spans. The first build prepares the cold shape, using a shared scratch index to resolve internal branches. Promotion or resident discovery MAY extend the unit with previously undecoded instructions. Tier-1 lowering reuses the existing trace when it has no internal edge eligible for resident entry. First visits execute in the core interpreter under A64-TR-2.
 
 ## Tier-1 modules
 

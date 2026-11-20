@@ -601,6 +601,7 @@ pub(crate) struct DecodeCounts {
 pub(crate) struct Decodes {
     pages: FxHashMap<u32, FxHashMap<u32, Entry>>,
     pending: Vec<(u32, u32)>,
+    pub(super) trace_slots: Vec<u16>,
     pub counts: DecodeCounts,
 }
 

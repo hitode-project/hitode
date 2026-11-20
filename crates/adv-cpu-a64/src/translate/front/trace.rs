@@ -126,7 +126,7 @@ pub struct Trace {
     /// Flags an observer may see after the instruction.
     pub observe_out: Vec<FlagSet>,
     frames: Vec<Frame>,
-    /// Instruction index + 1 by (EIP, frame), open addressing.
+    /// Instruction index + 1 by (EIP, frame), borrowed during construction.
     slots: Vec<u16>,
     /// End of the original path, before any appended paths.
     pub primary: usize,
@@ -327,6 +327,7 @@ impl Trace {
         (loops, observed): (bool, Option<&[u32; 8]>),
         decodes: &mut Decodes,
     ) {
+        self.slots = std::mem::take(&mut decodes.trace_slots);
         let limit = if loops { LOOP_LIMIT } else { MAX_INSTRUCTIONS };
         match self.build_paths(
             memory,
@@ -391,6 +392,7 @@ impl Trace {
                 });
             }
         }
+        decodes.trace_slots = std::mem::take(&mut self.slots);
         self.mark_spin_backedges(memory, decodes);
         self.analyze();
     }
@@ -1011,7 +1013,6 @@ impl Trace {
             x86: self.x86.clone(),
             code: self.code.clone(),
             frames: self.frames.clone(),
-            slots: self.slots.clone(),
             primary: self.primary,
             failure: self.failure,
             bodies: self.bodies.clone(),
@@ -1063,24 +1064,30 @@ impl Trace {
 
     /// The discovery and resident paths of a back edge can observe every
     /// flag even when its Tier-1 path stays internal.
-    pub(in crate::translate) fn observe_resident_links(&mut self) {
-        self.resident_heads.clear();
-        self.resident_heads.resize(self.len(), false);
-        for inst in &self.insts {
+    pub(in crate::translate) fn with_resident_links(&self) -> Option<Self> {
+        let mut heads = self.insts.iter().flat_map(|inst| {
             let next = match inst.next {
                 Next::Edge(edge) => Some(edge),
                 _ => None,
             };
-            for edge in [next, inst.taken].into_iter().flatten() {
-                if let Edge::Internal(to) = edge
-                    && inst.resident_backedge(self.insts[to].pc)
-                {
-                    self.resident_heads[to] = true;
-                }
-            }
+            [next, inst.taken]
+                .into_iter()
+                .flatten()
+                .filter_map(move |edge| match edge {
+                    Edge::Internal(to) if inst.resident_backedge(self.insts[to].pc) => Some(to),
+                    _ => None,
+                })
+        });
+        let first = heads.next()?;
+        let mut trace = self.clone();
+        trace.resident_heads.resize(trace.len(), false);
+        trace.resident_heads[first] = true;
+        for to in heads {
+            trace.resident_heads[to] = true;
         }
-        while self.liveness(true, true) {}
-        while self.liveness(false, true) {}
+        while trace.liveness(true, true) {}
+        while trace.liveness(false, true) {}
+        Some(trace)
     }
 
     pub(in crate::translate) fn resident_edge(&self, from: usize, to: usize) -> bool {

@@ -33,7 +33,7 @@ pub struct Unit {
     pub(crate) tables: Vec<tables::Table>,
     pub(crate) trace: Trace,
     pub(super) regions: Vec<(usize, NativeRegion)>,
-    resident_links: OnceLock<Trace>,
+    resident_links: OnceLock<Option<Trace>>,
     pub(crate) table_target: bool,
 }
 
@@ -89,11 +89,10 @@ impl Unit {
 
     pub(super) fn jit_trace(&self, resident_links: bool) -> &Trace {
         if resident_links {
-            self.resident_links.get_or_init(|| {
-                let mut trace = self.trace.clone();
-                trace.observe_resident_links();
-                trace
-            })
+            self.resident_links
+                .get_or_init(|| self.trace.with_resident_links())
+                .as_ref()
+                .unwrap_or(&self.trace)
         } else {
             &self.trace
         }
