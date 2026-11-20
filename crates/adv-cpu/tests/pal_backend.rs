@@ -613,7 +613,7 @@ fn setup_segments_uses_owned_descriptor_tables_and_windows_selectors() {
         cpu.set_fs_base(TEB).unwrap();
         let bytes = assemble(CODE, |a| {
             a.xor(eax, eax).unwrap();
-            for (segment, offset) in [(cs, 0), (ds, 4), (es, 8), (ss, 12), (fs, 16)] {
+            for (segment, offset) in [(cs, 0), (ds, 4), (es, 8), (ss, 12), (fs, 16), (gs, 20)] {
                 a.mov(ax, segment).unwrap();
                 a.mov(dword_ptr(DATA as i32 + offset), eax).unwrap();
             }
@@ -630,7 +630,15 @@ fn setup_segments_uses_owned_descriptor_tables_and_windows_selectors() {
         }
         start(&mut cpu, CODE);
         assert_eq!(cpu.run(&mut UnexpectedTrap), Exit::Parked);
-        for (offset, selector) in [(0, 0x23), (4, 0x2b), (8, 0x2b), (12, 0x30), (16, 0x53)] {
+        // Current WoW64 selectors, measured by tools/cpu/test-segment-native.ps1.
+        for (offset, selector) in [
+            (0, 0x23),
+            (4, 0x2b),
+            (8, 0x2b),
+            (12, 0x2b),
+            (16, 0x53),
+            (20, 0x2b),
+        ] {
             assert_eq!(cpu.read_u32(DATA + offset).unwrap(), selector);
         }
         assert_eq!(cpu.read_u16(DATA + 32).unwrap(), 127);
