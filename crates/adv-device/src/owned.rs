@@ -11,6 +11,8 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
+const EPS: f64 = 0.000001;
+
 // Keep timeline precision separately from the public integer guest timestamp.
 // Overlap only changes this view; callback code never shifts or destroys PCM.
 struct Queued {
@@ -82,6 +84,12 @@ impl OwnedVoice {
             timeline_end,
             rendered_until: 0.0,
         }))
+    }
+    pub(crate) fn frequency(&self) -> u32 {
+        self.frequency
+    }
+    pub(crate) fn output_rate(&self) -> u32 {
+        self.converter.rate
     }
     pub(crate) fn prepare(&mut self, rate: u32, reset: bool) -> Result<(), String> {
         if !self.converter.matches(self.frequency, rate) {
@@ -186,10 +194,13 @@ impl OwnedVoice {
     fn sample(queue: &VecDeque<Queued>, pts: f64) -> [f32; 2] {
         let Some(block) = queue
             .iter()
-            .find(|block| pts + 0.000001 >= block.pts && pts + 0.000001 < block.end())
+            .find(|block| pts + EPS >= block.pts && pts + EPS < block.end())
         else {
             return [0.0; 2];
         };
+        Self::read_block(block, pts)
+    }
+    fn read_block(block: &Queued, pts: f64) -> [f32; 2] {
         let frame = (((pts - block.pts).max(0.0) * f64::from(block.pcm.sample_rate) / 1_000_000.0)
             .round() as usize)
             .min(block.frames() - 1)
@@ -218,6 +229,9 @@ impl OwnedVoice {
         if self.paused || rate != self.converter.rate {
             return 0;
         }
+        if rate == self.frequency {
+            return self.render_native(out, channels, pts, retired, missing);
+        }
         if !self.initialized {
             self.read_pts = pts;
             self.initialized = true;
@@ -231,7 +245,7 @@ impl OwnedVoice {
             while self
                 .queue
                 .front()
-                .is_some_and(|block| block.end() <= time + 0.000001)
+                .is_some_and(|block| block.end() <= time + EPS)
                 && !retired.is_full()
             {
                 let block = self.queue.pop_front().unwrap().pcm;
@@ -242,10 +256,10 @@ impl OwnedVoice {
             let covered = self
                 .queue
                 .iter()
-                .any(|block| time + 0.000001 >= block.pts && time + 0.000001 < block.end());
+                .any(|block| time + EPS >= block.pts && time + EPS < block.end());
             if !covered
-                && self.first_pts.is_some_and(|first| time + 0.000001 >= first)
-                && (!self.ended || time + 0.000001 < self.timeline_end)
+                && self.first_pts.is_some_and(|first| time + EPS >= first)
+                && (!self.ended || time + EPS < self.timeline_end)
             {
                 missing_frames += 1;
                 missing[index / 64] |= 1 << (index % 64);
@@ -270,6 +284,74 @@ impl OwnedVoice {
         }
         self.rendered_until =
             pts + out.len() as f64 / f64::from(channels) * 1_000_000.0 / f64::from(rate);
+        missing_frames
+    }
+    fn render_native(
+        &mut self,
+        out: &mut [f32],
+        channels: u16,
+        pts: f64,
+        retired: &mut Producer<Retired>,
+        missing: &mut [u64],
+    ) -> u64 {
+        let ch = usize::from(channels);
+        if self.paused || ch == 0 {
+            return 0;
+        }
+        let frames = out.len() / ch;
+        if frames == 0 {
+            return 0;
+        }
+        let step_us = 1_000_000.0 / f64::from(self.frequency);
+        let mut block_idx = 0;
+        let mut missing_frames = 0;
+        for (index, output) in out.chunks_exact_mut(ch).enumerate() {
+            let time = pts + index as f64 * step_us;
+            while block_idx < self.queue.len() && self.queue[block_idx].end() <= time + EPS {
+                block_idx += 1;
+            }
+            let sample = match self.queue.get(block_idx) {
+                Some(block) if time + EPS >= block.pts && time + EPS < block.end() => {
+                    Self::read_block(block, time)
+                }
+                _ => {
+                    if self.first_pts.is_some_and(|first| time + EPS >= first)
+                        && (!self.ended || time + EPS < self.timeline_end)
+                    {
+                        missing_frames += 1;
+                        missing[index / 64] |= 1 << (index % 64);
+                    }
+                    [0.0; 2]
+                }
+            };
+            if self.gain_frames != 0 {
+                for (gain, target) in self.gain.iter_mut().zip(self.target) {
+                    *gain += (target - *gain) / self.gain_frames as f32;
+                }
+                self.gain_frames -= 1;
+            }
+            if channels == 1 {
+                output[0] += (sample[0] * self.gain[0] + sample[1] * self.gain[1]) * 0.5;
+            } else {
+                output[0] += sample[0] * self.gain[0];
+                output[1] += sample[1] * self.gain[1];
+            }
+        }
+        let last_time = pts + (frames - 1) as f64 * step_us;
+        while self
+            .queue
+            .front()
+            .is_some_and(|block| block.end() <= last_time + EPS)
+            && !retired.is_full()
+        {
+            let block = self.queue.pop_front().unwrap().pcm;
+            self.return_credit(&block);
+            let result = retired.push(Retired::Pcm(block));
+            debug_assert!(result.is_ok());
+        }
+        self.rendered_until = pts + frames as f64 * step_us;
+        self.read_pts = self.rendered_until;
+        self.initialized = true;
         missing_frames
     }
 }
