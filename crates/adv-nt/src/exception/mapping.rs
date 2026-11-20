@@ -163,6 +163,13 @@ fn map_stop(
         {
             PRIVILEGED_INSTRUCTION
         }
+        Exception::Trap { vector: 13, .. } => {
+            // Current WoW64 reports a user #GP as a read access violation at
+            // an unknown address.
+            record.count = 2;
+            record.information[1] = u32::MAX;
+            ACCESS_VIOLATION
+        }
         Exception::Trap { vector: 3, .. } => {
             record.address = breakpoint_address(cpu, pc)?;
             record.count = 1; // Owned x86 native CC/CD03 oracle: Information[0]=0.

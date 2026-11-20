@@ -274,6 +274,12 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     if let Some(cc) = counted {
         return Some(Op::Jcc(cc, near()?));
     }
+    // Segment register pushes and loads use the core guest system profile.
+    if matches!(mnemonic, M::Push | M::Pop | M::Mov)
+        && instruction.op0_register().is_segment_register()
+    {
+        return Some(Op::Event(EventOp::System));
+    }
     let narrow = match mnemonic {
         M::Mov => Some(None),
         M::Add => Some(Some(Alu::Add)),
@@ -1269,8 +1275,12 @@ mod whitelist_audit {
                                 OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI
                             )
                         });
+                        let segment =
+                            matches!(i.mnemonic(), Mnemonic::Push | Mnemonic::Pop | Mnemonic::Mov)
+                                && i.op0_register().is_segment_register();
                         let allowed = floating
                             || word_string
+                            || segment
                             || matches!(
                                 i.mnemonic(),
                                 Mnemonic::Cli

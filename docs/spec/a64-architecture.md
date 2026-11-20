@@ -126,7 +126,7 @@ The Tier-1 suffix keeps up to three versions, from most specific to most general
 | A waiting x87 instruction with a pending unmasked exception | Deliver #MF through the interpreter at the faulting instruction |
 | A misaligned aligned access or invalid LDMXCSR value (#GP), division (#DE), UD2 (#UD), or an unmasked SSE exception (#XM) | Deliver the architectural exception with any committed state |
 | A software interrupt, including INT 0x2e without a host handler | Complete the owner trap action |
-| SGDT, SIDT, SLDT, CLI and STI | Execute through the interpreter using the core guest system profile |
+| SGDT, SIDT, SLDT, CLI, STI, and segment register pushes and loads | Execute through the interpreter using the core guest system profile |
 | A core semantic gap carrying the decoded form and EIP | Report the terminal unsupported-instruction outcome. This includes SMSW, STR, DAA, DAS, AAA, AAS, AAM and AAD, and unsupported operands. |
 
 ### A64A-FALL-5 Value calls
