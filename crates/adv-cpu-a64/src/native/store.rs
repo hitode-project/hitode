@@ -236,6 +236,7 @@ pub(super) struct CodeStore<R> {
     pub(super) value_counts: FxHashMap<u32, u64>,
     /// Unit entries by the guest pages their code came from.
     pub(super) pages: FxHashMap<u32, Vec<u32>>,
+    pub(super) pages_by_unit: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
     /// branch to: the head of a list in `linked`.
     pub(super) links: FxHashMap<u32, u32>,
@@ -1095,6 +1096,21 @@ impl<R> CodeStore<R> {
     }
 
     pub(super) fn invalidate_unit(&mut self, eip: u32) -> bool {
+        if let Some(pages) = self.pages_by_unit.remove(&eip) {
+            for page in pages {
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    self.pages.entry(page)
+                {
+                    let units = entry.get_mut();
+                    if let Some(index) = units.iter().position(|&unit| unit == eip) {
+                        units.swap_remove(index);
+                    }
+                    if units.is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
         self.repoint_internal_edges(eip, None);
         let dropped = self.chains.remove(&eip).is_some();
         if self.table_sources.remove(&eip) {
@@ -1140,13 +1156,17 @@ impl<R> CodeStore<R> {
         if let Some((from, to)) = merged {
             memory.watch_code(from, (to - u64::from(from)) as usize);
         }
+        let pages = self.pages_by_unit.entry(eip).or_default();
         let mut last = None;
         for &(start, len) in spans.iter().filter(|&&(_, len)| len != 0) {
             let end = (u64::from(start) + u64::from(len) - 1).min(u64::from(u32::MAX));
             for page in (start & !0xfff..=end as u32 & !0xfff).step_by(4096) {
                 if last.is_none_or(|last| last < page) {
                     last = Some(page);
-                    self.pages.entry(page).or_default().push(eip);
+                    if let Err(index) = pages.binary_search(&page) {
+                        pages.insert(index, page);
+                        self.pages.entry(page).or_default().push(eip);
+                    }
                 }
             }
         }

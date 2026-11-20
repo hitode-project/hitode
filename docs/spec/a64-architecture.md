@@ -40,6 +40,8 @@ Every module MAY use `jit_map` behind its enable switch. Only `translate::front`
 
 A site's immutable unit holds decoded operations, control flow, inlined frames, switch tables, addressing streams, access summaries and watched code spans. The first build prepares the cold shape, using a shared scratch index to resolve internal branches. Promotion or resident discovery MAY extend the unit with previously undecoded instructions. Tier-1 lowering reuses the existing trace when it has no internal edge eligible for resident entry. First visits execute in the core interpreter under A64-TR-2.
 
+The page index records one dependency per site and page across all live shapes. Dropping a site removes its entries from every page it depended on. Clearing generated code keeps the index for the retained front-end shapes.
+
 ## Tier-1 modules
 
 ### A64A-ROLE-3 Facts

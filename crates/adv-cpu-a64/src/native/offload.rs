@@ -2112,6 +2112,24 @@ mod tests {
         );
     }
 
+    // spec: A64A-ROLE-2 A64-CTL-10
+    #[test]
+    fn rebuilding_a_cross_page_unit_keeps_one_reverse_dependency() {
+        let destination = CODE + 0x1000;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.jmp(u64::from(destination)).unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        let memory = executor.memory_mut();
+        memory.protect(CODE, 0x4000, READ | WRITE | EXEC).unwrap();
+        for first in [0x90, 0x40, 0x90, 0x40, 0x90] {
+            memory.write(destination, &[first, 0xc3]).unwrap();
+            native.invalidate(memory);
+            let unit = native.front_unit(memory, CODE, false, false, None);
+            assert!(unit.code().iter().any(|&(at, _)| at == destination));
+        }
+        assert_eq!(native.code.pages.get(&CODE).unwrap().as_slice(), &[CODE]);
+    }
+
     // spec: A64-OPT-8 A64-OPT-14
     #[test]
     fn unpriced_first_target_leaves_the_router_open() {

@@ -880,6 +880,7 @@ impl Native {
                 #[cfg(test)]
                 value_counts: FxHashMap::default(),
                 pages: FxHashMap::default(),
+                pages_by_unit: FxHashMap::default(),
                 links: FxHashMap::default(),
                 linked: Vec::new(),
                 points: Vec::new(),
