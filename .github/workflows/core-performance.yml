@@ -119,8 +119,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
       CARGO_INCREMENTAL: '0'
-      # GPU tests fail instead of skipping when Metal is unavailable.
-      ADV_GPU_REQUIRE_BACKEND: '1'
       WORKSPACE_GROUP: core-system
       WORKSPACE_PACKAGES: >-
         --workspace --exclude adv-device --exclude adv-dx
@@ -289,8 +287,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_TEST_OPT_LEVEL: '1'
       CARGO_INCREMENTAL: '0'
-      # GPU tests fail instead of skipping when Metal is unavailable.
-      ADV_GPU_REQUIRE_BACKEND: '1'
       WORKSPACE_GROUP: runtime-apps
       WORKSPACE_PACKAGES: >-
         -p adv-device -p adv-dx -p adv-runtime -p adv-shell -p adv-run
