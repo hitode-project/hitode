@@ -2042,6 +2042,40 @@ mod tests {
             .unwrap()
     }
 
+    // spec: A64-OPT-8 A64-CTL-10
+    #[test]
+    fn slot_discovery_watches_only_code_reached_from_an_unchanged_base() {
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.mov(ebp, esi).unwrap();
+        let call = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32;
+        a.call(dword_ptr(ebp + 4)).unwrap();
+        a.int3().unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        let memory = executor.memory_mut();
+        memory.map(INPUT, 0x4000, READ | WRITE | EXEC).unwrap();
+        memory.write(INPUT, &[0xc3]).unwrap(); // ret
+        let mut regs = [0; 8];
+        regs[5] = INPUT + 0x100;
+        memory.write(regs[5] + 4, &INPUT.to_le_bytes()).unwrap();
+
+        let unit = native.front_unit(memory, call, true, false, Some(&regs));
+        assert!(unit.trace.insts[0].guarded_slot.is_none());
+        assert!(!memory.stores_code(INPUT, 1));
+
+        memory.protect(INPUT, 0x4000, READ | EXEC).unwrap();
+        let unit = native.front_unit(memory, CODE, true, false, Some(&regs));
+        assert!(unit.trace.insts[1].guarded_slot.is_none());
+        assert!(!memory.stores_code(INPUT, 1));
+
+        let unit = native.front_unit(memory, call, true, false, Some(&regs));
+        assert_eq!(
+            unit.trace.insts[0].op,
+            translate::front::decode::Op::Call(INPUT)
+        );
+        assert!(unit.trace.insts[0].guarded_slot.is_some());
+        assert!(memory.stores_code(INPUT, 1));
+    }
+
     // spec: A64-OPT-8 A64-OPT-14
     #[test]
     fn unpriced_first_target_leaves_the_router_open() {

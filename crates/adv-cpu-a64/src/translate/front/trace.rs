@@ -19,7 +19,7 @@
 //! Flags (A64-FLAG-3): backward liveness tracks recovery observations
 //! separately from guest reads. Merges agree on the flags recovery needs.
 
-use adv_cpu_core::memory::Memory;
+use adv_cpu_core::memory::{Memory, WRITE};
 
 use super::decode::{Decodes, Effects, Fetcher, Helper, Op, Src};
 use crate::translate::front::flags::FlagSet;
@@ -760,14 +760,26 @@ impl Trace {
                         && !slot.fs
                         && slot.address_bits == 32 =>
                 {
+                    // The entry registers name this slot only while no
+                    // earlier instruction rewrote its base. An unconfirmed
+                    // target in writable memory can be data, even on an
+                    // executable page such as a guest stack.
                     let target = observed.zip(slot.base).and_then(|(regs, base)| {
+                        if decodes.may_write_register(
+                            self.insts.iter().map(|inst| (inst.pc, inst.op)),
+                            base,
+                        ) {
+                            return None;
+                        }
                         let address = regs[usize::from(base)].wrapping_add(slot.disp);
                         if !memory.computation_range(address, 4, false) {
                             return None;
                         }
                         let mut word = [0; 4];
                         memory.read_into(address, &mut word).ok()?;
-                        Some(u32::from_le_bytes(word))
+                        let target = u32::from_le_bytes(word);
+                        (memory.executable(target, 1) && !memory.accessible(target, 1, WRITE))
+                            .then_some(target)
                     });
                     if let Some(target) = target {
                         guarded_slot = Some(slot);

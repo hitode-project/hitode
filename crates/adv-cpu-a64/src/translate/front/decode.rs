@@ -667,6 +667,41 @@ impl Decodes {
             .collect()
     }
 
+    /// Whether any of these traced instructions may write general register
+    /// `reg`. A bound host body follows the call convention and clobbers
+    /// EAX, ECX and EDX; an undecoded instruction may write anything.
+    pub(super) fn may_write_register(
+        &self,
+        insts: impl Iterator<Item = (u32, Op)>,
+        reg: u8,
+    ) -> bool {
+        let mut factory = iced_x86::InstructionInfoFactory::new();
+        insts.into_iter().any(|(pc, op)| {
+            if matches!(op, Op::Body(_)) {
+                return reg < 3;
+            }
+            let Some(sample) = self.get(pc) else {
+                return true;
+            };
+            factory
+                .info(&sample.instruction(pc))
+                .used_registers()
+                .iter()
+                .any(|used| {
+                    let r = used.register();
+                    r.is_gpr()
+                        && r.full_register32().number() == usize::from(reg)
+                        && !matches!(
+                            used.access(),
+                            iced_x86::OpAccess::Read
+                                | iced_x86::OpAccess::CondRead
+                                | iced_x86::OpAccess::None
+                                | iced_x86::OpAccess::NoMemAccess
+                        )
+                })
+        })
+    }
+
     pub(super) fn spin(&self, insts: &[super::trace::Inst], target: u32, latch: u32) -> bool {
         if insts.iter().any(|inst| self.get(inst.pc).is_none()) {
             return false;
