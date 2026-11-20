@@ -109,6 +109,7 @@ struct Front<'a> {
     checked: Option<&'a dyn Fn(u32) -> bool>,
     division_safe: Vec<bool>,
     write_through: bool,
+    scope_access: Option<&'a [Option<u8>]>,
     at: &'a CpuState,
     assumed: Assumed,
     func: Func,
@@ -165,12 +166,22 @@ pub(crate) fn build_with(
             checked,
             refused,
         }),
+        None,
     )
 }
 
 /// Builds the admitted job form.
 pub(crate) fn build(unit: &Unit, facts: &dyn Facts, at: &CpuState) -> Result<Built, Reject> {
-    build_form(unit, facts, at, None)
+    build_form(unit, facts, at, None, None)
+}
+
+pub(crate) fn build_scoped(
+    unit: &Unit,
+    proof: &Proof,
+    at: &CpuState,
+    access: &[Option<u8>],
+) -> Result<Built, Reject> {
+    build_form(unit, proof, at, None, Some(access))
 }
 
 fn build_form(
@@ -178,12 +189,18 @@ fn build_form(
     facts: &dyn Facts,
     at: &CpuState,
     resident: Option<Resident<'_>>,
+    scope_access: Option<&[Option<u8>]>,
 ) -> Result<Built, Reject> {
     let mut cut = vec![false; unit.trace.len()];
     let mut view = None::<Unit>;
     loop {
-        let reject = match build_trace(view.as_ref().unwrap_or(unit), facts, at, resident.as_ref())
-        {
+        let reject = match build_trace(
+            view.as_ref().unwrap_or(unit),
+            facts,
+            at,
+            resident.as_ref(),
+            scope_access,
+        ) {
             Ok((func, assumed, plain_sites)) => {
                 let cuts = cut.iter().filter(|&&c| c).count();
                 return Ok(Built {
@@ -196,7 +213,13 @@ fn build_form(
             Err(reject) => reject,
         };
         match reject.index() {
-            Some(i) if i >= unit.trace.primary && cut.get(i) == Some(&false) => cut[i] = true,
+            Some(i)
+                if scope_access.is_none()
+                    && i >= unit.trace.primary
+                    && cut.get(i) == Some(&false) =>
+            {
+                cut[i] = true
+            }
             _ => return Err(reject),
         }
         view = Some(unit.cut(&cut));
@@ -208,6 +231,7 @@ fn build_trace(
     facts: &dyn Facts,
     at: &CpuState,
     resident: Option<&Resident<'_>>,
+    scope_access: Option<&[Option<u8>]>,
 ) -> Result<(Func, Assumed, Vec<u32>), Reject> {
     if unit.trace.insts.is_empty() {
         return Err(Reject::Empty);
@@ -303,7 +327,8 @@ fn build_trace(
             false,
         )
     };
-    let (offsets, frame, cells, escaped) = if resident.is_some_and(|r| (r.refused)(u32::MAX))
+    let (offsets, frame, cells, escaped) = if scope_access.is_some()
+        || resident.is_some_and(|r| (r.refused)(u32::MAX))
         || accesses
             .as_ref()
             .is_some_and(|uses| uses.iter().any(Option::is_none))
@@ -604,6 +629,7 @@ fn build_trace(
         checked: resident.map(|r| r.checked),
         division_safe,
         write_through,
+        scope_access,
         at,
         assumed,
         func,

@@ -29,6 +29,27 @@ impl ResidentCold {
     }
 }
 
+/// One invariant indirect target carried by a prepared resident row form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowTarget {
+    pub base: u8,
+    pub offset: u32,
+    pub value: u32,
+}
+
+/// Row entry failures precede guest effects. A short profitable-work
+/// check is ordinary routing and never contributes to withdrawal.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum RowFailure {
+    Target,
+    Range,
+    Alias,
+    Parameter,
+    Count,
+    Span,
+}
+
 /// Slots for opt-in per-head counters. Conditional cases use ordered arms.
 #[derive(Clone, Copy)]
 pub(crate) enum Counter {
@@ -38,11 +59,11 @@ pub(crate) enum Counter {
     Batch,
     Class(u8),
     RowEntry,
-    TargetMiss,
-    RowMiss,
+    RowArrival,
+    RowShort,
 }
 
-pub(crate) const COUNTERS: usize = 23;
+pub(crate) const COUNTERS: usize = 25;
 
 impl Counter {
     pub(crate) fn index(self) -> usize {
@@ -53,8 +74,8 @@ impl Counter {
             Self::Batch => 3,
             Self::Class(class) => 4 + usize::from(class),
             Self::RowEntry => 20,
-            Self::TargetMiss => 21,
-            Self::RowMiss => 22,
+            Self::RowArrival => 23,
+            Self::RowShort => 24,
         }
     }
 }

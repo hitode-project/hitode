@@ -48,6 +48,7 @@ pub(in crate::native) struct Compiled {
     pub task: Task,
     pub at: CpuState,
     pub resident: Option<Result<ResidentForm, front::Reject>>,
+    pub unit: Arc<Unit>,
     pub job: Option<Job>,
 }
 
@@ -76,6 +77,8 @@ impl ResidentForm {
             sites: &lowered.sites,
             marks: &lowered.marks,
             split: lowered.split,
+            row_price: lowered.row_price,
+            row_failures: &lowered.row_failures,
             counters: &lowered.counters,
         }
     }
@@ -132,6 +135,32 @@ fn specialize_split(proof: &mut Proof, trace: &Trace) {
     });
 }
 
+fn scoped_form(unit: &Unit, proof: &Proof, at: &CpuState) -> Option<JobForm> {
+    let Some(frame) = proof.scope_frame() else {
+        let built = front::build(unit, proof, at).ok()?;
+        let lowered = back::lower(&built.func);
+        return Some(JobForm { built, lowered });
+    };
+    // The optimizer retains guest PCs on memory operations. Only a PC
+    // whose occurrences all name the same private cell can use this form.
+    let mut accesses = std::collections::BTreeMap::new();
+    for (inst, &cell) in unit.trace.insts.iter().zip(&frame.access) {
+        if accesses
+            .insert(inst.pc, cell)
+            .is_some_and(|prior| prior != cell)
+        {
+            return None;
+        }
+    }
+    let accesses = accesses
+        .into_iter()
+        .filter_map(|(pc, cell)| Some((pc, cell?)))
+        .collect();
+    let built = front::build_scoped(unit, proof, at, &frame.access).ok()?;
+    let lowered = back::lower_scoped(&built.func, &accesses);
+    Some(JobForm { built, lowered })
+}
+
 fn compile(request: Request) -> Compiled {
     let Request {
         eip,
@@ -147,6 +176,7 @@ fn compile(request: Request) -> Compiled {
         cuts,
         count_entries,
     } = request;
+    let can_scope = task == Task::Discover || (task == Task::Append && proof.is_none());
     let proof = if task == Task::Discover {
         proof.or_else(|| computation_proof(&unit.trace))
     } else {
@@ -207,17 +237,25 @@ fn compile(request: Request) -> Compiled {
                 if built.cuts != 0 {
                     return None;
                 }
-                if task == Task::Discover {
-                    specialize_split(&mut proof, &rows.trace);
+                if can_scope {
+                    proof.prove_scoped_split(&rows.trace);
+                    crate::jit_map::optimized(
+                        eip,
+                        format_args!(
+                            "row scope {}",
+                            if proof.scoped_splits() {
+                                "eligible"
+                            } else {
+                                "carried state or frame"
+                            }
+                        ),
+                    );
                 }
                 let offer = proof.scoped_splits();
                 let lowered =
                     back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
                 if offer {
-                    let form = front::build(rows, &proof, &at).ok().map(|built| JobForm {
-                        lowered: back::lower(&built.func),
-                        built,
-                    });
+                    let form = scoped_form(rows, &proof, &at);
                     scoped_job = Some(Job {
                         proof,
                         form,
@@ -280,6 +318,7 @@ fn compile(request: Request) -> Compiled {
         task,
         at,
         resident,
+        unit,
         job: scoped_job.or(job),
     }
 }
@@ -293,6 +332,7 @@ impl Compiled {
             task: request.task,
             at: request.at,
             resident: None,
+            unit: request.unit,
             job: None,
         }
     }

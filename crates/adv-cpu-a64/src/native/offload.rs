@@ -17,11 +17,12 @@ use rustc_hash::FxHashMap;
 
 use super::plan::{Arbiter, JobPlan, REOFFER};
 use super::store::{self, ACTIVE, Active, FaultCapture, WorkerCode, WorkerFaults, site_at};
+use crate::runtime::SCOPE_CELLS;
 use crate::runtime::{
     COMPUTATION_SLICE, Enter, ExecutionContext, Exit, Runtime, alias_base, record_branch,
 };
 use crate::translate::opt::Assumed;
-use crate::translate::opt::computation::{Evaluation, Plan, Proof, Range};
+use crate::translate::opt::computation::{Evaluation, Plan, Proof, Range, ScopeCell};
 use crate::translate::opt::recovery;
 use crate::translate::opt::recovery::{FlagRecipe, Host, Record};
 use crate::translate::opt::{back::Lowered, front::Built, ir::Source};
@@ -55,6 +56,7 @@ pub(super) struct WorkerJob<U> {
 #[derive(Clone)]
 pub(super) struct Code {
     pub placed: WorkerCode,
+    pub frame: Arc<[ScopeCell]>,
     /// The optimized form, run instead when a job meets its assumptions.
     pub optimized: Option<Arc<Optimized>>,
 }
@@ -380,7 +382,14 @@ struct Drained {
     /// From submission to its first claim.
     claimed_after: Duration,
     /// The last block's completion and its thread.
-    last: Option<(u32, Completion<Option<ExecutionContext>>, u32)>,
+    last: Option<LastBlock>,
+}
+
+struct LastBlock {
+    index: u32,
+    done: Completion<Option<ExecutionContext>>,
+    thread: u32,
+    frame: [u32; SCOPE_CELLS],
 }
 
 pub(super) const ESP: usize = 4;
@@ -501,7 +510,12 @@ impl Blocks {
             out.optimized += done.optimized;
             out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
             if last || self.scoped {
-                out.last = Some((index, done, thread));
+                out.last = Some(LastBlock {
+                    index,
+                    done,
+                    thread,
+                    frame: runtime.scope_frame,
+                });
             }
         }
         out.elapsed = started.elapsed();
@@ -1002,6 +1016,10 @@ impl<'a, U> Session<'a, U> {
         let mut helped = Duration::ZERO;
         self.counts.splits += 1;
         self.counts.scoped += u64::from(scoped);
+        if scoped {
+            let job = self.plans.job(eip).unwrap();
+            job.scope_splits.set(job.scope_splits.get() + 1);
+        }
         self.counts.wakes += submitted as u64;
         for _ in 0..submitted {
             let drained = recv.recv().expect("block helper");
@@ -1018,7 +1036,7 @@ impl<'a, U> Session<'a, U> {
                 && total
                     .last
                     .as_ref()
-                    .is_none_or(|previous| previous.0 < last.0)
+                    .is_none_or(|previous| previous.index < last.index)
             {
                 total.last = Some(last);
             }
@@ -1032,7 +1050,15 @@ impl<'a, U> Session<'a, U> {
             claimed * size
         };
         let (mut completion, last) = match total.last.take() {
-            Some((_, done, thread)) => (done, Some(thread)),
+            Some(last) => {
+                publish_frame(
+                    &blocks.code.frame,
+                    &last.frame,
+                    blocks.start.cpu(),
+                    self.entry.alias,
+                );
+                (last.done, Some(last.thread))
+            }
             None => (
                 Completion {
                     id,
@@ -1101,6 +1127,14 @@ impl<'a, U> Session<'a, U> {
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
         self.account(job.entry, job.iteration, done)
+    }
+}
+
+fn publish_frame(cells: &[ScopeCell], values: &[u32; SCOPE_CELLS], start: &CpuState, alias: u64) {
+    for (&ScopeCell { base, offset }, &value) in cells.iter().zip(values) {
+        let address = start.regs[usize::from(base)].wrapping_add_signed(offset);
+        // SAFETY: the owner still holds the write lease on this dword.
+        unsafe { (alias.wrapping_add(u64::from(address)) as *mut u32).write_unaligned(value) };
     }
 }
 
@@ -1233,15 +1267,32 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             return None;
         }
         let mut scratch = ExecuteScratch::default();
+        let quiet = Signals {
+            recall: self.signals.recall.clone(),
+            pending: (self.signals.pending.0.clone(), 0),
+        };
+        let signals = if code.frame.is_empty() {
+            (&self.signals, LOCAL)
+        } else {
+            (&quiet, 0)
+        };
         let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
             (&code, u32::from(iteration || scoped)),
-            (&self.signals, LOCAL),
+            signals,
             &mut scratch,
         );
+        if !code.frame.is_empty() {
+            publish_frame(
+                &code.frame,
+                &self.runtime.scope_frame,
+                context.cpu(),
+                self.entry.alias,
+            );
+        }
         if let Some(plan) = plan
             && !done.completion.requires_owner
         {
@@ -1483,13 +1534,32 @@ mod tests {
     // spec: A64-OPT-9, A64-TR-9
     #[test]
     fn scoped_rows_split_under_the_lease_and_match_serial() {
+        scoped_split(false);
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn scoped_rows_use_host_frame_cells_and_preserve_guest_bytes() {
+        scoped_split(true);
+    }
+
+    fn scoped_split(frame: bool) {
         let _pool = exclusive_pool();
         const ROWS: u32 = 128;
         const WIDTH: u32 = 8;
+        const FRAME_PAGE: u32 = 0x8_0000;
+        let original_frame = [0xa6; 0x4000];
         let mut a = CodeAssembler::new(32).unwrap();
         a.nop().unwrap();
         let mut row = a.create_label();
         a.set_label(&mut row).unwrap();
+        let mut callee = a.create_label();
+        if frame {
+            a.mov(dword_ptr(esp + 8), esi).unwrap();
+            a.mov(esi, dword_ptr(esp + 8)).unwrap();
+            a.mov(dword_ptr(ebx + 4), esi).unwrap();
+            a.call(callee).unwrap();
+        }
         a.mov(ecx, WIDTH).unwrap();
         let mut pixel = a.create_label();
         a.set_label(&mut pixel).unwrap();
@@ -1502,6 +1572,14 @@ mod tests {
         a.jnz(pixel).unwrap();
         a.dec(edx).unwrap();
         a.jnz(row).unwrap();
+        if frame {
+            let mut done = a.create_label();
+            a.jmp(done).unwrap();
+            a.set_label(&mut callee).unwrap();
+            a.mov(esi, dword_ptr(ebx + 4)).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut done).unwrap();
+        }
         a.int3().unwrap();
         let (mut executor, mut native) = fixture(&mut a);
         let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
@@ -1517,10 +1595,25 @@ mod tests {
                 .map(OUTPUT, len.next_multiple_of(0x4000), READ | WRITE)
                 .unwrap();
             memory.write(INPUT, &input).unwrap();
+            if frame {
+                memory
+                    .map(FRAME_PAGE, original_frame.len(), READ | WRITE)
+                    .unwrap();
+                memory.write(FRAME_PAGE, &original_frame).unwrap();
+            }
         }
         let mut cpu = CpuState {
             eip: head,
-            regs: [0, 0, ROWS, 0, 0, 0, INPUT, OUTPUT],
+            regs: [
+                0,
+                0,
+                ROWS,
+                FRAME_PAGE + 0x200,
+                FRAME_PAGE + 0x100,
+                0,
+                INPUT,
+                OUTPUT,
+            ],
             ..CpuState::default()
         };
         cpu.mmx[7] = 0xff00_0000_ff00_0000;
@@ -1537,6 +1630,10 @@ mod tests {
         assert!(native.force_resident_at(executor.memory_mut(), cpu.clone()));
         let job = native.plans.job(head).expect("scoped worker artifact");
         assert!(job.scoped);
+        assert_eq!(
+            native.worker_jobs[&head].code.frame.len(),
+            usize::from(frame) * 3
+        );
         job.per_iteration
             .set(Some((u64::from(WIDTH) * 7 + 3, 20_000.0)));
         native.pace.set(Some(Pace::default()));
@@ -1592,9 +1689,41 @@ mod tests {
         let split = split.expect("leased split");
         assert_eq!(native.diagnostics.split.scoped, 1);
         assert_eq!(split.retired, retired);
+        let mut parallel = split.context.unwrap().cpu;
+        native.set_computation_offer(false, None);
+        for _ in 0..64 {
+            if parallel.eip == stop {
+                break;
+            }
+            retired += u64::from(
+                native
+                    .run(
+                        &mut parallel,
+                        executor.memory_mut(),
+                        stop,
+                        1 << 16,
+                        std::ptr::null_mut(),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .retired,
+            );
+        }
         let split_memory = executor.memory().read(OUTPUT, len).unwrap().to_vec();
         executor.memory_mut().write(OUTPUT, &vec![0; len]).unwrap();
-        native.set_computation_offer(false, None);
+        let frame_after_split = frame.then(|| {
+            executor
+                .memory()
+                .read(FRAME_PAGE, original_frame.len())
+                .unwrap()
+                .to_vec()
+        });
+        if frame {
+            executor
+                .memory_mut()
+                .write(FRAME_PAGE, &original_frame)
+                .unwrap();
+        }
         let mut serial = start;
         let mut serial_retired = 0;
         for _ in 0..64 {
@@ -1613,7 +1742,6 @@ mod tests {
                 .unwrap();
             serial_retired += u64::from(run.retired);
         }
-        let mut parallel = split.context.unwrap().cpu;
         for state in [&mut serial, &mut parallel] {
             state.settle_flags();
             state.refresh_mmx();
@@ -1626,6 +1754,18 @@ mod tests {
         assert_eq!(serial.x87, parallel.x87);
         assert_eq!(serial_retired, u64::from(first.retired) + retired);
         assert_eq!(executor.memory().read(OUTPUT, len).unwrap(), split_memory);
+        if let Some(split) = frame_after_split {
+            assert_eq!(
+                executor
+                    .memory()
+                    .read(FRAME_PAGE, original_frame.len())
+                    .unwrap(),
+                split
+            );
+            for untouched in [0..0xfc, 0x100..0x108, 0x10c..0x204, 0x208..split.len()] {
+                assert_eq!(split[untouched.clone()], original_frame[untouched]);
+            }
+        }
     }
 
     // spec: A64-TR-9
@@ -2854,6 +2994,7 @@ mod tests {
         assert_eq!(native.code.cache.append(emitted.words), Some(at));
         native.code.cache.sync();
         let code = Code {
+            frame: Arc::new([]),
             placed: WorkerCode {
                 entry: at,
                 end: at + emitted.words.len() * 4,

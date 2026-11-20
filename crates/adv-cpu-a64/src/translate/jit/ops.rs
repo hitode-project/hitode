@@ -607,6 +607,14 @@ impl Translator<'_> {
         }
         match inst.mode {
             Mode::Inline(expected) => {
+                #[cfg(native)]
+                if self
+                    .computation_facts
+                    .and_then(|facts| facts.scope_access)
+                    .is_some_and(|access| access[self.index].is_some())
+                {
+                    return;
+                }
                 // The callee may have changed its return address.
                 self.mov_imm(X17, expected);
                 self.emit(sub(W, X17, X16, X17, Lsl, 0));

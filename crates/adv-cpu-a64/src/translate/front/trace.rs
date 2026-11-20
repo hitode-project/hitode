@@ -421,7 +421,10 @@ impl Trace {
                     || !(start..test.pc).contains(&inst.pc)
                     || !matches!(
                         cond,
-                        iced_x86::ConditionCode::s | iced_x86::ConditionCode::ns
+                        iced_x86::ConditionCode::s
+                            | iced_x86::ConditionCode::ns
+                            | iced_x86::ConditionCode::e
+                            | iced_x86::ConditionCode::ne
                     )
                 {
                     return None;

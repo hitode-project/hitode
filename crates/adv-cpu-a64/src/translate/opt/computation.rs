@@ -19,9 +19,12 @@ use crate::translate::front::decode::{
 use crate::translate::front::forms::{Division, Integer};
 use crate::translate::front::forms::{Loc, SimdKind as Kind};
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
-use crate::translate::lower::access::FrameCache;
+pub(crate) use crate::translate::lower::access::ScopeCell;
+use crate::translate::lower::access::{FrameCache, ScopeFrame};
 
 mod carried;
+mod scope;
+use crate::runtime::SCOPE_CELLS;
 
 type ExprId = usize;
 type VarId = usize;
@@ -161,6 +164,7 @@ pub(crate) struct Proof {
     frame_cache: Option<FrameCache>,
     based: u8,
     outer: Option<Outer>,
+    scope_frame: Option<ScopeFrame>,
     /// Each trace instruction as decoded once from guest bytes, for the
     /// split proof and the optimizer's component effects.
     instructions: Vec<Option<Arc<Summary>>>,
@@ -247,6 +251,10 @@ struct Graph {
 impl Graph {
     /// Fails with the shape that stops it and the instruction it stops at.
     fn build(trace: &Trace) -> Result<Self, Refusal> {
+        Self::build_selected(trace, false)
+    }
+
+    fn build_selected(trace: &Trace, selected: bool) -> Result<Self, Refusal> {
         let refuse = |why, at| Err(Refusal { why, at });
         let n = trace.len();
         if n == 0 {
@@ -256,7 +264,7 @@ impl Graph {
             Edge::Internal(to) => Some(to),
             _ => None,
         };
-        let edges: Vec<_> = trace
+        let mut edges: Vec<_> = trace
             .insts
             .iter()
             .enumerate()
@@ -295,7 +303,18 @@ impl Graph {
             color[at] = 2;
         }
         let mut back = Vec::new();
-        visit(&edges, 0, &mut vec![0; n], &mut back);
+        let mut color = vec![0; n];
+        visit(&edges, 0, &mut color, &mut back);
+        if selected {
+            for (at, edges) in edges.iter_mut().enumerate() {
+                if color[at] == 0 {
+                    *edges = [None; 2];
+                }
+            }
+            for arrivals in &mut incoming {
+                arrivals.retain(|&at| color[at] != 0);
+            }
+        }
         if back.is_empty() {
             return refuse("graph: no loop", 0);
         }
@@ -1387,7 +1406,7 @@ impl Builder<'_> {
         }
     }
 
-    /// Prove that a shared sign latch's entry arm takes the child on
+    /// Prove that a shared latch's entry arm takes the child on
     /// every row. After flag separation, only this pretest is outside it.
     fn row_pretest(
         &mut self,
@@ -1402,8 +1421,8 @@ impl Builder<'_> {
             return None;
         };
         let (enters, skips, choice) = match cond {
-            Cond::ns => (taken, fall, true),
-            Cond::s => (fall, taken, false),
+            Cond::ns | Cond::ne => (taken, fall, true),
+            Cond::s | Cond::e => (fall, taken, false),
             _ => return None,
         };
         let child = self.graph.heads[enters]?;
@@ -1413,12 +1432,18 @@ impl Builder<'_> {
         {
             return None;
         }
-        let Some(Test::Zero(value)) = &state.test else {
-            return None;
-        };
-        let value = value.invariant()?;
-        let next = self.add(value, self.one);
-        self.check(Check::Positive(next, 1 << 31));
+        let value = match &state.test {
+            Some(Test::Zero(value)) => value,
+            Some(Test::Compare(value, zero)) if zero.invariant() == Some(self.zero) => value,
+            _ => return None,
+        }
+        .invariant()?;
+        if matches!(cond, Cond::e | Cond::ne) {
+            self.check(Check::Positive(value, u32::MAX));
+        } else {
+            let next = self.add(value, self.one);
+            self.check(Check::Positive(next, 1 << 31));
+        }
         Some(choice)
     }
 
@@ -1902,7 +1927,7 @@ impl Proof {
     }
 
     fn prove(trace: &Trace, refused: &Cell<Option<Refusal>>, rows: bool) -> Option<Self> {
-        let graph = match Graph::build(trace) {
+        let graph = match Graph::build_selected(trace, rows) {
             Ok(graph) => graph,
             Err(refusal) => {
                 refused.set(Some(refusal));
@@ -1914,6 +1939,14 @@ impl Proof {
                 .insts
                 .iter()
                 .find_map(|inst| inst.guarded_slot.and_then(|slot| slot.base))
+                .or_else(|| {
+                    trace.insts.iter().find_map(|inst| match inst.op {
+                        Op::Mov(Src::Mem(mem), Src::Reg(_)) if mem.index.is_none() && !mem.fs => {
+                            mem.base.filter(|&reg| reg != ESP && reg != EBP)
+                        }
+                        _ => None,
+                    })
+                })
                 .unwrap_or(EBP)
         } else {
             EBP
@@ -1969,6 +2002,9 @@ impl Proof {
         }
         let mut frame: [Vec<(i32, i64)>; 4] = Default::default();
         effects.retain(|effect| {
+            if rows {
+                return true;
+            }
             let Some(offset) = b.frame_offset(&effect.addr) else {
                 return true;
             };
@@ -2069,6 +2105,7 @@ impl Proof {
                 outer.counter = outer.counter.and_then(|var| ids.get(&var).copied());
                 outer
             }),
+            scope_frame: None,
             instructions: Vec::new(),
         })
     }
@@ -2080,6 +2117,28 @@ impl Proof {
         &mut self,
         trace: &Trace,
         decode: impl Fn(u32, u32) -> Option<Arc<Summary>>,
+    ) {
+        self.prove_chunks(trace, decode, false);
+    }
+
+    pub(crate) fn prove_scoped_split(&mut self, trace: &Trace) {
+        let mut i = 0;
+        self.prove_chunks(
+            trace,
+            |_, _| {
+                let result = trace.x86[i].clone();
+                i += 1;
+                result
+            },
+            true,
+        );
+    }
+
+    fn prove_chunks(
+        &mut self,
+        trace: &Trace,
+        mut decode: impl FnMut(u32, u32) -> Option<Arc<Summary>>,
+        scoped: bool,
     ) {
         self.instructions = trace
             .insts
@@ -2102,11 +2161,25 @@ impl Proof {
             .flatten()
             .map(|&(offset, _, step)| (offset, zero(step)))
             .collect();
-        let carried =
-            carried::independent(trace, affine, &slots, &self.divisions, &self.instructions);
+        let carried = carried::independent(
+            trace,
+            affine,
+            &slots,
+            &self.divisions,
+            &self.instructions,
+            scoped,
+        );
+        if scoped {
+            self.scope_frame = scope::frame(self, trace);
+        }
+        let split = if scoped {
+            carried.is_some() && self.scope_frame.is_some()
+        } else {
+            carried.is_some()
+        };
         self.outer = Some(Outer {
-            split: carried.is_some(),
-            frame: carried.flatten().is_some(),
+            split,
+            frame: !scoped && carried.flatten().is_some(),
             ..outer
         });
     }
@@ -2117,6 +2190,12 @@ impl Proof {
 
     pub(crate) fn scoped_splits(&self) -> bool {
         self.outer.is_some_and(|outer| outer.split && !outer.frame)
+    }
+
+    pub(crate) fn scope_frame(&self) -> Option<&ScopeFrame> {
+        self.scope_frame
+            .as_ref()
+            .filter(|frame| !frame.cells.is_empty())
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every
@@ -2139,6 +2218,13 @@ impl Proof {
         // Each block's frame bytes are its own: only the span matters.
         let mut frame = (i64::MAX, i64::MIN);
         for effect in &self.effects {
+            if self
+                .scope_frame
+                .as_ref()
+                .is_some_and(|frame| scope::routed(self, frame, effect))
+            {
+                continue;
+            }
             let Some((lo, hi)) =
                 self.interval(&effect.addr, &effect.limits, cpu, scratch, &mut read)?
             else {
@@ -2204,7 +2290,15 @@ impl Proof {
         });
         let private = spans
             .iter()
-            .all(|&(lo, hi, ..)| hi <= frame.0 || frame.1 <= lo);
+            .all(|&(lo, hi, ..)| hi <= frame.0 || frame.1 <= lo)
+            && self.scope_frame.as_ref().is_none_or(|frame| {
+                frame.cells.iter().all(|cell| {
+                    let lo = i64::from(
+                        cpu.regs[usize::from(cell.base)].wrapping_add_signed(cell.offset),
+                    );
+                    spans.iter().all(|&(a, b, ..)| b <= lo || lo + 4 <= a)
+                })
+            });
         scratch.spans = spans;
         if !independent || !private {
             return None;

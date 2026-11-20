@@ -253,10 +253,21 @@ impl Native {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
                 PlanEvent::OfferReady => exit = Exit::Computation,
+                PlanEvent::RowTargetMiss => {
+                    self.observe_row_target(memory, cpu, payload);
+                    self.observe_row_failure(cpu.eip);
+                }
+                PlanEvent::RowGuardMiss => self.observe_row_failure(cpu.eip),
                 PlanEvent::ResidentSplitOffer(version) => {
                     let head = cpu.eip;
+                    let job = self.plans.job(head).filter(|job| job.scoped);
+                    if let Some(job) = job
+                        && self.code.version_stats.is_some()
+                    {
+                        job.scope_offers.set(job.scope_offers.get() + 1);
+                    }
                     if self.code.offers_split(head, usize::from(version))
-                        && let Some(job) = self.plans.job(head).filter(|job| job.scoped)
+                        && let Some(job) = job
                         && self.offer_split(job.scope_cost(payload))
                     {
                         exit = Exit::Computation;
@@ -563,7 +574,7 @@ impl Native {
         } else {
             0
         };
-        if head.cold_window.is_none() {
+        if head.cold_window.is_none() && !head.row_accounting() {
             self.code.measure_cold(eip, true);
         }
         if head.observe_cold(site, reason, self.code.accounted(eip), cold_iterations) {
@@ -587,7 +598,7 @@ impl Native {
 
     fn stop_cold_window(&mut self, eip: u32) {
         let head = self.plans.resident_mut(eip).unwrap();
-        if head.cold_window.take().is_some() {
+        if head.cold_window.take().is_some() && !head.row_accounting() {
             self.code.measure_cold(eip, false);
         }
     }
@@ -979,35 +990,81 @@ impl Native {
         if self.plans.baseline_only {
             return;
         }
-        let mut unit = self.front_unit(memory, eip, true, true, None);
-        if unit.trace.insts[..unit.trace.primary].iter().any(|inst| {
+        let unit = self.front_unit(memory, eip, true, true, None);
+        let guarded = unit.trace.insts[..unit.trace.primary].iter().any(|inst| {
             matches!(inst.op, crate::translate::front::decode::Op::CallIndirect(
                 crate::translate::front::decode::Src::Mem(slot)
             ) if slot.base.is_some() && slot.index.is_none() && !slot.fs)
-        }) {
-            let extension = self.front_unit(memory, eip, true, true, Some(&at.regs));
-            if extension
-                .trace
-                .insts
-                .iter()
-                .any(|inst| inst.guarded_slot.is_some())
-            {
-                unit = extension;
-            }
-        }
+        });
+        let extension = guarded.then(|| self.front_unit(memory, eip, true, true, Some(&at.regs)));
         let code = self.code.tier1(source).unwrap().unit;
         self.plans.discover(eip, source, code);
         self.code.prepare_resident(eip, unit, SAMPLE);
-        self.request_resident(eip, compile::Task::Discover, at);
+        self.request_resident_unit(eip, compile::Task::Discover, at, extension);
     }
 
-    pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, mut at: CpuState) {
-        at.refresh_mmx();
-        let checked = self
+    fn observe_row_target(&mut self, memory: &mut Memory, cpu: &CpuState, target: u32) {
+        let eip = cpu.eip;
+        let site = self.code.resident(eip).unwrap();
+        site.row_feedback.as_deref().unwrap().target_next.set(32);
+        let plan = self.plans.resident_mut(eip).unwrap();
+        if plan.pending.is_none()
+            && plan.row_targets.len() < plan::VERSIONS
+            && !plan.row_targets.contains(&target)
+        {
+            plan.row_targets.push(target);
+            let unit = self.front_unit(memory, eip, true, true, Some(&cpu.regs));
+            self.request_resident_unit(eip, compile::Task::Append, cpu.clone(), Some(unit));
+        }
+    }
+
+    fn observe_row_failure(&mut self, eip: u32) {
+        let feedback = self
             .code
             .resident(eip)
             .unwrap()
-            .unit
+            .row_feedback
+            .as_deref()
+            .unwrap();
+        feedback.next.set(32);
+        let failures = feedback.failures.iter().map(std::cell::Cell::get).sum();
+        let Some(costs) = self.code.row_costs(eip) else {
+            return;
+        };
+        let plan = self.plans.resident_mut(eip).unwrap();
+        if plan.pending.is_some() || plan.declined() {
+            return;
+        }
+        if !plan.row_accounting() && plan.cold_window.is_none() {
+            self.code.measure_cold(eip, true);
+        }
+        let measured = self.code.accounted(eip);
+        if plan.row_failures_exceed_savings(failures, measured, costs) {
+            self.count_sensor_decision("row_withdrawn");
+            self.code.measure_cold(eip, false);
+            self.decline_resident(eip, Decline::Unprofitable);
+            self.code.sync();
+        }
+    }
+
+    pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, at: CpuState) {
+        self.request_resident_unit(eip, task, at, None);
+    }
+
+    fn request_resident_unit(
+        &mut self,
+        eip: u32,
+        task: compile::Task,
+        mut at: CpuState,
+        unit: Option<Arc<Unit>>,
+    ) {
+        at.refresh_mmx();
+        let site = self.code.resident(eip).unwrap();
+        let unit = unit.unwrap_or_else(|| match task {
+            compile::Task::Replace(index) => Arc::clone(&site.versions[index].unit),
+            _ => Arc::clone(&site.unit),
+        });
+        let checked = unit
             .trace
             .insts
             .iter()
@@ -1025,7 +1082,7 @@ impl Native {
             generation: self.code.generation,
             code: head.code,
             task,
-            unit: Arc::clone(&self.code.resident(eip).unwrap().unit),
+            unit,
             proof: self.worker_jobs.get(&eip).map(|job| job.proof.clone()),
             at,
             checked,
@@ -1166,10 +1223,11 @@ impl Native {
                 continue;
             };
             head.pending = None;
-            if let Some(job) = done.job {
+            if let Some(job) = done.job
+                && head.accepts(done.task)
+            {
                 head.has_proof = true;
-                let unit = Arc::clone(&self.code.resident(eip).unwrap().unit);
-                self.place_job(eip, &done.at, unit, job);
+                self.place_job(eip, &done.at, Arc::clone(&done.unit), job);
                 self.install_offer_link(eip);
             }
             let head = self.plans.resident(eip).unwrap();
@@ -1177,7 +1235,7 @@ impl Native {
                 && let Some(result) = done.resident
             {
                 let decline = match result {
-                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form))
+                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form, done.unit))
                         .then_some(Decline::CacheFull),
                     Err(reject) => Some(Decline::Compile(reject)),
                 };
@@ -1199,7 +1257,21 @@ impl Native {
         task: compile::Task,
         at: CpuState,
         mut form: compile::ResidentForm,
+        unit: Arc<Unit>,
     ) -> bool {
+        if let Some(expected) = self
+            .code
+            .resident(eip)
+            .unwrap()
+            .versions
+            .first()
+            .and_then(|v| v.row_target)
+            && form.lowered.row_target.is_none_or(|target| {
+                (target.base, target.offset) != (expected.base, expected.offset)
+            })
+        {
+            return false;
+        }
         let lowered = &mut form.lowered;
         let source = self.plans.resident(eip).unwrap().source;
         let tier1 = self.code.tier1_words.get(&source).and_then(|words| {
@@ -1236,6 +1308,7 @@ impl Native {
             mmx: form.built.assumed.mmx,
         };
         let spill_cells = form.lowered.spill_cells;
+        let row_target = form.lowered.row_target;
         if !self.code.place_resident(
             eip,
             index,
@@ -1248,6 +1321,8 @@ impl Native {
             probation.as_ref().map(|_| PROBATION),
             MISSES,
             form.placement(),
+            unit,
+            row_target,
         ) {
             return false;
         }
@@ -1256,8 +1331,21 @@ impl Native {
         }
         let head = self.plans.resident_mut(eip).unwrap();
         let period = head.installed(index, probation);
+        if head.row_accounting() {
+            head.reset_row_accounting();
+            self.code.measure_cold(eip, false);
+        }
         self.code.resident_mut(eip).unwrap().suspended = head.rebuilds != 0;
-        self.code.start_link_sampling(eip, SAMPLE);
+        if let Some(target) = row_target {
+            if !head.row_targets.contains(&target.value) {
+                head.row_targets.push(target.value);
+            }
+            if !self.code.publish_row_targets(eip) {
+                return false;
+            }
+        } else {
+            self.code.start_link_sampling(eip, SAMPLE);
+        }
         self.code.publish_resident(eip, period);
         self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
         self.publish_scope(eip);
@@ -1276,6 +1364,11 @@ impl Native {
             .take()
             .unwrap();
         let (entries, retired) = self.code.finish_probation(eip, index);
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.row_accounting() {
+            head.reset_row_accounting();
+            self.code.measure_cold(eip, false);
+        }
         if probation.profitable(entries, retired) {
             self.code.sync();
             self.count_sensor_decision("probation_kept");
@@ -1514,6 +1607,10 @@ impl Native {
                     code: Code {
                         placed: code,
                         optimized: None,
+                        frame: job.proof.scope_frame().map_or_else(
+                            || Arc::from([]),
+                            |frame| Arc::from(frame.cells.as_slice()),
+                        ),
                     },
                     proof: job.proof,
                     retired: unit.trace.prepaid(0),

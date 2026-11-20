@@ -88,6 +88,9 @@ pub(crate) struct Lowered {
     pub exit: usize,
     pub counters: Vec<(u32, Counter, usize)>,
     rows: bool,
+    pub row_price: Option<crate::translate::lower::resident::RowPrice>,
+    pub row_failures: Vec<(crate::translate::lower::resident::RowFailure, usize)>,
+    pub row_target: Option<crate::translate::lower::resident::RowTarget>,
     pub split: Option<crate::translate::lower::resident::SplitPoint>,
 }
 
@@ -107,13 +110,17 @@ impl Lowered {
 }
 
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None, false, false, None)
+    lower_form(func, None, false, false, None, None)
+}
+
+pub(crate) fn lower_scoped(func: &Func, access: &std::collections::BTreeMap<u32, u8>) -> Lowered {
+    lower_form(func, None, false, false, None, Some(access))
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), false, false, None)
+    lower_form(func, Some((assumed, entry)), false, false, None, None)
 }
 
 /// A resident form entered from patchable links, accessing guest memory
@@ -125,7 +132,14 @@ pub(crate) fn lower_resident(
     count_entries: bool,
 ) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), true, count_entries, None)
+    lower_form(
+        func,
+        Some((assumed, entry)),
+        true,
+        count_entries,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn lower_rows(
@@ -141,6 +155,7 @@ pub(crate) fn lower_rows(
         true,
         count_entries,
         Some((domain, offer)),
+        None,
     );
     lowered.rows.then_some(lowered)
 }
@@ -159,6 +174,7 @@ fn lower_form(
     resident: bool,
     count_entries: bool,
     domain: Option<(&Domain, bool)>,
+    scope_access: Option<&std::collections::BTreeMap<u32, u8>>,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
@@ -173,9 +189,10 @@ fn lower_form(
             (
                 resident,
                 count_entries,
-                domain.filter(|_| !batches.is_empty()),
+                domain.filter(|(domain, _)| !batches.is_empty() || domain.call_savings() != 0),
             ),
             &batches,
+            scope_access,
         );
         if !e.unpriced.is_empty() {
             batches.retain(|batch| {
@@ -250,6 +267,11 @@ fn lower_form(
                 leave: e.asm.position(leave) / 4,
             },
         );
+    let row_failures = e
+        .row_failures
+        .iter()
+        .map(|&(reason, label)| (reason, e.asm.position(label) / 4))
+        .collect();
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -280,6 +302,9 @@ fn lower_form(
         spill_cells,
         counters,
         rows,
+        row_price: e.row_price,
+        row_failures,
+        row_target: e.domain.and_then(|(domain, _)| domain.target()),
         split,
     }
 }
@@ -308,6 +333,7 @@ fn emit<'a>(
     inline: Option<(&Assumed, &[Source])>,
     (resident, count_entries, domain): (bool, bool, Option<(&'a Domain, bool)>),
     batches: &[loops::Batch],
+    scope_access: Option<&'a std::collections::BTreeMap<u32, u8>>,
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -396,6 +422,9 @@ fn emit<'a>(
         mmx_miss,
         domain,
         row_budget: None,
+        row_price: None,
+        scope_access,
+        row_failures: Vec::new(),
         split: None,
     };
     let first = func.blocks[0].head.unwrap().record;
@@ -667,11 +696,21 @@ fn emit<'a>(
             .iter()
             .map(|batch| batch.spans.len() as u32 * 8)
             .min()
-            .unwrap();
+            .unwrap_or(0)
+            + e.domain.unwrap().0.call_savings();
+        let saved = saved - 2;
+        e.row_price = Some(crate::translate::lower::resident::RowPrice {
+            guard: words,
+            saved,
+        });
         e.asm.bind(rows);
         e.asm.emit_all(&[words.div_ceil(saved), 0]);
         e.asm.bind(inner);
         e.asm.emit_all(&[min_inner, 0]);
+    }
+    for &(_, failure) in &e.row_failures {
+        e.asm.bind(failure);
+        e.asm.emit(0);
     }
     if let Some((_, threshold, _)) = e.split {
         e.asm.bind(threshold);
@@ -741,6 +780,9 @@ struct Emitter<'a> {
     mmx_miss: Option<Label>,
     domain: Option<(&'a Domain, bool)>,
     row_budget: Option<((Label, Label), u32)>,
+    row_price: Option<crate::translate::lower::resident::RowPrice>,
+    scope_access: Option<&'a std::collections::BTreeMap<u32, u8>>,
+    row_failures: Vec<(crate::translate::lower::resident::RowFailure, Label)>,
     split: Option<(Label, Label, Label)>,
 }
 
@@ -755,6 +797,11 @@ impl CheckedEmitter for Emitter<'_> {
 }
 
 impl<'a> Emitter<'a> {
+    fn scope_offset(&self, pc: u32) -> Option<u32> {
+        let cell = self.scope_access?.get(&pc)?;
+        Some(runtime::SCOPE_FRAME + u32::from(*cell) * 4)
+    }
+
     fn data_view(&self) -> Reg {
         if self.resident { WINDOW } else { ALIAS }
     }
@@ -1100,7 +1147,12 @@ impl<'a> Emitter<'a> {
             }
         };
         self.asm.emit(instruction);
-        if head_exit && !self.resident {
+        if head_exit && (!self.resident || self.domain.is_some()) {
+            let leave = if self.resident {
+                self.normal_exit(record, true)
+            } else {
+                self.cold[record.0 as usize]
+            };
             let resume = self.asm.label();
             self.asm.emit(ldr(W, T, RT, runtime::HEAD_EXIT));
             self.asm.cbz(W, false, T, resume);
@@ -1108,7 +1160,7 @@ impl<'a> Emitter<'a> {
                 sub_imm(W, T, T, 1, false),
                 str(W, T, RT, runtime::HEAD_EXIT),
             ]);
-            self.asm.cbz(W, false, T, self.cold[record.0 as usize]);
+            self.asm.cbz(W, false, T, leave);
             self.asm.bind(resume);
         }
         if charge > 0 {
@@ -1980,6 +2032,14 @@ impl<'a> Emitter<'a> {
                 pc,
                 clock,
             } => {
+                if let Some(offset) = self.scope_offset(pc) {
+                    assert_eq!((width, ty), (4, Type::I32));
+                    self.asm.emit(ldr(W, d, RT, offset));
+                    if let Some(loc) = loc {
+                        self.copy(loc, Host::Register(d), Type::I32);
+                    }
+                    return;
+                }
                 self.guest_eip = pc;
                 let addr = self.gp(addr, U);
                 let base = self.data_view();
@@ -2041,6 +2101,14 @@ impl<'a> Emitter<'a> {
                 checked,
                 pc,
             } => {
+                if let Some(offset) = self.scope_offset(pc) {
+                    assert_eq!((width, self.func.ty(value)), (4, Type::I32));
+                    let value = self.gp(value, T);
+                    self.asm.emit(str(W, value, RT, offset));
+                    self.region = after;
+                    self.mark(Part::Body, self.func.records[after.0 as usize].eip);
+                    return;
+                }
                 self.guest_eip = pc;
                 let addr = self.gp(addr, U);
                 let base = self.data_view();

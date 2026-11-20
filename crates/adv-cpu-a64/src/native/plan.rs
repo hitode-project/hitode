@@ -55,6 +55,8 @@ pub(super) struct JobPlan {
     pub splits: bool,
     pub scoped: bool,
     pub split_minimum: Cell<u64>,
+    pub scope_offers: Cell<u64>,
+    pub scope_splits: Cell<u64>,
     misses: Cell<u32>,
     /// Optimized forms requested, and whether one is being built.
     forms: Cell<u8>,
@@ -87,6 +89,8 @@ impl JobPlan {
             splits,
             scoped: false,
             split_minimum: Cell::new(2),
+            scope_offers: Cell::new(0),
+            scope_splits: Cell::new(0),
             split_ticks: Cell::new(0),
             misses: Cell::new(0),
             forms: Cell::new(0),
@@ -509,6 +513,8 @@ pub(super) struct ResidentPlan {
     state: ResidentState,
     pub(super) has_proof: bool,
     recorded_gap: bool,
+    pub(super) row_targets: Vec<u32>,
+    row_window: Option<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -538,6 +544,8 @@ impl ResidentPlan {
             state: ResidentState::Profiling,
             has_proof: false,
             recorded_gap: false,
+            row_targets: Vec::new(),
+            row_window: None,
         }
     }
     pub(super) fn declined(&self) -> bool {
@@ -581,6 +589,30 @@ impl ResidentPlan {
         };
         self.probes -= 1;
         (link, self.probes == 0)
+    }
+
+    pub(super) fn row_accounting(&self) -> bool {
+        self.row_window.is_some()
+    }
+
+    pub(super) fn reset_row_accounting(&mut self) {
+        self.row_window = None;
+    }
+
+    pub(super) fn row_failures_exceed_savings(
+        &mut self,
+        failures: u64,
+        (entries, iterations): (u64, u64),
+        (guard, saved): (u32, u32),
+    ) -> bool {
+        let snapshot = (failures, entries, iterations);
+        let Some((before, entered, completed)) = self.row_window.replace(snapshot) else {
+            return false;
+        };
+        let misses = failures - before;
+        let admitted = entries - entered;
+        let rows = iterations - completed;
+        misses >= 32 && (misses + admitted) * u64::from(guard) > rows * u64::from(saved)
     }
 
     pub(super) fn record_cold(&mut self, site: u32, reason: ResidentCold) -> u64 {

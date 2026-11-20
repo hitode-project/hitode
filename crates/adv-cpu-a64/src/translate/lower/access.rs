@@ -214,6 +214,19 @@ pub(in crate::translate) fn check_class(
     }
 }
 
+/// A proved, fully written dword redirected only in a scoped worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScopeCell {
+    pub base: u8,
+    pub offset: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScopeFrame {
+    pub cells: Vec<ScopeCell>,
+    pub access: Vec<Option<u8>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FrameCache {
     pub head: usize,

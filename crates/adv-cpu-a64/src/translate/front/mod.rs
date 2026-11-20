@@ -137,7 +137,6 @@ pub(crate) fn instruction_form(memory: &adv_cpu_core::Memory, eip: u32) -> Optio
 pub(crate) struct Site {
     pub cold: Option<Arc<Unit>>,
     pub hot: Option<Arc<Unit>>,
-    pub guarded: Option<Arc<Unit>>,
 }
 
 use trace::{Edge, Mode, Next};

@@ -166,8 +166,9 @@ pub(super) fn independent(
     slots: &[(i32, bool)],
     divisions: &[Option<Division>],
     instructions: &[Option<Arc<Summary>>],
+    scoped: bool,
 ) -> Option<Option<(i32, i32)>> {
-    let graph = Graph::build(trace).ok()?;
+    let graph = Graph::build_selected(trace, scoped).ok()?;
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
     let mut decoded_at: Vec<Option<Decoded>> = (0..n).map(|_| None).collect();
@@ -184,7 +185,9 @@ pub(super) fn independent(
             Next::Dynamic => return None,
         };
         // A side exit would let a later block run past it.
-        if inst.mode != Mode::Plain
+        let inline_return =
+            scoped && matches!(inst.mode, Mode::Inline(_)) && matches!(inst.op, Op::Ret(0));
+        if (inst.mode != Mode::Plain && !inline_return)
             || !inside(next)
             || !inside(inst.taken)
             || matches!(inst.op, Op::Integer(Integer::Divide(..)) if divisions[at].is_none())
@@ -271,7 +274,7 @@ pub(super) fn independent(
     }
     let frame_written = written[1..].iter().any(|&w| w != 0);
     // The last block runs the tail on its private frame too.
-    if frame_written {
+    if frame_written && !scoped {
         for at in (0..n).filter(|&at| !lp.inside[at]) {
             instructions[at].as_ref()?.stack?;
         }

@@ -108,6 +108,7 @@ pub struct Runtime {
     pub(crate) value_frame: ValueFrame,
     /// Absolute-page read and write denial summaries.
     pub window_spans: [u64; 2],
+    pub scope_frame: [u32; SCOPE_CELLS],
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -168,6 +169,7 @@ impl Runtime {
             locked_access: 0,
             value_frame: ValueFrame::default(),
             window_spans: [0; 2],
+            scope_frame: [0; SCOPE_CELLS],
         }
     }
 }
@@ -260,6 +262,8 @@ pub enum PlanEvent {
     OfferReady,
     /// A proved row domain at its canonical resident entry.
     ResidentSplitOffer(u8),
+    RowTargetMiss,
+    RowGuardMiss,
     /// The high word names the resident head, independently of the exit EIP.
     Probation(u8),
     /// A detached computation transferred indirectly. The high word holds the source EIP.
@@ -276,6 +280,8 @@ impl PlanEvent {
             Self::EnvironmentMiss => "environment_miss",
             Self::OfferReady => "offer_ready",
             Self::ResidentSplitOffer(_) => "resident_split_offer",
+            Self::RowTargetMiss => "row_target_miss",
+            Self::RowGuardMiss => "row_guard_miss",
             Self::Probation(_) => "probation",
             Self::WorkerBranch(_) => "worker_branch",
         }
@@ -391,6 +397,8 @@ impl Exit {
             Self::Plan(PlanEvent::DiscoverBackEdge) => 16,
             Self::Plan(PlanEvent::EnvironmentMiss) => 18,
             Self::Plan(PlanEvent::OfferReady) => 19,
+            Self::Plan(PlanEvent::RowTargetMiss) => 20,
+            Self::Plan(PlanEvent::RowGuardMiss) => 21,
             Self::Plan(PlanEvent::ResidentSplitOffer(version)) => 0x4200 | version as u16,
             Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
             Self::Plan(PlanEvent::WorkerBranch(kind)) => 0x4000 | kind as u16,
@@ -428,6 +436,8 @@ impl Exit {
             16 => Some(Self::Plan(PlanEvent::DiscoverBackEdge)),
             18 => Some(Self::Plan(PlanEvent::EnvironmentMiss)),
             19 => Some(Self::Plan(PlanEvent::OfferReady)),
+            20 => Some(Self::Plan(PlanEvent::RowTargetMiss)),
+            21 => Some(Self::Plan(PlanEvent::RowGuardMiss)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
             0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {
@@ -512,6 +522,8 @@ pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
+pub(crate) const SCOPE_CELLS: usize = 8;
+pub(crate) const SCOPE_FRAME: u32 = field(offset_of!(Runtime, scope_frame));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));
 pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells));

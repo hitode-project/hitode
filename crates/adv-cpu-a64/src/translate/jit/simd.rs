@@ -1707,7 +1707,14 @@ impl Translator<'_> {
     fn mmx_aliased(&mut self, n: u8) {
         self.aliased |= 1 << n;
         self.cpu();
-        if self.tier1 {
+        let mut owner_alias = self.tier1;
+        #[cfg(native)]
+        {
+            owner_alias |= self
+                .computation_facts
+                .is_some_and(|facts| facts.scope_access.is_some());
+        }
+        if owner_alias {
             crate::facts::refresh_mmx_slot(self.asm, n);
             return;
         }

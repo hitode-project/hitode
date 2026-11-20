@@ -36,6 +36,28 @@ pub(crate) fn branch(from: usize, to: usize) -> u32 {
     b((to as i64 - from as i64) as i32)
 }
 
+pub(crate) struct RowFeedback {
+    pub failures: [Cell<u64>; 6],
+    pub next: Cell<u32>,
+    pub target_next: Cell<u32>,
+}
+
+impl Default for RowFeedback {
+    fn default() -> Self {
+        Self {
+            failures: Default::default(),
+            next: Cell::new(32),
+            target_next: Cell::new(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RowPrice {
+    pub guard: u32,
+    pub saved: u32,
+}
+
 /// Relocations in a lowered resident artifact, in words except link and site offsets.
 pub(crate) struct Layout<'a> {
     pub words: &'a mut [u32],
@@ -54,6 +76,8 @@ pub(crate) struct Layout<'a> {
     pub sites: &'a [(usize, super::super::Site)],
     pub marks: &'a [crate::jit_map::Mark],
     pub split: Option<SplitPoint>,
+    pub row_price: Option<RowPrice>,
+    pub row_failures: &'a [(super::RowFailure, usize)],
     pub counters: &'a [(u32, super::Counter, usize)],
 }
 
@@ -318,6 +342,137 @@ fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
         movz(W, r(1), head as u16, 0),
         movk(W, r(1), (head >> 16) as u16, 16),
     ]);
+}
+
+/// Read an ordinary invariant slot once and select its prepared case.
+pub(crate) fn row_entry(
+    head: u32,
+    (base, offset): (u8, u32),
+    cases: &[(u32, usize)],
+    (at, fallback, exit): (usize, usize, usize),
+    (feedback, arrivals): (&RowFeedback, Option<&std::cell::Cell<u64>>),
+) -> Vec<u32> {
+    let mut asm = Asm::new();
+    let safe = asm.label();
+    let search = asm.label();
+    let sample = asm.label();
+    let count = asm.label();
+    let poll = asm.label();
+    let bad = asm.label();
+    let failed = asm.label();
+    let mut destinations = Vec::new();
+    let counter = arrivals.map(|_| asm.label());
+    if let Some(counter) = counter {
+        asm.ldr_literal(r(0), counter);
+        asm.emit_all(&[
+            ldr(X, r(1), r(0), 0),
+            add_imm(X, r(1), r(1), 1, false),
+            str(X, r(1), r(0), 0),
+        ]);
+    }
+
+    asm.emit(mrs_nzcv(r(6)));
+    constant(&mut asm, r(7), u64::from(offset));
+    asm.emit_all(&[
+        add(W, r(7), r(19 + base), r(7), Lsl, 0),
+        mov(W, r(0), r(7)),
+        add_imm(X, r(1), r(0), 3, false),
+        lsr_imm(X, r(2), r(1), 32),
+    ]);
+    asm.cbz(X, true, r(2), bad);
+    crate::facts::batch_span(&mut asm, false, false, search, safe);
+    asm.b(bad);
+    asm.bind(safe);
+    asm.emit(add_ext(X, r(1), r(27), r(7), Extend::Uxtw, 0));
+    asm.emit(ldr(W, r(7), r(1), 0));
+    for &(value, target) in cases {
+        let selected = asm.label();
+        constant(&mut asm, r(0), u64::from(value));
+        asm.emit(cmp(W, r(7), r(0), Lsl, 0));
+        asm.b_cond(Cond::Eq, selected);
+        destinations.push((selected, target));
+    }
+    asm.ldr_literal(r(0), count);
+    asm.emit_all(&[
+        ldr(X, r(1), r(0), 0),
+        add_imm(X, r(1), r(1), 1, false),
+        str(X, r(1), r(0), 0),
+    ]);
+    runtime::emit_sensor(&mut asm, poll, r(0), r(1), sample);
+    asm.b(failed);
+    asm.bind(sample);
+    asm.emit(msr_nzcv(r(6)));
+    guest_exit(&mut asm, head, Exit::Plan(PlanEvent::RowTargetMiss));
+    asm.emit(orr(X, r(0), r(0), r(7), Lsl, 32));
+    asm.emit(branch(at + asm.offset(), exit));
+    for (label, target) in destinations {
+        asm.bind(label);
+        asm.emit(msr_nzcv(r(6)));
+        asm.emit(branch(at + asm.offset(), target));
+    }
+    asm.bind(bad);
+    asm.emit(msr_nzcv(r(6)));
+    row_feedback(
+        &mut asm,
+        head,
+        super::RowFailure::Parameter,
+        (at, fallback, exit),
+        feedback,
+    );
+    asm.bind(failed);
+    asm.emit(msr_nzcv(r(6)));
+    asm.emit(branch(at + asm.offset(), fallback));
+    crate::facts::batch_span_search(&mut asm, search, false);
+    literal(
+        &mut asm,
+        count,
+        feedback.failures[super::RowFailure::Target as usize].as_ptr() as u64,
+    );
+    literal(&mut asm, poll, feedback.target_next.as_ptr() as u64);
+    if let Some((label, counter)) = counter.zip(arrivals) {
+        literal(&mut asm, label, counter.as_ptr() as u64);
+    }
+    asm.finish()
+}
+
+pub(crate) fn row_failure(
+    head: u32,
+    reason: super::RowFailure,
+    addresses: (usize, usize, usize),
+    feedback: &RowFeedback,
+) -> Vec<u32> {
+    let mut asm = Asm::new();
+    row_feedback(&mut asm, head, reason, addresses, feedback);
+    asm.finish()
+}
+
+fn row_feedback(
+    asm: &mut Asm,
+    head: u32,
+    reason: super::RowFailure,
+    (at, fallback, exit): (usize, usize, usize),
+    feedback: &RowFeedback,
+) {
+    let count = asm.label();
+    let poll = asm.label();
+    let sample = asm.label();
+    asm.ldr_literal(r(0), count);
+    asm.emit_all(&[
+        ldr(X, r(1), r(0), 0),
+        add_imm(X, r(1), r(1), 1, false),
+        str(X, r(1), r(0), 0),
+    ]);
+    runtime::emit_sensor(asm, poll, r(0), r(1), sample);
+    asm.emit(branch(at + asm.offset(), fallback));
+    asm.bind(sample);
+    guest_exit(asm, head, Exit::Plan(PlanEvent::RowGuardMiss));
+    asm.emit(branch(at + asm.offset(), exit));
+    literal(
+        asm,
+        count,
+        feedback.failures[reason as usize].as_ptr() as u64,
+    );
+    literal(asm, poll, feedback.next.as_ptr() as u64);
 }
 
 pub(crate) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {

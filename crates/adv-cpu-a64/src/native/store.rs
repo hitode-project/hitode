@@ -21,7 +21,7 @@ use crate::translate::front::{Decodes, Unit, decode::Helper, trace::Trace};
 use crate::translate::lower::{
     Link, Site, Stubs, VersionLayout,
     flags::{Operand, Sense},
-    resident::{self as ingress, Slot},
+    resident::{self as ingress, Counter, Slot},
 };
 
 #[derive(Clone, Copy)]
@@ -117,6 +117,8 @@ pub(super) struct ResidentSite<R> {
     pub versions: Vec<ResidentVersion<R>>,
     pub fallback: usize,
     pub suspended: bool,
+    row_entry: Option<usize>,
+    pub row_feedback: Option<Box<ingress::RowFeedback>>,
 }
 
 impl<R> ResidentSite<R> {
@@ -124,7 +126,7 @@ impl<R> ResidentSite<R> {
         self.versions
             .first()
             .filter(|_| !self.suspended)
-            .map(|v| v.probe)
+            .and_then(|v| v.row_target.map_or(Some(v.probe), |_| self.row_entry))
     }
 }
 
@@ -153,6 +155,9 @@ pub(super) struct ResidentVersion<R> {
     pub at: CpuState,
     pub key: Key,
     pub plain_sites: Vec<u32>,
+    pub unit: Arc<Unit>,
+    pub row_price: Option<ingress::RowPrice>,
+    pub row_target: Option<crate::translate::lower::resident::RowTarget>,
     pub recovery: R,
     pub slot: Box<Slot>,
     pub probation: bool,
@@ -291,6 +296,8 @@ impl<R> CodeStore<R> {
             versions: Vec::new(),
             fallback: 0,
             suspended: false,
+            row_entry: None,
+            row_feedback: None,
         });
     }
 
@@ -353,6 +360,8 @@ impl<R> CodeStore<R> {
         probation: Option<u32>,
         misses: u32,
         layout: ingress::Layout<'_>,
+        unit: Arc<Unit>,
+        row_target: Option<crate::translate::lower::resident::RowTarget>,
     ) -> bool {
         let fallback = if let Some(tier1) = self.resident_fallback(eip) {
             tier1
@@ -365,6 +374,12 @@ impl<R> CodeStore<R> {
             self.resident_mut(eip).unwrap().fallback = at;
             at
         };
+        if layout.row_price.is_some() {
+            self.resident_mut(eip)
+                .unwrap()
+                .row_feedback
+                .get_or_insert_with(Box::default);
+        }
         let site = self.chains[&eip].resident.as_ref().unwrap();
         let slot = Box::<Slot>::default();
         slot.probation.set(probation.unwrap_or_default());
@@ -381,7 +396,8 @@ impl<R> CodeStore<R> {
             self.version_stats.is_some(),
             ingress::Targets {
                 at: base,
-                proved_body: (!key.uses_resident_context()).then_some(layout.body),
+                proved_body: (row_target.is_none() && !key.uses_resident_context())
+                    .then_some(layout.body),
                 tier1: fallback,
                 exit: self.stubs.exit,
                 resident_exit: self.resident_exit,
@@ -432,7 +448,23 @@ impl<R> CodeStore<R> {
             let word = offset / 4 + 3;
             words[word] = branch(entry.form + word * 4, self.stubs.dispatch);
         }
+        let mut feedback_words = Vec::new();
+        if let Some(feedback) = &site.row_feedback {
+            let cold = entry.form + layout.cold * 4;
+            for &(reason, offset) in layout.row_failures {
+                let at = entry.form + (words.len() + feedback_words.len()) * 4;
+                let from = entry.form + offset * 4;
+                words[offset] = branch(from, at);
+                feedback_words.extend(ingress::row_failure(
+                    eip,
+                    reason,
+                    (at, cold, self.stubs.exit),
+                    feedback,
+                ));
+            }
+        }
         entry.words.extend_from_slice(words);
+        entry.words.extend(feedback_words);
         let placed = &mut entry.words[(entry.form - base) / 4..];
         let accounting = layout
             .accounting
@@ -501,6 +533,9 @@ impl<R> CodeStore<R> {
             at,
             key,
             plain_sites,
+            unit,
+            row_target,
+            row_price: layout.row_price,
             recovery,
             slot,
             probation: probation.is_some(),
@@ -517,6 +552,41 @@ impl<R> CodeStore<R> {
         }
         self.uses_permissions = true;
         self.faults.end.set(self.cache.next());
+        true
+    }
+
+    pub(super) fn publish_row_targets(&mut self, eip: u32) -> bool {
+        let arrivals = self.version_stats.as_ref().and_then(|stats| {
+            stats
+                .get(&eip)
+                .map(|stats| &stats.spans[Counter::RowArrival.index()])
+        });
+        let site = self.chains[&eip].resident.as_ref().unwrap();
+        let Some(slot) = site.versions.first().and_then(|v| v.row_target) else {
+            return true;
+        };
+        let cases: Vec<_> = site
+            .versions
+            .iter()
+            .map(|v| {
+                let target = v.row_target.expect("each case has the same slot");
+                debug_assert_eq!((slot.base, slot.offset), (target.base, target.offset));
+                (target.value, v.entry)
+            })
+            .collect();
+        let fallback = site.versions[0].cold;
+        let at = self.cache.next();
+        let words = ingress::row_entry(
+            eip,
+            (slot.base, slot.offset),
+            &cases,
+            (at, fallback, self.stubs.exit),
+            (site.row_feedback.as_deref().unwrap(), arrivals),
+        );
+        let Some(addr) = self.cache.append(&words) else {
+            return false;
+        };
+        self.resident_mut(eip).unwrap().row_entry = Some(addr);
         true
     }
 
@@ -545,17 +615,22 @@ impl<R> CodeStore<R> {
                 .map(|c| c.as_ptr() as u64)
         });
         for (index, version) in site.versions.iter().enumerate() {
-            let tail = index + 1 == site.versions.len();
-            let next = site.versions.get(index + 1).map_or(fallback, |v| v.entry);
+            let tail = index + 1 == site.versions.len() || version.row_target.is_some();
+            let next = if tail {
+                fallback
+            } else {
+                site.versions[index + 1].entry
+            };
             self.cache.patch(version.next, branch(version.next, next));
             self.cache
                 .patch(version.cold, branch(version.cold, fallback));
-            let target = if let Some(period) = period.filter(|_| tail) {
-                version.slot.retry.set(period);
-                version.retry
-            } else {
-                next
-            };
+            let target =
+                if let Some(period) = period.filter(|_| tail && version.row_target.is_none()) {
+                    version.slot.retry.set(period);
+                    version.retry
+                } else {
+                    next
+                };
             if let Some(counter) = &version.miss_counter {
                 let address = counters.unwrap()[usize::from(tail)];
                 self.cache.patch(counter.literal, address as u32);
@@ -610,6 +685,20 @@ impl<R> CodeStore<R> {
         if self.cache.append(&words).is_some() {
             self.chains.entry(eip).or_default().offer = Some((at, fallback));
         }
+    }
+
+    pub(super) fn row_costs(&self, eip: u32) -> Option<(u32, u32)> {
+        let mut prices = self
+            .resident(eip)?
+            .versions
+            .iter()
+            .filter_map(|v| v.row_price);
+        let first = prices.next()?;
+        Some(
+            prices.fold((first.guard, first.saved), |(guard, saved), p| {
+                (guard.max(p.guard), saved.min(p.saved))
+            }),
+        )
     }
 
     pub(super) fn accounted(&self, eip: u32) -> (u64, u64) {
