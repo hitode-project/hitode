@@ -1,7 +1,0 @@
-{
-  "spec": ["GFX-CAP-1", "GFX-FIXED-2"],
-  "exe": "d3d9_texture_stages.exe",
-  "args": ["--headless-gpu"],
-  "seconds": 60,
-  "outputs": ["d3d9-texture-stages.bin"]
-}

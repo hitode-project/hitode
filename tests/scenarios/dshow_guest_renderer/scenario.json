@@ -1,6 +1,0 @@
-{
-  "spec": ["MEDIA-DMO-2"],
-  "exe": "dshow_guest_renderer.exe",
-  "seconds": 60,
-  "outputs": ["dshow-guest-renderer.bin"]
-}
