@@ -70,7 +70,7 @@ struct Limit {
 
 #[derive(Clone, Debug)]
 enum Var {
-    Counter(Option<ExprId>),
+    Counter(u32, Option<ExprId>),
     Remainder {
         divisor: ExprId,
         normalized: bool,
@@ -467,7 +467,7 @@ struct Builder<'a> {
     remaining: usize,
     states: Vec<Vec<Option<State>>>,
     outer: Option<Outer>,
-    rows: bool,
+    rows: Option<&'a [u32; 8]>,
     based: u8,
 }
 
@@ -917,9 +917,7 @@ impl Builder<'_> {
             return None;
         }
         if let Some((reg, mask, nonzero)) = inst.row_alignment {
-            if !self.rows {
-                return None;
-            }
+            self.rows?;
             let address = self.register(state, reg)?;
             self.check(Check::Mask(address.base, mask, nonzero));
             for (_, stride) in address.terms {
@@ -1115,9 +1113,7 @@ impl Builder<'_> {
                     return None;
                 }
                 if let Some(slot) = inst.guarded_slot {
-                    if !self.rows {
-                        return None;
-                    }
+                    self.rows?;
                     let addr = self.address(state, slot)?.invariant()?;
                     let word = self.expr(Expr::Word(addr));
                     self.check(Check::Target(word, target));
@@ -1168,6 +1164,12 @@ impl Builder<'_> {
             Op::Simd(s) if s.kind != Kind::MaskMove => {
                 if s.memory() {
                     let addr = self.address(state, s.mem)?;
+                    if s.aligned && self.rows.is_some() {
+                        self.check(Check::Mask(addr.base, 15, false));
+                        for &(_, stride) in &addr.terms {
+                            self.check(Check::Mask(stride, 15, false));
+                        }
+                    }
                     if s.dst == Loc::Mem {
                         self.write(state, addr, s.width, None, record);
                     } else {
@@ -1364,7 +1366,7 @@ impl Builder<'_> {
             let inside = |to| lp.is_none_or(|l| self.graph.loops[l].inside[to]);
             let [fall, mut taken] = self.graph.edges[at].map(|edge| edge.filter(|&to| inside(to)));
             let mut fall = fall;
-            if self.rows
+            if self.rows.is_some()
                 && let Some(lp) = lp
                 && let Some(choice) = self.row_pretest(at, lp, &state, [fall, taken])
             {
@@ -1438,13 +1440,28 @@ impl Builder<'_> {
             _ => return None,
         }
         .invariant()?;
+        let observed = self.observe(value);
         if matches!(cond, Cond::e | Cond::ne) {
+            if observed == Some(0) {
+                self.check(Check::Equal(value, self.zero));
+                return Some(!choice);
+            }
             self.check(Check::Positive(value, u32::MAX));
         } else {
+            if observed.is_some_and(|value| (value as i32) < 0) {
+                self.check(Check::Mask(value, 1 << 31, true));
+                return Some(!choice);
+            }
             let next = self.add(value, self.one);
             self.check(Check::Positive(next, 1 << 31));
         }
         Some(choice)
+    }
+
+    /// Entry registers can select an optional tail. The selected condition
+    /// remains a range proof check, and parameter reads stay guarded.
+    fn observe(&self, id: ExprId) -> Option<u32> {
+        observe_expr(&self.exprs, self.rows?, id)
     }
 
     /// A forward branch over a child loop, on a value that is the same in
@@ -1497,7 +1514,9 @@ impl Builder<'_> {
             {
                 self.add(a.base, self.one)
             }
-            (Test::Zero(a), Cond::ns, true) | (Test::Zero(a), Cond::s, false) if self.rows => {
+            (Test::Zero(a), Cond::ns, true) | (Test::Zero(a), Cond::s, false)
+                if self.rows.is_some() =>
+            {
                 let [(induction, scale)] = *a.terms.as_slice() else {
                     return None;
                 };
@@ -1627,7 +1646,8 @@ impl Builder<'_> {
                 break first;
             }
         };
-        let var = self.variable(Var::Counter(None));
+        let pc = self.trace.insts[head].pc;
+        let var = self.variable(Var::Counter(pc, None));
         let mut recurring = [const { None }; 8];
         let mut slots = BTreeMap::new();
         let mut before = initial.clone();
@@ -1696,7 +1716,7 @@ impl Builder<'_> {
         let Some(count) = after.test.take().and_then(|t| self.trip(lp, t, var)) else {
             return self.refuse("trip", test);
         };
-        self.vars[var] = Var::Counter(Some(count));
+        self.vars[var] = Var::Counter(pc, Some(count));
         after.cdq = false;
         after.entry_reads |= used | initial.entry_reads;
         after.limits = initial.limits;
@@ -1911,6 +1931,31 @@ fn renumber(
     id
 }
 
+fn observe_expr(exprs: &[Expr], regs: &[u32; 8], id: ExprId) -> Option<u32> {
+    let mut values: Vec<Option<u32>> = Vec::with_capacity(id + 1);
+    for expr in &exprs[..=id] {
+        let value = match *expr {
+            Expr::Constant(value) => Some(value),
+            Expr::Register(reg) => Some(regs[usize::from(reg)]),
+            Expr::Word(_) => None,
+            Expr::Add(a, b) => values[a].zip(values[b]).map(|(a, b)| a.wrapping_add(b)),
+            Expr::Mul(a, b) => values[a].zip(values[b]).map(|(a, b)| a.wrapping_mul(b)),
+            Expr::Neg(a) => values[a].map(u32::wrapping_neg),
+            Expr::SignTrip(a, shift) => values[a].map(|a| sign_trip(a, shift)),
+        };
+        values.push(value);
+    }
+    values[id]
+}
+
+fn sign_trip(first: u32, shift: u32) -> u32 {
+    if (first as i32) < 0 {
+        1
+    } else {
+        (first >> shift) + 2
+    }
+}
+
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -1918,7 +1963,7 @@ fn gcd(a: u64, b: u64) -> u64 {
 impl Proof {
     pub(crate) fn build(trace: &Trace) -> Result<Self, Refusal> {
         let refused = Cell::new(None);
-        Self::prove(trace, &refused, false).ok_or_else(|| {
+        Self::prove(trace, &refused, None).ok_or_else(|| {
             refused.get().unwrap_or(Refusal {
                 why: "proof",
                 at: 0,
@@ -1926,15 +1971,19 @@ impl Proof {
         })
     }
 
-    fn prove(trace: &Trace, refused: &Cell<Option<Refusal>>, rows: bool) -> Option<Self> {
-        let graph = match Graph::build_selected(trace, rows) {
+    fn prove(
+        trace: &Trace,
+        refused: &Cell<Option<Refusal>>,
+        rows: Option<&[u32; 8]>,
+    ) -> Option<Self> {
+        let graph = match Graph::build_selected(trace, rows.is_some()) {
             Ok(graph) => graph,
             Err(refusal) => {
                 refused.set(Some(refusal));
                 return None;
             }
         };
-        let based = if rows {
+        let based = if rows.is_some() {
             trace
                 .insts
                 .iter()
@@ -2002,7 +2051,7 @@ impl Proof {
         }
         let mut frame: [Vec<(i32, i64)>; 4] = Default::default();
         effects.retain(|effect| {
-            if rows {
+            if rows.is_some() {
                 return true;
             }
             let Some(offset) = b.frame_offset(&effect.addr) else {
@@ -2671,7 +2720,7 @@ impl Proof {
         for &(var, coefficient) in &form.terms {
             let k = self.value(coefficient, cpu, scratch, read)? as i32;
             let (a, b) = match self.vars[var] {
-                Var::Counter(Some(count)) => {
+                Var::Counter(_, Some(count)) => {
                     (0, i64::from(self.value(count, cpu, scratch, read)?) - 1)
                 }
                 Var::Remainder {
@@ -2801,14 +2850,7 @@ impl Proof {
                 .value(a, cpu, scratch, read)?
                 .wrapping_mul(self.value(b, cpu, scratch, read)?),
             Expr::Neg(a) => self.value(a, cpu, scratch, read)?.wrapping_neg(),
-            Expr::SignTrip(a, shift) => {
-                let result = self.value(a, cpu, scratch, read)? as i32;
-                if result < 0 {
-                    1
-                } else {
-                    ((result as u32) >> shift) + 2
-                }
-            }
+            Expr::SignTrip(a, shift) => sign_trip(self.value(a, cpu, scratch, read)?, shift),
         };
         scratch.values[id] = Some(value);
         Some(value)

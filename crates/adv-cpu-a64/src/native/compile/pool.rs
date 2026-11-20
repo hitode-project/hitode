@@ -227,8 +227,11 @@ fn compile(request: Request) -> Compiled {
                 &|pc| refused.contains(&pc),
             )
         };
-        let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace).and_then(
-            |(domain, mut proof)| {
+        let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace, &at.regs)
+            .and_then(|(domain, mut proof)| {
+                let mut shape = rows.clone();
+                domain.use_proved_alignment(&mut shape.trace);
+                let rows = &shape;
                 let built = build(rows, None)
                     .inspect_err(|rejection| {
                         crate::jit_map::optimized(eip, format_args!("row lowering {rejection:?}"));
@@ -267,8 +270,7 @@ fn compile(request: Request) -> Compiled {
                     });
                 }
                 Some(ResidentForm { built, lowered })
-            },
-        );
+            });
         let result = match (scoped, guarded) {
             (Some(scoped), _) => Ok(scoped),
             (None, Some(index)) => Err(front::Reject::Unsupported(index)),

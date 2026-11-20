@@ -1,7 +1,9 @@
-//! A prepared affine row domain. The generated entry proves its entire
-//! ordinary-window and alias footprint before it executes any guest effect.
+//! A prepared affine row domain. The generated entry proves its ordinary
+//! window, alignment and aliases before any guest effect, clipping at the
+//! first denied page when a profitable prefix remains. An observed optional
+//! tail is guarded separately from the strip that pays for the proof.
 
-use super::{Access, Check, Effect, Expr, ExprId, Graph, Proof, Var};
+use super::{Access, Check, Effect, Expr, ExprId, Graph, Proof, Var, observe_expr};
 use crate::asm::{Asm, Label};
 use crate::encode::{
     Cond, Extend, Reg,
@@ -10,6 +12,7 @@ use crate::encode::{
     add, add_ext, add_imm, and_imm, cmp, csel, ldr, lsr_imm, mov, movk, movz, mrs_nzcv, msr_nzcv,
     mul, mvn, sbfx, str, sub, sub_imm, udiv,
 };
+use crate::translate::front::{decode::Op, trace::Trace};
 use crate::translate::lower::resident::RowFailure;
 use std::cell::Cell;
 
@@ -20,7 +23,9 @@ pub(crate) struct Domain {
     spans: Vec<Span>,
     aliases: Vec<(usize, usize)>,
     rows: ExprId,
-    inner: Vec<ExprId>,
+    inner: Vec<(u32, ExprId)>,
+    aligned: Vec<usize>,
+    alignment_strip: Option<(u32, ExprId, u32, u32)>,
     slots_read: usize,
     direct_calls: u32,
     target: Option<crate::translate::lower::resident::RowTarget>,
@@ -39,7 +44,7 @@ struct Span {
 }
 
 impl Domain {
-    pub(crate) fn build(trace: &crate::translate::front::trace::Trace) -> Option<(Self, Proof)> {
+    pub(crate) fn build(trace: &Trace, observed: &[u32; 8]) -> Option<(Self, Proof)> {
         let head = trace.insts.first()?.pc;
         let graph = Graph::build_selected(trace, true)
             .inspect_err(|why| {
@@ -56,7 +61,7 @@ impl Domain {
             return None;
         }
         let refused = Cell::new(None);
-        let proof = Proof::prove(trace, &refused, true).or_else(|| {
+        let proof = Proof::prove(trace, &refused, Some(observed)).or_else(|| {
             let reason = refused.get();
             let op = reason
                 .as_ref()
@@ -72,7 +77,7 @@ impl Domain {
             .iter()
             .enumerate()
             .filter_map(|(id, var)| match *var {
-                Var::Counter(Some(count)) if Some(id) != outer.counter => Some(count),
+                Var::Counter(head, Some(count)) if Some(id) != outer.counter => Some((head, count)),
                 _ => None,
             })
             .collect();
@@ -80,6 +85,7 @@ impl Domain {
             return None;
         }
         let mut spans = Vec::new();
+        let mut aligned = Vec::new();
         for effect in &proof.effects {
             let Effect {
                 addr,
@@ -101,7 +107,7 @@ impl Domain {
                 .terms
                 .iter()
                 .map(|&(var, step)| match proof.vars[var] {
-                    Var::Counter(Some(count)) => Some((count, step)),
+                    Var::Counter(_, Some(count)) => Some((count, step)),
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -120,13 +126,44 @@ impl Domain {
             if !spans.contains(&span) {
                 spans.push(span);
             }
+            aligned.extend(
+                effect.indices.iter().copied().filter(
+                    |&i| matches!(trace.insts[i].op, Op::Simd(s) if s.aligned && s.memory()),
+                ),
+            );
         }
+        aligned.sort_unstable();
+        aligned.dedup();
+        // Tier-1 tests address alignment at each such access. A proved
+        // aligned strip may pay for its row guard even without a wider batch.
+        let alignment_strip = graph
+            .loops
+            .iter()
+            .enumerate()
+            .filter(|&(i, lp)| i != outer_index && graph.loops[outer_index].inside[lp.head])
+            .filter_map(|(i, lp)| {
+                let head = trace.insts[lp.head].pc;
+                let count = inner
+                    .iter()
+                    .find_map(|&(pc, count)| (pc == head).then_some(count))?;
+                let accesses = aligned
+                    .iter()
+                    .filter(|&&site| lp.inside[site] && dominates_latch(&graph, i, site))
+                    .count() as u32;
+                let minimum = observe_expr(&proof.exprs, observed, count)
+                    .and_then(|count| count.checked_ilog2())
+                    .map_or(1, |shift| 1 << shift);
+                let saved = (accesses * 2).saturating_mul(minimum).saturating_sub(2);
+                (saved != 0).then_some((head, count, minimum, saved))
+            })
+            .max_by_key(|&(_, _, _, saved)| saved);
+
         // Entry parameter reads, including the indirect slot, cannot be
         // overwritten anywhere in the proved region.
         let mut used = vec![false; proof.exprs.len()];
         let mut mark = |id| mark_expression(&proof.exprs, &mut used, id);
         mark(rows);
-        for &count in &inner {
+        for &(_, count) in &inner {
             mark(count);
         }
         for check in &proof.checks {
@@ -220,10 +257,21 @@ impl Domain {
             aliases,
             rows,
             inner,
+            aligned,
+            alignment_strip,
             slots_read,
             frame: frame as u32,
         };
         Some((domain, proof))
+    }
+
+    /// These accesses are aligned on every row under the entry's masks.
+    pub(crate) fn use_proved_alignment(&self, trace: &mut Trace) {
+        for &at in &self.aligned {
+            if let Op::Simd(s) = &mut trace.insts[at].op {
+                s.aligned = false;
+            }
+        }
     }
 
     pub(crate) fn target(&self) -> Option<crate::translate::lower::resident::RowTarget> {
@@ -243,12 +291,22 @@ impl Domain {
         }
     }
 
+    pub(crate) fn strip_count(&self, head: u32) -> Option<usize> {
+        self.inner
+            .iter()
+            .find_map(|&(pc, count)| (pc == head).then_some(count))
+    }
+
+    pub(crate) fn alignment_strip(&self) -> Option<(u32, ExprId, u32, u32)> {
+        self.alignment_strip
+    }
+
     /// Entry code owns its scratch. A failed guard leaves with the original
     /// Tier-1 assignment, including the incoming flags.
     pub(crate) fn emit(
         &self,
         asm: &mut Asm,
-        minimum: (Label, Label),
+        (minimum, strip): ((Label, Label), usize),
         short: Label,
         failures: [(RowFailure, Label); 5],
         offer: Option<Label>,
@@ -290,12 +348,10 @@ impl Domain {
         let ranges = self.exprs.len() as u32 * 4;
         let limit = ranges + self.spans.len() as u32 * 8;
         emit.asm.emit(str(W, A, SP, limit));
-        for &inner in &self.inner {
-            emit.expression(inner, A);
-            emit.asm.ldr_literal(B, minimum.1);
-            emit.asm.emit(cmp(W, A, B, Lsl, 0));
-            emit.asm.b_cond(Cond::Lo, small);
-        }
+        emit.expression(strip, A);
+        emit.asm.ldr_literal(B, minimum.1);
+        emit.asm.emit(cmp(W, A, B, Lsl, 0));
+        emit.asm.b_cond(Cond::Lo, small);
         for &check in &self.checks {
             match check {
                 Check::Equal(a, b) => {

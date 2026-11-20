@@ -186,11 +186,7 @@ fn lower_form(
             &allocation,
             asm,
             inline,
-            (
-                resident,
-                count_entries,
-                domain.filter(|_| !batches.is_empty()),
-            ),
+            (resident, count_entries, domain),
             &batches,
             scope_access,
         );
@@ -354,6 +350,38 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
+    let row_strip = domain.and_then(|(domain, _)| {
+        let batch = batches
+            .iter()
+            .filter_map(|batch| Some((batch, domain.strip_count(batch.loop_.eip)?)))
+            .max_by_key(|(batch, _)| {
+                batch
+                    .loop_
+                    .streams
+                    .iter()
+                    .map(|stream| u32::from(stream.width))
+                    .sum::<u32>()
+            })
+            .map(|(batch, count)| RowStrip {
+                head: batch.loop_.eip,
+                count,
+                minimum: u32::from(batch.plan.lanes) + 1,
+                saved: batch.spans.len() as u32 * 8 + domain.call_savings() - 2,
+            });
+        let alignment = domain
+            .alignment_strip()
+            .map(|(head, count, minimum, saved)| RowStrip {
+                head,
+                count,
+                minimum,
+                saved,
+            });
+        batch
+            .into_iter()
+            .chain(alignment)
+            .max_by_key(|strip| strip.saved)
+    });
+    let domain = domain.filter(|_| row_strip.is_some());
     let span_search = [false, true].map(|backwards| {
         (resident && domain.is_none() && batches.iter().any(|batch| batch.backwards == backwards))
             .then(|| asm.label())
@@ -421,6 +449,7 @@ fn emit<'a>(
         count_entries,
         mmx_miss,
         domain,
+        row_strip,
         row_budget: None,
         row_price: None,
         scope_access,
@@ -652,11 +681,7 @@ fn emit<'a>(
         e.asm.bind(label);
         e.asm.emit_all(&[0, 0]);
     }
-    let mut min_inner = batches
-        .iter()
-        .map(|b| u32::from(b.plan.lanes) + 1)
-        .max()
-        .unwrap_or(0);
+    let mut min_inner = e.row_strip.map_or(0, |strip| strip.minimum);
     for (batch, price) in prices {
         let saved = if price.classes.is_empty() {
             let scalar = cost::cheapest(func, &costs, &batch.loop_) * u32::from(batch.plan.lanes);
@@ -685,7 +710,11 @@ fn emit<'a>(
             e.unpriced.push(batch.loop_.head);
         } else {
             let min_batches = price.admission.div_ceil(saved);
-            min_inner = min_inner.max(min_batches * u32::from(batch.plan.lanes) + 1);
+            if e.row_strip
+                .is_some_and(|strip| strip.head == batch.loop_.eip)
+            {
+                min_inner = min_inner.max(min_batches * u32::from(batch.plan.lanes) + 1);
+            }
             e.asm.emit_all(&[min_batches, 0]);
         }
     }
@@ -693,13 +722,7 @@ fn emit<'a>(
         // A range proven at the row entry removes at least the first-leaf
         // hit of every covered stream on each row with an inner strip.
         let domain = e.domain.unwrap().0;
-        let saved = batches
-            .iter()
-            .map(|batch| batch.spans.len() as u32 * 8)
-            .min()
-            .unwrap()
-            + domain.call_savings()
-            - 2;
+        let saved = e.row_strip.unwrap().saved;
         let price = crate::translate::lower::resident::RowPrice {
             guard: words,
             saved,
@@ -724,6 +747,16 @@ fn emit<'a>(
         e.asm.emit_all(&[value as u32, (value >> 32) as u32]);
     }
     (e, exit, miss, cold)
+}
+
+/// A batch whose saved work pays for the row proof. Any narrower
+/// strips apply their own batch minimum when reached.
+#[derive(Clone, Copy)]
+struct RowStrip {
+    head: u32,
+    count: usize,
+    minimum: u32,
+    saved: u32,
 }
 
 struct FpCheck {
@@ -782,6 +815,7 @@ struct Emitter<'a> {
     count_entries: bool,
     mmx_miss: Option<Label>,
     domain: Option<(&'a Domain, bool)>,
+    row_strip: Option<RowStrip>,
     row_budget: Option<((Label, Label), u32)>,
     row_price: Option<crate::translate::lower::resident::RowPrice>,
     scope_access: Option<&'a std::collections::BTreeMap<u32, u8>>,

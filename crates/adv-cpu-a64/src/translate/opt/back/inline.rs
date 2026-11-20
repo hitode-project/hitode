@@ -81,7 +81,8 @@ impl Emitter<'_> {
             .map(|kind| (kind, self.asm.label()));
             self.row_failures.extend(failures);
             let leave = offer.then(|| self.asm.label());
-            let mut words = domain.emit(&mut self.asm, minimum, short, failures, leave);
+            let count = self.row_strip.unwrap().count;
+            let mut words = domain.emit(&mut self.asm, (minimum, count), short, failures, leave);
             if self.count_entries {
                 let hit = self.asm.label();
                 self.asm.b(hit);

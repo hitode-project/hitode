@@ -2093,6 +2093,105 @@ fn row_domain_separates_pretest_and_latch_flags() {
     assert!(counts[20] > 0, "{counts:?}");
 }
 
+// spec: A64-OPT-8, A64-OPT-10
+#[test]
+fn row_domain_prices_the_main_strip_with_zero_or_short_tails() {
+    const SOURCE: u32 = 0x2_0000;
+    const DEST: u32 = 0x3_4000;
+    const ROWS: u32 = 192;
+    const WIDTH: u32 = 256;
+    const SPACE: usize = 0x10000;
+
+    let extra = [(DEST, SPACE)];
+    for (aligned, tail) in [(false, 0), (false, 1), (true, 0)] {
+        let bytes = if aligned { 16 } else { 8 };
+        let image = Image::loop_body(|a, row, _| {
+            let mut strip = a.create_label();
+            let mut strip_test = a.create_label();
+            let mut tail = a.create_label();
+            let mut tail_test = a.create_label();
+            a.mov(ecx, edx).unwrap();
+            a.sub(ecx, bytes).unwrap();
+            a.jmp(strip_test).unwrap();
+            a.set_label(&mut strip).unwrap();
+            if aligned {
+                a.movaps(xmm0, xmmword_ptr(esi)).unwrap();
+                a.orps(xmm0, xmm7).unwrap();
+                a.movntps(xmmword_ptr(edi), xmm0).unwrap();
+            } else {
+                a.movq(mm0, qword_ptr(esi)).unwrap();
+                a.por(mm0, mm7).unwrap();
+                a.movntq(qword_ptr(edi), mm0).unwrap();
+            }
+            a.add(esi, bytes).unwrap();
+            a.add(edi, bytes).unwrap();
+            a.sub(ecx, bytes).unwrap();
+            a.set_label(&mut strip_test).unwrap();
+            a.jns(strip).unwrap();
+            a.add(ecx, bytes).unwrap();
+            a.jmp(tail_test).unwrap();
+            a.set_label(&mut tail).unwrap();
+            a.mov(al, byte_ptr(esi)).unwrap();
+            a.mov(byte_ptr(edi), al).unwrap();
+            a.inc(esi).unwrap();
+            a.inc(edi).unwrap();
+            a.dec(ecx).unwrap();
+            a.set_label(&mut tail_test).unwrap();
+            a.jne(tail).unwrap();
+            if aligned {
+                a.add(esi, eax).unwrap();
+            }
+            a.dec(ebx).unwrap();
+            a.jne(row).unwrap();
+        });
+        let mut state = initial(0);
+        state.eip = image.head;
+        state.regs[2] = WIDTH + tail;
+        state.regs[3] = ROWS;
+        state.regs[6] = SOURCE;
+        state.regs[7] = DEST;
+        state.x87.regs[7] = adv_cpu_core::X87Register::from_parts(0xff00_0000_ff00_0000, 0xffff);
+        state.refresh_mmx();
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            format!("row tail {tail}, aligned {aligned}"),
+            &extra,
+            |m| {
+                m.map(SOURCE, SPACE, READ | WRITE).unwrap();
+                m.map(DEST, SPACE, READ | WRITE).unwrap();
+                m.write(SOURCE, &vector_data(437)).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(100_000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(counts[20] > 0, "{counts:?}");
+        if tail == 0 {
+            for executor in [&mut trial.live, &mut trial.reference] {
+                executor.state = state.clone();
+                executor.state.regs[if aligned { 0 } else { 2 }] += 1;
+            }
+            if aligned {
+                let run = trial.run_native(100_000).unwrap();
+                assert_eq!(run.exit, Exit::Event(crate::runtime::Event::Exception(13)));
+                let retired = u64::from(run.retired);
+                assert_eq!(
+                    trial.reference.run(trial.stop, retired).unwrap(),
+                    RunOutcome::Budget
+                );
+                trial.same_position_and_memory(retired, false);
+            } else {
+                assert_eq!(trial.compare(100_000).0, RunOutcome::ReachedStop);
+            }
+            let next = trial.live.native.as_ref().unwrap().span_counts(image.head);
+            assert_eq!(next[20], counts[20]);
+            assert!(next[22] > counts[22]);
+        }
+    }
+}
+
 // spec: A64-OPT-9, A64-OPT-10
 #[test]
 fn row_domain_clips_at_a_denied_page_in_both_directions() {
