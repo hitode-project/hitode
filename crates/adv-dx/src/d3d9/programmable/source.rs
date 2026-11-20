@@ -58,7 +58,7 @@ pub(super) fn build_with_fixed(
     let (second, clip, fog, fixed) = features;
     let specular = ps.is_none() && fixed & 2 != 0;
     let flat = fixed & 4 != 0;
-    let factor = ps.is_none() && fixed & 8 != 0;
+    let stage_arguments = ps.is_none() && fixed & STAGE_ARGUMENTS != 0;
     let vertex_fog = vs.is_none() && fixed & 32 != 0;
     let mut used = varyings(ps, second);
     used[1] |= specular;
@@ -88,7 +88,7 @@ pub(super) fn build_with_fixed(
         s.push_str("@location(12) fog:f32,\n");
     }
     s.push_str("}\n");
-    if factor || (second && fixed != 0) {
+    if stage_arguments || (second && fixed != 0) {
         s = s.replace("switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}", "var v=texel;switch (a&15u) {case 0u:{v=diffuse;}case 1u:{v=current;}case 3u:{v=bitcast<vec4<f32>>(draw_parameters.values[36]);}default:{}}if (a&32u)!=0u {v=vec4<f32>(v.a);}if (a&16u)!=0u {v=vec4<f32>(1.0)-v;}return v;");
     }
     s.push_str(adv_device::gpu::BORDER_WGSL);
@@ -345,7 +345,7 @@ pub(super) fn build_with_fixed(
         s.push_str("let result=ps_run(registers);var color=result.colors[0];\n");
     } else {
         s.push_str("var texel=ps_sample_0(input.t0,0u);if draw_parameters.values[2].x!=0u {texel.a=1.0;}\nlet rgb=adv_combine(draw_parameters.values[1].x,input.c0,texel).rgb;let alpha=adv_combine(draw_parameters.values[1].y,input.c0,texel).a;var color=vec4<f32>(rgb,alpha);\n");
-        if factor {
+        if stage_arguments {
             s.push_str("{let stage=draw_parameters.values[37];let rgb=adv_stage(stage.x,adv_argument(stage.y&255u,input.c0,input.c0,texel),adv_argument(stage.y>>8u,input.c0,input.c0,texel),input.c0).rgb;let alpha=adv_stage(stage.z,adv_argument(stage.w&255u,input.c0,input.c0,texel),adv_argument(stage.w>>8u,input.c0,input.c0,texel),input.c0).a;color=vec4<f32>(rgb,alpha);if stage.x==1u {color=input.c0;}}\n");
         }
         if second {

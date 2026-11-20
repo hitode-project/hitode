@@ -65,7 +65,7 @@ fn schedule(
         .programs
         .last_draw
         .unwrap_or((4, None));
-    let prediction = fixed::prepare_state(env, pointer, kind)
+    let prediction = fixed::prepare_state(env, pointer, kind, key.fixed & STAGE_ARGUMENTS != 0)
         .ok()
         .map(|(target, _, state)| {
             let textures = std::array::from_fn(|slot| texture(env, pointer, slot, &state).ok());

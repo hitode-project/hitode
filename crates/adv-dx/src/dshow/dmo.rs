@@ -2,8 +2,8 @@
 //! push-mode transform. Compressed samples arrive through IMemInputPin::Receive
 //! on the upstream (usually guest) streaming thread. Decoded video is held until
 //! the graph position reaches it and delivered to the downstream input on that
-//! same thread; decoded audio goes to the DirectSound mixer, which paces the
-//! thread through its bounded queue.
+//! same thread. Decoded audio goes to the connected guest renderer or to the
+//! DirectSound mixer for a host renderer.
 use adv_device::media::{AudioFrame, CodecFormat, Decoded, PacketDecoder, VideoFrame};
 use adv_device::mixer::PcmBlock;
 use adv_machine::{Env, Handle, Object, Outcome, Wait};
@@ -767,7 +767,8 @@ fn deliver_video(
     })
 }
 
-/// Queue PCM at its media time; a full mixer queue holds the upstream thread.
+/// Deliver PCM to the connected renderer. A guest renderer needs a sample
+/// while paused to finish its transition before the graph can run.
 fn push_audio(
     env: &mut Env<'_>,
     filter: u32,
@@ -788,12 +789,32 @@ fn push_audio(
     if filter_state == graph::STOPPED || !state(env).graphs.contains_key(&graph) {
         return then(env, VFW_E_WRONG_STATE);
     }
-    let connected = pin_of(env, filter, OUTPUT).is_some_and(|out| state(env).pins[&out].peer != 0);
+    let Some(out) = pin_of(env, filter, OUTPUT) else {
+        return then(env, VFW_E_NOT_CONNECTED);
+    };
+    let p = &state(env).pins[&out];
+    let (peer, mem, allocator) = (p.peer, p.mem, p.allocator);
+    if peer == 0 {
+        return then(env, S_OK);
+    }
+    if mem != 0 && allocator != 0 && filter::host_pin(env, peer).is_none() {
+        let Some(sample) = sample::take(env, allocator) else {
+            let wake = state(env).allocators[&allocator].wake;
+            return Outcome::block(
+                Wait::Object {
+                    handle: wake,
+                    deadline: Some(env.sys.clock.now_us() + POLL_US),
+                },
+                move |env, _| push_audio(env, filter, frame, then),
+            );
+        };
+        return deliver_audio(env, filter, mem, sample, frame, then);
+    }
     let enabled = env
         .ext
         .try_get::<Sound>()
         .is_some_and(|sound| sound.enabled);
-    if !connected || !enabled {
+    if !enabled {
         return then(env, S_OK);
     }
     let now = env.sys.clock.now_us();
@@ -852,6 +873,41 @@ fn push_audio(
             )
         }
     }
+}
+
+fn deliver_audio(
+    env: &mut Env<'_>,
+    filter: u32,
+    mem: u32,
+    sample: u32,
+    frame: AudioFrame,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let channels = usize::from(frame.channels);
+    let bytes: Vec<u8> = frame
+        .samples
+        .chunks_exact(channels)
+        .flat_map(|values| values.iter().take(2))
+        .flat_map(|value| ((*value * 32768.0) as i16).to_le_bytes())
+        .collect();
+    let s = &state(env).samples[&sample];
+    let (buffer, capacity) = (s.buffer, s.size as usize);
+    if bytes.len() > capacity || env.cpu.write(buffer, &bytes).is_err() {
+        release(env, sample);
+        return then(env, E_FAIL);
+    }
+    let start = frame.pts_us as i64 * 10;
+    let duration =
+        (frame.samples.len() / channels) as i64 * 10_000_000 / i64::from(frame.sample_rate);
+    let discontinuity = std::mem::take(&mut dmo(env, filter).unwrap().discontinuity);
+    let s = state(env).samples.get_mut(&sample).unwrap();
+    s.actual = bytes.len() as u32;
+    s.time = Some((start, start + duration));
+    s.discontinuity = discontinuity;
+    guest_call(env, mem, 6, vec![sample], move |env, hr| {
+        release(env, sample);
+        then(env, hr)
+    })
 }
 
 /// IPin streaming calls on DMO pins.
@@ -1053,4 +1109,64 @@ pub(super) fn buffer_method(env: &mut Env<'_>, this: u32, method: &str) -> Optio
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{DATA, activate, env, machine, method, query};
+    use super::*;
+    use adv_cpu::backend::Guest;
+
+    // spec: MEDIA-DMO-2
+    #[test]
+    fn paused_decoder_sends_pcm_to_its_guest_renderer() {
+        let mut m = machine();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let filter = activate(&mut m, CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+        let wrapper = query(&mut m, filter, IID_IDMOWRAPPERFILTER);
+        m.cpu.write(DATA, &CLSID_WMA_DECODER).unwrap();
+        assert_eq!(
+            method(&mut m, "IDMOWrapperFilter::Init", &[wrapper, DATA, DATA]),
+            S_OK
+        );
+        assert_eq!(
+            method(&mut m, "IFilterGraph2::AddFilter", &[graph, filter, 0]),
+            S_OK
+        );
+        let mem = DATA + 64;
+        let vtable = DATA + 128;
+        let receive = DATA + 256;
+        m.cpu.write_u32(mem, vtable).unwrap();
+        m.cpu.write_u32(vtable + 6 * 4, receive).unwrap();
+        let mut env = env(&mut m);
+        let out = pin_of(&env, filter, OUTPUT).unwrap();
+        let allocator = sample::create_allocator(&mut env, 1, 16).unwrap();
+        let p = state(&mut env).pins.get_mut(&out).unwrap();
+        p.peer = DATA + 512;
+        p.mem = mem;
+        p.allocator = allocator;
+        filter::set_state(&mut env, filter, graph::PAUSED);
+        let frame = AudioFrame {
+            pts_us: 1000,
+            sample_rate: 48_000,
+            channels: 2,
+            samples: vec![0.5, -0.5],
+        };
+        let Outcome::Call {
+            target, args, then, ..
+        } = push_audio(&mut env, filter, frame, |_, hr| Outcome::Return(hr))
+        else {
+            panic!("the paused guest renderer needs its first sample");
+        };
+        assert_eq!((target, args[0]), (receive, mem));
+        let s = &state(&mut env).samples[&args[1]];
+        assert_eq!((s.actual, s.time), (4, Some((10_000, 10_208))));
+        let buffer = s.buffer;
+        assert_eq!(env.cpu.read_u32(buffer).unwrap(), 0xc000_4000);
+        assert!(matches!(
+            then(&mut env, adv_machine::Resume::Returned(S_OK)),
+            Outcome::Return(S_OK)
+        ));
+        assert_eq!(state(&mut env).allocators[&allocator].free, [args[1]]);
+    }
 }
