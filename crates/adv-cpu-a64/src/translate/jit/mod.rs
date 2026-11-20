@@ -688,6 +688,7 @@ impl Jit<'_> {
 pub(crate) struct ComputationFacts<'a> {
     pub frame_cache: Option<&'a FrameCache>,
     pub scope_access: Option<&'a [Option<u8>]>,
+    pub scope_mmx: u16,
     pub divisions: &'a [Option<Division>],
 }
 

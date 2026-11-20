@@ -109,6 +109,8 @@ pub struct Runtime {
     /// Absolute-page read and write denial summaries.
     pub window_spans: [u64; 2],
     pub scope_frame: [u32; SCOPE_CELLS],
+    /// Scoped chunk's actual MMX writes, plus its TOP and tag change.
+    pub scope_written: u32,
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -170,6 +172,7 @@ impl Runtime {
             value_frame: ValueFrame::default(),
             window_spans: [0; 2],
             scope_frame: [0; SCOPE_CELLS],
+            scope_written: 0,
         }
     }
 }
@@ -524,6 +527,7 @@ pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const SCOPE_CELLS: usize = 8;
 pub(crate) const SCOPE_FRAME: u32 = field(offset_of!(Runtime, scope_frame));
+pub(crate) const SCOPE_WRITTEN: u32 = field(offset_of!(Runtime, scope_written));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));
 pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells));

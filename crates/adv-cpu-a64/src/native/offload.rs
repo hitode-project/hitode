@@ -57,6 +57,7 @@ pub(super) struct WorkerJob<U> {
 pub(super) struct Code {
     pub placed: WorkerCode,
     pub frame: Arc<[ScopeCell]>,
+    pub scoped_mmx: u16,
     /// The optimized form, run instead when a job meets its assumptions.
     pub optimized: Option<Arc<Optimized>>,
 }
@@ -187,6 +188,9 @@ fn run(
     runtime.computation_pending_mask = signals.pending.1;
     runtime.head_exit = head_exit;
     runtime.deferred = 0;
+    if code.scoped_mmx != 0 {
+        runtime.scope_written = 0;
+    }
     let started = Instant::now();
     let cpu = context.cpu_mut();
     cpu.settle_flags();
@@ -250,6 +254,7 @@ fn execute(
 ) -> (Exit, u64, bool) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
+    let scoped_mmx = code.scoped_mmx;
     let code = optimized.map_or(&code.placed, |o| &o.code);
     if let Some(o) = optimized {
         if scratch.saved.len() < o.cells {
@@ -302,7 +307,7 @@ fn execute(
         let recovery = &runtime.recovery;
         let record = &o.records[recovery.record as usize];
         // SAFETY: as above, the frame lies in the leased ranges.
-        let refund = recovery::materialize(
+        let (refund, mmx_meta) = recovery::materialize(
             record,
             &recovery.dump,
             &scratch.saved,
@@ -314,6 +319,9 @@ fn execute(
             },
         );
         retired = retired.wrapping_sub(u64::from(refund));
+        if scoped_mmx != 0 {
+            runtime.scope_written = (mmx_meta & 0xff) | (u32::from(mmx_meta & 0x700 != 0) << 8);
+        }
         // Every exit but a recall, failures included, continues where the
         // owner dispatches.
         exit = if recovery.recalled != 0 {
@@ -383,6 +391,57 @@ struct Drained {
     claimed_after: Duration,
     /// The last block's completion and its thread.
     last: Option<LastBlock>,
+    mmx: MmxJoin,
+}
+
+/// The last block that actually wrote each omitted MMX component.
+#[derive(Default)]
+struct MmxJoin {
+    slots: [Option<(u32, adv_cpu_core::X87Register)>; 8],
+    env: Option<(u32, (u8, u16))>,
+}
+
+impl MmxJoin {
+    fn record(&mut self, index: u32, mask: u16, cpu: &CpuState) {
+        for (i, value) in self.slots.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                *value = Some((index, cpu.x87.regs[i]));
+            }
+        }
+        if mask & (1 << 8) != 0 {
+            self.env = Some((index, (cpu.x87.top() as u8, cpu.x87.tag)));
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        fn latest<T>(at: &mut Option<(u32, T)>, next: Option<(u32, T)>) {
+            if let Some((index, _)) = next
+                && at.as_ref().is_none_or(|&(first, _)| first < index)
+            {
+                *at = next;
+            }
+        }
+        for (at, next) in self.slots.iter_mut().zip(other.slots) {
+            latest(at, next);
+        }
+        latest(&mut self.env, other.env);
+    }
+
+    fn publish(self, mask: u16, start: &CpuState, cpu: &mut CpuState) {
+        for (i, value) in self.slots.into_iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                cpu.x87.regs[i] = value.map_or(start.x87.regs[i], |(_, value)| value);
+            }
+        }
+        if mask & (1 << 8) != 0 {
+            let (top, tag) = self
+                .env
+                .map_or((start.x87.top() as u8, start.x87.tag), |(_, env)| env);
+            cpu.x87.set_top(usize::from(top));
+            cpu.x87.tag = tag;
+        }
+        cpu.refresh_mmx();
+    }
 }
 
 struct LastBlock {
@@ -509,6 +568,13 @@ impl Blocks {
             out.retired += done.retired;
             out.optimized += done.optimized;
             out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
+            if self.code.scoped_mmx != 0 {
+                out.mmx.record(
+                    index,
+                    self.code.scoped_mmx & runtime.scope_written as u16,
+                    cpu,
+                );
+            }
             if last || self.scoped {
                 out.last = Some(LastBlock {
                     index,
@@ -988,6 +1054,9 @@ impl<'a, U> Session<'a, U> {
         let scoped = self.plans.job(eip).unwrap().scoped;
         let mut start = context.clone();
         start.cpu_mut().settle_flags();
+        if code.scoped_mmx != 0 {
+            start.cpu_mut().refresh_mmx();
+        }
         let blocks = Arc::new(Blocks {
             next: AtomicU32::new(0),
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -1032,6 +1101,7 @@ impl<'a, U> Session<'a, U> {
             total.retired += drained.retired;
             total.optimized += drained.optimized;
             total.sticky |= drained.sticky;
+            total.mmx.merge(drained.mmx);
             if let Some(last) = drained.last
                 && total
                     .last
@@ -1077,6 +1147,13 @@ impl<'a, U> Session<'a, U> {
             last,
             iterations,
         );
+        if code.scoped_mmx != 0 {
+            total.mmx.publish(
+                code.scoped_mmx,
+                blocks.start.cpu(),
+                completion.context.as_mut().unwrap().cpu_mut(),
+            );
+        }
         self.counts.blocks += u64::from(total.blocks);
         completion.id = id;
         completion.retired = total.retired;
@@ -1534,16 +1611,23 @@ mod tests {
     // spec: A64-OPT-9, A64-TR-9
     #[test]
     fn scoped_rows_split_under_the_lease_and_match_serial() {
-        scoped_split(false);
+        scoped_split(false, false, false);
     }
 
     // spec: A64-OPT-9
     #[test]
     fn scoped_rows_use_host_frame_cells_and_preserve_guest_bytes() {
-        scoped_split(true);
+        scoped_split(true, false, false);
     }
 
-    fn scoped_split(frame: bool) {
+    // spec: A64-OPT-9
+    #[test]
+    fn scoped_rows_join_the_latest_actual_mmx_writers_before_the_tail() {
+        scoped_split(true, true, false);
+        scoped_split(true, true, true);
+    }
+
+    fn scoped_split(frame: bool, conditional_mmx: bool, raw: bool) {
         let _pool = exclusive_pool();
         const ROWS: u32 = 128;
         const WIDTH: u32 = 8;
@@ -1560,18 +1644,35 @@ mod tests {
             a.mov(dword_ptr(ebx + 4), esi).unwrap();
             a.call(callee).unwrap();
         }
+        if conditional_mmx {
+            let mut skip = a.create_label();
+            a.cmp(edx, ROWS / 2).unwrap();
+            a.jbe(skip).unwrap();
+            a.movq(mm1, qword_ptr(esi)).unwrap();
+            a.set_label(&mut skip).unwrap();
+        }
+        let step = if conditional_mmx { 16 } else { 8 };
         a.mov(ecx, WIDTH).unwrap();
         let mut pixel = a.create_label();
         a.set_label(&mut pixel).unwrap();
-        a.movq(mm0, qword_ptr(esi)).unwrap();
-        a.por(mm0, mm7).unwrap();
-        a.movntq(qword_ptr(edi), mm0).unwrap();
-        a.add(esi, 8).unwrap();
-        a.add(edi, 8).unwrap();
+        if conditional_mmx {
+            a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+            a.por(xmm0, xmm7).unwrap();
+            a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
+        } else {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.por(mm0, mm7).unwrap();
+            a.movntq(qword_ptr(edi), mm0).unwrap();
+        }
+        a.add(esi, step).unwrap();
+        a.add(edi, step).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(pixel).unwrap();
         a.dec(edx).unwrap();
         a.jnz(row).unwrap();
+        if conditional_mmx {
+            a.movd(eax, mm1).unwrap();
+        }
         if frame {
             let mut done = a.create_label();
             a.jmp(done).unwrap();
@@ -1584,7 +1685,7 @@ mod tests {
         let (mut executor, mut native) = fixture(&mut a);
         let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
         let head = CODE + 1;
-        let len = (ROWS * WIDTH * 8) as usize;
+        let len = (ROWS * WIDTH * step as u32) as usize;
         let input: Vec<u8> = (0..len as u32).map(|n| n.wrapping_mul(37) as u8).collect();
         {
             let memory = executor.memory_mut();
@@ -1617,6 +1718,9 @@ mod tests {
             ..CpuState::default()
         };
         cpu.mmx[7] = 0xff00_0000_ff00_0000;
+        if conditional_mmx {
+            cpu.x87.set_top(3);
+        }
         executor.memory_mut().attach().unwrap();
         native
             .run(
@@ -1628,6 +1732,15 @@ mod tests {
             )
             .unwrap();
         assert!(native.force_resident_at(executor.memory_mut(), cpu.clone()));
+        let code = &mut native.worker_jobs.get_mut(&head).unwrap().code;
+        if conditional_mmx {
+            assert_eq!(code.scoped_mmx, (1 << 1) | (1 << 8));
+            if raw {
+                code.optimized = None;
+            } else {
+                assert!(code.optimized.is_some());
+            }
+        }
         let job = native.plans.job(head).expect("scoped worker artifact");
         assert!(job.scoped);
         assert_eq!(
@@ -1690,6 +1803,11 @@ mod tests {
         assert_eq!(native.diagnostics.split.scoped, 1);
         assert_eq!(split.retired, retired);
         let mut parallel = split.context.unwrap().cpu;
+        if conditional_mmx {
+            assert_eq!(parallel.x87.top(), 0);
+            assert_eq!(parallel.x87.tag, 0);
+            assert_ne!(parallel.mmx[1], 0);
+        }
         native.set_computation_offer(false, None);
         for _ in 0..64 {
             if parallel.eip == stop {
@@ -2995,6 +3113,7 @@ mod tests {
         native.code.cache.sync();
         let code = Code {
             frame: Arc::new([]),
+            scoped_mmx: 0,
             placed: WorkerCode {
                 entry: at,
                 end: at + emitted.words.len() * 4,

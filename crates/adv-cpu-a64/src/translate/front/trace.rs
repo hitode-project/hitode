@@ -946,6 +946,30 @@ impl Trace {
         index as u16
     }
 
+    /// A scoped join publishes conditional state before the serial tail
+    /// can observe it. The worker leaves on the latch's non-returning edge.
+    pub(crate) fn end_at_latch(&mut self, at: usize, loops_on_taken: bool) {
+        let target = if loops_on_taken {
+            match self.insts[at].next {
+                Next::Fall => Edge::Internal(at + 1),
+                Next::Edge(edge) => edge,
+                Next::Dynamic => unreachable!(),
+            }
+        } else {
+            self.insts[at].taken.unwrap()
+        };
+        let exit = match target {
+            Edge::Internal(to) => Edge::Exit(self.insts[to].pc),
+            Edge::Exit(pc) | Edge::Event(pc) => Edge::Exit(pc),
+        };
+        if loops_on_taken {
+            self.insts[at].next = Next::Edge(exit);
+        } else {
+            self.insts[at].taken = Some(exit);
+        }
+        self.analyze();
+    }
+
     /// A copy in which each `cut` instruction leaves at its own EIP instead
     /// of running, analysed again. It has no helpers: only forms that refuse
     /// them build from it.

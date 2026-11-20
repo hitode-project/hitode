@@ -383,7 +383,7 @@ impl Native {
         recovery::restore_inline_entry(&recovery.entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
         self.runtime.shadow = recovery.dump.x[28];
-        let refund = recovery::materialize(
+        let (refund, _) = recovery::materialize(
             record,
             &recovery.dump,
             &self.inline_saved,
@@ -1613,6 +1613,7 @@ impl Native {
                     code: Code {
                         placed: code,
                         optimized: None,
+                        scoped_mmx: job.proof.scoped_mmx(),
                         frame: job.proof.scope_frame().map_or_else(
                             || Arc::from([]),
                             |frame| Arc::from(frame.cells.as_slice()),

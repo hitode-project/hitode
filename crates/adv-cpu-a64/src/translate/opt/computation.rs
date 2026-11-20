@@ -2170,7 +2170,12 @@ impl Proof {
             scoped,
         );
         if scoped {
-            self.scope_frame = scope::frame(self, trace);
+            self.scope_frame = carried.as_ref().and_then(|carried| {
+                let mut frame = scope::frame(self, trace)?;
+                frame.mmx = carried.mmx;
+                frame.latch = (carried.mmx != 0).then_some(carried.latch);
+                Some(frame)
+            });
         }
         let split = if scoped {
             carried.is_some() && self.scope_frame.is_some()
@@ -2179,7 +2184,7 @@ impl Proof {
         };
         self.outer = Some(Outer {
             split,
-            frame: !scoped && carried.flatten().is_some(),
+            frame: !scoped && carried.is_some_and(|proof| proof.frame.is_some()),
             ..outer
         });
     }
@@ -2196,6 +2201,14 @@ impl Proof {
         self.scope_frame
             .as_ref()
             .filter(|frame| !frame.cells.is_empty())
+    }
+
+    pub(crate) fn scoped_mmx(&self) -> u16 {
+        self.scope_frame.as_ref().map_or(0, |frame| frame.mmx)
+    }
+
+    pub(crate) fn scoped_latch(&self) -> Option<(usize, bool)> {
+        self.scope_frame.as_ref()?.latch
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every

@@ -255,11 +255,15 @@ fn compile(request: Request) -> Compiled {
                 let lowered =
                     back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
                 if offer {
-                    let form = scoped_form(rows, &proof, &at);
+                    let mut worker = rows.clone();
+                    if let Some((latch, taken)) = proof.scoped_latch() {
+                        worker.trace.end_at_latch(latch, taken);
+                    }
+                    let form = scoped_form(&worker, &proof, &at);
                     scoped_job = Some(Job {
                         proof,
                         form,
-                        scoped: Some(Arc::new(rows.clone())),
+                        scoped: Some(Arc::new(worker)),
                     });
                 }
                 Some(ResidentForm { built, lowered })

@@ -192,6 +192,7 @@ pub(crate) fn lower_computation<'a>(
             None
         },
         scope_access: proof.scope_frame().map(|frame| frame.access.as_slice()),
+        scope_mmx: proof.scoped_mmx(),
         divisions: proof.divisions(),
     });
     jit::lower_computation(

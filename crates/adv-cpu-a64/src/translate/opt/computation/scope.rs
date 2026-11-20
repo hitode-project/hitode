@@ -88,7 +88,12 @@ pub(super) fn frame(proof: &Proof, trace: &Trace) -> Option<ScopeFrame> {
             }
         }
     }
-    Some(ScopeFrame { cells, access })
+    Some(ScopeFrame {
+        cells,
+        access,
+        mmx: 0,
+        latch: None,
+    })
 }
 
 pub(super) fn routed(proof: &Proof, frame: &ScopeFrame, effect: &Effect) -> bool {

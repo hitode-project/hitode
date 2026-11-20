@@ -3367,7 +3367,7 @@ pub(in crate::translate) mod opt_back {
             let record = RecordId(word(offset_of!(runtime::Runtime, recovery.record)));
             let mut cpu = initial();
             let mut frame = Vec::new();
-            let refund = materialize(
+            let (refund, _) = materialize(
                 &lowered.records[record.0 as usize],
                 &registers,
                 &spills,

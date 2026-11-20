@@ -397,7 +397,7 @@ pub(crate) fn materialize(
     flags: &[Option<FlagRecipe>],
     cpu: &mut adv_cpu_core::CpuState,
     mut frame: impl FnMut(i32, &[u8]),
-) -> u32 {
+) -> (u32, u32) {
     let values = Locations {
         dump,
         spills,
@@ -447,7 +447,7 @@ pub(crate) fn materialize(
             &values.locate(location).to_le_bytes()[..usize::from(width)],
         );
     }
-    record.refund
+    (record.refund, meta)
 }
 
 fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::CpuState) {

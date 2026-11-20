@@ -225,6 +225,8 @@ pub(crate) struct ScopeCell {
 pub(crate) struct ScopeFrame {
     pub cells: Vec<ScopeCell>,
     pub access: Vec<Option<u8>>,
+    pub mmx: u16,
+    pub latch: Option<(usize, bool)>,
 }
 
 #[derive(Clone)]
