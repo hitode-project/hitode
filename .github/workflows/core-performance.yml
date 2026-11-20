@@ -2,7 +2,6 @@ name: Core execution validation
 
 on:
   pull_request:
-  merge_group:
   workflow_dispatch:
     inputs:
       slow-tests:
@@ -11,7 +10,7 @@ on:
         default: true
   schedule:
     # Daily at 09:17 Taipei, when macOS runners are free: refreshes the
-    # master caches pull requests and the merge queue restore.
+    # master caches pull requests restore and checks master itself.
     - cron: '17 1 * * *'
     # Weekly at 11:17 Taipei: also runs the slow test matrices.
     - cron: '17 3 * * 1'
@@ -106,14 +105,11 @@ jobs:
           python3 tools/layering/check_layers.py
 
   # macOS runners are scarce (an organization runs at most five macOS jobs
-  # at once), so the two macOS jobs run only for the merge queue, the daily
-  # cache refresh and manual runs. A pull request skips them, and a skipped
-  # job counts as passed. The merge queue tests the exact commit master
-  # becomes, so nothing reruns after a merge. The two jobs share their steps
-  # through a YAML anchor; WORKSPACE_GROUP selects the group-only steps.
+  # at once), so a pull request uses two macOS jobs and nothing reruns after
+  # a merge. The daily schedule runs them on master. The two jobs share their
+  # steps through a YAML anchor; WORKSPACE_GROUP selects the group-only steps.
   workspace-core:
     name: workspace (core-system, macOS ARM64)
-    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 45
     env:
@@ -134,8 +130,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-          # The first parent is the merge queue's base.
-          fetch-depth: 2
       - name: Record native ARM64 environment
         run: |
           rustup update stable --no-self-update
@@ -284,7 +278,6 @@ jobs:
 
   workspace-apps:
     name: workspace (runtime-apps, macOS ARM64)
-    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 45
     env:

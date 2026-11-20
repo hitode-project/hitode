@@ -13,12 +13,12 @@ An agent works for a maintainer when `git config --get hitode.maintainer` prints
 
 ## Integrating a branch
 
-Master takes changes only through pull requests and its merge queue. A pull request runs the Linux checks, and its macOS jobs report as skipped. Auto-merge then queues it, and the queue runs the macOS jobs once on the exact commit master becomes, so nothing reruns after a merge.
+Master takes changes only through pull requests, which must pass the checks its branch protection lists. A pull request runs two macOS jobs; nothing reruns after a merge, and a daily scheduled run checks master itself.
 
 1. Commit in the worktree and bring in the latest master with `git merge origin/master`.
 2. Run `python3 tools/check.py --ci` and test the affected crates.
-3. Push the branch, open a pull request with `gh pr create`, and turn on auto-merge with `gh pr merge --auto`. The queue merges with a merge commit.
-4. When CI or the merge queue fails, fix it on the same branch and turn auto-merge on again. After the merge, delete the branch and worktree, and fast-forward the main checkout.
+3. Push the branch, open a pull request with `gh pr create`, and turn on auto-merge with `gh pr merge --auto --merge`.
+4. When CI fails, fix it on the same branch. After the merge, delete the branch and worktree, and fast-forward the main checkout.
 
 Merge master into open branches as soon as fixes there pass, so long-running branches do not drift.
 

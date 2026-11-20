@@ -50,7 +50,7 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. |
 | `levels` | Report counters compared by their final value, such as `peak_rss`, the build's peak resident memory. |
 
-The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In the merge queue, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
+The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In CI, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
 
 - Every scenario of the base MUST pass on the change, with byte-identical outputs.
 - An output may differ, or a base scenario may fail, only when the change adds or edits a scenario that fails on the base, passes on the change and shares a spec ID with it. The base's `spec` list decides that ID.

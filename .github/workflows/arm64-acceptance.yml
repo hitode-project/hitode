@@ -9,7 +9,6 @@ name: ARM64 hardware acceptance
 
 on:
   pull_request:
-  merge_group:
   push:
     branches:
       - 'ci/arm64**'
