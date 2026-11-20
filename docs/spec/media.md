@@ -53,7 +53,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-2 File sources
 
-**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing files or invalid arguments without publishing a source or touching its output. Its async reader MUST load undecodable contents, which rendering then rejects with `VFW_E_UNSUPPORTED_STREAM`. File-source filters MUST keep their file sharing locks.
+**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing files or invalid arguments without publishing a source or touching its output. Its async reader MUST load undecodable contents, which rendering then rejects with `VFW_E_UNSUPPORTED_STREAM`. The WM ASF Reader MUST be this source, loading through IFileSourceFilter before or after graph join, rejecting undecodable files and keeping the file lock.
 **Verification**: Test
 
 ### MEDIA-GRAPH-3 Render negotiation
@@ -136,10 +136,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: Graph transitions MUST return the first member result that is not S_OK, and Stop from Running MUST pause every member first. GetState MUST poll every member and report VFW_S_STATE_INTERMEDIATE until all reach the graph state or the timeout passes. Stop MUST return only after every host stream thread has left the downstream filters.
 **Verification**: Test
 
-### MEDIA-GRAPH-19 ASF reader lifecycle
-
-**Rule**: ASF Load MUST retain the first filename without opening it, ignore supplied media types, and reject subsequent loads with E_FAIL. Graph join MUST open the file and publish named compressed stream pins, and state transitions before successful opening MUST fail without changing state. GetCurFile MUST preserve unspecified media-type fields, and compressed delivery MUST use ReceiveMultiple with separate stream threads when downstream reception can block.
-**Verification**: Test
+Withdrawn: MEDIA-GRAPH-19
 
 ### MEDIA-GRAPH-20 Asynchronous run
 
@@ -363,7 +360,4 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 **Rule**: Renderless VMR MUST retain the guest allocator-presenter and DirectDraw device and allocate surfaces during allocator configuration. Samples MUST populate those surfaces and invoke PrepareSurface followed by PresentImage with their timestamps. Renderless VMR MUST NOT publish frames through the host video provider.
 **Verification**: Test
 
-### MEDIA-VIDEO-15 Video Renderer window
-
-**Rule**: Render MUST give the Video Renderer its own guest window sized to the video, as windowed VMR has. The graph's IVideoWindow MUST forward to a renderer that owns a window, except full-screen mode, which the graph keeps.
-**Verification**: Test
+Withdrawn: MEDIA-VIDEO-15

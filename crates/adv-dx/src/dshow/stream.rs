@@ -356,9 +356,6 @@ pub(crate) fn thread_entry(env: &mut Env<'_>) -> Outcome {
     if let Some(graph) = state(env).async_runs.remove(&id) {
         return graph::async_run(env, graph);
     }
-    if state(env).asf_threads.contains_key(&id) {
-        return super::asf::thread(env, id);
-    }
     if state(env).audio_feeds.contains_key(&id) {
         return feed(env, id);
     }

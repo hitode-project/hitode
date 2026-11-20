@@ -15,7 +15,6 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_os::Heaps;
 use adv_os::com::{Com, Iid, QueryError};
 
-mod asf;
 mod automation;
 mod dmo;
 #[cfg(test)]
@@ -230,7 +229,8 @@ const CLSID_MPEG_AUDIO_CODEC: Iid = guid(
     0x11ce,
     [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
 );
-/// qasf's WM ASF Reader publishes compressed streams when it joins a graph.
+/// qasf's WM ASF Reader: a file source whose Load hands the file to the
+/// common decoder, so Windows Media streams render natively.
 pub(crate) const CLSID_WMASF_READER: Iid = guid(
     0x1874_63a0,
     0x5bb7,
@@ -283,9 +283,6 @@ pub(crate) enum Face {
     MediaBuffer,
     QualityControl,
     PersistStream,
-    ServiceProvider,
-    WmHeaderInfo,
-    WmReaderAdvanced,
     VmrFilterConfig,
     VmrWindowlessControl,
     VmrProtection,
@@ -307,7 +304,7 @@ pub(crate) enum Face {
     Inner,
 }
 
-const FACES: [(Face, &str); 48] = [
+const FACES: [(Face, &str); 45] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -335,9 +332,6 @@ const FACES: [(Face, &str); 48] = [
     (Face::MediaBuffer, "IMediaBuffer"),
     (Face::QualityControl, "IQualityControl"),
     (Face::PersistStream, "IPersistStream"),
-    (Face::ServiceProvider, "IServiceProvider"),
-    (Face::WmHeaderInfo, "IWMHeaderInfo"),
-    (Face::WmReaderAdvanced, "IWMReaderAdvanced2"),
     (Face::VmrFilterConfig, "IVMRFilterConfig"),
     (Face::VmrWindowlessControl, "IVMRWindowlessControl"),
     (Face::VmrProtection, "IAMCertifiedOutputProtection"),
@@ -392,9 +386,6 @@ impl Face {
             Face::MediaBuffer => &[dmo::IID_IMEDIABUFFER],
             Face::QualityControl => &[IID_IQUALITYCONTROL],
             Face::PersistStream => &[IID_IPERSISTSTREAM],
-            Face::ServiceProvider => &[asf::IID_ISERVICEPROVIDER],
-            Face::WmHeaderInfo => &[asf::IID_IWMHEADERINFO],
-            Face::WmReaderAdvanced => &[asf::IID_IWMREADERADVANCED, asf::IID_IWMREADERADVANCED2],
             Face::VmrFilterConfig => &[vmr::IID_IVMRFILTERCONFIG],
             Face::VmrWindowlessControl => &[vmr::IID_IVMRWINDOWLESSCONTROL],
             Face::VmrProtection => &[vmr::IID_IAMCERTIFIEDOUTPUTPROTECTION],
@@ -457,7 +448,6 @@ pub(crate) struct State {
     pub(crate) sessions: BTreeMap<u32, stream::Session>,
     /// Delivery threads (by thread id) of guest audio inputs.
     pub(crate) audio_feeds: BTreeMap<u32, stream::AudioFeed>,
-    asf_threads: BTreeMap<u32, (u32, Vec<(u32, usize)>)>,
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
@@ -495,7 +485,6 @@ fn interface_methods(interface: &str) -> Vec<(&'static str, Conv, u16)> {
         return from_abi;
     }
     dmo::interface_methods(interface)
-        .or_else(|| asf::interface_methods(interface))
         .or_else(|| filter::interface_methods(interface).map(<[_]>::to_vec))
         .or_else(|| vmr::interface_methods(interface).map(<[_]>::to_vec))
         .unwrap_or_default()
@@ -600,7 +589,6 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         samples: BTreeMap::new(),
         sessions: BTreeMap::new(),
         audio_feeds: BTreeMap::new(),
-        asf_threads: BTreeMap::new(),
         next_session: 1,
         pending_threads: Vec::new(),
         async_runs: BTreeMap::new(),
@@ -774,9 +762,6 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
             if let Some(handle) = filter.source.and_then(|s| s.file_handle) {
                 host::close(env, handle);
             }
-            if let Some(asf) = filter.asf {
-                asf::destroyed(env, asf);
-            }
             if let Some(dmo) = filter.dmo {
                 dmo::destroyed(env, dmo);
             }
@@ -924,7 +909,6 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         Face::MemAllocator | Face::MediaSample => sample::call(env, face, &method, this),
         Face::VmrFilterConfig | Face::VmrWindowlessControl => vmr::call(env, face, &method, this),
         Face::MediaBuffer => dmo::buffer_method(env, this, &method),
-        Face::ServiceProvider | Face::WmHeaderInfo | Face::WmReaderAdvanced => None,
         Face::PersistStream => filter::call(env, Face::BaseFilter, &method, this),
         Face::VmrProtection
         | Face::VmrMisc

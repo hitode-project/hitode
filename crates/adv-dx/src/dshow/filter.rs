@@ -52,7 +52,6 @@ pub(crate) struct Filter {
     pub source_path: Vec<u16>,
     pub dmo: Option<super::dmo::Dmo>,
     pub vmr: Option<super::vmr::Vmr>,
-    pub asf: Option<super::asf::Asf>,
     /// The controlling outer object of an aggregated filter, and the filter's
     /// own non-delegating IUnknown; both zero otherwise.
     pub outer: u32,
@@ -165,7 +164,7 @@ pub(crate) fn create_vmr_renderer(env: &mut Env<'_>, iid: Iid, outer: u32, outpu
         Outcome::Return(S_OK) => {
             let pointer = env.cpu.read_u32(output).unwrap();
             let filter = canonical(env, pointer).unwrap();
-            super::video::window::create_vmr_window(env, filter, |_, hr| Outcome::Return(hr))
+            super::video::window::create_vmr_window(env, filter)
         }
         outcome => outcome,
     }
@@ -213,13 +212,6 @@ pub(super) fn new_filter(
 ) -> Result<u32, u32> {
     let is_vmr = role == Role::VideoRenderer && clsid == super::vmr::CLSID_VIDEO_MIXING_RENDERER;
     let faces: &[Face] = match role {
-        Role::FileSource if clsid == CLSID_WMASF_READER => &[
-            Face::BaseFilter,
-            Face::FileSource,
-            Face::ServiceProvider,
-            Face::WmHeaderInfo,
-            Face::WmReaderAdvanced,
-        ],
         Role::FileSource => &[Face::BaseFilter, Face::FileSource],
         Role::DmoDecoder => &[Face::BaseFilter, Face::DmoWrapper, Face::PersistStream],
         Role::AudioDecoder => &[Face::BaseFilter, Face::MpegAudioDecoder],
@@ -261,7 +253,6 @@ pub(super) fn new_filter(
             *faces.last().unwrap()
         },
     );
-    let asf = (clsid == CLSID_WMASF_READER).then(|| super::asf::Asf::new(env));
     let vmr = (role == Role::VideoRenderer).then(|| super::vmr::Vmr::new(env));
     state(env).filters.insert(
         base,
@@ -276,7 +267,6 @@ pub(super) fn new_filter(
             source_path: Vec::new(),
             dmo: None,
             vmr,
-            asf,
             outer,
             inner,
             position: 0,
@@ -290,7 +280,6 @@ pub(super) fn new_filter(
         },
     );
     let pins: &[(u32, &'static str, Iid)] = match role {
-        Role::FileSource if clsid == CLSID_WMASF_READER => &[],
         Role::FileSource => &[(OUTPUT, "Output", MEDIATYPE_STREAM)],
         Role::Splitter => &[(INPUT, "Input", MEDIATYPE_STREAM)],
         Role::VideoDecoder => &[
@@ -328,7 +317,7 @@ pub(super) fn new_pin(
     let f = &state(env).filters[&filter];
     let clsid = f.clsid;
     let role = f.role;
-    let owned = f.asf.is_some() || role == Role::DmoDecoder;
+    let owned = role == Role::DmoDecoder;
     let mpeg = matches!(
         role,
         Role::Splitter | Role::VideoDecoder | Role::AudioDecoder
@@ -410,14 +399,11 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         Face::StreamSelect => Some(stream_select(env, host_filter(env, this)?, method)),
         Face::QualityControl => Some(quality_control(env, host_pin(env, this)?, method)),
         Face::MpegAudioDecoder => Some(Outcome::Return(E_NOTIMPL)),
-        Face::FileSource => {
-            let filter = host_filter(env, this)?;
-            Some(if state(env).filters[&filter].asf.is_some() {
-                super::asf::file_method(env, filter, method)
-            } else {
-                super::graph::source::file_method(env, filter, method)
-            })
-        }
+        Face::FileSource => Some(super::graph::source::file_method(
+            env,
+            host_filter(env, this)?,
+            method,
+        )),
         Face::BaseFilter => filter_method(env, host_filter(env, this)?, method),
         Face::Pin => pin_method(env, host_pin(env, this)?, method),
         Face::MemInputPin => {
@@ -573,7 +559,7 @@ fn quality_control(env: &mut Env<'_>, pin: u32, method: &str) -> Outcome {
 pub(super) fn seeking(env: &mut Env<'_>, pin: u32, method: &str) -> Outcome {
     let filter = state(env).pins[&pin].filter;
     let f = &state(env).filters[&filter];
-    if f.asf.is_some() || f.role == Role::DmoDecoder {
+    if f.role == Role::DmoDecoder {
         return Outcome::Return(E_NOTIMPL);
     }
     let duration = f.source.as_ref().map_or(0, |s| s.duration_us as i64 * 10);
@@ -837,21 +823,6 @@ pub(crate) fn join_graph(
     name: Vec<u16>,
     then: Done,
 ) -> Outcome {
-    if state(env).filters[&filter].asf.is_some() {
-        return super::asf::join(
-            env,
-            filter,
-            graph,
-            Box::new(move |env, hr| {
-                if hr == S_OK {
-                    let f = state(env).filters.get_mut(&filter).unwrap();
-                    f.graph = graph;
-                    f.name = name;
-                }
-                then(env, hr)
-            }),
-        );
-    }
     let f = state(env).filters.get_mut(&filter).unwrap();
     f.graph = graph;
     f.name = name;
@@ -868,9 +839,6 @@ pub(crate) fn transition(
     then: Done,
 ) -> Outcome {
     let f = &self::state(env).filters[&filter];
-    if f.asf.is_some() {
-        return super::asf::transition(env, filter, state, then);
-    }
     if f.role == Role::DmoDecoder {
         return super::dmo::transition(env, filter, state, then);
     }
@@ -1625,9 +1593,6 @@ fn playable(mt: &MediaType) -> bool {
 fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
     let state = env.ext.get::<State>();
     let p = &state.pins[&pin];
-    if state.filters[&p.filter].asf.is_some() {
-        return super::asf::types(env, pin);
-    }
     let role = state.filters.get(&p.filter).map(|f| f.role);
     match (role, p.dir) {
         (Some(Role::Splitter), INPUT) => [
@@ -2062,9 +2027,7 @@ fn finish_guest_connection(
 /// A host output's own allocator, sized for its samples, offered to the guest input.
 fn output_allocator(env: &mut Env<'_>, out: u32, input: u32, mem: u32, mt: MediaType) -> Outcome {
     let filter = state(env).pins[&out].filter;
-    let size = if state(env).filters[&filter].asf.is_some() {
-        super::asf::sample_size(env, out)
-    } else if role_of(env, out) == Role::Splitter {
+    let size = if role_of(env, out) == Role::Splitter {
         state(env).filters[&filter]
             .packets
             .as_ref()
