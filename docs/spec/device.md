@@ -26,6 +26,8 @@ This spec covers the neutral device services behind the API front ends: frames, 
 **Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries, copy their union since each slot's serial, and rebuild fully after missing history or source/layout changes. Native software slots MUST accumulate their own damage debt and wait for completed ingest before reuse, even without further guest submissions.
 **Verification**: Test
 
+If device loss cancels an explicit flush completion, the owner wakes and closes the stream so blocked slot producers can report the failure.
+
 ### DEV-FRAME-5 Consumer damage accumulation
 
 **Rule**: Each consumer MUST accumulate history since its last converted serial, preserve undamaged BGRA pixels, and fully convert when history is missing. Damage MUST be a region of 8x8-pixel cells covering every changed pixel, so distant changes stay apart and no layer merges them into bounds. Bottom-up storage and indexed palettes MUST preserve exact pixels.

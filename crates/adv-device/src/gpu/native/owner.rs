@@ -3,7 +3,7 @@
 //! stay with the encoder until its submission completes.
 
 use super::resources::Storage;
-use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource};
+use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource, Waker};
 use super::{Depth, Image, Target, backing, pass};
 use crate::frame::{Base, Frame, Presenter, SwapImage};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
@@ -12,6 +12,20 @@ use adv_gpu::{Encoder, Extent, Queue, Rect, RenderPassDesc, Span, Token};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+fn retirement_wake(wake: Waker) -> Box<dyn FnOnce() + Send> {
+    struct WakeOnDrop(Waker);
+    impl Drop for WakeOnDrop {
+        fn drop(&mut self) {
+            self.0.poke();
+        }
+    }
+
+    // Device loss can cancel the callback. Wake on both paths so the owner
+    // polls the queue and reports the failure to slot waiters.
+    let wake = WakeOnDrop(wake);
+    Box::new(move || drop(wake))
+}
 
 pub(super) struct Owner {
     join: Option<std::thread::JoinHandle<()>>,
@@ -478,8 +492,8 @@ impl State {
                 let token = self.submit(None)?;
                 // A producer waiting for a software slot may have no more
                 // commands to publish until this boundary retires.
-                let wake = self.wake.clone();
-                self.queue.on_complete(token, Box::new(move || wake.poke()));
+                self.queue
+                    .on_complete(token, retirement_wake(self.wake.clone()));
             }
             Command::PresentSwap {
                 image,
@@ -1343,6 +1357,18 @@ struct Color {rgba:vec4<f32>}
         drop(producer);
         drop(owner);
         assert!(completed > 0);
+    }
+
+    // spec: DEV-FRAME-4
+    #[test]
+    fn canceling_retirement_notification_wakes_the_owner() {
+        let Some((device, _)) = open() else {
+            return;
+        };
+        let (producer, consumer) = super::super::stream::channel(device.ring(128 << 10).unwrap());
+        drop(retirement_wake(consumer.waker()));
+        drop(producer);
+        assert!(matches!(consumer.next(), super::super::stream::Next::Woken));
     }
 
     // spec: GFX-REC-5
