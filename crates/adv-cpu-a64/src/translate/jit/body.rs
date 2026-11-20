@@ -1,6 +1,5 @@
 //! Argument forwarding, register saves and constant memory-call expansions.
 
-use super::decode::{Alu, ESP, Op, Src};
 use super::{Cold, RUNTIME, Translator, WINDOW, X0, X1, X3, X4, X6, X16, X17, host};
 use crate::encode::Extend::Uxtw;
 use crate::encode::Index::Post;
@@ -8,11 +7,12 @@ use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit};
+use crate::translate::front::decode::{Alu, ESP, Op, Src};
 
 impl Translator<'_> {
     pub(super) fn body_call(&mut self, body: adv_cpu_core::body::DirectBody) {
         self.body_simd(false);
-        super::lower::body::emit_call(self.asm, body);
+        crate::translate::lower::body::emit_call(self.asm, body);
         self.body_simd(true);
     }
 
@@ -177,7 +177,7 @@ impl Translator<'_> {
     }
 
     fn body_invariant(&self, reg: u8) -> bool {
-        use super::simd::Loc;
+        use crate::translate::front::forms::Loc;
         reg != ESP
             && self.trace.insts.iter().all(|inst| match inst.op {
                 Op::Mov(Src::Reg(dst), _)
@@ -207,7 +207,7 @@ impl Translator<'_> {
     /// A balanced trace can check its argument-stack page once before its
     /// loop labels. Backedges then reuse that grant until the next dispatch.
     pub(super) fn body_stack_span(&self) -> Option<(i32, u32)> {
-        use super::trace::{Edge, Next};
+        use crate::translate::front::trace::{Edge, Next};
         if (self.checked)(self.trace.insts[0].pc) {
             return None;
         }
@@ -254,7 +254,7 @@ impl Translator<'_> {
                 Op::Mov(Src::Reg(reg), _) | Op::Alu(_, Src::Reg(reg), _) | Op::Step(_, reg)
                     if reg != ESP => {}
                 Op::Nop | Op::Jcc(..) | Op::Jmp(_) | Op::Ret(_) | Op::Direction(_) => {}
-                Op::Simd(simd) if simd.dst != super::simd::Loc::Gpr(ESP) => {}
+                Op::Simd(simd) if simd.dst != crate::translate::front::forms::Loc::Gpr(ESP) => {}
                 _ => return None,
             }
         }

@@ -1,6 +1,6 @@
 use super::{FlagKind, FpOp, Front, IntOp, Op, Reject, Type, Value, VecOp, VecToInt, VecUnary};
 use crate::encode::{Float, Logic};
-use crate::translate::simd::{Kind, Loc, Simd};
+use crate::translate::front::forms::{Loc, Simd, SimdKind as Kind};
 
 impl Front<'_> {
     pub(super) fn simd(&mut self, s: Simd) -> Result<(), Reject> {

@@ -13,10 +13,10 @@ use crate::translate::front::{
     tags::{OpAccess, Register, RflagsBits},
 };
 
-use super::super::decode::Op;
-use super::super::integer::Integer;
-use super::super::trace::{Edge, Mode, Next, Trace};
 use super::{Division, Graph, Loop};
+use crate::translate::front::decode::Op;
+use crate::translate::front::forms::Integer;
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 
 const XMM: u32 = 8;
 const MM: u32 = 16;

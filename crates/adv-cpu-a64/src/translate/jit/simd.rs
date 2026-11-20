@@ -49,7 +49,7 @@ use crate::translate::lower::fp_class;
 use crate::translate::lower::stubs;
 
 #[cfg(test)]
-use super::front::plans::simd as plan;
+use crate::translate::front::plans::simd as plan;
 #[cfg(test)]
 use iced_x86::Instruction;
 
@@ -57,10 +57,10 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit};
 
-use super::decode::Mem;
 use super::residency::Entry;
 use crate::asm::Label;
 use crate::jit_map::Part;
+use crate::translate::front::forms::{Loc, Simd, SimdKind as Kind};
 use crate::translate::lower::flags::Operand;
 
 use super::{Cold, RUNTIME, Translator, X5, X6, X13, X14, X16, X17, host};
@@ -69,134 +69,7 @@ const V0: VReg = VReg::new(0);
 const V1: VReg = VReg::new(1);
 const V2: VReg = VReg::new(2);
 
-/// An operand of a SIMD instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Loc {
-    Mmx(u8),
-    Xmm(u8),
-    Gpr(u8),
-    /// `Simd::mem`, of `Simd::width` bytes.
-    Mem,
-    /// `Simd::imm`, or no operand.
-    Imm,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// `dst = src`, zero-extending a narrower value into a register.
-    Move,
-    /// Scalar register moves: only the lane of `1 << log2` bytes changes.
-    MoveLow(u8),
-    MoveHalf(bool),
-    MaskMove,
-    PackedToInt(bool, bool),
-    SignMask(bool),
-    ShuffleWords(bool),
-    Shufpd,
-    MulDwords,
-    SadBytes,
-    /// A selected 16-bit lane, zero-extended into a GPR.
-    ExtractWord,
-    /// One sign bit per byte of an MMX or XMM source.
-    ByteMask,
-    InsertWord,
-    ShiftBytes(bool),
-    StoreControl,
-    LoadControl,
-    /// Scalar integer conversion: double precision selector.
-    ScalarFromInt(bool),
-    /// Scalar to signed dword: double precision and truncation selectors.
-    ScalarToInt(bool, bool),
-    /// A lane-wise operation on lanes of `1 << log2` bytes.
-    Same(Same, u8),
-    Logic(Logic),
-    /// `pandn`: `!dst & src`.
-    AndNot,
-    /// Interleaves the low (`Zip1`) or high (`Zip2`) halves.
-    Unpack(Permute, u8),
-    /// Saturates the lanes of dst then src to lanes of `1 << log2` bytes.
-    Pack(Narrowing, u8),
-    ShiftImm(ShiftImm, u8),
-    /// A shift by the 64-bit count in src.
-    ShiftBy(ShiftImm, u8),
-    /// The high halves of signed (true) or unsigned 16-bit products.
-    MulHigh(bool),
-    /// `pmaddwd`.
-    MulAdd,
-    /// `pshufw` or `pshufd`: lanes of `1 << log2` bytes of src picked by
-    /// `imm`.
-    Shuffle(u8),
-    Shufps,
-    Emms,
-    /// `addps`-style arithmetic on every lane, or on the low one (`true`).
-    Float(Float, bool),
-    /// Double-precision arithmetic, scalar when the selector is true.
-    Double(Float, bool),
-    /// Signed packed dwords to single or double precision (`true`).
-    FromInt(bool),
-    /// Single to double precision, packed or scalar (`true`).
-    Widen(bool),
-    /// Scalar double to single precision.
-    Narrow(bool),
-    Approximate(bool, bool),
-    /// COMIS/UCOMIS, using core value semantics for NaNs: double precision,
-    /// and whether a quiet NaN also raises invalid (COMIS).
-    FlagCompare(bool, bool),
-    /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
-    Compare(bool, bool),
-    /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
-    MinMax(bool, bool, bool),
-    Sqrt(bool, bool),
-    /// `cvtps2pi`, or `cvttps2pi` (true).
-    /// `movlps` or `movhps` (true): a 64-bit half to or from memory.
-    Half(bool),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Simd {
-    pub kind: Kind,
-    pub dst: Loc,
-    pub src: Loc,
-    pub mem: Mem,
-    pub imm: u8,
-    /// Bytes a move or a memory operand covers.
-    pub width: u8,
-    /// A 16-byte memory operand that must be aligned.
-    pub aligned: bool,
-    /// The helper for forms without native lowering.
-    pub helper: u8,
-}
-
 impl Simd {
-    pub fn memory(&self) -> bool {
-        self.dst == Loc::Mem || self.src == Loc::Mem || self.kind == Kind::MaskMove
-    }
-
-    /// Whether it is an MMX instruction, with the x87 effects of one.
-    pub fn mmx(&self) -> bool {
-        matches!(self.dst, Loc::Mmx(_))
-            || matches!(self.src, Loc::Mmx(_))
-            || self.kind == Kind::Emms
-    }
-
-    /// Whether it can require a value call.
-    pub fn floating(&self) -> bool {
-        matches!(
-            self.kind,
-            Kind::Float(..)
-                | Kind::Double(..)
-                | Kind::ScalarFromInt(_)
-                | Kind::ScalarToInt(..)
-                | Kind::FromInt(_)
-                | Kind::Widen(_)
-                | Kind::Narrow(..)
-                | Kind::FlagCompare(..)
-                | Kind::Compare(..)
-                | Kind::MinMax(..)
-                | Kind::Sqrt(..)
-        )
-    }
-
     pub(super) fn control_helper(self, key: crate::facts::Key) -> bool {
         self.floating()
             && !key.mxcsr().is_some_and(|class| {
@@ -2205,7 +2078,7 @@ mod tests {
                 .trace
                 .insts
                 .iter()
-                .all(|i| !matches!(i.op, super::super::decode::Op::Value(_)))
+                .all(|i| !matches!(i.op, crate::translate::front::decode::Op::Value(_)))
         );
         // Samples can tell the residency code from the body.
         let parts: Vec<_> = work.marks().iter().map(|mark| mark.part).collect();

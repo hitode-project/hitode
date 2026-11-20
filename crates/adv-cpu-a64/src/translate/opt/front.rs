@@ -9,8 +9,8 @@ use super::ir::*;
 use super::recovery::{IrRecord, Location, Recipe, X87};
 use crate::translate::Unit;
 use crate::translate::computation::Proof;
-use crate::translate::decode::{self, Cc, EBP, ESP, Mem, Part, Src};
-use crate::translate::trace::{Edge, Mode, Next};
+use crate::translate::front::decode::{self, Cc, EBP, ESP, Mem, Part, Src};
+use crate::translate::front::trace::{Edge, Mode, Next};
 
 mod cells;
 pub(crate) mod facts;
@@ -256,7 +256,7 @@ fn build_trace(
         return Err(Reject::Mode(i));
     }
     let mmx = !x87 && mmx_index.is_some();
-    let simd = |pick: fn(&crate::translate::simd::Simd) -> bool| {
+    let simd = |pick: fn(&crate::translate::front::forms::Simd) -> bool| {
         insts
             .iter()
             .any(|i| matches!(i.op, decode::Op::Simd(s) if pick(&s)))
@@ -275,7 +275,8 @@ fn build_trace(
     let control = simd(|s| {
         matches!(
             s.kind,
-            crate::translate::simd::Kind::StoreControl | crate::translate::simd::Kind::LoadControl
+            crate::translate::front::forms::SimdKind::StoreControl
+                | crate::translate::front::forms::SimdKind::LoadControl
         )
     });
     // Precision exceptions are sticky and the form's arithmetic may raise
@@ -1134,7 +1135,7 @@ fn frame_offset(mem: Mem, offsets: &[Option<i32>; 8]) -> Option<i32> {
 type Layout = (Vec<Offsets>, Vec<i32>, BTreeMap<i32, u8>, bool);
 
 fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<Layout, Reject> {
-    use crate::translate::integer::Integer;
+    use crate::translate::front::forms::Integer;
     use decode::Op as D;
 
     let trace = &unit.trace;
@@ -1433,7 +1434,7 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                     _ => None,
                 }
             }
-            decode::Op::Simd(s) if s.dst == crate::translate::simd::Loc::Mem => {
+            decode::Op::Simd(s) if s.dst == crate::translate::front::forms::Loc::Mem => {
                 Some((s.mem, s.width))
             }
             decode::Op::Alu(op, Src::Mem(mem), _)
@@ -1465,7 +1466,7 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
             saved.retain(|&s, _| s + 4 <= p || p + i32::from(width) <= s);
         }
         if let decode::Op::Simd(s) = inst.op
-            && let crate::translate::simd::Loc::Gpr(r) = s.dst
+            && let crate::translate::front::forms::Loc::Gpr(r) = s.dst
         {
             regs[r as usize] = None;
         }

@@ -8,7 +8,7 @@ use crate::translate::front::{
 };
 
 use super::{Mem, Offsets, Proof, Unit, decode, frame_offset, model::Model, part};
-use crate::translate::{integer::Integer, trace::Inst};
+use crate::translate::front::{forms::Integer, trace::Inst};
 
 pub(crate) trait Facts {
     fn invariant_read(&self, load: usize) -> bool;

@@ -259,7 +259,7 @@ impl CodeStore {
 /// the unlinked dispatch and discovery counter.
 pub(super) fn tier1_words(
     work: &translate::Workspace,
-    trace: &translate::Trace,
+    trace: &translate::front::trace::Trace,
 ) -> FxHashMap<u32, u32> {
     use crate::jit_map::Part;
 

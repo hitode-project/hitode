@@ -2,7 +2,10 @@
 use super::*;
 use crate::emulator::{CODE as HOST_CODE, Emulator};
 use crate::runtime;
+use crate::translate::front::decode::Op;
+use crate::translate::front::forms::Integer;
 use crate::translate::lower::stubs;
+use crate::translate::opt;
 use adv_cpu_core::{CpuState, Memory, X87State, interpreter::Interpreter};
 use iced_x86::code_asm::*;
 use std::mem::{offset_of, size_of};
@@ -1894,7 +1897,7 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
             let mut fixed = 0;
             let mut hot = 0;
             for (index, inst) in work.unit.trace.insts.iter().enumerate() {
-                if !matches!(inst.op, Op::Cdq | Op::Integer(integer::Integer::Divide(..))) {
+                if !matches!(inst.op, Op::Cdq | Op::Integer(Integer::Divide(..))) {
                     continue;
                 }
                 let begin = code.asm.position(code.labels[index]) / 4;
@@ -1931,7 +1934,7 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
                     .trace
                     .insts
                     .iter()
-                    .filter(|inst| matches!(inst.op, Op::Integer(integer::Integer::Divide(..))))
+                    .filter(|inst| matches!(inst.op, Op::Integer(Integer::Divide(..))))
                 {
                     let site = code
                         .sites
@@ -2459,10 +2462,10 @@ fn table_row_loops_admit_gathered_entries_mirrored_pointers_and_inclusive_bounds
 
 pub(in crate::translate) mod opt_back {
     pub(in crate::translate) mod inline;
-    use super::super::opt::{back, eval, ir::*, recovery::*};
-    use super::super::opt::{ir::Op, recovery::Recipe};
     use super::*;
     use crate::encode::bl;
+    use crate::translate::opt::{back, eval, ir::*, recovery::*};
+    use crate::translate::opt::{ir::Op, recovery::Recipe};
 
     mod resident {
         use super::*;

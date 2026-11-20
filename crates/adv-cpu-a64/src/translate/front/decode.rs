@@ -93,16 +93,16 @@ pub enum Op {
     /// `cld` (false) or `std`.
     Direction(bool),
     /// An MMX or SSE instruction.
-    Simd(crate::translate::simd::Simd),
+    Simd(crate::translate::front::forms::Simd),
     /// A string instruction, perhaps repeated.
-    Strings(crate::translate::strings::Strings),
-    Integer(crate::translate::integer::Integer),
+    Strings(crate::translate::front::forms::Strings),
+    Integer(crate::translate::front::forms::Integer),
     /// An x87 instruction `fast::classify` accepts.
-    X87(crate::translate::x87::X87),
+    X87(crate::translate::front::forms::X87),
     /// An exact signed 64-bit integer load into the extended x87 stack.
     Fild64(Mem, u8, Option<u16>),
     /// A native integer instruction over partial operands (A64-TR-4).
-    Parts(crate::translate::parts::Parts),
+    Parts(crate::translate::front::forms::Parts),
     /// A prepared floating-point value operation, indexed in the trace.
     Value(u8),
     /// A direct body call, by its index in the trace's bodies (A64-CALL-2).
@@ -911,7 +911,10 @@ impl Op {
             // interpreter.
             Op::Simd(simd) => (
                 F::NONE,
-                if matches!(simd.kind, crate::translate::simd::Kind::FlagCompare(..)) {
+                if matches!(
+                    simd.kind,
+                    crate::translate::front::forms::SimdKind::FlagCompare(..)
+                ) {
                     F::ALL
                 } else {
                     F::NONE
@@ -920,7 +923,7 @@ impl Op {
             ),
             // A REP compare of no elements keeps the flags.
             Op::Strings(strings) if strings.compares() => {
-                let reads = if strings.rep == crate::translate::strings::Rep::None {
+                let reads = if strings.rep == crate::translate::front::forms::Rep::None {
                     F::NONE
                 } else {
                     F::ALL

@@ -1,6 +1,6 @@
 //! Switch-table lowering (A64-CTL-6).
-use super::decode::{Op, Src};
 use super::{Cold, Label, NOP, State, Translator, X, X17, biased, br, host, ldr_reg, simd};
+use crate::translate::front::decode::{Op, Src};
 use adv_cpu_core::IndirectBranchKind;
 
 impl Translator<'_> {

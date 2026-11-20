@@ -1258,7 +1258,7 @@ mod tests {
             sense: Sense::Subtraction,
             carry: Carry::Host,
             nz: None,
-            overflow: translate::Overflow::Host,
+            overflow: crate::translate::lower::flags::Overflow::Host,
             recipe: Recipe::Canonical,
             simd_dirty: 0,
             resume: 0,
@@ -1354,7 +1354,7 @@ mod tests {
         );
         let original = work.words().to_vec();
         assert_eq!(work.unit.fact_mask(), 0);
-        translate::lower_tier1(
+        translate::jit::lower_tier1(
             &mut work.code,
             &work.unit,
             HEAD,
@@ -2591,7 +2591,7 @@ mod tests {
                 sense: Sense::Addition,
                 carry: Carry::Host,
                 nz: None,
-                overflow: translate::Overflow::Host,
+                overflow: crate::translate::lower::flags::Overflow::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
                 checked: false,
                 simd_dirty: 0,

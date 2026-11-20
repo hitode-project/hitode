@@ -42,7 +42,6 @@ ROLES.update({
     ("native",): "native::run",
     ("native", "head"): "native::store",
     ("translate",): "translate::jit",
-    ("translate", "body"): "translate::lower",
 })
 
 # (Current file, disallowed dependency or parent glob). Delete an entry
@@ -61,18 +60,11 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("native/plan.rs", "translate::jit"),
     ("native/store.rs", "native::run"),
     ("native/store.rs", "translate::jit"),
-    ("translate/body.rs", "translate::jit"),
     ("translate/opt/front.rs", "translate::jit"),
     ("translate/opt/front/cells.rs", "translate::jit"),
-    ("translate/opt/front/facts.rs", "translate::jit"),
-    ("translate/opt/front/integer.rs", "translate::jit"),
     ("translate/opt/front/live.rs", "translate::jit"),
-    ("translate/opt/front/model.rs", "translate::jit"),
-    ("translate/opt/front/simd.rs", "translate::jit"),
-    ("translate/opt/front/x87.rs", "translate::jit"),
     # Decoder and interpreter references awaiting their module moves.
     ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
-    ("translate/front/plans.rs", "translate::jit"),
     # Existing test assemblies and reference interpreters.
     ("executor.rs", "iced_x86 (tests)"),
     ("executor/differential.rs", "iced_x86 (tests)"),
@@ -86,19 +78,19 @@ TRANSITIONAL: set[tuple[str, str]] = {
     ("executor/differential/resident.rs", "iced_x86 (tests)"),
     ("executor/host_call_tests.rs", "iced_x86 (tests)"),
     ("native/offload.rs", "iced_x86 (tests)"),
-    ("translate/body.rs", "iced_x86 (tests)"),
+    ("translate/jit/body.rs", "iced_x86 (tests)"),
     ("translate/computation.rs", "iced_x86 (tests)"),
-    ("translate/integer.rs", "iced_x86 (tests)"),
+    ("translate/jit/integer.rs", "iced_x86 (tests)"),
     ("translate/opt/front/tests.rs", "adv_cpu_core::interpreter (tests)"),
     ("translate/opt/front/tests.rs", "iced_x86 (tests)"),
-    ("translate/parts.rs", "iced_x86 (tests)"),
-    ("translate/residency.rs", "iced_x86 (tests)"),
-    ("translate/simd.rs", "iced_x86 (tests)"),
-    ("translate/strings.rs", "iced_x86 (tests)"),
-    ("translate/tests.rs", "adv_cpu_core::interpreter (tests)"),
-    ("translate/tests.rs", "iced_x86 (tests)"),
-    ("translate/tests/opt_back/inline.rs", "adv_cpu_core::interpreter (tests)"),
-    ("translate/x87.rs", "iced_x86 (tests)"),
+    ("translate/jit/parts.rs", "iced_x86 (tests)"),
+    ("translate/jit/residency.rs", "iced_x86 (tests)"),
+    ("translate/jit/simd.rs", "iced_x86 (tests)"),
+    ("translate/jit/strings.rs", "iced_x86 (tests)"),
+    ("translate/jit/tests.rs", "adv_cpu_core::interpreter (tests)"),
+    ("translate/jit/tests.rs", "iced_x86 (tests)"),
+    ("translate/jit/tests/opt_back/inline.rs", "adv_cpu_core::interpreter (tests)"),
+    ("translate/jit/x87.rs", "iced_x86 (tests)"),
 }
 
 INTERPRETER_FORM = re.compile(r"\bself\.helper(?:_for)?\([^;]+\); // transitional interpreter form: ([\w-]+)$", re.M)

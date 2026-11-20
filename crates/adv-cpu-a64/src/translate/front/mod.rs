@@ -7,6 +7,7 @@
 
 pub(crate) mod decode;
 pub(crate) mod flags;
+pub(crate) mod forms;
 pub(super) mod plans;
 mod quick_form;
 pub(crate) mod summary;

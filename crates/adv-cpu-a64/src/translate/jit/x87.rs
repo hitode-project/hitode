@@ -25,11 +25,12 @@
 //! 2^51 rounds the value, and it orders values as they do unless two equal
 //! ones lost bits. Stores to binary64 round the significand in integers.
 
+use crate::translate::front::forms::X87;
 use crate::translate::lower::stubs;
 use adv_cpu_core::floating::fast::{self, Fast, Op as Arith, PE, RANGE, Source};
 
 #[cfg(test)]
-use super::front::plans::x87 as plan;
+use crate::translate::front::plans::x87 as plan;
 #[cfg(test)]
 use iced_x86::Instruction;
 
@@ -40,8 +41,8 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime::{self, Exit};
 
-use super::decode::Mem;
 use super::{RUNTIME, Translator, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
+use crate::translate::front::decode::Mem;
 use crate::translate::lower::access::{Addr, Dir};
 use crate::translate::lower::flags::Operand;
 
@@ -65,17 +66,6 @@ const C2: u32 = 0x400;
 const C3: u32 = 0x4000;
 /// The extended exponent bias minus the binary64 one.
 const REBIAS: u32 = 0x3fff - 1023;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct X87 {
-    pub fast: Fast,
-    /// The memory operand, if any.
-    pub mem: Option<Mem>,
-    /// The helper that runs the instruction otherwise.
-    pub helper: u8,
-    /// The opcode the instruction records, if it records one.
-    pub opcode: Option<u16>,
-}
 
 /// How `double` takes an extended value.
 #[derive(Clone, Copy, PartialEq, Eq)]

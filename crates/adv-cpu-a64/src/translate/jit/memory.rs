@@ -7,11 +7,11 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, ACCESS_STORE};
 
-use super::decode::{ESP, Mem};
-use super::lower::access::{
+use super::{Cold, RUNTIME, SHADOW, Translator, WINDOW, X3, X5, biased, host};
+use crate::translate::front::decode::{ESP, Mem};
+use crate::translate::lower::access::{
     Addr, CheckedEmitter, Dir, Value, check_class, checked_alias, page_crossing,
 };
-use super::{Cold, RUNTIME, SHADOW, Translator, WINDOW, X3, X5, biased, host};
 
 impl Translator<'_> {
     #[cfg(native)]

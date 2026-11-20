@@ -21,8 +21,9 @@
 //! precise access event. Source overrides use FS's thread base or the flat
 //! segment base. Word addresses wrap before adding the segment base.
 
+use crate::translate::front::forms::{Rep, StringKind as Kind, Strings};
 #[cfg(test)]
-use super::front::plans::strings as plan;
+use crate::translate::front::plans::strings as plan;
 use crate::translate::lower::stubs;
 #[cfg(test)]
 use iced_x86::Instruction;
@@ -38,43 +39,6 @@ use super::{
     host, temp,
 };
 use crate::translate::lower::access::PAGE_SHIFT;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Movs,
-    Stos,
-    Lods,
-    Scas,
-    Cmps,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rep {
-    None,
-    /// `rep`, or `repe` before a compare.
-    #[allow(clippy::enum_variant_names)] // The x86 prefix name.
-    Rep,
-    /// `repne` before a compare.
-    Repne,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Strings {
-    pub kind: Kind,
-    /// 1, 2 or 4 bytes.
-    pub width: u8,
-    pub rep: Rep,
-    pub word: bool,
-    pub fs: bool,
-}
-
-impl Strings {
-    /// Whether it writes the arithmetic flags, which a REP of no elements
-    /// leaves as they were.
-    pub fn compares(self) -> bool {
-        matches!(self.kind, Kind::Scas | Kind::Cmps)
-    }
-}
 
 const EAX: u8 = 0;
 const ECX: u8 = 1;

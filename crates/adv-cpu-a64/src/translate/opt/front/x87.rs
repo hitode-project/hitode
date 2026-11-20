@@ -1,5 +1,5 @@
 use super::{FpOp, FpUnary, Front, Location, Mem, Op, Recipe, Reject, Source, Type, Value, model};
-use crate::translate::x87::X87 as Instruction;
+use crate::translate::front::forms::X87 as Instruction;
 use adv_cpu_core::floating::fast::{Fast, Source as Operand};
 
 impl Front<'_> {

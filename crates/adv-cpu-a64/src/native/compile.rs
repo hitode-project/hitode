@@ -8,8 +8,12 @@ use adv_cpu_core::CpuState;
 use rustc_hash::FxHashSet;
 
 use crate::translate::computation::Proof;
+use crate::translate::front::{
+    Unit,
+    decode::Op,
+    trace::{Mode, Trace},
+};
 use crate::translate::opt::{back, front};
-use crate::translate::{Mode, Op, Trace, Unit};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Task {

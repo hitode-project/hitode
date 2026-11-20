@@ -2,13 +2,13 @@
 //! dataflow and loop edges; no addresses, symbols or byte signatures are used.
 //! A batch replaces 64 iterations. One following scalar iteration is also
 //! proven non-faulting: it restores every temporary and flag before any exit.
-use super::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, Src};
-use super::trace::{Edge, Mode, Next, Trace};
 use super::{
     Cond, ConditionCode, Label, Lsl, Narrow, RUNTIME, Reg, Translator, VMem, VReg, W, WINDOW, X,
     X0, X1, X2, X3, X4, X5, X6, X9, X15, X16, X17, add, add_imm, and, cmp, host, ldr, ldr_narrow,
     ldr_reg, lsr_imm, mov, mrs_nzcv, msr_nzcv, orr, sub, vldr_reg, vst_interleaved,
 };
+use crate::translate::front::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, Src};
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 const BATCH: u32 = 64;

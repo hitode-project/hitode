@@ -632,10 +632,10 @@ impl Trace {
             let cost = if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
-                    Op::Simd(crate::translate::simd::Simd {
-                        kind: crate::translate::simd::Kind::PackedToInt(..)
-                            | crate::translate::simd::Kind::MaskMove
-                            | crate::translate::simd::Kind::Approximate(..),
+                    Op::Simd(crate::translate::front::forms::Simd {
+                        kind: crate::translate::front::forms::SimdKind::PackedToInt(..)
+                            | crate::translate::front::forms::SimdKind::MaskMove
+                            | crate::translate::front::forms::SimdKind::Approximate(..),
                         ..
                     })
                 ) {

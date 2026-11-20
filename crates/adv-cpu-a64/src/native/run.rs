@@ -42,7 +42,7 @@ impl Native {
                     translated: 0,
                 }));
             }
-            None if !crate::translate::Fetcher::fetchable(memory, cpu.eip) => {
+            None if !crate::translate::front::decode::Fetcher::fetchable(memory, cpu.eip) => {
                 self.diagnostics.untracked += 1;
                 return Ok(Some(Run {
                     exit: Exit::Untracked,

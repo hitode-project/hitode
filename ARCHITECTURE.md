@@ -93,10 +93,10 @@ A guest call to a function that has a native body, such as `memcpy` or `SetEvent
    Code: [`Trace::build`](crates/adv-cpu-a64/src/translate/front/trace.rs), [`Redirect`](crates/adv-cpu-a64/src/translate/front/trace.rs), [`Bound`](crates/adv-cpu-a64/src/translate/front/trace.rs), [`Op::Body`](crates/adv-cpu-a64/src/translate/front/decode.rs), [`TrapHandler::direct_body`](crates/adv-cpu-core/src/backend/mod.rs).
    Rules: A64-CALL-1, A64-CTL-11, A64-CTL-14.
 3. **Run the body on the window.** The site forwards profitable adjacent argument pushes for inline expansions, loads other declared stack, register, floating-control and bound constant inputs into w1–w7, points x0 at the body context, and calls the body as an AAPCS64 leaf, saving only unpublished caller-saved XMM values. Constant memory calls up to 64 bytes expand inline; blocked or crossing spans take the body. Omitted argument stores are restored before an out-of-line body runs, so ordinary bodies need no stack-alias exclusion. The body checks each 4 KiB page's class once, then reads and writes the guest window directly. The site writes the declared result registers and pops the arguments.
-   Code: [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs), [`Translator::inline_body`](crates/adv-cpu-a64/src/translate/body.rs), [`body`](crates/adv-cpu-core/src/body.rs) (the macro), [`BodyContext`](crates/adv-cpu-core/src/body.rs), [`DirectBody`](crates/adv-cpu-core/src/body.rs), [`Window`](crates/adv-cpu-core/src/body.rs).
+   Code: [`Translator::body`](crates/adv-cpu-a64/src/translate/jit/ops.rs), [`Translator::inline_body`](crates/adv-cpu-a64/src/translate/jit/body.rs), [`body`](crates/adv-cpu-core/src/body.rs) (the macro), [`BodyContext`](crates/adv-cpu-core/src/body.rs), [`DirectBody`](crates/adv-cpu-core/src/body.rs), [`Window`](crates/adv-cpu-core/src/body.rs).
    Rules: A64-CALL-2, A64-CALL-3, A64-CALL-4, A64-CALL-8, NAT-BODY-17.
 4. **Leave for the full path.** A page the window may not take, such as a guard, file, shared or watched page, stops the body with `Stop::Slow` before it writes anything. Unmasked pixel arithmetic also takes this path, so a trap retains the writes that precede it. A call site writes the guest return address and transfers to the thunk. An entry site transfers using the existing return address.
-   Code: [`Stop`](crates/adv-cpu-core/src/body.rs), [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs).
+   Code: [`Stop`](crates/adv-cpu-core/src/body.rs), [`Translator::body`](crates/adv-cpu-a64/src/translate/jit/ops.rs).
    Rules: A64-CALL-4, A64-CALL-5.
 5. **Run the full path.** The entry's redirect or the generated call site reaches the thunk, and the machine runs its handler. A direct body runs again over `GuestMem`, which completes every access as a guest instruction would. A body that is not yet direct runs here with the handler's environment.
    Code: [`run_inner`](crates/adv-cpu-a64/src/executor.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs), [`run`](crates/adv-nt/src/native.rs), [`run_body`](crates/adv-nt/src/native.rs), [`run_full`](crates/adv-nt/src/native.rs), [`GuestMem`](crates/adv-cpu-core/src/body.rs).
@@ -127,9 +127,10 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 
 | Modules | Responsible for | Not responsible for |
 |---|---|---|
+| [`translate` module](crates/adv-cpu-a64/src/translate/mod.rs) | Translation modules and public exports | |
 | [`translate::front` module](crates/adv-cpu-a64/src/translate/front/mod.rs) | Decodes guest code and prepares immutable units with traces, switch tables and instruction access summaries (A64A-ROLE-2) | Host code emission |
 | [`translate::lower` module](crates/adv-cpu-a64/src/translate/lower/mod.rs) | Shared AArch64 emission for checked access, direct body calls, entry and exit, link slots, and fault sites (A64A-ROLE-4) | Register allocation |
-| `translate::jit` in [`translate`](crates/adv-cpu-a64/src/translate/mod.rs) | Tier-1 lowering (A64-TR-3) | Executable memory |
+| [`translate::jit` module](crates/adv-cpu-a64/src/translate/jit/mod.rs) | Tier-1 lowering (A64-TR-3) | Executable memory |
 | `translate::opt` in [`opt`](crates/adv-cpu-a64/src/translate/opt/mod.rs) | Resident and worker lowering | Executable memory |
 | [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 entry keys and guards. Resident guards are in [`head`](crates/adv-cpu-a64/src/native/head.rs). | Code placement |
 | [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement, Tier-1 version chains, links and page watches, with resident trampolines in [`head`](crates/adv-cpu-a64/src/native/head.rs) | Guest semantics |

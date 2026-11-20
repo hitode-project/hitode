@@ -988,7 +988,7 @@ impl Native {
                 None if main
                     && index <= first
                     && self.ran(target)
-                    && crate::translate::Fetcher::fetchable(memory, target) =>
+                    && crate::translate::front::decode::Fetcher::fetchable(memory, target) =>
                 {
                     match self.emit(memory, target, observed) {
                         Some(entry) => entry.unit,
@@ -1017,7 +1017,7 @@ impl Native {
         } else {
             self.code.counter(eip, 0)
         };
-        translate::lower_tier1(
+        translate::jit::lower_tier1(
             &mut work.code,
             &unit,
             eip,
@@ -1246,7 +1246,7 @@ impl Native {
         let arrivals = self.code.counter(eip, position);
         let mut work = std::mem::take(&mut self.code.work);
         let all = self.checks != Checks::Adaptive;
-        translate::lower_tier1(
+        translate::jit::lower_tier1(
             &mut work.code,
             &chain.unit,
             eip,
@@ -1998,7 +1998,9 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         native.code.cache.sync();
         return point;
     }
-    if entry.is_none() && (!crate::translate::Fetcher::fetchable(memory, eip) || !native.ran(eip)) {
+    if entry.is_none()
+        && (!crate::translate::front::decode::Fetcher::fetchable(memory, eip) || !native.ran(eip))
+    {
         return 0;
     }
     let before = native.code.cache.used();

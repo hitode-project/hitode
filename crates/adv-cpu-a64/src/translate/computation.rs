@@ -11,10 +11,12 @@ use adv_cpu_core::floating::fast::{Fast, Source};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use super::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
-use super::integer::Integer;
-use super::simd::{Kind, Loc};
-use super::trace::{Edge, Mode, Next, Trace};
+use super::front::forms::Integer;
+use super::front::forms::{Loc, SimdKind as Kind};
+use crate::translate::front::decode::{
+    Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src,
+};
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 
 mod carried;
 

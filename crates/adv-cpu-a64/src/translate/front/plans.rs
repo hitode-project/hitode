@@ -1,14 +1,9 @@
 //! Forms that lowerings can implement, selected from decoded instructions.
 use super::decode::{Mem, Part, ShiftKind, Src, memory, memory_sized};
-use crate::encode::{Float, Logic, Narrowing, Permute, Same, ShiftImm};
-use crate::translate::{
-    biased,
-    integer::Integer,
-    parts::{Count, Parts},
-    simd::{Kind, Loc, Simd},
-    strings::{Kind as StringKind, Rep, Strings},
-    x87::X87,
+use super::forms::{
+    Count, Integer, Loc, Parts, Rep, Simd, SimdKind as Kind, StringKind, Strings, X87, biased,
 };
+use crate::encode::{Float, Logic, Narrowing, Permute, Same, ShiftImm};
 use adv_cpu_core::floating::fast::{self, Fast};
 use adv_cpu_core::integer::{self, Operand, Operation};
 use iced_x86::{Code, Instruction, Mnemonic as M, Mnemonic, OpKind, Register};

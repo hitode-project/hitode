@@ -205,7 +205,7 @@ impl Native {
         proof: &translate::computation::Proof,
     ) -> Option<Code> {
         let retired = unit.trace.prepaid(0);
-        let code = translate::lower_computation(
+        let code = translate::jit::lower_computation(
             unit,
             &mut self.offload.unit_code,
             eip,
@@ -2862,7 +2862,7 @@ mod tests {
         );
         let at = native.code.cache.next();
         let mut scratch = translate::Code::default();
-        let emitted = translate::lower_computation(
+        let emitted = translate::jit::lower_computation(
             &work.unit,
             &mut scratch,
             CODE,

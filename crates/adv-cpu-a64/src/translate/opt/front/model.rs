@@ -258,7 +258,7 @@ impl Model {
         }
     }
     fn step(&mut self, op: decode::Op, offsets: &[Option<i32>; 8], i: usize) -> Result<(), Reject> {
-        use crate::translate::integer::Integer;
+        use crate::translate::front::forms::Integer;
         use decode::Op as D;
         let part = |s| match s {
             Src::Reg(r) => Part::Reg(r),
@@ -384,15 +384,15 @@ impl Model {
                 self.valid |= 1 << top;
                 self.c1 = C1::Constant(false);
             }
-            D::Simd(s) if s.kind == crate::translate::simd::Kind::StoreControl => {
+            D::Simd(s) if s.kind == crate::translate::front::forms::SimdKind::StoreControl => {
                 self.write(Part::Mem(s.mem), 4, Some(self.mxcsr), offsets);
             }
             D::Simd(s) => {
-                if s.kind == crate::translate::simd::Kind::Emms {
+                if s.kind == crate::translate::front::forms::SimdKind::Emms {
                     self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x200;
                     self.mmx_meta.1 |= 0x300;
                 } else if s.mmx() {
-                    let write_bit = if let crate::translate::simd::Loc::Mmx(n) = s.dst {
+                    let write_bit = if let crate::translate::front::forms::Loc::Mmx(n) = s.dst {
                         1u32 << n
                     } else {
                         0
@@ -400,10 +400,10 @@ impl Model {
                     self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x500 | write_bit;
                     self.mmx_meta.1 |= 0x700 | write_bit;
                 }
-                if s.dst == crate::translate::simd::Loc::Mem {
+                if s.dst == crate::translate::front::forms::Loc::Mem {
                     self.write(Part::Mem(s.mem), s.width, None, offsets);
                 }
-                if let crate::translate::simd::Loc::Gpr(r) = s.dst {
+                if let crate::translate::front::forms::Loc::Gpr(r) = s.dst {
                     self.regs[r as usize] = (0, 0);
                 }
             }

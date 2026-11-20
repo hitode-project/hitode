@@ -53,7 +53,7 @@ fn built(code: &[u8], at: &CpuState) -> (Unit, Proof, Built) {
     assert_eq!(verify::verify(&built.func), Ok(()));
     super::super::back::lower(&built.func);
     #[cfg(emulator)]
-    crate::translate::tests::opt_back::inline::check_guest_snapshots(
+    crate::translate::jit::tests::opt_back::inline::check_guest_snapshots(
         &built.func,
         &built.assumed,
         at,
@@ -138,7 +138,9 @@ fn compare(code: &[u8], at: &CpuState, initialize: impl Fn(&mut Memory), fail: b
     initialize(&mut reference);
     #[cfg(emulator)]
     if !fail {
-        crate::translate::tests::opt_back::inline::compare_guest_exit(&built, at, &reference, id);
+        crate::translate::jit::tests::opt_back::inline::compare_guest_exit(
+            &built, at, &reference, id,
+        );
     }
     let mut cpu = at.clone();
     let mut interpreter = Interpreter::new();
@@ -1561,11 +1563,11 @@ fn probe_an_image_unit() {
     if std::env::var_os("ADV_OPT_DEBUG").is_some() {
         for (i, inst) in unit.trace.insts.iter().enumerate() {
             let next = match inst.next {
-                crate::translate::trace::Next::Edge(e) => Some(e),
+                crate::translate::front::trace::Next::Edge(e) => Some(e),
                 _ => None,
             };
             for e in [next, inst.taken].into_iter().flatten() {
-                if let crate::translate::trace::Edge::Internal(t) = e
+                if let crate::translate::front::trace::Edge::Internal(t) = e
                     && t <= i
                 {
                     println!(
@@ -1612,12 +1614,12 @@ fn probe_an_image_unit() {
         Err(reject) => {
             if let Some(at) = reject.index() {
                 for (i, inst) in unit.trace.insts.iter().enumerate() {
-                    let into = |e: Option<crate::translate::trace::Edge>| matches!(e, Some(crate::translate::trace::Edge::Internal(t)) if t == at);
+                    let into = |e: Option<crate::translate::front::trace::Edge>| matches!(e, Some(crate::translate::front::trace::Edge::Internal(t)) if t == at);
                     let fall = match inst.next {
-                        crate::translate::trace::Next::Fall => {
-                            Some(crate::translate::trace::Edge::Internal(i + 1))
+                        crate::translate::front::trace::Next::Fall => {
+                            Some(crate::translate::front::trace::Edge::Internal(i + 1))
                         }
-                        crate::translate::trace::Next::Edge(e) => Some(e),
+                        crate::translate::front::trace::Next::Edge(e) => Some(e),
                         _ => None,
                     };
                     if i.abs_diff(at) < 6 || into(fall) || into(inst.taken) {

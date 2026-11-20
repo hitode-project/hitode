@@ -2,46 +2,16 @@
 //! Operands use the ordinary access emitter. Results and flags commit only
 //! after the last access, including zero-count memory shifts (A64-FLAG-4).
 
-use super::front::tags::Mnemonic as M;
+use crate::translate::front::forms::{Count, Parts};
+use crate::translate::front::tags::Mnemonic as M;
 
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Alu, Mem, Part};
 use super::{State, Translator, X0, X1, X2, X6, X10, X11, X13, X14, host};
+use crate::translate::front::decode::Alu;
 
 const ECX: u8 = 1;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Count {
-    /// The masked immediate count, 0 to 31.
-    Imm(u8),
-    Cl,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Parts {
-    pub kind: M,
-    /// 1, 2 or 4 bytes.
-    pub width: u8,
-    pub dst: Part,
-    /// A binary source, or the register a double shift fills from, and its width.
-    pub source: Option<(Part, u8)>,
-    /// A shift's count.
-    pub count: Option<Count>,
-}
-
-impl Parts {
-    /// The operand in memory, if one is.
-    pub fn memory(&self) -> Option<Mem> {
-        [Some(self.dst), self.source.map(|(part, _)| part)]
-            .into_iter()
-            .find_map(|part| match part {
-                Some(Part::Mem(mem)) => Some(mem),
-                _ => None,
-            })
-    }
-}
 
 impl Translator<'_> {
     pub(super) fn parts(&mut self, op: Parts) {
@@ -299,7 +269,7 @@ fn sub_reg(size: Size, rd: Reg, rn: Reg, rm: Reg) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::decode::{Fetcher, Op};
+    use crate::translate::front::decode::{Fetcher, Op};
     use iced_x86::code_asm::*;
 
     /// The ops the forms below decode to, one per instruction.

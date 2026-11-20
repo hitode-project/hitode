@@ -6,9 +6,10 @@
 //! Registers change only after every access, so a fault leaves the
 //! instruction undone, as in the interpreter.
 
+use crate::translate::front::forms::Integer;
 #[cfg(test)]
-use super::front::plans::integer as plan;
-use super::front::tags::{ConditionCode, Mnemonic as M};
+use crate::translate::front::plans::integer as plan;
+use crate::translate::front::tags::{ConditionCode, Mnemonic as M};
 #[cfg(test)]
 use iced_x86::Instruction;
 
@@ -16,11 +17,11 @@ use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Mem, Part, ShiftKind, Src};
 use super::{
     Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
     biased, host, temp,
 };
+use crate::translate::front::decode::{Mem, Part, ShiftKind, Src};
 use crate::translate::front::flags::FlagSet;
 
 // Partial-width forms canonicalize before borrowing the recipe temporaries.
@@ -30,107 +31,6 @@ const X8: Reg = Reg::new(8);
 const EAX: u8 = 0;
 const ECX: u8 = 1;
 const EDX: u8 = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Integer {
-    NarrowShift(ShiftKind, u8, u8, u32),
-    NarrowNeg(u8, u8),
-    /// BSF (false) or BSR of a word/dword source, retaining dst on zero.
-    Scan(bool, u8, Src, u8),
-    /// `rcl` (true) or `rcr` of a 32-bit register by 1 to 31.
-    Through(bool, u8, u32),
-    /// `xadd dst, src`.
-    Xadd(Src, u8),
-    /// `xchg dst, src`.
-    Xchg(Src, u8),
-    CompareExchange8(Mem),
-    Cbw,
-    Bswap(u8),
-    /// `mul` or `imul` (true) of EAX into EDX:EAX.
-    Multiply(Src, bool),
-    /// `div` or `idiv` (true) of EDX:EAX, with the helper that raises #DE.
-    Divide(Src, bool, u8),
-    Sahf,
-    Lea16(u8, Mem),
-    ReadSegment(Part, u8, u8),
-    TestBit(Src, u8),
-    Bit(M, Part, Part, u8),
-    Product(Part, Option<(Part, Option<u32>)>, bool, u8),
-    Quotient(Part, bool, u8, u8),
-    Exchange(M, Part, u8, u8),
-    Cwd,
-    MemoryNeg(Part, u8),
-    Set(ConditionCode, Part),
-    Cmov(ConditionCode, Part, Part, u8),
-    Extend(Part, Part, u8, u8, bool),
-    Complement(Part, u8),
-    ClearWord(u8),
-    Touch(Mem),
-    Xlat(Mem),
-    CarryFlag(M),
-}
-
-impl Integer {
-    /// Flags read, flags written, and whether it has a fault site.
-    pub fn effects(self) -> (FlagSet, FlagSet, bool) {
-        use FlagSet as F;
-        let mem = |src: Src| matches!(src, Src::Mem(_));
-        match self {
-            Integer::Bit(_, dst, _, _) => (F::NONE, F::CF, matches!(dst, Part::Mem(_))),
-            Integer::Product(src, other, _, _) => (
-                F::NONE,
-                F::CF.or(F::OF),
-                matches!(src, Part::Mem(_)) || matches!(other, Some((Part::Mem(_), _))),
-            ),
-            Integer::Quotient(..) => (F::NONE, F::NONE, true),
-            Integer::Exchange(kind, dst, _, _) => (
-                F::NONE,
-                if kind == M::Xchg { F::NONE } else { F::ALL },
-                matches!(dst, Part::Mem(_)),
-            ),
-            Integer::MemoryNeg(_, _) => (F::NONE, F::ALL, true),
-            Integer::Set(cc, dst) => (F::of(cc), F::NONE, matches!(dst, Part::Mem(_))),
-            Integer::Cmov(cc, _, src, _) => (F::of(cc), F::NONE, matches!(src, Part::Mem(_))),
-            Integer::Extend(_, src, _, _, _) => (F::NONE, F::NONE, matches!(src, Part::Mem(_))),
-            Integer::Cwd | Integer::ClearWord(_) => (F::NONE, F::NONE, false),
-            Integer::Complement(dst, _) => (F::NONE, F::NONE, matches!(dst, Part::Mem(_))),
-            Integer::Touch(_) | Integer::Xlat(_) => (F::NONE, F::NONE, true),
-            Integer::CarryFlag(kind) => {
-                (if kind == M::Cmc { F::CF } else { F::NONE }, F::CF, false)
-            }
-            Integer::NarrowNeg(..) => (F::NONE, F::ALL, false),
-            Integer::NarrowShift(kind, _, width, count) => {
-                let mut writes = F::PF.or(F::ZF).or(F::SF);
-                if kind == ShiftKind::Sar || count <= u32::from(width) * 8 {
-                    writes = writes.or(F::CF);
-                }
-                if count == 1 {
-                    writes = writes.or(F::OF);
-                }
-                if count == 0 {
-                    writes = F::NONE;
-                }
-                (F::NONE, writes, false)
-            }
-            Integer::Scan(_, _, src, _) => (F::NONE, F::ZF, mem(src)),
-            Integer::Through(_, _, count) => {
-                let overflow = if count == 1 { F::OF } else { F::NONE };
-                (F::CF, F::CF.or(overflow), false)
-            }
-            Integer::Xadd(dst, _) => (F::NONE, F::ALL, mem(dst)),
-            Integer::Xchg(dst, _) => (F::NONE, F::NONE, mem(dst)),
-            Integer::CompareExchange8(..) => (F::NONE, F::ZF, true),
-            Integer::Bswap(_) | Integer::Cbw => (F::NONE, F::NONE, false),
-            Integer::Multiply(src, _) => (F::NONE, F::CF.or(F::OF), mem(src)),
-            // The helper reads every flag.
-            Integer::Divide(..) => (F::NONE, F::NONE, true),
-            Integer::Lea16(..) => (F::NONE, F::NONE, false),
-            Integer::ReadSegment(_, _, _) => (F::NONE, F::NONE, true),
-            Integer::Sahf => (F::NONE, F::ALL.minus(F::OF), false),
-            Integer::TestBit(src, _) => (F::NONE, F::CF, mem(src)),
-        }
-    }
-}
 
 impl Translator<'_> {
     pub(super) fn integer(&mut self, op: Integer) {

@@ -7,14 +7,16 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::translate::lower::stubs;
 
-use super::decode::{Alu, ESP, EventOp, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
-use super::trace::{Inst, Mode};
 use super::{
     Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X9, X10, X11, X13,
     X14, X15, X16, X17, biased, host, temp,
 };
 use crate::runtime::{self, Exit};
+use crate::translate::front::decode::{
+    Alu, ESP, EventOp, Mem, Narrow8or16, Op, Part, ShiftKind, Src,
+};
 use crate::translate::front::flags::FlagSet;
+use crate::translate::front::trace::{Inst, Mode};
 use crate::translate::lower::access::{Addr, Dir};
 use crate::translate::lower::flags::{Carry, Operand, Recipe, Sense};
 use adv_cpu_core::IndirectBranchKind;
@@ -280,8 +282,12 @@ impl Translator<'_> {
         *self.uses_permissions = true;
         let (slow, done) = (self.asm.label(), self.asm.label());
         let mut address = self.effective(mem);
-        if let Op::Integer(super::integer::Integer::Bit(_, _, index @ Part::Reg(_), width)) =
-            inst.op
+        if let Op::Integer(crate::translate::front::forms::Integer::Bit(
+            _,
+            _,
+            index @ Part::Reg(_),
+            width,
+        )) = inst.op
         {
             self.narrow_read(index, width, Reg::ZR, X6);
             self.emit_all(&[
@@ -631,7 +637,7 @@ impl Translator<'_> {
     /// entry, returning as the function does. A body that stops leaves for
     /// the full path. A call materializes its return address before transferring
     /// to the thunk. An entry already has its caller's return address.
-    fn body(&mut self, inst: Inst, bound: super::Bound) {
+    fn body(&mut self, inst: Inst, bound: crate::translate::front::trace::Bound) {
         use adv_cpu_core::body::{EAX, ECX, EDX, Input};
         // AAPCS64 keeps x19-x29 and d8-d15: the guest map survives; the
         // countdown, DF in x12 and the XMM cache do not.

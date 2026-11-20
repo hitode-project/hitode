@@ -36,9 +36,9 @@
 //! there would fail on every entry after EMMS, and its body establishes
 //! them as before.
 
-use super::decode::Op;
 use super::simd::Guards;
-use super::trace::{Edge, Mode, Next, Trace};
+use crate::translate::front::decode::Op;
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 
 /// What a merge holds on arrival.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -297,7 +297,8 @@ pub(super) fn entries(
             }
             let inst = trace.insts[index];
             dirty = footprints[index].map_or(0, |(_, writes)| dirty | writes);
-            if matches!(inst.op, Op::Simd(simd) if simd.kind == super::simd::Kind::Emms) {
+            if matches!(inst.op, Op::Simd(simd) if simd.kind == crate::translate::front::forms::SimdKind::Emms)
+            {
                 dirty &= !mmx;
             }
             if let Some(Edge::Internal(to)) = inst.taken {

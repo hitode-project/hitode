@@ -8,9 +8,9 @@ use crate::translate::front::tags::{OpAccess, Register};
 use super::facts::{self, Facts};
 use super::{Offsets, frame_offset};
 use crate::translate::Unit;
-use crate::translate::decode::{self, ESP, Mem};
-use crate::translate::integer::Integer;
-use crate::translate::trace::{Edge, Next};
+use crate::translate::front::decode::{self, ESP, Mem};
+use crate::translate::front::forms::Integer;
+use crate::translate::front::trace::{Edge, Next};
 
 /// Registers 0–7 as bits 0–7, XMM registers as bits 8–15, MMX registers as
 /// bits 16–23, and frame bytes by their index in the layout's frame.

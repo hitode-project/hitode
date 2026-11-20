@@ -35,15 +35,15 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime;
 
-use super::super::decode::{Alu, Mem, Narrow8or16, Op, Part as OperandPart, Src};
-use super::super::simd::{Kind, Loc};
-use super::super::trace::{Edge, Mode, Next, Trace};
 use super::super::{
     Cold as UnitCold, RUNTIME, State, Translator, X0, X1, X2, X3, X13, X14, X15, X16, X17,
 };
 use super::pair::Generic;
 use super::{V0, X4, X5, X6, X7, X8, X87};
 use crate::runtime::Exit;
+use crate::translate::front::decode::{Alu, Mem, Narrow8or16, Op, Part as OperandPart, Src};
+use crate::translate::front::forms::{Loc, SimdKind as Kind};
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 
 /// Lane 0 carries suspended status and entry TOP, lane 1 control, and
 /// lanes 2 and 3 the IP and opcode at the last loop merge.
