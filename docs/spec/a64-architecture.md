@@ -60,7 +60,7 @@ A site's immutable unit holds decoded operations, control flow, inlined frames, 
 
 The build key projects live facts onto the unit's trace mask. An empty mask assumes nothing. A lowering reads unassumed fields from `CpuState`.
 
-Range guards over page facts use the Memory permission tables and stay outside the key.
+Range guards over page facts use the Memory permission tables and stay outside the key. An invariant indirect target guard checks the slot’s readable range and value outside the key. The code store watches the prepared target’s code dependencies.
 
 ### A64A-ROLE-4 Lowerings
 

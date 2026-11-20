@@ -240,6 +240,8 @@ impl Native {
                 returned.remaining.wrapping_neg(),
             );
         }
+        let mut scoped = false;
+        let mut scope_declined = false;
         if let Exit::Plan(event) = exit {
             let payload = (returned.reason >> 32) as u32;
             match event {
@@ -253,6 +255,29 @@ impl Native {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
                 PlanEvent::OfferReady => exit = Exit::Computation,
+                PlanEvent::RowTargetMiss => {
+                    self.observe_row_target(memory, cpu, payload);
+                    self.observe_row_failure(cpu.eip);
+                }
+                PlanEvent::RowGuardMiss => self.observe_row_failure(cpu.eip),
+                PlanEvent::ResidentSplitOffer(version) => {
+                    let head = cpu.eip;
+                    let job = self.plans.job(head).filter(|job| job.scoped);
+                    if let Some(job) = job
+                        && self.code.version_stats.is_some()
+                    {
+                        job.scope_offers.set(job.scope_offers.get() + 1);
+                    }
+                    if self.code.offers_split(head, usize::from(version))
+                        && let Some(job) = job
+                        && self.offer_split(job.scope_cost(payload))
+                    {
+                        exit = Exit::Computation;
+                        scoped = true;
+                    } else {
+                        scope_declined = true;
+                    }
+                }
                 PlanEvent::Probation(version) => {
                     self.finish_probation(payload, usize::from(version))
                 }
@@ -277,8 +302,8 @@ impl Native {
         if retired != 0 {
             self.progressed();
         }
-        if exit == Exit::Computation && !self.offer_job(cpu) {
-            self.plans.offer_resume = Some(cpu.eip);
+        if scope_declined || (exit == Exit::Computation && !scoped && !self.offer_job(cpu)) {
+            self.set_computation_offer(self.offload.enabled, Some(cpu.eip));
             exit = Exit::Dispatch;
         }
         let retired = retired as u32;
@@ -329,6 +354,7 @@ impl Native {
         runtime.offer_gate = gate;
         runtime.alias = alias_base(memory);
         runtime.plain_pages = memory.plain_pages() as u64;
+        runtime.window_spans = memory.window_spans().map(|ptr| ptr as u64);
         runtime.memory_base = memory.base;
         runtime.memory_pages = (memory.len / adv_cpu_core::memory::PAGE_SIZE) as u32;
         runtime.rep_pending = u32::from(cpu.rep.is_some());
@@ -359,7 +385,7 @@ impl Native {
         recovery::restore_inline_entry(&recovery.entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
         self.runtime.shadow = recovery.dump.x[28];
-        let refund = recovery::materialize(
+        let (refund, _) = recovery::materialize(
             record,
             &recovery.dump,
             &self.inline_saved,
@@ -408,6 +434,7 @@ impl Native {
             alias: alias_base(memory),
             fault: self.code.stubs.fault,
         };
+        let mut updates = Vec::new();
         if let Some(mut session) = Session::new(
             entry,
             (&self.worker_jobs, &mut self.plans),
@@ -418,6 +445,10 @@ impl Native {
             (self.pace.get(), &mut self.diagnostics.split),
         ) {
             visit(&mut session);
+            updates = session.take_scope_updates();
+        }
+        for eip in updates {
+            self.publish_scope(eip);
         }
     }
 }
@@ -545,7 +576,7 @@ impl Native {
         } else {
             0
         };
-        if head.cold_window.is_none() {
+        if head.cold_window.is_none() && !head.row_accounting() {
             self.code.measure_cold(eip, true);
         }
         if head.observe_cold(site, reason, self.code.accounted(eip), cold_iterations) {
@@ -569,7 +600,7 @@ impl Native {
 
     fn stop_cold_window(&mut self, eip: u32) {
         let head = self.plans.resident_mut(eip).unwrap();
-        if head.cold_window.take().is_some() {
+        if head.cold_window.take().is_some() && !head.row_accounting() {
             self.code.measure_cold(eip, false);
         }
     }
@@ -822,7 +853,7 @@ impl Native {
 
     fn emit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> Option<Tier1Unit> {
         let loops = self.promotion == 0 || self.plans.promoted(eip);
-        let unit = self.front_unit(memory, eip, loops, false);
+        let unit = self.front_unit(memory, eip, loops, false, None);
         let at = self.code.next();
         let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;
@@ -974,20 +1005,81 @@ impl Native {
         if self.plans.baseline_only {
             return;
         }
-        let unit = self.front_unit(memory, eip, true, true);
+        let unit = self.front_unit(memory, eip, true, true, None);
+        let guarded = unit.trace.insts[..unit.trace.primary].iter().any(|inst| {
+            matches!(inst.op, crate::translate::front::decode::Op::CallIndirect(
+                crate::translate::front::decode::Src::Mem(slot)
+            ) if slot.base.is_some() && slot.index.is_none() && !slot.fs)
+        });
+        let extension = guarded.then(|| self.front_unit(memory, eip, true, true, Some(&at.regs)));
         let code = self.code.tier1(source).unwrap().unit;
         self.plans.discover(eip, source, code);
         self.code.prepare_resident(eip, unit, SAMPLE);
-        self.request_resident(eip, compile::Task::Discover, at);
+        self.request_resident_unit(eip, compile::Task::Discover, at, extension);
     }
 
-    pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, mut at: CpuState) {
-        at.refresh_mmx();
-        let checked = self
+    fn observe_row_target(&mut self, memory: &mut Memory, cpu: &CpuState, target: u32) {
+        let eip = cpu.eip;
+        let site = self.code.resident(eip).unwrap();
+        site.row_feedback.as_deref().unwrap().target_next.set(32);
+        let plan = self.plans.resident_mut(eip).unwrap();
+        if plan.pending.is_none()
+            && plan.row_targets.len() < plan::VERSIONS
+            && !plan.row_targets.contains(&target)
+        {
+            plan.row_targets.push(target);
+            let unit = self.front_unit(memory, eip, true, true, Some(&cpu.regs));
+            self.request_resident_unit(eip, compile::Task::Append, cpu.clone(), Some(unit));
+        }
+    }
+
+    fn observe_row_failure(&mut self, eip: u32) {
+        let feedback = self
             .code
             .resident(eip)
             .unwrap()
-            .unit
+            .row_feedback
+            .as_deref()
+            .unwrap();
+        feedback.next.set(32);
+        let failures = feedback.failures.iter().map(std::cell::Cell::get).sum();
+        let Some(costs) = self.code.row_costs(eip) else {
+            return;
+        };
+        let plan = self.plans.resident_mut(eip).unwrap();
+        if plan.pending.is_some() || plan.declined() {
+            return;
+        }
+        if !plan.row_accounting() && plan.cold_window.is_none() {
+            self.code.measure_cold(eip, true);
+        }
+        let measured = self.code.accounted(eip);
+        if plan.row_failures_exceed_savings(failures, measured, costs) {
+            self.count_sensor_decision("row_withdrawn");
+            self.code.measure_cold(eip, false);
+            self.decline_resident(eip, Decline::Unprofitable);
+            self.code.sync();
+        }
+    }
+
+    pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, at: CpuState) {
+        self.request_resident_unit(eip, task, at, None);
+    }
+
+    fn request_resident_unit(
+        &mut self,
+        eip: u32,
+        task: compile::Task,
+        mut at: CpuState,
+        unit: Option<Arc<Unit>>,
+    ) {
+        at.refresh_mmx();
+        let site = self.code.resident(eip).unwrap();
+        let unit = unit.unwrap_or_else(|| match task {
+            compile::Task::Replace(index) => Arc::clone(&site.versions[index].unit),
+            _ => Arc::clone(&site.unit),
+        });
+        let checked = unit
             .trace
             .insts
             .iter()
@@ -1005,7 +1097,7 @@ impl Native {
             generation: self.code.generation,
             code: head.code,
             task,
-            unit: Arc::clone(&self.code.resident(eip).unwrap().unit),
+            unit,
             proof: self.worker_jobs.get(&eip).map(|job| job.proof.clone()),
             at,
             checked,
@@ -1146,10 +1238,11 @@ impl Native {
                 continue;
             };
             head.pending = None;
-            if let Some(job) = done.job {
+            if let Some(job) = done.job
+                && head.accepts(done.task)
+            {
                 head.has_proof = true;
-                let unit = Arc::clone(&self.code.resident(eip).unwrap().unit);
-                self.place_job(eip, &done.at, unit, job);
+                self.place_job(eip, &done.at, Arc::clone(&done.unit), job);
                 self.install_offer_link(eip);
             }
             let head = self.plans.resident(eip).unwrap();
@@ -1157,16 +1250,22 @@ impl Native {
                 && let Some(result) = done.resident
             {
                 let decline = match result {
-                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form))
+                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form, done.unit))
                         .then_some(Decline::CacheFull),
                     Err(reject) => Some(Decline::Compile(reject)),
                 };
-                if matches!(
-                    done.task,
-                    compile::Task::Discover | compile::Task::Replace(_)
-                ) && let Some(reason) = decline
-                {
-                    self.decline_resident(eip, reason);
+                if let Some(reason) = decline {
+                    if done.task == compile::Task::Append {
+                        let observed = &self.plans.resident(eip).unwrap().row_targets;
+                        if !observed.is_empty() && self.code.publish_row_targets(eip, observed) {
+                            self.repoint_resident_edges(
+                                eip,
+                                self.code.resident(eip).unwrap().entry(),
+                            );
+                        }
+                    } else {
+                        self.decline_resident(eip, reason);
+                    }
                 }
             }
             self.rebuild_resident(eip);
@@ -1179,7 +1278,21 @@ impl Native {
         task: compile::Task,
         at: CpuState,
         mut form: compile::ResidentForm,
+        unit: Arc<Unit>,
     ) -> bool {
+        if let Some(expected) = self
+            .code
+            .resident(eip)
+            .unwrap()
+            .versions
+            .first()
+            .and_then(|v| v.row_target)
+            && form.lowered.row_target.is_none_or(|target| {
+                (target.base, target.offset) != (expected.base, expected.offset)
+            })
+        {
+            return false;
+        }
         let lowered = &mut form.lowered;
         let source = self.plans.resident(eip).unwrap().source;
         let tier1 = self.code.tier1_words.get(&source).and_then(|words| {
@@ -1204,7 +1317,11 @@ impl Native {
             compile::Task::Replace(i) => i,
             _ => self.code.resident(eip).unwrap().versions.len(),
         };
-        let gate = self.plans.job(eip).map(JobPlan::gate);
+        let gate = self
+            .plans
+            .job(eip)
+            .filter(|job| !job.scoped)
+            .map(JobPlan::gate);
         self.stop_cold_window(eip);
         let recovery = compile::ResidentRecovery {
             records: std::mem::take(&mut form.lowered.records),
@@ -1212,6 +1329,7 @@ impl Native {
             mmx: form.built.assumed.mmx,
         };
         let spill_cells = form.lowered.spill_cells;
+        let row_target = form.lowered.row_target;
         if !self.code.place_resident(
             eip,
             index,
@@ -1224,6 +1342,8 @@ impl Native {
             probation.as_ref().map(|_| PROBATION),
             MISSES,
             form.placement(),
+            unit,
+            row_target,
         ) {
             return false;
         }
@@ -1232,15 +1352,29 @@ impl Native {
         }
         let head = self.plans.resident_mut(eip).unwrap();
         let period = head.installed(index, probation);
+        if head.row_accounting() {
+            head.reset_row_accounting();
+            self.code.measure_cold(eip, false);
+        }
         self.code.resident_mut(eip).unwrap().suspended = head.rebuilds != 0;
-        self.code.start_link_sampling(eip, SAMPLE);
+        if let Some(target) = row_target {
+            if !head.row_targets.contains(&target.value) {
+                head.row_targets.push(target.value);
+            }
+            if !self.code.publish_row_targets(eip, &head.row_targets) {
+                return false;
+            }
+        } else {
+            self.code.start_link_sampling(eip, SAMPLE);
+        }
         self.code.publish_resident(eip, period);
         self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
+        self.publish_scope(eip);
         true
     }
 
     fn install_offer_link(&mut self, eip: u32) {
-        if let Some(job) = self.plans.job(eip) {
+        if let Some(job) = self.plans.job(eip).filter(|job| !job.scoped) {
             self.code.install_offer(eip, job.gate());
         }
     }
@@ -1251,6 +1385,11 @@ impl Native {
             .take()
             .unwrap();
         let (entries, retired) = self.code.finish_probation(eip, index);
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.row_accounting() {
+            head.reset_row_accounting();
+            self.code.measure_cold(eip, false);
+        }
         if probation.profitable(entries, retired) {
             self.code.sync();
             self.count_sensor_decision("probation_kept");
@@ -1376,8 +1515,36 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
 
 impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        let changed = self.offload.enabled != enabled;
         self.offload.enabled = enabled;
-        self.plans.offer_resume = skip;
+        let before = std::mem::replace(&mut self.plans.offer_resume, skip);
+        if changed {
+            self.publish_scopes();
+        } else if before != skip {
+            for head in [before, skip].into_iter().flatten() {
+                self.publish_scope(head);
+            }
+        }
+    }
+
+    fn publish_scope(&mut self, eip: u32) {
+        if let Some(job) = self.plans.job(eip).filter(|job| job.scoped) {
+            let enabled = self.offload.enabled && self.plans.offer_resume != Some(eip);
+            self.code.publish_split(eip, job.scope_threshold(enabled));
+            self.code.sync();
+        }
+    }
+
+    fn publish_scopes(&mut self) {
+        let scoped: Vec<_> = self
+            .worker_jobs
+            .keys()
+            .copied()
+            .filter(|&eip| self.plans.job(eip).is_some_and(|job| job.scoped))
+            .collect();
+        for eip in scoped {
+            self.publish_scope(eip);
+        }
     }
 
     pub(crate) fn set_async_compilation(&mut self, enabled: bool) {
@@ -1385,11 +1552,17 @@ impl Native {
     }
 
     pub(crate) fn progressed(&mut self) {
-        self.plans.offer_resume = None;
+        if let Some(head) = self.plans.offer_resume.take() {
+            self.publish_scope(head);
+        }
     }
 
     pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
-        self.plans.offer_resume.take()
+        let skip = self.plans.offer_resume.take();
+        if let Some(head) = skip {
+            self.publish_scope(head);
+        }
+        skip
     }
 
     /// Whether the computation reached at EIP goes to the job layer
@@ -1437,6 +1610,8 @@ impl Native {
     }
 
     fn place_job(&mut self, eip: u32, at: &CpuState, unit: Arc<Unit>, job: compile::Job) {
+        let scoped = job.scoped.is_some();
+        let unit = job.scoped.unwrap_or(unit);
         let iterates = unit.trace.returns_at_head();
         if let Some(code) = self.emit_computation(
             &unit,
@@ -1446,7 +1621,9 @@ impl Native {
         ) {
             self.diagnostics.split_proofs += u64::from(job.proof.splits());
             let entry_registers = job.proof.entry_registers();
-            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            self.plans.add_job(eip, iterates, job.proof.splits());
+            let policy = self.plans.job_mut(eip).unwrap();
+            policy.scoped = scoped;
             policy.requested();
             policy.built();
             self.worker_jobs.insert(
@@ -1455,6 +1632,11 @@ impl Native {
                     code: Code {
                         placed: code,
                         optimized: None,
+                        scoped_mmx: job.proof.scoped_mmx(),
+                        frame: job.proof.scope_frame().map_or_else(
+                            || Arc::from([]),
+                            |frame| Arc::from(frame.cells.as_slice()),
+                        ),
                     },
                     proof: job.proof,
                     retired: unit.trace.prepaid(0),

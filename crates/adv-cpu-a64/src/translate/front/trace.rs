@@ -73,6 +73,8 @@ pub enum Mode {
 pub struct Inst {
     /// The thunk of a recognized host call (A64-CTL-12).
     pub call: Option<u32>,
+    pub guarded_slot: Option<super::decode::Mem>,
+    pub row_alignment: Option<(u8, u32, bool)>,
     pub locked: Option<(super::decode::Mem, u8, u8)>,
     pub pc: u32,
     pub next_pc: u32,
@@ -283,6 +285,8 @@ fn forwarded_body(
     None
 }
 
+type RowObservation<'a> = Option<&'a [u32; 8]>;
+
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry. `redirect` gives, for a function entry whose calls go
@@ -301,7 +305,15 @@ impl Trace {
         loops: bool,
     ) {
         let mut decodes = Decodes::default();
-        self.build_cached(memory, entry, stops, host, redirect, loops, &mut decodes);
+        self.build_cached(
+            memory,
+            entry,
+            stops,
+            host,
+            redirect,
+            (loops, None),
+            &mut decodes,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -312,11 +324,19 @@ impl Trace {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
-        loops: bool,
+        (loops, observed): (bool, Option<&[u32; 8]>),
         decodes: &mut Decodes,
     ) {
         let limit = if loops { LOOP_LIMIT } else { MAX_INSTRUCTIONS };
-        match self.build_paths(memory, entry, stops, host, redirect, (limit, None), decodes) {
+        match self.build_paths(
+            memory,
+            entry,
+            stops,
+            host,
+            redirect,
+            (limit, None, observed),
+            decodes,
+        ) {
             Some(end) => {
                 self.build_paths(
                     memory,
@@ -324,7 +344,7 @@ impl Trace {
                     stops,
                     host,
                     redirect,
-                    (LOOP_LIMIT, Some(end)),
+                    (LOOP_LIMIT, Some(end), observed),
                     decodes,
                 );
             }
@@ -335,7 +355,7 @@ impl Trace {
                     stops,
                     host,
                     redirect,
-                    (MAX_INSTRUCTIONS, None),
+                    (MAX_INSTRUCTIONS, None, observed),
                     decodes,
                 );
             }
@@ -373,6 +393,109 @@ impl Trace {
         }
         self.mark_spin_backedges(memory, decodes);
         self.analyze();
+    }
+
+    /// A pretest and a returning latch can share their guest address
+    /// while consuming flag values from different instructions.
+    pub(crate) fn row_latches(&self) -> Vec<(usize, usize)> {
+        self.insts
+            .iter()
+            .enumerate()
+            .filter_map(|(at, inst)| {
+                let latch = match inst.next {
+                    Next::Fall => at + 1,
+                    Next::Edge(Edge::Internal(latch)) => latch,
+                    _ => return None,
+                };
+                let test = self.insts.get(latch)?;
+                let (
+                    Op::Jcc(crate::translate::front::decode::Cc::Flags(cond), _),
+                    Some(Edge::Internal(body)),
+                ) = (test.op, test.taken)
+                else {
+                    return None;
+                };
+                let start = self.insts[body].pc;
+                if inst.frame != test.frame
+                    || inst.next_pc != test.pc
+                    || !(start..test.pc).contains(&inst.pc)
+                    || !matches!(
+                        cond,
+                        iced_x86::ConditionCode::s
+                            | iced_x86::ConditionCode::ns
+                            | iced_x86::ConditionCode::e
+                            | iced_x86::ConditionCode::ne
+                    )
+                {
+                    return None;
+                }
+                self.insts
+                    .iter()
+                    .enumerate()
+                    .any(|(before, pretest)| {
+                        let reach = pretest.next == Next::Edge(Edge::Internal(latch))
+                            || (pretest.next == Next::Fall && before + 1 == latch)
+                            || pretest.taken == Some(Edge::Internal(latch));
+                        reach && pretest.frame == test.frame && pretest.pc < start
+                    })
+                    .then_some((at, latch))
+            })
+            .collect()
+    }
+
+    pub(crate) fn separate_row_latches(&mut self, latches: &[(usize, usize)]) {
+        for &(tail, at) in latches {
+            let mut test = self.insts[at];
+            if test.next == Next::Fall {
+                test.next = Next::Edge(Edge::Internal(at + 1));
+            }
+            self.insts[tail].next = Next::Edge(Edge::Internal(self.insts.len()));
+            self.insts.push(test);
+            self.x86.push(self.x86[at].clone());
+        }
+        self.analyze();
+    }
+
+    /// Specialize a TEST/Jcc alignment fork. The affine proof must
+    /// establish both the first address and the pitch under this mask.
+    pub(crate) fn specialize_row_alignment(&mut self, regs: &[u32; 8]) -> bool {
+        use super::decode::{Alu, Cc};
+        use iced_x86::ConditionCode::{e, ne};
+        let mut changed = false;
+        for at in 1..self.insts.len() {
+            let test = self.insts[at - 1];
+            let branch = self.insts[at];
+            let Op::Alu(Alu::Test, Src::Reg(reg), Src::Imm(mask)) = test.op else {
+                continue;
+            };
+            if !(3..=31).contains(&mask)
+                || !(mask + 1).is_power_of_two()
+                || test.next != Next::Fall
+                || test.next_pc != branch.pc
+                || self.merge[at]
+            {
+                continue;
+            }
+            let Op::Jcc(Cc::Flags(condition @ (e | ne)), target) = branch.op else {
+                continue;
+            };
+            let nonzero = regs[usize::from(reg)] & mask != 0;
+            self.insts[at - 1].row_alignment = Some((reg, mask, nonzero));
+            let branch = &mut self.insts[at];
+            if nonzero == (condition == ne) {
+                branch.op = Op::Jmp(target);
+                branch.next = Next::Edge(branch.taken.unwrap());
+            } else {
+                branch.op = Op::Nop;
+            }
+            branch.effects = branch.op.effects();
+            branch.taken = None;
+            changed = true;
+        }
+        if changed {
+            self.analyze();
+        }
+        changed
     }
 
     fn mark_spin_backedges(&mut self, memory: &Memory, decodes: &Decodes) {
@@ -418,10 +541,10 @@ impl Trace {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
-        bounds: (usize, Option<(u32, u16)>),
+        bounds: (usize, Option<(u32, u16)>, RowObservation<'_>),
         decodes: &mut Decodes,
     ) -> Option<(u32, u16)> {
-        let (limit, end) = bounds;
+        let (limit, end, observed) = bounds;
         self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
         self.x86.clear();
@@ -440,7 +563,7 @@ impl Trace {
         fetcher.helpers = Some(std::mem::take(&mut self.helpers));
         let stops = Stops::new(stops);
         let mut weight = 0;
-        let bounds = (limit, &stops, end);
+        let bounds = (limit, &stops, end, observed);
         self.path(
             (entry, 0),
             &mut weight,
@@ -515,7 +638,7 @@ impl Trace {
         (mut pc, mut frame): (u32, u16),
         weight: &mut usize,
         (memory, fetcher, decodes): (&mut Memory, &mut Fetcher, &mut Decodes),
-        (limit, stops, stop): (usize, &Stops<'_>, Option<(u32, u16)>),
+        (limit, stops, stop, observed): (usize, &Stops<'_>, Option<(u32, u16)>, RowObservation<'_>),
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) -> bool {
@@ -591,6 +714,7 @@ impl Trace {
             // Import slots and the entries calls reach are watched like code,
             // so a transfer through them is static (A64-CALL-1).
             let mut watched = Vec::new();
+            let mut guarded_slot = None;
             let op = match op {
                 Op::CallIndirect(Src::Mem(slot)) | Op::JmpIndirect(Src::Mem(slot))
                     if slot.base.is_none()
@@ -612,11 +736,35 @@ impl Trace {
                         Err(_) => op,
                     }
                 }
+                Op::CallIndirect(Src::Mem(slot))
+                    if frame == 0
+                        && slot.index.is_none()
+                        && !slot.fs
+                        && slot.address_bits == 32 =>
+                {
+                    let target = observed.zip(slot.base).and_then(|(regs, base)| {
+                        let address = regs[usize::from(base)].wrapping_add(slot.disp);
+                        if !memory.computation_range(address, 4, false) {
+                            return None;
+                        }
+                        let mut word = [0; 4];
+                        memory.read_into(address, &mut word).ok()?;
+                        Some(u32::from_le_bytes(word))
+                    });
+                    if let Some(target) = target {
+                        guarded_slot = Some(slot);
+                        Op::Call(target)
+                    } else {
+                        op
+                    }
+                }
                 _ => op,
             };
             let op = match op {
                 Op::Call(target)
-                    if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
+                    if guarded_slot.is_none()
+                        && target != next_pc
+                        && self.bodies.len() <= usize::from(u8::MAX) =>
                 {
                     match forwarded_body(memory, target, redirect, stops, decodes) {
                         Some((bound, dependencies)) => {
@@ -658,6 +806,8 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
+                guarded_slot,
+                row_alignment: None,
                 locked: fetcher.locked,
                 call: if matches!(op, Op::Syscall) && size == 2 {
                     let mut bytes = [0; 7];
@@ -796,6 +946,30 @@ impl Trace {
         index as u16
     }
 
+    /// A scoped join publishes conditional state before the serial tail
+    /// can observe it. The worker leaves on the latch's non-returning edge.
+    pub(crate) fn end_at_latch(&mut self, at: usize, loops_on_taken: bool) {
+        let target = if loops_on_taken {
+            match self.insts[at].next {
+                Next::Fall => Edge::Internal(at + 1),
+                Next::Edge(edge) => edge,
+                Next::Dynamic => unreachable!(),
+            }
+        } else {
+            self.insts[at].taken.unwrap()
+        };
+        let exit = match target {
+            Edge::Internal(to) => Edge::Exit(self.insts[to].pc),
+            Edge::Exit(pc) | Edge::Event(pc) => Edge::Exit(pc),
+        };
+        if loops_on_taken {
+            self.insts[at].next = Next::Edge(exit);
+        } else {
+            self.insts[at].taken = Some(exit);
+        }
+        self.analyze();
+    }
+
     /// A copy in which each `cut` instruction leaves at its own EIP instead
     /// of running, analysed again. It has no helpers: only forms that refuse
     /// them build from it.
@@ -804,6 +978,8 @@ impl Trace {
         for (inst, _) in insts.iter_mut().zip(cut).filter(|(_, cut)| **cut) {
             *inst = Inst {
                 call: None,
+                guarded_slot: None,
+                row_alignment: None,
                 locked: None,
                 op: Op::Nop,
                 effects: Op::Nop.effects(),

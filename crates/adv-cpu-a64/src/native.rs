@@ -660,6 +660,26 @@ impl Native {
         self.code.value_counts.get(&pc).copied().unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn span_counts(
+        &self,
+        head: u32,
+    ) -> [u64; crate::translate::lower::resident::COUNTERS] {
+        let mut counts = self.code.version_stats.as_ref().unwrap()[&head]
+            .spans
+            .each_ref()
+            .map(Cell::get);
+        if let Some(feedback) = self
+            .code
+            .resident(head)
+            .and_then(|site| site.row_feedback.as_deref())
+        {
+            counts[21] = feedback.failures[0].get();
+            counts[22] = feedback.failures[1..].iter().map(Cell::get).sum();
+        }
+        counts
+    }
+
     pub(crate) fn version_diagnostics(&self) -> Option<String> {
         use std::fmt::Write as _;
         let stats = self.code.version_stats.as_ref()?;
@@ -667,6 +687,51 @@ impl Native {
         entries.sort_unstable_by_key(|(eip, _)| **eip);
         let mut output = String::new();
         for (&eip, stats) in entries {
+            let mut counts = stats.spans.each_ref().map(Cell::get);
+            if let Some(feedback) = self
+                .code
+                .resident(eip)
+                .and_then(|site| site.row_feedback.as_deref())
+            {
+                let reasons = feedback.failures.each_ref().map(Cell::get);
+                counts[21] = reasons[0];
+                counts[22] = reasons[1..].iter().sum();
+                let _ = write!(
+                    output,
+                    " row failures {eip:#010x} [target {}, range {}, alias {}, parameter {}, count {}, span {}]",
+                    reasons[0], reasons[1], reasons[2], reasons[3], reasons[4], reasons[5]
+                );
+            }
+            if let Some(job) = self.plans.job(eip).filter(|job| job.scoped) {
+                let offers = job.scope_offers.get();
+                let splits = job.scope_splits.get();
+                let declines = offers.saturating_sub(splits);
+                let _ = write!(
+                    output,
+                    " row splits {eip:#010x} [offers {offers}, declines {declines}, splits {splits}]"
+                );
+            }
+            if counts[23] != 0 {
+                let _ = write!(
+                    output,
+                    " row arrivals {eip:#010x} [total {}, short {}]",
+                    counts[23], counts[24]
+                );
+            }
+            if counts.iter().any(|&n| n != 0) {
+                let _ = write!(
+                    output,
+                    " span {eip:#010x}=[entries {}, mmx misses {}, range misses {}, batches {}, ordered classes {:?}, row entries {}, target misses {}, row misses {}]",
+                    counts[0],
+                    counts[1],
+                    counts[2],
+                    counts[3],
+                    &counts[4..20],
+                    counts[20],
+                    counts[21],
+                    counts[22]
+                );
+            }
             let versions = self
                 .code
                 .tier1_chain(eip)
@@ -940,9 +1005,17 @@ impl Native {
         eip: u32,
         loops: bool,
         summarize: bool,
+        observed: Option<&[u32; 8]>,
     ) -> Arc<Unit> {
         let site = self.front_units.entry(eip).or_default();
-        let shape = if loops { &mut site.hot } else { &mut site.cold };
+        let mut guarded = None;
+        let shape = if observed.is_some() {
+            &mut guarded
+        } else if loops {
+            &mut site.hot
+        } else {
+            &mut site.cold
+        };
         let unit = shape.get_or_insert_with(|| {
             let handler = if self.bridge.is_null() {
                 None
@@ -969,7 +1042,7 @@ impl Native {
                         body: handler.direct_body(pc),
                     })
                 },
-                loops,
+                (loops, observed),
                 &mut self.decodes,
             );
             self.code

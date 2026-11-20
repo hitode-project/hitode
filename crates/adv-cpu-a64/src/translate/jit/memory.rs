@@ -78,6 +78,29 @@ impl Translator<'_> {
     /// addresses take no offset; pushes and pops move ESP. Uses x3 to x5.
     pub(super) fn access(&mut self, addr: Addr, width: u8, dir: Dir, rt: Reg) {
         let store = dir == Dir::Store;
+        #[cfg(native)]
+        if let Some(slot) = self
+            .computation_facts
+            .and_then(|facts| facts.scope_access)
+            .and_then(|access| access[self.index])
+        {
+            let offset = runtime::SCOPE_FRAME + 4 * u32::from(slot);
+            self.emit(if store {
+                str(W, rt, RUNTIME, offset)
+            } else {
+                ldr(W, rt, RUNTIME, offset)
+            });
+            if matches!(addr, Addr::Push | Addr::Pop) {
+                let esp = host(ESP);
+                self.emit(if matches!(addr, Addr::Push) {
+                    sub_imm(W, X5, esp, 4, false)
+                } else {
+                    add_imm(W, X5, esp, 4, false)
+                });
+                self.emit(add_ext(X, esp, WINDOW, X5, Uxtw, 0));
+            }
+            return;
+        }
         match addr {
             #[cfg(native)]
             Addr::FrameCache(slot) => {

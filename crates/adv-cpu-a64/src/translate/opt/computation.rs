@@ -3,6 +3,8 @@
 //! results, flags, exceptional exits and floating-point state.
 
 use std::cell::Cell;
+
+pub(crate) mod rows;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::translate::front::{summary::Summary, tags::ConditionCode as Cond};
@@ -17,9 +19,12 @@ use crate::translate::front::decode::{
 use crate::translate::front::forms::{Division, Integer};
 use crate::translate::front::forms::{Loc, SimdKind as Kind};
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
-use crate::translate::lower::access::FrameCache;
+pub(crate) use crate::translate::lower::access::ScopeCell;
+use crate::translate::lower::access::{FrameCache, ScopeFrame};
 
 mod carried;
+mod scope;
+use crate::runtime::SCOPE_CELLS;
 
 type ExprId = usize;
 type VarId = usize;
@@ -37,6 +42,7 @@ enum Expr {
     Add(ExprId, ExprId),
     Mul(ExprId, ExprId),
     Neg(ExprId),
+    SignTrip(ExprId, u32),
 }
 
 // An affine sum in the guest's modulo-2^32 address arithmetic. Coefficients
@@ -64,7 +70,7 @@ struct Limit {
 
 #[derive(Clone, Debug)]
 enum Var {
-    Counter(Option<ExprId>),
+    Counter(u32, Option<ExprId>),
     Remainder {
         divisor: ExprId,
         normalized: bool,
@@ -103,6 +109,8 @@ enum Check {
     Equal(ExprId, ExprId),
     Positive(ExprId, u32),
     StackAlignment(u32),
+    Target(ExprId, u32),
+    Mask(ExprId, u32, bool),
 }
 
 /// An ordinary guest span, still to be checked against the memory authority
@@ -154,7 +162,9 @@ pub(crate) struct Proof {
     effects: Vec<Effect>,
     divisions: Vec<Option<Division>>,
     frame_cache: Option<FrameCache>,
+    based: u8,
     outer: Option<Outer>,
+    scope_frame: Option<ScopeFrame>,
     /// Each trace instruction as decoded once from guest bytes, for the
     /// split proof and the optimizer's component effects.
     instructions: Vec<Option<Arc<Summary>>>,
@@ -241,6 +251,10 @@ struct Graph {
 impl Graph {
     /// Fails with the shape that stops it and the instruction it stops at.
     fn build(trace: &Trace) -> Result<Self, Refusal> {
+        Self::build_selected(trace, false)
+    }
+
+    fn build_selected(trace: &Trace, selected: bool) -> Result<Self, Refusal> {
         let refuse = |why, at| Err(Refusal { why, at });
         let n = trace.len();
         if n == 0 {
@@ -250,7 +264,7 @@ impl Graph {
             Edge::Internal(to) => Some(to),
             _ => None,
         };
-        let edges: Vec<_> = trace
+        let mut edges: Vec<_> = trace
             .insts
             .iter()
             .enumerate()
@@ -289,7 +303,18 @@ impl Graph {
             color[at] = 2;
         }
         let mut back = Vec::new();
-        visit(&edges, 0, &mut vec![0; n], &mut back);
+        let mut color = vec![0; n];
+        visit(&edges, 0, &mut color, &mut back);
+        if selected {
+            for (at, edges) in edges.iter_mut().enumerate() {
+                if color[at] == 0 {
+                    *edges = [None; 2];
+                }
+            }
+            for arrivals in &mut incoming {
+                arrivals.retain(|&at| color[at] != 0);
+            }
+        }
         if back.is_empty() {
             return refuse("graph: no loop", 0);
         }
@@ -442,6 +467,8 @@ struct Builder<'a> {
     remaining: usize,
     states: Vec<Vec<Option<State>>>,
     outer: Option<Outer>,
+    rows: Option<&'a [u32; 8]>,
+    based: u8,
 }
 
 impl Builder<'_> {
@@ -662,7 +689,7 @@ impl Builder<'_> {
     fn slot_of(&self, form: &Form) -> Option<Slot> {
         let id = form.invariant()?;
         let base = |id: ExprId| match self.exprs[id] {
-            Expr::Register(r @ (ESP | EBP)) => Some(r),
+            Expr::Register(r) if r == ESP || r == EBP || r == self.based => Some(r),
             _ => None,
         };
         match self.exprs[id] {
@@ -889,6 +916,14 @@ impl Builder<'_> {
         if inst.locked.is_some() || inst.call.is_some() || inst.spin {
             return None;
         }
+        if let Some((reg, mask, nonzero)) = inst.row_alignment {
+            self.rows?;
+            let address = self.register(state, reg)?;
+            self.check(Check::Mask(address.base, mask, nonzero));
+            for (_, stride) in address.terms {
+                self.check(Check::Mask(stride, mask, false));
+            }
+        }
         if inst.effects.writes != crate::translate::front::flags::FlagSet::NONE {
             state.test = None;
         }
@@ -1077,6 +1112,12 @@ impl Builder<'_> {
                 if self.graph.edges[at][0].is_none() && target != inst.next_pc {
                     return None;
                 }
+                if let Some(slot) = inst.guarded_slot {
+                    self.rows?;
+                    let addr = self.address(state, slot)?.invariant()?;
+                    let word = self.expr(Expr::Word(addr));
+                    self.check(Check::Target(word, target));
+                }
                 let ret = self.imm(inst.next_pc);
                 self.push(state, Some(ret), record)?;
             }
@@ -1123,6 +1164,12 @@ impl Builder<'_> {
             Op::Simd(s) if s.kind != Kind::MaskMove => {
                 if s.memory() {
                     let addr = self.address(state, s.mem)?;
+                    if s.aligned && self.rows.is_some() {
+                        self.check(Check::Mask(addr.base, 15, false));
+                        for &(_, stride) in &addr.terms {
+                            self.check(Check::Mask(stride, 15, false));
+                        }
+                    }
                     if s.dst == Loc::Mem {
                         self.write(state, addr, s.width, None, record);
                     } else {
@@ -1318,6 +1365,17 @@ impl Builder<'_> {
             }
             let inside = |to| lp.is_none_or(|l| self.graph.loops[l].inside[to]);
             let [fall, mut taken] = self.graph.edges[at].map(|edge| edge.filter(|&to| inside(to)));
+            let mut fall = fall;
+            if self.rows.is_some()
+                && let Some(lp) = lp
+                && let Some(choice) = self.row_pretest(at, lp, &state, [fall, taken])
+            {
+                if choice {
+                    fall = None;
+                } else {
+                    taken = None;
+                }
+            }
             if fall.is_some() && taken.is_some() && self.enters_loop(at, &state) {
                 taken = None;
             }
@@ -1348,6 +1406,62 @@ impl Builder<'_> {
             },
             None => Some(None),
         }
+    }
+
+    /// Prove that a shared latch's entry arm takes the child on
+    /// every row. After flag separation, only this pretest is outside it.
+    fn row_pretest(
+        &mut self,
+        at: usize,
+        parent: usize,
+        state: &State,
+        [fall, taken]: [Option<usize>; 2],
+    ) -> Option<bool> {
+        let fall = fall?;
+        let taken = taken?;
+        let Op::Jcc(Cc::Flags(cond), _) = self.trace.insts[at].op else {
+            return None;
+        };
+        let (enters, skips, choice) = match cond {
+            Cond::ns | Cond::ne => (taken, fall, true),
+            Cond::s | Cond::e => (fall, taken, false),
+            _ => return None,
+        };
+        let child = self.graph.heads[enters]?;
+        if child == parent
+            || self.graph.loops[child].inside[at]
+            || self.graph.loops[child].inside[skips]
+        {
+            return None;
+        }
+        let value = match &state.test {
+            Some(Test::Zero(value)) => value,
+            Some(Test::Compare(value, zero)) if zero.invariant() == Some(self.zero) => value,
+            _ => return None,
+        }
+        .invariant()?;
+        let observed = self.observe(value);
+        if matches!(cond, Cond::e | Cond::ne) {
+            if observed == Some(0) {
+                self.check(Check::Equal(value, self.zero));
+                return Some(!choice);
+            }
+            self.check(Check::Positive(value, u32::MAX));
+        } else {
+            if observed.is_some_and(|value| (value as i32) < 0) {
+                self.check(Check::Mask(value, 1 << 31, true));
+                return Some(!choice);
+            }
+            let next = self.add(value, self.one);
+            self.check(Check::Positive(next, 1 << 31));
+        }
+        Some(choice)
+    }
+
+    /// Entry registers can select an optional tail. The selected condition
+    /// remains a range proof check, and parameter reads stay guarded.
+    fn observe(&self, id: ExprId) -> Option<u32> {
+        observe_expr(&self.exprs, self.rows?, id)
     }
 
     /// A forward branch over a child loop, on a value that is the same in
@@ -1399,6 +1513,21 @@ impl Builder<'_> {
                 if coefficient(&a, *self.interned.get(&Expr::Constant(u32::MAX))?) =>
             {
                 self.add(a.base, self.one)
+            }
+            (Test::Zero(a), Cond::ns, true) | (Test::Zero(a), Cond::s, false)
+                if self.rows.is_some() =>
+            {
+                let [(induction, scale)] = *a.terms.as_slice() else {
+                    return None;
+                };
+                let Expr::Constant(scale) = self.exprs[scale] else {
+                    return None;
+                };
+                let stride = scale.wrapping_neg();
+                if induction != var || !stride.is_power_of_two() || stride >= 1 << 31 {
+                    return None;
+                }
+                self.expr(Expr::SignTrip(a.base, stride.trailing_zeros()))
             }
             (Test::Compare(a, b), Cond::l | Cond::b | Cond::le, true)
             | (Test::Compare(a, b), Cond::ge | Cond::ae | Cond::g, false)
@@ -1517,7 +1646,8 @@ impl Builder<'_> {
                 break first;
             }
         };
-        let var = self.variable(Var::Counter(None));
+        let pc = self.trace.insts[head].pc;
+        let var = self.variable(Var::Counter(pc, None));
         let mut recurring = [const { None }; 8];
         let mut slots = BTreeMap::new();
         let mut before = initial.clone();
@@ -1586,7 +1716,7 @@ impl Builder<'_> {
         let Some(count) = after.test.take().and_then(|t| self.trip(lp, t, var)) else {
             return self.refuse("trip", test);
         };
-        self.vars[var] = Var::Counter(Some(count));
+        self.vars[var] = Var::Counter(pc, Some(count));
         after.cdq = false;
         after.entry_reads |= used | initial.entry_reads;
         after.limits = initial.limits;
@@ -1801,6 +1931,31 @@ fn renumber(
     id
 }
 
+fn observe_expr(exprs: &[Expr], regs: &[u32; 8], id: ExprId) -> Option<u32> {
+    let mut values: Vec<Option<u32>> = Vec::with_capacity(id + 1);
+    for expr in &exprs[..=id] {
+        let value = match *expr {
+            Expr::Constant(value) => Some(value),
+            Expr::Register(reg) => Some(regs[usize::from(reg)]),
+            Expr::Word(_) => None,
+            Expr::Add(a, b) => values[a].zip(values[b]).map(|(a, b)| a.wrapping_add(b)),
+            Expr::Mul(a, b) => values[a].zip(values[b]).map(|(a, b)| a.wrapping_mul(b)),
+            Expr::Neg(a) => values[a].map(u32::wrapping_neg),
+            Expr::SignTrip(a, shift) => values[a].map(|a| sign_trip(a, shift)),
+        };
+        values.push(value);
+    }
+    values[id]
+}
+
+fn sign_trip(first: u32, shift: u32) -> u32 {
+    if (first as i32) < 0 {
+        1
+    } else {
+        (first >> shift) + 2
+    }
+}
+
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -1808,7 +1963,7 @@ fn gcd(a: u64, b: u64) -> u64 {
 impl Proof {
     pub(crate) fn build(trace: &Trace) -> Result<Self, Refusal> {
         let refused = Cell::new(None);
-        Self::prove(trace, &refused).ok_or_else(|| {
+        Self::prove(trace, &refused, None).ok_or_else(|| {
             refused.get().unwrap_or(Refusal {
                 why: "proof",
                 at: 0,
@@ -1816,13 +1971,34 @@ impl Proof {
         })
     }
 
-    fn prove(trace: &Trace, refused: &Cell<Option<Refusal>>) -> Option<Self> {
-        let graph = match Graph::build(trace) {
+    fn prove(
+        trace: &Trace,
+        refused: &Cell<Option<Refusal>>,
+        rows: Option<&[u32; 8]>,
+    ) -> Option<Self> {
+        let graph = match Graph::build_selected(trace, rows.is_some()) {
             Ok(graph) => graph,
             Err(refusal) => {
                 refused.set(Some(refusal));
                 return None;
             }
+        };
+        let based = if rows.is_some() {
+            trace
+                .insts
+                .iter()
+                .find_map(|inst| inst.guarded_slot.and_then(|slot| slot.base))
+                .or_else(|| {
+                    trace.insts.iter().find_map(|inst| match inst.op {
+                        Op::Mov(Src::Mem(mem), Src::Reg(_)) if mem.index.is_none() && !mem.fs => {
+                            mem.base.filter(|&reg| reg != ESP && reg != EBP)
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or(EBP)
+        } else {
+            EBP
         };
         let mut b = Builder {
             trace,
@@ -1841,6 +2017,8 @@ impl Proof {
             remaining: PROOF_STEPS,
             states: Vec::new(),
             outer: None,
+            rows,
+            based,
         };
         b.zero = b.constant(0);
         b.one = b.constant(1);
@@ -1873,6 +2051,9 @@ impl Proof {
         }
         let mut frame: [Vec<(i32, i64)>; 4] = Default::default();
         effects.retain(|effect| {
+            if rows.is_some() {
+                return true;
+            }
             let Some(offset) = b.frame_offset(&effect.addr) else {
                 return true;
             };
@@ -1946,7 +2127,7 @@ impl Proof {
                         continue;
                     }
                 }
-                Check::Equal(..) => {}
+                Check::Equal(..) | Check::Target(..) | Check::Mask(..) => {}
             }
             checks.push(check);
         }
@@ -1968,10 +2149,12 @@ impl Proof {
             effects,
             divisions: divisions.into_iter().map(Option::flatten).collect(),
             frame_cache,
+            based,
             outer: outer.map(|mut outer| {
                 outer.counter = outer.counter.and_then(|var| ids.get(&var).copied());
                 outer
             }),
+            scope_frame: None,
             instructions: Vec::new(),
         })
     }
@@ -1983,6 +2166,28 @@ impl Proof {
         &mut self,
         trace: &Trace,
         decode: impl Fn(u32, u32) -> Option<Arc<Summary>>,
+    ) {
+        self.prove_chunks(trace, decode, false);
+    }
+
+    pub(crate) fn prove_scoped_split(&mut self, trace: &Trace) {
+        let mut i = 0;
+        self.prove_chunks(
+            trace,
+            |_, _| {
+                let result = trace.x86[i].clone();
+                i += 1;
+                result
+            },
+            true,
+        );
+    }
+
+    fn prove_chunks(
+        &mut self,
+        trace: &Trace,
+        mut decode: impl FnMut(u32, u32) -> Option<Arc<Summary>>,
+        scoped: bool,
     ) {
         self.instructions = trace
             .insts
@@ -2005,17 +2210,54 @@ impl Proof {
             .flatten()
             .map(|&(offset, _, step)| (offset, zero(step)))
             .collect();
-        let carried =
-            carried::independent(trace, affine, &slots, &self.divisions, &self.instructions);
+        let carried = carried::independent(
+            trace,
+            affine,
+            &slots,
+            &self.divisions,
+            &self.instructions,
+            scoped,
+        );
+        if scoped {
+            self.scope_frame = carried.as_ref().and_then(|carried| {
+                let mut frame = scope::frame(self, trace)?;
+                frame.mmx = carried.mmx;
+                frame.latch = (carried.mmx != 0).then_some(carried.latch);
+                Some(frame)
+            });
+        }
+        let split = if scoped {
+            carried.is_some() && self.scope_frame.is_some()
+        } else {
+            carried.is_some()
+        };
         self.outer = Some(Outer {
-            split: carried.is_some(),
-            frame: carried.flatten().is_some(),
+            split,
+            frame: !scoped && carried.is_some_and(|proof| proof.frame.is_some()),
             ..outer
         });
     }
 
     pub(crate) fn splits(&self) -> bool {
         self.outer.is_some_and(|outer| outer.split)
+    }
+
+    pub(crate) fn scoped_splits(&self) -> bool {
+        self.outer.is_some_and(|outer| outer.split && !outer.frame)
+    }
+
+    pub(crate) fn scope_frame(&self) -> Option<&ScopeFrame> {
+        self.scope_frame
+            .as_ref()
+            .filter(|frame| !frame.cells.is_empty())
+    }
+
+    pub(crate) fn scoped_mmx(&self) -> u16 {
+        self.scope_frame.as_ref().map_or(0, |frame| frame.mmx)
+    }
+
+    pub(crate) fn scoped_latch(&self) -> Option<(usize, bool)> {
+        self.scope_frame.as_ref()?.latch
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every
@@ -2038,6 +2280,13 @@ impl Proof {
         // Each block's frame bytes are its own: only the span matters.
         let mut frame = (i64::MAX, i64::MIN);
         for effect in &self.effects {
+            if self
+                .scope_frame
+                .as_ref()
+                .is_some_and(|frame| scope::routed(self, frame, effect))
+            {
+                continue;
+            }
             let Some((lo, hi)) =
                 self.interval(&effect.addr, &effect.limits, cpu, scratch, &mut read)?
             else {
@@ -2103,7 +2352,15 @@ impl Proof {
         });
         let private = spans
             .iter()
-            .all(|&(lo, hi, ..)| hi <= frame.0 || frame.1 <= lo);
+            .all(|&(lo, hi, ..)| hi <= frame.0 || frame.1 <= lo)
+            && self.scope_frame.as_ref().is_none_or(|frame| {
+                frame.cells.iter().all(|cell| {
+                    let lo = i64::from(
+                        cpu.regs[usize::from(cell.base)].wrapping_add_signed(cell.offset),
+                    );
+                    spans.iter().all(|&(a, b, ..)| b <= lo || lo + 4 <= a)
+                })
+            });
         scratch.spans = spans;
         if !independent || !private {
             return None;
@@ -2345,6 +2602,16 @@ impl Proof {
                         return None;
                     }
                 }
+                Check::Mask(expr, mask, nonzero) => {
+                    if (self.value(expr, cpu, scratch, read)? & mask != 0) != nonzero {
+                        return None;
+                    }
+                }
+                Check::Target(word, target) => {
+                    if self.value(word, cpu, scratch, read)? != target {
+                        return None;
+                    }
+                }
                 Check::Equal(a, b) => {
                     if self.value(a, cpu, scratch, read)? != self.value(b, cpu, scratch, read)? {
                         return None;
@@ -2453,7 +2720,7 @@ impl Proof {
         for &(var, coefficient) in &form.terms {
             let k = self.value(coefficient, cpu, scratch, read)? as i32;
             let (a, b) = match self.vars[var] {
-                Var::Counter(Some(count)) => {
+                Var::Counter(_, Some(count)) => {
                     (0, i64::from(self.value(count, cpu, scratch, read)?) - 1)
                 }
                 Var::Remainder {
@@ -2583,6 +2850,7 @@ impl Proof {
                 .value(a, cpu, scratch, read)?
                 .wrapping_mul(self.value(b, cpu, scratch, read)?),
             Expr::Neg(a) => self.value(a, cpu, scratch, read)?.wrapping_neg(),
+            Expr::SignTrip(a, shift) => sign_trip(self.value(a, cpu, scratch, read)?, shift),
         };
         scratch.values[id] = Some(value);
         Some(value)
@@ -2594,10 +2862,14 @@ impl Proof {
 
     fn based_offset(&self, id: ExprId) -> Option<i64> {
         match self.exprs[id] {
-            Expr::Register(EBP) => Some(0),
+            Expr::Register(base) if base == EBP || base == self.based => Some(0),
             Expr::Add(a, b) => match (self.exprs[a], self.exprs[b]) {
-                (Expr::Register(EBP), Expr::Constant(c))
-                | (Expr::Constant(c), Expr::Register(EBP)) => Some(i64::from(c as i32)),
+                (Expr::Register(base), Expr::Constant(c))
+                | (Expr::Constant(c), Expr::Register(base))
+                    if base == EBP || base == self.based =>
+                {
+                    Some(i64::from(c as i32))
+                }
                 _ => None,
             },
             _ => None,

@@ -36,6 +36,35 @@ pub(crate) fn branch(from: usize, to: usize) -> u32 {
     b((to as i64 - from as i64) as i32)
 }
 
+pub(crate) struct RowFeedback {
+    pub failures: [Cell<u64>; 6],
+    pub next: Cell<u32>,
+    pub target_next: Cell<u32>,
+}
+
+impl Default for RowFeedback {
+    fn default() -> Self {
+        Self {
+            failures: Default::default(),
+            next: Cell::new(32),
+            target_next: Cell::new(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RowPrice {
+    pub guard: u32,
+    pub saved: u32,
+    pub count_register: Option<u8>,
+}
+
+impl RowPrice {
+    pub(crate) fn minimum(self) -> u32 {
+        self.guard.div_ceil(self.saved)
+    }
+}
+
 /// Relocations in a lowered resident artifact, in words except link and site offsets.
 pub(crate) struct Layout<'a> {
     pub words: &'a mut [u32],
@@ -53,6 +82,17 @@ pub(crate) struct Layout<'a> {
     pub transitions: &'a [(usize, usize)],
     pub sites: &'a [(usize, super::super::Site)],
     pub marks: &'a [crate::jit_map::Mark],
+    pub split: Option<SplitPoint>,
+    pub row_price: Option<RowPrice>,
+    pub row_failures: &'a [(super::RowFailure, usize)],
+    pub counters: &'a [(u32, super::Counter, usize)],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SplitPoint {
+    pub sensor: usize,
+    pub threshold: usize,
+    pub leave: usize,
 }
 
 pub(crate) struct Targets {
@@ -61,6 +101,7 @@ pub(crate) struct Targets {
     pub tier1: usize,
     pub exit: usize,
     pub resident_exit: usize,
+    pub split: bool,
 }
 
 pub(crate) struct MissCounter {
@@ -81,6 +122,7 @@ pub(crate) struct Entry {
     pub tail: usize,
     pub environment: usize,
     pub probation: usize,
+    pub split: Option<usize>,
     pub miss_counter: Option<MissCounter>,
 }
 
@@ -195,6 +237,18 @@ pub(crate) fn emit(
     ]);
     asm.b(exit);
 
+    let split = targets.split.then(|| {
+        let at = at + asm.offset();
+        guest_exit(
+            &mut asm,
+            head,
+            Exit::Plan(PlanEvent::ResidentSplitOffer(version as u8)),
+        );
+        asm.emit(orr(X, r(0), r(0), r(7), Lsl, 32));
+        asm.b(exit);
+        at
+    });
+
     if version == 0 {
         asm.bind(sampled);
         observe(&mut asm, head, 0, runtime::RESIDENT_LINK_SAMPLE);
@@ -257,6 +311,7 @@ pub(crate) fn emit(
         tail,
         environment,
         probation,
+        split,
         miss_counter,
     }
 }
@@ -280,12 +335,181 @@ fn observe(asm: &mut Asm, head: u32, version: usize, kind: u16) {
     stubs::emit_restore_light(asm);
 }
 
+/// An active decision reads one owner-published limit. A settled sensor
+/// replaces the first word with a branch over the other two words.
+pub(crate) fn split_sensor(asm: &mut Asm, count: Reg, threshold: Label, accepted: Label) {
+    asm.ldr_literal(r(16), threshold);
+    asm.emit(sub(X, r(17), count, r(16), Lsl, 0));
+    asm.tbz(false, r(17), 63, accepted);
+}
+
 fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
     asm.emit_all(&[
         movz(W, r(0), exit.word(), 0),
         movz(W, r(1), head as u16, 0),
         movk(W, r(1), (head >> 16) as u16, 16),
     ]);
+}
+
+/// Read an ordinary invariant slot once and select its prepared case.
+pub(crate) fn row_entry(
+    head: u32,
+    (base, offset): (u8, u32),
+    cases: &[(u32, Option<usize>)],
+    (at, fallback, exit): (usize, usize, usize),
+    feedback: &RowFeedback,
+    minimum: Option<(u8, u32)>,
+    counters: Option<[u64; 2]>,
+) -> Vec<u32> {
+    let mut asm = Asm::new();
+    let safe = asm.label();
+    let search = asm.label();
+    let sample = asm.label();
+    let count = asm.label();
+    let poll = asm.label();
+    let bad = asm.label();
+    let failed = asm.label();
+    let mut destinations = Vec::new();
+    let short = minimum.map(|_| asm.label());
+    let counters = counters.map(|counters| counters.map(|address| (asm.label(), address)));
+    if let Some([(arrivals, _), _]) = counters {
+        increment_row_counter(&mut asm, arrivals);
+    }
+    if let Some((reg, minimum)) = minimum {
+        if minimum < 4096 {
+            asm.emit(sub_imm(W, r(0), r(19 + reg), minimum, false));
+        } else {
+            constant(&mut asm, r(0), u64::from(minimum));
+            asm.emit(sub(W, r(0), r(19 + reg), r(0), Lsl, 0));
+        }
+        asm.tbz(true, r(0), 31, short.unwrap());
+    }
+    asm.emit(mrs_nzcv(r(6)));
+    constant(&mut asm, r(7), u64::from(offset));
+    asm.emit_all(&[
+        add(W, r(7), r(19 + base), r(7), Lsl, 0),
+        mov(W, r(0), r(7)),
+        add_imm(X, r(1), r(0), 3, false),
+        lsr_imm(X, r(2), r(1), 32),
+    ]);
+    asm.cbz(X, true, r(2), bad);
+    crate::facts::batch_span(&mut asm, false, false, search, safe);
+    asm.b(bad);
+    asm.bind(safe);
+    asm.emit(add_ext(X, r(1), r(27), r(7), Extend::Uxtw, 0));
+    asm.emit(ldr(W, r(7), r(1), 0));
+    for &(value, target) in cases {
+        let selected = if let Some(target) = target {
+            let selected = asm.label();
+            destinations.push((selected, target));
+            selected
+        } else {
+            failed
+        };
+        constant(&mut asm, r(0), u64::from(value));
+        asm.emit(cmp(W, r(7), r(0), Lsl, 0));
+        asm.b_cond(Cond::Eq, selected);
+    }
+    asm.ldr_literal(r(0), count);
+    asm.emit_all(&[
+        ldr(X, r(1), r(0), 0),
+        add_imm(X, r(1), r(1), 1, false),
+        str(X, r(1), r(0), 0),
+    ]);
+    runtime::emit_sensor(&mut asm, poll, r(0), r(1), sample);
+    asm.b(failed);
+    asm.bind(sample);
+    asm.emit(msr_nzcv(r(6)));
+    guest_exit(&mut asm, head, Exit::Plan(PlanEvent::RowTargetMiss));
+    asm.emit(orr(X, r(0), r(0), r(7), Lsl, 32));
+    asm.emit(branch(at + asm.offset(), exit));
+    for (label, target) in destinations {
+        asm.bind(label);
+        asm.emit(msr_nzcv(r(6)));
+        asm.emit(branch(at + asm.offset(), target));
+    }
+    asm.bind(bad);
+    asm.emit(msr_nzcv(r(6)));
+    row_feedback(
+        &mut asm,
+        head,
+        super::RowFailure::Parameter,
+        (at, fallback, exit),
+        feedback,
+    );
+    asm.bind(failed);
+    asm.emit(msr_nzcv(r(6)));
+    asm.emit(branch(at + asm.offset(), fallback));
+    if let Some(short) = short {
+        asm.bind(short);
+        if let Some([_, (count, _)]) = counters {
+            increment_row_counter(&mut asm, count);
+        }
+        asm.emit(branch(at + asm.offset(), fallback));
+    }
+    crate::facts::batch_span_search(&mut asm, search, false);
+    literal(
+        &mut asm,
+        count,
+        feedback.failures[super::RowFailure::Target as usize].as_ptr() as u64,
+    );
+    literal(&mut asm, poll, feedback.target_next.as_ptr() as u64);
+    if let Some([(arrivals, arrival_address), (count, short_address)]) = counters {
+        literal(&mut asm, arrivals, arrival_address);
+        if short.is_some() {
+            literal(&mut asm, count, short_address);
+        }
+    }
+    asm.finish()
+}
+
+fn increment_row_counter(asm: &mut Asm, counter: Label) {
+    asm.ldr_literal(r(0), counter);
+    asm.emit_all(&[
+        ldr(X, r(1), r(0), 0),
+        add_imm(X, r(1), r(1), 1, false),
+        str(X, r(1), r(0), 0),
+    ]);
+}
+
+pub(crate) fn row_failure(
+    head: u32,
+    reason: super::RowFailure,
+    addresses: (usize, usize, usize),
+    feedback: &RowFeedback,
+) -> Vec<u32> {
+    let mut asm = Asm::new();
+    row_feedback(&mut asm, head, reason, addresses, feedback);
+    asm.finish()
+}
+
+fn row_feedback(
+    asm: &mut Asm,
+    head: u32,
+    reason: super::RowFailure,
+    (at, fallback, exit): (usize, usize, usize),
+    feedback: &RowFeedback,
+) {
+    let count = asm.label();
+    let poll = asm.label();
+    let sample = asm.label();
+    asm.ldr_literal(r(0), count);
+    asm.emit_all(&[
+        ldr(X, r(1), r(0), 0),
+        add_imm(X, r(1), r(1), 1, false),
+        str(X, r(1), r(0), 0),
+    ]);
+    runtime::emit_sensor(asm, poll, r(0), r(1), sample);
+    asm.emit(branch(at + asm.offset(), fallback));
+    asm.bind(sample);
+    guest_exit(asm, head, Exit::Plan(PlanEvent::RowGuardMiss));
+    asm.emit(branch(at + asm.offset(), exit));
+    literal(
+        asm,
+        count,
+        feedback.failures[reason as usize].as_ptr() as u64,
+    );
+    literal(asm, poll, feedback.next.as_ptr() as u64);
 }
 
 pub(crate) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
@@ -386,6 +610,26 @@ mod tests {
     use super::*;
     use crate::cache::CodeCache;
 
+    // spec: A64-OPT-8, A64-OPT-9
+    #[test]
+    fn short_row_router_skips_the_slot_in_three_words() {
+        let at = 0x8000;
+        let fallback = 0x9000;
+        let words = row_entry(
+            0,
+            (3, 4),
+            &[(0x1234, Some(at + 0x400)), (0x2345, None)],
+            (at, fallback, at + 0x800),
+            &RowFeedback::default(),
+            Some((2, 128)),
+            None,
+        );
+        assert_eq!(words[0], sub_imm(W, r(0), r(21), 128, false));
+        let short = ((words[1] >> 5) & 0x3fff) as usize * 4 + 4;
+        assert_eq!(words[1], tbz(true, r(0), 31, short as i32 - 4));
+        assert_eq!(words[short / 4], branch(at + short, fallback));
+    }
+
     // spec: A64A-PLACE-3
     #[test]
     fn split_offer_rearms_and_a_decided_sensor_executes_one_word() {
@@ -435,6 +679,23 @@ mod tests {
             assert_eq!(cache.word(at + index * 4), word);
         }
         assert_eq!((enter(), counter.get()), (0, 1));
+    }
+
+    // spec: A64A-PLACE-3, A64-OPT-9
+    #[test]
+    fn a_split_decline_reads_one_limit_and_preserves_nzcv() {
+        let mut asm = Asm::new();
+        let threshold = asm.label();
+        let accept = asm.label();
+        split_sensor(&mut asm, r(7), threshold, accept);
+        assert_eq!(asm.offset(), 12);
+        asm.bind(accept);
+        asm.bind(threshold);
+        asm.emit_all(&[0, 0]);
+        let words = asm.finish();
+        assert_eq!(words[1], sub(X, r(17), r(7), r(16), Lsl, 0));
+        assert_eq!(words[2], tbz(false, r(17), 63, 4));
+        assert_eq!(b(12), 0x14000003);
     }
 
     // spec: A64A-PLACE-3

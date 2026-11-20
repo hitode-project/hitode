@@ -40,6 +40,10 @@ impl Native {
             .is_some_and(|head| !head.versions.is_empty())
     }
 
+    pub(crate) fn wait_resident_builds(&mut self) {
+        self.install_optimized(true);
+    }
+
     pub(crate) fn tier1_versions(&self, eip: u32) -> usize {
         self.code
             .tier1_chain(eip)

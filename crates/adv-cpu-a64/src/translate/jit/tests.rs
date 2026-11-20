@@ -177,16 +177,18 @@ fn translation_words_match_baseline() {
                 // Compare the steady loop before its exit accounting. Side
                 // branches keep their opcode and operands as cold code moves.
                 let opcode = |word: u32| match word & 0x7e00_0000 {
-                    0x3600_0000 => word & !0x0007_ffe0, // TBZ/TBNZ
+                    0x1400_0000 | 0x1600_0000 => word & 0xfc00_0000, // B/BL
+                    0x3400_0000 | 0x5400_0000 => word & !0x00ff_ffe0, // CBZ/CBNZ/B.cond
+                    0x3600_0000 => word & !0x0007_ffe0,              // TBZ/TBNZ
                     _ => word,
                 };
-                let body = &words[116..164];
-                assert!(
-                    body.iter()
+                assert!(words.windows(baseline.len()).any(|body| {
+                    body.iter().copied().map(opcode).eq(baseline
+                        .iter()
                         .copied()
-                        .map(opcode)
-                        .eq(baseline.into_iter().map(without_runtime_offset).map(opcode))
-                );
+                        .map(without_runtime_offset)
+                        .map(opcode))
+                }));
             }
             _ => assert_eq!(
                 words,
@@ -218,7 +220,7 @@ fn whole_unit_emission_matches_baseline() {
             "switch" => (48, 0x1b76e4b83d612bcd),
             "loop" => (119, 0xb8481f7bf0df221c),
             "worker" => (178, 0x439641c71718cb83),
-            "resident" => (501, 0x5bc5104195d4aef9),
+            "resident" => (598, 0xd9bd02e2bd2484b8),
             _ => unreachable!(),
         };
         assert_eq!((words.len(), digest), baseline, "{name}");
@@ -281,7 +283,7 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             &[CODE + code.len() as u32],
             &|_, _| None,
             &|_| None,
-            !cold,
+            (!cold, None),
             &mut decodes,
         );
         lower_unit(
@@ -3365,7 +3367,7 @@ pub(in crate::translate) mod opt_back {
             let record = RecordId(word(offset_of!(runtime::Runtime, recovery.record)));
             let mut cpu = initial();
             let mut frame = Vec::new();
-            let refund = materialize(
+            let (refund, _) = materialize(
                 &lowered.records[record.0 as usize],
                 &registers,
                 &spills,

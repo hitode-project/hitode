@@ -23,6 +23,7 @@ const MM: u32 = 16;
 const FLAGS: u32 = 24;
 /// TOP and the tag word, which every MMX instruction but EMMS sets.
 const ENV: u64 = 1 << 31;
+const JOIN_MMX: u64 = (0xff << MM) | ENV;
 const FLAG_BITS: [u32; 7] = [
     RflagsBits::OF,
     RflagsBits::SF,
@@ -155,6 +156,12 @@ fn any(a: &Set, b: &Set, without: &Set) -> bool {
         .any(|((a, b), c)| a & b & !c != 0)
 }
 
+pub(super) struct Independence {
+    pub frame: Option<(i32, i32)>,
+    pub mmx: u16,
+    pub latch: (usize, bool),
+}
+
 /// The frame span `[lo, hi)` the head loop of `trace` writes, relative to
 /// ESP at its head, or `Some(None)` if it writes none, when its iterations
 /// carry only the `affine` registers and the affine dword `slots`, and leave
@@ -166,8 +173,9 @@ pub(super) fn independent(
     slots: &[(i32, bool)],
     divisions: &[Option<Division>],
     instructions: &[Option<Arc<Summary>>],
-) -> Option<Option<(i32, i32)>> {
-    let graph = Graph::build(trace).ok()?;
+    scoped: bool,
+) -> Option<Independence> {
+    let graph = Graph::build_selected(trace, scoped).ok()?;
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
     let mut decoded_at: Vec<Option<Decoded>> = (0..n).map(|_| None).collect();
@@ -184,7 +192,9 @@ pub(super) fn independent(
             Next::Dynamic => return None,
         };
         // A side exit would let a later block run past it.
-        if inst.mode != Mode::Plain
+        let inline_return =
+            scoped && matches!(inst.mode, Mode::Inline(_)) && matches!(inst.op, Op::Ret(0));
+        if (inst.mode != Mode::Plain && !inline_return)
             || !inside(next)
             || !inside(inst.taken)
             || matches!(inst.op, Op::Integer(Integer::Divide(..)) if divisions[at].is_none())
@@ -271,7 +281,7 @@ pub(super) fn independent(
     }
     let frame_written = written[1..].iter().any(|&w| w != 0);
     // The last block runs the tail on its private frame too.
-    if frame_written {
+    if frame_written && !scoped {
         for at in (0..n).filter(|&at| !lp.inside[at]) {
             instructions[at].as_ref()?.stack?;
         }
@@ -280,6 +290,20 @@ pub(super) fn independent(
     let invariant: Set = written.iter().zip(&steady).map(|(w, s)| !w | s).collect();
     let uniform = uniform(&graph, lp, &uses, &invariant);
     let k = uniform.len().min(UNIFORM);
+    // EMMS changes tags without writing TOP. Keep both under the ordinary
+    // proof when an iteration can clear tags.
+    let mergeable = if scoped
+        && (0..n).filter(|&at| lp.inside[at]).all(|at| {
+            instructions[at]
+                .as_ref()
+                .and_then(|inst| inst.carried)
+                .is_some_and(|state| !state.emms)
+        }) {
+        JOIN_MMX
+    } else {
+        0
+    };
+    let mut conditional = 0;
     // Every iteration of a run takes a uniform branch the same way, so
     // each choice of their directions is checked on its own.
     for choice in 0..1u32 << k {
@@ -289,11 +313,14 @@ pub(super) fn independent(
                 .position(|&u| u == at)
                 .is_none_or(|i| choice >> i & 1 == edge as u32)
         };
-        if !private(&graph, lp, &uses, &carried, follows) {
-            return None;
-        }
+        conditional |= private(&graph, lp, &uses, &carried, mergeable, follows)?;
     }
-    Some(frame_written.then_some((lo, hi)))
+    let mmx = ((conditional >> MM) as u16 & 0xff) | (u16::from(conditional & ENV != 0) << 8);
+    Some(Independence {
+        frame: frame_written.then_some((lo, hi)),
+        mmx,
+        latch: (lp.test, lp.taken),
+    })
 }
 
 /// The most uniform branches whose directions are checked separately.
@@ -389,8 +416,9 @@ fn private(
     lp: &Loop,
     uses: &[Use],
     carried: &Set,
+    mergeable: u64,
     follows: impl Fn(usize, usize) -> bool,
-) -> bool {
+) -> Option<u64> {
     let n = uses.len();
     let words = carried.len();
     let mut reached = vec![false; n];
@@ -435,7 +463,7 @@ fn private(
                     })
             };
             if any(&uses[at].reads, &exchanged, &before) {
-                return false;
+                return None;
             }
             let after: Set = before
                 .iter()
@@ -448,6 +476,15 @@ fn private(
             }
         }
     }
-    let all = vec![u64::MAX; words];
-    !reached[lp.test] || !any(&exchanged, &all, &defined[lp.test])
+    if !reached[lp.test] {
+        return Some(0);
+    }
+    let exit = &defined[lp.test];
+    let missing = exchanged[0] & !exit[0];
+    (missing & !mergeable == 0
+        && exchanged[1..]
+            .iter()
+            .zip(&exit[1..])
+            .all(|(w, d)| w & !d == 0))
+    .then_some(missing)
 }

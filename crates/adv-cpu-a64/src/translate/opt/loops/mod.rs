@@ -18,6 +18,7 @@ pub(super) enum Reject {
     Address,
     Access,
     Kernel,
+    Cost,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub(super) struct Trip {
     pub stride: i32,
     /// The condition that takes the back edge.
     pub again: Cc,
+    pub sign: bool,
 }
 
 impl Trip {
@@ -89,6 +91,7 @@ impl Stream {
 /// The blocks are in topological order inside the iteration.
 pub(super) struct Loop {
     pub head: Block,
+    pub eip: u32,
     pub latch: Block,
     pub latch_taken: bool,
     pub blocks: Vec<Block>,
@@ -103,6 +106,23 @@ pub(super) struct Loop {
 }
 
 impl Loop {
+    fn covering_read(&self, narrow: Stream) -> Option<(Value, u32)> {
+        if narrow.width != 4 || narrow.write() || narrow.stride == 0 {
+            return None;
+        }
+        self.streams.iter().find_map(|wide| {
+            let Access::Load(value) = wide.access else {
+                return None;
+            };
+            let offset = narrow.addr.offset.wrapping_sub(wide.addr.offset);
+            (wide.width == 8
+                && wide.stride == narrow.stride
+                && wide.addr.base == narrow.addr.base
+                && matches!(offset, 0 | 4))
+            .then(|| (value, offset * 8))
+        })
+    }
+
     fn groups(&self) -> Vec<Vec<(usize, Stream)>> {
         let mut groups: Vec<Vec<(usize, Stream)>> = Vec::new();
         for (i, &s) in self.streams.iter().enumerate() {
@@ -324,24 +344,50 @@ fn classify(
     else {
         return Err(Reject::Latch);
     };
-    let (mut value, mut bound) = match kind {
-        FlagKind::Sub => (defs.affine(a), Some(b)),
-        FlagKind::Increment | FlagKind::Decrement if matches!(cond, Cc::e | Cc::ne) => {
-            let offset = if kind == FlagKind::Increment {
-                1
-            } else {
-                u32::MAX
-            };
-            (defs.affine(a).shifted(offset), None)
+    let sign = matches!(cond, Cc::s | Cc::ns);
+    let (mut value, mut bound) = if sign {
+        if !func.resident {
+            return Err(Reject::Latch);
         }
-        FlagKind::Logic if matches!(cond, Cc::e | Cc::ne | Cc::l | Cc::le | Cc::g | Cc::ge) => {
-            (defs.affine(a), None)
+        cond = if cond == Cc::s { Cc::l } else { Cc::ge };
+        // SF describes the wrapped result. Ordered comparisons of the
+        // operands would instead include the subtraction's overflow bit.
+        let value = match kind {
+            FlagKind::Sub | FlagKind::Add => {
+                let rhs = defs.constant(b).ok_or(Reject::Latch)? as u32;
+                let offset = if kind == FlagKind::Sub {
+                    rhs.wrapping_neg()
+                } else {
+                    rhs
+                };
+                defs.affine(a).shifted(offset)
+            }
+            FlagKind::Increment => defs.affine(a).shifted(1),
+            FlagKind::Decrement => defs.affine(a).shifted(u32::MAX),
+            FlagKind::Logic => defs.affine(a),
+            _ => return Err(Reject::Latch),
+        };
+        (value, None)
+    } else {
+        match kind {
+            FlagKind::Sub => (defs.affine(a), Some(b)),
+            FlagKind::Increment | FlagKind::Decrement if matches!(cond, Cc::e | Cc::ne) => {
+                let offset = if kind == FlagKind::Increment {
+                    1
+                } else {
+                    u32::MAX
+                };
+                (defs.affine(a).shifted(offset), None)
+            }
+            FlagKind::Logic if matches!(cond, Cc::e | Cc::ne | Cc::l | Cc::le | Cc::g | Cc::ge) => {
+                (defs.affine(a), None)
+            }
+            FlagKind::Add if matches!(cond, Cc::e | Cc::ne) => {
+                let n = defs.constant(b).ok_or(Reject::Latch)? as u32;
+                (defs.affine(a).shifted(n), None)
+            }
+            _ => return Err(Reject::Latch),
         }
-        FlagKind::Add if matches!(cond, Cc::e | Cc::ne) => {
-            let n = defs.constant(b).ok_or(Reject::Latch)? as u32;
-            (defs.affine(a).shifted(n), None)
-        }
-        _ => return Err(Reject::Latch),
     };
     if stride(value.base).is_none()
         && let Some(rhs) = bound
@@ -357,16 +403,21 @@ fn classify(
         bound,
         stride: stride(value.base).ok_or(Reject::Induction)?,
         again: cond,
+        sign,
     };
 
     let mut streams = Vec::new();
     for &b in &blocks {
         for &(result, op) in &func.blocks[b.0 as usize].insts {
             let (addr, width, access) = match op {
-                Op::Load { checked: true, .. }
-                | Op::Store { checked: true, .. }
-                | Op::Load { clock: true, .. }
-                | Op::FrameStore { .. } => return Err(Reject::Access),
+                Op::Load { clock: true, .. } | Op::FrameStore { .. } => {
+                    return Err(Reject::Access);
+                }
+                Op::Load { checked: true, .. } | Op::Store { checked: true, .. }
+                    if !func.resident =>
+                {
+                    return Err(Reject::Access);
+                }
                 Op::Load { addr, width, .. } => (addr, width, Access::Load(result.unwrap())),
                 Op::Store {
                     addr, width, value, ..
@@ -376,7 +427,15 @@ fn classify(
             let addr = defs.affine(addr);
             streams.push(Stream {
                 addr,
-                stride: stride(addr.base).ok_or(Reject::Address)?,
+                stride: stride(addr.base)
+                    .or_else(|| {
+                        (func.resident
+                            && matches!(access, Access::Load(_))
+                            && (defs.invariant(&blocks, addr.base)
+                                || carried.contains(&(addr.base, addr.base))))
+                        .then_some(0)
+                    })
+                    .ok_or(Reject::Address)?,
                 width,
                 access,
             });
@@ -384,6 +443,7 @@ fn classify(
     }
     Ok(Loop {
         head: Block(head as u32),
+        eip: func.records[func.blocks[edge.block.0 as usize].head.unwrap().record.0 as usize].eip,
         latch: Block(latch as u32),
         latch_taken,
         blocks,
@@ -408,6 +468,8 @@ pub(super) fn invert(cc: Cc) -> Option<Cc> {
         Cc::ge => Cc::l,
         Cc::le => Cc::g,
         Cc::g => Cc::le,
+        Cc::s => Cc::ns,
+        Cc::ns => Cc::s,
         _ => return None,
     })
 }
@@ -441,6 +503,7 @@ pub(super) struct Plan {
     pub name: &'static str,
     pub lanes: u8,
     pub inputs: Vec<Value>,
+    pub conditional: bool,
     pub body: Box<dyn BatchBody>,
 }
 
@@ -471,6 +534,12 @@ pub(super) struct Batch {
 }
 
 impl Batch {
+    pub fn priced(&self) -> bool {
+        self.plan.conditional
+            || self.loop_.trip.sign
+            || self.loop_.streams.iter().any(|s| s.stride == 0)
+    }
+
     pub fn inputs(&self) -> impl Iterator<Item = Value> + '_ {
         self.loop_
             .ivs
@@ -478,20 +547,46 @@ impl Batch {
             .map(|iv| iv.base)
             .chain(self.recovery.iter().map(|(_, a)| a.base))
             .chain(self.loop_.trip.bound)
+            .chain(
+                self.spans
+                    .iter()
+                    .filter(|s| s.step == 0)
+                    .map(|s| s.start.base),
+            )
             .chain(self.frame.iter().map(|f| f.start.base))
             .chain(self.plan.inputs.iter().copied())
     }
 
     fn new(func: &Func, loop_: Loop, plan: Plan) -> Option<Self> {
-        let groups = loop_.groups();
-        let backwards = groups.first().is_some_and(|g| g[0].1.stride < 0);
+        let mut groups = loop_.groups();
+        if plan.conditional {
+            let mut stores = Vec::new();
+            groups.retain(|group| {
+                let stream = group[0].1;
+                if !stream.write() {
+                    return !group.iter().all(|&(_, s)| loop_.covering_read(s).is_some());
+                }
+                let range = (stream.addr, stream.stride, stream.width);
+                if stores.contains(&range) {
+                    return false;
+                }
+                stores.push(range);
+                true
+            });
+        }
+        let backwards = groups
+            .iter()
+            .map(|g| g[0].1.stride)
+            .find(|&stride| stride != 0)
+            .is_some_and(|stride| stride < 0);
         let spans = groups
             .iter()
             .map(|group| {
                 let (_, s) = group[0];
                 let width = u32::from(s.width) * group.len() as u32;
                 let stride = s.stride.unsigned_abs();
-                if (s.stride < 0) != backwards || !func.resident && width != stride {
+                if stride != 0 && ((s.stride < 0) != backwards || !func.resident && width != stride)
+                {
                     return None;
                 }
                 Some(Span {
@@ -513,14 +608,19 @@ impl Batch {
                 } else {
                     (group, other)
                 };
-                let in_place = reads.len() == writes.len()
-                    && reads.iter().zip(writes).all(|(&(r, read), &(w, write))| {
-                        !read.write()
-                            && r < w
-                            && read.stride == write.stride
-                            && read.width == write.width
-                            && u32::from(read.width) <= read.stride.unsigned_abs()
-                    });
+                let in_place = plan.conditional
+                    && !reads[0].1.write()
+                    && reads[0].1.stride != 0
+                    && spans[a].step == spans[b].step
+                    && spans[a].width == spans[b].width
+                    || reads.len() == writes.len()
+                        && reads.iter().zip(writes).all(|(&(r, read), &(w, write))| {
+                            !read.write()
+                                && r < w
+                                && read.stride == write.stride
+                                && read.width == write.width
+                                && u32::from(read.width) <= read.stride.unsigned_abs()
+                        });
                 if !in_place || spans[a].start != spans[b].start {
                     alias.push((a, b, in_place));
                 }
@@ -615,15 +715,7 @@ pub(super) fn plan(func: &Func, kernels: &[&dyn LoopKernel]) -> Vec<Batch> {
                 .ok_or(Reject::Kernel)
         });
         match batch {
-            Ok(batch) => {
-                crate::jit_map::vectorized(
-                    head,
-                    batch.plan.name,
-                    batch.plan.lanes,
-                    batch.loop_.streams.len(),
-                );
-                batches.push(batch);
-            }
+            Ok(batch) => batches.push(batch),
             Err(reason) => crate::jit_map::loop_reject(head, format_args!("{reason:?}")),
         }
     }

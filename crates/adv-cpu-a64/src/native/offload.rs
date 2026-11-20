@@ -17,11 +17,12 @@ use rustc_hash::FxHashMap;
 
 use super::plan::{Arbiter, JobPlan, REOFFER};
 use super::store::{self, ACTIVE, Active, FaultCapture, WorkerCode, WorkerFaults, site_at};
+use crate::runtime::SCOPE_CELLS;
 use crate::runtime::{
     COMPUTATION_SLICE, Enter, ExecutionContext, Exit, Runtime, alias_base, record_branch,
 };
 use crate::translate::opt::Assumed;
-use crate::translate::opt::computation::{Evaluation, Plan, Proof, Range};
+use crate::translate::opt::computation::{Evaluation, Plan, Proof, Range, ScopeCell};
 use crate::translate::opt::recovery;
 use crate::translate::opt::recovery::{FlagRecipe, Host, Record};
 use crate::translate::opt::{back::Lowered, front::Built, ir::Source};
@@ -55,6 +56,8 @@ pub(super) struct WorkerJob<U> {
 #[derive(Clone)]
 pub(super) struct Code {
     pub placed: WorkerCode,
+    pub frame: Arc<[ScopeCell]>,
+    pub scoped_mmx: u16,
     /// The optimized form, run instead when a job meets its assumptions.
     pub optimized: Option<Arc<Optimized>>,
 }
@@ -185,6 +188,9 @@ fn run(
     runtime.computation_pending_mask = signals.pending.1;
     runtime.head_exit = head_exit;
     runtime.deferred = 0;
+    if code.scoped_mmx != 0 {
+        runtime.scope_written = 0;
+    }
     let started = Instant::now();
     let cpu = context.cpu_mut();
     cpu.settle_flags();
@@ -248,6 +254,7 @@ fn execute(
 ) -> (Exit, u64, bool) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
+    let scoped_mmx = code.scoped_mmx;
     let code = optimized.map_or(&code.placed, |o| &o.code);
     if let Some(o) = optimized {
         if scratch.saved.len() < o.cells {
@@ -300,7 +307,7 @@ fn execute(
         let recovery = &runtime.recovery;
         let record = &o.records[recovery.record as usize];
         // SAFETY: as above, the frame lies in the leased ranges.
-        let refund = recovery::materialize(
+        let (refund, mmx_meta) = recovery::materialize(
             record,
             &recovery.dump,
             &scratch.saved,
@@ -312,6 +319,9 @@ fn execute(
             },
         );
         retired = retired.wrapping_sub(u64::from(refund));
+        if scoped_mmx != 0 {
+            runtime.scope_written = (mmx_meta & 0xff) | (u32::from(mmx_meta & 0x700 != 0) << 8);
+        }
         // Every exit but a recall, failures included, continues where the
         // owner dispatches.
         exit = if recovery.recalled != 0 {
@@ -336,6 +346,7 @@ fn execute(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SplitCounts {
     pub splits: u64,
+    pub scoped: u64,
     pub blocks: u64,
     pub wakes: u64,
     /// Helpers that found no block left to claim.
@@ -366,6 +377,7 @@ struct Blocks {
     code: Code,
     signals: Signals,
     submitted: Instant,
+    scoped: bool,
 }
 
 #[derive(Default)]
@@ -378,7 +390,65 @@ struct Drained {
     /// From submission to its first claim.
     claimed_after: Duration,
     /// The last block's completion and its thread.
-    last: Option<(Completion<Option<ExecutionContext>>, u32)>,
+    last: Option<LastBlock>,
+    mmx: MmxJoin,
+}
+
+/// The last block that actually wrote each omitted MMX component.
+#[derive(Default)]
+struct MmxJoin {
+    slots: [Option<(u32, adv_cpu_core::X87Register)>; 8],
+    env: Option<(u32, (u8, u16))>,
+}
+
+impl MmxJoin {
+    fn record(&mut self, index: u32, mask: u16, cpu: &CpuState) {
+        for (i, value) in self.slots.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                *value = Some((index, cpu.x87.regs[i]));
+            }
+        }
+        if mask & (1 << 8) != 0 {
+            self.env = Some((index, (cpu.x87.top() as u8, cpu.x87.tag)));
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        fn latest<T>(at: &mut Option<(u32, T)>, next: Option<(u32, T)>) {
+            if let Some((index, _)) = next
+                && at.as_ref().is_none_or(|&(first, _)| first < index)
+            {
+                *at = next;
+            }
+        }
+        for (at, next) in self.slots.iter_mut().zip(other.slots) {
+            latest(at, next);
+        }
+        latest(&mut self.env, other.env);
+    }
+
+    fn publish(self, mask: u16, start: &CpuState, cpu: &mut CpuState) {
+        for (i, value) in self.slots.into_iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                cpu.x87.regs[i] = value.map_or(start.x87.regs[i], |(_, value)| value);
+            }
+        }
+        if mask & (1 << 8) != 0 {
+            let (top, tag) = self
+                .env
+                .map_or((start.x87.top() as u8, start.x87.tag), |(_, env)| env);
+            cpu.x87.set_top(usize::from(top));
+            cpu.x87.tag = tag;
+        }
+        cpu.refresh_mmx();
+    }
+}
+
+struct LastBlock {
+    index: u32,
+    done: Completion<Option<ExecutionContext>>,
+    thread: u32,
+    frame: [u32; SCOPE_CELLS],
 }
 
 pub(super) const ESP: usize = 4;
@@ -498,8 +568,20 @@ impl Blocks {
             out.retired += done.retired;
             out.optimized += done.optimized;
             out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
-            if last {
-                out.last = Some((done, thread));
+            if self.code.scoped_mmx != 0 {
+                out.mmx.record(
+                    index,
+                    self.code.scoped_mmx & runtime.scope_written as u16,
+                    cpu,
+                );
+            }
+            if last || self.scoped {
+                out.last = Some(LastBlock {
+                    index,
+                    done,
+                    thread,
+                    frame: runtime.scope_frame,
+                });
             }
         }
         out.elapsed = started.elapsed();
@@ -689,6 +771,16 @@ impl Admission {
         self.sites.clear();
     }
 
+    fn recheck(&mut self, eip: u32, memory: &Memory, active: &[ActiveTask]) -> bool {
+        self.sync_generation(memory);
+        self.sites[&eip].evaluation.admitted().iter().all(|range| {
+            !conflicts(range, active)
+                && self
+                    .grants
+                    .allows(memory, range.start, range.end, range.write)
+        })
+    }
+
     fn sync_generation(&mut self, memory: &Memory) {
         let generation = (memory.identity(), memory.map_generation());
         if self.generation != generation {
@@ -852,6 +944,7 @@ pub(super) struct Session<'a, U> {
     runtime: Runtime,
     pace: Option<Pace>,
     counts: &'a mut SplitCounts,
+    scope_updates: Vec<u32>,
 }
 
 impl<'a, U> Session<'a, U> {
@@ -886,7 +979,12 @@ impl<'a, U> Session<'a, U> {
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
             pace,
             counts,
+            scope_updates: Vec::new(),
         })
+    }
+
+    pub(super) fn take_scope_updates(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.scope_updates)
     }
 
     fn prepare(&mut self, id: u32, context: &ExecutionContext) -> Option<(&Code, &[Range], bool)> {
@@ -923,10 +1021,7 @@ impl<'a, U> Session<'a, U> {
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
         let counts = &*self.counts;
-        let wake = match counts.wakes - counts.idle_wakes {
-            0 => WAKE_NS,
-            claimed => counts.claim_ns as f64 / claimed as f64,
-        };
+        let wake = wake_cost(counts);
         let need = pace.need(serial as u64) as f64;
         let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
         if helpers == 0 {
@@ -955,8 +1050,13 @@ impl<'a, U> Session<'a, U> {
             }
         }
         let started = Instant::now();
+        let eip = context.cpu().eip;
+        let scoped = self.plans.job(eip).unwrap().scoped;
         let mut start = context.clone();
         start.cpu_mut().settle_flags();
+        if code.scoped_mmx != 0 {
+            start.cpu_mut().refresh_mmx();
+        }
         let blocks = Arc::new(Blocks {
             next: AtomicU32::new(0),
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -969,14 +1069,26 @@ impl<'a, U> Session<'a, U> {
             code: code.clone(),
             signals: self.signals.clone(),
             submitted: started,
+            scoped,
         });
         let (send, recv) = sync_channel(helpers);
         let submitted = (0..helpers)
-            .take_while(|_| self.pool.submit(Job::Blocks(blocks.clone(), send.clone())))
+            .take_while(|_| {
+                (!scoped || self.admission.recheck(eip, self.memory, &self.active))
+                    && self.pool.submit(Job::Blocks(blocks.clone(), send.clone()))
+            })
             .count();
+        if scoped && submitted == 0 {
+            return None;
+        }
         let mut total = blocks.drain(&mut self.runtime, &mut ExecuteScratch::default());
         let mut helped = Duration::ZERO;
         self.counts.splits += 1;
+        self.counts.scoped += u64::from(scoped);
+        if scoped {
+            let job = self.plans.job(eip).unwrap();
+            job.scope_splits.set(job.scope_splits.get() + 1);
+        }
         self.counts.wakes += submitted as u64;
         for _ in 0..submitted {
             let drained = recv.recv().expect("block helper");
@@ -989,7 +1101,15 @@ impl<'a, U> Session<'a, U> {
             total.retired += drained.retired;
             total.optimized += drained.optimized;
             total.sticky |= drained.sticky;
-            total.last = total.last.or(drained.last);
+            total.mmx.merge(drained.mmx);
+            if let Some(last) = drained.last
+                && total
+                    .last
+                    .as_ref()
+                    .is_none_or(|previous| previous.index < last.index)
+            {
+                total.last = Some(last);
+            }
             helped += drained.elapsed;
         }
         // A recall stops claims: the completed prefix returns at the head.
@@ -1000,7 +1120,15 @@ impl<'a, U> Session<'a, U> {
             claimed * size
         };
         let (mut completion, last) = match total.last.take() {
-            Some((done, thread)) => (done, Some(thread)),
+            Some(last) => {
+                publish_frame(
+                    &blocks.code.frame,
+                    &last.frame,
+                    blocks.start.cpu(),
+                    self.entry.alias,
+                );
+                (last.done, Some(last.thread))
+            }
             None => (
                 Completion {
                     id,
@@ -1019,6 +1147,13 @@ impl<'a, U> Session<'a, U> {
             last,
             iterations,
         );
+        if code.scoped_mmx != 0 {
+            total.mmx.publish(
+                code.scoped_mmx,
+                blocks.start.cpu(),
+                completion.context.as_mut().unwrap().cpu_mut(),
+            );
+        }
         self.counts.blocks += u64::from(total.blocks);
         completion.id = id;
         completion.retired = total.retired;
@@ -1030,6 +1165,7 @@ impl<'a, U> Session<'a, U> {
             self.plans.job(context.cpu().eip).unwrap(),
             &completion,
             iterations,
+            wake_cost(self.counts),
         );
         Some(completion)
     }
@@ -1071,6 +1207,14 @@ impl<'a, U> Session<'a, U> {
     }
 }
 
+fn publish_frame(cells: &[ScopeCell], values: &[u32; SCOPE_CELLS], start: &CpuState, alias: u64) {
+    for (&ScopeCell { base, offset }, &value) in cells.iter().zip(values) {
+        let address = start.regs[usize::from(base)].wrapping_add_signed(offset);
+        // SAFETY: the owner still holds the write lease on this dword.
+        unsafe { (alias.wrapping_add(u64::from(address)) as *mut u32).write_unaligned(value) };
+    }
+}
+
 /// The fewest helpers whose blocks cut `serial` ns by `need` ns, or all
 /// that are worth waking, given the `wake` latency and the most a `slice`
 /// block takes. One is worth waking only if its part of the loop exceeds
@@ -1090,15 +1234,32 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
         .unwrap_or(most)
 }
 
+fn wake_cost(counts: &SplitCounts) -> f64 {
+    match counts.wakes - counts.idle_wakes {
+        0 => WAKE_NS,
+        claimed => (counts.claim_ns as f64 / claimed as f64).max(1.0),
+    }
+}
+
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
-fn learn(prepared: &JobPlan, done: &Completion<Option<ExecutionContext>>, iterations: u32) {
+fn learn(
+    prepared: &JobPlan,
+    done: &Completion<Option<ExecutionContext>>,
+    iterations: u32,
+    wake: f64,
+) {
     if iterations == 0 || done.requires_owner {
         return;
     }
     let n = u64::from(iterations);
     let ns = (done.elapsed + done.helpers).as_nanos() as f64;
     prepared.set_cost(ns as u64);
+    if prepared.scoped && ns > 0.0 {
+        prepared
+            .split_minimum
+            .set((9.0 * wake * n as f64 / ns).ceil().max(2.0) as u64);
+    }
     prepared
         .per_iteration
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
@@ -1110,7 +1271,9 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             return false;
         };
         let guest_entry = context.cpu().eip;
-        if self.active.len() == self.pool.limit {
+        if self.plans.job(guest_entry).is_some_and(|job| job.scoped)
+            || self.active.len() == self.pool.limit
+        {
             return false;
         }
         let mut grant = self.admission.spare.pop().unwrap_or_default();
@@ -1160,6 +1323,10 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
         } else {
             None
         };
+        let scoped = self.plans.job(guest_entry).unwrap().scoped;
+        if scoped {
+            self.scope_updates.push(guest_entry);
+        }
         if let Some(plan) = plan
             && let Some(pace) = self.pace
             && let Some(per_iteration) = self.plans.job(guest_entry).unwrap().per_iteration.get()
@@ -1172,21 +1339,42 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             };
             return Some(self.account(guest_entry, false, done));
         }
+        let job = self.plans.job(guest_entry).unwrap();
+        if scoped && (plan.is_none() || job.per_iteration.get().is_some()) {
+            return None;
+        }
         let mut scratch = ExecuteScratch::default();
+        let quiet = Signals {
+            recall: self.signals.recall.clone(),
+            pending: (self.signals.pending.0.clone(), 0),
+        };
+        let signals = if code.frame.is_empty() {
+            (&self.signals, LOCAL)
+        } else {
+            (&quiet, 0)
+        };
         let done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
-            (&code, u32::from(iteration)),
-            (&self.signals, LOCAL),
+            (&code, u32::from(iteration || scoped)),
+            signals,
             &mut scratch,
         );
+        if !code.frame.is_empty() {
+            publish_frame(
+                &code.frame,
+                &self.runtime.scope_frame,
+                context.cpu(),
+                self.entry.alias,
+            );
+        }
         if let Some(plan) = plan
             && !done.completion.requires_owner
         {
             let eip = done.completion.context.as_ref().unwrap().cpu().eip;
-            let iterations = match (eip == guest_entry, iteration) {
+            let iterations = match (eip == guest_entry, iteration || scoped) {
                 (false, _) => plan.iterations,
                 (true, true) => 1,
                 (true, false) => 0,
@@ -1195,6 +1383,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
                 self.plans.job(guest_entry).unwrap(),
                 &done.completion,
                 iterations,
+                wake_cost(self.counts),
             );
         }
         Some(self.account(guest_entry, iteration, done))
@@ -1419,6 +1608,284 @@ mod tests {
         assert!(!native.worker_jobs.contains_key(&head));
     }
 
+    // spec: A64-OPT-9, A64-TR-9
+    #[test]
+    fn scoped_rows_split_under_the_lease_and_match_serial() {
+        scoped_split(false, false, false);
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn scoped_rows_use_host_frame_cells_and_preserve_guest_bytes() {
+        scoped_split(true, false, false);
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn scoped_rows_join_the_latest_actual_mmx_writers_before_the_tail() {
+        scoped_split(true, true, false);
+        scoped_split(true, true, true);
+    }
+
+    fn scoped_split(frame: bool, conditional_mmx: bool, raw: bool) {
+        let _pool = exclusive_pool();
+        const ROWS: u32 = 128;
+        const WIDTH: u32 = 8;
+        const FRAME_PAGE: u32 = 0x8_0000;
+        let original_frame = [0xa6; 0x4000];
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut row = a.create_label();
+        a.set_label(&mut row).unwrap();
+        let mut callee = a.create_label();
+        if frame {
+            a.mov(dword_ptr(esp + 8), esi).unwrap();
+            a.mov(esi, dword_ptr(esp + 8)).unwrap();
+            a.mov(dword_ptr(ebx + 4), esi).unwrap();
+            a.call(callee).unwrap();
+        }
+        if conditional_mmx {
+            let mut skip = a.create_label();
+            a.cmp(edx, ROWS / 2).unwrap();
+            a.jbe(skip).unwrap();
+            a.movq(mm1, qword_ptr(esi)).unwrap();
+            a.set_label(&mut skip).unwrap();
+        }
+        let step = if conditional_mmx { 16 } else { 8 };
+        a.mov(ecx, WIDTH).unwrap();
+        let mut pixel = a.create_label();
+        a.set_label(&mut pixel).unwrap();
+        if conditional_mmx {
+            a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+            a.por(xmm0, xmm7).unwrap();
+            a.movdqu(xmmword_ptr(edi), xmm0).unwrap();
+        } else {
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.por(mm0, mm7).unwrap();
+            a.movntq(qword_ptr(edi), mm0).unwrap();
+        }
+        a.add(esi, step).unwrap();
+        a.add(edi, step).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(pixel).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(row).unwrap();
+        if conditional_mmx {
+            a.movd(eax, mm1).unwrap();
+        }
+        if frame {
+            let mut done = a.create_label();
+            a.jmp(done).unwrap();
+            a.set_label(&mut callee).unwrap();
+            a.mov(esi, dword_ptr(ebx + 4)).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut done).unwrap();
+        }
+        a.int3().unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let head = CODE + 1;
+        let len = (ROWS * WIDTH * step as u32) as usize;
+        let input: Vec<u8> = (0..len as u32).map(|n| n.wrapping_mul(37) as u8).collect();
+        {
+            let memory = executor.memory_mut();
+            memory
+                .map(INPUT, len.next_multiple_of(0x4000), READ | WRITE)
+                .unwrap();
+            memory
+                .map(OUTPUT, len.next_multiple_of(0x4000), READ | WRITE)
+                .unwrap();
+            memory.write(INPUT, &input).unwrap();
+            if frame {
+                memory
+                    .map(FRAME_PAGE, original_frame.len(), READ | WRITE)
+                    .unwrap();
+                memory.write(FRAME_PAGE, &original_frame).unwrap();
+            }
+        }
+        let mut cpu = CpuState {
+            eip: head,
+            regs: [
+                0,
+                0,
+                ROWS,
+                FRAME_PAGE + 0x200,
+                FRAME_PAGE + 0x100,
+                0,
+                INPUT,
+                OUTPUT,
+            ],
+            ..CpuState::default()
+        };
+        cpu.mmx[7] = 0xff00_0000_ff00_0000;
+        if conditional_mmx {
+            cpu.x87.set_top(3);
+        }
+        executor.memory_mut().attach().unwrap();
+        native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                0,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        assert!(native.force_resident_at(executor.memory_mut(), cpu.clone()));
+        let code = &mut native.worker_jobs.get_mut(&head).unwrap().code;
+        if conditional_mmx {
+            assert_eq!(code.scoped_mmx, (1 << 1) | (1 << 8));
+            if raw {
+                code.optimized = None;
+            } else {
+                assert!(code.optimized.is_some());
+            }
+        }
+        let job = native.plans.job(head).expect("scoped worker artifact");
+        assert!(job.scoped);
+        assert_eq!(
+            native.worker_jobs[&head].code.frame.len(),
+            usize::from(frame) * 3
+        );
+        job.per_iteration
+            .set(Some((u64::from(WIDTH) * 7 + 3, 20_000.0)));
+        native.pace.set(Some(Pace::default()));
+        native.set_computation_offer(true, None);
+        let start = cpu.clone();
+        let first = native
+            .run(
+                &mut cpu,
+                executor.memory_mut(),
+                stop,
+                1 << 16,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.exit, Exit::Computation);
+        let context = Some(ExecutionContext {
+            cpu,
+            offered: None,
+            resume: None,
+            fuel_debt: 0,
+        });
+        let map_bytes = len.next_multiple_of(0x4000);
+        executor
+            .memory_mut()
+            .protect(OUTPUT, map_bytes, READ)
+            .unwrap();
+        let mut denied_retired = 0;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut denied_retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |session| assert!(session.run_local(1, &context).is_none()),
+        );
+        assert_eq!(denied_retired, 0);
+        executor
+            .memory_mut()
+            .protect(OUTPUT, map_bytes, READ | WRITE)
+            .unwrap();
+        let mut split = None;
+        let mut retired = 0;
+        native.with_computation(
+            executor.memory_mut(),
+            &mut retired,
+            (Arc::new(AtomicU32::new(0)), adv_sync::pending::DEADLINE),
+            None,
+            &mut |session| {
+                assert!(!session.submit(1, &context));
+                split = session.run_local(1, &context);
+            },
+        );
+        let split = split.expect("leased split");
+        assert_eq!(native.diagnostics.split.scoped, 1);
+        assert_eq!(split.retired, retired);
+        let mut parallel = split.context.unwrap().cpu;
+        if conditional_mmx {
+            assert_eq!(parallel.x87.top(), 0);
+            assert_eq!(parallel.x87.tag, 0);
+            assert_ne!(parallel.mmx[1], 0);
+        }
+        native.set_computation_offer(false, None);
+        for _ in 0..64 {
+            if parallel.eip == stop {
+                break;
+            }
+            retired += u64::from(
+                native
+                    .run(
+                        &mut parallel,
+                        executor.memory_mut(),
+                        stop,
+                        1 << 16,
+                        std::ptr::null_mut(),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .retired,
+            );
+        }
+        let split_memory = executor.memory().read(OUTPUT, len).unwrap().to_vec();
+        executor.memory_mut().write(OUTPUT, &vec![0; len]).unwrap();
+        let frame_after_split = frame.then(|| {
+            executor
+                .memory()
+                .read(FRAME_PAGE, original_frame.len())
+                .unwrap()
+                .to_vec()
+        });
+        if frame {
+            executor
+                .memory_mut()
+                .write(FRAME_PAGE, &original_frame)
+                .unwrap();
+        }
+        let mut serial = start;
+        let mut serial_retired = 0;
+        for _ in 0..64 {
+            if serial.eip == stop {
+                break;
+            }
+            let run = native
+                .run(
+                    &mut serial,
+                    executor.memory_mut(),
+                    stop,
+                    1 << 16,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            serial_retired += u64::from(run.retired);
+        }
+        for state in [&mut serial, &mut parallel] {
+            state.settle_flags();
+            state.refresh_mmx();
+        }
+        assert_eq!(serial.eip, stop);
+        assert_eq!(parallel.eip, serial.eip);
+        assert_eq!(serial.regs, parallel.regs);
+        assert_eq!(serial.eflags, parallel.eflags);
+        assert_eq!(serial.mmx, parallel.mmx);
+        assert_eq!(serial.x87, parallel.x87);
+        assert_eq!(serial_retired, u64::from(first.retired) + retired);
+        assert_eq!(executor.memory().read(OUTPUT, len).unwrap(), split_memory);
+        if let Some(split) = frame_after_split {
+            assert_eq!(
+                executor
+                    .memory()
+                    .read(FRAME_PAGE, original_frame.len())
+                    .unwrap(),
+                split
+            );
+            for untouched in [0..0xfc, 0x100..0x108, 0x10c..0x204, 0x208..split.len()] {
+                assert_eq!(split[untouched.clone()], original_frame[untouched]);
+            }
+        }
+    }
+
     // spec: A64-TR-9
     #[test]
     fn helpers_save_the_share_past_their_wake() {
@@ -1549,6 +2016,7 @@ mod tests {
                 pending: (Arc::new(AtomicU32::new(0)), 0),
             },
             submitted: Instant::now(),
+            scoped: false,
         }
     }
 
@@ -2644,6 +3112,8 @@ mod tests {
         assert_eq!(native.code.cache.append(emitted.words), Some(at));
         native.code.cache.sync();
         let code = Code {
+            frame: Arc::new([]),
+            scoped_mmx: 0,
             placed: WorkerCode {
                 entry: at,
                 end: at + emitted.words.len() * 4,

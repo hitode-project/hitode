@@ -48,6 +48,7 @@ pub(in crate::native) struct Compiled {
     pub task: Task,
     pub at: CpuState,
     pub resident: Option<Result<ResidentForm, front::Reject>>,
+    pub unit: Arc<Unit>,
     pub job: Option<Job>,
 }
 
@@ -75,6 +76,10 @@ impl ResidentForm {
             transitions: &lowered.transitions,
             sites: &lowered.sites,
             marks: &lowered.marks,
+            split: lowered.split,
+            row_price: lowered.row_price,
+            row_failures: &lowered.row_failures,
+            counters: &lowered.counters,
         }
     }
 }
@@ -89,6 +94,7 @@ pub(in crate::native) struct ResidentRecovery {
 pub(in crate::native) struct Job {
     pub proof: Proof,
     pub form: Option<JobForm>,
+    pub scoped: Option<Arc<Unit>>,
 }
 
 pub(in crate::native) struct JobForm {
@@ -116,13 +122,43 @@ fn computation_proof(trace: &Trace) -> Option<Proof> {
         return None;
     }
     let mut proof = Proof::build(trace).ok()?;
+    specialize_split(&mut proof, trace);
+    Some(proof)
+}
+
+fn specialize_split(proof: &mut Proof, trace: &Trace) {
     let index = std::cell::Cell::new(0);
     proof.prove_split(trace, |_, _| {
         let i = index.get();
         index.set(i + 1);
         trace.x86[i].clone()
     });
-    Some(proof)
+}
+
+fn scoped_form(unit: &Unit, proof: &Proof, at: &CpuState) -> Option<JobForm> {
+    let Some(frame) = proof.scope_frame() else {
+        let built = front::build(unit, proof, at).ok()?;
+        let lowered = back::lower(&built.func);
+        return Some(JobForm { built, lowered });
+    };
+    // The optimizer retains guest PCs on memory operations. Only a PC
+    // whose occurrences all name the same private cell can use this form.
+    let mut accesses = std::collections::BTreeMap::new();
+    for (inst, &cell) in unit.trace.insts.iter().zip(&frame.access) {
+        if accesses
+            .insert(inst.pc, cell)
+            .is_some_and(|prior| prior != cell)
+        {
+            return None;
+        }
+    }
+    let accesses = accesses
+        .into_iter()
+        .filter_map(|(pc, cell)| Some((pc, cell?)))
+        .collect();
+    let built = front::build_scoped(unit, proof, at, &frame.access).ok()?;
+    let lowered = back::lower_scoped(&built.func, &accesses);
+    Some(JobForm { built, lowered })
 }
 
 fn compile(request: Request) -> Compiled {
@@ -140,12 +176,14 @@ fn compile(request: Request) -> Compiled {
         cuts,
         count_entries,
     } = request;
+    let can_scope = task == Task::Discover || (task == Task::Append && proof.is_none());
     let proof = if task == Task::Discover {
         proof.or_else(|| computation_proof(&unit.trace))
     } else {
         proof
     };
     let started = std::time::Instant::now();
+    let mut scoped_job = None;
     let resident = if task == Task::Job {
         None
     } else {
@@ -162,39 +200,119 @@ fn compile(request: Request) -> Compiled {
             cut_unit = unit.cut(&cut);
             &cut_unit
         };
-        match front::build_with(
-            unit,
-            proof.as_ref(),
-            &at,
-            &|pc| all_checked || checked.contains(&pc),
-            &|pc| refused.contains(&pc),
-        ) {
-            Ok(built) => {
+        let guarded = unit
+            .trace
+            .insts
+            .iter()
+            .position(|inst| inst.guarded_slot.is_some());
+        let latches = unit.trace.row_latches();
+        let row_unit;
+        let rows = if latches.is_empty() {
+            unit
+        } else {
+            row_unit = {
+                let mut shape = unit.clone();
+                shape.trace.separate_row_latches(&latches);
+                shape.trace.specialize_row_alignment(&at.regs);
+                shape
+            };
+            &row_unit
+        };
+        let build = |unit: &Unit, proof: Option<&Proof>| {
+            front::build_with(
+                unit,
+                proof,
+                &at,
+                &|pc| all_checked || checked.contains(&pc),
+                &|pc| refused.contains(&pc),
+            )
+        };
+        let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace, &at.regs)
+            .and_then(|(domain, mut proof)| {
+                let mut shape = rows.clone();
+                domain.use_proved_alignment(&mut shape.trace);
+                let rows = &shape;
+                let built = build(rows, None)
+                    .inspect_err(|rejection| {
+                        crate::jit_map::optimized(eip, format_args!("row lowering {rejection:?}"));
+                    })
+                    .ok()?;
+                if built.cuts != 0 {
+                    return None;
+                }
+                if can_scope {
+                    proof.prove_scoped_split(&rows.trace);
+                    crate::jit_map::optimized(
+                        eip,
+                        format_args!(
+                            "row scope {}",
+                            if proof.scoped_splits() {
+                                "eligible"
+                            } else {
+                                "carried state or frame"
+                            }
+                        ),
+                    );
+                }
+                let offer = proof.scoped_splits();
+                let lowered =
+                    back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
+                if offer {
+                    let mut worker = rows.clone();
+                    if let Some((latch, taken)) = proof.scoped_latch() {
+                        worker.trace.end_at_latch(latch, taken);
+                    }
+                    let form = scoped_form(&worker, &proof, &at);
+                    scoped_job = Some(Job {
+                        proof,
+                        form,
+                        scoped: Some(Arc::new(worker)),
+                    });
+                }
+                Some(ResidentForm { built, lowered })
+            });
+        let result = match (scoped, guarded) {
+            (Some(scoped), _) => Ok(scoped),
+            (None, Some(index)) => Err(front::Reject::Unsupported(index)),
+            (None, None) => build(unit, proof.as_ref()).map(|built| {
                 let lowered = back::lower_resident(
                     &built.func,
                     &built.assumed,
                     &built.func.entry,
                     count_entries,
                 );
-                let (cuts, us) = (built.cuts + cuts.len(), started.elapsed().as_micros());
-                crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
-                Some(Ok(ResidentForm { built, lowered }))
+                ResidentForm { built, lowered }
+            }),
+        };
+        match &result {
+            Ok(form) => {
+                let (cuts, us) = (form.built.cuts + cuts.len(), started.elapsed().as_micros());
+                let shape = if form.lowered.has_rows() {
+                    "rows"
+                } else {
+                    "built"
+                };
+                crate::jit_map::optimized(eip, format_args!("{shape}\t{cuts}\t{us}us"));
             }
             Err(reject) => {
                 let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
                 let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
                 crate::jit_map::optimized(eip, format_args!("{reject:?}\t{pc}\t{op:?}"));
-                Some(Err(reject))
             }
         }
+        Some(result)
     };
-    let job = if matches!(task, Task::Discover | Task::Job) {
+    let job = if scoped_job.is_none() && matches!(task, Task::Discover | Task::Job) {
         proof.map(|proof| {
             let form = front::build(&unit, &proof, &at).ok().map(|built| JobForm {
                 lowered: back::lower(&built.func),
                 built,
             });
-            Job { proof, form }
+            Job {
+                proof,
+                form,
+                scoped: None,
+            }
         })
     } else {
         None
@@ -206,7 +324,8 @@ fn compile(request: Request) -> Compiled {
         task,
         at,
         resident,
-        job,
+        unit,
+        job: scoped_job.or(job),
     }
 }
 
@@ -219,6 +338,7 @@ impl Compiled {
             task: request.task,
             at: request.at,
             resident: None,
+            unit: request.unit,
             job: None,
         }
     }

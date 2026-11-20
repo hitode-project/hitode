@@ -2,17 +2,35 @@ use super::{
     Asm, COUNT, Cond, Emitter, Extend, Host, IntOp, Label, Lsl, Op, RT, Reg, T, Type, U, VReg,
     Value, W, X, X0, X1, X2, X3, add, add_ext, add_imm, add_immediate, and_imm, cmp, csel, eor_imm,
     int_immediate, ldr, loops, lsr_imm, mov, movz, mul, mvn, page_crossing, runtime, sub, sub_imm,
-    subs, subs_imm, udiv,
+    subs, subs_imm, udiv, umulh,
 };
 use crate::translate::lower::{X4, X5};
 
 use crate::translate::front::tags::ConditionCode as Cc;
 use loops::{Affine, Batch, Span, Trip};
 
+use super::Counter;
+use crate::encode::{Shift, and, orr, vumov};
+use loops::vector::ClassPath;
+
+pub(super) struct ClassPrice {
+    pub first: ClassPath,
+    pub second: ClassPath,
+    pub words: u32,
+}
+
+pub(super) struct Price {
+    pub label: Label,
+    pub admission: u32,
+    pub common: u32,
+    pub classes: Vec<ClassPrice>,
+}
+
 /// The kernel can emit instructions and read the checked addresses and
 /// invariant SSA inputs. It cannot change the scalar CFG or recovery records.
 pub(in crate::translate::opt) struct BatchEmitter<'b, 'f> {
     emitter: &'b mut Emitter<'f>,
+    head: u32,
 }
 
 impl BatchEmitter<'_, '_> {
@@ -38,6 +56,62 @@ impl BatchEmitter<'_, '_> {
             .emit_all(&[mul(X, U, count, U), add(X, X5, X5, U, Lsl, 0)]);
     }
 
+    pub fn count_class(&mut self, class: u8) {
+        self.emitter.count(self.head, Counter::Class(class));
+    }
+
+    pub fn price_class(&mut self, first: ClassPath, second: ClassPath, words: u32) {
+        self.emitter.class_prices.push(ClassPrice {
+            first,
+            second,
+            words,
+        });
+    }
+
+    pub fn publish(&mut self, value: Value, lane: u32, ty: Type, from: VReg) {
+        let loc = self.emitter.locations[value.0 as usize];
+        if ty == Type::I32 {
+            let out = self.emitter.rd(value);
+            self.asm().emit(vumov(2, out, from, lane * 2));
+            self.emitter.copy(loc, Host::Register(out), ty);
+        } else {
+            let out = self.emitter.vd(value);
+            self.asm().emit(vumov(3, T, from, lane));
+            self.asm().emit(super::fmov_to_v(X, out, T));
+            self.emitter.copy(loc, Host::Vector(out), ty);
+        }
+    }
+
+    pub fn update(&mut self, value: Value, keep: u32, set: u32) {
+        let loc = self.emitter.locations[value.0 as usize];
+        let out = self.emitter.rd(value);
+        if keep == 0 {
+            self.emitter.imm(out, u64::from(set));
+        } else {
+            let old = self.emitter.gp_at(loc, T);
+            if keep != u32::MAX {
+                self.emitter.imm(U, u64::from(keep));
+                self.asm().emit(and(W, out, old, U, Shift::Lsl, 0));
+            } else if out != old {
+                self.asm().emit(mov(W, out, old));
+            }
+            if set != 0 {
+                self.emitter.imm(U, u64::from(set));
+                self.asm().emit(orr(W, out, out, U, Shift::Lsl, 0));
+            }
+        }
+        self.emitter.copy(loc, Host::Register(out), Type::I32);
+    }
+
+    pub fn debit(&mut self, cost: i32) {
+        self.emitter.imm(T, cost.unsigned_abs() as u64);
+        self.asm().emit(if cost >= 0 {
+            add(X, X5, X5, T, Lsl, 0)
+        } else {
+            sub(X, X5, X5, T, Lsl, 0)
+        });
+    }
+
     pub fn address(&mut self, addr: Affine) -> Reg {
         self.emitter.batch_address(addr, T, U);
         let view = self.emitter.data_view();
@@ -47,7 +121,15 @@ impl BatchEmitter<'_, '_> {
 }
 
 impl Emitter<'_> {
-    pub(super) fn batch(&mut self, batch: &Batch, pages: Option<Label>, backedge: Label) -> u32 {
+    pub(super) fn batch(
+        &mut self,
+        batch: &Batch,
+        pages: Option<Label>,
+        backedge: Label,
+    ) -> (u32, Option<Price>) {
+        self.reciprocal_division = batch.priced();
+        let price = batch.priced().then(|| self.asm.label());
+        let admission = self.asm.offset();
         let entry = self.asm.label();
         let inner = self.asm.label();
         let scalar = self.asm.label();
@@ -82,11 +164,13 @@ impl Emitter<'_> {
         self.asm.tbz(true, X3, 63, scalar);
         self.batch_div(X3, X3, charge + u64::from(lanes) * prefix);
         self.batch_trip(batch.loop_.trip, lanes, scalar);
-        self.asm.cbz(X, false, X3, scalar);
+        self.batch_minimum(price, scalar);
 
-        for &span in &batch.spans {
-            self.batch_range(span, batch.backwards, pages, scalar);
-            self.asm.cbz(X, false, X3, scalar);
+        if self.row_budget.is_none() {
+            for &span in &batch.spans {
+                self.batch_range(span, batch.backwards, pages, scalar, batch.loop_.eip);
+                self.asm.cbz(X, false, X3, scalar);
+            }
         }
         for &(a, b, in_place) in &batch.alias {
             self.batch_disjoint(
@@ -108,7 +192,7 @@ impl Emitter<'_> {
                 self.batch_disjoint(span, frame, batch.backwards, false, scalar);
             }
         }
-        self.asm.cbz(X, false, X3, scalar);
+        self.batch_minimum(price, scalar);
         for stream in &batch.crossings {
             // The first scalar iteration must reconstruct the guest state
             // without taking a PageCross cut.
@@ -123,8 +207,13 @@ impl Emitter<'_> {
         self.imm(T, charge);
         self.asm.emit_all(&[mul(X, X5, X3, T), mov(X, X4, X3)]);
         self.asm.bind(inner);
+        self.count(batch.loop_.eip, Counter::Batch);
         let inner_start = self.asm.offset();
-        batch.plan.body.lower(&mut BatchEmitter { emitter: self });
+        batch.plan.body.lower(&mut BatchEmitter {
+            emitter: self,
+            head: batch.loop_.eip,
+        });
+        let body_end = self.asm.offset();
         for iv in &batch.loop_.ivs {
             let loc = self.locations[iv.base.0 as usize];
             let src = self.gp_at(loc, T);
@@ -163,7 +252,36 @@ impl Emitter<'_> {
         self.asm.bind(scalar);
         self.asm.emit(movz(W, X5, lanes as u16, 0));
         self.asm.bind(body);
-        words
+        self.reciprocal_division = false;
+        // Include the bounded long-range search and the scalar tail transfer.
+        let prefix = ((inner_start - admission) / 4) as u32 + 3;
+        let pages = pages.map_or(0, |_| 84 * batch.spans.len() as u32);
+        let classes = std::mem::take(&mut self.class_prices);
+        let common = if classes.is_empty() {
+            words
+        } else {
+            words - ((body_end - inner_start) / 4) as u32
+        };
+        let worst = classes.iter().map(|class| class.words).max().unwrap_or(0);
+        (
+            common + worst,
+            price.map(|label| Price {
+                label,
+                admission: prefix + pages,
+                common,
+                classes,
+            }),
+        )
+    }
+
+    fn batch_minimum(&mut self, price: Option<Label>, scalar: Label) {
+        if let Some(price) = price {
+            self.asm.ldr_literal(T, price);
+            self.asm.emit(cmp(X, X3, T, Lsl, 0));
+            self.asm.b_cond(Cond::Lo, scalar);
+        } else {
+            self.asm.cbz(X, false, X3, scalar);
+        }
     }
 
     fn batch_gp(&mut self, value: Value, scratch: Reg) -> Reg {
@@ -203,8 +321,14 @@ impl Emitter<'_> {
         }
     }
 
-    fn batch_range(&mut self, span: Span, backwards: bool, pages: Option<Label>, scalar: Label) {
-        const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
+    fn batch_range(
+        &mut self,
+        span: Span,
+        backwards: bool,
+        pages: Option<Label>,
+        scalar: Label,
+        head: u32,
+    ) {
         self.batch_span_start(span, backwards, X0);
         if backwards && span.width > 1 {
             // A first scalar access that straddles guest zero has no interval.
@@ -212,27 +336,18 @@ impl Emitter<'_> {
             self.asm.emit(cmp(W, X0, T, Lsl, 0));
             self.asm.b_cond(Cond::Hi, scalar);
         }
-        if let Some(pages) = pages {
+        let hit = self.asm.label();
+        if let Some(search) = pages {
             self.imm(T, u64::from(span.step));
             self.asm.emit_all(&[
                 mul(X, X1, X3, T),
                 add_imm(X, X1, X1, span.width - 1, false),
                 add(X, X1, X1, X0, Lsl, 0),
-                lsr_imm(X, X1, X1, PAGE_SHIFT),
-                lsr_imm(W, X0, X0, PAGE_SHIFT),
             ]);
-            self.imm(
-                X2,
-                if backwards {
-                    u64::from(u32::MAX >> PAGE_SHIFT)
-                } else {
-                    0
-                },
-            );
-            self.imm(X5, if span.write { 8 } else { 0 });
-            self.asm.bl(pages);
+            crate::facts::batch_span(&mut self.asm, span.write, backwards, search, hit);
+            self.count(head, Counter::SpanMiss);
             self.batch_span_start(span, backwards, X1);
-            self.asm.emit(sub(X, X2, X0, X1, Lsl, 0));
+            self.asm.emit(sub(X, X2, X2, X1, Lsl, 0));
         } else {
             // The owner admits all scalar accesses of a job. The combined
             // interval must also stay contiguous in the alias.
@@ -240,6 +355,7 @@ impl Emitter<'_> {
             self.asm.emit(sub(X, X2, T, X0, Lsl, 0));
         }
         self.batch_span_limit(span, scalar);
+        self.asm.bind(hit);
     }
 
     fn batch_disjoint(&mut self, a: Span, b: Span, backwards: bool, in_place: bool, scalar: Label) {
@@ -280,6 +396,14 @@ impl Emitter<'_> {
         if divisor.is_power_of_two() {
             self.asm
                 .emit(lsr_imm(X, dst, src, divisor.trailing_zeros()));
+        } else if self.reciprocal_division {
+            // The countdown and guest spans bound x * divisor below 2^64,
+            // so rounding the reciprocal up cannot advance the quotient.
+            let reciprocal = (1u128 << 64).div_ceil(u128::from(divisor)) as u64;
+            let label = self.asm.label();
+            self.reciprocals.push((reciprocal, label));
+            self.asm.ldr_literal(U, label);
+            self.asm.emit(umulh(dst, src, U));
         } else {
             self.imm(U, divisor);
             self.asm.emit(udiv(X, dst, src, U));

@@ -21,7 +21,7 @@ use crate::translate::front::{Decodes, Unit, decode::Helper, trace::Trace};
 use crate::translate::lower::{
     Link, Site, Stubs, VersionLayout,
     flags::{Operand, Sense},
-    resident::{self as ingress, Slot},
+    resident::{self as ingress, Counter, Slot},
 };
 
 #[derive(Clone, Copy)]
@@ -71,6 +71,7 @@ pub(super) struct VersionStats {
     pub(super) joins: u64,
     pub(super) resident_misses: [Cell<u64>; 2],
     pub(super) arrivals: [Cell<u64>; CHAIN_LEN],
+    pub(super) spans: [Cell<u64>; crate::translate::lower::resident::COUNTERS],
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +117,8 @@ pub(super) struct ResidentSite<R> {
     pub versions: Vec<ResidentVersion<R>>,
     pub fallback: usize,
     pub suspended: bool,
+    row_entry: Option<usize>,
+    pub row_feedback: Option<Box<ingress::RowFeedback>>,
 }
 
 impl<R> ResidentSite<R> {
@@ -123,7 +126,7 @@ impl<R> ResidentSite<R> {
         self.versions
             .first()
             .filter(|_| !self.suspended)
-            .map(|v| v.probe)
+            .and_then(|v| v.row_target.map_or(Some(v.probe), |_| self.row_entry))
     }
 }
 
@@ -152,12 +155,23 @@ pub(super) struct ResidentVersion<R> {
     pub at: CpuState,
     pub key: Key,
     pub plain_sites: Vec<u32>,
+    pub unit: Arc<Unit>,
+    pub row_price: Option<ingress::RowPrice>,
+    pub row_target: Option<crate::translate::lower::resident::RowTarget>,
     pub recovery: R,
     pub slot: Box<Slot>,
     pub probation: bool,
     pub probation_sensors: Vec<usize>,
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
+    split: Option<PlacedSplit>,
+}
+
+struct PlacedSplit {
+    sensor: usize,
+    active: u32,
+    threshold: usize,
+    published: Option<u64>,
 }
 
 impl<R> ResidentVersion<R> {
@@ -282,7 +296,46 @@ impl<R> CodeStore<R> {
             versions: Vec::new(),
             fallback: 0,
             suspended: false,
+            row_entry: None,
+            row_feedback: None,
         });
+    }
+
+    pub(super) fn publish_split(&mut self, eip: u32, threshold: Option<u64>) {
+        let Some(site) = self
+            .chains
+            .get_mut(&eip)
+            .and_then(|site| site.resident.as_mut())
+        else {
+            return;
+        };
+        for split in site
+            .versions
+            .iter_mut()
+            .filter_map(|version| version.split.as_mut())
+        {
+            if split.published == threshold {
+                continue;
+            }
+            split.published = threshold;
+            let sensor = if let Some(threshold) = threshold {
+                self.cache.patch(split.threshold, threshold as u32);
+                self.cache
+                    .patch(split.threshold + 4, (threshold >> 32) as u32);
+                split.active
+            } else {
+                b(12)
+            };
+            self.cache.patch(split.sensor, sensor);
+        }
+    }
+
+    pub(super) fn offers_split(&self, eip: u32, version: usize) -> bool {
+        self.resident(eip)
+            .filter(|site| !site.suspended)
+            .and_then(|site| site.versions.get(version))
+            .and_then(|version| version.split.as_ref())
+            .is_some_and(|split| split.published.is_some())
     }
 
     pub(super) fn resident_fallback(&self, eip: u32) -> Option<usize> {
@@ -307,6 +360,8 @@ impl<R> CodeStore<R> {
         probation: Option<u32>,
         misses: u32,
         layout: ingress::Layout<'_>,
+        unit: Arc<Unit>,
+        row_target: Option<crate::translate::lower::resident::RowTarget>,
     ) -> bool {
         let fallback = if let Some(tier1) = self.resident_fallback(eip) {
             tier1
@@ -319,6 +374,12 @@ impl<R> CodeStore<R> {
             self.resident_mut(eip).unwrap().fallback = at;
             at
         };
+        if layout.row_price.is_some() {
+            self.resident_mut(eip)
+                .unwrap()
+                .row_feedback
+                .get_or_insert_with(Box::default);
+        }
         let site = self.chains[&eip].resident.as_ref().unwrap();
         let slot = Box::<Slot>::default();
         slot.probation.set(probation.unwrap_or_default());
@@ -335,10 +396,12 @@ impl<R> CodeStore<R> {
             self.version_stats.is_some(),
             ingress::Targets {
                 at: base,
-                proved_body: (!key.uses_resident_context()).then_some(layout.body),
+                proved_body: (row_target.is_none() && !key.uses_resident_context())
+                    .then_some(layout.body),
                 tier1: fallback,
                 exit: self.stubs.exit,
                 resident_exit: self.resident_exit,
+                split: layout.split.is_some(),
             },
         );
         let probe_word = (index == 0).then(|| entry.words[(entry.probe - base) / 4]);
@@ -347,6 +410,13 @@ impl<R> CodeStore<R> {
             words[at] = pointer as u32;
             words[at + 1] = (pointer >> 32) as u32;
         };
+        if !layout.counters.is_empty() {
+            let stats = self.version_stats.get_or_insert_with(FxHashMap::default);
+            for &(head, kind, offset) in layout.counters {
+                let stats = stats.entry(head).or_default();
+                literal(words, offset, stats.spans[kind.index()].as_ptr() as u64);
+            }
+        }
         literal(words, layout.probation_slot, slot.countdown.as_ptr() as u64);
         let (sensors, counter, leave) = layout.probation_sensor;
         literal(words, *counter, slot.probation.as_ptr() as u64);
@@ -362,11 +432,39 @@ impl<R> CodeStore<R> {
         ] {
             words[offset] = branch(entry.form + offset * 4, target);
         }
+        let split = layout.split.zip(entry.split).map(|(split, target)| {
+            let leave = entry.form + split.leave * 4;
+            words[split.leave] = branch(leave, target);
+            let active = words[split.sensor];
+            words[split.sensor] = b(12);
+            PlacedSplit {
+                sensor: entry.form + split.sensor * 4,
+                active,
+                threshold: entry.form + split.threshold * 4,
+                published: None,
+            }
+        });
         for &(offset, _) in layout.links {
             let word = offset / 4 + 3;
             words[word] = branch(entry.form + word * 4, self.stubs.dispatch);
         }
+        let mut feedback_words = Vec::new();
+        if let Some(feedback) = &site.row_feedback {
+            let cold = entry.form + layout.cold * 4;
+            for &(reason, offset) in layout.row_failures {
+                let at = entry.form + (words.len() + feedback_words.len()) * 4;
+                let from = entry.form + offset * 4;
+                words[offset] = branch(from, at);
+                feedback_words.extend(ingress::row_failure(
+                    eip,
+                    reason,
+                    (at, cold, self.stubs.exit),
+                    feedback,
+                ));
+            }
+        }
         entry.words.extend_from_slice(words);
+        entry.words.extend(feedback_words);
         let placed = &mut entry.words[(entry.form - base) / 4..];
         let accounting = layout
             .accounting
@@ -435,12 +533,16 @@ impl<R> CodeStore<R> {
             at,
             key,
             plain_sites,
+            unit,
+            row_target,
+            row_price: layout.row_price,
             recovery,
             slot,
             probation: probation.is_some(),
             probation_sensors,
             accounting,
             iteration_retired: u64::from(iteration_retired),
+            split,
         };
         let versions = &mut self.resident_mut(eip).unwrap().versions;
         if index == versions.len() {
@@ -450,6 +552,60 @@ impl<R> CodeStore<R> {
         }
         self.uses_permissions = true;
         self.faults.end.set(self.cache.next());
+        true
+    }
+
+    pub(super) fn publish_row_targets(&mut self, eip: u32, observed: &[u32]) -> bool {
+        let counters = self.version_stats.as_ref().and_then(|stats| {
+            stats.get(&eip).map(|stats| {
+                [Counter::RowArrival, Counter::RowShort]
+                    .map(|kind| stats.spans[kind.index()].as_ptr() as u64)
+            })
+        });
+        let site = self.chains[&eip].resident.as_ref().unwrap();
+        let Some(slot) = site.versions.first().and_then(|v| v.row_target) else {
+            return true;
+        };
+        let mut cases: Vec<_> = site
+            .versions
+            .iter()
+            .map(|v| {
+                let target = v.row_target.expect("each case has the same slot");
+                debug_assert_eq!((slot.base, slot.offset), (target.base, target.offset));
+                (target.value, Some(v.entry))
+            })
+            .collect();
+        for &target in observed {
+            if cases.iter().all(|&(installed, _)| installed != target) {
+                cases.push((target, None));
+            }
+        }
+        let minimum = site.versions[0].row_price.and_then(|first| {
+            let reg = first.count_register?;
+            let minimum = site
+                .versions
+                .iter()
+                .try_fold(first.minimum(), |min, version| {
+                    let price = version.row_price?;
+                    (price.count_register == Some(reg)).then(|| min.min(price.minimum()))
+                })?;
+            Some((reg, minimum))
+        });
+        let fallback = site.versions[0].cold;
+        let at = self.cache.next();
+        let words = ingress::row_entry(
+            eip,
+            (slot.base, slot.offset),
+            &cases,
+            (at, fallback, self.stubs.exit),
+            site.row_feedback.as_deref().unwrap(),
+            minimum,
+            counters,
+        );
+        let Some(addr) = self.cache.append(&words) else {
+            return false;
+        };
+        self.resident_mut(eip).unwrap().row_entry = Some(addr);
         true
     }
 
@@ -478,17 +634,22 @@ impl<R> CodeStore<R> {
                 .map(|c| c.as_ptr() as u64)
         });
         for (index, version) in site.versions.iter().enumerate() {
-            let tail = index + 1 == site.versions.len();
-            let next = site.versions.get(index + 1).map_or(fallback, |v| v.entry);
+            let tail = index + 1 == site.versions.len() || version.row_target.is_some();
+            let next = if tail {
+                fallback
+            } else {
+                site.versions[index + 1].entry
+            };
             self.cache.patch(version.next, branch(version.next, next));
             self.cache
                 .patch(version.cold, branch(version.cold, fallback));
-            let target = if let Some(period) = period.filter(|_| tail) {
-                version.slot.retry.set(period);
-                version.retry
-            } else {
-                next
-            };
+            let target =
+                if let Some(period) = period.filter(|_| tail && version.row_target.is_none()) {
+                    version.slot.retry.set(period);
+                    version.retry
+                } else {
+                    next
+                };
             if let Some(counter) = &version.miss_counter {
                 let address = counters.unwrap()[usize::from(tail)];
                 self.cache.patch(counter.literal, address as u32);
@@ -543,6 +704,20 @@ impl<R> CodeStore<R> {
         if self.cache.append(&words).is_some() {
             self.chains.entry(eip).or_default().offer = Some((at, fallback));
         }
+    }
+
+    pub(super) fn row_costs(&self, eip: u32) -> Option<(u32, u32)> {
+        let mut prices = self
+            .resident(eip)?
+            .versions
+            .iter()
+            .filter_map(|v| v.row_price);
+        let first = prices.next()?;
+        Some(
+            prices.fold((first.guard, first.saved), |(guard, saved), p| {
+                (guard.max(p.guard), saved.min(p.saved))
+            }),
+        )
     }
 
     pub(super) fn accounted(&self, eip: u32) -> (u64, u64) {

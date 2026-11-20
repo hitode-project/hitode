@@ -160,8 +160,11 @@ impl Front<'_> {
                 let Mode::Inline(expected) = inst.mode else {
                     unreachable!()
                 };
-                if self.models[self.index].load(mem, 4, &self.offsets[self.index])
-                    != Some(u64::from(expected))
+                if self
+                    .scope_access
+                    .is_none_or(|access| access[self.index].is_none())
+                    && self.models[self.index].load(mem, 4, &self.offsets[self.index])
+                        != Some(u64::from(expected))
                 {
                     return Err(Reject::Dynamic(self.index));
                 }

@@ -120,6 +120,7 @@ impl LoopKernel for TestKernel {
             name: "test",
             lanes: 16,
             inputs: vec![],
+            conditional: false,
             body: Box::new(Self),
         })
     }
@@ -156,6 +157,7 @@ fn charged_latch_and_frame_bound() {
                 stride: 1,
                 bound: Some(fixture.bound),
                 again: cond,
+                sign: false,
             }
         );
     }

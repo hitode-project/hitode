@@ -49,12 +49,67 @@ impl Emitter<'_> {
             &mut self.asm,
             CPU,
             true,
-            if self.resident { miss } else { cold },
+            if self.resident {
+                self.mmx_miss.unwrap_or(miss)
+            } else {
+                cold
+            },
         );
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
+        if let Some((domain, offer)) = self.domain {
+            let minimum = (self.asm.label(), self.asm.label());
+            let head = self.func.records[0].eip;
+            if domain.target().is_none() {
+                self.count(head, super::Counter::RowArrival);
+            }
+            let short = if self.count_entries {
+                self.asm.label()
+            } else {
+                cold
+            };
+            use crate::translate::lower::resident::RowFailure;
+            let failures = [
+                RowFailure::Range,
+                RowFailure::Alias,
+                RowFailure::Parameter,
+                RowFailure::Count,
+                RowFailure::Span,
+            ]
+            .map(|kind| (kind, self.asm.label()));
+            self.row_failures.extend(failures);
+            let leave = offer.then(|| self.asm.label());
+            let count = self.row_strip.unwrap().count;
+            let mut words = domain.emit(&mut self.asm, (minimum, count), short, failures, leave);
+            if self.count_entries {
+                let hit = self.asm.label();
+                self.asm.b(hit);
+                self.asm.bind(short);
+                self.count(head, super::Counter::RowShort);
+                self.asm.b(cold);
+                self.asm.bind(hit);
+            }
+            if let Some(leave) = leave {
+                let (sensor, threshold) = (self.asm.label(), self.asm.label());
+                self.asm.bind(sensor);
+                crate::translate::lower::resident::split_sensor(
+                    &mut self.asm,
+                    Reg::new(7),
+                    threshold,
+                    leave,
+                );
+                self.split = Some((sensor, threshold, leave));
+                words += 3;
+            }
+            self.count(head, super::Counter::RowEntry);
+            if let Some(target) = domain.target() {
+                self.count(target.value, super::Counter::RowEntry);
+            }
+            self.row_budget = Some((minimum, words));
+            self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        }
 
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {

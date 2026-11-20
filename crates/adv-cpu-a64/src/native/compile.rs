@@ -186,7 +186,13 @@ pub(crate) fn lower_computation<'a>(
     (control, pe, proof): (u16, bool, Option<&Proof>),
 ) -> Option<jit::ComputationCode<'a>> {
     let assumptions = proof.map(|proof| jit::ComputationFacts {
-        frame_cache: proof.frame_cache(),
+        frame_cache: if proof.scope_frame().is_none() {
+            proof.frame_cache()
+        } else {
+            None
+        },
+        scope_access: proof.scope_frame().map(|frame| frame.access.as_slice()),
+        scope_mmx: proof.scoped_mmx(),
         divisions: proof.divisions(),
     });
     jit::lower_computation(

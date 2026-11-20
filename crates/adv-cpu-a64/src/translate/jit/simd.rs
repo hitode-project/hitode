@@ -361,6 +361,10 @@ impl Translator<'_> {
         } else {
             self.simd_body(simd, address);
         }
+        #[cfg(native)]
+        if mmx && !ready {
+            self.scope_mmx_write(1 << 8);
+        }
         if mmx && simd.kind != Kind::Emms && !ready {
             self.as_part(Part::SimdGuard, |t| {
                 t.cpu();
@@ -1707,7 +1711,14 @@ impl Translator<'_> {
     fn mmx_aliased(&mut self, n: u8) {
         self.aliased |= 1 << n;
         self.cpu();
-        if self.tier1 {
+        let mut owner_alias = self.tier1;
+        #[cfg(native)]
+        {
+            owner_alias |= self
+                .computation_facts
+                .is_some_and(|facts| facts.scope_access.is_some() || facts.scope_mmx != 0);
+        }
+        if owner_alias {
             crate::facts::refresh_mmx_slot(self.asm, n);
             return;
         }
@@ -1740,10 +1751,24 @@ impl Translator<'_> {
         }
     }
 
+    #[cfg(native)]
+    fn scope_mmx_write(&mut self, bits: u16) {
+        let mask = self.computation_facts.map_or(0, |facts| facts.scope_mmx) & bits;
+        if mask != 0 {
+            self.emit_all(&[
+                ldr(W, X17, RUNTIME, runtime::SCOPE_WRITTEN),
+                orr_imm(W, X17, X17, u64::from(mask)),
+                str(W, X17, RUNTIME, runtime::SCOPE_WRITTEN),
+            ]);
+        }
+    }
+
     /// Defers the write until an edge or observer publishes it.
     fn written(&mut self, loc: Loc) {
         match loc {
             Loc::Mmx(n) => {
+                #[cfg(native)]
+                self.scope_mmx_write(1 << n);
                 self.vector.mmx |= 1 << n;
                 self.vector.dirty |= 1 << n;
             }

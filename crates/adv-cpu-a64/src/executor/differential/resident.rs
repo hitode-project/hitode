@@ -1930,6 +1930,474 @@ fn vector_unrolls_independent_packed_integer_iterations() {
 
 // spec: A64-OPT-10
 #[test]
+fn vector_spans_use_sign_latches_and_interleaved_qword_stores() {
+    let image = Image::loop_body(|a, head, _| {
+        for (n, mm) in [mm0, mm1, mm2, mm3].into_iter().enumerate() {
+            a.movq(mm, qword_ptr(esi + n * 8)).unwrap();
+            a.por(mm, mm7).unwrap();
+            a.movntq(qword_ptr(edi + n * 8), mm).unwrap();
+        }
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        a.sub(ecx, 8).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut cpu = initial(8 * 70 - 1);
+    cpu.mmx[7] = 0xff00_0000_ff00_0000;
+    let data = vector_data(0x73a2);
+    let mut trial = Trial::new(&image, &cpu, "interleaved qword sign latch", &[], |m| {
+        m.write(DATA, &data).unwrap();
+    });
+    vector_install(&mut trial, cpu, 2);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_ne!(trial.live.native.as_ref().unwrap().vector_regions(), 0);
+}
+
+// spec: A64-OPT-8, A64-OPT-10, A64A-ROLE-3
+#[test]
+fn row_domain_guards_return_to_tier1_on_target_mismatch() {
+    const SLOT: u32 = DATA + 0x8000;
+    const PITCH: u32 = 64;
+    let mut targets = [0; 2];
+    let image = Image::assemble(
+        |a, head, _| {
+            a.call(dword_ptr(ebx)).unwrap();
+            a.add(esi, PITCH as i32 - 64).unwrap();
+            a.add(edi, PITCH as i32 - 64).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(head).unwrap();
+        },
+        |a| {
+            a.nop().unwrap();
+            // The two targets have identical stream effects and different
+            // architectural results, so a frozen slot is observable.
+            for (i, target) in targets.iter_mut().enumerate() {
+                *target = a.instructions().len();
+                let mut inner = a.create_label();
+                if i == 0 {
+                    a.mov(ecx, 7).unwrap();
+                    a.set_label(&mut inner).unwrap();
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
+                    a.por(mm0, mm7).unwrap();
+                    a.movntq(qword_ptr(edi), mm0).unwrap();
+                    a.add(esi, 8).unwrap();
+                    a.add(edi, 8).unwrap();
+                    a.sub(ecx, 1).unwrap();
+                    a.jns(inner).unwrap();
+                } else {
+                    let mut test = a.create_label();
+                    a.mov(ecx, 8).unwrap();
+                    a.test(ecx, ecx).unwrap();
+                    a.jmp(test).unwrap();
+                    a.set_label(&mut inner).unwrap();
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
+                    a.por(mm0, mm6).unwrap();
+                    a.movntq(qword_ptr(edi), mm0).unwrap();
+                    a.add(esi, 8).unwrap();
+                    a.add(edi, 8).unwrap();
+                    a.dec(ecx).unwrap();
+                    a.set_label(&mut test).unwrap();
+                    a.jne(inner).unwrap();
+                }
+                a.ret().unwrap();
+            }
+        },
+    );
+    let locations = {
+        let mut decoder = iced_x86::Decoder::with_ip(32, &image.code, u64::from(CODE), 0);
+        decoder.iter().map(|inst| inst.ip32()).collect::<Vec<_>>()
+    };
+    let mut state = initial(0);
+    state.eip = image.head;
+    state.regs[2] = 200;
+    state.regs[3] = SLOT;
+    state.regs[7] = DATA + 0x4000;
+    state.x87.regs[6] = adv_cpu_core::X87Register::from_parts(0x8f00_0000_8f00_0000, 0xffff);
+    state.x87.regs[7] = adv_cpu_core::X87Register::from_parts(0xff00_0000_ff00_0000, 0xffff);
+    state.refresh_mmx();
+    let mut trial = Trial::new(
+        &image,
+        &state,
+        "guarded row target",
+        &[(DATA + 0x4000, HOST_PAGE)],
+        |m| {
+            m.map(DATA + 0x4000, HOST_PAGE, READ | WRITE).unwrap();
+            m.map(SLOT, HOST_PAGE, READ | WRITE).unwrap();
+            m.write(DATA, &vector_data(773)).unwrap();
+            m.write(SLOT, &locations[targets[0]].to_le_bytes()).unwrap();
+        },
+    );
+    trial.live.native.as_mut().unwrap().count_resident_entries = true;
+    assert!(trial.try_install_at(state.clone()));
+    for changed in [false, true] {
+        if changed {
+            for executor in [&mut trial.live, &mut trial.reference] {
+                executor.state = state.clone();
+                executor
+                    .memory
+                    .write(SLOT, &locations[targets[1]].to_le_bytes())
+                    .unwrap();
+            }
+        }
+        assert_eq!(trial.compare(40_000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(counts[20 + usize::from(changed)] > 0, "{counts:?}");
+    }
+    let before = trial.live.native.as_ref().unwrap().span_counts(image.head);
+    trial.live.native.as_mut().unwrap().wait_resident_builds();
+    for executor in [&mut trial.live, &mut trial.reference] {
+        executor.state = state.clone();
+    }
+    assert_eq!(trial.compare(40_000).0, RunOutcome::ReachedStop);
+    let after = trial.live.native.as_ref().unwrap().span_counts(image.head);
+    assert!(after[20] > before[20], "{before:?} -> {after:?}");
+    assert_eq!(before[21], after[21]);
+}
+
+// spec: A64-OPT-8, A64-OPT-10
+#[test]
+fn row_domain_separates_pretest_and_latch_flags() {
+    let image = Image::loop_body(|a, row, _| {
+        let mut pixel = a.create_label();
+        let mut test = a.create_label();
+        a.mov(ecx, 8).unwrap();
+        a.sub(ecx, 1).unwrap();
+        a.jmp(test).unwrap();
+        a.set_label(&mut pixel).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.por(mm0, mm7).unwrap();
+        a.movntq(qword_ptr(edi), mm0).unwrap();
+        a.sub(esi, 8).unwrap();
+        a.sub(edi, 8).unwrap();
+        a.sub(ecx, 1).unwrap();
+        a.set_label(&mut test).unwrap();
+        a.jns(pixel).unwrap();
+        a.add(esi, 128).unwrap();
+        a.add(edi, 128).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(row).unwrap();
+    });
+    let mut state = initial(0);
+    state.eip = image.head;
+    state.regs[2] = 58;
+    state.regs[6] += 56;
+    state.regs[7] += 56;
+    state.mmx[7] = 0xff00_0000_ff00_0000;
+    let mut trial = Trial::new(&image, &state, "shared sign branch", &[], |m| {
+        m.write(DATA, &vector_data(773)).unwrap();
+    });
+    trial.live.native.as_mut().unwrap().count_resident_entries = true;
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+    assert!(counts[20] > 0, "{counts:?}");
+}
+
+// spec: A64-OPT-8, A64-OPT-10
+#[test]
+fn row_domain_prices_the_main_strip_with_zero_or_short_tails() {
+    const SOURCE: u32 = 0x2_0000;
+    const DEST: u32 = 0x3_4000;
+    const ROWS: u32 = 192;
+    const WIDTH: u32 = 256;
+    const SPACE: usize = 0x10000;
+
+    let extra = [(DEST, SPACE)];
+    for (aligned, tail) in [(false, 0), (false, 1), (true, 0)] {
+        let bytes = if aligned { 16 } else { 8 };
+        let image = Image::loop_body(|a, row, _| {
+            let mut strip = a.create_label();
+            let mut strip_test = a.create_label();
+            let mut tail = a.create_label();
+            let mut tail_test = a.create_label();
+            a.mov(ecx, edx).unwrap();
+            a.sub(ecx, bytes).unwrap();
+            a.jmp(strip_test).unwrap();
+            a.set_label(&mut strip).unwrap();
+            if aligned {
+                a.movaps(xmm0, xmmword_ptr(esi)).unwrap();
+                a.orps(xmm0, xmm7).unwrap();
+                a.movntps(xmmword_ptr(edi), xmm0).unwrap();
+            } else {
+                a.movq(mm0, qword_ptr(esi)).unwrap();
+                a.por(mm0, mm7).unwrap();
+                a.movntq(qword_ptr(edi), mm0).unwrap();
+            }
+            a.add(esi, bytes).unwrap();
+            a.add(edi, bytes).unwrap();
+            a.sub(ecx, bytes).unwrap();
+            a.set_label(&mut strip_test).unwrap();
+            a.jns(strip).unwrap();
+            a.add(ecx, bytes).unwrap();
+            a.jmp(tail_test).unwrap();
+            a.set_label(&mut tail).unwrap();
+            a.mov(al, byte_ptr(esi)).unwrap();
+            a.mov(byte_ptr(edi), al).unwrap();
+            a.inc(esi).unwrap();
+            a.inc(edi).unwrap();
+            a.dec(ecx).unwrap();
+            a.set_label(&mut tail_test).unwrap();
+            a.jne(tail).unwrap();
+            if aligned {
+                a.add(esi, eax).unwrap();
+            }
+            a.dec(ebx).unwrap();
+            a.jne(row).unwrap();
+        });
+        let mut state = initial(0);
+        state.eip = image.head;
+        state.regs[2] = WIDTH + tail;
+        state.regs[3] = ROWS;
+        state.regs[6] = SOURCE;
+        state.regs[7] = DEST;
+        state.x87.regs[7] = adv_cpu_core::X87Register::from_parts(0xff00_0000_ff00_0000, 0xffff);
+        state.refresh_mmx();
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            format!("row tail {tail}, aligned {aligned}"),
+            &extra,
+            |m| {
+                m.map(SOURCE, SPACE, READ | WRITE).unwrap();
+                m.map(DEST, SPACE, READ | WRITE).unwrap();
+                m.write(SOURCE, &vector_data(437)).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(100_000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(counts[20] > 0, "{counts:?}");
+        if tail == 0 {
+            for executor in [&mut trial.live, &mut trial.reference] {
+                executor.state = state.clone();
+                executor.state.regs[if aligned { 0 } else { 2 }] += 1;
+            }
+            if aligned {
+                let run = trial.run_native(100_000).unwrap();
+                assert_eq!(run.exit, Exit::Event(crate::runtime::Event::Exception(13)));
+                let retired = u64::from(run.retired);
+                assert_eq!(
+                    trial.reference.run(trial.stop, retired).unwrap(),
+                    RunOutcome::Budget
+                );
+                trial.same_position_and_memory(retired, false);
+            } else {
+                assert_eq!(trial.compare(100_000).0, RunOutcome::ReachedStop);
+            }
+            let next = trial.live.native.as_ref().unwrap().span_counts(image.head);
+            assert_eq!(next[20], counts[20]);
+            assert!(next[22] > counts[22]);
+        }
+    }
+}
+
+// spec: A64-OPT-9, A64-OPT-10
+#[test]
+fn row_domain_clips_at_a_denied_page_in_both_directions() {
+    const SOURCE: u32 = 0x2_0000;
+    const DEST: u32 = DATA + HOST_PAGE as u32;
+    const PITCH: i32 = 128;
+    const ROWS: u32 = 160;
+    for reverse in [false, true] {
+        let image = Image::loop_body(|a, row, _| {
+            let mut pixel = a.create_label();
+            a.mov(ecx, 8).unwrap();
+            a.set_label(&mut pixel).unwrap();
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.por(mm0, mm7).unwrap();
+            a.movntq(qword_ptr(edi), mm0).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(pixel).unwrap();
+            a.add(esi, if reverse { -PITCH - 64 } else { PITCH - 64 })
+                .unwrap();
+            a.add(edi, PITCH - 64).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(row).unwrap();
+        });
+        let mut state = initial(0);
+        state.eip = image.head;
+        state.regs[2] = ROWS;
+        state.regs[6] = if reverse {
+            SOURCE + 0x8000 - 64
+        } else {
+            SOURCE
+        };
+        state.regs[7] = DEST;
+        state.mmx[7] = 0xff00_0000_ff00_0000;
+        let extra = [(DEST, 0x8000)];
+        let mut trial = Trial::new(
+            &image,
+            &state,
+            format!("clipped rows reverse={reverse}"),
+            &extra,
+            |m| {
+                let denied = if reverse { SOURCE } else { SOURCE + 0x4000 };
+                let ordinary = if reverse { SOURCE + 0x4000 } else { SOURCE };
+                m.map(ordinary, HOST_PAGE, READ | WRITE).unwrap();
+                m.map_shared_audio(denied, HOST_PAGE).unwrap();
+                m.map(DEST, 0x8000, READ | WRITE).unwrap();
+                m.write(ordinary, &vector_data(773)).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        assert!(trial.try_install_at(state));
+        assert_eq!(trial.compare(20_000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(counts[20] > 0, "{counts:?}");
+    }
+}
+
+// spec: A64-OPT-8, A64-OPT-9
+#[test]
+fn failing_row_proof_is_withdrawn_with_diagnostics_off() {
+    const SLOT: u32 = DATA + 0xc000;
+    const SOURCE: u32 = DATA + 0x8000;
+    let mut target = 0;
+    let image = Image::assemble(
+        |a, head, _| {
+            a.call(dword_ptr(ebx)).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(head).unwrap();
+        },
+        |a| {
+            a.nop().unwrap();
+            target = a.instructions().len();
+            let mut inner = a.create_label();
+            a.mov(ecx, 8).unwrap();
+            a.set_label(&mut inner).unwrap();
+            a.movq(mm0, qword_ptr(esi)).unwrap();
+            a.por(mm0, mm7).unwrap();
+            a.movntq(qword_ptr(edi), mm0).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(inner).unwrap();
+            a.ret().unwrap();
+        },
+    );
+    let locations = iced_x86::Decoder::with_ip(32, &image.code, u64::from(CODE), 0)
+        .iter()
+        .map(|inst| inst.ip32())
+        .collect::<Vec<_>>();
+    let mut state = initial(0);
+    state.eip = image.head;
+    state.regs[2] = 200;
+    state.regs[3] = SLOT;
+    state.regs[6] = SOURCE;
+    state.regs[7] = DATA;
+    let mut trial = Trial::new(&image, &state, "row backoff", &[], |m| {
+        m.map(SLOT, HOST_PAGE, READ | WRITE).unwrap();
+        m.write(SLOT, &locations[target].to_le_bytes()).unwrap();
+        m.map_shared_audio(SOURCE, HOST_PAGE).unwrap();
+    });
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(30_000).0, RunOutcome::ReachedStop);
+    for executor in [&mut trial.live, &mut trial.reference] {
+        executor.state = state.clone();
+    }
+    assert_eq!(trial.compare(30_000).0, RunOutcome::ReachedStop);
+    assert!(
+        trial
+            .live
+            .native
+            .as_ref()
+            .unwrap()
+            .resident_arrivals(image.head)
+            .is_none()
+    );
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_conditional_stores_match_every_ordered_arm_pair() {
+    let image = Image::loop_body(|a, head, _| {
+        let mut done = a.create_label();
+        let mut saturate = a.create_label();
+        let mut copy = a.create_label();
+        a.mov(ebp, dword_ptr(ebx)).unwrap();
+        a.mov(eax, dword_ptr(esi + 4)).unwrap();
+        a.or(eax, dword_ptr(esi)).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.test(eax, eax).unwrap();
+        a.je(done).unwrap();
+        a.cmp(eax, 0x00ff_ffff).unwrap();
+        a.jbe(saturate).unwrap();
+        a.cmp(eax, 0xff00_0000u32).unwrap();
+        a.jae(copy).unwrap();
+        a.movq(mm2, qword_ptr(edi)).unwrap();
+        a.movq(mm3, mm2).unwrap();
+        a.shr(eax, 24).unwrap();
+        a.xor(eax, 255).unwrap();
+        a.movd(mm1, eax).unwrap();
+        a.pshufw(mm1, mm1, 0).unwrap();
+        a.punpcklbw(mm2, mm7).unwrap();
+        a.punpckhbw(mm3, mm7).unwrap();
+        a.pmullw(mm2, mm1).unwrap();
+        a.pmullw(mm3, mm1).unwrap();
+        a.psrlw(mm2, 8).unwrap();
+        a.psrlw(mm3, 8).unwrap();
+        a.packuswb(mm2, mm3).unwrap();
+        a.paddusb(mm0, mm2).unwrap();
+        a.jmp(copy).unwrap();
+        a.set_label(&mut saturate).unwrap();
+        a.paddusb(mm0, qword_ptr(edi)).unwrap();
+        a.set_label(&mut copy).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut rng = Rng(1508);
+    let mut data = Vec::new();
+    for _ in 0..8 {
+        for a in [0, 1, 112, 255] {
+            for b in [0, 1, 112, 255] {
+                for alpha in [a, a, b, b] {
+                    let pixel = match alpha {
+                        0 => 0,
+                        1 => 1 | rng.next() as u32 & 0x00ff_ffff,
+                        _ => (alpha << 24) | rng.next() as u32 & 0x00ff_ffff,
+                    };
+                    data.extend(pixel.to_le_bytes());
+                }
+            }
+        }
+    }
+    for in_place in [false, true] {
+        let mut cpu = initial((data.len() / 4 - 1) as u32);
+        cpu.regs[3] = RESULTS;
+        if in_place {
+            cpu.regs[7] = DATA;
+        }
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("conditional MMX, in place {in_place}"),
+            &[],
+            |m| {
+                m.write(DATA, &data).unwrap();
+                m.write(OUTPUT, &vector_data(213)).unwrap();
+                m.write(RESULTS, &97u32.to_le_bytes()).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        vector_install(&mut trial, cpu, 2);
+        assert_eq!(trial.compare(30000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(
+            counts[4..20].iter().all(|&n| n > 0),
+            "in place {in_place}: {counts:?}"
+        );
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
 fn vector_signed_bound_in_a_frame_cell() {
     let image = Image::loop_body(|a, head, _| {
         a.movzx(eax, byte_ptr(esi)).unwrap();
