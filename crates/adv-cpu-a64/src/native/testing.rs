@@ -21,7 +21,7 @@ impl Native {
         }
         let head = at.eip;
         self.invalidate(memory);
-        if !self.code.units.contains_key(&head) {
+        if self.code.tier1(head).is_none() {
             self.translate(
                 memory,
                 head,
@@ -35,20 +35,20 @@ impl Native {
             self.discover(memory, head, head, at);
             self.install_optimized(true);
         }
-        self.plans
+        self.code
             .resident(head)
             .is_some_and(|head| !head.versions.is_empty())
     }
 
     pub(crate) fn tier1_versions(&self, eip: u32) -> usize {
         self.code
-            .chains
-            .get(&eip)
+            .tier1_chain(eip)
+            .filter(|chain| chain.mask != 0)
             .map_or(0, |chain| chain.versions.len())
     }
 
     pub(crate) fn resident_arrivals(&self, head: u32) -> Option<u32> {
-        let head = self.plans.resident(head)?;
+        let head = self.code.resident(head)?;
         (!head.versions.is_empty()).then(|| super::plan::SAMPLE - head.sample.get())
     }
 }

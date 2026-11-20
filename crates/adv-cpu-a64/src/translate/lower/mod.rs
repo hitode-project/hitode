@@ -14,6 +14,7 @@ pub(crate) mod access;
 pub(super) mod body;
 pub(crate) mod flags;
 pub(super) mod fp_class;
+pub(crate) mod resident;
 pub(crate) mod stubs;
 
 pub(in crate::translate) const X0: Reg = Reg::new(0);
@@ -87,6 +88,18 @@ pub(crate) struct InternalLink {
     pub counter: Option<usize>,
     pub sensor: Option<usize>,
     pub source_pc: u32,
+}
+
+pub(crate) struct Tier1Placement<'a> {
+    pub words: &'a [u32],
+    pub sites: &'a [(usize, Site)],
+    pub marks: &'a [crate::jit_map::Mark],
+    pub retired: u32,
+    pub version: VersionLayout,
+    pub links: &'a [Link],
+    pub internal_links: &'a [InternalLink],
+    pub table_positions: &'a [(usize, usize)],
+    pub uses_permissions: bool,
 }
 
 /// Host addresses of the `runtime` stubs units branch to.

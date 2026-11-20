@@ -188,6 +188,10 @@ impl Key {
         self.mask
     }
 
+    pub(crate) fn uses_resident_context(self) -> bool {
+        self.context_mask != 0
+    }
+
     pub(crate) fn proves(self, other: Self) -> bool {
         self.mask & other.mask == other.mask
             && self.value & other.mask == other.value

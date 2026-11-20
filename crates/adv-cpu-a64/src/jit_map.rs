@@ -288,7 +288,7 @@ pub(crate) fn demoted(head: u32, version: usize, entries: u64, iterations: u64) 
 }
 
 #[cfg(native)]
-pub(crate) fn declined(head: u32, reason: crate::runtime::ResidentCold) {
+pub(crate) fn declined(head: u32, reason: crate::translate::lower::resident::ResidentCold) {
     if let Some(files) = files() {
         let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
         let _ = writeln!(files.3, "declined\t{head}\t{reason:?}");

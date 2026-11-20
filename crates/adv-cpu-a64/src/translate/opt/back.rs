@@ -22,10 +22,11 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::facts::{Assumed, Key};
 use crate::jit_map::{Mark, Part};
-use crate::runtime::{self, ResidentCold, Runtime};
+use crate::runtime::{self, Runtime};
 use crate::translate::lower::access::{CheckedEmitter, Value as AccessReg, page_crossing};
 use crate::translate::lower::flags::{Carry, Overflow, Sense};
 use crate::translate::lower::fp_class;
+use crate::translate::lower::resident::ResidentCold;
 use crate::translate::lower::{Site, WINDOW, X0, X1, X2, X3};
 pub(super) use batch::BatchEmitter;
 use std::mem::offset_of;
@@ -50,6 +51,7 @@ pub(crate) struct Lowered {
     /// The inline entry, miss and cold branch words.
     pub entry: usize,
     pub key: Key,
+    pub body: usize,
     pub miss: usize,
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
@@ -184,6 +186,7 @@ fn lower_form(
     assert_no_fp_state(&words);
     Lowered {
         entry: 0,
+        body: e.body,
         key: inline.map_or_else(Key::default, |(assumed, entry)| entry_key(assumed, entry)),
         miss,
         env_miss,
@@ -283,6 +286,7 @@ fn emit<'a>(
         env_miss,
         probation,
         entry_words: 0,
+        body: 0,
         exit_words: 0,
         iteration: cost::Iteration::default(),
         fact_misses: Vec::new(),
@@ -545,6 +549,7 @@ struct Emitter<'a> {
     env_miss: Option<Label>,
     probation: Option<resident::Probation>,
     entry_words: u32,
+    body: usize,
     exit_words: u32,
     iteration: cost::Iteration,
     fact_misses: Vec<Label>,

@@ -26,6 +26,27 @@ class ModuleDependenciesTest(unittest.TestCase):
             "encode.rs": "",
         }, set()), [])
 
+    # spec: A64A-ROLE-6
+    def test_arbiter_can_decide_from_facts_and_artifacts_but_cannot_emit(self):
+        self.assertEqual(violations({
+            "asm.rs": "",
+            "cache.rs": "",
+            "encode.rs": "",
+            "facts.rs": "",
+            "runtime.rs": "",
+            "native/store.rs": "",
+            "native/compile.rs": "",
+            "native/plan.rs": (
+                "use crate::{facts::Key, asm::Asm, encode::b, cache::CodeCache, runtime::Runtime};\n"
+                "use super::{store::CodeStore, compile::Compiler};"
+            ),
+        }, set()), [
+            "native/plan.rs:1: native::plan -> asm: disallowed",
+            "native/plan.rs:1: native::plan -> cache: disallowed",
+            "native/plan.rs:1: native::plan -> encode: disallowed",
+            "native/plan.rs:1: native::plan -> runtime: disallowed",
+        ])
+
     # spec: A64A-DEP-1, A64A-ROLE-2
     def test_front_may_name_encoder_operation_types_only(self):
         self.assertEqual(violations({

@@ -1,27 +1,18 @@
-//! Resident entry, version misses and recovery tails (A64-OPT-8).
-//!
-//! Owner-only sensors use plan cells embedded as code literals. Their
-//! cold paths either patch a stable link in place or leave before the
-//! owner changes the version chain. Detached jobs have their own entry
-//! code and retain no pointers to these cells.
+//! Owner-only resident entry sequences.
 
-use crate::translate::lower::stubs;
 use std::cell::Cell;
-
-use crate::facts::Key;
-use adv_cpu_core::CpuState;
 
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit, PlanEvent};
-use crate::translate::opt::{back::Lowered, recovery::*};
+use crate::translate::lower::stubs;
 
 /// These counters are private to one version and written only by the owner.
 #[derive(Default)]
 #[repr(C)]
-pub(super) struct Slot {
+pub(crate) struct Slot {
     pub retry: Cell<u32>,
     pub env: [Cell<u32>; 8],
     /// Snapshot followed by total retirement, as read by the lowered calls.
@@ -33,76 +24,6 @@ pub(super) struct Slot {
 const _: () =
     assert!(std::mem::offset_of!(Slot, entries) == std::mem::offset_of!(Slot, countdown) + 16);
 
-pub(super) struct Version {
-    pub entry: usize,
-    pub probe: usize,
-    pub probe_word: u32,
-    pub next: usize,
-    pub retry: (usize, u32),
-    pub environment: Vec<usize>,
-    pub at: CpuState,
-    pub key: Key,
-    pub mmx: bool,
-    pub plain_sites: Vec<u32>,
-    pub records: Vec<Record<Host>>,
-    pub flags: Vec<Option<FlagRecipe>>,
-    pub slot: Box<Slot>,
-    pub probation: Option<Probation>,
-    pub probation_sensors: Vec<usize>,
-    pub iteration_retired: u64,
-    pub accounting: Vec<(usize, u32)>,
-}
-
-impl Version {
-    pub fn set_retry(&self, cache: &mut crate::cache::CodeCache, period: Option<u32>) {
-        let (point, word) = self.retry;
-        let replacement = match period {
-            Some(count) => {
-                self.slot.retry.set(count);
-                word
-            }
-            None => branch(point, self.next),
-        };
-        cache.patch(point, replacement);
-    }
-
-    pub fn iterations(&self, retired: u64) -> u64 {
-        retired.checked_div(self.iteration_retired).unwrap_or(0)
-    }
-
-    pub fn account(&self, cache: &mut crate::cache::CodeCache, enabled: bool) {
-        for &(point, call) in &self.accounting {
-            cache.patch(point, if enabled { call } else { NOP });
-        }
-        if self.probation.is_none() {
-            let skip = if enabled {
-                runtime::SENSOR_BYTES
-            } else {
-                runtime::SENSOR_BYTES + 4
-            };
-            for &point in &self.probation_sensors {
-                cache.patch(point, b(skip as i32));
-            }
-        }
-    }
-}
-
-pub(super) struct Probation {
-    pub iteration_retired: u64,
-    pub saved_words: u64,
-    pub entry_exit_words: u64,
-    pub cold_entries: u64,
-    pub cold_retired: u64,
-}
-
-impl Probation {
-    pub fn profitable(&self, slot: &Slot) -> bool {
-        let entries = slot.entries.get() + self.cold_entries;
-        let retired = slot.countdown[1].get() + self.cold_retired;
-        retired / entries / self.iteration_retired * self.saved_words >= self.entry_exit_words
-    }
-}
-
 const fn r(n: u8) -> Reg {
     Reg::new(n)
 }
@@ -111,37 +32,70 @@ const RT: Reg = r(29);
 const GATE: Reg = r(16);
 const SLOT: Reg = r(15);
 
-pub(super) fn branch(from: usize, to: usize) -> u32 {
+pub(crate) fn branch(from: usize, to: usize) -> u32 {
     b((to as i64 - from as i64) as i32)
 }
 
-pub(super) struct Targets {
+/// Relocations in a lowered resident artifact, in words except link and site offsets.
+pub(crate) struct Layout<'a> {
+    pub words: &'a mut [u32],
+    pub body: usize,
+    pub miss: usize,
+    pub cold: usize,
+    pub env_miss: usize,
+    pub environment: &'a [(usize, usize)],
+    pub exit: usize,
+    pub spill_cells: usize,
+    pub probation_slot: usize,
+    pub probation_sensor: &'a (Vec<usize>, usize, usize),
+    pub accounting: &'a [usize],
+    pub links: &'a [(usize, u32)],
+    pub transitions: &'a [(usize, usize)],
+    pub sites: &'a [(usize, super::super::Site)],
+    pub marks: &'a [crate::jit_map::Mark],
+}
+
+pub(crate) struct Targets {
+    pub at: usize,
+    pub proved_body: Option<usize>,
     pub tier1: usize,
     pub exit: usize,
-    pub dispatch: usize,
     pub resident_exit: usize,
 }
 
-pub(super) struct Entry {
+pub(crate) struct MissCounter {
+    pub entry: usize,
+    pub next: usize,
+    pub literal: usize,
+}
+
+pub(crate) struct Entry {
     pub words: Vec<u32>,
     pub entry: usize,
+    pub proved: Option<usize>,
+    pub proved_cold: Option<usize>,
     pub probe: usize,
     pub next: usize,
     pub retry: usize,
     pub form: usize,
+    pub tail: usize,
+    pub environment: usize,
+    pub probation: usize,
+    pub miss_counter: Option<MissCounter>,
 }
 
 /// Prefix and resident form, with the context-miss continuation patchable
 /// independently of the Tier-1 fallback shared by the head's versions.
-pub(super) fn emit(
+pub(crate) fn emit(
     (head, version): (u32, usize),
     sample: &Cell<u32>,
     slot: &Slot,
     gate: Option<OfferEntry>,
-    form: &mut Lowered,
-    at: usize,
+    spill_cells: usize,
+    count_misses: bool,
     targets: Targets,
 ) -> Entry {
+    let at = targets.at;
     let mut asm = Asm::new();
     let offer_exit = asm.label();
     let offer_fallback = asm.label();
@@ -156,8 +110,8 @@ pub(super) fn emit(
     let sampled = asm.label();
     let entry = asm.label();
     let probation = asm.label();
+    let proved_cold = asm.label();
     let next = asm.label();
-    let tier1 = asm.label();
     let exit = asm.label();
     let opt_exit = asm.label();
 
@@ -174,9 +128,27 @@ pub(super) fn emit(
         literal(&mut asm, sample_counter, sample.as_ptr() as u64);
     }
 
+    let miss_counter = count_misses.then(|| {
+        let address = asm.label();
+        let entry = at + asm.offset();
+        asm.ldr_literal(SLOT, address);
+        asm.emit_all(&[
+            ldr(X, r(0), SLOT, 0),
+            add_imm(X, r(0), r(0), 1, false),
+            str(X, r(0), SLOT, 0),
+        ]);
+        let next = at + asm.offset();
+        asm.emit(0);
+        let literal_at = at + asm.offset();
+        literal(&mut asm, address, 0);
+        MissCounter {
+            entry,
+            next,
+            literal: literal_at,
+        }
+    });
+
     asm.bind(next);
-    asm.emit(0);
-    asm.bind(tier1);
     asm.emit(0);
 
     asm.bind(miss);
@@ -184,8 +156,8 @@ pub(super) fn emit(
     asm.b(next);
 
     asm.bind(retry);
-    guest_exit(&mut asm, head, Exit::Plan(PlanEvent::ContextRetry));
-    asm.emit(movk(X, r(0), version as u16, 32));
+    observe(&mut asm, head, version, runtime::RESIDENT_VERSION_MISS);
+    asm.b(next);
     asm.bind(exit);
     asm.emit(0);
 
@@ -199,7 +171,7 @@ pub(super) fn emit(
 
     // x16 and x17 hold no form values at a cold exit (A64-OPT-7).
     asm.bind(tail);
-    constant(&mut asm, r(16), form.spill_cells as u64);
+    constant(&mut asm, r(16), spill_cells as u64);
     asm.emit(str(X, r(16), RT, runtime::RECOVERY_CELLS));
     constant(&mut asm, r(16), u64::from(head));
     asm.emit_all(&[
@@ -225,20 +197,27 @@ pub(super) fn emit(
 
     if version == 0 {
         asm.bind(sampled);
-        stubs::emit_save_light(&mut asm);
-        asm.emit(ldr(X, r(0), RT, runtime::CPU_STATE));
-        stubs::emit_store_guest(&mut asm, r(0));
-        constant(&mut asm, r(1), u64::from(head));
-        asm.emit_all(&[
-            mov(X, r(0), RT),
-            mov(X, r(2), r(14)),
-            movz(W, r(3), runtime::RESIDENT_LINK_SAMPLE, 0),
-            ldr(X, r(16), RT, runtime::PLAN_OBSERVATION),
-            blr(r(16)),
-        ]);
-        stubs::emit_restore_light(&mut asm);
+        observe(&mut asm, head, 0, runtime::RESIDENT_LINK_SAMPLE);
         asm.b(entry);
     }
+    let proved = targets.proved_body.map(|offset| {
+        asm.bind(proved_cold);
+        let fallback = at + asm.offset();
+        asm.emit(branch(fallback, targets.tier1));
+        let entry = at + asm.offset();
+        if let Some(gate) = gate {
+            offer(&mut asm, gate, offer_counter, offer_exit);
+        }
+        let rep_pending = std::mem::offset_of!(runtime::Runtime, rep_pending) as u32;
+        asm.emit_all(&[
+            ldr(X, r(0), RT, runtime::CPU_STATE),
+            ldr(W, r(16), RT, rep_pending),
+        ]);
+        asm.cbz(W, true, r(16), proved_cold);
+        let branch = at + asm.offset();
+        asm.emit(0);
+        (entry, branch, offset)
+    });
     asm.bind(probe);
     if version == 0 {
         runtime::emit_sensor(&mut asm, sample_counter, SLOT, r(0), sampled);
@@ -251,52 +230,54 @@ pub(super) fn emit(
 
     let form_at = at + asm.offset();
     let address = |label| at + asm.position(label);
-    let pointer = slot.countdown.as_ptr() as u64;
-    form.words[form.probation_slot] = pointer as u32;
-    form.words[form.probation_slot + 1] = (pointer >> 32) as u32;
-    let (_, counter, leave) = form.probation_sensor.as_ref().unwrap();
-    let pointer = slot.probation.as_ptr() as u64;
-    form.words[*counter] = pointer as u32;
-    form.words[*counter + 1] = (pointer >> 32) as u32;
-    form.words[*leave] = branch(form_at + leave * 4, address(probation));
-    for (fact, &(_, literal)) in form.environment.iter().enumerate() {
-        let cell = &slot.env[fact];
-        let pointer = cell.as_ptr() as u64;
-        form.words[literal] = pointer as u32;
-        form.words[literal + 1] = (pointer >> 32) as u32;
-    }
     let patches = [
         (address(next), targets.tier1),
-        (address(tier1), targets.tier1),
         (address(exit), targets.exit),
         (address(opt_exit), targets.resident_exit),
     ];
-    form.place(form_at, address(tail));
-    form.words[form.miss] = branch(form_at + form.miss * 4, address(miss));
-    // On the frozen back end the two labels share a word.
-    if form.env_miss != form.miss {
-        form.words[form.env_miss] = branch(form_at + form.env_miss * 4, address(env));
-    }
-    form.words[form.cold] = branch(form_at + form.cold * 4, address(tier1));
-    for &(offset, _) in &form.links {
-        let word = offset / 4 + 3;
-        form.words[word] = branch(form_at + word * 4, targets.dispatch);
-    }
     let (entry, probe, next, retry) =
         (address(entry), address(probe), address(next), address(miss));
+    let (tail, environment, probation) = (address(tail), address(env), address(probation));
     let mut words = asm.finish();
     for (from, to) in patches {
         words[(from - at) / 4] = branch(from, to);
     }
-    words.extend_from_slice(&form.words);
+    if let Some((_, point, offset)) = proved {
+        words[(point - at) / 4] = branch(point, form_at + offset);
+    }
     Entry {
         words,
         entry,
+        proved: proved.map(|(entry, _, _)| entry),
+        proved_cold: proved.map(|(entry, _, _)| entry - 4),
         probe,
         next,
         retry,
         form: form_at,
+        tail,
+        environment,
+        probation,
+        miss_counter,
     }
+}
+
+fn observe(asm: &mut Asm, head: u32, version: usize, kind: u16) {
+    stubs::emit_save_light(asm);
+    asm.emit(ldr(X, r(0), RT, runtime::CPU_STATE));
+    stubs::emit_store_guest(asm, r(0));
+    constant(asm, r(1), u64::from(head));
+    asm.emit_all(&[
+        mov(X, r(0), RT),
+        if kind == runtime::RESIDENT_LINK_SAMPLE {
+            mov(X, r(2), r(14))
+        } else {
+            movz(X, r(2), version as u16, 0)
+        },
+        movz(W, r(3), kind, 0),
+        ldr(X, r(16), RT, runtime::PLAN_OBSERVATION),
+        blr(r(16)),
+    ]);
+    stubs::emit_restore_light(asm);
 }
 
 fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
@@ -307,21 +288,29 @@ fn guest_exit(asm: &mut Asm, head: u32, exit: Exit) {
     ]);
 }
 
-pub(super) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
+pub(crate) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
     let mut asm = Asm::new();
     guest_exit(&mut asm, head, Exit::Dispatch);
     asm.emit(branch(at + asm.offset(), exit));
     asm.finish()
 }
 
+pub(crate) fn version_miss(head: u32, at: usize, dispatch: usize) -> Vec<u32> {
+    let mut asm = Asm::new();
+    super::super::emit_target(&mut asm, head);
+    asm.emit(mvn(X, r(2), Reg::ZR));
+    asm.emit(branch(at + asm.offset(), dispatch));
+    asm.finish()
+}
+
 /// Stable plan cells read only by the owner.
 #[derive(Clone, Copy)]
-pub(super) struct OfferEntry {
+pub(crate) struct OfferEntry {
     pub counter: u64,
     pub split: bool,
 }
 
-pub(super) fn offer_link(
+pub(crate) fn offer_link(
     head: u32,
     at: usize,
     exit: usize,

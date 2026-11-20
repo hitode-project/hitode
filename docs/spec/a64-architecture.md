@@ -70,12 +70,23 @@ Range guards over page facts use the Memory permission tables and stay outside t
 
 ### A64A-ROLE-5 Code store
 
-**Rule**: `native::store` MUST key Tier-1 versions by entry EIP and fact key. Dispatch, indirect transfers and resident continuations MUST enter the chain's checked head. Invalidation MUST drop all versions of the entry.
+**Rule**: `native::store` MUST key owner code by entry EIP and fact key. It MUST be the only module that places, links, versions, watches and drops code. Resident forms and Tier-1 versions at an entry MUST share one chain.
 **Applies to**: AArch64
 **Verification**: Test
 **Basis**: A64-OPT-11
 
-Each version has guards, a body and a miss slot. The slot branches to the next checked entry or to the version-miss stub. A return continuation checks facts its callee may change.
+The chain has a resident prefix and a Tier-1 suffix. Dispatch, indirect slots, and same-head, countdown and REP continuations enter the checked Tier-1 suffix. Eligible backward links and outside direct arrivals enter the checked resident prefix. An empty key has no guards.
+
+A failed key guard continues through its miss slot to the next checked version or the version-miss stub. A static edge that proves the key enters past those guards. A return continuation checks the facts its callee may change. Invalidation drops both segments.
+
+### A64A-ROLE-6 Arbiter
+
+**Rule**: `native::plan` MUST decide tiers, version selection, build configuration and offload in response to plan events. It MUST NOT emit host code or read guest memory.
+**Applies to**: AArch64
+**Verification**: Test
+**Basis**: A64-OPT-12
+
+Plan events include discovery, version misses, sensor triggers, compile completion, cold exits, faults, invalidation and probation end.
 
 ### A64A-ROLE-8 Plan events
 
@@ -95,11 +106,11 @@ Events that may invalidate an active continuation MUST leave with their identity
 
 ### A64A-FALL-3 Version misses
 
-**Rule**: A guard miss MUST look up or build the matching version on the owner without leaving generated code. A full chain MUST replace its tail with a version keyed by the join of the tail and the observed facts.
+**Rule**: A guard miss MUST look up or build the matching version on the owner without leaving generated code. A full Tier-1 suffix MUST replace its tail with a version keyed by the join of the tail and the observed facts.
 **Applies to**: AArch64
 **Verification**: Test
 
-The chain keeps up to three versions, from most specific to most general. A join keeps each complete field on which the keys agree.
+The Tier-1 suffix keeps up to three versions, from most specific to most general. A join keeps each complete field on which the keys agree. The resident prefix keeps up to three forms in discovery order. Its last miss proceeds through the checked Tier-1 suffix.
 
 ### A64A-FALL-4 Events
 

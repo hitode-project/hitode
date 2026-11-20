@@ -312,11 +312,15 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             compare("worker", &opt::back::lower(&built.func).words);
             let built =
                 opt::front::build_with(&work.unit, None, &at, &|_| false, &|_| false).unwrap();
-            compare(
-                "resident",
-                &opt::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false)
-                    .words,
-            );
+            let mut form =
+                opt::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+            // The only changed word in this lowering is the MMX test's miss
+            // target. Validate it before putting the old guard relocation back
+            // for the full-word baseline comparison.
+            let imm19 = (form.words[2] >> 5) & 0x7ffff;
+            assert_eq!(2 + imm19 as usize, form.miss);
+            form.words[2] = form.words[4] + (2 << 5);
+            compare("resident", &form.words);
         }
     }
 }

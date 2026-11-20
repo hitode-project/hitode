@@ -1,8 +1,8 @@
 //! Executable units, link records, fault recovery and page watches.
 //!
-//! The store places artifacts and holds the data for link, repoint and
-//! invalidation operations. Worker placements retain their own fault sites
-//! for the lifetime of a job.
+//! One chain holds the checked resident prefix and Tier-1 suffix for each
+//! guest entry. The store publishes their code, links and watches together.
+//! Detached worker placements retain their own fault sites.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
@@ -10,15 +10,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::cache::CodeCache;
-use crate::encode::{b, bl};
+use crate::encode::{NOP, b, bl};
 use crate::facts::Key;
-use adv_cpu_core::CpuState;
+use adv_cpu_core::{CpuState, Memory};
+
+pub(super) use crate::translate::lower::resident::OfferEntry;
 
 use crate::runtime::{self, Enter};
-use crate::translate::front::{Unit, decode::Helper, trace::Trace};
+use crate::translate::front::{Decodes, Unit, decode::Helper, trace::Trace};
 use crate::translate::lower::{
     Link, Site, Stubs, VersionLayout,
     flags::{Operand, Sense},
+    resident::{self as ingress, Slot},
 };
 
 #[derive(Clone, Copy)]
@@ -30,8 +33,25 @@ pub(super) struct Tier1Unit {
 }
 
 pub(super) const CHAIN_LEN: usize = 3;
+pub(super) const EMPTY: [u64; 2] = [u64::MAX, 0];
 
-pub(super) struct Chain {
+pub(super) struct Chain<R> {
+    pub(super) tier1: Option<Tier1Chain>,
+    pub(super) resident: Option<ResidentSite<R>>,
+    offer: Option<(usize, usize)>,
+}
+
+impl<R> Default for Chain<R> {
+    fn default() -> Self {
+        Self {
+            tier1: None,
+            resident: None,
+            offer: None,
+        }
+    }
+}
+
+pub(super) struct Tier1Chain {
     pub(super) unit: Arc<Unit>,
     pub(super) mask: u64,
     pub(super) helpers: u32,
@@ -49,6 +69,7 @@ pub(super) struct VersionStats {
     pub(super) built: u64,
     pub(super) misses: u64,
     pub(super) joins: u64,
+    pub(super) resident_misses: [Cell<u64>; 2],
     pub(super) arrivals: [Cell<u64>; CHAIN_LEN],
 }
 
@@ -89,7 +110,79 @@ pub(super) struct SlowPaths {
     pub(super) values: BTreeMap<u32, u64>,
 }
 
-pub(super) struct CodeStore {
+pub(super) struct ResidentSite<R> {
+    pub unit: Arc<Unit>,
+    pub sample: Box<Cell<u32>>,
+    pub versions: Vec<ResidentVersion<R>>,
+    pub fallback: usize,
+    pub suspended: bool,
+}
+
+impl<R> ResidentSite<R> {
+    pub fn entry(&self) -> Option<usize> {
+        self.versions
+            .first()
+            .filter(|_| !self.suspended)
+            .map(|v| v.probe)
+    }
+}
+
+pub(super) fn place_stubs(capacity: usize, words: &[u32]) -> Result<(CodeCache, usize), String> {
+    let mut cache = CodeCache::new(capacity)?;
+    let base = cache.append(words).ok_or("stubs do not fit")?;
+    Ok((cache, base))
+}
+
+pub(super) fn branch(from: usize, to: usize) -> u32 {
+    b((to as i64 - from as i64) as i32)
+}
+
+pub(super) struct ResidentVersion<R> {
+    pub entry: usize,
+    pub proved: Option<usize>,
+    proved_cold: Option<usize>,
+    pub probe: usize,
+    pub probe_word: u32,
+    pub next: usize,
+    pub miss: usize,
+    miss_counter: Option<ingress::MissCounter>,
+    pub cold: usize,
+    pub retry: usize,
+    pub environment: Vec<usize>,
+    pub at: CpuState,
+    pub key: Key,
+    pub plain_sites: Vec<u32>,
+    pub recovery: R,
+    pub slot: Box<Slot>,
+    pub probation: bool,
+    pub probation_sensors: Vec<usize>,
+    pub iteration_retired: u64,
+    pub accounting: Vec<(usize, u32)>,
+}
+
+impl<R> ResidentVersion<R> {
+    pub fn iterations(&self, retired: u64) -> u64 {
+        retired.checked_div(self.iteration_retired).unwrap_or(0)
+    }
+
+    pub fn account(&self, cache: &mut crate::cache::CodeCache, enabled: bool) {
+        for &(point, call) in &self.accounting {
+            cache.patch(point, if enabled { call } else { NOP });
+        }
+        if !self.probation {
+            let skip = if enabled {
+                runtime::SENSOR_BYTES
+            } else {
+                runtime::SENSOR_BYTES + 4
+            };
+            for &point in &self.probation_sensors {
+                cache.patch(point, b(skip as i32));
+            }
+        }
+    }
+}
+
+pub(super) struct CodeStore<R> {
     pub(super) resident_exit: usize,
     /// Switch-table slots by guest target: source entry, host slot and
     /// original shared stub. Dispatch looks targets up on every miss.
@@ -102,8 +195,7 @@ pub(super) struct CodeStore {
     pub(super) stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     pub(super) stub_len: usize,
-    pub(super) units: FxHashMap<u32, Tier1Unit>,
-    pub(super) chains: FxHashMap<u32, Chain>,
+    pub(super) chains: FxHashMap<u32, Chain<R>>,
     pub(super) version_stats: Option<FxHashMap<u32, Box<VersionStats>>>,
     pub(super) slow_paths: Option<SlowPaths>,
     #[cfg(test)]
@@ -136,17 +228,608 @@ pub(super) struct CodeStore {
     pub(super) faults: Faults,
 }
 
-impl CodeStore {
-    pub(super) fn contains_unit(&self, entry: u32, address: usize) -> bool {
-        self.units
-            .get(&entry)
-            .is_some_and(|unit| unit.unit == address)
-            || self.chains.get(&entry).is_some_and(|chain| {
-                chain
-                    .versions
-                    .iter()
-                    .any(|version| version.entry.unit == address)
+impl<R> CodeStore<R> {
+    pub(super) fn used(&self) -> usize {
+        self.cache.used()
+    }
+
+    pub(super) fn next(&self) -> usize {
+        self.cache.next()
+    }
+
+    pub(super) fn install_tier1_version(
+        &mut self,
+        eip: u32,
+        mut chain: Tier1Chain,
+        position: usize,
+        version: Version,
+    ) {
+        let previous = chain.versions[position - 1].entry.miss.unwrap();
+        self.repoint(previous, version.entry.unit);
+        chain.versions.truncate(position);
+        chain.versions.push(version);
+        self.set_tier1(eip, chain);
+    }
+
+    pub(super) fn tier1(&self, eip: u32) -> Option<Tier1Unit> {
+        self.tier1_chain(eip).map(|chain| chain.versions[0].entry)
+    }
+
+    pub(super) fn tier1_chain(&self, eip: u32) -> Option<&Tier1Chain> {
+        self.chains.get(&eip)?.tier1.as_ref()
+    }
+
+    pub(super) fn set_tier1(&mut self, eip: u32, chain: Tier1Chain) {
+        self.chains.entry(eip).or_default().tier1 = Some(chain);
+    }
+
+    pub(super) fn take_tier1(&mut self, eip: u32) -> Option<Tier1Chain> {
+        self.chains.get_mut(&eip)?.tier1.take()
+    }
+
+    pub(super) fn resident(&self, eip: u32) -> Option<&ResidentSite<R>> {
+        self.chains.get(&eip)?.resident.as_ref()
+    }
+
+    pub(super) fn resident_mut(&mut self, eip: u32) -> Option<&mut ResidentSite<R>> {
+        self.chains.get_mut(&eip)?.resident.as_mut()
+    }
+
+    pub(super) fn prepare_resident(&mut self, eip: u32, unit: Arc<Unit>, sample: u32) {
+        self.chains.entry(eip).or_default().resident = Some(ResidentSite {
+            unit,
+            sample: Box::new(sample.into()),
+            versions: Vec::new(),
+            fallback: 0,
+            suspended: false,
+        });
+    }
+
+    pub(super) fn resident_fallback(&self, eip: u32) -> Option<usize> {
+        self.tier1(eip).map(|entry| entry.unit).or_else(|| {
+            self.resident(eip)
+                .map(|site| site.fallback)
+                .filter(|&at| at != 0)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn place_resident(
+        &mut self,
+        eip: u32,
+        index: usize,
+        at: CpuState,
+        key: Key,
+        plain_sites: Vec<u32>,
+        recovery: R,
+        iteration_retired: u32,
+        gate: Option<OfferEntry>,
+        probation: Option<u32>,
+        misses: u32,
+        layout: ingress::Layout<'_>,
+    ) -> bool {
+        let fallback = if let Some(tier1) = self.resident_fallback(eip) {
+            tier1
+        } else {
+            let at = self.cache.next();
+            let words = ingress::version_miss(eip, at, self.stubs.dispatch);
+            if self.cache.append(&words).is_none() {
+                return false;
+            }
+            self.resident_mut(eip).unwrap().fallback = at;
+            at
+        };
+        let site = self.chains[&eip].resident.as_ref().unwrap();
+        let slot = Box::<Slot>::default();
+        slot.probation.set(probation.unwrap_or_default());
+        for counter in &slot.env {
+            counter.set(misses);
+        }
+        let base = self.cache.next();
+        let mut entry = ingress::emit(
+            (eip, index),
+            &site.sample,
+            &slot,
+            gate,
+            layout.spill_cells,
+            self.version_stats.is_some(),
+            ingress::Targets {
+                at: base,
+                proved_body: (!key.uses_resident_context()).then_some(layout.body),
+                tier1: fallback,
+                exit: self.stubs.exit,
+                resident_exit: self.resident_exit,
+            },
+        );
+        let probe_word = entry.words[(entry.probe - base) / 4];
+        let words = layout.words;
+        let literal = |words: &mut [u32], at: usize, pointer: u64| {
+            words[at] = pointer as u32;
+            words[at + 1] = (pointer >> 32) as u32;
+        };
+        literal(words, layout.probation_slot, slot.countdown.as_ptr() as u64);
+        let (sensors, counter, leave) = layout.probation_sensor;
+        literal(words, *counter, slot.probation.as_ptr() as u64);
+        words[*leave] = branch(entry.form + leave * 4, entry.probation);
+        for (ordinal, &(_, offset)) in layout.environment.iter().enumerate() {
+            literal(words, offset, slot.env[ordinal].as_ptr() as u64);
+        }
+        for (offset, target) in [
+            (layout.exit, entry.tail),
+            (layout.miss, entry.retry),
+            (layout.env_miss, entry.environment),
+            (layout.cold, fallback),
+        ] {
+            words[offset] = branch(entry.form + offset * 4, target);
+        }
+        for &(offset, _) in layout.links {
+            let word = offset / 4 + 3;
+            words[word] = branch(entry.form + word * 4, self.stubs.dispatch);
+        }
+        entry.words.extend_from_slice(words);
+        let placed = &mut entry.words[(entry.form - base) / 4..];
+        let accounting = layout
+            .accounting
+            .iter()
+            .map(|&word| {
+                let call = placed[word];
+                if probation.is_none() {
+                    placed[word] = NOP;
+                }
+                (entry.form + word * 4, call)
             })
+            .collect();
+        let probation_sensors = sensors
+            .iter()
+            .map(|&word| {
+                if probation.is_none() {
+                    placed[word] = b((runtime::SENSOR_BYTES + 4) as i32);
+                }
+                entry.form + word * 4
+            })
+            .collect();
+        if self.cache.append(&entry.words).is_none() {
+            return false;
+        }
+        self.direct_points.extend(
+            layout
+                .transitions
+                .iter()
+                .map(|&(point, transition)| (entry.form + point, entry.form + transition)),
+        );
+        let from = self.faults.sites.len().saturating_sub(1);
+        self.faults.sites.extend(
+            layout
+                .sites
+                .iter()
+                .map(|&(offset, site)| (entry.form + offset, site)),
+        );
+        if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
+            self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
+        }
+        crate::jit_map::optimized(eip, format_args!("installed\t-\t-"));
+        crate::jit_map::record(
+            entry.form,
+            words,
+            eip,
+            site.unit.trace.prepaid(0),
+            layout.marks,
+            "a64-resident",
+        );
+        let version = ResidentVersion {
+            entry: entry.entry,
+            proved: entry.proved,
+            proved_cold: entry.proved_cold,
+            probe: entry.probe,
+            probe_word,
+            next: entry.next,
+            miss: entry.form + layout.miss * 4,
+            miss_counter: entry.miss_counter,
+            cold: entry.form + layout.cold * 4,
+            retry: entry.retry,
+            environment: layout
+                .environment
+                .iter()
+                .map(|&(sensor, _)| entry.form + sensor)
+                .collect(),
+            at,
+            key,
+            plain_sites,
+            recovery,
+            slot,
+            probation: probation.is_some(),
+            probation_sensors,
+            accounting,
+            iteration_retired: u64::from(iteration_retired),
+        };
+        let versions = &mut self.resident_mut(eip).unwrap().versions;
+        if index == versions.len() {
+            versions.push(version);
+        } else {
+            versions[index] = version;
+        }
+        self.uses_permissions = true;
+        self.faults.end.set(self.cache.next());
+        true
+    }
+
+    pub(super) fn start_link_sampling(&mut self, eip: u32, period: u32) {
+        let site = self.chains[&eip].resident.as_ref().unwrap();
+        site.sample.set(period);
+        let first = &site.versions[0];
+        self.cache.patch(first.probe, first.probe_word);
+    }
+
+    pub(super) fn publish_resident(&mut self, eip: u32, period: Option<u32>) {
+        let fallback = self.resident_fallback(eip).unwrap();
+        let site = self
+            .chains
+            .get_mut(&eip)
+            .unwrap()
+            .resident
+            .as_mut()
+            .unwrap();
+        let counters = self.version_stats.as_mut().map(|stats| {
+            stats
+                .entry(eip)
+                .or_default()
+                .resident_misses
+                .each_ref()
+                .map(|c| c.as_ptr() as u64)
+        });
+        for (index, version) in site.versions.iter().enumerate() {
+            let tail = index + 1 == site.versions.len();
+            let next = site.versions.get(index + 1).map_or(fallback, |v| v.entry);
+            self.cache.patch(version.next, branch(version.next, next));
+            self.cache
+                .patch(version.cold, branch(version.cold, fallback));
+            let target = if let Some(period) = period.filter(|_| tail) {
+                version.slot.retry.set(period);
+                version.retry
+            } else {
+                next
+            };
+            if let Some(counter) = &version.miss_counter {
+                let address = counters.unwrap()[usize::from(tail)];
+                self.cache.patch(counter.literal, address as u32);
+                self.cache
+                    .patch(counter.literal + 4, (address >> 32) as u32);
+                self.cache.patch(counter.next, branch(counter.next, target));
+                self.cache
+                    .patch(version.miss, branch(version.miss, counter.entry));
+            } else {
+                self.cache.patch(version.miss, branch(version.miss, target));
+            }
+        }
+    }
+
+    pub(super) fn repoint_resident_fallback(&mut self, eip: u32, target: usize) {
+        if let Some((_, fallback)) = self.offer(eip) {
+            self.repoint(fallback, target);
+        }
+        let Some(site) = self
+            .chains
+            .get(&eip)
+            .and_then(|chain| chain.resident.as_ref())
+        else {
+            return;
+        };
+        for version in &site.versions {
+            self.cache.patch(version.cold, branch(version.cold, target));
+            if let Some(point) = version.proved_cold {
+                self.cache.patch(point, branch(point, target));
+            }
+        }
+        if let Some(tail) = site.versions.last() {
+            self.cache.patch(tail.next, branch(tail.next, target));
+            let point = tail
+                .miss_counter
+                .as_ref()
+                .map_or(tail.miss, |counter| counter.next);
+            if self.cache.word(point) != branch(point, tail.retry) {
+                self.cache.patch(point, branch(point, target));
+            }
+        }
+    }
+
+    pub(super) fn offer(&self, eip: u32) -> Option<(usize, usize)> {
+        self.chains.get(&eip)?.offer
+    }
+
+    pub(super) fn install_offer(&mut self, eip: u32, gate: OfferEntry) {
+        let at = self.cache.next();
+        let unit = self.tier1(eip).map(|entry| entry.unit);
+        let (words, fallback) = ingress::offer_link(eip, at, self.stubs.exit, unit, gate);
+        if self.cache.append(&words).is_some() {
+            self.chains.entry(eip).or_default().offer = Some((at, fallback));
+        }
+    }
+
+    pub(super) fn accounted(&self, eip: u32) -> (u64, u64) {
+        self.resident(eip).unwrap().versions.iter().fold(
+            (0, 0),
+            |(entries, iterations), version| {
+                (
+                    entries + version.slot.entries.get(),
+                    iterations + version.iterations(version.slot.countdown[1].get()),
+                )
+            },
+        )
+    }
+
+    pub(super) fn contains_unit(&self, entry: u32, address: usize) -> bool {
+        self.tier1_chain(entry).is_some_and(|chain| {
+            chain
+                .versions
+                .iter()
+                .any(|version| version.entry.unit == address)
+        })
+    }
+
+    fn proved_resident(site: &ResidentSite<R>, proof: Option<&Key>) -> Option<usize> {
+        let proof = proof?;
+        site.versions
+            .iter()
+            .find_map(|v| v.proved.filter(|_| proof.proves(v.key)))
+    }
+
+    fn resident_target(&self, eip: u32, point: usize, checked: Option<usize>) -> Option<usize> {
+        checked.map(|entry| {
+            self.resident(eip)
+                .and_then(|site| Self::proved_resident(site, self.point_facts.get(&point)))
+                .unwrap_or(entry)
+        })
+    }
+
+    pub(super) fn patch_link(
+        &mut self,
+        eip: u32,
+        point: usize,
+        checked: usize,
+        counting: bool,
+        offer: bool,
+    ) {
+        let link = self.link(point, eip);
+        let target = self.linked_target(point, eip, checked);
+        if link.back {
+            let fallback = point + runtime::BACK_UNIT;
+            self.repoint(fallback, target);
+            if !counting {
+                self.repoint(point + runtime::BACK_COUNT, fallback);
+            }
+        }
+        let checked = self.resident(eip).and_then(ResidentSite::entry);
+        let resident = self.resident_target(eip, point, checked);
+        let gate = self.offer(eip).filter(|_| offer).map(|(entry, _)| entry);
+        Self::route_link(&mut self.cache, &link, resident, counting, gate, target);
+    }
+
+    fn route_link(
+        cache: &mut CodeCache,
+        link: &Linked,
+        resident: Option<usize>,
+        counting: bool,
+        offer: Option<usize>,
+        tier1: usize,
+    ) {
+        let point = link.point;
+        let target = match (resident, link.back, link.direct, offer, counting) {
+            (Some(entry), true, _, _, _) => entry,
+            (Some(entry), false, Some(transition), _, _) => {
+                cache.patch(transition + 4, branch(transition + 4, entry));
+                transition
+            }
+            (_, _, _, Some(gate), _) => gate,
+            (_, true, _, _, true) => point + runtime::BACK_COUNT,
+            _ => tier1,
+        };
+        cache.patch(point, link.branch(target));
+    }
+
+    pub(super) fn repoint_tier1(&mut self, eip: u32, checked: usize, counting: bool, offer: bool) {
+        let slot = &mut self.table[runtime::table_slot(eip)];
+        if slot[0] == u64::from(eip) {
+            slot[1] = checked as u64;
+        }
+        self.repoint_resident_fallback(eip, checked);
+        let resident = self.resident(eip).and_then(ResidentSite::entry);
+        let gate = self.offer(eip).filter(|_| offer).map(|(entry, _)| entry);
+        let mut next = self.links.get(&eip).copied().unwrap_or(u32::MAX);
+        while let Some(link) = self.linked.get(next as usize).copied() {
+            next = link.next;
+            let target = self.linked_target(link.point, eip, checked);
+            if link.back {
+                self.repoint(link.point + runtime::BACK_UNIT, target);
+            }
+            if resident.is_some() && (link.back || link.direct.is_some()) {
+                continue;
+            }
+            Self::route_link(&mut self.cache, &link, resident, counting, gate, target);
+        }
+    }
+
+    pub(super) fn repoint_resident_edges(
+        &mut self,
+        eip: u32,
+        resident: Option<usize>,
+        counting: bool,
+        offer: bool,
+    ) {
+        self.repoint_internal_edges(eip, resident);
+        let mut next = self.links.get(&eip).copied().unwrap_or(u32::MAX);
+        let gate = self.offer(eip);
+        let Some(tier1) = self
+            .resident_fallback(eip)
+            .or_else(|| gate.map(|(_, fallback)| fallback))
+        else {
+            return;
+        };
+        while let Some(edge) = self.linked.get(next as usize).copied() {
+            next = edge.next;
+            if edge.back || edge.direct.is_some() || gate.is_some() {
+                let target = self.linked_target(edge.point, eip, tier1);
+                let resident = self.resident_target(eip, edge.point, resident);
+                Self::route_link(
+                    &mut self.cache,
+                    &edge,
+                    resident,
+                    counting,
+                    gate.filter(|_| offer).map(|(entry, _)| entry),
+                    target,
+                );
+            }
+        }
+    }
+
+    fn repoint_internal_edges(&mut self, eip: u32, resident: Option<usize>) {
+        let site = self
+            .chains
+            .get(&eip)
+            .and_then(|chain| chain.resident.as_ref());
+        for edge in self.internal_edges.get_mut(&eip).into_iter().flatten() {
+            let target = if let Some(entry) = resident.filter(|_| {
+                edge.back
+                    || !site
+                        .unwrap()
+                        .unit
+                        .trace
+                        .insts
+                        .iter()
+                        .any(|inst| inst.pc == edge.source_pc)
+            }) {
+                let entry = Self::proved_resident(site.unwrap(), self.point_facts.get(&edge.point))
+                    .unwrap_or(entry);
+                self.cache.patch(edge.link, branch(edge.link, entry));
+                edge.transition
+            } else {
+                edge.target
+            };
+            self.cache.patch(edge.point, branch(edge.point, target));
+        }
+    }
+
+    pub(super) fn publish_switch(&mut self, eip: u32, target: usize) {
+        for &(_, point, _) in self.rows.get(&eip).into_iter().flatten() {
+            self.cache.patch(point, target as u32);
+            self.cache.patch(point + 4, ((target as u64) >> 32) as u32);
+        }
+    }
+
+    pub(super) fn publish_indirect(&mut self, eip: u32, target: usize) {
+        self.table[runtime::table_slot(eip)] = [u64::from(eip), target as u64];
+    }
+
+    pub(super) fn sync(&mut self) {
+        self.cache.sync();
+        self.faults.end.set(self.cache.next());
+    }
+
+    pub(super) fn bind_counter(&mut self, point: usize, address: u64) {
+        self.cache.patch(point, address as u32);
+        self.cache.patch(point + 4, (address >> 32) as u32);
+    }
+
+    pub(super) fn stop_counting(&mut self, eip: u32) {
+        let mut next = self.links.get(&eip).copied().unwrap_or(u32::MAX);
+        while let Some(link) = self.linked.get(next as usize).copied() {
+            next = link.next;
+            if link.back {
+                self.repoint(
+                    link.point + runtime::BACK_COUNT,
+                    link.point + runtime::BACK_UNIT,
+                );
+            }
+        }
+        for edge in self.internal_edges.get(&eip).into_iter().flatten() {
+            if let Some(sensor) = edge.sensor {
+                self.cache.patch(sensor, branch(sensor, edge.target));
+            }
+        }
+    }
+
+    pub(super) fn settle_sample(&mut self, eip: u32) {
+        let version = &self.chains[&eip].resident.as_ref().unwrap().versions[0];
+        self.cache
+            .patch(version.probe, branch(version.probe, version.entry));
+    }
+
+    pub(super) fn specialize_link(&mut self, eip: u32, point: usize, version: usize) {
+        let patch = if let Some(edge) = self
+            .internal_edges
+            .get(&eip)
+            .and_then(|edges| edges.iter().find(|edge| edge.point == point))
+        {
+            edge.link
+        } else {
+            let mut next = self.links[&eip];
+            while self.linked[next as usize].point != point {
+                next = self.linked[next as usize].next;
+            }
+            self.linked[next as usize]
+                .direct
+                .map_or(point, |transition| transition + 4)
+        };
+        let entry = self.resident(eip).unwrap().versions[version].entry;
+        self.repoint(patch, entry);
+    }
+
+    pub(super) fn environment_failed(&mut self, eip: u32, version: usize, fact: usize) -> u32 {
+        let version = &self.chains[&eip].resident.as_ref().unwrap().versions[version];
+        self.cache
+            .patch(version.environment[fact], b(runtime::SENSOR_BYTES as i32));
+        version.plain_sites[fact]
+    }
+
+    pub(super) fn measure_cold(&mut self, eip: u32, enabled: bool) {
+        for version in &self.chains[&eip].resident.as_ref().unwrap().versions {
+            if !version.probation {
+                if enabled {
+                    version.slot.entries.set(0);
+                    version.slot.countdown[1].set(0);
+                }
+                version.account(&mut self.cache, enabled);
+            }
+        }
+        self.sync();
+    }
+
+    pub(super) fn finish_probation(&mut self, eip: u32, index: usize) -> (u64, u64) {
+        let version = &mut self
+            .chains
+            .get_mut(&eip)
+            .unwrap()
+            .resident
+            .as_mut()
+            .unwrap()
+            .versions[index];
+        version.probation = false;
+        version.account(&mut self.cache, false);
+        (version.slot.entries.get(), version.slot.countdown[1].get())
+    }
+
+    pub(super) fn forget_dynamic(&mut self) -> u64 {
+        self.table.fill(EMPTY);
+        self.shadow.top()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.cache.truncate(self.stub_len);
+        self.chains.clear();
+        self.rows.clear();
+        self.table_sources.clear();
+        self.uses_permissions = false;
+        self.links.clear();
+        self.linked.clear();
+        self.back_points.clear();
+        self.direct_points.clear();
+        self.point_facts.clear();
+        self.internal_edges.clear();
+        self.tier1_words.clear();
+        self.placed.clear();
+        self.helpers.clear();
+        self.generation += 1;
+        self.faults.sites.clear();
+        self.faults.end.set(self.cache.next());
     }
 
     pub(super) fn link(&mut self, point: usize, eip: u32) -> Linked {
@@ -173,11 +856,8 @@ impl CodeStore {
         let Some(proved) = self.point_facts.get(&point) else {
             return checked;
         };
-        if self
-            .units
-            .get(&eip)
-            .is_some_and(|entry| entry.unit == checked)
-            && let Some(chain) = self.chains.get(&eip)
+        if self.tier1(eip).is_some_and(|entry| entry.unit == checked)
+            && let Some(chain) = self.tier1_chain(eip)
             && let Some(version) = chain
                 .versions
                 .iter()
@@ -195,7 +875,8 @@ impl CodeStore {
     }
 
     pub(super) fn invalidate_unit(&mut self, eip: u32) -> bool {
-        self.chains.remove(&eip);
+        self.repoint_internal_edges(eip, None);
+        let dropped = self.chains.remove(&eip).is_some();
         if self.table_sources.remove(&eip) {
             self.rows.retain(|_, slots| {
                 slots.retain(|&(source, _, _)| source != eip);
@@ -212,10 +893,33 @@ impl CodeStore {
             next = link.next;
         }
         self.tier1_words.remove(&eip);
-        self.units.remove(&eip).is_some()
+        dropped
     }
 
-    pub(super) fn watch_pages(&mut self, eip: u32, spans: &[(u32, u32)]) {
+    pub(super) fn watch_pages(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        spans: &[(u32, u32)],
+        decodes: &mut Decodes,
+    ) {
+        // The front end returns sorted dependency spans, including failed
+        // fetches and the bytes used to admit a redirect.
+        let mut merged: Option<(u32, u64)> = None;
+        for (start, len) in decodes.watch_spans(spans) {
+            let stop = u64::from(start) + u64::from(len);
+            match &mut merged {
+                Some((_, end)) if u64::from(start) <= *end => *end = (*end).max(stop),
+                _ => {
+                    if let Some((from, to)) = merged.replace((start, stop)) {
+                        memory.watch_code(from, (to - u64::from(from)) as usize);
+                    }
+                }
+            }
+        }
+        if let Some((from, to)) = merged {
+            memory.watch_code(from, (to - u64::from(from)) as usize);
+        }
         let mut last = None;
         for &(start, len) in spans.iter().filter(|&&(_, len)| len != 0) {
             let end = (u64::from(start) + u64::from(len) - 1).min(u64::from(u32::MAX));
@@ -229,6 +933,16 @@ impl CodeStore {
     }
 
     /// Appends a unit for `eip` whose `sites` are at byte offsets.
+    pub(super) fn place_worker_form(
+        &mut self,
+        words: &mut [u32],
+        exit: usize,
+        sites: &[(usize, Site)],
+    ) -> Option<WorkerCode> {
+        words[exit] = branch(self.cache.next() + exit * 4, self.stubs.opt_exit);
+        self.place_worker(words, sites)
+    }
+
     pub(super) fn place_worker(
         &mut self,
         words: &[u32],
@@ -245,6 +959,118 @@ impl CodeStore {
             end: entry + words.len() * 4,
             sites: sites.into(),
         })
+    }
+
+    pub(super) fn place_tier1(
+        &mut self,
+        eip: u32,
+        work: &crate::translate::lower::Tier1Placement<'_>,
+        unit: &Unit,
+        key: Key,
+        record_cost: bool,
+        mut counter: impl FnMut(u32) -> (u64, u32),
+    ) -> Option<Tier1Unit> {
+        let entry = self.install_unit(
+            eip,
+            work.words,
+            work.sites,
+            work.retired,
+            work.marks,
+            work.version,
+        )?;
+        let at = entry.unit;
+        if !unit.tables.is_empty() {
+            self.table_sources.insert(eip);
+        }
+        for (table, &(offset, stub)) in unit.tables.iter().zip(work.table_positions) {
+            for (index, &target) in table.targets.iter().enumerate() {
+                let slot = (eip, at + offset + index * 8, at + stub);
+                self.rows.entry(target).or_default().push(slot);
+            }
+        }
+        let proofs = if key.mask() == 0 {
+            key
+        } else {
+            key.project(unit.preserved_facts())
+        };
+        for link in work.links {
+            let point = at + link.offset;
+            if proofs.mask() != 0 {
+                self.point_facts.insert(point, proofs);
+            }
+            self.points.push((point, link.eip, link.main));
+            if let Some(transition) = link.direct {
+                self.direct_points.insert(point, at + transition);
+            }
+            if link.back {
+                self.back_points.insert(point);
+                let (address, count) = counter(link.eip);
+                self.bind_counter(point + runtime::BACK_COUNTER, address);
+                if count == u32::MAX {
+                    self.cache
+                        .patch(point + runtime::BACK_COUNT, b(runtime::SENSOR_BYTES as i32));
+                }
+            }
+        }
+        for link in work.internal_links {
+            let edge = InternalEdge {
+                point: at + link.point,
+                target: at + link.target,
+                transition: at + link.transition,
+                link: at + link.link,
+                source: eip,
+                unit: at,
+                source_pc: link.source_pc,
+                back: link.counter.is_some(),
+                sensor: link.sensor.map(|offset| at + offset),
+            };
+            if proofs.mask() != 0 {
+                self.point_facts.insert(edge.point, proofs);
+            }
+            let value = if let Some(address_slot) = link.counter {
+                let (address, value) = counter(link.eip);
+                self.bind_counter(at + address_slot, address);
+                value
+            } else {
+                u32::MAX
+            };
+            let resident = self.resident(link.eip);
+            if let Some(entry) = resident.and_then(|site| {
+                site.entry().filter(|_| {
+                    edge.back
+                        || !site
+                            .unit
+                            .trace
+                            .insts
+                            .iter()
+                            .any(|inst| inst.pc == edge.source_pc)
+                })
+            }) {
+                let target = self
+                    .resident_target(link.eip, edge.point, Some(entry))
+                    .unwrap();
+                self.repoint(edge.link, target);
+                self.cache
+                    .patch(edge.point, branch(edge.point, edge.transition));
+            } else if resident.is_some() || value == u32::MAX {
+                self.cache
+                    .patch(edge.point, branch(edge.point, edge.target));
+            }
+            if value == u32::MAX
+                && let Some(sensor) = edge.sensor
+            {
+                self.cache.patch(sensor, branch(sensor, edge.target));
+            }
+            self.internal_edges.entry(link.eip).or_default().push(edge);
+        }
+        if record_cost {
+            self.tier1_words.insert(
+                eip,
+                tier1_words(work.marks, work.links, work.words.len(), &unit.trace),
+            );
+        }
+        self.uses_permissions |= work.uses_permissions;
+        Some(entry)
     }
 
     pub(super) fn install_unit(

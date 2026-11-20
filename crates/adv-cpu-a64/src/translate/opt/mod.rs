@@ -76,7 +76,7 @@ pub(crate) mod verify;
 
 use adv_cpu_core::CpuState;
 
-use crate::facts::Assumed;
+pub(crate) use crate::facts::Assumed;
 use ir::Source;
 
 /// Fills `out` with the entry cells of an optimized form when `cpu` meets the

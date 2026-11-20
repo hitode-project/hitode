@@ -7,17 +7,25 @@ use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::trap::Bridge;
 use adv_cpu_core::{CpuState, Memory};
 
+use super::compile;
+use super::offload::{Code, WorkerJob};
 use super::offload::{Entry, Notifications, Session};
-use super::plan::{self, dispatch, lookup_miss};
-use super::store::{ACTIVE, Active, Faults};
+use super::plan::{
+    self, ColdAction, Decline, JobPlan, MISSES, PROBATION, Probation, SAMPLE, Tier1Miss,
+};
+use super::store::{self, ACTIVE, Active, Faults, Tier1Chain, Tier1Unit, Version, WorkerCode};
 use super::{
     CLEAR_GATE, Checks, Native, Owner, Run, SLICE, STALE_GATE, access, call, locked_access,
     timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
-use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, ResidentCold, Runtime, alias_base};
-use crate::translate::front::decode::Fetcher;
+use crate::runtime::record_branch;
+use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, Runtime, alias_base};
+use crate::translate::front::{Unit, decode::Fetcher};
+use crate::translate::lower::resident::ResidentCold;
+use crate::translate::opt::computation::Proof;
 use crate::translate::opt::recovery;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 impl Native {
@@ -37,7 +45,7 @@ impl Native {
         self.invalidate(memory);
         self.observe_stop(stop);
         self.install_optimized(false);
-        let (entry, translated) = match self.code.units.get(&cpu.eip).copied() {
+        let (entry, translated) = match self.code.tier1(cpu.eip) {
             Some(entry) => (entry, 0),
             None if !memory.executable(cpu.eip, 1) => {
                 return Ok(Some(Run {
@@ -63,10 +71,10 @@ impl Native {
                 }));
             }
             None => {
-                let before = self.code.cache.used();
+                let before = self.code.used();
                 let eip = cpu.eip;
                 let entry = self.translate(memory, eip, Key::read(cpu, facts::ALL));
-                (entry?, self.code.cache.used().saturating_sub(before))
+                (entry?, self.code.used().saturating_sub(before))
             }
         };
         if fuel == 0 {
@@ -74,7 +82,7 @@ impl Native {
         }
         let offer = match self.plans.arrival(cpu.eip) {
             plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
-                job.sample_offer() && job.offer_due(self.published_gate())
+                job.sample_offer() && job.offer_due(self.published_gate(), super::ticks)
             }
             _ => false,
         };
@@ -112,8 +120,7 @@ impl Native {
                 std::sync::atomic::Ordering::AcqRel,
             );
         }
-        self.code.cache.sync();
-        self.code.faults.end.set(self.code.cache.next());
+        self.code.sync();
         self.prepare_inline(cpu, memory, fuel.max(budget), budget);
         let resumed_repeat = cpu.rep.take().map(|rep| {
             let visible_flags = cpu.eflags;
@@ -240,7 +247,6 @@ impl Native {
                     self.stop_counting(head);
                     self.discover(memory, head, head, cpu.clone());
                 }
-                PlanEvent::ContextRetry => self.retry_resident(cpu, payload as usize),
                 PlanEvent::EnvironmentMiss => {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
@@ -345,9 +351,9 @@ impl Native {
         let recovery = &self.runtime.recovery;
         let eip = recovery.head;
         let index = recovery.version as usize;
-        let head = self.plans.resident(eip).unwrap();
+        let head = self.code.resident(eip).unwrap();
         let version = &head.versions[index];
-        let record = &version.records[recovery.record as usize];
+        let record = &version.recovery.records[recovery.record as usize];
         recovery::restore_inline_entry(&recovery.entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
         self.runtime.shadow = recovery.dump.x[28];
@@ -355,7 +361,7 @@ impl Native {
             record,
             &recovery.dump,
             &self.inline_saved,
-            &version.flags,
+            &version.recovery.flags,
             cpu,
             // SAFETY: the resident entry admitted these frame bytes.
             |offset, bytes| unsafe {
@@ -363,11 +369,11 @@ impl Native {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
             },
         );
-        if version.mmx || cpu.mmx_mode != 0 {
+        if version.recovery.mmx || cpu.mmx_mode != 0 {
             cpu.refresh_mmx();
         }
         let fault = self.code.faults.site(self.code.faults.capture.pc.get());
-        if let Some((site, reason)) = recovery.cold() {
+        if let Some((site, reason)) = ResidentCold::decode(recovery.detail) {
             (refund, site, reason, false)
         } else if let Some(site) = fault {
             (refund, site.eip, ResidentCold::HostFault, site.checked)
@@ -392,7 +398,7 @@ impl Native {
             return;
         }
         self.invalidate(memory);
-        self.code.cache.sync();
+        self.code.sync();
         let entry = Entry {
             enter: self.code.enter,
             opt_enter: self.code.opt_enter,
@@ -411,5 +417,1108 @@ impl Native {
         ) {
             visit(&mut session);
         }
+    }
+}
+
+impl Native {
+    pub(super) fn stop_counting(&mut self, eip: u32) {
+        self.count_sensor_decision("back_edge_discovery");
+        self.plans.counter_at(eip).unwrap().set(u32::MAX);
+        self.code.stop_counting(eip);
+        self.repoint_resident_edges(eip, None);
+    }
+
+    fn repoint_resident_edges(&mut self, eip: u32, resident: Option<usize>) {
+        if let Some(head) = self.plans.resident_mut(eip) {
+            head.link_samples.clear();
+        }
+        let (counting, offer) = self.plans.routing(eip);
+        self.code
+            .repoint_resident_edges(eip, resident, counting, offer);
+        self.code.sync();
+    }
+
+    fn repoint_tier1(&mut self, eip: u32, checked: usize) {
+        self.resolve_tables(eip, checked);
+        let (counting, offer) = self.plans.routing(eip);
+        self.code.repoint_tier1(eip, checked, counting, offer);
+    }
+
+    pub(super) fn patch(&mut self, point: usize, eip: u32, unit: usize) {
+        let (counting, offer) = self.plans.routing(eip);
+        self.code.patch_link(eip, point, unit, counting, offer);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.diagnostics.clears += 1;
+        self.code.clear();
+        self.worker_jobs.clear();
+        self.offload.admission.clear();
+        self.plans.clear_overlays();
+        self.forget_dynamic();
+    }
+
+    pub(super) fn count_plan_event(&mut self, event: &'static str) {
+        if self.count_resident_entries {
+            *self.diagnostics.plan_events.entry(event).or_default() += 1;
+        }
+    }
+
+    fn count_sensor_decision(&mut self, decision: &'static str) {
+        if self.count_resident_entries {
+            *self
+                .diagnostics
+                .sensor_decisions
+                .entry(decision)
+                .or_default() += 1;
+        }
+    }
+
+    pub(super) fn apply_back_edge_sample(
+        &mut self,
+        memory: &mut Memory,
+        sample: super::BackEdgeSample,
+    ) {
+        if self.code.generation == sample.generation
+            && self.code.contains_unit(sample.source, sample.unit)
+            && self.plans.resident(sample.at.eip).is_none()
+        {
+            self.discover(memory, sample.at.eip, sample.source, sample.at);
+        }
+    }
+
+    pub(super) fn resident_cold_exit(
+        &mut self,
+        (eip, version_index): (u32, usize),
+        site: u32,
+        reason: ResidentCold,
+        checked: bool,
+        refund: u32,
+        elapsed: u64,
+    ) {
+        self.diagnostics.resident_cold_exits += 1;
+        *self
+            .diagnostics
+            .resident_cold_exits_by_reason
+            .entry(reason)
+            .or_default() += 1;
+        let Some(head) = self.plans.resident_mut(eip) else {
+            return;
+        };
+        let count = head.record_cold(site, reason);
+        if count.is_power_of_two() {
+            crate::jit_map::optimized(
+                eip,
+                format_args!("resident\tcold\t{site}\t{reason:?}\t{count}"),
+            );
+        }
+        if head.declined() {
+            return;
+        }
+        let site_versions = self.code.chains[&eip].resident.as_ref().unwrap();
+        let version = &site_versions.versions[version_index];
+        let measured = head.probation[version_index].is_some() || head.cold_window.is_some();
+        let retired = elapsed
+            .wrapping_sub(version.slot.countdown[0].get())
+            .wrapping_sub(u64::from(refund));
+        match head.cold_action(version_index, site, reason, checked, count, retired) {
+            ColdAction::FinishProbation => {
+                self.finish_probation(eip, version_index);
+                return;
+            }
+            ColdAction::CheckStream => {
+                head.check_stream(compile::stream_sites(&site_versions.unit, site), site);
+                crate::jit_map::optimized(
+                    eip,
+                    format_args!("resident\tchecked\t{site}\t{reason:?}"),
+                );
+                self.rebuild_resident_versions(eip);
+                return;
+            }
+            ColdAction::Ignore => return,
+            ColdAction::Observe => {}
+        }
+        let cold_iterations = if measured {
+            version.iterations(retired)
+        } else {
+            0
+        };
+        if head.cold_window.is_none() {
+            self.code.measure_cold(eip, true);
+        }
+        if head.observe_cold(site, reason, self.code.accounted(eip), cold_iterations) {
+            self.stop_cold_window(eip);
+            if reason == ResidentCold::FrameDisjoint {
+                self.refuse_resident_fact(eip, u32::MAX);
+                *self
+                    .diagnostics
+                    .resident_refusals_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+                crate::jit_map::optimized(
+                    eip,
+                    format_args!("resident\trefused\t{site}\t{reason:?}"),
+                );
+            } else {
+                self.cut_resident_site(eip, site, reason);
+            }
+        }
+    }
+
+    fn stop_cold_window(&mut self, eip: u32) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.cold_window.take().is_some() {
+            self.code.measure_cold(eip, false);
+        }
+    }
+
+    /// Keeps the loop at `head` in ordinary units, for tests of their
+    /// mechanisms.
+    #[cfg(test)]
+    pub(crate) fn keep_ordinary(&mut self, head: u32) {
+        self.plans.site(head).force_tier1 = true;
+        if let Some(count) = self.plans.counter_at(head) {
+            count.set(u32::MAX);
+        }
+    }
+
+    /// Counts a fault at an unchecked site of `eip`, at host address `pc`.
+    /// From `CHECK_AFTER` on, `eip` is checked and a new unit supersedes
+    /// the one holding `pc`.
+    pub(super) fn strike(&mut self, memory: &mut Memory, eip: u32, pc: usize, cpu: &CpuState) {
+        if !self.plans.strike(eip) {
+            return;
+        }
+        let index = self.code.placed.partition_point(|&(start, _)| start <= pc);
+        let Some(&(start, entry)) = index.checked_sub(1).map(|index| &self.code.placed[index])
+        else {
+            return;
+        };
+        // A unit dropped before stays in `placed`.
+        if self.code.contains_unit(entry, start) {
+            self.replace_unit(memory, entry, Key::read(cpu, facts::ALL));
+        }
+    }
+
+    /// Points the runtime at the page classes of the current permissions.
+    /// The unit at `eip`, translated if needed; a nonzero `point` is
+    /// patched into a branch to it. The caller keeps stops unlinked: the
+    /// owner must see them.
+    pub(super) fn link(
+        &mut self,
+        memory: &mut Memory,
+        point: usize,
+        eip: u32,
+        entry: Option<Tier1Unit>,
+        observed: Key,
+    ) -> Result<usize, String> {
+        let generation = self.code.generation;
+        let entry = match entry {
+            Some(entry) => entry,
+            None => self.translate(memory, eip, observed)?,
+        };
+        // Translating may have cleared the cache and the link point with it.
+        if point != 0 && self.code.generation == generation {
+            self.patch(point, eip, entry.unit);
+            if self.code.back_points.contains(&point) {
+                // Reload the back edge's identity after the dispatch stub.
+                return Ok(point - 4);
+            }
+            if self.code.offer(eip).is_some()
+                || self.code.direct_points.contains_key(&point)
+                    && self
+                        .code
+                        .resident(eip)
+                        .and_then(store::ResidentSite::entry)
+                        .is_some()
+            {
+                return Ok(point);
+            }
+        }
+        Ok(entry.unit)
+    }
+
+    /// Rebuild with checked argument stores at each site after the entry's
+    /// hoisted stack guard refused the span.
+    pub(super) fn refuse_body_stack(&mut self, memory: &mut Memory, cpu: &CpuState) {
+        let eip = cpu.eip;
+        self.plans.mark_checked(eip);
+        if !self.replace_unit(memory, eip, Key::read(cpu, facts::ALL)) {
+            self.clear();
+        }
+    }
+
+    /// Tier-1 replacement keeps old continuations and all their watches.
+    pub(super) fn replace_unit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> bool {
+        let Some(new) = self.emit(memory, eip, observed) else {
+            return false;
+        };
+        self.repoint_tier1(eip, new.unit);
+        self.code.sync();
+        true
+    }
+
+    pub(super) fn resolve_tables(&mut self, eip: u32, unit: usize) {
+        if !self.code.rows.contains_key(&eip)
+            || self.is_stop(eip)
+            || !self.front_units.get(&eip).is_some_and(|site| {
+                site.hot
+                    .as_ref()
+                    .or(site.cold.as_ref())
+                    .is_some_and(|unit| unit.table_target)
+            })
+        {
+            return;
+        }
+        self.code.publish_switch(eip, unit);
+    }
+
+    /// Drops units whose guest code changed, and restores the link points
+    /// that branch to them.
+    pub(super) fn invalidate(&mut self, memory: &mut Memory) {
+        if memory.dirty_pages.is_empty() {
+            return;
+        }
+        let mut dropped = false;
+        for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
+            self.decodes.invalidate(page);
+            for eip in self.code.pages.remove(&page).unwrap_or_default() {
+                let unit = self.drop_unit(eip);
+                self.diagnostics.dropped_units += u64::from(unit);
+                dropped |= unit;
+            }
+        }
+        if dropped {
+            self.plans.reset_samples();
+            self.forget_dynamic();
+        }
+    }
+
+    /// Drops the unit at `eip`, if any, and restores the link points that
+    /// branch to it; the caller forgets dynamic targets.
+    pub(super) fn drop_unit(&mut self, eip: u32) -> bool {
+        self.front_units.remove(&eip);
+        let dropped = self.code.invalidate_unit(eip);
+        self.plans.invalidate(eip);
+        self.worker_jobs.remove(&eip);
+        self.offload.admission.invalidate(eip);
+        dropped
+    }
+
+    /// Empties the indirect table and the shadow stack, which may lead to
+    /// dropped units.
+    pub(super) fn forget_dynamic(&mut self) {
+        self.diagnostics.global_invalidations += 1;
+        self.runtime.shadow = self.code.forget_dynamic();
+    }
+
+    /// Units must not run past any stop; a new one cuts those that could.
+    pub(super) fn observe_stop(&mut self, stop: u32) {
+        if self.stops.contains(&stop) {
+            return;
+        }
+        self.stops.push(stop);
+        if let Some(word) = &self.interrupt {
+            word.fetch_or(
+                adv_sync::pending::STOP,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        self.cut(stop, stop.saturating_add(1));
+    }
+
+    /// Drops the units decoded from the pages of `start..end`, which hold
+    /// every unit whose trace runs through a new boundary there, and the
+    /// unit starting at it, whose dropping restores the links to it.
+    pub(super) fn cut(&mut self, start: u32, end: u32) {
+        let end = u64::from(end).max(u64::from(start) + 1);
+        let mut dropped = false;
+        for page in (u64::from(start & !0xfff)..end).step_by(4096) {
+            for eip in self.code.pages.remove(&(page as u32)).unwrap_or_default() {
+                dropped |= self.drop_unit(eip);
+            }
+        }
+        if dropped {
+            self.forget_dynamic();
+        }
+    }
+
+    /// Whether code at `eip` is known to run, so translating it pays.
+    pub(super) fn ran(&self, eip: u32) -> bool {
+        self.plans.ran(eip, self.first_visits)
+    }
+
+    /// Whether `eip`, which has no unit, runs for the first time; it will
+    /// not be again.
+    pub(super) fn first_visit(&mut self, eip: u32) -> bool {
+        self.plans
+            .first_visit(eip, self.first_visits, self.code.tier1(eip).is_some())
+    }
+
+    /// Translates the unit at `eip`, and ahead of time the units its main
+    /// path leaves to that have run before, so they share one cache sync
+    /// and link directly. Every link point of these units to a unit that
+    /// exists is patched.
+    pub(super) fn translate(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        observed: Key,
+    ) -> Result<Tier1Unit, String> {
+        self.code.points.clear();
+        let entry = match self.emit(memory, eip, observed) {
+            Some(entry) => entry,
+            None => {
+                self.clear();
+                self.code.points.clear();
+                self.emit(memory, eip, observed)
+                    .ok_or("a64 unit does not fit an empty cache")?
+            }
+        };
+        // Only the first unit's main path is translated ahead: deeper
+        // successors are less certain to run.
+        let first = self.code.points.len();
+        let mut index = 0;
+        while let Some(&(point, target, main)) = self.code.points.get(index) {
+            index += 1;
+            // The owner must see stops.
+            if self.is_stop(target) {
+                continue;
+            }
+            let unit = match self.code.tier1(target) {
+                Some(entry) => entry.unit,
+                // A full cache waits for the next miss to clear it.
+                None if main
+                    && index <= first
+                    && self.ran(target)
+                    && Fetcher::fetchable(memory, target) =>
+                {
+                    match self.emit(memory, target, observed) {
+                        Some(entry) => entry.unit,
+                        None => break,
+                    }
+                }
+                None => continue,
+            };
+            self.patch(point, target, unit);
+        }
+        Ok(entry)
+    }
+
+    fn emit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> Option<Tier1Unit> {
+        let loops = self.promotion == 0 || self.plans.promoted(eip);
+        let unit = self.front_unit(memory, eip, loops, false);
+        let at = self.code.next();
+        let mut work = std::mem::take(&mut self.compiler.tier1);
+        let all = self.checks != Checks::Adaptive;
+        let mask = unit.fact_mask();
+        let key = observed.project(mask);
+        let helpers = self.code.helpers.len() as u32;
+        let arrivals = if mask == 0 {
+            0
+        } else {
+            self.code.counter(eip, 0)
+        };
+        work.lower_tier1(
+            &unit,
+            eip,
+            &|pc| all || self.plans.checked(pc),
+            helpers,
+            self.features,
+            at,
+            self.code.stubs,
+            !self.plans.baseline_only,
+            key,
+            arrivals,
+        );
+        if work.retired() == 0 {
+            self.diagnostics.empty_units[usize::from(unit.trace.failure & 3)] += 1;
+        }
+        let entry = self.place_tier1(memory, eip, &work, &unit, key, true);
+        if let Some(entry) = entry {
+            self.code.helpers.extend(unit.helpers().iter().cloned());
+            self.code.set_tier1(
+                eip,
+                Tier1Chain {
+                    unit,
+                    mask,
+                    helpers,
+                    versions: vec![Version { key, entry }],
+                },
+            );
+            self.code.repoint_resident_fallback(eip, entry.unit);
+            if mask != 0
+                && let Some(stats) = &mut self.code.version_stats
+            {
+                stats.get_mut(&eip).unwrap().built += 1;
+            }
+        }
+        self.compiler.tier1 = work;
+        entry
+    }
+
+    fn place_tier1(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        work: &compile::Workspace,
+        unit: &Unit,
+        key: Key,
+        head: bool,
+    ) -> Option<Tier1Unit> {
+        let cost =
+            head && (self.plans.counter_at(eip).is_some() || !work.internal_links().is_empty());
+        let entry = self
+            .code
+            .place_tier1(eip, &work.placement(), unit, key, cost, |target| {
+                self.plans.counter(target)
+            })?;
+        let mut targets: Vec<_> = unit
+            .tables
+            .iter()
+            .flat_map(|table| table.targets.iter().copied())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            if let Some(entry) = self.code.tier1(target) {
+                self.resolve_tables(target, entry.unit);
+            }
+        }
+        if self.code.uses_permissions {
+            self.classify(memory);
+        }
+        Some(entry)
+    }
+
+    fn miss_version(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        observed: Key,
+    ) -> Result<usize, String> {
+        let Some(chain) = self.code.take_tier1(eip) else {
+            if let Some(entry) = self.code.tier1(eip) {
+                return Ok(entry.unit);
+            }
+            return self
+                .translate(memory, eip, observed)
+                .map(|entry| entry.unit);
+        };
+        if let Some(stats) = &mut self.code.version_stats {
+            stats.get_mut(&eip).unwrap().misses += 1;
+        }
+        let (key, position, joining) = match plan::tier1_miss(&chain, observed) {
+            Tier1Miss::Match(entry) => {
+                self.code.set_tier1(eip, chain);
+                return Ok(entry);
+            }
+            Tier1Miss::Build {
+                key,
+                position,
+                joining,
+            } => (key, position, joining),
+        };
+        let arrivals = self.code.counter(eip, position);
+        let mut work = std::mem::take(&mut self.compiler.tier1);
+        let all = self.checks != Checks::Adaptive;
+        work.lower_tier1(
+            &chain.unit,
+            eip,
+            &|pc| all || self.plans.checked(pc),
+            chain.helpers,
+            self.features,
+            self.code.next(),
+            self.code.stubs,
+            !self.plans.baseline_only,
+            key,
+            arrivals,
+        );
+        let entry = self.place_tier1(memory, eip, &work, &chain.unit, key, false);
+        self.compiler.tier1 = work;
+        let Some(entry) = entry else {
+            self.clear();
+            return self
+                .translate(memory, eip, observed)
+                .map(|entry| entry.unit);
+        };
+        self.code
+            .install_tier1_version(eip, chain, position, Version { key, entry });
+        if joining {
+            self.repoint_tier1(eip, self.code.tier1(eip).unwrap().unit);
+        }
+        if let Some(stats) = &mut self.code.version_stats {
+            let stats = stats.get_mut(&eip).unwrap();
+            stats.built += 1;
+            stats.joins += u64::from(joining);
+        }
+        Ok(entry.unit)
+    }
+
+    pub(super) fn discover(&mut self, memory: &mut Memory, eip: u32, source: u32, at: CpuState) {
+        if self.plans.baseline_only {
+            return;
+        }
+        let unit = self.front_unit(memory, eip, true, true);
+        let code = self.code.tier1(source).unwrap().unit;
+        self.plans.discover(eip, source, code);
+        self.code.prepare_resident(eip, unit, SAMPLE);
+        self.request_resident(eip, compile::Task::Discover, at);
+    }
+
+    pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, mut at: CpuState) {
+        at.refresh_mmx();
+        let checked = self
+            .code
+            .resident(eip)
+            .unwrap()
+            .unit
+            .trace
+            .insts
+            .iter()
+            .filter_map(|inst| self.plans.checked(inst.pc).then_some(inst.pc))
+            .collect::<FxHashSet<_>>();
+        let head = self.plans.resident_mut(eip).unwrap();
+        head.pending = Some(task);
+        if self.code.resident(eip).unwrap().entry().is_some() {
+            self.code.publish_resident(eip, None);
+        }
+        let mut checked = checked;
+        checked.extend(&head.checked);
+        self.compiler.request(compile::Request {
+            eip,
+            generation: self.code.generation,
+            code: head.code,
+            task,
+            unit: Arc::clone(&self.code.resident(eip).unwrap().unit),
+            proof: self.worker_jobs.get(&eip).map(|job| job.proof.clone()),
+            at,
+            checked,
+            all_checked: self.checks != Checks::Adaptive,
+            refused: head.refused.clone(),
+            cuts: head.cuts.clone(),
+            count_entries: self.count_resident_entries,
+        });
+    }
+
+    pub(super) fn retry_resident(&mut self, cpu: &CpuState, version: usize) {
+        let eip = cpu.eip;
+        let head = self.plans.resident(eip).unwrap();
+        if head.retry(version) {
+            self.count_sensor_decision("context_retry");
+            self.request_resident(eip, compile::Task::Append, cpu.clone());
+            self.code.sync();
+        }
+    }
+
+    pub(super) fn sample_resident_link(&mut self, cpu: &CpuState, eip: u32, point: usize) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        let site = self.code.resident(eip).unwrap();
+        site.sample.set(SAMPLE);
+        if !head.sampling() {
+            return;
+        }
+        self.diagnostics.rust_decisions_on_decided_sites += u64::from(head.probes == 0);
+        let version = site
+            .versions
+            .iter()
+            .position(|v| cpu.rep.is_none() && v.key.holds(cpu));
+        let (link, settled) = head.sample_link(point, version);
+        if let Some(version) = link {
+            self.code.specialize_link(eip, point, version);
+        }
+        if settled {
+            self.code.settle_sample(eip);
+            self.count_sensor_decision("resident_links_settled");
+        }
+        if settled || link.is_some() {
+            self.code.sync();
+        }
+    }
+
+    pub(super) fn environment_miss(&mut self, eip: u32, index: usize, fact: usize) {
+        let site = self.code.environment_failed(eip, index, fact);
+        self.count_sensor_decision("environment_rebuild");
+        self.refuse_resident_fact(eip, site);
+    }
+
+    pub(super) fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
+        let versions = &self.code.resident(eip).unwrap().versions;
+        let affected = versions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, version)| version.plain_sites.contains(&site).then_some(i));
+        if self.plans.resident_mut(eip).unwrap().refuse(site, affected) {
+            self.rebuild_resident(eip);
+        }
+    }
+
+    pub(super) fn cut_resident_site(&mut self, eip: u32, site: u32, reason: ResidentCold) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.cuts.insert(site) {
+            if self
+                .code
+                .resident(eip)
+                .unwrap()
+                .unit
+                .trace
+                .reaches_latch_without(&|pc| head.cuts.contains(&pc))
+            {
+                *self
+                    .diagnostics
+                    .resident_cuts_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+                crate::jit_map::optimized(eip, format_args!("resident\tcut\t{site}\t{reason:?}"));
+                self.rebuild_resident_versions(eip);
+            } else {
+                *self
+                    .diagnostics
+                    .resident_demotions_by_reason
+                    .entry(reason)
+                    .or_default() += 1;
+                crate::jit_map::declined(eip, reason);
+                self.decline_resident(eip, Decline::Cold(reason));
+            }
+        }
+    }
+
+    pub(super) fn rebuild_resident_versions(&mut self, eip: u32) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        head.rebuilds = (1 << head.probation.len()) - 1;
+        self.rebuild_resident(eip);
+    }
+
+    pub(super) fn rebuild_resident(&mut self, eip: u32) {
+        let head = self.plans.resident_mut(eip).unwrap();
+        if !head.needs_rebuild() {
+            return;
+        }
+        self.stop_cold_window(eip);
+        self.code.resident_mut(eip).unwrap().suspended = true;
+        self.repoint_resident_edges(eip, None);
+        let head = self.plans.resident_mut(eip).unwrap();
+        if let Some(index) = head.next_rebuild() {
+            let at = self.code.resident(eip).unwrap().versions[index].at.clone();
+            self.request_resident(eip, compile::Task::Replace(index), at);
+        }
+    }
+
+    pub(super) fn install_optimized(&mut self, wait: bool) {
+        while let Some(done) = self.compiler.next(wait) {
+            let eip = done.eip;
+            if done.generation != self.code.generation {
+                continue;
+            }
+            if done.task == compile::Task::Job {
+                if !self.finish_job(eip, done.code, done.job) {
+                    continue;
+                }
+                if let Some(head) = self.plans.resident_mut(eip) {
+                    head.pending = None;
+                    if let Some(period) = head.retry_period() {
+                        self.code.publish_resident(eip, Some(period));
+                    }
+                    self.rebuild_resident(eip);
+                }
+                continue;
+            }
+            let Some(head) = self
+                .plans
+                .resident_mut(eip)
+                .filter(|head| head.code == done.code)
+            else {
+                continue;
+            };
+            head.pending = None;
+            if let Some(job) = done.job {
+                head.has_proof = true;
+                let unit = Arc::clone(&self.code.resident(eip).unwrap().unit);
+                self.place_job(eip, &done.at, unit, job);
+                self.install_offer_link(eip);
+            }
+            let head = self.plans.resident(eip).unwrap();
+            if head.accepts(done.task)
+                && let Some(result) = done.resident
+            {
+                let decline = match result {
+                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form))
+                        .then_some(Decline::CacheFull),
+                    Err(reject) => Some(Decline::Compile(reject)),
+                };
+                if matches!(
+                    done.task,
+                    compile::Task::Discover | compile::Task::Replace(_)
+                ) && let Some(reason) = decline
+                {
+                    self.decline_resident(eip, reason);
+                }
+            }
+            self.rebuild_resident(eip);
+        }
+    }
+
+    pub(super) fn install_resident(
+        &mut self,
+        eip: u32,
+        task: compile::Task,
+        at: CpuState,
+        mut form: compile::ResidentForm,
+    ) -> bool {
+        let lowered = &mut form.lowered;
+        let source = self.plans.resident(eip).unwrap().source;
+        let tier1 = self.code.tier1_words.get(&source).and_then(|words| {
+            lowered
+                .iteration_pcs
+                .iter()
+                .try_fold(0u32, |sum, pc| words.get(pc).map(|&cost| sum + cost))
+        });
+        let probation = match Probation::price(
+            tier1,
+            lowered.iteration_words,
+            lowered.iteration_retired,
+            lowered.entry_words + lowered.exit_words,
+        ) {
+            Ok(probation) => probation,
+            Err(reason) => {
+                self.decline_resident(eip, reason);
+                return true;
+            }
+        };
+        let index = match task {
+            compile::Task::Replace(i) => i,
+            _ => self.code.resident(eip).unwrap().versions.len(),
+        };
+        let gate = self.plans.job(eip).map(JobPlan::gate);
+        self.stop_cold_window(eip);
+        let recovery = compile::ResidentRecovery {
+            records: std::mem::take(&mut form.lowered.records),
+            flags: std::mem::take(&mut form.lowered.flags),
+            mmx: form.built.assumed.mmx,
+        };
+        let spill_cells = form.lowered.spill_cells;
+        if !self.code.place_resident(
+            eip,
+            index,
+            at,
+            form.lowered.key,
+            std::mem::take(&mut form.built.plain_sites),
+            recovery,
+            form.lowered.iteration_retired,
+            gate,
+            probation.as_ref().map(|_| PROBATION),
+            MISSES,
+            form.placement(),
+        ) {
+            return false;
+        }
+        if self.inline_saved.len() < spill_cells {
+            self.inline_saved.resize(spill_cells, 0);
+        }
+        let head = self.plans.resident_mut(eip).unwrap();
+        let period = head.installed(index, probation);
+        self.code.resident_mut(eip).unwrap().suspended = head.rebuilds != 0;
+        self.code.start_link_sampling(eip, SAMPLE);
+        self.code.publish_resident(eip, period);
+        self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
+        true
+    }
+
+    fn install_offer_link(&mut self, eip: u32) {
+        if let Some(job) = self.plans.job(eip) {
+            self.code.install_offer(eip, job.gate());
+        }
+    }
+
+    pub(super) fn finish_probation(&mut self, eip: u32, index: usize) {
+        self.stop_cold_window(eip);
+        let probation = self.plans.resident_mut(eip).unwrap().probation[index]
+            .take()
+            .unwrap();
+        let (entries, retired) = self.code.finish_probation(eip, index);
+        if probation.profitable(entries, retired) {
+            self.code.sync();
+            self.count_sensor_decision("probation_kept");
+        } else {
+            crate::jit_map::demoted(eip, index, entries, retired / probation.iteration_retired);
+            self.count_sensor_decision("probation_declined");
+            self.decline_resident(eip, Decline::Unprofitable);
+        }
+    }
+
+    pub(super) fn decline_resident(&mut self, eip: u32, reason: Decline) {
+        self.stop_cold_window(eip);
+        let head = self.plans.resident_mut(eip).unwrap();
+        if head.decline_with(reason) {
+            let reason = head.decline().unwrap();
+            crate::jit_map::optimized(eip, format_args!("coverage-gap\t{reason}"));
+            self.diagnostics.proof_without_resident += 1;
+        }
+        self.repoint_resident_edges(eip, None);
+        self.code.resident_mut(eip).unwrap().versions.clear();
+    }
+
+    /// Budget samples select Tier-1 loop traces.
+    pub(super) fn sample(&mut self, memory: &mut Memory, cpu: &CpuState) {
+        let eip = cpu.eip;
+        if self.promotion != 0 && !self.is_stop(eip) && self.plans.sample(eip, self.promotion) {
+            self.diagnostics.promotions += 1;
+            crate::jit_map::optimized(eip, format_args!("promoted\t-\t-"));
+            self.replace_unit(memory, eip, Key::read(cpu, facts::ALL));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare_job(&mut self, memory: &mut Memory, stop: u32, at: &CpuState) {
+        self.observe_stop(stop);
+        if self.code.tier1(at.eip).is_none() {
+            self.translate(memory, at.eip, Key::read(at, facts::ALL))
+                .unwrap();
+        }
+        self.discover(memory, at.eip, at.eip, at.clone());
+        self.install_optimized(true);
+        if !self.plans.resident(at.eip).unwrap().declined() {
+            self.decline_resident(at.eip, Decline::Unprofitable);
+        }
+    }
+}
+
+/// Called by the `dispatch` stub with the guest EIP and the link point to
+/// patch, or 0. Returns the unit to continue at, or 0 to leave.
+pub(super) unsafe extern "C" fn lookup_miss(runtime: *mut Runtime, eip: u32, branch: u64) -> usize {
+    // SAFETY: the current run owns the CPU and the dispatch context.
+    unsafe {
+        record_branch(&mut *(*runtime).cpu, branch, eip);
+        let owner = &*((*runtime).owner as *const Owner);
+        (*owner.native).count_plan_event("lookup_miss");
+    }
+    unsafe { dispatch(runtime, eip, 0) }
+}
+
+pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> usize {
+    // SAFETY: `run` points `owner` at a live `Owner` whose pointees it does
+    // not touch while translated code runs.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    if owner.error.is_some() {
+        return 0;
+    }
+    if native.is_stop(eip) {
+        return 0;
+    }
+    if point == usize::MAX {
+        let before = native.code.used();
+        let observed = Key::read(unsafe { &*(*runtime).cpu }, facts::ALL);
+        let entry = match native.miss_version(memory, eip, observed) {
+            Ok(entry) => entry,
+            Err(error) => {
+                owner.error = Some(error);
+                return 0;
+            }
+        };
+        owner.translated += native.code.used().saturating_sub(before);
+        native.code.sync();
+        return entry;
+    }
+    // A first visit runs in the owner; the point links on the next one.
+    let entry = native.code.tier1(eip);
+    if entry.is_none()
+        && native.code.direct_points.contains_key(&point)
+        && native
+            .code
+            .resident(eip)
+            .and_then(store::ResidentSite::entry)
+            .is_some()
+    {
+        native.patch(point, eip, native.code.resident_fallback(eip).unwrap());
+        native.code.sync();
+        return point;
+    }
+    if entry.is_none() && (!Fetcher::fetchable(memory, eip) || !native.ran(eip)) {
+        return 0;
+    }
+    let before = native.code.used();
+    let observed = if entry.is_none() {
+        Key::read(unsafe { &*(*runtime).cpu }, facts::ALL)
+    } else {
+        Key::default()
+    };
+    let unit = match native.link(memory, point, eip, entry, observed) {
+        Ok(unit) => unit,
+        Err(error) => {
+            owner.error = Some(error);
+            return 0;
+        }
+    };
+    native.resolve_tables(eip, native.code.tier1(eip).unwrap().unit);
+    if point == 0 {
+        native.code.publish_indirect(eip, unit);
+    }
+    owner.translated += native.code.used().saturating_sub(before);
+    native.code.sync();
+    unit
+}
+
+impl Native {
+    pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        self.offload.enabled = enabled;
+        self.plans.offer_resume = skip;
+    }
+
+    pub(crate) fn progressed(&mut self) {
+        self.plans.offer_resume = None;
+    }
+
+    pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
+        self.plans.offer_resume.take()
+    }
+
+    /// Whether the computation reached at EIP goes to the job layer
+    /// because a peer runs beside it.
+    pub(super) fn offer_computation(&self) -> bool {
+        self.offload.enabled
+            && (self.bridge.is_null()
+                // SAFETY: this query occurs only within the owning run.
+                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
+    }
+
+    /// A single context may offer a loop whose blocks split when the
+    /// frame's pace needs it to save time on a loop of serial `cost` ns.
+    pub(super) fn offer_split(&self, cost: u64) -> bool {
+        if !self.bridge.is_null() {
+            // SAFETY: this query occurs only within the owning run.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            self.pace
+                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
+        }
+        self.offload.enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
+    }
+
+    /// An offer event is separate from ordinary owner dispatch.
+    pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
+        let job = self.plans.job(cpu.eip).unwrap();
+        let cost = job.cost();
+        let split = job.splits && cost > 0;
+        let peer = self.offer_computation();
+        let paced = split && self.offer_split(cost);
+        if !peer && !paced {
+            job.defer_offer();
+            return false;
+        }
+        if job.wants_form()
+            && self
+                .plans
+                .resident(cpu.eip)
+                .is_none_or(|head| head.pending.is_none())
+        {
+            self.request_optimized(cpu.eip, cpu.clone());
+        }
+        true
+    }
+
+    fn place_job(&mut self, eip: u32, at: &CpuState, unit: Arc<Unit>, job: compile::Job) {
+        let iterates = unit.trace.returns_at_head();
+        if let Some(code) = self.emit_computation(
+            &unit,
+            eip,
+            (at.x87.control, at.x87.status & 0x20 != 0),
+            &job.proof,
+        ) {
+            self.diagnostics.split_proofs += u64::from(job.proof.splits());
+            let entry_registers = job.proof.entry_registers();
+            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            policy.requested();
+            policy.built();
+            self.worker_jobs.insert(
+                eip,
+                WorkerJob {
+                    code: Code {
+                        placed: code,
+                        optimized: None,
+                    },
+                    proof: job.proof,
+                    retired: unit.trace.prepaid(0),
+                    unit,
+                    entry_registers,
+                },
+            );
+            if let Some(form) = job.form {
+                self.install_job(eip, form);
+            }
+        }
+    }
+
+    fn finish_job(&mut self, eip: u32, code: usize, job: Option<compile::Job>) -> bool {
+        let Some(_) = self
+            .worker_jobs
+            .get(&eip)
+            .filter(|prepared| prepared.code.placed.entry == code)
+        else {
+            return false;
+        };
+        self.plans.job(eip).unwrap().built();
+        if let Some(form) = job.and_then(|job| job.form) {
+            self.install_job(eip, form);
+        }
+        true
+    }
+
+    fn emit_computation(
+        &mut self,
+        unit: &Unit,
+        eip: u32,
+        (control, pe): (u16, bool),
+        proof: &Proof,
+    ) -> Option<WorkerCode> {
+        let retired = unit.trace.prepaid(0);
+        let code = compile::lower_computation(
+            unit,
+            &mut self.compiler.computation,
+            eip,
+            self.features,
+            self.code.next(),
+            self.code.stubs,
+            (control, pe, Some(proof)),
+        )?;
+        let placed = self.code.place_worker(code.words, code.sites)?;
+        crate::jit_map::record(placed.entry, code.words, eip, retired, code.marks, "a64");
+        Some(placed)
+    }
+
+    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
+        at.refresh_mmx();
+        let prepared = &self.worker_jobs[&eip];
+        self.plans.job(eip).unwrap().requested();
+        if let Some(head) = self.plans.resident_mut(eip) {
+            head.pending = Some(compile::Task::Job);
+            if !head.probation.is_empty() {
+                self.code.publish_resident(eip, None);
+            }
+        }
+        self.compiler.request(compile::Request {
+            eip,
+            generation: self.code.generation,
+            code: prepared.code.placed.entry,
+            task: compile::Task::Job,
+            unit: Arc::clone(&prepared.unit),
+            proof: Some(prepared.proof.clone()),
+            at,
+            checked: FxHashSet::default(),
+            all_checked: false,
+            refused: FxHashSet::default(),
+            cuts: FxHashSet::default(),
+            count_entries: false,
+        });
+        self.install_optimized(false);
+    }
+
+    fn install_job(&mut self, eip: u32, form: compile::JobForm) {
+        self.worker_jobs.get_mut(&eip).unwrap().install(
+            &mut self.code,
+            eip,
+            form.built,
+            form.lowered,
+        );
     }
 }

@@ -56,6 +56,36 @@ pub(in crate::native) struct ResidentForm {
     pub lowered: back::Lowered,
 }
 
+impl ResidentForm {
+    pub fn placement(&mut self) -> crate::translate::lower::resident::Layout<'_> {
+        let lowered = &mut self.lowered;
+        crate::translate::lower::resident::Layout {
+            words: &mut lowered.words,
+            body: lowered.body,
+            miss: lowered.miss,
+            cold: lowered.cold,
+            env_miss: lowered.env_miss,
+            environment: &lowered.environment,
+            exit: lowered.exit,
+            spill_cells: lowered.spill_cells,
+            probation_slot: lowered.probation_slot,
+            probation_sensor: lowered.probation_sensor.as_ref().unwrap(),
+            accounting: &lowered.probation,
+            links: &lowered.links,
+            transitions: &lowered.transitions,
+            sites: &lowered.sites,
+            marks: &lowered.marks,
+        }
+    }
+}
+
+pub(in crate::native) struct ResidentRecovery {
+    pub records:
+        Vec<crate::translate::opt::recovery::Record<crate::translate::opt::recovery::Host>>,
+    pub flags: Vec<Option<crate::translate::opt::recovery::FlagRecipe>>,
+    pub mmx: bool,
+}
+
 pub(in crate::native) struct Job {
     pub proof: Proof,
     pub form: Option<JobForm>,

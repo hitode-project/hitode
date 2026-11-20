@@ -1346,7 +1346,8 @@ fn a_read_modify_write_crossing_into_read_only_memory_has_precise_state() {
     assert_eq!(retired, 5);
     let diagnostics = &trial.live.native.as_ref().unwrap().diagnostics;
     assert_eq!(
-        diagnostics.resident_cold_exits_by_reason[&crate::runtime::ResidentCold::PageCross],
+        diagnostics.resident_cold_exits_by_reason
+            [&crate::translate::lower::resident::ResidentCold::PageCross],
         1
     );
     assert_eq!(diagnostics.resident_page_crossings, 0);

@@ -169,19 +169,6 @@ impl Runtime {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u32)]
-pub(crate) enum ResidentCold {
-    Other,
-    #[cfg(native)]
-    HostFault,
-    Validation,
-    BlockedAccess,
-    PageCross,
-    FrameDisjoint,
-    Division,
-}
-
 /// Host state shared by optimized exits and signal-context capture.
 #[repr(C)]
 #[derive(Clone, Debug, Default)]
@@ -235,22 +222,6 @@ pub struct Recovery {
     pub detail: u64,
 }
 
-#[cfg(native)]
-impl Recovery {
-    pub(crate) fn cold(&self) -> Option<(u32, ResidentCold)> {
-        let reason = match self.detail >> 32 {
-            0 => return None,
-            n if n == ResidentCold::Validation as u64 => ResidentCold::Validation,
-            n if n == ResidentCold::BlockedAccess as u64 => ResidentCold::BlockedAccess,
-            n if n == ResidentCold::PageCross as u64 => ResidentCold::PageCross,
-            n if n == ResidentCold::FrameDisjoint as u64 => ResidentCold::FrameDisjoint,
-            n if n == ResidentCold::Division as u64 => ResidentCold::Division,
-            _ => unreachable!("resident cold reason"),
-        };
-        Some((self.detail as u32, reason))
-    }
-}
-
 /// An event at a precise guest instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -282,7 +253,6 @@ pub enum PlanEvent {
     BodyStack,
     ResidentRecovery,
     DiscoverBackEdge,
-    ContextRetry,
     EnvironmentMiss,
     OfferReady,
     /// The high word names the resident head, independently of the exit EIP.
@@ -298,7 +268,6 @@ impl PlanEvent {
             Self::BodyStack => "body_stack",
             Self::ResidentRecovery => "resident_recovery",
             Self::DiscoverBackEdge => "external_discovery",
-            Self::ContextRetry => "context_retry",
             Self::EnvironmentMiss => "environment_miss",
             Self::OfferReady => "offer_ready",
             Self::Probation(_) => "probation",
@@ -309,6 +278,8 @@ impl PlanEvent {
 
 pub(crate) const DISCOVER_INTERNAL: u16 = 0;
 pub(crate) const RESIDENT_LINK_SAMPLE: u16 = 1;
+#[cfg(native)]
+pub(crate) const RESIDENT_VERSION_MISS: u16 = 3;
 #[cfg(native)]
 pub(crate) const CHECK_OFFER: u16 = 2;
 
@@ -412,7 +383,6 @@ impl Exit {
             Self::Plan(PlanEvent::BodyStack) => 12,
             Self::Plan(PlanEvent::ResidentRecovery) => 15,
             Self::Plan(PlanEvent::DiscoverBackEdge) => 16,
-            Self::Plan(PlanEvent::ContextRetry) => 17,
             Self::Plan(PlanEvent::EnvironmentMiss) => 18,
             Self::Plan(PlanEvent::OfferReady) => 19,
             Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
@@ -449,7 +419,6 @@ impl Exit {
             14 => Some(Self::Event(Event::System)),
             15 => Some(Self::Plan(PlanEvent::ResidentRecovery)),
             16 => Some(Self::Plan(PlanEvent::DiscoverBackEdge)),
-            17 => Some(Self::Plan(PlanEvent::ContextRetry)),
             18 => Some(Self::Plan(PlanEvent::EnvironmentMiss)),
             19 => Some(Self::Plan(PlanEvent::OfferReady)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),

@@ -38,10 +38,8 @@ pub struct Unit {
 }
 
 impl Unit {
-    /// Traces the unit at `eip`, ending before any of `stops`. Each byte
-    /// the unit depends on is registered with `watch_code`, so a store to
-    /// it reaches the owner. `host`, `redirect` and `loops` are as for
-    /// trace construction.
+    /// Traces the unit at `eip`, ending before any of `stops`.
+    /// The code store registers the resulting dependencies before placement.
     pub fn build(
         &mut self,
         memory: &mut adv_cpu_core::memory::Memory,
@@ -75,7 +73,6 @@ impl Unit {
             && memory.committed(eip, 15).is_ok()
             && !memory.shared_range(eip, 15)
             && decodes.table_target(eip);
-        decodes.watch(memory, &self.trace.code);
     }
 
     pub(crate) fn summarize(&mut self, decodes: &mut Decodes) {

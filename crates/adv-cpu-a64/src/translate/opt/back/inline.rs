@@ -45,10 +45,16 @@ impl Emitter<'_> {
         delay_frames: bool,
     ) {
         self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
-        key.guard_mmx(&mut self.asm, CPU, true, cold);
+        key.guard_mmx(
+            &mut self.asm,
+            CPU,
+            true,
+            if self.resident { miss } else { cold },
+        );
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
         key.guard_resident(&mut self.asm, CPU, miss);
+        self.body = self.asm.offset();
 
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {

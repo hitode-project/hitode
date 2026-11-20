@@ -42,23 +42,11 @@ RULES["translate"] = {"translate::front", "translate::jit", "translate::lower"}
 ROLES = {tuple(role.split("::")): role for role in RULES if role != "lib"}
 ROLES.update({
     ("native",): "native::run",
-    ("native", "head"): "native::store",
 })
 
 # (Current file, disallowed dependency or parent glob). Delete an entry
 # in the same change that removes its last occurrence.
 TRANSITIONAL: set[tuple[str, str]] = {
-    # Resident head placement and chain publication move together in RC.
-    ("native/head.rs", "asm"),
-    ("native/head.rs", "translate::opt"),
-    ("native/plan.rs", "cache"),
-    ("native/plan.rs", "encode"),
-    ("native/plan.rs", "native::run"),
-    ("native/plan.rs", "runtime"),
-    ("native/plan.rs", "translate::front"),
-    # Resident admission and worker admission and installation
-    # (AdmissionCache, WorkerJob, Optimized, install_job).
-    ("native/plan.rs", "translate::opt"),
     # Existing test assemblies and reference interpreters.
     ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
     ("executor.rs", "iced_x86 (tests)"),

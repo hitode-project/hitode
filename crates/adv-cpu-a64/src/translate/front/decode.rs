@@ -608,25 +608,13 @@ impl Decodes {
         }
     }
 
-    pub(super) fn watch(&mut self, memory: &mut Memory, spans: &[(u32, u32)]) {
+    pub(crate) fn watch_spans(
+        &mut self,
+        spans: &[(u32, u32)],
+    ) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.pending.extend_from_slice(spans);
         self.pending.sort_unstable();
-        let mut span: Option<(u32, u64)> = None;
-        for (pc, len) in self.pending.drain(..) {
-            let limit = u64::from(pc) + u64::from(len);
-            match &mut span {
-                Some((_, end)) if u64::from(pc) <= *end => *end = (*end).max(limit),
-                _ => {
-                    if let Some((start, end)) = span {
-                        memory.watch_code(start, (end - u64::from(start)) as usize);
-                    }
-                    span = Some((pc, limit));
-                }
-            }
-        }
-        if let Some((start, end)) = span {
-            memory.watch_code(start, (end - u64::from(start)) as usize);
-        }
+        self.pending.drain(..)
     }
 
     fn get(&self, pc: u32) -> Option<&Sample> {

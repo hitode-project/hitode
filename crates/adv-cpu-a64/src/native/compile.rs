@@ -3,11 +3,25 @@
 #[cfg(native)]
 mod pool;
 #[cfg(native)]
-pub(super) use pool::{Compiler, Job, JobForm, Request, ResidentForm, Task};
+pub(super) use pool::{Compiler, Job, JobForm, Request, ResidentForm, ResidentRecovery, Task};
 
 use crate::jit_map::Mark;
 use crate::translate::jit::{self, Code};
 use crate::translate::lower::Site;
+#[cfg(native)]
+pub(super) use crate::translate::{lower::resident::ResidentCold, opt::front::Reject};
+
+#[cfg(native)]
+pub(super) fn stream_sites(unit: &Unit, site: u32) -> impl Iterator<Item = u32> + '_ {
+    let sites = unit.trace.insts.iter().zip(&unit.trace.x86);
+    let key = sites
+        .clone()
+        .find(|(inst, _)| inst.pc == site)
+        .and_then(|(_, summary)| summary.as_ref()?.stream);
+    sites.filter_map(move |(inst, summary)| {
+        (key.is_some() && summary.as_ref()?.stream == key).then_some(inst.pc)
+    })
+}
 
 #[cfg(native)]
 use crate::facts::Key;
@@ -115,6 +129,21 @@ pub(crate) fn translate(
 }
 
 impl Workspace {
+    #[cfg(native)]
+    pub(super) fn placement(&self) -> crate::translate::lower::Tier1Placement<'_> {
+        crate::translate::lower::Tier1Placement {
+            words: self.words(),
+            sites: self.sites(),
+            marks: self.marks(),
+            retired: self.retired(),
+            version: self.code.version,
+            table_positions: &self.code.table_positions,
+            links: self.links(),
+            internal_links: self.internal_links(),
+            uses_permissions: self.code.uses_permissions,
+        }
+    }
+
     #[cfg(native)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn lower_tier1(

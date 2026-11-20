@@ -28,13 +28,13 @@
 //! pointers, without retaining Arc snapshots that would force whole-table copies.
 //! Mapping changes and code discovery refresh changed pages before reentry.
 //!
-//! Code invalidation: translation registers its guest bytes with
+//! Code invalidation: the store registers the front end's dependencies with
 //! `watch_code`, which write-protects them in the window, so any store to
 //! them reaches the interpreter or Rust and marks the page dirty. Dirty
 //! pages drop their units before the next dispatch.
 //!
 //! The execution plane spans `run` and `store`. The `plan` arbiter records
-//! decisions and publishes links. The Tier-1 translator and `compile` produce
+//! decisions, and the store publishes links. The Tier-1 translator and `compile` produce
 //! typed artifacts. `offload` alone consumes worker jobs.
 //! See A64-OPT-11, A64-OPT-12, A64-OPT-13 and A64-OPT-14.
 
@@ -50,17 +50,16 @@ use adv_cpu_core::memory::accessible;
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 
-use crate::cache::CodeCache;
-use crate::runtime::{self, Enter, Exit, ResidentCold, Runtime, alias_base};
+use crate::runtime::{self, Enter, Exit, Runtime, alias_base};
 use crate::translate::front::{self, Unit, trace::Redirect};
 use crate::translate::jit::Features;
 use crate::translate::lower::Stubs;
+use crate::translate::lower::resident::ResidentCold;
 use crate::translate::opt;
 
-use store::{FaultCapture, Faults, InterpreterCause, ShadowStack, on_fault};
+use store::{EMPTY, FaultCapture, Faults, InterpreterCause, ShadowStack, on_fault};
 
 pub(crate) mod compile;
-mod head;
 mod offload;
 mod plan;
 mod run;
@@ -87,9 +86,6 @@ const CACHE_LEN: usize = 64 << 20;
 /// deadlines and interrupts while linked units loop.
 pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
-
-/// An indirect table entry no EIP matches.
-const EMPTY: [u64; 2] = [u64::MAX, 0];
 
 /// Doubling copies fill the 1 MiB table with a few memcpys; an element-wise
 /// fill dominates executor creation in unoptimized test builds.
@@ -247,7 +243,14 @@ unsafe extern "C" fn plan_observation(
         native.count_plan_event("offer_check");
         let job = native.plans.job(eip).unwrap();
         job.defer_offer();
-        return u32::from(job.offer_due(native.published_gate()));
+        return u32::from(job.offer_due(native.published_gate(), ticks));
+    }
+    if kind == runtime::RESIDENT_VERSION_MISS {
+        native.count_plan_event("resident_version_miss");
+        let mut at = cpu.clone();
+        at.eip = eip;
+        native.retry_resident(&at, point);
+        return 0;
     }
     if kind == runtime::RESIDENT_LINK_SAMPLE {
         native.count_plan_event("resident_link_sample");
@@ -571,7 +574,7 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 }
 
 pub(crate) struct Native {
-    code: store::CodeStore,
+    code: store::CodeStore<compile::ResidentRecovery>,
     decodes: front::Decodes,
     front_units: FxHashMap<u32, front::Site>,
     plans: plan::Arbiter,
@@ -604,7 +607,7 @@ pub(crate) struct Native {
     /// split (A64-TR-9).
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     offload: offload::Offload,
-    worker_jobs: FxHashMap<u32, plan::WorkerJob>,
+    worker_jobs: FxHashMap<u32, offload::WorkerJob<Arc<Unit>>>,
     /// Where `opt_exit` saves an inline form's spill cells.
     inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
@@ -666,15 +669,18 @@ impl Native {
         for (&eip, stats) in entries {
             let versions = self
                 .code
-                .chains
-                .get(&eip)
+                .tier1_chain(eip)
                 .map_or(0, |chain| chain.versions.len());
             let arrivals =
                 std::array::from_fn::<_, { store::CHAIN_LEN }, _>(|n| stats.arrivals[n].get());
             let _ = write!(
                 output,
-                " {eip:#010x}=[builds {}, misses {}, joins {}, versions {versions}, arrivals {arrivals:?}]",
-                stats.built, stats.misses, stats.joins,
+                " {eip:#010x}=[builds {}, misses {}, joins {}, versions {versions}, arrivals {arrivals:?}, resident next {}, resident tier1 {}]",
+                stats.built,
+                stats.misses,
+                stats.joins,
+                stats.resident_misses[0].get(),
+                stats.resident_misses[1].get()
             );
         }
         for (&reason, &count) in &self.diagnostics.exit_counts {
@@ -697,7 +703,6 @@ impl Native {
     /// `window` is the host address of guest address 0 in the guest's
     /// `GuestWindow`, which must outlive this.
     pub fn new(window: usize) -> Result<Self, String> {
-        let mut cache = CodeCache::new(CACHE_LEN)?;
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
         unsafe extern "C" fn resident_access(
             runtime: *mut Runtime,
@@ -731,7 +736,7 @@ impl Native {
         stubs
             .code
             .extend(opt::back::access_stub(resident_access as *const () as u64));
-        let base = cache.append(&stubs.code).ok_or("stubs do not fit")?;
+        let (cache, base) = store::place_stubs(CACHE_LEN, &stubs.code)?;
         crate::jit_map::record_stubs(
             base,
             base + 4 * stubs.code.len(),
@@ -795,7 +800,6 @@ impl Native {
                     fault: base + stubs.fault,
                     opt_exit: base + stubs.opt_exit,
                 },
-                units: FxHashMap::default(),
                 chains: FxHashMap::default(),
                 version_stats: crate::jit_map::enabled().then(FxHashMap::default),
                 slow_paths: crate::jit_map::enabled().then(store::SlowPaths::default),
@@ -922,7 +926,7 @@ impl Native {
 
     #[cfg(test)]
     pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
-        self.code.units.get(&eip).map(|entry| entry.unit)
+        self.code.tier1(eip).map(|entry| entry.unit)
     }
 
     /// Guest instructions whose accesses check their page.
@@ -968,10 +972,11 @@ impl Native {
                 loops,
                 &mut self.decodes,
             );
+            self.code
+                .watch_pages(memory, eip, unit.code(), &mut self.decodes);
             unit.prepare_regions(memory, &|pc, code| {
                 handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
             });
-            self.code.watch_pages(eip, unit.code());
             Arc::new(unit)
         });
         if summarize && unit.trace.x86.is_empty() {
@@ -1072,13 +1077,24 @@ mod tests {
             .code
             .install_unit(eip, &words, &[(0, site)], 1, &[], Default::default())
             .unwrap();
-        native.code.units.insert(eip, unit);
+        native.code.set_tier1(
+            eip,
+            store::Tier1Chain {
+                unit: Arc::default(),
+                mask: 0,
+                helpers: 0,
+                versions: vec![store::Version {
+                    key: crate::facts::Key::default(),
+                    entry: unit,
+                }],
+            },
+        );
     }
 
     // spec: A64A-PLACE-2 A64A-ROLE-5
     #[test]
     fn proved_link_enters_past_the_guards() {
-        use super::store::{Chain, Version};
+        use super::store::{Tier1Chain, Version};
         use crate::facts::Key;
 
         let (_, mut native) = native();
@@ -1099,10 +1115,9 @@ mod tests {
                 },
             )
             .unwrap();
-        native.code.units.insert(eip, version);
-        native.code.chains.insert(
+        native.code.set_tier1(
             eip,
-            Chain {
+            Tier1Chain {
                 unit: Arc::default(),
                 mask: key.mask(),
                 helpers: 0,
@@ -1116,7 +1131,7 @@ mod tests {
         native.patch(point, eip, version.unit);
         assert_eq!(
             native.code.cache.word(point),
-            head::branch(point, version.body)
+            store::branch(point, version.body)
         );
         assert!(native.code.invalidate_unit(eip));
         assert!(!native.code.chains.contains_key(&eip));
@@ -1205,7 +1220,7 @@ mod tests {
             discovered, first,
             "resident discovery shares the cold prefix"
         );
-        assert!(!native.plans.resident(HEAD).unwrap().versions.is_empty());
+        assert!(!native.code.resident(HEAD).unwrap().versions.is_empty());
         native.rebuild_resident_versions(HEAD);
         native.install_optimized(true);
         assert_eq!(native.translation_decodes(), discovered);
@@ -1300,7 +1315,7 @@ mod tests {
         let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
         native.prepare_job(&mut memory, stop, &resident_cpu(HEAD, 20));
         native.set_computation_offer(true, None);
-        let gate = native.plans.job(HEAD).unwrap().gate_entry;
+        let gate = native.code.offer(HEAD).unwrap().0;
         assert!(native.plans.resident(HEAD).unwrap().declined());
         native.plans.job(HEAD).unwrap().reoffer.set(3);
         for left in [2, 1] {
@@ -1372,7 +1387,7 @@ mod tests {
         assert_eq!((state.eip, run.retired), (stop, 2 + 4 * plan::HOT));
         assert_eq!(native.plans.counter_at(HEAD).unwrap().get(), 1);
         assert!(!native.plans.resident(HEAD).is_some());
-        let unit = native.code.units[&HEAD].unit;
+        let unit = native.code.tier1(HEAD).unwrap().unit;
         let table = runtime::table_slot(HEAD);
         assert_eq!(native.code.table[table], [u64::from(HEAD), unit as u64]);
 
@@ -1380,21 +1395,24 @@ mod tests {
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 22));
         let edge = &native.code.internal_edges[&HEAD][0];
-        let (back, transition, fallback, resident) =
+        let (back, transition, original_target, resident) =
             (edge.point, edge.transition, edge.target, edge.link);
         let link = outside_link(&native, HEAD);
         let (outside, unresolved) = (link.point, link.original);
         let arrival = link.direct.unwrap();
-        assert_eq!(native.plans.resident(HEAD).unwrap().versions.len(), 1);
-        let trampoline = native.plans.resident(HEAD).unwrap().trampoline;
-        assert_eq!(native.code.cache.word(back), head::branch(back, transition));
+        assert_eq!(native.code.resident(HEAD).unwrap().versions.len(), 1);
+        let resident_entry = native.code.resident(HEAD).unwrap().entry().unwrap();
+        assert_eq!(
+            native.code.cache.word(back),
+            store::branch(back, transition)
+        );
         assert_eq!(
             native.code.cache.word(resident),
-            head::branch(resident, trampoline)
+            store::branch(resident, resident_entry)
         );
         assert_eq!(
             native.code.cache.word(outside),
-            head::branch(outside, arrival)
+            store::branch(outside, arrival)
         );
         assert_eq!(native.code.table[table][1], unit as u64);
 
@@ -1406,25 +1424,26 @@ mod tests {
                 ..CpuState::default()
             },
         );
-        let new = native.code.units[&HEAD].unit;
+        let new = native.code.tier1(HEAD).unwrap().unit;
         assert_ne!(new, unit);
         assert_eq!(native.diagnostics.promotions, 1);
-        assert_eq!(native.code.cache.word(back), head::branch(back, transition));
+        assert_eq!(
+            native.code.cache.word(back),
+            store::branch(back, transition)
+        );
         assert_eq!(
             native.code.cache.word(resident),
-            head::branch(resident, trampoline)
+            store::branch(resident, resident_entry)
         );
         assert_eq!(
             native.code.cache.word(outside),
-            head::branch(outside, arrival)
+            store::branch(outside, arrival)
         );
         assert_eq!(native.code.table[table][1], new as u64);
+        let fallback = native.code.resident(HEAD).unwrap().versions[0].cold;
         assert_eq!(
-            native
-                .code
-                .cache
-                .word(native.plans.resident(HEAD).unwrap().tier1),
-            head::branch(native.plans.resident(HEAD).unwrap().tier1, new)
+            native.code.cache.word(fallback),
+            store::branch(fallback, new)
         );
         assert_eq!(native.diagnostics.global_invalidations, invalidations);
 
@@ -1432,9 +1451,99 @@ mod tests {
         memory.write(HEAD, &[0x90]).unwrap();
         native.invalidate(&mut memory);
         assert!(!native.plans.resident(HEAD).is_some());
-        assert_eq!(native.code.cache.word(back), head::branch(back, fallback));
+        assert_eq!(
+            native.code.cache.word(back),
+            store::branch(back, original_target)
+        );
         assert_eq!(native.code.cache.word(outside), unresolved);
         assert_eq!(native.code.table[table], EMPTY);
+    }
+
+    // spec: A64A-ROLE-5 A64A-PLACE-2 A64A-PLACE-3 A64-OPT-8
+    #[test]
+    fn shared_chain_settled_arrivals_keep_their_word_budget() {
+        fn target(native: &Native, point: usize) -> usize {
+            let word = native.code.cache.word(point);
+            assert_eq!(word >> 26, 0b000101);
+            point.wrapping_add_signed(((word << 6) as i32 >> 4) as isize)
+        }
+
+        let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+        native.promotion = 0;
+        native.count_resident_entries = true;
+        assert!(native.force_resident(&mut memory, HEAD));
+        let ordinary = native.code.tier1(HEAD).unwrap();
+        let resident = native.code.resident(HEAD).unwrap();
+        let (probe, checked) = (resident.versions[0].probe, resident.versions[0].entry);
+        native.code.settle_sample(HEAD);
+        assert_eq!(target(&native, probe), checked);
+
+        for (start, retired) in [(HEAD, 4), (OUTSIDE + 16, 6), (OUTSIDE + 16, 6)] {
+            let before = native.diagnostics.resident_entries;
+            let mut state = resident_cpu(start, 1);
+            let run = enter(&mut native, &mut memory, stop, &mut state);
+            assert_eq!((state.eip, run.retired), (stop, retired));
+            assert_eq!(native.diagnostics.resident_entries, before);
+        }
+        assert_eq!(native.code.tier1(HEAD).unwrap().body, ordinary.unit);
+        let slot = &native.code.table[runtime::table_slot(HEAD)];
+        assert_eq!(*slot, [u64::from(HEAD), ordinary.unit as u64]);
+
+        let before = native.diagnostics.resident_entries;
+        let mut state = resident_cpu(OUTSIDE, 1);
+        assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 6);
+        assert_eq!(native.diagnostics.resident_entries, before + 1);
+        let outside = outside_link(&native, HEAD);
+        let transition = target(&native, outside.point);
+        assert_eq!(Some(transition), outside.direct);
+        assert_eq!(target(&native, transition + 4), probe);
+        // Branch, ADR, branch, settled sensor. The former trampoline
+        // added one more branch before the same checked form.
+        let outside_words = 1 + (transition + 8 - transition) / 4 + 1;
+        assert!(outside_words <= 5);
+
+        let edge = native.code.internal_edges[&HEAD]
+            .iter()
+            .find(|edge| edge.back)
+            .unwrap();
+        assert_eq!(target(&native, edge.point), edge.transition);
+        assert_eq!(target(&native, edge.link), probe);
+        let publication_words = (edge.link - edge.transition) / 4;
+        let back_words = 1 + publication_words + 1 + 1;
+        assert!(back_words <= 1 + publication_words + 1 + 2);
+
+        let version = &native.code.resident(HEAD).unwrap().versions[0];
+        let (key, proved) = (version.key, version.proved.unwrap());
+        let point = outside_link(&native, HEAD).point;
+        native.code.point_facts.insert(point, key);
+        native
+            .code
+            .repoint_resident_edges(HEAD, Some(probe), false, false);
+        native.code.sync();
+        assert_eq!(target(&native, transition + 4), proved);
+        let offer_words = native
+            .plans
+            .job(HEAD)
+            .map_or(0, |job| if job.splits { 5 } else { 8 });
+        assert!(target(&native, proved + (offer_words + 3) * 4) > checked);
+        let mut state = resident_cpu(OUTSIDE, 1);
+        assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 6);
+
+        let stubs = native.code.stubs;
+        assert_eq!((stubs.lookup_slow - stubs.lookup) / 4, 8);
+        assert_eq!((stubs.lookup - stubs.dispatch) / 4 - 2, 19);
+        assert_eq!(
+            native.code.cache.word(stubs.lookup + 7 * 4),
+            crate::encode::br(crate::encode::Reg::new(17))
+        );
+        assert_eq!(
+            native.code.cache.word(stubs.dispatch + 18 * 4),
+            crate::encode::br(crate::encode::Reg::new(0))
+        );
+        assert_eq!(
+            native.code.cache.word(native.code.enter.0 + 37 * 4),
+            crate::encode::br(crate::encode::Reg::new(17))
+        );
     }
 
     // spec: A64-OPT-9
@@ -1448,22 +1557,22 @@ mod tests {
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 2 + 3 * (plan::HOT + 1)));
         assert!(!native.worker_jobs.contains_key(&HEAD));
-        let head = native.plans.resident(HEAD).unwrap();
+        let head = native.code.resident(HEAD).unwrap();
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(head.versions.len(), 1);
         assert_eq!(
             native.code.cache.word(edge.point),
-            self::head::branch(edge.point, edge.transition)
+            store::branch(edge.point, edge.transition)
         );
         assert_eq!(
             native.code.cache.word(edge.link),
-            self::head::branch(edge.link, head.trampoline)
+            store::branch(edge.link, head.entry().unwrap())
         );
         let outside = outside_link(&native, HEAD);
         let transition = outside.direct.unwrap();
         assert_eq!(
             native.code.cache.word(outside.point),
-            self::head::branch(outside.point, transition)
+            store::branch(outside.point, transition)
         );
     }
 
@@ -1489,17 +1598,17 @@ mod tests {
         let mut state = resident_cpu(HEAD, 2);
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 25));
-        assert!(!native.code.units.contains_key(&head));
+        assert!(native.code.tier1(head).is_none());
         let edges = &native.code.internal_edges[&head];
         assert!(edges.iter().any(|edge| !edge.back));
         for edge in edges {
             assert_eq!(
                 native.code.cache.word(edge.point),
-                head::branch(edge.point, edge.transition)
+                store::branch(edge.point, edge.transition)
             );
         }
         assert_eq!(
-            native.plans.resident(head).unwrap().versions[0].at.regs[1],
+            native.code.resident(head).unwrap().versions[0].at.regs[1],
             1
         );
 
@@ -1507,22 +1616,19 @@ mod tests {
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 37));
         assert_eq!(
-            native.plans.resident(head).unwrap().versions[0]
+            native.code.resident(head).unwrap().versions[0]
                 .slot
                 .entries
                 .get(),
             1
         );
-        assert!(!native.code.units.contains_key(&head));
+        assert!(native.code.tier1(head).is_none());
 
         let mut state = resident_cpu(HEAD, 2);
         state.mxcsr ^= 0x2000;
         let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (head, 1));
-        assert!(!native.code.units.contains_key(&head));
-        let run = enter(&mut native, &mut memory, stop, &mut state);
-        assert_eq!((state.eip, run.retired), (stop, 24));
-        assert!(native.code.units.contains_key(&head));
+        assert_eq!((state.eip, run.retired), (stop, 25));
+        assert!(native.code.tier1(head).is_some());
 
         memory.protect(HEAD, 0x4000, READ | WRITE).unwrap();
         memory.write(head, &[0xcc]).unwrap();
@@ -1531,7 +1637,7 @@ mod tests {
         for edge in &native.code.internal_edges[&head] {
             assert_eq!(
                 native.code.cache.word(edge.point),
-                head::branch(edge.point, edge.target)
+                store::branch(edge.point, edge.target)
             );
         }
     }
@@ -1581,7 +1687,7 @@ mod tests {
             .unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
         assert!(
-            native.plans.resident(HEAD).unwrap().versions[0]
+            native.code.resident(HEAD).unwrap().versions[0]
                 .plain_sites
                 .is_empty()
         );
@@ -1601,7 +1707,7 @@ mod tests {
         state.regs[0] = 0;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((run.exit, run.retired), (Exit::Dispatch, 16));
-        let head = native.plans.resident(HEAD).unwrap();
+        let head = native.code.resident(HEAD).unwrap();
         assert_eq!(head.sample.get(), plan::SAMPLE - 1);
         assert_eq!(head.versions[0].slot.retry.get(), plan::MISSES);
         assert_eq!(
@@ -1626,28 +1732,27 @@ mod tests {
             state.mxcsr = 0x1f80 | mode << 13;
             for _ in 0..4 {
                 enter(&mut native, &mut memory, stop, &mut state);
-                if native.plans.resident(HEAD).unwrap().versions.len() == mode as usize + 1 {
+                if native.code.resident(HEAD).unwrap().versions.len() == mode as usize + 1 {
                     break;
                 }
                 state.eip = OUTSIDE;
             }
             assert_eq!(
-                native.plans.resident(HEAD).unwrap().versions.len(),
+                native.code.resident(HEAD).unwrap().versions.len(),
                 mode as usize + 1
             );
-            let versions = &native.plans.resident(HEAD).unwrap().versions;
+            let versions = &native.code.resident(HEAD).unwrap().versions;
             let previous = &versions[mode as usize - 1];
             assert_eq!(
                 native.code.cache.word(previous.next),
-                head::branch(previous.next, versions[mode as usize].entry)
+                store::branch(previous.next, versions[mode as usize].entry)
             );
-            let (point, _) = previous.retry;
             assert_eq!(
-                native.code.cache.word(point),
-                head::branch(point, previous.next)
+                native.code.cache.word(previous.miss),
+                store::branch(previous.miss, versions[mode as usize].entry)
             );
         }
-        let resident = native.plans.resident(HEAD).unwrap();
+        let resident = native.code.resident(HEAD).unwrap();
         let before: Vec<_> = resident
             .versions
             .iter()
@@ -1658,7 +1763,7 @@ mod tests {
         state.mxcsr = 0x7f80;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 10));
-        let resident = native.plans.resident(HEAD).unwrap();
+        let resident = native.code.resident(HEAD).unwrap();
         assert_eq!(resident.versions.len(), plan::VERSIONS);
         assert!(
             resident
@@ -1670,7 +1775,7 @@ mod tests {
         let last = resident.versions.last().unwrap();
         assert_eq!(
             native.code.cache.word(last.next),
-            head::branch(last.next, resident.tier1)
+            store::branch(last.next, native.code.resident_fallback(HEAD).unwrap())
         );
 
         for _ in 0..2 * plan::SAMPLE {
@@ -1678,12 +1783,12 @@ mod tests {
             state.mxcsr = 0x5f80;
             enter(&mut native, &mut memory, stop, &mut state);
         }
-        let resident = native.plans.resident(HEAD).unwrap();
+        let resident = native.code.resident(HEAD).unwrap();
         let transition = outside_link(&native, HEAD).direct.unwrap();
         let patch = transition + 4;
         assert_eq!(
             native.code.cache.word(patch),
-            head::branch(patch, resident.versions[2].entry)
+            store::branch(patch, resident.versions[2].entry)
         );
     }
 
@@ -1699,14 +1804,14 @@ mod tests {
             enter(&mut native, &mut memory, stop, &mut state).exit,
             Exit::Event(crate::runtime::Event::Replay)
         );
-        let old = native.code.units[&HEAD].unit;
+        let old = native.code.tier1(HEAD).unwrap().unit;
         for _ in 1..CHECK_AFTER {
             assert_eq!(
                 enter(&mut native, &mut memory, stop, &mut state).exit,
                 Exit::Event(crate::runtime::Event::Replay)
             );
         }
-        let new = native.code.units[&HEAD].unit;
+        let new = native.code.tier1(HEAD).unwrap().unit;
         assert_ne!(new, old);
         assert!(native.plans.checked(HEAD));
         assert_eq!(
@@ -1745,7 +1850,7 @@ mod tests {
         native.invalidate(&mut memory);
         native.install_optimized(true);
         for eip in [HEAD, other] {
-            assert_eq!(native.plans.resident(eip).unwrap().versions.len(), 1);
+            assert_eq!(native.code.resident(eip).unwrap().versions.len(), 1);
         }
         assert!(!native.plans.resident(stale).is_some());
         assert!(!native.worker_jobs.contains_key(&stale));
@@ -1760,7 +1865,7 @@ mod tests {
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         native.plans.mark_checked(HEAD);
         assert!(native.force_resident(&mut memory, HEAD));
-        let first = &native.plans.resident(HEAD).unwrap().versions[0];
+        let first = &native.code.resident(HEAD).unwrap().versions[0];
         assert!(first.plain_sites.contains(&HEAD));
         let old = first.entry;
 
@@ -1770,7 +1875,7 @@ mod tests {
         state.regs[6] = DATA;
         enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!(
-            native.plans.resident(HEAD).unwrap().versions[0].slot.env[0].get(),
+            native.code.resident(HEAD).unwrap().versions[0].slot.env[0].get(),
             2
         );
         for _ in 1..plan::MISSES.div_ceil(2) {
@@ -1780,8 +1885,12 @@ mod tests {
         }
         let resident = native.plans.resident(HEAD).unwrap();
         assert!(resident.refused.contains(&HEAD));
-        assert_ne!(resident.versions[0].entry, old);
-        assert!(!resident.versions[0].plain_sites.contains(&HEAD));
+        assert_ne!(native.code.resident(HEAD).unwrap().versions[0].entry, old);
+        assert!(
+            !native.code.resident(HEAD).unwrap().versions[0]
+                .plain_sites
+                .contains(&HEAD)
+        );
     }
 
     // spec: A64-OPT-9
@@ -1796,7 +1905,7 @@ mod tests {
         state.regs[4] = DATA;
         state.regs[7] = DATA + 4;
         assert!(native.force_resident_at(&mut memory, state.clone()));
-        let first = &native.plans.resident(HEAD).unwrap().versions[0];
+        let first = &native.code.resident(HEAD).unwrap().versions[0];
         assert!(first.plain_sites.contains(&u32::MAX));
         let old = first.entry;
         state.eip = OUTSIDE;
@@ -1810,8 +1919,12 @@ mod tests {
         let site = (HEAD + 4, ResidentCold::FrameDisjoint);
         assert_eq!(resident.cold_counts[&site], 2);
         assert_eq!(native.diagnostics.resident_refusals_by_reason[&site.1], 1);
-        assert_ne!(resident.versions[0].entry, old);
-        assert!(!resident.versions[0].plain_sites.contains(&u32::MAX));
+        assert_ne!(native.code.resident(HEAD).unwrap().versions[0].entry, old);
+        assert!(
+            !native.code.resident(HEAD).unwrap().versions[0]
+                .plain_sites
+                .contains(&u32::MAX)
+        );
 
         let before = native.diagnostics.resident_entries;
         let cold = native.diagnostics.resident_cold_exits;
@@ -1836,7 +1949,7 @@ mod tests {
         memory.map(DATA, 0x4000, READ | WRITE).unwrap();
         memory.map_shared_audio(DATA + 0x4000, 0x1000).unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
-        let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
+        let old = native.code.resident(HEAD).unwrap().versions[0].entry;
         let mut state = resident_cpu(OUTSIDE, 3);
         state.regs[6] = DATA + 0x4000 - 4;
         enter(&mut native, &mut memory, stop, &mut state);
@@ -1845,7 +1958,7 @@ mod tests {
             resident.cold_counts[&(HEAD + 2, ResidentCold::HostFault)],
             1
         );
-        assert_eq!(resident.versions[0].entry, old);
+        assert_eq!(native.code.resident(HEAD).unwrap().versions[0].entry, old);
         for expected in 1..=plan::CHECKED_FAULTS {
             let mut state = resident_cpu(OUTSIDE, 3);
             state.regs[6] = DATA + 0x4000;
@@ -1856,8 +1969,8 @@ mod tests {
         let resident = native.plans.resident(HEAD).unwrap();
         assert_eq!(resident.checked.len(), 2);
         assert!(resident.checked.contains(&HEAD) && resident.checked.contains(&(HEAD + 2)));
-        assert_ne!(resident.versions[0].entry, old);
-        let checked_entry = resident.versions[0].entry;
+        assert_ne!(native.code.resident(HEAD).unwrap().versions[0].entry, old);
+        let checked_entry = native.code.resident(HEAD).unwrap().versions[0].entry;
 
         for _ in 0..100 {
             let mut state = resident_cpu(OUTSIDE, 3);
@@ -1871,7 +1984,7 @@ mod tests {
             plan::CHECKED_FAULTS + 1
         );
         assert_eq!(
-            native.plans.resident(HEAD).unwrap().versions[0].entry,
+            native.code.resident(HEAD).unwrap().versions[0].entry,
             checked_entry
         );
     }
@@ -1896,7 +2009,7 @@ mod tests {
         setup(&mut memory, &mut state);
         native.count_resident_entries = true;
         assert!(native.force_resident_at(&mut memory, state.clone()));
-        let old = native.plans.resident(HEAD).unwrap().versions[0].entry;
+        let old = native.code.resident(HEAD).unwrap().versions[0].entry;
         state.eip = OUTSIDE;
         for _ in 0..2 {
             enter(&mut native, &mut memory, stop, &mut state.clone());
@@ -1906,7 +2019,7 @@ mod tests {
         assert_eq!(head.cold_counts.get(&(site, reason)), Some(&cold));
         assert!(head.cuts.contains(&site));
         assert_eq!(native.diagnostics.resident_cuts_by_reason[&reason], 1);
-        assert_ne!(head.versions[0].entry, old);
+        assert_ne!(native.code.resident(HEAD).unwrap().versions[0].entry, old);
 
         let first = enter(&mut native, &mut memory, stop, &mut state.clone());
         assert!(first.retired > 0);
@@ -2007,7 +2120,7 @@ mod tests {
         memory.map(DATA, 0x8000, READ | WRITE).unwrap();
         memory.protect(DATA + 0x4000, 0x4000, READ).unwrap();
         assert!(native.force_resident(&mut memory, HEAD));
-        let entry = native.plans.resident(HEAD).unwrap().versions[0].entry;
+        let entry = native.code.resident(HEAD).unwrap().versions[0].entry;
         let mut crossing = resident_cpu(OUTSIDE, 4);
         crossing.regs[6] = DATA + 0x3fff;
         enter(&mut native, &mut memory, stop, &mut crossing.clone());
@@ -2022,7 +2135,7 @@ mod tests {
         let head = native.plans.resident(HEAD).unwrap();
         assert_eq!(head.cold_counts[&(HEAD + 3, ResidentCold::PageCross)], 2);
         assert!(head.cuts.is_empty() && !head.declined());
-        assert_eq!(head.versions[0].entry, entry);
+        assert_eq!(native.code.resident(HEAD).unwrap().versions[0].entry, entry);
     }
 
     // spec: A64-OPT-9
@@ -2091,7 +2204,7 @@ mod tests {
         let mut state = resident_cpu(OUTSIDE, 2);
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!(state.eip, stop);
-        let slot = &native.plans.resident(HEAD).unwrap().versions[0].slot;
+        let slot = &native.code.resident(HEAD).unwrap().versions[0].slot;
         assert_eq!(slot.entries.get(), 1);
         // Only the two instructions leading into the loop retire in Tier 1.
         assert_eq!(u64::from(run.retired) - slot.countdown[1].get(), 2);
@@ -2107,17 +2220,17 @@ mod tests {
         let outside = outside_link(&native, HEAD);
         assert_eq!(
             native.code.cache.word(outside.point),
-            outside.branch(native.plans.job(HEAD).unwrap().gate_entry)
+            outside.branch(native.code.offer(HEAD).unwrap().0)
         );
-        let fallback = native.plans.job(HEAD).unwrap().gate_fallback;
+        let fallback = native.code.offer(HEAD).unwrap().1;
         assert_eq!(
             native.code.cache.word(fallback),
-            head::branch(fallback, native.code.units[&HEAD].unit)
+            store::branch(fallback, native.code.tier1(HEAD).unwrap().unit)
         );
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(
             native.code.cache.word(edge.point),
-            head::branch(edge.point, edge.target)
+            store::branch(edge.point, edge.target)
         );
     }
 
@@ -2126,8 +2239,8 @@ mod tests {
     fn resident_probation_keeps_long_invocations() {
         let (mut memory, mut native, stop) = probation_loop(100);
         let invalidations = native.diagnostics.global_invalidations;
-        let version = &native.plans.resident(HEAD).unwrap().versions[0];
-        assert!(version.probation.is_some());
+        let version = &native.code.resident(HEAD).unwrap().versions[0];
+        assert!(version.probation);
         let patches = version.accounting.clone();
         let sensors = version.probation_sensors.clone();
         for _ in 0..300 {
@@ -2157,7 +2270,7 @@ mod tests {
         let (_memory, mut native, _) = probation_loop(2);
         let head = native.plans.resident_mut(HEAD).unwrap();
         head.checked.insert(HEAD);
-        assert!(head.versions[0].probation.is_some());
+        assert!(head.probation[0].is_some());
         for _ in 0..plan::PROBATION {
             native.resident_cold_exit((HEAD, 0), HEAD, ResidentCold::HostFault, false, 0, 0);
         }
@@ -2171,14 +2284,20 @@ mod tests {
         let sample = BackEdgeSample {
             generation: native.code.generation,
             source: HEAD,
-            unit: native.code.units[&HEAD].unit,
+            unit: native.code.tier1(HEAD).unwrap().unit,
             at: resident_cpu(HEAD, 100),
         };
+        // Hold an optimized completion across the clear as well as the
+        // deferred discovery. The next Tier-1 placement can reuse its address.
+        native.rebuild_resident_versions(HEAD);
         native.clear();
         native
             .translate(&mut memory, HEAD, crate::facts::Key::default())
             .unwrap();
-        assert_eq!(native.code.units[&HEAD].unit, sample.unit);
+        assert_eq!(native.code.tier1(HEAD).unwrap().unit, sample.unit);
+        assert!(native.code.resident(HEAD).is_none());
+        assert!(!native.worker_jobs.contains_key(&HEAD));
+        native.install_optimized(true);
         native.apply_back_edge_sample(&mut memory, sample);
         assert!(native.plans.resident(HEAD).is_none());
     }
