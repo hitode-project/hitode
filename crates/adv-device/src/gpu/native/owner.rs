@@ -144,7 +144,7 @@ pub(super) fn run(
                         state.submit(None)?;
                     }
                     state.presenter.service(&mut state.queue, Some(&wake));
-                    Ok(())
+                    state.poll(&commands)
                 })?;
                 #[cfg(not(target_vendor = "apple"))]
                 {
@@ -155,6 +155,7 @@ pub(super) fn run(
                         state.submit(None)?;
                     }
                     state.presenter.service(&mut state.queue, Some(&wake));
+                    state.poll(&commands)?;
                 }
             }
             super::stream::Next::Chunk(chunk) => {
@@ -474,7 +475,11 @@ impl State {
                 self.queue.on_complete(token, done);
             }
             Command::Submit => {
-                self.submit(None)?;
+                let token = self.submit(None)?;
+                // A producer waiting for a software slot may have no more
+                // commands to publish until this boundary retires.
+                let wake = self.wake.clone();
+                self.queue.on_complete(token, Box::new(move || wake.poke()));
             }
             Command::PresentSwap {
                 image,
@@ -1314,6 +1319,30 @@ struct Color {rgba:vec4<f32>}
         assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 2);
         producer_thread.join().unwrap();
         owner.join().unwrap().unwrap();
+    }
+
+    // spec: DEV-FRAME-4
+    #[test]
+    fn flush_retires_without_more_commands() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let image = image(&device, 256, 128);
+        let (mut producer, consumer) =
+            super::super::stream::channel(device.ring(128 << 10).unwrap());
+        let gate = producer.gate();
+        let owner = Owner::start(queue, consumer, Box::new(Headless)).unwrap();
+        producer.push(color(&image));
+        producer.push(clear(rect(0, 0, 256, 128), [1., 0., 0., 1.]));
+        producer.push(Command::Submit);
+        let deadline = Instant::now() + TIMEOUT;
+        while gate.completed() == 0 && Instant::now() < deadline {
+            gate.wait_retired();
+        }
+        let completed = gate.completed();
+        drop(producer);
+        drop(owner);
+        assert!(completed > 0);
     }
 
     // spec: GFX-REC-5

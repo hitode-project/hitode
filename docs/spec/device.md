@@ -23,7 +23,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-4 Incremental complete slots
 
-**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries, copy their union since each slot's serial, and rebuild fully after missing history or source/layout changes. Native software slots MUST accumulate their own damage debt and wait for completed ingest before reuse.
+**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries, copy their union since each slot's serial, and rebuild fully after missing history or source/layout changes. Native software slots MUST accumulate their own damage debt and wait for completed ingest before reuse, even without further guest submissions.
 **Verification**: Test
 
 ### DEV-FRAME-5 Consumer damage accumulation
