@@ -13,7 +13,6 @@ mod resident;
 #[cfg(any(native, test))]
 pub(crate) use resident::access_stub;
 
-use super::front::Assumed;
 use super::ir::*;
 use super::loops;
 use super::recovery::{FlagRecipe, Host, Record};
@@ -21,6 +20,7 @@ use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::facts::{Assumed, Key};
 use crate::jit_map::{Mark, Part};
 use crate::runtime::{self, ResidentCold, Runtime};
 use crate::translate::lower::access::{CheckedEmitter, Value as AccessReg, page_crossing};
@@ -49,6 +49,7 @@ const DETAIL: u32 = offset_of!(Runtime, recovery.detail) as u32;
 pub(crate) struct Lowered {
     /// The inline entry, miss and cold branch words.
     pub entry: usize,
+    pub key: Key,
     pub miss: usize,
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
@@ -113,6 +114,14 @@ pub(crate) fn lower_resident(
     lower_form(func, Some((assumed, entry)), true, count_entries)
 }
 
+fn entry_key(assumed: &Assumed, entry: &[Source]) -> Key {
+    let exact = entry.iter().fold(0, |exact, source| match source {
+        Source::X87(slot) => exact | 1 << slot,
+        _ => exact,
+    });
+    Key::resident(assumed, exact)
+}
+
 fn lower_form(
     func: &Func,
     inline: Option<(&Assumed, &[Source])>,
@@ -175,6 +184,7 @@ fn lower_form(
     assert_no_fp_state(&words);
     Lowered {
         entry: 0,
+        key: inline.map_or_else(Key::default, |(assumed, entry)| entry_key(assumed, entry)),
         miss,
         env_miss,
         environment,
@@ -305,7 +315,14 @@ fn emit<'a>(
     let (miss, cold) = if let Some((assumed, entry)) = inline {
         let miss = e.asm.label();
         let cold = e.asm.label();
-        e.inline_entry(assumed, entry, bytes, miss, cold, last_fact.is_some());
+        e.inline_entry(
+            entry_key(assumed, entry),
+            entry,
+            bytes,
+            miss,
+            cold,
+            last_fact.is_some(),
+        );
         (Some(miss), Some(cold))
     } else {
         e.stack_frame(bytes, true);
@@ -466,7 +483,7 @@ fn emit<'a>(
     e.checked_accesses();
     e.page_crossings(count_entries);
     if let Some(pages) = batch_pages {
-        resident::batch_pages(&mut e.asm, pages);
+        crate::facts::batch_pages(&mut e.asm, pages);
     }
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);

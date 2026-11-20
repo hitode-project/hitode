@@ -1,19 +1,15 @@
 //! Window checks and the owner access call for resident forms.
 
 use super::{
-    AccessReg, Asm, COUNT, CheckedEmitter, Cond, Emitter, Extend, Index, IntOp, Label, Lsl, Lsr,
-    Narrow, Part, RT, RecordId, Reg, ResidentCold, Runtime, SP, Site, T, U, VReg, VSize, Value, W,
-    X, add, add_ext, add_imm, add_immediate, bic, blr, cmp, cmp_imm, eor, fmov_to_v, int_immediate,
-    ldp, ldp_v, ldr, ldr_narrow, lsl_imm, lsr_imm, mov, mov_sp, movk, movz, mrs_nzcv, msr_nzcv,
-    offset_of, page_crossing, ret, runtime, shiftv, stp, stp_v, str, sub, sub_ext, sub_imm, vldr,
-    vstr, vumov,
+    AccessReg, Asm, COUNT, CheckedEmitter, Cond, Emitter, Index, IntOp, Label, Lsl, Narrow, Part,
+    RT, RecordId, Reg, ResidentCold, Runtime, SP, Site, T, U, VReg, VSize, Value, W, X, add,
+    add_imm, add_immediate, blr, cmp, cmp_imm, fmov_to_v, int_immediate, ldp, ldp_v, ldr,
+    ldr_narrow, lsr_imm, mov, mov_sp, movk, movz, mrs_nzcv, msr_nzcv, offset_of, page_crossing,
+    ret, runtime, stp, stp_v, str, sub, sub_imm, vldr, vstr, vumov,
 };
 use crate::translate::lower::{X0, X1, X2, X3, X4, X5};
 use adv_cpu_core::memory::{LINEAR, READ, SHARED, WRITE};
 
-const MEMORY_BASE: u32 = offset_of!(Runtime, memory_base) as u32;
-const MEMORY_PAGES: u32 = offset_of!(Runtime, memory_pages) as u32;
-const PLAIN_PAGES: u32 = offset_of!(Runtime, plain_pages) as u32;
 const RESIDENT_ACCESS: u32 = offset_of!(Runtime, resident_access) as u32;
 
 pub(super) struct CheckedAccess {
@@ -107,7 +103,7 @@ impl Emitter<'_> {
             // Preserve the flags and any scalar store value reloaded into T.
             self.asm
                 .emit_all(&[mrs_nzcv(X5), stp(X, Index::Pre, T, X5, SP, -16)]);
-            self.plain_span(cross.address, cross.width, true, blocked);
+            crate::facts::plain_span(&mut self.asm, cross.address, cross.width, true, blocked);
             self.asm
                 .emit_all(&[ldp(X, Index::Post, T, X5, SP, 16), msr_nzcv(X5)]);
             self.sites.push((self.asm.offset(), cross.fault));
@@ -245,114 +241,8 @@ impl Emitter<'_> {
         }
 
         let addr = self.gp(addr, U);
-        self.plain_span(addr, bytes, write, miss);
+        crate::facts::plain_span(&mut self.asm, addr, bytes, write, miss);
     }
-
-    fn plain_span(&mut self, addr: Reg, bytes: u32, write: bool, miss: Label) {
-        let next = self.asm.label();
-        self.asm
-            .emit_all(&[ldr(W, X0, RT, MEMORY_BASE), cmp(W, addr, X0, Lsl, 0)]);
-        self.asm.b_cond(Cond::Lo, miss);
-        self.asm
-            .emit_all(&[mov(W, X1, addr), sub_ext(X, X1, X1, X0, Extend::Uxtw, 0)]);
-        self.imm(X2, u64::from(bytes - 1));
-        self.asm.emit_all(&[
-            add(X, X2, X1, X2, Lsl, 0),
-            lsr_imm(X, X1, X1, 12),
-            lsr_imm(X, X2, X2, 12),
-            ldr(W, X3, RT, MEMORY_PAGES),
-            cmp(X, X2, X3, Lsl, 0),
-        ]);
-        self.asm.b_cond(Cond::Hs, miss);
-        self.asm.emit(ldr(X, X3, RT, PLAIN_PAGES));
-        self.asm.emit(lsr_imm(W, X0, X0, 12));
-
-        self.asm.bind(next);
-        self.asm.emit_all(&[
-            lsr_imm(W, X4, X1, 6),
-            add(W, X4, X4, X4, Lsl, 1),
-            add_ext(X, X4, X3, X4, Extend::Uxtw, 3),
-            ldr(X, X5, X4, if write { 8 } else { 0 }),
-            shiftv(X, Lsr, X5, X5, X1),
-        ]);
-        self.asm.tbz(false, X5, 0, miss);
-        if write {
-            self.asm
-                .emit_all(&[ldr(X, X5, X4, 16), shiftv(X, Lsr, X5, X5, X1)]);
-            self.asm.tbz(true, X5, 0, miss);
-        }
-        // The guest permission bitmap does not include the host
-        // protection intersection when host pages exceed 4 KiB.
-        self.asm.emit_all(&[
-            add(W, X5, X0, X1, Lsl, 0),
-            ldr(X, X4, RT, runtime::CLASSES),
-            ldr_narrow(Narrow::Byte, X5, X4, X5),
-        ]);
-        if write {
-            self.asm.tbz(false, X5, WRITE.trailing_zeros(), miss);
-            self.asm
-                .tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
-        } else {
-            self.asm.tbz(false, X5, READ.trailing_zeros(), miss);
-            self.asm.tbz(true, X5, SHARED.trailing_zeros(), miss);
-        }
-        self.asm
-            .emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);
-        self.asm.b_cond(Cond::Ls, next);
-    }
-}
-
-/// Walks the candidate pages of one stream. X0 and X1 are the first and
-/// last pages in stream order. XOR with X2 gives the actual guest page.
-/// X5 is the bitmap offset (0 for reads, 8 for writes). Returns the
-/// projected byte boundary of the first unproved page in X0, preserving K
-/// in X3 and all allocated values.
-pub(super) fn batch_pages(asm: &mut Asm, entry: Label) {
-    use adv_cpu_core::memory::EXEC;
-    const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
-    let write = asm.label();
-    let next = asm.label();
-    let done = asm.label();
-    asm.bind(entry);
-    asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(W, U, RT, MEMORY_BASE),
-        sub(W, U, X4, U, Lsr, PAGE_SHIFT),
-        ldr(W, T, RT, MEMORY_PAGES),
-        cmp(W, U, T, Lsl, 0),
-    ]);
-    asm.b_cond(Cond::Hs, done);
-    asm.emit_all(&[
-        lsr_imm(W, T, U, 6),
-        add(W, T, T, T, Lsl, 1),
-        ldr(X, X4, RT, PLAIN_PAGES),
-        add_ext(X, T, X4, T, Extend::Uxtw, 3),
-        add(X, X4, T, X5, Lsl, 0),
-        ldr(X, X4, X4, 0),
-        ldr(X, T, T, 16),
-        bic(X, T, X4, T, Lsl, 0),
-        shiftv(X, Lsr, T, T, U),
-    ]);
-    asm.tbz(false, T, 0, done);
-    // The bitmap grants guest permission. The window class also accounts
-    // for the host protection intersection on hosts with larger pages.
-    asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(X, T, RT, runtime::CLASSES),
-        ldr_narrow(Narrow::Byte, T, T, X4),
-    ]);
-    asm.cbz(W, true, X5, write);
-    asm.tbz(false, T, READ.trailing_zeros(), done);
-    asm.tbz(true, T, SHARED.trailing_zeros(), done);
-    asm.b(next);
-    asm.bind(write);
-    asm.tbz(false, T, WRITE.trailing_zeros(), done);
-    asm.tbz(true, T, EXEC.trailing_zeros(), done);
-    asm.bind(next);
-    asm.emit_all(&[add_imm(W, X0, X0, 1, false), cmp(X, X0, X1, Lsl, 0)]);
-    asm.b_cond(Cond::Ls, entry);
-    asm.bind(done);
-    asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
 }
 
 /// Like the Tier-1 access stub, calls the owner's access helper. The

@@ -1,5 +1,5 @@
 use super::*;
-use crate::translate::opt::front::Assumed;
+use crate::facts::Assumed;
 use adv_cpu_core::X87Register;
 use std::cell::RefCell;
 

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::facts::Assumed;
 use crate::translate::front::tags::{ConditionCode, Mnemonic as M};
 use adv_cpu_core::CpuState;
 
@@ -35,27 +36,6 @@ pub(crate) struct Built {
 }
 
 /// Entry facts checked by admission before selecting this form.
-#[derive(Debug)]
-pub(crate) struct Assumed {
-    pub control: u16,
-    pub status: u16,
-    pub mxcsr: u32,
-    pub top: u8,
-    pub tags: u16,
-    /// ESP modulo 16, when the unit aligns ESP.
-    pub esp_low: Option<u8>,
-    /// EBP minus entry ESP when EBP addresses the frame.
-    pub ebp: Option<i32>,
-    pub denormal: bool,
-    /// Whether the form runs x87 instructions, so that the x87 facts hold.
-    pub x87: bool,
-    /// Whether the form runs MMX or EMMS instructions, requiring no pending x87 exception.
-    pub mmx: bool,
-    /// The MXCSR bits the form assumes: all of them when it runs SSE
-    /// floating-point or control instructions, else the control bits.
-    pub mxcsr_mask: u32,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Reject {
     Empty,

@@ -38,13 +38,12 @@ use super::store::{self, CHAIN_LEN, Chain, InternalEdge, Linked, Tier1Unit, Vers
 use super::{Checks, EMPTY, Native, Owner, compile, head};
 use crate::cache::CodeCache;
 use crate::encode::b;
-use crate::facts::{self, Key};
+use crate::facts::{self, Assumed, Key};
 use crate::runtime::{self, ResidentCold, Runtime, record_branch};
 use crate::translate::front::{Unit, decode::Fetcher};
 use crate::translate::opt::{
     self,
     computation::{Evaluation, Plan, Proof},
-    front::Assumed,
     ir::Source,
     recovery::{FlagRecipe, Host, Record},
 };
@@ -1402,17 +1401,10 @@ impl Native {
             let edge = &mut self.code.linked[next as usize];
             edge.direct.map_or(point, |transition| transition + 4)
         };
-        let version = head.versions.iter().position(|version| {
-            cpu.rep.is_none()
-                && cpu.mmx_mode == 0
-                && opt::admit_into(
-                    &version.sources,
-                    &version.assumed,
-                    cpu,
-                    &mut self.resident_params,
-                    |_, _| 0,
-                )
-        });
+        let version = head
+            .versions
+            .iter()
+            .position(|version| cpu.rep.is_none() && version.key.holds(cpu));
         let mut patched = false;
         if let Some(version) = version {
             let count = head
@@ -1725,8 +1717,8 @@ impl Native {
                 .map(|&(sensor, _)| entry.form + sensor)
                 .collect(),
             at,
-            assumed: built.assumed,
-            sources: built.func.entry,
+            key: lowered.key,
+            mmx: built.assumed.mmx,
             plain_sites: built.plain_sites,
             records: lowered.records,
             flags: lowered.flags,

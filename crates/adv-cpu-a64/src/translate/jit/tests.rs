@@ -2472,7 +2472,7 @@ pub(in crate::translate) mod opt_back {
 
     mod resident {
         use super::*;
-        use crate::translate::opt::front::Assumed;
+        use crate::facts::Assumed;
         use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
         const ALIAS: u64 = 8 << 32;

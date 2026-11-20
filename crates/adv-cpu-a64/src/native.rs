@@ -605,7 +605,6 @@ pub(crate) struct Native {
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     offload: offload::Offload,
     worker_jobs: FxHashMap<u32, plan::WorkerJob>,
-    resident_params: Vec<u128>,
     /// Where `opt_exit` saves an inline form's spill cells.
     inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
@@ -841,7 +840,6 @@ impl Native {
             pace: std::cell::Cell::new(None),
             offload: offload::Offload::default(),
             worker_jobs: FxHashMap::default(),
-            resident_params: Vec::new(),
             inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
             features: features(),

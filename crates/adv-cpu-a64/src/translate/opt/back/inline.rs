@@ -5,12 +5,12 @@ use super::super::recovery::{
 };
 use super::{
     A, ALIAS, Assumed, B, C, Cond, D, E, Emitter, Extend, FlagKind, FlagRecipe, Float, FpOp, Host,
-    Index, IntOp, Label, Lsl, Lsr, Narrow, Op, RT, Record, RecordId, Reg, Runtime, Source, T, Type,
-    U, VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, bitmask, clz, cmp,
-    cmp_imm, csel, dfloat, eor, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate, ldp, ldr,
-    ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv, offset_of,
-    orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, tst_imm, ubfx,
-    vfneg2d, vldr, vldur, vstur,
+    Index, IntOp, Label, Lsl, Narrow, Op, RT, Record, RecordId, Reg, Runtime, Source, T, Type, U,
+    VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, clz, cmp, cmp_imm,
+    csel, dfloat, eor, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate, ldp, ldr, ldr_narrow,
+    ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv, offset_of, orr, orr_imm,
+    runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, ubfx, vfneg2d, vldr, vldur,
+    vstur,
 };
 use crate::translate::lower::stubs;
 use crate::translate::lower::{emit_link_point, emit_link_transition};
@@ -37,19 +37,18 @@ const WINDOW_BASE: u32 = offset_of!(Runtime, window) as u32;
 impl Emitter<'_> {
     pub(super) fn inline_entry(
         &mut self,
-        assumed: &Assumed,
+        key: crate::facts::Key,
         entry: &[Source],
         bytes: u64,
         miss: Label,
         cold: Label,
         delay_frames: bool,
     ) {
-        self.asm
-            .emit_all(&[ldr(X, CPU, RT, CPU_PTR), ldr(W, T, CPU, runtime::MMX_MODE)]);
-        self.asm.cbz(W, true, T, cold);
+        self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        key.guard_mmx(&mut self.asm, CPU, true, cold);
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
-        self.entry_facts(assumed, miss);
+        key.guard_resident(&mut self.asm, CPU, miss);
 
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {
@@ -58,7 +57,7 @@ impl Emitter<'_> {
             self.asm.emit(mrs_nzcv(S5));
             for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
                 if let Source::X87(i) = source {
-                    self.binary64(i, inexact);
+                    crate::facts::guard_binary64(&mut self.asm, i, inexact);
                     self.copy(
                         self.locations[param.0 as usize],
                         Host::Register(T),
@@ -204,114 +203,6 @@ impl Emitter<'_> {
         self.bias_stack();
         self.stack_frame(bytes, false);
         self.asm.b(target);
-    }
-
-    fn entry_facts(&mut self, assumed: &Assumed, miss: Label) {
-        if assumed.x87 {
-            for (field, value) in [
-                (runtime::X87_CONTROL, assumed.control),
-                (
-                    runtime::X87_STATUS,
-                    assumed.status | u16::from(assumed.top) << 11,
-                ),
-                (runtime::X87_TAG, assumed.tags),
-            ] {
-                self.asm.emit(ldrh(T, CPU, field));
-                self.imm(U, u64::from(value));
-                self.asm.emit(eor(W, T, T, U, Lsl, 0));
-                self.asm.cbz(W, true, T, miss);
-            }
-        }
-        if assumed.mmx {
-            self.asm.emit(ldrh(T, CPU, runtime::X87_STATUS));
-            self.asm.tbz(true, T, 7, miss);
-        }
-        if assumed.mxcsr_mask != 0 {
-            self.asm.emit(ldr(W, T, CPU, runtime::MXCSR));
-            self.imm(U, u64::from(assumed.mxcsr & assumed.mxcsr_mask));
-            self.asm.emit(eor(W, T, T, U, Lsl, 0));
-            if assumed.mxcsr_mask != u32::MAX {
-                if bitmask(W, u64::from(assumed.mxcsr_mask)).is_some() {
-                    self.asm
-                        .emit(and_imm(W, T, T, u64::from(assumed.mxcsr_mask)));
-                } else {
-                    self.imm(U, u64::from(assumed.mxcsr_mask));
-                    self.asm.emit(and(W, T, T, U, Lsl, 0));
-                }
-            }
-            self.asm.cbz(W, true, T, miss);
-        }
-        if let Some(low) = assumed.esp_low {
-            self.asm.emit(and_imm(W, T, ESP, 15));
-            self.imm(U, u64::from(low));
-            self.asm.emit(eor(W, T, T, U, Lsl, 0));
-            self.asm.cbz(W, true, T, miss);
-        }
-        if let Some(offset) = assumed.ebp {
-            self.asm.emit(sub(W, T, guest(5), ESP, Lsl, 0));
-            self.imm(U, u64::from(offset as u32));
-            self.asm.emit(eor(W, T, T, U, Lsl, 0));
-            self.asm.cbz(W, true, T, miss);
-        }
-    }
-
-    /// Converts the physical x87 input to binary64 bits in T.
-    fn binary64(&mut self, i: u8, miss: Label) {
-        let zero = self.asm.label();
-        let special = self.asm.label();
-        let tiny = self.asm.label();
-        let done = self.asm.label();
-        self.asm.emit_all(&[
-            add_imm(X, S4, CPU, runtime::X87_REGS, false),
-            ldur(X, T, S4, 10 * i32::from(i)),
-            ldrh(S2, S4, 10 * u32::from(i) + 8),
-            ubfx(W, S3, S2, 0, 15),
-        ]);
-        self.asm.cbz(X, false, T, zero);
-        self.asm.tbz(false, T, 63, miss);
-        self.imm(U, 0x7fff);
-        self.asm.emit(cmp(W, S3, U, Lsl, 0));
-        self.asm.b_cond(Cond::Eq, special);
-
-        // Biased binary64 exponent. Subnormals use a variable right shift.
-        self.imm(U, 16383 - 1023);
-        self.asm.emit(sub(W, S3, S3, U, Lsl, 0));
-        self.asm.emit(cmp_imm(W, S3, 0, false));
-        self.asm.b_cond(Cond::Le, tiny);
-        self.asm.emit(cmp_imm(W, S3, 0x7ff, false));
-        self.asm.b_cond(Cond::Ge, miss);
-        self.asm.emit(tst_imm(X, T, 0x7ff));
-        self.asm.b_cond(Cond::Ne, miss);
-        self.asm
-            .emit_all(&[ubfx(X, T, T, 11, 52), orr(X, T, T, S3, Lsl, 52)]);
-        self.asm.b(done);
-
-        self.asm.bind(tiny);
-        self.imm(U, 12);
-        self.asm.emit(sub(W, S3, U, S3, Lsl, 0));
-        self.asm.emit(cmp_imm(W, S3, 64, false));
-        self.asm.b_cond(Cond::Hs, miss);
-        self.asm.emit_all(&[
-            shiftv(X, Lsr, U, T, S3),
-            shiftv(X, Lsl, S4, U, S3),
-            cmp(X, S4, T, Lsl, 0),
-        ]);
-        self.asm.b_cond(Cond::Ne, miss);
-        self.asm.emit(mov(X, T, U));
-        self.asm.b(done);
-
-        self.asm.bind(special);
-        self.imm(U, 1 << 63);
-        self.asm.emit(cmp(X, T, U, Lsl, 0));
-        self.asm.b_cond(Cond::Ne, miss);
-        self.imm(T, 0x7ff << 52);
-        self.asm.b(done);
-
-        self.asm.bind(zero);
-        self.asm.cbz(W, true, S3, miss);
-        self.asm.bind(done);
-        self.asm
-            .emit_all(&[ubfx(W, S2, S2, 15, 1), orr(X, T, T, S2, Lsl, 63)]);
     }
 
     /// Keeps the entry baseline in the runtime for cold recovery and frame access.

@@ -8,6 +8,7 @@
 use crate::translate::lower::stubs;
 use std::cell::Cell;
 
+use crate::facts::Key;
 use adv_cpu_core::CpuState;
 
 use crate::asm::{Asm, Label};
@@ -15,7 +16,7 @@ use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit, PlanEvent};
-use crate::translate::opt::{back::Lowered, front::Assumed, ir::Source, recovery::*};
+use crate::translate::opt::{back::Lowered, recovery::*};
 
 /// These counters are private to one version and written only by the owner.
 #[derive(Default)]
@@ -40,8 +41,8 @@ pub(super) struct Version {
     pub retry: (usize, u32),
     pub environment: Vec<usize>,
     pub at: CpuState,
-    pub assumed: Assumed,
-    pub sources: Vec<Source>,
+    pub key: Key,
+    pub mmx: bool,
     pub plain_sites: Vec<u32>,
     pub records: Vec<Record<Host>>,
     pub flags: Vec<Option<FlagRecipe>>,

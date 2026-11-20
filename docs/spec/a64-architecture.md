@@ -44,7 +44,7 @@ A site's immutable unit holds decoded operations, control flow, inlined frames, 
 
 ### A64A-ROLE-3 Facts
 
-**Rule**: `facts` MUST define each Tier-1 entry assumption. Each fact kind MUST have one reader, one guard emitter and one encoding. A key MUST be a fixed-width mask and value pair.
+**Rule**: `facts` MUST define each generated entry assumption. Each fact kind MUST have one reader, one guard emitter and one encoding. A key MUST be a fixed-width mask and value pair.
 **Applies to**: AArch64
 **Verification**: Test
 
@@ -53,10 +53,14 @@ A site's immutable unit holds decoded operations, control flow, inlined frames, 
 | x87 control word | `CpuState` x87 control |
 | TOP and tags | x87 status and the tags of slots the trace reads |
 | MMX mode and deferred EMMS | `CpuState` MMX mode |
-| Pending x87 exception | x87 status |
-| MXCSR class | `CpuState` MXCSR control bits |
+| x87 status, including pending exceptions | `CpuState` x87 status |
+| MXCSR class and sticky flags | `CpuState` MXCSR |
+| ESP alignment and EBP relative to ESP | `CpuState` general registers |
+| Exact x87 binary64 inputs | `CpuState` x87 registers |
 
 The build key projects live facts onto the unit's trace mask. An empty mask assumes nothing. A lowering reads unassumed fields from `CpuState`.
+
+Range guards over page facts use the Memory permission tables and stay outside the key.
 
 ### A64A-ROLE-4 Lowerings
 

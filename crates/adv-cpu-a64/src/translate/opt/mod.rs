@@ -76,7 +76,7 @@ pub(crate) mod verify;
 
 use adv_cpu_core::CpuState;
 
-use front::Assumed;
+use crate::facts::Assumed;
 use ir::Source;
 
 /// Fills `out` with the entry cells of an optimized form when `cpu` meets the
@@ -111,7 +111,7 @@ pub(crate) fn admit_into(
             Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
             Source::Mmx(i) => u128::from(cpu.mmx[usize::from(i)]),
             Source::X87(i) => {
-                let Some(value) = recovery::binary64(x87.regs[usize::from(i)]) else {
+                let Some(value) = crate::facts::binary64(x87.regs[usize::from(i)]) else {
                     return false;
                 };
                 u128::from(value)

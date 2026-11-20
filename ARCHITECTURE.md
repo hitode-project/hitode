@@ -132,7 +132,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | [`translate::lower` module](crates/adv-cpu-a64/src/translate/lower/mod.rs) | Shared AArch64 emission for checked access, direct body calls, entry and exit, link slots, and fault sites (A64A-ROLE-4) | Register allocation |
 | [`translate::jit` module](crates/adv-cpu-a64/src/translate/jit/mod.rs) | Tier-1 lowering (A64-TR-3) | Executable memory |
 | `translate::opt` in [`opt`](crates/adv-cpu-a64/src/translate/opt/mod.rs) | Resident and worker lowering | Executable memory |
-| [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 entry keys and guards. Resident guards are in [`head`](crates/adv-cpu-a64/src/native/head.rs). | Code placement |
+| [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 and resident entry keys, key guards and page range guards (A64A-ROLE-3) | Code placement |
 | [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement and fault sites for owner and worker entries, Tier-1 version chains, links and page watches, with resident trampolines in [`head`](crates/adv-cpu-a64/src/native/head.rs) | Guest semantics |
 | [`native::compile` module](crates/adv-cpu-a64/src/native/compile.rs) | Reusable Tier-1 build buffers and the optimized compile pool | Code placement |
 | [`native::plan` module](crates/adv-cpu-a64/src/native/plan.rs) | Site plans, tier decisions on plan events, and publication of sensor and link patches (A64A-PLACE-3) | Host code emission |

@@ -2,12 +2,15 @@
 //! forget whole fields, including each independently tracked x87 tag.
 
 use adv_cpu_core::CpuState;
+use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
 use crate::asm::{Asm, Label};
-use crate::encode::Shift::Lsl;
+use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::{
-    Reg, Shift, add_imm, and, and_imm, eor, ldr, ldrh, lsl_imm, movz, orr, shiftv, str, strh, ubfx,
+    Cond, Extend, Narrow, Reg, Shift, add, add_ext, add_imm, and, and_imm, bic, cmp, cmp_imm, eor,
+    ldr, ldr_narrow, ldrh, ldur, lsl_imm, lsr_imm, mov, movk, movz, orr, ret, shiftv, str, strh,
+    sub, sub_ext, tst_imm, ubfx,
 };
 use crate::runtime;
 
@@ -22,6 +25,39 @@ pub(crate) const MXCSR: u64 = 0x3ff << 53;
 pub(crate) const ALL: u64 = CONTROL | TOP | TAGS | MMX | ES | PE | MXCSR;
 const MXCSR_CLASS: u32 = 0xffc0;
 const MMX_MODE: u32 = 0xff07;
+
+// These fields extend the Tier-1 encoding for resident entry. TOP, ES and PE
+// keep their Tier-1 positions, even when a form assumes the entire status word.
+const X87_STATUS_REST: u64 = 0x7ff;
+const ESP_LOW_SHIFT: u32 = 11;
+const ESP_LOW: u64 = 0xf << ESP_LOW_SHIFT;
+const EBP_DELTA_SHIFT: u32 = 15;
+const EBP_DELTA: u64 = 0xffff_ffff << EBP_DELTA_SHIFT;
+const MXCSR_STICKY_SHIFT: u32 = 47;
+const MXCSR_STICKY: u64 = 0x3f << MXCSR_STICKY_SHIFT;
+const X87_EXACT_SHIFT: u32 = 53;
+const ESP: Reg = Reg::new(23);
+const EBP: Reg = Reg::new(24);
+
+fn status_bits(status: u16) -> u16 {
+    (status & 0x1f) | ((status >> 1) & 0x20) | ((status >> 2) & 0x1c0) | ((status >> 5) & 0x600)
+}
+
+fn status_word(bits: u16) -> u16 {
+    (bits & 0x1f) | ((bits & 0x20) << 1) | ((bits & 0x1c0) << 2) | ((bits & 0x600) << 5)
+}
+
+fn floating_facts(control: u16, status: u16, tags: u16, mode: u32, mxcsr: u32) -> u64 {
+    let top = (status >> 11) & 7;
+    let tag = tags.rotate_right(u32::from(top) * 2);
+    u64::from(control)
+        | (u64::from(top) << 16)
+        | (u64::from(tag) << TAG_SHIFT)
+        | (u64::from(mode & MMX_MODE) << 35)
+        | (u64::from(status & 0x80 != 0) * ES)
+        | (u64::from(status & 0x20 != 0) * PE)
+        | (u64::from(mxcsr & MXCSR_CLASS) << 47)
+}
 
 const CPU: Reg = Reg::new(5);
 const VALUE: Reg = Reg::new(16);
@@ -42,6 +78,8 @@ pub(crate) fn tags(slots: u8) -> u64 {
 pub(crate) struct Key {
     mask: u64,
     value: u64,
+    context_mask: u64,
+    context: u64,
 }
 
 impl Key {
@@ -50,20 +88,66 @@ impl Key {
             return Self::default();
         }
         let x87 = &cpu.x87;
-        let status = x87.status;
-        let top = (status >> 11) & 7;
-        let tag = x87.tag.rotate_right(u32::from(top) * 2);
-        let value = u64::from(x87.control)
-            | (u64::from(top) << 16)
-            | (u64::from(tag) << TAG_SHIFT)
-            | (u64::from(cpu.mmx_mode & MMX_MODE) << 35)
-            | (u64::from(status & 0x80 != 0) * ES)
-            | (u64::from(status & 0x20 != 0) * PE)
-            | (u64::from(cpu.mxcsr & MXCSR_CLASS) << 47);
         Self {
             mask,
-            value: value & mask,
+            value: floating_facts(x87.control, x87.status, x87.tag, cpu.mmx_mode, cpu.mxcsr) & mask,
+            ..Self::default()
         }
+    }
+
+    pub(crate) fn resident(assumed: &Assumed, exact: u8) -> Self {
+        let mut mask = MMX;
+        let mut context_mask = u64::from(exact) << X87_EXACT_SHIFT;
+        let mut context = context_mask;
+        if assumed.x87 {
+            mask |= CONTROL | TOP | TAGS | ES | PE;
+            context_mask |= X87_STATUS_REST;
+            context |= u64::from(status_bits(assumed.status));
+        }
+        if assumed.mmx {
+            mask |= ES;
+        }
+        if assumed.mxcsr_mask != 0 {
+            mask |= MXCSR;
+        }
+        if assumed.mxcsr_mask == u32::MAX {
+            context_mask |= MXCSR_STICKY;
+            context |= u64::from(assumed.mxcsr & 0x3f) << MXCSR_STICKY_SHIFT;
+        }
+        if let Some(low) = assumed.esp_low {
+            context_mask |= ESP_LOW;
+            context |= u64::from(low) << ESP_LOW_SHIFT;
+        }
+        if let Some(delta) = assumed.ebp {
+            context_mask |= EBP_DELTA;
+            context |= u64::from(delta as u32) << EBP_DELTA_SHIFT;
+        }
+        let status = if assumed.x87 {
+            assumed.status | u16::from(assumed.top) << 11
+        } else {
+            0
+        };
+        Self {
+            mask,
+            value: floating_facts(assumed.control, status, assumed.tags, 0, assumed.mxcsr) & mask,
+            context_mask,
+            context,
+        }
+    }
+
+    pub(crate) fn holds(self, cpu: &CpuState) -> bool {
+        let observed = Self::read(cpu, self.mask);
+        if !observed.proves(self.project(self.mask)) {
+            return false;
+        }
+        let context = u64::from(status_bits(cpu.x87.status))
+            | (u64::from(cpu.regs[4] & 15) << ESP_LOW_SHIFT)
+            | (u64::from(cpu.regs[5].wrapping_sub(cpu.regs[4])) << EBP_DELTA_SHIFT)
+            | (u64::from(cpu.mxcsr & 0x3f) << MXCSR_STICKY_SHIFT);
+        let exact = (self.context_mask >> X87_EXACT_SHIFT) as u8;
+        context & (self.context_mask & ((1 << X87_EXACT_SHIFT) - 1))
+            == self.context & ((1 << X87_EXACT_SHIFT) - 1)
+            && (0..8).all(|slot| exact & (1 << slot) == 0 || binary64(cpu.x87.regs[slot]).is_some())
     }
 
     /// Standalone lowering and the worker path still supply these two facts.
@@ -71,6 +155,7 @@ impl Key {
         Self {
             mask: CONTROL | PE,
             value: u64::from(control) | (u64::from(pe) * PE),
+            ..Self::default()
         }
     }
 
@@ -104,13 +189,17 @@ impl Key {
     }
 
     pub(crate) fn proves(self, other: Self) -> bool {
-        self.mask & other.mask == other.mask && self.value & other.mask == other.value
+        self.mask & other.mask == other.mask
+            && self.value & other.mask == other.value
+            && self.context_mask & other.context_mask == other.context_mask
+            && self.context & other.context_mask == other.context
     }
 
     pub(crate) fn project(self, mask: u64) -> Self {
         Self {
             mask: self.mask & mask,
             value: self.value & mask,
+            ..Self::default()
         }
     }
 
@@ -129,9 +218,19 @@ impl Key {
                 mask &= !field;
             }
         }
+        let mut context_mask = self.context_mask & other.context_mask;
+        let context_difference = self.context ^ other.context;
+        for field in [X87_STATUS_REST, ESP_LOW, EBP_DELTA, MXCSR_STICKY] {
+            if context_difference & field != 0 {
+                context_mask &= !field;
+            }
+        }
+        context_mask &= !(context_difference & (0xff << X87_EXACT_SHIFT));
         Self {
             mask,
             value: self.value & mask,
+            context_mask,
+            context: self.context & context_mask,
         }
     }
 
@@ -141,52 +240,96 @@ impl Key {
             return;
         }
         asm.emit(ldr(X, CPU, Reg::new(29), runtime::CPU_STATE));
+        self.guard_cpu(asm, CPU, false, miss);
+    }
+
+    pub(crate) fn guard_mmx(self, asm: &mut Asm, cpu: Reg, resident: bool, miss: Label) {
+        asm.emit(ldr(W, VALUE, cpu, runtime::MMX_MODE));
+        let mode = self.mmx().unwrap();
+        if resident {
+            asm.cbz(W, true, VALUE, miss);
+        } else {
+            compare(asm, mode as u16, MMX_MODE as u16, false, false, miss);
+        }
+    }
+
+    pub(crate) fn guard_resident(self, asm: &mut Asm, cpu: Reg, miss: Label) {
+        self.guard_cpu(asm, cpu, true, miss);
+        if self.context_mask & ESP_LOW != 0 {
+            asm.emit(and_imm(W, VALUE, ESP, 15));
+            asm.emit(movz(
+                X,
+                SCRATCH,
+                ((self.context & ESP_LOW) >> ESP_LOW_SHIFT) as u16,
+                0,
+            ));
+            asm.emit(eor(W, VALUE, VALUE, SCRATCH, Lsl, 0));
+            asm.cbz(W, true, VALUE, miss);
+        }
+        if self.context_mask & EBP_DELTA != 0 {
+            asm.emit(sub(W, VALUE, EBP, ESP, Lsl, 0));
+            let delta = ((self.context & EBP_DELTA) >> EBP_DELTA_SHIFT) as u32;
+            immediate(asm, SCRATCH, delta);
+            asm.emit(eor(W, VALUE, VALUE, SCRATCH, Lsl, 0));
+            asm.cbz(W, true, VALUE, miss);
+        }
+    }
+
+    fn guard_cpu(self, asm: &mut Asm, cpu: Reg, resident: bool, miss: Label) {
         if let Some(control) = self.control() {
-            asm.emit(ldrh(VALUE, CPU, runtime::X87_CONTROL));
-            compare(asm, control, u16::MAX, true, miss);
+            asm.emit(ldrh(VALUE, cpu, runtime::X87_CONTROL));
+            compare(asm, control, u16::MAX, true, resident, miss);
         }
         let top = ((self.value & TOP) >> 16) as u32;
-        let mask = if self.mask & TOP != 0 { 0x3800 } else { 0 }
+        let full_status = self.context_mask & X87_STATUS_REST != 0;
+        let mask = if full_status { 0xc75f } else { 0 }
+            | if self.mask & TOP != 0 { 0x3800 } else { 0 }
             | if self.mask & ES != 0 { 0x80 } else { 0 }
             | if self.mask & PE != 0 { 0x20 } else { 0 };
-        if mask != 0 {
-            let value = (top << 11) as u16
+        if resident && mask == 0x80 && !self.pending().unwrap() {
+            asm.emit(ldrh(VALUE, cpu, runtime::X87_STATUS));
+            asm.tbz(true, VALUE, 7, miss);
+        } else if mask != 0 {
+            let value = status_word((self.context & X87_STATUS_REST) as u16)
+                | (top << 11) as u16
                 | if self.value & ES != 0 { 0x80 } else { 0 }
                 | if self.value & PE != 0 { 0x20 } else { 0 };
-            asm.emit(ldrh(VALUE, CPU, runtime::X87_STATUS));
-            compare(asm, value, mask, true, miss);
+            asm.emit(ldrh(VALUE, cpu, runtime::X87_STATUS));
+            compare(asm, value, mask, true, resident, miss);
         }
         if self.mask & TAGS != 0 {
             let mut mask = (self.mask >> TAG_SHIFT) as u16;
             let mut value = (self.value >> TAG_SHIFT) as u16;
-            asm.emit(ldrh(VALUE, CPU, runtime::X87_TAG));
+            asm.emit(ldrh(VALUE, cpu, runtime::X87_TAG));
             if self.mask & TOP != 0 {
                 mask = mask.rotate_left(top * 2);
                 value = value.rotate_left(top * 2);
             } else {
                 asm.emit_all(&[
-                    ldrh(ROTATE, CPU, runtime::X87_STATUS),
+                    ldrh(ROTATE, cpu, runtime::X87_STATUS),
                     ubfx(W, ROTATE, ROTATE, 11, 3),
                     lsl_imm(W, ROTATE, ROTATE, 1),
                     orr(W, VALUE, VALUE, VALUE, Lsl, 16),
                     shiftv(W, Shift::Lsr, VALUE, VALUE, ROTATE),
                 ]);
             }
-            compare(asm, value, mask, false, miss);
+            compare(asm, value, mask, resident, resident, miss);
         }
-        if self.mask & MMX != 0 {
-            asm.emit(ldr(W, VALUE, CPU, runtime::MMX_MODE));
-            compare(
-                asm,
-                ((self.value & MMX) >> 35) as u16,
-                MMX_MODE as u16,
-                false,
-                miss,
-            );
+        if !resident && self.mask & MMX != 0 {
+            self.guard_mmx(asm, cpu, false, miss);
         }
         if let Some(mxcsr) = self.mxcsr() {
-            asm.emit(ldr(W, VALUE, CPU, runtime::MXCSR));
-            compare(asm, mxcsr as u16, MXCSR_CLASS as u16, false, miss);
+            asm.emit(ldr(W, VALUE, cpu, runtime::MXCSR));
+            let full = self.context_mask & MXCSR_STICKY != 0;
+            let value = mxcsr as u16 | ((self.context & MXCSR_STICKY) >> MXCSR_STICKY_SHIFT) as u16;
+            compare(
+                asm,
+                value,
+                if full { u16::MAX } else { MXCSR_CLASS as u16 },
+                full,
+                resident,
+                miss,
+            );
         }
     }
 }
@@ -266,25 +409,257 @@ pub(crate) fn default_mxcsr(class: u32) -> bool {
     class & MXCSR_CLASS == 0x1f80
 }
 
-fn compare(asm: &mut Asm, value: u16, mask: u16, halfword: bool, miss: Label) {
-    if value != 0 {
+fn compare(asm: &mut Asm, value: u16, mask: u16, full_load: bool, resident: bool, miss: Label) {
+    if value != 0 || resident {
         asm.emit_all(&[
-            movz(W, SCRATCH, value, 0),
+            movz(if resident { X } else { W }, SCRATCH, value, 0),
             eor(W, VALUE, VALUE, SCRATCH, Lsl, 0),
         ]);
     }
-    if !halfword || mask != u16::MAX {
-        asm.emit_all(&[
-            movz(W, SCRATCH, mask, 0),
-            and(W, VALUE, VALUE, SCRATCH, Lsl, 0),
-        ]);
+    if !full_load || mask != u16::MAX {
+        if resident && mask == MXCSR_CLASS as u16 {
+            asm.emit(and_imm(W, VALUE, VALUE, u64::from(mask)));
+        } else {
+            asm.emit_all(&[
+                movz(W, SCRATCH, mask, 0),
+                and(W, VALUE, VALUE, SCRATCH, Lsl, 0),
+            ]);
+        }
     }
     asm.cbz(W, true, VALUE, miss);
 }
 
+#[derive(Debug)]
+pub(crate) struct Assumed {
+    pub control: u16,
+    pub status: u16,
+    pub mxcsr: u32,
+    pub top: u8,
+    pub tags: u16,
+    /// ESP modulo 16, when the unit aligns ESP.
+    pub esp_low: Option<u8>,
+    /// EBP minus entry ESP when EBP addresses the frame.
+    pub ebp: Option<i32>,
+    pub denormal: bool,
+    /// Whether the form runs x87 instructions, so that the x87 facts hold.
+    pub x87: bool,
+    /// Whether the form runs MMX or EMMS instructions, requiring no pending x87 exception.
+    pub mmx: bool,
+    /// The MXCSR bits the form assumes: all of them when it runs SSE
+    /// floating-point or control instructions, else the control bits.
+    pub mxcsr_mask: u32,
+}
+
+/// The binary64 bits of an x87 register that holds a binary64 value
+/// exactly; `None` for NaN, unnormals and values binary64 cannot hold.
+pub(crate) fn binary64(reg: adv_cpu_core::state::X87Register) -> Option<u64> {
+    let (m, se) = (reg.significand(), reg.sign_exponent());
+    let sign = u64::from(se & 0x8000) << 48;
+    let e = i32::from(se & 0x7fff);
+    if m == 0 {
+        return (e == 0).then_some(sign);
+    }
+    if m >> 63 == 0 {
+        return None;
+    }
+    if e == 0x7fff {
+        return (m == 1 << 63).then_some(sign | 0x7ff << 52);
+    }
+    let exp = e - 16383;
+    if exp >= -1022 {
+        return (exp <= 1023 && m & 0x7ff == 0)
+            .then(|| sign | ((exp + 1023) as u64) << 52 | (m >> 11) & ((1 << 52) - 1));
+    }
+    let shift = u32::try_from(-1011 - exp).ok().filter(|&s| s < 64)?;
+    (m & ((1 << shift) - 1) == 0).then_some(sign | m >> shift)
+}
+
+/// Converts the physical x87 input to binary64 bits in T.
+pub(crate) fn guard_binary64(asm: &mut Asm, i: u8, miss: Label) {
+    let zero = asm.label();
+    let special = asm.label();
+    let tiny = asm.label();
+    let done = asm.label();
+    asm.emit_all(&[
+        add_imm(X, X4, X0, runtime::X87_REGS, false),
+        ldur(X, T, X4, 10 * i32::from(i)),
+        ldrh(X2, X4, 10 * u32::from(i) + 8),
+        ubfx(W, X3, X2, 0, 15),
+    ]);
+    asm.cbz(X, false, T, zero);
+    asm.tbz(false, T, 63, miss);
+    asm.emit(movz(X, U, 0x7fff, 0));
+    asm.emit(cmp(W, X3, U, Lsl, 0));
+    asm.b_cond(Cond::Eq, special);
+
+    // Biased binary64 exponent. Subnormals use a variable right shift.
+    asm.emit(movz(X, U, 16383 - 1023, 0));
+    asm.emit(sub(W, X3, X3, U, Lsl, 0));
+    asm.emit(cmp_imm(W, X3, 0, false));
+    asm.b_cond(Cond::Le, tiny);
+    asm.emit(cmp_imm(W, X3, 0x7ff, false));
+    asm.b_cond(Cond::Ge, miss);
+    asm.emit(tst_imm(X, T, 0x7ff));
+    asm.b_cond(Cond::Ne, miss);
+    asm.emit_all(&[ubfx(X, T, T, 11, 52), orr(X, T, T, X3, Lsl, 52)]);
+    asm.b(done);
+
+    asm.bind(tiny);
+    asm.emit(movz(X, U, 12, 0));
+    asm.emit(sub(W, X3, U, X3, Lsl, 0));
+    asm.emit(cmp_imm(W, X3, 64, false));
+    asm.b_cond(Cond::Hs, miss);
+    asm.emit_all(&[
+        shiftv(X, Lsr, U, T, X3),
+        shiftv(X, Lsl, X4, U, X3),
+        cmp(X, X4, T, Lsl, 0),
+    ]);
+    asm.b_cond(Cond::Ne, miss);
+    asm.emit(mov(X, T, U));
+    asm.b(done);
+
+    asm.bind(special);
+    asm.emit(movz(X, U, 0x8000, 48));
+    asm.emit(cmp(X, T, U, Lsl, 0));
+    asm.b_cond(Cond::Ne, miss);
+    asm.emit(movz(X, T, 0x7ff0, 48));
+    asm.b(done);
+
+    asm.bind(zero);
+    asm.cbz(W, true, X3, miss);
+    asm.bind(done);
+    asm.emit_all(&[ubfx(W, X2, X2, 15, 1), orr(X, T, T, X2, Lsl, 63)]);
+}
+
+const PAGE_SHIFT: u32 = adv_cpu_core::memory::PAGE_SIZE.trailing_zeros();
+const MEMORY_BASE: u32 = std::mem::offset_of!(runtime::Runtime, memory_base) as u32;
+const MEMORY_PAGES: u32 = std::mem::offset_of!(runtime::Runtime, memory_pages) as u32;
+const PLAIN_PAGES: u32 = std::mem::offset_of!(runtime::Runtime, plain_pages) as u32;
+
+const X0: Reg = Reg::new(0);
+const X1: Reg = Reg::new(1);
+const X2: Reg = Reg::new(2);
+const X3: Reg = Reg::new(3);
+const X4: Reg = Reg::new(4);
+const X5: Reg = CPU;
+const RT: Reg = Reg::new(29);
+const T: Reg = VALUE;
+const U: Reg = SCRATCH;
+
+fn immediate(asm: &mut Asm, reg: Reg, value: u32) {
+    if value & 0xffff == 0 && value != 0 {
+        asm.emit(movz(X, reg, (value >> 16) as u16, 16));
+    } else {
+        asm.emit(movz(X, reg, value as u16, 0));
+        if value >> 16 != 0 {
+            asm.emit(movk(X, reg, (value >> 16) as u16, 16));
+        }
+    }
+}
+
+/// Test every page of a statically sized resident span.
+pub(crate) fn plain_span(asm: &mut Asm, addr: Reg, bytes: u32, write: bool, miss: Label) {
+    let next = asm.label();
+    asm.emit_all(&[ldr(W, X0, RT, MEMORY_BASE), cmp(W, addr, X0, Lsl, 0)]);
+    asm.b_cond(Cond::Lo, miss);
+    asm.emit_all(&[mov(W, X1, addr), sub_ext(X, X1, X1, X0, Extend::Uxtw, 0)]);
+    immediate(asm, X2, bytes - 1);
+    asm.emit_all(&[
+        add(X, X2, X1, X2, Lsl, 0),
+        lsr_imm(X, X1, X1, 12),
+        lsr_imm(X, X2, X2, 12),
+        ldr(W, X3, RT, MEMORY_PAGES),
+        cmp(X, X2, X3, Lsl, 0),
+    ]);
+    asm.b_cond(Cond::Hs, miss);
+    asm.emit(ldr(X, X3, RT, PLAIN_PAGES));
+    asm.emit(lsr_imm(W, X0, X0, 12));
+
+    asm.bind(next);
+    asm.emit_all(&[
+        lsr_imm(W, X4, X1, 6),
+        add(W, X4, X4, X4, Lsl, 1),
+        add_ext(X, X4, X3, X4, Extend::Uxtw, 3),
+        ldr(X, X5, X4, if write { 8 } else { 0 }),
+        shiftv(X, Lsr, X5, X5, X1),
+    ]);
+    asm.tbz(false, X5, 0, miss);
+    if write {
+        asm.emit_all(&[ldr(X, X5, X4, 16), shiftv(X, Lsr, X5, X5, X1)]);
+        asm.tbz(true, X5, 0, miss);
+    }
+    // The guest permission bitmap does not include the host
+    // protection intersection when host pages exceed 4 KiB.
+    asm.emit_all(&[
+        add(W, X5, X0, X1, Lsl, 0),
+        ldr(X, X4, RT, runtime::CLASSES),
+        ldr_narrow(Narrow::Byte, X5, X4, X5),
+    ]);
+    if write {
+        asm.tbz(false, X5, WRITE.trailing_zeros(), miss);
+        asm.tbz(true, X5, adv_cpu_core::memory::EXEC.trailing_zeros(), miss);
+    } else {
+        asm.tbz(false, X5, READ.trailing_zeros(), miss);
+        asm.tbz(true, X5, SHARED.trailing_zeros(), miss);
+    }
+    asm.emit_all(&[add_imm(W, X1, X1, 1, false), cmp(W, X1, X2, Lsl, 0)]);
+    asm.b_cond(Cond::Ls, next);
+}
+
+/// Walks the candidate pages of one stream. X0 and X1 are the first and
+/// last pages in stream order. XOR with X2 gives the actual guest page.
+/// X5 is the bitmap offset (0 for reads, 8 for writes). Returns the
+/// projected byte boundary of the first unproved page in X0, preserving K
+/// in X3 and all allocated values.
+pub(crate) fn batch_pages(asm: &mut Asm, entry: Label) {
+    let write = asm.label();
+    let next = asm.label();
+    let done = asm.label();
+    asm.bind(entry);
+    asm.emit_all(&[
+        eor(W, X4, X0, X2, Lsl, 0),
+        ldr(W, U, RT, MEMORY_BASE),
+        sub(W, U, X4, U, Lsr, PAGE_SHIFT),
+        ldr(W, T, RT, MEMORY_PAGES),
+        cmp(W, U, T, Lsl, 0),
+    ]);
+    asm.b_cond(Cond::Hs, done);
+    asm.emit_all(&[
+        lsr_imm(W, T, U, 6),
+        add(W, T, T, T, Lsl, 1),
+        ldr(X, X4, RT, PLAIN_PAGES),
+        add_ext(X, T, X4, T, Extend::Uxtw, 3),
+        add(X, X4, T, X5, Lsl, 0),
+        ldr(X, X4, X4, 0),
+        ldr(X, T, T, 16),
+        bic(X, T, X4, T, Lsl, 0),
+        shiftv(X, Lsr, T, T, U),
+    ]);
+    asm.tbz(false, T, 0, done);
+    // The bitmap grants guest permission. The window class also accounts
+    // for the host protection intersection on hosts with larger pages.
+    asm.emit_all(&[
+        eor(W, X4, X0, X2, Lsl, 0),
+        ldr(X, T, RT, runtime::CLASSES),
+        ldr_narrow(Narrow::Byte, T, T, X4),
+    ]);
+    asm.cbz(W, true, X5, write);
+    asm.tbz(false, T, READ.trailing_zeros(), done);
+    asm.tbz(true, T, SHARED.trailing_zeros(), done);
+    asm.b(next);
+    asm.bind(write);
+    asm.tbz(false, T, WRITE.trailing_zeros(), done);
+    asm.tbz(true, T, EXEC.trailing_zeros(), done);
+    asm.bind(next);
+    asm.emit_all(&[add_imm(W, X0, X0, 1, false), cmp(X, X0, X1, Lsl, 0)]);
+    asm.b_cond(Cond::Ls, entry);
+    asm.bind(done);
+    asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Asm, CONTROL, ES, Key, MMX, MXCSR, TOP, tags};
+    use super::{Asm, Assumed, CONTROL, ES, Key, MMX, MXCSR, TOP, tags};
     use adv_cpu_core::CpuState;
 
     // spec: A64A-ROLE-3 A64A-FALL-3
@@ -300,6 +675,53 @@ mod tests {
         assert_eq!(joined.mask(), mask & !(CONTROL | TOP));
         assert!(original.proves(joined));
         assert!(observed.proves(joined));
+    }
+
+    // spec: A64A-ROLE-3
+    #[test]
+    fn resident_key_reads_context_and_exact_x87_inputs() {
+        use adv_cpu_core::state::X87Register;
+
+        let mut cpu = CpuState::default();
+        cpu.regs[4] = 0x1014;
+        cpu.regs[5] = 0x1040;
+        cpu.x87.status = 0x4e22;
+        cpu.mxcsr |= 0x20;
+        let assumed = Assumed {
+            control: cpu.x87.control,
+            status: cpu.x87.status & !0x3800,
+            mxcsr: cpu.mxcsr,
+            top: cpu.x87.top() as u8,
+            tags: cpu.x87.tag,
+            esp_low: Some(4),
+            ebp: Some(0x2c),
+            denormal: true,
+            x87: true,
+            mmx: false,
+            mxcsr_mask: u32::MAX,
+        };
+        let key = Key::resident(&assumed, 1);
+        assert!(key.holds(&cpu));
+        cpu.regs[4] += 16;
+        cpu.regs[5] += 16;
+        assert!(key.holds(&cpu));
+
+        let mut changed = cpu.clone();
+        changed.regs[4] += 4;
+        changed.regs[5] += 4;
+        assert!(!key.holds(&changed));
+        changed = cpu.clone();
+        changed.regs[5] += 16;
+        assert!(!key.holds(&changed));
+        changed = cpu.clone();
+        changed.mxcsr ^= 0x20;
+        assert!(!key.holds(&changed));
+        changed = cpu.clone();
+        changed.x87.status ^= 2;
+        assert!(!key.holds(&changed));
+        changed = cpu.clone();
+        changed.x87.regs[0] = X87Register::from_parts(0x8000_0000_0000_0001, 0x3fff);
+        assert!(!key.holds(&changed));
     }
 
     // spec: A64A-PLACE-2

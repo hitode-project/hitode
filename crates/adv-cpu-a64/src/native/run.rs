@@ -363,7 +363,7 @@ impl Native {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
             },
         );
-        if version.assumed.mmx || cpu.mmx_mode != 0 {
+        if version.mmx || cpu.mmx_mode != 0 {
             cpu.refresh_mmx();
         }
         let fault = self.code.faults.site(self.code.faults.capture.pc.get());
