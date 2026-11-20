@@ -172,7 +172,7 @@ fn directshow_samples() {
     probe("dshow", "media dshow ok");
 }
 
-// spec: WINE-MEDIA-8, WINE-MEDIA-10, WINE-MEDIA-11, MEDIA-VIDEO-15
+// spec: WINE-MEDIA-8, WINE-MEDIA-10, WINE-MEDIA-11
 #[test]
 fn native_video_at_client_position() {
     probe("video", "media video ok");

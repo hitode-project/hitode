@@ -481,8 +481,10 @@ pub(crate) fn show_windows(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome
         let v = f.vmr.as_ref()?;
         (f.graph == graph && v.mode <= VMR_MODE_WINDOWED && v.hwnd != 0).then_some(v.hwnd)
     });
+    let video = &state(env).graphs[&graph].video;
     if let Some(hwnd) = hwnd
-        && state(env).graphs[&graph].video.auto_show
+        && video.auto_show
+        && (video.owner == 0 || video.owner == hwnd)
     {
         state(env)
             .graphs
@@ -2250,6 +2252,28 @@ mod tests {
             .auto_show = true;
         m.ext
             .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .owner = 0x300;
+        assert!(matches!(
+            show_windows(
+                &mut crate::dshow::tests::env(&mut m),
+                graph,
+                Box::new(|_, _| Outcome::Return(123))
+            ),
+            Outcome::Return(123)
+        ));
+        m.ext
+            .get_mut::<State>()
+            .graphs
+            .get_mut(&graph)
+            .unwrap()
+            .video
+            .owner = 0;
+        m.ext
+            .get_mut::<State>()
             .filters
             .get_mut(&filter)
             .unwrap()
@@ -2265,6 +2289,81 @@ mod tests {
             ),
             Outcome::Return(123)
         ));
+    }
+
+    // spec: MEDIA-VIDEO-1, MEDIA-VIDEO-12
+    #[test]
+    fn graph_video_window_stays_virtual_with_windowed_vmr() {
+        let (mut m, graph, _, _, pin, _) = setup_windowless();
+        let filter = m.ext.get::<State>().pins[&pin].filter;
+        m.ext.insert(host::Host {
+            allocator: crate::interop::GuestAllocator {
+                allocate: |_, _| unreachable!(),
+                free: |_, _| unreachable!(),
+            },
+            open: |_, _, _| unreachable!(),
+            read: |_, _, _| unreachable!(),
+            close: |_, _| unreachable!(),
+            thread: |_, _| unreachable!(),
+            event: |_| unreachable!(),
+            signal: |_, _, _| unreachable!(),
+            post: |_, _| unreachable!(),
+            media_types: |_, _| unreachable!(),
+            sample: |_, _, _, _| unreachable!(),
+            export: |_, module, name| panic!("unexpected USER call {module}!{name}"),
+        });
+        let v = m
+            .ext
+            .get_mut::<State>()
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap();
+        v.hwnd = 0x999;
+        v.mode = VMR_MODE_WINDOWED;
+        m.ext.get_or_default::<Vec<Option<VideoLayer>>>().clear();
+
+        let video = query(&mut m, graph, IID_IVIDEOWINDOW);
+        assert_eq!(
+            method(&mut m, "IVideoWindow::put_Owner", &[video, 0x200]),
+            S_OK
+        );
+        assert_eq!(
+            method(
+                &mut m,
+                "IVideoWindow::put_WindowStyle",
+                &[video, 0x5000_0000],
+            ),
+            S_OK
+        );
+        assert_eq!(
+            method(
+                &mut m,
+                "IVideoWindow::SetWindowPosition",
+                &[video, 12, 16, 320, 240],
+            ),
+            S_OK
+        );
+        assert_eq!(m.ext.get::<State>().graphs[&graph].video.owner, 0x200);
+        assert!(matches!(
+            show_windows(
+                &mut crate::dshow::tests::env(&mut m),
+                graph,
+                Box::new(|_, _| Outcome::Return(123))
+            ),
+            Outcome::Return(123)
+        ));
+        let layer = m
+            .ext
+            .get::<Vec<Option<VideoLayer>>>()
+            .last()
+            .and_then(|layer| layer.as_ref())
+            .expect("virtual video window must present a video layer");
+        assert!(layer.visible);
+        assert_eq!((layer.destination.x, layer.destination.y), (22, 36));
+        assert_eq!((layer.destination.w, layer.destination.h), (320, 240));
     }
 
     // spec: MEDIA-VIDEO-14

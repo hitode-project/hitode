@@ -566,6 +566,46 @@ fn movie() -> Vec<u8> {
 
 #[cfg(feature = "media")]
 #[test]
+// spec: MEDIA-STREAM-5
+fn guest_reader_renders_any_decodable_container_without_demuxing_it() {
+    let (mut m, graph) =
+        fixture(include_bytes!("../../../../../adv-device/tests/fixtures/asf_movie.wmv").to_vec());
+    crate::dsound::install(&mut m).unwrap();
+    m.ext.get_mut::<crate::dsound::Sound>().enabled = true;
+    crate::dshow::video::set_video_provider(
+        &mut m.ext,
+        VideoProvider {
+            window: |_, _, _| None,
+            update: |_, _, _, _| Ok(1),
+            completed: |_, _| None,
+        },
+    );
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "Render", &[OUTPUT_PIN]),
+        S_OK
+    );
+    let state = m.ext.get::<State>();
+    let splitter = state
+        .filters
+        .values()
+        .find(|filter| filter.role == Role::Splitter)
+        .unwrap();
+    assert_eq!(
+        splitter
+            .source
+            .as_ref()
+            .unwrap()
+            .info
+            .as_ref()
+            .unwrap()
+            .container,
+        "asf"
+    );
+    assert!(splitter.packets.is_none());
+}
+
+#[cfg(feature = "media")]
+#[test]
 // spec: MEDIA-STREAM-9
 fn unclocked_video_presents_every_picture_at_once_and_completes_at_the_stop() {
     use crate::dshow::{tests::query, video};
