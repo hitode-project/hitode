@@ -59,6 +59,30 @@ impl Emitter<'_> {
         self.asm.cbz(W, true, T, cold);
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
+        if let Some(domain) = self.domain {
+            let minimum = (self.asm.label(), self.asm.label());
+            let head = self.func.records[0].eip;
+            let (miss, target_miss) = if self.count_entries {
+                let skip = self.asm.label();
+                let miss = self.asm.label();
+                let target = self.asm.label();
+                self.asm.b(skip);
+                self.asm.bind(miss);
+                self.count(head, super::Counter::RowMiss);
+                self.asm.b(cold);
+                self.asm.bind(target);
+                self.count(head, super::Counter::TargetMiss);
+                self.asm.b(cold);
+                self.asm.bind(skip);
+                (miss, target)
+            } else {
+                (cold, cold)
+            };
+            let words = domain.emit(&mut self.asm, minimum, miss, target_miss);
+            self.count(head, super::Counter::RowEntry);
+            self.row_budget = Some((minimum, words));
+            self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        }
 
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {

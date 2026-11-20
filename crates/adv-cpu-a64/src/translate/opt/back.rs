@@ -6,6 +6,7 @@
 mod alloc;
 mod batch;
 
+use super::computation::rows::Domain;
 use crate::translate::lower::resident::Counter;
 mod cost;
 mod flags;
@@ -86,6 +87,7 @@ pub(crate) struct Lowered {
     /// it to `opt_exit`.
     pub exit: usize,
     pub counters: Vec<(u32, Counter, usize)>,
+    rows: bool,
 }
 
 impl Lowered {
@@ -97,14 +99,20 @@ impl Lowered {
 
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
+impl Lowered {
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows
+    }
+}
+
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None, false, false)
+    lower_form(func, None, false, false, None)
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), false, false)
+    lower_form(func, Some((assumed, entry)), false, false, None)
 }
 
 /// A resident form entered from patchable links, accessing guest memory
@@ -116,7 +124,23 @@ pub(crate) fn lower_resident(
     count_entries: bool,
 ) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), true, count_entries)
+    lower_form(func, Some((assumed, entry)), true, count_entries, None)
+}
+
+pub(crate) fn lower_rows(
+    func: &Func,
+    assumed: &Assumed,
+    domain: &Domain,
+    count_entries: bool,
+) -> Option<Lowered> {
+    let lowered = lower_form(
+        func,
+        Some((assumed, &func.entry)),
+        true,
+        count_entries,
+        Some(domain),
+    );
+    lowered.rows.then_some(lowered)
 }
 
 fn entry_key(assumed: &Assumed, entry: &[Source]) -> Key {
@@ -132,6 +156,7 @@ fn lower_form(
     inline: Option<(&Assumed, &[Source])>,
     resident: bool,
     count_entries: bool,
+    domain: Option<&Domain>,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
@@ -143,7 +168,11 @@ fn lower_form(
             &allocation,
             asm,
             inline,
-            (resident, count_entries),
+            (
+                resident,
+                count_entries,
+                domain.filter(|_| !batches.is_empty()),
+            ),
             &batches,
         );
         if !e.unpriced.is_empty() {
@@ -210,6 +239,7 @@ fn lower_form(
         .iter()
         .map(|&(head, kind, label)| (head, kind, e.asm.position(label) / 4))
         .collect();
+    let rows = e.row_budget.is_some();
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -239,6 +269,7 @@ fn lower_form(
         flags: e.flags,
         spill_cells,
         counters,
+        rows,
     }
 }
 
@@ -264,7 +295,7 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
-    (resident, count_entries): (bool, bool),
+    (resident, count_entries, domain): (bool, bool, Option<&'a Domain>),
     batches: &[loops::Batch],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
@@ -287,7 +318,8 @@ fn emit<'a>(
     }
     let env_miss = resident.then(|| asm.label());
     let span_search = [false, true].map(|backwards| {
-        (resident && batches.iter().any(|batch| batch.backwards == backwards)).then(|| asm.label())
+        (resident && domain.is_none() && batches.iter().any(|batch| batch.backwards == backwards))
+            .then(|| asm.label())
     });
     let mut batch_backedges = vec![None; func.blocks.len()];
     for batch in batches {
@@ -351,6 +383,8 @@ fn emit<'a>(
         counters: Vec::new(),
         count_entries,
         mmx_miss,
+        domain,
+        row_budget: None,
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
@@ -577,6 +611,11 @@ fn emit<'a>(
         e.asm.bind(label);
         e.asm.emit_all(&[0, 0]);
     }
+    let mut min_inner = batches
+        .iter()
+        .map(|b| u32::from(b.plan.lanes) + 1)
+        .max()
+        .unwrap_or(0);
     for (batch, price) in prices {
         let saved = if price.classes.is_empty() {
             let scalar = cost::cheapest(func, &costs, &batch.loop_) * u32::from(batch.plan.lanes);
@@ -604,8 +643,23 @@ fn emit<'a>(
         if saved == 0 {
             e.unpriced.push(batch.loop_.head);
         } else {
-            e.asm.emit_all(&[price.admission.div_ceil(saved), 0]);
+            let min_batches = price.admission.div_ceil(saved);
+            min_inner = min_inner.max(min_batches * u32::from(batch.plan.lanes) + 1);
+            e.asm.emit_all(&[min_batches, 0]);
         }
+    }
+    if let Some(((rows, inner), words)) = e.row_budget {
+        // A range proven at the row entry removes at least the first-leaf
+        // hit of every covered stream on each row with an inner strip.
+        let saved = batches
+            .iter()
+            .map(|batch| batch.spans.len() as u32 * 8)
+            .min()
+            .unwrap();
+        e.asm.bind(rows);
+        e.asm.emit_all(&[words.div_ceil(saved), 0]);
+        e.asm.bind(inner);
+        e.asm.emit_all(&[min_inner, 0]);
     }
     for (value, label) in std::mem::take(&mut e.reciprocals) {
         e.asm.bind(label);
@@ -669,6 +723,8 @@ struct Emitter<'a> {
     counters: Vec<(u32, Counter, Label)>,
     count_entries: bool,
     mmx_miss: Option<Label>,
+    domain: Option<&'a Domain>,
+    row_budget: Option<((Label, Label), u32)>,
 }
 
 impl CheckedEmitter for Emitter<'_> {

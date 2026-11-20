@@ -808,7 +808,7 @@ impl Native {
 
     fn emit(&mut self, memory: &mut Memory, eip: u32, observed: Key) -> Option<Tier1Unit> {
         let loops = self.promotion == 0 || self.plans.promoted(eip);
-        let unit = self.front_unit(memory, eip, loops, false);
+        let unit = self.front_unit(memory, eip, loops, false, None);
         let at = self.code.next();
         let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;
@@ -960,7 +960,22 @@ impl Native {
         if self.plans.baseline_only {
             return;
         }
-        let unit = self.front_unit(memory, eip, true, true);
+        let mut unit = self.front_unit(memory, eip, true, true, None);
+        if unit.trace.insts[..unit.trace.primary].iter().any(|inst| {
+            matches!(inst.op, crate::translate::front::decode::Op::CallIndirect(
+                crate::translate::front::decode::Src::Mem(slot)
+            ) if slot.base.is_some() && slot.index.is_none() && !slot.fs)
+        }) {
+            let extension = self.front_unit(memory, eip, true, true, Some(&at.regs));
+            if extension
+                .trace
+                .insts
+                .iter()
+                .any(|inst| inst.guarded_slot.is_some())
+            {
+                unit = extension;
+            }
+        }
         let code = self.code.tier1(source).unwrap().unit;
         self.plans.discover(eip, source, code);
         self.code.prepare_resident(eip, unit, SAMPLE);

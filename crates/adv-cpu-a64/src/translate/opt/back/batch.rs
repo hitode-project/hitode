@@ -166,9 +166,11 @@ impl Emitter<'_> {
         self.batch_trip(batch.loop_.trip, lanes, scalar);
         self.batch_minimum(price, scalar);
 
-        for &span in &batch.spans {
-            self.batch_range(span, batch.backwards, pages, scalar, batch.loop_.eip);
-            self.asm.cbz(X, false, X3, scalar);
+        if self.row_budget.is_none() {
+            for &span in &batch.spans {
+                self.batch_range(span, batch.backwards, pages, scalar, batch.loop_.eip);
+                self.asm.cbz(X, false, X3, scalar);
+            }
         }
         for &(a, b, in_place) in &batch.alias {
             self.batch_disjoint(

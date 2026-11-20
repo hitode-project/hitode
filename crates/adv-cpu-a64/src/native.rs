@@ -682,12 +682,15 @@ impl Native {
             if counts.iter().any(|&n| n != 0) {
                 let _ = write!(
                     output,
-                    " span {eip:#010x}=[entries {}, mmx misses {}, range misses {}, batches {}, ordered classes {:?}]",
+                    " span {eip:#010x}=[entries {}, mmx misses {}, range misses {}, batches {}, ordered classes {:?}, row entries {}, target misses {}, row misses {}]",
                     counts[0],
                     counts[1],
                     counts[2],
                     counts[3],
-                    &counts[4..]
+                    &counts[4..20],
+                    counts[20],
+                    counts[21],
+                    counts[22]
                 );
             }
             let versions = self
@@ -963,9 +966,16 @@ impl Native {
         eip: u32,
         loops: bool,
         summarize: bool,
+        observed: Option<&[u32; 8]>,
     ) -> Arc<Unit> {
         let site = self.front_units.entry(eip).or_default();
-        let shape = if loops { &mut site.hot } else { &mut site.cold };
+        let shape = if observed.is_some() {
+            &mut site.guarded
+        } else if loops {
+            &mut site.hot
+        } else {
+            &mut site.cold
+        };
         let unit = shape.get_or_insert_with(|| {
             let handler = if self.bridge.is_null() {
                 None
@@ -992,7 +1002,7 @@ impl Native {
                         body: handler.direct_body(pc),
                     })
                 },
-                loops,
+                (loops, observed),
                 &mut self.decodes,
             );
             self.code

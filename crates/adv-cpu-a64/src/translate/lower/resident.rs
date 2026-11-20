@@ -37,9 +37,12 @@ pub(crate) enum Counter {
     SpanMiss,
     Batch,
     Class(u8),
+    RowEntry,
+    TargetMiss,
+    RowMiss,
 }
 
-pub(crate) const COUNTERS: usize = 20;
+pub(crate) const COUNTERS: usize = 23;
 
 impl Counter {
     pub(crate) fn index(self) -> usize {
@@ -49,6 +52,9 @@ impl Counter {
             Self::SpanMiss => 2,
             Self::Batch => 3,
             Self::Class(class) => 4 + usize::from(class),
+            Self::RowEntry => 20,
+            Self::TargetMiss => 21,
+            Self::RowMiss => 22,
         }
     }
 }

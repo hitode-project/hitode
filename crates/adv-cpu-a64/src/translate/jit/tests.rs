@@ -283,7 +283,7 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             &[CODE + code.len() as u32],
             &|_, _| None,
             &|_| None,
-            !cold,
+            (!cold, None),
             &mut decodes,
         );
         lower_unit(

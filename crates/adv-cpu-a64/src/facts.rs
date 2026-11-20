@@ -640,6 +640,19 @@ fn span_word(asm: &mut Asm, level: usize, backwards: bool, index: Reg, dst: Reg)
     }
 }
 
+/// The caller has validated the ordinary range before loading the slot.
+pub(crate) fn guard_indirect_target(
+    asm: &mut Asm,
+    value: Reg,
+    scratch: Reg,
+    target: u32,
+    miss: Label,
+) {
+    immediate(asm, scratch, target);
+    asm.emit(cmp(W, value, scratch, Lsl, 0));
+    asm.b_cond(Cond::Ne, miss);
+}
+
 /// Tests the projected inclusive byte range in X0..=X1. On a miss, X2
 /// contains the first denied byte. X3 holds the batch count.
 pub(crate) fn batch_span(asm: &mut Asm, write: bool, backwards: bool, search: Label, hit: Label) {

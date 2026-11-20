@@ -50,7 +50,15 @@ impl Unit {
         loops: bool,
     ) {
         let mut decodes = Decodes::default();
-        self.build_cached(memory, eip, stops, host, redirect, loops, &mut decodes);
+        self.build_cached(
+            memory,
+            eip,
+            stops,
+            host,
+            redirect,
+            (loops, None),
+            &mut decodes,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -61,13 +69,13 @@ impl Unit {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
-        loops: bool,
+        layout: (bool, Option<&[u32; 8]>),
         decodes: &mut Decodes,
     ) {
         self.regions.clear();
         self.resident_links.take();
         self.trace
-            .build_cached(memory, eip, stops, host, redirect, loops, decodes);
+            .build_cached(memory, eip, stops, host, redirect, layout, decodes);
         tables::prepare(self, memory);
         self.table_target = tables::image(&self.images, eip, 1)
             && memory.committed(eip, 15).is_ok()
@@ -129,6 +137,7 @@ pub(crate) fn instruction_form(memory: &adv_cpu_core::Memory, eip: u32) -> Optio
 pub(crate) struct Site {
     pub cold: Option<Arc<Unit>>,
     pub hot: Option<Arc<Unit>>,
+    pub guarded: Option<Arc<Unit>>,
 }
 
 use trace::{Edge, Mode, Next};
