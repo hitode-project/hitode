@@ -71,6 +71,7 @@ pub(super) struct VersionStats {
     pub(super) joins: u64,
     pub(super) resident_misses: [Cell<u64>; 2],
     pub(super) arrivals: [Cell<u64>; CHAIN_LEN],
+    pub(super) spans: [Cell<u64>; crate::translate::lower::resident::COUNTERS],
 }
 
 #[derive(Clone, Copy)]
@@ -347,6 +348,13 @@ impl<R> CodeStore<R> {
             words[at] = pointer as u32;
             words[at + 1] = (pointer >> 32) as u32;
         };
+        if !layout.counters.is_empty() {
+            let stats = self.version_stats.get_or_insert_with(FxHashMap::default);
+            for &(head, kind, offset) in layout.counters {
+                let stats = stats.entry(head).or_default();
+                literal(words, offset, stats.spans[kind.index()].as_ptr() as u64);
+            }
+        }
         literal(words, layout.probation_slot, slot.countdown.as_ptr() as u64);
         let (sensors, counter, leave) = layout.probation_sensor;
         literal(words, *counter, slot.probation.as_ptr() as u64);

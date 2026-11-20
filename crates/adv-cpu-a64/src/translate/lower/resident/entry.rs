@@ -53,6 +53,7 @@ pub(crate) struct Layout<'a> {
     pub transitions: &'a [(usize, usize)],
     pub sites: &'a [(usize, super::super::Site)],
     pub marks: &'a [crate::jit_map::Mark],
+    pub counters: &'a [(u32, super::Counter, usize)],
 }
 
 pub(crate) struct Targets {

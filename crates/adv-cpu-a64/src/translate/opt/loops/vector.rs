@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 
 use crate::encode::*;
 
+mod conditional;
+pub(in crate::translate::opt) use conditional::Path as ClassPath;
+
 pub(in crate::translate::opt) struct Vector;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,14 @@ impl Shape {
         }
     }
 
+    fn integers(self) -> Arr {
+        if self == Self::Packed(8) {
+            Arr::S4
+        } else {
+            self.arr()
+        }
+    }
+
     fn repeat(self) -> bool {
         self == Self::Packed(16)
     }
@@ -42,6 +53,7 @@ impl Shape {
 enum Unary {
     Not,
     Shift(ShiftImm, Arr, u32),
+    ShuffleWords(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +61,8 @@ enum Binary {
     Same(Same, Arr),
     Logic(Logic),
     UnsignedGt(Arr),
+    Unpack(Permute, u8),
+    Pack(Narrowing, u8),
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +80,11 @@ enum OpCode {
     Binary(Binary),
     Blend,
     Charge(i32),
+    ClassTest(u8),
+    LaneStore(Stream, u32),
+    Publish(Value, u32, Type),
+    Update(Value, u32, u32),
+    Debit(i32),
 }
 
 struct Inst {
@@ -82,6 +101,10 @@ enum Step {
     Vector(Value, VReg),
     Imm(u64),
     Charge(i32),
+    LaneStore(Stream, u32, VReg),
+    Publish(Value, u32, Type, VReg),
+    Update(Value, u32, u32),
+    Debit(i32),
 }
 
 const ADDRESS: Reg = Reg::new(16);
@@ -126,6 +149,17 @@ impl BatchBody for Program {
                     }
                     Step::Imm(bits) => emitter.immediate(SCALAR, bits),
                     Step::Charge(cost) => emitter.adjust_charge(SCALAR, cost),
+                    Step::LaneStore(stream, lane, value) => {
+                        emitter
+                            .address(stream.addr.shifted(lane.wrapping_mul(stream.stride as u32)));
+                        let physical = lane ^ u32::from(stream.stride < 0);
+                        let data = Reg::new(17);
+                        emitter.asm().emit(vumov(3, data, value, physical));
+                        emitter.asm().emit(str(Size::X, data, ADDRESS, 0));
+                    }
+                    Step::Publish(value, lane, ty, from) => emitter.publish(value, lane, ty, from),
+                    Step::Update(value, keep, set) => emitter.update(value, keep, set),
+                    Step::Debit(cost) => emitter.debit(cost),
                 }
             }
         }
@@ -139,9 +173,17 @@ impl LoopKernel for Vector {
             return None;
         }
         let groups = loop_.groups();
+        if func.resident
+            && loop_.streams.iter().any(|s| s.write() && s.width == 8)
+            && let Some(plan) = conditional::recognize(func, loop_, &defs, &groups)
+        {
+            return Some(plan);
+        }
         for group in &groups {
             let s = group[0].1;
-            if group.len() > 4 || s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
+            if group.len() > 4
+                || s.stride != 0
+                    && s.stride.unsigned_abs() != group.len() as u32 * u32::from(s.width)
             {
                 return None;
             }
@@ -154,7 +196,9 @@ impl LoopKernel for Vector {
         if width >= 8 {
             if !paths.selects.is_empty()
                 || !matches!(width, 8 | 16)
-                || groups.iter().any(|g| g.len() != 1 || g[0].1.width != width)
+                || groups.iter().any(|g| {
+                    g[0].1.stride != 0 && (g[0].1.width != width || width == 16 && g.len() != 1)
+                })
             {
                 return None;
             }
@@ -170,6 +214,7 @@ impl LoopKernel for Vector {
                 mapped: BTreeMap::new(),
                 insts: Vec::new(),
                 next: 0,
+                bindings: BTreeMap::new(),
             };
             if let Some(code) = builder.build(&groups) {
                 let inputs = builder
@@ -184,6 +229,7 @@ impl LoopKernel for Vector {
                     name: "V",
                     lanes: shape.lanes(),
                     inputs,
+                    conditional: false,
                     body: Box::new(Program { shape, code }),
                 });
             }
@@ -489,13 +535,23 @@ struct Builder<'a> {
     mapped: BTreeMap<(Value, u32), usize>,
     insts: Vec<Inst>,
     next: usize,
+    bindings: BTreeMap<Value, Value>,
 }
 
 impl Builder<'_> {
-    fn build(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<Vec<Step>> {
+    fn resolve(&self, value: Value) -> Value {
+        self.bindings.get(&value).copied().unwrap_or(value)
+    }
+
+    fn read_inputs(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<()> {
         for group in groups {
             let stream = group[0].1;
-            if stream.write() {
+            if stream.write()
+                || self.shape == Shape::Packed(8)
+                    && group
+                        .iter()
+                        .all(|&(_, s)| self.values.loop_.covering_read(s).is_some())
+            {
                 continue;
             }
             self.memory_shape(stream, group.len())?;
@@ -517,6 +573,11 @@ impl Builder<'_> {
                 outputs: range.collect(),
             });
         }
+        Some(())
+    }
+
+    fn build(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<Vec<Step>> {
+        self.read_inputs(groups)?;
         // Emit the entire read set before stores. The alias guard permits
         // identical in-place streams only when their scalar load is first.
         for group in groups {
@@ -568,6 +629,33 @@ impl Builder<'_> {
         self.allocate()
     }
 
+    fn effect(&mut self, op: OpCode, inputs: Vec<usize>) {
+        self.insts.push(Inst {
+            op,
+            inputs,
+            outputs: Vec::new(),
+        });
+    }
+
+    fn live_code(&mut self) -> Option<Vec<Step>> {
+        let mut live = vec![false; self.next];
+        self.insts = std::mem::take(&mut self.insts)
+            .into_iter()
+            .rev()
+            .filter(|inst| {
+                let needed = inst.outputs.is_empty() || inst.outputs.iter().any(|&v| live[v]);
+                if needed {
+                    for &v in &inst.inputs {
+                        live[v] = true;
+                    }
+                }
+                needed
+            })
+            .collect();
+        self.insts.reverse();
+        self.allocate()
+    }
+
     fn memory_shape(&self, stream: Stream, count: usize) -> Option<()> {
         (count == 1 || u32::from(self.shape.lanes()) * u32::from(stream.width) >= 8).then_some(())
     }
@@ -596,13 +684,14 @@ impl Builder<'_> {
             a
         } else {
             self.emit(
-                OpCode::Unary(Unary::Shift(op, self.shape.arr(), bits)),
+                OpCode::Unary(Unary::Shift(op, self.shape.integers(), bits)),
                 vec![a],
             )
         }
     }
 
     fn scalar(&mut self, v: Value, mask: u32) -> Option<usize> {
+        let v = self.resolve(v);
         if mask == 0 {
             return Some(self.constant(0));
         }
@@ -616,7 +705,7 @@ impl Builder<'_> {
 
     fn scalar_op(&mut self, v: Value, mask: u32) -> Option<usize> {
         let defs = self.values.defs;
-        let arr = self.shape.arr();
+        let arr = self.shape.integers();
         let bits = arr.bits();
         if let Some(n) = defs.constant(v) {
             return Some(self.constant(n));
@@ -633,7 +722,31 @@ impl Builder<'_> {
             return self.select(cond, a, b, mask);
         }
         Some(match defs.op(v)? {
-            Op::Load { .. } => *self.mapped.get(&(v, u32::MAX))?,
+            Op::Load { .. } => {
+                if let Some(&input) = self.mapped.get(&(v, u32::MAX)) {
+                    return Some(input);
+                }
+                if self.shape != Shape::Packed(8) {
+                    return None;
+                }
+                let narrow = self
+                    .values
+                    .loop_
+                    .streams
+                    .iter()
+                    .find(|s| s.access == Access::Load(v))?;
+                let (wide, shift) = self.values.loop_.covering_read(*narrow)?;
+                let input = self.packed(wide)?;
+                if shift == 0 {
+                    input
+                } else {
+                    self.emit(
+                        OpCode::Unary(Unary::Shift(ShiftImm::Ushr, Arr::D2, shift)),
+                        vec![input],
+                    )
+                }
+            }
+            Op::Bits { value, .. } if self.shape == Shape::Packed(8) => self.packed(value)?,
             Op::Int(op, a, b) => match op {
                 IntOp::And | IntOp::Or | IntOp::Xor => {
                     let (a, b, kind) = match op {
@@ -732,22 +845,27 @@ impl Builder<'_> {
     }
 
     fn compare(&mut self, test: Value) -> Option<Comparison> {
-        let Op::Test { flags, cond } = self.values.defs.op(test)? else {
+        let Op::Test { flags, cond } = self.values.defs.op(self.resolve(test))? else {
             return None;
         };
         let Op::Flags {
-            kind: FlagKind::Sub,
+            kind: kind @ (FlagKind::Sub | FlagKind::Logic),
             width,
             mut a,
             mut b,
             ..
-        } = self.values.defs.op(flags)?
+        } = self.values.defs.op(self.resolve(flags))?
         else {
             return None;
         };
         invert(cond)?;
         let signed = matches!(cond, Cc::l | Cc::le | Cc::g | Cc::ge);
-        let arr = self.shape.arr();
+        if kind == FlagKind::Logic
+            && (self.shape != Shape::Packed(8) || !matches!(cond, Cc::e | Cc::ne))
+        {
+            return None;
+        }
+        let arr = self.shape.integers();
         if arr.bits() < u32::from(width) * 8 {
             let omitted = !low_mask((arr.bits() / 8) as u8);
             if signed || (self.values.may_set(a) | self.values.may_set(b)) & omitted != 0 {
@@ -760,7 +878,11 @@ impl Builder<'_> {
         let inverted = matches!(cond, Cc::ne | Cc::ge | Cc::le | Cc::ae | Cc::be);
         let compare_mask = low_mask(width);
         let left = self.scalar(a, compare_mask)?;
-        let right = self.scalar(b, compare_mask)?;
+        let right = if kind == FlagKind::Logic {
+            self.constant(0)
+        } else {
+            self.scalar(b, compare_mask)?
+        };
         let shift = arr.bits().saturating_sub(u32::from(width) * 8);
         let left = self.shift(ShiftImm::Shl, shift, left);
         let right = self.shift(ShiftImm::Shl, shift, right);
@@ -815,6 +937,7 @@ impl Builder<'_> {
     }
 
     fn packed(&mut self, v: Value) -> Option<usize> {
+        let v = self.resolve(v);
         if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
             return Some(id);
         }
@@ -831,6 +954,16 @@ impl Builder<'_> {
         } else {
             match defs.op(v)? {
                 Op::VecUnary(VecUnary::Low64, a) if !full => self.packed(a)?,
+                Op::Bits { value, .. } if !full => {
+                    let input = self.scalar(value, u32::MAX)?;
+                    let low = self.constant(0xffff_ffff);
+                    self.binary(Binary::Logic(Logic::And), input, low)
+                }
+                Op::VecUnary(VecUnary::Shuffle(1, imm, false), a) if !full => {
+                    let a = self.packed(a)?;
+                    self.emit(OpCode::Unary(Unary::ShuffleWords(imm)), vec![a])
+                }
+                Op::Load { .. } if !full => self.scalar(v, u32::MAX)?,
                 Op::VecUnary(VecUnary::ShiftImm(op, log, n, q), a) if q == full && log <= 2 => {
                     let arr = Arr::new(u32::from(log), true);
                     let n = u32::from(n);
@@ -906,6 +1039,9 @@ impl Builder<'_> {
                     Shape::Scalar(_) => {
                         code.push(Step::Gp(v, target(), self.shape.arr()));
                     }
+                    Shape::Packed(_) if self.values.func.ty(v) == Type::I32 => {
+                        code.push(Step::Gp(v, target(), Arr::S4));
+                    }
                     Shape::Packed(_) => code.push(Step::Vector(v, target())),
                 },
                 OpCode::Constant(bits) => {
@@ -923,17 +1059,84 @@ impl Builder<'_> {
                         }
                     }
                 }
-                OpCode::Unary(op) => code.push(Step::Word(match op {
-                    Unary::Not => vnot(true, target(), read(0)),
-                    Unary::Shift(op, arr, n) => vshift(op, arr, target(), read(0), n),
-                })),
-                OpCode::Binary(op) => code.push(Step::Word(match op {
-                    Binary::Same(op, arr) => vsame(op, arr, target(), read(0), read(1)),
-                    Binary::Logic(op) => vlogic(op, true, target(), read(0), read(1)),
-                    Binary::UnsignedGt(arr) => {
-                        vsame(Same::Cmgt, arr, target(), read(0), read(1)) | 1 << 29
+                OpCode::Unary(op) => match op {
+                    Unary::Not => code.push(Step::Word(vnot(true, target(), read(0)))),
+                    Unary::Shift(op, arr, n) => {
+                        code.push(Step::Word(vshift(op, arr, target(), read(0), n)));
                     }
-                })),
+                    Unary::ShuffleWords(imm) => {
+                        let mut index = 0u64;
+                        for word in 0..4 {
+                            let byte = u64::from(2 * (imm >> (2 * word) & 3));
+                            index |= (byte | ((byte + 1) << 8)) << (16 * word);
+                        }
+                        let table = VReg::new(28);
+                        code.push(Step::Imm(index));
+                        code.push(Step::Word(fmov_to_v(Size::X, table, SCALAR)));
+                        code.push(Step::Imm(index + 0x0808_0808_0808_0808));
+                        code.push(Step::Word(vins_general(3, table, 1, SCALAR)));
+                        code.push(Step::Word(
+                            0x4e00_0000
+                                | (table.number() << 16)
+                                | (read(0).number() << 5)
+                                | target().number(),
+                        ));
+                    }
+                },
+                OpCode::Binary(op) => {
+                    let x = VReg::new(28);
+                    let y = VReg::new(29);
+                    let word = match op {
+                        Binary::Same(op, arr) => vsame(op, arr, target(), read(0), read(1)),
+                        Binary::Logic(op) => vlogic(op, true, target(), read(0), read(1)),
+                        Binary::UnsignedGt(arr) => {
+                            vsame(Same::Cmgt, arr, target(), read(0), read(1)) | 1 << 29
+                        }
+                        Binary::Unpack(op, log) => {
+                            let arr = Arr::new(u32::from(log), true);
+                            code.push(Step::Word(vpermute(
+                                Permute::Zip1,
+                                arr,
+                                x,
+                                read(0),
+                                read(1),
+                            )));
+                            code.push(Step::Word(vpermute(
+                                Permute::Zip2,
+                                arr,
+                                y,
+                                read(0),
+                                read(1),
+                            )));
+                            vpermute(op, Arr::D2, target(), x, y)
+                        }
+                        Binary::Pack(op, log) => {
+                            let narrow = Arr::new(u32::from(log), false);
+                            code.push(Step::Word(vnarrow(op, narrow, x, read(0))));
+                            code.push(Step::Word(vnarrow(op, narrow, y, read(1))));
+                            vpermute(Permute::Zip1, Arr::S4, target(), x, y)
+                        }
+                    };
+                    code.push(Step::Word(word));
+                }
+                OpCode::ClassTest(test) => {
+                    let r = Reg::new(test);
+                    let tmp = VReg::new(28);
+                    code.push(Step::Word(vpermute(
+                        Permute::Uzp1,
+                        Arr::S4,
+                        tmp,
+                        read(0),
+                        read(0),
+                    )));
+                    code.push(Step::Word(vumov(3, r, tmp, 0)));
+                }
+                OpCode::LaneStore(stream, lane) => {
+                    code.push(Step::LaneStore(stream, lane, read(0)))
+                }
+                OpCode::Publish(v, lane, ty) => code.push(Step::Publish(v, lane, ty, read(0))),
+                OpCode::Update(v, keep, set) => code.push(Step::Update(v, keep, set)),
+                OpCode::Debit(cost) => code.push(Step::Debit(cost)),
                 OpCode::Charge(cost) => {
                     if inst.inputs.is_empty() {
                         let lanes = if self.shape.repeat() {
@@ -979,6 +1182,22 @@ impl Builder<'_> {
         let s = memory.stream;
         let write = s.write();
         let mut log = s.width.trailing_zeros();
+        if s.stride == 0 {
+            let dst = regs[0];
+            let size = match s.width {
+                1 => VMem::B,
+                2 => VMem::H,
+                4 => VMem::S,
+                8 => VMem::D,
+                16 => VMem::Q,
+                _ => unreachable!(),
+            };
+            code.push(Step::Address(s, vldr(size, dst, ADDRESS, 0)));
+            if s.width < 16 {
+                code.push(Step::Word(vdup_lane(self.shape.arr(), dst, dst, 0)));
+            }
+            return;
+        }
         let (work, bytes) = match self.shape {
             Shape::Scalar(w) => (w.trailing_zeros(), s.width * self.shape.lanes()),
             Shape::Packed(_) => (log, 16),
@@ -1063,6 +1282,10 @@ impl Builder<'_> {
 
 fn packed_binary(op: VecOp, full: bool) -> Option<Binary> {
     Some(match op {
+        VecOp::Unpack(op @ (Permute::Zip1 | Permute::Zip2), log, false) if !full && log < 2 => {
+            Binary::Unpack(op, log)
+        }
+        VecOp::Pack(op, log, false) if !full => Binary::Pack(op, log),
         VecOp::And(q) if q == full => Binary::Logic(Logic::And),
         VecOp::AndNot(q) if q == full => Binary::Logic(Logic::Bic),
         VecOp::Or(q) if q == full => Binary::Logic(Logic::Orr),

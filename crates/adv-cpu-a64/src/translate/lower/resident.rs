@@ -29,6 +29,30 @@ impl ResidentCold {
     }
 }
 
+/// Slots for opt-in per-head counters. Conditional cases use ordered arms.
+#[derive(Clone, Copy)]
+pub(crate) enum Counter {
+    Entry,
+    MmxMiss,
+    SpanMiss,
+    Batch,
+    Class(u8),
+}
+
+pub(crate) const COUNTERS: usize = 20;
+
+impl Counter {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Entry => 0,
+            Self::MmxMiss => 1,
+            Self::SpanMiss => 2,
+            Self::Batch => 3,
+            Self::Class(class) => 4 + usize::from(class),
+        }
+    }
+}
+
 #[cfg(native)]
 mod entry;
 #[cfg(native)]

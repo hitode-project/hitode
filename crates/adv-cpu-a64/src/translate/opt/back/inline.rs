@@ -49,7 +49,11 @@ impl Emitter<'_> {
             &mut self.asm,
             CPU,
             true,
-            if self.resident { miss } else { cold },
+            if self.resident {
+                self.mmx_miss.unwrap_or(miss)
+            } else {
+                cold
+            },
         );
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);

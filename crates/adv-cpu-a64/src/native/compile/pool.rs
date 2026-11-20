@@ -75,6 +75,7 @@ impl ResidentForm {
             transitions: &lowered.transitions,
             sites: &lowered.sites,
             marks: &lowered.marks,
+            counters: &lowered.counters,
         }
     }
 }

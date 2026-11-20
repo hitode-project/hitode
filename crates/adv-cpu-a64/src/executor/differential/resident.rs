@@ -1930,6 +1930,117 @@ fn vector_unrolls_independent_packed_integer_iterations() {
 
 // spec: A64-OPT-10
 #[test]
+fn vector_spans_use_sign_latches_and_interleaved_qword_stores() {
+    let image = Image::loop_body(|a, head, _| {
+        for (n, mm) in [mm0, mm1, mm2, mm3].into_iter().enumerate() {
+            a.movq(mm, qword_ptr(esi + n * 8)).unwrap();
+            a.por(mm, mm7).unwrap();
+            a.movntq(qword_ptr(edi + n * 8), mm).unwrap();
+        }
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        a.sub(ecx, 8).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut cpu = initial(8 * 70 - 1);
+    cpu.mmx[7] = 0xff00_0000_ff00_0000;
+    let data = vector_data(0x73a2);
+    let mut trial = Trial::new(&image, &cpu, "interleaved qword sign latch", &[], |m| {
+        m.write(DATA, &data).unwrap();
+    });
+    vector_install(&mut trial, cpu, 2);
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_ne!(trial.live.native.as_ref().unwrap().vector_regions(), 0);
+}
+
+// spec: A64-OPT-10
+#[test]
+fn vector_conditional_stores_match_every_ordered_arm_pair() {
+    let image = Image::loop_body(|a, head, _| {
+        let mut done = a.create_label();
+        let mut saturate = a.create_label();
+        let mut copy = a.create_label();
+        a.mov(ebp, dword_ptr(ebx)).unwrap();
+        a.mov(eax, dword_ptr(esi + 4)).unwrap();
+        a.or(eax, dword_ptr(esi)).unwrap();
+        a.movq(mm0, qword_ptr(esi)).unwrap();
+        a.test(eax, eax).unwrap();
+        a.je(done).unwrap();
+        a.cmp(eax, 0x00ff_ffff).unwrap();
+        a.jbe(saturate).unwrap();
+        a.cmp(eax, 0xff00_0000u32).unwrap();
+        a.jae(copy).unwrap();
+        a.movq(mm2, qword_ptr(edi)).unwrap();
+        a.movq(mm3, mm2).unwrap();
+        a.shr(eax, 24).unwrap();
+        a.xor(eax, 255).unwrap();
+        a.movd(mm1, eax).unwrap();
+        a.pshufw(mm1, mm1, 0).unwrap();
+        a.punpcklbw(mm2, mm7).unwrap();
+        a.punpckhbw(mm3, mm7).unwrap();
+        a.pmullw(mm2, mm1).unwrap();
+        a.pmullw(mm3, mm1).unwrap();
+        a.psrlw(mm2, 8).unwrap();
+        a.psrlw(mm3, 8).unwrap();
+        a.packuswb(mm2, mm3).unwrap();
+        a.paddusb(mm0, mm2).unwrap();
+        a.jmp(copy).unwrap();
+        a.set_label(&mut saturate).unwrap();
+        a.paddusb(mm0, qword_ptr(edi)).unwrap();
+        a.set_label(&mut copy).unwrap();
+        a.movq(qword_ptr(edi), mm0).unwrap();
+        a.set_label(&mut done).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jns(head).unwrap();
+    });
+    let mut rng = Rng(1508);
+    let mut data = Vec::new();
+    for _ in 0..8 {
+        for a in [0, 1, 112, 255] {
+            for b in [0, 1, 112, 255] {
+                for alpha in [a, a, b, b] {
+                    let pixel = match alpha {
+                        0 => 0,
+                        1 => 1 | rng.next() as u32 & 0x00ff_ffff,
+                        _ => (alpha << 24) | rng.next() as u32 & 0x00ff_ffff,
+                    };
+                    data.extend(pixel.to_le_bytes());
+                }
+            }
+        }
+    }
+    for in_place in [false, true] {
+        let mut cpu = initial((data.len() / 4 - 1) as u32);
+        cpu.regs[3] = RESULTS;
+        if in_place {
+            cpu.regs[7] = DATA;
+        }
+        let mut trial = Trial::new(
+            &image,
+            &cpu,
+            format!("conditional MMX, in place {in_place}"),
+            &[],
+            |m| {
+                m.write(DATA, &data).unwrap();
+                m.write(OUTPUT, &vector_data(213)).unwrap();
+                m.write(RESULTS, &97u32.to_le_bytes()).unwrap();
+            },
+        );
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        vector_install(&mut trial, cpu, 2);
+        assert_eq!(trial.compare(30000).0, RunOutcome::ReachedStop);
+        let counts = trial.live.native.as_ref().unwrap().span_counts(image.head);
+        assert!(
+            counts[4..].iter().all(|&n| n > 0),
+            "in place {in_place}: {counts:?}"
+        );
+    }
+}
+
+// spec: A64-OPT-10
+#[test]
 fn vector_signed_bound_in_a_frame_cell() {
     let image = Image::loop_body(|a, head, _| {
         a.movzx(eax, byte_ptr(esi)).unwrap();

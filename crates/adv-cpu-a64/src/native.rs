@@ -660,6 +660,17 @@ impl Native {
         self.code.value_counts.get(&pc).copied().unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn span_counts(
+        &self,
+        head: u32,
+    ) -> [u64; crate::translate::lower::resident::COUNTERS] {
+        self.code.version_stats.as_ref().unwrap()[&head]
+            .spans
+            .each_ref()
+            .map(Cell::get)
+    }
+
     pub(crate) fn version_diagnostics(&self) -> Option<String> {
         use std::fmt::Write as _;
         let stats = self.code.version_stats.as_ref()?;
@@ -667,6 +678,18 @@ impl Native {
         entries.sort_unstable_by_key(|(eip, _)| **eip);
         let mut output = String::new();
         for (&eip, stats) in entries {
+            let counts = stats.spans.each_ref().map(Cell::get);
+            if counts.iter().any(|&n| n != 0) {
+                let _ = write!(
+                    output,
+                    " span {eip:#010x}=[entries {}, mmx misses {}, range misses {}, batches {}, ordered classes {:?}]",
+                    counts[0],
+                    counts[1],
+                    counts[2],
+                    counts[3],
+                    &counts[4..]
+                );
+            }
             let versions = self
                 .code
                 .tier1_chain(eip)

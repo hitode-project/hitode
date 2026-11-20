@@ -83,3 +83,25 @@ fn longest(
     paths[b] = Some(best);
     best
 }
+
+/// The cheapest returning path pays for the check and the batch, including
+/// cases where a scalar branch skips all effects.
+pub(super) fn cheapest(func: &Func, costs: &[BlockCost], lp: &super::loops::Loop) -> u32 {
+    let mut work = vec![0; func.blocks.len()];
+    for &block in lp.blocks.iter().rev() {
+        let i = block.0 as usize;
+        work[i] = costs[i].body
+            + if block == lp.latch {
+                costs[i].edges[usize::from(!lp.latch_taken)]
+            } else {
+                func.blocks[i]
+                    .end
+                    .targets()
+                    .enumerate()
+                    .map(|(edge, target)| costs[i].edges[edge] + work[target.block.0 as usize])
+                    .min()
+                    .unwrap()
+            };
+    }
+    work[lp.head.0 as usize]
+}

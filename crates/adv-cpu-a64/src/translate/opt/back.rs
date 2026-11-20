@@ -5,6 +5,8 @@
 //! (A64-OPT-4).
 mod alloc;
 mod batch;
+
+use crate::translate::lower::resident::Counter;
 mod cost;
 mod flags;
 mod inline;
@@ -83,6 +85,7 @@ pub(crate) struct Lowered {
     /// The word job and cold inline exits leave through. Placement binds
     /// it to `opt_exit`.
     pub exit: usize,
+    pub counters: Vec<(u32, Counter, usize)>,
 }
 
 impl Lowered {
@@ -131,12 +134,10 @@ fn lower_form(
     count_entries: bool,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let batches = loops::plan(func, &[&loops::vector::Vector]);
-    let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
+    let mut batches = loops::plan(func, &[&loops::vector::Vector]);
     let mut asm = Asm::new();
-    // A bit test whose target lands out of range is emitted wide, and the
-    // form again, as the ordinary translator does.
-    let (mut e, exit, miss, cold) = loop {
+    let (mut e, exit, miss, cold, spill_cells) = loop {
+        let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
         let (mut e, exit, miss, cold) = emit(
             func,
             &allocation,
@@ -145,12 +146,35 @@ fn lower_form(
             (resident, count_entries),
             &batches,
         );
-        if !e.asm.widen_bit_tests() {
-            break (e, exit, miss, cold);
+        if !e.unpriced.is_empty() {
+            batches.retain(|batch| {
+                let head = batch.loop_.head;
+                if e.unpriced.contains(&head) {
+                    crate::jit_map::loop_reject(
+                        batch.loop_.eip,
+                        format_args!("{:?}", loops::Reject::Cost),
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            asm = Asm::new();
+        } else if e.asm.widen_bit_tests() {
+            asm = e.asm;
+            asm.rewind();
+        } else {
+            break (e, exit, miss, cold, allocation.spill_cells);
         }
-        asm = e.asm;
-        asm.rewind();
     };
+    for batch in &batches {
+        crate::jit_map::vectorized(
+            batch.loop_.eip,
+            batch.plan.name,
+            batch.plan.lanes,
+            batch.loop_.streams.len(),
+        );
+    }
     // A host fault leaves through its region's record like a failed check.
     for (offset, site) in &mut e.sites {
         let cold = e.cold[site.opt_record.expect("optimized site") as usize];
@@ -181,6 +205,11 @@ fn lower_form(
             e.asm.position(p.leave) / 4,
         )
     });
+    let counters = e
+        .counters
+        .iter()
+        .map(|&(head, kind, label)| (head, kind, e.asm.position(label) / 4))
+        .collect();
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -208,7 +237,8 @@ fn lower_form(
         marks: e.marks,
         records,
         flags: e.flags,
-        spill_cells: allocation.spill_cells,
+        spill_cells,
+        counters,
     }
 }
 
@@ -272,6 +302,7 @@ fn emit<'a>(
                 .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
         })
         .flatten();
+    let mmx_miss = (resident && count_entries).then(|| asm.label());
     let mut e = Emitter {
         func,
         asm,
@@ -313,6 +344,13 @@ fn emit<'a>(
         edges: Vec::new(),
         links: Vec::new(),
         transitions: Vec::new(),
+        unpriced: Vec::new(),
+        reciprocals: Vec::new(),
+        reciprocal_division: false,
+        class_prices: Vec::new(),
+        counters: Vec::new(),
+        count_entries,
+        mmx_miss,
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
@@ -340,6 +378,7 @@ fn emit<'a>(
     }
     let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
     let mut head_batch = None;
+    let mut prices = Vec::new();
     for (b, data) in func.blocks.iter().enumerate() {
         if e.through(Block(b as u32)).is_some() {
             continue;
@@ -362,7 +401,11 @@ fn emit<'a>(
             .find(|batch| batch.loop_.head.0 as usize == b)
         {
             let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
-            let words = e.batch(batch, span_search[usize::from(batch.backwards)], backedge);
+            let (words, price) =
+                e.batch(batch, span_search[usize::from(batch.backwards)], backedge);
+            if let Some(price) = price {
+                prices.push((batch, price));
+            }
             if func.head_exit == Some(batch.loop_.head) {
                 head_batch = Some((words, u32::from(batch.plan.lanes)));
             }
@@ -525,6 +568,49 @@ fn emit<'a>(
         e.asm.bind(label);
         e.asm.emit(0);
     }
+    if let Some(label) = e.mmx_miss {
+        e.asm.bind(label);
+        e.count(func.records[first.0 as usize].eip, Counter::MmxMiss);
+        e.asm.b(miss.unwrap());
+    }
+    for &(_, _, label) in &e.counters {
+        e.asm.bind(label);
+        e.asm.emit_all(&[0, 0]);
+    }
+    for (batch, price) in prices {
+        let saved = if price.classes.is_empty() {
+            let scalar = cost::cheapest(func, &costs, &batch.loop_) * u32::from(batch.plan.lanes);
+            scalar.saturating_sub(price.common)
+        } else {
+            price
+                .classes
+                .iter()
+                .map(|class| {
+                    let scalar = class
+                        .first
+                        .iter()
+                        .chain(&class.second)
+                        .map(|(block, edge)| {
+                            let cost = costs[block.0 as usize];
+                            cost.body + cost.edges[*edge]
+                        })
+                        .sum::<u32>();
+                    scalar.saturating_sub(price.common + class.words)
+                })
+                .min()
+                .unwrap()
+        };
+        e.asm.bind(price.label);
+        if saved == 0 {
+            e.unpriced.push(batch.loop_.head);
+        } else {
+            e.asm.emit_all(&[price.admission.div_ceil(saved), 0]);
+        }
+    }
+    for (value, label) in std::mem::take(&mut e.reciprocals) {
+        e.asm.bind(label);
+        e.asm.emit_all(&[value as u32, (value >> 32) as u32]);
+    }
     (e, exit, miss, cold)
 }
 
@@ -576,6 +662,13 @@ struct Emitter<'a> {
     edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
     transitions: Vec<(usize, usize)>,
+    unpriced: Vec<Block>,
+    reciprocals: Vec<(u64, Label)>,
+    reciprocal_division: bool,
+    class_prices: Vec<batch::ClassPrice>,
+    counters: Vec<(u32, Counter, Label)>,
+    count_entries: bool,
+    mmx_miss: Option<Label>,
 }
 
 impl CheckedEmitter for Emitter<'_> {
@@ -602,9 +695,20 @@ impl<'a> Emitter<'a> {
         ((self.asm.offset() - start) / 4) as u32
     }
 
+    fn count(&mut self, head: u32, counter: Counter) {
+        if self.count_entries {
+            let address = self.asm.label();
+            self.counters.push((head, counter, address));
+            self.asm.ldr_literal(U, address);
+            self.asm
+                .emit_all(&[ldr(X, T, U, 0), add_imm(X, T, T, 1, false), str(X, T, U, 0)]);
+        }
+    }
+
     fn begin_body(&mut self, record: RecordId, count_entries: bool) {
         let start = self.asm.offset();
         if count_entries {
+            self.count(self.func.records[record.0 as usize].eip, Counter::Entry);
             let entries = offset_of!(Runtime, resident_entry_counter) as u32;
             self.asm.emit_all(&[
                 ldr(X, U, RT, entries),
