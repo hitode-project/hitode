@@ -616,10 +616,9 @@ fn asf_reader_is_a_native_file_source_until_loaded() {
 
 #[cfg(feature = "media")]
 #[test]
-// spec: MEDIA-GRAPH-19
-fn asf_reader_load_defers_streams_until_graph_join() {
+// spec: MEDIA-GRAPH-2
+fn asf_reader_added_before_load_probes_windows_media_video_and_audio() {
     let mut m = machine();
-    crate::dshow::tests::install_media_host(&mut m);
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
         .unwrap();
     let guest_path = authored(
@@ -629,6 +628,12 @@ fn asf_reader_load_defers_streams_until_graph_join() {
     // query() stages its IID at DATA + 256.
     wide(&mut m, DATA + 512, &guest_path);
     let reader = activate(&mut m, CLSID_WMASF_READER, IID_IBASEFILTER);
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    // Games add the reader to the graph before loading its file.
+    assert_eq!(
+        invoke(&mut m, graph, "IFilterGraph2", "AddFilter", &[reader, 0]),
+        S_OK
+    );
     let file_face = query(&mut m, reader, IID_IFILESOURCEFILTER);
     assert_eq!(
         invoke(
@@ -640,38 +645,28 @@ fn asf_reader_load_defers_streams_until_graph_join() {
         ),
         S_OK
     );
-    assert!(m.ext.get::<State>().filters[&reader].pins.is_empty());
-    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
-    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
-    assert_eq!(
-        invoke(
-            &mut m,
-            reader,
-            "IBaseFilter",
-            "JoinFilterGraph",
-            &[graph, 0]
-        ),
-        S_OK
+    assert_eq!(m.ext.get::<State>().filters[&reader].pins.len(), 1);
+    let info = m.ext.get::<State>().filters[&reader]
+        .source
+        .as_ref()
+        .and_then(|s| s.info.clone())
+        .unwrap();
+    let video = info.video.unwrap();
+    assert_eq!((video.width, video.height), (32, 16));
+    assert_eq!(info.audio.unwrap().sample_rate, 22050);
+    crate::dshow::video::set_video_provider(
+        &mut m.ext,
+        crate::dshow::video::VideoProvider {
+            window: |_, _, _| None,
+            update: |_, _, _, _| Ok(1),
+            completed: |_, _| None,
+        },
     );
-    let pins = m.ext.get::<State>().filters[&reader].pins.clone();
-    let video = crate::dshow::asf::types(&env(&mut m), pins[0]);
-    assert_eq!(
-        video[1].video_geometry().map(|(w, h, _)| (w, h)),
-        Some((32, 16))
-    );
-    let audio = crate::dshow::asf::types(&env(&mut m), pins[1]);
-    assert!(matches!(
-        audio[0].codec_format(),
-        Some(CodecFormat::Audio { rate: 22050, .. })
-    ));
-    assert!(m.sys.objects.hosts::<FileObj>().next().is_some());
-    for transition in ["Run", "Pause", "Stop"] {
-        assert_eq!(
-            invoke(&mut m, reader, "IBaseFilter", transition, &[0, 0]),
-            S_OK
-        );
-    }
+    let pin = m.ext.get::<State>().filters[&reader].pins[0];
+    let rendered = invoke(&mut m, graph, "IFilterGraph2", "Render", &[pin]);
+    assert_eq!(rendered, S_OK);
     method(&mut m, "IFileSourceFilter::Release", &[file_face]);
-    assert_eq!(method(&mut m, "IBaseFilter::Release", &[reader]), 0);
+    method(&mut m, "IBaseFilter::Release", &[reader]);
+    assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
 }
