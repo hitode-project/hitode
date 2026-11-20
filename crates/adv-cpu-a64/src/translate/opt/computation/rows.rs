@@ -236,6 +236,13 @@ impl Domain {
         self.direct_calls * 8
     }
 
+    pub(crate) fn count_register(&self) -> Option<u8> {
+        match self.exprs[self.rows] {
+            Expr::Register(reg) => Some(reg),
+            _ => None,
+        }
+    }
+
     /// Entry code owns its scratch. A failed guard leaves with the original
     /// Tier-1 assignment, including the incoming flags.
     pub(crate) fn emit(
@@ -262,10 +269,7 @@ impl Domain {
             range_cold: 0,
         };
         let frame = self.frame;
-        let count_register = match self.exprs[self.rows] {
-            Expr::Register(reg) => Some(guest(reg)),
-            _ => None,
-        };
+        let count_register = self.count_register().map(guest);
         if let Some(reg) = count_register {
             emit.asm.ldr_literal(B, minimum.0);
             emit.asm.emit(mov(W, A, reg));

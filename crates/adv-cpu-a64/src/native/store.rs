@@ -555,25 +555,42 @@ impl<R> CodeStore<R> {
         true
     }
 
-    pub(super) fn publish_row_targets(&mut self, eip: u32) -> bool {
-        let arrivals = self.version_stats.as_ref().and_then(|stats| {
-            stats
-                .get(&eip)
-                .map(|stats| &stats.spans[Counter::RowArrival.index()])
+    pub(super) fn publish_row_targets(&mut self, eip: u32, observed: &[u32]) -> bool {
+        let counters = self.version_stats.as_ref().and_then(|stats| {
+            stats.get(&eip).map(|stats| {
+                [Counter::RowArrival, Counter::RowShort]
+                    .map(|kind| stats.spans[kind.index()].as_ptr() as u64)
+            })
         });
         let site = self.chains[&eip].resident.as_ref().unwrap();
         let Some(slot) = site.versions.first().and_then(|v| v.row_target) else {
             return true;
         };
-        let cases: Vec<_> = site
+        let mut cases: Vec<_> = site
             .versions
             .iter()
             .map(|v| {
                 let target = v.row_target.expect("each case has the same slot");
                 debug_assert_eq!((slot.base, slot.offset), (target.base, target.offset));
-                (target.value, v.entry)
+                (target.value, Some(v.entry))
             })
             .collect();
+        for &target in observed {
+            if cases.iter().all(|&(installed, _)| installed != target) {
+                cases.push((target, None));
+            }
+        }
+        let minimum = site.versions[0].row_price.and_then(|first| {
+            let reg = first.count_register?;
+            let minimum = site
+                .versions
+                .iter()
+                .try_fold(first.minimum(), |min, version| {
+                    let price = version.row_price?;
+                    (price.count_register == Some(reg)).then(|| min.min(price.minimum()))
+                })?;
+            Some((reg, minimum))
+        });
         let fallback = site.versions[0].cold;
         let at = self.cache.next();
         let words = ingress::row_entry(
@@ -581,7 +598,9 @@ impl<R> CodeStore<R> {
             (slot.base, slot.offset),
             &cases,
             (at, fallback, self.stubs.exit),
-            (site.row_feedback.as_deref().unwrap(), arrivals),
+            site.row_feedback.as_deref().unwrap(),
+            minimum,
+            counters,
         );
         let Some(addr) = self.cache.append(&words) else {
             return false;

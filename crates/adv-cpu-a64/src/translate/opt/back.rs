@@ -189,7 +189,7 @@ fn lower_form(
             (
                 resident,
                 count_entries,
-                domain.filter(|(domain, _)| !batches.is_empty() || domain.call_savings() != 0),
+                domain.filter(|_| !batches.is_empty()),
             ),
             &batches,
             scope_access,
@@ -692,19 +692,22 @@ fn emit<'a>(
     if let Some(((rows, inner), words)) = e.row_budget {
         // A range proven at the row entry removes at least the first-leaf
         // hit of every covered stream on each row with an inner strip.
+        let domain = e.domain.unwrap().0;
         let saved = batches
             .iter()
             .map(|batch| batch.spans.len() as u32 * 8)
             .min()
-            .unwrap_or(0)
-            + e.domain.unwrap().0.call_savings();
-        let saved = saved - 2;
-        e.row_price = Some(crate::translate::lower::resident::RowPrice {
+            .unwrap()
+            + domain.call_savings()
+            - 2;
+        let price = crate::translate::lower::resident::RowPrice {
             guard: words,
             saved,
-        });
+            count_register: domain.count_register(),
+        };
+        e.row_price = Some(price);
         e.asm.bind(rows);
-        e.asm.emit_all(&[words.div_ceil(saved), 0]);
+        e.asm.emit_all(&[price.minimum(), 0]);
         e.asm.bind(inner);
         e.asm.emit_all(&[min_inner, 0]);
     }

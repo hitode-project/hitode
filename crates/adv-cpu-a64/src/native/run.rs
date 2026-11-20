@@ -1239,12 +1239,18 @@ impl Native {
                         .then_some(Decline::CacheFull),
                     Err(reject) => Some(Decline::Compile(reject)),
                 };
-                if matches!(
-                    done.task,
-                    compile::Task::Discover | compile::Task::Replace(_)
-                ) && let Some(reason) = decline
-                {
-                    self.decline_resident(eip, reason);
+                if let Some(reason) = decline {
+                    if done.task == compile::Task::Append {
+                        let observed = &self.plans.resident(eip).unwrap().row_targets;
+                        if !observed.is_empty() && self.code.publish_row_targets(eip, observed) {
+                            self.repoint_resident_edges(
+                                eip,
+                                self.code.resident(eip).unwrap().entry(),
+                            );
+                        }
+                    } else {
+                        self.decline_resident(eip, reason);
+                    }
                 }
             }
             self.rebuild_resident(eip);
@@ -1340,7 +1346,7 @@ impl Native {
             if !head.row_targets.contains(&target.value) {
                 head.row_targets.push(target.value);
             }
-            if !self.code.publish_row_targets(eip) {
+            if !self.code.publish_row_targets(eip, &head.row_targets) {
                 return false;
             }
         } else {

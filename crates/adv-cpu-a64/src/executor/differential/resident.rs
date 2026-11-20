@@ -1986,15 +1986,15 @@ fn row_domain_guards_return_to_tier1_on_target_mismatch() {
                     a.jns(inner).unwrap();
                 } else {
                     let mut test = a.create_label();
-                    a.mov(ecx, 16).unwrap();
+                    a.mov(ecx, 8).unwrap();
                     a.test(ecx, ecx).unwrap();
                     a.jmp(test).unwrap();
                     a.set_label(&mut inner).unwrap();
-                    a.movd(mm0, dword_ptr(esi)).unwrap();
+                    a.movq(mm0, qword_ptr(esi)).unwrap();
                     a.por(mm0, mm6).unwrap();
-                    a.movd(dword_ptr(edi), mm0).unwrap();
-                    a.add(esi, 4).unwrap();
-                    a.add(edi, 4).unwrap();
+                    a.movntq(qword_ptr(edi), mm0).unwrap();
+                    a.add(esi, 8).unwrap();
+                    a.add(edi, 8).unwrap();
                     a.dec(ecx).unwrap();
                     a.set_label(&mut test).unwrap();
                     a.jne(inner).unwrap();
@@ -2154,8 +2154,9 @@ fn row_domain_clips_at_a_denied_page_in_both_directions() {
 // spec: A64-OPT-8, A64-OPT-9
 #[test]
 fn failing_row_proof_is_withdrawn_with_diagnostics_off() {
-    const SLOT: u32 = DATA + 0x3000;
-    let mut targets = [0; 2];
+    const SLOT: u32 = DATA + 0xc000;
+    const SOURCE: u32 = DATA + 0x8000;
+    let mut target = 0;
     let image = Image::assemble(
         |a, head, _| {
             a.call(dword_ptr(ebx)).unwrap();
@@ -2164,9 +2165,9 @@ fn failing_row_proof_is_withdrawn_with_diagnostics_off() {
         },
         |a| {
             a.nop().unwrap();
-            targets[0] = a.instructions().len();
+            target = a.instructions().len();
             let mut inner = a.create_label();
-            a.mov(ecx, 12).unwrap();
+            a.mov(ecx, 8).unwrap();
             a.set_label(&mut inner).unwrap();
             a.movq(mm0, qword_ptr(esi)).unwrap();
             a.por(mm0, mm7).unwrap();
@@ -2175,8 +2176,6 @@ fn failing_row_proof_is_withdrawn_with_diagnostics_off() {
             a.add(edi, 8).unwrap();
             a.dec(ecx).unwrap();
             a.jne(inner).unwrap();
-            a.ret().unwrap();
-            targets[1] = a.instructions().len();
             a.ret().unwrap();
         },
     );
@@ -2188,22 +2187,19 @@ fn failing_row_proof_is_withdrawn_with_diagnostics_off() {
     state.eip = image.head;
     state.regs[2] = 200;
     state.regs[3] = SLOT;
+    state.regs[6] = SOURCE;
+    state.regs[7] = DATA;
     let mut trial = Trial::new(&image, &state, "row backoff", &[], |m| {
-        m.write(SLOT, &locations[targets[0]].to_le_bytes()).unwrap();
+        m.map(SLOT, HOST_PAGE, READ | WRITE).unwrap();
+        m.write(SLOT, &locations[target].to_le_bytes()).unwrap();
+        m.map_shared_audio(SOURCE, HOST_PAGE).unwrap();
     });
     assert!(trial.try_install_at(state.clone()));
-    for executor in [&mut trial.live, &mut trial.reference] {
-        executor
-            .memory
-            .write(SLOT, &locations[targets[1]].to_le_bytes())
-            .unwrap();
-    }
-    assert_eq!(trial.compare(4000).0, RunOutcome::ReachedStop);
-    trial.live.native.as_mut().unwrap().wait_resident_builds();
+    assert_eq!(trial.compare(30_000).0, RunOutcome::ReachedStop);
     for executor in [&mut trial.live, &mut trial.reference] {
         executor.state = state.clone();
     }
-    assert_eq!(trial.compare(4000).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.compare(30_000).0, RunOutcome::ReachedStop);
     assert!(
         trial
             .live
