@@ -178,7 +178,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-1 Pull delivery
 
-**Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest sample delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
+**Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, RGB555, or PCM with guest renderers and host allocators. Guest delivery MUST use graph time on dedicated guest threads, one per guest audio renderer, feeding it paused or running with EndOfStream after its samples. Host-rendered audio MUST enter the shared mixer, and rewinding MUST restart decoding at the first packet of every container.
 **Verification**: Test
 
 ### MEDIA-STREAM-2 Rejected push
