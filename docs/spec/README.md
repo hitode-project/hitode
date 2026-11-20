@@ -49,6 +49,7 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `frame` | When true, the last presented frame's hash is compared too. |
 | `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. |
 | `levels` | Report counters compared by their final value, such as `peak_rss`, the build's peak resident memory. |
+| `gpu` | When true, the scenario pins behavior of the target GPUs. CI runners lack them, so CI skips it by name; run it with `--gpu` on a target device when a change touches the GPU path. |
 
 The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In CI, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
 

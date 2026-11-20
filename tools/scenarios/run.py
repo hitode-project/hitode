@@ -41,10 +41,15 @@ STEADY_SLACK = (0.01, 0.05)
 COUNTER = re.compile(r"\b(\w+): (\d+)\b")
 
 
-def load(tree: Path) -> dict[str, dict]:
+def load(tree: Path, gpu: bool = False) -> dict[str, dict]:
+    """Scenarios of a tree. GPU scenarios load only on request: they pin
+    behavior of the target GPUs, which hosted CI runners do not have."""
     found = {}
     for spec in sorted((tree / SCENARIOS).glob("*/scenario.json")):
         scenario = json.loads(spec.read_text())
+        if scenario.get("gpu") and not gpu:
+            print(f"skip  {spec.parent.name}: needs a target GPU (run with --gpu)")
+            continue
         scenario["dir"] = spec.parent
         scenario["digest"] = digest(spec.parent)
         found[spec.parent.name] = scenario
@@ -205,7 +210,7 @@ def unknown_specs(tree: Path, scenarios: dict[str, dict]) -> list[str]:
 
 
 def gate(args: argparse.Namespace) -> int:
-    base, head = load(args.base_tree), load(args.head_tree)
+    base, head = load(args.base_tree, args.gpu), load(args.head_tree, args.gpu)
     if errors := unknown_specs(args.head_tree, head):
         for error in errors:
             print(f"FAIL  {error}")
@@ -237,17 +242,19 @@ def main(argv: list[str]) -> int:
     one.add_argument("--wine", type=Path, required=True)
     one.add_argument("--tree", type=Path, default=Path("."))
     one.add_argument("--out", type=Path)
+    one.add_argument("--gpu", action="store_true", help="also run scenarios that need a target GPU")
     one.add_argument("names", nargs="*")
     both = commands.add_parser("gate")
     for flag in ("--base-tree", "--base-bin", "--head-tree", "--head-bin", "--wine"):
         both.add_argument(flag, type=Path, required=True)
     both.add_argument("--out", type=Path)
+    both.add_argument("--gpu", action="store_true", help="also judge scenarios that need a target GPU")
     args = parser.parse_args(argv)
     if shutil.which(probes.COMPILER) is None:
         sys.exit(f"{probes.COMPILER} is not on PATH (docs/building.md)")
     if args.command == "gate":
         return gate(args)
-    scenarios = load(args.tree)
+    scenarios = load(args.tree, args.gpu)
     if args.names:
         scenarios = {n: scenarios[n] for n in args.names}
     results = run_all(scenarios, args.adv_run, args.wine)
