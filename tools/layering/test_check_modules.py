@@ -41,10 +41,10 @@ class ModuleDependenciesTest(unittest.TestCase):
     # spec: A64A-DEP-1
     def test_optimized_and_tier1_lowerings_cannot_use_each_other(self):
         self.assertEqual(violations({
-            "translate/mod.rs": "use self::opt::analyze;",
-            "translate/opt/mod.rs": "use super::Translator;",
+            "translate/jit/mod.rs": "use super::opt::analyze;",
+            "translate/opt/mod.rs": "use super::jit::Translator;",
         }, set()), [
-            "translate/mod.rs:1: translate::jit -> translate::opt: disallowed",
+            "translate/jit/mod.rs:1: translate::jit -> translate::opt: disallowed",
             "translate/opt/mod.rs:1: translate::opt -> translate::jit: disallowed",
         ])
 
@@ -54,16 +54,16 @@ class ModuleDependenciesTest(unittest.TestCase):
             "lib.rs": "#[cfg(test)] mod helpers;",
             "helpers.rs": "use super::*;",
             "translate/mod.rs": "",
-            "translate/ops.rs": """
+            "translate/jit/ops.rs": """
 #[cfg(all(test, native))] mod differential { use super::*; }
 #[test] fn unit_test() { use super::*; }
-#[cfg(any(test, native))] use crate::translate::{*};
+#[cfg(any(test, native))] use crate::translate::jit::{*};
 use crate::encode::*;
 """,
             "encode.rs": "",
         }
         self.assertEqual(violations(sources, set()), [
-            "translate/ops.rs:4: translate::jit -> parent glob crate::translate::*: disallowed",
+            "translate/jit/ops.rs:4: translate::jit -> parent glob crate::translate::jit::*: disallowed",
         ])
 
     # spec: A64A-DEP-1
@@ -71,14 +71,14 @@ use crate::encode::*;
         self.assertEqual(violations({
             "executor.rs": "use adv_cpu_core::interpreter::Interpreter;",
             "native/offload.rs": "use adv_cpu_core::interpreter as interp;",
-            "translate/simd.rs": """
+            "translate/jit/simd.rs": """
 use adv_cpu_core::{Memory, interpreter::Step};
 fn lower(insn: ::iced_x86::Instruction) {}
 """,
             "translate/front/decode.rs": "fn decode() { iced_x86::Decoder::new(); }",
         }, set()), [
-            "translate/simd.rs:2: translate::jit -> adv_cpu_core::interpreter: disallowed",
-            "translate/simd.rs:3: translate::jit -> iced_x86: disallowed",
+            "translate/jit/simd.rs:2: translate::jit -> adv_cpu_core::interpreter: disallowed",
+            "translate/jit/simd.rs:3: translate::jit -> iced_x86: disallowed",
         ])
 
     # spec: A64A-DEP-1
@@ -112,19 +112,19 @@ const TEXT: &str = r#"use super::*; iced_x86::Decoder"#;
 
     # spec: A64A-DEP-1
     def test_interpreter_form_exception_expires_with_the_call(self):
-        allowed = {("translate/simd.rs", "interpreter form sse-mxcsr")}
-        sources = {"translate/simd.rs": """
+        allowed = {("translate/jit/simd.rs", "interpreter form sse-mxcsr")}
+        sources = {"translate/jit/simd.rs": """
 fn floating() {
     self.helper_for(index, cause); // transitional interpreter form: sse-mxcsr
 }
 """}
         self.assertEqual(violations(sources, allowed), [])
         self.assertEqual(violations(sources, set()), [
-            "translate/simd.rs:3: translate::jit -> interpreter form sse-mxcsr: disallowed",
+            "translate/jit/simd.rs:3: translate::jit -> interpreter form sse-mxcsr: disallowed",
         ])
-        sources["translate/simd.rs"] = ""
+        sources["translate/jit/simd.rs"] = ""
         self.assertEqual(violations(sources, allowed), [
-            "translate/simd.rs -> interpreter form sse-mxcsr: transitional edge is gone; drop it",
+            "translate/jit/simd.rs -> interpreter form sse-mxcsr: transitional edge is gone; drop it",
         ])
 
 

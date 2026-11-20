@@ -1,6 +1,6 @@
 //! Translated execution on AArch64 hosts.
 //!
-//! Units come from `translate`. A dispatch does not leave translated code: the
+//! Tier-1 units come from `translate::jit`. A dispatch does not leave translated code: the
 //! `dispatch` stub calls `dispatch`, which finds or translates the target
 //! unit and, for a static target, patches the link point into a direct
 //! branch, so hot paths chain without even that call. Each unit's safepoint
@@ -44,15 +44,20 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use adv_cpu_core::CpuState;
 use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::memory::accessible;
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
-use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
-use crate::runtime::{self, Enter, Exit, ResidentCold, Runtime};
-use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
+use crate::runtime::{self, Enter, Exit, ResidentCold, Runtime, alias_base};
+use crate::translate::front::{self, Unit, trace::Redirect};
+use crate::translate::jit::Features;
+use crate::translate::lower::Stubs;
+use crate::translate::opt;
+
+use store::{FaultCapture, Faults, InterpreterCause, ShadowStack, on_fault};
 
 pub(crate) mod compile;
 mod head;
@@ -82,10 +87,6 @@ const CACHE_LEN: usize = 64 << 20;
 /// deadlines and interrupts while linked units loop.
 pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
 pub(crate) use plan::PROMOTION;
-
-fn alias_base(memory: &Memory) -> u64 {
-    (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64
-}
 
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
@@ -119,204 +120,6 @@ pub(crate) enum Checks {
     Slow,
 }
 
-/// What the signal handler may read while translated code runs.
-struct Faults {
-    /// Executable range of translated code.
-    start: usize,
-    end: Cell<usize>,
-    /// Host PC of each site, ascending: units are appended in address
-    /// order, and their sites in emission order.
-    sites: Vec<(usize, Site)>,
-    stub: usize,
-    capture: FaultCapture,
-    /// The shadow stack's guard pages.
-    guard: (usize, usize),
-    /// Where an overflow resumes, and the runtime field it reads the
-    /// faulting PC from.
-    reset: usize,
-    resume: *mut u64,
-}
-
-#[derive(Default)]
-struct FaultCapture {
-    /// The site that faulted, written in signal context.
-    pc: Cell<usize>,
-    /// v8-v23 captured before the fault stub restores host SIMD.
-    registers: Cell<runtime::FaultRegisters>,
-}
-
-fn site_at(sites: &[(usize, Site)], pc: usize) -> Option<Site> {
-    let index = sites.binary_search_by_key(&pc, |&(at, _)| at).ok()?;
-    Some(sites[index].1)
-}
-
-impl Faults {
-    fn site(&self, pc: usize) -> Option<Site> {
-        site_at(&self.sites, pc)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Active {
-    None,
-    Owner(*const Faults),
-    Worker(*const offload::Faults<'static>),
-}
-
-thread_local! {
-    /// The `Faults` of the code this thread is running, or null.
-    static ACTIVE: Cell<Active> = const { Cell::new(Active::None) };
-}
-
-impl FaultCapture {
-    fn record(
-        &self,
-        site: Site,
-        pc: usize,
-        stub: usize,
-        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
-    ) -> usize {
-        self.registers.set(runtime::FaultRegisters {
-            simd: std::array::from_fn(|n| snapshot.simd[8 + n]),
-            temps: [snapshot.gpr[7], snapshot.gpr[8]],
-        });
-        self.pc.set(pc);
-        if site.resume != 0 {
-            // The unit publishes its cached x87 state, then faults.
-            pc.wrapping_add_signed(site.resume as isize)
-        } else {
-            stub
-        }
-    }
-
-    fn recover(&self, cpu: &mut CpuState, site: Site) {
-        let registers = self.registers.get();
-        recover(cpu, site, registers.temps);
-        for (n, bytes) in registers.simd.into_iter().enumerate() {
-            if site.simd_dirty & (1 << n) == 0 {
-                continue;
-            }
-            if n < 8 {
-                let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                cpu.mmx[n] = value;
-                cpu.x87.regs[n] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
-            } else {
-                cpu.xmm[n - 8] = bytes;
-            }
-        }
-    }
-}
-
-/// Runs in signal context: no allocation, no locks.
-unsafe fn on_fault(
-    pc: usize,
-    address: usize,
-    snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
-) -> usize {
-    ACTIVE
-        .try_with(|slot| {
-            let faults = match slot.get() {
-                Active::None => return 0,
-                Active::Worker(faults) => {
-                    // SAFETY: the worker keeps its private capture and unit
-                    // side table alive while its entry is active on this thread.
-                    let faults = unsafe { &*faults };
-                    return faults.record(pc, snapshot);
-                }
-                Active::Owner(faults) => faults,
-            };
-            // SAFETY: `run` keeps the pointee alive and unmodified, apart
-            // from the fault capture cells, until it clears the slot.
-            let faults = unsafe { &*faults };
-            if !(faults.start..faults.end.get()).contains(&pc) {
-                return 0;
-            }
-            if (faults.guard.0..faults.guard.1).contains(&address) {
-                // A shadow push overflowed: empty the stack and retry it.
-                // SAFETY: the runtime outlives the run, and translated code
-                // is stopped here.
-                unsafe { faults.resume.write(pc as u64) };
-                return faults.reset;
-            }
-            let Some(site) = faults.site(pc) else {
-                return 0;
-            };
-            faults.capture.record(site, pc, faults.stub, snapshot)
-        })
-        .unwrap_or(0)
-}
-
-/// The shadow return stack: entries of {host continuation, guest EIP}
-/// growing down from sentinels that never match, over guard pages.
-struct ShadowStack {
-    base: *mut libc::c_void,
-    len: usize,
-    guard: usize,
-}
-
-impl ShadowStack {
-    const ENTRIES: usize = 1 << 16;
-
-    fn new() -> Result<Self, String> {
-        // SAFETY: sysconf has no preconditions.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let guard = page.max(16 << 10);
-        let len = guard + (Self::ENTRIES + runtime::SHADOW_SENTINELS) * 16;
-        let len = len.next_multiple_of(page);
-        // SAFETY: a fresh anonymous mapping.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err("cannot map the shadow stack".into());
-        }
-        let stack = Self { base, len, guard };
-        // SAFETY: inside the mapping just made.
-        let protected = unsafe {
-            libc::mprotect(
-                base.cast::<u8>().add(guard).cast(),
-                len - guard,
-                libc::PROT_READ | libc::PROT_WRITE,
-            )
-        };
-        if protected != 0 {
-            return Err("cannot protect the shadow stack".into());
-        }
-        let top = stack.top() as *mut u64;
-        for k in 0..runtime::SHADOW_SENTINELS {
-            // SAFETY: the sentinels are the last entries of the mapping.
-            unsafe {
-                top.add(2 * k).write(0);
-                top.add(2 * k + 1).write(u64::MAX);
-            }
-        }
-        Ok(stack)
-    }
-
-    /// The empty stack pointer, just below the sentinels.
-    fn top(&self) -> u64 {
-        (self.base as usize + self.len - runtime::SHADOW_SENTINELS * 16) as u64
-    }
-
-    fn guard(&self) -> (usize, usize) {
-        (self.base as usize, self.base as usize + self.guard)
-    }
-}
-
-impl Drop for ShadowStack {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `new` made.
-        unsafe { libc::munmap(self.base, self.len) };
-    }
-}
-
 /// Host features from the OS.
 fn features() -> Features {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -346,18 +149,6 @@ fn features() -> Features {
             flagm: found && value != 0,
         }
     }
-}
-
-/// Observed results of the existing interpreter event path.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum InterpreterCause {
-    HostFault,
-    DebugFlags,
-    System,
-    Fetch,
-    InvalidEncoding,
-    OperandFault,
-    Trap(u8),
 }
 
 /// One trip through translated code.
@@ -478,20 +269,6 @@ unsafe extern "C" fn plan_observation(
     });
     native.stop_counting(eip);
     0
-}
-
-fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
-    if branch != 0 {
-        cpu.last_indirect_branch = IndirectBranch {
-            source: branch as u32,
-            target,
-            kind: match branch >> 32 {
-                1 => IndirectBranchKind::Call,
-                2 => IndirectBranchKind::Jump,
-                _ => IndirectBranchKind::Return,
-            },
-        };
-    }
 }
 
 /// Performs the checked access. Refusal records the fault site and returns
@@ -795,8 +572,8 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 
 pub(crate) struct Native {
     code: store::CodeStore,
-    decodes: translate::front::Decodes,
-    front_units: FxHashMap<u32, translate::front::Site>,
+    decodes: front::Decodes,
+    front_units: FxHashMap<u32, front::Site>,
     plans: plan::Arbiter,
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     bridge: *mut std::ffi::c_void,
@@ -827,6 +604,7 @@ pub(crate) struct Native {
     /// split (A64-TR-9).
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     offload: offload::Offload,
+    worker_jobs: FxHashMap<u32, plan::WorkerJob>,
     resident_params: Vec<u128>,
     /// Where `opt_exit` saves an inline form's spill cells.
     inline_saved: Vec<u128>,
@@ -951,9 +729,9 @@ impl Native {
 
         let mut stubs = stubs::stubs();
         let access_entry = stubs.code.len() * 4;
-        stubs.code.extend(translate::opt::back::access_stub(
-            resident_access as *const () as u64,
-        ));
+        stubs
+            .code
+            .extend(opt::back::access_stub(resident_access as *const () as u64));
         let base = cache.append(&stubs.code).ok_or("stubs do not fit")?;
         crate::jit_map::record_stubs(
             base,
@@ -975,7 +753,7 @@ impl Native {
             ],
         );
         // SAFETY: `enter` and `opt_enter` follow the C calling convention with
-        // the signature of `Enter`; see `runtime::emit_enter` and `emit_opt_enter`.
+        // the signature of `Enter`; see the entry emitters in `translate::lower::stubs`.
         let enter = Enter(base + stubs.enter);
         let opt_enter = Enter(base + stubs.opt_enter);
         let mut table = empty_table();
@@ -987,7 +765,7 @@ impl Native {
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
         Ok(Self {
-            decodes: translate::front::Decodes::default(),
+            decodes: front::Decodes::default(),
             front_units: FxHashMap::default(),
             code: store::CodeStore {
                 resident_exit: base + stubs.resident_exit,
@@ -1062,6 +840,7 @@ impl Native {
             count_resident_entries: crate::jit_map::enabled(),
             pace: std::cell::Cell::new(None),
             offload: offload::Offload::default(),
+            worker_jobs: FxHashMap::default(),
             resident_params: Vec::new(),
             inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
@@ -1086,7 +865,7 @@ impl Native {
         self.runtime.spin_yield = u32::from(enabled);
     }
 
-    pub(crate) fn translation_decodes(&self) -> translate::front::DecodeCounts {
+    pub(crate) fn translation_decodes(&self) -> front::DecodeCounts {
         self.decodes.counts
     }
 
@@ -1153,6 +932,56 @@ impl Native {
         self.plans.checked_count()
     }
 
+    fn front_unit(
+        &mut self,
+        memory: &mut Memory,
+        eip: u32,
+        loops: bool,
+        summarize: bool,
+    ) -> Arc<Unit> {
+        let site = self.front_units.entry(eip).or_default();
+        let shape = if loops { &mut site.hot } else { &mut site.cold };
+        let unit = shape.get_or_insert_with(|| {
+            let handler = if self.bridge.is_null() {
+                None
+            } else {
+                // SAFETY: preparation stays within this owner's bridge call.
+                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()
+            };
+            let mut unit = Unit::default();
+            unit.images.clone_from(&self.images.borrow());
+            unit.build_cached(
+                memory,
+                eip,
+                &self.stops,
+                &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
+                &|pc| {
+                    let handler = handler?;
+                    let (target, original) = handler.redirect(pc)?;
+                    Some(Redirect {
+                        target,
+                        original: original.to_vec(),
+                        checks: handler.redirect_checks(pc).to_vec(),
+                        body: handler.direct_body(pc),
+                    })
+                },
+                loops,
+                &mut self.decodes,
+            );
+            unit.prepare_regions(memory, &|pc, code| {
+                handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
+            });
+            self.code.watch_pages(eip, unit.code());
+            Arc::new(unit)
+        });
+        if summarize && unit.trace.x86.is_empty() {
+            Arc::make_mut(unit).summarize(&mut self.decodes);
+        }
+        Arc::clone(unit)
+    }
+
     fn classify(&mut self, memory: &mut Memory) {
         if self.classified_epoch == Some(memory.epoch) {
             return;
@@ -1191,46 +1020,15 @@ impl Native {
     }
 }
 
-/// Rebuilds the x86 flags at a fault site, where the exit stub assumed
-/// subtraction sense and canonical PF/AF sources.
-fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
-    cpu.eip = site.eip;
-    let regs = cpu.regs;
-    let value = |operand| match operand {
-        Operand::Guest(index) => regs[usize::from(index)],
-        Operand::Temp(index) => temps[usize::from(index)] as u32,
-        Operand::Imm(value) => value,
-    };
-    if let Some(result) = site.nz {
-        let result = value(result);
-        cpu.eflags = cpu.eflags & !0xc0 | u32::from(result == 0) << 6 | (result >> 24 & 0x80);
-    }
-    if let Some(overflow) = site.overflow.evaluate(value) {
-        cpu.eflags = cpu.eflags & !0x800 | u32::from(overflow) << 11;
-    }
-    match site.carry.evaluate(value) {
-        Some(cf) => cpu.eflags = cpu.eflags & !1 | u32::from(cf),
-        None if site.sense == Sense::Addition => cpu.eflags ^= 1,
-        None => {}
-    }
-    if let Some((parity, adjust)) = site.recipe.evaluate(value) {
-        let pf = u32::from((parity as u8).count_ones().is_multiple_of(2));
-        cpu.eflags = cpu.eflags & !0x04 | pf << 2;
-        if let Some(adjust) = adjust {
-            cpu.eflags = cpu.eflags & !0x10 | adjust & 0x10;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use adv_cpu_core::memory::Memory;
 
-    use super::store::Linked;
+    use super::store::{Linked, recover};
     use super::*;
     use crate::encode::Size::{W, X};
     use crate::encode::{Reg, b, ldr, ldr_reg, ldur, movk, movz, sub_imm};
-    use crate::translate::{Carry, Recipe};
+    use crate::translate::{self, Carry, Operand, Recipe, Sense, Site};
 
     const X19: Reg = Reg::new(19);
     const X23: Reg = Reg::new(23);
@@ -1651,7 +1449,7 @@ mod tests {
         state.regs[6] = DATA;
         let run = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((state.eip, run.retired), (stop, 2 + 3 * (plan::HOT + 1)));
-        assert!(!native.offload.contains(HEAD));
+        assert!(!native.worker_jobs.contains_key(&HEAD));
         let head = native.plans.resident(HEAD).unwrap();
         let edge = &native.code.internal_edges[&HEAD][0];
         assert_eq!(head.versions.len(), 1);
@@ -1952,7 +1750,7 @@ mod tests {
             assert_eq!(native.plans.resident(eip).unwrap().versions.len(), 1);
         }
         assert!(!native.plans.resident(stale).is_some());
-        assert!(!native.offload.contains(stale));
+        assert!(!native.worker_jobs.contains_key(&stale));
     }
 
     // spec: A64-OPT-8, A64-OPT-9

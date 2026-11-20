@@ -34,6 +34,8 @@ RULES["native::run"] = set(RULES) - {"cpu"}
 RULES["executor"] = RULES["native::run"]
 # lib.rs exposes the crate's public entry points.
 RULES["lib"] = {"cache", "cpu", "executor"}
+# The translation root exposes its public types from their owning modules.
+RULES["translate"] = {"translate::front", "translate::jit", "translate::lower"}
 
 # Longest matching Rust module path wins. Files below the same role are
 # implementation details of that role.
@@ -41,27 +43,24 @@ ROLES = {tuple(role.split("::")): role for role in RULES if role != "lib"}
 ROLES.update({
     ("native",): "native::run",
     ("native", "head"): "native::store",
-    ("translate",): "translate::jit",
 })
 
 # (Current file, disallowed dependency or parent glob). Delete an entry
 # in the same change that removes its last occurrence.
 TRANSITIONAL: set[tuple[str, str]] = {
-    # Module responsibilities still colocated in the implementation.
+    # Resident head placement and chain publication move together in RC.
     ("native/head.rs", "asm"),
     ("native/head.rs", "translate::opt"),
-    ("native/offload.rs", "native::compile"),
-    ("native/offload.rs", "native::run"),
     ("native/plan.rs", "cache"),
     ("native/plan.rs", "encode"),
     ("native/plan.rs", "native::run"),
     ("native/plan.rs", "runtime"),
-    ("native/plan.rs", "translate::jit"),
-    ("native/store.rs", "native::run"),
-    ("native/store.rs", "translate::jit"),
-    # Decoder and interpreter references awaiting their module moves.
-    ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
+    ("native/plan.rs", "translate::front"),
+    # Resident admission and worker admission and installation
+    # (AdmissionCache, WorkerJob, Optimized, install_job).
+    ("native/plan.rs", "translate::opt"),
     # Existing test assemblies and reference interpreters.
+    ("translate/front/decode.rs", "adv_cpu_core::interpreter (tests)"),
     ("executor.rs", "iced_x86 (tests)"),
     ("executor/differential.rs", "iced_x86 (tests)"),
     ("executor/differential/native_instructions.rs", "iced_x86 (tests)"),

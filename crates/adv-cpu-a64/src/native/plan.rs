@@ -33,13 +33,21 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::sync::Arc;
 
+use super::store::WorkerCode;
 use super::store::{self, CHAIN_LEN, Chain, InternalEdge, Linked, Tier1Unit, Version};
-use super::{Checks, EMPTY, Native, Owner, compile, head, record_branch};
+use super::{Checks, EMPTY, Native, Owner, compile, head};
 use crate::cache::CodeCache;
 use crate::encode::b;
 use crate::facts::{self, Key};
-use crate::runtime::{self, ResidentCold, Runtime};
-use crate::translate;
+use crate::runtime::{self, ResidentCold, Runtime, record_branch};
+use crate::translate::front::{Unit, decode::Fetcher};
+use crate::translate::opt::{
+    self,
+    computation::{Evaluation, Plan, Proof},
+    front::Assumed,
+    ir::Source,
+    recovery::{FlagRecipe, Host, Record},
+};
 
 pub(super) const HOT: u32 = 64;
 pub(super) const VERSIONS: usize = 3;
@@ -63,9 +71,9 @@ pub(super) struct AdmissionCache {
     pub generation: Option<(u64, u64)>,
     pub regs: [u32; 8],
     pub words: Vec<(u32, Option<u32>)>,
-    pub evaluation: translate::opt::computation::Evaluation,
+    pub evaluation: Evaluation,
     pub admitted: bool,
-    pub split: Option<Option<translate::opt::computation::Plan>>,
+    pub split: Option<Option<Plan>>,
     #[cfg(test)]
     pub evaluations: u32,
 }
@@ -378,7 +386,7 @@ pub(super) struct ResidentPlan {
     pub code: usize,
     /// The Tier-1 unit containing the back edge that reached the threshold.
     pub source: u32,
-    pub unit: Arc<translate::Unit>,
+    pub unit: Arc<Unit>,
     pub trampoline: usize,
     pub tier1: usize,
     pub sample: Box<Cell<u32>>,
@@ -408,7 +416,7 @@ struct ColdWindow {
 }
 
 impl ResidentPlan {
-    pub fn new(code: usize, source: u32, unit: Arc<translate::Unit>) -> Self {
+    pub fn new(code: usize, source: u32, unit: Arc<Unit>) -> Self {
         Self {
             code,
             source,
@@ -481,7 +489,7 @@ enum ResidentState {
 
 #[derive(Debug)]
 pub(super) enum Decline {
-    Compile(translate::opt::front::Reject),
+    Compile(opt::front::Reject),
     Unprofitable,
     Cold(ResidentCold),
     CacheFull,
@@ -871,7 +879,7 @@ impl Native {
         let dropped = self.code.invalidate_unit(eip);
         self.repoint_internal_edges(eip, None);
         self.plans.invalidate(eip);
-        self.offload.invalidate(eip);
+        self.worker_jobs.remove(&eip);
         dropped
     }
 
@@ -920,7 +928,7 @@ impl Native {
         self.code.cache.truncate(self.code.stub_len);
         self.code.units.clear();
         self.code.chains.clear();
-        self.offload.clear();
+        self.worker_jobs.clear();
         self.code.rows.clear();
         self.code.table_sources.clear();
         self.code.uses_permissions = false;
@@ -988,7 +996,7 @@ impl Native {
                 None if main
                     && index <= first
                     && self.ran(target)
-                    && crate::translate::front::decode::Fetcher::fetchable(memory, target) =>
+                    && Fetcher::fetchable(memory, target) =>
                 {
                     match self.emit(memory, target, observed) {
                         Some(entry) => entry.unit,
@@ -1061,7 +1069,7 @@ impl Native {
         memory: &mut Memory,
         eip: u32,
         work: &compile::Workspace,
-        unit: &translate::Unit,
+        unit: &Unit,
         key: Key,
         head: bool,
     ) -> Option<Tier1Unit> {
@@ -1349,7 +1357,7 @@ impl Native {
             code: head.code,
             task,
             unit: Arc::clone(&head.unit),
-            proof: self.offload.proof(eip),
+            proof: self.worker_jobs.get(&eip).map(|job| job.proof.clone()),
             at,
             checked,
             all_checked: self.checks != Checks::Adaptive,
@@ -1397,7 +1405,7 @@ impl Native {
         let version = head.versions.iter().position(|version| {
             cpu.rep.is_none()
                 && cpu.mmx_mode == 0
-                && translate::opt::admit_into(
+                && opt::admit_into(
                     &version.sources,
                     &version.assumed,
                     cpu,
@@ -1895,56 +1903,6 @@ impl Native {
             self.decline_resident(at.eip, Decline::Unprofitable);
         }
     }
-
-    fn front_unit(
-        &mut self,
-        memory: &mut Memory,
-        eip: u32,
-        loops: bool,
-        summarize: bool,
-    ) -> Arc<translate::Unit> {
-        let site = self.front_units.entry(eip).or_default();
-        let shape = if loops { &mut site.hot } else { &mut site.cold };
-        let unit = shape.get_or_insert_with(|| {
-            let handler = if self.bridge.is_null() {
-                None
-            } else {
-                // SAFETY: preparation stays within this owner's bridge call.
-                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler
-                    .as_ref()
-            };
-            let mut unit = translate::Unit::default();
-            unit.images.clone_from(&self.images.borrow());
-            unit.build_cached(
-                memory,
-                eip,
-                &self.stops,
-                &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
-                &|pc| {
-                    let handler = handler?;
-                    let (target, original) = handler.redirect(pc)?;
-                    Some(translate::Redirect {
-                        target,
-                        original: original.to_vec(),
-                        checks: handler.redirect_checks(pc).to_vec(),
-                        body: handler.direct_body(pc),
-                    })
-                },
-                loops,
-                &mut self.decodes,
-            );
-            unit.prepare_regions(memory, &|pc, code| {
-                handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
-            });
-            self.code.watch_pages(eip, unit.code());
-            Arc::new(unit)
-        });
-        if summarize && unit.trace.x86.is_empty() {
-            Arc::make_mut(unit).summarize(&mut self.decodes);
-        }
-        Arc::clone(unit)
-    }
 }
 
 /// Called by the `dispatch` stub with the guest EIP and the link point to
@@ -1997,9 +1955,7 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
         native.code.cache.sync();
         return point;
     }
-    if entry.is_none()
-        && (!crate::translate::front::decode::Fetcher::fetchable(memory, eip) || !native.ran(eip))
-    {
+    if entry.is_none() && (!Fetcher::fetchable(memory, eip) || !native.ran(eip)) {
         return 0;
     }
     let before = native.code.cache.used();
@@ -2023,4 +1979,207 @@ pub(super) unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point:
     native.code.cache.sync();
     native.code.faults.end.set(native.code.cache.next());
     unit
+}
+
+pub(super) struct WorkerJob {
+    pub(super) code: Code,
+    pub(super) proof: Proof,
+    pub(super) unit: Arc<Unit>,
+    pub(super) entry_registers: u8,
+}
+
+#[derive(Clone)]
+pub(super) struct Code {
+    pub placed: WorkerCode,
+    /// The optimized form, run instead when a job meets its assumptions.
+    pub optimized: Option<Arc<Optimized>>,
+}
+
+/// An optimized form of the same unit (A64-OPT-1).
+pub(super) struct Optimized {
+    pub code: WorkerCode,
+    pub entry: Vec<Source>,
+    pub assumed: Assumed,
+    pub records: Vec<Record<Host>>,
+    pub flags: Vec<Option<FlagRecipe>>,
+    pub cells: usize,
+}
+
+impl Native {
+    pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
+        self.offload.enabled = enabled;
+        self.plans.offer_resume = skip;
+    }
+
+    pub(crate) fn progressed(&mut self) {
+        self.plans.offer_resume = None;
+    }
+
+    pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
+        self.plans.offer_resume.take()
+    }
+
+    /// Whether the computation reached at EIP goes to the job layer
+    /// because a peer runs beside it.
+    pub(super) fn offer_computation(&self) -> bool {
+        self.offload.enabled
+            && (self.bridge.is_null()
+                // SAFETY: this query occurs only within the owning run.
+                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
+                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
+    }
+
+    /// A single context may offer a loop whose blocks split when the
+    /// frame's pace needs it to save time on a loop of serial `cost` ns.
+    pub(super) fn offer_split(&self, cost: u64) -> bool {
+        if !self.bridge.is_null() {
+            // SAFETY: this query occurs only within the owning run.
+            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
+            self.pace
+                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
+        }
+        self.offload.enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
+    }
+
+    /// An offer event is separate from ordinary owner dispatch.
+    pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
+        let job = self.plans.job(cpu.eip).unwrap();
+        let cost = job.cost();
+        let split = job.splits && cost > 0;
+        let peer = self.offer_computation();
+        let paced = split && self.offer_split(cost);
+        if !peer && !paced {
+            job.defer_offer();
+            return false;
+        }
+        if job.wants_form()
+            && self
+                .plans
+                .resident(cpu.eip)
+                .is_none_or(|head| head.pending.is_none())
+        {
+            self.request_optimized(cpu.eip, cpu.clone());
+        }
+        true
+    }
+
+    fn place_job(&mut self, eip: u32, at: &CpuState, unit: Arc<Unit>, job: compile::Job) {
+        let iterates = unit.trace.returns_at_head();
+        if let Some(code) = self.emit_computation(
+            &unit,
+            eip,
+            (at.x87.control, at.x87.status & 0x20 != 0),
+            &job.proof,
+        ) {
+            self.diagnostics.split_proofs += u64::from(job.proof.splits());
+            let entry_registers = job.proof.entry_registers();
+            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
+            policy.requested();
+            policy.built();
+            self.worker_jobs.insert(
+                eip,
+                WorkerJob {
+                    code: Code {
+                        placed: code,
+                        optimized: None,
+                    },
+                    proof: job.proof,
+                    unit,
+                    entry_registers,
+                },
+            );
+            if let Some(form) = job.form {
+                self.install_job(eip, form);
+            }
+        }
+    }
+
+    fn finish_job(&mut self, eip: u32, code: usize, job: Option<compile::Job>) -> bool {
+        let Some(_) = self
+            .worker_jobs
+            .get(&eip)
+            .filter(|prepared| prepared.code.placed.entry == code)
+        else {
+            return false;
+        };
+        self.plans.job(eip).unwrap().built();
+        if let Some(form) = job.and_then(|job| job.form) {
+            self.install_job(eip, form);
+        }
+        true
+    }
+
+    fn emit_computation(
+        &mut self,
+        unit: &Unit,
+        eip: u32,
+        (control, pe): (u16, bool),
+        proof: &Proof,
+    ) -> Option<WorkerCode> {
+        let retired = unit.trace.prepaid(0);
+        let code = compile::lower_computation(
+            unit,
+            &mut self.compiler.computation,
+            eip,
+            self.features,
+            self.code.cache.next(),
+            self.code.stubs,
+            (control, pe, Some(proof)),
+        )?;
+        let placed = self.code.place_worker(code.words, code.sites)?;
+        crate::jit_map::record(placed.entry, code.words, eip, retired, code.marks, "a64");
+        Some(placed)
+    }
+
+    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
+        at.refresh_mmx();
+        let prepared = &self.worker_jobs[&eip];
+        self.plans.job(eip).unwrap().requested();
+        if let Some(head) = self.plans.resident_mut(eip) {
+            head.pending = Some(compile::Task::Job);
+            if let Some(last) = head.versions.last() {
+                last.set_retry(&mut self.code.cache, None);
+            }
+        }
+        self.compiler.request(compile::Request {
+            eip,
+            generation: self.code.generation,
+            code: prepared.code.placed.entry,
+            task: compile::Task::Job,
+            unit: Arc::clone(&prepared.unit),
+            proof: Some(prepared.proof.clone()),
+            at,
+            checked: FxHashSet::default(),
+            all_checked: false,
+            refused: FxHashSet::default(),
+            cuts: FxHashSet::default(),
+            count_entries: false,
+        });
+        self.install_optimized(false);
+    }
+
+    fn install_job(&mut self, eip: u32, form: compile::JobForm) {
+        let compile::JobForm { built, mut lowered } = form;
+        lowered.place(self.code.cache.next(), self.code.stubs.opt_exit);
+        let Some(placed) = self.code.place_worker(&lowered.words, &lowered.sites) else {
+            return;
+        };
+        let job = self.worker_jobs.get_mut(&eip).unwrap();
+        crate::jit_map::record(
+            placed.entry,
+            &lowered.words,
+            eip,
+            job.unit.trace.prepaid(0),
+            &lowered.marks,
+            "a64-opt",
+        );
+        job.code.optimized = Some(Arc::new(Optimized {
+            code: placed,
+            entry: built.func.entry,
+            assumed: built.assumed,
+            records: lowered.records,
+            flags: lowered.flags,
+            cells: lowered.spill_cells,
+        }));
+    }
 }

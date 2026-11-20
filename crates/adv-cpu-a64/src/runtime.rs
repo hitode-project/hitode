@@ -7,6 +7,8 @@
 use std::mem::offset_of;
 
 use adv_cpu_core::{CpuState, floating::ValueFrame};
+#[cfg(native)]
+use adv_cpu_core::{IndirectBranch, IndirectBranchKind, Memory};
 
 use crate::asm::Asm;
 use crate::encode::Size::W;
@@ -606,3 +608,25 @@ pub(crate) const VALUE_REGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, re
 pub(crate) const VALUE_EFLAGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, eflags));
 pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mxcsr));
 const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
+
+/// Host base of the alias data view relative to guest address zero.
+#[cfg(native)]
+pub(crate) fn alias_base(memory: &Memory) -> u64 {
+    (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64
+}
+
+/// Publish the source and kind saved in the generated branch payload.
+#[cfg(native)]
+pub(crate) fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
+    if branch != 0 {
+        cpu.last_indirect_branch = IndirectBranch {
+            source: branch as u32,
+            target,
+            kind: match branch >> 32 {
+                1 => IndirectBranchKind::Call,
+                2 => IndirectBranchKind::Jump,
+                _ => IndirectBranchKind::Return,
+            },
+        };
+    }
+}

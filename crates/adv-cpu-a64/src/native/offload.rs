@@ -10,287 +10,23 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use adv_cpu_core::CpuState;
 use adv_cpu_core::backend::{Completion, Computation, Pace};
-use adv_cpu_core::trap::Bridge;
+use adv_cpu_core::{CpuState, Memory};
 use adv_sync::WakeEvent;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
-use super::plan::{AdmissionCache, Arbiter, JobPlan, REOFFER};
-use super::{
-    ACTIVE, Active, Enter, Exit, FaultCapture, Memory, Native, Runtime, Site, alias_base, compile,
-    record_branch, translate,
+use super::plan::{AdmissionCache, Arbiter, Code, JobPlan, Optimized, REOFFER, WorkerJob};
+use super::store::{self, ACTIVE, Active, FaultCapture, WorkerFaults, site_at};
+use crate::runtime::{
+    COMPUTATION_SLICE, Enter, ExecutionContext, Exit, Runtime, alias_base, record_branch,
 };
-use crate::runtime::{COMPUTATION_SLICE, ExecutionContext};
 use crate::translate::opt::computation::{Plan, Proof, Range};
-use crate::translate::opt::front::Assumed;
-use crate::translate::opt::ir::Source;
-use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
+use crate::translate::opt::recovery;
 
 #[derive(Default)]
 pub(super) struct Offload {
-    jobs: FxHashMap<u32, WorkerJob>,
-    admission: Admission,
+    pub(super) admission: Admission,
     pub(super) enabled: bool,
-}
-
-impl Offload {
-    pub(super) fn proof(&self, eip: u32) -> Option<Proof> {
-        self.jobs.get(&eip).map(|job| job.proof.clone())
-    }
-
-    pub(super) fn invalidate(&mut self, eip: u32) {
-        self.jobs.remove(&eip);
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.jobs.clear();
-    }
-
-    #[cfg(test)]
-    pub(super) fn contains(&self, eip: u32) -> bool {
-        self.jobs.contains_key(&eip)
-    }
-}
-
-impl Native {
-    pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
-        self.offload.enabled = enabled;
-        self.plans.offer_resume = skip;
-    }
-
-    pub(crate) fn progressed(&mut self) {
-        self.plans.offer_resume = None;
-    }
-
-    pub(crate) fn take_offer_skip(&mut self) -> Option<u32> {
-        self.plans.offer_resume.take()
-    }
-
-    /// Whether the computation reached at EIP goes to the job layer
-    /// because a peer runs beside it.
-    pub(super) fn offer_computation(&self) -> bool {
-        self.offload.enabled
-            && (self.bridge.is_null()
-                // SAFETY: this query occurs only within the owning run.
-                || unsafe { &mut *self.bridge.cast::<Bridge<'_>>() }
-                    .handler.as_mut().is_some_and(|handler| handler.allow_computation()))
-    }
-
-    /// A single context may offer a loop whose blocks split when the
-    /// frame's pace needs it to save time on a loop of serial `cost` ns.
-    pub(super) fn offer_split(&self, cost: u64) -> bool {
-        if !self.bridge.is_null() {
-            // SAFETY: this query occurs only within the owning run.
-            let bridge = unsafe { &*self.bridge.cast::<Bridge<'_>>() };
-            self.pace
-                .set(bridge.handler.as_ref().and_then(|handler| handler.pace()));
-        }
-        self.offload.enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
-    }
-
-    pub(crate) fn with_computation(
-        &mut self,
-        memory: &mut Memory,
-        retired: &mut u64,
-        pending: (Arc<std::sync::atomic::AtomicU32>, u32),
-        wake: Option<adv_sync::WakeEvent>,
-        visit: &mut dyn FnMut(
-            &mut dyn adv_cpu_core::backend::Computation<Option<ExecutionContext>>,
-        ),
-    ) {
-        if self.plans.baseline_only || self.offload.jobs.is_empty() || memory.attach().is_err() {
-            return;
-        }
-        self.invalidate(memory);
-        self.code.cache.sync();
-        let entry = Entry {
-            enter: self.code.enter,
-            opt_enter: self.code.opt_enter,
-            window: self.runtime.window,
-            alias: alias_base(memory),
-            fault: self.code.stubs.fault,
-        };
-        if let Some(mut session) = Session::new(
-            entry,
-            (&self.offload.jobs, &mut self.plans),
-            memory,
-            &mut self.offload.admission,
-            (retired, &mut self.retired_forms),
-            Notifications { pending, wake },
-            (self.pace.get(), &mut self.diagnostics.split),
-        ) {
-            visit(&mut session);
-        }
-    }
-
-    /// An offer event is separate from ordinary owner dispatch.
-    pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
-        let job = self.plans.job(cpu.eip).unwrap();
-        let cost = job.cost();
-        let split = job.splits && cost > 0;
-        let peer = self.offer_computation();
-        let paced = split && self.offer_split(cost);
-        if !peer && !paced {
-            job.defer_offer();
-            return false;
-        }
-        if job.wants_form()
-            && self
-                .plans
-                .resident(cpu.eip)
-                .is_none_or(|head| head.pending.is_none())
-        {
-            self.request_optimized(cpu.eip, cpu.clone());
-        }
-        true
-    }
-
-    pub(super) fn place_job(
-        &mut self,
-        eip: u32,
-        at: &CpuState,
-        unit: Arc<translate::Unit>,
-        job: compile::Job,
-    ) {
-        let iterates = unit.trace.returns_at_head();
-        if let Some(code) = self.emit_computation(
-            &unit,
-            eip,
-            (at.x87.control, at.x87.status & 0x20 != 0),
-            &job.proof,
-        ) {
-            self.diagnostics.split_proofs += u64::from(job.proof.splits());
-            let entry_registers = job.proof.entry_registers();
-            let policy = self.plans.add_job(eip, iterates, job.proof.splits());
-            policy.requested();
-            policy.built();
-            self.offload.jobs.insert(
-                eip,
-                WorkerJob {
-                    code,
-                    proof: job.proof,
-                    unit,
-                    entry_registers,
-                },
-            );
-            if let Some(form) = job.form {
-                self.install_job(eip, form);
-            }
-        }
-    }
-
-    pub(super) fn finish_job(&mut self, eip: u32, code: usize, job: Option<compile::Job>) -> bool {
-        let Some(_) = self
-            .offload
-            .jobs
-            .get(&eip)
-            .filter(|prepared| prepared.code.entry == code)
-        else {
-            return false;
-        };
-        self.plans.job(eip).unwrap().built();
-        if let Some(form) = job.and_then(|job| job.form) {
-            self.install_job(eip, form);
-        }
-        true
-    }
-
-    fn emit_computation(
-        &mut self,
-        unit: &translate::Unit,
-        eip: u32,
-        (control, pe): (u16, bool),
-        proof: &translate::opt::computation::Proof,
-    ) -> Option<Code> {
-        let retired = unit.trace.prepaid(0);
-        let code = compile::lower_computation(
-            unit,
-            &mut self.compiler.computation,
-            eip,
-            self.features,
-            self.code.cache.next(),
-            self.code.stubs,
-            (control, pe, Some(proof)),
-        )?;
-        let entry = self.code.cache.append(code.words)?;
-        let mut sites: Vec<_> = code
-            .sites
-            .iter()
-            .map(|&(offset, site)| (entry + offset, site))
-            .collect();
-        sites.sort_unstable_by_key(|&(pc, _)| pc);
-        crate::jit_map::record(entry, code.words, eip, retired, code.marks, "a64");
-        Some(Code {
-            entry,
-            end: entry + code.words.len() * 4,
-            sites: sites.into(),
-            optimized: None,
-        })
-    }
-
-    fn request_optimized(&mut self, eip: u32, mut at: CpuState) {
-        at.refresh_mmx();
-        let prepared = &self.offload.jobs[&eip];
-        self.plans.job(eip).unwrap().requested();
-        if let Some(head) = self.plans.resident_mut(eip) {
-            head.pending = Some(compile::Task::Job);
-            if let Some(last) = head.versions.last() {
-                last.set_retry(&mut self.code.cache, None);
-            }
-        }
-        self.compiler.request(compile::Request {
-            eip,
-            generation: self.code.generation,
-            code: prepared.code.entry,
-            task: compile::Task::Job,
-            unit: Arc::clone(&prepared.unit),
-            proof: Some(prepared.proof.clone()),
-            at,
-            checked: FxHashSet::default(),
-            all_checked: false,
-            refused: FxHashSet::default(),
-            cuts: FxHashSet::default(),
-            count_entries: false,
-        });
-        self.install_optimized(false);
-    }
-
-    fn install_job(&mut self, eip: u32, form: compile::JobForm) {
-        let compile::JobForm { built, mut lowered } = form;
-        lowered.place(self.code.cache.next(), self.code.stubs.opt_exit);
-        let Some(entry) = self.code.cache.append(&lowered.words) else {
-            return;
-        };
-        let mut sites: Vec<_> = lowered
-            .sites
-            .into_iter()
-            .map(|(offset, site)| (entry + offset, site))
-            .collect();
-        sites.sort_unstable_by_key(|&(pc, _)| pc);
-        let job = self.offload.jobs.get_mut(&eip).unwrap();
-        crate::jit_map::record(
-            entry,
-            &lowered.words,
-            eip,
-            job.unit.trace.prepaid(0),
-            &lowered.marks,
-            "a64-opt",
-        );
-        job.code.optimized = Some(Arc::new(Optimized {
-            code: Code {
-                entry,
-                end: entry + lowered.words.len() * 4,
-                sites: sites.into(),
-                optimized: None,
-            },
-            entry: built.func.entry,
-            assumed: built.assumed,
-            records: lowered.records,
-            flags: lowered.flags,
-            cells: lowered.spill_cells,
-        }));
-    }
 }
 
 /// A helper's wake latency until helpers have shown theirs: it starts
@@ -304,52 +40,6 @@ const ROUND_NS: f64 = 10_000.0;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
 
-struct WorkerJob {
-    code: Code,
-    proof: Proof,
-    unit: Arc<translate::Unit>,
-    entry_registers: u8,
-}
-
-#[derive(Clone)]
-struct Code {
-    pub entry: usize,
-    pub end: usize,
-    pub sites: Arc<[(usize, Site)]>,
-    /// The optimized form, run instead when a job meets its assumptions.
-    pub optimized: Option<Arc<Optimized>>,
-}
-
-/// An optimized form of the same unit (A64-OPT-1).
-struct Optimized {
-    pub code: Code,
-    pub entry: Vec<Source>,
-    pub assumed: Assumed,
-    pub records: Vec<Record<Host>>,
-    pub flags: Vec<Option<FlagRecipe>>,
-    pub cells: usize,
-}
-
-pub(super) struct Faults<'a> {
-    code: &'a Code,
-    stub: usize,
-    capture: &'a FaultCapture,
-}
-
-impl Faults<'_> {
-    pub(super) fn record(
-        &self,
-        pc: usize,
-        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
-    ) -> usize {
-        if !(self.code.entry..self.code.end).contains(&pc) {
-            return 0;
-        }
-        super::site_at(&self.code.sites, pc)
-            .map_or(0, |site| self.capture.record(site, pc, self.stub, snapshot))
-    }
-}
-
 #[derive(Default)]
 struct ExecuteScratch {
     pub params: Vec<u128>,
@@ -358,7 +48,7 @@ struct ExecuteScratch {
 }
 
 #[derive(Clone, Copy)]
-struct Entry {
+pub(super) struct Entry {
     pub enter: Enter,
     pub opt_enter: Enter,
     pub window: u64,
@@ -389,7 +79,7 @@ const OWNER_NEEDED: u32 = 2;
 /// The owner's own job also stops for its ordinary work.
 const LOCAL: u32 = RECALL | OWNER_NEEDED;
 
-struct Notifications {
+pub(super) struct Notifications {
     pub pending: (Arc<AtomicU32>, u32),
     pub wake: Option<WakeEvent>,
 }
@@ -486,7 +176,7 @@ fn execute(
 ) -> (Exit, u64, bool) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
-    let code = optimized.map_or(code, |o| &o.code);
+    let code = optimized.map_or(&code.placed, |o| &o.code);
     if let Some(o) = optimized {
         if scratch.saved.len() < o.cells {
             scratch.saved.resize(o.cells, 0);
@@ -497,7 +187,7 @@ fn execute(
         runtime.recovery.recalled = 0;
     }
     scratch.capture.pc.set(0);
-    let faults = Faults {
+    let faults = WorkerFaults {
         code,
         stub: entry.fault,
         capture: &scratch.capture,
@@ -559,7 +249,7 @@ fn execute(
         };
     }
     if exit == Exit::Event(crate::runtime::Event::Replay) {
-        let site = super::site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
+        let site = site_at(&code.sites, faults.capture.pc.get()).expect("faulting site");
         faults.capture.recover(cpu, site);
         retired -= u64::from(site.refund);
     }
@@ -784,7 +474,7 @@ impl Pool {
                             0,
                         );
                     }
-                    crate::cache::execution_thread();
+                    store::prepare_execution_thread();
                     let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
                     let mut scratch = ExecuteScratch::default();
                     loop {
@@ -911,7 +601,7 @@ impl PageGrants {
 }
 
 #[derive(Default)]
-struct Admission {
+pub(super) struct Admission {
     grants: PageGrants,
     generation: (u64, u64),
     spare: Vec<Vec<Range>>,
@@ -1063,7 +753,7 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
     })
 }
 
-struct Session<'a> {
+pub(super) struct Session<'a> {
     entry: Entry,
     jobs: &'a FxHashMap<u32, WorkerJob>,
     plans: &'a mut Arbiter,
@@ -1472,6 +1162,7 @@ mod tests {
 
     use super::super::compile::{self, Workspace};
     use super::super::plan::Mode;
+    use super::super::store::WorkerCode;
     use super::*;
     use crate::Executor;
     use crate::native::Native;
@@ -1627,10 +1318,10 @@ mod tests {
                 enter: native.code.enter,
                 opt_enter: native.code.opt_enter,
                 window: native.runtime.window,
-                alias: super::super::alias_base(executor.memory()),
+                alias: alias_base(executor.memory()),
                 fault: native.code.stubs.fault,
             },
-            (&native.offload.jobs.get(&head).unwrap().code, 0),
+            (&native.worker_jobs.get(&head).unwrap().code, 0),
             (
                 &Signals {
                     recall: Arc::new(AtomicU32::new(0)),
@@ -1652,7 +1343,7 @@ mod tests {
         let memory = executor.memory_mut();
         memory.write(head, &[0xcc]).unwrap();
         native.invalidate(memory);
-        assert!(!native.offload.jobs.contains_key(&head));
+        assert!(!native.worker_jobs.contains_key(&head));
     }
 
     // spec: A64-TR-9
@@ -1697,7 +1388,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(offer.exit, Exit::Computation);
-        assert!(native.offload.jobs[&CODE].proof.splits());
+        assert!(native.worker_jobs[&CODE].proof.splits());
         native.pace.set(Some(Pace::default()));
         let mut results = Vec::new();
         let mut memories = Vec::new();
@@ -1754,7 +1445,7 @@ mod tests {
         claimed: u32,
     ) -> Blocks {
         let (proof, cpu) = (
-            &native.offload.jobs[&CODE].proof,
+            &native.worker_jobs[&CODE].proof,
             start.as_ref().unwrap().cpu(),
         );
         let mut scratch = Evaluation::default();
@@ -1776,10 +1467,10 @@ mod tests {
                 enter: native.code.enter,
                 opt_enter: native.code.opt_enter,
                 window: native.runtime.window,
-                alias: super::super::alias_base(executor.memory()),
+                alias: alias_base(executor.memory()),
                 fault: native.code.stubs.fault,
             },
-            code: native.offload.jobs[&CODE].code.clone(),
+            code: native.worker_jobs[&CODE].code.clone(),
             signals: Signals {
                 recall: Arc::new(AtomicU32::new(0)),
                 pending: (Arc::new(AtomicU32::new(0)), 0),
@@ -2077,7 +1768,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(offer.exit, Exit::Computation);
-        assert!(!native.offload.jobs[&CODE].proof.splits());
+        assert!(!native.worker_jobs[&CODE].proof.splits());
         let mut retired = 0;
         let mut done = None;
         native.with_computation(
@@ -2157,7 +1848,7 @@ mod tests {
             &mut |scope| clean_done = scope.run_local(1, &clean),
         );
         assert!(clean_done.unwrap().optimized > 0);
-        assert!(native.offload.jobs[&CODE].code.optimized.is_some());
+        assert!(native.worker_jobs[&CODE].code.optimized.is_some());
         let mut pending_done = None;
         native.with_computation(
             executor.memory_mut(),
@@ -2326,13 +2017,13 @@ mod tests {
                     .unwrap();
                 assert_eq!(offer.exit, Exit::Computation);
                 native.install_optimized(true);
-                let prepared = &native.offload.jobs[&CODE];
+                let prepared = &native.worker_jobs[&CODE];
                 assert!(prepared.code.optimized.is_some());
                 let entry = Entry {
                     enter: native.code.enter,
                     opt_enter: native.code.opt_enter,
                     window: native.runtime.window,
-                    alias: super::super::alias_base(executor.memory()),
+                    alias: alias_base(executor.memory()),
                     fault: native.code.stubs.fault,
                 };
                 let signals = Signals {
@@ -2420,7 +2111,7 @@ mod tests {
                         3,
                         f_start,
                         fault_entry,
-                        (&native.offload.jobs[&CODE].code, 0),
+                        (&native.worker_jobs[&CODE].code, 0),
                         (&clean_signals, LOCAL),
                         &mut ExecuteScratch::default(),
                     );
@@ -2624,7 +2315,7 @@ mod tests {
         };
         cpu.eip = head;
         native.prepare_job(executor.memory_mut(), stop, &cpu);
-        let prepared = &native.offload.jobs[&head];
+        let prepared = &native.worker_jobs[&head];
         let mut cache = AdmissionCache::default();
         let memory = executor.memory();
 
@@ -2746,12 +2437,12 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit, Exit::Computation);
         assert!(native.unit_address(CODE).is_some());
-        assert!(native.offload.jobs.contains_key(&CODE));
+        assert!(native.worker_jobs.contains_key(&CODE));
         let middle = CODE + 4096u32.div_ceil(nop.len() as u32) * nop.len() as u32;
         memory.write(middle, &[0xcc]).unwrap();
         native.invalidate(memory);
         assert!(native.unit_address(CODE).is_none());
-        assert!(!native.offload.jobs.contains_key(&CODE));
+        assert!(!native.worker_jobs.contains_key(&CODE));
     }
 
     // spec: A64A-ROLE-8 A64-CTL-4 A64-CTL-6 A64-CTL-9 A64-OPT-11
@@ -2875,13 +2566,15 @@ mod tests {
         assert_eq!(native.code.cache.append(emitted.words), Some(at));
         native.code.cache.sync();
         let code = Code {
-            entry: at,
-            end: at + emitted.words.len() * 4,
-            sites: emitted
-                .sites
-                .iter()
-                .map(|&(offset, site)| (at + offset, site))
-                .collect(),
+            placed: WorkerCode {
+                entry: at,
+                end: at + emitted.words.len() * 4,
+                sites: emitted
+                    .sites
+                    .iter()
+                    .map(|&(offset, site)| (at + offset, site))
+                    .collect(),
+            },
             optimized: None,
         };
         let entry = Entry {
@@ -3050,7 +2743,7 @@ mod tests {
             enter: native.code.enter,
             opt_enter: native.code.opt_enter,
             window: native.runtime.window,
-            alias: super::super::alias_base(executor.memory()),
+            alias: alias_base(executor.memory()),
             fault: native.code.stubs.fault,
         };
         let prepared = native.plans.job(CODE).unwrap();
@@ -3067,7 +2760,7 @@ mod tests {
                 1,
                 start.clone(),
                 entry,
-                (&native.offload.jobs[&CODE].code, 0),
+                (&native.worker_jobs[&CODE].code, 0),
                 (&pending, RECALL),
                 &mut ExecuteScratch::default(),
             );
@@ -3086,7 +2779,7 @@ mod tests {
             1,
             start.clone(),
             entry,
-            (&native.offload.jobs[&CODE].code, 1),
+            (&native.worker_jobs[&CODE].code, 1),
             (&recalled, RECALL),
             &mut ExecuteScratch::default(),
         )
@@ -3197,12 +2890,11 @@ mod tests {
             enter: native.code.enter,
             opt_enter: native.code.opt_enter,
             window: native.runtime.window,
-            alias: super::super::alias_base(executor.memory()),
+            alias: alias_base(executor.memory()),
             fault: native.code.stubs.fault,
         };
         let code = native
-            .offload
-            .jobs
+            .worker_jobs
             .get(&CODE)
             .expect("prepared x87 and SIMD")
             .code

@@ -1,19 +1,25 @@
-//! Executable units, link records and page watches.
+//! Executable units, link records, fault recovery and page watches.
 //!
 //! The store places artifacts and holds the data for link, repoint and
-//! invalidation operations. The arbiter alone publishes those changes.
+//! invalidation operations. Worker placements retain their own fault sites
+//! for the lifetime of a job.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{Enter, Faults, InterpreterCause, ShadowStack};
 use crate::cache::CodeCache;
 use crate::encode::{b, bl};
 use crate::facts::Key;
-use crate::runtime;
-use crate::translate::{self, Site, Stubs};
+use adv_cpu_core::CpuState;
+
+use crate::runtime::{self, Enter};
+use crate::translate::front::{Unit, decode::Helper, trace::Trace};
+use crate::translate::lower::{
+    Link, Site, Stubs, VersionLayout,
+    flags::{Operand, Sense},
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct Tier1Unit {
@@ -26,7 +32,7 @@ pub(super) struct Tier1Unit {
 pub(super) const CHAIN_LEN: usize = 3;
 
 pub(super) struct Chain {
-    pub(super) unit: Arc<translate::Unit>,
+    pub(super) unit: Arc<Unit>,
     pub(super) mask: u64,
     pub(super) helpers: u32,
     pub(super) versions: Vec<Version>,
@@ -121,7 +127,7 @@ pub(super) struct CodeStore {
     /// Each placed unit's host address and entry, ascending.
     pub(super) placed: Vec<(usize, u32)>,
     /// Prepared operand operations, indexed by generated value calls.
-    pub(super) helpers: Vec<translate::Helper>,
+    pub(super) helpers: Vec<Helper>,
     /// Counts cache clears, which invalidate link points.
     pub(super) generation: u64,
     /// The indirect table the runtime points at.
@@ -223,6 +229,24 @@ impl CodeStore {
     }
 
     /// Appends a unit for `eip` whose `sites` are at byte offsets.
+    pub(super) fn place_worker(
+        &mut self,
+        words: &[u32],
+        sites: &[(usize, Site)],
+    ) -> Option<WorkerCode> {
+        let entry = self.cache.append(words)?;
+        let mut sites: Vec<_> = sites
+            .iter()
+            .map(|&(offset, site)| (entry + offset, site))
+            .collect();
+        sites.sort_unstable_by_key(|&(pc, _)| pc);
+        Some(WorkerCode {
+            entry,
+            end: entry + words.len() * 4,
+            sites: sites.into(),
+        })
+    }
+
     pub(super) fn install_unit(
         &mut self,
         eip: u32,
@@ -230,7 +254,7 @@ impl CodeStore {
         sites: &[(usize, Site)],
         retired: u32,
         marks: &[crate::jit_map::Mark],
-        layout: crate::translate::lower::VersionLayout,
+        layout: VersionLayout,
     ) -> Option<Tier1Unit> {
         let unit = self.cache.append(words)?;
         let from = self.faults.sites.len().saturating_sub(1);
@@ -257,9 +281,9 @@ impl CodeStore {
 /// the unlinked dispatch and discovery counter.
 pub(super) fn tier1_words(
     marks: &[crate::jit_map::Mark],
-    links: &[crate::translate::lower::Link],
+    links: &[Link],
     code_words: usize,
-    trace: &translate::front::trace::Trace,
+    trace: &Trace,
 ) -> FxHashMap<u32, u32> {
     use crate::jit_map::Part;
 
@@ -288,4 +312,277 @@ pub(super) fn tier1_words(
         }
     }
     words
+}
+
+// Workers share immutable code and fault sites while a job is active.
+#[derive(Clone)]
+pub(super) struct WorkerCode {
+    pub entry: usize,
+    pub end: usize,
+    pub sites: Arc<[(usize, Site)]>,
+}
+
+pub(super) fn prepare_execution_thread() {
+    crate::cache::execution_thread();
+}
+
+/// Observed results of the existing interpreter event path.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum InterpreterCause {
+    HostFault,
+    DebugFlags,
+    System,
+    Fetch,
+    InvalidEncoding,
+    OperandFault,
+    Trap(u8),
+}
+
+/// What the signal handler may read while translated code runs.
+pub(super) struct Faults {
+    /// Executable range of translated code.
+    pub(super) start: usize,
+    pub(super) end: Cell<usize>,
+    /// Host PC of each site, ascending: units are appended in address
+    /// order, and their sites in emission order.
+    pub(super) sites: Vec<(usize, Site)>,
+    pub(super) stub: usize,
+    pub(super) capture: FaultCapture,
+    /// The shadow stack's guard pages.
+    pub(super) guard: (usize, usize),
+    /// Where an overflow resumes, and the runtime field it reads the
+    /// faulting PC from.
+    pub(super) reset: usize,
+    pub(super) resume: *mut u64,
+}
+
+#[derive(Default)]
+pub(super) struct FaultCapture {
+    /// The site that faulted, written in signal context.
+    pub(super) pc: Cell<usize>,
+    /// v8-v23 captured before the fault stub restores host SIMD.
+    pub(super) registers: Cell<runtime::FaultRegisters>,
+}
+
+pub(super) fn site_at(sites: &[(usize, Site)], pc: usize) -> Option<Site> {
+    let index = sites.binary_search_by_key(&pc, |&(at, _)| at).ok()?;
+    Some(sites[index].1)
+}
+
+impl Faults {
+    pub(super) fn site(&self, pc: usize) -> Option<Site> {
+        site_at(&self.sites, pc)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Active {
+    None,
+    Owner(*const Faults),
+    Worker(*const WorkerFaults<'static>),
+}
+
+thread_local! {
+    /// The `Faults` of the code this thread is running, or null.
+    pub(super) static ACTIVE: Cell<Active> = const { Cell::new(Active::None) };
+}
+
+impl FaultCapture {
+    pub(super) fn record(
+        &self,
+        site: Site,
+        pc: usize,
+        stub: usize,
+        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
+    ) -> usize {
+        self.registers.set(runtime::FaultRegisters {
+            simd: std::array::from_fn(|n| snapshot.simd[8 + n]),
+            temps: [snapshot.gpr[7], snapshot.gpr[8]],
+        });
+        self.pc.set(pc);
+        if site.resume != 0 {
+            // The unit publishes its cached x87 state, then faults.
+            pc.wrapping_add_signed(site.resume as isize)
+        } else {
+            stub
+        }
+    }
+
+    pub(super) fn recover(&self, cpu: &mut CpuState, site: Site) {
+        let registers = self.registers.get();
+        recover(cpu, site, registers.temps);
+        for (n, bytes) in registers.simd.into_iter().enumerate() {
+            if site.simd_dirty & (1 << n) == 0 {
+                continue;
+            }
+            if n < 8 {
+                let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                cpu.mmx[n] = value;
+                cpu.x87.regs[n] = adv_cpu_core::X87Register::from_parts(value, 0xffff);
+            } else {
+                cpu.xmm[n - 8] = bytes;
+            }
+        }
+    }
+}
+
+/// Runs in signal context: no allocation, no locks.
+pub(super) unsafe fn on_fault(
+    pc: usize,
+    address: usize,
+    snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
+) -> usize {
+    ACTIVE
+        .try_with(|slot| {
+            let faults = match slot.get() {
+                Active::None => return 0,
+                Active::Worker(faults) => {
+                    // SAFETY: the worker keeps its private capture and unit
+                    // side table alive while its entry is active on this thread.
+                    let faults = unsafe { &*faults };
+                    return faults.record(pc, snapshot);
+                }
+                Active::Owner(faults) => faults,
+            };
+            // SAFETY: `run` keeps the pointee alive and unmodified, apart
+            // from the fault capture cells, until it clears the slot.
+            let faults = unsafe { &*faults };
+            if !(faults.start..faults.end.get()).contains(&pc) {
+                return 0;
+            }
+            if (faults.guard.0..faults.guard.1).contains(&address) {
+                // A shadow push overflowed: empty the stack and retry it.
+                // SAFETY: the runtime outlives the run, and translated code
+                // is stopped here.
+                unsafe { faults.resume.write(pc as u64) };
+                return faults.reset;
+            }
+            let Some(site) = faults.site(pc) else {
+                return 0;
+            };
+            faults.capture.record(site, pc, faults.stub, snapshot)
+        })
+        .unwrap_or(0)
+}
+
+/// The shadow return stack: entries of {host continuation, guest EIP}
+/// growing down from sentinels that never match, over guard pages.
+pub(super) struct ShadowStack {
+    base: *mut libc::c_void,
+    len: usize,
+    guard: usize,
+}
+
+impl ShadowStack {
+    const ENTRIES: usize = 1 << 16;
+
+    pub(super) fn new() -> Result<Self, String> {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let guard = page.max(16 << 10);
+        let len = guard + (Self::ENTRIES + runtime::SHADOW_SENTINELS) * 16;
+        let len = len.next_multiple_of(page);
+        // SAFETY: a fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err("cannot map the shadow stack".into());
+        }
+        let stack = Self { base, len, guard };
+        // SAFETY: inside the mapping just made.
+        let protected = unsafe {
+            libc::mprotect(
+                base.cast::<u8>().add(guard).cast(),
+                len - guard,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        if protected != 0 {
+            return Err("cannot protect the shadow stack".into());
+        }
+        let top = stack.top() as *mut u64;
+        for k in 0..runtime::SHADOW_SENTINELS {
+            // SAFETY: the sentinels are the last entries of the mapping.
+            unsafe {
+                top.add(2 * k).write(0);
+                top.add(2 * k + 1).write(u64::MAX);
+            }
+        }
+        Ok(stack)
+    }
+
+    /// The empty stack pointer, just below the sentinels.
+    pub(super) fn top(&self) -> u64 {
+        (self.base as usize + self.len - runtime::SHADOW_SENTINELS * 16) as u64
+    }
+
+    pub(super) fn guard(&self) -> (usize, usize) {
+        (self.base as usize, self.base as usize + self.guard)
+    }
+}
+
+impl Drop for ShadowStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made.
+        unsafe { libc::munmap(self.base, self.len) };
+    }
+}
+
+pub(super) struct WorkerFaults<'a> {
+    pub(super) code: &'a WorkerCode,
+    pub(super) stub: usize,
+    pub(super) capture: &'a FaultCapture,
+}
+
+impl WorkerFaults<'_> {
+    pub(super) fn record(
+        &self,
+        pc: usize,
+        snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
+    ) -> usize {
+        if !(self.code.entry..self.code.end).contains(&pc) {
+            return 0;
+        }
+        site_at(&self.code.sites, pc)
+            .map_or(0, |site| self.capture.record(site, pc, self.stub, snapshot))
+    }
+}
+
+/// Rebuilds the x86 flags at a fault site, where the exit stub assumed
+/// subtraction sense and canonical PF/AF sources.
+pub(super) fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
+    cpu.eip = site.eip;
+    let regs = cpu.regs;
+    let value = |operand| match operand {
+        Operand::Guest(index) => regs[usize::from(index)],
+        Operand::Temp(index) => temps[usize::from(index)] as u32,
+        Operand::Imm(value) => value,
+    };
+    if let Some(result) = site.nz {
+        let result = value(result);
+        cpu.eflags = cpu.eflags & !0xc0 | u32::from(result == 0) << 6 | (result >> 24 & 0x80);
+    }
+    if let Some(overflow) = site.overflow.evaluate(value) {
+        cpu.eflags = cpu.eflags & !0x800 | u32::from(overflow) << 11;
+    }
+    match site.carry.evaluate(value) {
+        Some(cf) => cpu.eflags = cpu.eflags & !1 | u32::from(cf),
+        None if site.sense == Sense::Addition => cpu.eflags ^= 1,
+        None => {}
+    }
+    if let Some((parity, adjust)) = site.recipe.evaluate(value) {
+        let pf = u32::from((parity as u8).count_ones().is_multiple_of(2));
+        cpu.eflags = cpu.eflags & !0x04 | pf << 2;
+        if let Some(adjust) = adjust {
+            cpu.eflags = cpu.eflags & !0x10 | adjust & 0x10;
+        }
+    }
 }

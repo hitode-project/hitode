@@ -7,14 +7,18 @@ use adv_cpu_core::backend::OfferGate;
 use adv_cpu_core::trap::Bridge;
 use adv_cpu_core::{CpuState, Memory};
 
+use super::offload::{Entry, Notifications, Session};
 use super::plan::{self, dispatch, lookup_miss};
+use super::store::{ACTIVE, Active, Faults};
 use super::{
-    ACTIVE, Active, CLEAR_GATE, Checks, Faults, Native, Owner, Run, SLICE, STALE_GATE, access,
-    alias_base, call, locked_access, timestamp, value, value_access,
+    CLEAR_GATE, Checks, Native, Owner, Run, SLICE, STALE_GATE, access, call, locked_access,
+    timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
-use crate::runtime::{Event, Exit, PlanEvent, ResidentCold, Runtime};
-use crate::translate;
+use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, ResidentCold, Runtime, alias_base};
+use crate::translate::front::decode::Fetcher;
+use crate::translate::opt::recovery;
+use std::sync::Arc;
 
 impl Native {
     /// Runs the unit at `cpu.eip` on positive fuel, allowing that unit's
@@ -42,7 +46,7 @@ impl Native {
                     translated: 0,
                 }));
             }
-            None if !crate::translate::front::decode::Fetcher::fetchable(memory, cpu.eip) => {
+            None if !Fetcher::fetchable(memory, cpu.eip) => {
                 self.diagnostics.untracked += 1;
                 return Ok(Some(Run {
                     exit: Exit::Untracked,
@@ -344,10 +348,10 @@ impl Native {
         let head = self.plans.resident(eip).unwrap();
         let version = &head.versions[index];
         let record = &version.records[recovery.record as usize];
-        translate::opt::recovery::restore_inline_entry(&recovery.entry, cpu);
+        recovery::restore_inline_entry(&recovery.entry, cpu);
         let (alias, entry_esp) = (alias_base(memory), cpu.regs[4]);
         self.runtime.shadow = recovery.dump.x[28];
-        let refund = translate::opt::recovery::materialize(
+        let refund = recovery::materialize(
             record,
             &recovery.dump,
             &self.inline_saved,
@@ -369,6 +373,43 @@ impl Native {
             (refund, site.eip, ResidentCold::HostFault, site.checked)
         } else {
             (refund, record.eip, ResidentCold::Other, false)
+        }
+    }
+}
+
+impl Native {
+    pub(crate) fn with_computation(
+        &mut self,
+        memory: &mut Memory,
+        retired: &mut u64,
+        pending: (Arc<std::sync::atomic::AtomicU32>, u32),
+        wake: Option<adv_sync::WakeEvent>,
+        visit: &mut dyn FnMut(
+            &mut dyn adv_cpu_core::backend::Computation<Option<ExecutionContext>>,
+        ),
+    ) {
+        if self.plans.baseline_only || self.worker_jobs.is_empty() || memory.attach().is_err() {
+            return;
+        }
+        self.invalidate(memory);
+        self.code.cache.sync();
+        let entry = Entry {
+            enter: self.code.enter,
+            opt_enter: self.code.opt_enter,
+            window: self.runtime.window,
+            alias: alias_base(memory),
+            fault: self.code.stubs.fault,
+        };
+        if let Some(mut session) = Session::new(
+            entry,
+            (&self.worker_jobs, &mut self.plans),
+            memory,
+            &mut self.offload.admission,
+            (retired, &mut self.retired_forms),
+            Notifications { pending, wake },
+            (self.pace.get(), &mut self.diagnostics.split),
+        ) {
+            visit(&mut session);
         }
     }
 }

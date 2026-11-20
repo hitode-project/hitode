@@ -152,7 +152,7 @@ impl Simd {
     }
 
     /// The registers it surely reads and those it may write, as
-    /// `Vector::dirty` numbers them (`translate::residency`).
+    /// `Vector::dirty` numbers them (`translate::jit::residency`).
     pub fn footprint(&self) -> (u16, u16) {
         let bit = |loc| match loc {
             Loc::Mmx(n) => 1u16 << n,
@@ -240,7 +240,7 @@ pub struct Vector {
 
 /// Facts about `CpuState` that guards established on every path here.
 /// Nothing but helpers, x87 instructions and EMMS changes them, so they
-/// survive merges whose arrivals all hold them (`translate::residency`).
+/// survive merges whose arrivals all hold them (`translate::jit::residency`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Guards {
     /// No x87 exception is pending, and TOP and the tags are 0.
@@ -1756,7 +1756,7 @@ impl Translator<'_> {
     }
 
     /// Whether the cache holds every register and guard of `entry`, a
-    /// merge's entry (`translate::residency`).
+    /// merge's entry (`translate::jit::residency`).
     pub(super) fn holds(&self, entry: Entry) -> bool {
         let held = u16::from(self.vector.mmx) | u16::from(self.vector.xmm) << 8;
         entry.regs & !held == 0 && entry.guards.within(self.vector.guards)
