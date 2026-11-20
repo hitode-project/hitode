@@ -654,6 +654,17 @@ fn asf_reader_added_before_load_probes_windows_media_video_and_audio() {
     let video = info.video.unwrap();
     assert_eq!((video.width, video.height), (32, 16));
     assert_eq!(info.audio.unwrap().sample_rate, 22050);
+    crate::dshow::video::set_video_provider(
+        &mut m.ext,
+        crate::dshow::video::VideoProvider {
+            window: |_, _, _| None,
+            update: |_, _, _, _| Ok(1),
+            completed: |_, _| None,
+        },
+    );
+    let pin = m.ext.get::<State>().filters[&reader].pins[0];
+    let rendered = invoke(&mut m, graph, "IFilterGraph2", "Render", &[pin]);
+    assert_eq!(rendered, S_OK);
     method(&mut m, "IFileSourceFilter::Release", &[file_face]);
     method(&mut m, "IBaseFilter::Release", &[reader]);
     assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);

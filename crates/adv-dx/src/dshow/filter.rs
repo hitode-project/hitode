@@ -60,6 +60,9 @@ pub(crate) struct Filter {
     pub stop: Option<i64>,
     rate: f64,
     pub packets: Option<adv_device::media::Demuxed>,
+    /// A splitter Render inserted for any decodable container, rather than a
+    /// guest-created MPEG-1 Stream Splitter.
+    pub generic: bool,
     decoder: Option<Worker>,
     pushed_bytes: Vec<u8>,
     pushed_time: Option<i64>,
@@ -273,6 +276,7 @@ pub(super) fn new_filter(
             stop: None,
             rate: 1.0,
             packets: None,
+            generic: false,
             decoder: None,
             pushed_bytes: Vec::new(),
             pushed_time: None,
@@ -1503,7 +1507,7 @@ fn accepts(env: &Env<'_>, pin: u32, mt: &MediaType) -> bool {
         return false;
     }
     match (state.filters[&p.filter].role, p.dir) {
-        (Role::Splitter, INPUT) => {
+        (Role::Splitter, INPUT) if !state.filters[&p.filter].generic => {
             return [0xe436_eb84, 0xe436_eb85, 0xe436_eb86, 0xe436_eb87]
                 .into_iter()
                 .any(|id| mt.sub == amovie(id))
@@ -2639,11 +2643,19 @@ pub(super) fn attach_source(
     let length = bytes.len();
     let audio_type = output_type(MEDIATYPE_AUDIO, &bytes);
     let video_type = output_type(MEDIATYPE_VIDEO, &bytes);
-    let packets = adv_device::media::demux(bytes.clone()).ok();
+    let filter = state(env).pins[&pin].filter;
+    let generic = state(env).filters[&filter].generic;
+    // Only a guest-created splitter delivers compressed packets from a guest
+    // reader; Render's splitter decodes on the host.
+    let packets = if generic {
+        None
+    } else {
+        adv_device::media::demux(bytes.clone()).ok()
+    };
     let (decoder, info) = match Decoder::open_memory(bytes) {
         Ok(decoder) => {
             let info = decoder.info().clone();
-            if !["mpeg", "mpegvideo", "mp3"].contains(&info.container.as_str()) {
+            if !generic && !["mpeg", "mpegvideo", "mp3"].contains(&info.container.as_str()) {
                 return guest_call(env, reader, 2, vec![], |_, _| {
                     Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED)
                 });
@@ -2660,7 +2672,6 @@ pub(super) fn attach_source(
             });
         }
     };
-    let filter = state(env).pins[&pin].filter;
     let video = info.as_ref().is_none_or(|i| i.video.is_some());
     let audio = info.as_ref().is_some_and(|i| i.audio.is_some());
     log::info!(

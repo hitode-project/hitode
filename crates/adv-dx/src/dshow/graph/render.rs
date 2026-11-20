@@ -13,6 +13,7 @@ fn member(env: &mut Env<'_>, graph: u32, role: Role, clsid: Iid, name: &str) -> 
     let f = state(env).filters.get_mut(&filter).unwrap();
     f.graph = graph;
     f.name = name.clone();
+    f.generic = role == Role::Splitter;
     // Transfer the newly created reference to the graph.
     g(env, graph).join(Member {
         filter,

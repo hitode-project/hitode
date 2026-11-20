@@ -195,7 +195,7 @@ Withdrawn: MEDIA-GRAPH-19
 
 ### MEDIA-STREAM-5 MPEG media types
 
-**Rule**: MPEG filters MUST enumerate and validate the MPEG stream formats and decoded output formats exposed by Windows. Splitter audio types MUST preserve MPEG frame header fields and offer payload, elementary payload, and MP3 formats when applicable. Media negotiation MUST validate explicit output formats and prioritize downstream types for wildcard requests.
+**Rule**: Guest-created MPEG filters MUST enumerate and validate Windows' MPEG stream and decoded output formats, while Render's splitter MUST accept any decodable container without demuxing it. Splitter audio types MUST preserve MPEG frame header fields and offer payload, elementary payload, and MP3 formats when applicable. Media negotiation MUST validate explicit output formats and prioritize downstream types for wildcard requests.
 **Verification**: Test
 
 ### MEDIA-STREAM-6 Filter pin ownership
