@@ -1690,6 +1690,7 @@ impl Native {
                     placed: code,
                     optimized: None,
                     scoped_mmx: job.proof.scoped_mmx(),
+                    scoped_gpr: job.proof.scoped_gpr(),
                     frame: job
                         .proof
                         .scope_frame()

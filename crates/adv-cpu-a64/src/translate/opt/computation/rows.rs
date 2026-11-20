@@ -274,6 +274,33 @@ impl Domain {
         }
     }
 
+    /// Keep only edges covered by the same guards the row entry emits.
+    fn use_proved_branches(&self, proof: &Proof, trace: &mut Trace) -> Option<()> {
+        let mut choices = vec![[false; 2]; trace.len()];
+        for &(at, branch) in &proof.branches {
+            if let Some((taken, guard)) = branch {
+                if !self.checks.iter().any(|&check| match (guard, check) {
+                    (Check::Positive(a, limit), Check::Positive(b, max)) => a == b && max <= limit,
+                    (Check::Equal(..) | Check::Mask(..), _) => guard == check,
+                    _ => false,
+                }) {
+                    return None;
+                }
+                choices[at][usize::from(taken)] = true;
+            } else {
+                choices[at] = [true; 2];
+            }
+        }
+        trace.select_row_branches(&choices);
+        Some(())
+    }
+
+    pub(crate) fn prove_scoped_split(&self, proof: &mut Proof, trace: &mut Trace) {
+        if self.use_proved_branches(proof, trace).is_some() {
+            proof.prove_scoped_split(trace);
+        }
+    }
+
     pub(crate) fn target(&self) -> Option<crate::translate::lower::resident::RowTarget> {
         self.target
     }
@@ -728,5 +755,121 @@ impl RangeEmitter<'_> {
         }
         self.slots[id] = true;
         self.asm.emit(str(W, dst, SP, id as u32 * 4));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Evaluation, tests::*};
+    use super::*;
+    use crate::CpuState;
+
+    // spec: A64-TR-9
+    #[test]
+    fn scoped_rows_require_the_guard_and_reject_carried_reads_and_shared_rows() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Shape {
+            Guarded,
+            HighBytes,
+            Carried,
+            Shared,
+        }
+        for shape in [
+            Shape::Guarded,
+            Shape::HighBytes,
+            Shape::Carried,
+            Shape::Shared,
+        ] {
+            let mut trace = trace(|a| {
+                let mut row = a.create_label();
+                let mut body = a.create_label();
+                let mut pretest = a.create_label();
+                a.set_label(&mut row).unwrap();
+                if shape == Shape::Shared {
+                    a.mov(ebp, dword_ptr(esp + 8)).unwrap();
+                }
+                a.mov(ecx, ebx).unwrap();
+                a.sub(ecx, 2).unwrap();
+                a.jmp(pretest).unwrap();
+                a.set_label(&mut body).unwrap();
+                if shape == Shape::Carried {
+                    a.mov(dword_ptr(edi), eax).unwrap();
+                }
+                if shape == Shape::HighBytes {
+                    a.mov(al, byte_ptr(esi)).unwrap();
+                } else {
+                    a.mov(eax, dword_ptr(esi)).unwrap();
+                }
+                if shape == Shape::Shared {
+                    a.mov(dword_ptr(ebp), eax).unwrap();
+                    a.add(ebp, 4).unwrap();
+                }
+                a.mov(dword_ptr(edi), eax).unwrap();
+                if shape == Shape::HighBytes {
+                    a.mov(ah, byte_ptr(esi + 1)).unwrap();
+                }
+                a.add(edi, 4).unwrap();
+                a.add(esi, 4).unwrap();
+                a.sub(ecx, 2).unwrap();
+                a.set_label(&mut pretest).unwrap();
+                a.jns(body).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.add(edi, 4).unwrap();
+                a.dec(edx).unwrap();
+                a.jne(row).unwrap();
+                a.int3().unwrap();
+            });
+            let latches = trace.row_latches();
+            assert_eq!(latches.len(), 1);
+            trace.separate_row_latches(&latches);
+            let cpu = CpuState {
+                regs: [7, 0, 8, 8, 0x50000, 0, 0x20000, 0x30000],
+                ..CpuState::default()
+            };
+            let (mut domain, mut proof) = Domain::build(&trace, &cpu.regs).expect("row domain");
+            let read = |addr| {
+                if addr == cpu.regs[4] + 8 {
+                    Some(0x40000)
+                } else {
+                    (cpu.regs[6]..cpu.regs[6] + 0x1000)
+                        .contains(&addr)
+                        .then_some(cpu.regs[0])
+                }
+            };
+            let mut scratch = Evaluation::default();
+            assert!(
+                proof.evaluate(&cpu, &mut scratch, read).is_some(),
+                "{shape:?} serial admission: {:?}",
+                domain.checks
+            );
+            let mut worker = trace.clone();
+            domain.prove_scoped_split(&mut proof, &mut worker);
+            assert_eq!(
+                proof.scoped_splits(),
+                matches!(shape, Shape::Guarded | Shape::Shared),
+                "{shape:?}",
+            );
+            assert_eq!(
+                proof.plan(&cpu, &mut scratch, read).is_some(),
+                shape == Shape::Guarded
+            );
+
+            if shape == Shape::Guarded {
+                let mut short = cpu.clone();
+                short.regs[3] = 1;
+                assert!(proof.evaluate(&short, &mut scratch, read).is_none());
+                // The same proof with the branch's guard absent cannot
+                // supply a scoped artifact.
+                let mut proof = Domain::build(&trace, &cpu.regs).unwrap().1;
+                let (_, (_, guard)) = proof
+                    .branches
+                    .iter()
+                    .find_map(|&(at, choice)| Some((at, choice?)))
+                    .unwrap();
+                domain.checks.retain(|&check| check != guard);
+                domain.prove_scoped_split(&mut proof, &mut trace);
+                assert!(!proof.scoped_splits());
+            }
+        }
     }
 }

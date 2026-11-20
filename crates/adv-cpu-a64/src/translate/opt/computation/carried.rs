@@ -18,11 +18,12 @@ use crate::translate::front::decode::Op;
 use crate::translate::front::forms::Integer;
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 
-const XMM: u32 = 8;
-const MM: u32 = 16;
-const FLAGS: u32 = 24;
+const XMM: u32 = 32;
+const MM: u32 = 40;
+const FLAGS: u32 = 48;
 /// TOP and the tag word, which every MMX instruction but EMMS sets.
-const ENV: u64 = 1 << 31;
+const ENV: u64 = 1 << 55;
+const JOIN_GPR: u64 = u32::MAX as u64;
 const JOIN_MMX: u64 = (0xff << MM) | ENV;
 const FLAG_BITS: [u32; 7] = [
     RflagsBits::OF,
@@ -68,16 +69,26 @@ fn flags(bits: u32) -> Option<u64> {
     (rest == 0).then_some(set)
 }
 
-fn register(reg: Register) -> Option<(u64, bool)> {
+fn register(reg: Register) -> Option<u64> {
     if reg.is_gpr() {
-        Some((1 << reg.full_register32().number(), reg.size() == 4))
+        let byte = u32::from(matches!(
+            reg,
+            Register::AH | Register::CH | Register::DH | Register::BH
+        ));
+        Some(((1 << reg.size()) - 1) << (4 * reg.full_register32().number() as u32 + byte))
     } else if reg.is_xmm() {
-        Some((1 << (XMM + reg.number() as u32), true))
+        Some(1 << (XMM + reg.number() as u32))
     } else if reg.is_mm() {
-        Some((1 << (MM + reg.number() as u32), true))
+        Some(1 << (MM + reg.number() as u32))
     } else {
         None
     }
+}
+
+fn gpr_bytes(regs: u8) -> u64 {
+    (0..8).fold(0, |mask, reg| {
+        mask | (0xf * u64::from(regs >> reg & 1)) << (reg * 4)
+    })
 }
 
 /// Effects of one instruction on the components a split block can reproduce.
@@ -108,18 +119,18 @@ fn decoded(ins: &Summary) -> Option<Decoded> {
         if reg == Register::ESP {
             continue;
         }
-        let (bit, full) = register(reg)?;
+        let bit = register(reg)?;
         mmx |= bit >> MM & 0xff != 0;
         match used.access {
             OpAccess::Read | OpAccess::CondRead => out.reads |= bit,
-            OpAccess::Write if full => {
+            OpAccess::Write => {
                 out.defines |= bit;
                 out.writes |= bit;
             }
-            OpAccess::Write
-            | OpAccess::CondWrite
-            | OpAccess::ReadWrite
-            | OpAccess::ReadCondWrite => {
+            OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite => {
+                if used.access == OpAccess::ReadWrite {
+                    out.defines |= bit;
+                }
                 out.reads |= bit;
                 out.writes |= bit;
             }
@@ -159,7 +170,8 @@ fn any(a: &Set, b: &Set, without: &Set) -> bool {
 pub(super) struct Independence {
     pub frame: Option<(i32, i32)>,
     pub mmx: u16,
-    pub latch: (usize, bool),
+    pub gpr: u32,
+    pub gpr_writes: Vec<u32>,
 }
 
 /// The frame span `[lo, hi)` the head loop of `trace` writes, relative to
@@ -169,13 +181,14 @@ pub(super) struct Independence {
 /// by zero.
 pub(super) fn independent(
     trace: &Trace,
+    graph: &Graph,
     (affine, still): (u8, u8),
     slots: &[(i32, bool)],
     divisions: &[Option<Division>],
     instructions: &[Option<Arc<Summary>>],
-    scoped: bool,
+    scope: Option<&[Option<u8>]>,
 ) -> Option<Independence> {
-    let graph = Graph::build_selected(trace, scoped).ok()?;
+    let scoped = scope.is_some();
     let lp = &graph.loops[graph.heads[0]?];
     let n = trace.len();
     let mut decoded_at: Vec<Option<Decoded>> = (0..n).map(|_| None).collect();
@@ -268,8 +281,8 @@ pub(super) fn independent(
     }
     let mut carried = empty.clone();
     let mut steady = empty.clone();
-    carried[0] = u64::from(affine);
-    steady[0] = u64::from(still);
+    carried[0] = gpr_bytes(affine);
+    steady[0] = gpr_bytes(still);
     for &(slot, zero) in slots
         .iter()
         .filter(|&&(slot, _)| lo <= slot && slot + 4 <= hi)
@@ -288,21 +301,22 @@ pub(super) fn independent(
     }
     // Components the loop never writes keep their entry value.
     let invariant: Set = written.iter().zip(&steady).map(|(w, s)| !w | s).collect();
-    let uniform = uniform(&graph, lp, &uses, &invariant);
+    let uniform = uniform(graph, lp, &uses, &invariant, scope.unwrap_or_default());
     let k = uniform.len().min(UNIFORM);
     // EMMS changes tags without writing TOP. Keep both under the ordinary
     // proof when an iteration can clear tags.
-    let mergeable = if scoped
-        && (0..n).filter(|&at| lp.inside[at]).all(|at| {
+    let mut mergeable = 0;
+    if scoped {
+        mergeable = JOIN_GPR;
+        if (0..n).filter(|&at| lp.inside[at]).all(|at| {
             instructions[at]
                 .as_ref()
                 .and_then(|inst| inst.carried)
                 .is_some_and(|state| !state.emms)
         }) {
-        JOIN_MMX
-    } else {
-        0
-    };
+            mergeable |= JOIN_MMX;
+        }
+    }
     let mut conditional = 0;
     // Every iteration of a run takes a uniform branch the same way, so
     // each choice of their directions is checked on its own.
@@ -313,13 +327,35 @@ pub(super) fn independent(
                 .position(|&u| u == at)
                 .is_none_or(|i| choice >> i & 1 == edge as u32)
         };
-        conditional |= private(&graph, lp, &uses, &carried, mergeable, follows)?;
+        conditional |= private(graph, lp, &uses, &carried, mergeable, follows)?;
     }
     let mmx = ((conditional >> MM) as u16 & 0xff) | (u16::from(conditional & ENV != 0) << 8);
+    let gpr = conditional as u32;
+    let mut gpr_writes = Vec::new();
+    if gpr != 0 {
+        gpr_writes.resize(n, 0);
+        // Writes in one straight-line block share a mask update at its last
+        // write. Entry and outgoing edges delimit the group.
+        let mut previous = None;
+        for (at, inst) in trace.insts.iter().enumerate() {
+            if trace.merge[at] || trace.head(at) {
+                previous = None;
+            }
+            let mask = uses[at].defines.first().copied().unwrap_or(0) as u32 & gpr;
+            if mask != 0 {
+                gpr_writes[at] = mask | previous.map_or(0, |p| std::mem::take(&mut gpr_writes[p]));
+                previous = Some(at);
+            }
+            if inst.next != Next::Fall || inst.taken.is_some() {
+                previous = None;
+            }
+        }
+    }
     Some(Independence {
         frame: frame_written.then_some((lo, hi)),
         mmx,
-        latch: (lp.test, lp.taken),
+        gpr,
+        gpr_writes,
     })
 }
 
@@ -339,7 +375,13 @@ fn bits(set: &Set) -> impl Iterator<Item = usize> + '_ {
 /// definition is the entry value of an `invariant` one, or one instruction
 /// whose own inputs are steady. A load from memory is steady with its
 /// address, since admitted iterations never write what another reads.
-fn uniform(graph: &Graph, lp: &Loop, uses: &[Use], invariant: &Set) -> Vec<usize> {
+fn uniform(
+    graph: &Graph,
+    lp: &Loop,
+    uses: &[Use],
+    invariant: &Set,
+    scope: &[Option<u8>],
+) -> Vec<usize> {
     const UNSEEN: u16 = u16::MAX - 2;
     const HEAD: u16 = u16::MAX - 1;
     const MANY: u16 = u16::MAX;
@@ -381,7 +423,11 @@ fn uniform(graph: &Graph, lp: &Loop, uses: &[Use], invariant: &Set) -> Vec<usize
             }
         }
     }
-    let mut steady = vec![true; n];
+    // A private cell can hold a different value in every row even when
+    // its guest address is steady.
+    let mut steady: Vec<_> = (0..n)
+        .map(|at| scope.get(at).is_none_or(Option::is_none))
+        .collect();
     let mut changed = true;
     while changed {
         changed = false;

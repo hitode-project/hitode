@@ -214,6 +214,26 @@ pub(in crate::translate) fn check_class(
     }
 }
 
+/// Record writes to GPR bytes whose latest writer may be in another block.
+pub(in crate::translate) fn scope_written(asm: &mut Asm, runtime: Reg, a: Reg, b: Reg, mask: u32) {
+    let offset = runtime::SCOPE_GPR_WRITTEN;
+    if mask == u32::MAX {
+        asm.emit(mvn(W, a, Reg::new(31)));
+    } else {
+        asm.emit(ldr(W, a, runtime, offset));
+        if bitmask(W, u64::from(mask)).is_some() {
+            asm.emit(orr_imm(W, a, a, u64::from(mask)));
+        } else {
+            asm.emit(movz(W, b, mask as u16, 0));
+            if mask >> 16 != 0 {
+                asm.emit(movk(W, b, (mask >> 16) as u16, 16));
+            }
+            asm.emit(orr(W, a, a, b, Lsl, 0));
+        }
+    }
+    asm.emit(str(W, a, runtime, offset));
+}
+
 /// A proved, fully written dword redirected only in a scoped worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScopeCell {
@@ -226,7 +246,9 @@ pub(crate) struct ScopeFrame {
     pub cells: Vec<ScopeCell>,
     pub access: Vec<Option<u8>>,
     pub mmx: u16,
-    pub latch: Option<(usize, bool)>,
+    pub gpr: u32,
+    pub gpr_writes: Vec<u32>,
+    pub latch: (usize, bool),
 }
 
 #[derive(Clone)]

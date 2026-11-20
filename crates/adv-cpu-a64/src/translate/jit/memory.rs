@@ -79,12 +79,7 @@ impl Translator<'_> {
     pub(super) fn access(&mut self, addr: Addr, width: u8, dir: Dir, rt: Reg) {
         let store = dir == Dir::Store;
         #[cfg(native)]
-        if let Some(slot) = self
-            .computation_facts
-            .and_then(|facts| facts.scope_access)
-            .and_then(|access| access[self.index])
-        {
-            let offset = runtime::SCOPE_FRAME + 4 * u32::from(slot);
+        if let Some(offset) = self.scope_offset() {
             self.emit(if store {
                 str(W, rt, RUNTIME, offset)
             } else {
@@ -189,8 +184,23 @@ impl Translator<'_> {
         });
     }
 
+    #[cfg(native)]
+    fn scope_offset(&self) -> Option<u32> {
+        let slot = self.computation_facts?.scope_access?[self.index]?;
+        Some(runtime::SCOPE_FRAME + 4 * u32::from(slot))
+    }
+
     /// A vector access using the same sites and permission checks as integers.
     pub(super) fn vector_access(&mut self, size: VMem, value: VReg, address: Reg, store: bool) {
+        #[cfg(native)]
+        if let Some(offset) = self.scope_offset() {
+            self.emit(if store {
+                vstr(size, value, RUNTIME, offset)
+            } else {
+                vldr(size, value, RUNTIME, offset)
+            });
+            return;
+        }
         let direct = if store {
             vstr_reg(size, value, self.data_view(), address)
         } else {

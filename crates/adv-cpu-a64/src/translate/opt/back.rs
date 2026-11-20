@@ -110,17 +110,13 @@ impl Lowered {
 }
 
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None, false, false, None, None)
-}
-
-pub(crate) fn lower_scoped(func: &Func, access: &std::collections::BTreeMap<u32, u8>) -> Lowered {
-    lower_form(func, None, false, false, None, Some(access))
+    lower_form(func, None, false, false, None)
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)), false, false, None, None)
+    lower_form(func, Some((assumed, entry)), false, false, None)
 }
 
 /// A resident form entered from patchable links, accessing guest memory
@@ -132,14 +128,7 @@ pub(crate) fn lower_resident(
     count_entries: bool,
 ) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(
-        func,
-        Some((assumed, entry)),
-        true,
-        count_entries,
-        None,
-        None,
-    )
+    lower_form(func, Some((assumed, entry)), true, count_entries, None)
 }
 
 pub(crate) fn lower_rows(
@@ -155,7 +144,6 @@ pub(crate) fn lower_rows(
         true,
         count_entries,
         Some((domain, offer)),
-        None,
     );
     lowered.rows.then_some(lowered)
 }
@@ -174,7 +162,6 @@ fn lower_form(
     resident: bool,
     count_entries: bool,
     domain: Option<(&Domain, bool)>,
-    scope_access: Option<&std::collections::BTreeMap<u32, u8>>,
 ) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
@@ -188,7 +175,6 @@ fn lower_form(
             inline,
             (resident, count_entries, domain),
             &batches,
-            scope_access,
         );
         if !e.unpriced.is_empty() {
             batches.retain(|batch| {
@@ -329,7 +315,6 @@ fn emit<'a>(
     inline: Option<(&Assumed, &[Source])>,
     (resident, count_entries, domain): (bool, bool, Option<(&'a Domain, bool)>),
     batches: &[loops::Batch],
-    scope_access: Option<&'a std::collections::BTreeMap<u32, u8>>,
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
@@ -452,7 +437,6 @@ fn emit<'a>(
         row_strip,
         row_budget: None,
         row_price: None,
-        scope_access,
         row_failures: Vec::new(),
         split: None,
     };
@@ -818,7 +802,6 @@ struct Emitter<'a> {
     row_strip: Option<RowStrip>,
     row_budget: Option<((Label, Label), u32)>,
     row_price: Option<crate::translate::lower::resident::RowPrice>,
-    scope_access: Option<&'a std::collections::BTreeMap<u32, u8>>,
     row_failures: Vec<(crate::translate::lower::resident::RowFailure, Label)>,
     split: Option<(Label, Label, Label)>,
 }
@@ -834,11 +817,6 @@ impl CheckedEmitter for Emitter<'_> {
 }
 
 impl<'a> Emitter<'a> {
-    fn scope_offset(&self, pc: u32) -> Option<u32> {
-        let cell = self.scope_access?.get(&pc)?;
-        Some(runtime::SCOPE_FRAME + u32::from(*cell) * 4)
-    }
-
     fn data_view(&self) -> Reg {
         if self.resident { WINDOW } else { ALIAS }
     }
@@ -2068,12 +2046,19 @@ impl<'a> Emitter<'a> {
                 checked,
                 pc,
                 clock,
+                scope,
             } => {
-                if let Some(offset) = self.scope_offset(pc) {
-                    assert_eq!((width, ty), (4, Type::I32));
-                    self.asm.emit(ldr(W, d, RT, offset));
+                if let Some(cell) = scope {
+                    let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
+                    let source = if matches!(ty, Type::I32 | Type::I64) {
+                        self.asm.emit(ldr(W, d, RT, offset));
+                        Host::Register(d)
+                    } else {
+                        self.asm.emit(vldr(VMem::S, q, RT, offset));
+                        Host::Vector(q)
+                    };
                     if let Some(loc) = loc {
-                        self.copy(loc, Host::Register(d), Type::I32);
+                        self.copy(loc, source, ty);
                     }
                     return;
                 }
@@ -2137,11 +2122,16 @@ impl<'a> Emitter<'a> {
                 after,
                 checked,
                 pc,
+                scope,
             } => {
-                if let Some(offset) = self.scope_offset(pc) {
-                    assert_eq!((width, self.func.ty(value)), (4, Type::I32));
-                    let value = self.gp(value, T);
-                    self.asm.emit(str(W, value, RT, offset));
+                if let Some(cell) = scope {
+                    let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
+                    let word = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                        str(W, self.gp(value, T), RT, offset)
+                    } else {
+                        vstr(VMem::S, self.vr(value, A), RT, offset)
+                    };
+                    self.asm.emit(word);
                     self.region = after;
                     self.mark(Part::Body, self.func.records[after.0 as usize].eip);
                     return;
@@ -2240,6 +2230,9 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
+            }
+            Op::ScopeWritten(mask) => {
+                crate::translate::lower::access::scope_written(&mut self.asm, RT, T, U, mask)
             }
             Op::Validate => {}
         }

@@ -41,6 +41,7 @@ fn fixture(cc: Cc) -> Fixture {
     });
     func.blocks[split.0 as usize].head = Some(Head { record });
     let load = Op::Load {
+        scope: None,
         addr: pointer,
         width: 1,
         ty: Type::I32,
@@ -52,6 +53,7 @@ fn fixture(cc: Cc) -> Fixture {
     func.push(
         body,
         Op::Store {
+            scope: None,
             addr: pointer,
             width: 1,
             value: loaded,

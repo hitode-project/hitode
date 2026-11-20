@@ -175,13 +175,8 @@ pub(crate) fn build(unit: &Unit, facts: &dyn Facts, at: &CpuState) -> Result<Bui
     build_form(unit, facts, at, None, None)
 }
 
-pub(crate) fn build_scoped(
-    unit: &Unit,
-    proof: &Proof,
-    at: &CpuState,
-    access: &[Option<u8>],
-) -> Result<Built, Reject> {
-    build_form(unit, proof, at, None, Some(access))
+pub(crate) fn build_scoped(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, Reject> {
+    build_form(unit, proof, at, None, Some(proof))
 }
 
 fn build_form(
@@ -189,7 +184,7 @@ fn build_form(
     facts: &dyn Facts,
     at: &CpuState,
     resident: Option<Resident<'_>>,
-    scope_access: Option<&[Option<u8>]>,
+    scope: Option<&Proof>,
 ) -> Result<Built, Reject> {
     let mut cut = vec![false; unit.trace.len()];
     let mut view = None::<Unit>;
@@ -199,7 +194,7 @@ fn build_form(
             facts,
             at,
             resident.as_ref(),
-            scope_access,
+            scope,
         ) {
             Ok((func, assumed, plain_sites)) => {
                 let cuts = cut.iter().filter(|&&c| c).count();
@@ -213,11 +208,7 @@ fn build_form(
             Err(reject) => reject,
         };
         match reject.index() {
-            Some(i)
-                if scope_access.is_none()
-                    && i >= unit.trace.primary
-                    && cut.get(i) == Some(&false) =>
-            {
+            Some(i) if scope.is_none() && i >= unit.trace.primary && cut.get(i) == Some(&false) => {
                 cut[i] = true
             }
             _ => return Err(reject),
@@ -231,8 +222,12 @@ fn build_trace(
     facts: &dyn Facts,
     at: &CpuState,
     resident: Option<&Resident<'_>>,
-    scope_access: Option<&[Option<u8>]>,
+    scope: Option<&Proof>,
 ) -> Result<(Func, Assumed, Vec<u32>), Reject> {
+    let scope_access = scope
+        .and_then(Proof::scope_frame)
+        .map(|frame| frame.access.as_slice());
+    let scope_writes = scope.map_or(&[][..], Proof::scoped_gpr_writes);
     if unit.trace.insts.is_empty() {
         return Err(Reject::Empty);
     }
@@ -730,8 +725,14 @@ fn build_trace(
                     after,
                     checked: f.checked.is_some_and(|checked| checked(inst.pc)),
                     pc: inst.pc,
+                    scope: scope_access.and_then(|access| access[i]),
                 },
             );
+        }
+        if let Some(&mask) = scope_writes.get(i)
+            && mask != 0
+        {
+            f.func.push(f.block, Op::ScopeWritten(mask));
         }
         let fall = match inst.next {
             Next::Fall => Edge::Internal(i + 1),
@@ -909,6 +910,7 @@ impl Front<'_> {
             width,
             addr,
             pc,
+            scope: self.scope_access.and_then(|access| access[self.index]),
             checked: self.checked.is_some_and(|checked| checked(pc)),
             clock: inst.op.reads_clock(),
         });

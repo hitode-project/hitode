@@ -253,6 +253,7 @@ pub(crate) enum Op {
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
         pc: u32,
+        scope: Option<u8>,
         /// A shared clock observation stays at its original instruction.
         clock: bool,
     },
@@ -266,6 +267,7 @@ pub(crate) enum Op {
         /// Tests page classes first, as Tier-1 checked accesses do.
         checked: bool,
         pc: u32,
+        scope: Option<u8>,
     },
     /// An entry fact of a resident form: the pages `addr..addr + bytes`
     /// are ordinary (A64-MEM-14). Only the entry block holds these, before
@@ -325,6 +327,8 @@ pub(crate) enum Op {
         single: bool,
         pc: u32,
     },
+    /// Accumulate actual writes for the owner's scoped GPR join.
+    ScopeWritten(u32),
     /// Effect boundary for floating-point checks.
     Validate,
 }
@@ -332,7 +336,7 @@ pub(crate) enum Op {
 impl Op {
     pub(crate) fn uses(&self) -> impl Iterator<Item = Value> {
         let list: [Option<Value>; 3] = match *self {
-            Op::Constant(..) | Op::Validate => [None; 3],
+            Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => [None; 3],
             Op::SseInput { a, b, .. } => [Some(a), b, None],
             Op::Snapshot(a)
             | Op::IntUnary(_, a)
@@ -420,7 +424,7 @@ impl Op {
         self.can_fail()
             || matches!(
                 self,
-                Op::FrameStore { .. } | Op::Validate | Op::PlainPage { .. }
+                Op::FrameStore { .. } | Op::Validate | Op::PlainPage { .. } | Op::ScopeWritten(_)
             )
     }
 
@@ -627,6 +631,7 @@ impl Func {
             | Op::FrameStore { .. }
             | Op::SseInput { .. }
             | Op::Validate
+            | Op::ScopeWritten(_)
             | Op::PlainPage { .. }
             | Op::PageCross { .. }
             | Op::FrameDisjoint { .. } => {

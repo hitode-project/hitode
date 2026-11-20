@@ -689,6 +689,7 @@ pub(crate) struct ComputationFacts<'a> {
     pub frame_cache: Option<&'a FrameCache>,
     pub scope_access: Option<&'a [Option<u8>]>,
     pub scope_mmx: u16,
+    pub scope_gpr_writes: &'a [u32],
     pub divisions: &'a [Option<Division>],
 }
 
@@ -904,6 +905,14 @@ impl Translator<'_> {
             }
         }
         self.op(inst);
+        #[cfg(native)]
+        if let Some(&mask) = self
+            .computation_facts
+            .and_then(|facts| facts.scope_gpr_writes.get(index))
+            && mask != 0
+        {
+            super::lower::access::scope_written(self.asm, RUNTIME, X16, X17, mask);
+        }
         if let Next::Edge(edge) = inst.next {
             self.x87_before_edge();
             self.follow(edge);

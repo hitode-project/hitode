@@ -476,26 +476,42 @@ impl Trace {
             {
                 continue;
             }
-            let Op::Jcc(Cc::Flags(condition @ (e | ne)), target) = branch.op else {
+            let Op::Jcc(Cc::Flags(condition @ (e | ne)), _) = branch.op else {
                 continue;
             };
             let nonzero = regs[usize::from(reg)] & mask != 0;
             self.insts[at - 1].row_alignment = Some((reg, mask, nonzero));
-            let branch = &mut self.insts[at];
-            if nonzero == (condition == ne) {
-                branch.op = Op::Jmp(target);
-                branch.next = Next::Edge(branch.taken.unwrap());
-            } else {
-                branch.op = Op::Nop;
-            }
-            branch.effects = branch.op.effects();
-            branch.taken = None;
+            self.select_branch(at, nonzero == (condition == ne));
             changed = true;
         }
         if changed {
             self.analyze();
         }
         changed
+    }
+
+    fn select_branch(&mut self, at: usize, taken: bool) {
+        let branch = &mut self.insts[at];
+        let Op::Jcc(_, target) = branch.op else {
+            unreachable!()
+        };
+        branch.op = if taken {
+            branch.next = Next::Edge(branch.taken.unwrap());
+            Op::Jmp(target)
+        } else {
+            Op::Nop
+        };
+        branch.effects = branch.op.effects();
+        branch.taken = None;
+    }
+
+    pub(crate) fn select_row_branches(&mut self, choices: &[[bool; 2]]) {
+        for (at, &[fall, taken]) in choices.iter().enumerate() {
+            if fall != taken {
+                self.select_branch(at, taken);
+            }
+        }
+        self.analyze();
     }
 
     fn mark_spin_backedges(&mut self, memory: &Memory, decodes: &Decodes) {

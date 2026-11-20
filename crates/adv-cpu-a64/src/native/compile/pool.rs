@@ -138,28 +138,8 @@ fn specialize_split(proof: &mut Proof, trace: &Trace) {
 }
 
 fn scoped_form(unit: &Unit, proof: &Proof, at: &CpuState) -> Option<JobForm> {
-    let Some(frame) = proof.scope_frame() else {
-        let built = front::build(unit, proof, at).ok()?;
-        let lowered = back::lower(&built.func);
-        return Some(JobForm { built, lowered });
-    };
-    // The optimizer retains guest PCs on memory operations. Only a PC
-    // whose occurrences all name the same private cell can use this form.
-    let mut accesses = std::collections::BTreeMap::new();
-    for (inst, &cell) in unit.trace.insts.iter().zip(&frame.access) {
-        if accesses
-            .insert(inst.pc, cell)
-            .is_some_and(|prior| prior != cell)
-        {
-            return None;
-        }
-    }
-    let accesses = accesses
-        .into_iter()
-        .filter_map(|(pc, cell)| Some((pc, cell?)))
-        .collect();
-    let built = front::build_scoped(unit, proof, at, &frame.access).ok()?;
-    let lowered = back::lower_scoped(&built.func, &accesses);
+    let built = front::build_scoped(unit, proof, at).ok()?;
+    let lowered = back::lower(&built.func);
     Some(JobForm { built, lowered })
 }
 
@@ -242,7 +222,8 @@ fn compile(request: Request) -> Compiled {
                 if built.cuts != 0 {
                     return None;
                 }
-                proof.prove_scoped_split(&rows.trace);
+                let mut worker = rows.clone();
+                domain.prove_scoped_split(&mut proof, &mut worker.trace);
                 crate::jit_map::optimized(
                     eip,
                     format_args!(
@@ -257,11 +238,8 @@ fn compile(request: Request) -> Compiled {
                 let offer = proof.scoped_splits();
                 let lowered =
                     back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
-                if offer {
-                    let mut worker = rows.clone();
-                    if let Some((latch, taken)) = proof.scoped_latch() {
-                        worker.trace.end_at_latch(latch, taken);
-                    }
+                if let Some((latch, taken)) = proof.scoped_latch() {
+                    worker.trace.end_at_latch(latch, taken);
                     let form = scoped_form(&worker, &proof, &at);
                     scoped_job = Some(Job {
                         proof,
@@ -314,10 +292,14 @@ fn compile(request: Request) -> Compiled {
     };
     let job = if scoped_job.is_none() && matches!(task, Task::Discover | Task::Job) {
         proof.map(|proof| {
-            let form = front::build(&unit, &proof, &at).ok().map(|built| JobForm {
-                lowered: back::lower(&built.func),
-                built,
-            });
+            let form = if proof.scoped_latch().is_some() {
+                scoped_form(&unit, &proof, &at)
+            } else {
+                front::build(&unit, &proof, &at).ok().map(|built| JobForm {
+                    lowered: back::lower(&built.func),
+                    built,
+                })
+            };
             Job {
                 proof,
                 form,
