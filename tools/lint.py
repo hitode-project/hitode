@@ -24,7 +24,7 @@ import env as toolchain  # noqa: E402
 
 ROOT = toolchain.ROOT
 # The features CI lints the workspace with.
-WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked",
+WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked", "--keep-going",
                   "--features", "adv-shell/gpu,adv-shell/media,adv-device/slow-tests"]
 TARGETS = ("host", "ios", "android")
 

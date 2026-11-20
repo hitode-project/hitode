@@ -71,9 +71,10 @@ jobs:
       - name: Lint execution layer
         run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
       - name: Test execution layer
+        if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
+          cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/core-tests.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -96,8 +97,10 @@ jobs:
           rustup update stable --no-self-update
           cargo fmt --all -- --check
       - name: Test runtime comparison gates
+        if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s tools/performance -v
       - name: Check crate layering
+        if: ${{ !cancelled() }}
         run: |
           python3 -m unittest discover -s tools/layering -v
           python3 tools/layering/check_layers.py
@@ -189,14 +192,16 @@ jobs:
       - name: Build every crate with default features
         if: env.WORKSPACE_GROUP == 'core-system'
         timeout-minutes: 10
-        run: cargo check --workspace --exclude adv-launcher --all-targets --locked
+        run: cargo check --workspace --exclude adv-launcher --all-targets --locked --keep-going
       - name: Lint the whole workspace
-        if: env.WORKSPACE_GROUP == 'core-system'
+        if: ${{ !cancelled() && env.WORKSPACE_GROUP == 'core-system' }}
         timeout-minutes: 10
         run: |
           set -o pipefail
           python3 tools/lint.py host 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
       - name: Compile test programs
+        id: compile
+        if: ${{ !cancelled() }}
         timeout-minutes: 25
         run: |
           set -o pipefail
@@ -204,8 +209,9 @@ jobs:
           args=(--locked --lib --tests "${packages[@]}")
           if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
           if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then args+=(--features adv-device/slow-tests); fi
-          cargo test "${args[@]}" --no-run --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
+          cargo test "${args[@]}" --no-run --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
       - name: Execute tests
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           set -o pipefail
@@ -219,14 +225,14 @@ jobs:
       # scenarios and judge. Every master commit since then passed the same
       # gate, so its intended changes carry their claiming scenarios.
       - name: Restore the latest master build for behavior scenarios
-        if: env.WORKSPACE_GROUP == 'runtime-apps'
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/scenario-base
           key: scenario-adv-run-${{ github.sha }}
           restore-keys: scenario-adv-run-
       - name: Judge behavior scenarios
-        if: env.WORKSPACE_GROUP == 'runtime-apps'
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
         timeout-minutes: 10
         run: |
           set -o pipefail

@@ -47,7 +47,7 @@ jobs:
         run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
       - name: Test execution layer
         # PRs already run this checked-memory release suite in the core job.
-        if: github.event_name != 'pull_request'
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         run: |
           set -o pipefail
           cargo test --release --locked -p adv-cpu --no-fail-fast --lib --tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/tests.txt"
