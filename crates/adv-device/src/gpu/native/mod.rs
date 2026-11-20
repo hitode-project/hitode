@@ -69,7 +69,8 @@ pub struct Gpu {
         Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], pipelines::PipelineJob>>>,
     pipeline_counters: super::compile::CompileCounters,
     facade_id: u64,
-    failure: Arc<std::sync::OnceLock<String>>,
+    failure: Arc<std::sync::Mutex<Option<Error>>>,
+    wake: std::cell::Cell<bool>,
     draws: u64,
     /// The damage rectangle the next operations are limited to.
     clip: Option<Rect>,
@@ -81,6 +82,9 @@ pub struct Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        if self.wake.get() {
+            self.execution.worker.set_wake(self.facade_id, None);
+        }
         self.execution.worker.drop_facade(self.facade_id);
     }
 }
@@ -171,7 +175,7 @@ impl Gpu {
     fn facade(execution: std::rc::Rc<Execution>) -> Result<Self, Error> {
         let device = execution.device.clone();
         let stream = execution.stream.clone();
-        let failure = Arc::new(std::sync::OnceLock::new());
+        let failure = Arc::new(std::sync::Mutex::new(None));
         let (facade_id, pipeline_jobs, pipeline_counters) =
             execution.worker.create_facade(failure.clone())?;
         Ok(Self {
@@ -181,6 +185,7 @@ impl Gpu {
             pipeline_counters,
             facade_id,
             failure,
+            wake: std::cell::Cell::new(false),
             draws: 0,
             clip: None,
             readbacks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -196,10 +201,11 @@ impl Gpu {
             worker_shared.push_capture(tx);
         }))
     }
-    /// Register an execution-thread wake event so backpressure returns
-    /// `Error::Busy` instead of blocking on a condvar.
+    /// Register an execution-thread wake event so backpressure on this facade
+    /// returns `Error::Busy` instead of blocking on a condvar.
     pub fn set_wake(&self, wake: Option<Arc<adv_sync::WakeEvent>>) {
-        self.execution.worker.set_wake(wake);
+        self.wake.set(wake.is_some());
+        self.execution.worker.set_wake(self.facade_id, wake);
     }
     /// Check device health, test submission gate, and in-flight frame budget
     /// before starting a presentation.
@@ -207,11 +213,18 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.check()?;
-        self.execution.worker.admit_present()
+        self.execution.worker.admit_present(self.wake.get())
     }
     /// Synchronously drain all commands currently queued in `"adv-gfx-worker"`.
     pub fn drain_worker(&self) {
         self.execution.worker.drain();
+    }
+    /// Drain queued commands and clear a recoverable per-facade worker error
+    /// (such as a single failed pipeline build) before device reset. Permanent
+    /// GPU owner or hardware device loss remains reported by [`Self::check`].
+    pub fn clear_worker_failure(&self) {
+        self.drain_worker();
+        *self.failure.lock().unwrap() = None;
     }
     /// Device shared with the presenting queue, including decoder pools.
     pub fn device(&self) -> &adv_gpu::Device {
@@ -269,19 +282,16 @@ impl Gpu {
     pub fn stats(&self) -> Stats {
         self.execution.worker.stats(self.facade_id)
     }
-    /// Device loss, as reported by `"adv-gfx-worker"` or `"GPU owner"`.
+    /// Device loss or per-facade worker error, as reported by `"adv-gfx-worker"` or `"GPU owner"`.
     pub fn check(&self) -> Result<(), Error> {
-        if let Some(failure) = self
-            .execution
-            .owner
-            .failure
-            .get()
-            .or_else(|| self.failure.get())
-        {
+        if let Some(failure) = self.execution.owner.failure.get() {
             return Err(Error::Device(failure.clone()));
         }
         if let Some(failure) = self.device.lost() {
             return Err(Error::Device(failure));
+        }
+        if let Some(failure) = self.failure.lock().unwrap().clone() {
+            return Err(failure);
         }
         Ok(())
     }

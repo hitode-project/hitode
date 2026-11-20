@@ -58,7 +58,8 @@ impl Slots {
     }
     /// The only admission point for CPU writes to a slot. A held frame has no
     /// completion token yet; a submitted ingest retires with its queue token.
-    fn acquire(&mut self, gate: &Gate, mut flush: impl FnMut()) -> usize {
+    fn acquire(&mut self, gate: &Gate, mut flush: impl FnMut()) -> Result<usize, String> {
+        let mut flushed = false;
         loop {
             let completed = gate.completed();
             for offset in 0..3 {
@@ -67,10 +68,16 @@ impl Slots {
                 if state != u64::MAX && state <= completed {
                     self.entries[i].state.store(u64::MAX, Ordering::Release);
                     self.next = (i + 1) % 3;
-                    return i;
+                    return Ok(i);
                 }
             }
-            flush();
+            if gate.consumer_closed() {
+                return Err("GPU owner stopped".into());
+            }
+            if !flushed {
+                flush();
+                flushed = true;
+            }
             gate.wait_retired();
         }
     }
@@ -87,7 +94,7 @@ impl Slots {
         for entry in &mut self.entries {
             entry.debt.union(&damage);
         }
-        let i = self.acquire(gate, flush);
+        let i = self.acquire(gate, flush)?;
         // A guest read failure must not retain a partly overwritten baseline.
         self.last = self.last.filter(|&last| last != i);
         let entry = &mut self.entries[i];
@@ -363,12 +370,16 @@ mod tests {
             held.push(take(base).0);
         }
         let (events, recv) = mpsc::channel();
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushes_thread = flushes.clone();
         let thread = std::thread::spawn(move || {
             events.send(0).unwrap();
             slots
                 .publish(
                     &gate,
-                    || {},
+                    || {
+                        flushes_thread.fetch_add(1, Ordering::Relaxed);
+                    },
                     &s,
                     &memory,
                     Region::whole((s.width, s.height)),
@@ -385,6 +396,48 @@ mod tests {
         consumer.retired(adv_gpu::Token(7));
         assert_eq!(recv.recv_timeout(TIMEOUT).unwrap(), 1);
         thread.join().unwrap();
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn held_ingests_fail_cleanly_when_consumer_drops() {
+        let (device, _queue) = open();
+        let s = surface(PixelFormat::Bgra32, 4, 4, 0);
+        let memory = Memory {
+            bytes: vec![0; (s.pitch * s.height) as usize],
+            reads: Mutex::new(Vec::new()),
+        };
+        let mut slots = Slots::new(&device, &s).unwrap();
+        let (producer, consumer) = stream::channel(device.ring(4096).unwrap());
+        let gate = producer.gate();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let (_, base) = slots
+                .publish(
+                    &gate,
+                    || {},
+                    &s,
+                    &memory,
+                    Region::whole((s.width, s.height)),
+                    false,
+                )
+                .unwrap();
+            held.push(take(base).0);
+        }
+        drop(consumer);
+        assert!(
+            slots
+                .publish(
+                    &gate,
+                    || {},
+                    &s,
+                    &memory,
+                    Region::whole((s.width, s.height)),
+                    false,
+                )
+                .is_err()
+        );
+        drop(held);
     }
 
     #[test]

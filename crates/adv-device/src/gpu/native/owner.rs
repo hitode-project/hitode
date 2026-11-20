@@ -1097,11 +1097,14 @@ struct Color {rgba:vec4<f32>}
         let destination = image(&h.device, 4, 4);
         h.producer.push(color(&source));
         h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
-        let bytes = h.producer.bytes(
-            16,
-            h.device.caps().limits.uniform_offset_alignment,
-            |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
-        );
+        let bytes = h
+            .producer
+            .bytes(
+                16,
+                h.device.caps().limits.uniform_offset_alignment,
+                |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
+            )
+            .unwrap();
         let pipeline = pipeline(&h.device);
         let index = h
             .device
@@ -1183,11 +1186,14 @@ struct Color {rgba:vec4<f32>}
         h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
         let pipeline = pipeline(&h.device);
         for _ in 0..127 {
-            let bytes = h.producer.bytes(
-                16,
-                h.device.caps().limits.uniform_offset_alignment,
-                |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
-            );
+            let bytes = h
+                .producer
+                .bytes(
+                    16,
+                    h.device.caps().limits.uniform_offset_alignment,
+                    |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
+                )
+                .unwrap();
             h.producer.draw(
                 draw(pipeline.clone(), rect(0, 0, 4, 4)),
                 [(0, Binding::Uniform(bytes))],
@@ -1202,11 +1208,14 @@ struct Color {rgba:vec4<f32>}
         );
         assert_eq!(h.state.passes.len(), 1);
         h.producer.push(clear(rect(0, 0, 1, 1), [1., 0., 0., 1.]));
-        let bytes = h.producer.bytes(
-            16,
-            h.device.caps().limits.uniform_offset_alignment,
-            |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
-        );
+        let bytes = h
+            .producer
+            .bytes(
+                16,
+                h.device.caps().limits.uniform_offset_alignment,
+                |bytes| bytes.copy_from_slice(bytemuck::cast_slice(&[0f32, 0., 1., 1.])),
+            )
+            .unwrap();
         h.producer.draw(
             draw(pipeline, rect(0, 0, 4, 4)),
             [(0, Binding::Uniform(bytes))],
@@ -1279,7 +1288,7 @@ struct Color {rgba:vec4<f32>}
             super::super::stream::channel(device.ring(128 << 10).unwrap());
         let (send, events) = mpsc::channel();
         let producer_thread = std::thread::spawn(move || {
-            let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(1));
+            let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(1)).unwrap();
             producer.push(Command::Upload {
                 source: UploadSource::Ring(bytes),
                 pitch: 1024,
@@ -1288,7 +1297,7 @@ struct Color {rgba:vec4<f32>}
                 rect: rect(0, 0, 256, 128),
             });
             send.send(1).unwrap();
-            let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(2));
+            let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(2)).unwrap();
             send.send(2).unwrap();
             producer.push(Command::Upload {
                 source: UploadSource::Ring(bytes),
@@ -1549,13 +1558,16 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32
             let align = h.device.caps().limits.storage_offset_alignment.max(32);
             let instance_at = 48u32.next_multiple_of(align);
             let index_at = instance_at + 64;
-            let data = h.producer.bytes(index_at + 24, align, |bytes| {
-                bytes[..48].copy_from_slice(bytemuck::cast_slice(&positions));
-                bytes[instance_at as usize..index_at as usize]
-                    .copy_from_slice(bytemuck::cast_slice(&instances));
-                bytes[index_at as usize..]
-                    .copy_from_slice(bytemuck::cast_slice(&[0u32, 1, 2, 3, 4, 5]));
-            });
+            let data = h
+                .producer
+                .bytes(index_at + 24, align, |bytes| {
+                    bytes[..48].copy_from_slice(bytemuck::cast_slice(&positions));
+                    bytes[instance_at as usize..index_at as usize]
+                        .copy_from_slice(bytemuck::cast_slice(&instances));
+                    bytes[index_at as usize..]
+                        .copy_from_slice(bytemuck::cast_slice(&[0u32, 1, 2, 3, 4, 5]));
+                })
+                .unwrap();
             let part = |offset, len| Bytes {
                 span: data.span,
                 offset: data.offset + offset,
