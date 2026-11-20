@@ -4,8 +4,9 @@
 //!
 //! A body is written once, generic over [`Mem`]. Generated code calls its
 //! [`Window`] form: one page class read per 4 KiB page, then plain loads
-//! and stores through the window. A page that form may not take, such as a
-//! guard, file, shared or watched page, stops the body with [`Stop::Slow`]
+//! and stores through the window or private alias. Read-page grants may
+//! also use the live backing of a read-only file view. A blocked access,
+//! such as a guard page or a watched store, stops the body with [`Stop::Slow`]
 //! before it writes anything, and the call runs again on the full path. That
 //! path's [`GuestMem`] form completes every access a guest instruction
 //! would, and stops with [`Stop::Fault`] only where the guest would fault.
@@ -15,7 +16,7 @@
 //! x0 (EDX:EAX) and x1 (ECX, with the status above it).
 
 use crate::backend::{Guest, Prot};
-use crate::memory::{EXEC, READ, SHARED, WRITE};
+use crate::memory::{EXEC, Memory, READ, SHARED, WRITE};
 
 const PAGE_SHIFT: u32 = 12;
 /// Body-page flags, separate from native two-page grants.
@@ -138,10 +139,12 @@ pub struct BodyContext {
     pub window: *mut u8,
     /// Private linear storage, for pages restricted only by window host protection.
     pub alias: *mut u8,
-    /// A class byte per 4 KiB guest page. ALIAS selects private storage;
-    /// NO_ALIAS confines overlays to the window.
+    /// A class byte per 4 KiB guest page. ALIAS selects private storage.
+    /// NO_ALIAS prevents access through the private alias.
     pub classes: *const u8,
     pub services: Services,
+    /// The current memory owner, for read-only file pages outside the window.
+    pub memory: *const Memory,
 }
 
 impl Default for BodyContext {
@@ -151,6 +154,7 @@ impl Default for BodyContext {
             alias: std::ptr::null_mut(),
             classes: std::ptr::null(),
             services: Services::default(),
+            memory: std::ptr::null(),
         }
     }
 }
@@ -287,6 +291,11 @@ pub trait Mem {
         Ok(None)
     }
 
+    /// Bases that can reconstruct a page grant from its guest address.
+    fn linear_bases(&self) -> [*const u8; 2] {
+        [std::ptr::null(); 2]
+    }
+
     /// The `len` bytes at `at`, to read.
     fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop>;
     /// The `len` bytes at `at`, holding their current bytes, to write.
@@ -337,17 +346,20 @@ pub struct Window {
     alias: *mut u8,
     classes: *const u8,
     services: Services,
+    memory: *const Memory,
 }
 
 impl Window {
     /// # Safety
-    /// `context` must describe the live window and class table.
+    /// `context` must describe the live window and class table. A non-null
+    /// memory owner and its mappings must remain live and stable for the call.
     pub unsafe fn new(context: &BodyContext) -> Self {
         Self {
             window: context.window,
             alias: context.alias,
             classes: context.classes,
             services: context.services,
+            memory: context.memory,
         }
     }
 
@@ -370,6 +382,11 @@ impl Window {
                 flags |= class;
             }
         }
+        self.pointer(at, flags)
+    }
+
+    #[inline]
+    fn pointer(&self, at: u32, flags: u8) -> Result<*mut u8, Stop> {
         let base = if flags & ALIAS != 0 {
             if flags & NO_ALIAS != 0 {
                 return Err(Stop::Slow);
@@ -380,14 +397,36 @@ impl Window {
         };
         Ok(base.wrapping_add(at as usize))
     }
+
+    #[cold]
+    fn file_page(&self, at: u32) -> Result<Option<*const u8>, Stop> {
+        // SAFETY: the owner serializes bodies with mapping changes. The
+        // allocation stays mapped after the temporary view is dropped.
+        unsafe { self.memory.as_ref() }
+            .and_then(|memory| memory.read_only_file_view(at, 1 << PAGE_SHIFT))
+            .map(|view| Some(view.as_ptr()))
+            .ok_or(Stop::Slow)
+    }
 }
 
 impl Mem for Window {
     const WINDOW: bool = true;
     #[inline]
     fn read_page(&mut self, page: u32) -> Result<Option<*const u8>, Stop> {
-        self.check(page << PAGE_SHIFT, 1 << PAGE_SHIFT, READ, SHARED)
-            .map(|pointer| Some(pointer.cast_const()))
+        let at = page << PAGE_SHIFT;
+        let class = self.class(page);
+        if class & (READ | SHARED) == READ {
+            self.pointer(at, class)
+                .map(|pointer| Some(pointer.cast_const()))
+        } else if class & (READ | WRITE | SHARED) == READ | SHARED {
+            self.file_page(at)
+        } else {
+            Err(Stop::Slow)
+        }
+    }
+
+    fn linear_bases(&self) -> [*const u8; 2] {
+        [self.window.cast_const(), self.alias.cast_const()]
     }
 
     fn services(&self) -> Services {
@@ -766,6 +805,7 @@ mod tests {
             alias: bytes.as_mut_ptr(),
             classes: table.as_ptr(),
             services: Services::default(),
+            memory: std::ptr::null(),
         };
         (window, table)
     }
@@ -785,6 +825,79 @@ mod tests {
         assert_eq!(w.input(3 << 12, 1), Err(Stop::Slow), "an unmapped page");
         assert_eq!(w.input(u32::MAX, 2), Err(Stop::Slow), "a wrapping range");
         assert!(w.input(3 << 12, 0).is_ok(), "no bytes");
+    }
+
+    // spec: A64-CALL-4, A64-MEM-13
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn read_page_uses_live_read_only_file_backing_outside_the_window() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileExt;
+
+        const BASE: u32 = 0x10000;
+        const LEN: usize = 1 << PAGE_SHIFT;
+        let host = crate::virtual_memory::host_page_size().unwrap().max(16384);
+        let mut memory = Memory::window_at_host_size(BASE, host, host).unwrap();
+        let path = std::env::temp_dir().join(format!("adv-body-file-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.write_all(&[b'a'; LEN]).unwrap();
+        let storage =
+            crate::shared_memory::SharedAllocation::map_file(file.as_fd(), 0, LEN, false).unwrap();
+        memory
+            .map_shared_file(BASE, LEN, storage, READ, true)
+            .unwrap();
+        let with_window = |memory: &mut Memory, check: fn(&mut Window)| {
+            let classes = memory.fast.body_table((BASE >> PAGE_SHIFT) as usize);
+            drop(memory.native_permissions());
+            let context = BodyContext {
+                window: memory.window_base().unwrap() as *mut u8,
+                classes,
+                memory,
+                ..BodyContext::default()
+            };
+            // SAFETY: the owner and its class table stay live during the check.
+            check(&mut unsafe { Window::new(&context) });
+        };
+        with_window(&mut memory, |window| {
+            let page = BASE >> PAGE_SHIFT;
+            assert_eq!(window.class(page), READ | SHARED | ALIAS | NO_ALIAS);
+            let pointer = window.read_page(page).unwrap().unwrap();
+            // SAFETY: the grant covers the live file page.
+            assert_eq!(unsafe { pointer.read() }, b'a');
+            assert_eq!(window.output(BASE, 1), Err(Stop::Slow));
+        });
+        file.write_all_at(b"b", 0).unwrap();
+        memory.watch_code(BASE, 1);
+        with_window(&mut memory, |window| {
+            let pointer = window.read_page(BASE >> PAGE_SHIFT).unwrap().unwrap();
+            // SAFETY: the read grant retains the same file backing.
+            assert_eq!(unsafe { pointer.read() }, b'b');
+        });
+        memory.protect(BASE, LEN, 0).unwrap();
+        with_window(&mut memory, |window| {
+            assert_eq!(window.read_page(BASE >> PAGE_SHIFT), Err(Stop::Slow));
+        });
+        memory.unmap(BASE, LEN).unwrap();
+        let storage =
+            crate::shared_memory::SharedAllocation::map_file(file.as_fd(), 0, LEN, true).unwrap();
+        memory
+            .map_shared_file(BASE, LEN, storage, READ, false)
+            .unwrap();
+        with_window(&mut memory, |window| {
+            assert_eq!(window.read_page(BASE >> PAGE_SHIFT), Err(Stop::Slow));
+        });
     }
 
     // spec: A64-CALL-4

@@ -1230,12 +1230,14 @@ impl Native {
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
+            (*runtime).body.memory = owner.memory;
             let previous = ACTIVE.replace(Active::Owner(faults));
             enter(runtime, entry.unit);
             ACTIVE.set(previous);
         }
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
+        self.runtime.body.memory = std::ptr::null();
         if let Some(error) = owner.error {
             return Err(error);
         }
@@ -1706,6 +1708,7 @@ impl Native {
                 memory.fast.body_table((memory.base >> 12) as usize)
             },
             services: self.runtime.body.services,
+            memory: self.runtime.body.memory,
         };
         self.classified_epoch = Some(memory.epoch);
     }
