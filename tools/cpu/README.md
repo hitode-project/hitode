@@ -26,6 +26,7 @@ cargo run -p adv-cpu --release --example sst386 -- target/cpu-reference/sst386-e
 python -m unittest discover -s tools/cpu -p 'test_*.py'
 cargo test -p adv-cpu --release --example sst386 --test word_moves
 & tools/cpu/test-mov16-native.ps1
+& tools/cpu/test-segment-native.ps1
 ```
 
 The optional integer `97` also exercises every 97th selected vector through a

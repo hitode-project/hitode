@@ -75,10 +75,12 @@ impl SegmentState {
         memory.pages(addr, 4096)?;
         memory.committed(addr, 4096)?;
         let mut gdt = [0u8; 128];
+        // The selectors and their loadability match current WoW64. 0x30
+        // names the 64-bit user code segment there, readable from 32-bit code.
         for (selector, code, dpl) in [
             (0x23u16, true, 3),
             (0x2b, false, 3),
-            (0x30, false, 0),
+            (0x30, true, 3),
             (0x53, false, 3),
         ] {
             let offset = usize::from(selector >> 3) * 8;
@@ -88,7 +90,7 @@ impl SegmentState {
         let idt_base = addr + SegmentSetup::IDT_OFFSET;
         memory.write(idt_base, &[0; SegmentSetup::IDT_LIMIT as usize + 1])?;
         Ok(Self {
-            selectors: [0x2b, 0x23, 0x30, 0x2b, 0x53, 0],
+            selectors: [0x2b, 0x23, 0x2b, 0x2b, 0x53, 0x2b],
             gdt_base: addr,
             gdt_limit: 127,
             idt_base,

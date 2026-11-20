@@ -1432,8 +1432,12 @@ mod whitelist_audit {
                                 OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI
                             )
                         });
+                        let segment =
+                            matches!(i.mnemonic(), Mnemonic::Push | Mnemonic::Pop | Mnemonic::Mov)
+                                && i.op0_register().is_segment_register();
                         let allowed = floating
                             || word_string
+                            || segment
                             || matches!(
                                 i.mnemonic(),
                                 Mnemonic::Cli
