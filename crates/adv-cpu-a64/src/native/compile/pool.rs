@@ -342,6 +342,11 @@ impl Compiler {
         }
     }
 
+    /// Compile in place, or on the background pool. Set before the first run.
+    pub fn set_inline(&mut self, inline: bool) {
+        self.inline = inline.then(VecDeque::new);
+    }
+
     pub fn request(&mut self, request: Request) {
         if let Some(ready) = &mut self.inline {
             ready.push_back(compile(request));

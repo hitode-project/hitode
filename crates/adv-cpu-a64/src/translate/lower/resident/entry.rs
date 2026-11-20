@@ -336,16 +336,19 @@ pub(crate) fn offer_link(
     (asm.finish(), fallback)
 }
 
+/// A stale gate means the decision may have changed, so the entry checks at
+/// once; a split gate's pacing deadline is sampled.
 fn offer(asm: &mut Asm, gate: OfferEntry, counter: Label, leave: Label) {
     let proceed = asm.label();
-    if !gate.split {
+    if gate.split {
+        runtime::emit_sensor(asm, counter, SLOT, r(0), leave);
+    } else {
         asm.emit_all(&[
             ldr(X, GATE, RT, runtime::OFFER_GATE),
             ldr(W, r(17), GATE, 0),
         ]);
-        asm.cbz(W, false, r(17), proceed);
+        asm.cbz(W, true, r(17), leave);
     }
-    runtime::emit_sensor(asm, counter, SLOT, r(0), leave);
     asm.bind(proceed);
 }
 
@@ -453,7 +456,7 @@ mod tests {
             &[
                 ldr(X, GATE, RT, runtime::OFFER_GATE),
                 ldr(W, r(17), GATE, 0),
-                cbz(W, false, r(17), 24),
+                cbz(W, true, r(17), 4),
             ]
         );
     }

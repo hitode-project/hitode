@@ -82,7 +82,9 @@ impl Native {
         }
         let offer = match self.plans.arrival(cpu.eip) {
             plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
-                job.sample_offer() && job.offer_due(self.published_gate(), super::ticks)
+                let gate = self.published_gate();
+                let stale = gate.stale.load(std::sync::atomic::Ordering::Relaxed) != 0;
+                (stale || job.sample_offer()) && job.offer_due(gate, super::ticks)
             }
             _ => false,
         };
@@ -1376,6 +1378,10 @@ impl Native {
     pub(crate) fn set_computation_offer(&mut self, enabled: bool, skip: Option<u32>) {
         self.offload.enabled = enabled;
         self.plans.offer_resume = skip;
+    }
+
+    pub(crate) fn set_async_compilation(&mut self, enabled: bool) {
+        self.compiler.set_inline(!enabled);
     }
 
     pub(crate) fn progressed(&mut self) {

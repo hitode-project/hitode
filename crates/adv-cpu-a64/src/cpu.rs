@@ -1,8 +1,8 @@
 //! The guest CPU the machine layer drives, on the a64 engine: [`Cpu`]
 //! implements `Backend` and `Engine` over [`Executor`] as `JitCpu` does
-//! over the x64 executor. Translation is synchronous and cheap, so the
-//! compiler policy of `EngineOptions` does not apply; the background
-//! service exists only for the shell's other execution-owned work.
+//! over the x64 executor. Tier-1 translation is synchronous and cheap, so the
+//! compiler policy of `EngineOptions` does not apply; optimized forms compile
+//! on a background pool unless tests turn that off.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -72,9 +72,11 @@ impl Cpu {
         self.inner.stats.clone()
     }
 
-    /// Translation is always synchronous here, so there is nothing to turn
-    /// off; callers shared with the x64 engine need no target cfg.
-    pub fn set_async_compilation(&mut self, _enabled: bool) {}
+    /// Disabled, optimized forms and computation jobs compile in place
+    /// before the run continues, so execution tests are deterministic.
+    pub fn set_async_compilation(&mut self, enabled: bool) {
+        self.inner.set_async_compilation(enabled);
+    }
 
     /// Install the execution owner's retained event before the first run.
     pub fn set_waker(&mut self, wake: WakeEvent) -> Result<(), String> {

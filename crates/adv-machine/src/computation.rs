@@ -728,6 +728,8 @@ mod tests {
         // Enough budget slices to promote the loop before nominating it.
         const COUNT: u32 = 160_000;
         let mut m = machine(true);
+        // The loop must not outrun its own optimized compile.
+        m.cpu.set_async_compilation(false);
         let trace = Trace::default();
         m.sys.schedule_trace = ScheduleTrace::to_writer(Box::new(trace.clone())).unwrap();
         m.sys.stats.services_enabled = true;

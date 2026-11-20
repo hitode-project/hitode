@@ -284,6 +284,15 @@ impl Executor {
         self.set_deadline(None);
     }
 
+    pub fn set_async_compilation(&mut self, enabled: bool) {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.set_async_compilation(enabled);
+        }
+        #[cfg(not(native))]
+        let _ = enabled;
+    }
+
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
         if deadline.is_some() && self.alarm.is_none() {
