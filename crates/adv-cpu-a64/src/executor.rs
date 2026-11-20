@@ -62,7 +62,8 @@ pub struct Executor {
     diagnostics: u8,
     alarm: Option<adv_sync::pending::Deadline>,
     deadline: Option<Instant>,
-    offered: Option<u32>,
+    #[cfg(native)]
+    offered: Option<(u32, Option<crate::runtime::ScopedOffer>)>,
     computation_resume: Option<(u32, Exit)>,
     /// Retirement past the preceding slice, paid before another unit enters.
     fuel_debt: u64,
@@ -148,6 +149,7 @@ impl Executor {
             diagnostics: 0,
             alarm: None,
             deadline: None,
+            #[cfg(native)]
             offered: None,
             computation_resume: None,
             fuel_debt: 0,
@@ -243,6 +245,7 @@ impl Executor {
         cpu.refresh_mmx();
         Ok(ExecutionContext {
             cpu,
+            #[cfg(native)]
             offered: self.offered,
             resume: self.computation_resume,
             fuel_debt: self.fuel_debt,
@@ -252,7 +255,10 @@ impl Executor {
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
-        self.offered = context.offered;
+        #[cfg(native)]
+        {
+            self.offered = context.offered;
+        }
         self.computation_resume = context.resume;
         self.fuel_debt = context.fuel_debt;
         Ok(())
@@ -463,7 +469,10 @@ impl Executor {
             native.set_spin_yield(yield_on_spin);
             native.set_computation_offer(
                 self.verifier.is_none() && bridge.handler.is_some(),
-                self.offered.take().filter(|&pc| pc == self.state.eip),
+                self.offered
+                    .take()
+                    .map(|(pc, _)| pc)
+                    .filter(|&pc| pc == self.state.eip),
             );
             native.set_body_services(
                 bridge
@@ -491,7 +500,9 @@ impl Executor {
         let result = self.run_inner(stop, budget, &mut bridge, trace.as_deref_mut());
         #[cfg(native)]
         if let Some(native) = &mut self.native {
-            self.offered = self.offered.or(native.take_offer_skip());
+            self.offered = self
+                .offered
+                .or(native.take_offer_skip().map(|pc| (pc, None)));
         }
         if let Some(trace) = &mut trace {
             trace.boundary(&result, &self.state, &self.memory);
@@ -723,7 +734,11 @@ impl Executor {
                         None,
                     ),
                     Exit::Computation => {
-                        self.offered = Some(self.state.eip);
+                        #[cfg(native)]
+                        {
+                            let scoped = self.native.as_mut().unwrap().scoped_offer.take();
+                            self.offered = Some((self.state.eip, scoped));
+                        }
                         return Ok(RunOutcome::Computation);
                     }
                     Exit::Plan(_) => unreachable!("plan events complete at the native boundary"),

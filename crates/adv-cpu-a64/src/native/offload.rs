@@ -53,6 +53,14 @@ pub(super) struct WorkerJob<U> {
     pub(super) entry_registers: u8,
 }
 
+pub(super) struct ScopedJob<U> {
+    pub(super) worker: WorkerJob<U>,
+    pub(super) policy: JobPlan,
+}
+
+pub(super) type ScopedJobs<U> = FxHashMap<(u32, u8), ScopedJob<U>>;
+type JobKey = (u32, Option<u8>);
+
 #[derive(Clone)]
 pub(super) struct Code {
     pub placed: WorkerCode,
@@ -145,6 +153,7 @@ struct Task {
 struct Done {
     completion: Completion<Option<ExecutionContext>>,
     deadline_recall: bool,
+    rows: u32,
     /// Whether the optimized form admitted the entry state, if there is one.
     admitted: Option<bool>,
 }
@@ -202,6 +211,7 @@ fn run(
     let elapsed = started.elapsed();
     context.finish_computation(exit);
     Done {
+        rows: 0,
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
         deadline_recall: (exit == Exit::Recall || deferred)
             && signals.pending.0.load(Ordering::Acquire)
@@ -756,24 +766,24 @@ impl PageGrants {
 
 #[derive(Default)]
 pub(super) struct Admission {
-    sites: FxHashMap<u32, AdmissionCache>,
+    sites: FxHashMap<JobKey, AdmissionCache>,
     grants: PageGrants,
     generation: (u64, u64),
     spare: Vec<Vec<Range>>,
 }
 
 impl Admission {
-    pub(super) fn invalidate(&mut self, eip: u32) {
-        self.sites.remove(&eip);
+    pub(super) fn invalidate(&mut self, key: JobKey) {
+        self.sites.remove(&key);
     }
 
     pub(super) fn clear(&mut self) {
         self.sites.clear();
     }
 
-    fn recheck(&mut self, eip: u32, memory: &Memory, active: &[ActiveTask]) -> bool {
+    fn recheck(&mut self, key: JobKey, memory: &Memory, active: &[ActiveTask]) -> bool {
         self.sync_generation(memory);
-        self.sites[&eip].evaluation.admitted().iter().all(|range| {
+        self.sites[&key].evaluation.admitted().iter().all(|range| {
             !conflicts(range, active)
                 && self
                     .grants
@@ -791,13 +801,13 @@ impl Admission {
 
     fn ranges<'a>(
         &'a mut self,
-        job: &WorkerJob<impl Sized>,
+        (key, job): (JobKey, &WorkerJob<impl Sized>),
         cpu: &CpuState,
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<&'a [Range]> {
         self.sync_generation(memory);
-        let cache = self.sites.entry(cpu.eip).or_default();
+        let cache = self.sites.entry(key).or_default();
         let regs = std::array::from_fn(|i| {
             if job.entry_registers & (1 << i) != 0 {
                 cpu.regs[i]
@@ -844,14 +854,14 @@ impl Admission {
     /// After `ranges`, the blocks of its head loop, if it splits.
     fn plan(
         &mut self,
-        proof: &Proof,
+        (key, proof): (JobKey, &Proof),
         cpu: &CpuState,
         memory: &Memory,
         active: &[ActiveTask],
     ) -> Option<Plan> {
         let alias = alias_base(memory);
         let grants = &mut self.grants;
-        let cache = self.sites.get_mut(&cpu.eip).unwrap();
+        let cache = self.sites.get_mut(&key).unwrap();
         *cache.split.get_or_insert_with(|| {
             proof.plan(cpu, &mut cache.evaluation, |addr| {
                 let value = parameter(memory, grants, alias, active, addr);
@@ -870,9 +880,9 @@ impl Admission {
         memory: &Memory,
         active: &[ActiveTask],
         region: &Range,
-        eip: u32,
+        key: JobKey,
     ) -> bool {
-        let admitted = self.sites[&eip].evaluation.admitted();
+        let admitted = self.sites[&key].evaluation.admitted();
         let overlaps = |other: &Range| {
             u64::from(region.start) < other.end && u64::from(other.start) < region.end
         };
@@ -912,7 +922,7 @@ fn parameter(
 
 struct ActiveTask {
     id: u32,
-    entry: u32,
+    entry: JobKey,
     iteration: bool,
     ranges: Vec<Range>,
 }
@@ -927,10 +937,12 @@ fn conflicts(range: &Range, active: &[ActiveTask]) -> bool {
     })
 }
 
-pub(super) struct Session<'a, U> {
+pub(super) struct Session<'a, U, R> {
     entry: Entry,
     jobs: &'a FxHashMap<u32, WorkerJob<U>>,
-    plans: &'a mut Arbiter,
+    plans: &'a Arbiter,
+    scoped: &'a ScopedJobs<U>,
+    code: &'a store::CodeStore<R>,
     memory: &'a Memory,
     admission: &'a mut Admission,
     retired: &'a mut u64,
@@ -947,10 +959,14 @@ pub(super) struct Session<'a, U> {
     scope_updates: Vec<u32>,
 }
 
-impl<'a, U> Session<'a, U> {
+impl<'a, U, R> Session<'a, U, R> {
     pub(super) fn new(
-        entry: Entry,
-        (jobs, plans): (&'a FxHashMap<u32, WorkerJob<U>>, &'a mut Arbiter),
+        (entry, code): (Entry, &'a store::CodeStore<R>),
+        (jobs, scoped, plans): (
+            &'a FxHashMap<u32, WorkerJob<U>>,
+            &'a ScopedJobs<U>,
+            &'a Arbiter,
+        ),
         memory: &'a Memory,
         admission: &'a mut Admission,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
@@ -963,6 +979,8 @@ impl<'a, U> Session<'a, U> {
             entry,
             jobs,
             plans,
+            scoped,
+            code,
             memory,
             admission,
             retired,
@@ -987,7 +1005,22 @@ impl<'a, U> Session<'a, U> {
         std::mem::take(&mut self.scope_updates)
     }
 
-    fn prepare(&mut self, id: u32, context: &ExecutionContext) -> Option<(&Code, &[Range], bool)> {
+    fn job(&self, (eip, version): JobKey) -> Option<(&'a WorkerJob<U>, &'a JobPlan)> {
+        match version {
+            Some(version) => self
+                .scoped
+                .get(&(eip, version))
+                .map(|job| (&job.worker, &job.policy)),
+            None => Some((self.jobs.get(&eip)?, self.plans.job(eip).unwrap())),
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        id: u32,
+        context: &ExecutionContext,
+        key: JobKey,
+    ) -> Option<(&'a WorkerJob<U>, &'a JobPlan, &[Range], bool)> {
         let cpu = context.cpu();
         if self.signals.requested() || self.active.iter().any(|job| job.id == id) {
             return None;
@@ -995,14 +1028,16 @@ impl<'a, U> Session<'a, U> {
         if cpu.eflags & ((1 << 8) | (1 << 16)) != 0 || cpu.rep.is_some() || context.has_resume() {
             return None;
         }
-        let job = self.jobs.get(&cpu.eip)?;
-        let policy = self.plans.job_mut(cpu.eip).unwrap();
+        let (job, policy) = self.job(key)?;
         let iteration = policy.iteration();
-        let Some(ranges) = self.admission.ranges(job, cpu, self.memory, &self.active) else {
+        let Some(ranges) = self
+            .admission
+            .ranges((key, job), cpu, self.memory, &self.active)
+        else {
             policy.reoffer.set(REOFFER);
             return None;
         };
-        Some((&job.code, ranges, iteration))
+        Some((job, policy, ranges, iteration))
     }
 
     /// Runs the admitted head loop as blocks of about one budget slice, on
@@ -1012,11 +1047,11 @@ impl<'a, U> Session<'a, U> {
         &mut self,
         id: u32,
         context: &ExecutionContext,
-        code: &Code,
+        (key, code, policy): (JobKey, &Code, &JobPlan),
         plan: Plan,
         (retired, ns): (u64, f64),
         pace: Pace,
-    ) -> Option<Completion<Option<ExecutionContext>>> {
+    ) -> Option<Done> {
         let slice = (u64::from(COMPUTATION_SLICE) / retired).clamp(1, u64::from(u32::MAX)) as u32;
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
@@ -1044,14 +1079,13 @@ impl<'a, U> Session<'a, U> {
             };
             if !self
                 .admission
-                .private(self.memory, &self.active, &region, context.cpu().eip)
+                .private(self.memory, &self.active, &region, key)
             {
                 return None;
             }
         }
         let started = Instant::now();
-        let eip = context.cpu().eip;
-        let scoped = self.plans.job(eip).unwrap().scoped;
+        let scoped = policy.scoped;
         let mut start = context.clone();
         start.cpu_mut().settle_flags();
         if code.scoped_mmx != 0 {
@@ -1074,7 +1108,7 @@ impl<'a, U> Session<'a, U> {
         let (send, recv) = sync_channel(helpers);
         let submitted = (0..helpers)
             .take_while(|_| {
-                (!scoped || self.admission.recheck(eip, self.memory, &self.active))
+                (!scoped || self.admission.recheck(key, self.memory, &self.active))
                     && self.pool.submit(Job::Blocks(blocks.clone(), send.clone()))
             })
             .count();
@@ -1086,8 +1120,7 @@ impl<'a, U> Session<'a, U> {
         self.counts.splits += 1;
         self.counts.scoped += u64::from(scoped);
         if scoped {
-            let job = self.plans.job(eip).unwrap();
-            job.scope_splits.set(job.scope_splits.get() + 1);
+            policy.scope_splits.set(policy.scope_splits.get() + 1);
         }
         self.counts.wakes += submitted as u64;
         for _ in 0..submitted {
@@ -1161,24 +1194,28 @@ impl<'a, U> Session<'a, U> {
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
         completion.context.as_mut().unwrap().cpu_mut().mxcsr |= total.sticky;
-        learn(
-            self.plans.job(context.cpu().eip).unwrap(),
-            &completion,
-            iterations,
-            wake_cost(self.counts),
-        );
-        Some(completion)
+        learn(policy, &completion, iterations, wake_cost(self.counts));
+        Some(Done {
+            completion,
+            deadline_recall: false,
+            admitted: None,
+            rows: if scoped { iterations } else { 0 },
+        })
     }
 
     fn account(
         &mut self,
-        entry: u32,
+        key: JobKey,
         iteration: bool,
         done: Done,
     ) -> Completion<Option<ExecutionContext>> {
-        let policy = self.plans.job(entry).unwrap();
+        let (eip, version) = key;
+        if let Some(version) = version {
+            self.code.resident(eip).unwrap().versions[usize::from(version)].account_rows(done.rows);
+        }
+        let (_, policy) = self.job(key).unwrap();
         policy.observe(
-            entry,
+            eip,
             iteration,
             done.deadline_recall,
             &done.completion,
@@ -1265,25 +1302,23 @@ fn learn(
         .set(Some(((done.retired / n).max(1), ns / n as f64)));
 }
 
-impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
+impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
     fn submit(&mut self, id: u32, context: &Option<ExecutionContext>) -> bool {
         let Some(context) = context.as_ref() else {
             return false;
         };
-        let guest_entry = context.cpu().eip;
-        if self.plans.job(guest_entry).is_some_and(|job| job.scoped)
-            || self.active.len() == self.pool.limit
-        {
+        let key = (context.cpu().eip, None);
+        if context.scoped_offer().is_some() || self.active.len() == self.pool.limit {
             return false;
         }
         let mut grant = self.admission.spare.pop().unwrap_or_default();
         grant.clear();
-        let Some((code, ranges, iteration)) = self.prepare(id, context) else {
+        let Some((job, _, ranges, iteration)) = self.prepare(id, context, key) else {
             self.admission.spare.push(grant);
             return false;
         };
         grant.extend_from_slice(ranges);
-        let code = code.clone();
+        let code = job.code.clone();
         if self.pool.submit(Job::Whole(Box::new(Task {
             id,
             context: context.clone(),
@@ -1296,7 +1331,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
         }))) {
             self.active.push(ActiveTask {
                 id,
-                entry: guest_entry,
+                entry: key,
                 iteration,
                 ranges: grant,
             });
@@ -1314,33 +1349,40 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
     ) -> Option<Completion<Option<ExecutionContext>>> {
         let context = context.as_ref()?;
         let guest_entry = context.cpu().eip;
-        let (code, _, iteration) = self.prepare(id, context)?;
-        let code = code.clone();
-        let prepared = &self.jobs[&guest_entry];
-        let plan = if prepared.proof.splits() {
+        let offer = context.scoped_offer();
+        let key = (guest_entry, offer.map(|offer| offer.version));
+        if let Some(offer) = offer {
+            let job = self.scoped.get(&(guest_entry, offer.version))?;
+            if offer.generation != self.code.generation
+                || offer.entry != job.worker.code.placed.entry
+                || !self
+                    .code
+                    .offers_split(guest_entry, usize::from(offer.version))
+            {
+                return None;
+            }
+        }
+        let (job, policy, _, iteration) = self.prepare(id, context, key)?;
+        let code = &job.code;
+        let plan = if job.proof.splits() {
             self.admission
-                .plan(&prepared.proof, context.cpu(), self.memory, &self.active)
+                .plan((key, &job.proof), context.cpu(), self.memory, &self.active)
         } else {
             None
         };
-        let scoped = self.plans.job(guest_entry).unwrap().scoped;
+        let scoped = policy.scoped;
         if scoped {
             self.scope_updates.push(guest_entry);
         }
         if let Some(plan) = plan
             && let Some(pace) = self.pace
-            && let Some(per_iteration) = self.plans.job(guest_entry).unwrap().per_iteration.get()
-            && let Some(completion) = self.split(id, context, &code, plan, per_iteration, pace)
+            && let Some(per_iteration) = policy.per_iteration.get()
+            && let Some(done) =
+                self.split(id, context, (key, code, policy), plan, per_iteration, pace)
         {
-            let done = Done {
-                completion,
-                deadline_recall: false,
-                admitted: None,
-            };
-            return Some(self.account(guest_entry, false, done));
+            return Some(self.account(key, false, done));
         }
-        let job = self.plans.job(guest_entry).unwrap();
-        if scoped && (plan.is_none() || job.per_iteration.get().is_some()) {
+        if scoped && (plan.is_none() || policy.per_iteration.get().is_some()) {
             return None;
         }
         let mut scratch = ExecuteScratch::default();
@@ -1353,12 +1395,12 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
         } else {
             (&quiet, 0)
         };
-        let done = run(
+        let mut done = run(
             &mut self.runtime,
             id,
             context.clone(),
             self.entry,
-            (&code, u32::from(iteration || scoped)),
+            (code, u32::from(iteration || scoped)),
             signals,
             &mut scratch,
         );
@@ -1379,14 +1421,10 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
                 (true, true) => 1,
                 (true, false) => 0,
             };
-            learn(
-                self.plans.job(guest_entry).unwrap(),
-                &done.completion,
-                iterations,
-                wake_cost(self.counts),
-            );
+            learn(policy, &done.completion, iterations, wake_cost(self.counts));
         }
-        Some(self.account(guest_entry, iteration, done))
+        done.rows = u32::from(scoped && !done.completion.requires_owner);
+        Some(self.account(key, iteration, done))
     }
 
     fn poll(&mut self) -> Option<Completion<Option<ExecutionContext>>> {
@@ -1409,7 +1447,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
     }
 }
 
-impl<U> Drop for Session<'_, U> {
+impl<U, R> Drop for Session<'_, U, R> {
     fn drop(&mut self) {
         self.recall();
         while self.wait(None).is_some() {}
@@ -1627,6 +1665,262 @@ mod tests {
         scoped_split(true, true, true);
     }
 
+    const ROW_SLOT: u32 = 0x8_0000;
+    const ROW_STACK: u32 = ROW_SLOT + 0x4000;
+    const ROW_MISS: u32 = ROW_STACK + 0x4000;
+    const ROWS: u32 = 128;
+
+    fn routed_rows() -> (Executor, Native, CpuState, u32, [u32; 3]) {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut row = a.create_label();
+        let mut stop = a.create_label();
+        a.set_label(&mut row).unwrap();
+        a.call(dword_ptr(ebx)).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(row).unwrap();
+        a.jmp(stop).unwrap();
+        let mut targets = [a.create_label(), a.create_label(), a.create_label()];
+        let mut inner_heads = [a.create_label(), a.create_label()];
+        for (i, target) in targets.iter_mut().enumerate() {
+            a.set_label(target).unwrap();
+            if i != 0 {
+                let inner = &mut inner_heads[i - 1];
+                a.mov(ecx, 8).unwrap();
+                a.set_label(inner).unwrap();
+                a.movq(mm0, qword_ptr(esi)).unwrap();
+                a.por(mm0, [mm6, mm7][i - 1]).unwrap();
+                a.movntq(qword_ptr(edi), mm0).unwrap();
+                a.add(esi, 8).unwrap();
+                a.add(edi, 8).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(*inner).unwrap();
+            }
+            a.ret().unwrap();
+        }
+        a.set_label(&mut stop).unwrap();
+        a.int3().unwrap();
+        let image = a
+            .assemble_options(
+                u64::from(CODE),
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        native.first_visits = false;
+        for head in inner_heads {
+            native.keep_ordinary(image.label_ip(&head).unwrap() as u32);
+        }
+        let memory = executor.memory_mut();
+        for start in [INPUT, OUTPUT, ROW_SLOT, ROW_STACK] {
+            memory.map(start, 0x4000, READ | WRITE).unwrap();
+        }
+        memory.map_shared_audio(ROW_MISS, 0x4000).unwrap();
+        memory.attach().unwrap();
+        let mut cpu = CpuState {
+            eip: CODE,
+            regs: [0, 0, ROWS, ROW_SLOT, ROW_STACK + 0x100, 0, INPUT, OUTPUT],
+            ..CpuState::default()
+        };
+        cpu.x87.regs[6] = adv_cpu_core::X87Register::from_parts(0x1111, 0xffff);
+        cpu.x87.regs[7] = adv_cpu_core::X87Register::from_parts(0x2222, 0xffff);
+        cpu.refresh_mmx();
+        let stop = image.label_ip(&stop).unwrap() as u32;
+        native.observe_stop(stop);
+        (
+            executor,
+            native,
+            cpu,
+            stop,
+            targets.map(|label| image.label_ip(&label).unwrap() as u32),
+        )
+    }
+
+    fn row_run(
+        native: &mut Native,
+        memory: &mut Memory,
+        cpu: &mut CpuState,
+        stop: u32,
+    ) -> crate::native::Run {
+        native
+            .run(cpu, memory, stop, 1 << 16, std::ptr::null_mut())
+            .unwrap()
+            .unwrap()
+    }
+
+    // spec: A64-OPT-8 A64-OPT-14
+    #[test]
+    fn unpriced_first_target_leaves_the_router_open() {
+        let (mut executor, mut native, start, stop, [unpriced, priced, _]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &unpriced.to_le_bytes()).unwrap();
+        assert!(!native.force_resident_at(memory, start.clone()));
+        assert!(!native.plans.resident(CODE).unwrap().declined());
+        assert_eq!(native.plans.resident(CODE).unwrap().row_targets, [unpriced]);
+
+        let mut cpu = start.clone();
+        assert_eq!(
+            row_run(&mut native, memory, &mut cpu, stop).exit,
+            Exit::Dispatch
+        );
+        assert_eq!((cpu.eip, cpu.regs[2]), (stop, 0));
+        let feedback = native
+            .code
+            .resident(CODE)
+            .unwrap()
+            .row_feedback
+            .as_deref()
+            .unwrap();
+        assert_eq!(feedback.failures[0].get(), 0);
+
+        memory.write(ROW_SLOT, &priced.to_le_bytes()).unwrap();
+        let mut cpu = start.clone();
+        assert_eq!(
+            row_run(&mut native, memory, &mut cpu, stop).exit,
+            Exit::Dispatch
+        );
+        let versions = &native.code.resident(CODE).unwrap().versions;
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].row_target.unwrap().value, priced);
+
+        memory.write(ROW_SLOT, &unpriced.to_le_bytes()).unwrap();
+        let mut cpu = start;
+        assert_eq!(
+            row_run(&mut native, memory, &mut cpu, stop).exit,
+            Exit::Dispatch
+        );
+        assert_eq!((cpu.eip, cpu.regs[2]), (stop, 0));
+        let feedback = native
+            .code
+            .resident(CODE)
+            .unwrap()
+            .row_feedback
+            .as_deref()
+            .unwrap();
+        assert_eq!(feedback.failures[0].get(), 1);
+    }
+
+    // spec: A64-OPT-8 A64-OPT-9
+    #[test]
+    fn routed_versions_each_offer_their_own_scoped_job() {
+        let (mut executor, mut native, start, stop, [_, first, second]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &first.to_le_bytes()).unwrap();
+        assert!(native.force_resident_at(memory, start.clone()));
+        memory.write(ROW_SLOT, &second.to_le_bytes()).unwrap();
+        row_run(&mut native, memory, &mut start.clone(), stop);
+        assert_eq!(native.scoped_jobs.len(), 2);
+        native.pace.set(Some(Pace::default()));
+        native.set_computation_offer(true, None);
+        for (index, target) in [first, second].into_iter().enumerate() {
+            let index = index as u8;
+            memory.write(ROW_SLOT, &target.to_le_bytes()).unwrap();
+            let mut cpu = start.clone();
+            let run = row_run(&mut native, memory, &mut cpu, stop);
+            assert_eq!(run.exit, Exit::Computation);
+            let offer = native.scoped_offer.take().unwrap();
+            assert_eq!(offer.version, index);
+            assert_eq!(
+                offer.entry,
+                native.scoped_jobs[&(CODE, index)].worker.code.placed.entry
+            );
+        }
+        assert_ne!(
+            native.scoped_jobs[&(CODE, 0)].worker.code.placed.entry,
+            native.scoped_jobs[&(CODE, 1)].worker.code.placed.entry
+        );
+        native.drop_unit(CODE);
+        assert!(native.scoped_jobs.is_empty());
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn split_heavy_row_ledger_keeps_the_driver() {
+        row_ledger(16);
+    }
+
+    // spec: A64-OPT-9
+    #[test]
+    fn failure_heavy_row_ledger_withdraws_the_driver() {
+        row_ledger(0);
+    }
+
+    fn row_ledger(splits: u64) {
+        let _pool = exclusive_pool();
+        let (mut executor, mut native, start, stop, [_, priced, _]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &priced.to_le_bytes()).unwrap();
+        assert!(native.force_resident_at(memory, start.clone()));
+        let feedback = native
+            .code
+            .resident(CODE)
+            .unwrap()
+            .row_feedback
+            .as_deref()
+            .unwrap();
+        feedback.next.set(1);
+        let mut miss = start.clone();
+        miss.regs[6] = ROW_MISS;
+        row_run(&mut native, memory, &mut miss, stop);
+        assert!(native.plans.resident(CODE).unwrap().row_accounting());
+        let measured = native.code.accounted(CODE);
+        let costs = native.code.row_costs(CODE).unwrap();
+        let rows = (0..splits)
+            .map(|_| {
+                let policy = &native.scoped_jobs[&(CODE, 0)].policy;
+                policy.per_iteration.set(Some((59, 1_000_000.0)));
+                policy.split_minimum.set(2);
+                native.pace.set(Some(Pace::default()));
+                native.set_computation_offer(true, None);
+                let mut cpu = start.clone();
+                let run = row_run(&mut native, memory, &mut cpu, stop);
+                assert_eq!(run.exit, Exit::Computation);
+                assert_eq!(cpu.eip, CODE);
+                let offer = native.scoped_offer.take().expect("resident split offer");
+                let rows = cpu.regs[2];
+                let context = Some(ExecutionContext {
+                    cpu,
+                    offered: Some((CODE, Some(offer))),
+                    resume: None,
+                    fuel_debt: 0,
+                });
+                native.with_computation(
+                    memory,
+                    &mut 0,
+                    (Arc::new(AtomicU32::new(0)), 0),
+                    None,
+                    &mut |session| assert!(session.run_local(1, &context).is_some()),
+                );
+                native.set_computation_offer(false, None);
+                u64::from(rows)
+            })
+            .sum::<u64>();
+        assert_eq!(native.diagnostics.split.scoped, splits);
+        assert_eq!(
+            native.code.accounted(CODE),
+            (measured.0 + splits, measured.1 + rows)
+        );
+
+        let mut miss = start;
+        miss.regs[6] = ROW_MISS;
+        row_run(&mut native, memory, &mut miss, stop);
+        let site = native.code.resident(CODE).unwrap();
+        let failures = site
+            .row_feedback
+            .as_deref()
+            .unwrap()
+            .failures
+            .iter()
+            .map(std::cell::Cell::get)
+            .sum::<u64>();
+        assert_eq!(failures, 33);
+        assert_eq!(
+            site.versions.len(),
+            usize::from(splits != 0),
+            "{splits} admissions, {rows} rows, {failures} failures, guard and savings costs {costs:?}"
+        );
+        assert_eq!(native.plans.resident(CODE).unwrap().declined(), splits == 0);
+    }
+
     fn scoped_split(frame: bool, conditional_mmx: bool, raw: bool) {
         let _pool = exclusive_pool();
         const ROWS: u32 = 128;
@@ -1732,7 +2026,8 @@ mod tests {
             )
             .unwrap();
         assert!(native.force_resident_at(executor.memory_mut(), cpu.clone()));
-        let code = &mut native.worker_jobs.get_mut(&head).unwrap().code;
+        let scoped = native.scoped_jobs.get_mut(&(head, 0)).unwrap();
+        let code = &mut scoped.worker.code;
         if conditional_mmx {
             assert_eq!(code.scoped_mmx, (1 << 1) | (1 << 8));
             if raw {
@@ -1741,12 +2036,9 @@ mod tests {
                 assert!(code.optimized.is_some());
             }
         }
-        let job = native.plans.job(head).expect("scoped worker artifact");
+        let job = &scoped.policy;
         assert!(job.scoped);
-        assert_eq!(
-            native.worker_jobs[&head].code.frame.len(),
-            usize::from(frame) * 3
-        );
+        assert_eq!(code.frame.len(), usize::from(frame) * 3);
         job.per_iteration
             .set(Some((u64::from(WIDTH) * 7 + 3, 20_000.0)));
         native.pace.set(Some(Pace::default()));
@@ -1765,7 +2057,7 @@ mod tests {
         assert_eq!(first.exit, Exit::Computation);
         let context = Some(ExecutionContext {
             cpu,
-            offered: None,
+            offered: Some((head, native.scoped_offer.take())),
             resume: None,
             fuel_debt: 0,
         });
@@ -2857,6 +3149,7 @@ mod tests {
         cpu.eip = head;
         native.prepare_job(executor.memory_mut(), stop, &cpu);
         let prepared = &native.worker_jobs[&head];
+        let key = (head, None);
         let memory = executor.memory();
 
         // Initial check and sliding pointers inside the first page and across
@@ -2869,7 +3162,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, memory, &[])
+                .ranges((key, prepared), &cpu, memory, &[])
                 .is_some()
         );
         cpu.regs[6] = INPUT + 64;
@@ -2878,7 +3171,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, memory, &[])
+                .ranges((key, prepared), &cpu, memory, &[])
                 .is_some()
         );
         cpu.regs[6] = INPUT + 0x1000;
@@ -2887,20 +3180,20 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, memory, &[])
+                .ranges((key, prepared), &cpu, memory, &[])
                 .is_some()
         );
 
-        let evaluations = native.offload.admission.sites[&cpu.eip].evaluations;
+        let evaluations = native.offload.admission.sites[&key].evaluations;
         assert!(
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, memory, &[])
+                .ranges((key, prepared), &cpu, memory, &[])
                 .is_some()
         );
         assert_eq!(
-            native.offload.admission.sites[&cpu.eip].evaluations,
+            native.offload.admission.sites[&key].evaluations,
             evaluations
         );
         // Removing read permission on the cached first input page invalidates it.
@@ -2911,20 +3204,20 @@ mod tests {
             !native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, executor.memory(), &[])
+                .ranges((key, prepared), &cpu, executor.memory(), &[])
                 .is_some()
         );
 
-        let evaluations = native.offload.admission.sites[&cpu.eip].evaluations;
+        let evaluations = native.offload.admission.sites[&key].evaluations;
         assert!(
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, executor.memory(), &[])
+                .ranges((key, prepared), &cpu, executor.memory(), &[])
                 .is_none()
         );
         assert_eq!(
-            native.offload.admission.sites[&cpu.eip].evaluations,
+            native.offload.admission.sites[&key].evaluations,
             evaluations
         );
 
@@ -2938,7 +3231,7 @@ mod tests {
             native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, executor.memory(), &[])
+                .ranges((key, prepared), &cpu, executor.memory(), &[])
                 .is_some()
         );
 
@@ -2949,7 +3242,7 @@ mod tests {
             !native
                 .offload
                 .admission
-                .ranges(prepared, &cpu, executor.memory(), &[])
+                .ranges((key, prepared), &cpu, executor.memory(), &[])
                 .is_some()
         );
     }
@@ -3383,6 +3676,7 @@ mod tests {
             },
             deadline_recall: false,
             admitted: None,
+            rows: 0,
         };
         prepared.observe(
             CODE,

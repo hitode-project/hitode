@@ -457,10 +457,20 @@ impl Exit {
 }
 
 /// A saved guest CPU and its continuation between the owner and workers.
+/// Identifies the worker that admitted a resident checkpoint.
+#[cfg(native)]
+#[derive(Clone, Copy)]
+pub(crate) struct ScopedOffer {
+    pub(crate) version: u8,
+    pub(crate) entry: usize,
+    pub(crate) generation: u64,
+}
+
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub(crate) cpu: CpuState,
-    pub(crate) offered: Option<u32>,
+    #[cfg(native)]
+    pub(crate) offered: Option<(u32, Option<ScopedOffer>)>,
     pub(crate) resume: Option<(u32, Exit)>,
     pub(crate) fuel_debt: u64,
 }
@@ -480,8 +490,13 @@ impl ExecutionContext {
     }
 
     #[cfg(native)]
+    pub(crate) fn scoped_offer(&self) -> Option<ScopedOffer> {
+        self.offered.filter(|&(pc, _)| pc == self.cpu.eip)?.1
+    }
+
+    #[cfg(native)]
     pub(crate) fn finish_computation(&mut self, exit: Exit) {
-        self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
+        self.offered = (exit == Exit::Recall).then_some((self.cpu.eip, None));
         self.resume = matches!(exit, Exit::Event(_)).then_some((self.cpu.eip, exit));
     }
 }

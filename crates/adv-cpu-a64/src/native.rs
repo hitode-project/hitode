@@ -608,6 +608,8 @@ pub(crate) struct Native {
     pub(crate) pace: std::cell::Cell<Option<adv_cpu_core::backend::Pace>>,
     offload: offload::Offload,
     worker_jobs: FxHashMap<u32, offload::WorkerJob<Arc<Unit>>>,
+    scoped_jobs: offload::ScopedJobs<Arc<Unit>>,
+    pub(crate) scoped_offer: Option<runtime::ScopedOffer>,
     /// Where `opt_exit` saves an inline form's spill cells.
     inline_saved: Vec<u128>,
     /// Builds optimized forms, which `install_optimized` adopts.
@@ -702,9 +704,16 @@ impl Native {
                     reasons[0], reasons[1], reasons[2], reasons[3], reasons[4], reasons[5]
                 );
             }
-            if let Some(job) = self.plans.job(eip).filter(|job| job.scoped) {
-                let offers = job.scope_offers.get();
-                let splits = job.scope_splits.get();
+            let (jobs, offers, splits) = (0..plan::VERSIONS as u8)
+                .filter_map(|version| self.scoped_jobs.get(&(eip, version)))
+                .fold((0, 0u64, 0), |(jobs, offers, splits), job| {
+                    (
+                        jobs + 1,
+                        offers + job.policy.scope_offers.get(),
+                        splits + job.policy.scope_splits.get(),
+                    )
+                });
+            if jobs != 0 {
                 let declines = offers.saturating_sub(splits);
                 let _ = write!(
                     output,
@@ -909,6 +918,8 @@ impl Native {
             pace: std::cell::Cell::new(None),
             offload: offload::Offload::default(),
             worker_jobs: FxHashMap::default(),
+            scoped_jobs: FxHashMap::default(),
+            scoped_offer: None,
             inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
             features: features(),
