@@ -482,6 +482,16 @@ fn buffer_copy_and_fill() {
     for word in bytes[256..].chunks(4) {
         assert_eq!(u32::from_le_bytes(word.try_into().unwrap()), 0xa5a5_5a5a);
     }
+
+    let readback = gpu.buffer(256, BufferUsage::COPY_DST, Memory::Readback);
+    let mut encoder = gpu.queue.encoder("readback followed by an empty pass");
+    encoder.copy_buffer(device.slice(0..256), &readback, 0);
+    drop(encoder.compute_pass(&ComputePassDesc {
+        timestamps: None,
+        label: "empty pass",
+    }));
+    gpu.submit(encoder);
+    assert_eq!(mapped(&readback), source);
 }
 
 #[test]
@@ -1287,21 +1297,22 @@ fn occlusion_counts_samples() {
     if !gpu.has(Features::OCCLUSION_QUERIES) {
         return;
     }
-    let set = gpu
-        .device
-        .create_query_set(QueryKind::Occlusion, 1)
-        .expect("query set");
     let image = gpu.target(16, 16, Format::Rgba8Unorm);
     let pipeline = gpu.pipeline(&gpu.solid_desc(Format::Rgba8Unorm));
     let (uniforms, _) = gpu.uniforms(&[block(RED, 0.5)]);
     let results = gpu.buffer(8, BufferUsage::COPY_DST, Memory::Readback);
     let mut encoder = gpu.queue.encoder("occlusion");
+    let set;
     {
         let mut pass = encoder.render_pass(&pass(
             color(image.view(), Load::DontCare),
             None,
             whole(16, 16),
         ));
+        set = gpu
+            .device
+            .create_query_set(QueryKind::Occlusion, 1)
+            .expect("query set");
         pass.set_pipeline(&pipeline);
         pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
         pass.begin_occlusion(&set, 0);
@@ -1353,6 +1364,52 @@ fn multisampled_targets_resolve() {
         &[block(GREEN, 0.5)],
         None,
     );
+    for texel in gpu.read(&resolved).chunks(4) {
+        assert_eq!(texel, rgba8(GREEN));
+    }
+}
+
+#[test]
+fn loaded_multisample_target_resolves_without_draws() {
+    let mut gpu = gpu!();
+    if !gpu.has(Features::MULTISAMPLE) || gpu.device.caps().limits.sample_counts & (1 << 2) == 0 {
+        return;
+    }
+    let msaa = gpu
+        .device
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: extent(8, 8),
+            format: Format::Rgba8Unorm,
+            mips: 1,
+            samples: 4,
+            usage: Usage::COLOR,
+            view_formats: &[],
+            label: "stored msaa",
+        })
+        .unwrap();
+    let resolved = gpu.target(8, 8, Format::Rgba8Unorm);
+    let mut encoder = gpu.queue.encoder("resolve stored samples");
+    drop(encoder.render_pass(&pass(
+        color(msaa.view(), Load::Clear(GREEN.map(f64::from))),
+        None,
+        whole(8, 8),
+    )));
+    drop(
+        encoder.render_pass(&pass(
+            [ColorAttachment {
+                view: msaa.view(),
+                load: Load::Load,
+                store: Store::DontCare,
+                resolve: Some(resolved.view()),
+            }]
+            .into_iter()
+            .collect(),
+            None,
+            whole(8, 8),
+        )),
+    );
+    gpu.submit(encoder);
     for texel in gpu.read(&resolved).chunks(4) {
         assert_eq!(texel, rgba8(GREEN));
     }
@@ -1989,4 +2046,190 @@ vertex float4 vs(uint i [[vertex_id]], sampler s [[sampler(0)]]) {
     assert!(
         matches!(gpu.device.create_render_pipeline(&desc, None), Err(Error::Invalid(reason)) if reason.contains("collide modulo 16"))
     );
+}
+
+#[test]
+fn copy_image_regions_batches_disjoint_rects() {
+    let mut gpu = gpu!();
+    let (w, h) = (64, 64);
+    let src = gpu.target(w, h, Format::Rgba8Unorm);
+    let dst = gpu.target(w, h, Format::Rgba8Unorm);
+    let mut encoder = gpu.queue.encoder("setup");
+    drop(encoder.render_pass(&pass(color(src.view(), clear(RED)), None, whole(w, h))));
+    drop(encoder.render_pass(&pass(color(dst.view(), clear(BLUE)), None, whole(w, h))));
+    let mut regions = Vec::new();
+    for gy in 0..4 {
+        for gx in 0..4 {
+            regions.push(adv_gpu::encode::ImageCopyRegion {
+                src_mip: 0,
+                src_layer: 0,
+                src_origin: (gx * 16, gy * 16, 0),
+                dst_mip: 0,
+                dst_layer: 0,
+                dst_origin: (gx * 16, gy * 16, 0),
+                size: Extent {
+                    width: 8,
+                    height: 8,
+                    depth_or_layers: 1,
+                },
+            });
+        }
+    }
+    encoder.copy_image_regions(&src, &dst, &regions);
+    gpu.submit(encoder);
+    let bytes = gpu.read(&dst);
+    for y in 0..h {
+        for x in 0..w {
+            let expected = if (x % 16) < 8 && (y % 16) < 8 {
+                RED
+            } else {
+                BLUE
+            };
+            assert_eq!(pixel(&bytes, w, x, y), rgba8(expected), "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn dropped_bindings_outlive_bind_until_draw() {
+    let mut gpu = gpu!();
+    let target = gpu.target(8, 8, Format::Rgba8Unorm);
+    let shader = gpu
+        .device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(
+                "
+struct Block { tint: vec4<f32> }
+@group(0) @binding(0) var<uniform> block: Block;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(0) var samp: sampler;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.5, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, p.xy / 8.0) * block.tint;
+}
+",
+            ),
+            identity: 1003,
+            label: "dropped bindings",
+        })
+        .unwrap();
+    let mut colors = ArrayVec::new();
+    colors.push(ColorTarget {
+        format: Format::Rgba8Unorm,
+        blend: None,
+        write_mask: 0xf,
+    });
+    let pipeline = gpu.pipeline(&RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::UniformBuffer,
+                stages: Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::FRAGMENT,
+            },
+        ],
+        primitive: primitive(),
+        colors,
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "dropped bindings",
+    });
+    let sampler = gpu
+        .device
+        .sampler(&SamplerDesc {
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
+            mip: Filter::Nearest,
+            address: [Address::Clamp; 3],
+            border: BorderColor::TransparentBlack,
+            lod_bias: 0,
+            lod_min: 0,
+            lod_max: 0,
+            anisotropy: 1,
+            compare: None,
+        })
+        .unwrap();
+    let temp_tex = gpu
+        .device
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: Extent {
+                width: 4,
+                height: 4,
+                depth_or_layers: 1,
+            },
+            format: Format::Rgba8Unorm,
+            mips: 1,
+            samples: 1,
+            usage: Usage::COLOR | Usage::SAMPLED,
+            view_formats: &[],
+            label: "temp tex",
+        })
+        .unwrap();
+    let mut encoder = gpu.queue.encoder("dropped bindings");
+    drop(encoder.render_pass(&pass(color(temp_tex.view(), clear(RED)), None, whole(4, 4))));
+    {
+        let mut p =
+            encoder.render_pass(&pass(color(target.view(), clear(BLUE)), None, whole(8, 8)));
+        p.set_pipeline(&pipeline);
+        {
+            let tint: [u8; 16] = [1.0f32, 1.0, 1.0, 1.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let temp_buf = gpu
+                .device
+                .create_buffer(&BufferDesc {
+                    size: 16,
+                    usage: BufferUsage::UNIFORM,
+                    memory: Memory::Upload,
+                    label: "temp uniform",
+                })
+                .unwrap();
+            unsafe { temp_buf.mapped().unwrap().as_mut() }.copy_from_slice(&tint);
+            let temp_view = temp_tex
+                .create_view(&adv_gpu::resource::ViewDesc {
+                    format: Some(Format::Rgba8Unorm),
+                    dimension: Some(Dimension::D2),
+                    mips: 0..1,
+                    layers: 0..1,
+                    plane: 0,
+                })
+                .unwrap();
+            p.bind(0, Bind::Uniform(temp_buf.slice(0..16)));
+            p.bind(0, Bind::Sampled(&temp_view));
+            p.bind(0, Bind::Sampler(&sampler));
+            drop(temp_tex);
+            // temp_buf, temp_view, and temp_tex are all dropped here BEFORE draw()!
+        }
+        p.draw(0..3, 0..1);
+    }
+    gpu.submit(encoder);
+    let bytes = gpu.read(&target);
+    for y in 0..8 {
+        for x in 0..8 {
+            assert_eq!(pixel(&bytes, 8, x, y), rgba8(RED), "({x}, {y})");
+        }
+    }
 }

@@ -8,10 +8,19 @@ pub(crate) struct Encoder {
     pub(super) device: Device,
     pub(super) command: Object<dyn MTLCommandBuffer>,
     pub(super) spans: Vec<crate::Span>,
-    visibility: Option<Object<dyn MTLBuffer>>,
+    pub(super) bindings: Option<Box<Bindings>>,
+    blit: Option<Object<dyn MTLBlitCommandEncoder>>,
+    pub(super) visibility: Option<Object<dyn MTLBuffer>>,
+    visibility_needs_zero: bool,
     visibility_offset: usize,
     /// Timestamp resolves, encoded after this submission completes.
     pub(super) resolves: Vec<Resolve>,
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        self.finish_blit();
+    }
 }
 
 /// macOS 26 and later lose counter samples resolved before the sampling
@@ -36,36 +45,48 @@ pub(crate) struct RenderPass<'e> {
     resolves: Vec<(Object<dyn MTLTexture>, Object<dyn MTLTexture>)>,
     pipeline: Option<Arc<RenderData>>,
     raster: Raster,
-    bindings: Box<Bindings>,
     index: Option<(Object<dyn MTLBuffer>, usize, IndexFormat)>,
     depth_bias: (f32, f32, f32),
 }
 pub(crate) struct ComputePass<'e> {
     pipeline: Option<Arc<ComputeData>>,
-    bindings: Box<Bindings>,
     pub(super) raw: Object<dyn MTLComputeCommandEncoder>,
-    /// Holds the encoder exclusively while the pass is open.
-    _encoder: std::marker::PhantomData<&'e mut Encoder>,
+    encoder: &'e mut Encoder,
     timestamps: Option<(Arc<QueryData>, u32)>,
     /// Dispatches reached the GPU, so encoder-boundary samples are written.
     pub(super) work: bool,
 }
 
 impl Encoder {
-    pub(super) fn new(device: Device, command: Object<dyn MTLCommandBuffer>) -> Self {
+    pub(super) fn new(
+        device: Device,
+        command: Object<dyn MTLCommandBuffer>,
+        bindings: Box<Bindings>,
+        visibility: Option<Object<dyn MTLBuffer>>,
+    ) -> Self {
         Self {
             device,
             command,
             spans: Vec::new(),
-            visibility: None,
+            bindings: Some(bindings),
+            blit: None,
+            visibility,
+            visibility_needs_zero: true,
             visibility_offset: 0,
             resolves: Vec::new(),
         }
     }
-    fn blit(&self) -> Object<dyn MTLBlitCommandEncoder> {
-        self.command
-            .blitCommandEncoder()
-            .expect("Metal blit encoder")
+    fn blit(&mut self) -> &ProtocolObject<dyn MTLBlitCommandEncoder> {
+        self.blit.get_or_insert_with(|| {
+            self.command
+                .blitCommandEncoder()
+                .expect("Metal blit encoder")
+        })
+    }
+    pub(super) fn finish_blit(&mut self) {
+        if let Some(blit) = self.blit.take() {
+            blit.endEncoding();
+        }
     }
     pub(crate) fn render_pass<'e>(
         &'e mut self,
@@ -187,19 +208,16 @@ impl Encoder {
         // Counting results accumulate; reuse the slots only after the previous
         // pass copied its results out, with tracked hazards ordering the reset.
         if self.visibility_offset != 0 {
-            let blit = self.blit();
-            blit.fillBuffer_range_value(
-                self.visibility.as_ref().unwrap(),
-                NSRange::new(0, self.visibility_offset),
-                0,
-            );
-            blit.endEncoding();
+            let offset = self.visibility_offset;
+            let visibility = self.visibility.as_ref().unwrap().clone();
+            self.blit()
+                .fillBuffer_range_value(&visibility, NSRange::new(0, offset), 0);
             self.visibility_offset = 0;
         }
-        // Visibility buffers must be specified before creating the render encoder.
+        self.finish_blit();
+        // A pass can begin an occlusion query created after it opens.
         let visibility = self.visibility.get_or_insert_with(|| {
-            let buffer = self
-                .device
+            self.device
                 .0
                 .raw
                 .newBufferWithLength_options(
@@ -207,12 +225,7 @@ impl Encoder {
                     MTLResourceOptions::StorageModeShared
                         | MTLResourceOptions::HazardTrackingModeTracked,
                 )
-                .expect("Metal visibility buffer");
-            // The command buffer has not been submitted, so the CPU owns it.
-            unsafe {
-                std::ptr::write_bytes(buffer.contents().as_ptr().cast::<u8>(), 0, 65536);
-            }
-            buffer
+                .expect("Metal visibility buffer")
         });
         d.setVisibilityResultBuffer(Some(visibility));
         if let Some((set, first)) = desc.timestamps
@@ -255,7 +268,6 @@ impl Encoder {
                 resolves,
                 pipeline: None,
                 raster: Raster::DEFAULT,
-                bindings: Bindings::new(),
                 index: None,
                 depth_bias: (0.0, 0.0, 0.0),
             },
@@ -265,6 +277,7 @@ impl Encoder {
         &'e mut self,
         desc: &ComputePassDesc<'_>,
     ) -> crate::ComputePass<'e> {
+        self.finish_blit();
         let d = MTLComputePassDescriptor::new();
         if let Some((set, first)) = desc.timestamps
             && let QueryData::Timestamp { raw, .. } = &*set.inner.0
@@ -284,9 +297,8 @@ impl Encoder {
         crate::ComputePass {
             inner: ComputePass {
                 pipeline: None,
-                bindings: Bindings::new(),
                 raw,
-                _encoder: std::marker::PhantomData,
+                encoder: self,
                 timestamps: desc
                     .timestamps
                     .map(|(set, first)| (set.inner.0.clone(), first)),
@@ -309,7 +321,6 @@ impl Encoder {
                 metal_size(size.width, size.height, depth), &dst.image.inner.data.raw, slice, dst.mip as usize, origin);
             }
         }
-        blit.endEncoding();
     }
     pub(crate) fn copy_image_to_buffer(
         &mut self,
@@ -327,7 +338,6 @@ impl Encoder {
                 dst.offset as usize + offset * stride, pitch, stride);
             }
         }
-        blit.endEncoding();
     }
     pub(crate) fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         let blit = self.blit();
@@ -340,7 +350,52 @@ impl Encoder {
                 &dst.image.inner.data.raw, ds, dst.mip as usize, dest);
             }
         }
-        blit.endEncoding();
+    }
+    pub(crate) fn copy_image_regions(
+        &mut self,
+        src: &crate::Image,
+        dst: &crate::Image,
+        copies: &[ImageCopyRegion],
+    ) {
+        if copies.is_empty() {
+            return;
+        }
+        let src_d3 = src.desc().dimension == Dimension::D3;
+        let dst_d3 = dst.desc().dimension == Dimension::D3;
+        let src_raw = &src.inner.data.raw;
+        let dst_raw = &dst.inner.data.raw;
+        let blit = self.blit();
+        for copy in copies {
+            let so = MTLOrigin {
+                x: copy.src_origin.0 as usize,
+                y: copy.src_origin.1 as usize,
+                z: copy.src_origin.2 as usize,
+            };
+            let dest = MTLOrigin {
+                x: copy.dst_origin.0 as usize,
+                y: copy.dst_origin.1 as usize,
+                z: copy.dst_origin.2 as usize,
+            };
+            if src_d3 || dst_d3 {
+                let size = metal_size(copy.size.width, copy.size.height, copy.size.depth_or_layers);
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        src_raw, 0, copy.src_mip as usize, so, size,
+                        dst_raw, 0, copy.dst_mip as usize, dest,
+                    );
+                }
+            } else {
+                let size = metal_size(copy.size.width, copy.size.height, 1);
+                for layer in 0..copy.size.depth_or_layers {
+                    unsafe {
+                        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            src_raw, (copy.src_layer + layer) as usize, copy.src_mip as usize, so, size,
+                            dst_raw, (copy.dst_layer + layer) as usize, copy.dst_mip as usize, dest,
+                        );
+                    }
+                }
+            }
+        }
     }
     pub(crate) fn copy_buffer(
         &mut self,
@@ -358,21 +413,13 @@ impl Encoder {
                 src.size as usize,
             );
         }
-        blit.endEncoding();
     }
     pub(crate) fn fill_buffer(&mut self, dst: BufferSlice<'_>, value: u32) {
         if dst.size == 0 {
             return;
         }
-        let blit = self.blit();
         let bytes = value.to_le_bytes();
-        if bytes.iter().all(|&b| b == bytes[0]) {
-            blit.fillBuffer_range_value(
-                &dst.buffer.inner.0.raw,
-                NSRange::new(dst.offset as usize, dst.size as usize),
-                bytes[0],
-            );
-        } else {
+        let seed = (!bytes.iter().all(|&b| b == bytes[0])).then(|| {
             // Seed one word, then double non-overlapping ranges in GPU memory.
             let seed = self
                 .device
@@ -386,6 +433,12 @@ impl Encoder {
                     seed.contents().as_ptr().cast::<u8>(),
                     4,
                 );
+            }
+            seed
+        });
+        let blit = self.blit();
+        if let Some(seed) = seed {
+            unsafe {
                 let raw = &dst.buffer.inner.0.raw;
                 let offset = dst.offset as usize;
                 let size = dst.size as usize;
@@ -405,8 +458,13 @@ impl Encoder {
                     filled += count;
                 }
             }
+        } else {
+            blit.fillBuffer_range_value(
+                &dst.buffer.inner.0.raw,
+                NSRange::new(dst.offset as usize, dst.size as usize),
+                bytes[0],
+            );
         }
-        blit.endEncoding();
     }
     pub(crate) fn retain(&mut self, span: crate::Span) {
         self.spans.push(span);
@@ -441,7 +499,6 @@ impl Encoder {
                         range.len() * 8,
                     );
                 }
-                blit.endEncoding();
             }
         }
     }
@@ -528,14 +585,16 @@ impl Drop for RenderPass<'_> {
             set.mark(*first, !self.work);
         }
         self.raw.endEncoding();
+        self.encoder.bindings.as_mut().unwrap().clear();
         if self.occlusion.is_empty() && self.resolves.is_empty() {
             return;
         }
+        let visibility = self.encoder.visibility.clone();
         let blit = self.encoder.blit();
         for (dst, offset, src) in &self.occlusion {
             unsafe {
                 blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    self.encoder.visibility.as_ref().unwrap(),
+                    visibility.as_ref().unwrap(),
                     *src,
                     dst,
                     *offset,
@@ -554,7 +613,6 @@ impl Drop for RenderPass<'_> {
                 src, 0, 0, origin, metal_size(self.area.w, self.area.h, 1), dst, 0, 0, origin);
             }
         }
-        blit.endEncoding();
     }
 }
 impl RenderPass<'_> {
@@ -593,11 +651,11 @@ impl RenderPass<'_> {
                 .setDepthBias_slopeScale_clamp(constant, slope, clamp);
         }
         self.raster = new;
-        self.bindings.sizes_dirty |= p.sizes.iter().any(Option::is_some);
+        self.encoder.bindings.as_mut().unwrap().sizes_dirty |= p.sizes.iter().any(Option::is_some);
         self.pipeline = Some(p.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.bindings.bind(slot, resource);
+        self.encoder.bindings.as_mut().unwrap().bind(slot, resource);
     }
     /// Gives each stage the bindings it reads that changed since its last draw.
     fn flush(&mut self) -> MTLPrimitiveType {
@@ -605,11 +663,12 @@ impl RenderPass<'_> {
             .pipeline
             .as_deref()
             .expect("render pipeline before draw");
-        let sizes = std::mem::take(&mut self.bindings.sizes_dirty);
+        let bindings = self.encoder.bindings.as_mut().unwrap();
+        let sizes = std::mem::take(&mut bindings.sizes_dirty);
         let raw = &*self.raw;
         let table = |stage: usize| p.sizes[stage].as_deref().filter(|_| sizes);
-        self.bindings.flush(0, p.used[0], table(0), &Vertex(raw));
-        self.bindings.flush(1, p.used[1], table(1), &Fragment(raw));
+        bindings.flush(0, p.used[0], table(0), &Vertex(raw));
+        bindings.flush(1, p.used[1], table(1), &Fragment(raw));
         p.topology
     }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
@@ -707,6 +766,14 @@ impl RenderPass<'_> {
     }
     pub(crate) fn begin_occlusion(&mut self, set: &crate::queue::QuerySet, index: u32) {
         if let QueryData::Occlusion(raw) = &*set.inner.0 {
+            if self.encoder.visibility_needs_zero {
+                let visibility = self.encoder.visibility.as_ref().unwrap();
+                // The command buffer has not been submitted, so the CPU owns it.
+                unsafe {
+                    std::ptr::write_bytes(visibility.contents().as_ptr().cast::<u8>(), 0, 65536);
+                }
+                self.encoder.visibility_needs_zero = false;
+            }
             let offset = self.encoder.visibility_offset;
             self.encoder.visibility_offset += 8;
             self.raw
@@ -726,6 +793,7 @@ impl Drop for ComputePass<'_> {
             set.mark(*first, !self.work);
         }
         self.raw.endEncoding();
+        self.encoder.bindings.as_mut().unwrap().clear();
     }
 }
 impl ComputePass<'_> {
@@ -751,20 +819,21 @@ impl ComputePass<'_> {
                     .setThreadgroupMemoryLength_atIndex(length as usize, index)
             };
         }
-        self.bindings.sizes_dirty |= p.sizes.is_some();
+        self.encoder.bindings.as_mut().unwrap().sizes_dirty |= p.sizes.is_some();
         self.pipeline = Some(p.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.bindings.bind(slot, resource);
+        self.encoder.bindings.as_mut().unwrap().bind(slot, resource);
     }
     fn flush(&mut self) -> MTLSize {
         let p = self
             .pipeline
             .as_deref()
             .expect("compute pipeline before dispatch");
-        let sizes = std::mem::take(&mut self.bindings.sizes_dirty);
+        let bindings = self.encoder.bindings.as_mut().unwrap();
+        let sizes = std::mem::take(&mut bindings.sizes_dirty);
         let table = p.sizes.as_deref().filter(|_| sizes);
-        self.bindings.flush(0, p.used, table, &Compute(&self.raw));
+        bindings.flush(0, p.used, table, &Compute(&self.raw));
         p.workgroup
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -785,6 +854,9 @@ impl ComputePass<'_> {
                 );
         }
     }
+    pub(crate) fn dispatch_indirect_unordered(&mut self, args: BufferSlice<'_>) {
+        self.dispatch_indirect(args);
+    }
 }
 
 fn index_type(f: IndexFormat) -> (MTLIndexType, usize) {
@@ -801,10 +873,18 @@ fn same<T: objc2::Message + ?Sized>(a: &Retained<T>, b: &Retained<T>) -> bool {
 /// [`shader::index`]), and which of it each stage has yet to receive. `bind`
 /// only records; draws send each stage the changed indices it reads, so
 /// slots persist across pipelines and may be bound before one is set.
-struct Bindings {
+///
+/// Bound objects are retained in place on slot changes so safe callers may drop
+/// temporary resources between `bind()` and `draw()`/`dispatch()`, while
+/// unchanged bindings skip retain/release via pointer equality and `clear()`
+/// only resets touched slots via bitmasks.
+pub(super) struct Bindings {
     buffers: [Option<BufferBinding>; 31],
     textures: [Option<Object<dyn MTLTexture>>; 128],
     samplers: [Option<Object<dyn MTLSamplerState>>; 32],
+    bound_buffers: u32,
+    bound_textures: u128,
+    bound_samplers: u32,
     sampler_slots: [u32; 2],
     /// Per stage: indices whose resource changed since the stage last drew.
     dirty: [Used; 2],
@@ -821,6 +901,9 @@ struct BufferBinding {
     offset: u64,
     size: u64,
 }
+
+// SAFETY: Bindings is cleared at the end of every pass before returning to Queue.
+unsafe impl Send for Bindings {}
 
 /// One stage of an encoder, as `Bindings::flush` writes to it.
 trait Target {
@@ -884,17 +967,48 @@ target!(
 );
 
 impl Bindings {
-    fn new() -> Box<Self> {
+    pub(super) fn new() -> Box<Self> {
         Box::new(Self {
             buffers: std::array::from_fn(|_| None),
             textures: std::array::from_fn(|_| None),
             samplers: std::array::from_fn(|_| None),
+            bound_buffers: 0,
+            bound_textures: 0,
+            bound_samplers: 0,
             sampler_slots: [0; 2],
             dirty: [Used::default(); 2],
             moved: [0; 2],
             sizes_dirty: false,
             sent: [None, None],
         })
+    }
+    fn clear(&mut self) {
+        let mut b = self.bound_buffers;
+        while b != 0 {
+            let i = b.trailing_zeros() as usize;
+            b &= b - 1;
+            self.buffers[i] = None;
+        }
+        let mut t = self.bound_textures;
+        while t != 0 {
+            let i = t.trailing_zeros() as usize;
+            t &= t - 1;
+            self.textures[i] = None;
+        }
+        let mut s = self.bound_samplers;
+        while s != 0 {
+            let i = s.trailing_zeros() as usize;
+            s &= s - 1;
+            self.samplers[i] = None;
+        }
+        self.bound_buffers = 0;
+        self.bound_textures = 0;
+        self.bound_samplers = 0;
+        self.sampler_slots = [0; 2];
+        self.dirty = [Used::default(); 2];
+        self.moved = [0; 2];
+        self.sizes_dirty = false;
+        self.sent = [None, None];
     }
     fn bind(&mut self, slot: u32, resource: Bind<'_>) {
         let index;
@@ -921,6 +1035,7 @@ impl Bindings {
                             offset: b.offset,
                             size: b.size,
                         });
+                        self.bound_buffers |= 1 << index;
                         self.sizes_dirty = true;
                         self.moved[0] |= 1 << index;
                         self.moved[1] |= 1 << index;
@@ -944,6 +1059,7 @@ impl Bindings {
                     return;
                 }
                 *entry = Some(image.inner.raw.clone());
+                self.bound_textures |= 1 << index;
                 self.dirty[0].textures |= 1 << index;
                 self.dirty[1].textures |= 1 << index;
             }
@@ -952,11 +1068,12 @@ impl Bindings {
                 let entry = &mut self.samplers[index as usize];
                 if entry
                     .as_ref()
-                    .is_some_and(|old| same(old, &*sampler.inner.0))
+                    .is_some_and(|old| same(old, &sampler.inner.0))
                 {
                     return;
                 }
                 *entry = Some((*sampler.inner.0).clone());
+                self.bound_samplers |= 1 << index;
                 self.dirty[0].samplers |= 1 << index;
                 self.dirty[1].samplers |= 1 << index;
             }

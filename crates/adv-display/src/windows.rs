@@ -44,11 +44,17 @@ impl Windows {
         }
     }
 
-    /// Write the changed windows into images for the compositor. A window
-    /// whose images are all on screen waits for the next frame.
+    /// Write the changed windows into images for the compositor, coalescing
+    /// their uploads into `ring` and the frame's `encoder`. A window whose
+    /// images are all on screen waits for the next frame.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload(
         &mut self,
         (device, queue): (&Device, &mut Queue),
+        ring: &mut adv_gpu::Ring,
+        encoder: &mut Option<adv_gpu::Encoder>,
+        spans: &mut Vec<adv_gpu::Span>,
+        fallback_buffers: &mut Vec<adv_gpu::Buffer>,
         info: &FrameInfo,
         windows: Vec<Window>,
         images: &mut Vec<AcquiredImage>,
@@ -83,59 +89,81 @@ impl Windows {
                     self.images.get_mut(&window.id).unwrap()
                 }
             };
-            let Some(mut image) = pool.acquire(queue)? else {
+            let Some(image) = pool.acquire(queue)? else {
                 continue;
             };
-            let upload = device.create_buffer(&BufferDesc {
-                size: window.pixels.len() as u64,
-                usage: BufferUsage::COPY_SRC,
-                memory: Memory::Upload,
-                label: "guest window pixels",
-            })?;
-            // SAFETY: the buffer is new and not submitted yet.
-            let bytes = unsafe { upload.mapped().unwrap().as_mut() };
-            // GDI leaves alpha undefined on non-layered windows; layered windows
-            // carry premultiplied alpha.
-            for (out, pixel) in bytes
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(window.pixels.as_chunks::<4>().0)
-            {
-                let a = if window.layered { pixel[3] } else { 255 };
-                *out = if adv_gpu::present::COLOR_FORMAT == adv_gpu::Format::Rgba8Unorm {
-                    [pixel[2], pixel[1], pixel[0], a]
-                } else {
-                    [pixel[0], pixel[1], pixel[2], a]
-                };
+            let swizzle = |bytes: &mut [u8]| {
+                // GDI leaves alpha undefined on non-layered windows; layered windows
+                // carry premultiplied alpha.
+                for (out, pixel) in bytes
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(window.pixels.as_chunks::<4>().0)
+                {
+                    let a = if window.layered { pixel[3] } else { 255 };
+                    *out = if adv_gpu::present::COLOR_FORMAT == adv_gpu::Format::Rgba8Unorm {
+                        [pixel[2], pixel[1], pixel[0], a]
+                    } else {
+                        [pixel[0], pixel[1], pixel[2], a]
+                    };
+                }
+            };
+            let extent = Extent {
+                width,
+                height,
+                depth_or_layers: 1,
+            };
+            let dst = ImageCopy {
+                image: image.image(),
+                mip: 0,
+                layer: 0,
+                origin: (0, 0, 0),
+            };
+            let enc = encoder.get_or_insert_with(|| queue.encoder("display"));
+            match ring.reserve(window.pixels.len() as u64, 256) {
+                Ok(mut span) => {
+                    swizzle(span.bytes());
+                    enc.copy_buffer_to_image(
+                        BufferCopy {
+                            buffer: span.buffer(),
+                            offset: span.offset(),
+                            row_pitch: width * 4,
+                            rows: height,
+                        },
+                        dst,
+                        extent,
+                    );
+                    spans.push(span);
+                }
+                Err(adv_gpu::Error::Busy) => {
+                    let upload = device.create_buffer(&BufferDesc {
+                        size: window.pixels.len() as u64,
+                        usage: BufferUsage::COPY_SRC,
+                        memory: Memory::Upload,
+                        label: "guest window pixels",
+                    })?;
+                    // SAFETY: the buffer is new and not submitted yet.
+                    swizzle(unsafe { upload.mapped().unwrap().as_mut() });
+                    enc.copy_buffer_to_image(
+                        BufferCopy {
+                            buffer: &upload,
+                            offset: 0,
+                            row_pitch: width * 4,
+                            rows: height,
+                        },
+                        dst,
+                        extent,
+                    );
+                    fallback_buffers.push(upload);
+                }
+                Err(error) => return Err(error),
             }
-            let mut encoder = queue.encoder("guest window");
-            encoder.copy_buffer_to_image(
-                BufferCopy {
-                    buffer: &upload,
-                    offset: 0,
-                    row_pitch: width * 4,
-                    rows: height,
-                },
-                ImageCopy {
-                    image: image.image(),
-                    mip: 0,
-                    layer: 0,
-                    origin: (0, 0, 0),
-                },
-                Extent {
-                    width,
-                    height,
-                    depth_or_layers: 1,
-                },
-            );
-            let token = queue.submit_present(encoder, &mut [&mut image])?;
-            queue.on_complete(token, Box::new(move || drop(upload)));
             *version = window.version;
             images.push(AcquiredImage {
                 layer: LayerId::Window(window.id),
                 image,
-                acquire: token,
+                acquire: adv_gpu::Token(0),
             });
         }
         self.current = windows;

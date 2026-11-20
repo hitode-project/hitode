@@ -38,21 +38,15 @@ impl Device {
             }
             key.colors[i] = color.view.inner.raw.pixelFormat();
             key.samples = color.view.inner.raw.sampleCount();
-            if encode::partial(desc.area, color.view.size()) {
-                match color.load {
-                    Load::Clear(c) => {
-                        values[i] = if key.colors[i] == MTLPixelFormat::R32Uint {
-                            c.map(|v| v as u32)
-                        } else {
-                            c.map(|v| (v as f32).to_bits())
-                        };
-                        key.write |= 1 << i;
-                    }
-                    Load::DontCare => {
-                        key.write |= 1 << i;
-                    }
-                    _ => {}
-                }
+            if encode::partial(desc.area, color.view.size())
+                && let Load::Clear(c) = color.load
+            {
+                values[i] = if key.colors[i] == MTLPixelFormat::R32Uint {
+                    c.map(|v| v as u32)
+                } else {
+                    c.map(|v| (v as f32).to_bits())
+                };
+                key.write |= 1 << i;
             }
         }
         let (mut depth_value, mut stencil_value) = (0.0f32, 0u32);
@@ -62,34 +56,24 @@ impl Device {
             key.samples = depth.view.inner.raw.sampleCount();
             if encode::attached(depth.depth.0, depth.depth.1) {
                 key.depth = format;
-                if bounded && !depth.read_only {
-                    match depth.depth.0 {
-                        Load::Clear(value) => {
-                            depth_value = value;
-                            key.clear_depth = true;
-                        }
-                        Load::DontCare => {
-                            key.clear_depth = true;
-                        }
-                        _ => {}
-                    }
+                if bounded
+                    && !depth.read_only
+                    && let Load::Clear(value) = depth.depth.0
+                {
+                    depth_value = value;
+                    key.clear_depth = true;
                 }
             }
             if format == MTLPixelFormat::Depth32Float_Stencil8
                 && encode::attached(depth.stencil.0, depth.stencil.1)
             {
                 key.stencil = format;
-                if bounded && !depth.read_only {
-                    match depth.stencil.0 {
-                        Load::Clear(value) => {
-                            stencil_value = value;
-                            key.clear_stencil = true;
-                        }
-                        Load::DontCare => {
-                            key.clear_stencil = true;
-                        }
-                        _ => {}
-                    }
+                if bounded
+                    && !depth.read_only
+                    && let Load::Clear(value) = depth.stencil.0
+                {
+                    stencil_value = value;
+                    key.clear_stencil = true;
                 }
             }
         }

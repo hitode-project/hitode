@@ -190,6 +190,17 @@ const WINDOW: u32 = 4;
 const VOTES: u64 = 64;
 const HYPOTHESIS_WORDS: u64 = 11;
 
+#[derive(Default)]
+struct CpuScratch {
+    rects: Vec<adv_gpu::Rect>,
+    stale_rects: Vec<adv_gpu::Rect>,
+    tiles: Vec<bool>,
+    tile_list: Vec<u32>,
+    seen: Vec<u64>,
+    compared: Vec<u32>,
+    anchored: Vec<u32>,
+}
+
 /// One model at one canvas size. Only the selected model is resident.
 pub struct Upscaling {
     model: Model,
@@ -231,6 +242,8 @@ pub struct Upscaling {
     halo: u32,
     /// Storage offset alignment, in list entries.
     align: u32,
+    /// Reused per-frame CPU scratch buffers.
+    cpu_scratch: RefCell<CpuScratch>,
 }
 
 /// Word offsets into the state buffer.
@@ -667,6 +680,7 @@ impl Upscaling {
             grids,
             halo,
             align,
+            cpu_scratch: RefCell::default(),
         })
     }
 
@@ -726,21 +740,28 @@ impl Upscaling {
         }
         let exact = input == Input::Exact || !initialized;
         let (columns, rows) = (self.size.0.div_ceil(8), self.size.1.div_ceil(8));
-        let rects: Vec<Rect> = region.rects().into_iter().map(Into::into).collect();
+        let mut cpu = self.cpu_scratch.borrow_mut();
+        let CpuScratch {
+            rects,
+            stale_rects,
+            tiles,
+            tile_list,
+            seen,
+            compared,
+            anchored,
+        } = &mut *cpu;
+        rects.clear();
+        region.for_each_rect(|r| rects.push(r));
         // The bookkeeping tiles: wherever this change or the last one reaches.
         let tile_columns = self.size.0.div_ceil(TILE);
         let tile_rows = self.size.1.div_ceil(TILE);
-        let mut tiles = vec![false; (tile_columns * tile_rows) as usize];
-        let stale = self.stale.borrow();
-        let reached = rects.iter().copied().chain(
-            stale
-                .as_ref()
-                .map(Region::rects)
-                .unwrap_or_default()
-                .into_iter()
-                .map(Into::into),
-        );
-        for r in reached {
+        tiles.clear();
+        tiles.resize((tile_columns * tile_rows) as usize, false);
+        stale_rects.clear();
+        if let Some(stale) = self.stale.borrow().as_ref() {
+            stale.for_each_rect(|r| stale_rects.push(r));
+        }
+        for r in rects.iter().chain(stale_rects.iter()) {
             let x0 = r.x.saturating_sub(self.halo) / TILE;
             let y0 = r.y.saturating_sub(self.halo) / TILE;
             let x1 = (r.x + r.w + self.halo).min(self.size.0).div_ceil(TILE);
@@ -751,12 +772,14 @@ impl Upscaling {
                 }
             }
         }
-        drop(stale);
-        let tile_list: Vec<u32> = (0..tile_rows)
-            .flat_map(|y| (0..tile_columns).map(move |x| (x, y)))
-            .filter(|&(x, y)| tiles[(y * tile_columns + x) as usize])
-            .map(|(x, y)| x | y << 16)
-            .collect();
+        tile_list.clear();
+        for y in 0..tile_rows {
+            for x in 0..tile_columns {
+                if tiles[(y * tile_columns + x) as usize] {
+                    tile_list.push(x | y << 16);
+                }
+            }
+        }
         // Without exact damage, the anchor pass also finds the change among
         // the producer's cells. Compare checks them and every cell sharing an
         // output field with them under the offset hypotheses. A whole-canvas
@@ -764,27 +787,37 @@ impl Upscaling {
         // nothing to compare against. Offsets are sought only for changes
         // over an eighth of the canvas's cells: smaller ones skip the four
         // stages that find and copy them.
-        let whole = region.rects() == Region::whole(self.size).rects();
+        let whole = rects.len() == 1
+            && rects[0]
+                == adv_gpu::Rect {
+                    x: 0,
+                    y: 0,
+                    w: self.size.0,
+                    h: self.size.1,
+                };
         let cells: u32 = rects
             .iter()
             .map(|r| r.w.div_ceil(8) * r.h.div_ceil(8))
             .sum();
         let motion = initialized && cells >= (columns * rows).div_ceil(8);
-        let (mut compared, mut anchored) = (vec![], vec![]);
+        compared.clear();
+        anchored.clear();
         if !whole {
-            let mut seen = vec![0u64; (columns * rows).div_ceil(64) as usize];
+            let seen_words = (columns * rows).div_ceil(64) as usize;
+            seen.clear();
+            seen.resize(seen_words, 0);
             if motion {
-                compared = self.cells(&rects, 0, 0, &mut seen);
+                self.cells_into(rects, 0, 0, seen, compared);
                 let ring = 8 * self.model.neighbourhood();
-                compared.extend(self.cells(&rects, ring, ring, &mut seen));
+                self.cells_into(rects, ring, ring, seen, compared);
             }
             // Encodes seeking no offsets hash no anchors: the anchor pass
             // then only finds the change among the producer's cells.
             seen.fill(0);
             if motion {
-                anchored = self.cells(&rects, WINDOW - 1, 0, &mut seen);
+                self.cells_into(rects, WINDOW - 1, 0, seen, anchored);
             } else if !exact {
-                anchored = self.cells(&rects, 0, 0, &mut seen);
+                self.cells_into(rects, 0, 0, seen, anchored);
             }
         }
         let all = (columns * rows) as usize;
@@ -825,7 +858,7 @@ impl Upscaling {
                 put(FRAME_WORDS + tile_at + i, tile);
             }
             if exact {
-                for r in &rects {
+                for r in rects.iter() {
                     for y in r.y / 8..(r.y + r.h).div_ceil(8) {
                         for x in r.x / 8..(r.x + r.w).div_ceil(8) {
                             let at =
@@ -940,7 +973,11 @@ impl Upscaling {
                         Bind::StorageBuffer(self.compacted.slice(start..start + n * 4)),
                     );
                     let at = (set + self.layout.copy_arguments + slice as u64 * 4) * 4;
-                    compute.dispatch_indirect(self.state.slice(at..at + 12));
+                    if slice == 0 {
+                        compute.dispatch_indirect(self.state.slice(at..at + 12));
+                    } else {
+                        compute.dispatch_indirect_unordered(self.state.slice(at..at + 12));
+                    }
                 }
             }
         }
@@ -976,7 +1013,11 @@ impl Upscaling {
                     Bind::StorageBuffer(self.compacted.slice(start..start + n * 4)),
                 );
                 let at = (set + grid.arguments + slice as u64 * 4) * 4;
-                compute.dispatch_indirect(self.state.slice(at..at + 12));
+                if slice == 0 {
+                    compute.dispatch_indirect(self.state.slice(at..at + 12));
+                } else {
+                    compute.dispatch_indirect_unordered(self.state.slice(at..at + 12));
+                }
             }
         }
         drop(compute);
@@ -984,14 +1025,21 @@ impl Upscaling {
         self.epoch.set(epoch);
         self.newest.set(written);
         *self.stale.borrow_mut() = Some(region);
-        Ok(self.reached(&rects))
+        let reached = self.reached_gpu(rects);
+        Ok(reached)
     }
 
     /// The source cells meeting `rects` grown by `before` pixels up and left
     /// and `after` down and right, packed, skipping and marking those `seen`.
-    fn cells(&self, rects: &[Rect], before: u32, after: u32, seen: &mut [u64]) -> Vec<u32> {
+    fn cells_into(
+        &self,
+        rects: &[adv_gpu::Rect],
+        before: u32,
+        after: u32,
+        seen: &mut [u64],
+        found: &mut Vec<u32>,
+    ) {
         let columns = self.size.0.div_ceil(8);
-        let mut found = Vec::new();
         for r in rects {
             let (x0, y0) = (
                 r.x.saturating_sub(before) / 8,
@@ -1009,10 +1057,26 @@ impl Upscaling {
                 }
             }
         }
-        found
+    }
+
+    fn reached_gpu(&self, damage: &[adv_gpu::Rect]) -> u64 {
+        let reach = self.model.reach();
+        let mut reached = Region::empty(self.size);
+        for r in damage.iter().filter(|r| r.w > 0 && r.h > 0) {
+            let x = r.x.saturating_sub(reach);
+            let y = r.y.saturating_sub(reach);
+            reached.add(adv_gpu::Rect {
+                x,
+                y,
+                w: (r.x + r.w + reach).min(self.size.0) - x,
+                h: (r.y + r.h + reach).min(self.size.1) - y,
+            });
+        }
+        reached.area()
     }
 
     /// Input pixels a change within `damage` reaches in the output, in cells.
+    #[cfg(test)]
     pub(crate) fn reached(&self, damage: &[Rect]) -> u64 {
         let reach = self.model.reach();
         let mut reached = Region::empty(self.size);

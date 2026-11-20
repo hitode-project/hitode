@@ -653,7 +653,9 @@ fn buffer_age_table() {
     ] {
         let mut pools = warm(0, f.canvas, age);
         for _ in 0..count {
-            pools.history.push_back(cells(&[rect(65, 65, 1, 1)]));
+            pools
+                .history
+                .push_back(std::sync::Arc::new(cells(&[rect(65, 65, 1, 1)])));
         }
         let p = run(&f, &settings(), &caps(), &pools);
         assert_eq!(stage_tiles(&p.stages[0])[0].rects, expected, "{age:?}");

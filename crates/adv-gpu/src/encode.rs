@@ -60,10 +60,11 @@ pub struct RenderPassDesc<'a> {
     /// Load operations (including `Clear` and `DontCare`), draws and stores
     /// apply inside it only; every attachment keeps its contents outside it.
     /// Vulkan passes it as `renderArea`. Metal clamps every scissor to it, and
-    /// where its load actions would act on the whole attachment (a `Clear` or
-    /// `DontCare` with an area smaller than the target) it loads and clears
-    /// the area with a draw instead. Loads and stores outside it are not paid
-    /// on either backend.
+    /// where its load actions would act on the whole attachment (a `Clear`
+    /// with an area smaller than the target) it loads and clears the area with
+    /// a draw instead; `DontCare` loads without clearing so contents outside
+    /// the area stay preserved. Loads and stores outside it are not paid on
+    /// either backend.
     pub area: Rect,
     /// Write GPU timestamps at the pass's start and end into `(set, first)` and
     /// `(set, first + 1)`. Needs [`crate::Features::TIMESTAMPS`]. Timestamps
@@ -127,6 +128,17 @@ pub struct ImageCopy<'a> {
     pub origin: (u32, u32, u32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageCopyRegion {
+    pub src_mip: u32,
+    pub src_layer: u32,
+    pub src_origin: (u32, u32, u32),
+    pub dst_mip: u32,
+    pub dst_layer: u32,
+    pub dst_origin: (u32, u32, u32),
+    pub size: Extent,
+}
+
 #[derive(Clone, Copy)]
 pub struct BufferCopy<'a> {
     pub buffer: &'a Buffer,
@@ -155,6 +167,9 @@ impl Encoder {
     }
     pub fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.inner.copy_image(src, dst, size)
+    }
+    pub fn copy_image_regions(&mut self, src: &Image, dst: &Image, regions: &[ImageCopyRegion]) {
+        self.inner.copy_image_regions(src, dst, regions)
     }
     pub fn copy_buffer(&mut self, src: BufferSlice<'_>, dst: &Buffer, dst_offset: u64) {
         self.inner.copy_buffer(src, dst, dst_offset)
@@ -264,5 +279,10 @@ impl ComputePass<'_> {
     /// Needs [`crate::Features::INDIRECT`]. Tile lists use this.
     pub fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
         self.inner.dispatch_indirect(args)
+    }
+    /// Indirect dispatch that writes disjoint outputs from the previous
+    /// dispatch in the same pass, skipping the inter-dispatch memory barrier.
+    pub fn dispatch_indirect_unordered(&mut self, args: BufferSlice<'_>) {
+        self.inner.dispatch_indirect_unordered(args)
     }
 }
