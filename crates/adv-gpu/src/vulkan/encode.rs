@@ -271,6 +271,7 @@ impl Encoder {
                 | vk::AccessFlags2::HOST_READ,
         );
     }
+    #[allow(clippy::too_many_arguments)]
     fn push_transition(
         &mut self,
         barriers: &mut Vec<vk::ImageMemoryBarrier2<'static>>,
@@ -410,12 +411,19 @@ impl Encoder {
         self.push_transition(&mut barriers, core, mips, layers, layout, access, stage);
         self.flush_image_barriers(&barriers);
     }
-    /// True if any image touched earlier in this encoder (excluding `attachments`)
-    /// is currently in a non-read-only layout and could need a mid-pass transition.
+    /// True if any image touched earlier in this encoder (excluding single-subresource
+    /// `attachments`) could need a mid-pass transition (either currently in a non-read-only
+    /// layout, or created with `Usage::STORAGE` so a later pass can transition it to `GENERAL`).
     fn has_pending_image_transitions(&self, attachments: &[vk::Image]) -> bool {
         self.originals.iter().any(|(core, _, _)| {
-            if attachments.contains(&core.handle) {
+            if core.desc.mips == 1
+                && (core.desc.dimension == Dimension::D3 || core.desc.size.depth_or_layers == 1)
+                && attachments.contains(&core.handle)
+            {
                 return false;
+            }
+            if core.desc.usage.contains(Usage::STORAGE) {
+                return true;
             }
             core.states.lock().unwrap().iter().any(|s| {
                 s.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
@@ -1409,6 +1417,7 @@ fn buffer_image_copies(
     regions
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PassBegin {
     Dynamic {
         colors: ArrayVec<vk::RenderingAttachmentInfo<'static>, 8>,
@@ -1704,18 +1713,26 @@ impl RenderPass<'_> {
             "video buffer belongs to another pool"
         );
         if self.begun {
-            let command = self.encoder.command;
-            if let Some(cb) =
-                Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
-            {
-                self.encoder.command = cb;
-                self.encoder.view_transition(
-                    &image.image().view().inner,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::AccessFlags2::SHADER_READ,
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                );
-                self.encoder.command = command;
+            let core = &image.image().inner.core;
+            let family = self.encoder.shared.context.family;
+            let stale = {
+                let state = core.states.lock().unwrap()[0];
+                state.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL || state.family != family
+            };
+            if stale {
+                let command = self.encoder.command;
+                if let Some(cb) =
+                    Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
+                {
+                    self.encoder.command = cb;
+                    self.encoder.view_transition(
+                        &image.image().view().inner,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    );
+                    self.encoder.command = command;
+                }
             }
         } else {
             self.encoder.view_transition(
