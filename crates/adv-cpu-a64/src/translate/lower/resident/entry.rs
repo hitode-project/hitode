@@ -360,7 +360,7 @@ pub(crate) fn row_entry(
     feedback: &RowFeedback,
     minimum: Option<(u8, u32)>,
     counters: Option<[u64; 2]>,
-) -> Vec<u32> {
+) -> (Vec<u32>, [usize; 2]) {
     let mut asm = Asm::new();
     let safe = asm.label();
     let search = asm.label();
@@ -430,7 +430,7 @@ pub(crate) fn row_entry(
     }
     asm.bind(bad);
     asm.emit(msr_nzcv(r(6)));
-    row_feedback(
+    let parameter = row_feedback(
         &mut asm,
         head,
         super::RowFailure::Parameter,
@@ -439,7 +439,8 @@ pub(crate) fn row_entry(
     );
     asm.bind(failed);
     asm.emit(msr_nzcv(r(6)));
-    asm.emit(branch(at + asm.offset(), fallback));
+    let pass = at + asm.offset();
+    asm.emit(branch(pass, fallback));
     if let Some(short) = short {
         asm.bind(short);
         if let Some([_, (count, _)]) = counters {
@@ -460,7 +461,7 @@ pub(crate) fn row_entry(
             literal(&mut asm, count, short_address);
         }
     }
-    asm.finish()
+    (asm.finish(), [parameter, pass])
 }
 
 fn increment_row_counter(asm: &mut Asm, counter: Label) {
@@ -489,7 +490,7 @@ fn row_feedback(
     reason: super::RowFailure,
     (at, fallback, exit): (usize, usize, usize),
     feedback: &RowFeedback,
-) {
+) -> usize {
     let count = asm.label();
     let poll = asm.label();
     let sample = asm.label();
@@ -500,7 +501,8 @@ fn row_feedback(
         str(X, r(1), r(0), 0),
     ]);
     runtime::emit_sensor(asm, poll, r(0), r(1), sample);
-    asm.emit(branch(at + asm.offset(), fallback));
+    let point = at + asm.offset();
+    asm.emit(branch(point, fallback));
     asm.bind(sample);
     guest_exit(asm, head, Exit::Plan(PlanEvent::RowGuardMiss));
     asm.emit(branch(at + asm.offset(), exit));
@@ -510,6 +512,7 @@ fn row_feedback(
         feedback.failures[reason as usize].as_ptr() as u64,
     );
     literal(asm, poll, feedback.next.as_ptr() as u64);
+    point
 }
 
 pub(crate) fn fallback(head: u32, at: usize, exit: usize) -> Vec<u32> {
@@ -615,7 +618,7 @@ mod tests {
     fn short_row_router_skips_the_slot_in_three_words() {
         let at = 0x8000;
         let fallback = 0x9000;
-        let words = row_entry(
+        let (words, _) = row_entry(
             0,
             (3, 4),
             &[(0x1234, Some(at + 0x400)), (0x2345, None)],

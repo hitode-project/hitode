@@ -13,6 +13,7 @@ use crate::translate::front::{
     trace::{Mode, Trace},
 };
 use crate::translate::jit::Code;
+use crate::translate::lower::resident::RowTarget;
 use crate::translate::opt::computation::Proof;
 use crate::translate::opt::{back, front};
 
@@ -49,6 +50,7 @@ pub(in crate::native) struct Compiled {
     pub at: CpuState,
     pub resident: Option<Result<ResidentForm, front::Reject>>,
     pub unit: Arc<Unit>,
+    pub pass_through: Option<RowTarget>,
     pub job: Option<Job>,
 }
 
@@ -176,7 +178,6 @@ fn compile(request: Request) -> Compiled {
         cuts,
         count_entries,
     } = request;
-    let can_scope = task == Task::Discover || (task == Task::Append && proof.is_none());
     let proof = if task == Task::Discover {
         proof.or_else(|| computation_proof(&unit.trace))
     } else {
@@ -184,6 +185,7 @@ fn compile(request: Request) -> Compiled {
     };
     let started = std::time::Instant::now();
     let mut scoped_job = None;
+    let mut pass_through = None;
     let resident = if task == Task::Job {
         None
     } else {
@@ -240,20 +242,18 @@ fn compile(request: Request) -> Compiled {
                 if built.cuts != 0 {
                     return None;
                 }
-                if can_scope {
-                    proof.prove_scoped_split(&rows.trace);
-                    crate::jit_map::optimized(
-                        eip,
-                        format_args!(
-                            "row scope {}",
-                            if proof.scoped_splits() {
-                                "eligible"
-                            } else {
-                                "carried state or frame"
-                            }
-                        ),
-                    );
-                }
+                proof.prove_scoped_split(&rows.trace);
+                crate::jit_map::optimized(
+                    eip,
+                    format_args!(
+                        "row scope {}",
+                        if proof.scoped_splits() {
+                            "eligible"
+                        } else {
+                            "carried state or frame"
+                        }
+                    ),
+                );
                 let offer = proof.scoped_splits();
                 let lowered =
                     back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
@@ -273,7 +273,17 @@ fn compile(request: Request) -> Compiled {
             });
         let result = match (scoped, guarded) {
             (Some(scoped), _) => Ok(scoped),
-            (None, Some(index)) => Err(front::Reject::Unsupported(index)),
+            (None, Some(index)) => {
+                let inst = &unit.trace.insts[index];
+                if let (Some(slot), Op::Call(value)) = (inst.guarded_slot, inst.op) {
+                    pass_through = Some(RowTarget {
+                        base: slot.base.unwrap(),
+                        offset: slot.disp,
+                        value,
+                    });
+                }
+                Err(front::Reject::Unsupported(index))
+            }
             (None, None) => build(unit, proof.as_ref()).map(|built| {
                 let lowered = back::lower_resident(
                     &built.func,
@@ -325,6 +335,7 @@ fn compile(request: Request) -> Compiled {
         at,
         resident,
         unit,
+        pass_through,
         job: scoped_job.or(job),
     }
 }
@@ -339,6 +350,7 @@ impl Compiled {
             at: request.at,
             resident: None,
             unit: request.unit,
+            pass_through: None,
             job: None,
         }
     }

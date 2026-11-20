@@ -289,9 +289,7 @@ impl Arbiter {
         let Some(site) = self.sites.get(&eip) else {
             return Arrival::Baseline;
         };
-        if let Some(job) = &site.job
-            && !job.scoped
-        {
+        if let Some(job) = &site.job {
             return Arrival::Offerable(job);
         }
         match site.resident.as_ref().map(|head| &head.state) {
@@ -390,10 +388,6 @@ impl Arbiter {
 
     pub(super) fn job(&self, eip: u32) -> Option<&JobPlan> {
         self.sites.get(&eip)?.job.as_deref()
-    }
-
-    pub(super) fn job_mut(&mut self, eip: u32) -> Option<&mut JobPlan> {
-        self.sites.get_mut(&eip)?.job.as_deref_mut()
     }
 
     pub(super) fn invalidate(&mut self, eip: u32) {

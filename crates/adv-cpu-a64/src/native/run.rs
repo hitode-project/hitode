@@ -8,7 +8,7 @@ use adv_cpu_core::trap::Bridge;
 use adv_cpu_core::{CpuState, Memory};
 
 use super::compile;
-use super::offload::{Code, WorkerJob};
+use super::offload::{Code, ScopedJob, WorkerJob};
 use super::offload::{Entry, Notifications, Session};
 use super::plan::{
     self, ColdAction, Decline, JobPlan, MISSES, PROBATION, Probation, SAMPLE, Tier1Miss,
@@ -20,7 +20,7 @@ use super::{
 };
 use crate::facts::{self, Key};
 use crate::runtime::record_branch;
-use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, Runtime, alias_base};
+use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, Runtime, ScopedOffer, alias_base};
 use crate::translate::front::{Unit, decode::Fetcher};
 use crate::translate::lower::resident::ResidentCold;
 use crate::translate::opt::computation::Proof;
@@ -262,21 +262,25 @@ impl Native {
                 PlanEvent::RowGuardMiss => self.observe_row_failure(cpu.eip),
                 PlanEvent::ResidentSplitOffer(version) => {
                     let head = cpu.eip;
-                    let job = self.plans.job(head).filter(|job| job.scoped);
-                    if let Some(job) = job
-                        && self.code.version_stats.is_some()
-                    {
-                        job.scope_offers.set(job.scope_offers.get() + 1);
+                    if let Some(job) = self.scoped_jobs.get(&(head, version)) {
+                        if self.code.version_stats.is_some() {
+                            job.policy
+                                .scope_offers
+                                .set(job.policy.scope_offers.get() + 1);
+                        }
+                        if self.code.offers_split(head, usize::from(version))
+                            && self.offer_split(job.policy.scope_cost(payload))
+                        {
+                            exit = Exit::Computation;
+                            scoped = true;
+                            self.scoped_offer = Some(ScopedOffer {
+                                version,
+                                entry: job.worker.code.placed.entry,
+                                generation: self.code.generation,
+                            });
+                        }
                     }
-                    if self.code.offers_split(head, usize::from(version))
-                        && let Some(job) = job
-                        && self.offer_split(job.scope_cost(payload))
-                    {
-                        exit = Exit::Computation;
-                        scoped = true;
-                    } else {
-                        scope_declined = true;
-                    }
+                    scope_declined = !scoped;
                 }
                 PlanEvent::Probation(version) => {
                     self.finish_probation(payload, usize::from(version))
@@ -422,7 +426,10 @@ impl Native {
             &mut dyn adv_cpu_core::backend::Computation<Option<ExecutionContext>>,
         ),
     ) {
-        if self.plans.baseline_only || self.worker_jobs.is_empty() || memory.attach().is_err() {
+        if self.plans.baseline_only
+            || (self.worker_jobs.is_empty() && self.scoped_jobs.is_empty())
+            || memory.attach().is_err()
+        {
             return;
         }
         self.invalidate(memory);
@@ -436,8 +443,8 @@ impl Native {
         };
         let mut updates = Vec::new();
         if let Some(mut session) = Session::new(
-            entry,
-            (&self.worker_jobs, &mut self.plans),
+            (entry, &self.code),
+            (&self.worker_jobs, &self.scoped_jobs, &self.plans),
             memory,
             &mut self.offload,
             (retired, &mut self.retired_forms),
@@ -486,6 +493,7 @@ impl Native {
         self.diagnostics.clears += 1;
         self.code.clear();
         self.worker_jobs.clear();
+        self.scoped_jobs.clear();
         self.offload.admission.clear();
         self.plans.clear_overlays();
         self.forget_dynamic();
@@ -731,10 +739,11 @@ impl Native {
     /// branch to it; the caller forgets dynamic targets.
     pub(super) fn drop_unit(&mut self, eip: u32) -> bool {
         self.front_units.remove(&eip);
+        self.remove_scoped_jobs(eip);
         let dropped = self.code.invalidate_unit(eip);
         self.plans.invalidate(eip);
         self.worker_jobs.remove(&eip);
-        self.offload.admission.invalidate(eip);
+        self.offload.admission.invalidate((eip, None));
         dropped
     }
 
@@ -1238,61 +1247,93 @@ impl Native {
                 continue;
             };
             head.pending = None;
-            if let Some(job) = done.job
-                && head.accepts(done.task)
-            {
-                head.has_proof = true;
-                self.place_job(eip, &done.at, Arc::clone(&done.unit), job);
-                self.install_offer_link(eip);
-            }
-            let head = self.plans.resident(eip).unwrap();
-            if head.accepts(done.task)
-                && let Some(result) = done.resident
-            {
-                let decline = match result {
-                    Ok(form) => (!self.install_resident(eip, done.task, done.at, form, done.unit))
-                        .then_some(Decline::CacheFull),
-                    Err(reject) => Some(Decline::Compile(reject)),
-                };
-                if let Some(reason) = decline {
-                    if done.task == compile::Task::Append {
-                        let observed = &self.plans.resident(eip).unwrap().row_targets;
-                        if !observed.is_empty() && self.code.publish_row_targets(eip, observed) {
-                            self.repoint_resident_edges(
-                                eip,
-                                self.code.resident(eip).unwrap().entry(),
-                            );
+            if head.accepts(done.task) {
+                let mut scoped = done.job;
+                head.has_proof |= scoped.is_some();
+                if scoped.as_ref().is_some_and(|job| job.scoped.is_none()) {
+                    let job = scoped.take().unwrap();
+                    self.place_job(eip, &done.at, Arc::clone(&done.unit), job, None);
+                    self.install_offer_link(eip);
+                }
+                match (done.resident, done.pass_through) {
+                    (Some(Ok(form)), _) => {
+                        let site = self.code.resident(eip).unwrap();
+                        if site.row_entry.as_ref().is_some_and(|row| {
+                            form.lowered
+                                .row_target
+                                .is_none_or(|target| row.slot != (target.base, target.offset))
+                        }) {
+                            if done.task != compile::Task::Append {
+                                self.decline_resident(eip, Decline::CacheFull);
+                            }
+                            self.rebuild_resident(eip);
+                            continue;
                         }
-                    } else {
-                        self.decline_resident(eip, reason);
+                        let at = done.at;
+                        let index = match done.task {
+                            compile::Task::Replace(index) => index,
+                            _ => self.code.resident(eip).unwrap().versions.len(),
+                        };
+                        match self.install_resident(
+                            eip,
+                            index,
+                            at.clone(),
+                            form,
+                            Arc::clone(&done.unit),
+                        ) {
+                            Ok(()) => {
+                                if let Some(job) = scoped {
+                                    self.place_job(eip, &at, done.unit, job, Some(index as u8));
+                                }
+                                self.publish_scope(eip);
+                            }
+                            Err(reason) => self.decline_resident(eip, reason),
+                        }
                     }
+                    (Some(Err(reject)), target) => {
+                        let head = self.plans.resident_mut(eip).unwrap();
+                        let slot = match (done.task, target) {
+                            (compile::Task::Discover, Some(target)) => {
+                                head.row_targets.push(target.value);
+                                Some((target.base, target.offset))
+                            }
+                            (compile::Task::Append, _) => self
+                                .code
+                                .resident(eip)
+                                .unwrap()
+                                .row_entry
+                                .as_ref()
+                                .map(|row| row.slot),
+                            _ => None,
+                        };
+                        if let Some(slot) = slot {
+                            if self.code.publish_row_targets(eip, slot, &head.row_targets) {
+                                self.repoint_resident_edges(
+                                    eip,
+                                    self.code.resident(eip).unwrap().entry(),
+                                );
+                            } else {
+                                self.decline_resident(eip, Decline::CacheFull);
+                            }
+                        } else if done.task != compile::Task::Append {
+                            self.decline_resident(eip, Decline::Compile(reject));
+                        }
+                    }
+                    _ => {}
                 }
             }
             self.rebuild_resident(eip);
         }
     }
 
-    pub(super) fn install_resident(
+    fn install_resident(
         &mut self,
         eip: u32,
-        task: compile::Task,
+        index: usize,
         at: CpuState,
         mut form: compile::ResidentForm,
         unit: Arc<Unit>,
-    ) -> bool {
-        if let Some(expected) = self
-            .code
-            .resident(eip)
-            .unwrap()
-            .versions
-            .first()
-            .and_then(|v| v.row_target)
-            && form.lowered.row_target.is_none_or(|target| {
-                (target.base, target.offset) != (expected.base, expected.offset)
-            })
-        {
-            return false;
-        }
+    ) -> Result<(), Decline> {
         let lowered = &mut form.lowered;
         let source = self.plans.resident(eip).unwrap().source;
         let tier1 = self.code.tier1_words.get(&source).and_then(|words| {
@@ -1301,27 +1342,13 @@ impl Native {
                 .iter()
                 .try_fold(0u32, |sum, pc| words.get(pc).map(|&cost| sum + cost))
         });
-        let probation = match Probation::price(
+        let probation = Probation::price(
             tier1,
             lowered.iteration_words,
             lowered.iteration_retired,
             lowered.entry_words + lowered.exit_words,
-        ) {
-            Ok(probation) => probation,
-            Err(reason) => {
-                self.decline_resident(eip, reason);
-                return true;
-            }
-        };
-        let index = match task {
-            compile::Task::Replace(i) => i,
-            _ => self.code.resident(eip).unwrap().versions.len(),
-        };
-        let gate = self
-            .plans
-            .job(eip)
-            .filter(|job| !job.scoped)
-            .map(JobPlan::gate);
+        )?;
+        let gate = self.plans.job(eip).map(JobPlan::gate);
         self.stop_cold_window(eip);
         let recovery = compile::ResidentRecovery {
             records: std::mem::take(&mut form.lowered.records),
@@ -1345,8 +1372,9 @@ impl Native {
             unit,
             row_target,
         ) {
-            return false;
+            return Err(Decline::CacheFull);
         }
+        self.remove_scoped_job(eip, index as u8);
         if self.inline_saved.len() < spill_cells {
             self.inline_saved.resize(spill_cells, 0);
         }
@@ -1361,20 +1389,22 @@ impl Native {
             if !head.row_targets.contains(&target.value) {
                 head.row_targets.push(target.value);
             }
-            if !self.code.publish_row_targets(eip, &head.row_targets) {
-                return false;
+            if !self
+                .code
+                .publish_row_targets(eip, (target.base, target.offset), &head.row_targets)
+            {
+                return Err(Decline::CacheFull);
             }
         } else {
             self.code.start_link_sampling(eip, SAMPLE);
         }
         self.code.publish_resident(eip, period);
         self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
-        self.publish_scope(eip);
-        true
+        Ok(())
     }
 
     fn install_offer_link(&mut self, eip: u32) {
-        if let Some(job) = self.plans.job(eip).filter(|job| !job.scoped) {
+        if let Some(job) = self.plans.job(eip) {
             self.code.install_offer(eip, job.gate());
         }
     }
@@ -1409,7 +1439,10 @@ impl Native {
             self.diagnostics.proof_without_resident += 1;
         }
         self.repoint_resident_edges(eip, None);
-        self.code.resident_mut(eip).unwrap().versions.clear();
+        self.remove_scoped_jobs(eip);
+        let site = self.code.resident_mut(eip).unwrap();
+        site.versions.clear();
+        site.row_entry = None;
     }
 
     /// Budget samples select Tier-1 loop traces.
@@ -1528,22 +1561,45 @@ impl Native {
     }
 
     fn publish_scope(&mut self, eip: u32) {
-        if let Some(job) = self.plans.job(eip).filter(|job| job.scoped) {
-            let enabled = self.offload.enabled && self.plans.offer_resume != Some(eip);
-            self.code.publish_split(eip, job.scope_threshold(enabled));
-            self.code.sync();
+        if self.scoped_jobs.is_empty() {
+            return;
         }
+        let enabled = self.offload.enabled && self.plans.offer_resume != Some(eip);
+        for index in 0..self
+            .code
+            .resident(eip)
+            .map_or(0, |site| site.versions.len()) as u8
+        {
+            if let Some(job) = self.scoped_jobs.get(&(eip, index)) {
+                self.code
+                    .publish_split(eip, index, job.policy.scope_threshold(enabled));
+            }
+        }
+        self.code.sync();
     }
 
     fn publish_scopes(&mut self) {
-        let scoped: Vec<_> = self
-            .worker_jobs
-            .keys()
-            .copied()
-            .filter(|&eip| self.plans.job(eip).is_some_and(|job| job.scoped))
-            .collect();
-        for eip in scoped {
-            self.publish_scope(eip);
+        for (&(eip, index), job) in &self.scoped_jobs {
+            let enabled = self.offload.enabled && self.plans.offer_resume != Some(eip);
+            self.code
+                .publish_split(eip, index, job.policy.scope_threshold(enabled));
+        }
+        self.code.sync();
+    }
+
+    fn remove_scoped_job(&mut self, eip: u32, index: u8) {
+        if self.scoped_jobs.remove(&(eip, index)).is_some() {
+            self.offload.admission.invalidate((eip, Some(index)));
+        }
+    }
+
+    fn remove_scoped_jobs(&mut self, eip: u32) {
+        for index in 0..self
+            .code
+            .resident(eip)
+            .map_or(0, |site| site.versions.len()) as u8
+        {
+            self.remove_scoped_job(eip, index);
         }
     }
 
@@ -1606,46 +1662,57 @@ impl Native {
         {
             self.request_optimized(cpu.eip, cpu.clone());
         }
+        self.scoped_offer = None;
         true
     }
 
-    fn place_job(&mut self, eip: u32, at: &CpuState, unit: Arc<Unit>, job: compile::Job) {
-        let scoped = job.scoped.is_some();
+    fn place_job(
+        &mut self,
+        eip: u32,
+        at: &CpuState,
+        unit: Arc<Unit>,
+        job: compile::Job,
+        version: Option<u8>,
+    ) {
         let unit = job.scoped.unwrap_or(unit);
-        let iterates = unit.trace.returns_at_head();
         if let Some(code) = self.emit_computation(
             &unit,
             eip,
             (at.x87.control, at.x87.status & 0x20 != 0),
             &job.proof,
         ) {
-            self.diagnostics.split_proofs += u64::from(job.proof.splits());
+            let splits = job.proof.splits();
+            self.diagnostics.split_proofs += u64::from(splits);
+            let iterates = unit.trace.returns_at_head();
             let entry_registers = job.proof.entry_registers();
-            self.plans.add_job(eip, iterates, job.proof.splits());
-            let policy = self.plans.job_mut(eip).unwrap();
-            policy.scoped = scoped;
-            policy.requested();
-            policy.built();
-            self.worker_jobs.insert(
-                eip,
-                WorkerJob {
-                    code: Code {
-                        placed: code,
-                        optimized: None,
-                        scoped_mmx: job.proof.scoped_mmx(),
-                        frame: job.proof.scope_frame().map_or_else(
-                            || Arc::from([]),
-                            |frame| Arc::from(frame.cells.as_slice()),
-                        ),
-                    },
-                    proof: job.proof,
-                    retired: unit.trace.prepaid(0),
-                    unit,
-                    entry_registers,
+            let mut worker = WorkerJob {
+                code: Code {
+                    placed: code,
+                    optimized: None,
+                    scoped_mmx: job.proof.scoped_mmx(),
+                    frame: job
+                        .proof
+                        .scope_frame()
+                        .map_or_else(|| Arc::from([]), |frame| Arc::from(frame.cells.as_slice())),
                 },
-            );
+                proof: job.proof,
+                retired: unit.trace.prepaid(0),
+                unit,
+                entry_registers,
+            };
             if let Some(form) = job.form {
-                self.install_job(eip, form);
+                worker.install(&mut self.code, eip, form.built, form.lowered);
+            }
+            if let Some(version) = version {
+                let mut policy = JobPlan::new(iterates, splits);
+                policy.scoped = true;
+                self.scoped_jobs
+                    .insert((eip, version), ScopedJob { worker, policy });
+            } else {
+                self.worker_jobs.insert(eip, worker);
+                let policy = self.plans.add_job(eip, iterates, splits);
+                policy.requested();
+                policy.built();
             }
         }
     }
