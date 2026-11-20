@@ -142,7 +142,7 @@ pub(super) struct ResidentVersion<R> {
     pub proved: Option<usize>,
     proved_cold: Option<usize>,
     pub probe: usize,
-    pub probe_word: u32,
+    probe_word: Option<u32>,
     pub next: usize,
     pub miss: usize,
     miss_counter: Option<ingress::MissCounter>,
@@ -341,7 +341,7 @@ impl<R> CodeStore<R> {
                 resident_exit: self.resident_exit,
             },
         );
-        let probe_word = entry.words[(entry.probe - base) / 4];
+        let probe_word = (index == 0).then(|| entry.words[(entry.probe - base) / 4]);
         let words = layout.words;
         let literal = |words: &mut [u32], at: usize, pointer: u64| {
             words[at] = pointer as u32;
@@ -457,7 +457,7 @@ impl<R> CodeStore<R> {
         let site = self.chains[&eip].resident.as_ref().unwrap();
         site.sample.set(period);
         let first = &site.versions[0];
-        self.cache.patch(first.probe, first.probe_word);
+        self.cache.patch(first.probe, first.probe_word.unwrap());
     }
 
     pub(super) fn publish_resident(&mut self, eip: u32, period: Option<u32>) {

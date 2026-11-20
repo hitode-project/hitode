@@ -1792,6 +1792,34 @@ mod tests {
         );
     }
 
+    // spec: A64A-FALL-3 A64-OPT-8
+    #[test]
+    fn a_second_resident_version_needs_no_link_sample_word() {
+        let (mut memory, mut native, stop) = resident_loop(&[0x8b, 0x36, 0x49, 0x75, 0xfb, 0xcc]);
+        native.code.version_stats = Some(FxHashMap::default());
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        memory.write(DATA, &DATA.to_le_bytes()).unwrap();
+        assert!(native.force_resident(&mut memory, HEAD));
+        assert!(native.code.offer(HEAD).is_none());
+
+        for _ in 0..plan::MISSES {
+            let mut state = resident_cpu(OUTSIDE, 2);
+            state.regs[6] = DATA;
+            state.mxcsr ^= 0x2000;
+            let run = enter(&mut native, &mut memory, stop, &mut state);
+            assert_eq!((state.eip, state.regs[6], run.retired), (stop, DATA, 8));
+        }
+        assert_eq!(native.code.resident(HEAD).unwrap().versions.len(), 2);
+        let mut state = resident_cpu(OUTSIDE, 2);
+        state.regs[6] = DATA;
+        state.mxcsr ^= 0x2000;
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!((state.eip, state.regs[6], run.retired), (stop, DATA, 8));
+        let misses = &native.code.version_stats.as_ref().unwrap()[&HEAD].resident_misses;
+        assert!(misses[0].get() > 0);
+        assert!(misses[1].get() >= u64::from(plan::MISSES));
+    }
+
     // spec: A64-MEM-7, A64-OPT-8
     #[test]
     fn replacing_a_checked_tier1_unit_keeps_dynamic_links() {
