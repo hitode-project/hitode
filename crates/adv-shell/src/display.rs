@@ -182,6 +182,10 @@ impl Startup {
         self.presenter.shared.clone()
     }
 
+    pub(crate) fn set_timings(&mut self, enabled: bool) {
+        self.presenter.display.set_timings(enabled);
+    }
+
     pub fn start(self) -> Result<adv_device::gpu::Gpu, String> {
         adv_device::gpu::Gpu::request_with_presenter(
             self.device,

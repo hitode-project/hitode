@@ -155,6 +155,7 @@ impl Native {
             (*runtime).call = call as *const () as u64;
             (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
+            (*runtime).body.memory = owner.memory;
             let previous = ACTIVE.replace(Active::Owner(faults));
             let returned = enter.run(runtime, entry.unit);
             ACTIVE.set(previous);
@@ -162,6 +163,7 @@ impl Native {
         };
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
+        self.runtime.body.memory = std::ptr::null();
         if returned.reason as u32 != Exit::Optimized.raw() {
             self.runtime.shadow = returned.shadow;
         }

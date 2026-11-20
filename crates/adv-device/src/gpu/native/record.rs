@@ -13,7 +13,7 @@ use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 const MAX_UPLOAD: usize = 16 << 20;
 const MAX_READBACKS: usize = 8;
@@ -45,7 +45,9 @@ impl Recording {
             },
             alpha: gpu::AlphaMode::Stored,
         };
-        let bytes = stream.bytes(4, 4, |bytes| bytes.fill(255));
+        let bytes = stream
+            .bytes(4, 4, |bytes| bytes.fill(255))
+            .map_err(gpu_error)?;
         stream.push(Command::Upload {
             source: super::stream::UploadSource::Ring(bytes),
             pitch: 4,
@@ -184,7 +186,7 @@ type FacadeInitReply = Result<(PipelineJobs, gpu::compile::CompileCounters), Err
 pub(super) enum WorkerItem {
     CreateFacade {
         id: u64,
-        failure: Arc<OnceLock<String>>,
+        failure: Arc<Mutex<Option<Error>>>,
         reply: mpsc::SyncSender<FacadeInitReply>,
     },
     DropFacade(u64),
@@ -230,12 +232,14 @@ pub(super) enum WorkerItem {
         clip: Option<Rect>,
     },
     UploadBytes {
+        facade: u64,
         image: Image,
         rectangle: Rect,
         pitch: u32,
         bytes: UploadPayload,
     },
     UploadStaged {
+        facade: u64,
         image: Image,
         rectangle: Rect,
         staged: super::Staged,
@@ -317,7 +321,7 @@ pub(super) struct WorkerShared {
     queued_cmds: AtomicUsize,
     queued_bytes: AtomicUsize,
     in_flight_frames: AtomicUsize,
-    wake: Mutex<Option<Arc<adv_sync::WakeEvent>>>,
+    wakes: Mutex<Vec<(u64, Arc<adv_sync::WakeEvent>)>>,
 }
 
 impl WorkerShared {
@@ -329,18 +333,15 @@ impl WorkerShared {
             queued_cmds: AtomicUsize::new(0),
             queued_bytes: AtomicUsize::new(0),
             in_flight_frames: AtomicUsize::new(0),
-            wake: Mutex::new(None),
+            wakes: Mutex::new(Vec::new()),
         }
     }
 
     fn signal_wake(&self) {
-        if let Some(wake) = self.wake.lock().unwrap().as_ref() {
+        let wakes = self.wakes.lock().unwrap();
+        for (_, wake) in wakes.iter() {
             wake.signal();
         }
-    }
-
-    fn has_wake(&self) -> bool {
-        self.wake.lock().unwrap().is_some()
     }
 
     pub(super) fn push_capture(&self, tx: crate::frame::CaptureReply) {
@@ -420,13 +421,22 @@ impl WorkerHandle {
         self.shared.clone()
     }
 
-    pub(super) fn set_wake(&self, wake: Option<Arc<adv_sync::WakeEvent>>) {
-        *self.shared.wake.lock().unwrap() = wake;
+    pub(super) fn set_wake(&self, facade: u64, wake: Option<Arc<adv_sync::WakeEvent>>) {
+        let mut wakes = self.shared.wakes.lock().unwrap();
+        if let Some(wake) = wake {
+            if let Some((_, slot)) = wakes.iter_mut().find(|(id, _)| *id == facade) {
+                *slot = wake;
+            } else {
+                wakes.push((facade, wake));
+            }
+        } else {
+            wakes.retain(|(id, _)| *id != facade);
+        }
     }
 
     pub(super) fn create_facade(
         &self,
-        failure: Arc<OnceLock<String>>,
+        failure: Arc<Mutex<Option<Error>>>,
     ) -> Result<(u64, PipelineJobs, gpu::compile::CompileCounters), Error> {
         let id = self.next_facade.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = mpsc::sync_channel(1);
@@ -463,7 +473,7 @@ impl WorkerHandle {
         Vec::with_capacity(len)
     }
 
-    pub(super) fn admit_cmd(&self, bytes: usize) -> Result<(), Error> {
+    pub(super) fn admit_cmd(&self, bytes: usize, nonblocking: bool) -> Result<(), Error> {
         let within_budget = || {
             let cmds = self.shared.queued_cmds.load(Ordering::Acquire);
             let queued_bytes = self.shared.queued_bytes.load(Ordering::Acquire);
@@ -478,7 +488,7 @@ impl WorkerHandle {
             if within_budget() {
                 return Ok(());
             }
-            if self.shared.has_wake() {
+            if nonblocking {
                 if self.shared.queue.lock().unwrap().closed {
                     return Err(Error::Device("adv-gfx-worker stopped".into()));
                 }
@@ -500,7 +510,7 @@ impl WorkerHandle {
         }
     }
 
-    pub(super) fn admit_present(&self) -> Result<(), Error> {
+    pub(super) fn admit_present(&self, nonblocking: bool) -> Result<(), Error> {
         loop {
             if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
                 return Ok(());
@@ -509,7 +519,7 @@ impl WorkerHandle {
             if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
                 return Ok(());
             }
-            if self.shared.has_wake() {
+            if nonblocking {
                 if self.shared.queue.lock().unwrap().closed {
                     return Err(Error::Device("adv-gfx-worker stopped".into()));
                 }
@@ -648,10 +658,21 @@ impl Drop for WorkerHandle {
 }
 
 struct FacadeState {
-    failure: Arc<OnceLock<String>>,
+    failure: Arc<Mutex<Option<Error>>>,
     pipelines: Pipelines,
     recording: Recording,
     stats: Stats,
+}
+
+struct WorkerExit(Arc<WorkerShared>);
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        if let Ok(mut q) = self.0.queue.lock() {
+            q.closed = true;
+        }
+        self.0.space_cv.notify_all();
+        self.0.signal_wake();
+    }
 }
 
 struct WorkerState {
@@ -669,6 +690,7 @@ fn worker_loop(
     shared: Arc<WorkerShared>,
     owner_waker: Option<super::stream::Waker>,
 ) {
+    let _exit = WorkerExit(shared.clone());
     let mut state = WorkerState {
         device,
         stream,
@@ -716,14 +738,25 @@ fn worker_loop(
 }
 
 impl WorkerState {
+    fn facade_failure(&self, facade: u64) -> Option<Error> {
+        self.facades
+            .get(&facade)
+            .and_then(|f| f.failure.lock().unwrap().clone())
+    }
+
     fn process_batch(&mut self, batch: &mut Vec<WorkerItemEntry>) {
         let mut drained_cmds = 0usize;
         let mut drained_bytes = 0usize;
         for entry in batch.drain(..) {
             drained_cmds += 1;
             drained_bytes += entry.bytes;
-            if let Err((facade, error)) = self.execute(entry.item) {
-                let _ = self.facades[&facade].failure.set(error.to_string());
+            if let Err((facade, error)) = self.execute(entry.item)
+                && let Some(state) = self.facades.get(&facade)
+            {
+                let mut slot = state.failure.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(error);
+                }
             }
         }
         self.shared
@@ -765,6 +798,9 @@ impl WorkerState {
                 depth,
                 stencil,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 self.select(facade, &target);
                 self.stream.push(Command::Clear {
                     area: native_rect(area),
@@ -782,6 +818,12 @@ impl WorkerState {
                 inclusive,
                 clips,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    if let VertexPayload::Owned(buf) = vertices {
+                        self.shared.recycle_verts(buf);
+                    }
+                    return Ok(());
+                }
                 let result = self.execute_draw_fixed(
                     facade,
                     &target,
@@ -803,6 +845,9 @@ impl WorkerState {
                 state,
                 clips,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 self.execute_draw_programmable(facade, &target, &draw, &state, &clips)
                     .map_err(|error| (facade, error))?;
             }
@@ -815,6 +860,9 @@ impl WorkerState {
                 filter,
                 clip,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 self.blit_validated(
                     facade,
                     &source,
@@ -834,14 +882,24 @@ impl WorkerState {
                 region,
                 clip,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 self.copy_validated(facade, &source, rectangle, &destination, region, clip);
             }
             WorkerItem::UploadBytes {
+                facade,
                 image,
                 rectangle,
                 pitch,
                 bytes,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    if let UploadPayload::Owned(buf) = bytes {
+                        self.shared.recycle_bytes(buf);
+                    }
+                    return Ok(());
+                }
                 let row = upload_row_bytes(&image, rectangle);
                 let src = bytes.as_slice();
                 let ring_bytes = self.stream.bytes(row * rectangle.h, 256, |out| {
@@ -858,6 +916,7 @@ impl WorkerState {
                 if let UploadPayload::Owned(buf) = bytes {
                     self.shared.recycle_bytes(buf);
                 }
+                let ring_bytes = ring_bytes.map_err(|error| (facade, gpu_error(error)))?;
                 self.record_upload(
                     &image,
                     rectangle,
@@ -866,10 +925,14 @@ impl WorkerState {
                 );
             }
             WorkerItem::UploadStaged {
+                facade,
                 image,
                 rectangle,
                 staged,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 let pitch = staged.pitch();
                 self.record_upload(
                     &image,
@@ -923,8 +986,12 @@ impl WorkerState {
                 image,
                 regions,
                 worker,
-                transfer,
+                mut transfer,
             } => {
+                if let Some(error) = self.facade_failure(facade) {
+                    transfer.finish(Err(error));
+                    return Ok(());
+                }
                 self.execute_readback(facade, &image, &regions, worker, transfer);
             }
             WorkerItem::SnapshotCopy {
@@ -933,6 +1000,9 @@ impl WorkerState {
                 destination,
                 regions,
             } => {
+                if self.facade_failure(facade).is_some() {
+                    return Ok(());
+                }
                 for &area in &regions {
                     if readback_copyable(&source)
                         && color_format(&source) == color_format(&destination)
@@ -1192,25 +1262,29 @@ impl WorkerState {
         let vertex_offset = 32usize.next_multiple_of(alignment as usize);
         let len = vertex_offset + std::mem::size_of_val(vertices);
         self.stream.ensure_room(areas.len());
-        let data = self.stream.bytes(len as u32, alignment, |bytes| {
-            bytes[..32].copy_from_slice(bytemuck::cast_slice(&parameters));
-            bytes[vertex_offset..].copy_from_slice(bytemuck::cast_slice(vertices));
-            #[cfg(target_vendor = "apple")]
-            if matches!(
-                state.topology,
-                gpu::Topology::Lines | gpu::Topology::LineStrip
-            ) {
-                for (bytes, vertex) in bytes[vertex_offset..]
-                    .as_chunks_mut::<40>()
-                    .0
-                    .iter_mut()
-                    .zip(vertices)
-                {
-                    let y = vertex.position[1] + vertex.position[3] / (64. * state.viewport.height);
-                    bytes[4..8].copy_from_slice(&y.to_ne_bytes());
+        let data = self
+            .stream
+            .bytes(len as u32, alignment, |bytes| {
+                bytes[..32].copy_from_slice(bytemuck::cast_slice(&parameters));
+                bytes[vertex_offset..].copy_from_slice(bytemuck::cast_slice(vertices));
+                #[cfg(target_vendor = "apple")]
+                if matches!(
+                    state.topology,
+                    gpu::Topology::Lines | gpu::Topology::LineStrip
+                ) {
+                    for (bytes, vertex) in bytes[vertex_offset..]
+                        .as_chunks_mut::<40>()
+                        .0
+                        .iter_mut()
+                        .zip(vertices)
+                    {
+                        let y =
+                            vertex.position[1] + vertex.position[3] / (64. * state.viewport.height);
+                        bytes[4..8].copy_from_slice(&y.to_ne_bytes());
+                    }
                 }
-            }
-        });
+            })
+            .map_err(gpu_error)?;
         let base = summary(state, pipeline, areas[0].0, 0..vertices.len() as u32);
         self.stream.draw_clips(
             base,
@@ -1284,33 +1358,36 @@ impl WorkerState {
         cursor += draw.indices.as_ref().map_or(0, |i| i.len() * 4);
         // Ensure all K clip draws stay in the same chunk as their shared ring span.
         self.stream.ensure_room(areas.len());
-        let data = self.stream.bytes(cursor as u32, alignment as u32, |bytes| {
-            bytes.fill(0);
-            for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
-                .into_iter()
-                .enumerate()
-            {
-                let base = if stage == 0 { 0 } else { pixel_offset };
-                for register in draw.program.constants[stage]
-                    .ranges()
-                    .flat_map(|range| range.start / 16..range.end / 16)
+        let data = self
+            .stream
+            .bytes(cursor as u32, alignment as u32, |bytes| {
+                bytes.fill(0);
+                for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
+                    .into_iter()
+                    .enumerate()
                 {
-                    bytes[base + register * 16..base + (register + 1) * 16]
-                        .copy_from_slice(bytemuck::bytes_of(&constants.register(register)));
+                    let base = if stage == 0 { 0 } else { pixel_offset };
+                    for register in draw.program.constants[stage]
+                        .ranges()
+                        .flat_map(|range| range.start / 16..range.end / 16)
+                    {
+                        bytes[base + register * 16..base + (register + 1) * 16]
+                            .copy_from_slice(bytemuck::bytes_of(&constants.register(register)));
+                    }
                 }
-            }
-            bytes[parameters_offset..parameters_offset + 640]
-                .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
-            for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                let offset = offset as usize;
-                stream
-                    .bytes
-                    .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
-            }
-            if let Some(indices) = &draw.indices {
-                bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
-            }
-        });
+                bytes[parameters_offset..parameters_offset + 640]
+                    .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
+                for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
+                    let offset = offset as usize;
+                    stream
+                        .bytes
+                        .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
+                }
+                if let Some(indices) = &draw.indices {
+                    bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
+                }
+            })
+            .map_err(gpu_error)?;
         let mut bindings = arrayvec::ArrayVec::<(u32, Binding), 58>::new();
         bindings.push((
             slot::VERTEX_UNIFORMS,
@@ -1754,7 +1831,7 @@ impl Gpu {
             color[3] = 1.;
         }
         self.check()?;
-        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
         self.execution.worker.push(
             WorkerItem::Clear {
                 facade: self.facade_id,
@@ -1851,7 +1928,7 @@ impl Gpu {
             }
         };
         self.check()?;
-        self.execution.worker.admit_cmd(byte_len)?;
+        self.execution.worker.admit_cmd(byte_len, self.wake.get())?;
         let payload = if let Some(shared) = shared {
             VertexPayload::Shared(shared)
         } else {
@@ -2003,7 +2080,9 @@ impl Gpu {
         gpu::validate_program(&draw.program)?;
         self.check()?;
         let payload_bytes = total + draw.indices.as_ref().map_or(0, |i| i.len() * 4);
-        self.execution.worker.admit_cmd(payload_bytes)?;
+        self.execution
+            .worker
+            .admit_cmd(payload_bytes, self.wake.get())?;
         let draw = shared.unwrap_or_else(|| Arc::new(draw.clone()));
         self.execution.worker.push(
             WorkerItem::DrawProgrammable {
@@ -2068,7 +2147,8 @@ impl Gpu {
         filter: Filter,
     ) -> Result<(), Error> {
         self.check()?;
-        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
+        let area = self.clip.map_or(region, |clip| region.clipped(clip));
         self.execution.worker.push(
             WorkerItem::Blit {
                 facade: self.facade_id,
@@ -2081,6 +2161,9 @@ impl Gpu {
             },
             0,
         );
+        if !area.empty() {
+            self.draws += 1;
+        }
         Ok(())
     }
     pub fn copy(
@@ -2124,7 +2207,7 @@ impl Gpu {
         region: Rect,
     ) -> Result<(), Error> {
         self.check()?;
-        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
         self.execution.worker.push(
             WorkerItem::Copy {
                 facade: self.facade_id,
@@ -2149,8 +2232,8 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.check()?;
-        if !self.execution.worker.shared.has_wake() {
-            self.execution.worker.admit_present()?;
+        if !self.wake.get() {
+            self.execution.worker.admit_present(false)?;
         }
         self.execution.worker.push_present(WorkerItem::PresentSwap {
             image: image.clone(),
@@ -3477,5 +3560,73 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
             }
         }
         assert_eq!(gpu.stats().draws, 16);
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn worker_failure_is_per_facade_skips_queued_work_and_clears_on_reset() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let mut peer = gpu.fork().unwrap();
+        let target = gpu.target(2, 2, false).unwrap();
+        gpu.clear(&target, Some([0., 1., 0., 1.]), None).unwrap();
+        gpu.drain_worker();
+
+        // Simulate a per-facade worker error (e.g. backend shader build failure).
+        *gpu.failure.lock().unwrap() = Some(Error::Unavailable("simulated pipeline error".into()));
+        assert!(matches!(gpu.check(), Err(Error::Unavailable(_))));
+        // Peer facade on the same worker stays unaffected.
+        assert!(peer.check().is_ok());
+        peer.clear(&target, Some([0., 0., 1., 1.]), None).unwrap();
+        assert_eq!(read(&mut peer, &target.image), [255, 0, 0, 255].repeat(4));
+
+        // Reset clears recoverable per-facade worker errors while preserving draw ability.
+        gpu.clear_worker_failure();
+        assert!(gpu.check().is_ok());
+        gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+        assert_eq!(read(&mut gpu, &target.image), [0, 0, 255, 255].repeat(4));
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn set_wake_backpressure_is_scoped_per_facade_and_blit_tracks_draw_count() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let peer = gpu.fork().unwrap();
+        let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+        gpu.set_wake(Some(wake));
+        gpu.execution
+            .worker
+            .shared
+            .in_flight_frames
+            .store(MAX_IN_FLIGHT_FRAMES, Ordering::Release);
+        assert!(matches!(gpu.admit_present(), Err(Error::Busy)));
+        // Peer has no wake registered, so admit_present waits rather than returning Busy
+        // once the frame budget is released.
+        let shared = peer.execution.worker.shared.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            shared.in_flight_frames.store(0, Ordering::Release);
+            shared.space_cv.notify_all();
+        });
+        peer.admit_present().unwrap();
+        releaser.join().unwrap();
+        gpu.set_wake(None);
+
+        // Verify draw_count() agrees with stats().draws across scaled blits.
+        let src = gpu.image(1, 1).unwrap();
+        let dst = gpu.target(2, 2, false).unwrap();
+        gpu.upload(&src, whole(&src), 4, &[1, 2, 3, 255]).unwrap();
+        gpu.blit(
+            &src,
+            whole(&src),
+            &dst.image,
+            whole(&dst.image),
+            Filter::Linear,
+        )
+        .unwrap();
+        assert_eq!(gpu.draw_count(), gpu.stats().draws);
     }
 }

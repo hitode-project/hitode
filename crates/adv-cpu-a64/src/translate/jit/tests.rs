@@ -218,9 +218,9 @@ fn whole_unit_emission_matches_baseline() {
             "scalar" => (24, 0x7ced329c2d703d35),
             "checked" => (104, 0x20f24b50de03f256),
             "switch" => (48, 0x1b76e4b83d612bcd),
-            "loop" => (119, 0xb8481f7bf0df221c),
-            "worker" => (178, 0x439641c71718cb83),
-            "resident" => (598, 0xd9bd02e2bd2484b8),
+            "loop" => (119, 0x648442f8babf1b84),
+            "worker" => (178, 0x15be680ab5bbca1f),
+            "resident" => (598, 0xdec1c49f9c607c18),
             _ => unreachable!(),
         };
         assert_eq!((words.len(), digest), baseline, "{name}");

@@ -508,9 +508,10 @@ impl Gpu {
         self.stream.0.borrow().admit()?;
         upload_bounds(image, rectangle, staged.pitch, staged.len())?;
         self.check()?;
-        self.execution.worker.admit_cmd(0)?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
         self.execution.worker.push(
             super::record::WorkerItem::UploadStaged {
+                facade: self.facade_id,
                 image: image.clone(),
                 rectangle,
                 staged: staged.clone(),
@@ -531,7 +532,7 @@ impl Gpu {
         let row = upload_bounds(image, rectangle, pitch, bgra.len())?;
         self.check()?;
         let len = (row * rectangle.h) as usize;
-        self.execution.worker.admit_cmd(len)?;
+        self.execution.worker.admit_cmd(len, self.wake.get())?;
         let mut buf = self.execution.worker.take_bytes_buf(len);
         if pitch == row && bgra.len() >= len {
             buf.extend_from_slice(&bgra[..len]);
@@ -543,6 +544,7 @@ impl Gpu {
         }
         self.execution.worker.push(
             super::record::WorkerItem::UploadBytes {
+                facade: self.facade_id,
                 image: image.clone(),
                 rectangle,
                 pitch: row,
@@ -566,9 +568,10 @@ impl Gpu {
         let row = upload_bounds(image, rectangle, pitch, pixels.len())?;
         self.check()?;
         let len = (row * rectangle.h) as usize;
-        self.execution.worker.admit_cmd(len)?;
+        self.execution.worker.admit_cmd(len, self.wake.get())?;
         self.execution.worker.push(
             super::record::WorkerItem::UploadBytes {
+                facade: self.facade_id,
                 image: image.clone(),
                 rectangle,
                 pitch,

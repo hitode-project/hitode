@@ -1102,6 +1102,7 @@ impl Native {
                 memory.fast.body_table((memory.base >> 12) as usize)
             },
             services: self.runtime.body.services,
+            memory: self.runtime.body.memory,
         };
         self.classified_epoch = Some(memory.epoch);
     }

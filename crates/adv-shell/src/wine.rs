@@ -106,6 +106,14 @@ fn start(
     })
 }
 
+fn display_timings_requested(options: &Options) -> bool {
+    options.frame_budget
+        || options.profile
+        || options.host_profile.is_some()
+        || options.schedule_profile.is_some()
+        || super::debug::requested(options.debug)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
     let wake = WakeEvent::new().map_err(|e| e.to_string())?;
@@ -116,12 +124,15 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         .map_err(|e| e.to_string())?;
     let mut service = background.start().map_err(|e| e.to_string())?;
     let result = (|| {
-        let display_startup = crate::display::headless(
+        let mut display_startup = crate::display::headless(
             options.gpu_software,
             (options.width, options.height),
             wake.clone(),
             Some(options.gpu_cache_dir()),
         )?;
+        if display_timings_requested(options) {
+            display_startup.set_timings(true);
+        }
         let debug_display =
             super::debug::requested(options.debug).then(|| display_startup.debug_settings());
         let display_gpu = display_startup.start()?;
@@ -185,7 +196,12 @@ pub(super) fn run_execution(
     let gpu = worker
         .display
         .take()
-        .map(|startup| startup.start())
+        .map(|mut startup| {
+            if display_timings_requested(options) {
+                startup.set_timings(true);
+            }
+            startup.start()
+        })
         .transpose()?;
     let pacer = super::frame_pacer::HostPacer {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
