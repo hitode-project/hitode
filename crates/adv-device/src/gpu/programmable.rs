@@ -108,8 +108,9 @@ impl Default for ConstantBlock {
 pub struct Program {
     pub(super) id: u64,
     pub(super) writes_depth: bool,
-    /// Complete validated WGSL with vertex_main and fragment_main entry points.
+    /// Complete WGSL with vertex_main and fragment_main entry points.
     pub(super) source: Arc<str>,
+    pub(super) validation_error: Option<Arc<str>>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
     pub textures: Vec<bool>,
     /// External register usage; hand-authored programs default to complete blocks.
@@ -143,10 +144,14 @@ impl Program {
         static NEXT_PROGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         // Conservative: a false match only keeps a bound depth attachment.
         let writes_depth = source.contains("frag_depth");
+        let validation_error = super::program_module(&source)
+            .err()
+            .map(|error| Arc::from(error.to_string()));
         Self {
             writes_depth,
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source,
+            validation_error,
             textures,
             constants: [crate::constants::ConstantUsage::ALL; 2],
         }

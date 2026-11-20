@@ -181,33 +181,52 @@ pub(crate) fn channel(ring: Ring) -> (Producer, Consumer) {
 
 /// A wake of the same owner that consumes guest commands; it owns no GPU state.
 #[derive(Clone)]
-pub struct Waker(Arc<Shared>);
+pub struct Waker {
+    shared: Arc<Shared>,
+    capture_hook: Option<Arc<dyn Fn(crate::frame::CaptureReply) + Send + Sync>>,
+}
 impl Waker {
     pub fn poke(&self) {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         state.poked = true;
-        self.0.work.notify_one();
+        self.shared.work.notify_one();
     }
     pub(crate) fn wait(&self) -> bool {
-        let state = self.0.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         let mut state = self
-            .0
+            .shared
             .work
             .wait_while(state, |s| !s.poked && !s.closed)
             .unwrap();
         state.poked = false;
         !state.closed
     }
-    pub fn capture(&self) -> std::sync::mpsc::Receiver<Result<crate::frame::Captured, String>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut state = self.0.state.lock().unwrap();
+    pub(crate) fn with_capture_hook(
+        &self,
+        hook: Arc<dyn Fn(crate::frame::CaptureReply) + Send + Sync>,
+    ) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            capture_hook: Some(hook),
+        }
+    }
+    pub(crate) fn enqueue_capture(&self, tx: crate::frame::CaptureReply) {
+        let mut state = self.shared.state.lock().unwrap();
         state.captures.push(tx);
         state.poked = true;
-        self.0.work.notify_one();
+        self.shared.work.notify_one();
+    }
+    pub fn capture(&self) -> std::sync::mpsc::Receiver<Result<crate::frame::Captured, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(hook) = &self.capture_hook {
+            hook(tx);
+        } else {
+            self.enqueue_capture(tx);
+        }
         rx
     }
     pub fn captures(&self) -> Vec<crate::frame::CaptureReply> {
-        std::mem::take(&mut self.0.state.lock().unwrap().captures)
+        std::mem::take(&mut self.shared.state.lock().unwrap().captures)
     }
 }
 pub(crate) enum Next {
@@ -246,7 +265,23 @@ impl Producer {
         }
     }
 
+    /// Ensure `count` upcoming commands fit in the current chunk without
+    /// splitting shared ring spans or binding slices across chunks.
+    pub fn ensure_room(&mut self, count: usize) {
+        if !self.chunk.commands.is_empty() && self.chunk.commands.len() + count > CHUNK {
+            self.hand_off();
+        }
+    }
+
+    /// Hand off any buffered commands immediately.
+    pub fn flush_chunk(&mut self) {
+        if !self.chunk.commands.is_empty() {
+            self.hand_off();
+        }
+    }
+
     /// `draw.bindings` is ignored and set to `bindings`.
+    #[cfg(test)]
     pub fn draw(&mut self, mut draw: Draw, bindings: impl IntoIterator<Item = (u32, Binding)>) {
         let start = self.chunk.bindings.len() as u32;
         self.chunk.bindings.extend(bindings);
@@ -254,6 +289,60 @@ impl Producer {
         self.chunk.draws.push(draw);
         let index = self.chunk.draws.len() as u32 - 1;
         self.push(Command::Draw(index));
+    }
+
+    /// Emit `areas.len()` draws sharing one binding slice and ring payload.
+    /// Caller MUST call `ensure_room(areas.len())` before reserving ring bytes
+    /// so every emitted draw stays in the same chunk as its ring span.
+    pub fn draw_clips(
+        &mut self,
+        base: Draw,
+        bindings: impl IntoIterator<Item = (u32, Binding)>,
+        areas: &[(adv_gpu::Rect, Option<adv_gpu::Rect>)],
+    ) {
+        if areas.is_empty() {
+            return;
+        }
+        let start = self.chunk.bindings.len() as u32;
+        self.chunk.bindings.extend(bindings);
+        let binding_range = start..self.chunk.bindings.len() as u32;
+        for &(area, opaque) in areas {
+            let index_binding = match &base.index {
+                Some((Binding::Storage(bytes), fmt)) => Some((Binding::Storage(*bytes), *fmt)),
+                Some((Binding::Uniform(bytes), fmt)) => Some((Binding::Uniform(*bytes), *fmt)),
+                Some((Binding::Buffer(buf, range), fmt)) => {
+                    Some((Binding::Buffer(buf.clone(), range.clone()), *fmt))
+                }
+                _ => None,
+            };
+            let draw = Draw {
+                pipeline: base.pipeline.clone(),
+                bindings: binding_range.clone(),
+                index: index_binding,
+                vertices: base.vertices.clone(),
+                instances: base.instances.clone(),
+                base_vertex: base.base_vertex,
+                viewport: base.viewport,
+                scissor: area,
+                stencil_reference: base.stencil_reference,
+                blend_constant: base.blend_constant,
+                area,
+                writes_color: base.writes_color,
+                uses_depth: base.uses_depth,
+                writes_depth: base.writes_depth,
+                opaque,
+            };
+            self.chunk.draws.push(draw);
+            let index = self.chunk.draws.len() as u32 - 1;
+            self.chunk.commands.push(Command::Draw(index));
+        }
+        if self.chunk.commands.len() >= CHUNK {
+            self.hand_off();
+        }
+    }
+
+    pub fn gate(&self) -> Gate {
+        Gate(self.shared.clone())
     }
 
     /// Reserve `len` bytes for this chunk's commands and let `write` fill
@@ -297,11 +386,6 @@ impl Producer {
         (self.chunk.spans.len() - 1) as u16
     }
 
-    pub fn completed(&self) -> u64 {
-        self.shared
-            .completed
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
     pub fn wait(&mut self) {
         self.push(Command::Submit);
         let state = self.shared.state.lock().unwrap();
@@ -343,7 +427,10 @@ pub(crate) struct Consumer {
 
 impl Consumer {
     pub fn waker(&self) -> Waker {
-        Waker(self.shared.clone())
+        Waker {
+            shared: self.shared.clone(),
+            capture_hook: None,
+        }
     }
     /// A poke or the next chunk, blocking only while neither exists.
     pub fn next(&self) -> Next {
@@ -392,20 +479,28 @@ impl Consumer {
     }
 }
 
-/// Shared only on the execution thread; borrowing does not take a lock.
+/// Execution-thread handle to shared stream completion and test gates (without
+/// owning the upload ring or chunk producer, which live on `"adv-gfx-worker"`).
 #[derive(Clone)]
-pub(crate) struct ExecutionStream(pub std::rc::Rc<std::cell::RefCell<Producer>>);
-impl ExecutionStream {
-    pub fn push(&mut self, command: Command) {
-        self.0.borrow_mut().push(command);
+pub(crate) struct Gate(Arc<Shared>);
+impl Gate {
+    pub fn completed(&self) -> u64 {
+        self.0.completed.load(std::sync::atomic::Ordering::Acquire)
     }
-    pub fn bytes(&mut self, len: u32, align: u32, write: impl FnOnce(&mut [u8])) -> Bytes {
-        self.0.borrow_mut().bytes(len, align, write)
-    }
-    pub fn draw(&mut self, draw: Draw, bindings: impl IntoIterator<Item = (u32, Binding)>) {
-        self.0.borrow_mut().draw(draw, bindings);
+    pub fn wait_retired(&self) {
+        let state = self.0.state.lock().unwrap();
+        drop(
+            self.0
+                .retired
+                .wait_timeout(state, std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
     }
 }
+
+/// Shared only on the execution thread; borrowing does not take a lock.
+#[derive(Clone)]
+pub(crate) struct ExecutionStream(pub std::rc::Rc<std::cell::RefCell<Gate>>);
 
 #[cfg(feature = "test-support")]
 #[derive(Default)]
@@ -423,17 +518,17 @@ impl Drop for SubmissionPause {
     }
 }
 #[cfg(feature = "test-support")]
-impl Producer {
+impl Gate {
     pub fn pause_submissions(&self) -> Result<SubmissionPause, super::super::Error> {
-        let mut paused = self.shared.submissions.paused.lock().unwrap();
+        let mut paused = self.0.submissions.paused.lock().unwrap();
         if *paused {
             return Err(super::super::Error::Busy);
         }
         *paused = true;
-        Ok(SubmissionPause(self.shared.submissions.clone()))
+        Ok(SubmissionPause(self.0.submissions.clone()))
     }
     pub fn admit(&self) -> Result<(), super::super::Error> {
-        if *self.shared.submissions.paused.lock().unwrap() {
+        if *self.0.submissions.paused.lock().unwrap() {
             Err(super::super::Error::Busy)
         } else {
             Ok(())

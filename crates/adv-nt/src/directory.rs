@@ -33,13 +33,15 @@ const FILE_ID_FULL_DIRECTORY_INFORMATION: u32 = 38;
 const FILE_ID_EXTD_DIRECTORY_INFORMATION: u32 = 60;
 const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION: u32 = 63;
 
-pub(crate) const FIND_QUERY: &str = "find_first_directory_query";
+pub(crate) const FIND_QUERY: &str = "find_directory_query";
 
 struct FindQuerySlot(u32);
 
-/// Route Wine's initial Win32 file search through the current guest import.
-/// Some inline hooks handle the older directory record but return empty
-/// success for the extended record Wine requests.
+/// Route Wine's Win32 file searches through the current guest import,
+/// asking for the record Windows asks for. `FindFirstFileExW` and
+/// `FindNextFileW` on Windows query `FileBothDirectoryInformation`; Wine
+/// asks for `FileIdExtdBothDirectoryInformation`, which inline hooks written
+/// against Windows answer with an empty success.
 pub(crate) fn bind_find_query(env: &mut Env<'_>, base: u32, pe: &Pe) {
     let Some(table) = env
         .ext
@@ -51,22 +53,9 @@ pub(crate) fn bind_find_query(env: &mut Env<'_>, base: u32, pe: &Pe) {
     else {
         return;
     };
-    let Some(function) = table.named("FindFirstFileExW") else {
+    let (Ok(relocations), Ok(imports)) = (pe.relocations(), pe.imports()) else {
         return;
     };
-    let (Ok(relocations), Ok(code), Ok(imports)) = (
-        pe.relocations(),
-        pe.slice(function.rva, function.size),
-        pe.imports(),
-    ) else {
-        return;
-    };
-    let entry = base + function.rva;
-    if !crate::identity::intact(env.cpu, entry, function, |address| {
-        relocations.contains(&address.wrapping_sub(base))
-    }) {
-        return;
-    }
     let Some(slot) = imports
         .into_iter()
         .filter(|module| module.dll.eq_ignore_ascii_case("ntdll.dll"))
@@ -80,14 +69,32 @@ pub(crate) fn bind_find_query(env: &mut Env<'_>, base: u32, pe: &Pe) {
     else {
         return;
     };
-    let Some(call) = Decoder::with_ip(32, code, u64::from(entry), DecoderOptions::NONE)
-        .into_iter()
-        .find(|ins| {
-            ins.code() == Code::Call_rm32 && ins.len() == 6 && ins.memory_displacement32() == slot
-        })
-    else {
-        return;
-    };
+    let mut calls = Vec::new();
+    for name in ["FindFirstFileExW", "FindNextFileW"] {
+        let Some(function) = table.named(name) else {
+            return;
+        };
+        let Ok(code) = pe.slice(function.rva, function.size) else {
+            return;
+        };
+        let entry = base + function.rva;
+        if !crate::identity::intact(env.cpu, entry, function, |address| {
+            relocations.contains(&address.wrapping_sub(base))
+        }) {
+            return;
+        }
+        let Some(call) = Decoder::with_ip(32, code, u64::from(entry), DecoderOptions::NONE)
+            .into_iter()
+            .find(|ins| {
+                ins.code() == Code::Call_rm32
+                    && ins.len() == 6
+                    && ins.memory_displacement32() == slot
+            })
+        else {
+            return;
+        };
+        calls.push(call.ip32());
+    }
     let Ok(thunk) = env
         .sys
         .thunks
@@ -95,13 +102,23 @@ pub(crate) fn bind_find_query(env: &mut Env<'_>, base: u32, pe: &Pe) {
     else {
         return;
     };
-    let at = call.ip32();
-    let mut bytes = [0xe8, 0, 0, 0, 0, 0x90];
-    bytes[1..5].copy_from_slice(&thunk.wrapping_sub(at + 5).to_le_bytes());
-    if env.cpu.write(at, &bytes).is_ok() {
-        env.ext.insert(FindQuerySlot(slot));
+    for at in calls {
+        let mut bytes = [0xe8, 0, 0, 0, 0, 0x90];
+        bytes[1..5].copy_from_slice(&thunk.wrapping_sub(at + 5).to_le_bytes());
+        if env.cpu.write(at, &bytes).is_err() {
+            return;
+        }
     }
+    env.ext.insert(FindQuerySlot(slot));
 }
+
+/// A `FileBothDirectoryInformation` record: the fixed part before the name.
+const BOTH_FIXED: usize = 94;
+/// Where `FileIdExtdBothDirectoryInformation` inserts its reparse tag and
+/// 128-bit file id, which push the short and long names 20 bytes further.
+const EXTD_INSERT: usize = 68;
+const EXTD_GROWTH: usize = 20;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
     let slot = env.ext.get::<FindQuerySlot>().0;
@@ -109,65 +126,70 @@ pub(crate) fn find_query(env: &mut Env<'_>) -> Outcome {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
     let mut args: [u32; 11] = std::array::from_fn(|i| env.arg(i as u32));
-    let (io, buffer, length, class, mask, restart) =
-        (args[4], args[5], args[6], args[7], args[9], args[10]);
+    let (io, buffer, length) = (args[4], args[5], args[6]);
+    // A record grows by at most 24 bytes once aligned, and the smallest
+    // aligned record is 96 bytes: four fifths of the buffer always fit.
+    args[6] = length / 5 * 4;
+    args[7] = FILE_BOTH_DIRECTORY_INFORMATION;
     Outcome::call(target, args, move |env, result| {
-        if class != FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION {
+        if result.value() != status::SUCCESS {
             return Outcome::Return(result.value());
         }
-        let legacy_hook_error = matches!(
-            result.value(),
-            status::INVALID_HANDLE | status::INVALID_INFO_CLASS
-        );
-        let empty_exact_lookup = result.value() == status::SUCCESS
-            && restart as u8 != 0
-            && env.cpu.read_u32(io + 4).ok() == Some(0)
-            && read_unicode_string(env, mask).is_ok_and(|name| {
-                !name.is_empty() && !name.iter().any(|unit| WILDCARDS.contains(unit))
-            });
-        if !legacy_hook_error && !empty_exact_lookup {
-            return Outcome::Return(result.value());
-        }
-        args[7] = FILE_BOTH_DIRECTORY_INFORMATION;
-        if legacy_hook_error {
-            // Translate one entry so a legacy hook's multi-entry wildcard reply still converts cleanly.
-            args[8] = 1;
-        }
-        Outcome::call(target, args, move |env, legacy| {
-            if legacy.value() == status::SUCCESS
-                && let Some(bytes) = legacy_find_record(env, io, buffer, length)
-                && env.cpu.write(buffer, &bytes).is_ok()
-            {
-                return status::finish(
-                    write_u32(env, io + 4, bytes.len() as u32).map_err(Error::Status),
-                );
-            }
-            if legacy_hook_error {
-                return Outcome::Return(legacy.value());
-            }
-            // Leave the result of the original empty query intact.
-            status::finish(
-                write_u32(env, io, status::SUCCESS)
-                    .and_then(|()| write_u32(env, io + 4, 0))
-                    .map_err(Error::Status),
-            )
-        })
+        status::finish(extend_records(env, io, buffer, length).map_err(Error::Status))
     })
 }
 
-fn legacy_find_record(env: &Env<'_>, io: u32, buffer: u32, length: u32) -> Option<Vec<u8>> {
-    let size = env.cpu.read_u32(io + 4).ok()?;
-    if size < 94 || size > length.checked_sub(20)? {
-        return None;
+/// Rewrites the `FileBothDirectoryInformation` records a query left in
+/// `buffer` as the `FileIdExtdBothDirectoryInformation` records Wine reads.
+/// The file id is not part of the Windows record and stays zero; the reparse
+/// tag comes from `EaSize`, where the Windows record reports it.
+fn extend_records(env: &mut Env<'_>, io: u32, buffer: u32, length: u32) -> Result<(), Status> {
+    let size = env
+        .cpu
+        .read_u32(io + 4)
+        .map_err(|_| status::ACCESS_VIOLATION)?;
+    let mut old = vec![0; size as usize];
+    env.cpu
+        .read(buffer, &mut old)
+        .map_err(|_| status::ACCESS_VIOLATION)?;
+    let mut new = Vec::with_capacity(length as usize);
+    let mut at = 0;
+    while at < old.len() {
+        let field = |offset: usize| {
+            old.get(at + offset..at + offset + 4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+                .ok_or(status::INVALID_PARAMETER)
+        };
+        let (next, attributes, name, ea) = (field(0)?, field(56)?, field(60)?, field(64)?);
+        let end = at + BOTH_FIXED + name;
+        if end > old.len() || (next != 0 && at + next < end) {
+            return Err(status::INVALID_PARAMETER);
+        }
+        let start = new.len();
+        let tag = if attributes as u32 & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            ea
+        } else {
+            0
+        };
+        new.extend_from_slice(&old[at..at + EXTD_INSERT]);
+        new.extend_from_slice(&(tag as u32).to_le_bytes());
+        new.extend_from_slice(&[0; EXTD_GROWTH - 4]);
+        new.extend_from_slice(&old[at + EXTD_INSERT..end]);
+        if next == 0 {
+            break;
+        }
+        new.resize(start + (new.len() - start).next_multiple_of(8), 0);
+        let offset = (new.len() - start) as u32;
+        new[start..start + 4].copy_from_slice(&offset.to_le_bytes());
+        at += next;
     }
-    let mut entry = vec![0; size as usize];
-    env.cpu.read(buffer, &mut entry).ok()?;
-    let name_len = u32::from_le_bytes(entry[60..64].try_into().unwrap());
-    if entry[..4] != [0; 4] || name_len > size - 94 || name_len > 518 || entry[68] > 24 {
-        return None;
+    if new.len() > length as usize {
+        return Err(status::INVALID_PARAMETER);
     }
-    entry.splice(68..68, [0; 20]);
-    Some(entry)
+    env.cpu
+        .write(buffer, &new)
+        .map_err(|_| status::ACCESS_VIOLATION)?;
+    write_u32(env, io + 4, new.len() as u32)
 }
 
 /// The listing of each directory handle that has been queried.

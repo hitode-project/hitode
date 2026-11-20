@@ -156,7 +156,7 @@ pub(super) struct Pipelines {
 }
 
 // Task, unclaimed speculative recipe bytes, and creation-time origin.
-type PipelineJob = (Compile<Result<Built, Error>>, Option<usize>, bool);
+pub(super) type PipelineJob = (Compile<Result<Built, Error>>, Option<usize>, bool);
 
 /// Creation-time pipeline state and the same job table used by draws.
 #[derive(Clone)]
@@ -301,7 +301,6 @@ impl Pipelines {
             self.anticipated += u64::from(*anticipated);
             return Ok(pipeline.clone());
         }
-        gpu::validate_program(&draw.program)?;
         self.demand(
             device,
             key,
@@ -524,6 +523,29 @@ impl Pipelines {
             ..Default::default()
         }
     }
+    pub(super) fn jobs(&self) -> Arc<Mutex<HashMap<[u8; 32], PipelineJob>>> {
+        self.jobs.clone()
+    }
+    pub(super) fn counters(&self) -> CompileCounters {
+        self.counters.clone()
+    }
+    pub(super) fn open_cache(
+        &mut self,
+        device: &Device,
+        directory: Option<&Path>,
+    ) -> Arc<Mutex<HashMap<[u8; 32], PipelineJob>>> {
+        self.open(device, directory);
+        self.jobs.clone()
+    }
+    pub(super) fn flush_cache(&mut self) -> std::io::Result<()> {
+        self.flush()
+    }
+    #[cfg(test)]
+    pub(super) fn archive_info(&self) -> Option<(PathBuf, String, usize)> {
+        self.store
+            .as_ref()
+            .map(|s| (s.path.clone(), s.identity.clone(), s.recipes.len()))
+    }
     /// The final write supersedes the background one, so only its failure
     /// leaves the archive without the latest recipes.
     fn flush(&mut self) -> std::io::Result<()> {
@@ -545,7 +567,7 @@ impl Drop for Pipelines {
     }
 }
 #[derive(Clone)]
-struct Built {
+pub(super) struct Built {
     pipeline: RenderPipeline,
     identity: u64,
 }
@@ -619,8 +641,8 @@ impl Gpu {
         });
         Compiler {
             device: self.device.clone(),
-            jobs: self.pipelines.jobs.clone(),
-            counters: self.pipelines.counters.clone(),
+            jobs: self.pipeline_jobs.clone(),
+            counters: self.pipeline_counters.clone(),
             recipe,
             sampling: prediction.map_or([None; 20], |(_, _, textures)| {
                 std::array::from_fn(|n| textures[n].as_ref().map(program_sampling_flags))
@@ -628,10 +650,13 @@ impl Gpu {
         }
     }
     pub fn set_pipeline_cache_directory(&mut self, directory: Option<&Path>) {
-        self.pipelines.open(&self.device, directory);
+        self.pipeline_jobs = self
+            .execution
+            .worker
+            .set_pipeline_cache_directory(self.facade_id, directory.map(Path::to_path_buf));
     }
     pub fn flush_pipeline_cache(&mut self) -> std::io::Result<()> {
-        self.pipelines.flush()
+        self.execution.worker.flush_pipeline_cache(self.facade_id)
     }
 }
 
@@ -725,15 +750,8 @@ fn valid_recipe(recipe: &Recipe) -> bool {
                 modes,
                 streams,
             } => {
-                gpu::program_module(source).is_ok_and(|module| {
-                    module
-                        .entry_points
-                        .iter()
-                        .any(|e| e.name == "vertex_main" && e.stage == naga::ShaderStage::Vertex)
-                        && module.entry_points.iter().any(|e| {
-                            e.name == "fragment_main" && e.stage == naga::ShaderStage::Fragment
-                        })
-                }) && textures.iter().filter(|&&vs| vs).count() <= 4
+                gpu::program_module(source).is_ok()
+                    && textures.iter().filter(|&&vs| vs).count() <= 4
                     && textures.iter().filter(|&&vs| !vs).count() <= 16
                     && modes.len() == textures.len()
                     && modes.iter().all(|&m| m <= 3 | BORDER_SAMPLING)
@@ -1544,10 +1562,18 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
         upload_chunk(&mut gpu, &mut queue, &consumer);
         assert_eq!(sample(&mut gpu, &mut queue, &image), [255; 4]);
         for filter in [gpu::Filter::Nearest, gpu::Filter::Linear] {
-            let pipeline = gpu
-                .pipelines
-                .blit(&gpu.device, filter, Format::Bgra8Unorm, 0)
-                .unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            gpu.execution
+                .worker
+                .inspect_pipelines(gpu.facade_id, move |pipelines, device| {
+                    tx.send(
+                        pipelines
+                            .blit(device, filter, Format::Bgra8Unorm, 0)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                });
+            let pipeline = rx.recv().unwrap();
             let target = gpu.target_levels(1, 1, 1).unwrap();
             assert_eq!(
                 super::super::resources::tests::render(
@@ -1647,21 +1673,29 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
             draw.streams[0].instance = true;
             draw.streams[0].stride = stride;
             draw.streams[0].attributes[0].offset = 4;
-            let pipeline = gpu
-                .pipelines
-                .programmable(
-                    &gpu.device,
-                    &draw,
-                    &DrawState::new(1, 1),
-                    &[Format::Bgra8Unorm],
-                    None,
-                    &draw
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let draw_clone = draw.clone();
+            gpu.execution
+                .worker
+                .inspect_pipelines(gpu.facade_id, move |pipelines, device| {
+                    let sampling: arrayvec::ArrayVec<_, 20> = draw_clone
                         .textures
                         .iter()
                         .map(program_sampling_flags)
-                        .collect::<arrayvec::ArrayVec<_, 20>>(),
-                )
-                .unwrap();
+                        .collect();
+                    let p = pipelines
+                        .programmable(
+                            device,
+                            &draw_clone,
+                            &DrawState::new(1, 1),
+                            &[Format::Bgra8Unorm],
+                            None,
+                            &sampling,
+                        )
+                        .unwrap();
+                    tx.send(p).unwrap();
+                });
+            let pipeline = rx.recv().unwrap();
             let target = gpu.target_levels(1, 1, 1).unwrap();
             let result = render_stream(
                 &mut gpu,
@@ -1761,21 +1795,29 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 sampler: state.sampler,
             },
         ];
-        let pipeline = gpu
-            .pipelines
-            .programmable(
-                &gpu.device,
-                &draw,
-                &state,
-                &[Format::Bgra8Unorm],
-                None,
-                &draw
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let draw_clone = draw.clone();
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |pipelines, device| {
+                let sampling: arrayvec::ArrayVec<_, 20> = draw_clone
                     .textures
                     .iter()
                     .map(program_sampling_flags)
-                    .collect::<arrayvec::ArrayVec<_, 20>>(),
-            )
-            .unwrap();
+                    .collect();
+                let p = pipelines
+                    .programmable(
+                        device,
+                        &draw_clone,
+                        &state,
+                        &[Format::Bgra8Unorm],
+                        None,
+                        &sampling,
+                    )
+                    .unwrap();
+                tx.send(p).unwrap();
+            });
+        let pipeline = rx.recv().unwrap();
         let target = gpu.target_levels(1, 1, 1).unwrap();
         let mut vertex = bytemuck::bytes_of(&ConstantBlock::default()).to_vec();
         vertex.extend_from_slice(bytemuck::bytes_of(&draw.parameters));
@@ -1853,8 +1895,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             .join()
             .unwrap();
         let anticipated = gpu
-            .pipelines
-            .jobs
+            .pipeline_jobs
             .lock()
             .unwrap()
             .values()
@@ -1863,13 +1904,19 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             .0
             .clone();
         anticipated.resolve().as_ref().unwrap().as_ref().unwrap();
-        assert_eq!(gpu.pipelines.jobs.lock().unwrap().len(), 1);
-        assert!(gpu.pipelines.store.as_ref().unwrap().recipes.is_empty());
+        assert_eq!(gpu.pipeline_jobs.lock().unwrap().len(), 1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |p, _| {
+                tx.send(p.archive_info().unwrap()).unwrap();
+            });
+        assert_eq!(rx.recv().unwrap().2, 0);
         state.color_write = 1;
         gpu.draw_programmable(&target, &draw, &state).unwrap();
         assert_eq!(gpu.stats().anticipated_pipeline_draws, 0);
         assert_eq!(gpu.stats().prebuild_misses, 1);
-        let jobs = gpu.pipelines.jobs.lock().unwrap();
+        let jobs = gpu.pipeline_jobs.lock().unwrap();
         assert_eq!(jobs.len(), 2);
         assert_eq!(
             jobs.values().filter(|(_, size, _)| size.is_some()).count(),
@@ -1877,8 +1924,14 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         );
         drop(jobs);
         gpu.flush_pipeline_cache().unwrap();
-        let store = gpu.pipelines.store.as_ref().unwrap();
-        let (recipes, _) = load_archive(&store.path, &store.identity).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |p, _| {
+                tx.send(p.archive_info().unwrap()).unwrap();
+            });
+        let (path, identity, _) = rx.recv().unwrap();
+        let (recipes, _) = load_archive(&path, &identity).unwrap();
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].raster.color_write, 1);
         gpu.set_pipeline_cache_directory(None);
@@ -1914,29 +1967,39 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         upload_chunk(&mut gpu, &mut queue, &consumer);
         assert_eq!(sample(&mut gpu, &mut queue, &image), [11, 22, 33, 44]);
         let draw = draw(AttributeFormat::Float4, vec![0; 48]);
-        gpu.pipelines
-            .programmable(
-                &gpu.device,
-                &draw,
-                &DrawState::new(1, 1),
-                &[Format::Bgra8Unorm],
-                None,
-                &draw
-                    .textures
-                    .iter()
-                    .map(program_sampling_flags)
-                    .collect::<arrayvec::ArrayVec<_, 20>>(),
-            )
-            .unwrap();
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |pipelines, device| {
+                let sampling: arrayvec::ArrayVec<_, 20> =
+                    draw.textures.iter().map(program_sampling_flags).collect();
+                pipelines
+                    .programmable(
+                        device,
+                        &draw,
+                        &DrawState::new(1, 1),
+                        &[Format::Bgra8Unorm],
+                        None,
+                        &sampling,
+                    )
+                    .unwrap();
+            });
         gpu.flush_pipeline_cache().unwrap();
-        let store = gpu.pipelines.store.as_ref().unwrap();
-        let (path, identity) = (store.path.clone(), store.identity.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        gpu.execution
+            .worker
+            .inspect_pipelines(gpu.facade_id, move |p, _| {
+                let store = p.store.as_ref().unwrap();
+                tx.send((
+                    store.path.clone(),
+                    store.identity.clone(),
+                    store.recipes.clone(),
+                ))
+                .unwrap();
+            });
+        let (path, identity, saved_recipes) = rx.recv().unwrap();
         let (loaded, driver) = load_archive(&path, &identity).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(
-            gpu.pipelines.stats().persisted_pipelines,
-            loaded.len() as u64
-        );
+        assert_eq!(gpu.stats().persisted_pipelines, loaded.len() as u64);
         assert!(load_archive(&path, "another driver").is_none());
         let mut warmed = Pipelines::default();
         warmed.open(&gpu.device, Some(&directory));
@@ -1972,7 +2035,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         *bytes.last_mut().unwrap() ^= 1;
         std::fs::write(&path, bytes).unwrap();
         assert!(load_archive(&path, &identity).is_none());
-        let mut malformed = gpu.pipelines.store.as_ref().unwrap().recipes.clone();
+        let mut malformed = saved_recipes;
         let program = malformed
             .iter_mut()
             .find(|r| matches!(r.kind, Kind::Program { .. }))

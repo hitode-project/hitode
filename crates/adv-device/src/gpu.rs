@@ -29,7 +29,10 @@ pub use programmable::{
 
 /// Validate guest-derived source before handing it to the device.
 pub fn validate_program(program: &Program) -> Result<(), Error> {
-    program_module(program.source()).map(drop)
+    match &program.validation_error {
+        Some(error) => Err(Error::Invalid(error.to_string())),
+        None => Ok(()),
+    }
 }
 pub(super) fn program_module(source: &str) -> Result<naga::Module, Error> {
     if source.len() > Program::MAX_SOURCE_LEN {
@@ -43,6 +46,18 @@ pub(super) fn program_module(source: &str) -> Result<naga::Module, Error> {
     )
     .validate(&module)
     .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
+    for (stage, name) in [
+        (naga::ShaderStage::Vertex, "vertex_main"),
+        (naga::ShaderStage::Fragment, "fragment_main"),
+    ] {
+        if !module
+            .entry_points
+            .iter()
+            .any(|e| e.stage == stage && e.name == name)
+        {
+            return Err(Error::Invalid(format!("program has no {name}")));
+        }
+    }
     Ok(module)
 }
 

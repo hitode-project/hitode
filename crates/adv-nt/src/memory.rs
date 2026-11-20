@@ -49,6 +49,11 @@ const PAGE_GUARD: u32 = 0x100;
 pub const PAGE_GUARD_READWRITE: u32 = PAGE_GUARD | PAGE_READWRITE;
 const PAGE_NOCACHE: u32 = 0x200;
 const PAGE_WRITECOMBINE: u32 = 0x400;
+/// Control-flow-guard target bits: `PAGE_TARGETS_INVALID` at allocation,
+/// `PAGE_TARGETS_NO_UPDATE` when changing protection.
+const PAGE_TARGETS: u32 = 0x4000_0000;
+/// Accepted alongside `PAGE_TARGETS` when changing protection.
+const PAGE_ENCLAVE_UNVALIDATED: u32 = 0x2000_0000;
 
 /// The highest address of the user address space.
 pub const USER_END: u32 = 0x7fff_0000;
@@ -222,6 +227,20 @@ pub fn set_protections(memory: &mut Memory, base: u32, protections: &[u32]) {
 
 pub(crate) const SECTION_PROTECTION: Status = 0xc000_004e;
 const CAP_READ: u8 = 1;
+/// Drops the control-flow-guard `bits` from `protection`, as Windows does
+/// for an executable protection; with any other protection they are `error`.
+fn without_targets(protection: u32, bits: u32, error: Status) -> Result<u32, Status> {
+    if protection & bits == 0 {
+        return Ok(protection);
+    }
+    let executable =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if protection & executable == 0 {
+        return Err(error);
+    }
+    Ok(protection & !bits)
+}
+
 const CAP_WRITE: u8 = 2;
 const CAP_EXEC: u8 = 4;
 
@@ -522,6 +541,7 @@ fn allocate_in(
     let &[process, base_out, _zero_bits, size_out, kind, protection] = args else {
         unreachable!()
     };
+    let protection = without_targets(protection, PAGE_TARGETS, status::INVALID_PARAMETER)?;
     if process != CURRENT_PROCESS {
         return Err(status::INVALID_HANDLE);
     }
@@ -774,6 +794,11 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
     let &[process, base_out, size_out, protection, old_out] = args else {
         unreachable!()
     };
+    let protection = without_targets(
+        protection,
+        PAGE_TARGETS | PAGE_ENCLAVE_UNVALIDATED,
+        status::INVALID_PARAMETER_4,
+    )?;
     if process != CURRENT_PROCESS {
         return Err(status::INVALID_HANDLE);
     }
@@ -1953,5 +1978,37 @@ mod volume_tests {
             Ok(())
         );
         assert!(prot_rx.contains(Prot::EXEC));
+    }
+}
+
+#[cfg(test)]
+mod target_bits_tests {
+    use super::*;
+
+    // spec: NT-SYS-2
+    #[test]
+    fn guard_target_bits_follow_windows_by_service() {
+        // Statuses measured on Windows 11 for a WoW64 process.
+        let change = |protection| {
+            without_targets(
+                protection,
+                PAGE_TARGETS | PAGE_ENCLAVE_UNVALIDATED,
+                status::INVALID_PARAMETER_4,
+            )
+        };
+        assert_eq!(change(0x6000_0080), Ok(PAGE_EXECUTE_WRITECOPY));
+        assert_eq!(change(0x4000_0080), Ok(PAGE_EXECUTE_WRITECOPY));
+        assert_eq!(change(0x2000_0040), Ok(PAGE_EXECUTE_READWRITE));
+        assert_eq!(change(0x6000_0004), Err(status::INVALID_PARAMETER_4));
+        assert_eq!(change(PAGE_EXECUTE_READ), Ok(PAGE_EXECUTE_READ));
+        let allocate =
+            |protection| without_targets(protection, PAGE_TARGETS, status::INVALID_PARAMETER);
+        assert_eq!(allocate(0x4000_0040), Ok(PAGE_EXECUTE_READWRITE));
+        assert_eq!(allocate(0x4000_0010), Ok(PAGE_EXECUTE));
+        assert_eq!(allocate(0x4000_0004), Err(status::INVALID_PARAMETER));
+        assert_eq!(allocate(0x4000_0001), Err(status::INVALID_PARAMETER));
+        // The enclave bit is not a target bit at allocation, so `prot`
+        // rejects it as an invalid protection.
+        assert_eq!(allocate(0x2000_0040), Ok(0x2000_0040));
     }
 }

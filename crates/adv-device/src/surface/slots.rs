@@ -1,7 +1,7 @@
 //! Three guest-format buffers, each with its own accumulated damage debt.
 use super::*;
 use crate::frame::{Base, Slot};
-use crate::gpu::native::stream::{Command, Producer};
+use crate::gpu::native::stream::Gate;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Entry {
@@ -58,9 +58,9 @@ impl Slots {
     }
     /// The only admission point for CPU writes to a slot. A held frame has no
     /// completion token yet; a submitted ingest retires with its queue token.
-    fn acquire(&mut self, stream: &mut Producer) -> usize {
+    fn acquire(&mut self, gate: &Gate, mut flush: impl FnMut()) -> usize {
         loop {
-            let completed = stream.completed();
+            let completed = gate.completed();
             for offset in 0..3 {
                 let i = (self.next + offset) % 3;
                 let state = self.entries[i].state.load(Ordering::Acquire);
@@ -70,25 +70,24 @@ impl Slots {
                     return i;
                 }
             }
-            stream.wait();
+            flush();
+            gate.wait_retired();
         }
     }
     #[allow(clippy::too_many_arguments)]
     pub fn publish(
         &mut self,
-        stream: &mut Producer,
+        gate: &Gate,
+        flush: impl FnMut(),
         s: &Surface,
         m: &dyn SurfaceMemory,
         damage: Region,
         whole: bool,
-        serial: u64,
-        video: Arc<[crate::frame::VideoPlane]>,
-        windows: Arc<[crate::frame::WindowLayer]>,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, Base), String> {
         for entry in &mut self.entries {
             entry.debt.union(&damage);
         }
-        let i = self.acquire(stream);
+        let i = self.acquire(gate, flush);
         // A guest read failure must not retain a partly overwritten baseline.
         self.last = self.last.filter(|&last| last != i);
         let entry = &mut self.entries[i];
@@ -130,25 +129,22 @@ impl Slots {
         } else {
             damage
         };
-        stream.push(Command::Present {
-            base: Base::Software {
+        Ok((
+            copied,
+            Base::Software {
                 slot,
                 format: s.format,
                 palette: self.palette.clone(),
                 damage,
             },
-            video,
-            windows,
-            serial,
-        });
-        Ok(copied)
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::native::stream::{self, Consumer};
+    use crate::gpu::native::stream;
     use adv_gpu::queue::DeviceOptions;
     use std::sync::{Mutex, mpsc};
     use std::time::Duration;
@@ -198,28 +194,22 @@ mod tests {
         }
     }
     fn take(
-        consumer: &Consumer,
+        base: Base,
     ) -> (
         Slot,
         PixelFormat,
         Option<crate::frame::Palette>,
         crate::frame::Region,
     ) {
-        let mut chunk = consumer.try_next().unwrap();
-        let Command::Present {
-            base:
-                Base::Software {
-                    slot,
-                    format,
-                    palette,
-                    damage,
-                },
-            ..
-        } = chunk.commands.remove(0)
+        let Base::Software {
+            slot,
+            format,
+            palette,
+            damage,
+        } = base
         else {
             panic!("software frame")
         };
-        consumer.recycle(chunk);
         (slot, format, palette, damage)
     }
 
@@ -236,7 +226,8 @@ mod tests {
         for entry in &slots.entries {
             unsafe { entry.buffer.mapped().unwrap().as_mut() }.fill(0xa5);
         }
-        let (mut producer, consumer) = stream::channel(device.ring(4096).unwrap());
+        let (producer, _consumer) = stream::channel(device.ring(4096).unwrap());
+        let gate = producer.gate();
         let mut ids = Vec::new();
         for frame in 0..9 {
             // Cells apart, so each slot's debt stays three separate cells.
@@ -249,19 +240,17 @@ mod tests {
             let at = s.row(rect.x, 0) as usize;
             memory.bytes[at..at + 3].fill(frame as u8);
             memory.reads.lock().unwrap().clear();
-            let copied = slots
+            let (copied, base) = slots
                 .publish(
-                    &mut producer,
+                    &gate,
+                    || {},
                     &s,
                     &memory,
                     super::region((s.width, s.height), rect),
                     frame == 3,
-                    frame as u64,
-                    Arc::from([]),
-                    Arc::from([]),
                 )
                 .unwrap();
-            let (slot, _, _, damage) = take(&consumer);
+            let (slot, _, _, damage) = take(base);
             if frame == 3 {
                 assert!(damage.is_whole());
             }
@@ -303,22 +292,21 @@ mod tests {
             bytes: vec![1; 32],
             reads: Mutex::new(Vec::new()),
         };
-        let (mut producer, consumer) = stream::channel(device.ring(4096).unwrap());
+        let (producer, _consumer) = stream::channel(device.ring(4096).unwrap());
+        let gate = producer.gate();
         let mut slots = Slots::new(&device, &s).unwrap();
         for serial in 0..3 {
-            slots
+            let (_, base) = slots
                 .publish(
-                    &mut producer,
+                    &gate,
+                    || {},
                     &s,
                     &memory,
                     Region::empty((s.width, s.height)),
                     serial == 0,
-                    serial,
-                    Arc::from([]),
-                    Arc::from([]),
                 )
                 .unwrap();
-            let (slot, _, palette, _) = take(&consumer);
+            let (slot, _, palette, _) = take(base);
             assert!(Arc::ptr_eq(
                 palette.as_ref().unwrap(),
                 s.palette.as_ref().unwrap()
@@ -328,22 +316,18 @@ mod tests {
         let previous = s.palette.clone().unwrap();
         Arc::make_mut(s.palette.as_mut().unwrap())[1] = [1, 2, 3, 4];
         memory.reads.lock().unwrap().clear();
-        assert_eq!(
-            slots
-                .publish(
-                    &mut producer,
-                    &s,
-                    &memory,
-                    Region::empty((s.width, s.height)),
-                    false,
-                    3,
-                    Arc::from([]),
-                    Arc::from([]),
-                )
-                .unwrap(),
-            0
-        );
-        let (_, _, palette, damage) = take(&consumer);
+        let (copied, base) = slots
+            .publish(
+                &gate,
+                || {},
+                &s,
+                &memory,
+                Region::empty((s.width, s.height)),
+                false,
+            )
+            .unwrap();
+        assert_eq!(copied, 0);
+        let (_, _, palette, damage) = take(base);
         assert!(Arc::ptr_eq(
             palette.as_ref().unwrap(),
             s.palette.as_ref().unwrap()
@@ -362,36 +346,33 @@ mod tests {
             reads: Mutex::new(Vec::new()),
         };
         let mut slots = Slots::new(&device, &s).unwrap();
-        let (mut producer, consumer) = stream::channel(device.ring(4096).unwrap());
+        let (producer, consumer) = stream::channel(device.ring(4096).unwrap());
+        let gate = producer.gate();
         let mut held = Vec::new();
-        for serial in 0..3 {
-            slots
+        for _ in 0..3 {
+            let (_, base) = slots
                 .publish(
-                    &mut producer,
+                    &gate,
+                    || {},
                     &s,
                     &memory,
                     Region::whole((s.width, s.height)),
                     false,
-                    serial,
-                    Arc::from([]),
-                    Arc::from([]),
                 )
                 .unwrap();
-            held.push(take(&consumer).0);
+            held.push(take(base).0);
         }
         let (events, recv) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             events.send(0).unwrap();
             slots
                 .publish(
-                    &mut producer,
+                    &gate,
+                    || {},
                     &s,
                     &memory,
                     Region::whole((s.width, s.height)),
                     false,
-                    3,
-                    Arc::from([]),
-                    Arc::from([]),
                 )
                 .unwrap();
             events.send(1).unwrap();

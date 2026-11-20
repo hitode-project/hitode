@@ -190,6 +190,7 @@ enum Command {
     Committed(u64, u32, u32),
     Gain(u64, [f32; 2]),
     Retune(u64, u32, Converter, Option<u64>),
+    Prepare(u64, Converter),
     Notices(u64, Vec<(u32, u32)>),
     Pause(u64, bool),
     End(u64),
@@ -227,6 +228,13 @@ impl Voice {
             Self::Owned { voice, .. } => voice.active(),
         }
     }
+    fn output_rate(&self) -> Option<u32> {
+        match self {
+            Self::XAudio { .. } => None,
+            Self::Ring { voice, .. } => Some(voice.output_rate()),
+            Self::Owned { voice, .. } => Some(voice.output_rate()),
+        }
+    }
     fn retire(self) -> Retired {
         match self {
             Self::XAudio { graph, .. } => Retired::XAudio(graph),
@@ -258,6 +266,8 @@ pub(crate) struct Shared {
     engine: AtomicPtr<Engine>,
     clock: Arc<PlaybackClock>,
     rate: AtomicU32,
+    prepare_pending: AtomicBool,
+    prepare_source: AtomicU64,
     suspended: AtomicBool,
     desired_active: AtomicU64,
     pending_commands: AtomicU64,
@@ -284,10 +294,29 @@ struct Control {
     backlog: VecDeque<Command>,
     formats: BTreeMap<u64, (u32, Arc<SourceState>)>,
     rings: BTreeMap<u64, (u32, u32)>,
+    output_rate: u32,
     pending_events: VecDeque<AudioEvent>,
     retired_owners: BTreeSet<u32>,
     guest_us: u64,
     device_us: u64,
+}
+impl Control {
+    #[allow(clippy::result_large_err)] // SPSC transfers inline commands.
+    fn enqueue(&mut self, command: Command, pending: &AtomicU64) -> Result<(), Command> {
+        if !self.backlog.is_empty() {
+            if self.backlog.len() == self.backlog.capacity() {
+                return Err(command);
+            }
+            pending.fetch_add(1, Ordering::Release);
+            self.backlog.push_back(command);
+        } else {
+            pending.fetch_add(1, Ordering::Release);
+            if let Err(command) = self.commands.push(command) {
+                self.backlog.push_back(command);
+            }
+        }
+        Ok(())
+    }
 }
 /// Clone only within the execution thread. The SPSC endpoint itself is never cloned.
 #[derive(Clone)]
@@ -306,6 +335,8 @@ impl AudioControl {
             engine: AtomicPtr::new(std::ptr::null_mut()),
             clock,
             rate: AtomicU32::new(44100),
+            prepare_pending: AtomicBool::new(false),
+            prepare_source: AtomicU64::new(0),
             suspended: AtomicBool::new(false),
             desired_active: AtomicU64::new(0),
             pending_commands: AtomicU64::new(0),
@@ -343,6 +374,7 @@ impl AudioControl {
                 backlog: VecDeque::with_capacity(4096),
                 formats: BTreeMap::new(),
                 rings: BTreeMap::new(),
+                output_rate: 44100,
                 pending_events: VecDeque::new(),
                 retired_owners: BTreeSet::new(),
                 guest_us: 0,
@@ -363,27 +395,9 @@ impl AudioControl {
     #[allow(clippy::result_large_err)] // SPSC transfers inline commands without allocating an envelope.
     fn try_send(&self, command: Command) -> Result<(), Command> {
         self.maintain();
-        {
-            let mut local = self.local.borrow_mut();
-            if !local.backlog.is_empty() {
-                if local.backlog.len() == local.backlog.capacity() {
-                    return Err(command);
-                }
-                self.stream
-                    .shared
-                    .pending_commands
-                    .fetch_add(1, Ordering::Release);
-                local.backlog.push_back(command);
-            } else {
-                self.stream
-                    .shared
-                    .pending_commands
-                    .fetch_add(1, Ordering::Release);
-                if let Err(command) = local.commands.push(command) {
-                    local.backlog.push_back(command);
-                }
-            }
-        }
+        self.local
+            .borrow_mut()
+            .enqueue(command, &self.stream.shared.pending_commands)?;
         if let Some(mut reader) = self.stream.claim() {
             reader.engine.service(&reader.shared);
         }
@@ -410,10 +424,49 @@ impl AudioControl {
                 local.pending_events.push_back(event);
             }
         }
+        let shared = &self.stream.shared;
+        let rate = shared.rate.load(Ordering::Acquire);
+        if rate != local.output_rate {
+            for command in &mut local.backlog {
+                match command {
+                    Command::Ring(_, voice, _) => {
+                        let _ = voice.prepare(rate, false);
+                    }
+                    Command::Owned(_, voice, _) => {
+                        let _ = voice.prepare(rate, false);
+                    }
+                    Command::Retune(_, frequency, converter, _) if converter.rate != rate => {
+                        if let Ok(prepared) = Converter::new(*frequency, rate) {
+                            *converter = prepared;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            local.output_rate = rate;
+        }
         while let Some(command) = local.backlog.pop_front() {
             if let Err(command) = local.commands.push(command) {
                 local.backlog.push_front(command);
                 break;
+            }
+        }
+        if local.backlog.len() < local.backlog.capacity()
+            && shared.prepare_pending.swap(false, Ordering::AcqRel)
+        {
+            let source = shared.prepare_source.load(Ordering::Relaxed);
+            let frequency = local
+                .rings
+                .get(&source)
+                .map(|(frequency, _)| *frequency)
+                .or_else(|| local.formats.get(&source).map(|(frequency, _)| *frequency));
+            if let Some(frequency) = frequency
+                && let Ok(converter) = Converter::new(frequency, rate)
+            {
+                let _ = local.enqueue(
+                    Command::Prepare(source, converter),
+                    &shared.pending_commands,
+                );
             }
         }
     }
@@ -622,8 +675,11 @@ impl AudioControl {
         if !self.send(Command::Retune(source, frequency, converter, generation)) {
             return Err("audio command limit".into());
         }
-        if let Some(rate) = self.local.borrow_mut().rings.get_mut(&source) {
+        let mut local = self.local.borrow_mut();
+        if let Some(rate) = local.rings.get_mut(&source) {
             rate.0 = frequency;
+        } else if let Some(format) = local.formats.get_mut(&source) {
+            format.0 = frequency;
         }
         Ok(())
     }
@@ -820,6 +876,7 @@ impl Engine {
                 | Command::Committed(id, ..)
                 | Command::Gain(id, ..)
                 | Command::Retune(id, ..)
+                | Command::Prepare(id, ..)
                 | Command::Notices(id, ..)
                 | Command::Pause(id, ..)
                 | Command::End(id)
@@ -876,6 +933,26 @@ impl Engine {
                     }
                 }
                 Command::Suspend(suspended) => self.suspended = suspended,
+                Command::Prepare(_, converter) => {
+                    // A rate change can overlap an already published command.
+                    // Repair that converter without changing the source's frequency or epoch.
+                    let old = match at.and_then(|i| self.voices[i].as_mut()) {
+                        Some(Voice::Ring { voice, .. })
+                            if voice.output_rate() != self.rate
+                                && converter.matches(voice.frequency(), self.rate) =>
+                        {
+                            voice.retune(voice.frequency(), converter)
+                        }
+                        Some(Voice::Owned { voice, .. })
+                            if voice.output_rate() != self.rate
+                                && converter.matches(voice.frequency(), self.rate) =>
+                        {
+                            voice.retune(voice.frequency(), converter)
+                        }
+                        _ => converter,
+                    };
+                    self.retire(Retired::Converter(old));
+                }
                 command => {
                     if let Some(voice) = at.and_then(|i| self.voices[i].as_mut()) {
                         match (voice, command) {
@@ -976,6 +1053,9 @@ impl Engine {
                                 let old = voice.retune(frequency, converter);
                                 self.retire(Retired::Converter(old));
                             }
+                            (_, Command::Retune(_, _, converter, _)) => {
+                                self.retire(Retired::Converter(converter))
+                            }
                             (_, Command::Notices(_, entries)) => {
                                 self.retire(Retired::Notices(entries))
                             }
@@ -996,6 +1076,21 @@ impl Engine {
         for voice in self.voices.iter_mut().flatten() {
             if let Voice::XAudio { graph, .. } = voice {
                 graph.service();
+            }
+        }
+        if let Some(voice) = self
+            .voices
+            .iter()
+            .flatten()
+            .find(|voice| voice.output_rate().is_some_and(|rate| rate != self.rate))
+        {
+            shared
+                .prepare_source
+                .store(voice.source(), Ordering::Relaxed);
+            if !shared.prepare_pending.swap(true, Ordering::AcqRel)
+                && let Some(waker) = shared.waker.get()
+            {
+                waker.signal();
             }
         }
         let active = self.voices.iter().flatten().filter(|v| v.active()).count() as u64;

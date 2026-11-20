@@ -2,13 +2,13 @@
 //!
 //! # Threads
 //!
-//! - The execution thread calls the facade and creates resources. Pipelines
-//!   share one job table with the low-priority compiler (`adv_gpu::Device` is
-//!   `Send + Sync`); creation-time predictions compile before demand. Data is
-//!   written once, into the upload ring or pooled staging buffers, in the
-//!   resource's own format. Every GPU operation becomes a [`stream::Command`].
-//!   It never encodes, submits or
-//!   waits for the GPU, except a readback the guest waits for.
+//! - The execution thread calls the facade, validates arguments, snapshots
+//!   guest memory and creates resources (`adv_gpu::Device` is `Send + Sync`).
+//! - The CSMT worker thread (`"adv-gfx-worker"`, [`record`]) owns `Pipelines`,
+//!   sampler caches, `record::Recording` and the upload ring (`stream::Producer`).
+//!   Pipeline compilation waits, uniform/vertex packing, recipe expansion and
+//!   multi-scissor deduplication happen here without stalling the execution
+//!   thread or the GPU owner.
 //! - The GPU owner thread ([`owner`]) owns the `adv_gpu::Queue`. It turns
 //!   command chunks into passes ([`pass`]), encodes and submits them,
 //!   and hands each presented frame to the display layer on the same thread,
@@ -59,18 +59,30 @@ pub use resources::{Depth, Image, ImageId, Staged, Target};
 use super::{Error, Rect, Stats};
 
 /// Execution-thread GPU state. Facades and software surface stores created on
-/// one thread share its device, producer and owner; the facade stays on that
-/// thread. The last facade closes the producer before joining the owner.
+/// one thread share its device, `"adv-gfx-worker"` CSMT thread and `"GPU owner"`;
+/// the facade stays on that thread. The last facade closes `"adv-gfx-worker"`
+/// (which closes `stream::Producer`) before joining `"GPU owner"`.
 pub struct Gpu {
     device: adv_gpu::Device,
     stream: stream::ExecutionStream,
-    pipelines: pipelines::Pipelines,
+    pipeline_jobs:
+        Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], pipelines::PipelineJob>>>,
+    pipeline_counters: super::compile::CompileCounters,
+    facade_id: u64,
+    failure: Arc<std::sync::OnceLock<String>>,
+    draws: u64,
     /// The damage rectangle the next operations are limited to.
     clip: Option<Rect>,
-    stats: Stats,
-    recording: record::Recording,
+    readbacks: Arc<std::sync::atomic::AtomicUsize>,
+    readback_limit: usize,
     staging: resources::StagingPool,
     execution: std::rc::Rc<Execution>,
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        self.execution.worker.drop_facade(self.facade_id);
+    }
 }
 
 impl Gpu {
@@ -133,14 +145,16 @@ impl Gpu {
             };
             let (producer, commands) =
                 stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
+            let gate = producer.gate();
+            let owner = owner::Owner::start(queue, commands, presenter)?;
+            let worker = record::WorkerHandle::start(device.clone(), producer, owner.wake.clone())?;
             let execution = std::rc::Rc::new(Execution {
                 device,
-                stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(
-                    producer,
-                ))),
+                stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(gate))),
+                worker,
+                owner,
                 #[cfg(feature = "test-support")]
                 capture: Default::default(),
-                owner: owner::Owner::start(queue, commands, presenter)?,
             });
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
@@ -149,7 +163,7 @@ impl Gpu {
     }
     /// Another facade on this execution, for a child process that the
     /// session drives on the same thread. Its commands share the device,
-    /// stream and owner; pipelines, recording state and staging start fresh.
+    /// worker, stream and owner; pipelines, recording state and staging start fresh.
     pub fn fork(&self) -> Result<Self, Error> {
         self.check()?;
         Self::facade(self.execution.clone())
@@ -157,20 +171,47 @@ impl Gpu {
     fn facade(execution: std::rc::Rc<Execution>) -> Result<Self, Error> {
         let device = execution.device.clone();
         let stream = execution.stream.clone();
-        let recording = record::Recording::new(&device, &mut stream.0.borrow_mut())?;
+        let failure = Arc::new(std::sync::OnceLock::new());
+        let (facade_id, pipeline_jobs, pipeline_counters) =
+            execution.worker.create_facade(failure.clone())?;
         Ok(Self {
             device,
             stream,
-            pipelines: Default::default(),
+            pipeline_jobs,
+            pipeline_counters,
+            facade_id,
+            failure,
+            draws: 0,
             clip: None,
-            stats: Stats::default(),
-            recording,
+            readbacks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            readback_limit: 8,
             staging: Default::default(),
             execution,
         })
     }
     pub fn waker(&self) -> crate::frame::Waker {
-        self.execution.owner.wake.as_ref().unwrap().clone()
+        let owner_wake = self.execution.owner.wake.as_ref().unwrap();
+        let worker_shared = self.execution.worker.shared();
+        owner_wake.with_capture_hook(Arc::new(move |tx| {
+            worker_shared.push_capture(tx);
+        }))
+    }
+    /// Register an execution-thread wake event so backpressure returns
+    /// `Error::Busy` instead of blocking on a condvar.
+    pub fn set_wake(&self, wake: Option<Arc<adv_sync::WakeEvent>>) {
+        self.execution.worker.set_wake(wake);
+    }
+    /// Check device health, test submission gate, and in-flight frame budget
+    /// before starting a presentation.
+    pub fn admit_present(&self) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
+        self.check()?;
+        self.execution.worker.admit_present()
+    }
+    /// Synchronously drain all commands currently queued in `"adv-gfx-worker"`.
+    pub fn drain_worker(&self) {
+        self.execution.worker.drain();
     }
     /// Device shared with the presenting queue, including decoder pools.
     pub fn device(&self) -> &adv_gpu::Device {
@@ -196,40 +237,47 @@ impl Gpu {
         windows: Arc<[crate::frame::WindowLayer]>,
     ) -> Result<u64, String> {
         self.check().map_err(|e| e.to_string())?;
-        slots.publish(
-            &mut self.stream.0.borrow_mut(),
+        let (copied, base) = slots.publish(
+            &self.stream.0.borrow(),
+            || {
+                self.execution
+                    .worker
+                    .push_boundary(record::WorkerItem::Flush, 0);
+            },
             surface,
             memory,
             damage,
             whole,
-            serial,
-            video,
-            windows,
-        )
+        )?;
+        self.execution
+            .worker
+            .push_present(record::WorkerItem::PresentSoftware {
+                base,
+                video,
+                windows,
+                serial,
+            });
+        Ok(copied)
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
     }
     pub fn draw_count(&self) -> u64 {
-        self.stats.draws
+        self.draws
     }
 
     pub fn stats(&self) -> Stats {
-        let mut stats = self.stats;
-        let cache = self.pipelines.stats();
-        stats.pipeline_cache_hits += cache.pipeline_cache_hits;
-        stats.anticipated_pipeline_draws += cache.anticipated_pipeline_draws;
-        stats.compile_waits += cache.compile_waits;
-        stats.compile_wait_ns += cache.compile_wait_ns;
-        stats.prebuild_hits += cache.prebuild_hits;
-        stats.prebuild_misses += cache.prebuild_misses;
-        stats.persisted_pipelines = cache.persisted_pipelines;
-        stats.discarded_pipelines = cache.discarded_pipelines;
-        stats
+        self.execution.worker.stats(self.facade_id)
     }
-    /// Device loss, as reported by the owner thread.
+    /// Device loss, as reported by `"adv-gfx-worker"` or `"GPU owner"`.
     pub fn check(&self) -> Result<(), Error> {
-        if let Some(failure) = self.execution.owner.failure.get() {
+        if let Some(failure) = self
+            .execution
+            .owner
+            .failure
+            .get()
+            .or_else(|| self.failure.get())
+        {
             return Err(Error::Device(failure.clone()));
         }
         if let Some(failure) = self.device.lost() {
@@ -242,8 +290,10 @@ impl Gpu {
 use std::sync::Arc;
 struct Execution {
     device: adv_gpu::Device,
-    // The producer must close before Owner joins its thread.
     stream: stream::ExecutionStream,
+    // Drop order: `worker` closes and joins `"adv-gfx-worker"` (dropping
+    // `stream::Producer`) BEFORE `owner` joins `"GPU owner"`.
+    worker: record::WorkerHandle,
     owner: owner::Owner,
     #[cfg(feature = "test-support")]
     capture: std::cell::RefCell<Option<std::rc::Rc<test_support::Frames>>>,
@@ -287,7 +337,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let mut gpu =
+        let gpu =
             Gpu::request_with_presenter(device.clone(), queue, Box::new(Capture(tx))).unwrap();
         let (other_tx, _) = std::sync::mpsc::channel();
         let (other_device, other_queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
@@ -304,17 +354,19 @@ mod tests {
         let slot =
             crate::frame::Slot::new(&gpu.device, 1, 1, 4, crate::surface::PixelFormat::Bgra32)
                 .unwrap();
-        gpu.stream.push(stream::Command::Present {
-            base: crate::frame::Base::Software {
-                slot,
-                format: crate::surface::PixelFormat::Bgra32,
-                palette: None,
-                damage: crate::frame::Region::whole((1, 1)),
-            },
-            video: Arc::from([]),
-            windows: Arc::from([]),
-            serial: 7,
-        });
+        gpu.execution
+            .worker
+            .push_present(record::WorkerItem::PresentSoftware {
+                base: crate::frame::Base::Software {
+                    slot,
+                    format: crate::surface::PixelFormat::Bgra32,
+                    palette: None,
+                    damage: crate::frame::Region::whole((1, 1)),
+                },
+                video: Arc::from([]),
+                windows: Arc::from([]),
+                serial: 7,
+            });
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap(),
             7

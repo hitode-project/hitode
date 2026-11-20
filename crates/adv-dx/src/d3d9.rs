@@ -573,6 +573,7 @@ pub fn set_gpu(ext: &mut Ext, mut gpu: Gpu) -> Result<(), String> {
     }
     state.shader_translations.ieee_f32 = gpu.device().caps().ieee_f32;
     gpu.set_pipeline_cache_directory(state.shader_cache.as_deref());
+    gpu.set_wake(state.wake.clone());
     state.gpu = Some(gpu);
     Ok(())
 }
@@ -582,8 +583,12 @@ pub fn set_background(
     wake: adv_sync::WakeEvent,
 ) {
     let state = ext.get_mut::<State>();
+    let wake = std::sync::Arc::new(wake);
+    if let Some(gpu) = &state.gpu {
+        gpu.set_wake(Some(wake.clone()));
+    }
     state.sender = Some(sender);
-    state.wake = Some(std::sync::Arc::new(wake));
+    state.wake = Some(wake);
 }
 /// Assemble an installed child frontend with the parent's host-device and
 /// completion policy. Guest COM objects, vtables and pending work stay local.
@@ -1581,20 +1586,28 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             pitch,
             rectangle,
         } => match pixels {
-            Pixels::Host(pixels, _) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
+            Pixels::Host(pixels, _) => {
+                gpu.upload_arc(&target.image, *rectangle, *pitch, Arc::clone(pixels))
+            }
             Pixels::Staged(staged, _) => gpu.upload_staged(&target.image, *rectangle, staged),
         }
         .map(|()| Completion::Command),
         Operation::Draw(draw) => {
             let before = gpu.draw_count();
             let result = if let Some(program) = &draw.programmable {
-                gpu.draw_programmable(&draw.target, program, &draw.state)
-            } else {
-                gpu.draw(
+                gpu.draw_programmable_arc_clips(
                     &draw.target,
-                    &draw.vertices,
+                    Arc::clone(program),
+                    &draw.state,
+                    None,
+                )
+            } else {
+                gpu.draw_arc_clips(
+                    &draw.target,
+                    Arc::clone(&draw.vertices),
                     draw.image.as_ref(),
                     draw.state,
+                    None,
                 )
             };
             let draws = gpu.draw_count() - before;
@@ -1617,6 +1630,36 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);
     result
+}
+fn execute_draw_clips(
+    env: &mut Env<'_>,
+    draw: &fixed::Draw,
+    clips: &[adv_device::surface::Rect],
+) -> Result<Completion, Error> {
+    let mut gpu = env
+        .ext
+        .get_mut::<State>()
+        .gpu
+        .take()
+        .ok_or_else(|| Error::Unavailable("D3D9 GPU is absent".into()))?;
+    let before = gpu.draw_count();
+    let result = if let Some(program) = &draw.programmable {
+        gpu.draw_programmable_arc_clips(&draw.target, Arc::clone(program), &draw.state, Some(clips))
+    } else {
+        gpu.draw_arc_clips(
+            &draw.target,
+            Arc::clone(&draw.vertices),
+            draw.image.as_ref(),
+            draw.state,
+            Some(clips),
+        )
+    };
+    let draws = gpu.draw_count() - before;
+    let frames = &mut env.ext.get_mut::<State>().frames;
+    frames.gpu_draws += draws;
+    frames.uncoalesced_gpu_draws += draws;
+    env.ext.get_mut::<State>().gpu = Some(gpu);
+    result.map(|()| Completion::Command)
 }
 fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
     if let Completion::Presented(serial, deadline) = result {

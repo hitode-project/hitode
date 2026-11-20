@@ -147,9 +147,11 @@ A mask without wildcards MUST name at most one entry, found as an indexed lookup
 Directory query `BOOLEAN` arguments MUST use only the low byte of their stack slot.
 **Verification**: Test
 
-Wine retries an initial exact file lookup with the legacy directory record if
-the guest returns success without data for the extended record. Both calls
-use the current guest import so inline hooks remain effective.
+Win32 file searches (`FindFirstFileExW`, `FindNextFileW`) query the directory
+record Windows queries, `FileBothDirectoryInformation`, through the current
+guest import, and convert it to the record Wine reads. Inline hooks written
+against Windows answer only that record; Wine's extended record gets an empty
+success from them.
 
 ### WINE-SYS-7 Instruction coherence
 
@@ -296,6 +298,7 @@ are ignored. The supported fields restore without changing the current reserved 
 
 **Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
 An unconstrained private allocation MUST be able to use free user addresses outside the dynamic arena.
+Control-flow-guard protection bits MUST follow Windows. Allocation accepts `PAGE_TARGETS_INVALID` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER`. A protection change accepts `PAGE_TARGETS_NO_UPDATE` and `0x20000000` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER_4`. Accepted bits MUST NOT be stored in the page protection.
 **Verification**: Test
 
 ### NT-SYS-3 Guest system state
