@@ -57,6 +57,9 @@ def digest(directory: Path) -> str:
 
 
 def build(scenario: dict, into: Path) -> None:
+    for data in sorted(scenario["dir"].iterdir()):
+        if data.is_file() and data.suffix not in (".c", ".h") and data.name != "scenario.json":
+            shutil.copy(data, into / data.name)
     sources = sorted(scenario["dir"].glob("*.c"))
     for source in sources:
         outputs, errors = probes.commands(source)
