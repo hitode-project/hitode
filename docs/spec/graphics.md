@@ -506,6 +506,7 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 ### GFX-FIXED-2 Fog, texture factor and shading
 
 **Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed vertex stages MUST run on the shared GPU shader path and specialize on layout, lighting, fog and point-scaling inputs.
+Fixed texture stages MUST apply supported operations to both configured arguments, including when the two arguments use the same source.
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
 

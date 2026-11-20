@@ -1126,6 +1126,30 @@ mod fixed_completion {
     }
     // spec: GFX-FIXED-2
     #[test]
+    fn alpha_modulate_accepts_diffuse_for_both_arguments() {
+        let (mut m, p, target) = fixture();
+        let mut e = env(&mut m);
+        let this = GuestPtr::new(p);
+        assert_eq!(set_render(&mut e, this, 137, 0), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 4, 4), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 5, 0), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 6, 0), 0);
+        texture(&mut e, p, [128, 255, 64, 224]);
+        close(
+            pixel(
+                &mut e,
+                p,
+                &target,
+                0x42,
+                &[0, 0, 0.5f32.to_bits(), 0x80ff_ffff],
+                1,
+                1,
+            ),
+            [128, 255, 64, 64],
+        );
+    }
+    // spec: GFX-FIXED-2
+    #[test]
     fn scaled_modulate_doubles_or_quadruples_then_saturates() {
         let (mut m, p, target) = fixture();
         let mut e = env(&mut m);

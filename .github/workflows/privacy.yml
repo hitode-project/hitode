@@ -18,4 +18,5 @@ jobs:
       - name: Test the scanner
         run: python3 -m unittest discover -s tools/privacy -v
       - name: Scan files for host paths and email addresses
+        if: ${{ !cancelled() }}
         run: python3 tools/privacy/scan.py

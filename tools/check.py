@@ -18,7 +18,7 @@ These run on the working copy and need `pnpm install --frozen-lockfile` in
 apps/adv-launcher once.
 
 --ci checks that every crate builds with default features (the launcher
-needs media, so it is left out) and runs the workspace-lint Clippy gate as CI
+needs media, so it is left out) and runs the workspace Clippy gate as CI
 does. Cargo commands get FFMPEG_DIR and LIBCLANG_PATH from Homebrew ffmpeg@8 and the Xcode clang when they are unset.
 
 Committing code on master prints a note: the default branch accepts code only
@@ -159,7 +159,7 @@ def master_note() -> None:
 
 
 def clippy() -> bool:
-    """The workspace-lint gate of .github/workflows/core-performance.yml."""
+    """The workspace Clippy gate of the core-system job in .github/workflows/core-performance.yml."""
     return lint.lint("host")
 
 
