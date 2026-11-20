@@ -1633,6 +1633,7 @@ impl Native {
                         placed: code,
                         optimized: None,
                         scoped_mmx: job.proof.scoped_mmx(),
+                        scoped_gpr: job.proof.scoped_gpr(),
                         frame: job.proof.scope_frame().map_or_else(
                             || Arc::from([]),
                             |frame| Arc::from(frame.cells.as_slice()),

@@ -111,6 +111,8 @@ pub struct Runtime {
     pub scope_frame: [u32; SCOPE_CELLS],
     /// Scoped chunk's actual MMX writes, plus its TOP and tag change.
     pub scope_written: u32,
+    /// Bytes actually written in the scoped chunk, four bits per GPR.
+    pub scope_gpr_written: u32,
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -173,6 +175,7 @@ impl Runtime {
             window_spans: [0; 2],
             scope_frame: [0; SCOPE_CELLS],
             scope_written: 0,
+            scope_gpr_written: 0,
         }
     }
 }
@@ -527,6 +530,7 @@ pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
 pub(crate) const SCOPE_CELLS: usize = 8;
 pub(crate) const SCOPE_FRAME: u32 = field(offset_of!(Runtime, scope_frame));
+pub(crate) const SCOPE_GPR_WRITTEN: u32 = field(offset_of!(Runtime, scope_gpr_written));
 pub(crate) const SCOPE_WRITTEN: u32 = field(offset_of!(Runtime, scope_written));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
 pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));

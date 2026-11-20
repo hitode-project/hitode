@@ -373,7 +373,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             0
         }
-        Op::Validate => 0,
+        Op::Validate | Op::ScopeWritten(_) => 0,
     })
 }
 
@@ -902,6 +902,7 @@ mod tests {
         f.push(
             b,
             Op::Store {
+                scope: None,
                 width: 8,
                 addr,
                 value: p,
@@ -964,6 +965,7 @@ mod tests {
         f.push(
             b,
             Op::Store {
+                scope: None,
                 width: 4,
                 addr: unmapped,
                 value: unmapped,

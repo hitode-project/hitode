@@ -58,6 +58,7 @@ pub(super) struct Code {
     pub placed: WorkerCode,
     pub frame: Arc<[ScopeCell]>,
     pub scoped_mmx: u16,
+    pub scoped_gpr: u32,
     /// The optimized form, run instead when a job meets its assumptions.
     pub optimized: Option<Arc<Optimized>>,
 }
@@ -190,6 +191,9 @@ fn run(
     runtime.deferred = 0;
     if code.scoped_mmx != 0 {
         runtime.scope_written = 0;
+    }
+    if code.scoped_gpr != 0 {
+        runtime.scope_gpr_written = 0;
     }
     let started = Instant::now();
     let cpu = context.cpu_mut();
@@ -392,6 +396,69 @@ struct Drained {
     /// The last block's completion and its thread.
     last: Option<LastBlock>,
     mmx: MmxJoin,
+    gpr: Option<Box<GprJoin>>,
+}
+
+impl Drained {
+    fn merge(&mut self, other: Self) {
+        self.blocks += other.blocks;
+        self.retired += other.retired;
+        self.optimized += other.optimized;
+        self.sticky |= other.sticky;
+        self.mmx.merge(other.mmx);
+        if let Some(gpr) = other.gpr {
+            if let Some(total) = &mut self.gpr {
+                total.merge(&gpr);
+            } else {
+                self.gpr = Some(gpr);
+            }
+        }
+        if let Some(last) = other.last
+            && self
+                .last
+                .as_ref()
+                .is_none_or(|prior| prior.index < last.index)
+        {
+            self.last = Some(last);
+        }
+    }
+}
+
+/// The latest completed writer of each byte, ordered by block index.
+#[derive(Default)]
+struct GprJoin {
+    bytes: [Option<(u32, u8)>; 32],
+}
+
+impl GprJoin {
+    fn record(&mut self, index: u32, mask: u32, cpu: &CpuState) {
+        for (i, byte) in self.bytes.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                *byte = Some((index, cpu.regs[i / 4].to_le_bytes()[i % 4]));
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (at, next) in self.bytes.iter_mut().zip(other.bytes) {
+            if let Some((index, _)) = next
+                && at.is_none_or(|(prior, _)| prior < index)
+            {
+                *at = next;
+            }
+        }
+    }
+
+    fn publish(&self, mask: u32, start: &CpuState, cpu: &mut CpuState) {
+        for (i, value) in self.bytes.iter().enumerate() {
+            if mask & (1 << i) != 0 {
+                let shift = (i % 4) * 8;
+                let byte = value.map_or(start.regs[i / 4] >> shift, |(_, byte)| u32::from(byte));
+                let reg = &mut cpu.regs[i / 4];
+                *reg = (*reg & !(0xff << shift)) | ((byte & 0xff) << shift);
+            }
+        }
+    }
 }
 
 /// The last block that actually wrote each omitted MMX component.
@@ -547,45 +614,110 @@ impl Blocks {
                 out.claimed_after = started - self.submitted;
             }
             out.blocks += 1;
-            let last = index + 1 == self.count;
-            let iterations = if last { 0 } else { self.size };
-            let context = self.enter(index * self.size, thread);
-            let done = run(
-                runtime,
-                0,
-                context,
-                self.entry,
-                (&self.code, iterations),
-                (&quiet, 0),
-                scratch,
-            )
-            .completion;
-            let cpu = done.context.as_ref().expect("block context").cpu();
-            assert!(
-                last || (!done.requires_owner && cpu.eip == self.start.cpu().eip),
-                "a proved block left its iterations"
-            );
-            out.retired += done.retired;
-            out.optimized += done.optimized;
-            out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
-            if self.code.scoped_mmx != 0 {
-                out.mmx.record(
-                    index,
-                    self.code.scoped_mmx & runtime.scope_written as u16,
-                    cpu,
-                );
-            }
-            if last || self.scoped {
-                out.last = Some(LastBlock {
-                    index,
-                    done,
-                    thread,
-                    frame: runtime.scope_frame,
-                });
-            }
+            self.run_block(index, thread, runtime, scratch, &quiet, &mut out);
         }
         out.elapsed = started.elapsed();
         out
+    }
+    fn run_block(
+        &self,
+        index: u32,
+        thread: u32,
+        runtime: &mut Runtime,
+        scratch: &mut ExecuteScratch,
+        quiet: &Signals,
+        out: &mut Drained,
+    ) {
+        let last = index + 1 == self.count;
+        let iterations = if last { 0 } else { self.size };
+        let context = self.enter(index * self.size, thread);
+        let done = run(
+            runtime,
+            0,
+            context,
+            self.entry,
+            (&self.code, iterations),
+            (quiet, 0),
+            scratch,
+        )
+        .completion;
+        let cpu = done.context.as_ref().expect("block context").cpu();
+        assert!(
+            last || (!done.requires_owner && cpu.eip == self.start.cpu().eip),
+            "a proved block left its iterations"
+        );
+        out.retired += done.retired;
+        out.optimized += done.optimized;
+        out.sticky |= cpu.mxcsr & MXCSR_FLAGS;
+        if self.code.scoped_mmx != 0 {
+            out.mmx.record(
+                index,
+                self.code.scoped_mmx & runtime.scope_written as u16,
+                cpu,
+            );
+        }
+        if self.code.scoped_gpr != 0 {
+            out.gpr
+                .get_or_insert_with(Box::default)
+                .record(index, runtime.scope_gpr_written, cpu);
+        }
+        if last || self.scoped {
+            out.last = Some(LastBlock {
+                index,
+                done,
+                thread,
+                frame: runtime.scope_frame,
+            });
+        }
+    }
+
+    /// Once all claims have drained, publish either the final row or the
+    /// prefix that completed before recall, before the owner runs guest code.
+    fn finish(&self, id: u32, total: Drained) -> (Completion<Option<ExecutionContext>>, u32) {
+        let claimed = self.next.load(Ordering::Acquire).min(self.count);
+        let iterations = if claimed == self.count {
+            self.plan.iterations
+        } else {
+            claimed * self.size
+        };
+        let (mut completion, last) = match total.last {
+            Some(last) => {
+                publish_frame(
+                    &self.code.frame,
+                    &last.frame,
+                    self.start.cpu(),
+                    self.entry.alias,
+                );
+                (last.done, Some(last.thread))
+            }
+            None => (
+                Completion {
+                    id,
+                    context: Some(self.at(iterations)),
+                    retired: 0,
+                    optimized: 0,
+                    elapsed: Duration::ZERO,
+                    helpers: Duration::ZERO,
+                    requires_owner: false,
+                },
+                None,
+            ),
+        };
+        let cpu = completion.context.as_mut().unwrap().cpu_mut();
+        self.settle(cpu, last, iterations);
+        if self.code.scoped_mmx != 0 {
+            total
+                .mmx
+                .publish(self.code.scoped_mmx, self.start.cpu(), cpu);
+        }
+        if let Some(gpr) = total.gpr {
+            gpr.publish(self.code.scoped_gpr, self.start.cpu(), cpu);
+        }
+        cpu.mxcsr |= total.sticky;
+        completion.id = id;
+        completion.retired = total.retired;
+        completion.optimized = total.optimized;
+        (completion, iterations)
     }
 }
 
@@ -1097,70 +1229,13 @@ impl<'a, U> Session<'a, U> {
             } else {
                 self.counts.claim_ns += drained.claimed_after.as_nanos() as u64;
             }
-            total.blocks += drained.blocks;
-            total.retired += drained.retired;
-            total.optimized += drained.optimized;
-            total.sticky |= drained.sticky;
-            total.mmx.merge(drained.mmx);
-            if let Some(last) = drained.last
-                && total
-                    .last
-                    .as_ref()
-                    .is_none_or(|previous| previous.index < last.index)
-            {
-                total.last = Some(last);
-            }
             helped += drained.elapsed;
-        }
-        // A recall stops claims: the completed prefix returns at the head.
-        let claimed = blocks.next.load(Ordering::Acquire).min(count);
-        let iterations = if claimed == count {
-            plan.iterations
-        } else {
-            claimed * size
-        };
-        let (mut completion, last) = match total.last.take() {
-            Some(last) => {
-                publish_frame(
-                    &blocks.code.frame,
-                    &last.frame,
-                    blocks.start.cpu(),
-                    self.entry.alias,
-                );
-                (last.done, Some(last.thread))
-            }
-            None => (
-                Completion {
-                    id,
-                    context: Some(blocks.at(iterations)),
-                    retired: 0,
-                    optimized: 0,
-                    elapsed: Duration::ZERO,
-                    helpers: Duration::ZERO,
-                    requires_owner: false,
-                },
-                None,
-            ),
-        };
-        blocks.settle(
-            completion.context.as_mut().unwrap().cpu_mut(),
-            last,
-            iterations,
-        );
-        if code.scoped_mmx != 0 {
-            total.mmx.publish(
-                code.scoped_mmx,
-                blocks.start.cpu(),
-                completion.context.as_mut().unwrap().cpu_mut(),
-            );
+            total.merge(drained);
         }
         self.counts.blocks += u64::from(total.blocks);
-        completion.id = id;
-        completion.retired = total.retired;
-        completion.optimized = total.optimized;
+        let (mut completion, iterations) = blocks.finish(id, total);
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
-        completion.context.as_mut().unwrap().cpu_mut().mxcsr |= total.sticky;
         learn(
             self.plans.job(context.cpu().eip).unwrap(),
             &completion,
@@ -1883,6 +1958,286 @@ mod tests {
             for untouched in [0..0xfc, 0x100..0x108, 0x10c..0x204, 0x208..split.len()] {
                 assert_eq!(split[untouched.clone()], original_frame[untouched]);
             }
+        }
+    }
+
+    // spec: A64-TR-9, A64-OPT-9
+    #[test]
+    fn scoped_rows_publish_byte_writers_and_private_cells_at_completion_and_recall() {
+        let _pool = exclusive_pool();
+        const ROWS: u32 = 128;
+        const WIDTH: u32 = 8;
+        const PITCH: u32 = (WIDTH / 2 + 1) * 16;
+        const FRAME: u32 = 0x8_0000;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        let mut row = a.create_label();
+        let mut pixel = a.create_label();
+        let mut test = a.create_label();
+        let mut callee = a.create_label();
+        let mut tail = a.create_label();
+        let mut stop = a.create_label();
+        a.set_label(&mut row).unwrap();
+        a.mov(dword_ptr(ebx + 4), edx).unwrap();
+        a.mov(dword_ptr(ebx + 4), esi).unwrap();
+        a.mov(dword_ptr(ebx + 8), edx).unwrap();
+        a.mov(ecx, WIDTH).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.jmp(test).unwrap();
+        a.set_label(&mut pixel).unwrap();
+        a.movaps(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movaps(xmmword_ptr(edi), xmm0).unwrap();
+        a.mov(ebp, dword_ptr(esi)).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        a.sub(ecx, 2).unwrap();
+        a.set_label(&mut test).unwrap();
+        a.jns(pixel).unwrap();
+        a.call(callee).unwrap();
+        a.add(ebx, 4).unwrap();
+        a.call(callee).unwrap();
+        a.sub(ebx, 4).unwrap();
+        a.imul_2(ebp, dword_ptr(ebx + 8)).unwrap();
+        a.mov(dword_ptr(edi + 4), ebp).unwrap();
+
+        let mut skip_full = a.create_label();
+        a.cmp(edx, 110).unwrap();
+        a.jbe(skip_full).unwrap();
+        a.mov(eax, dword_ptr(esi + 8)).unwrap();
+        a.set_label(&mut skip_full).unwrap();
+        let mut skip_word = a.create_label();
+        a.cmp(edx, 102).unwrap();
+        a.jne(skip_word).unwrap();
+        a.mov(ax, 0x5678).unwrap();
+        a.set_label(&mut skip_word).unwrap();
+        let mut skip_pair = a.create_label();
+        a.cmp(edx, 95).unwrap();
+        a.jne(skip_pair).unwrap();
+        a.mov(ah, 0x42).unwrap();
+        a.mov(al, 0x64).unwrap();
+        a.set_label(&mut skip_pair).unwrap();
+        let mut skip_byte = a.create_label();
+        a.cmp(edx, 80).unwrap();
+        a.jne(skip_byte).unwrap();
+        a.mov(al, byte_ptr(esi)).unwrap();
+        a.mov(byte_ptr(edi), al).unwrap();
+        a.set_label(&mut skip_byte).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        a.dec(edx).unwrap();
+        a.jne(row).unwrap();
+        a.set_label(&mut tail).unwrap();
+        a.mov(ecx, eax).unwrap();
+        a.add(ecx, dword_ptr(ebx + 4)).unwrap();
+        a.set_label(&mut stop).unwrap();
+        a.int3().unwrap();
+        a.set_label(&mut callee).unwrap();
+        a.add(ebp, dword_ptr(ebx + 4)).unwrap();
+        a.ret().unwrap();
+        let labels = a
+            .assemble_options(
+                u64::from(CODE),
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let head = labels.label_ip(&row).unwrap() as u32;
+        let tail = labels.label_ip(&tail).unwrap() as u32;
+        let stop = labels.label_ip(&stop).unwrap() as u32;
+
+        let len = (ROWS * PITCH) as usize;
+        let mut input: Vec<_> = (0..len).map(|i| (i ^ (i >> 5)) as u8).collect();
+        let last_dword = ((ROWS - 111) * PITCH + PITCH - 8) as usize;
+        input[last_dword..last_dword + 4].copy_from_slice(&0x2456_8899u32.to_le_bytes());
+        input[((ROWS - 80) * PITCH + PITCH - 16) as usize] = 0x33;
+        for (raw, recall) in [(false, true), (false, false), (true, true), (true, false)] {
+            let (mut serial, mut native) = fixture(&mut a);
+            let memory = serial.memory_mut();
+            for at in [INPUT, OUTPUT, FRAME] {
+                memory.map(at, 0x4000, READ | WRITE).unwrap();
+            }
+            memory.write(INPUT, &input).unwrap();
+            let reset = |memory: &mut Memory| {
+                memory.write(OUTPUT, &vec![0; len]).unwrap();
+                memory.write(FRAME, &[0xa6; 0x400]).unwrap();
+            };
+            reset(memory);
+            let start = CpuState {
+                eip: head,
+                regs: [
+                    0x1337_0033,
+                    0,
+                    ROWS,
+                    FRAME + 0x200,
+                    FRAME + 0x100,
+                    0,
+                    INPUT,
+                    OUTPUT,
+                ],
+                ..CpuState::default()
+            };
+            memory.attach().unwrap();
+            assert!(native.force_resident_at(memory, start.clone()));
+            let job = &native.worker_jobs[&head];
+            let frame = job.proof.scope_frame().unwrap();
+            assert_eq!(frame.cells.len(), 3);
+            let accesses: Vec<_> = job.unit.trace.insts.iter().zip(&frame.access).collect();
+            assert!(accesses.iter().any(|(a, x)| {
+                x.is_some()
+                    && accesses
+                        .iter()
+                        .any(|(b, y)| a.pc == b.pc && y.is_some() && x != y)
+            }));
+            assert_eq!(job.code.scoped_gpr, 0xf);
+            assert!(job.code.optimized.is_some());
+            let mut evaluation = Evaluation::default();
+            let memory = serial.memory();
+            let read = |addr| {
+                let bytes = memory.read(addr, 4).ok()?;
+                Some(u32::from_le_bytes(bytes.try_into().ok()?))
+            };
+            job.proof
+                .evaluate(&start, &mut evaluation, read)
+                .expect("admitted test ranges");
+            let plan = job
+                .proof
+                .plan(&start, &mut evaluation, read)
+                .expect("disjoint test rows");
+            let context = Some(ExecutionContext {
+                cpu: start.clone(),
+                offered: None,
+                resume: None,
+                fuel_debt: 0,
+            });
+            native.pace.set(Some(Pace::default()));
+            let snapshot = |memory: &Memory| {
+                [
+                    memory.read(OUTPUT, len).unwrap().to_vec(),
+                    memory.read(FRAME, 0x400).unwrap().to_vec(),
+                ]
+            };
+            if raw {
+                native.worker_jobs.get_mut(&head).unwrap().code.optimized = None;
+            }
+            reset(serial.memory_mut());
+            let mut retired = 0;
+            let mut completion = None;
+            native
+                .plans
+                .job(head)
+                .unwrap()
+                .per_iteration
+                .set(Some((64, 20_000.0)));
+            if recall {
+                let job = &native.worker_jobs[&head];
+                let memory = serial.memory();
+                // Eight claims are in flight when recall arrives.
+                let blocks = Blocks {
+                    next: AtomicU32::new(8),
+                    stop: std::sync::atomic::AtomicBool::new(false),
+                    threads: AtomicU32::new(0),
+                    count: ROWS / 8,
+                    size: 8,
+                    plan,
+                    start: context.clone().unwrap(),
+                    entry: Entry {
+                        enter: native.code.enter,
+                        opt_enter: native.code.opt_enter,
+                        window: native.runtime.window,
+                        alias: alias_base(memory),
+                        fault: native.code.stubs.fault,
+                    },
+                    code: job.code.clone(),
+                    signals: Signals {
+                        recall: Arc::new(AtomicU32::new(RECALL)),
+                        pending: (Arc::new(AtomicU32::new(0)), 0),
+                    },
+                    submitted: Instant::now(),
+                    scoped: true,
+                };
+                let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
+                let mut scratch = ExecuteScratch::default();
+                let mut total = blocks.drain(&mut runtime, &mut scratch);
+                assert_eq!(total.blocks, 0);
+                let mut even = Drained::default();
+                let mut odd = Drained::default();
+                for index in 0..8 {
+                    let out = if index % 2 == 0 { &mut even } else { &mut odd };
+                    blocks.run_block(
+                        index,
+                        index % 2,
+                        &mut runtime,
+                        &mut scratch,
+                        &blocks.signals,
+                        out,
+                    );
+                }
+                total.merge(odd);
+                total.merge(even);
+                let (prefix, rows) = blocks.finish(1, total);
+                assert_eq!(rows, 64);
+                completion = Some(prefix);
+            } else {
+                native.with_computation(
+                    serial.memory_mut(),
+                    &mut retired,
+                    (Arc::new(AtomicU32::new(0)), 0),
+                    None,
+                    &mut |session| completion = session.run_local(1, &context),
+                );
+            }
+            let completed = completion.unwrap();
+            assert_eq!(completed.optimized, if raw { 0 } else { completed.retired });
+            let mut parallel = completed.context.unwrap().cpu;
+            assert_eq!(parallel.regs[0], 0x2456_4233);
+            assert_eq!(parallel.eip, if recall { head } else { tail });
+            if recall {
+                let prefix = snapshot(serial.memory());
+                reset(serial.memory_mut());
+                serial.state = start.clone();
+                assert_eq!(
+                    serial.run(stop, completed.retired).unwrap(),
+                    adv_cpu_core::RunOutcome::Budget,
+                );
+                assert_eq!(serial.state.eip, head);
+                assert_eq!(serial.state.regs[0], parallel.regs[0]);
+                assert_eq!(prefix, snapshot(serial.memory()));
+            } else {
+                assert_ne!(native.diagnostics.split.scoped, 0);
+            }
+            let mut retired = completed.retired;
+            for _ in 0..64 {
+                if parallel.eip == stop {
+                    break;
+                }
+                let run = native
+                    .run(
+                        &mut parallel,
+                        serial.memory_mut(),
+                        stop,
+                        1 << 16,
+                        std::ptr::null_mut(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                retired += u64::from(run.retired);
+            }
+            let image = snapshot(serial.memory());
+            reset(serial.memory_mut());
+            serial.state = start.clone();
+            let budget = 1 << 16;
+            assert_eq!(
+                serial.run(stop, budget).unwrap(),
+                adv_cpu_core::RunOutcome::ReachedStop,
+            );
+            assert_eq!(retired, budget - serial.state.fuel);
+            for cpu in [&mut parallel, &mut serial.state] {
+                cpu.fuel = 0;
+                // The interpreter records inlined returns for dispatch.
+                cpu.last_indirect_branch = Default::default();
+                cpu.settle_flags();
+            }
+            assert_eq!(parallel, serial.state, "raw={raw}, recall={recall}");
+            assert_eq!(image, snapshot(serial.memory()));
         }
     }
 
@@ -3114,6 +3469,7 @@ mod tests {
         let code = Code {
             frame: Arc::new([]),
             scoped_mmx: 0,
+            scoped_gpr: 0,
             placed: WorkerCode {
                 entry: at,
                 end: at + emitted.words.len() * 4,

@@ -2727,6 +2727,7 @@ pub(in crate::translate) mod opt_back {
             f.push(
                 b,
                 Op::Load {
+                    scope: None,
                     ty: Type::I32,
                     width: 4,
                     addr,
@@ -2749,6 +2750,7 @@ pub(in crate::translate) mod opt_back {
             f.push(
                 b,
                 Op::Store {
+                    scope: None,
                     width: 4,
                     addr,
                     value,
@@ -4577,6 +4579,7 @@ pub(in crate::translate) mod opt_back {
             f.push(
                 b,
                 Op::Store {
+                    scope: None,
                     width,
                     addr: p[0],
                     value: p[1],
@@ -4589,6 +4592,7 @@ pub(in crate::translate) mod opt_back {
                 .push(
                     b,
                     Op::Load {
+                        scope: None,
                         ty,
                         width,
                         addr: p[0],
@@ -4617,6 +4621,7 @@ pub(in crate::translate) mod opt_back {
                 f.push(
                     b,
                     Op::Store {
+                        scope: None,
                         width: 8,
                         addr: p[0],
                         value: p[1],
@@ -4630,6 +4635,7 @@ pub(in crate::translate) mod opt_back {
                 f.push(
                     b,
                     Op::Load {
+                        scope: None,
                         ty: Type::I64,
                         width: 8,
                         addr: p[0],
@@ -4933,6 +4939,7 @@ pub(in crate::translate) mod opt_back {
         f.push(
             b,
             Op::Store {
+                scope: None,
                 width: 8,
                 addr: p[0],
                 value: p[1],

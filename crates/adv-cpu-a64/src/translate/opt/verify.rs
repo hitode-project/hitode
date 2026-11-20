@@ -207,7 +207,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         }
         Op::X87Load { bits, single, .. } => is(bits, if single { Type::I32 } else { Type::I64 }),
         Op::SseInput { a, b, .. } => is(a, Type::V128) && b.is_none_or(|b| is(b, Type::V128)),
-        Op::Constant(..) | Op::Bits { .. } | Op::Validate => true,
+        Op::Constant(..) | Op::Bits { .. } | Op::Validate | Op::ScopeWritten(_) => true,
         Op::PlainPage { addr, .. } | Op::PageCross { addr, .. } => is(addr, Type::I32),
         Op::FrameDisjoint {
             addr, base, lo, hi, ..
@@ -443,6 +443,7 @@ mod tests {
         f.push(
             body,
             Op::Store {
+                scope: None,
                 width: 8,
                 addr: eax,
                 value: bits,
@@ -490,6 +491,7 @@ mod tests {
         f.push(
             join,
             Op::Store {
+                scope: None,
                 width: 4,
                 addr: eax,
                 value: eax,
@@ -563,6 +565,7 @@ mod tests {
             (
                 None,
                 Op::Store {
+                    scope: None,
                     width: 4,
                     addr: eax,
                     value: eax,

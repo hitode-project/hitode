@@ -89,7 +89,7 @@ pub(super) fn run(
 fn map_op(op: &mut Op, aliases: &[Value]) {
     let f = |v: &mut Value| *v = resolve(*v, aliases);
     match op {
-        Op::Constant(..) | Op::Validate => {}
+        Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => {}
         Op::SseInput { a, b, .. } => {
             f(a);
             if let Some(b) = b {
@@ -500,7 +500,17 @@ fn propagate(func: &mut Func) -> bool {
                 }
             }
             defs[r.0 as usize] = Some(*op);
-            if op.pure() || block_index == 0 && matches!(op, Op::Load { clock: false, .. }) {
+            if op.pure()
+                || block_index == 0
+                    && matches!(
+                        op,
+                        Op::Load {
+                            clock: false,
+                            scope: None,
+                            ..
+                        }
+                    )
+            {
                 if let Some((_, other)) = numbered.iter().find(|(other, _)| match (*other, *op) {
                     (
                         Op::Load {
@@ -1310,6 +1320,7 @@ fn hoist(
             addr,
             width,
             clock: false,
+            scope: None,
             ..
         } = op
         else {

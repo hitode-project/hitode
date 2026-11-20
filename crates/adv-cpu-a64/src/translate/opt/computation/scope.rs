@@ -4,23 +4,20 @@
 
 use super::{Access, ESP, Effect, Expr, Graph, Loop, Proof, SCOPE_CELLS, ScopeCell, ScopeFrame};
 use crate::translate::front::{
-    decode::{Op, Src},
+    decode::Op,
     trace::{Mode, Trace},
 };
 
-pub(super) fn frame(proof: &Proof, trace: &Trace) -> Option<ScopeFrame> {
-    let graph = Graph::build_selected(trace, true).ok()?;
+pub(super) fn frame(proof: &Proof, trace: &Trace, graph: &Graph) -> Option<ScopeFrame> {
     let lp = &graph.loops[graph.heads[0]?];
     let outer = proof.outer?;
     let mut cells = Vec::new();
-    // Each cell has one instruction that writes it on every row.
-    let mut definitions = Vec::new();
+    let mut definitions: Vec<Vec<usize>> = Vec::new();
     for effect in &proof.effects {
         if effect.tail || !matches!(effect.access, Access::Write | Access::FrameWrite) {
             continue;
         }
-        let location = cell(proof, effect);
-        let Some(location) = location else {
+        let Some(location) = cell(proof, effect) else {
             if effect.access == Access::FrameWrite {
                 return None;
             }
@@ -30,23 +27,30 @@ pub(super) fn frame(proof: &Proof, trace: &Trace) -> Option<ScopeFrame> {
         if proof.exprs[start] != Expr::Register(location.base)
             || proof.exprs[step] != Expr::Constant(0)
             || effect.bytes != 4
-            || cells.len() == SCOPE_CELLS
-            || cells.iter().any(|c: &ScopeCell| {
-                c.base == location.base && c.offset.abs_diff(location.offset) < 4
-            })
         {
             return None;
         }
-        let [write] = *effect.indices.as_slice() else {
-            return None;
-        };
-        if !matches!(trace.insts[write].op, Op::Mov(Src::Mem(_), _) | Op::Call(_))
-            || !dominates(&graph, lp, write, lp.tail)
-        {
-            return None;
+        if let Some(i) = cells.iter().position(|c| *c == location) {
+            definitions[i].extend(&effect.indices);
+        } else {
+            if cells.len() == SCOPE_CELLS
+                || cells.iter().any(|c: &ScopeCell| {
+                    c.base == location.base && c.offset.abs_diff(location.offset) < 4
+                })
+            {
+                return None;
+            }
+            cells.push(location);
+            definitions.push(effect.indices.clone());
         }
-        cells.push(location);
-        definitions.push(write);
+    }
+    // The owner publishes the last completed row's frame on both exits.
+    // A cell must therefore have a definition even in a row with no reads.
+    if definitions
+        .iter()
+        .any(|defs| reaches(graph, lp, lp.head, lp.test, |at| defs.contains(&at)))
+    {
+        return None;
     }
     let mut access = vec![None; trace.len()];
     for effect in &proof.effects {
@@ -60,22 +64,32 @@ pub(super) fn frame(proof: &Proof, trace: &Trace) -> Option<ScopeFrame> {
             if slot.base != location.base || at + 4 <= lo || lo + bytes <= at {
                 continue;
             }
-            if effect.tail || location != *slot || effect.bytes != 4 {
+            if location != *slot || effect.bytes != 4 {
                 return None;
             }
+            if effect.tail {
+                continue;
+            }
+            let read = matches!(effect.access, Access::Read | Access::FrameRead);
             for &index in &effect.indices {
-                if index != definitions[i]
-                    && (!matches!(trace.insts[index].op, Op::Mov(_, Src::Mem(_)) | Op::Ret(0))
-                        || !dominates(&graph, lp, definitions[i], index))
-                {
+                let defs = &definitions[i];
+                if read && !defs.iter().any(|&def| dominates(graph, lp, def, index)) {
                     return None;
                 }
                 if let Op::Ret(0) = trace.insts[index].op {
                     let Mode::Inline(expected) = trace.insts[index].mode else {
                         return None;
                     };
-                    let write = trace.insts[definitions[i]];
-                    if !matches!(write.op, Op::Call(_)) || write.next_pc != expected {
+                    let matching_call = |at: usize| {
+                        let inst = trace.insts[at];
+                        matches!(inst.op, Op::Call(_)) && inst.next_pc == expected
+                    };
+                    // Check every reaching definition of the return address.
+                    if reaches(graph, lp, lp.head, index, matching_call)
+                        || defs.iter().any(|&def| {
+                            !matching_call(def) && reaches(graph, lp, def, index, matching_call)
+                        })
+                    {
                         return None;
                     }
                 }
@@ -88,12 +102,23 @@ pub(super) fn frame(proof: &Proof, trace: &Trace) -> Option<ScopeFrame> {
             }
         }
     }
-    Some(ScopeFrame {
+    // Lowering redirects every memory operand of a mapped instruction.
+    let frame = ScopeFrame {
         cells,
         access,
         mmx: 0,
-        latch: None,
-    })
+        gpr: 0,
+        gpr_writes: Vec::new(),
+        latch: (lp.test, lp.taken),
+    };
+    if proof.effects.iter().any(|effect| {
+        !effect.tail
+            && effect.indices.iter().any(|&at| frame.access[at].is_some())
+            && !routed(proof, &frame, effect)
+    }) {
+        return None;
+    }
+    Some(frame)
 }
 
 pub(super) fn routed(proof: &Proof, frame: &ScopeFrame, effect: &Effect) -> bool {
@@ -101,13 +126,12 @@ pub(super) fn routed(proof: &Proof, frame: &ScopeFrame, effect: &Effect) -> bool
         return false;
     };
     effect.bytes == 4
-        && !effect.tail
         && frame.cells.contains(&cell)
-        && !effect.indices.is_empty()
-        && effect
-            .indices
-            .iter()
-            .all(|&at| frame.access[at].is_some_and(|i| frame.cells[usize::from(i)] == cell))
+        && (effect.tail
+            || effect
+                .indices
+                .iter()
+                .all(|&at| frame.access[at].is_some_and(|i| frame.cells[usize::from(i)] == cell)))
 }
 
 fn cell(proof: &Proof, effect: &Effect) -> Option<ScopeCell> {
@@ -131,16 +155,32 @@ fn cell(proof: &Proof, effect: &Effect) -> Option<ScopeCell> {
 }
 
 fn dominates(graph: &Graph, lp: &Loop, definition: usize, use_: usize) -> bool {
+    definition != use_ && !reaches(graph, lp, lp.head, use_, |at| at == definition)
+}
+
+fn reaches(
+    graph: &Graph,
+    lp: &Loop,
+    start: usize,
+    use_: usize,
+    stops: impl Fn(usize) -> bool,
+) -> bool {
     let mut seen = vec![false; graph.edges.len()];
-    let mut next = vec![lp.head];
+    let mut next = vec![start];
     while let Some(at) = next.pop() {
-        if at == definition || !lp.inside[at] || std::mem::replace(&mut seen[at], true) {
+        if stops(at) || !lp.inside[at] || std::mem::replace(&mut seen[at], true) {
             continue;
         }
         if at == use_ {
-            return false;
+            return true;
         }
-        next.extend(graph.edges[at].iter().flatten().copied());
+        next.extend(
+            graph.edges[at]
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&at| at != lp.head),
+        );
     }
-    true
+    false
 }

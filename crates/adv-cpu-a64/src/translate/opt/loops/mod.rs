@@ -410,7 +410,11 @@ fn classify(
     for &b in &blocks {
         for &(result, op) in &func.blocks[b.0 as usize].insts {
             let (addr, width, access) = match op {
-                Op::Load { clock: true, .. } | Op::FrameStore { .. } => {
+                Op::Load { clock: true, .. }
+                | Op::Load { scope: Some(_), .. }
+                | Op::Store { scope: Some(_), .. }
+                | Op::ScopeWritten(_)
+                | Op::FrameStore { .. } => {
                     return Err(Reject::Access);
                 }
                 Op::Load { checked: true, .. } | Op::Store { checked: true, .. }

@@ -159,6 +159,7 @@ pub(crate) struct Proof {
     exprs: Vec<Expr>,
     vars: Vec<Var>,
     checks: Vec<Check>,
+    branches: Vec<(usize, Option<(bool, Check)>)>,
     effects: Vec<Effect>,
     divisions: Vec<Option<Division>>,
     frame_cache: Option<FrameCache>,
@@ -459,6 +460,7 @@ struct Builder<'a> {
     vars: Vec<Var>,
     effects: Vec<(usize, Effect)>,
     checks: Vec<Check>,
+    branches: Vec<(usize, Option<(bool, Check)>)>,
     divisions: Vec<(usize, Option<Division>)>,
     frame_heads: Vec<(usize, Option<i32>)>,
     at: usize,
@@ -1366,18 +1368,26 @@ impl Builder<'_> {
             let inside = |to| lp.is_none_or(|l| self.graph.loops[l].inside[to]);
             let [fall, mut taken] = self.graph.edges[at].map(|edge| edge.filter(|&to| inside(to)));
             let mut fall = fall;
-            if self.rows.is_some()
-                && let Some(lp) = lp
-                && let Some(choice) = self.row_pretest(at, lp, &state, [fall, taken])
-            {
-                if choice {
-                    fall = None;
-                } else {
-                    taken = None;
+            if matches!(self.trace.insts[at].op, Op::Jcc(..)) {
+                let branch = self
+                    .rows
+                    .and(lp)
+                    .and_then(|lp| self.row_pretest(at, lp, &state, [fall, taken]))
+                    .or_else(|| {
+                        fall.zip(taken)?;
+                        Some((false, self.enters_loop(at, &state)?))
+                    });
+                if record && self.rows.is_some() {
+                    self.branches.push((at, branch));
                 }
-            }
-            if fall.is_some() && taken.is_some() && self.enters_loop(at, &state) {
-                taken = None;
+                if let Some((choice, guard)) = branch {
+                    self.check(guard);
+                    if choice {
+                        fall = None;
+                    } else {
+                        taken = None;
+                    }
+                }
             }
             if let Some(to) = fall {
                 if taken.is_some() {
@@ -1416,7 +1426,7 @@ impl Builder<'_> {
         parent: usize,
         state: &State,
         [fall, taken]: [Option<usize>; 2],
-    ) -> Option<bool> {
+    ) -> Option<(bool, Check)> {
         let fall = fall?;
         let taken = taken?;
         let Op::Jcc(Cc::Flags(cond), _) = self.trace.insts[at].op else {
@@ -1441,21 +1451,18 @@ impl Builder<'_> {
         }
         .invariant()?;
         let observed = self.observe(value);
-        if matches!(cond, Cond::e | Cond::ne) {
+        Some(if matches!(cond, Cond::e | Cond::ne) {
             if observed == Some(0) {
-                self.check(Check::Equal(value, self.zero));
-                return Some(!choice);
+                (!choice, Check::Equal(value, self.zero))
+            } else {
+                (choice, Check::Positive(value, u32::MAX))
             }
-            self.check(Check::Positive(value, u32::MAX));
+        } else if observed.is_some_and(|value| (value as i32) < 0) {
+            (!choice, Check::Mask(value, 1 << 31, true))
         } else {
-            if observed.is_some_and(|value| (value as i32) < 0) {
-                self.check(Check::Mask(value, 1 << 31, true));
-                return Some(!choice);
-            }
             let next = self.add(value, self.one);
-            self.check(Check::Positive(next, 1 << 31));
-        }
-        Some(choice)
+            (choice, Check::Positive(next, 1 << 31))
+        })
     }
 
     /// Entry registers can select an optional tail. The selected condition
@@ -1467,10 +1474,10 @@ impl Builder<'_> {
     /// A forward branch over a child loop, on a value that is the same in
     /// every iteration, as compilers guard a loop that may run zero times:
     /// the walk enters the loop, and admission checks the value does.
-    fn enters_loop(&mut self, at: usize, state: &State) -> bool {
+    fn enters_loop(&mut self, at: usize, state: &State) -> Option<Check> {
         let inst = &self.trace.insts[at];
         let Op::Jcc(Cc::Flags(cond), target) = inst.op else {
-            return false;
+            return None;
         };
         let pc = |i: usize| self.trace.insts[i].pc;
         if !self
@@ -1479,7 +1486,7 @@ impl Builder<'_> {
             .iter()
             .any(|l| inst.pc < pc(l.head) && pc(l.head) < target)
         {
-            return false;
+            return None;
         }
         // A result's own zero and sign flags, or a compare with zero, which
         // also clears overflow: the loop runs when the branch is not taken,
@@ -1487,21 +1494,18 @@ impl Builder<'_> {
         let (value, compared) = match &state.test {
             Some(Test::Zero(a)) => (a, false),
             Some(Test::Compare(a, b)) if b.invariant() == Some(self.zero) => (a, true),
-            _ => return false,
+            _ => return None,
         };
-        let Some(value) = value.invariant() else {
-            return false;
-        };
-        match cond {
-            Cond::e => self.check(Check::Positive(value, u32::MAX)),
-            Cond::le if compared => self.check(Check::Positive(value, i32::MAX as u32)),
+        let value = value.invariant()?;
+        Some(match cond {
+            Cond::e => Check::Positive(value, u32::MAX),
+            Cond::le if compared => Check::Positive(value, i32::MAX as u32),
             Cond::s | Cond::l if compared || cond == Cond::s => {
                 let next = self.add(value, self.one);
-                self.check(Check::Positive(next, 1 << 31));
+                Check::Positive(next, 1 << 31)
             }
-            _ => return false,
-        }
-        true
+            _ => return None,
+        })
     }
 
     fn trip(&mut self, lp: usize, test: Test, var: VarId) -> Option<ExprId> {
@@ -1673,6 +1677,7 @@ impl Builder<'_> {
         // it with symbolic iteration indices, discarding dead or unproved
         // candidates before using the resulting memory effects.
         let checks = self.checks.len();
+        let branches = self.branches.len();
         let effects = self.effects.len();
         let divisions = self.divisions.len();
         let frame_heads = self.frame_heads.len();
@@ -1708,6 +1713,7 @@ impl Builder<'_> {
                 break after;
             }
             self.checks.truncate(checks);
+            self.branches.truncate(branches);
             self.effects.truncate(effects);
             self.divisions.truncate(divisions);
             self.frame_heads.truncate(frame_heads);
@@ -2009,6 +2015,7 @@ impl Proof {
             vars: Vec::new(),
             effects: Vec::new(),
             checks: Vec::new(),
+            branches: Vec::new(),
             divisions: Vec::new(),
             frame_heads: Vec::new(),
             at: 0,
@@ -2146,6 +2153,7 @@ impl Proof {
             exprs: b.exprs,
             vars,
             checks,
+            branches: b.branches,
             effects,
             divisions: divisions.into_iter().map(Option::flatten).collect(),
             frame_cache,
@@ -2170,7 +2178,7 @@ impl Proof {
         self.prove_chunks(trace, decode, false);
     }
 
-    pub(crate) fn prove_scoped_split(&mut self, trace: &Trace) {
+    fn prove_scoped_split(&mut self, trace: &Trace) {
         let mut i = 0;
         self.prove_chunks(
             trace,
@@ -2210,30 +2218,37 @@ impl Proof {
             .flatten()
             .map(|&(offset, _, step)| (offset, zero(step)))
             .collect();
-        let carried = carried::independent(
+        let Ok(graph) = Graph::build_selected(trace, scoped) else {
+            return;
+        };
+        let mut frame = if scoped {
+            let Some(frame) = scope::frame(self, trace, &graph) else {
+                return;
+            };
+            Some(frame)
+        } else {
+            None
+        };
+        let Some(carried) = carried::independent(
             trace,
+            &graph,
             affine,
             &slots,
             &self.divisions,
             &self.instructions,
-            scoped,
-        );
-        if scoped {
-            self.scope_frame = carried.as_ref().and_then(|carried| {
-                let mut frame = scope::frame(self, trace)?;
-                frame.mmx = carried.mmx;
-                frame.latch = (carried.mmx != 0).then_some(carried.latch);
-                Some(frame)
-            });
-        }
-        let split = if scoped {
-            carried.is_some() && self.scope_frame.is_some()
-        } else {
-            carried.is_some()
+            frame.as_ref().map(|frame| frame.access.as_slice()),
+        ) else {
+            return;
         };
+        if let Some(frame) = &mut frame {
+            frame.mmx = carried.mmx;
+            frame.gpr = carried.gpr;
+            frame.gpr_writes = carried.gpr_writes;
+        }
+        self.scope_frame = frame;
         self.outer = Some(Outer {
-            split,
-            frame: !scoped && carried.is_some_and(|proof| proof.frame.is_some()),
+            split: true,
+            frame: !scoped && carried.frame.is_some(),
             ..outer
         });
     }
@@ -2256,8 +2271,18 @@ impl Proof {
         self.scope_frame.as_ref().map_or(0, |frame| frame.mmx)
     }
 
+    pub(crate) fn scoped_gpr(&self) -> u32 {
+        self.scope_frame.as_ref().map_or(0, |frame| frame.gpr)
+    }
+
+    pub(crate) fn scoped_gpr_writes(&self) -> &[u32] {
+        self.scope_frame
+            .as_ref()
+            .map_or(&[], |frame| frame.gpr_writes.as_slice())
+    }
+
     pub(crate) fn scoped_latch(&self) -> Option<(usize, bool)> {
-        self.scope_frame.as_ref()?.latch
+        Some(self.scope_frame.as_ref()?.latch)
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every
@@ -2892,7 +2917,7 @@ impl Proof {
 pub(crate) mod tests {
     use super::*;
     use adv_cpu_core::Memory;
-    use iced_x86::code_asm::*;
+    pub(super) use iced_x86::code_asm::*;
 
     const CODE: u32 = 0x10000;
     const FRAME: u32 = 0x20000;
@@ -2910,6 +2935,15 @@ pub(crate) mod tests {
         memory.protect(CODE, 4096, 5).unwrap();
         let mut trace = Trace::default();
         trace.build(&mut memory, CODE, &[], &|_, _| None, &|_| None, true);
+        trace.x86 = trace
+            .insts
+            .iter()
+            .map(|inst| {
+                let at = (inst.pc - CODE) as usize;
+                let end = (inst.next_pc - CODE) as usize;
+                crate::translate::front::summary::from_bytes(code.get(at..end)?, inst.pc)
+            })
+            .collect();
         trace
     }
 
