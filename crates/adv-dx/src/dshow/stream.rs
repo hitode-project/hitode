@@ -324,7 +324,7 @@ pub(crate) fn apply_volume(env: &mut Env<'_>, graph: u32) {
 
 /// Start the guest thread `id` at [`thread_entry`]; with a host, at its next
 /// call boundary.
-fn spawn(env: &mut Env<'_>, name: &str, id: u32) -> Result<(), String> {
+pub(crate) fn spawn(env: &mut Env<'_>, name: &str, id: u32) -> Result<(), String> {
     if env.ext.try_get::<Host>().is_some() {
         state(env).pending_threads.push(id);
         return Ok(());
@@ -361,6 +361,9 @@ pub(crate) fn thread_entry(env: &mut Env<'_>) -> Outcome {
     }
     if state(env).audio_feeds.contains_key(&id) {
         return feed(env, id);
+    }
+    if state(env).window_threads.contains_key(&id) {
+        return super::video::window::thread(env, id);
     }
     pump(env, id)
 }

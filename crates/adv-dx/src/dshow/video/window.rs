@@ -2,7 +2,7 @@
 //! coordinates; presentation owns the conversion to the owner's canvas.
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::{media::VideoInfo, surface::VideoFrame};
-use adv_machine::{Env, Outcome};
+use adv_machine::{Env, Handle, Object, Outcome, Wait};
 
 use crate::dshow::{
     E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, Face, S_FALSE, S_OK, State,
@@ -15,6 +15,7 @@ const VFW_E_NO_PALETTE_AVAILABLE: u32 = 0x8004_0220;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WM_SIZE: u32 = 0x0005;
 const WM_CLOSE: u32 = 0x0010;
+const WM_NULL: u32 = 0x0000;
 const WS_FORBIDDEN: u32 = 0x0800_0000 | 0x2000_0000 | 0x0100_0000 | 0x0020_0000 | 0x0010_0000;
 // Parent/clip/visibility and conventional nonclient style metadata. Scroll,
 // disabled and iconic/maximized windows are excluded by IVideoWindow's contract.
@@ -304,17 +305,76 @@ pub(crate) fn user(
     }
 }
 
+/// A renderer window's own thread. As on Windows, it creates the window,
+/// dispatches its messages and destroys it, so IVideoWindow calls from any
+/// thread complete while the application's threads do not pump messages.
+pub(crate) struct WindowThread {
+    filter: u32,
+    hwnd: u32,
+    /// Set when the window exists or creation failed, and when the thread ends.
+    signal: Handle,
+    running: bool,
+    quit: bool,
+}
+
 pub(crate) fn create_vmr_window(
     env: &mut Env<'_>,
     filter: u32,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    use crate::dshow::{alloc, free};
     if env.ext.try_get::<crate::dshow::host::Host>().is_none() {
         return then(env, S_OK);
     }
+    let signal = env.sys.objects.insert(Object::Event {
+        manual_reset: true,
+        signaled: false,
+    });
+    let id = state(env).next_session;
+    state(env).next_session += 1;
+    state(env).window_threads.insert(
+        id,
+        WindowThread {
+            filter,
+            hwnd: 0,
+            signal,
+            running: true,
+            quit: false,
+        },
+    );
+    if let Err(error) = crate::dshow::stream::spawn(env, "dshow-window", id) {
+        log::warn!("DirectShow: renderer window thread: {error}");
+        state(env).window_threads.remove(&id);
+        env.sys.objects.close(signal);
+        return then(env, E_FAIL);
+    }
+    graph::flush_posts(
+        env,
+        Box::new(move |_, _| {
+            Outcome::block(
+                Wait::Object {
+                    handle: signal,
+                    deadline: None,
+                },
+                move |env, _| {
+                    if state(env).window_threads[&id].hwnd != 0 {
+                        return then(env, S_OK);
+                    }
+                    state(env).window_threads.remove(&id);
+                    env.sys.objects.close(signal);
+                    then(env, E_FAIL)
+                },
+            )
+        }),
+    )
+}
+
+/// The window thread's body: create the window, then dispatch messages
+/// until the renderer releases it.
+pub(crate) fn thread(env: &mut Env<'_>, id: u32) -> Outcome {
+    use crate::dshow::{alloc, free};
+    let signal = state(env).window_threads[&id].signal;
     let Some(text) = alloc(env, 64) else {
-        return then(env, E_OUTOFMEMORY);
+        return end_thread(env, id);
     };
     let bytes: Vec<u8> = "static\0ActiveMovie Window\0"
         .encode_utf16()
@@ -327,17 +387,19 @@ pub(crate) fn create_vmr_window(
         vec![0, text, text + 14, 0x06cf_0000, 0, 0, 0, 0, 0, 0, 0, 0],
         move |env, hwnd| {
             free(env, text);
-            if hwnd == 0 {
-                return then(env, E_FAIL);
-            }
-            state(env)
+            let filter = state(env).window_threads[&id].filter;
+            let msg = alloc(env, 28);
+            let (Some(msg), true) = (msg, hwnd != 0) else {
+                return end_thread(env, id);
+            };
+            state(env).window_threads.get_mut(&id).unwrap().hwnd = hwnd;
+            if let Some(vmr) = state(env)
                 .filters
                 .get_mut(&filter)
-                .unwrap()
-                .vmr
-                .as_mut()
-                .unwrap()
-                .hwnd = hwnd;
+                .and_then(|f| f.vmr.as_mut())
+            {
+                vmr.hwnd = hwnd;
+            }
             let proc = env
                 .sys
                 .thunks
@@ -347,7 +409,74 @@ pub(crate) fn create_vmr_window(
                 env,
                 "SetWindowLongW",
                 vec![hwnd, (-4i32) as u32, proc],
-                move |env, _| then(env, S_OK),
+                move |env, _| {
+                    env.sys.set_event(signal);
+                    pump_window(env, id, msg)
+                },
+            )
+        },
+    )
+}
+
+fn pump_window(env: &mut Env<'_>, id: u32, msg: u32) -> Outcome {
+    user(env, "GetMessageW", vec![msg, 0, 0, 0], move |env, got| {
+        if got == 0 || got == u32::MAX || state(env).window_threads[&id].quit {
+            crate::dshow::free(env, msg);
+            let hwnd = state(env).window_threads[&id].hwnd;
+            return user(env, "DestroyWindow", vec![hwnd], move |env, _| {
+                end_thread(env, id)
+            });
+        }
+        user(env, "DispatchMessageW", vec![msg], move |env, _| {
+            pump_window(env, id, msg)
+        })
+    })
+}
+
+fn end_thread(env: &mut Env<'_>, id: u32) -> Outcome {
+    let thread = state(env).window_threads.get_mut(&id).unwrap();
+    thread.running = false;
+    let signal = thread.signal;
+    env.sys.set_event(signal);
+    Outcome::Return(0)
+}
+
+/// Destroy `filter`'s window on its thread and wait for the thread to end,
+/// as a renderer does before its last reference goes.
+pub(crate) fn destroy_vmr_window(
+    env: &mut Env<'_>,
+    filter: u32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    let Some((&id, thread)) = state(env)
+        .window_threads
+        .iter_mut()
+        .find(|(_, thread)| thread.filter == filter)
+    else {
+        return then(env);
+    };
+    let (signal, hwnd, running) = (thread.signal, thread.hwnd, thread.running);
+    let finish = move |env: &mut Env<'_>| {
+        state(env).window_threads.remove(&id);
+        env.sys.objects.close(signal);
+        then(env)
+    };
+    if !running {
+        return finish(env);
+    }
+    thread.quit = true;
+    env.sys.reset_event(signal);
+    user(
+        env,
+        "PostMessageW",
+        vec![hwnd, WM_NULL, 0, 0],
+        move |_, _| {
+            Outcome::block(
+                Wait::Object {
+                    handle: signal,
+                    deadline: None,
+                },
+                move |env, _| finish(env),
             )
         },
     )

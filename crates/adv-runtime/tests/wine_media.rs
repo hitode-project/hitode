@@ -178,6 +178,12 @@ fn native_video_at_client_position() {
     probe("video", "media video ok");
 }
 
+// spec: MEDIA-VIDEO-15
+#[test]
+fn renderer_window_has_its_own_thread() {
+    probe("window_thread", "media window_thread ok");
+}
+
 // spec: WINE-MEDIA-12, MEDIA-DMO-1
 #[test]
 fn original_quartz_class_and_exports() {

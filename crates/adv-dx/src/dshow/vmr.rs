@@ -512,42 +512,37 @@ pub(crate) fn release_window(env: &mut Env<'_>, this: u32) -> Option<Outcome> {
     if com.references(&env.sys.objects, id) != Some(1) {
         return None;
     }
-    Some(video::window::user(
-        env,
-        "DestroyWindow",
-        vec![hwnd],
-        move |env, _| {
-            state(env)
-                .filters
-                .get_mut(&filter)
-                .unwrap()
-                .vmr
-                .as_mut()
-                .unwrap()
-                .hwnd = 0;
-            let v = state(env)
-                .filters
-                .get_mut(&filter)
-                .unwrap()
-                .vmr
-                .as_mut()
-                .unwrap();
-            let calls = [v.device, v.surface_allocator, v.presenter]
-                .into_iter()
-                .filter(|&p| p != 0)
-                .map(|p| Call(p, 2, vec![]))
-                .collect();
-            v.device = 0;
-            v.surface_allocator = 0;
-            v.presenter = 0;
-            chain(
-                env,
-                calls,
-                Vec::new(),
-                Box::new(move |env, _| Outcome::Return(release(env, this))),
-            )
-        },
-    ))
+    Some(video::window::destroy_vmr_window(env, filter, move |env| {
+        state(env)
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap()
+            .hwnd = 0;
+        let v = state(env)
+            .filters
+            .get_mut(&filter)
+            .unwrap()
+            .vmr
+            .as_mut()
+            .unwrap();
+        let calls = [v.device, v.surface_allocator, v.presenter]
+            .into_iter()
+            .filter(|&p| p != 0)
+            .map(|p| Call(p, 2, vec![]))
+            .collect();
+        v.device = 0;
+        v.surface_allocator = 0;
+        v.presenter = 0;
+        chain(
+            env,
+            calls,
+            Vec::new(),
+            Box::new(move |env, _| Outcome::Return(release(env, this))),
+        )
+    }))
 }
 
 fn notify_call(env: &mut Env<'_>, filter: u32, method: &str) -> Outcome {

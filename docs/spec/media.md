@@ -365,5 +365,5 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-VIDEO-15 Video Renderer window
 
-**Rule**: Render MUST give the Video Renderer its own guest window sized to the video, as windowed VMR has. The graph's IVideoWindow MUST forward to a renderer that owns a window, except full-screen mode, which the graph keeps.
+**Rule**: Render MUST give the Video Renderer its own guest window sized to the video, as windowed VMR has. Each renderer window MUST belong to its own thread, which dispatches its messages as on Windows. The graph's IVideoWindow MUST forward to a renderer that owns a window, except full-screen mode, which the graph keeps.
 **Verification**: Test

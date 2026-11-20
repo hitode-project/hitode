@@ -457,6 +457,8 @@ pub(crate) struct State {
     pub(crate) sessions: BTreeMap<u32, stream::Session>,
     /// Delivery threads (by thread id) of guest audio inputs.
     pub(crate) audio_feeds: BTreeMap<u32, stream::AudioFeed>,
+    /// Renderer window threads (by thread id).
+    pub(crate) window_threads: BTreeMap<u32, video::window::WindowThread>,
     asf_threads: BTreeMap<u32, (u32, Vec<(u32, usize)>)>,
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
@@ -600,6 +602,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         samples: BTreeMap::new(),
         sessions: BTreeMap::new(),
         audio_feeds: BTreeMap::new(),
+        window_threads: BTreeMap::new(),
         asf_threads: BTreeMap::new(),
         next_session: 1,
         pending_threads: Vec::new(),
