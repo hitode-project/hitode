@@ -452,7 +452,7 @@ pub(crate) struct State {
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
     /// Worker threads (by thread id) finishing an asynchronous graph Run.
-    pub(crate) async_runs: BTreeMap<u32, u32>,
+    pub(crate) async_runs: BTreeMap<u32, (u32, u64)>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
     /// The quartz type library and the ITypeInfo of each automation
     /// interface, loaded on first use and kept for the process, as strmbase does.

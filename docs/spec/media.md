@@ -143,6 +143,8 @@ Withdrawn: MEDIA-GRAPH-19
 **Rule**: When the pause of IMediaControl::Run from Stopped returns S_FALSE, Run MUST return S_FALSE and report Running unless a member's GetState(0) gives VFW_S_CANT_CUE. A worker MUST then run the members once all have paused unless Pause or Stop comes first, and streams MUST stay paused until then. Otherwise, and for IMediaFilter::Run from any state, the graph MUST run every member at once.
 **Verification**: Test
 
+Pause and Stop cancel earlier Run requests even during a guest callback. A canceled request MUST neither call further members nor publish a new running state.
+
 ### MEDIA-GRAPH-21 Event notification
 
 **Rule**: Default handling MUST consume only EC_COMPLETE and EC_REPAINT, and every other event MUST be queued. While AM_MEDIAEVENT_NONOTIFY is set, events MUST be dropped, and setting it MUST discard the queue and reset the event handle.

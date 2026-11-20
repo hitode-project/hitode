@@ -341,10 +341,10 @@ fn spawn(env: &mut Env<'_>, name: &str, id: u32) -> Result<(), String> {
 }
 
 /// A worker for `graph`'s asynchronous Run, as quartz's thread pool work.
-pub(crate) fn spawn_async_run(env: &mut Env<'_>, graph: u32) {
+pub(crate) fn spawn_async_run(env: &mut Env<'_>, graph: u32, generation: u64) {
     let id = state(env).next_session;
     state(env).next_session += 1;
-    state(env).async_runs.insert(id, graph);
+    state(env).async_runs.insert(id, (graph, generation));
     if let Err(error) = spawn(env, "dshow-run", id) {
         log::warn!("DirectShow: graph run thread: {error}");
         state(env).async_runs.remove(&id);
@@ -353,8 +353,8 @@ pub(crate) fn spawn_async_run(env: &mut Env<'_>, graph: u32) {
 
 pub(crate) fn thread_entry(env: &mut Env<'_>) -> Outcome {
     let id = env.arg(0);
-    if let Some(graph) = state(env).async_runs.remove(&id) {
-        return graph::async_run(env, graph);
+    if let Some((graph, generation)) = state(env).async_runs.remove(&id) {
+        return graph::async_run(env, graph, generation);
     }
     if state(env).audio_feeds.contains_key(&id) {
         return feed(env, id);
