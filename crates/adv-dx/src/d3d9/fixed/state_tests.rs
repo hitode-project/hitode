@@ -1126,6 +1126,50 @@ mod fixed_completion {
     }
     // spec: GFX-FIXED-2
     #[test]
+    fn missing_texture_disables_first_stage() {
+        let (mut m, p, target) = fixture();
+        let mut e = env(&mut m);
+        let this = GuestPtr::new(p);
+        assert_eq!(set_render(&mut e, this, 137, 0), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 1, 4), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 2, 2), 0);
+        assert_eq!(set_stage(&mut e, this, 0, 3, 2), 0);
+        let rgba = pixel(
+            &mut e,
+            p,
+            &target,
+            0x42,
+            &[0, 0, 0.5f32.to_bits(), 0xff20_4060],
+            1,
+            1,
+        );
+        assert_eq!(rgba, [96, 64, 32, 255]);
+    }
+
+    // spec: GFX-FIXED-2
+    #[test]
+    fn missing_second_texture_keeps_the_first_stage_result() {
+        let (mut m, p, target) = fixture();
+        let mut e = env(&mut m);
+        let this = GuestPtr::new(p);
+        assert_eq!(set_render(&mut e, this, 137, 0), 0);
+        texture(&mut e, p, [96, 64, 32, 255]);
+        assert_eq!(set_stage(&mut e, this, 1, 1, 2), 0);
+        assert_eq!(set_stage(&mut e, this, 1, 2, 2), 0);
+        let rgba = pixel(
+            &mut e,
+            p,
+            &target,
+            0x42,
+            &[0, 0, 0.5f32.to_bits(), 0xffff_ffff],
+            1,
+            1,
+        );
+        assert_eq!(rgba, [96, 64, 32, 255]);
+    }
+
+    // spec: GFX-FIXED-2
+    #[test]
     fn alpha_modulate_accepts_diffuse_for_both_arguments() {
         let (mut m, p, target) = fixture();
         let mut e = env(&mut m);

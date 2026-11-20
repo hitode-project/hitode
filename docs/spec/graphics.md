@@ -510,6 +510,8 @@ Fixed texture stages MUST apply supported operations to both configured argument
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
 
+A fixed texture stage whose first color argument selects an unbound texture ends the cascade at that stage.
+
 ### GFX-COPY-3 System-memory surface uploads
 
 **Rule**: UpdateSurface MUST upload matching-format SYSTEMMEM surfaces or texture levels into DEFAULT destinations, honoring optional source rectangles and destination points. Invalid pools, formats, locked surfaces, depth/stencil, multisampling, and out-of-bounds rectangles MUST return D3DERR_INVALIDCALL. Uploads MUST preserve pixels outside the destination rectangle and track resource-level writes.

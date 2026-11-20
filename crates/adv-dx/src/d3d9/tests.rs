@@ -1108,6 +1108,15 @@ mod package_a {
             0
         );
         assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetTextureStageState",
+                &[device, 0, 2, 0]
+            ),
+            0
+        );
         for (kind, value) in [(1, 2), (2, 4)] {
             assert_eq!(
                 result(

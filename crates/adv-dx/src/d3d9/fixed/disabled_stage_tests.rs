@@ -111,8 +111,9 @@ mod disabled_stage_tests {
         };
         let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
         let this = GuestPtr::new(pointer);
-        let second =
-            |env: &Env<'_>| second_stage(&current(env, pointer).unwrap()).map_err(|e| e.code);
+        let second = |env: &Env<'_>| {
+            second_stage(&current(env, pointer).unwrap(), [true, true]).map_err(|e| e.code)
+        };
         assert_eq!(second(&env), Ok(None));
         for op in [2, 3, 4, 7, 10] {
             assert_eq!(set_stage(&mut env, this, 1, 1, op), 0);
@@ -127,7 +128,7 @@ mod disabled_stage_tests {
             second(&env),
             Ok(Some([10, 2 | 1 << 8, 10 | 2 << 8 | 1 << 16, 3]))
         );
-        assert!(programmable::active(&env, pointer));
+        assert!(!programmable::active(&env, pointer));
         // A disabled first stage ends the cascade before stage one.
         assert_eq!(set_stage(&mut env, this, 0, 1, 1), 0);
         assert_eq!(second(&env), Ok(None));
@@ -138,7 +139,6 @@ mod disabled_stage_tests {
         for value in [4, 5, 0x14, 0x25] {
             assert_eq!(set_stage(&mut env, this, 1, 2, value), 0);
             assert_eq!(second(&env), Err(UNAVAILABLE));
-            assert!(programmable::active(&env, pointer));
         }
         for value in [3, 0x12, 0x21] {
             assert_eq!(set_stage(&mut env, this, 1, 2, value), 0);
