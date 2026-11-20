@@ -256,7 +256,9 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
-    let batch_pages = (resident && !batches.is_empty()).then(|| asm.label());
+    let span_search = [false, true].map(|backwards| {
+        (resident && batches.iter().any(|batch| batch.backwards == backwards)).then(|| asm.label())
+    });
     let mut batch_backedges = vec![None; func.blocks.len()];
     for batch in batches {
         batch_backedges[batch.loop_.latch.0 as usize] = Some((batch.loop_.head, asm.label()));
@@ -360,7 +362,7 @@ fn emit<'a>(
             .find(|batch| batch.loop_.head.0 as usize == b)
         {
             let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
-            let words = e.batch(batch, batch_pages, backedge);
+            let words = e.batch(batch, span_search[usize::from(batch.backwards)], backedge);
             if func.head_exit == Some(batch.loop_.head) {
                 head_batch = Some((words, u32::from(batch.plan.lanes)));
             }
@@ -486,8 +488,10 @@ fn emit<'a>(
     }
     e.checked_accesses();
     e.page_crossings(count_entries);
-    if let Some(pages) = batch_pages {
-        crate::facts::batch_pages(&mut e.asm, pages);
+    for (backwards, search) in [false, true].into_iter().zip(span_search) {
+        if let Some(search) = search {
+            crate::facts::batch_span_search(&mut e.asm, search, backwards);
+        }
     }
     for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
         e.asm.bind(label);

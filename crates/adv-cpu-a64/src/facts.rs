@@ -2,15 +2,15 @@
 //! forget whole fields, including each independently tracked x87 tag.
 
 use adv_cpu_core::CpuState;
-use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
+use adv_cpu_core::memory::{READ, SHARED, WINDOW_SPAN_WORDS, WRITE};
 
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::{
-    Cond, Extend, Narrow, Reg, Shift, add, add_ext, add_imm, and, and_imm, bic, cmp, cmp_imm, eor,
-    ldr, ldr_narrow, ldrh, ldur, lsl_imm, lsr_imm, mov, movk, movz, orr, ret, shiftv, str, strh,
-    sub, sub_ext, tst_imm, ubfx,
+    Cond, Extend, Narrow, Reg, Shift, add, add_ext, add_imm, and, and_imm, clz, cmp, cmp_imm, eor,
+    eor_imm, ldr, ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movk, movz, orr, rbit,
+    ret, shiftv, str, strh, sub, sub_ext, tst_imm, ubfx,
 };
 use crate::runtime;
 
@@ -610,61 +610,163 @@ pub(crate) fn plain_span(asm: &mut Asm, addr: Reg, bytes: u32, write: bool, miss
     asm.b_cond(Cond::Ls, next);
 }
 
-/// Walks the candidate pages of one stream. X0 and X1 are the first and
-/// last pages in stream order. XOR with X2 gives the actual guest page.
-/// X5 is the bitmap offset (0 for reads, 8 for writes). Returns the
-/// projected byte boundary of the first unproved page in X0, preserving K
-/// in X3 and all allocated values.
-pub(crate) fn batch_pages(asm: &mut Asm, entry: Label) {
-    let write = asm.label();
-    let next = asm.label();
-    let done = asm.label();
+const WINDOW_SPANS: u32 = std::mem::offset_of!(runtime::Runtime, window_spans) as u32;
+const LEAF_SHIFT: u32 = PAGE_SHIFT + 6;
+
+fn span_word(asm: &mut Asm, level: usize, backwards: bool, index: Reg, dst: Reg) {
+    let words = WINDOW_SPAN_WORDS[level];
+    let offset = WINDOW_SPAN_WORDS[..level].iter().sum::<usize>() as u32 * 8;
+    let base = if level == 0 {
+        X5
+    } else {
+        immediate(asm, U, offset);
+        asm.emit(add(X, U, X5, U, Lsl, 0));
+        U
+    };
+    let index = if backwards && words != 1 {
+        asm.emit(eor_imm(X, dst, index, (words - 1) as u64));
+        dst
+    } else {
+        index
+    };
+    asm.emit(ldr_reg(X, dst, base, index, true));
+    if backwards {
+        asm.emit(rbit(X, dst, dst));
+        if level == WINDOW_SPAN_WORDS.len() - 1 {
+            asm.emit(lsr_imm(X, dst, dst, 60));
+        }
+    } else if level == WINDOW_SPAN_WORDS.len() - 1 {
+        asm.emit(and_imm(X, dst, dst, 15));
+    }
+}
+
+/// Tests the projected inclusive byte range in X0..=X1. On a miss, X2
+/// contains the first denied byte. X3 holds the batch count.
+pub(crate) fn batch_span(asm: &mut Asm, write: bool, backwards: bool, search: Label, hit: Label) {
+    let denied = asm.label();
+    let check = asm.label();
+    asm.emit_all(&[
+        ldr(X, X5, RT, WINDOW_SPANS + 8 * u32::from(write)),
+        lsr_imm(X, X0, X0, PAGE_SHIFT),
+        lsr_imm(X, X2, X0, 6),
+    ]);
+    span_word(asm, 0, backwards, X2, X4);
+    asm.emit(shiftv(X, Lsr, X4, X4, X0));
+    asm.cbz(X, true, X4, denied);
+    asm.emit(cmp(X, X2, X1, Lsr, LEAF_SHIFT));
+    asm.b_cond(Cond::Eq, hit);
+
+    // Test the next leaf directly before asking the hierarchy for a bound.
+    let farther = asm.label();
+    asm.emit(add_imm(X, X2, X2, 1, false));
+    asm.emit(cmp(X, X2, X1, Lsr, LEAF_SHIFT));
+    asm.b_cond(Cond::Ne, farther);
+    asm.emit(cmp_imm(X, X2, 1 << 2, true));
+    asm.b_cond(Cond::Hs, farther);
+    span_word(asm, 0, backwards, X2, X4);
+    asm.cbz(X, false, X4, hit);
+    asm.emit(lsl_imm(X, X0, X2, 6));
+    asm.b(denied);
+
+    asm.bind(farther);
+    asm.bl(search);
+    asm.b(check);
+
+    asm.bind(denied);
+    asm.emit_all(&[
+        rbit(X, X4, X4),
+        clz(X, X4, X4),
+        add(X, X2, X0, X4, Lsl, 0),
+        lsl_imm(X, X2, X2, PAGE_SHIFT),
+    ]);
+    asm.bind(check);
+    asm.emit(cmp(X, X2, X1, Lsl, 0));
+    asm.b_cond(Cond::Hi, hit);
+}
+
+/// Finds the first denied page at or beyond leaf X2 in projected order.
+/// The fixed-height tree yields either the byte boundary or 4 GiB.
+pub(crate) fn batch_span_search(asm: &mut Asm, entry: Label, backwards: bool) {
+    let end = asm.label();
+    let finish = asm.label();
+    let found = std::array::from_fn::<_, 4, _>(|_| asm.label());
     asm.bind(entry);
-    asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(W, U, RT, MEMORY_BASE),
-        sub(W, U, X4, U, Lsr, PAGE_SHIFT),
-        ldr(W, T, RT, MEMORY_PAGES),
-        cmp(W, U, T, Lsl, 0),
-    ]);
-    asm.b_cond(Cond::Hs, done);
-    asm.emit_all(&[
-        lsr_imm(W, T, U, 6),
-        add(W, T, T, T, Lsl, 1),
-        ldr(X, X4, RT, PLAIN_PAGES),
-        add_ext(X, T, X4, T, Extend::Uxtw, 3),
-        add(X, X4, T, X5, Lsl, 0),
-        ldr(X, X4, X4, 0),
-        ldr(X, T, T, 16),
-        bic(X, T, X4, T, Lsl, 0),
-        shiftv(X, Lsr, T, T, U),
-    ]);
-    asm.tbz(false, T, 0, done);
-    // The bitmap grants guest permission. The window class also accounts
-    // for the host protection intersection on hosts with larger pages.
-    asm.emit_all(&[
-        eor(W, X4, X0, X2, Lsl, 0),
-        ldr(X, T, RT, runtime::CLASSES),
-        ldr_narrow(Narrow::Byte, T, T, X4),
-    ]);
-    asm.cbz(W, true, X5, write);
-    asm.tbz(false, T, READ.trailing_zeros(), done);
-    asm.tbz(true, T, SHARED.trailing_zeros(), done);
-    asm.b(next);
-    asm.bind(write);
-    asm.tbz(false, T, WRITE.trailing_zeros(), done);
-    asm.tbz(true, T, EXEC.trailing_zeros(), done);
-    asm.bind(next);
-    asm.emit_all(&[add_imm(W, X0, X0, 1, false), cmp(X, X0, X1, Lsl, 0)]);
-    asm.b_cond(Cond::Ls, entry);
-    asm.bind(done);
-    asm.emit_all(&[lsl_imm(X, X0, X0, PAGE_SHIFT), ret(Reg::LR)]);
+    for (level, &found) in found.iter().enumerate() {
+        let children = WINDOW_SPAN_WORDS[level.saturating_sub(1)];
+        let (limit, shifted) = if children >= 4096 {
+            ((children >> 12) as u32, true)
+        } else {
+            (children as u32, false)
+        };
+        asm.emit(cmp_imm(X, X2, limit, shifted));
+        asm.b_cond(Cond::Hs, end);
+        if level == 0 {
+            span_word(asm, 0, backwards, X2, X4);
+            asm.cbz(X, true, X4, found);
+            asm.emit(add_imm(X, X2, X2, 1, false));
+        } else {
+            asm.emit(lsr_imm(X, T, X2, 6));
+            span_word(asm, level, backwards, T, X4);
+            asm.emit(shiftv(X, Lsr, X4, X4, X2));
+            asm.cbz(X, true, X4, found);
+            asm.emit(add_imm(X, X2, T, 1, false));
+        }
+    }
+    asm.bind(end);
+    asm.emit(movz(X, X2, 1, 32));
+    asm.emit(ret(Reg::LR));
+    for (level, &found) in found.iter().enumerate() {
+        asm.bind(found);
+        if level == 0 {
+            asm.emit(lsl_imm(X, X2, X2, 6));
+        }
+        asm.emit_all(&[rbit(X, X4, X4), clz(X, X4, X4), add(X, X2, X2, X4, Lsl, 0)]);
+        for child in (0..level).rev() {
+            span_word(asm, child, backwards, X2, X4);
+            asm.emit_all(&[rbit(X, X4, X4), clz(X, X4, X4), add(X, X2, X4, X2, Lsl, 6)]);
+        }
+        asm.b(finish);
+    }
+    asm.bind(finish);
+    asm.emit_all(&[lsl_imm(X, X2, X2, PAGE_SHIFT), ret(Reg::LR)]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Asm, Assumed, CONTROL, ES, Key, MMX, MXCSR, TOP, tags};
     use adv_cpu_core::CpuState;
+
+    // spec: A64-OPT-10
+    #[test]
+    fn same_leaf_span_hit_cost() {
+        use super::{batch_span, ldr_reg};
+        for backwards in [false, true] {
+            let mut asm = Asm::new();
+            let search = asm.label();
+            let hit = asm.label();
+            batch_span(&mut asm, false, backwards, search, hit);
+            asm.bind(search);
+            asm.bind(hit);
+            let words = asm.finish();
+            // The first CBNZ branches over the extension path. The common
+            // leaf hits through one of the two following conditional branches.
+            let branch = 5 + usize::from(backwards) * 2;
+            let imm = (words[branch] >> 5) & 0x7ffff;
+            assert_eq!(words[branch] & 0xff00_0000, 0xb500_0000);
+            let short = branch + 3;
+            let bounded = branch + 7;
+            assert!(short <= 10 && bounded <= 14);
+            assert!(branch + imm as usize + 6 <= words.len());
+            let leaf = ldr_reg(
+                super::X,
+                super::X4,
+                super::X5,
+                if backwards { super::X4 } else { super::X2 },
+                true,
+            );
+            assert_eq!(words[..branch].iter().filter(|&&w| w == leaf).count(), 1);
+        }
+    }
 
     // spec: A64A-ROLE-3 A64A-FALL-3
     #[test]

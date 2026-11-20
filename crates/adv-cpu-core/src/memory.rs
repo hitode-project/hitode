@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod fast;
 mod locks;
 mod page_map;
+mod spans;
 
 pub use fast::FastPermissions;
+pub use spans::WINDOW_SPAN_WORDS;
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -184,6 +186,7 @@ pub struct Memory {
     /// line `i`, so translated stores can tell data on a code page.
     code_lines: Vec<u64>,
     plain_pages: Vec<Cell<u64>>,
+    window_spans: Option<spans::WindowSpans>,
     pub mapped: Arc<Vec<bool>>,
     /// Pages changed since the controller last looked, each with its version
     /// before the first change, and the changed bytes while they stay few.
@@ -456,6 +459,13 @@ impl Memory {
         !self.selective_code_writes() && flags & EXEC != 0
     }
 
+    /// Stable absolute-page denial bitmaps for the ordinary guest window.
+    pub fn window_spans(&self) -> [*const u64; 2] {
+        self.window_spans
+            .as_ref()
+            .map_or_else(spans::denied, spans::WindowSpans::pointers)
+    }
+
     fn observed_code(&self, page: usize, bytes: std::ops::Range<usize>) -> bool {
         self.watched[page]
             && self
@@ -525,6 +535,7 @@ impl Memory {
             watched: vec![false; len / PAGE_SIZE],
             code_lines: vec![0; len / PAGE_SIZE],
             plain_pages: vec![Cell::new(0); 3 * (len / PAGE_SIZE).div_ceil(64)],
+            window_spans: None,
             code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -577,6 +588,7 @@ impl Memory {
             watched: vec![false; len / PAGE_SIZE],
             code_lines: vec![0; len / PAGE_SIZE],
             plain_pages: vec![Cell::new(0); 3 * plain_pages.div_ceil(64)],
+            window_spans: None,
             code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
@@ -659,6 +671,7 @@ impl Memory {
         memory.mapped = Arc::new(vec![false; len / PAGE_SIZE]);
         memory.reservation = Some(reservation);
         // All pages start unmapped, so attaching the window leaves every bit clear.
+        memory.window_spans = Some(spans::WindowSpans::new());
         memory.window = Some(window);
         Ok(memory)
     }
@@ -772,12 +785,15 @@ impl Memory {
                 while page < pages.end && committed(page) && protection(page) == wanted {
                     page += 1;
                 }
-                reservation.protect_direct(
-                    self.window_slack() + start * PAGE_SIZE,
-                    (page - start) * PAGE_SIZE,
-                    wanted,
-                )?;
+                reservation
+                    .protect_direct(
+                        self.window_slack() + start * PAGE_SIZE,
+                        (page - start) * PAGE_SIZE,
+                        wanted,
+                    )
+                    .inspect_err(|_| self.update_window_spans(pages.clone()))?;
             }
+            self.update_window_spans(pages);
         }
 
         Ok(())
@@ -840,7 +856,7 @@ impl Memory {
     fn update_plain_pages(&self, pages: std::ops::Range<usize>) {
         #[cfg(unix)]
         if self.window.is_some() {
-            for page in pages {
+            for page in pages.clone() {
                 let mut info = HostRange::EMPTY;
                 self.include_host_page(&mut info, page);
                 let permissions = self.computation_permissions(info);
@@ -856,9 +872,42 @@ impl Memory {
                     word.set((word.get() & !mask) | bit);
                 }
             }
+            self.update_window_spans(pages);
         }
         #[cfg(not(unix))]
         let _ = pages;
+    }
+
+    #[cfg(unix)]
+    fn update_window_spans(&self, pages: std::ops::Range<usize>) {
+        use crate::virtual_memory::GuestAccess;
+        let spans = self.window_spans.as_ref().unwrap();
+        let view = self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .direct_fault_view()
+            .unwrap();
+        let slack = self.window_slack();
+        let host = view.host_page_size();
+        let first = (slack + pages.start * PAGE_SIZE) / host * host;
+        let end = ((slack + pages.end * PAGE_SIZE).div_ceil(host) * host).min(slack + self.len);
+        let first = (first.saturating_sub(slack)) / PAGE_SIZE;
+        let end = (end - slack) / PAGE_SIZE;
+        let base = self.base as usize / PAGE_SIZE;
+        for page in first..end {
+            let group = page / 64 * 3;
+            let bit = 1 << (page % 64);
+            let offset = slack + page * PAGE_SIZE;
+            let unwatched = self.plain_pages[group + 2].get() & bit == 0;
+            let read = unwatched
+                && self.plain_pages[group].get() & bit != 0
+                && view.host_allows(offset, GuestAccess::Read);
+            let write = unwatched
+                && self.plain_pages[group + 1].get() & bit != 0
+                && view.host_allows(offset, GuestAccess::Write);
+            spans.update(base + page, read, write);
+        }
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
@@ -2935,6 +2984,45 @@ mod window_tests {
             memory.map(0x20000, len, READ).unwrap();
             assert_eq!(memory.read(0x20100, 5).unwrap(), [0; 5], "{host}");
         }
+    }
+
+    // spec: A64-OPT-10
+    #[test]
+    fn window_spans_revoke_at_the_edges_and_inside_a_run() {
+        let start = 0x40000;
+        let pages = 512;
+        let mut memory = Memory::window(start, pages * PAGE_SIZE).unwrap();
+        memory.map(start, pages * PAGE_SIZE, READ | WRITE).unwrap();
+        let tables = memory.window_spans();
+        let denied = |level: usize, index: usize, write: bool| {
+            let word = WINDOW_SPAN_WORDS[..level].iter().sum::<usize>() + index / 64;
+            // SAFETY: the boxed table stays at this address for the lifetime of Memory.
+            unsafe { tables[usize::from(write)].add(word).read() & (1 << (index % 64)) != 0 }
+        };
+        let first = start as usize / PAGE_SIZE;
+        for offset in [0, 63, 64, 233, pages - 1] {
+            let page = first + offset;
+            let address = (page * PAGE_SIZE) as u32;
+            assert!(!denied(0, page, true));
+            assert!(!denied(1, page / 64, true));
+            memory.protect(address, PAGE_SIZE, READ).unwrap();
+            assert!(denied(0, page, true));
+            assert!(denied(1, page / 64, true));
+            let host = crate::virtual_memory::host_page_size().unwrap() / PAGE_SIZE;
+            if host > 1 {
+                assert!(denied(0, page ^ 1, true));
+            }
+            memory.protect(address, PAGE_SIZE, READ | WRITE).unwrap();
+            assert!(!denied(1, page / 64, true));
+            assert!(!denied(0, page, true));
+        }
+        let page = first + 127;
+        memory.watch_code((page * PAGE_SIZE) as u32, 1);
+        assert!(denied(0, page, false));
+        assert!(denied(0, page, true));
+        assert!(denied(1, page / 64, false));
+        assert!(!denied(1, page / 64 + 1, false));
+        assert_eq!(memory.window_spans(), tables);
     }
 
     /// Native code takes a page directly only where its host page lets it:

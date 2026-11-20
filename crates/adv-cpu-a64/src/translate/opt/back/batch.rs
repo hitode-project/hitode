@@ -204,7 +204,6 @@ impl Emitter<'_> {
     }
 
     fn batch_range(&mut self, span: Span, backwards: bool, pages: Option<Label>, scalar: Label) {
-        const PAGE_SHIFT: u32 = crate::translate::lower::access::PAGE_SHIFT;
         self.batch_span_start(span, backwards, X0);
         if backwards && span.width > 1 {
             // A first scalar access that straddles guest zero has no interval.
@@ -212,27 +211,17 @@ impl Emitter<'_> {
             self.asm.emit(cmp(W, X0, T, Lsl, 0));
             self.asm.b_cond(Cond::Hi, scalar);
         }
-        if let Some(pages) = pages {
+        let hit = self.asm.label();
+        if let Some(search) = pages {
             self.imm(T, u64::from(span.step));
             self.asm.emit_all(&[
                 mul(X, X1, X3, T),
                 add_imm(X, X1, X1, span.width - 1, false),
                 add(X, X1, X1, X0, Lsl, 0),
-                lsr_imm(X, X1, X1, PAGE_SHIFT),
-                lsr_imm(W, X0, X0, PAGE_SHIFT),
             ]);
-            self.imm(
-                X2,
-                if backwards {
-                    u64::from(u32::MAX >> PAGE_SHIFT)
-                } else {
-                    0
-                },
-            );
-            self.imm(X5, if span.write { 8 } else { 0 });
-            self.asm.bl(pages);
+            crate::facts::batch_span(&mut self.asm, span.write, backwards, search, hit);
             self.batch_span_start(span, backwards, X1);
-            self.asm.emit(sub(X, X2, X0, X1, Lsl, 0));
+            self.asm.emit(sub(X, X2, X2, X1, Lsl, 0));
         } else {
             // The owner admits all scalar accesses of a job. The combined
             // interval must also stay contiguous in the alias.
@@ -240,6 +229,7 @@ impl Emitter<'_> {
             self.asm.emit(sub(X, X2, T, X0, Lsl, 0));
         }
         self.batch_span_limit(span, scalar);
+        self.asm.bind(hit);
     }
 
     fn batch_disjoint(&mut self, a: Span, b: Span, backwards: bool, in_place: bool, scalar: Label) {

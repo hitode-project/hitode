@@ -106,6 +106,8 @@ pub struct Runtime {
     pub(crate) value_access: u64,
     pub(crate) locked_access: u64,
     pub(crate) value_frame: ValueFrame,
+    /// Absolute-page read and write denial summaries.
+    pub window_spans: [u64; 2],
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -165,6 +167,7 @@ impl Runtime {
             value_access: 0,
             locked_access: 0,
             value_frame: ValueFrame::default(),
+            window_spans: [0; 2],
         }
     }
 }
