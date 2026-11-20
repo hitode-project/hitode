@@ -5,7 +5,7 @@ use ff::{Rational, codec, format, frame, media, software};
 use ffmpeg_next as ff;
 
 use super::native::{Input, configure_video_context, transfer_hardware};
-use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream};
+use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream, ReadSeek};
 
 #[cfg(not(feature = "gpu"))]
 use super::VideoFrame;
@@ -58,9 +58,9 @@ fn format_of(stream: &format::stream::Stream<'_>) -> Option<CodecFormat> {
     }
 }
 
-pub(super) fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
+pub(super) fn demux(reader: Box<dyn ReadSeek>) -> Result<Demuxed, Error> {
     ff::init()?;
-    let mut input = Input::open(Box::new(std::io::Cursor::new(bytes)))?;
+    let mut input = Input::open(reader)?;
     let context = &mut input.context;
     let origin = unsafe { (*context.as_ptr()).start_time };
     let origin = if origin == ff::ffi::AV_NOPTS_VALUE {
@@ -108,7 +108,7 @@ pub(super) fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
             time_100ns: time,
             duration_100ns: hundred_ns(packet.duration(), tb).max(0) as u64,
             key: packet.is_key(),
-            data: data.to_vec(),
+            data: data.into(),
         });
     }
     let mut duration = (context.duration().max(0) as u64).saturating_mul(10);

@@ -185,7 +185,7 @@ pub struct Packet {
     pub time_100ns: u64,
     pub duration_100ns: u64,
     pub key: bool,
-    pub data: Vec<u8>,
+    pub data: std::sync::Arc<[u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,13 +208,17 @@ pub struct Demuxed {
 
 /// Split a whole in-memory container into its audio and video samples.
 pub fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
+    demux_reader(std::io::Cursor::new(bytes))
+}
+
+pub fn demux_reader(reader: impl ReadSeek + 'static) -> Result<Demuxed, Error> {
     #[cfg(feature = "media")]
     {
-        packets::demux(bytes)
+        packets::demux(Box::new(reader))
     }
     #[cfg(not(feature = "media"))]
     {
-        let _ = bytes;
+        let _ = reader;
         Err(Error::Unavailable)
     }
 }

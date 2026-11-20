@@ -122,7 +122,13 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
                 &hot.fixed,
                 fixed::layout(env, pointer).ok().map(|l| l.transformed),
             ) != 0
-            || !matches!(fixed::second_stage(&hot.fixed), Ok(None))
+            || !matches!(
+                fixed::second_stage(
+                    &hot.fixed,
+                    [hot.texture.is_some(), hot.shaders.textures[1].is_some()],
+                ),
+                Ok(None)
+            )
     })
 }
 const STAGE_ARGUMENTS: u32 = 1 << 3;
@@ -343,6 +349,7 @@ fn prepare_checked(
         device(env, pointer).unwrap().needs_reset,
     );
     let hot = hot_cell.borrow();
+    let has_texture = [hot.texture.is_some(), hot.shaders.textures[1].is_some()];
     if !hot.scene || needs_reset {
         return Err(INVALID);
     }
@@ -455,7 +462,7 @@ fn prepare_checked(
         && ps_id.is_none()
         && features == 0
         && !instanced
-        && fixed::second_stage(&hot.fixed).is_ok_and(|s| s.is_none());
+        && fixed::second_stage(&hot.fixed, has_texture).is_ok_and(|s| s.is_none());
     if simple_fixed && matches!(kind, 2 | 3) {
         fixed::prepare_lines(&mut draw, &streams, output_indices.as_ref(), length)?;
         return Ok(draw);
@@ -532,7 +539,7 @@ fn prepare_checked(
             image: draw.image.clone(),
             sampler: draw.state.sampler,
         });
-        let second = fixed::second_stage(&hot.fixed).map_err(|e| e.code)?;
+        let second = fixed::second_stage(&hot.fixed, has_texture).map_err(|e| e.code)?;
         if second.is_some() {
             slots.push((false, 1));
             bindings.push(texture(env, pointer, 1, &draw.state)?);
@@ -565,7 +572,11 @@ fn prepare_checked(
     parameters[13] = second.unwrap_or_default();
     parameters[36] = fixed::lighting::color(hot.fixed.render[&60]).map(f32::to_bits);
     parameters[37] = [
-        hot.fixed.stage[&1],
+        if fixed::stage_enabled(&hot.fixed.stage, has_texture[0]) {
+            hot.fixed.stage[&1]
+        } else {
+            1
+        },
         hot.fixed.stage[&2] | hot.fixed.stage[&3] << 8,
         hot.fixed.stage[&4],
         hot.fixed.stage[&5] | hot.fixed.stage[&6] << 8,

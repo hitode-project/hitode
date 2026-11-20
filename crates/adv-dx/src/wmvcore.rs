@@ -1202,7 +1202,7 @@ fn decoded_packet(frame: media::Decoded, format: &CodecFormat) -> media::Packet 
                 _ => 0,
             },
             key: true,
-            data: frame.into_bgra(),
+            data: frame.into_bgra().into(),
         },
         media::Decoded::Audio(frame) => media::Packet {
             time_100ns: frame.pts_us * 10,
@@ -1396,7 +1396,7 @@ fn poll_next_sample(env: &mut Env<'_>, this: u32, number: u16, outputs: [u32; 6]
         packet.key,
         if !compressed && let CodecFormat::Video { width, height, .. } = media.streams[index].format
         {
-            dshow::convert_bgra(width, height, &packet.data, &stream.output_type)
+            dshow::convert_bgra(width, height, &packet.data, &stream.output_type).into()
         } else {
             packet.data.clone()
         },

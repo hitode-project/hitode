@@ -1236,12 +1236,18 @@ fn multiply_transform(
         ))
     })
 }
+pub(super) fn stage_enabled(stage: &StateMap, has_texture: bool) -> bool {
+    stage[&1] != 1 && (has_texture || stage[&2] & 0xf != 2)
+}
+
 /// The enabled second stage as `[color op, color arguments, alpha op and
-/// arguments, coordinate set]`, each argument a byte; `None` when the first
-/// or second stage is disabled.
-pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
+/// arguments, coordinate set]`, each argument a byte.
+pub(super) fn second_stage(
+    f: &Fixed,
+    has_texture: [bool; 2],
+) -> Result<Option<[u32; 4]>, Rejected> {
     let s = &f.stage_slots[1];
-    if f.stage[&1] == 1 || s[&1] == 1 {
+    if !stage_enabled(&f.stage, has_texture[0]) || !stage_enabled(s, has_texture[1]) {
         return Ok(None);
     }
     // Diffuse, current, texture and texture factor, including argument modifiers.

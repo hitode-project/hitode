@@ -22,7 +22,7 @@ fn packets(times_ms: &[u64], key: impl Fn(usize) -> bool, tag: u8) -> Vec<Packet
             time_100ns: time * MS,
             duration_100ns: 100 * MS,
             key: key(i),
-            data: vec![tag, i as u8, 0x5a],
+            data: vec![tag, i as u8, 0x5a].into(),
         })
         .collect()
 }
@@ -501,13 +501,13 @@ fn native_reader_decodes_uncompressed_streams_on_demand_and_drops_on_mode_switch
                     time_100ns: 0,
                     duration_100ns: MS,
                     key: true,
-                    data: vec![0x00, 0x10, 0x00, 0x20],
+                    data: vec![0x00, 0x10, 0x00, 0x20].into(),
                 },
                 Packet {
                     time_100ns: 100 * MS,
                     duration_100ns: MS,
                     key: true,
-                    data: vec![0x00, 0x30, 0x00, 0x40],
+                    data: vec![0x00, 0x30, 0x00, 0x40].into(),
                 },
             ],
         }],

@@ -288,6 +288,7 @@ pub(crate) struct Vmr {
     pub color_key: u32,
     pub wake: Handle,
     pub flushing: bool,
+    stream_generation: u64,
     pub stopping: bool,
     pub eos: bool,
     pub complete_sent: bool,
@@ -319,6 +320,7 @@ impl Vmr {
             color_key: 0,
             wake,
             flushing: false,
+            stream_generation: 0,
             stopping: false,
             eos: false,
             complete_sent: false,
@@ -1231,6 +1233,7 @@ pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32, previous
     v.stopping = false;
     let mut deliver_eos = false;
     if value == graph::STOPPED {
+        v.stream_generation = v.stream_generation.wrapping_add(1);
         v.prerolled = false;
         v.flushing = false;
         v.eos = false;
@@ -1335,6 +1338,7 @@ pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Ou
             let v = filter_vmr(env, filter)?;
             let wake = v.wake;
             v.flushing = true;
+            v.stream_generation = v.stream_generation.wrapping_add(1);
             env.sys.set_event(wake);
             Some(Outcome::Return(S_OK))
         }
@@ -1348,9 +1352,12 @@ pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Ou
         }
         "NewSegment" => {
             let v = filter_vmr(env, filter)?;
+            v.stream_generation = v.stream_generation.wrapping_add(1);
             v.eos = false;
             v.complete_sent = false;
             v.prerolled = false;
+            let wake = v.wake;
+            env.sys.set_event(wake);
             Some(Outcome::Return(S_OK))
         }
         "EndOfStream" => {
@@ -1502,6 +1509,11 @@ fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome
     if filter_state == graph::STOPPED {
         return done(env, VFW_E_WRONG_STATE);
     }
+    let delivery = Delivery {
+        filter,
+        graph,
+        generation: v.stream_generation,
+    };
     if let Some(s) = canonical(env, sample).and_then(|c| state(env).samples.get(&c).cloned()) {
         let len = s.actual as usize;
         let mut bytes = vec![0u8; len];
@@ -1510,8 +1522,7 @@ fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome
         }
         return present_sample(
             env,
-            filter,
-            graph,
+            delivery,
             fmt,
             ReadSample {
                 bytes,
@@ -1522,7 +1533,7 @@ fn receive_then(env: &mut Env<'_>, pin: u32, sample: u32, done: Done) -> Outcome
         );
     }
     read_guest_sample(env, sample, move |env, result| match result {
-        Ok(read) => present_sample(env, filter, graph, fmt, read, done),
+        Ok(read) => present_sample(env, delivery, fmt, read, done),
         Err(hr) => done(env, hr),
     })
 }
@@ -1575,10 +1586,26 @@ fn read_guest_sample(
     })
 }
 
-fn present_sample(
-    env: &mut Env<'_>,
+#[derive(Clone, Copy)]
+struct Delivery {
     filter: u32,
     graph: u32,
+    generation: u64,
+}
+
+impl Delivery {
+    fn cancelled(self, v: &Vmr) -> bool {
+        self.generation != v.stream_generation || v.flushing || v.stopping
+    }
+
+    fn current(self, env: &mut Env<'_>) -> bool {
+        filter_vmr(env, self.filter).is_some_and(|v| !self.cancelled(v))
+    }
+}
+
+fn present_sample(
+    env: &mut Env<'_>,
+    delivery: Delivery,
     fmt: PixelFormat,
     sample: ReadSample,
     done: Done,
@@ -1587,14 +1614,14 @@ fn present_sample(
         Ok(bgra) => bgra,
         Err(hr) => return done(env, hr),
     };
-    wait_due(env, filter, graph, sample.start_100ns, move |env, hr| {
+    wait_due(env, delivery, sample.start_100ns, move |env, hr| {
         if hr != S_OK {
             return done(env, hr);
         }
-        if filter_vmr(env, filter).unwrap().mode == VMR_MODE_RENDERLESS {
+        if filter_vmr(env, delivery.filter).unwrap().mode == VMR_MODE_RENDERLESS {
             return present_renderless(
                 env,
-                filter,
+                delivery,
                 fmt,
                 sample.start_100ns,
                 sample.end_100ns,
@@ -1603,27 +1630,27 @@ fn present_sample(
             );
         }
         let pts_us = (sample.start_100ns.unwrap_or(0).max(0) / 10) as u64;
-        publish_frame(env, filter, graph, fmt, pts_us, bgra, done)
+        publish_frame(env, delivery, fmt, pts_us, bgra, done)
     })
 }
 
 fn wait_due(
     env: &mut Env<'_>,
-    filter: u32,
-    graph: u32,
+    delivery: Delivery,
     start_100ns: Option<i64>,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
-    let (filter_state, flushing, stopping, prerolled, wake) = {
+    let Delivery { filter, graph, .. } = delivery;
+    let (filter_state, cancelled, prerolled, wake) = {
         let Some(f) = state(env).filters.get(&filter) else {
             return then(env, VFW_E_WRONG_STATE);
         };
         let Some(v) = f.vmr.as_ref() else {
             return then(env, VFW_E_WRONG_STATE);
         };
-        (f.state, v.flushing, v.stopping, v.prerolled, v.wake)
+        (f.state, delivery.cancelled(v), v.prerolled, v.wake)
     };
-    if flushing || stopping {
+    if cancelled {
         return then(env, S_FALSE);
     }
     if filter_state == graph::STOPPED || !state(env).graphs.contains_key(&graph) {
@@ -1650,26 +1677,25 @@ fn wait_due(
             handle: wake,
             deadline: Some(now + wait_us.max(1)),
         },
-        move |env, _| wait_due(env, filter, graph, start_100ns, then),
+        move |env, _| wait_due(env, delivery, start_100ns, then),
     )
 }
 
 fn publish_frame(
     env: &mut Env<'_>,
-    filter: u32,
-    graph: u32,
+    delivery: Delivery,
     fmt: PixelFormat,
     pts_us: u64,
     bgra: Vec<u8>,
     done: Done,
 ) -> Outcome {
+    let Delivery { filter, graph, .. } = delivery;
     let Some(v) = filter_vmr(env, filter) else {
         return done(env, VFW_E_WRONG_STATE);
     };
-    if v.flushing || v.stopping {
+    if delivery.cancelled(v) {
         return done(env, S_FALSE);
     }
-    v.prerolled = true;
     let output = v.output.get_or_insert_with(RawVideoOutput::new);
     let frame = match output.push_bgra(pts_us, fmt.width, fmt.height, bgra.clone()) {
         Ok(frame) => frame,
@@ -1682,7 +1708,7 @@ fn publish_frame(
                     handle: wake,
                     deadline: Some(now + 1000),
                 },
-                move |env, _| publish_frame(env, filter, graph, fmt, pts_us, bgra, done),
+                move |env, _| publish_frame(env, delivery, fmt, pts_us, bgra, done),
             );
         }
         Err(_) => {
@@ -1695,14 +1721,15 @@ fn publish_frame(
     };
     match video::publish(env, graph, frame) {
         Ok(outcome) => {
+            filter_vmr(env, filter).unwrap().prerolled = true;
             env.ext.get_or_default::<Playback>().video_frames += 1;
             match outcome {
                 Some(outcome) => after(
                     env,
                     outcome,
-                    Box::new(move |env, _| hold_sample(env, filter, done)),
+                    Box::new(move |env, _| hold_sample(env, delivery, done)),
                 ),
-                None => hold_sample(env, filter, done),
+                None => hold_sample(env, delivery, done),
             }
         }
         Err(hr) => {
@@ -1717,13 +1744,14 @@ fn publish_frame(
 
 fn present_renderless(
     env: &mut Env<'_>,
-    filter: u32,
+    delivery: Delivery,
     fmt: PixelFormat,
     start: Option<i64>,
     end: Option<i64>,
     bgra: Vec<u8>,
     done: Done,
 ) -> Outcome {
+    let filter = delivery.filter;
     let v = filter_vmr(env, filter).unwrap();
     let (owner, presenter, cookie) = (v.surface_allocator, v.presenter, v.cookie);
     let surface = v.surfaces[v.surface_next];
@@ -1750,10 +1778,18 @@ fn present_renderless(
                 .write(pixels + y * pitch, &bgra[row..row + fmt.width as usize * 4]);
         }
         guest_call(env, surface, 32, vec![0], move |env, _| {
+            if !delivery.current(env) {
+                free(env, scratch);
+                return done(env, S_FALSE);
+            }
             guest_call(env, owner, 5, vec![cookie, surface, 0], move |env, hr| {
                 if hr != S_OK {
                     free(env, scratch);
                     return done(env, hr);
+                }
+                if !delivery.current(env) {
+                    free(env, scratch);
+                    return done(env, S_FALSE);
                 }
                 let mt = {
                     let s = state(env);
@@ -1775,24 +1811,29 @@ fn present_renderless(
                 let _ = env.cpu.write(scratch, &info);
                 guest_call(env, presenter, 5, vec![cookie, scratch], move |env, hr| {
                     free(env, scratch);
-                    filter_vmr(env, filter).unwrap().prerolled = true;
                     if hr != S_OK {
                         return done(env, hr);
                     }
-                    hold_sample(env, filter, done)
+                    if !delivery.current(env) {
+                        return done(env, S_FALSE);
+                    }
+                    filter_vmr(env, filter).unwrap().prerolled = true;
+                    hold_sample(env, delivery, done)
                 })
             })
         })
     })
 }
 
-fn hold_sample(env: &mut Env<'_>, filter: u32, done: Done) -> Outcome {
-    let f = &state(env).filters[&filter];
+fn hold_sample(env: &mut Env<'_>, delivery: Delivery, done: Done) -> Outcome {
+    let Some(f) = state(env).filters.get(&delivery.filter) else {
+        return done(env, S_OK);
+    };
     let v = f.vmr.as_ref().unwrap();
     if v.closed {
         return done(env, E_UNEXPECTED);
     }
-    if f.state != graph::PAUSED || v.flushing || v.stopping {
+    if f.state != graph::PAUSED || delivery.cancelled(v) {
         return done(env, S_OK);
     }
     let wake = v.wake;
@@ -1802,7 +1843,7 @@ fn hold_sample(env: &mut Env<'_>, filter: u32, done: Done) -> Outcome {
             handle: wake,
             deadline: None,
         },
-        move |env, _| hold_sample(env, filter, done),
+        move |env, _| hold_sample(env, delivery, done),
     )
 }
 
@@ -2117,6 +2158,38 @@ mod tests {
 
     // spec: MEDIA-VIDEO-11
     #[test]
+    fn old_vmr_sample_cannot_resume_after_a_complete_flush() {
+        let (mut m, graph, _, _, pin, _) = setup_windowless();
+        let filter = m.ext.get::<State>().pins[&pin].filter;
+        assert_eq!(method(&mut m, "IBaseFilter::Pause", &[filter]), S_FALSE);
+        let mut e = crate::dshow::tests::env(&mut m);
+        filter_vmr(&mut e, filter).unwrap().prerolled = true;
+        let Outcome::Block { then, .. } = wait_due(
+            &mut e,
+            Delivery {
+                filter,
+                graph,
+                generation: 0,
+            },
+            Some(0),
+            |_, hr| Outcome::Return(hr),
+        ) else {
+            panic!("expected an old sample waiting while paused");
+        };
+        assert_eq!(method(&mut m, "IPin::BeginFlush", &[pin]), S_OK);
+        assert_eq!(method(&mut m, "IPin::EndFlush", &[pin]), S_OK);
+        let resumed = then(
+            &mut crate::dshow::tests::env(&mut m),
+            adv_machine::Resume::Woke(adv_machine::WakeReason::Signaled),
+        );
+        assert!(
+            matches!(resumed, Outcome::Return(S_FALSE)),
+            "the old sample became eligible for preroll after EndFlush"
+        );
+    }
+
+    // spec: MEDIA-VIDEO-11
+    #[test]
     fn renderer_readiness_tracks_samples_eos_flush_and_stop() {
         let (mut m, _graph, _, _, pin, _) = setup_windowless();
         let filter = m.ext.get::<State>().pins[&pin].filter;
@@ -2178,6 +2251,7 @@ mod tests {
                 free: |_, _| unreachable!(),
             },
             open: |_, _, _| unreachable!(),
+            demux: |_, _, _| unreachable!(),
             read: |_, _, _| unreachable!(),
             close: |_, _| unreachable!(),
             thread: |_, _| unreachable!(),
@@ -2302,6 +2376,7 @@ mod tests {
                 free: |_, _| unreachable!(),
             },
             open: |_, _, _| unreachable!(),
+            demux: |_, _, _| unreachable!(),
             read: |_, _, _| unreachable!(),
             close: |_, _| unreachable!(),
             thread: |_, _| unreachable!(),
@@ -2432,9 +2507,14 @@ mod tests {
             parse_video_format(&MediaType::video_rgb(MEDIASUBTYPE_RGB32, 2, 2, 333_333)).unwrap();
         filter::set_state(&mut crate::dshow::tests::env(&mut m), filter, graph::PAUSED);
         let updates = m.ext.get_or_default::<Vec<Option<VideoLayer>>>().len();
+        let delivery = Delivery {
+            filter,
+            graph: 0,
+            generation: 0,
+        };
         outcome = present_renderless(
             &mut crate::dshow::tests::env(&mut m),
-            filter,
+            delivery,
             fmt,
             Some(0),
             Some(333_333),

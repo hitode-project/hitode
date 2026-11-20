@@ -16,6 +16,7 @@ mod wine {
 }
 
 fn probe(name: &str, expected: &str) {
+    let video = matches!(name, "video" | "video_read");
     // wineserver owns C globals and can run only once in a host process.
     let thread = std::thread::current();
     let case = thread.name().unwrap();
@@ -72,7 +73,7 @@ fn probe(name: &str, expected: &str) {
     let mut pixels = false;
     let stop = loop {
         let stop = session.run_ui(until);
-        if name == "video" {
+        if video {
             let store = session
                 .machine
                 .ext
@@ -109,7 +110,7 @@ fn probe(name: &str, expected: &str) {
     };
     if matches!(stop, Stop::Exited(0)) {
         match name {
-            "dshow" | "mci" | "video" => {
+            "dshow" | "mci" | "video" | "video_read" => {
                 let stats = session.machine.ext.get::<adv_dx::dshow::Playback>();
                 if name != "dshow" {
                     assert!(stats.audio_frames > 0, "native graph decoded no audio");
@@ -131,8 +132,14 @@ fn probe(name: &str, expected: &str) {
             }
             _ => {}
         }
-        if name == "video" {
+        if video {
             assert!(pixels, "no presented native video pixels");
+        }
+        if name == "video_read" {
+            assert!(adv_nt::identity::reads_hooked(
+                &session.machine.cpu,
+                &session.machine.ext
+            ));
         }
     }
     drop(session);
@@ -179,6 +186,12 @@ fn directshow_samples() {
 #[test]
 fn native_video_at_client_position() {
     probe("video", "media video ok");
+}
+
+// spec: MEDIA-GRAPH-8
+#[test]
+fn native_video_through_guest_reads() {
+    probe("video_read", "media video ok");
 }
 
 // spec: WINE-MEDIA-12, MEDIA-DMO-1

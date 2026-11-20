@@ -352,9 +352,9 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 
 ### HOST-LIFE-1 Close and quit
 
-**Rule**: Closing the window or the first quit MUST post `WM_CLOSE` and wait for the guest without a timeout. `applicationShouldTerminate:` MUST return `NSTerminateLater` and reply only after the session finishes.
+**Rule**: Closing the window or the first quit MUST post `WM_CLOSE` and wait for the guest without a timeout. A request before a top-level window exists MUST wait for one to become available. `applicationShouldTerminate:` MUST return `NSTerminateLater` and reply only after the session finishes.
 **Applies to**: macOS
-**Verification**: Review — `NSApplication` termination cannot run in a test.
+**Verification**: Test
 
 ### HOST-LIFE-2 Forced quit
 

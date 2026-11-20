@@ -424,6 +424,7 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
                 if let Some(window) = env.ext.get_mut::<Windows>().0.get_mut(&hwnd) {
                     window.style = style.value();
                 }
+                project::close_when_ready(env.ext);
                 if let Err(error) = surface::compose(env, None) {
                     return Outcome::Fail(error);
                 }

@@ -1,10 +1,14 @@
 //! Native media fronts, with Wine kept under separate names for other exports
 //! and classes. Files still open through Wine and retain its sharing lock.
-use std::fs::File;
-use std::io::{Cursor, Read};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::BorrowedFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use adv_abi::dll::{Export, Import, ModuleImage};
 use adv_abi::{Conv, Registry};
@@ -18,6 +22,8 @@ use adv_pe::{ImportModule, ImportName};
 const QUARTZ: &str = "quartz.dll";
 const WMVCORE: &str = "wmvcore.dll";
 const QASF: &str = "qasf.dll";
+const READ_THREAD: &str = "<DirectShowReadThread>";
+const E_FAIL: u32 = 0x8000_4005;
 const ORIGINAL_QUARTZ: &str = adv_dx::dshow::WINE_QUARTZ;
 const ORIGINAL_WMVCORE: &str = "winewmvcore.dll";
 const ORIGINAL_QASF: &str = "wineqasf.dll";
@@ -72,6 +78,7 @@ const MODULES: &[(&str, &str, &[ExportSpec])] = &[
 pub(super) fn register(registry: &mut Registry) {
     adv_dx::dshow::register(registry);
     adv_dx::wmvcore::register(registry);
+    registry.add(QUARTZ, READ_THREAD, Conv::Stdcall { argc: 1 }, read_thread);
     for (module_index, &(module, _, exports)) in MODULES.iter().enumerate() {
         for (index, &(name, _, argc)) in exports.iter().enumerate() {
             if module == WMVCORE && name == "WMCreateSyncReader" {
@@ -116,6 +123,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
     machine.ext.insert(adv_dx::dshow::Host {
         allocator: super::allocator(),
         open,
+        demux: demux_file,
         read: read_file,
         close,
         thread,
@@ -268,44 +276,254 @@ fn file(env: &mut Env<'_>, filename: u32, then: FileOpened) -> Outcome {
     )
 }
 
-/// Bytes each guest ReadFile reads.
-const CHUNK: u32 = 4 << 20;
-fn guest_contents(env: &mut Env<'_>, handle: u32, then: FileOpened) -> Outcome {
-    let read = match export(env, "kernel32.dll", "ReadFile") {
-        Ok(read) => read,
-        Err(error) => return Outcome::Fail(error),
-    };
-    // The chunk, then the count ReadFile writes.
-    let Some(buffer) = (super::allocator().allocate)(env, CHUNK + 4) else {
-        return guest_close(env, handle, move |env| then(env, Err(0x8007_000e)));
-    };
-    read_chunks(read, handle, buffer, Vec::new(), then)
+/// Keep the guest's sequential ReadFile contract while letting AVIO seek
+/// within bytes already read. Reads ahead are driven by AVIO, not by file size.
+const CHUNK: u32 = 256 << 10;
+
+#[derive(Default)]
+struct Progress {
+    written: u64,
+    requested: u64,
+    done: Option<bool>,
+    closed: bool,
 }
-fn read_chunks(
-    read: u32,
-    handle: u32,
-    buffer: u32,
-    mut bytes: Vec<u8>,
-    then: FileOpened,
-) -> Outcome {
-    let args = [handle, buffer, CHUNK, buffer + CHUNK, 0];
-    Outcome::call(read, args, move |env, result| {
-        let count = env.cpu.read_u32(buffer + CHUNK).unwrap_or(0) as usize;
-        let start = bytes.len();
-        bytes.resize(start + count, 0);
-        let copied = env.cpu.read(buffer, &mut bytes[start..]).is_ok();
-        if result.value() != 0 && copied && count != 0 {
-            return read_chunks(read, handle, buffer, bytes, then);
+
+struct SharedRead {
+    progress: Mutex<Progress>,
+    changed: Condvar,
+    wake: Option<adv_sync::WakeEvent>,
+}
+
+impl SharedRead {
+    fn signal(&self) {
+        if let Some(wake) = &self.wake {
+            wake.signal();
         }
-        (super::allocator().free)(env, buffer);
-        let contents = if result.value() == 0 || !copied {
-            Err(0x8000_4005)
-        } else {
-            Ok((Box::new(Cursor::new(bytes)) as Contents, None))
-        };
-        guest_close(env, handle, move |env| then(env, contents))
+    }
+}
+
+struct GuestReader {
+    file: File,
+    shared: Arc<SharedRead>,
+}
+
+impl GuestReader {
+    fn require(&self, offset: u64, end: u64) -> io::Result<()> {
+        let mut p = self.shared.progress.lock().unwrap();
+        if p.written <= offset && p.done.is_none() {
+            p.requested = p.requested.max(end);
+            self.shared.signal();
+            p = self
+                .shared
+                .changed
+                .wait_while(p, |p| p.written <= offset && p.done.is_none())
+                .unwrap();
+        }
+        if p.done == Some(false) {
+            return Err(io::Error::other("guest ReadFile failed"));
+        }
+        Ok(())
+    }
+}
+
+impl Read for GuestReader {
+    fn read(&mut self, dest: &mut [u8]) -> io::Result<usize> {
+        if dest.is_empty() {
+            return Ok(0);
+        }
+        let offset = self.file.stream_position()?;
+        self.require(offset, offset.saturating_add(dest.len() as u64))?;
+        self.file.read(dest)
+    }
+}
+
+impl Seek for GuestReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        if matches!(from, SeekFrom::End(_)) {
+            self.require(u64::MAX, u64::MAX)?;
+        }
+        self.file.seek(from)
+    }
+}
+
+impl Drop for GuestReader {
+    fn drop(&mut self) {
+        self.shared.progress.lock().unwrap().closed = true;
+        self.shared.signal();
+    }
+}
+
+struct GuestWriter {
+    file: File,
+    shared: Arc<SharedRead>,
+    handle: u32,
+    read: u32,
+    wake: adv_machine::Handle,
+}
+
+impl Drop for GuestWriter {
+    fn drop(&mut self) {
+        let mut progress = self.shared.progress.lock().unwrap();
+        progress.done.get_or_insert(false);
+        self.shared.changed.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct GuestReads {
+    pending: HashMap<adv_machine::Handle, GuestWriter>,
+    active: HashMap<adv_machine::Handle, Weak<SharedRead>>,
+}
+
+fn buffer_file() -> io::Result<File> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    loop {
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = dir.join(format!("hitode-media-{}-{next}", std::process::id()));
+        match File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&name)
+        {
+            Ok(file) => {
+                fs::remove_file(name)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn guest_contents(env: &mut Env<'_>, handle: u32, then: FileOpened) -> Outcome {
+    let (Ok(read), Ok(file)) = (export(env, "kernel32.dll", "ReadFile"), buffer_file()) else {
+        return guest_close(env, handle, move |env| then(env, Err(E_FAIL)));
+    };
+    let Ok(output) = file.try_clone() else {
+        return guest_close(env, handle, move |env| then(env, Err(E_FAIL)));
+    };
+    let shared = Arc::new(SharedRead {
+        progress: Mutex::new(Progress::default()),
+        changed: Condvar::new(),
+        wake: env.sys.poll_wake.clone(),
+    });
+    let wake = env.sys.objects.insert(adv_machine::Object::Event {
+        manual_reset: false,
+        signaled: false,
+    });
+    let reads = env.ext.get_or_default::<GuestReads>();
+    reads.active.insert(wake, Arc::downgrade(&shared));
+    reads.pending.insert(
+        wake,
+        GuestWriter {
+            file: output,
+            shared: shared.clone(),
+            handle,
+            read,
+            wake,
+        },
+    );
+    guest_thread(env, READ_THREAD, wake, move |env, hr| {
+        if hr != 0 {
+            let reads = env.ext.get_mut::<GuestReads>();
+            reads.active.remove(&wake);
+            reads.pending.remove(&wake);
+            env.sys.objects.close(wake);
+            return guest_close(env, handle, move |env| then(env, Err(hr)));
+        }
+        then(env, Ok((Box::new(GuestReader { file, shared }), None)))
     })
 }
+
+fn read_thread(env: &mut Env<'_>) -> Outcome {
+    let wake = env.arg(0);
+    let Some(writer) = env.ext.get_or_default::<GuestReads>().pending.remove(&wake) else {
+        return Outcome::Return(E_FAIL);
+    };
+    let Some(buffer) = (super::allocator().allocate)(env, CHUNK + 4) else {
+        return close_writer(env, writer, false);
+    };
+    copy_requested(env, writer, buffer, vec![0; CHUNK as usize])
+}
+
+/// Deliver a host reader's request onto the guest copy thread.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+pub(super) fn pump_reads<B: Backend>(machine: &mut Machine<B>) {
+    if let Some(reads) = machine.ext.try_get::<GuestReads>() {
+        for (&wake, shared) in &reads.active {
+            if let Some(shared) = shared.upgrade() {
+                let p = shared.progress.lock().unwrap();
+                if p.closed || p.requested > p.written {
+                    machine.sys.set_event(wake);
+                }
+            }
+        }
+    }
+}
+
+fn close_writer(env: &mut Env<'_>, writer: GuestWriter, success: bool) -> Outcome {
+    {
+        let mut p = writer.shared.progress.lock().unwrap();
+        p.done = Some(success);
+        writer.shared.changed.notify_all();
+    }
+    env.ext.get_mut::<GuestReads>().active.remove(&writer.wake);
+    env.sys.objects.close(writer.wake);
+    guest_close(env, writer.handle, |_| Outcome::Return(0))
+}
+
+fn copy_requested(
+    env: &mut Env<'_>,
+    writer: GuestWriter,
+    buffer: u32,
+    mut scratch: Vec<u8>,
+) -> Outcome {
+    let (offset, requested, closed) = {
+        let p = writer.shared.progress.lock().unwrap();
+        (p.written, p.requested, p.closed)
+    };
+    if closed {
+        (super::allocator().free)(env, buffer);
+        return close_writer(env, writer, true);
+    }
+    if offset >= requested {
+        let wake = writer.wake;
+        let deadline = writer
+            .shared
+            .wake
+            .is_none()
+            .then(|| env.sys.clock.now_us() + 1000);
+        return Outcome::block(
+            Wait::Object {
+                handle: wake,
+                deadline,
+            },
+            move |env, _| copy_requested(env, writer, buffer, scratch),
+        );
+    }
+    let args = [writer.handle, buffer, CHUNK, buffer + CHUNK, 0];
+    Outcome::call(writer.read, args, move |env, result| {
+        let count = env.cpu.read_u32(buffer + CHUNK).unwrap_or(0) as usize;
+        let success = result.value() != 0
+            && count <= scratch.len()
+            && env.cpu.read(buffer, &mut scratch[..count]).is_ok()
+            && writer.file.write_all_at(&scratch[..count], offset).is_ok();
+        if !success || count == 0 {
+            (super::allocator().free)(env, buffer);
+            return close_writer(env, writer, success);
+        }
+        {
+            let mut p = writer.shared.progress.lock().unwrap();
+            p.written += count as u64;
+            writer.shared.changed.notify_all();
+        }
+        copy_requested(env, writer, buffer, scratch)
+    })
+}
+
 fn guest_close(
     env: &mut Env<'_>,
     handle: u32,
@@ -318,6 +536,22 @@ fn guest_close(
 }
 
 fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcome {
+    read_on_worker(
+        env,
+        filename,
+        |file| Ok(Decoder::open_reader(file).ok()),
+        then,
+    )
+}
+
+type ReadDone<T> = Box<dyn FnOnce(&mut Env<'_>, Result<(T, Option<u32>), u32>) -> Outcome>;
+
+fn read_on_worker<T: Send + 'static>(
+    env: &mut Env<'_>,
+    filename: u32,
+    work: impl FnOnce(Contents) -> Result<T, u32> + Send + 'static,
+    then: ReadDone<T>,
+) -> Outcome {
     file(
         env,
         filename,
@@ -327,32 +561,39 @@ fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcom
                 Err(hr) => return then(env, Err(hr)),
             };
             let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = send.send(Decoder::open_reader(file).ok());
-            });
-            opened(env, handle, receive, then)
+            if std::thread::Builder::new()
+                .name("media-open".into())
+                .spawn(move || {
+                    let _ = send.send(work(file));
+                })
+                .is_err()
+            {
+                release(env, handle);
+                return then(env, Err(E_FAIL));
+            }
+            read_result(env, handle, receive, then)
         }),
     )
 }
-fn opened(
+
+fn read_result<T: 'static>(
     env: &mut Env<'_>,
     handle: Option<u32>,
-    receive: Receiver<Option<Decoder>>,
-    then: adv_dx::dshow::Opened,
+    receive: Receiver<Result<T, u32>>,
+    then: ReadDone<T>,
 ) -> Outcome {
-    match receive.try_recv() {
-        // Undecodable contents still make a source, as the async reader does.
-        Ok(decoder) => then(env, Ok((decoder, handle))),
+    let error = match receive.try_recv() {
+        Ok(Ok(value)) => return then(env, Ok((value, handle))),
+        Ok(Err(hr)) => hr,
         Err(TryRecvError::Empty) => {
-            Outcome::block(Wait::Until(env.sys.clock.now_us() + 1000), move |env, _| {
-                opened(env, handle, receive, then)
-            })
+            return Outcome::block(Wait::Until(env.sys.clock.now_us() + 1000), move |env, _| {
+                read_result(env, handle, receive, then)
+            });
         }
-        Err(TryRecvError::Disconnected) => {
-            release(env, handle);
-            then(env, Err(0x8000_4005))
-        }
-    }
+        Err(TryRecvError::Disconnected) => E_FAIL,
+    };
+    release(env, handle);
+    then(env, Err(error))
 }
 const MEDIA_TYPES: &str = "\\Registry\\Machine\\Software\\Classes\\Media Type";
 /// Registry strings longer than this are no GUID or pattern quartz reads.
@@ -443,93 +684,147 @@ fn sample(
     ranges: adv_dx::dshow::Ranges,
     then: adv_dx::dshow::Sampled,
 ) -> Outcome {
-    use std::io::{Seek, SeekFrom};
-    file(
+    read_on_worker(
         env,
         filename,
-        Box::new(move |env, result| {
-            let (mut file, handle) = match result {
-                Ok(value) => value,
-                Err(hr) => return then(env, Err(hr)),
-            };
-            let sampled = ranges
-                .iter()
-                .map(|&(offset, length)| {
+        move |mut file| {
+            Ok(ranges
+                .into_iter()
+                .map(|(offset, length)| {
                     let mut bytes = vec![0; length];
                     file.seek(SeekFrom::Start(offset)).ok()?;
                     file.read_exact(&mut bytes).ok()?;
                     Some(bytes)
                 })
-                .collect();
-            release(env, handle);
-            then(env, Ok(sampled))
-        }),
+                .collect())
+        },
+        Box::new(move |env, result| then_without_handle(env, result, then)),
+    )
+}
+
+fn demux_file(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::DemuxFile) -> Outcome {
+    read_on_worker(
+        env,
+        filename,
+        |file| {
+            adv_device::media::demux_reader(file).map_err(|error| {
+                log::warn!("DirectShow: packet demux failed: {error}");
+                E_FAIL
+            })
+        },
+        Box::new(move |env, result| then_without_handle(env, result, then)),
     )
 }
 
 fn read_file(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::ReadFile) -> Outcome {
-    file(
+    read_on_worker(
         env,
         filename,
-        Box::new(move |env, result| {
-            let (mut file, handle) = match result {
-                Ok(value) => value,
-                Err(hr) => return then(env, Err(hr)),
-            };
-            let (send, receive) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let mut bytes = Vec::new();
-                let result = file
-                    .read_to_end(&mut bytes)
-                    .map(|_| bytes)
-                    .map_err(|_| 0x8000_4005);
-                let _ = send.send(result);
-            });
-            read_bytes(env, handle, receive, then)
-        }),
+        |mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|_| E_FAIL)?;
+            Ok(bytes)
+        },
+        then,
     )
 }
-fn read_bytes(
+
+fn then_without_handle<T>(
     env: &mut Env<'_>,
-    handle: Option<u32>,
-    receive: Receiver<Result<Vec<u8>, u32>>,
-    then: adv_dx::dshow::ReadFile,
+    result: Result<(T, Option<u32>), u32>,
+    then: impl FnOnce(&mut Env<'_>, Result<T, u32>) -> Outcome,
 ) -> Outcome {
-    match receive.try_recv() {
-        Ok(Ok(bytes)) => then(env, Ok((bytes, handle))),
-        Ok(Err(hr)) => {
+    match result {
+        Ok((value, handle)) => {
             release(env, handle);
-            then(env, Err(hr))
+            then(env, Ok(value))
         }
-        Err(TryRecvError::Empty) => {
-            Outcome::block(Wait::Until(env.sys.clock.now_us() + 1000), move |env, _| {
-                read_bytes(env, handle, receive, then)
-            })
-        }
-        Err(TryRecvError::Disconnected) => {
-            release(env, handle);
-            then(env, Err(0x8000_4005))
-        }
+        Err(hr) => then(env, Err(hr)),
     }
 }
+
 fn thread(env: &mut Env<'_>, id: u32) -> Outcome {
-    let create = match export(env, "kernel32.dll", "CreateThread") {
-        Ok(value) => value,
-        Err(error) => return Outcome::Fail(error),
+    guest_thread(env, "<DirectShowStreamThread>", id, |_, hr| {
+        Outcome::Return(hr)
+    })
+}
+
+fn guest_thread(
+    env: &mut Env<'_>,
+    name: &'static str,
+    id: u32,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
+    let Ok(create) = export(env, "kernel32.dll", "CreateThread") else {
+        return then(env, E_FAIL);
     };
-    let entry = match env
-        .sys
-        .thunks
-        .publish(env.cpu, QUARTZ, "<DirectShowStreamThread>")
-    {
-        Ok(value) => value,
-        Err(error) => return Outcome::Fail(error.to_string()),
+    let Ok(entry) = env.sys.thunks.publish(env.cpu, QUARTZ, name) else {
+        return then(env, E_FAIL);
     };
-    Outcome::call(create, [0, 0, entry, id, 0, 0], |env, result| {
-        close(env, result.value());
-        Outcome::Return(0)
+    Outcome::call(create, [0, 0, entry, id, 0, 0], move |env, result| {
+        let handle = result.value();
+        if handle == 0 {
+            let error = env.cpu.read_u32(env.ctx().teb + 0x34).unwrap_or(0);
+            return then(
+                env,
+                if error == 0 {
+                    E_FAIL
+                } else {
+                    0x8007_0000 | (error & 0xffff)
+                },
+            );
+        }
+        close(env, handle);
+        then(env, 0)
     })
 }
 fn post(env: &mut Env<'_>, args: [u32; 4]) {
     adv_drv::user::post_message(env.ext, args);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // spec: MEDIA-GRAPH-8
+    #[test]
+    fn guest_reader_returns_the_prefix_before_eof_and_can_seek_back() {
+        let file = buffer_file().unwrap();
+        let writer = file.try_clone().unwrap();
+        let wake = adv_sync::WakeEvent::new().unwrap();
+        let shared = Arc::new(SharedRead {
+            progress: Mutex::new(Progress::default()),
+            changed: Condvar::new(),
+            wake: Some(wake.clone()),
+        });
+        let mut reader = GuestReader {
+            file,
+            shared: shared.clone(),
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut bytes = [0; 4];
+            reader.read_exact(&mut bytes).unwrap();
+            reader.rewind().unwrap();
+            let mut prefix = [0; 2];
+            reader.read_exact(&mut prefix).unwrap();
+            send.send((bytes, prefix)).unwrap();
+        });
+        let timeout = Duration::from_secs(3);
+        assert!(wake.wait(Some(timeout)).unwrap());
+        {
+            let mut progress = shared.progress.lock().unwrap();
+            assert_eq!(progress.requested, 4);
+            assert!(progress.done.is_none());
+            writer.write_all_at(b"head", 0).unwrap();
+            progress.written = 4;
+            shared.changed.notify_all();
+        }
+        assert_eq!(receive.recv_timeout(timeout).unwrap(), (*b"head", *b"he"));
+        thread.join().unwrap();
+        let progress = shared.progress.lock().unwrap();
+        assert!(progress.closed);
+        assert!(progress.done.is_none());
+    }
 }

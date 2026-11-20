@@ -692,6 +692,14 @@ impl AudioControl {
     pub fn pause_pcm(&self, source: u64, paused: bool, _guest_us: u64) -> bool {
         self.send(Command::Pause(source, paused))
     }
+    /// All queued PCM has been consumed by the mixer.
+    pub fn pcm_drained(&self, source: u64) -> bool {
+        self.local
+            .borrow()
+            .formats
+            .get(&source)
+            .is_none_or(|(_, state)| state.queued_blocks.load(Ordering::Acquire) == 0)
+    }
     pub fn end_pcm(&self, source: u64) -> bool {
         self.send(Command::End(source))
     }

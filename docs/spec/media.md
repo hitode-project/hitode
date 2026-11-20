@@ -86,6 +86,8 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 **Rule**: File sources MUST read the host descriptor only while the guest's read path keeps its mapped entry bytes. The read path is kernelbase ReadFile and ntdll NtReadFile. Once guest code hooks it, the contents MUST come through the guest's ReadFile, and the handle MUST close through the guest's CloseHandle.
 **Verification**: Test
 
+Hooked reads MUST use bounded guest buffers and keep seekable backing bytes on disk.
+
 ### MEDIA-GRAPH-9 Event timeouts
 
 **Rule**: GetEvent MUST zero the event code before it waits, so a timeout returns `E_ABORT` with code zero. GetEvent finding no queued event MUST reset the event handle.
@@ -143,6 +145,8 @@ Withdrawn: MEDIA-GRAPH-19
 **Rule**: When the pause of IMediaControl::Run from Stopped returns S_FALSE, Run MUST return S_FALSE and report Running unless a member's GetState(0) gives VFW_S_CANT_CUE. A worker MUST then run the members once all have paused unless Pause or Stop comes first, and streams MUST stay paused until then. Otherwise, and for IMediaFilter::Run from any state, the graph MUST run every member at once.
 **Verification**: Test
 
+Pause and Stop cancel earlier Run requests even during a guest callback. A canceled request MUST neither call further members nor publish a new running state. Failed asynchronous startup MUST abort the completion wait and leave Run retryable.
+
 ### MEDIA-GRAPH-21 Event notification
 
 **Rule**: Default handling MUST consume only EC_COMPLETE and EC_REPAINT, and every other event MUST be queued. While AM_MEDIAEVENT_NONOTIFY is set, events MUST be dropped, and setting it MUST discard the queue and reset the event handle.
@@ -190,7 +194,7 @@ Withdrawn: MEDIA-GRAPH-19
 
 ### MEDIA-STREAM-4 Decoding off the execution thread
 
-**Rule**: Each movie source MUST decode on a host thread of its own and answer every request exactly as decoding on the caller's thread would. Between requests it MAY decode and convert the next frames ahead.
+**Rule**: Each movie source MUST decode on a host thread of its own and answer every request exactly as decoding on the caller's thread would. Between requests it MAY decode and convert the next frames ahead. Production MUST wait for queued updates when a downstream renderer or mixer cannot accept more data.
 **Verification**: Test
 
 ### MEDIA-STREAM-5 MPEG media types
@@ -236,15 +240,19 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 **Rule**: Built-in DMO decoders MUST accept only host samples, while registered media objects MUST receive buffers wrapping upstream samples. Decoded video MUST follow graph time with one paused preroll frame. Decoded audio MUST reach connected guest renderers during preroll and playback, or use the shared mixer for host renderers.
 **Verification**: Test
 
+A flush MUST discard decoded samples from earlier deliveries.
+
 ### MEDIA-DMO-3 End-of-stream ordering
 
 **Rule**: DMO EOS MUST drain the decoder before downstream forwarding. Audio-only completion MUST wait for queued PCM playback.
-**Verification**: Review — no existing DMO test observes decoder drain, downstream EOS, and final audible PCM ordering.
+**Verification**: Test
 
 ### MEDIA-DMO-4 Upstream seeking and control
 
 **Rule**: Connected DMO graphs MUST derive duration from upstream IMediaSeeking and forward seeks to that source. Pause and Run MUST invoke the upstream source last, and Stop MUST invoke it first.
 **Verification**: Test
+
+Before stopping a guest source that feeds a DMO, wake the host waits and begin flushing connected guest outputs so any blocked Receive can return. End this flush after the members stop.
 
 ### MEDIA-DMO-5 Wrapper identity and state
 
@@ -307,7 +315,7 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-VIDEO-4 Independent composition
 
-**Rule**: Video MUST update through the bounded frame mailbox independently of game Present while retaining an immutable game frame. GPU composition MUST avoid game-frame readback, and software rendering and explicit capture MUST use the same geometry.
+**Rule**: Video MUST update through the bounded frame mailbox independently of game Present while retaining an immutable game frame. GPU composition MUST avoid game-frame readback, and software rendering and explicit capture MUST use the same geometry. When no game surface has a published frame, video MUST compose over a blank base.
 **Verification**: Test
 
 ### MEDIA-VIDEO-5 Layer retirement

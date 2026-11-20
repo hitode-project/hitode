@@ -22,7 +22,9 @@ mod error_text_tests;
 mod filter;
 mod graph;
 pub(crate) mod host;
-pub use host::{Host, MediaEntry, MediaTypes, Opened, Ranges, ReadFile, Sampled, WINE_QUARTZ};
+pub use host::{
+    DemuxFile, Host, MediaEntry, MediaTypes, Opened, Ranges, ReadFile, Sampled, WINE_QUARTZ,
+};
 mod sample;
 mod stream;
 pub(crate) use stream::convert_bgra;
@@ -452,7 +454,7 @@ pub(crate) struct State {
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
     pub(crate) pending_threads: Vec<u32>,
     /// Worker threads (by thread id) finishing an asynchronous graph Run.
-    pub(crate) async_runs: BTreeMap<u32, u32>,
+    pub(crate) async_runs: BTreeMap<u32, (u32, u64)>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
     /// The quartz type library and the ITypeInfo of each automation
     /// interface, loaded on first use and kept for the process, as strmbase does.

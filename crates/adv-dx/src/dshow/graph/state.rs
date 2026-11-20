@@ -38,7 +38,7 @@ pub(super) fn get(env: &mut Env<'_>, graph: u32, timeout: u32, output: u32) -> O
         graph,
         target,
         end,
-        stop: |_, _| false,
+        run: None,
     };
     poll.start(env, Box::new(|_, hr| Outcome::Return(hr)))
 }
@@ -46,18 +46,12 @@ pub(super) fn get(env: &mut Env<'_>, graph: u32, timeout: u32, output: u32) -> O
 /// Wait until every member has paused for a pending IMediaControl::Run; S_OK
 /// when they have, otherwise the failing member result. Ends early when the
 /// graph no longer waits to run.
-pub(super) fn settle(env: &mut Env<'_>, graph: u32, then: Settled) -> Outcome {
+pub(super) fn settle(env: &mut Env<'_>, graph: u32, generation: u64, then: Settled) -> Outcome {
     let poll = Poll {
         graph,
         target: PAUSED,
         end: None,
-        stop: |env, graph| {
-            env.ext
-                .get::<State>()
-                .graphs
-                .get(&graph)
-                .is_none_or(|g| g.pending_run.is_none())
-        },
+        run: Some(generation),
     };
     poll.start(env, then)
 }
@@ -154,8 +148,8 @@ struct Poll {
     target: u32,
     /// Milliseconds clock deadline; none waits as long as members change.
     end: Option<u64>,
-    /// Whether the wait no longer matters.
-    stop: fn(&Env<'_>, u32) -> bool,
+    /// The asynchronous Run that is waiting for preroll, if any.
+    run: Option<u64>,
 }
 
 impl Poll {
@@ -196,6 +190,17 @@ impl Poll {
         scratch: u32,
         then: Settled,
     ) -> Outcome {
+        if let Some(generation) = self.run
+            && env
+                .ext
+                .get::<State>()
+                .graphs
+                .get(&self.graph)
+                .is_none_or(|g| g.pending_run != Some(generation))
+        {
+            free(env, scratch);
+            return then(env, S_FALSE);
+        }
         if let Some(filter) = guests.pop_front() {
             let target = self.target;
             let _ = env.cpu.write_u32(scratch, target);
@@ -207,11 +212,7 @@ impl Poll {
         }
         let now = u64::from(env.sys.clock.now_ms());
         let expired = self.end.is_some_and(|end| now >= end);
-        if round.hr != VFW_S_STATE_INTERMEDIATE
-            || expired
-            || round.changing == 0
-            || (self.stop)(env, self.graph)
-        {
+        if round.hr != VFW_S_STATE_INTERMEDIATE || expired || round.changing == 0 {
             free(env, scratch);
             return then(env, round.hr);
         }
