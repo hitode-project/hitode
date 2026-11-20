@@ -125,15 +125,17 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
             || !matches!(fixed::second_stage(&hot.fixed), Ok(None))
     })
 }
+const STAGE_ARGUMENTS: u32 = 1 << 3;
+
 fn fixed_features(f: &fixed::Fixed, transformed: Option<bool>) -> u32 {
+    let stage_arguments = [2, 3, 5, 6]
+        .iter()
+        .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2))
+        || fixed::compact_stage_ops(f).is_none();
     u32::from(transformed == Some(false) && f.render[&137] != 0)
         | (u32::from(f.render[&29] != 0) << 1)
         | (u32::from(f.render[&9] == 1) << 2)
-        | (u32::from(
-            [2, 3, 5, 6]
-                .iter()
-                .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2)),
-        ) << 3)
+        | (u32::from(stage_arguments) * STAGE_ARGUMENTS)
         | (u32::from(f.render[&194] != 0) << 4)
         | (u32::from(f.render[&28] != 0) << 5)
         | (u32::from(
@@ -431,7 +433,9 @@ fn prepare_checked(
         instanced,
         fixed_layout.is_some(),
     )?;
-    let (target, image, state) = fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+    let (target, image, state) =
+        fixed::prepare_state(env, pointer, kind, features & STAGE_ARGUMENTS != 0)
+            .map_err(|e| e.code)?;
     let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
     env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);
     let mut draw = fixed::Draw {
