@@ -37,6 +37,27 @@ A table or a list may follow the fields as part of the rule. Three kinds of note
 | Check | A compile-time assertion, `tools/check.py` or the build configuration enforces it | `Check — ` followed by what enforces it |
 | Review | Only a person can verify it | `Review — ` followed by why no test can |
 
+## Scenarios
+
+A scenario pins observable behavior of a whole build. It is a directory `tests/scenarios/NAME/` with guest C sources and a `scenario.json`:
+
+| Field | Meaning |
+|---|---|
+| `spec` | The rules it pins. Its claims cover only these IDs. |
+| `exe`, `args`, `seconds` | The guest program `adv-run` starts, extra `adv-run` options and the time limit. |
+| `outputs` | Files the guest writes. Their bytes are compared between builds. |
+| `frame` | When true, the last presented frame's hash is compared too. |
+| `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. |
+
+The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by its merge base, and CI runs the merge base's copy of that file:
+
+- Every scenario of the merge base MUST pass on the change, with byte-identical outputs.
+- An output may differ, or a base scenario may fail, only when the change adds or edits a scenario that fails on the merge base, passes on the change and shares a spec ID with it. The merge base's `spec` list decides that ID.
+- Steady counter growth per iteration MUST NOT rise, whatever the change claims.
+- A new or edited scenario MUST pass twice on the change with identical outputs, and every ID it names MUST exist.
+
+To change pinned behavior, edit the rule and the scenario together, so the edited scenario fails on the merge base. To widen what a rule's claims cover, first add the ID to scenarios in a change that keeps behavior.
+
 ## Language
 
 - Requirement keywords follow RFC 2119 and RFC 8174: **MUST**, **MUST NOT**, **SHOULD** (exceptions need a reason) and **MAY**. Only the uppercase forms carry meaning, so the lowercase forms of must, should and shall are not used. Each Rule contains at least one keyword.
