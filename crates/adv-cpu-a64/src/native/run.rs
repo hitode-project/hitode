@@ -1087,12 +1087,6 @@ impl Native {
     ) {
         at.refresh_mmx();
         let site = self.code.resident(eip).unwrap();
-        let route_alignment = task == compile::Task::Discover
-            || (matches!(task, compile::Task::Replace(_))
-                && site
-                    .row_entry
-                    .as_ref()
-                    .is_some_and(|row| row.slot.is_none()));
         let unit = unit.unwrap_or_else(|| match task {
             compile::Task::Replace(index) => Arc::clone(&site.versions[index].unit),
             _ => Arc::clone(&site.unit),
@@ -1123,7 +1117,6 @@ impl Native {
             refused: head.refused.clone(),
             cuts: head.cuts.clone(),
             count_entries: self.count_resident_entries,
-            route_alignment,
         });
     }
 
@@ -1224,20 +1217,7 @@ impl Native {
         self.code.resident_mut(eip).unwrap().suspended = true;
         self.repoint_resident_edges(eip, None);
         let head = self.plans.resident_mut(eip).unwrap();
-        let pair = self
-            .code
-            .resident(eip)
-            .unwrap()
-            .row_entry
-            .as_ref()
-            .is_some_and(|row| row.slot.is_none());
-        let index = if pair && head.pending.is_none() {
-            head.rebuilds = 0;
-            Some(0)
-        } else {
-            head.next_rebuild()
-        };
-        if let Some(index) = index {
+        if let Some(index) = head.next_rebuild() {
             let at = self.code.resident(eip).unwrap().versions[index].at.clone();
             self.request_resident(eip, compile::Task::Replace(index), at);
         }
@@ -1271,14 +1251,6 @@ impl Native {
             };
             head.pending = None;
             if head.accepts(done.task) {
-                if let Some((route, rows)) = done.aligned_rows {
-                    head.has_proof |= rows.iter().any(|row| row.job.is_some());
-                    if let Err(reason) = self.install_aligned_rows(eip, done.unit, &route, *rows) {
-                        self.decline_resident(eip, reason);
-                    }
-                    self.rebuild_resident(eip);
-                    continue;
-                }
                 let mut scoped = done.job;
                 head.has_proof |= scoped.is_some();
                 if scoped.as_ref().is_some_and(|job| job.scoped.is_none()) {
@@ -1290,12 +1262,9 @@ impl Native {
                     (Some(Ok(form)), _) => {
                         let site = self.code.resident(eip).unwrap();
                         if site.row_entry.as_ref().is_some_and(|row| {
-                            row.slot.is_none()
-                                || row.slot
-                                    != form
-                                        .lowered
-                                        .row_target
-                                        .map(|target| (target.base, target.offset))
+                            form.lowered
+                                .row_target
+                                .is_none_or(|target| row.slot != (target.base, target.offset))
                         }) {
                             if done.task != compile::Task::Append {
                                 self.decline_resident(eip, Decline::CacheFull);
@@ -1314,7 +1283,6 @@ impl Native {
                             at.clone(),
                             form,
                             Arc::clone(&done.unit),
-                            None,
                         ) {
                             Ok(()) => {
                                 if let Some(job) = scoped {
@@ -1338,7 +1306,7 @@ impl Native {
                                 .unwrap()
                                 .row_entry
                                 .as_ref()
-                                .and_then(|row| row.slot),
+                                .map(|row| row.slot),
                             _ => None,
                         };
                         if let Some(slot) = slot {
@@ -1361,34 +1329,6 @@ impl Native {
         }
     }
 
-    fn install_aligned_rows(
-        &mut self,
-        eip: u32,
-        unit: Arc<Unit>,
-        route: &crate::translate::lower::resident::RowAlignment,
-        rows: [compile::PreparedRow; 2],
-    ) -> Result<(), Decline> {
-        let mut jobs = [None, None];
-        for (index, row) in rows.into_iter().enumerate() {
-            self.install_resident(
-                eip,
-                index,
-                row.at.clone(),
-                row.form,
-                Arc::clone(&unit),
-                Some((route, index != 0)),
-            )?;
-            jobs[index] = row.job.map(|job| (row.at, job));
-        }
-        for (index, prepared) in jobs.into_iter().enumerate() {
-            if let Some((at, job)) = prepared {
-                self.place_job(eip, &at, Arc::clone(&unit), job, Some(index as u8));
-            }
-        }
-        self.publish_scope(eip);
-        Ok(())
-    }
-
     fn install_resident(
         &mut self,
         eip: u32,
@@ -1396,7 +1336,6 @@ impl Native {
         at: CpuState,
         mut form: compile::ResidentForm,
         unit: Arc<Unit>,
-        alignment: Option<(&crate::translate::lower::resident::RowAlignment, bool)>,
     ) -> Result<(), Decline> {
         let lowered = &mut form.lowered;
         let source = self.plans.resident(eip).unwrap().source;
@@ -1435,7 +1374,6 @@ impl Native {
             form.placement(),
             unit,
             row_target,
-            alignment,
         ) {
             return Err(Decline::CacheFull);
         }
@@ -1459,11 +1397,6 @@ impl Native {
                 .publish_row_targets(eip, (target.base, target.offset), &head.row_targets)
             {
                 return Err(Decline::CacheFull);
-            }
-        } else if let Some((_, other)) = alignment {
-            if !other {
-                // The pair is published only after both entry addresses are known.
-                return Ok(());
             }
         } else {
             self.code.start_link_sampling(eip, SAMPLE);
@@ -1849,7 +1782,6 @@ impl Native {
             refused: FxHashSet::default(),
             cuts: FxHashSet::default(),
             count_entries: false,
-            route_alignment: false,
         });
         self.install_optimized(false);
     }

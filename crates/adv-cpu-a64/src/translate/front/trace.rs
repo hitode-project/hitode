@@ -108,7 +108,6 @@ struct Frame {
 #[derive(Clone, Default)]
 pub struct Trace {
     pub insts: Vec<Inst>,
-    pub(crate) row_alignment_route: Option<(u32, bool)>,
     /// Decoded instructions supplied for optimized builds.
     pub(crate) x86: Vec<Option<std::sync::Arc<super::summary::Summary>>>,
     /// Guest bytes the trace was decoded from, as (address, length).
@@ -457,14 +456,17 @@ impl Trace {
         self.analyze();
     }
 
-    fn alignment_forks(&self) -> impl Iterator<Item = (usize, u8, u32, bool)> + '_ {
+    /// Specialize a TEST/Jcc alignment fork. The affine proof must
+    /// establish both the first address and the pitch under this mask.
+    pub(crate) fn specialize_row_alignment(&mut self, regs: &[u32; 8]) -> bool {
         use super::decode::{Alu, Cc};
         use iced_x86::ConditionCode::{e, ne};
-        (1..self.insts.len()).filter_map(|at| {
+        let mut changed = false;
+        for at in 1..self.insts.len() {
             let test = self.insts[at - 1];
             let branch = self.insts[at];
             let Op::Alu(Alu::Test, Src::Reg(reg), Src::Imm(mask)) = test.op else {
-                return None;
+                continue;
             };
             if !(3..=31).contains(&mask)
                 || !(mask + 1).is_power_of_two()
@@ -472,59 +474,20 @@ impl Trace {
                 || test.next_pc != branch.pc
                 || self.merge[at]
             {
-                return None;
+                continue;
             }
             let Op::Jcc(Cc::Flags(condition @ (e | ne)), _) = branch.op else {
-                return None;
+                continue;
             };
-            Some((at, reg, mask, condition == ne))
-        })
-    }
-
-    /// Specialize a TEST/Jcc alignment fork. The affine proof must
-    /// establish both the first address and the pitch under this mask.
-    pub(crate) fn specialize_row_alignment(&mut self, regs: &[u32; 8]) {
-        let forks: Vec<_> = self.alignment_forks().collect();
-        for &(at, reg, mask, taken_if_nonzero) in &forks {
             let nonzero = regs[usize::from(reg)] & mask != 0;
             self.insts[at - 1].row_alignment = Some((reg, mask, nonzero));
-            self.select_branch(at, nonzero == taken_if_nonzero);
+            self.select_branch(at, nonzero == (condition == ne));
+            changed = true;
         }
-        if !forks.is_empty() {
+        if changed {
             self.analyze();
         }
-    }
-
-    pub(crate) fn route_row_alignment(&mut self, nonzero: bool) -> bool {
-        let forks: Vec<_> = self.alignment_forks().collect();
-        let Some(&(first, _, mask, taken_if_nonzero)) = forks.first() else {
-            return false;
-        };
-        let target = self.insts[first].taken;
-        if forks.len() > 1
-            && (!taken_if_nonzero
-                || forks.iter().enumerate().any(|(i, &(at, _, bits, taken))| {
-                    at != first + 2 * i
-                        || bits != mask
-                        || !taken
-                        || self.insts[at].taken != target
-                        || (i != 0 && (self.merge[at - 1] || self.insts[at - 2].next != Next::Fall))
-                }))
-        {
-            return false;
-        }
-        for (i, &(at, reg, mask, taken_if_nonzero)) in forks.iter().enumerate() {
-            self.insts[at - 1].row_alignment = Some((reg, mask, nonzero));
-            // Keep the earlier taken edges on the nonzero arm. They
-            // preserve the guest's flag state and instruction retirement
-            // when more than one test can take us to the same successor.
-            if !nonzero || i + 1 == forks.len() {
-                self.select_branch(at, nonzero == taken_if_nonzero);
-            }
-        }
-        self.row_alignment_route = Some((mask, nonzero));
-        self.analyze();
-        true
+        changed
     }
 
     fn select_branch(&mut self, at: usize, taken: bool) {

@@ -95,14 +95,13 @@ pub(crate) struct SplitPoint {
     pub leave: usize,
 }
 
-pub(crate) struct Targets<'a> {
+pub(crate) struct Targets {
     pub at: usize,
     pub proved_body: Option<usize>,
     pub tier1: usize,
     pub exit: usize,
     pub resident_exit: usize,
     pub split: bool,
-    pub alignment: Option<(&'a super::RowAlignment, usize)>,
 }
 
 pub(crate) struct MissCounter {
@@ -114,7 +113,6 @@ pub(crate) struct MissCounter {
 pub(crate) struct Entry {
     pub words: Vec<u32>,
     pub entry: usize,
-    pub alignment: Option<usize>,
     pub proved: Option<usize>,
     pub proved_cold: Option<usize>,
     pub probe: usize,
@@ -137,8 +135,8 @@ pub(crate) fn emit(
     gate: Option<OfferEntry>,
     spill_cells: usize,
     count_misses: bool,
-    targets: Targets<'_>,
-) -> Option<Entry> {
+    targets: Targets,
+) -> Entry {
     let at = targets.at;
     let mut asm = Asm::new();
     let offer_exit = asm.label();
@@ -278,33 +276,6 @@ pub(crate) fn emit(
     if version == 0 {
         runtime::emit_sensor(&mut asm, sample_counter, SLOT, r(0), sampled);
     }
-    let alignment = if let Some((route, aligned)) = targets.alignment {
-        let start = at + asm.offset();
-        let mut sum = None;
-        for &(reg, offset) in &route.bases {
-            let mut value = r(19 + reg);
-            if offset != 0 {
-                let biased = r(u8::from(sum.is_some()));
-                asm.emit(add_imm(W, biased, value, offset, false));
-                value = biased;
-            }
-            sum = Some(if let Some(previous) = sum {
-                asm.emit(orr(W, r(0), previous, value, Lsl, 0));
-                r(0)
-            } else {
-                value
-            });
-        }
-        asm.emit(and_imm(W, r(0), sum.unwrap(), u64::from(route.mask)));
-        let displacement = aligned as i64 - (at + asm.offset()) as i64;
-        if !(-(1 << 20)..(1 << 20)).contains(&displacement) {
-            return None;
-        }
-        asm.emit(cbz(W, false, r(0), displacement as i32));
-        Some(start)
-    } else {
-        None
-    };
     asm.bind(entry);
     if let Some(gate) = gate {
         offer(&mut asm, gate, offer_counter, offer_exit);
@@ -328,10 +299,9 @@ pub(crate) fn emit(
     if let Some((_, point, offset)) = proved {
         words[(point - at) / 4] = branch(point, form_at + offset);
     }
-    Some(Entry {
+    Entry {
         words,
         entry,
-        alignment,
         proved: proved.map(|(entry, _, _)| entry),
         proved_cold: proved.map(|(entry, _, _)| entry - 4),
         probe,
@@ -343,7 +313,7 @@ pub(crate) fn emit(
         probation,
         split,
         miss_counter,
-    })
+    }
 }
 
 fn observe(asm: &mut Asm, head: u32, version: usize, kind: u16) {

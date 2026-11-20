@@ -13,8 +13,8 @@ use crate::translate::front::{
     trace::{Mode, Trace},
 };
 use crate::translate::jit::Code;
-use crate::translate::lower::resident::{RowAlignment, RowTarget};
-use crate::translate::opt::computation::{Proof, rows::Domain};
+use crate::translate::lower::resident::RowTarget;
+use crate::translate::opt::computation::Proof;
 use crate::translate::opt::{back, front};
 
 use super::Workspace;
@@ -40,7 +40,6 @@ pub(in crate::native) struct Request {
     pub refused: FxHashSet<u32>,
     pub cuts: FxHashSet<u32>,
     pub count_entries: bool,
-    pub route_alignment: bool,
 }
 
 pub(in crate::native) struct Compiled {
@@ -52,13 +51,6 @@ pub(in crate::native) struct Compiled {
     pub resident: Option<Result<ResidentForm, front::Reject>>,
     pub unit: Arc<Unit>,
     pub pass_through: Option<RowTarget>,
-    pub job: Option<Job>,
-    pub aligned_rows: Option<(RowAlignment, Box<[PreparedRow; 2]>)>,
-}
-
-pub(in crate::native) struct PreparedRow {
-    pub at: CpuState,
-    pub form: ResidentForm,
     pub job: Option<Job>,
 }
 
@@ -151,74 +143,13 @@ fn scoped_form(unit: &Unit, proof: &Proof, at: &CpuState) -> Option<JobForm> {
     Some(JobForm { built, lowered })
 }
 
-fn row_form(
-    mut unit: Unit,
-    mut at: CpuState,
-    count_entries: bool,
-    build: impl FnOnce(&Unit, Option<&Proof>, &CpuState) -> Result<front::Built, front::Reject>,
-) -> Option<(PreparedRow, Option<RowAlignment>)> {
-    let (domain, mut proof) = Domain::build(&unit.trace, &at.regs)?;
-    let alignment = domain.alignment().map(|(route, nonzero)| {
-        if route.nonzero(&at.regs) != *nonzero {
-            for &(reg, offset) in &route.bases {
-                let value = &mut at.regs[usize::from(reg)];
-                *value = (*value & !route.mask) | offset.wrapping_neg() & route.mask;
-            }
-            if *nonzero {
-                at.regs[usize::from(route.bases[0].0)] ^= 1;
-            }
-        }
-        route.clone()
-    });
-    domain.use_proved_alignment(&mut unit.trace);
-    let built = build(&unit, None, &at)
-        .inspect_err(|rejection| {
-            crate::jit_map::optimized(at.eip, format_args!("row lowering {rejection:?}"));
-        })
-        .ok()?;
-    if built.cuts != 0 {
-        return None;
-    }
-    domain.prove_scoped_split(&mut proof, &mut unit.trace);
-    let offer = proof.scoped_splits();
-    crate::jit_map::optimized(
-        at.eip,
-        format_args!(
-            "row scope {}",
-            if offer {
-                "eligible"
-            } else {
-                "carried state or frame"
-            }
-        ),
-    );
-    let lowered = back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
-    let job = proof.scoped_latch().map(|(latch, taken)| {
-        unit.trace.end_at_latch(latch, taken);
-        let form = scoped_form(&unit, &proof, &at);
-        Job {
-            proof,
-            form,
-            scoped: Some(Arc::new(unit)),
-        }
-    });
-    Some((
-        PreparedRow {
-            at,
-            form: ResidentForm { built, lowered },
-            job,
-        },
-        alignment,
-    ))
-}
-
 fn compile(request: Request) -> Compiled {
     let Request {
         eip,
         generation,
         code,
         task,
-        unit: original_unit,
+        unit,
         proof,
         at,
         checked,
@@ -226,10 +157,9 @@ fn compile(request: Request) -> Compiled {
         refused,
         cuts,
         count_entries,
-        route_alignment,
     } = request;
     let proof = if task == Task::Discover {
-        proof.or_else(|| computation_proof(&original_unit.trace))
+        proof.or_else(|| computation_proof(&unit.trace))
     } else {
         proof
     };
@@ -241,15 +171,15 @@ fn compile(request: Request) -> Compiled {
     } else {
         let cut_unit;
         let unit = if cuts.is_empty() {
-            &*original_unit
+            &*unit
         } else {
-            let cut: Vec<_> = original_unit
+            let cut: Vec<_> = unit
                 .trace
                 .insts
                 .iter()
                 .map(|i| cuts.contains(&i.pc))
                 .collect();
-            cut_unit = original_unit.cut(&cut);
+            cut_unit = unit.cut(&cut);
             &cut_unit
         };
         let guarded = unit
@@ -258,58 +188,67 @@ fn compile(request: Request) -> Compiled {
             .iter()
             .position(|inst| inst.guarded_slot.is_some());
         let latches = unit.trace.row_latches();
-        let build = |unit: &Unit, proof: Option<&Proof>, at: &CpuState| {
+        let row_unit;
+        let rows = if latches.is_empty() {
+            unit
+        } else {
+            row_unit = {
+                let mut shape = unit.clone();
+                shape.trace.separate_row_latches(&latches);
+                shape.trace.specialize_row_alignment(&at.regs);
+                shape
+            };
+            &row_unit
+        };
+        let build = |unit: &Unit, proof: Option<&Proof>| {
             front::build_with(
                 unit,
                 proof,
-                at,
+                &at,
                 &|pc| all_checked || checked.contains(&pc),
                 &|pc| refused.contains(&pc),
             )
         };
-        let mut rows = unit.clone();
-        if !latches.is_empty() {
-            rows.trace.separate_row_latches(&latches);
-        }
-        if guarded.is_none() && route_alignment {
-            let pair = [false, true].map(|nonzero| {
-                let mut arm = rows.clone();
-                if !arm.trace.route_row_alignment(nonzero) {
+        let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace, &at.regs)
+            .and_then(|(domain, mut proof)| {
+                let mut shape = rows.clone();
+                domain.use_proved_alignment(&mut shape.trace);
+                let rows = &shape;
+                let built = build(rows, None)
+                    .inspect_err(|rejection| {
+                        crate::jit_map::optimized(eip, format_args!("row lowering {rejection:?}"));
+                    })
+                    .ok()?;
+                if built.cuts != 0 {
                     return None;
                 }
-                row_form(arm, at.clone(), count_entries, build)
-            });
-            if let [
-                Some((aligned, Some(route))),
-                Some((other, Some(other_route))),
-            ] = pair
-                && route == other_route
-            {
+                let mut worker = rows.clone();
+                domain.prove_scoped_split(&mut proof, &mut worker.trace);
                 crate::jit_map::optimized(
                     eip,
-                    format_args!("alignment rows\t0\t{}us", started.elapsed().as_micros()),
+                    format_args!(
+                        "row scope {}",
+                        if proof.scoped_splits() {
+                            "eligible"
+                        } else {
+                            "carried state or frame"
+                        }
+                    ),
                 );
-                return Compiled {
-                    eip,
-                    generation,
-                    code,
-                    task,
-                    at,
-                    unit: original_unit,
-                    resident: None,
-                    pass_through: None,
-                    job: None,
-                    aligned_rows: Some((route, Box::new([aligned, other]))),
-                };
-            }
-        }
-        if !latches.is_empty() {
-            rows.trace.specialize_row_alignment(&at.regs);
-        }
-        let scoped = row_form(rows, at.clone(), count_entries, build).map(|(row, _)| {
-            scoped_job = row.job;
-            row.form
-        });
+                let offer = proof.scoped_splits();
+                let lowered =
+                    back::lower_rows(&built.func, &built.assumed, &domain, count_entries, offer)?;
+                if let Some((latch, taken)) = proof.scoped_latch() {
+                    worker.trace.end_at_latch(latch, taken);
+                    let form = scoped_form(&worker, &proof, &at);
+                    scoped_job = Some(Job {
+                        proof,
+                        form,
+                        scoped: Some(Arc::new(worker)),
+                    });
+                }
+                Some(ResidentForm { built, lowered })
+            });
         let result = match (scoped, guarded) {
             (Some(scoped), _) => Ok(scoped),
             (None, Some(index)) => {
@@ -323,7 +262,7 @@ fn compile(request: Request) -> Compiled {
                 }
                 Err(front::Reject::Unsupported(index))
             }
-            (None, None) => build(unit, proof.as_ref(), &at).map(|built| {
+            (None, None) => build(unit, proof.as_ref()).map(|built| {
                 let lowered = back::lower_resident(
                     &built.func,
                     &built.assumed,
@@ -354,14 +293,12 @@ fn compile(request: Request) -> Compiled {
     let job = if scoped_job.is_none() && matches!(task, Task::Discover | Task::Job) {
         proof.map(|proof| {
             let form = if proof.scoped_latch().is_some() {
-                scoped_form(&original_unit, &proof, &at)
+                scoped_form(&unit, &proof, &at)
             } else {
-                front::build(&original_unit, &proof, &at)
-                    .ok()
-                    .map(|built| JobForm {
-                        lowered: back::lower(&built.func),
-                        built,
-                    })
+                front::build(&unit, &proof, &at).ok().map(|built| JobForm {
+                    lowered: back::lower(&built.func),
+                    built,
+                })
             };
             Job {
                 proof,
@@ -379,10 +316,9 @@ fn compile(request: Request) -> Compiled {
         task,
         at,
         resident,
-        unit: original_unit,
+        unit,
         pass_through,
         job: scoped_job.or(job),
-        aligned_rows: None,
     }
 }
 
@@ -398,7 +334,6 @@ impl Compiled {
             unit: request.unit,
             pass_through: None,
             job: None,
-            aligned_rows: None,
         }
     }
 }

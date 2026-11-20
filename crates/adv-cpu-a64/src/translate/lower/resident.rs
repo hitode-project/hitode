@@ -37,31 +37,6 @@ pub(crate) struct RowTarget {
     pub value: u32,
 }
 
-/// Entry registers whose low bits select between two row forms.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RowAlignment {
-    pub mask: u32,
-    pub bases: Vec<(u8, u32)>,
-}
-
-impl RowAlignment {
-    pub(crate) fn nonzero(&self, regs: &[u32; 8]) -> bool {
-        self.bases
-            .iter()
-            .any(|&(reg, offset)| regs[usize::from(reg)].wrapping_add(offset) & self.mask != 0)
-    }
-
-    pub(crate) fn words(&self) -> u32 {
-        // OR the bases, adding each nonzero bias, then AND and branch.
-        1 + self.bases.len() as u32
-            + self
-                .bases
-                .iter()
-                .filter(|&&(_, offset)| offset != 0)
-                .count() as u32
-    }
-}
-
 /// Row entry failures precede guest effects. A short profitable-work
 /// check is ordinary routing and never contributes to withdrawal.
 #[derive(Clone, Copy, Debug)]

@@ -60,7 +60,6 @@ impl Emitter<'_> {
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
         if let Some((domain, offer)) = self.domain {
-            let guard_start = self.asm.offset();
             let minimum = (self.asm.label(), self.asm.label());
             let head = self.func.records[0].eip;
             if domain.target().is_none() {
@@ -84,9 +83,6 @@ impl Emitter<'_> {
             let leave = offer.then(|| self.asm.label());
             let count = self.row_strip.unwrap().count;
             let mut words = domain.emit(&mut self.asm, (minimum, count), short, failures, leave);
-            if let Some((route, _)) = domain.alignment() {
-                words += route.words();
-            }
             if self.count_entries {
                 let hit = self.asm.label();
                 self.asm.b(hit);
@@ -111,7 +107,7 @@ impl Emitter<'_> {
             if let Some(target) = domain.target() {
                 self.count(target.value, super::Counter::RowEntry);
             }
-            self.row_budget = Some((minimum, words, self.words_since(guard_start)));
+            self.row_budget = Some((minimum, words));
             self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
         }
 
