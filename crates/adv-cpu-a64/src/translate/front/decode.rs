@@ -669,22 +669,22 @@ impl Decodes {
 
     /// Whether any of these traced instructions may write general register
     /// `reg`. A bound host body follows the call convention and clobbers
-    /// EAX, ECX and EDX; an undecoded instruction may write anything.
-    pub(super) fn may_write_register(
-        &self,
-        insts: impl Iterator<Item = (u32, Op)>,
-        reg: u8,
-    ) -> bool {
+    /// EAX, ECX and EDX; an out-of-line call or undecoded instruction
+    /// may write any register.
+    pub(super) fn may_write_register(&self, insts: &[super::trace::Inst], reg: u8) -> bool {
         let mut factory = iced_x86::InstructionInfoFactory::new();
-        insts.into_iter().any(|(pc, op)| {
-            if matches!(op, Op::Body(_)) {
+        insts.iter().any(|inst| {
+            if inst.mode == super::trace::Mode::Real {
+                return true;
+            }
+            if matches!(inst.op, Op::Body(_)) {
                 return reg < 3;
             }
-            let Some(sample) = self.get(pc) else {
+            let Some(sample) = self.get(inst.pc) else {
                 return true;
             };
             factory
-                .info(&sample.instruction(pc))
+                .info(&sample.instruction(inst.pc))
                 .used_registers()
                 .iter()
                 .any(|used| {

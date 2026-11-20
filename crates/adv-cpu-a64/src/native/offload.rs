@@ -2076,6 +2076,42 @@ mod tests {
         assert!(memory.stores_code(INPUT, 1));
     }
 
+    // spec: A64-OPT-8
+    #[test]
+    fn slot_discovery_rejects_an_out_of_line_callee() {
+        let external = CODE + 0x100;
+        let stale = CODE + 0x200;
+        let actual = CODE + 0x300;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.call(u64::from(external)).unwrap();
+        a.call(dword_ptr(eax + 4)).unwrap();
+        a.int3().unwrap();
+        let (mut executor, mut native) = fixture(&mut a);
+        let memory = executor.memory_mut();
+        memory.protect(CODE, 0x4000, READ | WRITE).unwrap();
+        let mut callee = vec![0xb8];
+        callee.extend((INPUT + 0x200).to_le_bytes());
+        callee.push(0xc3);
+        memory.write(external, &callee).unwrap();
+        memory.write(stale, &[0xc3]).unwrap();
+        memory.write(actual, &[0xc3]).unwrap();
+        memory.protect(CODE, 0x4000, READ | EXEC).unwrap();
+        memory.map(INPUT, 0x4000, READ | WRITE).unwrap();
+        memory.write(INPUT + 0x104, &stale.to_le_bytes()).unwrap();
+        memory.write(INPUT + 0x204, &actual.to_le_bytes()).unwrap();
+        native.observe_stop(external);
+        let mut regs = [0; 8];
+        regs[0] = INPUT + 0x100;
+        let unit = native.front_unit(memory, CODE, true, false, Some(&regs));
+        let call = &unit.trace.insts[1];
+        assert_eq!(call.pc, CODE + 5);
+        assert!(
+            call.guarded_slot.is_none(),
+            "resolved using stale EAX: {:?}",
+            call.op
+        );
+    }
+
     // spec: A64-OPT-8 A64-OPT-14
     #[test]
     fn unpriced_first_target_leaves_the_router_open() {

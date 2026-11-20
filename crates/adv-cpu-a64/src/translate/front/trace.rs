@@ -765,10 +765,7 @@ impl Trace {
                     // target in writable memory can be data, even on an
                     // executable page such as a guest stack.
                     let target = observed.zip(slot.base).and_then(|(regs, base)| {
-                        if decodes.may_write_register(
-                            self.insts.iter().map(|inst| (inst.pc, inst.op)),
-                            base,
-                        ) {
+                        if decodes.may_write_register(&self.insts, base) {
                             return None;
                         }
                         let address = regs[usize::from(base)].wrapping_add(slot.disp);
