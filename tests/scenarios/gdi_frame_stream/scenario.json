@@ -1,0 +1,8 @@
+{
+  "gpu": true,
+  "spec": ["DEV-FRAME-4"],
+  "exe": "gdi_frame_stream.exe",
+  "args": ["--headless-gpu"],
+  "seconds": 30,
+  "outputs": ["gdi-frame-stream.bin"]
+}

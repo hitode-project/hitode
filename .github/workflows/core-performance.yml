@@ -111,7 +111,7 @@ jobs:
   workspace-core:
     name: workspace (core-system, macOS ARM64)
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: '3'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
@@ -185,25 +185,25 @@ jobs:
           cache-workspace-crates: true
       - name: Build every crate with default features
         if: env.WORKSPACE_GROUP == 'core-system'
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: cargo check --workspace --exclude adv-launcher --all-targets --locked --keep-going
       - name: Lint the whole workspace
         if: ${{ !cancelled() && env.WORKSPACE_GROUP == 'core-system' }}
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           set -o pipefail
           python3 tools/lint.py host 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
       - name: Compile test programs
         id: compile
         if: ${{ !cancelled() }}
-        timeout-minutes: 25
+        timeout-minutes: 50
         run: |
           set -o pipefail
           read -r -a packages <<< "$WORKSPACE_PACKAGES"
           args=(--locked --lib --tests "${packages[@]}")
           if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
           if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then args+=(--features adv-device/slow-tests); fi
-          cargo test "${args[@]}" --no-run --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
+          cargo build "${args[@]}" --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
       - name: Execute tests
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 15
@@ -279,7 +279,7 @@ jobs:
   workspace-apps:
     name: workspace (runtime-apps, macOS ARM64)
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: '3'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
