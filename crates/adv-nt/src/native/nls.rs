@@ -157,11 +157,26 @@ struct Page {
 }
 // The common call needs only a handful of pages. A call touching more than
 // 32 pages replays with this lazily initialized bitmap on the cold stack frame.
-// Two bits retain each grant and its window/private-alias selection.
+// Two bits retain each grant for either of two linear bases. Additional
+// backing addresses use the page cache without a bitmap entry.
 struct Grants {
     initialized: [u64; 256],
     bits: [MaybeUninit<u128>; 16384],
     bases: [*const u8; 2],
+}
+impl Grants {
+    fn retain(bases: [*const u8; 2], bits: &mut u128, bit: u128, page: Page) {
+        let offset = (page.number as usize) << 12;
+        if let Some(index) = bases
+            .iter()
+            .position(|base| base.wrapping_add(offset) == page.pointer)
+        {
+            *bits |= bit;
+            if index == 1 {
+                *bits |= bit << 64;
+            }
+        }
+    }
 }
 struct Memory<'a, M> {
     mem: &'a mut M,
@@ -205,20 +220,14 @@ impl<'a, M: Mem> Memory<'a, M> {
             }
             // SAFETY: this bitmap word was initialized above.
             let bits = unsafe { grants.bits[block].assume_init_mut() };
-            if *bits & mask == 0 {
+            let pointer = if *bits & mask == 0 {
                 let pointer = self.mem.read_page(number)?.unwrap();
-                let base = pointer.wrapping_sub((number as usize) << 12);
-                if grants.bases[0].is_null() {
-                    grants.bases[0] = base;
-                }
-                if base != grants.bases[0] {
-                    grants.bases[1] = base;
-                    *bits |= mask << 64;
-                }
-                *bits |= mask;
-            }
-            let pointer = grants.bases[usize::from(*bits & (mask << 64) != 0)]
-                .wrapping_add((number as usize) << 12);
+                Grants::retain(grants.bases, bits, mask, Page { number, pointer });
+                pointer
+            } else {
+                grants.bases[usize::from(*bits & (mask << 64) != 0)]
+                    .wrapping_add((number as usize) << 12)
+            };
             // Retain a hot direct-mapped slot over the complete bitmap.
             self.pages[first] = Some(Page { number, pointer });
             return Ok(pointer);
@@ -1177,7 +1186,7 @@ fn run_many_pages<M: Mem>(
     let mut grants = Grants {
         initialized: [0; 256],
         bits: [MaybeUninit::uninit(); 16384],
-        bases: [std::ptr::null(); 2],
+        bases: mem.linear_bases(),
     };
     for page in pages.iter().flatten() {
         let block = page.number as usize / 64;
@@ -1186,17 +1195,9 @@ fn run_many_pages<M: Mem>(
             grants.bits[block].write(0);
             grants.initialized[block / 64] |= 1 << (block % 64);
         }
-        let base = page.pointer.wrapping_sub((page.number as usize) << 12);
-        if grants.bases[0].is_null() {
-            grants.bases[0] = base;
-        }
         // SAFETY: the initialization bit above covers this word.
         let bits = unsafe { grants.bits[block].assume_init_mut() };
-        *bits |= bit;
-        if base != grants.bases[0] {
-            grants.bases[1] = base;
-            *bits |= bit << 64;
-        }
+        Grants::retain(grants.bases, bits, bit, *page);
     }
     let mut memory = Memory::new(mem, Some(&mut grants));
     memory.pages = pages;
@@ -1391,6 +1392,69 @@ pub(super) fn check_comparison_memory(cpu: &mut dyn adv_cpu::backend::Guest) {
                 assert_eq!(cpu.read_u32(thread + teb::LastErrorValue).unwrap(), 0x13579);
             }
         }
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    {
+        use adv_cpu::body::{ALIAS, NO_ALIAS};
+        use adv_cpu::memory::{READ, SHARED};
+        use std::os::fd::AsFd;
+
+        let file = std::fs::File::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vendor/wine/nls/l_intl.nls"
+        ))
+        .unwrap();
+        let len = u32::try_from(file.metadata().unwrap().len())
+            .unwrap()
+            .next_multiple_of(0x1000);
+        let table = BASE + 0x200000;
+        cpu.map_shared_file(table, len, file.as_fd(), 0, Prot::READ, false)
+            .unwrap();
+        // The test's window covers the private bytes. The casemap uses
+        // its own file view, as it does outside the window on 16 KiB hosts.
+        let mut backing = adv_cpu::Memory::reserve(table, len as usize).unwrap();
+        let storage = adv_cpu::shared_memory::SharedAllocation::map_file(
+            file.as_fd(),
+            0,
+            len as usize,
+            false,
+        )
+        .unwrap();
+        backing
+            .map_shared_file(table, len as usize, storage, READ, false)
+            .unwrap();
+        classes[(table >> 12) as usize..((table + len) >> 12) as usize]
+            .fill(READ | SHARED | ALIAS | NO_ALIAS);
+        let context = BodyContext {
+            classes: classes.as_ptr(),
+            memory: &backing,
+            ..context
+        };
+        // Wine skips the two header words before the uppercase table.
+        cpu.write_u32(BASE + layout().nls_info + NT_UPPER_CASE, table + 4)
+            .unwrap();
+        let (a, b) = (BASE + 0x100fff, BASE + 0x110fff);
+        cpu.write(a, &0x00e9u16.to_le_bytes().repeat(24)).unwrap();
+        cpu.write(b, &0x00c9u16.to_le_bytes().repeat(24)).unwrap();
+        for (i, arg) in [a, 24, b, 24, 1].into_iter().enumerate() {
+            cpu.write_u32(stack + 4 * i as u32, arg).unwrap();
+        }
+        let full = (COMPARE_ORDINAL.full)(
+            &mut GuestMem::new(cpu, &mut scratch),
+            [stack, thread, BASE, BASE, 0, 0, 0],
+        )
+        .unwrap();
+        // SAFETY: the class table and both mappings stay live during the call.
+        let direct =
+            unsafe { (COMPARE_ORDINAL.direct.call)(&context, stack, thread, BASE, BASE, 0, 0, 0) };
+        assert_eq!(full.value, 2);
+        assert_eq!(direct.extra, 0);
+        assert_eq!(direct.value, full.value);
     }
     let a = BASE + 0x100fff;
     let inputs = [stack, thread, BASE, BASE, 0, 0, 0];
