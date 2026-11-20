@@ -99,7 +99,11 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
             ));
         }
         let mut m = machine(&programs, true);
-        m.state.regs[1] = 100_000_000;
+        // Optimized forms of the loop are in place before it runs.
+        m.set_async_compilation(false);
+        // Seconds of work even for an optimized form: the notification, not
+        // the count or budget, ends the run however late its thread wakes.
+        m.state.regs[1] = u32::MAX;
         m.state.regs[2] = CODE;
         m.state.mmx[0] = 0;
         m.state.mmx[1] = u64::from_le_bytes([1; 8]);
@@ -113,8 +117,7 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
             notify.store(INTERRUPT, Ordering::Release);
         });
         let elapsed = Instant::now();
-        let budget = 100_000_000;
-        let outcome = m.run(STOP, budget).unwrap();
+        let outcome = m.run(STOP, u64::MAX >> 1).unwrap();
         producer.join().unwrap();
         assert_eq!(outcome, RunOutcome::Interrupted, "mode {mode}");
         assert!(elapsed.elapsed() < Duration::from_secs(2));
@@ -125,7 +128,7 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
         let pending_decrement =
             u32::from([instructions[0].next_ip(), instructions[1].next_ip()].contains(&pc));
         let pending_mmx = u32::from(pc == instructions[0].next_ip());
-        assert_eq!(m.state.regs[1], 100_000_000 - completed + pending_decrement);
+        assert_eq!(m.state.regs[1], u32::MAX - completed + pending_decrement);
         assert_eq!(
             m.state.mmx[0].to_le_bytes(),
             [(completed - pending_mmx) as u8; 8]

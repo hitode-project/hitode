@@ -233,6 +233,11 @@ impl Executor {
         self.add_region(region)
     }
 
+    /// Retirement past the last slice, which the next slice pays first.
+    pub fn fuel_debt(&self) -> u64 {
+        self.fuel_debt
+    }
+
     pub fn save_context(&self) -> Result<ExecutionContext, String> {
         let mut cpu = self.state.clone();
         cpu.refresh_mmx();

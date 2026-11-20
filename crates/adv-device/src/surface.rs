@@ -57,6 +57,39 @@ pub trait Presenter {
     fn present(&mut self, frame: FrameView<'_>) -> Result<(), String>;
 }
 
+/// Feeds a store's [`Snapshot`] with what it published, whichever back end
+/// presents, so tests read `presenter` the same way with or without `gpu`.
+#[cfg(feature = "test-support")]
+pub struct PresentedFrames {
+    #[cfg(feature = "gpu")]
+    capture: crate::gpu::test_support::SurfaceCapture,
+}
+
+#[cfg(feature = "test-support")]
+impl PresentedFrames {
+    /// Create it before the store: the GPU capture precedes other facades.
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "gpu")]
+            capture: crate::gpu::test_support::SurfaceCapture::new().unwrap(),
+        }
+    }
+
+    pub fn update(&mut self, surfaces: &mut SurfaceStore) {
+        #[cfg(feature = "gpu")]
+        self.capture.update(surfaces);
+        #[cfg(not(feature = "gpu"))]
+        let _ = surfaces;
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for PresentedFrames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Default)]
 pub struct Snapshot {
     pub width: u32,

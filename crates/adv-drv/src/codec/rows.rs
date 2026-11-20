@@ -165,13 +165,24 @@ mod tests {
         e
     }
 
-    fn compare(a: &mut Executor, b: &mut Executor, stop: u32, budget: u64) {
+    /// Run the translated executor, then the reference for exactly what the
+    /// translated slice retired: an admitted unit may run past its budget
+    /// and charge the excess to the next slice.
+    fn run_pair(a: &mut Executor, b: &mut Executor, stop: u32, budget: u64) {
+        let debt = a.fuel_debt();
+        let outcome = a
+            .run_with_traps(stop, budget, &mut Admission, false)
+            .unwrap();
+        let retired = (budget + a.fuel_debt()).saturating_sub(debt);
         assert_eq!(
-            a.run_with_traps(stop, budget, &mut Admission, false)
-                .unwrap(),
-            b.run_with_traps(stop, budget, &mut Admission, true)
+            outcome,
+            b.run_with_traps(stop, retired, &mut Admission, true)
                 .unwrap()
         );
+    }
+
+    fn compare(a: &mut Executor, b: &mut Executor, stop: u32, budget: u64) {
+        run_pair(a, b, stop, budget);
         assert_eq!(
             a.state.capture_architecture(),
             b.state.capture_architecture()
@@ -264,12 +275,7 @@ mod tests {
                     BATCHES.set(0);
                     // Compare the readable pages individually in the prefix-fault case.
                     let stop = CODE + AVERAGE.len() as u32;
-                    assert_eq!(
-                        a.run_with_traps(stop, budget, &mut Admission, false)
-                            .unwrap(),
-                        b.run_with_traps(stop, budget, &mut Admission, true)
-                            .unwrap()
-                    );
+                    run_pair(&mut a, &mut b, stop, budget);
                     assert_eq!(
                         a.state.capture_architecture(),
                         b.state.capture_architecture()

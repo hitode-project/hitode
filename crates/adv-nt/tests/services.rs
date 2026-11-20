@@ -47,8 +47,17 @@ impl adv_machine::Resolver for Platform {
                         if marker & 1 == 0 {
                             audit.begin[index] = calls;
                         } else {
-                            if index < 3 || !traced {
+                            if index < 3 {
                                 assert_eq!(calls - audit.begin[index], 1);
+                            } else if !traced {
+                                // A loop's call sites take the full path at
+                                // most once, on their first interpreted visit;
+                                // its 1000 calls then complete in place.
+                                assert!(
+                                    calls - audit.begin[index] <= 4,
+                                    "{}",
+                                    calls - audit.begin[index]
+                                );
                             } else {
                                 assert!(calls - audit.begin[index] > 1);
                             }
