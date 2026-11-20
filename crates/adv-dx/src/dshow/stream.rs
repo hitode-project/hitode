@@ -18,6 +18,7 @@ use crate::dsound::Sound;
 
 pub(crate) const THREAD_ENTRY: &str = "<DirectShowStreamThread>";
 const POLL_US: u64 = 10_000;
+const GUEST_AUDIO_QUEUE: usize = 128;
 const EC_COMPLETE: u32 = 1;
 /// Below the decoder's one-second seek threshold.
 const FREE_END_STEP_US: u64 = 500_000;
@@ -341,13 +342,71 @@ fn spawn(env: &mut Env<'_>, name: &str, id: u32) -> Result<(), String> {
 }
 
 /// A worker for `graph`'s asynchronous Run, as quartz's thread pool work.
-pub(crate) fn spawn_async_run(env: &mut Env<'_>, graph: u32, generation: u64) {
+pub(super) fn spawn_async_run(
+    env: &mut Env<'_>,
+    graph: u32,
+    generation: u64,
+    then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
+) -> Outcome {
     let id = state(env).next_session;
     state(env).next_session += 1;
     state(env).async_runs.insert(id, (graph, generation));
-    if let Err(error) = spawn(env, "dshow-run", id) {
-        log::warn!("DirectShow: graph run thread: {error}");
-        state(env).async_runs.remove(&id);
+    let done = move |env: &mut Env<'_>, hr| {
+        if hr != S_OK {
+            state(env).async_runs.remove(&id);
+        }
+        then(env, hr)
+    };
+    if let Some(thread) = env.ext.try_get::<Host>().map(|host| host.thread) {
+        let outcome = thread(env, id);
+        return after(
+            env,
+            outcome,
+            Box::new(move |env, results| done(env, results[0])),
+        );
+    }
+    match spawn(env, "dshow-run", id) {
+        Ok(()) => done(env, S_OK),
+        Err(error) => {
+            log::warn!("DirectShow: graph run thread: {error}");
+            done(env, E_FAIL)
+        }
+    }
+}
+
+pub(crate) fn thread_failed(env: &mut Env<'_>, id: u32, hr: u32) {
+    let graph = if let Some(feed) = state(env).audio_feeds.remove(&id) {
+        env.sys.objects.close(feed.wake);
+        let session = state(env).sessions.iter_mut().find_map(|(&session_id, s)| {
+            (s.audio_feed == Some(id)).then(|| {
+                s.audio_feed = None;
+                session_id
+            })
+        });
+        if let Some(session) = session {
+            stop(env, session);
+        }
+        feed.graph
+    } else if let Some(session) = state(env).sessions.remove(&id) {
+        env.sys.objects.close(session.wake);
+        if let Some(feed) = session
+            .audio_feed
+            .and_then(|id| state(env).audio_feeds.get_mut(&id))
+        {
+            feed.stopping = true;
+            let wake = feed.wake;
+            env.sys.set_event(wake);
+        }
+        session.graph
+    } else {
+        return;
+    };
+    graph::notify(env, graph, EC_ERRORABORT, hr, 0);
+    if !threads_running(env, graph)
+        && let Some(g) = state(env).graphs.get(&graph)
+    {
+        let idle = g.idle;
+        env.sys.set_event(idle);
     }
 }
 
@@ -407,6 +466,12 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     if ended || (paused && prerolled) {
         return wait(env, id, None);
+    }
+    if !paused && session(env, id).host {
+        push_audio(env, id);
+        if !session(env, id).pending_audio.is_empty() {
+            return wait(env, id, Some(env.sys.clock.now_us() + POLL_US));
+        }
     }
     let s = session(env, id);
     // Without a clock, renderers take pictures as soon as they come: a
@@ -1164,10 +1229,31 @@ fn produce(env: &mut Env<'_>, id: u32) {
         return;
     }
     let paused = graph_state.members_paused();
-    if paused && (session(env, id).prerolled || !session(env, id).updates.is_empty()) {
+    if session(env, id).compressed.is_some() {
+        return;
+    }
+    if paused && session(env, id).prerolled {
         return;
     }
     if !sync_audio_pause(env, id, paused) {
+        return;
+    }
+    if !paused {
+        push_audio(env, id);
+    }
+    let s = session(env, id);
+    let (queued, feed) = (
+        !s.updates.is_empty() || !s.pending_audio.is_empty(),
+        s.audio_feed,
+    );
+    if queued
+        || feed.is_some_and(|id| {
+            state(env)
+                .audio_feeds
+                .get(&id)
+                .is_some_and(|f| f.queue.len() >= GUEST_AUDIO_QUEUE)
+        })
+    {
         return;
     }
     let position = graph::stream_position(env, graph).max(0) as u64 / 10;

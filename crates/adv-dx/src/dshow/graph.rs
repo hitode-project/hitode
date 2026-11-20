@@ -1207,8 +1207,18 @@ pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                         let graph_state = g(env, graph);
                         graph_state.state = RUNNING;
                         graph_state.pending_run = Some(request.generation);
-                        stream::spawn_async_run(env, graph, request.generation);
-                        flush_posts(env, Box::new(move |env, _| then(env, vec![hr])))
+                        stream::spawn_async_run(
+                            env,
+                            graph,
+                            request.generation,
+                            move |env, result| {
+                                if result != S_OK {
+                                    fail_async_run(env, graph, request.generation, result);
+                                }
+                                let result = if result == S_OK { hr } else { result };
+                                flush_posts(env, Box::new(move |env, _| then(env, vec![result])))
+                            },
+                        )
                     }),
                 )
             }),
@@ -1246,14 +1256,42 @@ pub(crate) fn async_run(env: &mut Env<'_>, graph: u32, generation: u64) -> Outco
             if !request.current(env) || g(env, graph).pending_run != Some(generation) {
                 return Outcome::Return(0);
             }
-            g(env, graph).pending_run = None;
             if hr == S_OK {
-                ran(env, request, 0, Box::new(|_, _| Outcome::Return(0)))
+                ran(
+                    env,
+                    request,
+                    0,
+                    Box::new(move |env, results| {
+                        if let Some(hr) = results.into_iter().find(|hr| hr & 0x8000_0000 != 0) {
+                            fail_async_run(env, graph, generation, hr);
+                        }
+                        flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
+                    }),
+                )
             } else {
-                Outcome::Return(0)
+                fail_async_run(env, graph, generation, hr);
+                flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
             }
         }),
     )
+}
+
+fn fail_async_run(env: &mut Env<'_>, graph: u32, generation: u64, hr: u32) {
+    let request = Transition { graph, generation };
+    if !request.current(env) {
+        return;
+    }
+    let now = env.sys.clock.now_us();
+    let graph_state = g(env, graph);
+    graph_state.position = graph_state.position(now);
+    graph_state.origin = None;
+    graph_state.pending_run = None;
+    graph_state.state = PAUSED;
+    let finished = graph_state.finished;
+    graph_state.completion = Some(EC_ERRORABORT);
+    env.sys.set_event(finished);
+    notify(env, graph, EC_ERRORABORT, hr, 0);
+    wake_sessions(env, graph);
 }
 
 /// Start the stream as quartz's graph_start: a new run clears completion and
@@ -1266,7 +1304,6 @@ fn ran(env: &mut Env<'_>, request: Transition, start: u64, then: Then) -> Outcom
     let graph = request.graph;
     let graph_state = g(env, graph);
     let previous = graph_state.state;
-    graph_state.pending_run = None;
     graph_state.completed = 0;
     graph_state.complete_sent = false;
     graph_state.completion = None;
@@ -1311,6 +1348,7 @@ fn ran(env: &mut Env<'_>, request: Transition, start: u64, then: Then) -> Outcom
                             }
                             let now = env.sys.clock.now_us();
                             let graph_state = g(env, graph);
+                            graph_state.pending_run = None;
                             graph_state.origin = Some(now);
                             graph_state.state = RUNNING;
                             wake_sessions(env, graph);
@@ -1769,7 +1807,18 @@ pub(crate) fn flush_posts(env: &mut Env<'_>, then: Then) -> Outcome {
         let id = state(env).pending_threads.remove(0);
         let thread = env.ext.get::<Host>().thread;
         let outcome = thread(env, id);
-        return after(env, outcome, Box::new(move |env, _| flush_posts(env, then)));
+        return after(
+            env,
+            outcome,
+            Box::new(move |env, results| {
+                if let [hr] = results.as_slice()
+                    && *hr != S_OK
+                {
+                    stream::thread_failed(env, id, *hr);
+                }
+                flush_posts(env, then)
+            }),
+        );
     }
     if state(env).pending_posts.is_empty() {
         return then(env, Vec::new());
@@ -2074,6 +2123,48 @@ mod tests {
     use super::super::tests::{DATA, activate, env, machine};
     use super::*;
     use adv_machine::Resume;
+
+    // spec: MEDIA-GRAPH-20
+    #[test]
+    fn failed_async_preroll_cannot_claim_running_on_the_next_run() {
+        let mut m = machine();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let member = DATA + 0x400;
+        let vtable = member + 4;
+        let get_state = 0x7100_0007;
+        m.cpu.write_u32(member, vtable).unwrap();
+        m.cpu.write_u32(vtable + 7 * 4, get_state).unwrap();
+        let mut e = env(&mut m);
+        g(&mut e, graph).members.push(Member {
+            filter: member,
+            host: None,
+            name: Vec::new(),
+            seeking: 0,
+        });
+        let request = Transition::begin(&mut e, graph);
+        g(&mut e, graph).state = RUNNING;
+        g(&mut e, graph).pending_run = Some(request.generation);
+        let Outcome::Call { target, then, .. } = async_run(&mut e, graph, request.generation)
+        else {
+            panic!("expected guest GetState");
+        };
+        assert_eq!(target, get_state);
+        assert!(matches!(
+            then(&mut e, Resume::Returned(E_FAIL)),
+            Outcome::Return(0)
+        ));
+        assert_eq!(g(&mut e, graph).state, PAUSED);
+        assert!(matches!(
+            wait_completion(&mut e, graph, 0, DATA),
+            Outcome::Return(S_OK)
+        ));
+        assert_eq!(e.cpu.read_u32(DATA).unwrap(), EC_ERRORABORT);
+        let retry = run(&mut e, graph, state::reply());
+        assert!(
+            !matches!(retry, Outcome::Return(S_OK)),
+            "preroll failed before the member's Run, but the next Run returned S_OK"
+        );
+    }
 
     // spec: MEDIA-GRAPH-20
     #[test]

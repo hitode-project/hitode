@@ -270,6 +270,7 @@ mod tests {
         assert_eq!(shown.pixels.bgra, BLUE.repeat(32));
     }
 
+    // spec: MEDIA-VIDEO-4
     #[cfg(feature = "media")]
     #[test]
     fn video_layers_reach_the_native_display_without_a_game_present() {
@@ -312,16 +313,6 @@ mod tests {
         let mut memory = Flat(vec![0; 1 << 16]);
         let mut store =
             crate::surface::SurfaceStore::new(8, 8, 16, 65520, Default::default()).unwrap();
-        let base = store
-            .create(
-                8,
-                8,
-                false,
-                crate::surface::PixelFormat::Bgra32,
-                &mut memory,
-            )
-            .unwrap();
-        store.present(base, &memory, store[base].rect()).unwrap();
         let canvas = crate::surface::Rect {
             x: 0,
             y: 0,
@@ -346,7 +337,25 @@ mod tests {
         store
             .set_video_layer(7, Some(layer.clone()), &memory)
             .unwrap();
-        // The next movie sample publishes over the same software base.
+        let execution = super::super::EXECUTION
+            .with(|cached| cached.borrow().upgrade())
+            .unwrap();
+        let frames = execution.capture.borrow().clone().unwrap();
+        assert_eq!(frames.get(0).video, [7]);
+        store.set_video_layer(7, None, &memory).unwrap();
+        assert!(frames.get(1).video.is_empty());
+
+        let base = store
+            .create(
+                8,
+                8,
+                false,
+                crate::surface::PixelFormat::Bgra32,
+                &mut memory,
+            )
+            .unwrap();
+        store.present(base, &memory, store[base].rect()).unwrap();
+        assert!(frames.get(2).video.is_empty());
         store
             .set_video_layer(
                 7,
@@ -357,14 +366,9 @@ mod tests {
                 &memory,
             )
             .unwrap();
-        let execution = super::super::EXECUTION
-            .with(|cached| cached.borrow().upgrade())
-            .unwrap();
-        let frames = execution.capture.borrow().clone().unwrap();
-        assert!(frames.get(0).video.is_empty());
-        // The movie frame is shown over the unchanged base.
-        assert_eq!(frames.get(1).video, [7]);
-        assert_eq!(frames.get(1).pixels.frames, 2);
-        assert_eq!(frames.get(2).video, [7]);
+        assert_eq!(frames.get(3).video, [7]);
+        store.delete(base);
+        store.set_video_layer(7, None, &memory).unwrap();
+        assert!(frames.get(4).video.is_empty());
     }
 }

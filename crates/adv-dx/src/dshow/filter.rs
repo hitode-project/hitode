@@ -2615,17 +2615,15 @@ fn load_packets(
     let Some(name) = guest_name(env, &path) else {
         return then(env);
     };
-    (host.read)(
+    (host.demux)(
         env,
         name,
         Box::new(move |env, result| {
             free(env, name);
-            if let Ok((bytes, handle)) = result {
-                if let Some(handle) = handle {
-                    super::host::close(env, handle);
-                }
-                state(env).filters.get_mut(&splitter).unwrap().packets =
-                    adv_device::media::demux(bytes).ok();
+            if let Some(filter) = state(env).filters.get_mut(&splitter)
+                && let Ok(packets) = result
+            {
+                filter.packets = Some(packets);
             }
             then(env)
         }),
@@ -2647,12 +2645,13 @@ pub(super) fn attach_source(
     let generic = state(env).filters[&filter].generic;
     // Only a guest-created splitter delivers compressed packets from a guest
     // reader; Render's splitter decodes on the host.
+    let bytes = std::sync::Arc::<[u8]>::from(bytes);
     let packets = if generic {
         None
     } else {
-        adv_device::media::demux(bytes.clone()).ok()
+        adv_device::media::demux_reader(std::io::Cursor::new(bytes.clone())).ok()
     };
-    let (decoder, info) = match Decoder::open_memory(bytes) {
+    let (decoder, info) = match Decoder::open_reader(std::io::Cursor::new(bytes)) {
         Ok(decoder) => {
             let info = decoder.info().clone();
             if !generic && !["mpeg", "mpegvideo", "mp3"].contains(&info.container.as_str()) {

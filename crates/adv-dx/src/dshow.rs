@@ -22,7 +22,9 @@ mod error_text_tests;
 mod filter;
 mod graph;
 pub(crate) mod host;
-pub use host::{Host, MediaEntry, MediaTypes, Opened, Ranges, ReadFile, Sampled, WINE_QUARTZ};
+pub use host::{
+    DemuxFile, Host, MediaEntry, MediaTypes, Opened, Ranges, ReadFile, Sampled, WINE_QUARTZ,
+};
 mod sample;
 mod stream;
 pub(crate) use stream::convert_bgra;

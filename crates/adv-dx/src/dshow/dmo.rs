@@ -54,6 +54,7 @@ pub(crate) struct Dmo {
     input_allocator: u32,
     /// Mixer stream of the audio output.
     audio: Option<u64>,
+    stream_generation: u64,
     wake: Handle,
     flushing: bool,
     stopping: bool,
@@ -134,6 +135,7 @@ impl Dmo {
             decoder: None,
             input_allocator: 0,
             audio: None,
+            stream_generation: 0,
             wake,
             flushing: false,
             stopping: false,
@@ -409,6 +411,7 @@ pub(crate) fn disconnected(env: &mut Env<'_>, pin: u32) {
     }
     let allocator = match dmo(env, filter) {
         Some(dmo) => {
+            dmo.stream_generation = dmo.stream_generation.wrapping_add(1);
             dmo.decoder = None;
             std::mem::take(&mut dmo.input_allocator)
         }
@@ -428,6 +431,7 @@ pub(crate) fn begin_stop(env: &mut Env<'_>, graph: u32) -> Vec<u32> {
         .filter_map(|f| {
             let d = f.dmo.as_mut()?;
             d.stopping = true;
+            d.stream_generation = d.stream_generation.wrapping_add(1);
             Some(d.wake)
         })
         .collect();
@@ -476,6 +480,7 @@ pub(crate) fn state_changed(env: &mut Env<'_>, filter: u32, value: u32) {
     let wake = dmo.wake;
     dmo.stopping = false;
     if value == graph::STOPPED {
+        dmo.stream_generation = dmo.stream_generation.wrapping_add(1);
         dmo.prerolled = false;
         dmo.discontinuity = true;
         if let Some(decoder) = dmo.decoder.as_mut() {
@@ -630,6 +635,7 @@ fn receive_then(env: &mut Env<'_>, filter: u32, sample: u32, done: Done) -> Outc
     let Some(decoder) = d.decoder.as_mut() else {
         return done(env, VFW_E_NOT_CONNECTED);
     };
+    let generation = d.stream_generation;
     let frames = match decoder.decode(&data, s.time.map(|(start, _)| start.max(0) as u64)) {
         Ok(frames) => frames,
         Err(error) => {
@@ -637,7 +643,7 @@ fn receive_then(env: &mut Env<'_>, filter: u32, sample: u32, done: Done) -> Outc
             return abort(env, filter, done);
         }
     };
-    emit(env, filter, frames.into(), done)
+    emit(env, filter, generation, frames.into(), done)
 }
 
 /// A decoder failure stops the stream with EC_ERRORABORT, as the stock filter does.
@@ -656,7 +662,18 @@ fn abort(env: &mut Env<'_>, filter: u32, done: Done) -> Outcome {
 }
 
 /// Deliver decoded frames in order, each when it is due.
-fn emit(env: &mut Env<'_>, filter: u32, mut frames: VecDeque<Decoded>, done: Done) -> Outcome {
+fn emit(
+    env: &mut Env<'_>,
+    filter: u32,
+    generation: u64,
+    mut frames: VecDeque<Decoded>,
+    done: Done,
+) -> Outcome {
+    if dmo(env, filter)
+        .is_none_or(|d| d.stream_generation != generation || d.flushing || d.stopping)
+    {
+        return done(env, S_FALSE);
+    }
     let Some(frame) = frames.pop_front() else {
         return done(env, S_OK);
     };
@@ -664,22 +681,28 @@ fn emit(env: &mut Env<'_>, filter: u32, mut frames: VecDeque<Decoded>, done: Don
         Decoded::Video(frame) => {
             let segment = dmo(env, filter).map_or(0, |d| d.segment);
             let due = frame.pts_us as i64 * 10 + segment;
-            when_due(env, filter, due, move |env, ready| match ready {
-                Ready::Now => deliver_video(env, filter, frame, move |env, hr| {
-                    if hr & 0x8000_0000 != 0 || hr == S_FALSE {
-                        return done(env, hr);
-                    }
-                    emit(env, filter, frames, done)
-                }),
-                Ready::Stopped => done(env, VFW_E_WRONG_STATE),
-                Ready::Flushing => done(env, S_FALSE),
-            })
+            when_due(
+                env,
+                filter,
+                generation,
+                due,
+                move |env, ready| match ready {
+                    Ready::Now => deliver_video(env, filter, frame, move |env, hr| {
+                        if hr & 0x8000_0000 != 0 || hr == S_FALSE {
+                            return done(env, hr);
+                        }
+                        emit(env, filter, generation, frames, done)
+                    }),
+                    Ready::Stopped => done(env, VFW_E_WRONG_STATE),
+                    Ready::Flushing => done(env, S_FALSE),
+                },
+            )
         }
-        Decoded::Audio(frame) => push_audio(env, filter, frame, move |env, hr| {
+        Decoded::Audio(frame) => push_audio(env, filter, generation, frame, move |env, hr| {
             if hr != S_OK {
                 return done(env, hr);
             }
-            emit(env, filter, frames, done)
+            emit(env, filter, generation, frames, done)
         }),
     }
 }
@@ -695,6 +718,7 @@ enum Ready {
 fn when_due(
     env: &mut Env<'_>,
     filter: u32,
+    generation: u64,
     due: i64,
     then: impl FnOnce(&mut Env<'_>, Ready) -> Outcome + 'static,
 ) -> Outcome {
@@ -705,7 +729,7 @@ fn when_due(
     let Some(d) = dmo(env, filter) else {
         return then(env, Ready::Stopped);
     };
-    if d.flushing || d.stopping {
+    if d.flushing || d.stopping || d.stream_generation != generation {
         return then(env, Ready::Flushing);
     }
     let (prerolled, wake) = (d.prerolled, d.wake);
@@ -729,7 +753,7 @@ fn when_due(
             handle: wake,
             deadline: Some(now + wait_us.max(1)),
         },
-        move |env, _| when_due(env, filter, due, then),
+        move |env, _| when_due(env, filter, generation, due, then),
     )
 }
 
@@ -787,6 +811,7 @@ fn deliver_video(
 fn push_audio(
     env: &mut Env<'_>,
     filter: u32,
+    generation: u64,
     frame: AudioFrame,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
 ) -> Outcome {
@@ -797,7 +822,7 @@ fn push_audio(
     let Some(d) = dmo(env, filter) else {
         return then(env, VFW_E_WRONG_STATE);
     };
-    if d.flushing || d.stopping {
+    if d.flushing || d.stopping || d.stream_generation != generation {
         return then(env, S_FALSE);
     }
     let (wake, segment) = (d.wake, d.segment);
@@ -820,7 +845,7 @@ fn push_audio(
                     handle: wake,
                     deadline: Some(env.sys.clock.now_us() + POLL_US),
                 },
-                move |env, _| push_audio(env, filter, frame, then),
+                move |env, _| push_audio(env, filter, generation, frame, then),
             );
         };
         return deliver_audio(env, filter, mem, sample, frame, then);
@@ -840,7 +865,7 @@ fn push_audio(
                 handle: wake,
                 deadline: Some(now + POLL_US),
             },
-            move |env, _| push_audio(env, filter, frame, then),
+            move |env, _| push_audio(env, filter, generation, frame, then),
         );
     }
     let stream = match dmo(env, filter).unwrap().audio {
@@ -884,7 +909,7 @@ fn push_audio(
                     handle: wake,
                     deadline: Some(now + POLL_US),
                 },
-                move |env, _| push_audio(env, filter, frame, then),
+                move |env, _| push_audio(env, filter, generation, frame, then),
             )
         }
     }
@@ -946,6 +971,7 @@ pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Ou
         "BeginFlush" => {
             let d = dmo(env, filter)?;
             d.flushing = true;
+            d.stream_generation = d.stream_generation.wrapping_add(1);
             if let Some(decoder) = d.decoder.as_mut() {
                 decoder.reset();
             }
@@ -965,7 +991,11 @@ pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Ou
         }
         "NewSegment" => {
             let start = arg_i64(env, 1);
-            dmo(env, filter)?.segment = start;
+            let d = dmo(env, filter)?;
+            d.segment = start;
+            d.stream_generation = d.stream_generation.wrapping_add(1);
+            let wake = d.wake;
+            env.sys.set_event(wake);
             let args = (1..7).map(|i| env.arg(i)).collect();
             Some(forward(env, 17, args))
         }
@@ -975,27 +1005,45 @@ pub(crate) fn pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Option<Ou
 
 /// Decode what the decoder still holds, then pass end-of-stream downstream.
 fn end_of_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Outcome {
-    let frames = match dmo(env, filter)
-        .and_then(|d| d.decoder.as_mut())
-        .map(PacketDecoder::drain)
-    {
+    let Some(d) = dmo(env, filter) else {
+        return Outcome::Return(E_UNEXPECTED);
+    };
+    if d.flushing || d.stopping {
+        return Outcome::Return(S_FALSE);
+    }
+    let generation = d.stream_generation;
+    let frames = match d.decoder.as_mut().map(PacketDecoder::drain) {
         Some(Ok(frames)) => frames,
         Some(Err(error)) => {
             log::warn!("DirectShow DMO: drain: {error}");
-            Vec::new()
+            return abort(env, filter, Box::new(|_, hr| Outcome::Return(hr)));
         }
         None => Vec::new(),
     };
     emit(
         env,
         filter,
+        generation,
         frames.into(),
-        Box::new(move |env, _| finish_stream(env, filter, downstream)),
+        Box::new(move |env, hr| {
+            if hr != S_OK {
+                return Outcome::Return(hr);
+            }
+            finish_stream(env, filter, generation, downstream, false)
+        }),
     )
 }
 
-fn finish_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Outcome {
-    if dmo(env, filter).is_some_and(|d| d.flushing || d.stopping) {
+fn finish_stream(
+    env: &mut Env<'_>,
+    filter: u32,
+    generation: u64,
+    downstream: Option<u32>,
+    mut end_queued: bool,
+) -> Outcome {
+    if dmo(env, filter)
+        .is_none_or(|d| d.flushing || d.stopping || d.stream_generation != generation)
+    {
         return Outcome::Return(S_OK);
     }
     if let Some(peer) = downstream {
@@ -1005,7 +1053,12 @@ fn finish_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Out
     let graph = state(env).filters[&filter].graph;
     let audio = dmo(env, filter).and_then(|d| d.audio);
     if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
-        && !sound.audio.end_pcm(stream)
+        && {
+            if !end_queued {
+                end_queued = sound.audio.end_pcm(stream);
+            }
+            !end_queued || !sound.audio.pcm_drained(stream)
+        }
     {
         let wake = dmo(env, filter).map(|d| d.wake);
         let Some(wake) = wake else {
@@ -1017,7 +1070,7 @@ fn finish_stream(env: &mut Env<'_>, filter: u32, downstream: Option<u32>) -> Out
                 handle: wake,
                 deadline: Some(deadline),
             },
-            move |env, _| finish_stream(env, filter, downstream),
+            move |env, _| finish_stream(env, filter, generation, downstream, end_queued),
         );
     }
     let connected = pin_of(env, filter, OUTPUT).is_some_and(|out| state(env).pins[&out].peer != 0);
@@ -1132,6 +1185,132 @@ mod tests {
     use super::*;
     use adv_cpu::backend::Guest;
 
+    // spec: MEDIA-DMO-3
+    #[test]
+    fn end_of_stream_waits_for_the_mixer_to_consume_pcm() {
+        let mut m = machine();
+        crate::dsound::register(m.sys.thunks.resolver_mut::<adv_abi::Registry>().unwrap());
+        crate::dsound::install(&mut m).unwrap();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let filter = activate(&mut m, CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+        let wrapper = query(&mut m, filter, IID_IDMOWRAPPERFILTER);
+        m.cpu.write(DATA, &CLSID_WMA_DECODER).unwrap();
+        assert_eq!(
+            method(&mut m, "IDMOWrapperFilter::Init", &[wrapper, DATA, DATA]),
+            S_OK
+        );
+        assert_eq!(
+            method(&mut m, "IFilterGraph2::AddFilter", &[graph, filter, 0]),
+            S_OK
+        );
+        let sound = m.ext.get_mut::<Sound>();
+        let audio = sound.audio.clone();
+        let stream = sound.allocate_audio_id().unwrap();
+        assert!(
+            audio
+                .push_pcm(PcmBlock {
+                    stream_id: stream,
+                    guest_pts_us: 0,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples: vec![0.5; 100],
+                })
+                .is_ok()
+        );
+        let mut e = env(&mut m);
+        state(&mut e).graphs.get_mut(&graph).unwrap().expected = 1;
+        let out = pin_of(&e, filter, OUTPUT).unwrap();
+        state(&mut e).pins.get_mut(&out).unwrap().peer = DATA + 512;
+        dmo(&mut e, filter).unwrap().audio = Some(stream);
+        let Outcome::Block { then, .. } = finish_stream(&mut e, filter, 0, None, false) else {
+            panic!("EOS must wait for the queued sample");
+        };
+        assert_eq!(e.ext.get_or_default::<Playback>().completions, 0);
+        audio.sync_clock(200_000);
+        assert!(matches!(
+            then(
+                &mut e,
+                adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout)
+            ),
+            Outcome::Return(S_OK)
+        ));
+        assert_eq!(e.ext.get::<Playback>().completions, 1);
+    }
+
+    // spec: MEDIA-DMO-2
+    #[test]
+    fn flush_discards_the_remainder_of_a_decoded_audio_batch() {
+        let mut m = machine();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let filter = activate(&mut m, CLSID_DMO_WRAPPER, IID_IBASEFILTER);
+        let wrapper = query(&mut m, filter, IID_IDMOWRAPPERFILTER);
+        m.cpu.write(DATA, &CLSID_WMA_DECODER).unwrap();
+        assert_eq!(
+            method(&mut m, "IDMOWrapperFilter::Init", &[wrapper, DATA, DATA]),
+            S_OK
+        );
+        assert_eq!(
+            method(&mut m, "IFilterGraph2::AddFilter", &[graph, filter, 0]),
+            S_OK
+        );
+        let mem = DATA + 64;
+        let vtable = DATA + 128;
+        let peer = DATA + 512;
+        let receive = DATA + 256;
+        m.cpu.write_u32(mem, vtable).unwrap();
+        m.cpu.write_u32(peer, vtable).unwrap();
+        for slot in [6, 15, 16] {
+            m.cpu.write_u32(vtable + slot * 4, receive + slot).unwrap();
+        }
+        let mut e = env(&mut m);
+        let input = pin_of(&e, filter, INPUT).unwrap();
+        let out = pin_of(&e, filter, OUTPUT).unwrap();
+        let allocator = sample::create_allocator(&mut e, 1, 16).unwrap();
+        let p = state(&mut e).pins.get_mut(&out).unwrap();
+        p.peer = peer;
+        p.mem = mem;
+        p.allocator = allocator;
+        filter::set_state(&mut e, filter, graph::PAUSED);
+        let frames = [1000, 2000].map(|pts_us| {
+            Decoded::Audio(AudioFrame {
+                pts_us,
+                sample_rate: 48_000,
+                channels: 2,
+                samples: vec![0.5, -0.5],
+            })
+        });
+        let Outcome::Call {
+            target,
+            then: old_receive,
+            ..
+        } = emit(
+            &mut e,
+            filter,
+            0,
+            frames.into(),
+            Box::new(|_, hr| Outcome::Return(hr)),
+        )
+        else {
+            panic!("expected the first sample");
+        };
+        assert_eq!(target, receive + 6);
+        for (method, slot) in [("BeginFlush", 15), ("EndFlush", 16)] {
+            let Some(Outcome::Call { target, then, .. }) = pin_method(&mut e, input, method) else {
+                panic!("expected forwarded {method}");
+            };
+            assert_eq!(target, receive + slot);
+            assert!(matches!(
+                then(&mut e, adv_machine::Resume::Returned(S_OK)),
+                Outcome::Return(S_OK)
+            ));
+        }
+        let after_flush = old_receive(&mut e, adv_machine::Resume::Returned(S_OK));
+        assert!(
+            !matches!(after_flush, Outcome::Call { target, .. } if target == receive + 6),
+            "the second pre-flush frame was delivered to the renderer after EndFlush"
+        );
+    }
+
     // spec: MEDIA-DMO-2
     #[test]
     fn paused_decoder_sends_pcm_to_its_guest_renderer() {
@@ -1169,7 +1348,7 @@ mod tests {
         };
         let Outcome::Call {
             target, args, then, ..
-        } = push_audio(&mut env, filter, frame, |_, hr| Outcome::Return(hr))
+        } = push_audio(&mut env, filter, 0, frame, |_, hr| Outcome::Return(hr))
         else {
             panic!("the paused guest renderer needs its first sample");
         };
