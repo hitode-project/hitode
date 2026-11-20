@@ -618,6 +618,8 @@ fn execute_decoded(
     state.regs = tx.regs;
     state.eflags = tx.flags;
     state.eip = tx.eip;
+    state.fs_base = tx.fs_base;
+    state.segments = tx.segments;
     if let Some(branch) = tx.indirect_branch {
         state.last_indirect_branch = branch;
     }
@@ -1307,6 +1309,9 @@ enum Action {
     Cpuid,
     Rdtsc,
     ReadSegment(Operand, usize),
+    PushSegment(usize, u8),
+    PopSegment(usize, u8),
+    WriteSegment(Operand, usize),
     StoreDescriptorTable(Address, bool),
     StoreLdt(Operand),
     String(StringOp),
@@ -1413,6 +1418,18 @@ fn string_operation(i: &Instruction) -> Option<StringOp> {
     })
 }
 
+/// The x86 encoding index of a segment register: ES, CS, SS, DS, FS, GS.
+fn segment_index(register: R) -> usize {
+    match register {
+        R::ES => 0,
+        R::CS => 1,
+        R::SS => 2,
+        R::DS => 3,
+        R::FS => 4,
+        _ => 5,
+    }
+}
+
 fn same_width(dst: Operand, src: Operand) -> bool {
     src.width().is_none_or(|w| dst.width() == Some(w))
 }
@@ -1489,15 +1506,41 @@ fn predecode(i: &Instruction) -> Option<Action> {
                 R::ES | R::CS | R::SS | R::DS | R::FS | R::GS
             ) =>
         {
-            let index = match i.op1_register() {
-                R::ES => 0,
-                R::CS => 1,
-                R::SS => 2,
-                R::DS => 3,
-                R::FS => 4,
-                _ => 5,
+            Action::ReadSegment(op(0)?, segment_index(i.op1_register()))
+        }
+        M::Mov if i.op0_register().is_segment_register() => {
+            Action::WriteSegment(op(1)?, segment_index(i.op0_register()))
+        }
+        M::Push | M::Pop
+            if matches!(
+                i.op0_register(),
+                R::ES | R::CS | R::SS | R::DS | R::FS | R::GS
+            ) =>
+        {
+            let index = segment_index(i.op0_register());
+            let width = if matches!(
+                i.code(),
+                Code::Pushw_ES
+                    | Code::Pushw_CS
+                    | Code::Pushw_SS
+                    | Code::Pushw_DS
+                    | Code::Pushw_FS
+                    | Code::Pushw_GS
+                    | Code::Popw_ES
+                    | Code::Popw_SS
+                    | Code::Popw_DS
+                    | Code::Popw_FS
+                    | Code::Popw_GS
+            ) {
+                2
+            } else {
+                4
             };
-            Action::ReadSegment(op(0)?, index)
+            if i.mnemonic() == M::Push {
+                Action::PushSegment(index, width)
+            } else {
+                Action::PopSegment(index, width)
+            }
         }
         M::Mov => {
             let (dst, src) = pair()?;
@@ -1821,6 +1864,51 @@ pub fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> b
 }
 
 impl Transaction {
+    /// Loads a segment register under the protected-mode checks at CPL3.
+    /// A null selector loads into every register except SS; other failures
+    /// raise #GP. Loading FS with a descriptor moves FS to its base.
+    fn load_segment(&mut self, memory: &Memory, index: usize, selector: u16) -> Result<(), Step> {
+        let fault = Step::Trap {
+            pc: self.pc,
+            vector: 13,
+        };
+        if selector & !3 == 0 {
+            if index == 2 {
+                return Err(fault);
+            }
+            self.segments.selectors[index] = selector;
+            return Ok(());
+        }
+        let offset = u32::from(selector & !7);
+        if selector & 4 != 0 || offset + 7 > u32::from(self.segments.gdt_limit) {
+            return Err(fault);
+        }
+        // Descriptor reads are system accesses, outside guest page permissions.
+        let descriptor = memory
+            .read(self.segments.gdt_base.wrapping_add(offset), 8)
+            .map_err(|_| fault)?;
+        let low = u32::from_le_bytes(descriptor[..4].try_into().unwrap());
+        let high = u32::from_le_bytes(descriptor[4..].try_into().unwrap());
+        let kind = (high >> 8) & 0x1f;
+        let dpl = (high >> 13) & 3;
+        let (rpl, code, second) = (u32::from(selector & 3), kind & 8 != 0, kind & 2 != 0);
+        let allowed = kind & 0x10 != 0
+            && if index == 2 {
+                !code && second && rpl == 3 && dpl == 3
+            } else {
+                (!code || second) && (code && kind & 4 != 0 || dpl == 3)
+            };
+        // The profile's GDT holds only present descriptors, so a selector
+        // that passes these checks never raises #NP or #SS.
+        if !allowed {
+            return Err(fault);
+        }
+        self.segments.selectors[index] = selector;
+        if index == 4 {
+            self.fs_base = (low >> 16) | ((high & 0xff) << 16) | (high & 0xff00_0000);
+        }
+        Ok(())
+    }
     fn read_mem(&self, memory: &Memory, address: u32, width: u8) -> Result<u32, Step> {
         if !accessible(memory, address, width, READ) {
             return Err(Step::ReadFault {
@@ -1910,6 +1998,26 @@ impl Transaction {
             }
             Action::ReadSegment(dst, index) => {
                 self.store(memory, dst, u32::from(self.segments.selectors[index]))?;
+            }
+            Action::PushSegment(index, width) => {
+                // Current WoW64 hardware writes only the selector word of a
+                // 32-bit slot and leaves its upper half unchanged.
+                let address = self.regs[4].wrapping_sub(u32::from(width));
+                self.store(
+                    memory,
+                    Self::stack_operand_width(address, 2),
+                    u32::from(self.segments.selectors[index]),
+                )?;
+                self.regs[4] = address;
+            }
+            Action::PopSegment(index, width) => {
+                let selector = self.read_mem(memory, self.regs[4], 2)? as u16;
+                self.load_segment(memory, index, selector)?;
+                self.regs[4] = self.regs[4].wrapping_add(u32::from(width));
+            }
+            Action::WriteSegment(src, index) => {
+                let selector = self.read(memory, src)? as u16;
+                self.load_segment(memory, index, selector)?;
             }
             Action::StoreLdt(dst) => {
                 // UMIP is absent from the virtual CPU profile. SLDT is a
@@ -2487,6 +2595,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Runs one instruction at 0x1000 under the WoW64 segment profile with
+    /// `value` on the stack, which starts at 0x3000.
+    fn segment_step(code: &[u8], value: u32) -> (Step, CpuState, Memory) {
+        let mut memory = Memory::new(0x1000, 0x9000).unwrap();
+        memory.protect(0x1000, 0x3000, READ | WRITE | EXEC).unwrap();
+        let segments = crate::SegmentState::wow64(&mut memory, 0x8000).unwrap();
+        segments.set_fs_base(&mut memory, 0x7000).unwrap();
+        memory.write(0x1000, code).unwrap();
+        memory.write(0x3000, &value.to_le_bytes()).unwrap();
+        memory.write(0x2ffc, &0xdeadbeefu32.to_le_bytes()).unwrap();
+        let mut state = CpuState {
+            eip: 0x1000,
+            fs_base: 0x7000,
+            segments,
+            ..Default::default()
+        };
+        state.regs[1] = value;
+        state.regs[4] = 0x3000;
+        let step = Interpreter::new()
+            .run_chunk(&mut state, &mut memory, 1)
+            .step;
+        (step, state, memory)
+    }
+
+    // spec: A64-TR-4
+    #[test]
+    fn segment_pushes_write_the_selector_word_as_measured_on_wow64() {
+        for (code, esp, slot) in [
+            (&[0x06][..], 0x2ffc, 0xdead002b),
+            (&[0x0e], 0x2ffc, 0xdead0023),
+            (&[0x16], 0x2ffc, 0xdead002b),
+            (&[0x0f, 0xa0], 0x2ffc, 0xdead0053),
+            (&[0x0f, 0xa8], 0x2ffc, 0xdead002b),
+            (&[0x66, 0x06], 0x2ffe, 0x002bbeef),
+        ] {
+            let (step, state, memory) = segment_step(code, 0);
+            assert_eq!(step, Step::Executed, "{code:x?}");
+            assert_eq!(state.regs[4], esp, "{code:x?}");
+            let bytes = memory.read_data(0x2ffc, 4).unwrap();
+            let actual = u32::from_le_bytes(bytes.as_ref().try_into().unwrap());
+            assert_eq!(actual, slot, "{code:x?}");
+        }
+    }
+
+    // spec: A64-TR-4
+    #[test]
+    fn segment_pops_check_descriptors_as_measured_on_wow64() {
+        for (code, value, loaded) in [
+            (&[0x07][..], 0x2b, Some(0x2b)),
+            (&[0x07], 0x28, Some(0x28)),
+            (&[0x07], 0x23, Some(0x23)),
+            (&[0x07], 0x53, Some(0x53)),
+            (&[0x07], 0x30, Some(0x30)),
+            (&[0x07], 0, Some(0)),
+            (&[0x07], 3, Some(3)),
+            (&[0x07], 0xabcd_002b, Some(0x2b)),
+            (&[0x07], 0x1234, None),
+            (&[0x1f], 0x23, Some(0x23)),
+            (&[0x1f], 0, Some(0)),
+            (&[0x0f, 0xa9], 0x2b, Some(0x2b)),
+            (&[0x17], 0x2b, Some(0x2b)),
+            (&[0x17], 0, None),
+            (&[0x17], 0x23, None),
+        ] {
+            let (step, state, _) = segment_step(code, value);
+            let index = match code {
+                [0x07] => 0,
+                [0x17] => 2,
+                [0x1f] => 3,
+                _ => 5,
+            };
+            match loaded {
+                Some(selector) => {
+                    assert_eq!(step, Step::Executed, "{code:x?} {value:#x}");
+                    assert_eq!(state.segments.selectors[index], selector);
+                    assert_eq!(state.regs[4], 0x3004);
+                }
+                None => {
+                    assert_eq!(
+                        step,
+                        Step::Trap {
+                            pc: 0x1000,
+                            vector: 13
+                        },
+                        "{code:x?} {value:#x}"
+                    );
+                    assert_eq!(state.regs[4], 0x3000);
+                    assert_eq!(state.eip, 0x1000);
+                }
+            }
+        }
+        // MOV takes the low word of a register or a word of memory.
+        for (code, value, index, loaded) in [
+            (&[0x8e, 0xc1][..], 0x2b, 0, Some(0x2b)),
+            (&[0x8e, 0xc1], 0xabcd_0023, 0, Some(0x23)),
+            (&[0x8e, 0xc1], 0x1234, 0, None),
+            (&[0x66, 0x8e, 0xd9], 0, 3, Some(0)),
+            (&[0x8e, 0xd1], 0, 2, None),
+            (&[0x8e, 0x04, 0x24], 0x53, 0, Some(0x53)),
+        ] {
+            let (step, state, _) = segment_step(code, value);
+            assert_eq!(state.regs[4], 0x3000);
+            match loaded {
+                Some(selector) => {
+                    assert_eq!(step, Step::Executed, "{code:x?} {value:#x}");
+                    assert_eq!(state.segments.selectors[index], selector);
+                }
+                None => assert_eq!(
+                    step,
+                    Step::Trap {
+                        pc: 0x1000,
+                        vector: 13
+                    },
+                    "{code:x?} {value:#x}"
+                ),
+            }
+        }
+        // A data selector moves FS to its descriptor's base; the TEB selector returns it.
+        let (_, state, _) = segment_step(&[0x0f, 0xa1], 0x2b);
+        assert_eq!((state.segments.selectors[4], state.fs_base), (0x2b, 0));
+        let (_, state, _) = segment_step(&[0x0f, 0xa1], 0x53);
+        assert_eq!((state.segments.selectors[4], state.fs_base), (0x53, 0x7000));
     }
 
     #[test]
