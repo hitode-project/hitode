@@ -31,6 +31,7 @@ use crate::translate::opt::{back::Lowered, front::Built, ir::Source};
 pub(super) struct Offload {
     pub(super) admission: Admission,
     pub(super) enabled: bool,
+    wake: WakeEstimate,
 }
 
 #[derive(Default)]
@@ -106,7 +107,7 @@ impl<U> WorkerJob<U> {
 
 /// A helper's wake latency until helpers have shown theirs: it starts
 /// claiming this long after the owner.
-const WAKE_NS: f64 = 50_000.0;
+const WAKE_NS: u64 = 50_000;
 /// Blocks per thread, so the last block to finish leaves the others idle
 /// for about a quarter of a thread's part. A block is at most one slice.
 const BLOCKS_PER_THREAD: f64 = 4.0;
@@ -114,6 +115,30 @@ const BLOCKS_PER_THREAD: f64 = 4.0;
 const ROUND_NS: f64 = 10_000.0;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
+
+/// Rolling median of three claimed wakes, seeded with the startup estimate.
+struct WakeEstimate {
+    recent: [u64; 2],
+    ns: u64,
+}
+
+impl Default for WakeEstimate {
+    fn default() -> Self {
+        Self {
+            recent: [WAKE_NS; 2],
+            ns: WAKE_NS,
+        }
+    }
+}
+
+impl WakeEstimate {
+    fn record(&mut self, ns: u64) {
+        let [older, newer] = self.recent;
+        let ns = ns.max(1);
+        self.ns = ns.clamp(older.min(newer), older.max(newer));
+        self.recent = [newer, ns];
+    }
+}
 
 #[derive(Default)]
 struct ExecuteScratch {
@@ -172,6 +197,12 @@ impl Signals {
     }
 }
 
+enum Timing<'a> {
+    Whole,
+    Block(&'a mut Duration),
+    Sample(&'a mut Duration),
+}
+
 fn run(
     runtime: &mut Runtime,
     id: u32,
@@ -179,7 +210,7 @@ fn run(
     entry: Entry,
     (code, head_exit): (&Code, u32),
     (signals, recall_mask): (&Signals, u32),
-    scratch: &mut ExecuteScratch,
+    (scratch, timing): (&mut ExecuteScratch, Timing<'_>),
 ) -> Done {
     runtime.countdown = u64::from(COMPUTATION_SLICE);
     runtime.recall = signals.recall.as_ptr() as u64;
@@ -191,15 +222,20 @@ fn run(
     if code.scoped_mmx != 0 {
         runtime.scope_written = 0;
     }
-    let started = Instant::now();
+    let (started, execution) = match timing {
+        Timing::Whole => (Some(Instant::now()), None),
+        Timing::Block(execution) => (None, Some(execution)),
+        Timing::Sample(execution) => (Some(Instant::now()), Some(execution)),
+    };
     let cpu = context.cpu_mut();
     cpu.settle_flags();
     if code.optimized.as_deref().is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
         cpu.refresh_mmx();
     }
     let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
-    let (exit, retired, deferred) = execute(runtime, cpu, entry, code, optimized, scratch);
-    let elapsed = started.elapsed();
+    let (exit, retired, deferred) =
+        execute(runtime, cpu, entry, code, optimized, scratch, execution);
+    let elapsed = started.map_or(Duration::ZERO, |at| at.elapsed());
     context.finish_computation(exit);
     Done {
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
@@ -251,6 +287,7 @@ fn execute(
     code: &Code,
     optimized: Option<&Optimized>,
     scratch: &mut ExecuteScratch,
+    execution: Option<&mut Duration>,
 ) -> (Exit, u64, bool) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
@@ -279,7 +316,7 @@ fn execute(
     let previous = ACTIVE.replace(Active::Worker(std::ptr::from_ref(&faults).cast()));
     // SAFETY: the caller retains this code and mapping through the call.
     // The proved form touches only its admitted ranges and this thread's state.
-    let returned = unsafe {
+    let (returned, sample) = unsafe {
         // The publisher's ISB does not synchronize the worker's instruction stream.
         std::arch::asm!("isb", options(nostack, preserves_flags));
         let target_enter = if optimized.is_some() {
@@ -287,8 +324,12 @@ fn execute(
         } else {
             entry.enter
         };
-        target_enter.run(runtime, code.entry)
+        let sample = execution.map(|time| (time, Instant::now()));
+        (target_enter.run(runtime, code.entry), sample)
     };
+    if let Some((time, at)) = sample {
+        *time += at.elapsed();
+    }
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
     let mut exit = Exit::from_raw(returned.reason as u32).expect("computation exit");
@@ -351,7 +392,7 @@ pub(crate) struct SplitCounts {
     pub wakes: u64,
     /// Helpers that found no block left to claim.
     pub idle_wakes: u64,
-    /// Total time from submitting blocks to each helper's first claim.
+    /// Total time from split setup to drain entry for helpers that claimed a block.
     pub claim_ns: u64,
 }
 
@@ -385,9 +426,10 @@ struct Drained {
     retired: u64,
     optimized: u64,
     elapsed: Duration,
+    execution: Duration,
     sticky: u32,
     blocks: u32,
-    /// From submission to its first claim.
+    /// From split setup to drain entry, recorded only if it claimed a block.
     claimed_after: Duration,
     /// The last block's completion and its thread.
     last: Option<LastBlock>,
@@ -557,7 +599,7 @@ impl Blocks {
                 self.entry,
                 (&self.code, iterations),
                 (&quiet, 0),
-                scratch,
+                (scratch, Timing::Block(&mut out.execution)),
             )
             .completion;
             let cpu = done.context.as_ref().expect("block context").cpu();
@@ -650,7 +692,7 @@ impl Pool {
                             task.entry,
                             (&task.code, u32::from(task.once)),
                             (&task.signals, RECALL),
-                            &mut scratch,
+                            (&mut scratch, Timing::Whole),
                         );
                         if result.completion.requires_owner {
                             task.signals
@@ -944,6 +986,7 @@ pub(super) struct Session<'a, U> {
     runtime: Runtime,
     pace: Option<Pace>,
     counts: &'a mut SplitCounts,
+    wake_estimate: &'a mut WakeEstimate,
     scope_updates: Vec<u32>,
 }
 
@@ -952,7 +995,7 @@ impl<'a, U> Session<'a, U> {
         entry: Entry,
         (jobs, plans): (&'a FxHashMap<u32, WorkerJob<U>>, &'a mut Arbiter),
         memory: &'a Memory,
-        admission: &'a mut Admission,
+        offload: &'a mut Offload,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
         notifications: Notifications,
         (pace, counts): (Option<Pace>, &'a mut SplitCounts),
@@ -964,7 +1007,7 @@ impl<'a, U> Session<'a, U> {
             jobs,
             plans,
             memory,
-            admission,
+            admission: &mut offload.admission,
             retired,
             forms,
             pool,
@@ -979,6 +1022,7 @@ impl<'a, U> Session<'a, U> {
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
             pace,
             counts,
+            wake_estimate: &mut offload.wake,
             scope_updates: Vec::new(),
         })
     }
@@ -1020,8 +1064,7 @@ impl<'a, U> Session<'a, U> {
         let slice = (u64::from(COMPUTATION_SLICE) / retired).clamp(1, u64::from(u32::MAX)) as u32;
         let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
-        let counts = &*self.counts;
-        let wake = wake_cost(counts);
+        let wake = self.wake_estimate.ns as f64;
         let need = pace.need(serial as u64) as f64;
         let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
         if helpers == 0 {
@@ -1095,11 +1138,14 @@ impl<'a, U> Session<'a, U> {
             if drained.blocks == 0 {
                 self.counts.idle_wakes += 1;
             } else {
-                self.counts.claim_ns += drained.claimed_after.as_nanos() as u64;
+                let ns = drained.claimed_after.as_nanos() as u64;
+                self.counts.claim_ns += ns;
+                self.wake_estimate.record(ns);
             }
             total.blocks += drained.blocks;
             total.retired += drained.retired;
             total.optimized += drained.optimized;
+            total.execution += drained.execution;
             total.sticky |= drained.sticky;
             total.mmx.merge(drained.mmx);
             if let Some(last) = drained.last
@@ -1165,7 +1211,8 @@ impl<'a, U> Session<'a, U> {
             self.plans.job(context.cpu().eip).unwrap(),
             &completion,
             iterations,
-            wake_cost(self.counts),
+            total.execution,
+            self.wake_estimate.ns as f64,
         );
         Some(completion)
     }
@@ -1234,26 +1281,20 @@ fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> us
         .unwrap_or(most)
 }
 
-fn wake_cost(counts: &SplitCounts) -> f64 {
-    match counts.wakes - counts.idle_wakes {
-        0 => WAKE_NS,
-        claimed => (counts.claim_ns as f64 / claimed as f64).max(1.0),
-    }
-}
-
 /// Records the instructions and time per outer iteration of a job that ran
 /// `iterations` of them.
 fn learn(
     prepared: &JobPlan,
     done: &Completion<Option<ExecutionContext>>,
     iterations: u32,
+    execution: Duration,
     wake: f64,
 ) {
     if iterations == 0 || done.requires_owner {
         return;
     }
     let n = u64::from(iterations);
-    let ns = (done.elapsed + done.helpers).as_nanos() as f64;
+    let ns = execution.as_nanos() as f64;
     prepared.set_cost(ns as u64);
     if prepared.scoped && ns > 0.0 {
         prepared
@@ -1353,6 +1394,12 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
         } else {
             (&quiet, 0)
         };
+        let mut execution = Duration::ZERO;
+        let timing = if plan.is_some() {
+            Timing::Sample(&mut execution)
+        } else {
+            Timing::Whole
+        };
         let done = run(
             &mut self.runtime,
             id,
@@ -1360,7 +1407,7 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
             self.entry,
             (&code, u32::from(iteration || scoped)),
             signals,
-            &mut scratch,
+            (&mut scratch, timing),
         );
         if !code.frame.is_empty() {
             publish_frame(
@@ -1383,7 +1430,8 @@ impl<U> Computation<Option<ExecutionContext>> for Session<'_, U> {
                 self.plans.job(guest_entry).unwrap(),
                 &done.completion,
                 iterations,
-                wake_cost(self.counts),
+                execution,
+                self.wake_estimate.ns as f64,
             );
         }
         Some(self.account(guest_entry, iteration, done))
@@ -1594,7 +1642,7 @@ mod tests {
                 },
                 LOCAL,
             ),
-            &mut ExecuteScratch::default(),
+            (&mut ExecuteScratch::default(), Timing::Whole),
         )
         .completion;
         assert!(!local.requires_owner);
@@ -1897,6 +1945,56 @@ mod tests {
         assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 200_000.0, 7), 2);
         assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 400_000.0, 7), 7);
         assert_eq!(helpers(400_000.0, (12_000.0, 1e9), 0.0, 7), 0);
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn wake_estimate_rejects_isolated_outliers() {
+        let mut wake = WakeEstimate::default();
+        assert_eq!(wake.ns, WAKE_NS);
+        wake.record(1_600_000);
+        assert_eq!(wake.ns, WAKE_NS);
+        wake.record(12_000);
+        wake.record(12_000);
+        assert_eq!(wake.ns, 12_000);
+        for outlier in [1, 1_600_000] {
+            wake.record(outlier);
+            assert_eq!(wake.ns, 12_000);
+            wake.record(12_000);
+            wake.record(12_000);
+        }
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn learn_prices_execution_and_keeps_rows_splittable_after_a_cold_wake() {
+        let mut job = JobPlan::new(true, true);
+        job.scoped = true;
+        let rows = 240;
+        let execution = Duration::from_nanos(115_200);
+        let done = Completion {
+            id: 1,
+            context: None,
+            retired: 24_000,
+            optimized: 24_000,
+            elapsed: Duration::from_millis(2),
+            helpers: Duration::from_millis(1),
+            requires_owner: false,
+        };
+        for first in [12_000, 1_600_000] {
+            let mut wake = WakeEstimate::default();
+            wake.record(first);
+            for _ in 0..10 {
+                wake.record(12_000);
+            }
+            learn(&job, &done, rows, execution, wake.ns as f64);
+            assert_eq!(job.cost(), 115_200);
+            assert_eq!(job.per_iteration.get(), Some((100, 480.0)));
+            assert_eq!(job.split_minimum.get(), 225);
+            assert!(job.split_minimum.get() <= u64::from(rows));
+            let serial = job.scope_cost(rows) as f64;
+            assert_eq!(helpers(serial, (wake.ns as f64, serial), 10_000.0, 1), 1);
+        }
     }
 
     const SRC: u32 = 0x100_0000;
@@ -2582,7 +2680,7 @@ mod tests {
                     entry,
                     (&prepared.code, 0),
                     (&signals, LOCAL),
-                    &mut ExecuteScratch::default(),
+                    (&mut ExecuteScratch::default(), Timing::Whole),
                 )
                 .completion;
                 assert!(cut.optimized > 0 && cut.retired < u64::from(COUNT) * 13);
@@ -2654,7 +2752,7 @@ mod tests {
                         fault_entry,
                         (&native.worker_jobs[&CODE].code, 0),
                         (&clean_signals, LOCAL),
-                        &mut ExecuteScratch::default(),
+                        (&mut ExecuteScratch::default(), Timing::Whole),
                     );
                     assert_eq!(done.admitted, Some(true));
                     let faulted = done.completion;
@@ -3161,7 +3259,7 @@ mod tests {
             entry,
             (&code, 0),
             (&signals, LOCAL),
-            &mut ExecuteScratch::default(),
+            (&mut ExecuteScratch::default(), Timing::Whole),
         )
         .completion;
         for result in [
@@ -3310,7 +3408,7 @@ mod tests {
                 entry,
                 (&native.worker_jobs[&CODE].code, 0),
                 (&pending, RECALL),
-                &mut ExecuteScratch::default(),
+                (&mut ExecuteScratch::default(), Timing::Whole),
             );
             assert!(done.deadline_recall);
             prepared.observe(
@@ -3335,7 +3433,7 @@ mod tests {
             entry,
             (&native.worker_jobs[&CODE].code, 1),
             (&recalled, RECALL),
-            &mut ExecuteScratch::default(),
+            (&mut ExecuteScratch::default(), Timing::Whole),
         )
         .completion;
         assert!(!done.requires_owner);
@@ -3515,7 +3613,7 @@ mod tests {
                 entry,
                 (&code, 0),
                 (&signals, LOCAL),
-                &mut ExecuteScratch::default(),
+                (&mut ExecuteScratch::default(), Timing::Whole),
             )
             .completion;
             // A pending deadline finishes the iteration and returns at the head.

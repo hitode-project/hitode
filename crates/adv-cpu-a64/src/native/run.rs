@@ -439,7 +439,7 @@ impl Native {
             entry,
             (&self.worker_jobs, &mut self.plans),
             memory,
-            &mut self.offload.admission,
+            &mut self.offload,
             (retired, &mut self.retired_forms),
             Notifications { pending, wake },
             (self.pace.get(), &mut self.diagnostics.split),
