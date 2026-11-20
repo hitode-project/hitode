@@ -1438,11 +1438,14 @@ fn reset(
         Err(_) => return Outcome::Return(UNAVAILABLE),
     };
     let target = match env.ext.get::<State>().gpu.as_ref() {
-        Some(g) => g.presentation_target(
-            normalized.BackBufferWidth,
-            normalized.BackBufferHeight,
-            false,
-        ),
+        Some(g) => {
+            g.clear_worker_failure();
+            g.presentation_target(
+                normalized.BackBufferWidth,
+                normalized.BackBufferHeight,
+                false,
+            )
+        }
         None => return Outcome::Return(UNAVAILABLE),
     };
     let target = match target {

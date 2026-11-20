@@ -150,6 +150,7 @@ struct State {
     /// The owner thread waits for a chunk.
     idle: bool,
     closed: bool,
+    consumer_closed: bool,
     poked: bool,
     captures: Vec<crate::frame::CaptureReply>,
 }
@@ -348,42 +349,53 @@ impl Producer {
     /// Reserve `len` bytes for this chunk's commands and let `write` fill
     /// them. Small data shares one span per chunk; large uploads get their
     /// own. Waits for the GPU only when the whole ring is in flight.
-    pub fn bytes(&mut self, len: u32, align: u32, write: impl FnOnce(&mut [u8])) -> Bytes {
+    pub fn bytes(
+        &mut self,
+        len: u32,
+        align: u32,
+        write: impl FnOnce(&mut [u8]),
+    ) -> adv_gpu::Result<Bytes> {
         let (len64, align64) = (u64::from(len), u64::from(align));
         let (span, offset) = if len64 > SPAN / 4 {
-            (self.span(len64, align64), 0)
+            (self.span(len64, align64)?, 0)
         } else {
             let fits = self
                 .small
                 .map(|(span, cursor)| (span, cursor.next_multiple_of(align64)))
                 .filter(|(_, offset)| offset + len64 <= SPAN);
-            let (span, offset) = fits.unwrap_or_else(|| (self.span(SPAN, align64), 0));
+            let (span, offset) = match fits {
+                Some(pair) => pair,
+                None => (self.span(SPAN, align64)?, 0),
+            };
             self.small = Some((span, offset + len64));
             (span, offset)
         };
         let bytes = self.chunk.spans[usize::from(span)].bytes();
         write(&mut bytes[offset as usize..(offset + len64) as usize]);
-        Bytes {
+        Ok(Bytes {
             span,
             offset: offset as u32,
             len,
-        }
+        })
     }
 
-    fn span(&mut self, size: u64, align: u64) -> u16 {
+    fn span(&mut self, size: u64, align: u64) -> adv_gpu::Result<u16> {
         let span = loop {
             match self.ring.reserve(size, align) {
                 Ok(span) => break span,
                 Err(adv_gpu::Error::Busy) => {
+                    if self.shared.state.lock().unwrap().consumer_closed {
+                        return Err(adv_gpu::Error::DeviceLost("GPU owner stopped".into()));
+                    }
                     // The ring is in flight or held by recorded commands: have
                     // the owner submit everything, then wait for completions.
                     self.wait();
                 }
-                Err(error) => panic!("upload ring: {error}"),
+                Err(error) => return Err(error),
             }
         };
         self.chunk.spans.push(span);
-        (self.chunk.spans.len() - 1) as u16
+        Ok((self.chunk.spans.len() - 1) as u16)
     }
 
     pub fn wait(&mut self) {
@@ -479,6 +491,13 @@ impl Consumer {
     }
 }
 
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().consumer_closed = true;
+        self.shared.retired.notify_all();
+    }
+}
+
 /// Execution-thread handle to shared stream completion and test gates (without
 /// owning the upload ring or chunk producer, which live on `"adv-gfx-worker"`).
 #[derive(Clone)]
@@ -486,6 +505,9 @@ pub(crate) struct Gate(Arc<Shared>);
 impl Gate {
     pub fn completed(&self) -> u64 {
         self.0.completed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn consumer_closed(&self) -> bool {
+        self.0.state.lock().unwrap().consumer_closed
     }
     pub fn wait_retired(&self) {
         let state = self.0.state.lock().unwrap();
@@ -584,5 +606,29 @@ mod wake_tests {
         assert!(matches!(consumer.next(), Next::Chunk(_)));
         assert!(matches!(consumer.next(), Next::Woken));
         assert_eq!(wake.captures().len(), 1);
+    }
+
+    #[test]
+    fn consumer_drop_unblocks_full_ring_reserve_with_device_lost() {
+        let (device, _queue) = match adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            ..Default::default()
+        }) {
+            Ok(opened) => opened,
+            Err(adv_gpu::Error::Unavailable(_))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("open device: {error}"),
+        };
+        let (mut producer, consumer) = channel(device.ring(64 << 10).unwrap());
+        let gate = producer.gate();
+        assert!(!gate.consumer_closed());
+        drop(consumer);
+        assert!(gate.consumer_closed());
+        // Larger than ring capacity triggers Error::Busy -> consumer_closed -> DeviceLost.
+        let result = producer.bytes(128 << 10, 4, |_| {});
+        assert!(matches!(result, Err(adv_gpu::Error::DeviceLost(_))));
     }
 }

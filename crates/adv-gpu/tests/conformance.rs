@@ -2233,3 +2233,143 @@ struct Block { tint: vec4<f32> }
         }
     }
 }
+
+#[test]
+fn multi_mip_render_then_mid_pass_sample_other_mip_preserves_order() {
+    let mut gpu = gpu!();
+    let mip_image = gpu
+        .device
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: Extent {
+                width: 8,
+                height: 8,
+                depth_or_layers: 1,
+            },
+            format: Format::Rgba8Unorm,
+            mips: 2,
+            samples: 1,
+            usage: Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC,
+            view_formats: &[],
+            label: "two-mip target",
+        })
+        .unwrap();
+    let mip0 = mip_image
+        .create_view(&adv_gpu::resource::ViewDesc {
+            format: Some(Format::Rgba8Unorm),
+            dimension: Some(Dimension::D2),
+            mips: 0..1,
+            layers: 0..1,
+            plane: 0,
+        })
+        .unwrap();
+    let mip1 = mip_image
+        .create_view(&adv_gpu::resource::ViewDesc {
+            format: Some(Format::Rgba8Unorm),
+            dimension: Some(Dimension::D2),
+            mips: 1..2,
+            layers: 0..1,
+            plane: 0,
+        })
+        .unwrap();
+    let solid_shader = gpu.shader(
+        r#"
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+}
+"#,
+        1002,
+    );
+    let sample_shader = gpu.shader(
+        r#"
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(0) var smp: sampler;
+struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return V(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), p);
+}
+@fragment fn fs(v: V) -> @location(0) vec4<f32> {
+    return textureSample(tex, smp, v.uv);
+}
+"#,
+        1003,
+    );
+    let solid_pipeline = gpu.pipeline(&RenderPipelineDesc {
+        vertex: solid_shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(solid_shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![],
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "solid blue",
+    });
+    let sample_pipeline = gpu.pipeline(&RenderPipelineDesc {
+        vertex: sample_shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(sample_shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::FRAGMENT,
+            },
+        ],
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "sample mip1",
+    });
+    let sampler = gpu
+        .device
+        .sampler(&SamplerDesc {
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
+            mip: Filter::Nearest,
+            address: [Address::Clamp; 3],
+            border: BorderColor::TransparentBlack,
+            lod_bias: 0,
+            lod_min: 0,
+            lod_max: 0,
+            anisotropy: 1,
+            compare: None,
+        })
+        .unwrap();
+
+    // One encoder: pass 0 clears mip 1 to GREEN; pass 1 attaches mip 0, begins via a draw,
+    // then mid-pass binds mip 1 as Sampled and draws GREEN over mip 0.
+    let mut encoder = gpu.queue.encoder("multi-mip mid-pass sample");
+    drop(encoder.render_pass(&pass(color(&mip1, clear(GREEN)), None, whole(4, 4))));
+    {
+        let mut p = encoder.render_pass(&pass(color(&mip0, clear(RED)), None, whole(8, 8)));
+        p.set_pipeline(&solid_pipeline);
+        p.draw(0..3, 0..1);
+        p.set_pipeline(&sample_pipeline);
+        p.bind(0, Bind::Sampled(&mip1));
+        p.bind(0, Bind::Sampler(&sampler));
+        p.draw(0..3, 0..1);
+    }
+    gpu.submit(encoder);
+    let bytes = gpu.read(&mip_image);
+    for y in 0..8 {
+        for x in 0..8 {
+            assert_eq!(pixel(&bytes, 8, x, y), rgba8(GREEN), "({x}, {y})");
+        }
+    }
+}
