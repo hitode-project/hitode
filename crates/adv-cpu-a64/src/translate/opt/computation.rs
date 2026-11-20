@@ -21,6 +21,7 @@ use crate::translate::front::forms::{Loc, SimdKind as Kind};
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 pub(crate) use crate::translate::lower::access::ScopeCell;
 use crate::translate::lower::access::{FrameCache, ScopeFrame};
+use crate::translate::lower::resident::RowAlignment;
 
 mod carried;
 mod scope;
@@ -159,6 +160,7 @@ pub(crate) struct Proof {
     exprs: Vec<Expr>,
     vars: Vec<Var>,
     checks: Vec<Check>,
+    row_alignment: Option<(RowAlignment, bool)>,
     branches: Vec<(usize, Option<(bool, Check)>)>,
     effects: Vec<Effect>,
     divisions: Vec<Option<Division>>,
@@ -460,6 +462,7 @@ struct Builder<'a> {
     vars: Vec<Var>,
     effects: Vec<(usize, Effect)>,
     checks: Vec<Check>,
+    alignment_bases: Vec<(usize, (u8, u32))>,
     branches: Vec<(usize, Option<(bool, Check)>)>,
     divisions: Vec<(usize, Option<Division>)>,
     frame_heads: Vec<(usize, Option<i32>)>,
@@ -921,7 +924,12 @@ impl Builder<'_> {
         if let Some((reg, mask, nonzero)) = inst.row_alignment {
             self.rows?;
             let address = self.register(state, reg)?;
-            self.check(Check::Mask(address.base, mask, nonzero));
+            if self.trace.row_alignment_route.is_some() {
+                let (entry, offset) = rows::register_offset(&self.exprs, address.base)?;
+                self.alignment_bases.push((at, (entry, offset & mask)));
+            } else {
+                self.check(Check::Mask(address.base, mask, nonzero));
+            }
             for (_, stride) in address.terms {
                 self.check(Check::Mask(stride, mask, false));
             }
@@ -1677,6 +1685,7 @@ impl Builder<'_> {
         // it with symbolic iteration indices, discarding dead or unproved
         // candidates before using the resulting memory effects.
         let checks = self.checks.len();
+        let alignment_bases = self.alignment_bases.len();
         let branches = self.branches.len();
         let effects = self.effects.len();
         let divisions = self.divisions.len();
@@ -1713,6 +1722,7 @@ impl Builder<'_> {
                 break after;
             }
             self.checks.truncate(checks);
+            self.alignment_bases.truncate(alignment_bases);
             self.branches.truncate(branches);
             self.effects.truncate(effects);
             self.divisions.truncate(divisions);
@@ -2015,6 +2025,7 @@ impl Proof {
             vars: Vec::new(),
             effects: Vec::new(),
             checks: Vec::new(),
+            alignment_bases: Vec::new(),
             branches: Vec::new(),
             divisions: Vec::new(),
             frame_heads: Vec::new(),
@@ -2046,6 +2057,31 @@ impl Proof {
             None,
             true,
         )?;
+        let row_alignment = if let Some((mask, nonzero)) = trace.row_alignment_route {
+            b.alignment_bases.sort_unstable();
+            b.alignment_bases.dedup();
+            if b.alignment_bases.len()
+                != trace
+                    .insts
+                    .iter()
+                    .filter(|inst| inst.row_alignment.is_some())
+                    .count()
+                || b.alignment_bases
+                    .windows(2)
+                    .any(|pair| pair[0].0 == pair[1].0)
+            {
+                return None;
+            }
+            let mut bases: Vec<_> = b.alignment_bases.iter().map(|&(_, base)| base).collect();
+            bases.sort_unstable();
+            bases.dedup();
+            if bases.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return None;
+            }
+            Some((RowAlignment { mask, bases }, nonzero))
+        } else {
+            None
+        };
         let frame_cache = b.frame_cache();
         let mut effects = Vec::new();
         for (at, effect) in std::mem::take(&mut b.effects) {
@@ -2153,6 +2189,7 @@ impl Proof {
             exprs: b.exprs,
             vars,
             checks,
+            row_alignment,
             branches: b.branches,
             effects,
             divisions: divisions.into_iter().map(Option::flatten).collect(),
@@ -2620,6 +2657,13 @@ impl Proof {
         scratch.gathered.resize(self.vars.len(), None);
         scratch.tables.clear();
         scratch.entries = 0;
+        if self
+            .row_alignment
+            .as_ref()
+            .is_some_and(|(route, nonzero)| route.nonzero(&cpu.regs) != *nonzero)
+        {
+            return None;
+        }
         for &check in &self.checks {
             match check {
                 Check::Positive(expr, max) => {

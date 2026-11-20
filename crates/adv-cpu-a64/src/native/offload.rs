@@ -1881,6 +1881,132 @@ mod tests {
             .unwrap()
     }
 
+    // spec: A64-OPT-8 A64-OPT-9 A64-OPT-10
+    #[test]
+    fn alignment_routes_both_row_forms_on_the_first_narrow_call() {
+        check_alignment_rows(true);
+        check_alignment_rows(false);
+    }
+
+    fn check_alignment_rows(joined: bool) {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut row = a.create_label();
+        let mut unaligned = a.create_label();
+        let mut latch = a.create_label();
+        let mut stop = a.create_label();
+        a.set_label(&mut row).unwrap();
+        let bias = if joined {
+            a.test(esi, 15).unwrap();
+            a.jnz(unaligned).unwrap();
+            a.test(edi, 15).unwrap();
+            0
+        } else {
+            a.lea(eax, dword_ptr(esi + 8)).unwrap();
+            a.test(eax, 15).unwrap();
+            8
+        };
+        a.jnz(unaligned).unwrap();
+        for other in [false, true] {
+            if other {
+                a.set_label(&mut unaligned).unwrap();
+            }
+            let mut strip = a.create_label();
+            a.mov(ecx, ebx).unwrap();
+            a.set_label(&mut strip).unwrap();
+            if other {
+                a.movq(mm0, qword_ptr(esi + bias)).unwrap();
+                a.movq(qword_ptr(edi), mm0).unwrap();
+                a.movq(mm0, qword_ptr(esi + (bias + 8))).unwrap();
+                a.movq(qword_ptr(edi + 8), mm0).unwrap();
+            } else {
+                a.movaps(xmm0, xmmword_ptr(esi + bias)).unwrap();
+                a.movaps(xmmword_ptr(edi), xmm0).unwrap();
+            }
+            a.add(esi, 16).unwrap();
+            a.add(edi, 16).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(strip).unwrap();
+            if !other {
+                a.jmp(latch).unwrap();
+            }
+        }
+        a.set_label(&mut latch).unwrap();
+        a.dec(edx).unwrap();
+        a.jnz(row).unwrap();
+        a.set_label(&mut stop).unwrap();
+        a.int3().unwrap();
+        let image = a
+            .assemble_options(
+                u64::from(CODE),
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let stop = image.label_ip(&stop).unwrap() as u32;
+        let (mut executor, mut native) = fixture(&mut a);
+        native.first_visits = false;
+        native.observe_stop(stop);
+        let memory = executor.memory_mut();
+        for base in [INPUT, OUTPUT, ROW_STACK] {
+            memory.map(base, 0x10000, READ | WRITE).unwrap();
+        }
+        memory.attach().unwrap();
+        let start = CpuState {
+            eip: CODE,
+            regs: [
+                0,
+                0,
+                24,
+                320,
+                ROW_STACK + 0x100,
+                0,
+                INPUT + bias as u32,
+                OUTPUT,
+            ],
+            ..CpuState::default()
+        };
+        assert!(native.force_resident_at(memory, start.clone()));
+        let site = native.code.resident(CODE).unwrap();
+        assert_eq!(site.versions.len(), 2);
+        assert_eq!(site.versions[1].entry - site.entry().unwrap(), 3 * 4);
+        native.code.measure_cold(CODE, true);
+        let cases: &[_] = if joined {
+            &[(0, 0, 0), (8, 0, 1), (0, 8, 1)]
+        } else {
+            &[(0, 0, 0), (8, 0, 1)]
+        };
+        for &(source, dest, version) in cases {
+            let mut cpu = start.clone();
+            cpu.regs[3] = 96;
+            cpu.regs[6] += source;
+            cpu.regs[7] += dest;
+            let data = vec![0xa6 + version as u8; 24 * 96 * 16];
+            memory.write(cpu.regs[6] + bias as u32, &data).unwrap();
+            let before = native.code.resident(CODE).unwrap().versions[version]
+                .slot
+                .entries
+                .get();
+            assert_eq!(
+                row_run(&mut native, memory, &mut cpu, stop).exit,
+                Exit::Dispatch
+            );
+            assert_eq!((cpu.eip, cpu.regs[2]), (stop, 0));
+            let site = native.code.resident(CODE).unwrap();
+            assert!(
+                site.versions[version].slot.entries.get() > before,
+                "row version {version} for offsets {source}/{dest}, outer minimum {}, failures {:?}",
+                site.versions[version].row_price.unwrap().minimum(),
+                site.row_feedback.as_ref().unwrap().failures,
+            );
+            assert_eq!(
+                site.row_feedback.as_ref().unwrap().failures
+                    [crate::translate::lower::resident::RowFailure::Parameter as usize]
+                    .get(),
+                0,
+            );
+            assert_eq!(memory.read(OUTPUT + dest, data.len()).unwrap(), data);
+        }
+    }
+
     // spec: A64-OPT-8 A64-OPT-14
     #[test]
     fn unpriced_first_target_leaves_the_router_open() {

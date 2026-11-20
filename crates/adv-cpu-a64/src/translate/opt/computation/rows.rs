@@ -3,7 +3,7 @@
 //! first denied page when a profitable prefix remains. An observed optional
 //! tail is guarded separately from the strip that pays for the proof.
 
-use super::{Access, Check, Effect, Expr, ExprId, Graph, Proof, Var, observe_expr};
+use super::{Access, Check, Effect, Expr, ExprId, Graph, Proof, Var};
 use crate::asm::{Asm, Label};
 use crate::encode::{
     Cond, Extend, Reg,
@@ -13,20 +13,20 @@ use crate::encode::{
     mul, mvn, sbfx, str, sub, sub_imm, udiv,
 };
 use crate::translate::front::{decode::Op, trace::Trace};
-use crate::translate::lower::resident::RowFailure;
+use crate::translate::lower::resident::{RowAlignment, RowFailure};
 use std::cell::Cell;
 
 #[derive(Debug)]
 pub(crate) struct Domain {
     exprs: Vec<Expr>,
     checks: Vec<Check>,
+    alignment: Option<(RowAlignment, bool)>,
     spans: Vec<Span>,
     aliases: Vec<(usize, usize)>,
     rows: ExprId,
     inner: Vec<(u32, ExprId)>,
     aligned: Vec<usize>,
-    alignment_strip: Option<(u32, ExprId, u32, u32)>,
-    slots_read: usize,
+    alignment_strip: Option<(u32, ExprId, u32)>,
     direct_calls: u32,
     target: Option<crate::translate::lower::resident::RowTarget>,
     frame: u32,
@@ -150,13 +150,9 @@ impl Domain {
                     .iter()
                     .filter(|&&site| lp.inside[site] && dominates_latch(&graph, i, site))
                     .count() as u32;
-                let minimum = observe_expr(&proof.exprs, observed, count)
-                    .and_then(|count| count.checked_ilog2())
-                    .map_or(1, |shift| 1 << shift);
-                let saved = (accesses * 2).saturating_mul(minimum).saturating_sub(2);
-                (saved != 0).then_some((head, count, minimum, saved))
+                (accesses != 0).then_some((head, count, accesses * 2))
             })
-            .max_by_key(|&(_, _, _, saved)| saved);
+            .max_by_key(|&(_, _, saved)| saved);
 
         // Entry parameter reads, including the indirect slot, cannot be
         // overwritten anywhere in the proved region.
@@ -183,10 +179,8 @@ impl Domain {
                 mark(step);
             }
         }
-        let mut slots_read = 0;
         for (&expr, read) in proof.exprs.iter().zip(used) {
             if read && let Expr::Word(base) = expr {
-                slots_read += 1;
                 let span = Span {
                     base,
                     terms: Vec::new(),
@@ -253,13 +247,13 @@ impl Domain {
             target,
             exprs: proof.exprs.clone(),
             checks: proof.checks.clone(),
+            alignment: proof.row_alignment.clone(),
             spans,
             aliases,
             rows,
             inner,
             aligned,
             alignment_strip,
-            slots_read,
             frame: frame as u32,
         };
         Some((domain, proof))
@@ -305,6 +299,10 @@ impl Domain {
         self.target
     }
 
+    pub(crate) fn alignment(&self) -> Option<&(RowAlignment, bool)> {
+        self.alignment.as_ref()
+    }
+
     /// A guarded inline call still pushes its return address. The checked
     /// indirect table probe and shadow call/return transfers are eliminated.
     pub(crate) fn call_savings(&self) -> u32 {
@@ -324,7 +322,7 @@ impl Domain {
             .find_map(|&(pc, count)| (pc == head).then_some(count))
     }
 
-    pub(crate) fn alignment_strip(&self) -> Option<(u32, ExprId, u32, u32)> {
+    pub(crate) fn alignment_strip(&self) -> Option<(u32, ExprId, u32)> {
         self.alignment_strip
     }
 
@@ -404,6 +402,24 @@ impl Domain {
                 }
                 Check::StackAlignment(_) => {}
                 Check::Mask(value, mask, nonzero) => {
+                    if !nonzero
+                        && self
+                            .alignment
+                            .as_ref()
+                            .is_some_and(|(route, routed_nonzero)| {
+                                !routed_nonzero
+                                    && route.mask & mask == mask
+                                    && register_offset(&self.exprs, value).is_some_and(
+                                        |(reg, offset)| {
+                                            route.bases.iter().any(|&(base, bias)| {
+                                                reg == base && offset.wrapping_sub(bias) & mask == 0
+                                            })
+                                        },
+                                    )
+                            })
+                    {
+                        continue;
+                    }
                     emit.expression(value, A);
                     emit.asm.emit(and_imm(W, A, A, u64::from(mask)));
                     emit.asm.cbz(W, !nonzero, A, parameter);
@@ -473,10 +489,10 @@ impl Domain {
         emit.asm.emit(ldr(W, A, SP, limit));
         emit.asm.emit(cmp(W, A, ROWS, Lsl, 0));
         emit.asm.b_cond(Cond::Eq, complete);
+        let clip_start = emit.asm.offset();
         emit.asm.ldr_literal(B, minimum.0);
         emit.asm.emit(cmp(W, A, B, Lsl, 0));
         emit.asm.b_cond(Cond::Lo, range);
-        let clip_start = emit.asm.offset();
         // Reproject the stored bounds against the minimum over all streams.
         // Their entry expressions and row pitches have already been loaded.
         emit.asm.emit(sub(W, ROWS, ROWS, A, Lsl, 0));
@@ -541,11 +557,9 @@ impl Domain {
         emit.asm.bind(success);
         emit.asm
             .emit_all(&[add_imm(X, SP, SP, frame, false), msr_nzcv(FLAGS)]);
-        // Account for the bounded shared search at each range query.
-        proof_words - clip_words - emit.range_cold
-            + 2
-            + 84 * (self.spans.iter().filter(|span| !span.parameter).count() + self.slots_read)
-                as u32
+        // Price a complete forward domain with same-leaf hits and the
+        // longer successful alias test.
+        proof_words - clip_words - emit.range_cold + 2
     }
 }
 
@@ -567,7 +581,7 @@ fn tracked_base(exprs: &[Expr], id: ExprId) -> Option<u8> {
     register_offset(exprs, id).map(|(base, _)| base)
 }
 
-fn register_offset(exprs: &[Expr], id: ExprId) -> Option<(u8, u32)> {
+pub(super) fn register_offset(exprs: &[Expr], id: ExprId) -> Option<(u8, u32)> {
     match exprs[id] {
         Expr::Register(base) => Some((base, 0)),
         Expr::Add(a, b) => match (exprs[a], exprs[b]) {
@@ -642,10 +656,12 @@ impl RangeEmitter<'_> {
     }
 
     fn range(&mut self, write: bool, fail: Label) {
+        let start = self.asm.offset();
         let hit = self.asm.label();
-        crate::facts::batch_span(self.asm, write, false, self.search, hit);
+        let leaf = crate::facts::batch_span(self.asm, write, false, self.search, hit);
         self.asm.b(fail);
         self.asm.bind(hit);
+        self.range_cold += (self.asm.offset() - start) as u32 / 4 - leaf;
     }
 
     /// Bound a row-varying stream in row order. A denial supplies the
@@ -667,10 +683,10 @@ impl RangeEmitter<'_> {
         let done = self.asm.label();
         self.load(step, TEMP);
         self.asm.tbz(true, TEMP, 31, backwards);
-        crate::facts::batch_span(self.asm, write, false, self.search, done);
+        let start = self.asm.offset();
+        let leaf = crate::facts::batch_span(self.asm, write, false, self.search, done);
         self.asm.b(forward_denial);
 
-        let cold = self.asm.offset();
         self.asm.bind(backwards);
         self.asm.emit_all(&[
             ldr(W, A, SP, offset + 4),
@@ -707,8 +723,7 @@ impl RangeEmitter<'_> {
             str(W, A, SP, limit),
         ]);
         self.asm.bind(done);
-        // The backward setup adds four words to the forward path.
-        self.range_cold += (self.asm.offset() - cold) as u32 / 4 - 4;
+        self.range_cold += (self.asm.offset() - start) as u32 / 4 - leaf;
     }
 
     fn expression(&mut self, id: ExprId, dst: Reg) {
@@ -763,6 +778,73 @@ mod tests {
     use super::super::{Evaluation, tests::*};
     use super::*;
     use crate::CpuState;
+
+    // spec: A64-OPT-10
+    #[test]
+    fn row_guard_price_counts_the_emitted_leaf_hit_path() {
+        let trace = trace(|a| {
+            let mut row = a.create_label();
+            let mut strip = a.create_label();
+            a.set_label(&mut row).unwrap();
+            a.mov(ecx, ebx).unwrap();
+            a.set_label(&mut strip).unwrap();
+            a.movaps(xmm0, xmmword_ptr(esi)).unwrap();
+            a.movaps(xmmword_ptr(edi), xmm0).unwrap();
+            a.add(esi, 16).unwrap();
+            a.add(edi, 16).unwrap();
+            a.dec(ecx).unwrap();
+            a.jnz(strip).unwrap();
+            a.dec(edx).unwrap();
+            a.jnz(row).unwrap();
+            a.int3().unwrap();
+        });
+        let (domain, _) = Domain::build(&trace, &[0, 0, 2, 4, 0x50000, 0, 0x8000, 0x4000]).unwrap();
+        let mut asm = Asm::new();
+        let minimum = (asm.label(), asm.label());
+        let short = asm.label();
+        let failures = [
+            RowFailure::Range,
+            RowFailure::Alias,
+            RowFailure::Parameter,
+            RowFailure::Count,
+            RowFailure::Span,
+        ]
+        .map(|kind| (kind, asm.label()));
+        let price = domain.emit(
+            &mut asm,
+            (minimum, domain.alignment_strip().unwrap().1),
+            short,
+            failures,
+            None,
+        );
+        let end = asm.offset() / 4;
+        for label in [minimum.0, minimum.1, short]
+            .into_iter()
+            .chain(failures.map(|(_, label)| label))
+        {
+            asm.bind(label);
+            asm.emit(0);
+        }
+        let emitted = asm.finish();
+        let (mut pc, mut executed) = (0, 0);
+        while pc < end {
+            let word = emitted[pc];
+            // On this forward, complete admission the equality branches
+            // take the same-leaf hits and the complete-domain continuation.
+            let step = if word & 0xff00_001f == 0x5400_0000 {
+                (word >> 5) & 0x7ffff
+            } else if word & 0xfc00_0000 == 0x1400_0000 {
+                word & 0x03ff_ffff
+            } else {
+                1
+            };
+            assert_ne!(step, 0);
+            pc += step as usize;
+            executed += 1;
+        }
+        assert_eq!(pc, end);
+        assert_eq!(price, executed);
+    }
 
     // spec: A64-TR-9
     #[test]

@@ -352,19 +352,19 @@ fn emit<'a>(
                 count,
                 minimum: u32::from(batch.plan.lanes) + 1,
                 saved: batch.spans.len() as u32 * 8 + domain.call_savings() - 2,
+                saved_per_iteration: 0,
             });
-        let alignment = domain
-            .alignment_strip()
-            .map(|(head, count, minimum, saved)| RowStrip {
-                head,
-                count,
-                minimum,
-                saved,
-            });
-        batch
-            .into_iter()
-            .chain(alignment)
-            .max_by_key(|strip| strip.saved)
+        batch.or_else(|| {
+            domain
+                .alignment_strip()
+                .map(|(head, count, saved)| RowStrip {
+                    head,
+                    count,
+                    minimum: 1,
+                    saved: domain.call_savings(),
+                    saved_per_iteration: saved,
+                })
+        })
     });
     let domain = domain.filter(|_| row_strip.is_some());
     let span_search = [false, true].map(|backwards| {
@@ -702,11 +702,17 @@ fn emit<'a>(
             e.asm.emit_all(&[min_batches, 0]);
         }
     }
-    if let Some(((rows, inner), words)) = e.row_budget {
+    if let Some(((rows, inner), words, _)) = e.row_budget {
         // A range proven at the row entry removes at least the first-leaf
         // hit of every covered stream on each row with an inner strip.
         let domain = e.domain.unwrap().0;
-        let saved = e.row_strip.unwrap().saved;
+        let strip = e.row_strip.unwrap();
+        let mut saved = strip.saved;
+        if strip.saved_per_iteration != 0 {
+            // The strip pays for the complete entry proof and its row edge.
+            min_inner = min_inner.max((words + 2).div_ceil(strip.saved_per_iteration));
+            saved += min_inner * strip.saved_per_iteration - 2;
+        }
         let price = crate::translate::lower::resident::RowPrice {
             guard: words,
             saved,
@@ -741,6 +747,7 @@ struct RowStrip {
     count: usize,
     minimum: u32,
     saved: u32,
+    saved_per_iteration: u32,
 }
 
 struct FpCheck {
@@ -800,7 +807,7 @@ struct Emitter<'a> {
     mmx_miss: Option<Label>,
     domain: Option<(&'a Domain, bool)>,
     row_strip: Option<RowStrip>,
-    row_budget: Option<((Label, Label), u32)>,
+    row_budget: Option<((Label, Label), u32, u32)>,
     row_price: Option<crate::translate::lower::resident::RowPrice>,
     row_failures: Vec<(crate::translate::lower::resident::RowFailure, Label)>,
     split: Option<(Label, Label, Label)>,
@@ -862,7 +869,10 @@ impl<'a> Emitter<'a> {
             false,
         );
         if self.resident {
-            self.entry_words = self.words_since(0) - diagnostic_words;
+            let skipped = self
+                .row_budget
+                .map_or(0, |(_, words, emitted)| emitted - words);
+            self.entry_words = self.words_since(0) - diagnostic_words - skipped;
         }
     }
 
