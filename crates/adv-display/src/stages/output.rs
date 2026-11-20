@@ -93,96 +93,97 @@ pub fn encode(
         Scale::SharpBilinear { prescale } => (prescale, 1),
     };
     let d = transform.dst;
-    let mut constants = ring.reserve(64, 256)?;
-    let values = [
-        size.width as f32,
-        size.height as f32,
-        extent.0 as f32,
-        extent.1 as f32,
-        d.x as f32,
-        d.y as f32,
-        d.w as f32,
-        d.h as f32,
-        prescale.0 as f32,
-        prescale.1 as f32,
-    ];
-    for (out, value) in constants.bytes()[..40]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(values)
-    {
-        out.copy_from_slice(&value.to_ne_bytes());
-    }
-    let rotation: u32 = match transform.rotation {
-        Rotation::None => 0,
-        Rotation::Quarter => 1,
-        Rotation::Half => 2,
-        Rotation::ThreeQuarters => 3,
+    let rects_offset = 256u64;
+    let rects_len = tiles.rects.len() as u64 * 16;
+    let software_offset = (rects_offset + rects_len).next_multiple_of(256);
+    let software_len = if matches!(source, Source::Software(_)) {
+        ingest::source_bytes(0)
+    } else {
+        0
     };
-    constants.bytes()[40..44].copy_from_slice(&rotation.to_ne_bytes());
-    constants.bytes()[44..48].copy_from_slice(&linear.to_ne_bytes());
-    let source_rotation = match &source {
-        Source::Retained { rotation, .. } => match rotation {
-            Rotation::None => 0u32,
+    let total = if software_len > 0 {
+        software_offset + software_len
+    } else {
+        rects_offset + rects_len
+    };
+    let mut span = ring.reserve(total, 256)?;
+    {
+        let bytes = span.bytes();
+        let values = [
+            size.width as f32,
+            size.height as f32,
+            extent.0 as f32,
+            extent.1 as f32,
+            d.x as f32,
+            d.y as f32,
+            d.w as f32,
+            d.h as f32,
+            prescale.0 as f32,
+            prescale.1 as f32,
+        ];
+        for (out, value) in bytes[..40].as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            out.copy_from_slice(&value.to_ne_bytes());
+        }
+        let rotation: u32 = match transform.rotation {
+            Rotation::None => 0,
             Rotation::Quarter => 1,
             Rotation::Half => 2,
             Rotation::ThreeQuarters => 3,
-        },
-        _ => 0,
-    };
-    constants.bytes()[48..52].copy_from_slice(&source_rotation.to_ne_bytes());
-
-    let mut rectangles = ring.reserve(tiles.rects.len() as u64 * 16, 256)?;
-    for (out, r) in rectangles
-        .bytes()
-        .as_chunks_mut::<16>()
-        .0
-        .iter_mut()
-        .zip(&tiles.rects)
-    {
-        for (out, v) in out
-            .as_chunks_mut::<4>()
+        };
+        bytes[40..44].copy_from_slice(&rotation.to_ne_bytes());
+        bytes[44..48].copy_from_slice(&linear.to_ne_bytes());
+        let source_rotation = match &source {
+            Source::Retained { rotation, .. } => match rotation {
+                Rotation::None => 0u32,
+                Rotation::Quarter => 1,
+                Rotation::Half => 2,
+                Rotation::ThreeQuarters => 3,
+            },
+            _ => 0,
+        };
+        bytes[48..52].copy_from_slice(&source_rotation.to_ne_bytes());
+        for (out, r) in bytes[rects_offset as usize..(rects_offset + rects_len) as usize]
+            .as_chunks_mut::<16>()
             .0
             .iter_mut()
-            .zip([r.x, r.y, r.w, r.h])
+            .zip(&tiles.rects)
         {
-            out.copy_from_slice(&v.to_ne_bytes());
+            for (out, v) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip([r.x, r.y, r.w, r.h])
+            {
+                out.copy_from_slice(&v.to_ne_bytes());
+            }
+        }
+        if let Source::Software(s) = &source {
+            ingest::write_source(
+                &mut bytes[software_offset as usize..(software_offset + software_len) as usize],
+                s,
+                &Tiles::default(),
+            );
         }
     }
-    // Software bindings carry their own source-sized tile list; output uses slot 2.
-    let software_data = match &source {
-        Source::Software(s) => Some(ingest::source(ring, s, &Tiles::default())?),
-        _ => None,
-    };
+    let base = span.offset();
+    let buffer = span.buffer();
     pass.set_pipeline(pipeline);
-    pass.bind(
-        0,
-        Bind::Uniform(
-            constants
-                .buffer()
-                .slice(constants.offset()..constants.offset() + constants.len()),
-        ),
-    );
+    pass.bind(0, Bind::Uniform(buffer.slice(base..base + 64)));
     pass.bind(
         2,
-        Bind::StorageBuffer(
-            rectangles
-                .buffer()
-                .slice(rectangles.offset()..rectangles.offset() + rectangles.len()),
-        ),
+        Bind::StorageBuffer(buffer.slice(base + rects_offset..base + rects_offset + rects_len)),
     );
     match &source {
         Source::Image(view) | Source::Retained { view, .. } => pass.bind(0, Bind::Sampled(view)),
-        Source::Software(s) => ingest::bind(pass, s, software_data.as_ref().unwrap()),
+        Source::Software(s) => ingest::bind_slice(
+            pass,
+            s,
+            buffer.slice(base + software_offset..base + software_offset + software_len),
+        ),
     }
     pass.set_viewport(0., 0., size.width as f32, size.height as f32, 0., 1.);
     pass.draw(0..6, 0..tiles.rects.len() as u32);
     let mut data = arrayvec::ArrayVec::new();
-    data.push(constants);
-    data.push(rectangles);
-    if let Some(software) = software_data {
-        data.push(software);
-    }
+    data.push(span);
     Ok(data)
 }

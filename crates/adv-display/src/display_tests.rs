@@ -784,6 +784,7 @@ fn composition_uses_one_pass_for_base_borders_and_all_videos_and_records_gpu_tim
     c.solid_color_layers = false;
     let mut display =
         Display::new(d.clone(), Box::new(HeadlessCompositor::new(c)), settings()).unwrap();
+    display.set_timings(true);
     let (mut frame, _decoder) = video_frame(&d, &mut q, 1);
     // A second video from its own decoder.
     let (mut other, _second_decoder) = video_frame(&d, &mut q, 1);
@@ -1863,6 +1864,35 @@ fn window_layers_upload_once_capture_over_the_frame_and_leave() {
     // Closed, its layer goes.
     let third = shown(&mut display, &mut q, frame(3, &image, none()));
     assert!(third.layers.windows.is_empty());
+}
+
+// spec: WINE-GFX-10
+#[test]
+fn one_submission_can_publish_the_base_and_eight_windows() {
+    let (d, mut q, mut display, history) = setup();
+    let mut f = frame(1, &private(&d, &mut q), all());
+    for id in 1..=8 {
+        f.info.windows.push(WindowGeometry {
+            id,
+            at: (id as i32 * 4, 1),
+            size: (4, 2),
+            changed: false,
+        });
+        f.windows.push(crate::windows::Window {
+            id,
+            size: (4, 2),
+            pixels: vec![0; 32].into(),
+            layered: false,
+            version: 1,
+        });
+    }
+    let token = display.present(&mut q, f).unwrap();
+    assert!(q.wait(token, std::time::Duration::from_secs(20)).unwrap());
+    display.service(&mut q).unwrap();
+    let history = history.lock().unwrap();
+    let shown = history.last().unwrap();
+    assert_eq!(shown.acquires.len(), 9);
+    assert!(shown.acquires.iter().all(|(_, acquire)| *acquire == token));
 }
 
 // spec: HOST-VIEW-7, HOST-VIEW-10

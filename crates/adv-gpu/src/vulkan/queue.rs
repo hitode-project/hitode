@@ -6,6 +6,7 @@ pub(crate) struct Queue {
     device: crate::Device,
     _owner: std::marker::PhantomData<std::cell::Cell<()>>,
     pub(super) shared: Arc<Shared>,
+    bindings: Option<binding::Bindings>,
     sender: Option<mpsc::Sender<Message>>,
     waiter: Option<std::thread::JoinHandle<()>>,
 }
@@ -112,6 +113,7 @@ impl Queue {
             _owner: std::marker::PhantomData,
             device,
             shared,
+            bindings: None,
             sender: Some(sender),
             waiter: Some(waiter),
         })
@@ -120,8 +122,9 @@ impl Queue {
         &self.device
     }
     pub(crate) fn encoder(&mut self, _label: &'static str) -> crate::Encoder {
+        let bindings = self.bindings.take().unwrap_or_default();
         crate::Encoder {
-            inner: Encoder::new(self.shared.clone()),
+            inner: Encoder::new(self.shared.clone(), bindings),
         }
     }
     pub(crate) fn submit(&mut self, encoder: crate::Encoder) -> Result<Token> {
@@ -139,7 +142,7 @@ impl Queue {
         if let Some(error) = encoder.inner.error.take() {
             return Err(error);
         }
-        encoder.inner.memory_barrier();
+        encoder.inner.submit_barrier();
         #[cfg(target_os = "android")]
         {
             for (image, _) in buffers {
@@ -221,9 +224,7 @@ impl Queue {
             encoder.inner.commands = commands;
             return Err(error);
         }
-        for span in &mut encoder.inner.resources.spans {
-            span.submitted(token);
-        }
+        ring::Span::submit_batch(&mut encoder.inner.resources.spans, token);
         context.rings.lock().unwrap().retain(|weak| {
             if let Some(ring) = weak.upgrade() {
                 ring.submit_unused(token);
@@ -232,6 +233,9 @@ impl Queue {
                 false
             }
         });
+        if let Some(bindings) = encoder.inner.bindings.take() {
+            self.bindings = Some(bindings);
+        }
         let resources = std::mem::take(&mut encoder.inner.resources);
         state.pending.push_back(Submission {
             token,

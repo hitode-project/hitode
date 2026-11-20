@@ -249,8 +249,9 @@ struct Upscaled {
     /// Composition into the model's half-precision input.
     pipelines: Pipelines,
 }
-/// Timestamped passes per frame: every stage, plus the upscaler's compute.
-const TIMED_PASSES: u32 = 8;
+/// Timestamped passes per frame: every stage (including TBDR clusters), plus
+/// the upscaler's compute.
+const TIMED_PASSES: u32 = 16;
 pub struct Display {
     device: Device,
     compositor: Option<Box<dyn Compositor>>,
@@ -298,6 +299,7 @@ pub struct Display {
     video: Vec<Video>,
     publication: Option<Publication>,
     queries: Option<adv_gpu::queue::QuerySet>,
+    timing_enabled: bool,
     timings: VecDeque<Timing>,
     readbacks: Vec<adv_gpu::Buffer>,
     invalid: bool,
@@ -308,19 +310,6 @@ impl Display {
         compositor: Box<dyn Compositor>,
         settings: Settings,
     ) -> adv_gpu::Result<Self> {
-        let queries = if device
-            .caps()
-            .features
-            .contains(adv_gpu::Features::TIMESTAMPS)
-        {
-            match device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2) {
-                Ok(queries) => Some(queries),
-                Err(adv_gpu::Error::OutOfMemory) => return Err(adv_gpu::Error::OutOfMemory),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
         let ring = device.ring(4 << 20)?;
         let pipelines = Pipelines::new(&device, adv_gpu::present::COLOR_FORMAT)?;
         let mut this = Self {
@@ -356,13 +345,43 @@ impl Display {
             deferred: None,
             video: vec![],
             publication: None,
-            queries,
+            queries: None,
+            timing_enabled: false,
             timings: VecDeque::new(),
             readbacks: vec![],
             invalid: true,
         };
         this.configure();
         Ok(this)
+    }
+    /// Enable or disable per-pass GPU timestamp queries outside damage-overlay mode.
+    pub fn set_timings(&mut self, enabled: bool) {
+        self.timing_enabled = enabled;
+    }
+    fn timing_active(&self) -> bool {
+        self.settings.damage_overlay || self.timing_enabled
+    }
+    fn ensure_queries(&mut self) -> adv_gpu::Result<Option<&adv_gpu::queue::QuerySet>> {
+        if !self.timing_active() {
+            return Ok(None);
+        }
+        if self.queries.is_none()
+            && self
+                .device
+                .caps()
+                .features
+                .contains(adv_gpu::Features::TIMESTAMPS)
+        {
+            match self
+                .device
+                .create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2)
+            {
+                Ok(queries) => self.queries = Some(queries),
+                Err(adv_gpu::Error::OutOfMemory) => return Err(adv_gpu::Error::OutOfMemory),
+                Err(_) => {}
+            }
+        }
+        Ok(self.queries.as_ref())
     }
     fn configure(&mut self) {
         self.totals.configurations += 1;
@@ -1436,99 +1455,142 @@ impl Display {
                 _ => targets[into.0 as usize].as_ref().unwrap().image().clone(),
             };
             let size = destination.desc().size;
-            let (area, load) = ingest::coverage(drawn);
-            let mut pass = encoder
-                .as_mut()
-                .unwrap()
-                .render_pass(&adv_gpu::RenderPassDesc {
-                    colors: [adv_gpu::encode::ColorAttachment {
-                        view: destination.view(),
-                        load,
-                        store: adv_gpu::encode::Store::Store,
-                        resolve: None,
-                    }]
-                    .into_iter()
-                    .collect(),
-                    depth_stencil: None,
-                    area,
-                    timestamps: self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
-                    label: "display target",
-                });
-            match stage {
-                Stage::Ingest { .. } => {
-                    let output::Source::Software(source) = frame.base.source() else {
-                        unreachable!()
-                    };
-                    if let Some(data) = ingest::encode(
+            let queries_active = self.ensure_queries()?.is_some();
+            #[cfg(not(target_vendor = "apple"))]
+            let clusters = ingest::coverage_clusters(drawn, 4);
+            #[cfg(target_vendor = "apple")]
+            let clusters: Option<Vec<ingest::Cluster>> = None;
+            let single_coverage;
+            let pass_slices: Vec<(adv_gpu::Rect, adv_gpu::encode::Load<[f64; 4]>, &Tiles)> =
+                if let Some(ref clusters) = clusters {
+                    clusters
+                        .iter()
+                        .map(|c| (c.area, c.load, &c.tiles))
+                        .collect()
+                } else {
+                    single_coverage = ingest::coverage(drawn);
+                    vec![(single_coverage.0, single_coverage.1, drawn)]
+                };
+            for (area, load, pass_tiles) in pass_slices {
+                let has_ts = queries_active && statistics.passes < TIMED_PASSES;
+                let mut pass = encoder
+                    .as_mut()
+                    .unwrap()
+                    .render_pass(&adv_gpu::RenderPassDesc {
+                        colors: [adv_gpu::encode::ColorAttachment {
+                            view: destination.view(),
+                            load,
+                            store: adv_gpu::encode::Store::Store,
+                            resolve: None,
+                        }]
+                        .into_iter()
+                        .collect(),
+                        depth_stencil: None,
+                        area,
+                        timestamps: has_ts
+                            .then(|| self.queries.as_ref().map(|q| (q, statistics.passes * 2)))
+                            .flatten(),
+                        label: "display target",
+                    });
+                match stage {
+                    Stage::Ingest { .. } => {
+                        let output::Source::Software(source) = frame.base.source() else {
+                            unreachable!()
+                        };
+                        if let Some(data) = ingest::encode(
+                            &mut pass,
+                            &self.pipelines.ingest,
+                            &mut self.ring,
+                            &source,
+                            pass_tiles,
+                        )? {
+                            self.spans.push(data);
+                        }
+                    }
+                    Stage::Output {
+                        from,
+                        transform,
+                        scale,
+                        ..
+                    } => {
+                        let source = match from {
+                            Source::Base => frame.base.source(),
+                            Source::Pool(UPSCALE) => output::Source::Image(
+                                self.upscaled.as_ref().unwrap().upscaling.output().view(),
+                            ),
+                            Source::Pool(p) => output::Source::Image(
+                                targets[p.0 as usize].as_ref().unwrap().image().view(),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        let pipeline = if matches!(source, output::Source::Software(_)) {
+                            &self.pipelines.software
+                        } else {
+                            &self.pipelines.output
+                        };
+                        self.spans.extend(output::encode(
+                            &mut pass,
+                            source,
+                            size,
+                            *transform,
+                            *scale,
+                            pass_tiles,
+                            (pipeline, &mut self.ring),
+                        )?);
+                    }
+                    Stage::Video { .. } => self.compose(
                         &mut pass,
-                        &self.pipelines.ingest,
-                        &mut self.ring,
-                        &source,
-                        tiles,
-                    )? {
-                        self.spans.push(data);
+                        &destination,
+                        &frame.base,
+                        &frame.video,
+                        pass_tiles,
+                    )?,
+                    Stage::Upscale { video, .. } => {
+                        let video = if *video { &frame.video[..] } else { &[] };
+                        self.compose(&mut pass, &destination, &frame.base, video, pass_tiles)?
                     }
                 }
-                Stage::Output {
-                    from,
-                    transform,
-                    scale,
-                    ..
-                } => {
-                    let source = match from {
-                        Source::Base => frame.base.source(),
-                        Source::Pool(UPSCALE) => output::Source::Image(
-                            self.upscaled.as_ref().unwrap().upscaling.output().view(),
-                        ),
-                        Source::Pool(p) => output::Source::Image(
-                            targets[p.0 as usize].as_ref().unwrap().image().view(),
-                        ),
-                        _ => unreachable!(),
-                    };
-                    let pipeline = if matches!(source, output::Source::Software(_)) {
-                        &self.pipelines.software
-                    } else {
-                        &self.pipelines.output
-                    };
-                    self.spans.extend(output::encode(
-                        &mut pass,
-                        source,
-                        size,
-                        *transform,
-                        *scale,
-                        tiles,
-                        (pipeline, &mut self.ring),
-                    )?);
-                }
-                Stage::Video { .. } => {
-                    self.compose(&mut pass, &destination, &frame.base, &frame.video, tiles)?
-                }
-                Stage::Upscale { video, .. } => {
-                    let video = if *video { &frame.video[..] } else { &[] };
-                    self.compose(&mut pass, &destination, &frame.base, video, drawn)?
+                drop(pass);
+                statistics.passes += 1;
+                if has_ts {
+                    timed.push(index);
                 }
             }
-            drop(pass);
-            statistics.passes += 1;
-            timed.push(index);
             if let Stage::Upscale { .. } = stage {
                 // The model's compute pass is timed as a second span of its
                 // stage. Pixels bound the last model pass's recomputed work; none
                 // means no compute pass ran, nor wrote its timestamps.
+                let has_ts = queries_active && statistics.passes < TIMED_PASSES;
                 let u = self.upscaled.as_ref().unwrap();
                 let upscaled = u.upscaling.encode(
                     (encoder.as_mut().unwrap(), &mut self.ring),
                     Some(damage.as_deref().unwrap_or(&tiles.rects)),
                     input,
-                    self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
+                    has_ts
+                        .then(|| self.queries.as_ref().map(|q| (q, statistics.passes * 2)))
+                        .flatten(),
                 )?;
                 statistics.stages[index].pixels = upscaled;
                 if upscaled > 0 {
                     statistics.passes += 1;
-                    timed.push(index);
+                    if has_ts {
+                        timed.push(index);
+                    }
                 }
             }
         }
+        let mut window_images = Vec::new();
+        let mut window_fallbacks = Vec::new();
+        self.windows.upload(
+            (&self.device, queue),
+            &mut self.ring,
+            &mut encoder,
+            &mut self.spans,
+            &mut window_fallbacks,
+            &frame.info,
+            frame.windows,
+            &mut window_images,
+        )?;
         for data in self.spans.drain(..) {
             encoder.as_mut().unwrap().retain(data);
         }
@@ -1545,7 +1607,7 @@ impl Display {
                 encoder
                     .as_mut()
                     .unwrap()
-                    .resolve_queries(q, 0..statistics.passes * 2, &buffer, 0);
+                    .resolve_queries(q, 0..timed.len() as u32 * 2, &buffer, 0);
                 Some(buffer)
             } else {
                 None
@@ -1555,6 +1617,7 @@ impl Display {
         };
         let mut images = vec![];
         let source = planned.layers.base.source;
+        let base_from_pool = matches!(source, Source::Pool(_));
         if let Source::Pool(p) = source {
             let image = targets[p.0 as usize].take().unwrap();
             images.push(AcquiredImage {
@@ -1574,10 +1637,19 @@ impl Display {
         }
         let token = if let Some(encoder) = encoder {
             statistics.submissions = 1;
-            let mut writes = images.iter_mut().map(|i| &mut i.image).collect::<Vec<_>>();
+            let mut writes: Vec<&mut PresentImage> = Vec::new();
+            if base_from_pool {
+                writes.push(&mut images[0].image);
+            }
+            for w in &mut window_images {
+                writes.push(&mut w.image);
+            }
             let token = queue.submit_present(encoder, &mut writes)?;
-            for i in &mut images {
-                i.acquire = token;
+            if base_from_pool {
+                images[0].acquire = token;
+            }
+            for w in &mut window_images {
+                w.acquire = token;
             }
             // Intermediates the base read stay here, current for reuse.
             for target in targets.iter_mut().flatten() {
@@ -1598,8 +1670,14 @@ impl Display {
                 queue.on_complete(token, Box::new(move || w()));
             }
         }
-        if !retired.is_empty() {
-            queue.on_complete(token, Box::new(move || drop(retired)));
+        if !retired.is_empty() || !window_fallbacks.is_empty() {
+            queue.on_complete(
+                token,
+                Box::new(move || {
+                    drop(retired);
+                    drop(window_fallbacks);
+                }),
+            );
         }
         for (id, _) in &planned.layers.video {
             if let Some(image) = self.leases.remove(id) {
@@ -1610,12 +1688,7 @@ impl Display {
                 });
             }
         }
-        self.windows.upload(
-            (&self.device, queue),
-            &frame.info,
-            frame.windows,
-            &mut images,
-        )?;
+        images.extend(window_images);
         Ok(Pending {
             record: PresentRecord {
                 token: token.0,

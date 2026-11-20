@@ -135,23 +135,43 @@ pub(super) fn run(
         match commands.next() {
             super::stream::Next::Closed => break,
             super::stream::Next::Woken => {
-                state.close(pass::NextDepth::Keep)?;
-                // The closed run read consumed chunks; their spans join this submission.
-                state.recycle(state.cursor.0, &commands);
-                if state.encoder.is_some() {
-                    state.submit(None)?;
+                #[cfg(target_vendor = "apple")]
+                objc2::rc::autoreleasepool(|_| -> adv_gpu::Result<()> {
+                    state.close(pass::NextDepth::Keep)?;
+                    // The closed run read consumed chunks; their spans join this submission.
+                    state.recycle(state.cursor.0, &commands);
+                    if state.encoder.is_some() {
+                        state.submit(None)?;
+                    }
+                    state.presenter.service(&mut state.queue, Some(&wake));
+                    Ok(())
+                })?;
+                #[cfg(not(target_vendor = "apple"))]
+                {
+                    state.close(pass::NextDepth::Keep)?;
+                    // The closed run read consumed chunks; their spans join this submission.
+                    state.recycle(state.cursor.0, &commands);
+                    if state.encoder.is_some() {
+                        state.submit(None)?;
+                    }
+                    state.presenter.service(&mut state.queue, Some(&wake));
                 }
-                state.presenter.service(&mut state.queue, Some(&wake));
             }
             super::stream::Next::Chunk(chunk) => {
                 #[cfg(feature = "test-support")]
                 let _submissions = commands.submissions();
                 state.chunks.push_back(chunk);
                 #[cfg(target_vendor = "apple")]
-                objc2::rc::autoreleasepool(|_| state.drain(&commands))?;
+                objc2::rc::autoreleasepool(|_| -> adv_gpu::Result<()> {
+                    state.drain(&commands)?;
+                    state.presenter.service(&mut state.queue, None);
+                    Ok(())
+                })?;
                 #[cfg(not(target_vendor = "apple"))]
-                state.drain(&commands)?;
-                state.presenter.service(&mut state.queue, None);
+                {
+                    state.drain(&commands)?;
+                    state.presenter.service(&mut state.queue, None);
+                }
             }
         }
     }

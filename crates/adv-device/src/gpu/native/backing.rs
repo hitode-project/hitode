@@ -77,9 +77,9 @@ pub(super) struct DepthBacking {
 use super::resources::Storage;
 use super::{Depth, Image};
 use crate::frame::{Presenter, Region, SwapImage};
-use adv_gpu::encode::{ImageCopy, Load, Store};
+use adv_gpu::encode::{ImageCopyRegion, Load, Store};
 use adv_gpu::resource::{Dimension, ImageDesc, Usage};
-use adv_gpu::{Device, Encoder, Extent, Format, Queue, Rect};
+use adv_gpu::{Device, Encoder, Extent, Format, Queue};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -191,9 +191,27 @@ impl SwapBacking {
                 stale(&self.history, swap.size, age)
             };
             if !damage.is_empty() {
-                let encoder = encoder.get_or_insert_with(|| queue.encoder("guest commands"));
-                for rect in damage.rects() {
-                    repair(encoder, raw(previous), image, rect);
+                let source = raw(previous);
+                if source.id() != image.id() {
+                    let encoder = encoder.get_or_insert_with(|| queue.encoder("guest commands"));
+                    let regions: Vec<ImageCopyRegion> = damage
+                        .rects()
+                        .into_iter()
+                        .map(|rect| ImageCopyRegion {
+                            src_mip: 0,
+                            src_layer: 0,
+                            src_origin: (rect.x, rect.y, 0),
+                            dst_mip: 0,
+                            dst_layer: 0,
+                            dst_origin: (rect.x, rect.y, 0),
+                            size: Extent {
+                                width: rect.w,
+                                height: rect.h,
+                                depth_or_layers: 1,
+                            },
+                        })
+                        .collect();
+                    encoder.copy_image_regions(source, image, &regions);
                 }
             }
         }
@@ -228,36 +246,6 @@ fn raw(image: &SwapImage) -> &adv_gpu::Image {
         SwapImage::Private(image) => image,
         SwapImage::Presentable(image) => image.image(),
     }
-}
-
-fn repair(
-    encoder: &mut Encoder,
-    source: &adv_gpu::Image,
-    destination: &adv_gpu::Image,
-    rect: Rect,
-) {
-    if source.id() == destination.id() {
-        return;
-    }
-    encoder.copy_image(
-        ImageCopy {
-            image: source,
-            mip: 0,
-            layer: 0,
-            origin: (rect.x, rect.y, 0),
-        },
-        ImageCopy {
-            image: destination,
-            mip: 0,
-            layer: 0,
-            origin: (rect.x, rect.y, 0),
-        },
-        Extent {
-            width: rect.w,
-            height: rect.h,
-            depth_or_layers: 1,
-        },
-    );
 }
 
 pub(super) fn resolve(
@@ -381,6 +369,7 @@ fn stale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adv_gpu::Rect;
 
     // spec: GFX-PASS-3
     #[test]
