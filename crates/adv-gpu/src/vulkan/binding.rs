@@ -427,6 +427,21 @@ pub(super) struct Bindings {
 }
 const CLEAN: (usize, usize) = (usize::MAX, 0);
 impl Bindings {
+    pub(super) fn clear(&mut self) {
+        for slots in &mut self.slots {
+            slots.clear();
+        }
+        self.layout = vk::PipelineLayout::null();
+        self.heap_bound = false;
+        self.push.clear();
+        self.push_dirty = (0, 0);
+        self.uniform_sets.clear();
+        self.uniform_dirty = 0;
+        self.dirty = [0; 4];
+        self.changed = false;
+        self.pushed_layout = vk::PipelineLayout::null();
+        self.values.clear();
+    }
     pub(super) fn pipeline(&mut self, compiled: &Compiled) {
         if self.layout == compiled.layout {
             return;
@@ -480,7 +495,7 @@ impl Bindings {
         compiled: Option<&Compiled>,
         slot: u32,
         resource: Bind<'_>,
-        preamble: Option<vk::CommandBuffer>,
+        mut preamble: impl FnMut(&mut Encoder) -> Option<vk::CommandBuffer>,
     ) {
         if !encoder.ready() {
             return;
@@ -573,10 +588,10 @@ impl Bindings {
             });
             drop(states);
             if stale {
-                // Inside a render pass the barrier goes to the pass preamble.
+                // Inside an active render pass the barrier goes to the pass preamble.
                 let command = encoder.command;
-                if let Some(preamble) = preamble {
-                    encoder.command = preamble;
+                if let Some(cb) = preamble(encoder) {
+                    encoder.command = cb;
                 }
                 let write = if group == 1 {
                     vk::AccessFlags2::empty()

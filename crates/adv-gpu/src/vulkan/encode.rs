@@ -23,10 +23,14 @@ pub(crate) struct Encoder {
     pub(super) shared: Arc<queue::Shared>,
     pub(super) command: vk::CommandBuffer,
     pub(super) resources: Resources,
+    pub(super) bindings: Option<binding::Bindings>,
     pub(super) error: Option<Error>,
     pub(super) submitted: bool,
     /// No work recorded since the last memory barrier.
     pub(super) synced: bool,
+    /// Whether any query operation (timestamps, occlusion, resolve) has been
+    /// recorded in `command`.
+    has_query_ops: bool,
     /// Each image this encoder touched: its states before, and whether the
     /// encoder writes it.
     originals: Vec<(Arc<ImageCore>, Vec<ImageState>, bool)>,
@@ -136,15 +140,17 @@ impl Encoder {
             .unwrap()
             .get(&self.shared.context, layout, key)
     }
-    pub(super) fn new(shared: Arc<queue::Shared>) -> Self {
+    pub(super) fn new(shared: Arc<queue::Shared>, bindings: binding::Bindings) -> Self {
         shared.context.open.fetch_add(1, Ordering::AcqRel);
         let mut encoder = Self {
             shared,
             command: vk::CommandBuffer::null(),
             resources: Resources::default(),
+            bindings: Some(bindings),
             error: None,
             submitted: false,
             synced: false,
+            has_query_ops: false,
             originals: Vec::new(),
             commands: Vec::new(),
             pool: None,
@@ -155,6 +161,12 @@ impl Encoder {
         encoder
     }
     fn allocate_command(&mut self) -> Result<()> {
+        let buffer = self.allocate_buffer()?;
+        self.command = buffer;
+        self.has_query_ops = false;
+        Ok(())
+    }
+    fn allocate_buffer(&mut self) -> Result<vk::CommandBuffer> {
         let context = &self.shared.context;
         if self.pool.is_none() {
             let reused = self.shared.state.lock().unwrap().pools.pop();
@@ -163,43 +175,36 @@ impl Encoder {
                 None => Commands::new(context)?,
             });
         }
-        self.command = self.pool.as_mut().unwrap().next(context)?;
+        let buffer = self.pool.as_mut().unwrap().next(context)?;
         context.result(unsafe {
             context.device.begin_command_buffer(
-                self.command,
+                buffer,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
-        })
+        })?;
+        Ok(buffer)
     }
     /// False after a driver failure; later commands are dropped and submit
     /// reports it.
     pub(super) fn ready(&self) -> bool {
         self.error.is_none()
     }
-    /// Orders all earlier work, including earlier submissions, before what
-    /// follows. Skipped when nothing was recorded since the last one.
-    pub(super) fn memory_barrier(&mut self) {
-        if !self.ready() || self.synced {
-            return;
-        }
-        self.synced = true;
+    fn emit_memory_barrier(
+        &mut self,
+        src_stage: vk::PipelineStageFlags2,
+        src_access: vk::AccessFlags2,
+        dst_stage: vk::PipelineStageFlags2,
+        dst_access: vk::AccessFlags2,
+    ) {
         let context = &self.shared.context;
         unsafe {
             if context.caps.modern.contains(Modern::SYNCHRONIZATION2) {
                 let barriers = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(
-                        vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST,
-                    )
-                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::HOST_WRITE)
-                    .dst_stage_mask(
-                        vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST,
-                    )
-                    .dst_access_mask(
-                        vk::AccessFlags2::MEMORY_READ
-                            | vk::AccessFlags2::MEMORY_WRITE
-                            | vk::AccessFlags2::HOST_READ,
-                    )];
+                    .src_stage_mask(src_stage)
+                    .src_access_mask(src_access)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)];
                 let info = vk::DependencyInfo::default().memory_barriers(&barriers);
                 if context.api >= vk::API_VERSION_1_3 {
                     context.device.cmd_pipeline_barrier2(self.command, &info);
@@ -208,16 +213,12 @@ impl Encoder {
                 }
             } else {
                 let barriers = [vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
-                    .dst_access_mask(
-                        vk::AccessFlags::MEMORY_READ
-                            | vk::AccessFlags::MEMORY_WRITE
-                            | vk::AccessFlags::HOST_READ,
-                    )];
+                    .src_access_mask(vk::AccessFlags::from_raw(src_access.as_raw() as u32))
+                    .dst_access_mask(vk::AccessFlags::from_raw(dst_access.as_raw() as u32))];
                 context.device.cmd_pipeline_barrier(
                     self.command,
-                    vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-                    vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::from_raw(src_stage.as_raw() as u32),
+                    vk::PipelineStageFlags::from_raw(dst_stage.as_raw() as u32),
                     vk::DependencyFlags::empty(),
                     &barriers,
                     &[],
@@ -226,8 +227,53 @@ impl Encoder {
             }
         }
     }
-    fn transition(
+    /// Orders earlier GPU work before what follows. Skipped when nothing was
+    /// recorded since the last barrier.
+    pub(super) fn memory_barrier(&mut self) {
+        if !self.ready() || self.synced {
+            return;
+        }
+        self.synced = true;
+        self.emit_memory_barrier(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
+    }
+    /// Orders compute shader writes before subsequent compute or indirect dispatches.
+    fn compute_barrier(&mut self) {
+        if !self.ready() || self.synced {
+            return;
+        }
+        self.synced = true;
+        self.emit_memory_barrier(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::DRAW_INDIRECT,
+            vk::AccessFlags2::SHADER_READ
+                | vk::AccessFlags2::SHADER_WRITE
+                | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+        );
+    }
+    /// Orders all GPU writes in this submission before host reads and later submissions.
+    pub(super) fn submit_barrier(&mut self) {
+        if !self.ready() {
+            return;
+        }
+        self.synced = true;
+        self.emit_memory_barrier(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST,
+            vk::AccessFlags2::MEMORY_READ
+                | vk::AccessFlags2::MEMORY_WRITE
+                | vk::AccessFlags2::HOST_READ,
+        );
+    }
+    fn push_transition(
         &mut self,
+        barriers: &mut Vec<vk::ImageMemoryBarrier2<'static>>,
         core: &Arc<ImageCore>,
         mips: std::ops::Range<u32>,
         layers: std::ops::Range<u32>,
@@ -248,61 +294,45 @@ impl Encoder {
             Some(original) => original.2 |= written,
             None => self.originals.push((core.clone(), states.clone(), written)),
         }
-        let context = &self.shared.context;
+        #[cfg(target_os = "android")]
+        let family = self.shared.context.family;
+        let aspect = formats::aspect(core.desc.format);
         for layer in layers {
             for mip in mips.clone() {
                 let index = (layer * core.desc.mips + mip) as usize;
                 let old = states[index];
                 #[cfg(target_os = "android")]
-                let (src_family, dst_family) = old.queue_families(layout, context.family);
+                let (src_family, dst_family) = old.queue_families(layout, family);
                 #[cfg(not(target_os = "android"))]
                 let (src_family, dst_family) = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
+                if old.layout == layout
+                    && src_family == dst_family
+                    && !old.access.intersects(WRITES)
+                    && !written
+                {
+                    states[index].stage |= stage;
+                    states[index].access |= access;
+                    continue;
+                }
                 let range = vk::ImageSubresourceRange::default()
-                    .aspect_mask(formats::aspect(core.desc.format))
+                    .aspect_mask(aspect)
                     .base_mip_level(mip)
                     .level_count(1)
                     .base_array_layer(layer)
                     .layer_count(1);
-                unsafe {
-                    if context.caps.modern.contains(Modern::SYNCHRONIZATION2) {
-                        let barriers = [vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(old.stage)
-                            .src_access_mask(old.access)
-                            .dst_stage_mask(stage)
-                            .dst_access_mask(access)
-                            .old_layout(old.layout)
-                            .new_layout(layout)
-                            .src_queue_family_index(src_family)
-                            .dst_queue_family_index(dst_family)
-                            .image(core.handle)
-                            .subresource_range(range)];
-                        let info = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-                        if context.api >= vk::API_VERSION_1_3 {
-                            context.device.cmd_pipeline_barrier2(self.command, &info);
-                        } else {
-                            context.sync2.cmd_pipeline_barrier2(self.command, &info);
-                        }
-                    } else {
-                        let barriers = [vk::ImageMemoryBarrier::default()
-                            .src_access_mask(vk::AccessFlags::from_raw(old.access.as_raw() as u32))
-                            .dst_access_mask(vk::AccessFlags::from_raw(access.as_raw() as u32))
-                            .old_layout(old.layout)
-                            .new_layout(layout)
-                            .src_queue_family_index(src_family)
-                            .dst_queue_family_index(dst_family)
-                            .image(core.handle)
-                            .subresource_range(range)];
-                        context.device.cmd_pipeline_barrier(
-                            self.command,
-                            vk::PipelineStageFlags::from_raw(old.stage.as_raw() as u32),
-                            vk::PipelineStageFlags::from_raw(stage.as_raw() as u32),
-                            vk::DependencyFlags::empty(),
-                            &[],
-                            &[],
-                            &barriers,
-                        );
-                    }
-                }
+                barriers.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(old.stage)
+                        .src_access_mask(old.access)
+                        .dst_stage_mask(stage)
+                        .dst_access_mask(access)
+                        .old_layout(old.layout)
+                        .new_layout(layout)
+                        .src_queue_family_index(src_family)
+                        .dst_queue_family_index(dst_family)
+                        .image(core.handle)
+                        .subresource_range(range),
+                );
                 states[index] = ImageState {
                     layout,
                     access,
@@ -311,11 +341,87 @@ impl Encoder {
                     family: if layout == vk::ImageLayout::PRESENT_SRC_KHR {
                         vk::QUEUE_FAMILY_FOREIGN_EXT
                     } else {
-                        context.family
+                        family
                     },
                 };
             }
         }
+    }
+    fn flush_image_barriers(&mut self, barriers: &[vk::ImageMemoryBarrier2<'static>]) {
+        if barriers.is_empty() || !self.ready() {
+            return;
+        }
+        let context = &self.shared.context;
+        unsafe {
+            if context.caps.modern.contains(Modern::SYNCHRONIZATION2) {
+                let info = vk::DependencyInfo::default().image_memory_barriers(barriers);
+                if context.api >= vk::API_VERSION_1_3 {
+                    context.device.cmd_pipeline_barrier2(self.command, &info);
+                } else {
+                    context.sync2.cmd_pipeline_barrier2(self.command, &info);
+                }
+            } else {
+                let mut src_stage = vk::PipelineStageFlags::empty();
+                let mut dst_stage = vk::PipelineStageFlags::empty();
+                let legacy: Vec<_> = barriers
+                    .iter()
+                    .map(|b| {
+                        src_stage |=
+                            vk::PipelineStageFlags::from_raw(b.src_stage_mask.as_raw() as u32);
+                        dst_stage |=
+                            vk::PipelineStageFlags::from_raw(b.dst_stage_mask.as_raw() as u32);
+                        vk::ImageMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::from_raw(
+                                b.src_access_mask.as_raw() as u32
+                            ))
+                            .dst_access_mask(vk::AccessFlags::from_raw(
+                                b.dst_access_mask.as_raw() as u32
+                            ))
+                            .old_layout(b.old_layout)
+                            .new_layout(b.new_layout)
+                            .src_queue_family_index(b.src_queue_family_index)
+                            .dst_queue_family_index(b.dst_queue_family_index)
+                            .image(b.image)
+                            .subresource_range(b.subresource_range)
+                    })
+                    .collect();
+                context.device.cmd_pipeline_barrier(
+                    self.command,
+                    src_stage,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &legacy,
+                );
+            }
+        }
+    }
+    fn transition(
+        &mut self,
+        core: &Arc<ImageCore>,
+        mips: std::ops::Range<u32>,
+        layers: std::ops::Range<u32>,
+        layout: vk::ImageLayout,
+        access: vk::AccessFlags2,
+        stage: vk::PipelineStageFlags2,
+    ) {
+        let mut barriers = Vec::new();
+        self.push_transition(&mut barriers, core, mips, layers, layout, access, stage);
+        self.flush_image_barriers(&barriers);
+    }
+    /// True if any image touched earlier in this encoder (excluding `attachments`)
+    /// is currently in a non-read-only layout and could need a mid-pass transition.
+    fn has_pending_image_transitions(&self, attachments: &[vk::Image]) -> bool {
+        self.originals.iter().any(|(core, _, _)| {
+            if attachments.contains(&core.handle) {
+                return false;
+            }
+            core.states.lock().unwrap().iter().any(|s| {
+                s.layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    && s.layout != vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            })
+        })
     }
     /// Hand a presentable image to the compositor after this submission.
     #[cfg(target_os = "android")]
@@ -366,6 +472,7 @@ impl Encoder {
         if !self.ready() {
             return None;
         }
+        self.has_query_ops = true;
         let pool = set.inner.0.handle;
         unsafe {
             let device = &self.shared.context.device;
@@ -402,7 +509,6 @@ impl Encoder {
                 encoder: self,
                 timestamp,
                 pipeline: None,
-                bindings: binding::Bindings::default(),
             },
         }
     }
@@ -414,215 +520,313 @@ impl Encoder {
         let timestamp = self.timestamp_start(desc.timestamps);
         let modern = self.shared.context.caps.modern;
         let none = modern.contains(Modern::LOAD_STORE_OP_NONE);
-        // Colors, their resolves and depth: no allocation per pass.
-        let mut attachments = ArrayVec::<_, 17>::new();
-        let mut views = ArrayVec::<_, 17>::new();
-        let mut clears = ArrayVec::<_, 17>::new();
-        let mut colors = ArrayVec::<_, 8>::new();
-        let mut resolves = ArrayVec::<_, 8>::new();
-        let mut dynamic_colors = ArrayVec::<_, 8>::new();
-        let mut depth_info = vk::RenderingAttachmentInfo::default();
-        let mut stencil_info = vk::RenderingAttachmentInfo::default();
-        let mut depth_ref = None;
+        let dynamic = modern.contains(Modern::DYNAMIC_RENDERING);
+        let mut barriers = Vec::with_capacity(desc.colors.len() * 2 + 1);
+        let mut attachment_handles = ArrayVec::<vk::Image, 17>::new();
         let mut dimensions = Extent {
             width: desc.area.x + desc.area.w,
             height: desc.area.y + desc.area.h,
             depth_or_layers: 1,
         };
-        for color in &desc.colors {
-            let view = &color.view.inner;
-            dimensions = view.size();
-            self.view_transition(
-                view,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            );
-            let clear = match color.load {
-                Load::Clear(value) => vk::ClearValue {
-                    color: if view.0.format == Format::R32Uint {
-                        vk::ClearColorValue {
-                            uint32: value.map(|v| v as u32),
-                        }
-                    } else {
-                        vk::ClearColorValue {
-                            float32: value.map(|v| v as f32),
-                        }
-                    },
-                },
-                _ => vk::ClearValue::default(),
-            };
-            let index = attachments.len() as u32;
-            attachments.push(attachment(
-                view,
-                load_op(&color.load, none),
-                store_op(color.store, none),
-                vk::AttachmentLoadOp::DONT_CARE,
-                vk::AttachmentStoreOp::DONT_CARE,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            ));
-            views.push(view.0.handle);
-            clears.push(clear);
-            colors.push(vk::AttachmentReference {
-                attachment: index,
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            });
-            let mut dynamic = vk::RenderingAttachmentInfo::default()
-                .image_view(view.0.handle)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(load_op(&color.load, none))
-                .store_op(store_op(color.store, none))
-                .clear_value(clear);
-            if let Some(resolve) = color.resolve {
-                let view = &resolve.inner;
-                self.view_transition(
-                    view,
+        let mut needs_empty_pass = false;
+        let begin_info = if dynamic {
+            let mut dynamic_colors = ArrayVec::<vk::RenderingAttachmentInfo<'static>, 8>::new();
+            let mut depth_info = None;
+            let mut stencil_info = None;
+            for color in &desc.colors {
+                let view = &color.view.inner;
+                dimensions = view.size();
+                if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
+                    needs_empty_pass = true;
+                }
+                attachment_handles.push(view.0.image.inner.core.handle);
+                self.push_transition(
+                    &mut barriers,
+                    &view.0.image.inner.core,
+                    view.0.desc.mips.clone(),
+                    view.0.desc.layers.clone(),
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 );
-                dynamic = dynamic
-                    .resolve_mode(if matches!(view.0.format, Format::R32Uint) {
-                        vk::ResolveModeFlags::SAMPLE_ZERO
+                let clear = match color.load {
+                    Load::Clear(value) => vk::ClearValue {
+                        color: if view.0.format == Format::R32Uint {
+                            vk::ClearColorValue {
+                                uint32: value.map(|v| v as u32),
+                            }
+                        } else {
+                            vk::ClearColorValue {
+                                float32: value.map(|v| v as f32),
+                            }
+                        },
+                    },
+                    _ => vk::ClearValue::default(),
+                };
+                let mut info = vk::RenderingAttachmentInfo::default()
+                    .image_view(view.0.handle)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(load_op(&color.load, none))
+                    .store_op(store_op(color.store, none))
+                    .clear_value(clear);
+                if let Some(resolve) = color.resolve {
+                    let view = &resolve.inner;
+                    attachment_handles.push(view.0.image.inner.core.handle);
+                    self.push_transition(
+                        &mut barriers,
+                        &view.0.image.inner.core,
+                        view.0.desc.mips.clone(),
+                        view.0.desc.layers.clone(),
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    );
+                    info = info
+                        .resolve_mode(if matches!(view.0.format, Format::R32Uint) {
+                            vk::ResolveModeFlags::SAMPLE_ZERO
+                        } else {
+                            vk::ResolveModeFlags::AVERAGE
+                        })
+                        .resolve_image_view(view.0.handle)
+                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                }
+                dynamic_colors.push(info);
+            }
+            if let Some(depth) = &desc.depth_stencil {
+                let view = &depth.view.inner;
+                let size = view.size();
+                dimensions = if desc.colors.is_empty() {
+                    size
+                } else {
+                    Extent {
+                        width: dimensions.width.min(size.width),
+                        height: dimensions.height.min(size.height),
+                        ..dimensions
+                    }
+                };
+                if matches!(depth.depth.0, Load::Clear(_))
+                    || matches!(depth.stencil.0, Load::Clear(_))
+                {
+                    needs_empty_pass = true;
+                }
+                let layout = if depth.read_only {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                };
+                let access = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | if depth.read_only {
+                        vk::AccessFlags2::empty()
                     } else {
-                        vk::ResolveModeFlags::AVERAGE
-                    })
-                    .resolve_image_view(view.0.handle)
-                    .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-                resolves.push(vk::AttachmentReference {
-                    attachment: attachments.len() as u32,
-                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                });
+                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    };
+                attachment_handles.push(view.0.image.inner.core.handle);
+                self.push_transition(
+                    &mut barriers,
+                    &view.0.image.inner.core,
+                    view.0.desc.mips.clone(),
+                    view.0.desc.layers.clone(),
+                    layout,
+                    access,
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                );
+                let clear = vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: match depth.depth.0 {
+                            Load::Clear(v) => v,
+                            _ => 0.0,
+                        },
+                        stencil: match depth.stencil.0 {
+                            Load::Clear(v) => v,
+                            _ => 0,
+                        },
+                    },
+                };
+                if view.0.format.has_depth() {
+                    depth_info = Some(
+                        vk::RenderingAttachmentInfo::default()
+                            .image_view(view.0.handle)
+                            .image_layout(layout)
+                            .load_op(load_op(&depth.depth.0, none))
+                            .store_op(store_op(depth.depth.1, none))
+                            .clear_value(clear),
+                    );
+                }
+                if view.0.format.has_stencil() {
+                    stencil_info = Some(
+                        vk::RenderingAttachmentInfo::default()
+                            .image_view(view.0.handle)
+                            .image_layout(layout)
+                            .load_op(load_op(&depth.stencil.0, none))
+                            .store_op(store_op(depth.stencil.1, none))
+                            .clear_value(clear),
+                    );
+                }
+            }
+            self.flush_image_barriers(&barriers);
+            PassBegin::Dynamic {
+                colors: dynamic_colors,
+                depth: depth_info,
+                stencil: stencil_info,
+                layers: dimensions.depth_or_layers,
+            }
+        } else {
+            // Colors, their resolves and depth: no allocation per pass.
+            let mut attachments = ArrayVec::<_, 17>::new();
+            let mut views = ArrayVec::<_, 17>::new();
+            let mut clears = ArrayVec::<_, 17>::new();
+            let mut colors = ArrayVec::<_, 8>::new();
+            let mut resolves = ArrayVec::<_, 8>::new();
+            let mut depth_ref = None;
+            for color in &desc.colors {
+                let view = &color.view.inner;
+                dimensions = view.size();
+                if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
+                    needs_empty_pass = true;
+                }
+                attachment_handles.push(view.0.image.inner.core.handle);
+                self.push_transition(
+                    &mut barriers,
+                    &view.0.image.inner.core,
+                    view.0.desc.mips.clone(),
+                    view.0.desc.layers.clone(),
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                );
+                let clear = match color.load {
+                    Load::Clear(value) => vk::ClearValue {
+                        color: if view.0.format == Format::R32Uint {
+                            vk::ClearColorValue {
+                                uint32: value.map(|v| v as u32),
+                            }
+                        } else {
+                            vk::ClearColorValue {
+                                float32: value.map(|v| v as f32),
+                            }
+                        },
+                    },
+                    _ => vk::ClearValue::default(),
+                };
+                let index = attachments.len() as u32;
                 attachments.push(attachment(
                     view,
-                    vk::AttachmentLoadOp::DONT_CARE,
-                    vk::AttachmentStoreOp::STORE,
+                    load_op(&color.load, none),
+                    store_op(color.store, none),
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::DONT_CARE,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 ));
                 views.push(view.0.handle);
-                clears.push(vk::ClearValue::default());
-            } else {
-                resolves.push(vk::AttachmentReference {
-                    attachment: vk::ATTACHMENT_UNUSED,
-                    layout: vk::ImageLayout::UNDEFINED,
+                clears.push(clear);
+                colors.push(vk::AttachmentReference {
+                    attachment: index,
+                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 });
-            }
-            dynamic_colors.push(dynamic);
-        }
-        if let Some(depth) = &desc.depth_stencil {
-            let view = &depth.view.inner;
-            // The depth attachment may be larger than the color ones; the
-            // framebuffer may exceed none of them.
-            let size = view.size();
-            dimensions = if desc.colors.is_empty() {
-                size
-            } else {
-                Extent {
-                    width: dimensions.width.min(size.width),
-                    height: dimensions.height.min(size.height),
-                    ..dimensions
-                }
-            };
-            let layout = if depth.read_only {
-                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
-            } else {
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-            };
-            let access = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | if depth.read_only {
-                    vk::AccessFlags2::empty()
+                if let Some(resolve) = color.resolve {
+                    let view = &resolve.inner;
+                    attachment_handles.push(view.0.image.inner.core.handle);
+                    self.push_transition(
+                        &mut barriers,
+                        &view.0.image.inner.core,
+                        view.0.desc.mips.clone(),
+                        view.0.desc.layers.clone(),
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    );
+                    resolves.push(vk::AttachmentReference {
+                        attachment: attachments.len() as u32,
+                        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    });
+                    attachments.push(attachment(
+                        view,
+                        vk::AttachmentLoadOp::DONT_CARE,
+                        vk::AttachmentStoreOp::STORE,
+                        vk::AttachmentLoadOp::DONT_CARE,
+                        vk::AttachmentStoreOp::DONT_CARE,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    ));
+                    views.push(view.0.handle);
+                    clears.push(vk::ClearValue::default());
                 } else {
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-                };
-            self.view_transition(
-                view,
-                layout,
-                access,
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            );
-            let clear = vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: match depth.depth.0 {
-                        Load::Clear(v) => v,
-                        _ => 0.0,
-                    },
-                    stencil: match depth.stencil.0 {
-                        Load::Clear(v) => v,
-                        _ => 0,
-                    },
-                },
-            };
-            depth_info = vk::RenderingAttachmentInfo::default()
-                .image_view(view.0.handle)
-                .image_layout(layout)
-                .load_op(load_op(&depth.depth.0, none))
-                .store_op(store_op(depth.depth.1, none))
-                .clear_value(clear);
-            stencil_info = vk::RenderingAttachmentInfo::default()
-                .image_view(view.0.handle)
-                .image_layout(layout)
-                .load_op(load_op(&depth.stencil.0, none))
-                .store_op(store_op(depth.stencil.1, none))
-                .clear_value(clear);
-            depth_ref = Some(vk::AttachmentReference {
-                attachment: attachments.len() as u32,
-                layout,
-            });
-            attachments.push(attachment(
-                view,
-                load_op(&depth.depth.0, none),
-                store_op(depth.depth.1, none),
-                load_op(&depth.stencil.0, none),
-                store_op(depth.stencil.1, none),
-                layout,
-            ));
-            views.push(view.0.handle);
-            clears.push(clear);
-        }
-        // Keep the preamble open until the pass ends: its occlusion queries
-        // are discovered while recording and must be reset before the pass.
-        let preamble = self.command;
-        if self.ready() {
-            self.commands.push(preamble);
-            self.command = vk::CommandBuffer::null();
-            if let Err(error) = self.allocate_command() {
-                self.error = Some(error);
+                    resolves.push(vk::AttachmentReference {
+                        attachment: vk::ATTACHMENT_UNUSED,
+                        layout: vk::ImageLayout::UNDEFINED,
+                    });
+                }
             }
-        }
-        let dynamic = modern.contains(Modern::DYNAMIC_RENDERING);
-        let mut begun = false;
-        if self.ready() {
-            if dynamic {
-                let mut info = vk::RenderingInfo::default()
-                    .render_area(rect(desc.area))
-                    .layer_count(dimensions.depth_or_layers)
-                    .color_attachments(&dynamic_colors);
-                if let Some(depth) = &desc.depth_stencil {
-                    if depth.view.inner.0.format.has_depth() {
-                        info = info.depth_attachment(&depth_info);
+            if let Some(depth) = &desc.depth_stencil {
+                let view = &depth.view.inner;
+                let size = view.size();
+                dimensions = if desc.colors.is_empty() {
+                    size
+                } else {
+                    Extent {
+                        width: dimensions.width.min(size.width),
+                        height: dimensions.height.min(size.height),
+                        ..dimensions
                     }
-                    if depth.view.inner.0.format.has_stencil() {
-                        info = info.stencil_attachment(&stencil_info);
-                    }
+                };
+                if matches!(depth.depth.0, Load::Clear(_))
+                    || matches!(depth.stencil.0, Load::Clear(_))
+                {
+                    needs_empty_pass = true;
                 }
-                unsafe {
-                    if self.shared.context.api >= vk::API_VERSION_1_3 {
-                        self.shared
-                            .context
-                            .device
-                            .cmd_begin_rendering(self.command, &info);
+                let layout = if depth.read_only {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                };
+                let access = vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | if depth.read_only {
+                        vk::AccessFlags2::empty()
                     } else {
-                        self.shared
-                            .context
-                            .dynamic
-                            .cmd_begin_rendering(self.command, &info);
-                    }
-                }
-                begun = true;
-            } else {
+                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    };
+                attachment_handles.push(view.0.image.inner.core.handle);
+                self.push_transition(
+                    &mut barriers,
+                    &view.0.image.inner.core,
+                    view.0.desc.mips.clone(),
+                    view.0.desc.layers.clone(),
+                    layout,
+                    access,
+                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                );
+                let clear = vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: match depth.depth.0 {
+                            Load::Clear(v) => v,
+                            _ => 0.0,
+                        },
+                        stencil: match depth.stencil.0 {
+                            Load::Clear(v) => v,
+                            _ => 0,
+                        },
+                    },
+                };
+                depth_ref = Some(vk::AttachmentReference {
+                    attachment: attachments.len() as u32,
+                    layout,
+                });
+                attachments.push(attachment(
+                    view,
+                    load_op(&depth.depth.0, none),
+                    store_op(depth.depth.1, none),
+                    load_op(&depth.stencil.0, none),
+                    store_op(depth.stencil.1, none),
+                    layout,
+                ));
+                views.push(view.0.handle);
+                clears.push(clear);
+            }
+            self.flush_image_barriers(&barriers);
+            let legacy = if self.ready() {
                 match self.legacy_pass(
                     &attachments,
                     &views,
@@ -631,52 +835,48 @@ impl Encoder {
                     depth_ref.as_ref(),
                     dimensions,
                 ) {
-                    Ok((pass, framebuffer)) => {
-                        let info = vk::RenderPassBeginInfo::default()
-                            .render_pass(pass)
-                            .framebuffer(framebuffer)
-                            .render_area(rect(desc.area))
-                            .clear_values(&clears);
-                        unsafe {
-                            self.shared.context.device.cmd_begin_render_pass(
-                                self.command,
-                                &info,
-                                vk::SubpassContents::INLINE,
-                            );
-                        }
-                        begun = true;
+                    Ok(pair) => Some(pair),
+                    Err(e) => {
+                        self.error = Some(e);
+                        None
                     }
-                    Err(e) => self.error = Some(e),
                 }
-            }
-        }
-        let mut pass = RenderPass {
-            encoder: self,
-            area: desc.area,
-            dynamic,
-            begun,
-            timestamp,
-            occlusion: None,
-            preamble,
-            resets: Vec::new(),
-            pipeline: None,
-            state: None,
-            bindings: binding::Bindings::default(),
-            index: None,
+            } else {
+                None
+            };
+            PassBegin::Legacy { legacy, clears }
         };
-        pass.set_viewport(
-            desc.area.x as f32,
-            desc.area.y as f32,
-            desc.area.w as f32,
-            desc.area.h as f32,
-            0.0,
-            1.0,
-        );
-        pass.set_scissor(desc.area);
-        pass.set_stencil_reference(0);
-        pass.set_blend_constant([0.0; 4]);
-        pass.set_depth_bias(0.0, 0.0, 0.0);
-        crate::RenderPass { inner: pass }
+        let preamble_index = self.commands.len();
+        crate::RenderPass {
+            inner: RenderPass {
+                encoder: self,
+                area: desc.area,
+                begin_info,
+                attachment_handles,
+                needs_empty_pass,
+                begun: false,
+                timestamp,
+                occlusion: None,
+                preamble: None,
+                preamble_index,
+                resets: Vec::new(),
+                pipeline: None,
+                state: None,
+                index: None,
+                viewport: vk::Viewport {
+                    x: desc.area.x as f32,
+                    y: desc.area.y as f32,
+                    width: desc.area.w as f32,
+                    height: desc.area.h as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: rect(desc.area),
+                stencil_reference: 0,
+                blend_constant: [0.0; 4],
+                depth_bias: (0.0, 0.0, 0.0),
+            },
+        }
     }
     fn legacy_pass(
         &mut self,
@@ -827,62 +1027,133 @@ impl Encoder {
         );
     }
     pub(crate) fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
+        self.copy_image_regions(
+            src.image,
+            dst.image,
+            &[ImageCopyRegion {
+                src_mip: src.mip,
+                src_layer: src.layer,
+                src_origin: src.origin,
+                dst_mip: dst.mip,
+                dst_layer: dst.layer,
+                dst_origin: dst.origin,
+                size,
+            }],
+        );
+    }
+    pub(crate) fn copy_image_regions(
+        &mut self,
+        src: &crate::Image,
+        dst: &crate::Image,
+        copies: &[ImageCopyRegion],
+    ) {
+        if copies.is_empty() {
+            return;
+        }
         self.memory_barrier();
-        self.copy_transition(
-            src,
-            size,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags2::TRANSFER_READ,
-        );
-        self.copy_transition(
-            dst,
-            size,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        );
+        let mut barriers = Vec::with_capacity(2);
+        let src_d3 = src.desc().dimension == Dimension::D3;
+        let dst_d3 = dst.desc().dimension == Dimension::D3;
+        let mut seen_src = Vec::<(u32, u32)>::new();
+        let mut seen_dst = Vec::<(u32, u32)>::new();
+        for copy in copies {
+            let src_layers = if src_d3 { 1 } else { copy.size.depth_or_layers };
+            for layer in copy.src_layer..copy.src_layer + src_layers {
+                let key = (copy.src_mip, layer);
+                if !seen_src.contains(&key) {
+                    seen_src.push(key);
+                    self.push_transition(
+                        &mut barriers,
+                        &src.inner.core,
+                        copy.src_mip..copy.src_mip + 1,
+                        layer..layer + 1,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags2::TRANSFER_READ,
+                        vk::PipelineStageFlags2::TRANSFER,
+                    );
+                }
+            }
+            let dst_layers = if dst_d3 { 1 } else { copy.size.depth_or_layers };
+            for layer in copy.dst_layer..copy.dst_layer + dst_layers {
+                let key = (copy.dst_mip, layer);
+                if !seen_dst.contains(&key) {
+                    seen_dst.push(key);
+                    self.push_transition(
+                        &mut barriers,
+                        &dst.inner.core,
+                        copy.dst_mip..copy.dst_mip + 1,
+                        layer..layer + 1,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::TRANSFER,
+                    );
+                }
+            }
+        }
+        self.flush_image_barriers(&barriers);
         if !self.ready() {
             return;
         }
-        let regions: Vec<_> = (0..src.image.desc().format.planes())
-            .map(|plane| {
+        let planes = src.desc().format.planes();
+        let aspect = formats::aspect(src.desc().format);
+        let mut regions = Vec::with_capacity(copies.len() * planes as usize);
+        for copy in copies {
+            let src_layer_count = if src_d3 { 1 } else { copy.size.depth_or_layers };
+            let dst_layer_count = if dst_d3 { 1 } else { copy.size.depth_or_layers };
+            let base_extent = vk::Extent3D {
+                width: copy.size.width,
+                height: copy.size.height,
+                depth: if src_d3 { copy.size.depth_or_layers } else { 1 },
+            };
+            for plane in 0..planes {
                 let scale = if plane == 0 { 1 } else { 2 };
-                let mut source = subresource(src, size);
-                let mut destination = subresource(dst, size);
-                if src.image.desc().format.planes() > 1 {
-                    let aspect = if plane == 0 {
+                let plane_aspect = if planes > 1 {
+                    if plane == 0 {
                         vk::ImageAspectFlags::PLANE_0
                     } else {
                         vk::ImageAspectFlags::PLANE_1
-                    };
-                    source.aspect_mask = aspect;
-                    destination.aspect_mask = aspect;
-                }
-                let mut extent = copy_extent(src, size);
+                    }
+                } else {
+                    aspect
+                };
+                let source = vk::ImageSubresourceLayers::default()
+                    .aspect_mask(plane_aspect)
+                    .mip_level(copy.src_mip)
+                    .base_array_layer(copy.src_layer)
+                    .layer_count(src_layer_count);
+                let destination = vk::ImageSubresourceLayers::default()
+                    .aspect_mask(plane_aspect)
+                    .mip_level(copy.dst_mip)
+                    .base_array_layer(copy.dst_layer)
+                    .layer_count(dst_layer_count);
+                let mut extent = base_extent;
                 extent.width /= scale;
                 extent.height /= scale;
-                vk::ImageCopy::default()
-                    .src_subresource(source)
-                    .src_offset(offset((
-                        src.origin.0 / scale,
-                        src.origin.1 / scale,
-                        src.origin.2,
-                    )))
-                    .dst_subresource(destination)
-                    .dst_offset(offset((
-                        dst.origin.0 / scale,
-                        dst.origin.1 / scale,
-                        dst.origin.2,
-                    )))
-                    .extent(extent)
-            })
-            .collect();
+                regions.push(
+                    vk::ImageCopy::default()
+                        .src_subresource(source)
+                        .src_offset(offset((
+                            copy.src_origin.0 / scale,
+                            copy.src_origin.1 / scale,
+                            copy.src_origin.2,
+                        )))
+                        .dst_subresource(destination)
+                        .dst_offset(offset((
+                            copy.dst_origin.0 / scale,
+                            copy.dst_origin.1 / scale,
+                            copy.dst_origin.2,
+                        )))
+                        .extent(extent),
+                );
+            }
+        }
         self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_image(
                 self.command,
-                src.image.inner.core.handle,
+                src.inner.core.handle,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst.image.inner.core.handle,
+                dst.inner.core.handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
             );
@@ -943,6 +1214,7 @@ impl Encoder {
             return;
         }
         self.synced = false;
+        self.has_query_ops = true;
         unsafe {
             self.shared.context.device.cmd_copy_query_pool_results(
                 self.command,
@@ -1137,26 +1409,189 @@ fn buffer_image_copies(
     regions
 }
 
+enum PassBegin {
+    Dynamic {
+        colors: ArrayVec<vk::RenderingAttachmentInfo<'static>, 8>,
+        depth: Option<vk::RenderingAttachmentInfo<'static>>,
+        stencil: Option<vk::RenderingAttachmentInfo<'static>>,
+        layers: u32,
+    },
+    Legacy {
+        legacy: Option<(vk::RenderPass, vk::Framebuffer)>,
+        clears: ArrayVec<vk::ClearValue, 17>,
+    },
+}
+
 pub(crate) struct RenderPass<'e> {
     pub(super) encoder: &'e mut Encoder,
     area: Rect,
-    dynamic: bool,
+    begin_info: PassBegin,
+    attachment_handles: ArrayVec<vk::Image, 17>,
+    needs_empty_pass: bool,
     begun: bool,
     timestamp: Option<(vk::QueryPool, u32)>,
     occlusion: Option<(vk::QueryPool, u32)>,
-    preamble: vk::CommandBuffer,
+    preamble: Option<vk::CommandBuffer>,
+    preamble_index: usize,
     resets: Vec<(vk::QueryPool, u32)>,
     pipeline: Option<Arc<pipeline::Compiled>>,
     state: Option<pipeline::Dynamic>,
-    bindings: binding::Bindings,
     index: Option<(vk::Buffer, u64, IndexFormat)>,
+    viewport: vk::Viewport,
+    scissor: vk::Rect2D,
+    stencil_reference: u32,
+    blend_constant: [f32; 4],
+    depth_bias: (f32, f32, f32),
+}
+impl RenderPass<'_> {
+    fn ensure_preamble(
+        encoder: &mut Encoder,
+        preamble: &mut Option<vk::CommandBuffer>,
+        preamble_index: usize,
+    ) -> Option<vk::CommandBuffer> {
+        if let Some(cb) = *preamble {
+            return Some(cb);
+        }
+        if !encoder.ready() {
+            return None;
+        }
+        match encoder.allocate_buffer() {
+            Ok(cb) => {
+                encoder.commands.insert(preamble_index, cb);
+                *preamble = Some(cb);
+                Some(cb)
+            }
+            Err(error) => {
+                encoder.error = Some(error);
+                None
+            }
+        }
+    }
+    fn ensure_begun(&mut self) -> bool {
+        if self.begun {
+            return self.encoder.ready();
+        }
+        if !self.encoder.ready() {
+            return false;
+        }
+        // Only split out a preamble CB eagerly if an earlier command in this
+        // encoder touched an image that is not in a read-only layout or ran
+        // query ops, so any lazy mid-pass preamble stays strictly ordered.
+        if self
+            .encoder
+            .has_pending_image_transitions(&self.attachment_handles)
+            || self.encoder.has_query_ops
+        {
+            let preamble = self.encoder.command;
+            self.encoder.commands.push(preamble);
+            self.preamble = Some(preamble);
+            self.encoder.command = vk::CommandBuffer::null();
+            if let Err(error) = self.encoder.allocate_command() {
+                self.encoder.error = Some(error);
+                return false;
+            }
+        }
+        let context = &self.encoder.shared.context;
+        let command = self.encoder.command;
+        match &self.begin_info {
+            PassBegin::Dynamic {
+                colors,
+                depth,
+                stencil,
+                layers,
+            } => {
+                let mut info = vk::RenderingInfo::default()
+                    .render_area(rect(self.area))
+                    .layer_count(*layers)
+                    .color_attachments(colors);
+                if let Some(depth) = depth {
+                    info = info.depth_attachment(depth);
+                }
+                if let Some(stencil) = stencil {
+                    info = info.stencil_attachment(stencil);
+                }
+                unsafe {
+                    if context.api >= vk::API_VERSION_1_3 {
+                        context.device.cmd_begin_rendering(command, &info);
+                    } else {
+                        context.dynamic.cmd_begin_rendering(command, &info);
+                    }
+                }
+                self.begun = true;
+            }
+            PassBegin::Legacy { legacy, clears } => {
+                let Some((pass, framebuffer)) = *legacy else {
+                    return false;
+                };
+                let info = vk::RenderPassBeginInfo::default()
+                    .render_pass(pass)
+                    .framebuffer(framebuffer)
+                    .render_area(rect(self.area))
+                    .clear_values(clears);
+                unsafe {
+                    context.device.cmd_begin_render_pass(
+                        command,
+                        &info,
+                        vk::SubpassContents::INLINE,
+                    );
+                }
+                self.begun = true;
+            }
+        }
+        unsafe {
+            context
+                .device
+                .cmd_set_viewport(command, 0, &[self.viewport]);
+            context.device.cmd_set_scissor(command, 0, &[self.scissor]);
+            context.device.cmd_set_stencil_reference(
+                command,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                self.stencil_reference,
+            );
+            context
+                .device
+                .cmd_set_blend_constants(command, &self.blend_constant);
+            context.device.cmd_set_depth_bias(
+                command,
+                self.depth_bias.0,
+                self.depth_bias.2,
+                self.depth_bias.1,
+            );
+            if let Some(pipeline) = &self.pipeline {
+                context.device.cmd_bind_pipeline(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.handle,
+                );
+            }
+            if let Some(state) = &self.state {
+                state.emit(context, command, None);
+            }
+            if let Some((buffer, offset, format)) = self.index {
+                context.device.cmd_bind_index_buffer(
+                    command,
+                    buffer,
+                    offset,
+                    match format {
+                        IndexFormat::U16 => vk::IndexType::UINT16,
+                        IndexFormat::U32 => vk::IndexType::UINT32,
+                    },
+                );
+            }
+        }
+        self.encoder.synced = false;
+        true
+    }
 }
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
+        if !self.begun && self.needs_empty_pass {
+            self.ensure_begun();
+        }
         if self.begun && self.encoder.ready() {
             unsafe {
                 let context = &self.encoder.shared.context;
-                if self.dynamic {
+                if matches!(self.begin_info, PassBegin::Dynamic { .. }) {
                     if context.api >= vk::API_VERSION_1_3 {
                         context.device.cmd_end_rendering(self.encoder.command);
                     } else {
@@ -1168,17 +1603,16 @@ impl Drop for RenderPass<'_> {
             }
         }
         self.encoder.timestamp_end(self.timestamp);
-        if self.encoder.ready() {
-            let command = self.encoder.command;
-            self.encoder.command = self.preamble;
+        if self.encoder.ready()
+            && let Some(preamble) = self.preamble
+        {
             for &(pool, index) in &self.resets {
                 unsafe {
-                    self.encoder.shared.context.device.cmd_reset_query_pool(
-                        self.preamble,
-                        pool,
-                        index,
-                        1,
-                    );
+                    self.encoder
+                        .shared
+                        .context
+                        .device
+                        .cmd_reset_query_pool(preamble, pool, index, 1);
                 }
             }
             if let Err(error) = self.encoder.shared.context.result(unsafe {
@@ -1186,11 +1620,13 @@ impl Drop for RenderPass<'_> {
                     .shared
                     .context
                     .device
-                    .end_command_buffer(self.preamble)
+                    .end_command_buffer(preamble)
             }) {
                 self.encoder.error = Some(error);
             }
-            self.encoder.command = command;
+        }
+        if let Some(bindings) = &mut self.encoder.bindings {
+            bindings.clear();
         }
     }
 }
@@ -1200,36 +1636,57 @@ impl RenderPass<'_> {
             return;
         }
         let pipeline = &pipeline.inner;
-        let context = &self.encoder.shared.context;
-        let command = self.encoder.command;
-        if self
+        let changed = self
             .pipeline
             .as_ref()
-            .is_none_or(|p| p.handle != pipeline.compiled.handle)
-        {
-            unsafe {
-                context.device.cmd_bind_pipeline(
-                    command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.compiled.handle,
-                );
+            .is_none_or(|p| p.handle != pipeline.compiled.handle);
+        if changed {
+            if self.begun {
+                unsafe {
+                    self.encoder.shared.context.device.cmd_bind_pipeline(
+                        self.encoder.command,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline.compiled.handle,
+                    );
+                }
             }
-            self.bindings.pipeline(&pipeline.compiled);
+            self.encoder
+                .bindings
+                .as_mut()
+                .unwrap()
+                .pipeline(&pipeline.compiled);
             self.pipeline = Some(pipeline.compiled.clone());
         }
         if self.state != Some(pipeline.dynamic) {
-            pipeline.dynamic.emit(context, command, self.state.as_ref());
+            if self.begun {
+                pipeline.dynamic.emit(
+                    &self.encoder.shared.context,
+                    self.encoder.command,
+                    self.state.as_ref(),
+                );
+            }
             self.state = Some(pipeline.dynamic);
         }
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.bindings.bind(
+        let mut bindings = self.encoder.bindings.take().unwrap();
+        let begun = self.begun;
+        let preamble = &mut self.preamble;
+        let preamble_index = self.preamble_index;
+        bindings.bind(
             self.encoder,
             self.pipeline.as_deref(),
             slot,
             resource,
-            Some(self.preamble),
+            |encoder| {
+                if begun {
+                    Self::ensure_preamble(encoder, preamble, preamble_index)
+                } else {
+                    None
+                }
+            },
         );
+        self.encoder.bindings = Some(bindings);
     }
     #[cfg(target_os = "android")]
     pub(crate) fn bind_video(&mut self, image: &crate::PresentImage) {
@@ -1241,23 +1698,41 @@ impl RenderPass<'_> {
             .pipeline
             .as_ref()
             .expect("video pipeline before bind_video");
-        let (index, expected) = pipeline.video.as_ref().expect("converted video pipeline");
+        let (_, expected) = pipeline.video.as_ref().expect("converted video pipeline");
         debug_assert!(
             Arc::ptr_eq(pool, expected),
             "video buffer belongs to another pool"
         );
-        let command = self.encoder.command;
-        self.encoder.command = self.preamble;
-        self.encoder.view_transition(
-            &image.image().view().inner,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::AccessFlags2::SHADER_READ,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        );
-        self.encoder.command = command;
+        if self.begun {
+            let command = self.encoder.command;
+            if let Some(cb) =
+                Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
+            {
+                self.encoder.command = cb;
+                self.encoder.view_transition(
+                    &image.image().view().inner,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags2::SHADER_READ,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                );
+                self.encoder.command = command;
+            }
+        } else {
+            self.encoder.view_transition(
+                &image.image().view().inner,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags2::SHADER_READ,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            );
+            if !self.ensure_begun() {
+                return;
+            }
+        }
+        let pipeline = self.pipeline.as_ref().unwrap();
+        let (index, _) = pipeline.video.as_ref().unwrap();
         unsafe {
             self.encoder.shared.context.device.cmd_bind_descriptor_sets(
-                command,
+                self.encoder.command,
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline.layout,
                 *index,
@@ -1274,29 +1749,34 @@ impl RenderPass<'_> {
         if self.index == Some(value) {
             return;
         }
-        unsafe {
-            self.encoder.shared.context.device.cmd_bind_index_buffer(
-                self.encoder.command,
-                value.0,
-                value.1,
-                match format {
-                    IndexFormat::U16 => vk::IndexType::UINT16,
-                    IndexFormat::U32 => vk::IndexType::UINT32,
-                },
-            );
+        if self.begun {
+            unsafe {
+                self.encoder.shared.context.device.cmd_bind_index_buffer(
+                    self.encoder.command,
+                    value.0,
+                    value.1,
+                    match format {
+                        IndexFormat::U16 => vk::IndexType::UINT16,
+                        IndexFormat::U32 => vk::IndexType::UINT32,
+                    },
+                );
+            }
         }
         self.index = Some(value);
     }
     fn prepare(&mut self) -> bool {
+        if !self.ensure_begun() {
+            return false;
+        }
         let pipeline = self.pipeline.as_deref();
         debug_assert!(
             pipeline.is_some() || !self.encoder.ready(),
             "draw without a pipeline"
         );
-        let ready = pipeline.is_some_and(|p| {
-            self.bindings
-                .flush(self.encoder, p, vk::PipelineBindPoint::GRAPHICS)
-        });
+        let mut bindings = self.encoder.bindings.take().unwrap();
+        let ready = pipeline
+            .is_some_and(|p| bindings.flush(self.encoder, p, vk::PipelineBindPoint::GRAPHICS));
+        self.encoder.bindings = Some(bindings);
         self.encoder.synced &= !ready;
         ready
     }
@@ -1366,26 +1846,29 @@ impl RenderPass<'_> {
         min_depth: f32,
         max_depth: f32,
     ) {
-        if !self.begun || !self.encoder.ready() {
+        if !self.encoder.ready() {
             return;
         }
-        unsafe {
-            self.encoder.shared.context.device.cmd_set_viewport(
-                self.encoder.command,
-                0,
-                &[vk::Viewport {
-                    x,
-                    y,
-                    width: w,
-                    height: h,
-                    min_depth,
-                    max_depth,
-                }],
-            );
+        self.viewport = vk::Viewport {
+            x,
+            y,
+            width: w,
+            height: h,
+            min_depth,
+            max_depth,
+        };
+        if self.begun {
+            unsafe {
+                self.encoder.shared.context.device.cmd_set_viewport(
+                    self.encoder.command,
+                    0,
+                    &[self.viewport],
+                );
+            }
         }
     }
     pub(crate) fn set_scissor(&mut self, value: Rect) {
-        if !self.begun || !self.encoder.ready() {
+        if !self.encoder.ready() {
             return;
         }
         let x = value.x.max(self.area.x).min(self.area.x + self.area.w);
@@ -1400,21 +1883,28 @@ impl RenderPass<'_> {
             .saturating_add(value.h)
             .min(self.area.y + self.area.h)
             .max(y);
-        unsafe {
-            self.encoder.shared.context.device.cmd_set_scissor(
-                self.encoder.command,
-                0,
-                &[rect(Rect {
-                    x,
-                    y,
-                    w: right - x,
-                    h: bottom - y,
-                })],
-            );
+        self.scissor = rect(Rect {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        });
+        if self.begun {
+            unsafe {
+                self.encoder.shared.context.device.cmd_set_scissor(
+                    self.encoder.command,
+                    0,
+                    &[self.scissor],
+                );
+            }
         }
     }
     pub(crate) fn set_stencil_reference(&mut self, value: u32) {
-        if self.begun && self.encoder.ready() {
+        if !self.encoder.ready() {
+            return;
+        }
+        self.stencil_reference = value;
+        if self.begun {
             unsafe {
                 self.encoder
                     .shared
@@ -1429,7 +1919,11 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn set_blend_constant(&mut self, rgba: [f32; 4]) {
-        if self.begun && self.encoder.ready() {
+        if !self.encoder.ready() {
+            return;
+        }
+        self.blend_constant = rgba;
+        if self.begun {
             unsafe {
                 self.encoder
                     .shared
@@ -1440,7 +1934,11 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn set_depth_bias(&mut self, constant: f32, slope: f32, clamp: f32) {
-        if self.begun && self.encoder.ready() {
+        if !self.encoder.ready() {
+            return;
+        }
+        self.depth_bias = (constant, slope, clamp);
+        if self.begun {
             unsafe {
                 self.encoder.shared.context.device.cmd_set_depth_bias(
                     self.encoder.command,
@@ -1452,10 +1950,30 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn begin_occlusion(&mut self, set: &crate::queue::QuerySet, index: u32) {
-        if !self.begun || !self.encoder.ready() {
+        if !self.encoder.ready() {
             return;
         }
-        self.resets.push((set.inner.0.handle, index));
+        if !self.begun {
+            unsafe {
+                self.encoder.shared.context.device.cmd_reset_query_pool(
+                    self.encoder.command,
+                    set.inner.0.handle,
+                    index,
+                    1,
+                );
+            }
+            if !self.ensure_begun() {
+                return;
+            }
+        } else {
+            if Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
+                .is_none()
+            {
+                return;
+            }
+            self.resets.push((set.inner.0.handle, index));
+        }
+        self.encoder.has_query_ops = true;
         unsafe {
             self.encoder.shared.context.device.cmd_begin_query(
                 self.encoder.command,
@@ -1484,11 +2002,13 @@ pub(crate) struct ComputePass<'e> {
     pub(super) encoder: &'e mut Encoder,
     timestamp: Option<(vk::QueryPool, u32)>,
     pipeline: Option<Arc<pipeline::Compiled>>,
-    bindings: binding::Bindings,
 }
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
         self.encoder.timestamp_end(self.timestamp);
+        if let Some(bindings) = &mut self.encoder.bindings {
+            bindings.clear();
+        }
     }
 }
 impl ComputePass<'_> {
@@ -1509,12 +2029,19 @@ impl ComputePass<'_> {
                 compiled.handle,
             );
         }
-        self.bindings.pipeline(compiled);
+        self.encoder.bindings.as_mut().unwrap().pipeline(compiled);
         self.pipeline = Some(compiled.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.bindings
-            .bind(self.encoder, self.pipeline.as_deref(), slot, resource, None);
+        let mut bindings = self.encoder.bindings.take().unwrap();
+        bindings.bind(
+            self.encoder,
+            self.pipeline.as_deref(),
+            slot,
+            resource,
+            |_| None,
+        );
+        self.encoder.bindings = Some(bindings);
     }
     fn prepare(&mut self) -> bool {
         let pipeline = self.pipeline.as_deref();
@@ -1522,15 +2049,15 @@ impl ComputePass<'_> {
             pipeline.is_some() || !self.encoder.ready(),
             "dispatch without a pipeline"
         );
-        let ready = pipeline.is_some_and(|p| {
-            self.bindings
-                .flush(self.encoder, p, vk::PipelineBindPoint::COMPUTE)
-        });
+        let mut bindings = self.encoder.bindings.take().unwrap();
+        let ready = pipeline
+            .is_some_and(|p| bindings.flush(self.encoder, p, vk::PipelineBindPoint::COMPUTE));
+        self.encoder.bindings = Some(bindings);
         self.encoder.synced &= !ready;
         ready
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        self.encoder.memory_barrier();
+        self.encoder.compute_barrier();
         if self.prepare() {
             unsafe {
                 self.encoder
@@ -1542,7 +2069,10 @@ impl ComputePass<'_> {
         }
     }
     pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
-        self.encoder.memory_barrier();
+        self.encoder.compute_barrier();
+        self.dispatch_indirect_unordered(args);
+    }
+    pub(crate) fn dispatch_indirect_unordered(&mut self, args: BufferSlice<'_>) {
         if self.prepare() {
             unsafe {
                 self.encoder.shared.context.device.cmd_dispatch_indirect(

@@ -8,9 +8,14 @@ pub(crate) struct Queue {
     event: Object<dyn MTLSharedEvent>,
     listener: Retained<MTLSharedEventListener>,
     next: u64,
+    bindings: Option<Box<encode::Bindings>>,
+    visibility_pool: VecDeque<(u64, Object<dyn MTLBuffer>)>,
     // The public queue has one submitting owner.
     _not_sync: PhantomData<Cell<()>>,
 }
+
+// SAFETY: Queue has one owning thread at a time and MTLBuffer is thread-safe to move.
+unsafe impl Send for Queue {}
 
 impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
@@ -57,6 +62,8 @@ impl Device {
                 event,
                 listener: MTLSharedEventListener::new(),
                 next: 1,
+                bindings: None,
+                visibility_pool: VecDeque::new(),
                 _not_sync: PhantomData,
             },
         };
@@ -75,23 +82,36 @@ impl Queue {
             .commandBuffer()
             .expect("Metal command buffer allocation");
         command.setLabel(Some(&NSString::from_str(label)));
+        let bindings = self.bindings.take().unwrap_or_else(encode::Bindings::new);
+        let visibility = if self
+            .visibility_pool
+            .front()
+            .is_some_and(|(token, _)| *token <= self.event.signaledValue())
+        {
+            self.visibility_pool.pop_front().map(|(_, buf)| buf)
+        } else {
+            None
+        };
         crate::Encoder {
-            inner: Encoder::new(self.device.inner.clone(), command),
+            inner: Encoder::new(self.device.inner.clone(), command, bindings, visibility),
         }
     }
-    pub(crate) fn submit(&mut self, encoder: crate::Encoder) -> Result<Token> {
+    pub(crate) fn submit(&mut self, mut encoder: crate::Encoder) -> Result<Token> {
         self.device.inner.check()?;
-        let encode::Encoder {
-            command,
-            spans,
-            resolves,
-            ..
-        } = encoder.inner;
+        encoder.inner.finish_blit();
+        let command = encoder.inner.command.clone();
+        let spans = std::mem::take(&mut encoder.inner.spans);
+        let resolves = std::mem::take(&mut encoder.inner.resolves);
+        if let Some(bindings) = encoder.inner.bindings.take() {
+            self.bindings = Some(bindings);
+        }
+        let visibility = encoder.inner.visibility.take();
         let token = Token(self.next);
         self.next += 1;
-        for span in spans {
-            span.inner.submitted(token.0);
+        if let Some(visibility) = visibility {
+            self.visibility_pool.push_back((token.0, visibility));
         }
+        ring::Span::submit_batch(spans, token.0);
         self.rings(|ring| ring.submitted(token.0));
         // Timestamp resolves go to a buffer queued right behind this one and
         // encoded once it completes (see `encode::Resolve`); that buffer

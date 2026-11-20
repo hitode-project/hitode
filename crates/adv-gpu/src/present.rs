@@ -406,12 +406,15 @@ impl Queue {
         encoder: Encoder,
         images: &mut [&mut PresentImage],
     ) -> Result<Token> {
-        let (token, fence) = {
-            let buffers: arrayvec::ArrayVec<_, 8> = images
-                .iter()
-                .map(|i| (&i.buffer().image.inner, &i.buffer().raw))
-                .collect();
+        let buffers = images
+            .iter()
+            .map(|i| (&i.buffer().image.inner, &i.buffer().raw));
+        let (token, fence) = if images.len() <= 8 {
+            let buffers: arrayvec::ArrayVec<_, 8> = buffers.collect();
             self.inner.submit_present(encoder, &buffers)?
+        } else {
+            self.inner
+                .submit_present(encoder, &buffers.collect::<Vec<_>>())?
         };
         let mut fence = fence.map(|inner| Fence { inner });
         let last = images.len().saturating_sub(1);

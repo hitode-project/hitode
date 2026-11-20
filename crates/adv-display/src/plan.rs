@@ -6,6 +6,7 @@ pub use adv_gpu::Region;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Tiles the GPU stages run on. Tile size is per stage (the upscaler's
 /// workgroup footprint, the output pass's alignment); the list is the damage
@@ -165,13 +166,35 @@ pub struct Pool {
     pub buffers: Vec<PoolBuffer>,
 }
 
+mod arc_region_deque {
+    use super::Region;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    pub fn serialize<S: Serializer>(
+        deque: &VecDeque<Arc<Region>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(deque.iter().map(|r| r.as_ref()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<VecDeque<Arc<Region>>, D::Error> {
+        let regions = Vec::<Region>::deserialize(deserializer)?;
+        Ok(regions.into_iter().map(Arc::new).collect())
+    }
+}
+
 /// The executor keeps this ledger alongside its actual allocations. Invalidate
 /// it when geometry, scaling, the upscaler or the device changes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PoolState {
     pub pools: Vec<Pool>,
     /// Canvas damage, oldest first; bounded by `HISTORY`.
-    pub history: VecDeque<Region>,
+    #[serde(with = "arc_region_deque")]
+    pub history: VecDeque<Arc<Region>>,
 }
 
 /// A stage's chosen allocation. All stages for one pool write this buffer;
@@ -306,7 +329,7 @@ impl PoolState {
         for target in &plan.targets {
             self.buffer(target).age = Some(1);
         }
-        self.history.push_back(plan.damage.clone());
+        self.history.push_back(Arc::new(plan.damage.clone()));
         if self.history.len() > HISTORY {
             self.history.pop_front();
         }
@@ -547,9 +570,12 @@ fn tiles(
             .into(),
         );
     }
+    const MAX_TILES: usize = 64;
+    let mut parts = Vec::new();
+    cover.parts_into(MAX_TILES, &mut parts);
     Tiles {
         size,
-        rects: cover.rects().into_iter().map(Into::into).collect(),
+        rects: parts.into_iter().map(Into::into).collect(),
     }
 }
 /// Window layers: each at one integer scale near the host's, the largest

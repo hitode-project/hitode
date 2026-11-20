@@ -11,20 +11,18 @@ pub(super) struct RingCore {
 pub(super) struct RingState {
     head: u64,
     tail: u64,
-    spans: VecDeque<Arc<SpanState>>,
+    base_id: u64,
+    unsubmitted_dropped: u32,
+    spans: VecDeque<Reservation>,
 }
-pub(super) struct SpanState {
+struct Reservation {
     end: u64,
-    pub(super) status: Mutex<SpanStatus>,
-}
-pub(super) enum SpanStatus {
-    Reserved,
-    Unused,
-    Submitted(u64),
+    dropped: bool,
+    last: Option<u64>,
 }
 pub(crate) struct Span {
     ring: Arc<RingCore>,
-    pub(super) state: Arc<SpanState>,
+    id: u64,
     offset: u64,
     len: u64,
     retained: bool,
@@ -47,6 +45,8 @@ impl Device {
             state: Mutex::new(RingState {
                 head: 0,
                 tail: 0,
+                base_id: 0,
+                unsubmitted_dropped: 0,
                 spans: VecDeque::new(),
             }),
         });
@@ -80,17 +80,18 @@ impl Ring {
             return Err(Error::Busy);
         }
         let end = start + size;
-        let span = Arc::new(SpanState {
-            end,
-            status: Mutex::new(SpanStatus::Reserved),
-        });
+        let id = state.base_id + state.spans.len() as u64;
         state.head = end;
         state.tail = tail;
-        state.spans.push_back(span.clone());
+        state.spans.push_back(Reservation {
+            end,
+            dropped: false,
+            last: None,
+        });
         Ok(crate::Span {
             inner: Span {
                 ring: self.0.clone(),
-                state: span,
+                id,
                 offset: start % capacity,
                 len: size,
                 retained: false,
@@ -123,33 +124,57 @@ impl Span {
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
-    pub(super) fn submitted(&mut self, token: u64) {
-        *self.state.status.lock().unwrap() = SpanStatus::Submitted(token);
-        self.retained = true;
+    pub(super) fn submit_batch(spans: &mut [Span], token: u64) {
+        let mut i = 0;
+        while i < spans.len() {
+            let ring = spans[i].ring.clone();
+            let mut state = ring.state.lock().unwrap();
+            while i < spans.len() && Arc::ptr_eq(&spans[i].ring, &ring) {
+                let index = (spans[i].id - state.base_id) as usize;
+                let reservation = &mut state.spans[index];
+                reservation.last = Some(token);
+                reservation.dropped = true;
+                spans[i].retained = true;
+                i += 1;
+            }
+        }
     }
 }
 impl Drop for Span {
     fn drop(&mut self) {
         if !self.retained {
-            *self.state.status.lock().unwrap() = SpanStatus::Unused;
+            let mut state = self.ring.state.lock().unwrap();
+            let index = (self.id - state.base_id) as usize;
+            let reservation = &mut state.spans[index];
+            reservation.dropped = true;
+            if reservation.last.is_none() {
+                state.unsubmitted_dropped += 1;
+            }
         }
     }
 }
 impl RingCore {
     pub(super) fn submit_unused(&self, token: u64) {
-        for span in &self.state.lock().unwrap().spans {
-            let mut status = span.status.lock().unwrap();
-            if matches!(*status, SpanStatus::Unused) {
-                *status = SpanStatus::Submitted(token);
+        let mut state = self.state.lock().unwrap();
+        if state.unsubmitted_dropped == 0 {
+            return;
+        }
+        for span in &mut state.spans {
+            if span.dropped && span.last.is_none() {
+                span.last = Some(token);
             }
         }
+        state.unsubmitted_dropped = 0;
     }
     pub(super) fn retire(&self, completed: u64) {
         let mut state = self.state.lock().unwrap();
-        while state.spans.front().is_some_and(
-            |s| matches!(*s.status.lock().unwrap(),SpanStatus::Submitted(t) if t<=completed),
-        ) {
-            state.tail = state.spans.pop_front().unwrap().end;
+        while let Some(span) = state.spans.front() {
+            if !span.dropped || span.last.is_none_or(|t| t > completed) {
+                break;
+            }
+            state.tail = span.end;
+            state.spans.pop_front();
+            state.base_id += 1;
         }
     }
 }

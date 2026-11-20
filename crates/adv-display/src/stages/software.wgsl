@@ -16,7 +16,12 @@ fn software_pixel(x: u32, y: u32) -> vec4<f32> {
     var bgra = vec4<u32>(0u);
     if kind == 0u {
         let at = row + x * 4u;
-        bgra = vec4(byte_at(at), byte_at(at + 1u), byte_at(at + 2u), byte_at(at + 3u));
+        if (at & 3u) == 0u {
+            let word = pixels[at >> 2u];
+            bgra = vec4(word & 255u, (word >> 8u) & 255u, (word >> 16u) & 255u, (word >> 24u) & 255u);
+        } else {
+            bgra = vec4(byte_at(at), byte_at(at + 1u), byte_at(at + 2u), byte_at(at + 3u));
+        }
     } else if kind == 1u {
         let at = row + x * 3u;
         bgra = vec4(byte_at(at), byte_at(at + 1u), byte_at(at + 2u), 0u);
