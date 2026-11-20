@@ -1,4 +1,8 @@
-//! The optimizing tier for admitted computation.
+//! Optimized lowering for worker jobs and resident forms (A64A-ROLE-4).
+//!
+//! Compile passes an owned CPU snapshot and the arbiter's build configuration.
+//! The optimizer derives the form's entry facts from that snapshot and builds
+//! from the decoded unit, explicit assumptions and configuration.
 //!
 //! An optimized form lowers the same `Unit` as the ordinary computation form,
 //! but through an SSA IR ([`ir`]) whose values hold the whole guest state:
@@ -62,6 +66,7 @@
 //! depend only on its trace index; a record holds that refund.
 
 pub(crate) mod back;
+pub(crate) mod computation;
 pub(crate) mod eval;
 pub(crate) mod front;
 pub(crate) mod ir;

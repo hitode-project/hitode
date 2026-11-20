@@ -55,12 +55,13 @@ pub(crate) mod tests;
 mod x87;
 
 #[cfg(native)]
-use super::computation;
+use crate::translate::front::forms::Division;
 use crate::translate::front::forms::{SimdKind, biased};
 use crate::translate::front::tags::ConditionCode;
-use crate::translate::front::trace::Redirect;
 use crate::translate::front::{self, Unit, decode, trace};
 use crate::translate::lower::access;
+#[cfg(native)]
+use crate::translate::lower::access::FrameCache;
 use crate::translate::lower::flags::{Carry, Operand, Overflow, Recipe, Sense};
 use crate::translate::lower::stubs;
 use crate::translate::lower::{
@@ -139,70 +140,24 @@ impl Unit {
     }
 }
 
-/// The last unit translated, in buffers the next translation reuses.
-#[derive(Default)]
-pub struct Workspace {
-    pub(crate) unit: Unit,
-    pub(crate) code: Code,
-    /// Translate the next entry as cold: one path, no loop trace.
-    pub(crate) cold: bool,
-    pub(crate) resident_links: bool,
-}
-
 /// The JIT back end's output, in buffers the next unit reuses.
 #[derive(Default)]
 pub struct Code {
-    asm: Asm,
+    pub(crate) asm: Asm,
     x87: x87::Scratch,
     labels: Vec<Label>,
-    sites: Vec<(usize, Site)>,
+    pub(crate) sites: Vec<(usize, Site)>,
     /// Out-of-line paths with the guest instruction they serve.
     cold: Vec<(usize, Cold)>,
     far: Vec<(usize, usize)>,
-    links: Vec<Link>,
-    internal_links: Vec<InternalLink>,
-    marks: Vec<Mark>,
-    retired: u32,
+    pub(crate) links: Vec<Link>,
+    pub(crate) internal_links: Vec<InternalLink>,
+    pub(crate) marks: Vec<Mark>,
+    pub(crate) retired: u32,
     pub(crate) uses_permissions: bool,
     resident_links: bool,
     pub(crate) table_positions: Vec<(usize, usize)>,
     pub(crate) version: VersionLayout,
-}
-
-impl Workspace {
-    pub fn words(&self) -> &[u32] {
-        self.code.asm.words()
-    }
-
-    /// Byte offset of each site in `words`.
-    pub fn sites(&self) -> &[(usize, Site)] {
-        &self.code.sites
-    }
-
-    /// Instructions the entry prepays: the unit runs only with that much
-    /// countdown.
-    pub fn retired(&self) -> u32 {
-        self.code.retired
-    }
-
-    /// Guest bytes the unit depends on, as sorted
-    /// (address, length) spans.
-    pub fn code(&self) -> &[(u32, u32)] {
-        self.unit.code()
-    }
-
-    pub fn links(&self) -> &[Link] {
-        &self.code.links
-    }
-
-    pub(crate) fn internal_links(&self) -> &[InternalLink] {
-        &self.code.internal_links
-    }
-
-    /// Where each stretch of the unit starts, for samplers.
-    pub fn marks(&self) -> &[Mark] {
-        &self.code.marks
-    }
 }
 
 const X6: Reg = Reg::new(6);
@@ -513,50 +468,10 @@ struct Translator<'a> {
     computation: bool,
     resident_links: bool,
     #[cfg(native)]
-    proof: Option<&'a computation::Proof>,
+    computation_facts: Option<ComputationFacts<'a>>,
 }
 
-/// Translates the unit at `eip` into `work`, to be placed at host address
-/// `at`. Units end before any of `stops`, the accesses of instructions
-/// `checked` accepts check their page first, and the unit's helpers are
-/// numbered from `helpers`. x87 arithmetic runs natively under the
-/// control word `control`, the guest's at translation. Each translated byte is
-/// registered with `watch_code`, so a store to it reaches the owner.
-#[allow(clippy::too_many_arguments)]
-pub fn translate(
-    work: &mut Workspace,
-    memory: &mut adv_cpu_core::memory::Memory,
-    eip: u32,
-    stops: &[u32],
-    checked: &dyn Fn(u32) -> bool,
-    helpers: u32,
-    features: Features,
-    at: usize,
-    stubs: Stubs,
-    host: &dyn Fn(u32, u32) -> Option<u32>,
-    redirect: &dyn Fn(u32) -> Option<Redirect>,
-    admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
-    control: u16,
-    pe: bool,
-) {
-    work.unit
-        .build(memory, eip, stops, host, redirect, !work.cold);
-    work.unit.prepare_regions(memory, admit);
-    lower_unit(
-        &mut work.code,
-        &work.unit,
-        eip,
-        checked,
-        helpers,
-        features,
-        at,
-        stubs,
-        control,
-        pe,
-        work.resident_links,
-    );
-}
-
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_unit(
     code: &mut Code,
@@ -583,7 +498,7 @@ pub(crate) fn lower_unit(
         tier1: false,
         arrivals: 0,
         #[cfg(native)]
-        proof: None,
+        computation_facts: None,
     }
     .lower_form(unit, eip, false);
 }
@@ -614,13 +529,12 @@ pub(crate) fn lower_tier1(
         facts,
         tier1: true,
         arrivals,
-        proof: None,
+        computation_facts: None,
     }
     .lower_form(unit, eip, false);
 }
 
-/// The JIT back end: A64 code for host address `at`, with the parameters
-/// of [`translate`].
+/// The Tier-1 back end emits AArch64 code for host address `at`.
 pub struct Jit<'a> {
     pub code: &'a mut Code,
     pub features: Features,
@@ -632,7 +546,7 @@ pub struct Jit<'a> {
     tier1: bool,
     arrivals: usize,
     #[cfg(native)]
-    proof: Option<&'a computation::Proof>,
+    computation_facts: Option<ComputationFacts<'a>>,
 }
 
 impl Jit<'_> {
@@ -730,7 +644,7 @@ impl Jit<'_> {
             computation,
             resident_links: *resident_links && !computation,
             #[cfg(native)]
-            proof: self.proof,
+            computation_facts: self.computation_facts,
         };
         if self.arrivals != 0 {
             // A proved link enters past the guards and still counts the arrival.
@@ -768,6 +682,14 @@ impl Jit<'_> {
     }
 }
 
+/// Facts from job admission used by Tier-1 instruction selection.
+#[cfg(native)]
+#[derive(Clone, Copy)]
+pub(crate) struct ComputationFacts<'a> {
+    pub frame_cache: Option<&'a FrameCache>,
+    pub divisions: &'a [Option<Division>],
+}
+
 #[cfg(native)]
 pub(crate) struct ComputationCode<'a> {
     pub words: &'a [u32],
@@ -783,7 +705,7 @@ pub(crate) fn lower_computation<'a>(
     features: Features,
     at: usize,
     stubs: Stubs,
-    (control, pe, proof): (u16, bool, Option<&computation::Proof>),
+    (control, pe, computation_facts): (u16, bool, Option<ComputationFacts<'_>>),
 ) -> Option<ComputationCode<'a>> {
     Jit {
         code,
@@ -795,7 +717,7 @@ pub(crate) fn lower_computation<'a>(
         facts: Key::x87(control, pe),
         tier1: false,
         arrivals: 0,
-        proof,
+        computation_facts,
     }
     .lower_form(unit, eip, true);
     (!code.uses_permissions
@@ -960,7 +882,7 @@ impl Translator<'_> {
             self.body_stack_guard();
         }
         #[cfg(native)]
-        if let Some(cache) = self.proof.and_then(computation::Proof::frame_cache)
+        if let Some(cache) = self.computation_facts.and_then(|facts| facts.frame_cache)
             && cache.head == index
         {
             self.load_frame_cache(&cache.offsets);

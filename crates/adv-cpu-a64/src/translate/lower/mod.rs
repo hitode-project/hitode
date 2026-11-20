@@ -10,7 +10,7 @@ use crate::facts::Key;
 use crate::runtime::{self, Exit};
 use flags::{Carry, Operand, Overflow, Recipe, Sense};
 
-pub(super) mod access;
+pub(crate) mod access;
 pub(super) mod body;
 pub(crate) mod flags;
 pub(super) mod fp_class;

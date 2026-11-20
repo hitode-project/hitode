@@ -22,7 +22,7 @@ Instruction-level contracts are in [a64.md](a64.md). The shared execution contra
 | `translate::lower` | `translate::front`, `facts`, `runtime`, `asm`, `encode` |
 | `translate::jit`, `translate::opt` | `translate::lower`, `translate::front`, `facts`, `runtime`, `asm`, `encode` |
 | `native::store` | `cache`, `encode`, `facts`, `runtime`, `translate::front`, `translate::lower` |
-| `native::compile` | `translate::jit`, `translate::opt`, `translate::front`, `facts` |
+| `native::compile` | `translate::jit`, `translate::opt`, `translate::front`, `translate::lower`, `facts` |
 | `native::plan` | `native::store`, `native::compile`, `facts` |
 | `native::offload` | `native::store`, `native::plan`, `runtime`, `translate::opt` |
 | `native::run`, `executor` | every row above |
@@ -60,7 +60,7 @@ The build key projects live facts onto the unit's trace mask. An empty mask assu
 
 ### A64A-ROLE-4 Lowerings
 
-**Rule**: Tier-1 lowering MUST receive the fact key as an explicit build input. The lowering MUST NOT read live guest state or guest memory. It MUST accept any fact kind unassumed.
+**Rule**: `translate::jit` and `translate::opt` MUST lower under an explicit entry fact key and build configuration. Both lowerings MUST avoid reading live guest state or guest memory. Tier-1 lowering MUST accept any fact kind unassumed.
 **Applies to**: AArch64
 **Verification**: Test
 

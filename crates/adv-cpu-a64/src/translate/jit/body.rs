@@ -518,7 +518,8 @@ impl Translator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::translate::{Features, Redirect, Stubs, Workspace, translate};
+    use crate::native::compile::{Workspace, translate};
+    use crate::translate::{Features, Redirect, Stubs};
     use adv_cpu_core::Memory;
     use adv_cpu_core::body::{BodyContext, BodyResult, DirectBody, EAX, EDX, Inline, Input};
     use iced_x86::code_asm::*;

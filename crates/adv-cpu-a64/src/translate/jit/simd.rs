@@ -2014,7 +2014,8 @@ mod tests {
     // spec: A64F-FP-4
     #[test]
     fn mixed_mmx_scaling_loop_instruction_count() {
-        use crate::translate::{Features, Stubs, Workspace, translate};
+        use crate::native::compile::{Workspace, translate};
+        use crate::translate::{Features, Stubs};
         let mut a = CodeAssembler::new(32).unwrap();
         let mut repeat = a.create_label();
         a.set_label(&mut repeat).unwrap();

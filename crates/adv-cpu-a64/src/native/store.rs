@@ -120,8 +120,6 @@ pub(super) struct CodeStore {
     pub(super) uses_permissions: bool,
     /// Each placed unit's host address and entry, ascending.
     pub(super) placed: Vec<(usize, u32)>,
-    /// Buffers of the last translation.
-    pub(super) work: translate::Workspace,
     /// Prepared operand operations, indexed by generated value calls.
     pub(super) helpers: Vec<translate::Helper>,
     /// Counts cache clears, which invalidate link points.
@@ -258,13 +256,14 @@ impl CodeStore {
 /// back edge adds its canonical publication and patch word, excluding
 /// the unlinked dispatch and discovery counter.
 pub(super) fn tier1_words(
-    work: &translate::Workspace,
+    marks: &[crate::jit_map::Mark],
+    links: &[crate::translate::lower::Link],
+    code_words: usize,
     trace: &translate::front::trace::Trace,
 ) -> FxHashMap<u32, u32> {
     use crate::jit_map::Part;
 
     let mut words: FxHashMap<_, _> = trace.insts.iter().map(|inst| (inst.pc, 0)).collect();
-    let marks = work.marks();
     let cold = marks
         .iter()
         .position(|mark| mark.part == Part::Cold)
@@ -272,10 +271,10 @@ pub(super) fn tier1_words(
     for (i, mark) in marks[..cold].iter().enumerate() {
         let end = marks
             .get(i + 1)
-            .map_or(work.words().len() * 4, |mark| mark.offset as usize);
+            .map_or(code_words * 4, |mark| mark.offset as usize);
         *words.entry(mark.eip).or_default() += ((end - mark.offset as usize) / 4) as u32;
     }
-    for link in work.links().iter().filter(|link| link.back) {
+    for link in links.iter().filter(|link| link.back) {
         let at = marks.partition_point(|mark| mark.offset as usize <= link.offset);
         if at > cold {
             let start = marks[..at]

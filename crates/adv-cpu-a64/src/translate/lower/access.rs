@@ -213,3 +213,17 @@ pub(in crate::translate) fn check_class(
         asm.tbz(true, X4, bit(permission), excluded);
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct FrameCache {
+    pub head: usize,
+    /// Byte displacements from ESP on entry to the loop.
+    pub offsets: Vec<i32>,
+    pub(crate) reads: Vec<Option<u8>>,
+}
+
+impl FrameCache {
+    pub(crate) fn read(&self, index: usize) -> Option<u8> {
+        self.reads[index]
+    }
+}

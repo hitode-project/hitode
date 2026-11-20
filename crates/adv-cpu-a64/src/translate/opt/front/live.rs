@@ -7,7 +7,7 @@ use crate::translate::front::tags::{OpAccess, Register};
 
 use super::facts::{self, Facts};
 use super::{Offsets, frame_offset};
-use crate::translate::Unit;
+use crate::translate::front::Unit;
 use crate::translate::front::decode::{self, ESP, Mem};
 use crate::translate::front::forms::Integer;
 use crate::translate::front::trace::{Edge, Next};

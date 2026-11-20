@@ -1,11 +1,14 @@
 //! Execute whole generated units, including entry/exit flag mapping, on any host.
 use super::*;
 use crate::emulator::{CODE as HOST_CODE, Emulator};
+use crate::native::compile::{Workspace, translate};
 use crate::runtime;
 use crate::translate::front::decode::Op;
 use crate::translate::front::forms::Integer;
 use crate::translate::lower::stubs;
 use crate::translate::opt;
+#[cfg(native)]
+use crate::{native::compile::lower_computation, translate::opt::computation};
 use adv_cpu_core::{CpuState, Memory, X87State, interpreter::Interpreter};
 use iced_x86::code_asm::*;
 use std::mem::{offset_of, size_of};
@@ -1921,8 +1924,8 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
                     hot += words.len();
                 } else {
                     let fixed_words = match proof.division(index).unwrap() {
-                        computation::Division::SignExtended => 3,
-                        computation::Division::Normalized => 5,
+                        crate::translate::front::forms::Division::SignExtended => 3,
+                        crate::translate::front::forms::Division::Normalized => 5,
                     };
                     fixed += fixed_words;
                     hot += words.len();

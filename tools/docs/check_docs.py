@@ -61,7 +61,7 @@ SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)`")
 RULE = re.compile(r"^### ([A-Z0-9]+-[A-Z0-9]+-[0-9]+) ", re.M)
 WITHDRAWN = re.compile(r"^Withdrawn: (.*)$", re.M)
 PREFIX = re.compile(r"^ID prefix: ([A-Z0-9]+)$", re.M)
-MODULE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod ([a-z_][a-z0-9_]*);", re.M)
+MODULE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod ([a-z_][a-z0-9_]*);", re.M)
 
 
 def defines(source: str, name: str) -> bool:

@@ -62,7 +62,8 @@ fn checked_store_rebinds_a_writable_call_slot() {
 }
 
 fn no_operation_calls(p: &Program) {
-    use crate::translate::{Stubs, Workspace, translate};
+    use crate::native::compile::{Workspace, translate};
+    use crate::translate::Stubs;
     let mut memory = Memory::new(BASE, LEN).unwrap();
     load(&mut memory, p);
     let mut work = Workspace::default();

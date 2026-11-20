@@ -7,10 +7,10 @@ use adv_cpu_core::CpuState;
 
 use super::ir::*;
 use super::recovery::{IrRecord, Location, Recipe, X87};
-use crate::translate::Unit;
-use crate::translate::computation::Proof;
+use crate::translate::front::Unit;
 use crate::translate::front::decode::{self, Cc, EBP, ESP, Mem, Part, Src};
 use crate::translate::front::trace::{Edge, Mode, Next};
+use crate::translate::opt::computation::Proof;
 
 mod cells;
 pub(crate) mod facts;

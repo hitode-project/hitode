@@ -325,3 +325,11 @@ impl Simd {
 pub(in crate::translate) const fn biased(index: u8) -> bool {
     index == super::decode::ESP || index == super::decode::EBP
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Division {
+    /// The dividend is sign extended from EAX and the divisor is positive.
+    SignExtended,
+    /// EAX is a signed remainder plus its positive divisor (at most 2^30).
+    Normalized,
+}

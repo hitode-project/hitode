@@ -43,8 +43,8 @@ impl Translator<'_> {
     pub(super) fn address(&mut self, mem: Mem) -> Addr {
         #[cfg(native)]
         if let Some(slot) = self
-            .proof
-            .and_then(|proof| proof.frame_cache())
+            .computation_facts
+            .and_then(|facts| facts.frame_cache)
             .and_then(|cache| cache.read(self.index))
         {
             return Addr::FrameCache(slot);

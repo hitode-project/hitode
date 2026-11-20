@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::live::{Live, Set};
-use crate::translate::Unit;
+use crate::translate::front::Unit;
 use crate::translate::front::trace::{Edge, Next};
 
 /// Values a loop head may carry in general registers before its frame

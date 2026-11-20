@@ -5,18 +5,19 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
-use super::front::{summary::Summary, tags::ConditionCode as Cond};
+use crate::translate::front::{summary::Summary, tags::ConditionCode as Cond};
 use adv_cpu_core::CpuState;
 use adv_cpu_core::floating::fast::{Fast, Source};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use super::front::forms::Integer;
-use super::front::forms::{Loc, SimdKind as Kind};
 use crate::translate::front::decode::{
     Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src,
 };
+use crate::translate::front::forms::{Division, Integer};
+use crate::translate::front::forms::{Loc, SimdKind as Kind};
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
+use crate::translate::lower::access::FrameCache;
 
 mod carried;
 
@@ -186,28 +187,6 @@ pub(crate) struct Plan {
     /// The frame bytes `[lo, hi)` from ESP that the loop and the tail touch,
     /// if the loop writes any: each block runs on a private copy.
     pub frame: Option<(i32, i32)>,
-}
-
-#[derive(Clone)]
-pub(crate) struct FrameCache {
-    pub head: usize,
-    /// Byte displacements from ESP on entry to the loop.
-    pub offsets: Vec<i32>,
-    reads: Vec<Option<u8>>,
-}
-
-impl FrameCache {
-    pub(crate) fn read(&self, index: usize) -> Option<u8> {
-        self.reads[index]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Division {
-    /// The dividend is sign extended from EAX and the divisor is positive.
-    SignExtended,
-    /// EAX is a signed remainder plus its positive divisor (at most 2^30).
-    Normalized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2285,6 +2264,10 @@ impl Proof {
 
     pub(crate) fn frame_cache(&self) -> Option<&FrameCache> {
         self.frame_cache.as_ref()
+    }
+
+    pub(crate) fn divisions(&self) -> &[Option<Division>] {
+        &self.divisions
     }
 
     pub(crate) fn division(&self, index: usize) -> Option<Division> {

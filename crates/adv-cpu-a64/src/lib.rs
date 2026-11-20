@@ -19,6 +19,10 @@ mod facts;
 pub mod jit_map;
 #[cfg(native)]
 mod native;
+#[cfg(all(not(native), test, emulator))]
+mod native {
+    pub(crate) mod compile;
+}
 pub mod runtime;
 pub mod translate;
 

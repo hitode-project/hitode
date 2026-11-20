@@ -63,9 +63,9 @@ pub(super) struct AdmissionCache {
     pub generation: Option<(u64, u64)>,
     pub regs: [u32; 8],
     pub words: Vec<(u32, Option<u32>)>,
-    pub evaluation: translate::computation::Evaluation,
+    pub evaluation: translate::opt::computation::Evaluation,
     pub admitted: bool,
-    pub split: Option<Option<translate::computation::Plan>>,
+    pub split: Option<Option<translate::opt::computation::Plan>>,
     #[cfg(test)]
     pub evaluations: u32,
 }
@@ -1007,7 +1007,7 @@ impl Native {
             self.promotion == 0 || self.plans.sites.get(&eip).is_some_and(|plan| plan.promoted);
         let unit = self.front_unit(memory, eip, loops, false);
         let at = self.code.cache.next();
-        let mut work = std::mem::take(&mut self.code.work);
+        let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;
         let mask = unit.fact_mask();
         let key = observed.project(mask);
@@ -1017,8 +1017,7 @@ impl Native {
         } else {
             self.code.counter(eip, 0)
         };
-        translate::jit::lower_tier1(
-            &mut work.code,
+        work.lower_tier1(
             &unit,
             eip,
             &|pc| all || self.plans.checked(pc),
@@ -1053,7 +1052,7 @@ impl Native {
                 }
             }
         }
-        self.code.work = work;
+        self.compiler.tier1 = work;
         entry
     }
 
@@ -1061,7 +1060,7 @@ impl Native {
         &mut self,
         memory: &mut Memory,
         eip: u32,
-        work: &translate::Workspace,
+        work: &compile::Workspace,
         unit: &translate::Unit,
         key: Key,
         head: bool,
@@ -1181,9 +1180,10 @@ impl Native {
         }
         if head {
             if self.plans.counter_at(eip).is_some() || !work.internal_links().is_empty() {
-                self.code
-                    .tier1_words
-                    .insert(eip, store::tier1_words(work, &unit.trace));
+                self.code.tier1_words.insert(
+                    eip,
+                    store::tier1_words(work.marks(), work.links(), work.words().len(), &unit.trace),
+                );
             }
             if let Some(head) = self.plans.resident(eip).filter(|head| head.tier1 != 0) {
                 self.code
@@ -1244,10 +1244,9 @@ impl Native {
             observed
         };
         let arrivals = self.code.counter(eip, position);
-        let mut work = std::mem::take(&mut self.code.work);
+        let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;
-        translate::jit::lower_tier1(
-            &mut work.code,
+        work.lower_tier1(
             &chain.unit,
             eip,
             &|pc| all || self.plans.checked(pc),
@@ -1260,7 +1259,7 @@ impl Native {
             arrivals,
         );
         let entry = self.place_tier1(memory, eip, &work, &chain.unit, key, false);
-        self.code.work = work;
+        self.compiler.tier1 = work;
         let Some(entry) = entry else {
             self.clear();
             return self.translate(memory, eip, input).map(|entry| entry.unit);

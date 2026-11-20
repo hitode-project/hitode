@@ -22,7 +22,7 @@ use super::{
     record_branch, translate,
 };
 use crate::runtime::{COMPUTATION_SLICE, ExecutionContext};
-use crate::translate::computation::{Plan, Proof, Range};
+use crate::translate::opt::computation::{Plan, Proof, Range};
 use crate::translate::opt::front::Assumed;
 use crate::translate::opt::ir::Source;
 use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
@@ -30,7 +30,6 @@ use crate::translate::opt::recovery::{self, FlagRecipe, Host, Record};
 #[derive(Default)]
 pub(super) struct Offload {
     jobs: FxHashMap<u32, WorkerJob>,
-    unit_code: translate::Code,
     admission: Admission,
     pub(super) enabled: bool,
 }
@@ -202,12 +201,12 @@ impl Native {
         unit: &translate::Unit,
         eip: u32,
         (control, pe): (u16, bool),
-        proof: &translate::computation::Proof,
+        proof: &translate::opt::computation::Proof,
     ) -> Option<Code> {
         let retired = unit.trace.prepaid(0);
-        let code = translate::jit::lower_computation(
+        let code = compile::lower_computation(
             unit,
-            &mut self.offload.unit_code,
+            &mut self.compiler.computation,
             eip,
             self.features,
             self.code.cache.next(),
@@ -1471,12 +1470,13 @@ mod tests {
     use adv_cpu_core::memory::{EXEC, READ, WRITE};
     use iced_x86::code_asm::*;
 
+    use super::super::compile::{self, Workspace};
     use super::super::plan::Mode;
     use super::*;
     use crate::Executor;
     use crate::native::Native;
-    use crate::translate::computation::Evaluation;
-    use crate::translate::{self, Workspace};
+    use crate::translate;
+    use crate::translate::opt::computation::Evaluation;
 
     const CODE: u32 = 0x1_0000;
     const INPUT: u32 = 0x2_0000;
@@ -2862,7 +2862,7 @@ mod tests {
         );
         let at = native.code.cache.next();
         let mut scratch = translate::Code::default();
-        let emitted = translate::jit::lower_computation(
+        let emitted = compile::lower_computation(
             &work.unit,
             &mut scratch,
             CODE,

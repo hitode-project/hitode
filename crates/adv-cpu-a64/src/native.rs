@@ -54,7 +54,7 @@ use crate::cache::CodeCache;
 use crate::runtime::{self, Enter, Exit, ResidentCold, Runtime};
 use crate::translate::{self, Features, Operand, Sense, Site, Stubs};
 
-mod compile;
+pub(crate) mod compile;
 mod head;
 mod offload;
 mod plan;
@@ -1035,7 +1035,6 @@ impl Native {
                 tier1_words: FxHashMap::default(),
                 uses_permissions: false,
                 placed: Vec::new(),
-                work: translate::Workspace::default(),
                 helpers: Vec::new(),
                 generation: 0,
                 table,
@@ -1334,9 +1333,9 @@ mod tests {
         use crate::facts::Key;
 
         let (mut memory, native, stop) = resident_loop(&[0x31, 0xc0, 0x40]);
-        let mut work = translate::Workspace::default();
+        let mut work = compile::Workspace::default();
         let at = native.code.cache.next();
-        translate::translate(
+        compile::translate(
             &mut work,
             &mut memory,
             HEAD,

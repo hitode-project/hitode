@@ -702,18 +702,22 @@ impl Translator<'_> {
 
     fn divide(&mut self, src: Src, signed: bool, _helper: u8) {
         #[cfg(native)]
-        if signed && let Some(division) = self.proof.and_then(|proof| proof.division(self.index)) {
+        if signed
+            && let Some(division) = self
+                .computation_facts
+                .and_then(|facts| facts.divisions[self.index])
+        {
             let value = self.source(src);
             let (eax, edx) = (host(EAX), host(EDX));
             self.clobber(Operand::Guest(EAX));
             self.clobber(Operand::Guest(EDX));
             match division {
-                super::computation::Division::SignExtended => self.emit_all(&[
+                crate::translate::front::forms::Division::SignExtended => self.emit_all(&[
                     sdiv(W, X17, eax, value),
                     msub(W, edx, X17, value, eax),
                     mov(W, eax, X17),
                 ]),
-                super::computation::Division::Normalized => self.emit_all(&[
+                crate::translate::front::forms::Division::Normalized => self.emit_all(&[
                     // EAX is r+d, 1 <= EAX < 2*d, and 0 < d <= 2^30.
                     // The sign mask selects the adjustment without NZCV.
                     sub(W, X16, eax, value, Lsl, 0),
