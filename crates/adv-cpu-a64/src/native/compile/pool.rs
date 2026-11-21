@@ -80,6 +80,7 @@ impl ResidentForm {
             marks: &lowered.marks,
             split: lowered.split,
             row_price: lowered.row_price,
+            row_sample: lowered.row_sample,
             row_failures: &lowered.row_failures,
             counters: &lowered.counters,
         }

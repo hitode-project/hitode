@@ -135,6 +135,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | [`facts`](crates/adv-cpu-a64/src/facts.rs) | Tier-1 and resident entry keys, key guards and page range guards (A64A-ROLE-3) | Code placement |
 | [`native::store` module](crates/adv-cpu-a64/src/native/store.rs) | Native code placement and fault sites, shared resident and Tier-1 version chains, links and page watches | Guest semantics |
 | [`native::compile` module](crates/adv-cpu-a64/src/native/compile.rs) | Reusable Tier-1 build buffers and the optimized compile pool | Code placement |
+| [`policy`](crates/adv-cpu-a64/src/policy.rs) | Translation limits, sampling budgets and static prices by evidence gate | Runtime state and code emission |
 | [`native::plan` module](crates/adv-cpu-a64/src/native/plan.rs) | Site plans and tier, version, configuration and offload decisions on plan events (A64A-ROLE-6) | Host code emission |
 | [`native::offload` module](crates/adv-cpu-a64/src/native/offload.rs) | Admission and execution of placed worker jobs using core CPU state and the runtime handoff | Tier selection |
 | [`native::run` module](crates/adv-cpu-a64/src/native/run.rs) and [`native`](crates/adv-cpu-a64/src/native.rs) | Native entry, host calls and fault recovery | Choosing guest instructions |

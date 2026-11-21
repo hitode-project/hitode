@@ -13,7 +13,7 @@ use super::recovery::IrRecord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Value(pub u32);
 
-pub(crate) const MAX_PLAIN_FACTS: usize = 8;
+pub(crate) use crate::policy::resident::MAX_PLAIN_FACTS;
 
 /// Disjoint byte ranges in wrapping 32-bit guest address arithmetic.
 pub(crate) fn disjoint_ranges(a: u32, aw: u32, b: u32, bw: u32) -> bool {

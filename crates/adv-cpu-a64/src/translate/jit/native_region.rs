@@ -10,8 +10,7 @@ use super::{
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 use adv_cpu_core::native_region::{Affine, Aliasing, NativeRegion};
 
-const MINIMUM: u32 = 128;
-const MAXIMUM: u32 = 1024;
+use crate::policy::tier1::{NATIVE_REGION_MAX as MAXIMUM, NATIVE_REGION_MIN as MINIMUM};
 const SP: Reg = Reg::new(31);
 const ADDRESS: Reg = Reg::new(7);
 const FRAME: Reg = Reg::new(8);

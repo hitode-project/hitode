@@ -11,7 +11,7 @@ use super::compile;
 use super::offload::{Code, ScopedJob, WorkerJob};
 use super::offload::{Entry, Notifications, Session};
 use super::plan::{
-    self, ColdAction, Decline, JobPlan, MISSES, PROBATION, Probation, SAMPLE, Tier1Miss,
+    self, ColdAction, Decline, JobPlan, MISSES, PROBATION, Probation, RowAction, SAMPLE, Tier1Miss,
 };
 use super::store::{self, ACTIVE, Active, Faults, Tier1Chain, Tier1Unit, Version, WorkerCode};
 use super::{
@@ -19,6 +19,7 @@ use super::{
     timestamp, value, value_access,
 };
 use crate::facts::{self, Key};
+use crate::policy::proved::{ROW_SAMPLE, RowFailure};
 use crate::runtime::record_branch;
 use crate::runtime::{Event, ExecutionContext, Exit, PlanEvent, Runtime, ScopedOffer, alias_base};
 use crate::translate::front::{Unit, decode::Fetcher};
@@ -124,6 +125,7 @@ impl Native {
         }
         self.code.sync();
         self.prepare_inline(cpu, memory, fuel.max(budget), budget);
+        self.runtime.row_suppressed = 0;
         let resumed_repeat = cpu.rep.take().map(|rep| {
             let visible_flags = cpu.eflags;
             cpu.eflags = rep.native_input_flags(cpu);
@@ -257,10 +259,7 @@ impl Native {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
                 PlanEvent::OfferReady => exit = Exit::Computation,
-                PlanEvent::RowTargetMiss => {
-                    self.observe_row_target(memory, cpu, payload);
-                    self.observe_row_failure(cpu.eip);
-                }
+                PlanEvent::RowTargetMiss => self.observe_row_target(memory, cpu, payload),
                 PlanEvent::RowGuardMiss => self.observe_row_failure(cpu.eip),
                 PlanEvent::ResidentSplitOffer(version) => {
                     let head = cpu.eip;
@@ -278,6 +277,7 @@ impl Native {
                             scoped = true;
                             self.scoped_offer = Some(ScopedOffer {
                                 version,
+                                row_work: self.runtime.row_work,
                                 entry: job.worker.code.placed.entry,
                                 generation: self.code.generation,
                             });
@@ -587,7 +587,7 @@ impl Native {
         } else {
             0
         };
-        if head.cold_window.is_none() && !head.row_accounting() {
+        if head.cold_window.is_none() {
             self.code.measure_cold(eip, true);
         }
         if head.observe_cold(site, reason, self.code.accounted(eip), cold_iterations) {
@@ -611,7 +611,7 @@ impl Native {
 
     fn stop_cold_window(&mut self, eip: u32) {
         let head = self.plans.resident_mut(eip).unwrap();
-        if head.cold_window.take().is_some() && !head.row_accounting() {
+        if head.cold_window.take().is_some() {
             self.code.measure_cold(eip, false);
         }
     }
@@ -1033,7 +1033,11 @@ impl Native {
     fn observe_row_target(&mut self, memory: &mut Memory, cpu: &CpuState, target: u32) {
         let eip = cpu.eip;
         let site = self.code.resident(eip).unwrap();
-        site.row_feedback.as_deref().unwrap().target_next.set(32);
+        site.row_feedback
+            .as_deref()
+            .unwrap()
+            .target_next
+            .set(ROW_SAMPLE);
         let plan = self.plans.resident_mut(eip).unwrap();
         if plan.pending.is_none()
             && plan.row_targets.len() < plan::VERSIONS
@@ -1046,32 +1050,84 @@ impl Native {
     }
 
     fn observe_row_failure(&mut self, eip: u32) {
-        let feedback = self
+        let site = self.code.resident(eip).unwrap();
+        let feedback = site.row_feedback.as_ref().unwrap();
+        feedback.next.set(ROW_SAMPLE);
+        let head = self.plans.resident(eip).unwrap();
+        if head.pending.is_some() || head.declined() {
+            return;
+        }
+        // Price recurring failures after same-run retries have been coalesced.
+        if let Some(row) = self.row_ledger(eip)
+            && [
+                RowFailure::Parameter,
+                RowFailure::Alias,
+                RowFailure::Count,
+                RowFailure::Span,
+            ]
+            .iter()
+            .any(|&reason| row.failures[reason as usize] != 0)
+            && self.code.install_row_retry(eip)
+        {
+            if self.code.resident(eip).unwrap().row_entry.is_none() {
+                self.code.settle_sample(eip);
+            }
+            self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
+            return;
+        }
+        let site = self.code.resident(eip).unwrap();
+        let mut actions = Vec::new();
+        for (index, version) in site.versions.iter().enumerate() {
+            if version.enabled
+                && let Some(price) = version.row_price
+            {
+                let measured =
+                    plan::RowLedger::priced(price, version.row_counts(), version.row_failures());
+                let ledger = head.row_version(index, measured);
+                actions.push((
+                    index,
+                    head.observe_row(ledger, version.row_measuring, version.probation),
+                ));
+            }
+        }
+        for (index, action) in actions {
+            match action {
+                RowAction::Keep => {}
+                RowAction::Sample(active) => self.code.measure_rows(eip, index, active),
+                RowAction::Withdraw => self.withdraw_row(eip, index),
+            }
+            if self.plans.resident(eip).unwrap().declined() {
+                break;
+            }
+        }
+        self.code.sync();
+    }
+
+    fn withdraw_row(&mut self, eip: u32, index: usize) {
+        self.count_sensor_decision("row_withdrawn");
+        self.stop_cold_window(eip);
+        let site = self.code.resident_mut(eip).unwrap();
+        site.versions[index].enabled = false;
+        if !site.versions.iter().any(|v| v.enabled) {
+            self.decline_resident(eip, Decline::Unprofitable);
+            return;
+        }
+        self.remove_scoped_job(eip, index as u8);
+        let head = self.plans.resident(eip).unwrap();
+        if let Some(slot) = self
             .code
             .resident(eip)
             .unwrap()
-            .row_feedback
-            .as_deref()
-            .unwrap();
-        feedback.next.set(32);
-        let failures = feedback.failures.iter().map(std::cell::Cell::get).sum();
-        let Some(costs) = self.code.row_costs(eip) else {
-            return;
-        };
-        let plan = self.plans.resident_mut(eip).unwrap();
-        if plan.pending.is_some() || plan.declined() {
+            .row_entry
+            .as_ref()
+            .map(|row| row.slot)
+            && !self.code.publish_row_targets(eip, slot, &head.row_targets)
+        {
+            self.decline_resident(eip, Decline::CacheFull);
             return;
         }
-        if !plan.row_accounting() && plan.cold_window.is_none() {
-            self.code.measure_cold(eip, true);
-        }
-        let measured = self.code.accounted(eip);
-        if plan.row_failures_exceed_savings(failures, measured, costs) {
-            self.count_sensor_decision("row_withdrawn");
-            self.code.measure_cold(eip, false);
-            self.decline_resident(eip, Decline::Unprofitable);
-            self.code.sync();
-        }
+        self.code.publish_resident(eip, head.retry_period());
+        self.repoint_resident_edges(eip, self.code.resident(eip).unwrap().entry());
     }
 
     pub(super) fn request_resident(&mut self, eip: u32, task: compile::Task, at: CpuState) {
@@ -1141,7 +1197,7 @@ impl Native {
         let version = site
             .versions
             .iter()
-            .position(|v| cpu.rep.is_none() && v.key.holds(cpu));
+            .position(|v| v.enabled && cpu.rep.is_none() && v.key.holds(cpu));
         let (link, settled) = head.sample_link(point, version);
         if let Some(version) = link {
             self.code.specialize_link(eip, point, version);
@@ -1163,10 +1219,9 @@ impl Native {
 
     pub(super) fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
         let versions = &self.code.resident(eip).unwrap().versions;
-        let affected = versions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, version)| version.plain_sites.contains(&site).then_some(i));
+        let affected = versions.iter().enumerate().filter_map(|(i, version)| {
+            (version.enabled && version.plain_sites.contains(&site)).then_some(i)
+        });
         if self.plans.resident_mut(eip).unwrap().refuse(site, affected) {
             self.rebuild_resident(eip);
         }
@@ -1203,8 +1258,14 @@ impl Native {
     }
 
     pub(super) fn rebuild_resident_versions(&mut self, eip: u32) {
-        let head = self.plans.resident_mut(eip).unwrap();
-        head.rebuilds = (1 << head.probation.len()) - 1;
+        let versions = &self.code.resident(eip).unwrap().versions;
+        let rebuilds = versions
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, version)| {
+                mask | (u8::from(version.enabled) << index)
+            });
+        self.plans.resident_mut(eip).unwrap().rebuilds = rebuilds;
         self.rebuild_resident(eip);
     }
 
@@ -1360,6 +1421,19 @@ impl Native {
         };
         let spill_cells = form.lowered.spill_cells;
         let row_target = form.lowered.row_target;
+        let previous = self
+            .code
+            .resident(eip)
+            .unwrap()
+            .versions
+            .get(index)
+            .and_then(|version| {
+                Some(plan::RowLedger::priced(
+                    version.row_price?,
+                    version.row_counts(),
+                    version.row_failures(),
+                ))
+            });
         if !self.code.place_resident(
             eip,
             index,
@@ -1369,7 +1443,7 @@ impl Native {
             recovery,
             form.lowered.iteration_retired,
             gate,
-            probation.as_ref().map(|_| PROBATION),
+            (probation.is_some() || form.lowered.has_rows()).then_some(PROBATION),
             MISSES,
             form.placement(),
             unit,
@@ -1382,11 +1456,10 @@ impl Native {
             self.inline_saved.resize(spill_cells, 0);
         }
         let head = self.plans.resident_mut(eip).unwrap();
-        let period = head.installed(index, probation);
-        if head.row_accounting() {
-            head.reset_row_accounting();
-            self.code.measure_cold(eip, false);
+        if let Some(previous) = previous {
+            head.archive_row(index, previous);
         }
+        let period = head.installed(index, probation);
         self.code.resident_mut(eip).unwrap().suspended = head.rebuilds != 0;
         if let Some(target) = row_target {
             if !head.row_targets.contains(&target.value) {
@@ -1414,15 +1487,12 @@ impl Native {
 
     pub(super) fn finish_probation(&mut self, eip: u32, index: usize) {
         self.stop_cold_window(eip);
-        let probation = self.plans.resident_mut(eip).unwrap().probation[index]
-            .take()
-            .unwrap();
+        let probation = self.plans.resident_mut(eip).unwrap().probation[index].take();
         let (entries, retired) = self.code.finish_probation(eip, index);
-        let head = self.plans.resident_mut(eip).unwrap();
-        if head.row_accounting() {
-            head.reset_row_accounting();
-            self.code.measure_cold(eip, false);
-        }
+        let Some(probation) = probation else {
+            self.code.sync();
+            return;
+        };
         if probation.profitable(entries, retired) {
             self.code.sync();
             self.count_sensor_decision("probation_kept");
@@ -1434,6 +1504,9 @@ impl Native {
     }
 
     pub(super) fn decline_resident(&mut self, eip: u32, reason: Decline) {
+        if let Some(summary) = self.row_ledger(eip) {
+            self.plans.resident_mut(eip).unwrap().row = summary;
+        }
         self.stop_cold_window(eip);
         let head = self.plans.resident_mut(eip).unwrap();
         if head.decline_with(reason) {

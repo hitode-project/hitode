@@ -396,7 +396,7 @@ impl Translator<'_> {
             };
             if argument == 2 {
                 return match self.pushed_value(before, source) {
-                    Src::Imm(len) if len <= 64 => Some(len),
+                    Src::Imm(len) if len <= crate::policy::tier1::INLINE_BODY_BYTES => Some(len),
                     _ => None,
                 };
             }

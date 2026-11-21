@@ -14,7 +14,7 @@ Instruction-level contracts are in [a64.md](a64.md). The shared execution contra
 
 | Module | May use |
 |---|---|
-| `encode`, `cache`, `jit_map` | none |
+| `encode`, `cache`, `jit_map`, `policy` | none |
 | `asm` | `encode` |
 | `runtime` | `asm`, `encode` |
 | `facts` | `runtime`, `asm`, `encode` |
@@ -28,7 +28,7 @@ Instruction-level contracts are in [a64.md](a64.md). The shared execution contra
 | `native::run`, `executor` | every row above |
 | `cpu` | `executor` |
 
-Every module MAY use `jit_map` behind its enable switch. Only `translate::front` MAY use `iced_x86`. Only `executor` and `native::offload` MAY use `adv_cpu_core::interpreter`.
+Every module MAY use `policy` and MAY use `jit_map` behind its enable switch. Only `translate::front` MAY use `iced_x86`. Only `executor` and `native::offload` MAY use `adv_cpu_core::interpreter`.
 
 ## Modules
 
@@ -97,6 +97,25 @@ Plan events include discovery, version misses, sensor triggers, compile completi
 **Verification**: Test
 
 Events that may invalidate an active continuation MUST leave with their identity and recovery data. The owner MUST resolve recovery before changing the cache. Observations and stable link patches MAY continue through the stub. A deferred observation MUST retain the identity and generation of the source unit.
+
+### A64A-ROLE-9 Evidence gates
+
+**Rule**: Translation policy MUST assign each optimization to the evidence gate it needs. Static code prices MUST use AArch64 instruction words. Worker pacing MUST compare elapsed execution and wake costs in the same time unit.
+**Applies to**: AArch64
+**Verification**: Review — generated-code cost estimates and evidence ownership are checked at the decision sites.
+**Basis**: A64-OPT-12
+
+| Gate | Evidence | Permitted work |
+|---|---|---|
+| Tier-1 | Repeated arrival and decoded path | Bounded local lowering, entry-key versions and adaptive access checks |
+| Loop trace | Budget-exit samples | Wider traces and loop-carried local state |
+| Resident | Back-edge samples and validated recovery | Register and frame residency, reuse guarded by entry facts, checked rebuilds and cold cuts |
+| Proved regions | Trip, span, alias and exact-tail proofs | Batch kernels and row-domain specialization |
+| Worker | Computation proof, current range grants and scheduling demand | Detached jobs and independent slices |
+
+The gates describe the evidence for a transform. A proved region can be local to Tier-1, resident, or a worker job under the corresponding memory contract. A detached job can be admitted independently of owner residency. Native bodies use their signature and code identity under A64-CALL-1 through A64-CALL-8.
+
+The `policy` module owns static thresholds and budgets. `native::plan` owns feedback, break-even decisions and worker pacing. Lowering describes emitted costs and links the threshold operands. The code store binds code and retains counts for the owner.
 
 ## Leaving a Tier-1 fast path
 

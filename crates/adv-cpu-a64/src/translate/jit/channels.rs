@@ -11,7 +11,7 @@ use crate::translate::front::decode::{Alu, Cc, EBP, ESP, Mem, Narrow8or16, Op, P
 use crate::translate::front::trace::{Edge, Mode, Next, Trace};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
-const BATCH: u32 = 64;
+use crate::policy::tier1::CHANNEL_BATCH as BATCH;
 
 struct Plan {
     sources: Vec<Mem>,

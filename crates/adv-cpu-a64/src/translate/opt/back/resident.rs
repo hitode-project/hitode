@@ -328,13 +328,14 @@ pub(super) struct Probation {
     pub counter: Label,
     pub leave: Label,
     pub sensors: Vec<usize>,
-    exits: Vec<(Label, u32)>,
+    exits: Vec<(Label, u32, Label)>,
     snapshot: Label,
     account: Label,
+    rows: Option<(Option<u8>, [Label; 2])>,
 }
 
 impl Probation {
-    pub fn new(asm: &mut Asm) -> Self {
+    pub fn new(asm: &mut Asm, row_counter: Option<Option<u8>>) -> Self {
         Self {
             slot: asm.label(),
             calls: Vec::new(),
@@ -344,19 +345,32 @@ impl Probation {
             exits: Vec::new(),
             snapshot: asm.label(),
             account: asm.label(),
+            rows: row_counter.map(|reg| (reg, [asm.label(), asm.label()])),
         }
     }
 
-    pub fn call(&mut self, asm: &mut Asm, entry: bool) {
+    pub fn entry(&mut self, asm: &mut Asm) {
         self.calls.push(asm.offset() / 4);
-        asm.bl(if entry { self.snapshot } else { self.account });
+        asm.bl(self.snapshot);
     }
 
-    pub fn sensor(&mut self, asm: &mut Asm, eip: u32) {
+    pub fn exit(&mut self, asm: &mut Asm, eip: u32, returning: Option<bool>) {
+        let account =
+            self.rows
+                .zip(returning)
+                .map_or(self.account, |((reg, labels), returning)| {
+                    if returning && reg.is_none() {
+                        self.account
+                    } else {
+                        labels[usize::from(returning)]
+                    }
+                });
         let trigger = asm.label();
         self.sensors.push(asm.offset() / 4);
-        self.exits.push((trigger, eip));
+        self.exits.push((trigger, eip, account));
         runtime::emit_sensor(asm, self.counter, T, U, trigger);
+        self.calls.push(asm.offset() / 4);
+        asm.bl(account);
     }
 
     pub fn emit(&self, asm: &mut Asm) {
@@ -384,9 +398,34 @@ impl Probation {
             str(X, U, T, 16),
             ret(Reg::LR),
         ]);
-        for &(trigger, eip) in &self.exits {
+        if let Some((reg, labels)) = self.rows {
+            // Accounting runs after recovery at the outer head or beyond the latch.
+            for (returning, label) in labels.into_iter().enumerate() {
+                if returning != 0 && reg.is_none() {
+                    continue;
+                }
+                asm.bind(label);
+                asm.emit(ldr(W, U, RT, runtime::ROW_COUNT));
+                if let Some(reg) = reg.filter(|_| returning != 0) {
+                    asm.emit(sub(W, U, U, super::inline::guest(reg), Lsl, 0));
+                }
+                asm.ldr_literal(T, self.slot);
+                asm.emit_all(&[
+                    ldr(X, X0, T, 24),
+                    add(X, X0, U, X0, Lsl, 0),
+                    str(X, X0, T, 24),
+                    ldr(W, X0, RT, runtime::ROW_WORK),
+                    crate::encode::umull(U, U, X0),
+                    ldr(X, X0, T, 32),
+                    add(X, U, U, X0, Lsl, 0),
+                    str(X, U, T, 32),
+                ]);
+                asm.b(self.account);
+            }
+        }
+        for &(trigger, eip, account) in &self.exits {
             asm.bind(trigger);
-            asm.bl(self.account);
+            asm.bl(account);
             crate::translate::lower::emit_target(asm, eip);
             asm.b(self.leave);
         }

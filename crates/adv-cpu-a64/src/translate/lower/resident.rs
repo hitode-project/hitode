@@ -37,18 +37,7 @@ pub(crate) struct RowTarget {
     pub value: u32,
 }
 
-/// Row entry failures precede guest effects. A short profitable-work
-/// check is ordinary routing and never contributes to withdrawal.
-#[derive(Clone, Copy, Debug)]
-#[repr(u8)]
-pub(crate) enum RowFailure {
-    Target,
-    Range,
-    Alias,
-    Parameter,
-    Count,
-    Span,
-}
+pub(crate) use crate::policy::proved::RowFailure;
 
 /// Slots for opt-in per-head counters. Conditional cases use ordered arms.
 #[derive(Clone, Copy)]

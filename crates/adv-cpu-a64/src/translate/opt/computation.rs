@@ -30,9 +30,7 @@ type ExprId = usize;
 type VarId = usize;
 
 // Admission performs bounded work on the owner, including parameter reads.
-const PROOF_STEPS: usize = 128 * 1024;
-const PARAMETER_WORDS: usize = 32;
-const GATHERED_WORDS: usize = 4096;
+use crate::policy::worker::{GATHERED_WORDS, PARAMETER_WORDS, PROOF_STEPS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Expr {

@@ -80,12 +80,12 @@ static STALE_GATE: OfferGate = OfferGate {
     split_deadline: AtomicU64::new(u64::MAX),
 };
 
-const CACHE_LEN: usize = 64 << 20;
+use crate::policy::tier1::{CACHE_LEN, CHAIN_LEN};
 
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
 pub(crate) const SLICE: u64 = runtime::COMPUTATION_SLICE as u64;
-pub(crate) use plan::PROMOTION;
+pub(crate) use crate::policy::tier1::PROMOTION;
 
 /// Doubling copies fill the 1 MiB table with a few memcpys; an element-wise
 /// fill dominates executor creation in unoptimized test builds.
@@ -99,7 +99,7 @@ fn empty_table() -> Box<[[u64; 2]]> {
 }
 
 #[cfg(test)]
-pub(crate) use plan::CHECK_AFTER;
+pub(crate) use crate::policy::tier1::CHECK_AFTER;
 
 /// Page class table entries: every guest page.
 const CLASSES: usize = 1 << 20;
@@ -671,15 +671,62 @@ impl Native {
             .spans
             .each_ref()
             .map(Cell::get);
-        if let Some(feedback) = self
-            .code
-            .resident(head)
-            .and_then(|site| site.row_feedback.as_deref())
-        {
-            counts[21] = feedback.failures[0].get();
-            counts[22] = feedback.failures[1..].iter().map(Cell::get).sum();
+        if let Some(row) = self.row_ledger(head) {
+            counts[21] = row.failures[0];
+            counts[22] = row.failures[1..].iter().sum();
         }
         counts
+    }
+
+    fn row_ledger(&self, eip: u32) -> Option<plan::RowLedger> {
+        let site = self.code.resident(eip)?;
+        let feedback = site.row_feedback.as_ref()?;
+        let head = self.plans.resident(eip)?;
+        if head.declined() {
+            return Some(head.row);
+        }
+        let mut row = plan::RowLedger::default();
+        for (index, version) in site.versions.iter().enumerate() {
+            if let Some(price) = version.row_price {
+                let measured =
+                    plan::RowLedger::priced(price, version.row_counts(), version.row_failures());
+                row.add(head.row_version(index, measured));
+            }
+        }
+        row.router(
+            site.row_router_words,
+            feedback.failures.each_ref().map(Cell::get),
+        );
+        Some(row)
+    }
+
+    pub(crate) fn policy_diagnostics(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        self.code.version_stats.as_ref()?;
+        let mut heads: Vec<_> = self.plans.residents().collect();
+        heads.sort_unstable_by_key(|&(eip, _)| eip);
+        let mut report = String::new();
+        for (eip, head) in heads {
+            let Some(row) = self.row_ledger(eip) else {
+                continue;
+            };
+            let state = if head.declined() {
+                "declined"
+            } else {
+                "resident"
+            };
+            let _ = write!(
+                report,
+                " {eip:#010x} {state} saved={} wasted={} budget={} row_entries={} rows={} row_failures={}",
+                row.total.saved,
+                row.total.wasted,
+                crate::policy::proved::ROW_PROBE_WORDS,
+                row.entries,
+                row.rows,
+                row.failures.iter().sum::<u64>(),
+            );
+        }
+        Some(report)
     }
 
     pub(crate) fn version_diagnostics(&self) -> Option<String> {
@@ -690,12 +737,8 @@ impl Native {
         let mut output = String::new();
         for (&eip, stats) in entries {
             let mut counts = stats.spans.each_ref().map(Cell::get);
-            if let Some(feedback) = self
-                .code
-                .resident(eip)
-                .and_then(|site| site.row_feedback.as_deref())
-            {
-                let reasons = feedback.failures.each_ref().map(Cell::get);
+            if let Some(row) = self.row_ledger(eip) {
+                let reasons = row.failures;
                 counts[21] = reasons[0];
                 counts[22] = reasons[1..].iter().sum();
                 let _ = write!(
@@ -745,8 +788,7 @@ impl Native {
                 .code
                 .tier1_chain(eip)
                 .map_or(0, |chain| chain.versions.len());
-            let arrivals =
-                std::array::from_fn::<_, { store::CHAIN_LEN }, _>(|n| stats.arrivals[n].get());
+            let arrivals = std::array::from_fn::<_, { CHAIN_LEN }, _>(|n| stats.arrivals[n].get());
             let _ = write!(
                 output,
                 " {eip:#010x}=[builds {}, misses {}, joins {}, versions {versions}, arrivals {arrivals:?}, resident next {}, resident tier1 {}]",

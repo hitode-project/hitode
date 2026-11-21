@@ -16,6 +16,9 @@ use adv_sync::WakeEvent;
 use rustc_hash::FxHashMap;
 
 use super::plan::{Arbiter, JobPlan, REOFFER};
+#[cfg(test)]
+use super::plan::{WAKE_NS, helpers};
+use super::plan::{WakeEstimate, rows_per_slice};
 use super::store::{self, ACTIVE, Active, FaultCapture, WorkerCode, WorkerFaults, site_at};
 use crate::runtime::SCOPE_CELLS;
 use crate::runtime::{
@@ -117,40 +120,8 @@ impl<U> WorkerJob<U> {
     }
 }
 
-/// A helper's wake latency until helpers have shown theirs: it starts
-/// claiming this long after the owner.
-const WAKE_NS: u64 = 50_000;
-/// Blocks per thread, so the last block to finish leaves the others idle
-/// for about a quarter of a thread's part. A block is at most one slice.
-const BLOCKS_PER_THREAD: f64 = 4.0;
-/// The owner's fixed work in a split besides its blocks: admission and merge.
-const ROUND_NS: f64 = 10_000.0;
 /// MXCSR exception flags, sticky across a loop's blocks.
 const MXCSR_FLAGS: u32 = 0x3f;
-
-/// Rolling median of three claimed wakes, seeded with the startup estimate.
-struct WakeEstimate {
-    recent: [u64; 2],
-    ns: u64,
-}
-
-impl Default for WakeEstimate {
-    fn default() -> Self {
-        Self {
-            recent: [WAKE_NS; 2],
-            ns: WAKE_NS,
-        }
-    }
-}
-
-impl WakeEstimate {
-    fn record(&mut self, ns: u64) {
-        let [older, newer] = self.recent;
-        let ns = ns.max(1);
-        self.ns = ns.clamp(older.min(newer), older.max(newer));
-        self.recent = [newer, ns];
-    }
-}
 
 #[derive(Default)]
 struct ExecuteScratch {
@@ -1006,7 +977,7 @@ impl Pool {
     }
 }
 
-const PAGE_GRANTS: usize = 256;
+use crate::policy::worker::PAGE_GRANTS;
 
 struct PageGrants {
     slots: [u64; PAGE_GRANTS],
@@ -1222,6 +1193,7 @@ struct ActiveTask {
     id: u32,
     entry: JobKey,
     iteration: bool,
+    row_work: u32,
     ranges: Vec<Range>,
     start: Option<Box<CpuState>>,
 }
@@ -1370,17 +1342,14 @@ impl<'a, U, R> Session<'a, U, R> {
         (retired, ns): (u64, f64),
         pace: Pace,
     ) -> Option<Done> {
-        let slice = rows_per_slice(retired);
-        let serial = f64::from(plan.iterations) * ns;
         let most = self.pool.idle().min(plan.iterations as usize - 1);
-        let wake = self.wake_estimate.ns as f64;
-        let need = pace.need(serial as u64) as f64;
-        let helpers = helpers(serial, (wake, f64::from(slice) * ns), need, most);
-        if helpers == 0 {
-            return None;
-        }
-        let threads = (helpers + 1) as f64 * BLOCKS_PER_THREAD;
-        let size = slice.min((f64::from(plan.iterations) / threads).ceil() as u32);
+        let (helpers, size) = super::plan::split_work(
+            plan.iterations,
+            (retired, ns),
+            self.wake_estimate.ns,
+            pace,
+            most,
+        )?;
         let count = plan.iterations.div_ceil(size);
         // Private frames lie below ESP, one stride per thread.
         if let Some(frame) = plan.frame {
@@ -1458,7 +1427,7 @@ impl<'a, U, R> Session<'a, U, R> {
         let (mut completion, iterations) = blocks.finish(id, total);
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
-        learn(
+        JobPlan::learn(
             policy,
             &completion,
             iterations,
@@ -1478,11 +1447,13 @@ impl<'a, U, R> Session<'a, U, R> {
         &mut self,
         key: JobKey,
         iteration: bool,
+        row_work: u32,
         done: Done,
     ) -> Completion<Option<ExecutionContext>> {
         let (eip, version) = key;
         if let Some(version) = version {
-            self.code.resident(eip).unwrap().versions[usize::from(version)].account_rows(done.rows);
+            self.code.resident(eip).unwrap().versions[usize::from(version)]
+                .account_rows(done.rows, row_work);
         }
         let (_, policy) = self.job(key).unwrap();
         policy.observe(
@@ -1510,7 +1481,7 @@ impl<'a, U, R> Session<'a, U, R> {
         let mut total = Drained::default();
         total.record_scope(0, &job.code, (scope.mmx, scope.gpr), cpu);
         total.publish_scope(&job.code, Some(&scope.frame), start, cpu, self.entry.alias);
-        learn(
+        JobPlan::learn(
             policy,
             &done.completion,
             done.rows,
@@ -1533,12 +1504,8 @@ impl<'a, U, R> Session<'a, U, R> {
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
         *self.worker_retired += done.completion.retired;
-        self.account(job.entry, job.iteration, done)
+        self.account(job.entry, job.iteration, job.row_work, done)
     }
-}
-
-fn rows_per_slice(retired: u64) -> u32 {
-    (u64::from(COMPUTATION_SLICE) / retired).max(1) as u32
 }
 
 fn publish_frame(cells: &[ScopeCell], values: &[u32; SCOPE_CELLS], start: &CpuState, alias: u64) {
@@ -1547,50 +1514,6 @@ fn publish_frame(cells: &[ScopeCell], values: &[u32; SCOPE_CELLS], start: &CpuSt
         // SAFETY: the owner still holds the write lease on this dword.
         unsafe { (alias.wrapping_add(u64::from(address)) as *mut u32).write_unaligned(value) };
     }
-}
-
-/// The fewest helpers whose blocks cut `serial` ns by `need` ns, or all
-/// that are worth waking, given the `wake` latency and the most a `slice`
-/// block takes. One is worth waking only if its part of the loop exceeds
-/// four wake latencies.
-fn helpers(serial: f64, (wake, slice): (f64, f64), need: f64, most: usize) -> usize {
-    if need <= 0.0 {
-        return 0;
-    }
-    let worth = ((serial - wake) / (4.0 * wake) - 1.0).max(0.0) as usize;
-    let most = most.min(worth);
-    let target = serial - need;
-    (1..=most)
-        .find(|&h| {
-            let part = (serial - wake) / (h + 1) as f64;
-            wake + part + (part / BLOCKS_PER_THREAD).min(slice) + ROUND_NS <= target
-        })
-        .unwrap_or(most)
-}
-
-/// Records the instructions and time per outer iteration of a job that ran
-/// `iterations` of them.
-fn learn(
-    prepared: &JobPlan,
-    done: &Completion<Option<ExecutionContext>>,
-    iterations: u32,
-    execution: Duration,
-    wake: f64,
-) {
-    if iterations == 0 || done.requires_owner {
-        return;
-    }
-    let n = u64::from(iterations);
-    let ns = execution.as_nanos() as f64;
-    prepared.set_cost(ns as u64);
-    if prepared.scoped && ns > 0.0 {
-        prepared
-            .split_minimum
-            .set((9.0 * wake * n as f64 / ns).ceil().max(2.0) as u64);
-    }
-    prepared
-        .per_iteration
-        .set(Some(((done.retired / n).max(1), ns / n as f64)));
 }
 
 impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
@@ -1639,6 +1562,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                 id,
                 entry: key,
                 iteration,
+                row_work: context.scoped_offer().map_or(0, |offer| offer.row_work),
                 ranges: grant,
                 start: scoped.map(|_| Box::new(context.cpu().clone())),
             });
@@ -1665,6 +1589,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
         } else {
             None
         };
+        let row_work = context.scoped_offer().map_or(0, |offer| offer.row_work);
         if policy.scoped {
             let plan = plan?;
             if !self.active.is_empty() || policy.per_iteration.get().is_none() {
@@ -1681,7 +1606,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                     &mut ExecuteScratch::default(),
                 );
                 self.finish_scope(key, context.cpu(), &mut done);
-                return Some(self.account(key, false, done));
+                return Some(self.account(key, false, row_work, done));
             }
         }
         if let Some(plan) = plan
@@ -1693,7 +1618,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
             if policy.scoped {
                 self.scope_updates.push(guest_entry);
             }
-            return Some(self.account(key, false, done));
+            return Some(self.account(key, false, row_work, done));
         }
         if policy.scoped {
             return None;
@@ -1723,7 +1648,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                 (true, true) => 1,
                 (true, false) => 0,
             };
-            learn(
+            JobPlan::learn(
                 policy,
                 &done.completion,
                 iterations,
@@ -1731,7 +1656,7 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
                 self.wake_estimate.ns as f64,
             );
         }
-        Some(self.account(key, iteration, done))
+        Some(self.account(key, iteration, row_work, done))
     }
 
     fn poll(&mut self) -> Option<Completion<Option<ExecutionContext>>> {
@@ -2227,6 +2152,38 @@ mod tests {
         assert!(native.scoped_jobs.is_empty());
     }
 
+    // spec: A64-OPT-9
+    #[test]
+    fn failed_row_version_keeps_the_other_target_and_its_job() {
+        let (mut executor, mut native, start, stop, [_, first, second]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &first.to_le_bytes()).unwrap();
+        assert!(native.force_resident_at(memory, start.clone()));
+        memory.write(ROW_SLOT, &second.to_le_bytes()).unwrap();
+        row_run(&mut native, memory, &mut start.clone(), stop);
+        assert_eq!(native.scoped_jobs.len(), 2);
+
+        memory.write(ROW_SLOT, &first.to_le_bytes()).unwrap();
+        let mut miss = start.clone();
+        miss.regs[6] = ROW_MISS;
+        for _ in 0..4 {
+            row_run(&mut native, memory, &mut miss.clone(), stop);
+        }
+        let versions = &native.code.resident(CODE).unwrap().versions;
+        assert!(!versions[0].enabled);
+        assert!(versions[1].enabled);
+        assert!(!native.scoped_jobs.contains_key(&(CODE, 0)));
+
+        memory.write(ROW_SLOT, &second.to_le_bytes()).unwrap();
+        native.set_computation_offer(true, None);
+        let mut cpu = start;
+        assert_eq!(
+            row_run(&mut native, memory, &mut cpu, stop).exit,
+            Exit::Computation
+        );
+        assert_eq!(native.scoped_offer.take().unwrap().version, 1);
+    }
+
     // spec: A64-OPT-9 A64-OPT-14
     #[test]
     fn a_declined_scoped_offer_leaves_guest_state_at_the_head() {
@@ -2308,9 +2265,19 @@ mod tests {
         let mut miss = start.clone();
         miss.regs[6] = ROW_MISS;
         row_run(&mut native, memory, &mut miss, stop);
-        assert!(native.plans.resident(CODE).unwrap().row_accounting());
+        assert_eq!(
+            native
+                .row_ledger(CODE)
+                .unwrap()
+                .failures
+                .iter()
+                .sum::<u64>(),
+            1
+        );
         let measured = native.code.accounted(CODE);
-        let costs = native.code.row_costs(CODE).unwrap();
+        let costs = native.code.resident(CODE).unwrap().versions[0]
+            .row_price
+            .unwrap();
         let rows = (0..splits)
             .map(|_| {
                 let policy = &native.scoped_jobs[&(CODE, 0)].policy;
@@ -2351,13 +2318,11 @@ mod tests {
         miss.regs[6] = ROW_MISS;
         row_run(&mut native, memory, &mut miss, stop);
         let site = native.code.resident(CODE).unwrap();
-        let failures = site
-            .row_feedback
-            .as_deref()
+        let failures = native
+            .row_ledger(CODE)
             .unwrap()
             .failures
             .iter()
-            .map(std::cell::Cell::get)
             .sum::<u64>();
         assert_eq!(failures, 33);
         assert_eq!(
@@ -2766,6 +2731,7 @@ mod tests {
                 .plan(&start, &mut evaluation, read)
                 .expect("disjoint test rows");
             let offer = crate::runtime::ScopedOffer {
+                row_work: 0,
                 version: 0,
                 entry: job.code.placed.entry,
                 generation: native.code.generation,
@@ -2967,7 +2933,7 @@ mod tests {
             for _ in 0..10 {
                 wake.record(12_000);
             }
-            learn(&job, &done, rows, execution, wake.ns as f64);
+            JobPlan::learn(&job, &done, rows, execution, wake.ns as f64);
             assert_eq!(job.cost(), 115_200);
             assert_eq!(job.per_iteration.get(), Some((100, 480.0)));
             assert_eq!(job.split_minimum.get(), 225);

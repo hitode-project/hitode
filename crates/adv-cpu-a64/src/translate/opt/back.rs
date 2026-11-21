@@ -88,7 +88,8 @@ pub(crate) struct Lowered {
     pub exit: usize,
     pub counters: Vec<(u32, Counter, usize)>,
     rows: bool,
-    pub row_price: Option<crate::translate::lower::resident::RowPrice>,
+    pub row_price: Option<crate::policy::proved::RowPrice>,
+    pub row_sample: Option<(usize, usize)>,
     pub row_failures: Vec<(crate::translate::lower::resident::RowFailure, usize)>,
     pub row_target: Option<crate::translate::lower::resident::RowTarget>,
     pub split: Option<crate::translate::lower::resident::SplitPoint>,
@@ -246,7 +247,7 @@ fn lower_form(
             |(sensor, threshold, leave)| crate::translate::lower::resident::SplitPoint {
                 sensor: e.asm.position(sensor) / 4,
                 threshold: e.asm.position(threshold) / 4,
-                leave: e.asm.position(leave) / 4,
+                leave: e.asm.position(leave) / 4 + 1,
             },
         );
     let row_failures = e
@@ -254,6 +255,9 @@ fn lower_form(
         .iter()
         .map(|&(reason, label)| (reason, e.asm.position(label) / 4))
         .collect();
+    let row_sample = e
+        .row_sample
+        .map(|(word, label)| (word, e.asm.position(label) / 4));
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
@@ -285,6 +289,7 @@ fn lower_form(
         counters,
         rows,
         row_price: e.row_price,
+        row_sample,
         row_failures,
         row_target: e.domain.and_then(|(domain, _)| domain.target()),
         split,
@@ -350,21 +355,23 @@ fn emit<'a>(
             .map(|(batch, count)| RowStrip {
                 head: batch.loop_.eip,
                 count,
-                minimum: u32::from(batch.plan.lanes) + 1,
-                saved: batch.spans.len() as u32 * 8 + domain.call_savings() - 2,
+                shift: batch.plan.lanes.trailing_zeros(),
+                saved: 0,
+                setup_batches: 0,
+                row_savings: 0,
             });
-        let alignment = domain
-            .alignment_strip()
-            .map(|(head, count, minimum, saved)| RowStrip {
-                head,
-                count,
-                minimum,
-                saved,
-            });
-        batch
-            .into_iter()
-            .chain(alignment)
-            .max_by_key(|strip| strip.saved)
+        batch.or_else(|| {
+            domain
+                .alignment_strip()
+                .map(|(head, count, _, saved)| RowStrip {
+                    head,
+                    count,
+                    shift: 0,
+                    saved,
+                    setup_batches: 0,
+                    row_savings: 0,
+                })
+        })
     });
     let domain = domain.filter(|_| row_strip.is_some());
     let span_search = [false, true].map(|backwards| {
@@ -375,7 +382,9 @@ fn emit<'a>(
     for batch in batches {
         batch_backedges[batch.loop_.latch.0 as usize] = Some((batch.loop_.head, asm.label()));
     }
-    let probation = resident.then(|| resident::Probation::new(&mut asm));
+    let probation = resident.then(|| {
+        resident::Probation::new(&mut asm, domain.map(|(domain, _)| domain.row_counter()))
+    });
     let last_fact = resident
         .then(|| {
             func.blocks[0]
@@ -437,6 +446,7 @@ fn emit<'a>(
         row_strip,
         row_budget: None,
         row_price: None,
+        row_sample: None,
         row_failures: Vec::new(),
         split: None,
     };
@@ -492,7 +502,12 @@ fn emit<'a>(
             let (words, price) =
                 e.batch(batch, span_search[usize::from(batch.backwards)], backedge);
             if let Some(price) = price {
-                prices.push((batch, price));
+                prices.push((batch, words, 0, Some(price)));
+            } else if e
+                .row_strip
+                .is_some_and(|strip| strip.head == batch.loop_.eip)
+            {
+                prices.push((batch, words, e.words_since(start) - words, None));
             }
             if func.head_exit == Some(batch.loop_.head) {
                 head_batch = Some((words, u32::from(batch.plan.lanes)));
@@ -665,58 +680,73 @@ fn emit<'a>(
         e.asm.bind(label);
         e.asm.emit_all(&[0, 0]);
     }
-    let mut min_inner = e.row_strip.map_or(0, |strip| strip.minimum);
-    for (batch, price) in prices {
-        let saved = if price.classes.is_empty() {
-            let scalar = cost::cheapest(func, &costs, &batch.loop_) * u32::from(batch.plan.lanes);
-            scalar.saturating_sub(price.common)
-        } else {
-            price
-                .classes
-                .iter()
-                .map(|class| {
-                    let scalar = class
-                        .first
-                        .iter()
-                        .chain(&class.second)
-                        .map(|(block, edge)| {
-                            let cost = costs[block.0 as usize];
-                            cost.body + cost.edges[*edge]
-                        })
-                        .sum::<u32>();
-                    scalar.saturating_sub(price.common + class.words)
-                })
-                .min()
-                .unwrap()
-        };
-        e.asm.bind(price.label);
+    for (batch, words, prefix, price) in prices {
+        let saved = cost::batch_savings(func, &costs, batch, words, price.as_ref());
         if saved == 0 {
             e.unpriced.push(batch.loop_.head);
         } else {
-            let min_batches = price.admission.div_ceil(saved);
-            if e.row_strip
-                .is_some_and(|strip| strip.head == batch.loop_.eip)
-            {
-                min_inner = min_inner.max(min_batches * u32::from(batch.plan.lanes) + 1);
+            let prefix = price.as_ref().map_or(prefix, |price| price.admission);
+            if let Some(price) = price {
+                e.asm.bind(price.label);
+                e.asm.emit_all(&[
+                    crate::policy::proved::minimum_work(prefix, saved).unwrap(),
+                    0,
+                ]);
             }
-            e.asm.emit_all(&[min_batches, 0]);
+            if let Some(strip) = e
+                .row_strip
+                .as_mut()
+                .filter(|strip| strip.head == batch.loop_.eip)
+            {
+                strip.saved = saved;
+                let call = e.domain.unwrap().0.call_savings();
+                strip.setup_batches =
+                    crate::policy::proved::minimum_work(prefix.saturating_sub(call), saved)
+                        .unwrap();
+                strip.row_savings = strip.setup_batches * saved + call - prefix;
+            }
         }
     }
-    if let Some(((rows, inner), words)) = e.row_budget {
-        // A range proven at the row entry removes at least the first-leaf
-        // hit of every covered stream on each row with an inner strip.
+    if let Some(((minimum, exact), bias, words)) = e.row_budget {
         let domain = e.domain.unwrap().0;
-        let saved = e.row_strip.unwrap().saved;
-        let price = crate::translate::lower::resident::RowPrice {
-            guard: words,
-            saved,
-            count_register: domain.count_register(),
-        };
-        e.row_price = Some(price);
-        e.asm.bind(rows);
-        e.asm.emit_all(&[price.minimum(), 0]);
-        e.asm.bind(inner);
-        e.asm.emit_all(&[min_inner, 0]);
+        let strip = e.row_strip.unwrap();
+        if let Some(extra) = domain.call_savings().checked_div(strip.saved) {
+            // The final logical iteration runs scalar. Round strip setup
+            // up to whole batches so the credited work covers that cost.
+            if let Some(bias) = bias {
+                let count = Reg::new(0);
+                e.asm.words_mut()[bias] = if strip.shift == 0 {
+                    add_imm(W, count, count, extra, false)
+                } else {
+                    sub_imm(
+                        X,
+                        count,
+                        count,
+                        1 + (strip.setup_batches << strip.shift),
+                        false,
+                    )
+                };
+            }
+            let price = crate::policy::proved::RowPrice {
+                guard: words,
+                saved: strip.saved,
+                row_savings: if strip.shift == 0 {
+                    domain.call_savings() % strip.saved
+                } else {
+                    strip.row_savings
+                },
+                count_register: domain.count_register(),
+            };
+            e.row_price = Some(price);
+            e.asm.bind(minimum);
+            e.asm.emit_all(&[
+                crate::policy::proved::minimum_work(price.guard, price.saved).unwrap(),
+                0,
+            ]);
+            e.asm.bind(exact);
+            e.asm
+                .emit_all(&[price.saved, price.row_savings, price.guard]);
+        }
     }
     for &(_, failure) in &e.row_failures {
         e.asm.bind(failure);
@@ -739,8 +769,10 @@ fn emit<'a>(
 struct RowStrip {
     head: u32,
     count: usize,
-    minimum: u32,
+    shift: u32,
     saved: u32,
+    setup_batches: u32,
+    row_savings: u32,
 }
 
 struct FpCheck {
@@ -800,8 +832,9 @@ struct Emitter<'a> {
     mmx_miss: Option<Label>,
     domain: Option<(&'a Domain, bool)>,
     row_strip: Option<RowStrip>,
-    row_budget: Option<((Label, Label), u32)>,
-    row_price: Option<crate::translate::lower::resident::RowPrice>,
+    row_budget: Option<((Label, Label), Option<usize>, u32)>,
+    row_price: Option<crate::policy::proved::RowPrice>,
+    row_sample: Option<(usize, Label)>,
     row_failures: Vec<(crate::translate::lower::resident::RowFailure, Label)>,
     split: Option<(Label, Label, Label)>,
 }
@@ -854,7 +887,7 @@ impl<'a> Emitter<'a> {
         }
         let diagnostic_words = self.words_since(start);
         if let Some(probation) = &mut self.probation {
-            probation.call(&mut self.asm, true);
+            probation.entry(&mut self.asm);
         }
         self.charge(
             i64::from(self.func.records[record.0 as usize].refund),

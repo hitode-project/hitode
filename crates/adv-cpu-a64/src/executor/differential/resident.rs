@@ -2174,9 +2174,15 @@ fn row_domain_prices_the_main_strip_with_zero_or_short_tails() {
                 executor.state.regs[if aligned { 0 } else { 2 }] += 1;
             }
             if aligned {
-                let run = trial.run_native(100_000).unwrap();
+                let mut run = trial.run_native(100_000).unwrap();
+                let mut retired = u64::from(run.retired);
+                if run.exit == Exit::Dispatch {
+                    // The first row refusal publishes its retry policy at
+                    // the owner boundary before replaying the scalar path.
+                    run = trial.run_native(100_000 - retired).unwrap();
+                    retired += u64::from(run.retired);
+                }
                 assert_eq!(run.exit, Exit::Event(crate::runtime::Event::Exception(13)));
-                let retired = u64::from(run.retired);
                 assert_eq!(
                     trial.reference.run(trial.stop, retired).unwrap(),
                     RunOutcome::Budget
