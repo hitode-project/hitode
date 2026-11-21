@@ -188,7 +188,14 @@ fn run_batch<C>(
     delivery: Option<u64>,
     deadline: Option<Instant>,
 ) -> u32 {
+    let closed = || {
+        deadline.is_some_and(|at| Instant::now() >= at)
+            || delivery != wake.map(WakeEvent::generation)
+    };
     if let [id] = *offered {
+        if closed() {
+            return 0;
+        }
         // A single context may split its loop (A64-TR-9).
         let context = regs[id as usize].as_ref().expect("held snapshot");
         return match jobs.run_local(id, context) {
@@ -210,10 +217,7 @@ fn run_batch<C>(
             pending[offered.iter().position(|&id| id == done.id).unwrap()] = !done.requires_owner;
             owner_needed |= complete(sys, regs, done, false);
         }
-        if owner_needed
-            || deadline.is_some_and(|at| Instant::now() >= at)
-            || delivery != wake.map(WakeEvent::generation)
-        {
+        if owner_needed || closed() {
             break;
         }
         let local = pending.iter().rposition(|&ready| ready);
@@ -616,6 +620,42 @@ mod tests {
         assert_eq!(regs, [Some(1), Some(2), Some(3), Some(3)]);
         assert_eq!(machine.sys.clock.now_us(), time);
         assert_eq!(machine.sys.stats.total.cpu_runs, 1);
+    }
+
+    // spec: PROC-MACH-5
+    #[test]
+    fn closed_admission_skips_a_single_computation_offer() {
+        let mut machine = machine(false);
+        for _ in 0..2 {
+            machine.spawn("test", CODE, &[], 0x1_0000).unwrap();
+        }
+        let wake = WakeEvent::new().unwrap();
+        let before = wake.generation();
+        let due = Instant::now();
+        wake.signal();
+        for (delivery, deadline) in [(before, None), (wake.generation(), Some(due))] {
+            for offered in [&[0][..], &[0, 1]] {
+                let mut jobs = FakeJobs {
+                    submitted: VecDeque::new(),
+                    wake: wake.clone(),
+                    local: None,
+                    recalled: false,
+                };
+                let mut regs = [Some(0), Some(1)];
+                let admitted = run_batch(
+                    &mut jobs,
+                    &mut machine.sys,
+                    &mut regs,
+                    offered,
+                    Some(&wake),
+                    Some(delivery),
+                    deadline,
+                );
+                assert_eq!(admitted, 0);
+                assert_eq!(regs, [Some(0), Some(1)]);
+            }
+        }
+        assert_eq!(machine.sys.stats.total.cpu_runs, 0);
     }
 
     // spec: PROC-MACH-1 PROC-MACH-2 PROC-MACH-5 PROC-CLOCK-5
