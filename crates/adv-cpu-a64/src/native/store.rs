@@ -36,7 +36,6 @@ use crate::policy::tier1::CHAIN_LEN;
 pub(super) const EMPTY: [u64; 2] = [u64::MAX, 0];
 
 pub(super) struct Chain<R> {
-    pub(super) tier1: Option<Tier1Chain>,
     pub(super) resident: Option<Box<ResidentSite<R>>>,
     offer: Option<(usize, usize)>,
 }
@@ -44,7 +43,6 @@ pub(super) struct Chain<R> {
 impl<R> Default for Chain<R> {
     fn default() -> Self {
         Self {
-            tier1: None,
             resident: None,
             offer: None,
         }
@@ -52,11 +50,15 @@ impl<R> Default for Chain<R> {
 }
 
 pub(super) struct Tier1Chain {
-    pub(super) unit: Option<Arc<Unit>>,
-    pub(super) table_target: bool,
+    pub(super) unit: Arc<Unit>,
     pub(super) mask: u64,
     pub(super) helpers: u32,
     pub(super) versions: Vec<Version>,
+}
+
+pub(super) struct Tier1Placement {
+    entry: Tier1Unit,
+    table_target: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +266,10 @@ pub(super) struct CodeStore<R> {
     pub(super) stubs: Stubs,
     /// Cache bytes the stubs occupy; clearing keeps them.
     pub(super) stub_len: usize,
+    /// Checked Tier-1 entries are the common dispatch index.
+    pub(super) tier1: FxHashMap<u32, Tier1Placement>,
+    /// Only keyed entries own a trace and a version list.
+    pub(super) tier1_chains: FxHashMap<u32, Tier1Chain>,
     pub(super) chains: FxHashMap<u32, Chain<R>>,
     pub(super) version_stats: Option<FxHashMap<u32, Box<VersionStats>>>,
     pub(super) slow_paths: Option<SlowPaths>,
@@ -318,23 +324,44 @@ impl<R> CodeStore<R> {
         self.repoint(previous, version.entry.unit);
         chain.versions.truncate(position);
         chain.versions.push(version);
-        self.set_tier1(eip, chain);
+        self.tier1_chains.insert(eip, chain);
     }
 
     pub(super) fn tier1(&self, eip: u32) -> Option<Tier1Unit> {
-        self.tier1_chain(eip).map(|chain| chain.versions[0].entry)
+        Some(self.tier1.get(&eip)?.entry)
     }
 
     pub(super) fn tier1_chain(&self, eip: u32) -> Option<&Tier1Chain> {
-        self.chains.get(&eip)?.tier1.as_ref()
+        self.tier1_chains.get(&eip)
     }
 
-    pub(super) fn set_tier1(&mut self, eip: u32, chain: Tier1Chain) {
-        self.chains.entry(eip).or_default().tier1 = Some(chain);
+    pub(super) fn set_tier1(
+        &mut self,
+        eip: u32,
+        entry: Tier1Unit,
+        table_target: bool,
+        chain: Option<Tier1Chain>,
+    ) {
+        let previous = self.tier1.insert(
+            eip,
+            Tier1Placement {
+                entry,
+                table_target,
+            },
+        );
+        if let Some(chain) = chain {
+            self.tier1_chains.insert(eip, chain);
+        } else if previous.is_some() {
+            self.tier1_chains.remove(&eip);
+        }
     }
 
-    pub(super) fn take_tier1(&mut self, eip: u32) -> Option<Tier1Chain> {
-        self.chains.get_mut(&eip)?.tier1.take()
+    pub(super) fn take_tier1_chain(&mut self, eip: u32) -> Option<Tier1Chain> {
+        self.tier1_chains.remove(&eip)
+    }
+
+    pub(super) fn table_target(&self, eip: u32) -> bool {
+        self.tier1.get(&eip).is_some_and(|unit| unit.table_target)
     }
 
     pub(super) fn resident(&self, eip: u32) -> Option<&ResidentSite<R>> {
@@ -550,16 +577,7 @@ impl<R> CodeStore<R> {
                 .iter()
                 .map(|&(point, transition)| (entry.form + point, entry.form + transition)),
         );
-        let from = self.faults.sites.len().saturating_sub(1);
-        self.faults.sites.extend(
-            layout
-                .sites
-                .iter()
-                .map(|&(offset, site)| (entry.form + offset, site)),
-        );
-        if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
-            self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
-        }
+        self.faults.append(entry.form, layout.sites);
         crate::jit_map::optimized(eip, format_args!("installed\t-\t-"));
         crate::jit_map::record(
             entry.form,
@@ -830,12 +848,12 @@ impl<R> CodeStore<R> {
     }
 
     pub(super) fn contains_unit(&self, entry: u32, address: usize) -> bool {
-        self.tier1_chain(entry).is_some_and(|chain| {
-            chain
-                .versions
-                .iter()
-                .any(|version| version.entry.unit == address)
-        })
+        self.tier1(entry).is_some_and(|unit| unit.unit == address)
+            || self.tier1_chain(entry).is_some_and(|chain| {
+                chain.versions[1..]
+                    .iter()
+                    .any(|version| version.entry.unit == address)
+            })
     }
 
     fn proved_resident(site: &ResidentSite<R>, proof: Option<&Key>) -> Option<usize> {
@@ -1169,6 +1187,8 @@ impl<R> CodeStore<R> {
 
     pub(super) fn clear(&mut self) {
         self.cache.truncate(self.stub_len);
+        self.tier1.clear();
+        self.tier1_chains.clear();
         self.chains.clear();
         self.pages_by_unit.clear();
         self.pages.clear();
@@ -1248,7 +1268,8 @@ impl<R> CodeStore<R> {
             }
         }
         self.repoint_internal_edges(eip, None, None);
-        let dropped = self.chains.remove(&eip).is_some();
+        let dropped = self.tier1.remove(&eip).is_some() | self.chains.remove(&eip).is_some();
+        self.tier1_chains.remove(&eip);
         if self.table_sources.remove(&eip) {
             self.rows.retain(|_, slots| {
                 slots.retain(|&(source, _, _)| source != eip);
@@ -1369,6 +1390,7 @@ impl<R> CodeStore<R> {
         } else {
             key.project(unit.preserved_facts())
         };
+        let mut has_backedge = false;
         for link in work.links {
             let point = at + link.offset;
             if proofs.mask() != 0 {
@@ -1379,6 +1401,7 @@ impl<R> CodeStore<R> {
                 self.direct_points.insert(point, at + transition);
             }
             if link.back {
+                has_backedge = true;
                 self.back_points.insert(point);
                 let (address, count) = counter(link.eip);
                 self.bind_counter(point + runtime::BACK_COUNTER, address);
@@ -1407,6 +1430,7 @@ impl<R> CodeStore<R> {
                 self.point_facts.insert(edge.point, proofs);
             }
             let value = if let Some(address_slot) = link.counter {
+                has_backedge = true;
                 let (address, value) = counter(link.eip);
                 self.bind_counter(at + address_slot, address);
                 value
@@ -1441,10 +1465,14 @@ impl<R> CodeStore<R> {
             self.internal_edges.entry(link.eip).or_default().push(edge);
         }
         if record_cost {
-            self.tier1_words.insert(
-                eip,
-                tier1_words(work.marks, work.links, work.words.len(), &unit.trace),
-            );
+            if has_backedge {
+                self.tier1_words.insert(
+                    eip,
+                    tier1_words(work.marks, work.links, work.words.len(), &unit.trace),
+                );
+            } else {
+                self.tier1_words.remove(&eip);
+            }
         }
         self.uses_permissions |= work.uses_permissions;
         Some(entry)
@@ -1460,13 +1488,7 @@ impl<R> CodeStore<R> {
         layout: VersionLayout,
     ) -> Option<Tier1Unit> {
         let unit = self.cache.append(words)?;
-        let from = self.faults.sites.len().saturating_sub(1);
-        self.faults
-            .sites
-            .extend(sites.iter().map(|&(offset, site)| (unit + offset, site)));
-        if !self.faults.sites[from..].is_sorted_by_key(|&(at, _)| at) {
-            self.faults.sites.sort_unstable_by_key(|&(at, _)| at);
-        }
+        self.faults.append(unit, sites);
         let entry = Tier1Unit {
             unit,
             body: unit + layout.body,
@@ -1546,9 +1568,8 @@ pub(super) struct Faults {
     /// Executable range of translated code.
     pub(super) start: usize,
     pub(super) end: Cell<usize>,
-    /// Host PC of each site, ascending: units are appended in address
-    /// order, and their sites in emission order.
-    pub(super) sites: Vec<(usize, Site)>,
+    /// Cache-relative offset of each site, ascending. The owner cache fits in u32.
+    pub(super) sites: Vec<(u32, Site)>,
     pub(super) stub: usize,
     pub(super) capture: FaultCapture,
     /// The shadow stack's guard pages.
@@ -1573,8 +1594,26 @@ pub(super) fn site_at(sites: &[(usize, Site)], pc: usize) -> Option<Site> {
 }
 
 impl Faults {
+    fn append(&mut self, base: usize, sites: &[(usize, Site)]) {
+        let from = self.sites.len().saturating_sub(1);
+        let base = base - self.start;
+        self.sites.extend(
+            sites
+                .iter()
+                .map(|&(offset, site)| ((base + offset) as u32, site)),
+        );
+        if !self.sites[from..].is_sorted_by_key(|&(at, _)| at) {
+            self.sites.sort_unstable_by_key(|&(at, _)| at);
+        }
+    }
+
     pub(super) fn site(&self, pc: usize) -> Option<Site> {
-        site_at(&self.sites, pc)
+        let offset = u32::try_from(pc.checked_sub(self.start)?).ok()?;
+        let index = self
+            .sites
+            .binary_search_by_key(&offset, |&(at, _)| at)
+            .ok()?;
+        Some(self.sites[index].1)
     }
 }
 

@@ -792,10 +792,10 @@ impl Native {
                     counts[22]
                 );
             }
-            let versions = self
-                .code
-                .tier1_chain(eip)
-                .map_or(0, |chain| chain.versions.len());
+            let versions = self.code.tier1_chain(eip).map_or_else(
+                || usize::from(self.code.tier1(eip).is_some()),
+                |chain| chain.versions.len(),
+            );
             let arrivals = std::array::from_fn::<_, { CHAIN_LEN }, _>(|n| stats.arrivals[n].get());
             let _ = write!(
                 output,
@@ -925,6 +925,8 @@ impl Native {
                     fault: base + stubs.fault,
                     opt_exit: base + stubs.opt_exit,
                 },
+                tier1: FxHashMap::default(),
+                tier1_chains: FxHashMap::default(),
                 chains: FxHashMap::default(),
                 version_stats: crate::jit_map::enabled().then(FxHashMap::default),
                 slow_paths: crate::jit_map::enabled().then(store::SlowPaths::default),
@@ -1237,19 +1239,7 @@ mod tests {
             .code
             .install_unit(eip, &words, &[(0, site)], 1, &[], Default::default())
             .unwrap();
-        native.code.set_tier1(
-            eip,
-            store::Tier1Chain {
-                unit: None,
-                table_target: false,
-                mask: 0,
-                helpers: 0,
-                versions: vec![store::Version {
-                    key: crate::facts::Key::default(),
-                    entry: unit,
-                }],
-            },
-        );
+        native.code.set_tier1(eip, unit, false, None);
     }
 
     // spec: A64A-PLACE-2 A64A-ROLE-5
@@ -1278,16 +1268,17 @@ mod tests {
             .unwrap();
         native.code.set_tier1(
             eip,
-            Tier1Chain {
-                unit: Some(Arc::default()),
-                table_target: false,
+            version,
+            false,
+            Some(Tier1Chain {
+                unit: Arc::default(),
                 mask: key.mask(),
                 helpers: 0,
                 versions: vec![Version {
                     key,
                     entry: version,
                 }],
-            },
+            }),
         );
         native.code.point_facts.insert(point, key);
         native.patch(point, eip, version.unit);
@@ -1296,7 +1287,8 @@ mod tests {
             store::branch(point, version.body)
         );
         assert!(native.code.invalidate_unit(eip));
-        assert!(!native.code.chains.contains_key(&eip));
+        assert!(native.code.tier1(eip).is_none());
+        assert!(native.code.tier1_chain(eip).is_none());
         assert_eq!(native.code.cache.word(point), b(4));
     }
 
@@ -1381,7 +1373,8 @@ mod tests {
             assert_eq!(state.eip, stop);
             assert_eq!(state.regs[0], u32::from(value));
             assert!(native.scratch_decodes.is_empty());
-            assert!(native.code.tier1_chain(HEAD).unwrap().unit.is_none());
+            assert!(native.code.tier1_chain(HEAD).is_none());
+            assert!(!native.code.tier1_words.contains_key(&HEAD));
             let reused = Arc::as_ptr(native.tier1_scratch.as_ref().unwrap());
             assert_eq!(*storage.get_or_insert(reused), reused);
             assert_eq!(native.code.pages_by_unit[&HEAD], [HEAD]);

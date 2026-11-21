@@ -79,6 +79,8 @@ Range guards over page facts use the Memory permission tables and stay outside t
 
 The chain has a resident prefix and a Tier-1 suffix. Dispatch, indirect slots, and same-head, countdown and REP continuations enter the checked Tier-1 suffix. Eligible backward links and outside direct arrivals enter the checked resident prefix. An empty key has no guards.
 
+Ordinary Tier-1 placements keep the checked entry directly. The store allocates version metadata for keyed placements and resident state for discovered entries. Only code with a discovery edge keeps Tier-1 instruction prices. The arbiter tracks first visits independently of site plans. The owner fault index stores offsets within the code cache.
+
 A failed key guard continues through its miss slot to the next checked version or the version-miss stub. A static edge that proves the key enters past those guards. A return continuation checks the facts its callee may change. Invalidation drops both segments.
 
 ### A64A-ROLE-6 Arbiter

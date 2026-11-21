@@ -751,13 +751,7 @@ impl Native {
     }
 
     pub(super) fn resolve_tables(&mut self, eip: u32, unit: usize) {
-        if !self.code.rows.contains_key(&eip)
-            || self.is_stop(eip)
-            || !self
-                .code
-                .tier1_chain(eip)
-                .is_some_and(|chain| chain.table_target)
-        {
+        if !self.code.rows.contains_key(&eip) || self.is_stop(eip) || !self.code.table_target(eip) {
             return;
         }
         self.code.publish_switch(eip, unit);
@@ -945,22 +939,18 @@ impl Native {
         if let Some(entry) = entry {
             self.code.helpers.extend(unit.helpers().iter().cloned());
             let table_target = unit.table_target;
-            let unit = if mask == 0 {
+            let chain = if mask == 0 {
                 self.tier1_scratch = Some(unit);
                 None
             } else {
-                Some(unit)
-            };
-            self.code.set_tier1(
-                eip,
-                Tier1Chain {
-                    table_target,
+                Some(Tier1Chain {
                     unit,
                     mask,
                     helpers,
                     versions: vec![Version { key, entry }],
-                },
-            );
+                })
+            };
+            self.code.set_tier1(eip, entry, table_target, chain);
             self.code.repoint_resident_fallback(eip, entry.unit);
             if mask != 0
                 && let Some(stats) = &mut self.code.version_stats
@@ -1015,14 +1005,14 @@ impl Native {
         observed: Key,
     ) -> Result<usize, String> {
         let Some(chain) = self.code.tier1_chain(eip) else {
+            // A fact transfer can reach an entry whose standalone unit has no facts.
+            if let Some(entry) = self.code.tier1(eip) {
+                return Ok(entry.unit);
+            }
             return self
                 .translate(memory, eip, observed)
                 .map(|entry| entry.unit);
         };
-        // A fact transfer can reach an entry whose standalone unit has no facts.
-        if chain.mask == 0 {
-            return Ok(chain.versions[0].entry.unit);
-        }
         let action = plan::tier1_miss(chain, observed);
         if let Some(stats) = &mut self.code.version_stats {
             stats.get_mut(&eip).unwrap().misses += 1;
@@ -1035,8 +1025,8 @@ impl Native {
                 joining,
             } => (key, position, joining),
         };
-        let chain = self.code.take_tier1(eip).unwrap();
-        let unit = chain.unit.as_ref().unwrap();
+        let chain = self.code.take_tier1_chain(eip).unwrap();
+        let unit = &chain.unit;
         let arrivals = self.code.counter(eip, position);
         let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;

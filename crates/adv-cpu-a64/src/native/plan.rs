@@ -410,6 +410,7 @@ pub(super) fn split_work(
 
 #[derive(Default)]
 pub(super) struct Arbiter {
+    seen: FxHashSet<u32>,
     sites: FxHashMap<u32, SitePlan>,
     checked: usize,
     pub(super) baseline_only: bool,
@@ -418,7 +419,6 @@ pub(super) struct Arbiter {
 
 #[derive(Default)]
 pub(super) struct SitePlan {
-    seen: bool,
     samples: u8,
     promoted: bool,
     strikes: u32,
@@ -482,11 +482,11 @@ impl Arbiter {
     }
 
     pub(super) fn ran(&self, eip: u32, first_visits: bool) -> bool {
-        !first_visits || self.sites.get(&eip).is_some_and(|site| site.seen)
+        !first_visits || self.seen.contains(&eip)
     }
 
     pub(super) fn first_visit(&mut self, eip: u32, enabled: bool, placed: bool) -> bool {
-        enabled && !placed && !std::mem::replace(&mut self.site(eip).seen, true)
+        enabled && !placed && self.seen.insert(eip)
     }
 
     pub(super) fn promoted(&self, eip: u32) -> bool {
