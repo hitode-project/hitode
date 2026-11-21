@@ -233,6 +233,7 @@ fn standalone_render_target_locks_read_gpu_pixels_and_upload_writes() {
     }
 }
 
+// spec: GFX-SWAP-1
 #[test]
 fn actual_windowed_lockable_parameters_preserve_flags_and_use_client_size() {
     let mut m = super::super::tests::machine();
@@ -246,7 +247,7 @@ fn actual_windowed_lockable_parameters_preserve_flags_and_use_client_size() {
         Flags: 1,
         ..D3DPRESENT_PARAMETERS::default()
     };
-    for flags in [0, 1, 2, 3] {
+    for flags in [0, 1, 2, 3, 0x10, 0x11, 0x12, 0x13] {
         let normalized = normalize(
             &env,
             D3DPRESENT_PARAMETERS {

@@ -560,12 +560,12 @@ pub(super) fn create_texture(
         || usage & !(1 | 0x200) != 0
         || (pool != 0 && usage != 0)
         || (usage & 1 != 0 && usage & 0x200 != 0)
-        || (matches!(format, 23 | 26 | 28) && usage & 1 != 0)
+        || (matches!(format, 23 | 26 | 28 | format::L8) && usage & 1 != 0)
     {
         let reason = if format::bytes(format).is_none() {
-            "pixel format is unsupported (supported: 21/22/23/26/28)"
-        } else if matches!(format, 23 | 26 | 28) && usage & 1 != 0 {
-            "packed or alpha-only render targets are unavailable; formats 23/26/28 support sampled textures"
+            "pixel format is unsupported (supported: 21/22/23/26/28/50)"
+        } else if matches!(format, 23 | 26 | 28 | format::L8) && usage & 1 != 0 {
+            "formats 23/26/28/50 support sampled textures"
         } else {
             "usage/pool or shared-handle combination is unsupported"
         };
@@ -594,15 +594,12 @@ pub(super) fn create_texture(
     if pool < 2 {
         let target = match env.ext.get::<State>().gpu.as_ref() {
             Some(g) if usage & 1 != 0 => g.target_levels(width, height, levels.len() as u32),
-            Some(g) => {
-                let texel = format::texel(format).unwrap();
-                let stored = if g.stores(texel) {
-                    texel
-                } else {
-                    adv_device::gpu::TexelFormat::Bgra8
-                };
-                g.texture_levels(width, height, levels.len() as u32, stored)
-            }
+            Some(g) => g.texture_levels(
+                width,
+                height,
+                levels.len() as u32,
+                format::texture_storage(g, format),
+            ),
             None => return Outcome::Return(UNAVAILABLE),
         };
         let target = match target {

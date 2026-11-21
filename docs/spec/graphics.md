@@ -251,7 +251,8 @@ Runs require equal effective scissors and fit within the existing neutral draw l
 A Present is guest-timed when its thread armed a one-shot WinMM event since
 the previous Present and its latest message wait in that interval waited for
 either that event or mouse button messages. The compositor still presents on its
-own refresh cycle.
+own refresh cycle. A surface supplying the compositor's base image uses visible
+refresh pacing even when its device window is hidden.
 
 ### GFX-SWAP-1 Implicit swap chain
 
@@ -260,9 +261,11 @@ own refresh cycle.
 
 `QueryInterface` supports `IUnknown` and `IDirect3DSwapChain9`. Public references
 retain the device; `GetDevice` adds a device reference. `GetPresentParameters`
-returns the normalized device parameters, including after Reset. Both `GetRasterStatus`
-methods use the host display phase, or machine-clock refresh phase, with one modeled
-blanking line after the visible rows. Nonzero Present flags are unsupported.
+returns the normalized device parameters, including after Reset. `CreateDevice`
+and `Reset` accept and preserve the advisory `D3DPRESENTFLAG_VIDEO` bit.
+Both `GetRasterStatus` methods use the host display phase, or machine-clock
+refresh phase, with one modeled blanking line after the visible rows. Nonzero
+Present flags are unsupported.
 Front-buffer capture retains the device method's unsupported failure contract.
 Like Wine, windowed presentation accepts equal-size source and destination
 rectangles independently of swap effect.
@@ -423,6 +426,11 @@ Pretransformed draws MUST retain index order.
 
 - The staging pool MUST choose the smallest free buffer that fits.
 - The pool MUST retain at most 64 MiB of free buffers.
+
+### GFX-SAMPLER-5 Luminance textures
+
+**Rule**: Sampled `D3DFMT_L8` textures MUST store one byte per guest texel and sample that byte in all three color channels with opaque alpha.
+**Verification**: Test
 
 ## Bounded buffers
 

@@ -810,6 +810,128 @@ impl Request for IoctlRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct RecvSocketRequest {
+    pub header: RequestHeader,
+    pub oob: i32,
+    pub r#async: [u8; 40],
+    pub force_async: i32,
+    pub _pad0: [u8; 4],
+}
+impl Default for RecvSocketRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            oob: 0,
+            r#async: [0; 40],
+            force_async: 0,
+            _pad0: [0; 4],
+        }
+    }
+}
+const _: () = assert!(size_of::<RecvSocketRequest>() == 64);
+const _: () = assert!(std::mem::offset_of!(RecvSocketRequest, oob) == 12);
+const _: () = assert!(std::mem::offset_of!(RecvSocketRequest, r#async) == 16);
+const _: () = assert!(std::mem::offset_of!(RecvSocketRequest, force_async) == 56);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RecvSocketReply {
+    pub header: ReplyHeader,
+    pub wait: u32,
+    pub options: u32,
+    pub nonblocking: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<RecvSocketReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(RecvSocketReply, wait) == 8);
+const _: () = assert!(std::mem::offset_of!(RecvSocketReply, options) == 12);
+const _: () = assert!(std::mem::offset_of!(RecvSocketReply, nonblocking) == 16);
+
+impl Request for RecvSocketRequest {
+    const NUMBER: i32 = 55;
+    type Reply = RecvSocketReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SendSocketRequest {
+    pub header: RequestHeader,
+    pub flags: u32,
+    pub r#async: [u8; 40],
+}
+impl Default for SendSocketRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            flags: 0,
+            r#async: [0; 40],
+        }
+    }
+}
+const _: () = assert!(size_of::<SendSocketRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(SendSocketRequest, flags) == 12);
+const _: () = assert!(std::mem::offset_of!(SendSocketRequest, r#async) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendSocketReply {
+    pub header: ReplyHeader,
+    pub wait: u32,
+    pub options: u32,
+    pub nonblocking: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SendSocketReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(SendSocketReply, wait) == 8);
+const _: () = assert!(std::mem::offset_of!(SendSocketReply, options) == 12);
+const _: () = assert!(std::mem::offset_of!(SendSocketReply, nonblocking) == 16);
+
+impl Request for SendSocketRequest {
+    const NUMBER: i32 = 56;
+    type Reply = SendSocketReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetAsyncDirectResultRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub information: u64,
+    pub status: u32,
+    pub mark_pending: i32,
+}
+const _: () = assert!(size_of::<SetAsyncDirectResultRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(SetAsyncDirectResultRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetAsyncDirectResultRequest, information) == 16);
+const _: () = assert!(std::mem::offset_of!(SetAsyncDirectResultRequest, status) == 24);
+const _: () = assert!(std::mem::offset_of!(SetAsyncDirectResultRequest, mark_pending) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetAsyncDirectResultReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetAsyncDirectResultReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(SetAsyncDirectResultReply, handle) == 8);
+
+impl Request for SetAsyncDirectResultRequest {
+    const NUMBER: i32 = 135;
+    type Reply = SetAsyncDirectResultReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct WriteRequest {
     pub header: RequestHeader,
     pub _pad0: [u8; 4],
