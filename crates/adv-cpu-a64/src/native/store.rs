@@ -16,7 +16,7 @@ use adv_cpu_core::{CpuState, Memory};
 
 pub(super) use crate::translate::lower::resident::OfferEntry;
 
-use crate::runtime::{self, Enter};
+use crate::runtime::{self, Enter, ShadowStack};
 use crate::translate::front::{Decodes, Unit, decode::Helper, trace::Trace};
 use crate::translate::lower::{
     Link, Site, Stubs, VersionLayout,
@@ -292,7 +292,7 @@ pub(super) struct CodeStore<R> {
     pub(super) generation: u64,
     /// The indirect table the runtime points at.
     pub(super) table: Box<[[u64; 2]]>,
-    pub(super) shadow: ShadowStack,
+    pub(super) shadow: Arc<ShadowStack>,
     pub(super) faults: Faults,
 }
 
@@ -1648,77 +1648,6 @@ pub(super) unsafe fn on_fault(
             faults.capture.record(site, pc, faults.stub, snapshot)
         })
         .unwrap_or(0)
-}
-
-/// The shadow return stack: entries of {host continuation, guest EIP}
-/// growing down from sentinels that never match, over guard pages.
-pub(super) struct ShadowStack {
-    base: *mut libc::c_void,
-    len: usize,
-    guard: usize,
-}
-
-impl ShadowStack {
-    const ENTRIES: usize = 1 << 16;
-
-    pub(super) fn new() -> Result<Self, String> {
-        // SAFETY: sysconf has no preconditions.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let guard = page.max(16 << 10);
-        let len = guard + (Self::ENTRIES + runtime::SHADOW_SENTINELS) * 16;
-        let len = len.next_multiple_of(page);
-        // SAFETY: a fresh anonymous mapping.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err("cannot map the shadow stack".into());
-        }
-        let stack = Self { base, len, guard };
-        // SAFETY: inside the mapping just made.
-        let protected = unsafe {
-            libc::mprotect(
-                base.cast::<u8>().add(guard).cast(),
-                len - guard,
-                libc::PROT_READ | libc::PROT_WRITE,
-            )
-        };
-        if protected != 0 {
-            return Err("cannot protect the shadow stack".into());
-        }
-        let top = stack.top() as *mut u64;
-        for k in 0..runtime::SHADOW_SENTINELS {
-            // SAFETY: the sentinels are the last entries of the mapping.
-            unsafe {
-                top.add(2 * k).write(0);
-                top.add(2 * k + 1).write(u64::MAX);
-            }
-        }
-        Ok(stack)
-    }
-
-    /// The empty stack pointer, just below the sentinels.
-    pub(super) fn top(&self) -> u64 {
-        (self.base as usize + self.len - runtime::SHADOW_SENTINELS * 16) as u64
-    }
-
-    pub(super) fn guard(&self) -> (usize, usize) {
-        (self.base as usize, self.base as usize + self.guard)
-    }
-}
-
-impl Drop for ShadowStack {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `new` made.
-        unsafe { libc::munmap(self.base, self.len) };
-    }
 }
 
 pub(super) struct WorkerFaults<'a> {

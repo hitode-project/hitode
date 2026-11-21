@@ -247,12 +247,21 @@ impl Executor {
             cpu,
             #[cfg(native)]
             offered: self.offered,
+            #[cfg(native)]
+            shadow: self
+                .native
+                .as_ref()
+                .and_then(crate::native::Native::save_shadow),
             resume: self.computation_resume,
             fuel_debt: self.fuel_debt,
         })
     }
 
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.restore_shadow(context.shadow.as_ref())?;
+        }
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
         #[cfg(native)]
@@ -959,6 +968,108 @@ mod host_call_tests;
 #[cfg(all(test, native))]
 mod speed_tests {
     use super::*;
+
+    // spec: A64-CTL-4 A64-CTL-5
+    #[test]
+    fn shadow_returns_follow_the_saved_guest_context() {
+        use adv_cpu_core::memory::{EXEC, READ, WRITE};
+
+        const OUTSIDE: u32 = 0x1_0000;
+        const HEAD: u32 = OUTSIDE + 0x4000;
+        const DATA: u32 = 0x2_0000;
+        const SECOND: u32 = OUTSIDE + 0x100;
+        const CALLEE: u32 = OUTSIDE + 0x200;
+        let mut executor = Executor::address_space().unwrap();
+        let memory = &mut executor.memory;
+        memory.map(OUTSIDE, 0x8000, READ | WRITE).unwrap();
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        for addr in [OUTSIDE, SECOND] {
+            let mut code = vec![0xff, 0xd6, 0xe9]; // call esi; jmp HEAD
+            code.extend((HEAD - (addr + 7)).to_le_bytes());
+            memory.write(addr, &code).unwrap();
+        }
+        let mut callee = vec![0x90; 128];
+        callee.push(0xc3);
+        memory.write(CALLEE, &callee).unwrap();
+        memory.protect(OUTSIDE, 0x8000, READ | EXEC).unwrap();
+        let native = executor.native.as_mut().unwrap();
+        native.count_resident_entries = true;
+        native.first_visits = false;
+        let blank = executor.save_context().unwrap();
+        let suspend = |executor: &mut Executor, entry, stack| {
+            executor.restore_context(&blank).unwrap();
+            executor.state.eip = entry;
+            executor.state.regs[4] = stack;
+            executor.state.regs[6] = CALLEE;
+            let run = executor
+                .native
+                .as_mut()
+                .unwrap()
+                .run(
+                    &mut executor.state,
+                    &mut executor.memory,
+                    HEAD,
+                    1,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!((executor.state.eip, run.retired), (CALLEE, 1));
+            executor.save_context().unwrap()
+        };
+        let a = suspend(&mut executor, OUTSIDE, DATA + 0x1000);
+        let b = suspend(&mut executor, SECOND, DATA + 0x2000);
+        let misses = |native: &crate::native::Native| {
+            native
+                .diagnostics
+                .plan_events
+                .get("lookup_miss")
+                .copied()
+                .unwrap_or_default()
+        };
+        let before = misses(executor.native.as_ref().unwrap());
+        for (saved, stack) in [(&a, DATA + 0x1000), (&b, DATA + 0x2000)] {
+            executor.restore_context(saved).unwrap();
+            let native = executor.native.as_mut().unwrap();
+            let run = native
+                .run(
+                    &mut executor.state,
+                    &mut executor.memory,
+                    HEAD,
+                    4096,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (executor.state.eip, executor.state.regs[4], run.retired),
+                (HEAD, stack, 130)
+            );
+            assert!(native.save_shadow().is_none());
+            assert_eq!(misses(native), before);
+        }
+
+        let saved = suspend(&mut executor, OUTSIDE, DATA + 0x1000);
+        assert!(saved.shadow.is_some());
+        executor.native.as_mut().unwrap().clear();
+        executor.restore_context(&saved).unwrap();
+        let native = executor.native.as_mut().unwrap();
+        assert!(native.save_shadow().is_none());
+        let run = native
+            .run(
+                &mut executor.state,
+                &mut executor.memory,
+                HEAD,
+                4096,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (executor.state.eip, executor.state.regs[4], run.retired),
+            (HEAD, DATA + 0x1000, 130)
+        );
+    }
 
     // spec: A64-CTL-7 A64-CTL-9
     #[test]

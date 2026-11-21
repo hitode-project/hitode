@@ -30,6 +30,46 @@ use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 impl Native {
+    pub(crate) fn save_shadow(&self) -> Option<super::SavedShadow> {
+        (self.runtime.shadow != self.runtime.shadow_top).then(|| super::SavedShadow {
+            stack: self.code.shadow.clone(),
+            generation: self.shadow_generation.clone(),
+            pointer: self.runtime.shadow,
+        })
+    }
+
+    pub(crate) fn restore_shadow(
+        &mut self,
+        saved: Option<&super::SavedShadow>,
+    ) -> Result<(), String> {
+        let saved = saved.filter(|saved| Arc::ptr_eq(&saved.generation, &self.shadow_generation));
+        let (next, pointer) = match saved {
+            Some(saved) => (
+                (!Arc::ptr_eq(&self.code.shadow, &saved.stack)).then(|| saved.stack.clone()),
+                saved.pointer,
+            ),
+            None if Arc::strong_count(&self.code.shadow) == 1 => (None, self.runtime.shadow_top),
+            None => {
+                let stack = match self.shadow_spare.take() {
+                    Some(stack) => stack,
+                    None => Arc::new(super::ShadowStack::new()?),
+                };
+                let top = stack.top();
+                (Some(stack), top)
+            }
+        };
+        if let Some(stack) = next {
+            self.code.faults.guard = stack.guard();
+            self.runtime.shadow_top = stack.top();
+            let previous = std::mem::replace(&mut self.code.shadow, stack);
+            if Arc::strong_count(&previous) == 1 {
+                self.shadow_spare = Some(previous);
+            }
+        }
+        self.runtime.shadow = pointer;
+        Ok(())
+    }
+
     /// Runs the unit at `cpu.eip` on positive fuel, allowing that unit's
     /// first prepaid region to finish. A fault returns
     /// `Exit::Event(Event::Replay)` with EIP at the faulting instruction and the guest state
@@ -757,6 +797,7 @@ impl Native {
     /// dropped units.
     pub(super) fn forget_dynamic(&mut self) {
         self.diagnostics.global_invalidations += 1;
+        Arc::make_mut(&mut self.shadow_generation);
         self.runtime.shadow = self.code.forget_dynamic();
     }
 

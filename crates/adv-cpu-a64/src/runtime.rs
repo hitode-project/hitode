@@ -476,13 +476,102 @@ pub(crate) struct ScopedOffer {
     pub(crate) generation: u64,
 }
 
+/// The shadow return stack: entries of {host continuation, guest EIP}
+/// growing down from sentinels that never match, over guard pages.
+#[cfg(native)]
+pub(crate) struct ShadowStack {
+    base: usize,
+    len: usize,
+    guard: usize,
+}
+
+#[cfg(native)]
+impl ShadowStack {
+    const ENTRIES: usize = 1 << 16;
+
+    pub(crate) fn new() -> Result<Self, String> {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let guard = page.max(16 << 10);
+        let len = guard + (Self::ENTRIES + SHADOW_SENTINELS) * 16;
+        let len = len.next_multiple_of(page);
+        // SAFETY: a fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err("cannot map the shadow stack".into());
+        }
+        let stack = Self {
+            base: base as usize,
+            len,
+            guard,
+        };
+        // SAFETY: inside the mapping just made.
+        let protected = unsafe {
+            libc::mprotect(
+                base.cast::<u8>().add(guard).cast(),
+                len - guard,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        if protected != 0 {
+            return Err("cannot protect the shadow stack".into());
+        }
+        let top = stack.top() as *mut u64;
+        for k in 0..SHADOW_SENTINELS {
+            // SAFETY: the sentinels are the last entries of the mapping.
+            unsafe {
+                top.add(2 * k).write(0);
+                top.add(2 * k + 1).write(u64::MAX);
+            }
+        }
+        Ok(stack)
+    }
+
+    /// The empty stack pointer, just below the sentinels.
+    pub(crate) fn top(&self) -> u64 {
+        (self.base + self.len - SHADOW_SENTINELS * 16) as u64
+    }
+
+    pub(crate) fn guard(&self) -> (usize, usize) {
+        (self.base, self.base + self.guard)
+    }
+}
+
+#[cfg(native)]
+impl Drop for ShadowStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made.
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub(crate) cpu: CpuState,
     #[cfg(native)]
     pub(crate) offered: Option<(u32, Option<ScopedOffer>)>,
+    #[cfg(native)]
+    pub(crate) shadow: Option<SavedShadow>,
     pub(crate) resume: Option<(u32, Exit)>,
     pub(crate) fuel_debt: u64,
+}
+
+/// A suspended owner's return predictions in their own guarded mapping.
+#[cfg(native)]
+#[derive(Clone)]
+pub(crate) struct SavedShadow {
+    pub(crate) stack: std::sync::Arc<ShadowStack>,
+    pub(crate) generation: std::sync::Arc<()>,
+    pub(crate) pointer: u64,
 }
 
 impl ExecutionContext {

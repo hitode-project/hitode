@@ -2283,6 +2283,7 @@ mod tests {
                 let context = Some(ExecutionContext {
                     cpu,
                     offered: Some((CODE, Some(offer))),
+                    shadow: None,
                     resume: None,
                     fuel_debt: 0,
                 });
@@ -2459,6 +2460,7 @@ mod tests {
         let context = Some(ExecutionContext {
             cpu,
             offered: Some((head, native.scoped_offer.take())),
+            shadow: None,
             resume: None,
             fuel_debt: 0,
         });
@@ -2728,6 +2730,7 @@ mod tests {
             let context = Some(ExecutionContext {
                 cpu: start.clone(),
                 offered: Some((head, Some(offer))),
+                shadow: None,
                 resume: None,
                 fuel_debt: 0,
             });

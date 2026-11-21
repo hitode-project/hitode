@@ -50,14 +50,14 @@ use adv_cpu_core::memory::accessible;
 use adv_cpu_core::memory::{Memory, READ, WRITE};
 use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 
-use crate::runtime::{self, Enter, Exit, Runtime, alias_base};
+use crate::runtime::{self, Enter, Exit, Runtime, SavedShadow, ShadowStack, alias_base};
 use crate::translate::front::{self, Unit, trace::Redirect};
 use crate::translate::jit::Features;
 use crate::translate::lower::Stubs;
 use crate::translate::lower::resident::ResidentCold;
 use crate::translate::opt;
 
-use store::{EMPTY, FaultCapture, Faults, InterpreterCause, ShadowStack, on_fault};
+use store::{EMPTY, FaultCapture, Faults, InterpreterCause, on_fault};
 
 pub(crate) mod compile;
 mod offload;
@@ -575,6 +575,10 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 
 pub(crate) struct Native {
     code: store::CodeStore<compile::ResidentRecovery>,
+    /// Saved return addresses are usable only while this token is current.
+    shadow_generation: Arc<()>,
+    /// Reused when a guest context starts with no return predictions.
+    shadow_spare: Option<Arc<ShadowStack>>,
     decodes: front::Decodes,
     scratch_decodes: front::Decodes,
     tier1_scratch: Option<Arc<Unit>>,
@@ -878,7 +882,7 @@ impl Native {
         let enter = Enter(base + stubs.enter);
         let opt_enter = Enter(base + stubs.opt_enter);
         let mut table = empty_table();
-        let shadow = ShadowStack::new()?;
+        let shadow = Arc::new(ShadowStack::new()?);
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
         runtime.table = table.as_mut_ptr() as u64;
         runtime.resident_access = (base + access_entry) as u64;
@@ -940,6 +944,8 @@ impl Native {
                 table,
                 shadow,
             },
+            shadow_generation: Arc::new(()),
+            shadow_spare: None,
             plans: plan::Arbiter::new(
                 std::env::var_os("ADV_A64_BASELINE").is_some_and(|value| value == "1"),
             ),
