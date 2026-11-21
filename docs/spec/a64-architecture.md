@@ -34,7 +34,7 @@ Every module MAY use `policy` and MAY use `jit_map` behind its enable switch. On
 
 ### A64A-ROLE-2 Front end
 
-**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST reuse valid instruction snapshots for non-writable entry pages and use reusable scratch snapshots for writable entry pages. The front end MAY name encoder operation types but MUST NOT call encoders or emit host code.
+**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST use reusable scratch snapshots for writable entry pages and Tier-1-only machines, and reuse valid instruction snapshots for other builds. The front end MAY name encoder operation types but MUST NOT call encoders or emit host code.
 **Applies to**: AArch64
 **Verification**: Test
 
@@ -200,3 +200,6 @@ The countdown uses a literal address or a fixed runtime slot, followed by a load
 **Rule**: A Tier-1 version miss MAY build on the owner. A fact-version rebuild MUST reuse the site's unit without reading or decoding guest code.
 **Applies to**: AArch64
 **Verification**: Test
+
+Closing an execution owner MUST discard queued compilation and wait for any
+compilation already in flight to finish.

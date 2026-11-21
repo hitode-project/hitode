@@ -304,6 +304,14 @@ impl Executor {
         let _ = enabled;
     }
 
+    /// Use ordinary translation for a short-lived machine. Set before execution.
+    pub fn use_tier1_only(&mut self) {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.use_tier1_only();
+        }
+    }
+
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
         if deadline.is_some() && self.alarm.is_none() {

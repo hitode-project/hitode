@@ -576,7 +576,7 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 pub(crate) struct Native {
     code: store::CodeStore<compile::ResidentRecovery>,
     decodes: front::Decodes,
-    writable_decodes: front::Decodes,
+    scratch_decodes: front::Decodes,
     tier1_scratch: Option<Arc<Unit>>,
     plans: plan::Arbiter,
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
@@ -887,7 +887,7 @@ impl Native {
         runtime.shadow = shadow.top();
         Ok(Self {
             decodes: front::Decodes::default(),
-            writable_decodes: front::Decodes::default(),
+            scratch_decodes: front::Decodes::default(),
             tier1_scratch: None,
             code: store::CodeStore {
                 resident_exit: base + stubs.resident_exit,
@@ -988,17 +988,21 @@ impl Native {
         self.runtime.body.services = services;
     }
 
+    pub(crate) fn use_tier1_only(&mut self) {
+        self.plans.baseline_only = true;
+    }
+
     pub(crate) fn set_spin_yield(&mut self, enabled: bool) {
         self.runtime.spin_yield = u32::from(enabled);
     }
 
     pub(crate) fn translation_decodes(&self) -> front::DecodeCounts {
         let cached = self.decodes.counts;
-        let writable = self.writable_decodes.counts;
+        let scratch = self.scratch_decodes.counts;
         front::DecodeCounts {
-            quick: cached.quick + writable.quick,
-            full: cached.full + writable.full,
-            code_reads: cached.code_reads + writable.code_reads,
+            quick: cached.quick + scratch.quick,
+            full: cached.full + scratch.full,
+            code_reads: cached.code_reads + scratch.code_reads,
         }
     }
 
@@ -1073,9 +1077,9 @@ impl Native {
         summarize: bool,
         observed: Option<&[u32; 8]>,
     ) -> Arc<Unit> {
-        let writable = accessible(memory, eip, 1, WRITE);
-        let decodes = if writable {
-            &mut self.writable_decodes
+        let transient = self.plans.baseline_only || accessible(memory, eip, 1, WRITE);
+        let decodes = if transient {
+            &mut self.scratch_decodes
         } else {
             &mut self.decodes
         };
@@ -1119,7 +1123,7 @@ impl Native {
         if summarize {
             unit.summarize(decodes);
         }
-        if writable {
+        if transient {
             decodes.recycle();
         }
         storage
@@ -1361,7 +1365,7 @@ mod tests {
             assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 1);
             assert_eq!(state.eip, stop);
             assert_eq!(state.regs[0], u32::from(value));
-            assert!(native.writable_decodes.is_empty());
+            assert!(native.scratch_decodes.is_empty());
             assert!(native.code.tier1_chain(HEAD).unwrap().unit.is_none());
             let reused = Arc::as_ptr(native.tier1_scratch.as_ref().unwrap());
             assert_eq!(*storage.get_or_insert(reused), reused);

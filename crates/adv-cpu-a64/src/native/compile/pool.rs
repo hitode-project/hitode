@@ -350,17 +350,19 @@ struct Pool {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     done: Sender<Compiled>,
     results: Receiver<Compiled>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Pool {
     fn new() -> Self {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let (done, results) = channel();
-        let workers =
+        let count =
             std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
-        for _ in 0..workers {
+        let mut workers = Vec::with_capacity(count);
+        for _ in 0..count {
             let (queue, done) = (queue.clone(), done.clone());
-            std::thread::Builder::new()
+            let worker = std::thread::Builder::new()
                 .name("guest compile".into())
                 .spawn(move || {
                     set_priority();
@@ -386,6 +388,9 @@ impl Pool {
                         };
                         let mut compiled = compile(request);
                         let mut queue = lock.lock().unwrap();
+                        if queue.closed {
+                            return;
+                        }
                         queue.active.remove(&compiled.eip);
                         if queue
                             .pending
@@ -401,11 +406,13 @@ impl Pool {
                     }
                 })
                 .expect("compile thread");
+            workers.push(worker);
         }
         Self {
             queue,
             done,
             results,
+            workers,
         }
     }
 
@@ -425,8 +432,15 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         let (lock, ready) = &*self.queue;
-        lock.lock().unwrap().closed = true;
+        {
+            let mut queue = lock.lock().unwrap();
+            queue.closed = true;
+            queue.pending.clear();
+        }
         ready.notify_all();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -500,5 +514,19 @@ fn set_priority() {
     // SAFETY: sets this thread's own QoS class.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: A64A-PLACE-4
+    #[test]
+    fn dropping_the_compiler_waits_for_its_workers() {
+        let pool = Pool::new();
+        let queue = pool.queue.clone();
+        drop(pool);
+        assert_eq!(Arc::strong_count(&queue), 1);
     }
 }

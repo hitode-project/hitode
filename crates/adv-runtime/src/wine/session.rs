@@ -695,6 +695,7 @@ impl Session {
         let audio = adv_device::AudioControl::new(true);
         if !host.booted() {
             let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
+            boot.cpu.executor_mut().use_tier1_only();
             boot.ext.insert(prepared.mounts.clone());
             let command_line = format!("\"{WINEBOOT}\" --restart");
             let startup = Startup {
