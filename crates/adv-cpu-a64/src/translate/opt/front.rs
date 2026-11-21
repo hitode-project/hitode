@@ -29,7 +29,7 @@ mod x87;
 pub(crate) struct Built {
     pub func: Func,
     pub assumed: Assumed,
-    /// Appended-path instructions that leave instead of running.
+    /// Instructions that leave instead of running.
     pub cuts: usize,
     /// Guest EIPs of entry page facts, with u32::MAX for the frame.
     pub plain_sites: Vec<u32>,
@@ -189,7 +189,23 @@ fn build_form(
     split: bool,
 ) -> Result<Built, Reject> {
     let mut cut = vec![false; unit.trace.len()];
-    let mut view = None::<Unit>;
+    let mut pending_wait = false;
+    if at.x87.status & 0x80 != 0 {
+        for (cut, inst) in cut.iter_mut().zip(&unit.trace.insts) {
+            *cut = match inst.op {
+                decode::Op::X87(x) => x.waits(),
+                decode::Op::Fild64(..) => true,
+                _ => false,
+            };
+        }
+        if let Some(first) = cut.iter().position(|&cut| cut) {
+            if first == 0 || scope.is_some() {
+                return Err(Reject::Mode(first));
+            }
+            pending_wait = true;
+        }
+    }
+    let mut view = pending_wait.then(|| unit.cut(&cut));
     loop {
         let reject = match build_trace(
             view.as_ref().unwrap_or(unit),
@@ -198,6 +214,7 @@ fn build_form(
             resident.as_ref(),
             scope,
             split,
+            pending_wait,
         ) {
             Ok((func, assumed, plain_sites)) => {
                 let cuts = cut.iter().filter(|&&c| c).count();
@@ -227,6 +244,7 @@ fn build_trace(
     resident: Option<&Resident<'_>>,
     scope: Option<&Proof>,
     split: bool,
+    pending_wait: bool,
 ) -> Result<(Func, Assumed, Vec<u32>), Reject> {
     let scope_access = scope
         .and_then(Proof::scope_frame)
@@ -246,9 +264,12 @@ fn build_trace(
     {
         return Err(Reject::Unsupported(unit.trace.primary + i));
     }
-    let x87 = insts
-        .iter()
-        .any(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)));
+    // The cut form still needs the entry guard when all its x87
+    // instructions were removed. Clear status must select the uncut form.
+    let x87 = pending_wait
+        || insts
+            .iter()
+            .any(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)));
     let mmx_index = insts
         .iter()
         .position(|i| matches!(i.op, decode::Op::Simd(s) if s.mmx()));

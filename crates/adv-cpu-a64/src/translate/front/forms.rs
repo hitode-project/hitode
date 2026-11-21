@@ -192,6 +192,12 @@ pub struct X87 {
     pub opcode: Option<u16>,
 }
 
+impl X87 {
+    pub(crate) fn waits(self) -> bool {
+        !matches!(self.fast, Fast::StoreControl | Fast::StoreStatus)
+    }
+}
+
 /// An operand of a SIMD instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Loc {

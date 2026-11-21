@@ -180,8 +180,7 @@ impl Translator<'_> {
         self.cpu();
         let slow = self.asm.label();
         let done = self.asm.label();
-        let waits = !matches!(x.fast, Fast::StoreControl | Fast::StoreStatus);
-        self.x87_state(waits, slow);
+        self.x87_state(x.waits(), slow);
         if x.fast != Fast::Wait {
             self.emit_all(&[
                 ubfx(W, X15, X13, 11, 3),

@@ -119,6 +119,56 @@ fn resident_reloads_a_saved_frame_pointer_after_a_control_word_store() {
     assert_eq!(trial.live.state.regs[0], 42);
 }
 
+// spec: A64A-FALL-4 A64-OPT-4 A64-OPT-9
+#[test]
+fn resident_delivers_pending_x87_exception_at_the_waiting_instruction() {
+    for integer_load in [false, true] {
+        let image = Image::loop_body(|a, head, _| {
+            let mut latch_label = a.create_label();
+            a.fnstcw(word_ptr(edi + 8)).unwrap();
+            a.test(ebx, ebx).unwrap();
+            a.jz(latch_label).unwrap();
+            if integer_load {
+                a.fild(qword_ptr(esi)).unwrap();
+            } else {
+                a.fld1().unwrap();
+            }
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.set_label(&mut latch_label).unwrap();
+            latch(a, head);
+        });
+        for (pending, take_waiting) in [(true, true), (true, false), (false, true)] {
+            let mut state = initial(3);
+            state.regs[3] = u32::from(take_waiting);
+            state.x87.status = if pending { 0x80a1 } else { 0x20 };
+            state.x87.control = 0x027e;
+            if !pending {
+                // The successful arm pushes and pops 1.0 in the empty slot.
+                state.x87.regs[7] = adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff);
+            }
+            let mut trial = Trial::new(&image, &state, "x87 exception boundary", &[], |memory| {
+                memory.write(DATA, &1u64.to_le_bytes()).unwrap();
+            });
+            trial.live.native.as_mut().unwrap().count_resident_entries = true;
+            let mut nomination = state;
+            nomination.regs[3] = 0;
+            assert!(trial.try_install_at(nomination));
+
+            let serial = trial.reference.run(trial.stop, 128).unwrap();
+            if pending && take_waiting {
+                assert!(matches!(serial, RunOutcome::Trap { vector: 16, .. }));
+            } else {
+                assert_eq!(serial, RunOutcome::ReachedStop);
+            }
+            assert_eq!(trial.live.run(trial.stop, 128).unwrap(), serial);
+            trial.same_state();
+            trial.same_position_and_memory(0, false);
+            let diag = &trial.live.native.as_ref().unwrap().diagnostics;
+            assert_eq!(diag.resident_entries, 1);
+        }
+    }
+}
+
 struct Trial<'a> {
     live: Executor,
     reference: Executor,
