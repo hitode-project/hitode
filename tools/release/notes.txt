@@ -11,7 +11,7 @@ Hitode {version} improves performance and compatibility. / Hitode {version} 提�
 |---|---|
 | macOS (Apple silicon, macOS 11+) | `Hitode-{version}-macos-arm64.dmg` |
 | Android (ARMv8-A 64-bit) | `Hitode-{version}-android-arm64.apk` |
-| iOS / iPadOS (development signing / 开发签名) | `Hitode-{version}-ios-unsigned.ipa` |
+| iOS / iPadOS (development signing / 开发签名) | `Hitode-{version}-ios.ipa` |
 | iOS / iPadOS (TrollStore) | `Hitode-{version}-ios-trollstore.ipa` |
 
 Checksums / 校验值：`SHA256SUMS.txt`. Licenses / 许可证：`Hitode-{version}-licenses.zip`. Wine source / Wine 源码：`wine-11.0.tar.xz`.
