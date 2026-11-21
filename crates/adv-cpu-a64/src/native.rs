@@ -576,7 +576,8 @@ pub(crate) fn deadline(at: std::time::Instant) -> u64 {
 pub(crate) struct Native {
     code: store::CodeStore<compile::ResidentRecovery>,
     decodes: front::Decodes,
-    front_units: FxHashMap<u32, front::Site>,
+    writable_decodes: front::Decodes,
+    tier1_scratch: Option<Arc<Unit>>,
     plans: plan::Arbiter,
     pub(crate) images: std::rc::Rc<std::cell::RefCell<Vec<(u32, u32)>>>,
     bridge: *mut std::ffi::c_void,
@@ -886,7 +887,8 @@ impl Native {
         runtime.shadow = shadow.top();
         Ok(Self {
             decodes: front::Decodes::default(),
-            front_units: FxHashMap::default(),
+            writable_decodes: front::Decodes::default(),
+            tier1_scratch: None,
             code: store::CodeStore {
                 resident_exit: base + stubs.resident_exit,
                 rows: FxHashMap::default(),
@@ -991,7 +993,13 @@ impl Native {
     }
 
     pub(crate) fn translation_decodes(&self) -> front::DecodeCounts {
-        self.decodes.counts
+        let cached = self.decodes.counts;
+        let writable = self.writable_decodes.counts;
+        front::DecodeCounts {
+            quick: cached.quick + writable.quick,
+            full: cached.full + writable.full,
+            code_reads: cached.code_reads + writable.code_reads,
+        }
     }
 
     pub(super) fn is_stop(&self, eip: u32) -> bool {
@@ -1065,55 +1073,56 @@ impl Native {
         summarize: bool,
         observed: Option<&[u32; 8]>,
     ) -> Arc<Unit> {
-        let site = self.front_units.entry(eip).or_default();
-        let mut guarded = None;
-        let shape = if observed.is_some() {
-            &mut guarded
-        } else if loops {
-            &mut site.hot
+        let writable = accessible(memory, eip, 1, WRITE);
+        let decodes = if writable {
+            &mut self.writable_decodes
         } else {
-            &mut site.cold
+            &mut self.decodes
         };
-        let unit = shape.get_or_insert_with(|| {
-            let handler = if self.bridge.is_null() {
-                None
-            } else {
-                // SAFETY: preparation stays within this owner's bridge call.
-                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
-                    .handler
-                    .as_ref()
-            };
-            let mut unit = Unit::default();
-            unit.images.clone_from(&self.images.borrow());
-            unit.build_cached(
-                memory,
-                eip,
-                &self.stops,
-                &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
-                &|pc| {
-                    let handler = handler?;
-                    let (target, original) = handler.redirect(pc)?;
-                    Some(Redirect {
-                        target,
-                        original: original.to_vec(),
-                        checks: handler.redirect_checks(pc).to_vec(),
-                        body: handler.direct_body(pc),
-                    })
-                },
-                (loops, observed),
-                &mut self.decodes,
-            );
-            self.code
-                .watch_pages(memory, eip, unit.code(), &mut self.decodes);
-            unit.prepare_regions(memory, &|pc, code| {
-                handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
-            });
-            Arc::new(unit)
+        let handler = if self.bridge.is_null() {
+            None
+        } else {
+            // SAFETY: preparation stays within this owner's bridge call.
+            unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                .handler
+                .as_ref()
+        };
+        let mut storage = if summarize {
+            Arc::default()
+        } else {
+            self.tier1_scratch.take().unwrap_or_default()
+        };
+        let unit = Arc::get_mut(&mut storage).unwrap();
+        unit.images.clone_from(&self.images.borrow());
+        unit.build_cached(
+            memory,
+            eip,
+            &self.stops,
+            &|pc, word| handler.and_then(|handler| handler.host_thunk(pc, word)),
+            &|pc| {
+                let handler = handler?;
+                let (target, original) = handler.redirect(pc)?;
+                Some(Redirect {
+                    target,
+                    original: original.to_vec(),
+                    checks: handler.redirect_checks(pc).to_vec(),
+                    body: handler.direct_body(pc),
+                })
+            },
+            (loops, observed),
+            decodes,
+        );
+        self.code.watch_pages(memory, eip, unit.code(), decodes);
+        unit.prepare_regions(memory, &|pc, code| {
+            handler.map_or_else(Vec::new, |handler| handler.native_region(pc, code))
         });
-        if summarize && unit.trace.x86.is_empty() {
-            Arc::make_mut(unit).summarize(&mut self.decodes);
+        if summarize {
+            unit.summarize(decodes);
         }
-        Arc::clone(unit)
+        if writable {
+            decodes.recycle();
+        }
+        storage
     }
 
     fn classify(&mut self, memory: &mut Memory) {
@@ -1212,7 +1221,8 @@ mod tests {
         native.code.set_tier1(
             eip,
             store::Tier1Chain {
-                unit: Arc::default(),
+                unit: None,
+                table_target: false,
                 mask: 0,
                 helpers: 0,
                 versions: vec![store::Version {
@@ -1250,7 +1260,8 @@ mod tests {
         native.code.set_tier1(
             eip,
             Tier1Chain {
-                unit: Arc::default(),
+                unit: Some(Arc::default()),
+                table_target: false,
                 mask: key.mask(),
                 helpers: 0,
                 versions: vec![Version {
@@ -1333,6 +1344,35 @@ mod tests {
     // mov [edi],eax; add edi,4; dec ecx; jne HEAD; int3
     const STORE_LOOP: &[u8] = &[0x89, 0x07, 0x83, 0xc7, 4, 0x49, 0x75, 0xf8, 0xcc];
 
+    // spec: A64A-ROLE-2 A64A-PLACE-4
+    #[test]
+    fn writable_unkeyed_units_release_front_end_storage_after_placement() {
+        let (mut memory, mut native) = native();
+        let stop = HEAD + 5;
+        native.observe_stop(stop);
+        native.first_visits = false;
+        memory
+            .map(HEAD, 4096, READ | WRITE | adv_cpu_core::EXEC)
+            .unwrap();
+        let mut storage = None;
+        for value in [1, 2] {
+            memory.write(HEAD, &[0xb8, value, 0, 0, 0]).unwrap(); // mov eax, value
+            let mut state = cpu(HEAD, 0, 0);
+            assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 1);
+            assert_eq!(state.eip, stop);
+            assert_eq!(state.regs[0], u32::from(value));
+            assert!(native.writable_decodes.is_empty());
+            assert!(native.code.tier1_chain(HEAD).unwrap().unit.is_none());
+            let reused = Arc::as_ptr(native.tier1_scratch.as_ref().unwrap());
+            assert_eq!(*storage.get_or_insert(reused), reused);
+            assert_eq!(native.code.pages_by_unit[&HEAD], [HEAD]);
+        }
+        assert_eq!(native.diagnostics.dropped_units, 1);
+        native.clear();
+        assert!(!native.code.pages_by_unit.contains_key(&HEAD));
+        assert!(!native.code.pages.contains_key(&HEAD));
+    }
+
     // spec: A64A-FALL-3
     #[test]
     fn fact_transfer_at_an_unkeyed_entry_reuses_the_tier1_body() {
@@ -1386,7 +1426,7 @@ mod tests {
             .protect(HEAD, 4096, READ | adv_cpu_core::EXEC)
             .unwrap();
         native.invalidate(&mut memory);
-        assert!(!native.front_units.contains_key(&HEAD));
+        assert!(native.code.tier1(HEAD).is_none());
         native
             .translate(&mut memory, HEAD, crate::facts::Key::default())
             .unwrap();

@@ -571,7 +571,10 @@ impl Native {
                 return;
             }
             ColdAction::CheckStream => {
-                head.check_stream(compile::stream_sites(&site_versions.unit, site), site);
+                head.check_stream(
+                    compile::stream_sites(site_versions.unit.as_ref().unwrap(), site),
+                    site,
+                );
                 crate::jit_map::optimized(
                     eip,
                     format_args!("resident\tchecked\t{site}\t{reason:?}"),
@@ -705,12 +708,10 @@ impl Native {
     pub(super) fn resolve_tables(&mut self, eip: u32, unit: usize) {
         if !self.code.rows.contains_key(&eip)
             || self.is_stop(eip)
-            || !self.front_units.get(&eip).is_some_and(|site| {
-                site.hot
-                    .as_ref()
-                    .or(site.cold.as_ref())
-                    .is_some_and(|unit| unit.table_target)
-            })
+            || !self
+                .code
+                .tier1_chain(eip)
+                .is_some_and(|chain| chain.table_target)
         {
             return;
         }
@@ -741,7 +742,6 @@ impl Native {
     /// Drops the unit at `eip`, if any, and restores the link points that
     /// branch to it; the caller forgets dynamic targets.
     pub(super) fn drop_unit(&mut self, eip: u32) -> bool {
-        self.front_units.remove(&eip);
         self.remove_scoped_jobs(eip);
         let dropped = self.code.invalidate_unit(eip);
         self.plans.invalidate(eip);
@@ -898,9 +898,17 @@ impl Native {
         let entry = self.place_tier1(memory, eip, &work, &unit, key, true);
         if let Some(entry) = entry {
             self.code.helpers.extend(unit.helpers().iter().cloned());
+            let table_target = unit.table_target;
+            let unit = if mask == 0 {
+                self.tier1_scratch = Some(unit);
+                None
+            } else {
+                Some(unit)
+            };
             self.code.set_tier1(
                 eip,
                 Tier1Chain {
+                    table_target,
                     unit,
                     mask,
                     helpers,
@@ -913,6 +921,8 @@ impl Native {
             {
                 stats.get_mut(&eip).unwrap().built += 1;
             }
+        } else {
+            self.tier1_scratch = Some(unit);
         }
         self.compiler.tier1 = work;
         entry
@@ -980,11 +990,12 @@ impl Native {
             } => (key, position, joining),
         };
         let chain = self.code.take_tier1(eip).unwrap();
+        let unit = chain.unit.as_ref().unwrap();
         let arrivals = self.code.counter(eip, position);
         let mut work = std::mem::take(&mut self.compiler.tier1);
         let all = self.checks != Checks::Adaptive;
         work.lower_tier1(
-            &chain.unit,
+            unit,
             eip,
             &|pc| all || self.plans.checked(pc),
             chain.helpers,
@@ -995,7 +1006,7 @@ impl Native {
             key,
             arrivals,
         );
-        let entry = self.place_tier1(memory, eip, &work, &chain.unit, key, false);
+        let entry = self.place_tier1(memory, eip, &work, unit, key, false);
         self.compiler.tier1 = work;
         let Some(entry) = entry else {
             self.clear();
@@ -1150,7 +1161,7 @@ impl Native {
         let site = self.code.resident(eip).unwrap();
         let unit = unit.unwrap_or_else(|| match task {
             compile::Task::Replace(index) => Arc::clone(&site.versions[index].unit),
-            _ => Arc::clone(&site.unit),
+            _ => Arc::clone(site.unit.as_ref().unwrap()),
         });
         let checked = unit
             .trace
@@ -1247,6 +1258,8 @@ impl Native {
                 .resident(eip)
                 .unwrap()
                 .unit
+                .as_ref()
+                .unwrap()
                 .trace
                 .reaches_latch_without(&|pc| head.cuts.contains(&pc))
             {
@@ -1539,6 +1552,7 @@ impl Native {
         let site = self.code.resident_mut(eip).unwrap();
         site.versions.clear();
         site.row_entry = None;
+        site.unit = None;
     }
 
     /// Budget samples select Tier-1 loop traces.

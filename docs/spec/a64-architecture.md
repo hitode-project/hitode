@@ -34,13 +34,13 @@ Every module MAY use `policy` and MAY use `jit_map` behind its enable switch. On
 
 ### A64A-ROLE-2 Front end
 
-**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST decode each guest instruction at most once until its code is invalidated. The front end MAY name encoder operation types but MUST NOT call encoders or emit host code.
+**Rule**: The translation front end MUST be the only module in `adv-cpu-a64` that decodes guest bytes. It MUST reuse valid instruction snapshots for non-writable entry pages and use reusable scratch snapshots for writable entry pages. The front end MAY name encoder operation types but MUST NOT call encoders or emit host code.
 **Applies to**: AArch64
 **Verification**: Test
 
-A site's immutable unit holds decoded operations, control flow, inlined frames, switch tables, addressing streams, access summaries and watched code spans. The first build prepares the cold shape, using a shared scratch index to resolve internal branches. Promotion or resident discovery MAY extend the unit with previously undecoded instructions. Tier-1 lowering reuses the existing trace when it has no internal edge eligible for resident entry. First visits execute in the core interpreter under A64-TR-2.
+A unit holds decoded operations, control flow, inlined frames, switch tables, addressing streams, access summaries and watched code spans. Tier-1 builds use reusable trace storage. The store keeps the immutable trace only for a nonempty Tier-1 key or a live resident form or job. Promotion and resident discovery MAY extend a trace with previously undecoded instructions. First visits execute in the core interpreter under A64-TR-2.
 
-The page index records one dependency per site and page across all live shapes. Dropping a site removes its entries from every page it depended on. Clearing generated code keeps the index for the retained front-end shapes.
+The page index records one dependency per site and page across all live shapes and placements. Dropping a site removes its entries from every page it depended on. Clearing generated code clears the placement index. Guest memory keeps watching decoded bytes so that writes still invalidate retained snapshots.
 
 ## Tier-1 modules
 
@@ -197,6 +197,6 @@ The countdown uses a literal address or a fixed runtime slot, followed by a load
 
 ### A64A-PLACE-4 Build location
 
-**Rule**: A Tier-1 version miss MAY build on the owner. A rebuild MUST reuse the site's unit without reading or decoding guest code.
+**Rule**: A Tier-1 version miss MAY build on the owner. A fact-version rebuild MUST reuse the site's unit without reading or decoding guest code.
 **Applies to**: AArch64
 **Verification**: Test

@@ -600,12 +600,25 @@ pub(crate) struct DecodeCounts {
 #[derive(Default)]
 pub(crate) struct Decodes {
     pages: FxHashMap<u32, FxHashMap<u32, Entry>>,
+    spare_page: FxHashMap<u32, Entry>,
     pending: Vec<(u32, u32)>,
     pub(super) trace_slots: Vec<u16>,
     pub counts: DecodeCounts,
 }
 
 impl Decodes {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub(crate) fn recycle(&mut self) {
+        if let Some((_, mut page)) = self.pages.drain().next() {
+            page.clear();
+            self.spare_page = page;
+        }
+    }
+
     pub(crate) fn invalidate(&mut self, page: u32) {
         self.pages.remove(&page);
         if let Some(previous) = page.checked_sub(4096)
@@ -761,7 +774,7 @@ impl Fetcher {
         let entry = decodes
             .pages
             .entry(pc & !0xfff)
-            .or_default()
+            .or_insert_with(|| std::mem::take(&mut decodes.spare_page))
             .entry(pc)
             .or_insert_with(|| {
                 decodes.counts.code_reads += 1;

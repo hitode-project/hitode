@@ -37,7 +37,7 @@ pub(super) const EMPTY: [u64; 2] = [u64::MAX, 0];
 
 pub(super) struct Chain<R> {
     pub(super) tier1: Option<Tier1Chain>,
-    pub(super) resident: Option<ResidentSite<R>>,
+    pub(super) resident: Option<Box<ResidentSite<R>>>,
     offer: Option<(usize, usize)>,
 }
 
@@ -52,7 +52,8 @@ impl<R> Default for Chain<R> {
 }
 
 pub(super) struct Tier1Chain {
-    pub(super) unit: Arc<Unit>,
+    pub(super) unit: Option<Arc<Unit>>,
+    pub(super) table_target: bool,
     pub(super) mask: u64,
     pub(super) helpers: u32,
     pub(super) versions: Vec<Version>,
@@ -112,7 +113,7 @@ pub(super) struct SlowPaths {
 }
 
 pub(super) struct ResidentSite<R> {
-    pub unit: Arc<Unit>,
+    pub unit: Option<Arc<Unit>>,
     pub sample: Box<Cell<u32>>,
     pub versions: Vec<ResidentVersion<R>>,
     pub fallback: usize,
@@ -335,16 +336,16 @@ impl<R> CodeStore<R> {
     }
 
     pub(super) fn resident(&self, eip: u32) -> Option<&ResidentSite<R>> {
-        self.chains.get(&eip)?.resident.as_ref()
+        self.chains.get(&eip)?.resident.as_deref()
     }
 
     pub(super) fn resident_mut(&mut self, eip: u32) -> Option<&mut ResidentSite<R>> {
-        self.chains.get_mut(&eip)?.resident.as_mut()
+        self.chains.get_mut(&eip)?.resident.as_deref_mut()
     }
 
     pub(super) fn prepare_resident(&mut self, eip: u32, unit: Arc<Unit>, sample: u32) {
-        self.chains.entry(eip).or_default().resident = Some(ResidentSite {
-            unit,
+        self.chains.entry(eip).or_default().resident = Some(Box::new(ResidentSite {
+            unit: Some(unit),
             sample: Box::new(sample.into()),
             versions: Vec::new(),
             fallback: 0,
@@ -353,7 +354,7 @@ impl<R> CodeStore<R> {
             row_feedback: None,
             row_router_words: 0,
             row_retry: None,
-        });
+        }));
     }
 
     pub(super) fn publish_split(&mut self, eip: u32, index: u8, threshold: Option<u64>) {
@@ -560,7 +561,7 @@ impl<R> CodeStore<R> {
             entry.form,
             words,
             eip,
-            site.unit.trace.prepaid(0),
+            site.unit.as_ref().unwrap().trace.prepaid(0),
             layout.marks,
             "a64-resident",
         );
@@ -967,7 +968,7 @@ impl<R> CodeStore<R> {
         let site = self
             .chains
             .get(&eip)
-            .and_then(|chain| chain.resident.as_ref());
+            .and_then(|chain| chain.resident.as_deref());
         for edge in self.internal_edges.get_mut(&eip).into_iter().flatten() {
             Self::route_internal(
                 &mut self.cache,
@@ -990,6 +991,8 @@ impl<R> CodeStore<R> {
             edge.back
                 || !site
                     .unit
+                    .as_ref()
+                    .unwrap()
                     .trace
                     .insts
                     .iter()
@@ -1149,6 +1152,8 @@ impl<R> CodeStore<R> {
     pub(super) fn clear(&mut self) {
         self.cache.truncate(self.stub_len);
         self.chains.clear();
+        self.pages_by_unit.clear();
+        self.pages.clear();
         self.rows.clear();
         self.table_sources.clear();
         self.uses_permissions = false;
@@ -1396,7 +1401,7 @@ impl<R> CodeStore<R> {
                 self.cache.patch(sensor, branch(sensor, edge.target));
             }
             let chain = self.chains.get(&link.eip);
-            let resident = chain.and_then(|chain| chain.resident.as_ref());
+            let resident = chain.and_then(|chain| chain.resident.as_deref());
             if resident.is_some() || value == u32::MAX {
                 let offer = chain
                     .filter(|chain| {

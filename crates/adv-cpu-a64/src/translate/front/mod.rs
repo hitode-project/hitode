@@ -18,7 +18,7 @@ pub(crate) mod tags {
     pub use iced_x86::{Code, ConditionCode, Mnemonic, OpAccess, Register, RflagsBits};
 }
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use adv_cpu_core::{Memory, native_region::NativeRegion};
 use decode::Helper;
@@ -128,14 +128,6 @@ pub(crate) fn instruction_form(memory: &adv_cpu_core::Memory, eip: u32) -> Optio
     let mut decoder =
         iced_x86::Decoder::with_ip(32, &bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
     Some(decoder.decode().code())
-}
-
-/// The site's cold and extended layouts share the front end's instruction
-/// snapshots. Both layouts stay available while their code is valid.
-#[derive(Default)]
-pub(crate) struct Site {
-    pub cold: Option<Arc<Unit>>,
-    pub hot: Option<Arc<Unit>>,
 }
 
 use trace::{Edge, Mode, Next};
