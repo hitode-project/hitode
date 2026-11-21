@@ -5,6 +5,7 @@ mod information;
 mod io;
 mod probes;
 mod recent;
+mod socket;
 pub(crate) mod state;
 pub mod volume;
 

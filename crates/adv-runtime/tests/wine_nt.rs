@@ -82,6 +82,19 @@ fn assert_checks(text: &str, ok: &str, checks: &[&str]) {
     }
 }
 
+// spec: NT-SOCK-1
+#[test]
+fn winsock_transfers_streams_and_datagrams() {
+    let Some((stop, text)) = probe(
+        "winsock_transfers_streams_and_datagrams",
+        "socket_io.exe",
+        |_, _| {},
+    ) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+}
+
 // spec: NT-PROC-1, NT-PROC-2, NT-PROC-3, WINE-SES-4
 #[test]
 fn l_process() {

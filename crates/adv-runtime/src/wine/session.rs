@@ -536,8 +536,8 @@ fn run(
             }
         };
         match serve(machine) {
-            Ok(true) => continue,
-            Ok(false) => {}
+            Ok(progress) if progress || any_ready(machine) => continue,
+            Ok(_) => {}
             Err(error) => return Stop::Failed(error),
         }
         let deadline = with_notices(machine, deadline);
@@ -585,7 +585,8 @@ fn with_notices(machine: &Machine<Cpu>, deadline: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Take finished host work; true when guest work may continue.
+/// Take finished host work; true when it made progress, such as a
+/// completed readback or media event, that a waiting guest may observe.
 fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
     super::video::pump_reads(machine);
     let now = machine.sys.clock.now_us();
@@ -601,15 +602,18 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
     let video = adv_dx::dshow::pump_video(machine)?;
     machine.ext.insert(VideoDeadline(video));
     let media = adv_drv::media::pump(machine)?;
-    let ready = machine
+    #[cfg(feature = "gpu")]
+    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
+    #[cfg(not(feature = "gpu"))]
+    Ok(media)
+}
+
+fn any_ready(machine: &Machine<Cpu>) -> bool {
+    machine
         .sys
         .contexts
         .iter()
-        .any(|context| context.is_ready());
-    #[cfg(feature = "gpu")]
-    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media || ready);
-    #[cfg(not(feature = "gpu"))]
-    Ok(media || ready)
+        .any(|context| context.is_ready())
 }
 
 impl Session {
@@ -903,9 +907,13 @@ impl Session {
                     self.machine.run_slice(Duration::from_millis(10))
                 };
             self.metrics.run_time += started.elapsed();
-            if let Err(error) = serve(&mut self.machine) {
-                return Stop::Failed(error);
-            }
+            // Finished host work can wake a waiting guest; it must run now,
+            // not after the next unrelated wake or deadline. A context that is
+            // merely ready, such as a proven-idle poll, does not count.
+            let served = match serve(&mut self.machine) {
+                Ok(served) => served,
+                Err(error) => return Stop::Failed(error),
+            };
             let id = self.shared.id.get();
             // A single-process game is already foreground: skip the window view.
             if self.presented_frames() != before
@@ -973,6 +981,9 @@ impl Session {
                 }
                 SliceResult::Complete(RunResult::Failed(error)) => {
                     return Stop::Failed(format!("{error:?}"));
+                }
+                SliceResult::Complete(RunResult::Idle { .. }) if served => {
+                    self.idle.remove(&id);
                 }
                 SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                     let deadline = with_notices(&self.machine, next_deadline);
