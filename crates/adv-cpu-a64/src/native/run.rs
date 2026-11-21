@@ -1114,14 +1114,9 @@ impl Native {
         }
         // Price recurring failures after same-run retries have been coalesced.
         if let Some(row) = self.row_ledger(eip)
-            && [
-                RowFailure::Parameter,
-                RowFailure::Alias,
-                RowFailure::Count,
-                RowFailure::Span,
-            ]
-            .iter()
-            .any(|&reason| row.failures[reason as usize] != 0)
+            && [RowFailure::Parameter, RowFailure::Count, RowFailure::Span]
+                .iter()
+                .any(|&reason| row.failures[reason as usize] != 0)
             && self.code.install_row_retry(eip)
         {
             if self.code.resident(eip).unwrap().row_entry.is_none() {

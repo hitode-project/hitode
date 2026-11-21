@@ -1968,6 +1968,35 @@ mod tests {
             .unwrap()
     }
 
+    // spec: A64-OPT-9
+    #[test]
+    fn row_alias_refusal_retries_after_the_stream_moves() {
+        use crate::policy::proved::{ROW_SAMPLE, RowFailure};
+
+        let (mut executor, mut native, mut start, stop, [_, target, _]) = routed_rows();
+        let memory = executor.memory_mut();
+        memory.write(ROW_SLOT, &target.to_le_bytes()).unwrap();
+        native.count_resident_entries = true;
+        assert!(native.force_resident_at(memory, start.clone()));
+        let site = native.code.resident(CODE).unwrap();
+        site.row_feedback.as_ref().unwrap().next.set(ROW_SAMPLE);
+        assert!(native.code.install_row_retry(CODE));
+        let entry = native.code.resident(CODE).unwrap().entry();
+        native
+            .code
+            .repoint_resident_edges(CODE, entry, false, false);
+        native.code.sync();
+
+        // The ordinary first row brings the input to the call frame.
+        // One row later the moving span has passed it.
+        start.regs[6] = start.regs[4] - 16 - 64;
+        let run = row_run(&mut native, memory, &mut start, stop);
+        assert_eq!((start.eip, run.retired), (stop, 61 * ROWS + 1));
+        let version = &native.code.resident(CODE).unwrap().versions[0];
+        assert_eq!(version.row_failures()[RowFailure::Alias as usize], 1);
+        assert_eq!(native.diagnostics.resident_entries, 1);
+    }
+
     // spec: A64-OPT-8 A64-CTL-10
     #[test]
     fn slot_discovery_watches_only_code_reached_from_an_unchanged_base() {

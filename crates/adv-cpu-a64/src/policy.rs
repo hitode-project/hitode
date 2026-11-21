@@ -76,11 +76,11 @@ pub(crate) mod proved {
     }
 
     impl RowFailure {
-        // Page bounds can change at the next row. Other failures can
-        // wait for the next owner entry or an outside native arrival.
+        // Page bounds and a moving stream's alias can change at the next row.
+        // Other failures can wait for a new owner run or an outside arrival.
         #[cfg(native)]
         pub fn defer_backedge(self) -> bool {
-            !matches!(self, Self::Range)
+            !matches!(self, Self::Range | Self::Alias)
         }
     }
 
