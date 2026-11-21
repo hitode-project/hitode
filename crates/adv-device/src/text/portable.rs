@@ -1776,14 +1776,105 @@ impl Font {
         resolved.insert(code, found.clone());
         Ok(found)
     }
+    fn vertical_glyph(
+        &self,
+        font: &FontRef<'_>,
+        glyph: GlyphId,
+        code: Option<u32>,
+        substituted: bool,
+    ) -> bool {
+        if !self.request.face.starts_with('@') {
+            return false;
+        }
+        if substituted {
+            return true;
+        }
+        let fullwidth = || {
+            let loc = location(font, &self.request);
+            font.glyph_metrics(Size::new(self.em), &loc)
+                .advance_width(glyph)
+                .is_some_and(|advance| advance >= self.em * 0.75)
+        };
+        match code {
+            Some(0x0000..=0x007f | 0xff61..=0xffdc | 0xffe8..=0xffee) => false,
+            Some(
+                0x2010..=0x206f
+                | 0x2100..=0x27bf
+                | 0x3000..=0xfaff
+                | 0xfe10..=0xfe6f
+                | 0xff01..=0xff60
+                | 0xffe0..=0xffe6
+                | 0x20000..=0x3ffff,
+            ) => true,
+            Some(0x0080..=0x1fff) => {
+                matches!(
+                    self.metrics.encoding,
+                    Encoding::SimplifiedChinese | Encoding::TraditionalChinese | Encoding::Korean
+                ) && fullwidth()
+            }
+            Some(_) => false,
+            None => fullwidth(),
+        }
+    }
+    fn vertical_origin(
+        &self,
+        font: &FontRef<'_>,
+        glyph: GlyphId,
+        commands: &[Command],
+    ) -> Result<(f32, f32), TextError> {
+        let upem = f32::from(font.head().map_err(font_error)?.units_per_em());
+        let scale = self.em / upem;
+        let os2 = font.os2().ok();
+        let fallback_tx = os2
+            .as_ref()
+            .filter(|table| table.s_typo_ascender() > 0)
+            .map_or(self.metrics.ascent as f32, |table| {
+                f32::from(table.s_typo_ascender()) * scale
+            });
+        let tx = if let Ok(vorg) = font.vorg() {
+            f32::from(vorg.vertical_origin_y(glyph)) * scale
+        } else if let Ok(vmtx) = font.vmtx()
+            && let Some(tsb) = vmtx.side_bearing(glyph)
+        {
+            if let (Ok(glyf), Ok(loca)) = (font.glyf(), font.loca(None))
+                && let Ok(Some(record)) = loca.get_glyf(glyph, &glyf)
+            {
+                (f32::from(record.y_max()) + f32::from(tsb)) * scale
+            } else if !commands.is_empty() {
+                zeno::bounds(commands, zeno::Fill::NonZero, None).max.y + f32::from(tsb) * scale
+            } else {
+                fallback_tx
+            }
+        } else {
+            fallback_tx
+        };
+        let ty = os2
+            .as_ref()
+            .filter(|table| table.s_typo_ascender() > 0 && table.s_typo_descender() <= 0)
+            .map_or(-(self.metrics.descent as f32), |table| {
+                f32::from(table.s_typo_descender()) * scale
+            });
+        Ok((tx.round(), ty.round()))
+    }
     fn advance(&self, face: &Face, glyph: GlyphId, code: Option<u32>) -> Result<f32, TextError> {
         let font = face.font()?;
-        let bold = if synthetic_bold(&self.request, &font, face.info.weight.0) {
+        let vertical = self.vertical_glyph(&font, glyph, code, false);
+        self.advance_in_font(face, &font, glyph, code, vertical)
+    }
+    fn advance_in_font(
+        &self,
+        face: &Face,
+        font: &FontRef<'_>,
+        glyph: GlyphId,
+        code: Option<u32>,
+        vertical: bool,
+    ) -> Result<f32, TextError> {
+        let bold = if synthetic_bold(&self.request, font, face.info.weight.0) {
             1.0
         } else {
             0.0
         };
-        if self.request.face.starts_with('@')
+        if vertical
             && let Ok(vmtx) = font.vmtx()
             && let Some(advance) = vmtx.advance(glyph)
         {
@@ -1799,7 +1890,7 @@ impl Font {
             let full = matches!(code, 0x1100..=0x11ff | 0x2e80..=0xa4cf | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xfe10..=0xfe6f | 0xff01..=0xff60 | 0xffe0..=0xffe6 | 0x20000..=0x3ffff);
             return Ok((self.em * if full { 1.0 } else { 0.5 } * self.xscale).round() + bold);
         }
-        let loc = location(&font, &self.request);
+        let loc = location(font, &self.request);
         font.glyph_metrics(Size::new(self.em), &loc)
             .advance_width(glyph)
             .map(|n| (n * self.xscale).round() + bold)
@@ -2018,8 +2109,10 @@ impl Font {
             }
         };
         let font = face.font()?;
+        let base_glyph = glyph;
         let glyph = if self.request.face.starts_with('@')
             && let Some(code) = code
+            && code > 0x7f
             && let Some(c) = char::from_u32(code)
         {
             let face = rustybuzz::Face::from_slice(face.data.as_ref().as_ref(), face.index)
@@ -2036,6 +2129,7 @@ impl Font {
         } else {
             glyph
         };
+        let vertical = self.vertical_glyph(&font, glyph, code, glyph != base_glyph);
 
         let loc = location(&font, &self.request);
         let outlines = font.outline_glyphs();
@@ -2107,17 +2201,19 @@ impl Font {
         if synthetic_bold(&self.request, &font, face.info.weight.0) {
             synthesis::embolden(&mut pen.commands, 1.0);
         }
-        let angle = self.request.glyph_angle
-            + if self.request.face.starts_with('@') {
-                900
-            } else {
-                0
-            };
-        let matrix = compose(rotation(angle), request.transform);
-        for command in &mut pen.commands {
-            *command = synthesis::transform(*command, matrix);
+        if vertical && !pen.commands.is_empty() {
+            let (tx, ty) = self.vertical_origin(&font, glyph, &pen.commands)?;
+            for command in &mut pen.commands {
+                *command = synthesis::rotate_vertical(*command, tx, ty);
+            }
         }
-        let advance = self.advance(&face, glyph, code)?;
+        let matrix = compose(rotation(self.request.glyph_angle), request.transform);
+        if matrix != Transform::IDENTITY {
+            for command in &mut pen.commands {
+                *command = synthesis::transform(*command, matrix);
+            }
+        }
+        let advance = self.advance_in_font(&face, &font, glyph, code, vertical)?;
         let (advance_x, advance_y) = transform_point(
             compose(rotation(self.request.baseline_angle), request.transform),
             advance,

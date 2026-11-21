@@ -256,6 +256,11 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: Font cells and glyph baselines MUST use the selected face's own metrics. Automatic CJK substitutes MUST use their one-em typographic box when it is enclosed by a larger Windows cell. Exact matches and explicit host choices MUST use the selected face's Windows cell.
 **Verification**: Test
 
+### DEV-FONT-10 Vertical faces
+
+**Rule**: An `@`-prefixed face MUST rotate vertical-eligible glyphs ninety degrees counterclockwise into the horizontal cell using their vertical origin and typographic descender. This rotation and cell translation MUST precede glyph orientation and any caller glyph matrix. ASCII and halfwidth glyphs MUST remain unrotated and keep horizontal advances.
+**Verification**: Test
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration

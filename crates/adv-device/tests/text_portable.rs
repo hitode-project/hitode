@@ -1793,16 +1793,44 @@ fn apple_hvgl_outlines_render_without_drift_and_support_all_formats() {
     assert!(styled_glyph.metrics.width > 0 && styled_glyph.metrics.height > 0);
     assert!(styled_glyph.metrics.advance_x > regular.metrics.advance_x);
 
-    // Vertical `@PingFang SC` rotation and GSUB vertical punctuation must work cleanly.
+    // Vertical `@PingFang SC` rotation and GSUB vertical punctuation must work cleanly
+    // inside the horizontal cell, while ASCII stays upright with horizontal advance.
     let mut vertical = request.clone();
     vertical.face = "@PingFang SC".into();
-    let vert_glyph = text
+    let v_metrics = text.metrics(&vertical).unwrap();
+    for code in [0x3002u32, 0xFF0C, 0x82E5, 0x662F, 0x8FD8] {
+        let g = text
+            .glyph(
+                &vertical,
+                glyph(Character::Unicode(code), GlyphFormat::Gray8),
+            )
+            .unwrap();
+        assert!(g.metrics.width > 0 && g.metrics.height > 0);
+        assert!(
+            g.metrics.origin_x >= 0,
+            "U+{code:04X} origin_x={} drifted negative",
+            g.metrics.origin_x
+        );
+        assert!(
+            g.metrics.origin_y <= v_metrics.ascent,
+            "U+{code:04X} origin_y={} above ascent {}",
+            g.metrics.origin_y,
+            v_metrics.ascent
+        );
+    }
+    let h_ascii = text
         .glyph(
-            &vertical,
-            glyph(Character::Unicode(0x3002), GlyphFormat::Gray8),
+            &request,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8),
         )
         .unwrap();
-    assert!(vert_glyph.metrics.width > 0 && vert_glyph.metrics.height > 0);
+    let v_ascii = text
+        .glyph(
+            &vertical,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8),
+        )
+        .unwrap();
+    assert_eq!(v_ascii.metrics, h_ascii.metrics);
 
     // Paint a full mixed run and confirm pixels land inside the expected row range.
     let mut canvas = vec![0u8; 128 * 32 * 4];
@@ -1903,5 +1931,139 @@ fn macos_pingfang_hvgl_matches_cff_metrics_and_origins() {
             a.metrics.height,
             b.metrics.height
         );
+    }
+}
+
+// spec: DEV-FONT-10
+#[test]
+fn vertical_faces_place_rotated_glyphs_inside_the_cell_and_keep_ascii_upright() {
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(include_bytes!("fixtures/font-resource-japanese.ttf"), true)
+        .unwrap();
+    text.add_file_resource(
+        include_bytes!("fixtures/font-resource-japanese-cff.otf"),
+        true,
+    )
+    .unwrap();
+
+    for (family, ascent, descent) in [
+        ("ADV Japanese Fixture", 26, 6),
+        ("ADV Japanese CFF Fixture", 28, 4),
+    ] {
+        let mut horizontal = font(family);
+        horizontal.encoding = Encoding::Japanese;
+        horizontal.height = -32;
+        let mut vertical = horizontal.clone();
+        vertical.face = format!("@{family}");
+
+        let h_kana = text
+            .glyph(
+                &horizontal,
+                glyph(Character::Unicode(0x3042), GlyphFormat::Gray8),
+            )
+            .unwrap()
+            .metrics;
+        let v_kana = text
+            .glyph(
+                &vertical,
+                glyph(Character::Unicode(0x3042), GlyphFormat::Gray8),
+            )
+            .unwrap()
+            .metrics;
+        assert_eq!(v_kana.width, h_kana.height, "{family}: rotated width");
+        assert_eq!(v_kana.height, h_kana.width, "{family}: rotated height");
+        assert!(
+            v_kana.origin_x >= 0,
+            "{family}: origin_x={} must stay inside positive horizontal cell",
+            v_kana.origin_x
+        );
+        assert!(
+            v_kana.origin_y <= ascent,
+            "{family}: origin_y={} above ascent {ascent}",
+            v_kana.origin_y
+        );
+        assert!(
+            v_kana.origin_y - v_kana.height as i32 >= -descent,
+            "{family}: bottom below -descent"
+        );
+        // Expected Windows translation: x' = -y + typo_ascent, y' = x - typo_descent.
+        assert!((v_kana.origin_x - (ascent - h_kana.origin_y)).abs() <= 1);
+        assert!((v_kana.origin_y - (h_kana.origin_x + h_kana.width as i32 - descent)).abs() <= 1);
+
+        // Orientation 2700 cancels the +90° @-face rotation back to upright,
+        // translating the origin by (-descent, -ascent) just as Windows GDI does.
+        let mut vertical_270 = vertical.clone();
+        vertical_270.baseline_angle = 2700;
+        vertical_270.glyph_angle = 2700;
+        let v_kana_270 = text
+            .glyph(
+                &vertical_270,
+                glyph(Character::Unicode(0x3042), GlyphFormat::Gray8),
+            )
+            .unwrap()
+            .metrics;
+        assert_eq!(
+            v_kana_270.width, h_kana.width,
+            "{family}: 270° upright width"
+        );
+        assert_eq!(
+            v_kana_270.height, h_kana.height,
+            "{family}: 270° upright height"
+        );
+        assert!(
+            (v_kana_270.origin_x - (h_kana.origin_x - descent)).abs() <= 1,
+            "{family}: 270° origin_x={}",
+            v_kana_270.origin_x
+        );
+        assert!(
+            (v_kana_270.origin_y - (h_kana.origin_y - ascent)).abs() <= 1,
+            "{family}: 270° origin_y={}",
+            v_kana_270.origin_y
+        );
+        assert_eq!(v_kana_270.advance_x, 0);
+        assert_eq!(v_kana_270.advance_y, h_kana.advance_x);
+
+        // Scaling MAT2 scales the vertical-origin translation along with the outline.
+        let scaled = text
+            .glyph(
+                &vertical,
+                GlyphRequest {
+                    character: Character::Unicode(0x3042),
+                    format: GlyphFormat::Gray8,
+                    hinted: true,
+                    transform: Transform {
+                        xx: 2 << 16,
+                        xy: 0,
+                        yx: 0,
+                        yy: 2 << 16,
+                    },
+                },
+            )
+            .unwrap()
+            .metrics;
+        assert!((scaled.origin_x - v_kana.origin_x * 2).abs() <= 2);
+        assert!((scaled.origin_y - v_kana.origin_y * 2).abs() <= 2);
+
+        // ASCII stays unrotated and keeps its horizontal advance in `@`-faces.
+        for code in [0x0041u32, 0x0020] {
+            let h_ascii = text
+                .glyph(
+                    &horizontal,
+                    glyph(Character::Unicode(code), GlyphFormat::Gray8),
+                )
+                .unwrap()
+                .metrics;
+            let v_ascii = text
+                .glyph(
+                    &vertical,
+                    glyph(Character::Unicode(code), GlyphFormat::Gray8),
+                )
+                .unwrap()
+                .metrics;
+            assert_eq!(
+                v_ascii, h_ascii,
+                "{family}: ASCII U+{code:04X} must not rotate"
+            );
+        }
     }
 }
