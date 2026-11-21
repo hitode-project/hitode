@@ -482,12 +482,15 @@ pub fn complete_async(env: &mut Env<'_>, call: &[u8; 64]) -> Result<[u8; 40], Er
     let user = u64::from_le_bytes(call[8..16].try_into().unwrap());
     let iosb = word(16);
     let mut total = word(24);
-    let changes = env
+    if let Some((code, count)) = socket::complete(env, user, status)? {
+        status = code;
+        total = count;
+    } else if let Some((handle, buffer, length)) = env
         .ext
         .get_or_default::<DirectoryChanges>()
         .pending
-        .remove(&user);
-    if let Some((handle, buffer, length)) = changes {
+        .remove(&user)
+    {
         total = 0;
         if status == 0x101 {
             (status, total) = read_changes(env, handle, buffer, length)?;
@@ -510,7 +513,7 @@ pub fn complete_async(env: &mut Env<'_>, call: &[u8; 64]) -> Result<[u8; 40], Er
             write_bytes(env, buffer, &bytes[..size])?;
         }
     }
-    if iosb != 0 {
+    if iosb != 0 && status != PENDING {
         set_iosb(env, iosb, status, total)?;
     }
     let mut result = [0; 40];
@@ -544,7 +547,7 @@ pub fn create_mailslot(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
-fn set_iosb(env: &mut Env<'_>, io: u32, code: u32, count: u32) -> Result<(), Error> {
+pub(super) fn set_iosb(env: &mut Env<'_>, io: u32, code: u32, count: u32) -> Result<(), Error> {
     write_u32(env, io + 4, count)?;
     write_u32(env, io, code)?;
     Ok(())
@@ -680,7 +683,7 @@ pub fn flush_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     }
 }
 
-fn async_data(handle: u32, event: u32, apc: u32, context: u32, io: u32) -> [u8; 40] {
+pub(super) fn async_data(handle: u32, event: u32, apc: u32, context: u32, io: u32) -> [u8; 40] {
     let mut data = [0; 40];
     data[..4].copy_from_slice(&handle.to_le_bytes());
     data[4..8].copy_from_slice(&event.to_le_bytes());
@@ -694,6 +697,12 @@ fn async_data(handle: u32, event: u32, apc: u32, context: u32, io: u32) -> [u8; 
 pub fn device_control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] == u32::MAX {
         return Outcome::Return(status::INVALID_HANDLE);
+    }
+    match args[5] {
+        socket::RECVMSG => return socket::transfer(env, args, false),
+        socket::SENDMSG => return socket::transfer(env, args, true),
+        socket::FIONREAD => return socket::available(env, args),
+        _ => {}
     }
     if let Ok(fd) = server::handle_fd(env, args[0])
         && volume::mounts(env).info(fd.fd).is_some()

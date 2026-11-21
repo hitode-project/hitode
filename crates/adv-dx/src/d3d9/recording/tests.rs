@@ -1051,7 +1051,7 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
 #[test]
 fn repeat_keeps_refresh_wait_and_reset_release_and_unsupported_capture_commit_commands() {
     let mut f = fixture();
-    f.m.ext.get_mut::<State>().provider.visible = |_, _, _| Some(true);
+    f.m.ext.get_mut::<State>().provider.visible = |_, _, _, _| Some(true);
     for _ in 0..2 {
         clear(&mut f, 0xff123456);
         let outcome = f.call("IDirect3DDevice9::Present", &[f.device, 0, 0, 0, 0]);
@@ -1623,7 +1623,7 @@ fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundar
     for swap in [false, true] {
         let mut f = fixture();
         let chain = package_b_chain(&mut f);
-        f.m.ext.get_mut::<State>().provider.visible = |_, _, _| Some(true);
+        f.m.ext.get_mut::<State>().provider.visible = |_, _, _, _| Some(true);
         for color in [0xff112233, 0xff445566, 0xff445566] {
             clear(&mut f, color);
             let outcome = if swap {

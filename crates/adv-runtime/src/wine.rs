@@ -333,7 +333,12 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         window: |ext, objects, hwnd| {
             geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
         },
-        visible: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).map(|window| window.visible),
+        visible: |ext, _, hwnd, surface| {
+            if ext.get::<Surfaces<Snapshot>>().base_source() == Some(surface) {
+                return Some(true);
+            }
+            adv_drv::user::window(ext, hwnd).map(|window| window.visible)
+        },
         window_presented: |ext, hwnd| {
             if let Some(id) = ext.get::<Surfaces<Snapshot>>().base_source() {
                 adv_drv::user::input::front_frame(ext, hwnd, id);

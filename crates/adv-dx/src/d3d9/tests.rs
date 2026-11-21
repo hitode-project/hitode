@@ -35,7 +35,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         vsync: |_| None,
         guest_frame_wait: |_| false,
         window: |_, _, _| Some((16, 12)),
-        visible: |_, _, _| Some(false),
+        visible: |_, _, _, _| Some(false),
         window_presented: |_, _| {},
         fast_forward: |_| false,
         display: |_| (16, 12, 60),

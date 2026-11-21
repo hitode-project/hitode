@@ -60,6 +60,7 @@ const DEVICE_LOST: u32 = 0x88760868;
 const DEVICE_NOT_RESET: u32 = 0x88760869;
 const OUT_OF_MEMORY: u32 = 0x8007000e;
 const NO_INTERFACE: u32 = 0x80004002;
+const D3DPRESENTFLAG_VIDEO: u32 = 0x10;
 // Official SDK d3d9.h DEFINE_GUIDs in guest little-endian memory order.
 const IID_FACTORY: Iid = [
     0xca, 0xcb, 0xbd, 0x81, 0xd4, 0x64, 0x6d, 0x42, 0xae, 0x8d, 0xad, 1, 0x47, 0xf4, 0x27, 0x5c,
@@ -88,7 +89,7 @@ pub struct SurfaceProvider {
     /// Shared serial includes other devices, GDI, DirectDraw and video fronts.
     pub presentation_serial: fn(&Ext) -> Option<u64>,
     pub window: fn(&Ext, &Objects, u32) -> Option<(u32, u32)>,
-    pub visible: fn(&Ext, &Objects, u32) -> Option<bool>,
+    pub visible: fn(&Ext, &Objects, u32, u32) -> Option<bool>,
     pub window_presented: fn(&Ext, u32),
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
@@ -1024,7 +1025,11 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Op
             parameters.BackBufferCount,
             parameters.BackBufferCount <= 1,
         ),
-        ("Flags", parameters.Flags, parameters.Flags & !3 == 0),
+        (
+            "Flags",
+            parameters.Flags,
+            parameters.Flags & !(3 | D3DPRESENTFLAG_VIDEO) == 0,
+        ),
         (
             "AutoDepthStencilFormat",
             parameters.AutoDepthStencilFormat,
@@ -1971,8 +1976,9 @@ fn present(
     let deadline = if (provider.guest_frame_wait)(env) {
         None
     } else {
-        let occluded = (provider.visible)(env.ext, &env.sys.objects, parameters.hDeviceWindow)
-            .is_some_and(|visible| !visible);
+        let occluded =
+            (provider.visible)(env.ext, &env.sys.objects, parameters.hDeviceWindow, surface)
+                .is_some_and(|visible| !visible);
         match pacing::deadline(
             env.sys.clock.now_us(),
             parameters.PresentationInterval,

@@ -7,11 +7,13 @@ use xxhash_rust::xxh3::Xxh3;
 // D3DFORMAT names run from the most significant channel to the least:
 // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat
 
+pub(super) const L8: u32 = 50;
+
 pub(super) fn bytes(format: u32) -> Option<u32> {
     match format {
         21 | 22 => Some(4),
         23 | 26 => Some(2),
-        28 => Some(1),
+        28 | L8 => Some(1),
         _ => None,
     }
 }
@@ -26,7 +28,7 @@ pub(super) fn length(format: u32, width: u32, height: u32) -> Option<u32> {
         .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
 }
 
-pub(super) fn texel(format: u32) -> Option<adv_device::gpu::TexelFormat> {
+fn texel(format: u32) -> Option<adv_device::gpu::TexelFormat> {
     use adv_device::gpu::TexelFormat as T;
     Some(match format {
         21 => T::Bgra8,
@@ -36,6 +38,15 @@ pub(super) fn texel(format: u32) -> Option<adv_device::gpu::TexelFormat> {
         28 => T::A8,
         _ => return None,
     })
+}
+
+pub(super) fn texture_storage(
+    gpu: &adv_device::gpu::Gpu,
+    format: u32,
+) -> adv_device::gpu::TexelFormat {
+    texel(format)
+        .filter(|&texel| gpu.stores(texel))
+        .unwrap_or(adv_device::gpu::TexelFormat::Bgra8)
 }
 
 pub(super) fn covers(rectangle: Rect, image: &Image) -> bool {
@@ -122,7 +133,7 @@ pub(super) fn snapshot_with_hash(
         }
     };
     let mut hash = whole.then(Xxh3::new);
-    if destination.0.texel_format() == texel(format)? {
+    if Some(destination.0.texel_format()) == texel(format) {
         let row_bytes = self::pitch(format, width)?;
         if pitch == row_bytes
             && let Some(total) = row_bytes.checked_mul(height)
@@ -189,7 +200,7 @@ pub(super) fn upload(
     if width == 0 || pitch < row || pixels.len() < required as usize {
         return None;
     }
-    if matches!(format, 23 | 26 | 28) {
+    if matches!(format, 23 | 26 | 28 | L8) {
         let output_pitch = width.checked_mul(4)?;
         let mut output = vec![0; output_pitch.checked_mul(height)? as usize];
         for y in 0..height as usize {
@@ -199,6 +210,10 @@ pub(super) fn upload(
                     // D3DFMT_A8 is the documented undefined-channel exception:
                     // sampled RGB is zero, and the one guest byte is alpha.
                     output[destination + 3] = pixels[y * pitch as usize + x];
+                } else if format == L8 {
+                    let luminance = pixels[y * pitch as usize + x];
+                    output[destination..destination + 4]
+                        .copy_from_slice(&[luminance, luminance, luminance, 255]);
                 } else if format == 23 {
                     // R5G6B5 replicates high bits into the low ones, so a
                     // readback truncates to the same bytes; alpha is one.
@@ -254,13 +269,14 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
     if !pixels.len().is_multiple_of(4) {
         return None;
     }
-    if format == 28 {
+    if matches!(format, 28 | L8) {
+        let channel = if format == L8 { 0 } else { 3 };
         return Some(
             pixels
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|pixel| pixel[3])
+                .map(|pixel| pixel[channel])
                 .collect(),
         );
     }
@@ -367,5 +383,15 @@ mod tests {
         assert_eq!(&expanded[0x0841 * 4..0x0841 * 4 + 4], &[8, 8, 8, 255]);
         assert_eq!(readback(23, expanded).unwrap(), packed);
         assert_eq!(length(23, 3, 2), Some(12));
+    }
+
+    // spec: GFX-SAMPLER-5
+    #[test]
+    fn l8_expands_to_opaque_luminance_and_skips_guest_padding() {
+        let (expanded, pitch) = upload(L8, vec![7, 121, 254], 2, 1, 2).unwrap();
+        assert_eq!(pitch, 4);
+        assert_eq!(expanded, [7, 7, 7, 255, 254, 254, 254, 255]);
+        assert_eq!(readback(L8, expanded).unwrap(), [7, 254]);
+        assert_eq!(length(L8, 3, 2), Some(6));
     }
 }

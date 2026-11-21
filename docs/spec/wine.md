@@ -209,6 +209,15 @@ over 65536 names, or unreadable ones, keep host lookups. File writes and
 metadata changes leave listings intact. Lookups remember a drive by its link, so
 relinking the game drive for the next session ends them.
 
+### NT-SOCK-1 Wine socket I/O
+
+**Rule**: The NT platform MUST transfer Winsock stream and datagram payloads between guest buffers and server-owned sockets. It MUST preserve receive addresses, byte counts, readiness and asynchronous completion.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/ntdll/unix/socket.c`.
+
+The NT platform serves the Wine AFD send, receive and available-byte queries. The
+server retains ownership of the sockets, readiness queues and completion state.
+
 ## NT files
 
 NT services follow Wine 11.0's argument checks, server requests and status codes.
@@ -580,6 +589,9 @@ D3DX checks an admitted CRT entry against the exact relocated bytes saved at bin
 **Rule**: Our Direct3D 9 MUST load as a PE image in place of Wine's. Its surface DCs MUST be memory DCs that call GDI through its own IAT. A presented back buffer MUST reach the presenter.
 Child processes MUST defer native GPU presentation to the session's consumer before drawing.
 **Verification**: Test
+
+A swap chain supplying the presented base retains its presentation pacing even
+when its guest device window is hidden.
 
 ### WINE-GFX-7 Frames published on waits
 
