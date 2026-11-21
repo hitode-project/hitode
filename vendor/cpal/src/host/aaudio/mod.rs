@@ -319,6 +319,16 @@ where
             (error_callback)(StreamError::from(error))
         }))
         .open_stream()?;
+    // Keep low-latency MMAP/FastTrack streams near two bursts so the OS does
+    // not over-buffer; leave Legacy/Bluetooth streams at their system default.
+    if stream.performance_mode() == ndk::audio::AudioPerformanceMode::LowLatency {
+        let burst = stream.frames_per_burst();
+        let capacity = stream.buffer_capacity_in_frames();
+        if burst > 0 && capacity >= burst {
+            let target = burst.saturating_mul(2).min(capacity);
+            let _ = stream.set_buffer_size_in_frames(target);
+        }
+    }
     Ok(Stream::Output(stream))
 }
 
@@ -377,7 +387,40 @@ impl DeviceTrait for Device {
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         let mut configs: Vec<_> = self.supported_output_configs().unwrap().collect();
-        configs.sort_by(|a, b| b.cmp_default_heuristics(a));
+        // Prefer Android's native mixer rate (typically 48 kHz) over cpal's
+        // 44.1 kHz default heuristic so AAudio can select FastTrack/MMAP
+        // instead of falling back to Legacy deep-buffer resampling.
+        let preferred_rate =
+            SampleRate(java_interface::native_output_sample_rate().unwrap_or(48_000));
+        configs.sort_by(|a, b| {
+            let cmp_channels = (b.channels == 2)
+                .cmp(&(a.channels == 2))
+                .then_with(|| (b.channels == 1).cmp(&(a.channels == 1)))
+                .then_with(|| b.channels.cmp(&a.channels));
+            if cmp_channels != cmp::Ordering::Equal {
+                return cmp_channels;
+            }
+            let cmp_format = (b.sample_format == SampleFormat::F32)
+                .cmp(&(a.sample_format == SampleFormat::F32))
+                .then_with(|| {
+                    (b.sample_format == SampleFormat::I16)
+                        .cmp(&(a.sample_format == SampleFormat::I16))
+                })
+                .then_with(|| {
+                    (b.sample_format == SampleFormat::U16)
+                        .cmp(&(a.sample_format == SampleFormat::U16))
+                });
+            if cmp_format != cmp::Ordering::Equal {
+                return cmp_format;
+            }
+            let a_native =
+                a.min_sample_rate <= preferred_rate && preferred_rate <= a.max_sample_rate;
+            let b_native =
+                b.min_sample_rate <= preferred_rate && preferred_rate <= b.max_sample_rate;
+            b_native
+                .cmp(&a_native)
+                .then_with(|| b.cmp_default_heuristics(a))
+        });
         let config = configs
             .into_iter()
             .next()
@@ -471,6 +514,7 @@ impl DeviceTrait for Device {
 
         let builder = ndk::audio::AudioStreamBuilder::new()?
             .direction(ndk::audio::AudioDirection::Output)
+            .performance_mode(ndk::audio::AudioPerformanceMode::LowLatency)
             .channel_count(channel_count)
             .format(format);
 
