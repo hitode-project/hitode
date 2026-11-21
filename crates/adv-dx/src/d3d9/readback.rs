@@ -66,10 +66,11 @@ pub(super) fn create_offscreen(
     }
     if !matches!(pool, 0 | 2 | 3)
         || format::bytes(format).is_none()
+        || format == format::L8
         || (pool == 0 && format == 28)
         || !shared.is_null()
     {
-        let reason = if format::bytes(format).is_none() {
+        let reason = if format::bytes(format).is_none() || format == format::L8 {
             "pixel format is unsupported (supported: 21/22/23/26/28; DEFAULT: 21/22/23/26)"
         } else if pool == 0 && format == 28 {
             "DEFAULT offscreen GPU surfaces support formats 21/22/23/26"

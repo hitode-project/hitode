@@ -4,7 +4,7 @@ use adv_abi::types::D3DSURFACE_DESC;
 use resources::{Kind, Resource};
 
 pub(super) fn alpha_mode(format: u32) -> adv_device::gpu::AlphaMode {
-    if format == 22 {
+    if matches!(format, 22 | super::format::L8) {
         adv_device::gpu::AlphaMode::Opaque
     } else {
         adv_device::gpu::AlphaMode::Stored

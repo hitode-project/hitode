@@ -194,9 +194,7 @@ fn check_format(
                 3 => matches!(usage, 0 | 0x200),
                 _ => false,
             })
-        // A8 is an ordinary 2D sampled/dynamic format. Do not advertise A8
-        // render targets, standalone DEFAULT surfaces, vertex fetch or autogen.
-        || (check == 28 && resource == 3 && matches!(usage, 0 | 0x200))
+        || (matches!(check, 28 | super::format::L8) && resource == 3 && matches!(usage, 0 | 0x200))
         || (resource == 1 && usage == 2 && depth::format(check).is_some());
     let supported = supported && (!filter || resource == 3 && usage & 0x100000 == 0);
     if available(env) && format == 22 && supported {
@@ -555,6 +553,7 @@ mod tests {
             (0x20000, 3, 22),
             (0x20200, 3, 26),
             (0x20000, 3, 28),
+            (0x20000, 3, super::super::format::L8),
         ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),
