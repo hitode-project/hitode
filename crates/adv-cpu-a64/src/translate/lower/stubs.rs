@@ -654,11 +654,15 @@ fn emit_opt_exit(asm: &mut Asm, exit: Exit) {
 }
 
 /// Stores the guest registers and flags to `cpu`; uses x1 to x5.
-pub(crate) fn emit_store_guest(asm: &mut Asm, cpu: Reg) {
+pub(crate) fn emit_store_registers(asm: &mut Asm, cpu: Reg) {
     for (i, (a, b)) in GUEST.into_iter().enumerate() {
         // The low halves of x23 and x24 are ESP and EBP themselves.
         asm.emit(stp(W, Offset, r(a), r(b), cpu, REGS + 8 * i as i32));
     }
+}
+
+pub(crate) fn emit_store_guest(asm: &mut Asm, cpu: Reg) {
+    emit_store_registers(asm, cpu);
     emit_read_flags(asm, cpu);
     asm.emit(str(W, r(4), cpu, EFLAGS));
 }

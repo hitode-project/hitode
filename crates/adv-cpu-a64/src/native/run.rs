@@ -125,11 +125,15 @@ impl Native {
             plan::Arrival::Offerable(job) if self.plans.offer_resume != Some(cpu.eip) => {
                 let gate = self.published_gate();
                 let stale = gate.stale.load(std::sync::atomic::Ordering::Relaxed) != 0;
-                (stale || job.sample_offer()) && job.offer_due(gate, super::ticks)
+                if stale {
+                    job.offer_due(gate, super::ticks, 0)
+                } else {
+                    job.sample_offer() && self.job_offer_due(cpu.eip, cpu, memory)
+                }
             }
             _ => false,
         };
-        if offer && self.offer_job(cpu) {
+        if offer && self.offer_job(cpu, memory) {
             return Ok(Some(Run {
                 exit: Exit::Computation,
                 retired: 0,
@@ -311,7 +315,7 @@ impl Native {
                         }
                         if self.code.offers_split(head, usize::from(version))
                             && (self.offer_computation()
-                                || self.offer_split(job.policy.scope_cost(payload)))
+                                || self.offer_split(job.policy.estimated_cost(payload)))
                         {
                             exit = Exit::Computation;
                             scoped = true;
@@ -349,7 +353,8 @@ impl Native {
         if retired != 0 {
             self.progressed();
         }
-        if scope_declined || (exit == Exit::Computation && !scoped && !self.offer_job(cpu)) {
+        if scope_declined || (exit == Exit::Computation && !scoped && !self.offer_job(cpu, memory))
+        {
             self.set_computation_offer(self.offload.enabled, Some(cpu.eip));
             exit = Exit::Dispatch;
         }
@@ -1790,12 +1795,45 @@ impl Native {
         self.offload.enabled && self.pace.get().is_some_and(|pace| pace.need(cost) > 0)
     }
 
+    /// Quote only sampled offers when no peer is ready.
+    pub(super) fn job_offer_due(&mut self, eip: u32, cpu: &CpuState, memory: &Memory) -> bool {
+        if !self.offload.enabled {
+            return false;
+        }
+        let gate = self.published_gate();
+        let job = self.plans.job(eip).unwrap();
+        if gate.stale.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return job.offer_due(gate, super::ticks, 0);
+        }
+        let cost = self.split_cost(eip, cpu, memory);
+        self.plans
+            .job(eip)
+            .unwrap()
+            .offer_due(self.published_gate(), super::ticks, cost)
+    }
+
+    fn split_cost(&mut self, eip: u32, cpu: &CpuState, memory: &Memory) -> u64 {
+        let job = self.plans.job(eip).unwrap();
+        if !job.splits || job.per_iteration.get().is_none() {
+            return 0;
+        }
+        let proof = &self.worker_jobs[&eip].proof;
+        self.offload
+            .admission
+            .split_iterations(proof, cpu, memory)
+            .map_or(0, |count| job.estimated_cost(count))
+    }
+
     /// An offer event is separate from ordinary owner dispatch.
-    pub(super) fn offer_job(&mut self, cpu: &CpuState) -> bool {
-        let job = self.plans.job(cpu.eip).unwrap();
-        let cost = job.cost();
-        let split = job.splits && cost > 0;
+    fn offer_job(&mut self, cpu: &CpuState, memory: &Memory) -> bool {
         let peer = self.offer_computation();
+        let cost = if peer {
+            self.plans.job(cpu.eip).unwrap().cost()
+        } else {
+            self.split_cost(cpu.eip, cpu, memory)
+        };
+        let job = self.plans.job(cpu.eip).unwrap();
+        let split = job.splits && cost > 0;
         let paced = split && self.offer_split(cost);
         if !peer && !paced {
             job.defer_offer();

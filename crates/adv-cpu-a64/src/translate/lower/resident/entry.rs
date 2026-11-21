@@ -131,6 +131,7 @@ pub(crate) fn emit(
     let at = targets.at;
     let mut asm = Asm::new();
     let offer_exit = asm.label();
+    let offer_price = asm.label();
     let offer_fallback = asm.label();
     let offer_counter = asm.label();
     let retry = asm.label();
@@ -148,9 +149,15 @@ pub(crate) fn emit(
     let exit = asm.label();
     let opt_exit = asm.label();
 
-    if gate.is_some() {
-        asm.bind(offer_exit);
-        sample_offer(&mut asm, head, offer_fallback);
+    if let Some(gate) = gate {
+        sample_offer(
+            &mut asm,
+            head,
+            offer_fallback,
+            gate.split,
+            offer_exit,
+            offer_price,
+        );
         asm.b(exit);
     }
     if let Some(gate) = gate {
@@ -251,7 +258,7 @@ pub(crate) fn emit(
         asm.emit(branch(fallback, targets.tier1));
         let entry = at + asm.offset();
         if let Some(gate) = gate {
-            offer(&mut asm, gate, offer_counter, offer_exit);
+            offer(&mut asm, gate, offer_counter, offer_exit, offer_price);
         }
         let rep_pending = std::mem::offset_of!(runtime::Runtime, rep_pending) as u32;
         asm.emit_all(&[
@@ -269,7 +276,7 @@ pub(crate) fn emit(
     }
     asm.bind(entry);
     if let Some(gate) = gate {
-        offer(&mut asm, gate, offer_counter, offer_exit);
+        offer(&mut asm, gate, offer_counter, offer_exit, offer_price);
     }
     asm.bind(offer_fallback);
 
@@ -551,9 +558,10 @@ pub(crate) fn offer_link(
 ) -> (Vec<u32>, usize) {
     let mut asm = Asm::new();
     let request = asm.label();
+    let priced = asm.label();
     let counter = asm.label();
     let no_offer = asm.label();
-    offer(&mut asm, gate, counter, request);
+    offer(&mut asm, gate, counter, request, priced);
     asm.bind(no_offer);
     let fallback = at + asm.offset();
     if let Some(unit) = unit {
@@ -561,8 +569,7 @@ pub(crate) fn offer_link(
     } else {
         asm.emit_all(&self::fallback(head, fallback, exit));
     }
-    asm.bind(request);
-    sample_offer(&mut asm, head, no_offer);
+    sample_offer(&mut asm, head, no_offer, gate.split, request, priced);
     asm.emit(branch(at + asm.offset(), exit));
     literal(&mut asm, counter, gate.counter);
     (asm.finish(), fallback)
@@ -588,15 +595,28 @@ pub(crate) fn internal_offer(at: usize, transition: usize, target: usize) -> [u3
 }
 
 /// A stale peer decision takes precedence over the sampled split deadline.
-fn offer(asm: &mut Asm, gate: OfferEntry, counter: Label, leave: Label) {
+fn offer(asm: &mut Asm, gate: OfferEntry, counter: Label, leave: Label, priced: Label) {
     asm.emit_all(&load_peer_gate(GATE, r(17)));
     asm.cbz(W, true, r(17), leave);
     if gate.split {
-        runtime::emit_sensor(asm, counter, SLOT, r(0), leave);
+        runtime::emit_sensor(asm, counter, SLOT, r(0), priced);
     }
 }
 
-fn sample_offer(asm: &mut Asm, head: u32, fallback: Label) {
+fn sample_offer(
+    asm: &mut Asm,
+    head: u32,
+    fallback: Label,
+    split: bool,
+    leave: Label,
+    priced: Label,
+) {
+    asm.bind(priced);
+    if split {
+        asm.emit(ldr(X, r(0), RT, runtime::CPU_STATE));
+        stubs::emit_store_registers(asm, r(0));
+    }
+    asm.bind(leave);
     stubs::emit_save_light(asm);
     constant(asm, r(1), u64::from(head));
     asm.emit_all(&[
@@ -671,7 +691,7 @@ mod tests {
             counter: counter.as_ptr() as u64,
             split: true,
         };
-        offer(&mut asm, gate, data, sample);
+        offer(&mut asm, gate, data, sample, sample);
         let after = asm.offset();
         let sensor = gate_start + 3 * 4;
         assert_eq!(after - sensor, 5 * 4);
@@ -740,7 +760,7 @@ mod tests {
             counter: 0,
             split: false,
         };
-        offer(&mut asm, gate, data, sample);
+        offer(&mut asm, gate, data, sample, sample);
         asm.bind(sample);
         literal(&mut asm, data, gate.counter);
         let words = asm.finish();

@@ -1029,6 +1029,7 @@ pub(super) struct Admission {
     grants: PageGrants,
     generation: (u64, u64),
     spare: Vec<Vec<Range>>,
+    pricing: Evaluation,
 }
 
 impl Admission {
@@ -1038,6 +1039,19 @@ impl Admission {
 
     pub(super) fn clear(&mut self) {
         self.sites.clear();
+    }
+
+    pub(super) fn split_iterations(
+        &mut self,
+        proof: &Proof,
+        cpu: &CpuState,
+        memory: &Memory,
+    ) -> Option<u32> {
+        self.sync_generation(memory);
+        let alias = alias_base(memory);
+        proof.split_iterations(cpu, &mut self.pricing, |addr| {
+            parameter(memory, &mut self.grants, alias, &[], addr)
+        })
     }
 
     fn recheck(&mut self, key: JobKey, memory: &Memory, active: &[ActiveTask]) -> bool {
@@ -2958,7 +2972,7 @@ mod tests {
             assert_eq!(job.per_iteration.get(), Some((100, 480.0)));
             assert_eq!(job.split_minimum.get(), 225);
             assert!(job.split_minimum.get() <= u64::from(rows));
-            let serial = job.scope_cost(rows) as f64;
+            let serial = job.estimated_cost(rows) as f64;
             assert_eq!(helpers(serial, (wake.ns as f64, serial), 10_000.0, 1), 1);
         }
     }

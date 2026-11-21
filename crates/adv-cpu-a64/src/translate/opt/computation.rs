@@ -150,6 +150,16 @@ impl Evaluation {
     pub(crate) fn admitted(&self) -> &[Range] {
         &self.ranges
     }
+
+    fn reset_entry(&mut self, values: usize) {
+        self.values.clear();
+        self.values.resize(values, None);
+        self.words.clear();
+        self.ranges.clear();
+        self.parameters.clear();
+        self.frame.clear();
+        self.based.clear();
+    }
 }
 
 #[derive(Clone)]
@@ -2283,6 +2293,20 @@ impl Proof {
         Some(self.scope_frame.as_ref()?.latch)
     }
 
+    /// Quote a split against its current trip count before evaluating its
+    /// complete access plan at admission.
+    pub(crate) fn split_iterations(
+        &self,
+        cpu: &CpuState,
+        scratch: &mut Evaluation,
+        mut read: impl FnMut(u32) -> Option<u32>,
+    ) -> Option<u32> {
+        let count = self.outer.filter(|outer| outer.split)?.count;
+        scratch.reset_entry(count + 1);
+        self.value(count, cpu, scratch, &mut read)
+            .filter(|&n| n >= 2)
+    }
+
     /// After a successful `evaluate`, the head loop's iterations if every
     /// one writes only bytes no other iteration reads or writes. A write
     /// needs a nonzero stride, and an effect it meets the same stride and a
@@ -2604,16 +2628,10 @@ impl Proof {
         scratch: &mut Evaluation,
         read: &mut impl FnMut(u32) -> Option<u32>,
     ) -> Option<()> {
-        scratch.values.clear();
-        scratch.values.resize(self.exprs.len(), None);
-        scratch.words.clear();
-        scratch.ranges.clear();
-        scratch.parameters.clear();
+        scratch.reset_entry(self.exprs.len());
         scratch.outputs.clear();
         scratch.reads.clear();
         scratch.invariant.clear();
-        scratch.frame.clear();
-        scratch.based.clear();
         scratch.gathered.clear();
         scratch.gathered.resize(self.vars.len(), None);
         scratch.tables.clear();

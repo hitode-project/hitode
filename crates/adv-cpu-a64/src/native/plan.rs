@@ -33,6 +33,13 @@ use crate::policy::tier1::{CHAIN_LEN, CHECK_AFTER};
 use crate::policy::worker::RESPECIALIZE;
 pub(super) use crate::policy::worker::{REOFFER, WAKE_NS};
 
+fn split_ticks(ns: u64) -> u64 {
+    let hz = u128::from(adv_cpu_core::backend::host_tick_hz());
+    (u128::from(ns) * hz)
+        .div_ceil(1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64
+}
+
 const NO_LIMIT: u32 = i32::MAX as u32;
 const SHORT_JOB: Duration = Duration::from_nanos(WAKE_NS);
 
@@ -106,8 +113,6 @@ pub(super) enum RowAction {
 }
 
 pub(super) struct JobPlan {
-    /// The serial cost of a split loop in host ticks.
-    pub split_ticks: Cell<u64>,
     pub splits: bool,
     pub scoped: bool,
     pub split_minimum: Cell<u64>,
@@ -176,7 +181,6 @@ impl JobPlan {
             split_minimum: Cell::new(2),
             scope_offers: Cell::new(0),
             scope_splits: Cell::new(0),
-            split_ticks: Cell::new(0),
             misses: Cell::new(0),
             forms: Cell::new(0),
             building: Cell::new(false),
@@ -218,7 +222,7 @@ impl JobPlan {
         self.building.set(false);
     }
 
-    pub fn scope_cost(&self, count: u32) -> u64 {
+    pub fn estimated_cost(&self, count: u32) -> u64 {
         self.per_iteration
             .get()
             .map_or(WAKE_NS * (1 + 2 * BLOCKS_PER_THREAD as u64), |(_, ns)| {
@@ -237,14 +241,13 @@ impl JobPlan {
         }
     }
 
-    pub fn offer_due(&self, gate: &OfferGate, now: fn() -> u64) -> bool {
+    pub fn offer_due(&self, gate: &OfferGate, now: fn() -> u64, cost: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
 
-        let ticks = self.split_ticks.get();
         let due = gate.stale.load(Relaxed) != 0
-            || ticks != 0
+            || cost != 0
                 && (gate.split_over.load(Relaxed) != 0
-                    || now().wrapping_add(ticks) > gate.split_deadline.load(Relaxed));
+                    || now().wrapping_add(split_ticks(cost)) > gate.split_deadline.load(Relaxed));
         if !due {
             return false;
         }
@@ -286,15 +289,6 @@ impl JobPlan {
 
     pub fn set_cost(&self, ns: u64) {
         self.cost.set(ns);
-        let ticks = if self.splits && ns > 0 {
-            let hz = u128::from(adv_cpu_core::backend::host_tick_hz());
-            (u128::from(ns) * hz)
-                .div_ceil(1_000_000_000)
-                .min(u128::from(u64::MAX)) as u64
-        } else {
-            0
-        };
-        self.split_ticks.set(ticks);
     }
 
     pub fn observe(

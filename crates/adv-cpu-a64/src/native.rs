@@ -241,9 +241,10 @@ unsafe extern "C" fn plan_observation(
     let native = unsafe { &mut *owner.native };
     if kind == runtime::CHECK_OFFER {
         native.count_plan_event("offer_check");
-        let job = native.plans.job(eip).unwrap();
-        job.defer_offer();
-        return u32::from(job.offer_due(native.published_gate(), ticks));
+        native.plans.job(eip).unwrap().defer_offer();
+        // SAFETY: the sampled offer runs on this memory's execution owner.
+        let memory = unsafe { &*owner.memory };
+        return u32::from(native.job_offer_due(eip, cpu, memory));
     }
     if kind == runtime::RESIDENT_VERSION_MISS {
         native.count_plan_event("resident_version_miss");
@@ -2615,6 +2616,103 @@ mod tests {
             events + 1
         );
         assert!(native.plans.resident(head).is_some());
+    }
+
+    // spec: A64-OPT-8 A64-TR-9
+    #[test]
+    fn paced_offers_price_the_current_trip_count() {
+        use adv_cpu_core::backend::{Completion, Pace, host_tick_hz};
+        use adv_cpu_core::trap::ExecutionTrap;
+        use std::time::Duration;
+
+        struct FixedPace(OfferGate);
+        impl ExecutionTrap for FixedPace {
+            fn offer_gate(&self) -> Option<&OfferGate> {
+                Some(&self.0)
+            }
+
+            fn pace(&self) -> Option<Pace> {
+                Some(Pace {
+                    limit_ns: 3_600_000_000_000,
+                    ..Pace::default()
+                })
+            }
+
+            fn call(&mut self, _: &mut CpuState, _: &mut Memory, _: u32) -> Result<bool, String> {
+                unreachable!()
+            }
+        }
+
+        let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+        let mut jump = vec![0x89, 0xd1, 0x31, 0xc0, 0x0f, 0x84]; // mov ecx,edx; xor eax,eax; jz HEAD
+        jump.extend_from_slice(&(HEAD - OUTSIDE - 10).to_le_bytes());
+        memory.protect(OUTSIDE, 4096, READ | WRITE).unwrap();
+        memory.write(OUTSIDE, &jump).unwrap();
+        memory
+            .protect(OUTSIDE, 4096, READ | adv_cpu_core::EXEC)
+            .unwrap();
+        native.prepare_job(&mut memory, stop, &resident_cpu(HEAD, 1024));
+        let mut linked = resident_cpu(OUTSIDE, 1);
+        linked.regs[2] = 1;
+        enter(&mut native, &mut memory, stop, &mut linked);
+        native.set_computation_offer(true, None);
+        let mut frame = FixedPace(OfferGate {
+            stale: AtomicU32::new(0),
+            split_over: AtomicU32::new(0),
+            split_deadline: AtomicU64::new(ticks() + 3_600 * host_tick_hz()),
+        });
+        let mut bridge = Bridge {
+            timestamp: Default::default(),
+            memory: &mut memory,
+            error: None,
+            trap: None,
+            calls: 0,
+            handler: Some(&mut frame),
+            parked: false,
+            deadline: None,
+            clock_due: true,
+            unclocked_bytes: 0,
+            bulk_calls: 0,
+            bulk_bytes: 0,
+            cliffs: Default::default(),
+            scratch: Default::default(),
+        };
+        for source in [HEAD, OUTSIDE] {
+            for trained in [8, 1024] {
+                for trips in [8, 1024] {
+                    let job = native.plans.job(HEAD).unwrap();
+                    assert!(job.splits);
+                    let elapsed = Duration::from_secs(u64::from(trained) * 10);
+                    plan::JobPlan::learn(
+                        job,
+                        &Completion {
+                            id: 0,
+                            context: None,
+                            retired: u64::from(trained) * 4,
+                            optimized: 0,
+                            elapsed,
+                            helpers: Duration::ZERO,
+                            requires_owner: false,
+                        },
+                        trained,
+                        elapsed,
+                        50_000.0,
+                    );
+                    job.reoffer.set(1);
+                    let mut cpu = resident_cpu(source, trips);
+                    if source == OUTSIDE {
+                        cpu.regs[1] = if trips == 8 { 1024 } else { 8 };
+                        cpu.regs[2] = trips;
+                    }
+                    let result = native
+                        .run(&mut cpu, &mut memory, stop, 4096, (&raw mut bridge).cast())
+                        .unwrap()
+                        .unwrap();
+                    let offered = result.exit == Exit::Computation;
+                    assert_eq!(offered, trips == 1024);
+                }
+            }
+        }
     }
 
     // spec: A64A-FALL-2 A64-OPT-8
