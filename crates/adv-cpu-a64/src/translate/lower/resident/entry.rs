@@ -563,20 +563,32 @@ pub(crate) fn offer_link(
     (asm.finish(), fallback)
 }
 
-/// A stale gate means the decision may have changed, so the entry checks at
-/// once; a split gate's pacing deadline is sampled.
+fn load_peer_gate(address: Reg, stale: Reg) -> [u32; 2] {
+    [
+        ldr(X, address, RT, runtime::OFFER_GATE),
+        ldr(W, stale, address, 0),
+    ]
+}
+
+/// A detached job survives a resident decline. Reuse the back edge's
+/// discovery stub to reach its canonical transition when a peer may run.
+pub(crate) fn internal_offer(at: usize, transition: usize, target: usize) -> [u32; 4] {
+    let [address, stale] = load_peer_gate(r(0), r(1));
+    [
+        address,
+        stale,
+        cbz(W, true, r(1), (transition as i64 - (at + 8) as i64) as i32),
+        branch(at + 12, target),
+    ]
+}
+
+/// A stale peer decision takes precedence over the sampled split deadline.
 fn offer(asm: &mut Asm, gate: OfferEntry, counter: Label, leave: Label) {
-    let proceed = asm.label();
+    asm.emit_all(&load_peer_gate(GATE, r(17)));
+    asm.cbz(W, true, r(17), leave);
     if gate.split {
         runtime::emit_sensor(asm, counter, SLOT, r(0), leave);
-    } else {
-        asm.emit_all(&[
-            ldr(X, GATE, RT, runtime::OFFER_GATE),
-            ldr(W, r(17), GATE, 0),
-        ]);
-        asm.cbz(W, true, r(17), leave);
     }
-    asm.bind(proceed);
 }
 
 fn sample_offer(asm: &mut Asm, head: u32, fallback: Label) {
@@ -636,44 +648,57 @@ mod tests {
     // spec: A64A-PLACE-3
     #[test]
     fn split_offer_rearms_and_a_decided_sensor_executes_one_word() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
         let counter = Cell::new(2u32);
+        let stale = AtomicU32::new(0);
+        let mut runtime = runtime::Runtime::new(std::ptr::null_mut(), 0);
+        runtime.offer_gate = stale.as_ptr() as u64;
         let mut asm = Asm::new();
         let data = asm.label();
         let sample = asm.label();
-        asm.emit(cmp(W, r(0), r(0), Lsl, 0));
-        let sensor = asm.offset();
+        asm.emit_all(&[
+            mov(X, r(2), RT),
+            mov(X, RT, r(0)),
+            cmp(W, r(0), r(0), Lsl, 0),
+        ]);
+        let gate_start = asm.offset();
         let gate = OfferEntry {
             counter: counter.as_ptr() as u64,
             split: true,
         };
         offer(&mut asm, gate, data, sample);
         let after = asm.offset();
+        let sensor = gate_start + 3 * 4;
         assert_eq!(after - sensor, 5 * 4);
-        asm.emit_all(&[cset(W, r(0), Cond::Ne), ret(Reg::LR)]);
+        asm.emit_all(&[cset(W, r(0), Cond::Ne), mov(X, RT, r(2)), ret(Reg::LR)]);
         asm.bind(sample);
-        asm.emit_all(&[cset(W, r(0), Cond::Eq), ret(Reg::LR)]);
+        asm.emit_all(&[cset(W, r(0), Cond::Eq), mov(X, RT, r(2)), ret(Reg::LR)]);
         literal(&mut asm, data, gate.counter);
         let words = asm.finish();
         assert_eq!(
             &words[sensor / 4..after / 4],
             &[
-                ldr_literal(SLOT, 36),
+                ldr_literal(SLOT, 44),
                 ldr(W, r(0), SLOT, 0),
                 sub_imm(W, r(0), r(0), 1, false),
                 str(W, r(0), SLOT, 0),
-                cbz(W, false, r(0), 12),
+                cbz(W, false, r(0), 16),
             ]
         );
         let mut cache = CodeCache::new(64 << 10).unwrap();
         let at = cache.append(&words).unwrap();
         cache.sync();
-        // SAFETY: the emitted leaf returns u32 and uses only volatile registers.
-        let enter: extern "C" fn() -> u32 = unsafe { std::mem::transmute(at) };
-        assert_eq!((enter(), counter.get()), (0, 1));
-        assert_eq!((enter(), counter.get()), (1, 0));
+        // SAFETY: the emitted leaf reads the runtime and preserves nonvolatile registers.
+        let enter: extern "C" fn(&runtime::Runtime) -> u32 = unsafe { std::mem::transmute(at) };
+        stale.store(1, Relaxed);
+        assert_eq!((enter(&runtime), counter.get()), (1, 2));
+        stale.store(0, Relaxed);
+        assert_eq!((enter(&runtime), counter.get()), (0, 1));
+        assert_eq!((enter(&runtime), counter.get()), (1, 0));
         counter.set(2);
-        assert_eq!((enter(), counter.get()), (0, 1));
-        assert_eq!((enter(), counter.get()), (1, 0));
+        assert_eq!((enter(&runtime), counter.get()), (0, 1));
+        assert_eq!((enter(&runtime), counter.get()), (1, 0));
         counter.set(1);
         cache.patch(at + sensor, b((after - sensor) as i32));
         cache.sync();
@@ -681,7 +706,7 @@ mod tests {
         for (index, &word) in words.iter().enumerate().skip(sensor / 4 + 1) {
             assert_eq!(cache.word(at + index * 4), word);
         }
-        assert_eq!((enter(), counter.get()), (0, 1));
+        assert_eq!((enter(&runtime), counter.get()), (0, 1));
     }
 
     // spec: A64A-PLACE-3, A64-OPT-9

@@ -936,6 +936,10 @@ impl Native {
         }
     }
 
+    pub(crate) fn worker_retired(&self) -> u64 {
+        self.offload.worker_retired
+    }
+
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
         self.runtime.body.services = services;
     }
@@ -1420,14 +1424,13 @@ mod tests {
         native.set_computation_offer(true, None);
         let gate = native.code.offer(HEAD).unwrap().0;
         assert!(native.plans.resident(HEAD).unwrap().declined());
-        native.plans.job(HEAD).unwrap().reoffer.set(3);
-        for left in [2, 1] {
-            let mut state = resident_cpu(OUTSIDE, 20);
+        native.plans.job(HEAD).unwrap().back_off(2);
+        for _ in 0..2 {
+            let mut state = resident_cpu(OUTSIDE, 1);
             let result = enter(&mut native, &mut memory, stop, &mut state);
             assert_eq!((result.exit, state.eip), (Exit::Dispatch, stop));
-            assert_eq!(native.plans.job(HEAD).unwrap().reoffer.get(), left);
         }
-        let mut state = resident_cpu(OUTSIDE, 20);
+        let mut state = resident_cpu(OUTSIDE, 1);
         let result = enter(&mut native, &mut memory, stop, &mut state);
         assert_eq!((result.exit, state.eip), (Exit::Computation, HEAD));
         assert_eq!(native.plans.job(HEAD).unwrap().reoffer.get(), plan::REOFFER);
@@ -1627,7 +1630,7 @@ mod tests {
         let offer_words = native
             .plans
             .job(HEAD)
-            .map_or(0, |job| if job.splits { 5 } else { 8 });
+            .map_or(0, |job| if job.splits { 8 } else { 3 });
         assert!(target(&native, proved + (offer_words + 3) * 4) > checked);
         let mut state = resident_cpu(OUTSIDE, 1);
         assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 6);
@@ -2358,10 +2361,18 @@ mod tests {
             native.code.cache.word(fallback),
             store::branch(fallback, native.code.tier1(HEAD).unwrap().unit)
         );
-        let edge = &native.code.internal_edges[&HEAD][0];
+        let edge = native.code.internal_edges[&HEAD]
+            .iter()
+            .find(|edge| edge.back)
+            .unwrap();
+        let offer = native.code.offer(HEAD).unwrap().0;
         assert_eq!(
             native.code.cache.word(edge.point),
-            store::branch(edge.point, edge.target)
+            store::branch(edge.point, edge.sensor.unwrap())
+        );
+        assert_eq!(
+            native.code.cache.word(edge.link),
+            store::branch(edge.link, offer)
         );
     }
 

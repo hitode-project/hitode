@@ -875,9 +875,10 @@ impl<R> CodeStore<R> {
         counting: bool,
         offer: bool,
     ) {
-        self.repoint_internal_edges(eip, resident);
-        let mut next = self.links.get(&eip).copied().unwrap_or(u32::MAX);
         let gate = self.offer(eip);
+        let offer = gate.filter(|_| offer).map(|(entry, _)| entry);
+        self.repoint_internal_edges(eip, resident, offer);
+        let mut next = self.links.get(&eip).copied().unwrap_or(u32::MAX);
         let Some(tier1) = self
             .resident_fallback(eip)
             .or_else(|| gate.map(|(_, fallback)| fallback))
@@ -889,43 +890,57 @@ impl<R> CodeStore<R> {
             if edge.back || edge.direct.is_some() || gate.is_some() {
                 let target = self.linked_target(edge.point, eip, tier1);
                 let resident = self.resident_target(eip, edge.point, resident);
-                Self::route_link(
-                    &mut self.cache,
-                    &edge,
-                    resident,
-                    counting,
-                    gate.filter(|_| offer).map(|(entry, _)| entry),
-                    target,
-                );
+                Self::route_link(&mut self.cache, &edge, resident, counting, offer, target);
             }
         }
     }
 
-    fn repoint_internal_edges(&mut self, eip: u32, resident: Option<usize>) {
+    fn repoint_internal_edges(&mut self, eip: u32, resident: Option<usize>, offer: Option<usize>) {
         let site = self
             .chains
             .get(&eip)
             .and_then(|chain| chain.resident.as_ref());
         for edge in self.internal_edges.get_mut(&eip).into_iter().flatten() {
-            let target = if let Some(entry) = resident.filter(|_| {
-                edge.back
-                    || !site
-                        .unwrap()
-                        .unit
-                        .trace
-                        .insts
-                        .iter()
-                        .any(|inst| inst.pc == edge.source_pc)
-            }) {
-                let entry = Self::proved_resident(site.unwrap(), self.point_facts.get(&edge.point))
-                    .unwrap_or(entry);
-                self.cache.patch(edge.link, branch(edge.link, entry));
-                edge.transition
-            } else {
-                edge.target
-            };
-            self.cache.patch(edge.point, branch(edge.point, target));
+            Self::route_internal(
+                &mut self.cache,
+                edge,
+                site.zip(resident),
+                self.point_facts.get(&edge.point),
+                offer,
+            );
         }
+    }
+
+    fn route_internal(
+        cache: &mut CodeCache,
+        edge: &InternalEdge,
+        resident: Option<(&ResidentSite<R>, usize)>,
+        facts: Option<&Key>,
+        offer: Option<usize>,
+    ) {
+        let target = if let Some((site, entry)) = resident.filter(|(site, _)| {
+            edge.back
+                || !site
+                    .unit
+                    .trace
+                    .insts
+                    .iter()
+                    .any(|inst| inst.pc == edge.source_pc)
+        }) {
+            let entry = Self::proved_resident(site, facts).unwrap_or(entry);
+            cache.patch(edge.link, branch(edge.link, entry));
+            edge.transition
+        } else if let Some((sensor, offer)) = edge.sensor.zip(offer) {
+            let words = ingress::internal_offer(sensor, edge.transition, edge.target);
+            for (i, word) in words.into_iter().enumerate() {
+                cache.patch(sensor + i * 4, word);
+            }
+            cache.patch(edge.link, branch(edge.link, offer));
+            sensor
+        } else {
+            edge.target
+        };
+        cache.patch(edge.point, branch(edge.point, target));
     }
 
     pub(super) fn publish_switch(&mut self, eip: u32, target: usize) {
@@ -1111,7 +1126,7 @@ impl<R> CodeStore<R> {
                 }
             }
         }
-        self.repoint_internal_edges(eip, None);
+        self.repoint_internal_edges(eip, None, None);
         let dropped = self.chains.remove(&eip).is_some();
         if self.table_sources.remove(&eip) {
             self.rows.retain(|_, slots| {
@@ -1274,32 +1289,30 @@ impl<R> CodeStore<R> {
             } else {
                 u32::MAX
             };
-            let resident = self.resident(link.eip);
-            if let Some(entry) = resident.and_then(|site| {
-                site.entry().filter(|_| {
-                    edge.back
-                        || !site
-                            .unit
-                            .trace
-                            .insts
-                            .iter()
-                            .any(|inst| inst.pc == edge.source_pc)
-                })
-            }) {
-                let target = self
-                    .resident_target(link.eip, edge.point, Some(entry))
-                    .unwrap();
-                self.repoint(edge.link, target);
-                self.cache
-                    .patch(edge.point, branch(edge.point, edge.transition));
-            } else if resident.is_some() || value == u32::MAX {
-                self.cache
-                    .patch(edge.point, branch(edge.point, edge.target));
-            }
             if value == u32::MAX
                 && let Some(sensor) = edge.sensor
             {
                 self.cache.patch(sensor, branch(sensor, edge.target));
+            }
+            let chain = self.chains.get(&link.eip);
+            let resident = chain.and_then(|chain| chain.resident.as_ref());
+            if resident.is_some() || value == u32::MAX {
+                let offer = chain
+                    .filter(|chain| {
+                        chain
+                            .resident
+                            .as_ref()
+                            .is_some_and(|site| site.versions.is_empty())
+                    })
+                    .and_then(|chain| chain.offer)
+                    .map(|(entry, _)| entry);
+                Self::route_internal(
+                    &mut self.cache,
+                    &edge,
+                    resident.and_then(|site| Some((site, site.entry()?))),
+                    self.point_facts.get(&edge.point),
+                    offer,
+                );
             }
             self.internal_edges.entry(link.eip).or_default().push(edge);
         }

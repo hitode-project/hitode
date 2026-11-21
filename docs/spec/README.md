@@ -47,7 +47,7 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `exe`, `args`, `seconds` | The guest program `adv-run` starts, extra `adv-run` options and the time limit. |
 | `outputs` | Files the guest writes. Their bytes are compared between builds. |
 | `frame` | When true, the last presented frame's hash is compared too. |
-| `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. |
+| `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. On AArch64, `owner_retired` counts guest instructions completed on the owner, including its share of split jobs. |
 | `levels` | Report counters compared by their final value, such as `peak_rss`, the build's peak resident memory. |
 | `gpu` | When true, the scenario pins behavior of the target GPUs. CI runners lack them, so CI skips it by name; run it with `--gpu` on a target device when a change touches the GPU path. |
 

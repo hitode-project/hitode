@@ -62,6 +62,8 @@ pub(super) struct JobPlan {
     forms: Cell<u8>,
     building: Cell<bool>,
     pub reoffer: Cell<u32>,
+    /// Eligible offers to skip after a refused or short job.
+    backoff: Cell<u32>,
     pub mode: Cell<Mode>,
     /// Instructions and time per outer iteration, once a job showed them.
     pub per_iteration: Cell<Option<(u64, f64)>>,
@@ -96,6 +98,7 @@ impl JobPlan {
             forms: Cell::new(0),
             building: Cell::new(false),
             reoffer: Cell::new(1),
+            backoff: Cell::new(0),
             mode: Cell::new(mode),
             per_iteration: Cell::new(None),
             cost: Cell::new(0),
@@ -153,10 +156,19 @@ impl JobPlan {
         use std::sync::atomic::Ordering::Relaxed;
 
         let ticks = self.split_ticks.get();
-        gate.stale.load(Relaxed) != 0
+        let due = gate.stale.load(Relaxed) != 0
             || ticks != 0
                 && (gate.split_over.load(Relaxed) != 0
-                    || now().wrapping_add(ticks) > gate.split_deadline.load(Relaxed))
+                    || now().wrapping_add(ticks) > gate.split_deadline.load(Relaxed));
+        if !due {
+            return false;
+        }
+        let skip = self.backoff.get();
+        if skip != 0 {
+            self.backoff.set(skip - 1);
+            return false;
+        }
+        true
     }
 
     pub fn iteration(&self) -> bool {
@@ -170,6 +182,10 @@ impl JobPlan {
 
     pub fn defer_offer(&self) {
         self.reoffer.set(REOFFER);
+    }
+
+    pub fn back_off(&self, count: u32) {
+        self.backoff.set(count);
     }
 
     pub fn sample_offer(&self) -> bool {
@@ -232,12 +248,11 @@ impl JobPlan {
         }
         // Short jobs do not amortize admission and queueing. Give them
         // another trial after about one ordinary slice.
-        let skip = if completion.elapsed < SHORT_JOB {
-            (u64::from(slice) / completion.retired.max(1)).max(1) as u32
-        } else {
-            REOFFER
-        };
-        self.reoffer.set(skip.max(REOFFER));
+        if completion.elapsed < SHORT_JOB {
+            let skip = (u64::from(slice) / completion.retired.max(1)) as u32;
+            self.back_off(skip.max(REOFFER));
+        }
+        self.defer_offer();
     }
 }
 

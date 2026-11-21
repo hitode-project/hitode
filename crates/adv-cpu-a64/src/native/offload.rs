@@ -31,6 +31,7 @@ use crate::translate::opt::{back::Lowered, front::Built, ir::Source};
 pub(super) struct Offload {
     pub(super) admission: Admission,
     pub(super) enabled: bool,
+    pub(super) worker_retired: u64,
     wake: WakeEstimate,
 }
 
@@ -68,7 +69,7 @@ pub(super) struct Code {
     pub frame: Arc<[ScopeCell]>,
     pub scoped_mmx: u16,
     pub scoped_gpr: u32,
-    /// The optimized form, run instead when a job meets its assumptions.
+    /// Checked optimized forms of this job, most recently built first.
     pub optimized: Option<Arc<Optimized>>,
 }
 
@@ -80,6 +81,7 @@ pub(super) struct Optimized {
     pub records: Vec<Record<Host>>,
     pub flags: Vec<Option<FlagRecipe>>,
     pub cells: usize,
+    previous: Option<Arc<Optimized>>,
 }
 
 impl<U> WorkerJob<U> {
@@ -110,6 +112,7 @@ impl<U> WorkerJob<U> {
             records: lowered.records,
             flags: lowered.flags,
             cells: lowered.spill_cells,
+            previous: self.code.optimized.take(),
         }));
     }
 }
@@ -357,23 +360,28 @@ fn run_scoped(
     }
 }
 
-/// The optimized form of `code` if it has one whose entry facts hold at
-/// `cpu`, filling `params`. `alias` reaches the admitted frame.
+/// Selects an optimized form whose facts hold and fills its entry cells.
 fn admit<'a>(
     code: &'a Code,
     cpu: &CpuState,
     alias: u64,
     params: &mut Vec<u128>,
 ) -> Option<&'a Optimized> {
-    let o = code.optimized.as_deref()?;
-    // SAFETY: admission granted the frame's ranges.
-    crate::translate::opt::admit_into(&o.entry, &o.assumed, cpu, params, |addr, width| unsafe {
-        let mut bytes = [0; 8];
-        let at = alias.wrapping_add(u64::from(addr)) as *const u8;
-        std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), usize::from(width));
-        u64::from_le_bytes(bytes)
+    std::iter::successors(code.optimized.as_deref(), |form| form.previous.as_deref()).find(|form| {
+        // SAFETY: admission granted the frame's ranges.
+        crate::translate::opt::admit_into(
+            &form.entry,
+            &form.assumed,
+            cpu,
+            params,
+            |addr, width| unsafe {
+                let mut bytes = [0; 8];
+                let at = alias.wrapping_add(u64::from(addr)) as *const u8;
+                std::ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), usize::from(width));
+                u64::from_le_bytes(bytes)
+            },
+        )
     })
-    .then_some(o)
 }
 
 /// Enters `code`, or `optimized`, its admitted form, on this thread. The
@@ -1237,6 +1245,7 @@ pub(super) struct Session<'a, U, R> {
     memory: &'a Memory,
     admission: &'a mut Admission,
     retired: &'a mut u64,
+    worker_retired: &'a mut u64,
     forms: &'a mut Option<[u64; 5]>,
     pool: &'static Pool,
     active: Vec<ActiveTask>,
@@ -1276,6 +1285,7 @@ impl<'a, U, R> Session<'a, U, R> {
             memory,
             admission: &mut offload.admission,
             retired,
+            worker_retired: &mut offload.worker_retired,
             forms,
             pool,
             wake: notifications.wake,
@@ -1342,7 +1352,7 @@ impl<'a, U, R> Session<'a, U, R> {
             .admission
             .ranges((key, job), cpu, self.memory, &self.active)
         else {
-            policy.reoffer.set(REOFFER);
+            policy.back_off(REOFFER);
             return None;
         };
         Some((job, policy, ranges, iteration))
@@ -1440,6 +1450,7 @@ impl<'a, U, R> Session<'a, U, R> {
                 self.wake_estimate.record(ns);
             }
             helped += drained.elapsed;
+            *self.worker_retired += drained.retired;
             total.merge(drained);
         }
         self.counts.blocks += u64::from(total.blocks);
@@ -1521,6 +1532,7 @@ impl<'a, U, R> Session<'a, U, R> {
         }
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
+        *self.worker_retired += done.completion.retired;
         self.account(job.entry, job.iteration, done)
     }
 }
@@ -3188,6 +3200,12 @@ mod tests {
         let start = Some(executor.save_context().unwrap());
         let mut cpu = start.as_ref().unwrap().cpu().clone();
         native.prepare_job(executor.memory_mut(), stop, &cpu);
+        let mut alternate = cpu.clone();
+        alternate.x87.status |= 0x100;
+        let job = native.worker_jobs.get_mut(&CODE).unwrap();
+        let built = crate::translate::opt::front::build(&job.unit, &job.proof, &alternate).unwrap();
+        let lowered = crate::translate::opt::back::lower(&built.func);
+        job.install(&mut native.code, CODE, built, lowered);
         native.set_computation_offer(true, None);
         let offer = native
             .run(
@@ -3220,6 +3238,232 @@ mod tests {
             (0, SRC + N * 8, DST + N * 8)
         );
         assert_eq!(cpu.x87.tag, 0xffff);
+    }
+
+    // spec: A64-OPT-8 A64-OPT-9 A64-TR-9
+    #[test]
+    fn declined_resident_x87_blocks_still_offer_worker_jobs() {
+        use iced_x86::BlockEncoderOptions;
+
+        let _pool = exclusive_pool();
+        const BYTES: u32 = 1 << 18;
+        const STACK: u32 = 0x300_0000;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut outer = a.create_label();
+        let mut byte_loop = a.create_label();
+        let mut byte_exit = a.create_label();
+        let mut stop = a.create_label();
+        let mut convert = a.create_label();
+        let mut floor = a.create_label();
+        let mut rounded = a.create_label();
+
+        a.nop().unwrap();
+        a.set_label(&mut outer).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(esi + 8)).unwrap();
+        a.call(convert).unwrap();
+        a.mov(edx, eax).unwrap();
+        a.fld(qword_ptr(esi + 16)).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.call(floor).unwrap();
+        a.fnstcw(word_ptr(esp + 8)).unwrap();
+        a.movzx(eax, word_ptr(esp + 8)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(word_ptr(esp + 12), ax).unwrap();
+        a.fldcw(word_ptr(esp + 12)).unwrap();
+        a.fistp(dword_ptr(esp + 16)).unwrap();
+        a.fldcw(word_ptr(esp + 8)).unwrap();
+        a.add(edx, dword_ptr(esp + 16)).unwrap();
+        a.mov(ecx, 64).unwrap();
+        a.set_label(&mut byte_loop).unwrap();
+        a.movzx(eax, byte_ptr(esi + ecx + 23)).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(byte_ptr(edi + ecx - 1), al).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(byte_loop).unwrap();
+        a.set_label(&mut byte_exit).unwrap();
+        a.dec(ebx).unwrap();
+        a.jne(outer).unwrap();
+        a.set_label(&mut stop).unwrap();
+        a.int3().unwrap();
+
+        a.set_label(&mut convert).unwrap();
+        a.push(ebp).unwrap();
+        a.mov(ebp, esp).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.and(esp, -8).unwrap();
+        a.fstp(qword_ptr(esp)).unwrap();
+        a.cvttsd2si(eax, qword_ptr(esp)).unwrap();
+        a.leave().unwrap();
+        a.ret().unwrap();
+
+        a.set_label(&mut floor).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.stmxcsr(dword_ptr(esp + 4)).unwrap();
+        a.fnstcw(word_ptr(esp)).unwrap();
+        a.movq(xmm0, qword_ptr(esp + 12)).unwrap();
+        a.cvttsd2si(eax, xmm0).unwrap();
+        a.cvtsi2sd(xmm1, eax).unwrap();
+        a.ucomisd(xmm0, xmm1).unwrap();
+        a.jae(rounded).unwrap();
+        a.dec(eax).unwrap();
+        a.set_label(&mut rounded).unwrap();
+        a.mov(dword_ptr(esp + 4), eax).unwrap();
+        a.fild(dword_ptr(esp + 4)).unwrap();
+        a.add(esp, 8).unwrap();
+        a.ret().unwrap();
+
+        let code = a
+            .assemble_options(
+                u64::from(CODE),
+                BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let head = code.label_ip(&outer).unwrap() as u32;
+        let inner = code.label_ip(&byte_loop).unwrap() as u32;
+        let inner_stop = code.label_ip(&byte_exit).unwrap() as u32;
+        let stop = code.label_ip(&stop).unwrap() as u32;
+        let (mut executor, mut native) = fixture(&mut a);
+        native.first_visits = false;
+        let memory = executor.memory_mut();
+        memory
+            .map(SRC, BYTES as usize + 0x4000, READ | WRITE)
+            .unwrap();
+        memory.map(DST, BYTES as usize, READ | WRITE).unwrap();
+        memory.map(STACK, 0x1_0000, READ | WRITE).unwrap();
+        let input: Vec<_> = [5.25f64, 2.0, -3.25]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .chain((0..BYTES).map(|i| i as u8))
+            .collect();
+        memory.write(SRC, &input).unwrap();
+        let mut cpu = CpuState {
+            eip: CODE,
+            ..Default::default()
+        };
+        cpu.regs[3] = 4;
+        cpu.regs[ESP] = STACK + 0x8000;
+        cpu.regs[6] = SRC;
+        cpu.regs[7] = DST;
+        cpu.x87.control = 0x37f;
+        cpu.mxcsr = 0x1f80;
+        native.observe_stop(stop);
+        native
+            .translate(
+                memory,
+                CODE,
+                crate::facts::Key::read(&cpu, crate::facts::ALL),
+            )
+            .unwrap();
+        let mut at = cpu.clone();
+        at.eip = head;
+        assert!(!native.force_resident_at(memory, at));
+        assert!(native.worker_jobs.contains_key(&head));
+        native.set_computation_offer(true, None);
+        let offer = native
+            .run(&mut cpu, memory, stop, 1 << 26, std::ptr::null_mut())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (offer.exit, cpu.eip, cpu.regs[3]),
+            (Exit::Computation, head, 3)
+        );
+
+        executor.state = cpu;
+        let start = Some(executor.save_context().unwrap());
+        assert_eq!(
+            executor.run(stop, 1 << 26).unwrap(),
+            crate::RunOutcome::ReachedStop
+        );
+        let serial = executor.state.capture_architecture();
+        let expected = executor
+            .memory()
+            .read(DST, BYTES as usize)
+            .unwrap()
+            .to_vec();
+        let pending = (Arc::new(AtomicU32::new(0)), 0);
+        let mut retired = 0;
+        if Pool::get().is_some() {
+            executor
+                .memory_mut()
+                .fill(DST, &[0], BYTES as usize)
+                .unwrap();
+            native.with_computation(
+                executor.memory_mut(),
+                &mut retired,
+                pending.clone(),
+                None,
+                &mut |scope| {
+                    assert!(scope.submit(1, &start));
+                    let done = scope.wait(None).unwrap();
+                    assert!(!done.requires_owner);
+                    assert_eq!(
+                        done.context.unwrap().cpu_mut().capture_architecture(),
+                        serial
+                    );
+                },
+            );
+            assert!(retired > 0);
+            assert_eq!(native.offload.worker_retired, retired);
+            assert_eq!(
+                executor.memory().read(DST, BYTES as usize).unwrap(),
+                expected
+            );
+        }
+
+        if Pool::get().is_some_and(|pool| pool.limit >= 2) {
+            executor.restore_context(start.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                executor.run(inner, 1000).unwrap(),
+                crate::RunOutcome::ReachedStop
+            );
+            executor.state.regs[1] = BYTES;
+            let start = Some(executor.save_context().unwrap());
+            assert_eq!(
+                executor.run(inner_stop, 1 << 26).unwrap(),
+                crate::RunOutcome::ReachedStop
+            );
+            let serial = executor.state.capture_architecture();
+            let expected = executor
+                .memory()
+                .read(DST, BYTES as usize)
+                .unwrap()
+                .to_vec();
+            native.prepare_job(
+                executor.memory_mut(),
+                inner_stop,
+                start.as_ref().unwrap().cpu(),
+            );
+            let policy = native.plans.job(inner).unwrap();
+            assert!(policy.splits);
+            policy.per_iteration.set(Some((5, 50.0)));
+            native.pace.set(Some(Pace::default()));
+            executor
+                .memory_mut()
+                .fill(DST, &[0], BYTES as usize)
+                .unwrap();
+            native.with_computation(
+                executor.memory_mut(),
+                &mut retired,
+                pending,
+                None,
+                &mut |scope| {
+                    let done = scope.run_local(1, &start).unwrap();
+                    assert!(!done.requires_owner);
+                    assert!(done.helpers > Duration::ZERO);
+                    assert_eq!(
+                        done.context.unwrap().cpu_mut().capture_architecture(),
+                        serial
+                    );
+                },
+            );
+            assert_eq!(native.diagnostics.split.splits, 1);
+            assert!(native.diagnostics.split.blocks > 2);
+            assert_eq!(
+                executor.memory().read(DST, BYTES as usize).unwrap(),
+                expected
+            );
+        }
     }
 
     // spec: A64-OPT-1 A64-TR-9 A64F-FP-4

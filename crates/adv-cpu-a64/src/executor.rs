@@ -349,6 +349,14 @@ impl Executor {
         result
     }
 
+    pub(crate) fn worker_retired(&self) -> u64 {
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            return native.worker_retired();
+        }
+        0
+    }
+
     /// Diagnostic counts of the translated runs, as `name: value` pairs.
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]

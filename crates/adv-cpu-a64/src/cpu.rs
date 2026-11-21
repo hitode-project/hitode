@@ -855,7 +855,11 @@ impl Engine for Cpu {
             stats.compilations,
             stats.native_code_bytes,
             stats.verification.json(),
-            json(&self.inner.diagnostics()),
+            json(&format!(
+                "{} owner_retired: {}",
+                self.inner.diagnostics(),
+                self.retired - self.inner.worker_retired(),
+            )),
             self.inner
                 .retired_forms()
                 .map_or_else(|| "null".into(), |forms| format!("{forms:?}")),
