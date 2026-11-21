@@ -104,6 +104,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::VecToInt(_, a)
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
+        | Op::X87Store { value: a, .. }
         | Op::Load { addr: a, .. }
         | Op::PlainPage { addr: a, .. }
         | Op::PageCross { addr: a, .. }
@@ -113,9 +114,15 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::Test { flags: a, .. } => f(a),
         Op::Int(_, a, b)
         | Op::Fp(_, a, b)
+        | Op::X87Single(_, a, b)
         | Op::Fp32(_, a, b)
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
+        | Op::X87StoreC1 {
+            value: a,
+            stored: b,
+            ..
+        }
         | Op::Div {
             dividend: a,
             divisor: b,

@@ -538,14 +538,49 @@ fn loop_model(slots: [Known; 8], delta: u8) -> Model {
     model
 }
 
+/// Bits known independently of the control word at block entry.
+#[derive(Clone, Copy, Default)]
+struct ControlBits {
+    set: u16,
+    clear: u16,
+}
+
+impl ControlBits {
+    fn logical(self, op: Alu, mask: u16) -> Self {
+        match op {
+            Alu::And => Self {
+                set: self.set & mask,
+                clear: self.clear | !mask,
+            },
+            Alu::Or => Self {
+                set: self.set | mask,
+                clear: self.clear & !mask,
+            },
+            Alu::Xor => Self {
+                set: self.set & !mask | self.clear & mask,
+                clear: self.clear & !mask | self.set & mask,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn rounding(self) -> Option<u8> {
+        ((self.set | self.clear) & 0xc00 == 0xc00).then_some((self.set >> 10 & 3) as u8)
+    }
+
+    fn masks_all(self) -> bool {
+        self.set & 0x3f == 0x3f
+    }
+}
+
 /// Stack addresses relative to a still-known register value. Alignment starts
 /// a new origin; the frame pointer retains the old one until LEAVE.
 #[derive(Default)]
 struct MemoryRun {
     addresses: [Option<(usize, u32)>; 8],
-    words: [Option<u16>; 8],
-    saved: Vec<((usize, u32), u16)>,
-    control: Option<u16>,
+    words: [Option<ControlBits>; 8],
+    saved: Vec<((usize, u32), ControlBits)>,
+    control: Option<ControlBits>,
     transfers: Vec<((usize, u32), usize)>,
 }
 
@@ -558,7 +593,7 @@ impl MemoryRun {
         Some((origin, offset.wrapping_add(mem.disp)))
     }
 
-    fn store(&mut self, mem: Mem, width: u32, word: Option<u16>, transfer: Option<usize>) {
+    fn store(&mut self, mem: Mem, width: u32, word: Option<ControlBits>, transfer: Option<usize>) {
         let address = self.address(mem);
         let disjoint = |other: (usize, u32)| {
             address.is_some_and(|(origin, offset)| {
@@ -579,17 +614,24 @@ impl MemoryRun {
         }
     }
 
-    fn word(&self, mem: Mem) -> Option<u16> {
+    fn word(&self, mem: Mem) -> Option<ControlBits> {
         let at = self.address(mem)?;
         self.saved.iter().find(|w| w.0 == at).map(|w| w.1)
     }
 }
 
 /// Identify memory exchanges and saved-control restores along native paths.
-/// Stores remain real accesses; these facts only extend run planning and
-/// remove the unmask check when every possible loaded mask is unchanged.
-fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
-    let (mut crossings, mut controls) = (Vec::new(), Vec::new());
+/// Stores remain real accesses; these facts extend run planning and
+/// specialize control loads and conversions.
+#[derive(Default)]
+struct MemoryFacts {
+    crossings: Vec<usize>,
+    masks_all: Vec<usize>,
+    rounding: Vec<(usize, u8)>,
+}
+
+fn memory_runs(trace: &Trace) -> MemoryFacts {
+    let mut out = MemoryFacts::default();
     let mut facts = MemoryRun::default();
     for (index, inst) in trace.insts.iter().enumerate() {
         if trace.head(index)
@@ -606,30 +648,27 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
         match inst.op {
             Op::X87(x) => match x.fast {
                 Fast::StoreControl => {
-                    // A fresh save establishes the identity of the current word.
-                    if facts.control.is_none() {
-                        facts.saved.clear();
-                        facts.words = [None; 8];
-                    }
-                    let control = *facts.control.get_or_insert(0);
                     if let Some(mem) = x.mem {
-                        facts.store(mem, 2, Some(control), None);
+                        facts.store(mem, 2, facts.control, None);
                     }
-                    crossings.push(index);
+                    out.crossings.push(index);
                 }
                 Fast::LoadControl => {
                     let word = x.mem.and_then(|m| facts.word(m));
-                    if word.is_some() && facts.control.is_some() {
-                        controls.push(index);
+                    if word.is_some_and(ControlBits::masks_all) {
+                        out.masks_all.push(index);
                     }
                     facts.control = word;
                 }
                 Fast::Load(Source::F64) => {
                     if let Some(from) = x.mem.and_then(|mem| transfer(&facts, mem)) {
-                        crossings.extend([from, index]);
+                        out.crossings.extend([from, index]);
                     }
                 }
                 Fast::Store { width, integer, .. } => {
+                    if integer && let Some(rc) = facts.control.and_then(ControlBits::rounding) {
+                        out.rounding.push((index, rc));
+                    }
                     if let Some(mem) = x.mem {
                         facts.store(
                             mem,
@@ -655,7 +694,7 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
                     && let Some(from) = transfer(&facts, simd.mem)
                     && matches!(trace.insts[from].op, Op::X87(_))
                 {
-                    crossings.extend([from, index]);
+                    out.crossings.extend([from, index]);
                 }
                 if simd.kind == Kind::MaskMove {
                     facts.saved.clear();
@@ -689,10 +728,6 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
                 facts.words[usize::from(r)] = facts.word(mem);
                 facts.addresses[usize::from(r)] = None;
             }
-            Op::Alu(Alu::Or, Src::Reg(r), Src::Imm(0xc00)) => {
-                facts.words[usize::from(r)] = facts.words[usize::from(r)].map(|w| w | 0xc00);
-                facts.addresses[usize::from(r)] = None;
-            }
             Op::Alu(op @ (Alu::Add | Alu::Sub), Src::Reg(r), Src::Imm(n)) => {
                 let offset = if op == Alu::Add { n } else { n.wrapping_neg() };
                 facts.addresses[usize::from(r)] = facts.addresses[usize::from(r)]
@@ -706,6 +741,28 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
             Op::Alu(Alu::And, Src::Reg(4), Src::Imm(_)) => {
                 facts.addresses[4] = Some((index, 0));
                 facts.words[4] = None;
+            }
+            Op::Alu(op @ (Alu::And | Alu::Or | Alu::Xor), Src::Reg(r), Src::Imm(bits))
+            | Op::Narrow(
+                Some(op @ (Alu::And | Alu::Or | Alu::Xor)),
+                2,
+                OperandPart::Reg(r),
+                OperandPart::Imm(bits),
+            ) => {
+                let r = usize::from(r);
+                facts.words[r] = Some(facts.words[r].unwrap_or_default().logical(op, bits as u16));
+                facts.addresses[r] = None;
+            }
+            Op::Narrow(None, 2, OperandPart::Mem(mem), OperandPart::Reg(r)) => {
+                facts.store(mem, 2, facts.words[usize::from(r)], None);
+            }
+            Op::Narrow(None, 2, OperandPart::Reg(r), src) => {
+                facts.words[usize::from(r)] = match src {
+                    OperandPart::Reg(from) => facts.words[usize::from(from)],
+                    OperandPart::Mem(mem) => facts.word(mem),
+                    _ => None,
+                };
+                facts.addresses[usize::from(r)] = None;
             }
             Op::Push(_) | Op::Call(_) => {
                 facts.words[4] = None;
@@ -730,12 +787,13 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
                 facts.words[usize::from(r)] = None;
                 facts.addresses[usize::from(r)] = None;
             }
-            Op::Narrow(op, 2, OperandPart::Reg(r), _) => {
-                facts.words[usize::from(r)] = None;
-                facts.addresses[usize::from(r)] = None;
-                if op.is_some() {
-                    facts.transfers.clear();
-                }
+            Op::Narrow(_, width, OperandPart::Reg(r), _) => {
+                let r = usize::from(if width == 1 && r >= 4 { r - 4 } else { r });
+                facts.words[r] = None;
+                facts.addresses[r] = None;
+            }
+            Op::Narrow(_, width, OperandPart::Mem(mem), _) => {
+                facts.store(mem, u32::from(width), None, None);
             }
             _ => {
                 // An unmodelled writer cannot contribute to a saved-word proof.
@@ -747,9 +805,9 @@ fn memory_runs(trace: &Trace) -> (Vec<usize>, Vec<usize>) {
             }
         }
     }
-    crossings.sort_unstable();
-    crossings.dedup();
-    (crossings, controls)
+    out.crossings.sort_unstable();
+    out.crossings.dedup();
+    out
 }
 
 type Stack = ([Known; 8], u8);
@@ -914,8 +972,7 @@ pub(in super::super) struct Cache {
     pub(super) pe: bool,
     pub(super) control_stable: bool,
     publishers: Vec<(Model, Reg, Label)>,
-    crossings: Vec<usize>,
-    controls: Vec<usize>,
+    memory_facts: MemoryFacts,
 }
 
 impl Cache {
@@ -932,10 +989,8 @@ impl Cache {
                 }
             }
         }
-        let (crossings, controls) = memory_runs(trace);
         Self {
-            crossings,
-            controls,
+            memory_facts: memory_runs(trace),
             loops,
             loop_head,
             incoming,
@@ -962,7 +1017,7 @@ impl Translator<'_> {
         let mut last = None;
         let mut crossing = 0;
         for index in 0..len {
-            if self.x87.crossings.get(crossing) == Some(&index) {
+            if self.x87.memory_facts.crossings.get(crossing) == Some(&index) {
                 last = Some(index);
                 crossing += 1;
             }
@@ -1124,8 +1179,16 @@ impl Translator<'_> {
         self.x87.active.then(|| self.x87.model.used())
     }
 
-    pub(super) fn x87_saved_control(&self) -> bool {
-        self.x87.active && self.x87.controls.contains(&self.index)
+    pub(super) fn x87_masks_all(&self) -> bool {
+        self.x87.active && self.x87.memory_facts.masks_all.contains(&self.index)
+    }
+
+    pub(super) fn x87_store_rounding(&self) -> Option<u8> {
+        let facts = &self.x87.memory_facts.rounding;
+        let index = facts
+            .binary_search_by_key(&self.index, |&(index, _)| index)
+            .ok()?;
+        Some(facts[index].1)
     }
 
     /// The cacheable x87 instruction at `index`, if it is one.
@@ -1312,6 +1375,7 @@ impl Translator<'_> {
                     if end.is_some()
                         && self
                             .x87
+                            .memory_facts
                             .crossings
                             .iter()
                             .any(|&at| at >= start && at <= index)

@@ -231,6 +231,8 @@ pub(crate) enum Op {
         value: Value,
     },
     Fp(FpOp, Value, Value),
+    /// x87 precision 24 when both inputs are exact in binary32.
+    X87Single(FpOp, Value, Value),
     Fp32(FpOp, Value, Value),
     SseFp64(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
@@ -241,6 +243,19 @@ pub(crate) enum Op {
         value: Value,
         wide: bool,
         sse: bool,
+    },
+    /// Round to a signed integer or binary32 under an x87 control word.
+    X87Store {
+        value: Value,
+        width: u8,
+        rounding: u8,
+        integer: bool,
+    },
+    /// Whether a checked store increased the magnitude of its operand.
+    X87StoreC1 {
+        value: Value,
+        stored: Value,
+        integer: bool,
     },
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
@@ -346,6 +361,7 @@ impl Op {
             | Op::VecToInt(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
+            | Op::X87Store { value: a, .. }
             | Op::Load { addr: a, .. }
             | Op::PlainPage { addr: a, .. }
             | Op::PageCross { addr: a, .. }
@@ -355,9 +371,15 @@ impl Op {
             | Op::Test { flags: a, .. } => [Some(a), None, None],
             Op::Int(_, a, b)
             | Op::Fp(_, a, b)
+            | Op::X87Single(_, a, b)
             | Op::Fp32(_, a, b)
             | Op::SseFp64(_, a, b)
             | Op::Vec(_, a, b)
+            | Op::X87StoreC1 {
+                value: a,
+                stored: b,
+                ..
+            }
             | Op::Div {
                 dividend: a,
                 divisor: b,
@@ -387,9 +409,11 @@ impl Op {
     pub(crate) fn floating(&self) -> bool {
         match *self {
             Op::Fp(..)
+            | Op::X87Single(..)
             | Op::Fp32(..)
             | Op::SseFp64(..)
             | Op::ToInt { .. }
+            | Op::X87Store { .. }
             | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
@@ -618,10 +642,13 @@ impl Func {
             | Op::Snapshot(_)
             | Op::Test { .. }
             | Op::ToInt { wide: false, .. }
+            | Op::X87Store { width: 2 | 4, .. }
+            | Op::X87StoreC1 { .. }
             | Op::VecToInt(..) => Type::I32,
-            Op::ToInt { wide: true, .. } => Type::I64,
+            Op::ToInt { wide: true, .. } | Op::X87Store { .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..)
+            | Op::X87Single(..)
             | Op::SseFp64(..)
             | Op::FpUnary(..)
             | Op::FromInt(_)

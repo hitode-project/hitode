@@ -2086,7 +2086,9 @@ impl Translator<'_> {
                 if store {
                     self.emit(match value {
                         access::Value::Scalar(reg) => mov(W, X3, reg),
-                        access::Value::Vector(VMem::S, reg) => fmov_from_v(W, X3, reg),
+                        access::Value::Vector(VMem::B | VMem::H | VMem::S, reg) => {
+                            fmov_from_v(W, X3, reg)
+                        }
                         access::Value::Vector(size, reg) => {
                             vstr(size, reg, RUNTIME, crate::runtime::VALUE_OPERAND)
                         }
@@ -2097,7 +2099,9 @@ impl Translator<'_> {
                 if !store {
                     self.emit(match value {
                         access::Value::Scalar(reg) => mov(W, reg, X0),
-                        access::Value::Vector(VMem::S, reg) => fmov_to_v(W, reg, X0),
+                        access::Value::Vector(VMem::B | VMem::H | VMem::S, reg) => {
+                            fmov_to_v(W, reg, X0)
+                        }
                         access::Value::Vector(size, reg) => {
                             vldr(size, reg, RUNTIME, crate::runtime::VALUE_OPERAND)
                         }

@@ -20,7 +20,7 @@ pub(crate) enum Location<L> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Recipe<L> {
     /// C1 after `a op b` rounded under the form's control word.
-    C1 { op: FpOp, a: L, b: L },
+    C1 { op: FpOp, a: L, b: L, single: bool },
     /// EFLAGS of a `Flags` value: its kind and operands, as the interpreter
     /// computes them.
     Eflags(L),
@@ -337,9 +337,10 @@ impl Locations<'_> {
         match location {
             Location::Constant(bits) => u128::from(bits),
             Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => self.get(host),
-            Location::Recipe(Recipe::C1 { op, a, b }) => super::eval::locate(
+            Location::Recipe(Recipe::C1 { op, a, b, single }) => super::eval::locate(
                 &Location::Recipe(Recipe::C1 {
                     op,
+                    single,
                     a: Value(0),
                     b: Value(1),
                 }),
@@ -498,8 +499,9 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
         Location::Recipe(Recipe::Eflags(v)) => {
             Location::Recipe(Recipe::Eflags(locations[v.0 as usize]))
         }
-        Location::Recipe(Recipe::C1 { op, a, b }) => Location::Recipe(Recipe::C1 {
+        Location::Recipe(Recipe::C1 { op, a, b, single }) => Location::Recipe(Recipe::C1 {
             op,
+            single,
             a: locations[a.0 as usize],
             b: locations[b.0 as usize],
         }),

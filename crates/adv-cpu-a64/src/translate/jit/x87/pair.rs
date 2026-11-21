@@ -373,20 +373,18 @@ impl Translator<'_> {
                     eor(X, X17, X16, X2, Lsl, 0),
                     lsr_imm(X, X7, X17, 63),
                 ]);
-                self.store_rounding(width, false, bail);
+                self.store_rounding(width);
                 self.store_flags(bail);
             } else if !skip {
                 self.clear_c1();
             }
         } else {
-            if integer {
-                self.store_rounding(width, true, bail);
-            }
             // The sticky double: the top 53 bits of the value, the lowest
             // ORed with the rest. A low lane of the other sign takes one
             // unit off the high lane's magnitude.
-            if self.x87_narrow(n) {
-                self.emit_all(&[movz(W, X3, 0, 0), vmov(false, V0, v(n))]);
+            let sticky = !self.x87_narrow(n);
+            if !sticky {
+                self.emit(vmov(false, V0, v(n)));
             } else {
                 self.emit_all(&[
                     fmov_from_v(X, X16, v(n)),
@@ -402,7 +400,7 @@ impl Translator<'_> {
                     fmov_to_v(X, V0, X16),
                 ]);
             }
-            self.store_sticky(width, integer, bail, !skip);
+            self.store_sticky(width, integer, bail, !skip, sticky);
             if !skip {
                 self.store_flags(bail);
             }

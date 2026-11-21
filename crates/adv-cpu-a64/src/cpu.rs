@@ -1,8 +1,8 @@
 //! The guest CPU the machine layer drives, on the a64 engine: [`Cpu`]
 //! implements `Backend` and `Engine` over [`Executor`] as `JitCpu` does
-//! over the x64 executor. Tier-1 translation is synchronous and cheap, so the
-//! compiler policy of `EngineOptions` does not apply; optimized forms compile
-//! on a background pool unless tests turn that off.
+//! over the x64 executor. Tier-1 translation is synchronous. Optimized forms
+//! and worker jobs compile on a background pool unless the shell requests
+//! synchronous compilation for diagnostics.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -795,8 +795,11 @@ impl Engine for Cpu {
         Self::new(park, native)
     }
 
-    /// Translation stays synchronous; diagnostics may count exact Tier 0 retirement.
+    /// Diagnostics can compile in place and count exact Tier 0 retirement.
     fn configure(&mut self, options: &EngineOptions) -> Result<(), String> {
+        if !options.async_compilation {
+            self.set_async_compilation(false);
+        }
         self.inner
             .count_tier0(options.profiling || options.frame_timing);
         Ok(())

@@ -150,6 +150,13 @@ impl Translator<'_> {
         {
             return;
         }
+        if self.tier1 && x.fast == Fast::StoreControl && !x.waits() {
+            let address = self.effective(x.mem.expect("FNSTCW has a memory operand"));
+            self.cpu();
+            self.emit(ldrh(X0, X5, runtime::X87_CONTROL));
+            self.access(Addr::Window(address), 2, Dir::Store, X0);
+            return;
+        }
         if self.tier1 && x.fast == Fast::StoreStatus && x.mem.is_none() {
             self.cpu();
             self.emit(ldrh(X16, X5, runtime::X87_STATUS));
@@ -413,7 +420,7 @@ impl Translator<'_> {
                 self.access(Addr::Window(X6), 2, Dir::Load, X0);
                 self.x87_accessed();
                 // Unmasking a pending exception takes the interpreter.
-                if !self.x87_saved_control() {
+                if !self.x87_masks_all() {
                     self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
                     self.asm.cbz(W, true, X16, slow);
                 }
@@ -641,12 +648,9 @@ impl Translator<'_> {
     fn x87_store(&mut self, width: u8, integer: bool, pop: bool, slow: Label) {
         self.read(0, X0, X1, slow);
         self.ordinary(X0, X1, slow);
-        if integer {
-            self.store_rounding(width, true, slow);
-        }
         if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
-            self.store_sticky(width, integer, slow, true);
+            self.store_sticky(width, integer, slow, true, true);
         } else {
             // Round the significand to 53 bits, nearest even, in integers.
             let zero = self.asm.label();
@@ -676,7 +680,7 @@ impl Translator<'_> {
                 orr(X, X2, X2, X17, Lsl, 0),
             ]);
             self.asm.bind(zero);
-            self.store_rounding(width, false, slow);
+            self.store_rounding(width);
             self.emit_all(&[ubfx(X, X17, X2, 52, 11), cmp_imm(W, X17, 0x7ff, false)]);
             self.asm.b_cond(Cond::Eq, slow);
         }
@@ -695,74 +699,66 @@ impl Translator<'_> {
             self.x87_accessing();
             // The `access` stub's arguments take x1 to x4.
             self.emit(fmov_to_v(size, V1, X2));
-            let vmem = if width == 8 { VMem::D } else { VMem::S };
+            let vmem = match width {
+                2 => VMem::H,
+                4 => VMem::S,
+                _ => VMem::D,
+            };
             self.vector_access(vmem, V1, X6, true);
             self.x87_accessed();
         } else {
             self.site();
-            self.emit(str_reg(size, X2, self.data_view(), X6, false));
+            self.emit(if width == 2 {
+                str_narrow(Narrow::Half, X2, self.data_view(), X6)
+            } else {
+                str_reg(size, X2, self.data_view(), X6, false)
+            });
         }
     }
 
-    /// For integers, checks the control and leaves it in w7. For floats,
-    /// adjusts nearest x2 and its magnitude increment w7 when w3 is inexact.
-    /// Uses x16 and x17.
-    fn store_rounding(&mut self, width: u8, integer: bool, slow: Label) {
+    /// Adjusts nearest x2 and its magnitude increment w7 when w3 is
+    /// inexact and the control word selects directed rounding.
+    fn store_rounding(&mut self, width: u8) {
+        let done = self.asm.label();
         self.emit(ubfx(W, X17, X8, 10, 2));
-        if integer {
-            let nearest = self.asm.label();
-            self.asm.cbz(W, false, X17, nearest);
-            self.emit(cmp_imm(W, X17, 3, false));
-            self.asm.b_cond(Cond::Ne, slow);
-            self.asm.bind(nearest);
-            self.emit(mov(W, X7, X17));
-        } else {
-            let done = self.asm.label();
-            self.asm.cbz(W, false, X17, done);
-            self.asm.cbz(W, false, X3, done);
-            let size = if width == 8 { X } else { W };
-            // Truncate the magnitude, then add a unit for down on a
-            // negative value or up on a positive one.
-            self.emit_all(&[
-                lsr_imm(size, X16, X2, u32::from(width) * 8 - 1),
-                sub(size, X2, X2, X7, Lsl, 0),
-                sub_imm(W, X17, X17, 1, false),
-                eor(W, X17, X17, X16, Lsl, 0),
-                cmp_imm(W, X17, 1, false),
-                cset(W, X7, Cond::Eq),
-                add(size, X2, X2, X7, Lsl, 0),
-            ]);
-            self.asm.bind(done);
-        }
+        self.asm.cbz(W, false, X17, done);
+        self.asm.cbz(W, false, X3, done);
+        let size = if width == 8 { X } else { W };
+        // Truncate the magnitude, then add a unit for down on a
+        // negative value or up on a positive one.
+        self.emit_all(&[
+            lsr_imm(size, X16, X2, u32::from(width) * 8 - 1),
+            sub(size, X2, X2, X7, Lsl, 0),
+            sub_imm(W, X17, X17, 1, false),
+            eor(W, X17, X17, X16, Lsl, 0),
+            cmp_imm(W, X17, 1, false),
+            cset(W, X7, Cond::Eq),
+            add(size, X2, X2, X7, Lsl, 0),
+        ]);
+        self.asm.bind(done);
     }
 
     /// The bits of an integer or binary32 store in x2 from the value's
     /// sticky double in d0 (w3 whether it lost bits), w3 whether they are
     /// inexact and w7 whether rounding grew the magnitude.
-    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label, track: bool) {
+    fn store_sticky(&mut self, width: u8, integer: bool, slow: Label, track: bool, sticky: bool) {
         if integer {
-            // Below 2^63, and below 2^51 when bits were lost.
-            let whole = self.asm.label();
-            self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
-            self.asm.cbz(W, false, X3, whole);
-            self.emit(cmp_imm(W, X16, 1023 + 50, false));
-            self.asm.b_cond(Cond::Hi, slow);
-            self.asm.bind(whole);
-            self.emit(cmp_imm(W, X16, 1023 + 62, false));
-            self.asm.b_cond(Cond::Hi, slow);
-            let rounded = self.asm.label();
-            self.emit(unary(Unary::Frintn, V1, V0));
-            self.asm.cbz(W, false, X7, rounded);
-            self.emit(unary(Unary::Frintz, V1, V0));
-            self.asm.bind(rounded);
-            self.emit(fcvt_int(X, true, X2, V1));
-            if width == 4 {
-                self.emit_all(&[sbfx(X, X16, X2, 0, 32), cmp(X, X16, X2, Lsl, 0)]);
-                self.asm.b_cond(Cond::Ne, slow);
+            if width == 8 {
+                // A 64-bit destination cannot distinguish a saturating
+                // conversion. An operand with a sticky tail also needs its
+                // integer rounding boundary below the sticky bit.
+                self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+                if sticky {
+                    let whole = self.asm.label();
+                    self.asm.cbz(W, false, X3, whole);
+                    self.emit(cmp_imm(W, X16, 1023 + 50, false));
+                    self.asm.b_cond(Cond::Hi, slow);
+                    self.asm.bind(whole);
+                }
+                self.emit(cmp_imm(W, X16, 1023 + 62, false));
+                self.asm.b_cond(Cond::Hi, slow);
             }
-            if track {
-                self.grew(V1, V0);
-            }
+            self.round_integer(width, V0, slow, track);
         } else {
             // A normal input and output: no underflow or overflow.
             let zero = self.asm.label();
@@ -778,10 +774,67 @@ impl Translator<'_> {
             if track {
                 self.emit(unary(Unary::Widen, V1, V1));
                 self.grew(V1, V0);
-                self.store_rounding(width, false, slow);
+                self.store_rounding(width);
             }
             self.emit_all(&[ubfx(W, X16, X2, 23, 8), cmp_imm(W, X16, 0xff, false)]);
             self.asm.b_cond(Cond::Eq, slow);
+        }
+    }
+
+    /// The rounded signed integer in x2. An m64 caller excludes values
+    /// at or above 2^63 and narrower destinations check the full result.
+    fn round_integer(&mut self, width: u8, value: VReg, slow: Label, track: bool) {
+        let rounding = self.x87_store_rounding();
+        if let Some(rc) = rounding {
+            let op = [Unary::Frintn, Unary::Frintm, Unary::Frintp, Unary::Frintz][usize::from(rc)];
+            if rc != 3 || track {
+                self.emit(unary(op, V1, value));
+            }
+        } else {
+            let rounded = self.asm.label();
+            let nearest = self.asm.label();
+            let down = self.asm.label();
+            let up = self.asm.label();
+            self.emit(ubfx(W, X17, X8, 10, 2));
+            self.asm.cbz(W, false, X17, nearest);
+            self.emit(cmp_imm(W, X17, 3, false));
+            self.asm.b_cond(Cond::Ne, down);
+            self.emit(unary(Unary::Frintz, V1, value));
+            self.asm.b(rounded);
+            self.asm.bind(nearest);
+            self.emit(unary(Unary::Frintn, V1, value));
+            self.asm.b(rounded);
+            self.asm.bind(down);
+            self.asm.tbz(true, X17, 1, up);
+            self.emit(unary(Unary::Frintm, V1, value));
+            self.asm.b(rounded);
+            self.asm.bind(up);
+            self.emit(unary(Unary::Frintp, V1, value));
+            self.asm.bind(rounded);
+        }
+        let rounded = if rounding == Some(3) && !track {
+            value
+        } else {
+            V1
+        };
+        self.emit(fcvt_int(X, true, X2, rounded));
+        if width < 8 {
+            self.emit_all(&[
+                sbfx(X, X16, X2, 0, u32::from(width) * 8),
+                cmp(X, X16, X2, Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Ne, slow);
+        }
+        if track {
+            if rounding == Some(3) {
+                self.emit_all(&[
+                    fcmp(rounded, value),
+                    cset(W, X3, Cond::Ne),
+                    movz(W, X7, 0, 0),
+                ]);
+            } else {
+                self.grew(rounded, value);
+            }
         }
     }
 

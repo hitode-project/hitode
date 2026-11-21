@@ -3676,7 +3676,7 @@ pub(in crate::translate) mod opt_back {
         let mut at = initial();
         h.emu
             .map(WINDOW_BASE + u64::from(at.regs[4] - 0x1000), 0x1000);
-        for op in 0..9 {
+        for op in 0..18 {
             let mut pairs: Vec<(u64, u64)> = floating_pairs()
                 .into_iter()
                 .map(|(a, b)| (a.to_bits(), b.to_bits()))
@@ -3691,16 +3691,18 @@ pub(in crate::translate) mod opt_back {
                 }
                 .unwrap();
                 match op {
-                    0 => a.fadd(qword_ptr(esi + 8)),
-                    1 => a.fsub(qword_ptr(esi + 8)),
-                    2 => a.fmul(qword_ptr(esi + 8)),
-                    3 => a.fdiv(qword_ptr(esi + 8)),
+                    0 | 14 => a.fadd(qword_ptr(esi + 8)),
+                    1 | 15 => a.fsub(qword_ptr(esi + 8)),
+                    2 | 16 => a.fmul(qword_ptr(esi + 8)),
+                    3 | 17 => a.fdiv(qword_ptr(esi + 8)),
                     _ => Ok(()),
                 }
                 .unwrap();
                 match op {
-                    4 => a.fistp(dword_ptr(edi)),
-                    5 => a.fistp(qword_ptr(edi)),
+                    4 | 12 => a.fistp(dword_ptr(edi)),
+                    5 | 13 => a.fistp(qword_ptr(edi)),
+                    9 => a.fstp(dword_ptr(edi)),
+                    10 | 11 => a.fistp(word_ptr(edi)),
                     _ => a.fstp(qword_ptr(edi)),
                 }
                 .unwrap();
@@ -3708,7 +3710,13 @@ pub(in crate::translate) mod opt_back {
                 a.jne(head).unwrap();
             });
             at.regs[7] = DATA + 32;
-            at.x87.control = if matches!(op, 4 | 5) { 0x0e7f } else { 0x027f };
+            at.x87.control = 0x027f
+                | match op {
+                    4 | 5 | 11 => 0xc00,
+                    10 | 12 => 0x400,
+                    13 => 0x800,
+                    _ => 0,
+                };
             if op == 4 {
                 pairs.extend(
                     [
@@ -3736,12 +3744,32 @@ pub(in crate::translate) mod opt_back {
                     pairs.extend([(n as u64, 0), ((-n) as u64, 0)]);
                 }
                 pairs.push((i64::MIN as u64, 0));
+            } else if op == 9 {
+                let min = f64::from(f32::MIN_POSITIVE);
+                pairs.extend(
+                    [min, min.next_up(), min.next_down(), f64::from(f32::MAX)]
+                        .map(|a| (a.to_bits(), 0)),
+                );
+            } else if matches!(op, 10 | 11) {
+                pairs.extend([-32768.75f64, -32768.0, 32767.5, 32768.0].map(|a| (a.to_bits(), 0)));
             } else if op == 8 {
                 pairs = floating_pairs()
                     .into_iter()
                     .map(|(a, b)| (((a as f32).to_bits() as u64), (b as f32).to_bits() as u64))
                     .collect();
                 pairs.extend([(1, 0), (0x8000_0001, 0), (0x7f80_0001, 0)]);
+            }
+            if op >= 14 {
+                at.x87.control = 0x007f;
+                pairs.extend(
+                    [
+                        (1.0f64, 0.75 * f64::from(f32::EPSILON)),
+                        (1.0, 10.0),
+                        (f64::from(f32::MIN_POSITIVE), 2.0),
+                        (f64::from(f32::MAX), 2.0),
+                    ]
+                    .map(|(a, b)| (a.to_bits(), b.to_bits())),
+                );
             }
             for status in [0x20, 0x22] {
                 at.x87.status = status;
@@ -4752,6 +4780,7 @@ pub(in crate::translate) mod opt_back {
         f.push(b, Op::Validate);
         let exit = finish(&mut f, b, v);
         f.records[exit.0 as usize].x87.as_mut().unwrap().c1 = Some(Location::Recipe(Recipe::C1 {
+            single: false,
             op: FpOp::Div,
             a: p[0],
             b: p[1],

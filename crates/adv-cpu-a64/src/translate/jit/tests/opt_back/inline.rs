@@ -312,6 +312,7 @@ fn opt_inline_exit_equivalence() {
         f.push(b, Op::Validate);
         let exit = finish(&mut f, b, v);
         f.records[exit.0 as usize].x87.as_mut().unwrap().c1 = Some(Location::Recipe(Recipe::C1 {
+            single: false,
             op,
             a: p[0],
             b: p[1],

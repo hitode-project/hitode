@@ -40,7 +40,9 @@
 //! no failure returns past it.
 //!
 //! **Floating point (A64-OPT-4).** Under the default FPCR and x87 precision
-//! 53, AArch64 and x87 round once to the same precision. The value checks
+//! 53, AArch64 and x87 round once to the same precision. Precision 24 uses
+//! binary32 when both inputs fit exactly and the result fits its exponent range.
+//! The value checks
 //! exclude exceptions other than PE, assumed at entry, and results near the
 //! binary64 range limits that could differ from x87's wider exponent range.
 //! Recovery recomputes C1. x87 operands stay non-NaN: admission and loads

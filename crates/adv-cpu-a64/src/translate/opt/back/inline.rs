@@ -6,11 +6,11 @@ use super::super::recovery::{
 use super::{
     A, ALIAS, Assumed, B, C, Cond, D, E, Emitter, Extend, FlagKind, FlagRecipe, Float, FpOp, Host,
     Index, IntOp, Label, Lsl, Narrow, Op, RT, Record, RecordId, Reg, Runtime, Source, T, Type, U,
-    VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, clz, cmp, cmp_imm,
-    csel, dfloat, eor, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate, ldp, ldr, ldr_narrow,
-    ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv, offset_of, orr, orr_imm,
-    runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, ubfx, vfneg2d, vldr, vldur,
-    vstur,
+    Unary, VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, clz, cmp,
+    cmp_imm, csel, cset, dfloat, eor, fcmp, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate,
+    ldp, ldr, ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv,
+    offset_of, orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, ubfx,
+    unary, vfneg2d, vldr, vldur, vstur,
 };
 use crate::translate::lower::stubs;
 use crate::translate::lower::{emit_link_point, emit_link_transition};
@@ -636,8 +636,8 @@ impl Emitter<'_> {
             u64::from(x87.status & !0x3a00 | u16::from(x87.top) << 11),
         );
         if let Some(value) = x87.c1 {
-            let value = if let Location::Recipe(Recipe::C1 { op, a, b }) = value {
-                self.c1(op, a, b);
+            let value = if let Location::Recipe(Recipe::C1 { op, a, b, single }) = value {
+                self.c1(op, a, b, single);
                 T
             } else {
                 self.gp_at(numeric(value), T)
@@ -703,7 +703,7 @@ impl Emitter<'_> {
     }
 
     /// Recomputes the rounding direction used by recovery::materialize.
-    fn c1(&mut self, op: FpOp, a: Host, b: Host) {
+    fn c1(&mut self, op: FpOp, a: Host, b: Host, single: bool) {
         use Float::*;
         let a = self.v_at(a, A);
         let mut b = self.v_at(b, B);
@@ -739,6 +739,19 @@ impl Emitter<'_> {
         }
         self.asm
             .emit_all(&[lsr_imm(X, T, T, 63), csel(W, T, Reg::ZR, T, Cond::Eq)]);
+        if single {
+            self.asm.emit_all(&[
+                unary(Unary::Narrow, E, C),
+                unary(Unary::Widen, E, E),
+                unary(Unary::Fabs, E, E),
+                unary(Unary::Fabs, C, C),
+                fcmp(E, C),
+                cset(W, U, Cond::Gt),
+                csel(W, T, T, U, Cond::Eq),
+                fcmp_zero(C),
+                csel(W, T, Reg::ZR, T, Cond::Eq),
+            ]);
+        }
     }
 }
 

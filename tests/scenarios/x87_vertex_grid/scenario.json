@@ -1,0 +1,26 @@
+{
+  "spec": ["A64F-FP-3", "A64F-FP-7", "A64-OPT-2", "A64-OPT-3", "A64-OPT-9"],
+  "exe": "x87_vertex_grid.exe",
+  "args": ["--sync-compilation"],
+  "seconds": 60,
+  "outputs": ["x87-vertex-grid.bin"],
+  "steady": {
+    "iterations": [8, 16],
+    "counters": [
+      "owner_retired", "kernel_host_words", "kernel_tier1_cells", "kernel_resident_cells",
+      "kernel_x87_entries", "kernel_x87_publications", "kernel_control_updates",
+      "x87_value_completions", "x87_value_dispatches", "helper_exits",
+      "interpreter_instructions", "native_entries", "native_exits", "resident_cold_exits"
+    ],
+    "kernel_work": {
+      "calls": 180,
+      "rows": 2,
+      "kernels": [
+        ["_grid_one", 1], ["_grid_two", 2], ["_grid_chop", 17], ["_grid_wide", 64],
+        ["_grid_down", 17], ["_grid_up", 17], ["_grid_call", 17], ["_grid_single", 17],
+        ["_grid_heap", 17]
+      ],
+      "callees": [["_grid_call", "grid_convert", 6]]
+    }
+  }
+}

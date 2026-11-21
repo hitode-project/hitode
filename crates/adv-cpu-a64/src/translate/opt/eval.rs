@@ -170,6 +170,28 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
         }
         Op::Fp(op, a, b) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::X87Single(op, a, b) => {
+            let (a, b) = (f(a), f(b));
+            let (sa, sb) = (a as f32, b as f32);
+            if f64::from(sa) != a || f64::from(sb) != b {
+                return None;
+            }
+            let r = match op {
+                FpOp::Add => sa + sb,
+                FpOp::Sub => sa - sb,
+                FpOp::Mul => sa * sb,
+                FpOp::Div => sa / sb,
+            };
+            if r == 0.0 {
+                if !(matches!(op, FpOp::Add | FpOp::Sub) || a == 0.0 || op == FpOp::Mul && b == 0.0)
+                {
+                    return None;
+                }
+            } else if !r.is_normal() || r.abs() == f32::MIN_POSITIVE {
+                return None;
+            }
+            float(f64::from(r))?
+        }
         Op::Fp32(op, a, b) => {
             let a = f32::from_bits(get(a) as u32);
             let b = f32::from_bits(get(b) as u32);
@@ -221,6 +243,52 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             } else {
                 u128::from(n as u32)
             }
+        }
+        Op::X87Store {
+            value,
+            width,
+            rounding,
+            integer,
+        } => {
+            let value = f(value);
+            if integer {
+                let rounded = match rounding {
+                    0 => value.round_ties_even(),
+                    1 => value.floor(),
+                    2 => value.ceil(),
+                    _ => value.trunc(),
+                };
+                let limit = (1u64 << (width * 8 - 1)) as f64;
+                if !rounded.is_finite() || rounded.abs() >= limit {
+                    return None;
+                }
+                let n = rounded as i64;
+                if width == 8 {
+                    n as u64 as u128
+                } else {
+                    n as u32 as u128
+                }
+            } else {
+                let rounded = value as f32;
+                if value != 0.0 && (!rounded.is_normal() || rounded.abs() == f32::MIN_POSITIVE) {
+                    return None;
+                }
+                u128::from(rounded.to_bits())
+            }
+        }
+        Op::X87StoreC1 {
+            value,
+            stored,
+            integer,
+        } => {
+            let rounded = if !integer {
+                f64::from(f32::from_bits(get(stored) as u32))
+            } else if wide(stored) {
+                get(stored) as u64 as i64 as f64
+            } else {
+                f64::from(get(stored) as u32 as i32)
+            };
+            u128::from(rounded.abs() > f(value).abs())
         }
         Op::Vec(VecOp::LessF64, a, b) => {
             let mut result = 0;
@@ -835,17 +903,18 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
     match *location {
         Location::Constant(bits) => u128::from(bits),
         Location::At(v) | Location::Recipe(Recipe::Eflags(v)) => get(v),
-        Location::Recipe(Recipe::C1 { op, a, b }) => u128::from(rounded_up(
+        Location::Recipe(Recipe::C1 { op, a, b, single }) => u128::from(rounded_up(
             op,
             f64::from_bits(get(a) as u64),
             f64::from_bits(get(b) as u64),
+            single,
         )),
     }
 }
 
 /// C1 after a nearest-rounded `a op b` without other exceptions: whether
 /// the magnitude was rounded up.
-pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
+pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64, single: bool) -> bool {
     let (r, error) = match op {
         FpOp::Add | FpOp::Sub => {
             let b = if op == FpOp::Sub { -b } else { b };
@@ -862,6 +931,15 @@ pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
             (q, (-q).mul_add(b, a) * b.signum())
         }
     };
+    if single {
+        if r == 0.0 {
+            return false;
+        }
+        let (rounded, grew) = adv_cpu_core::floating::fast::round_single_precision(r);
+        if rounded != r {
+            return grew;
+        }
+    }
     error != 0.0 && error.signum() != r.signum()
 }
 
@@ -1084,10 +1162,10 @@ mod tests {
 
     #[test]
     fn c1_recipes_report_upward_rounding() {
-        assert!(rounded_up(FpOp::Div, 1.0, 10.0));
-        assert!(rounded_up(FpOp::Add, 0.1, 0.2));
-        assert!(!rounded_up(FpOp::Div, 1.0, 3.0));
-        assert!(!rounded_up(FpOp::Mul, 1.5, 2.0));
-        assert!(rounded_up(FpOp::Add, 1.0, f64::EPSILON * 0.75));
+        assert!(rounded_up(FpOp::Div, 1.0, 10.0, false));
+        assert!(rounded_up(FpOp::Add, 0.1, 0.2, false));
+        assert!(!rounded_up(FpOp::Div, 1.0, 3.0, false));
+        assert!(!rounded_up(FpOp::Mul, 1.5, 2.0, false));
+        assert!(rounded_up(FpOp::Add, 1.0, f64::EPSILON * 0.75, false));
     }
 }

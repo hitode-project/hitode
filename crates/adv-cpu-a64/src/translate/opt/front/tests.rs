@@ -929,13 +929,6 @@ fn rejects_unproved_modes_escaping_frames_and_unsupported_forms() {
         at.x87.control = control;
         assert!(matches!(rejected(&arithmetic, &at), Reject::Mode(_)));
     }
-    let m32 = assemble(|a| {
-        row(a, |a| {
-            a.fld(dword_ptr(esi)).unwrap();
-            a.fstp(dword_ptr(edi)).unwrap();
-        })
-    });
-    assert!(matches!(rejected(&m32, &initial()), Reject::Unsupported(_)));
     let escape = assemble(|a| {
         row(a, |a| {
             a.mov(eax, esp).unwrap();

@@ -48,8 +48,16 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `outputs` | Files the guest writes. Their bytes are compared between builds. |
 | `frame` | When true, the last presented frame's hash is compared too. |
 | `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. On AArch64, `owner_retired` counts guest instructions completed on the owner, including its share of split jobs. |
+| `steady.kernel_work` | Optional emitted host-word estimate for fixture kernels with fixed trip counts. It combines JIT map word counts and resident entry counts outside execution. Use `--sync-compilation` to make the form selection independent of background compilation progress. |
 | `levels` | Report counters compared by their final value, such as `peak_rss`, the build's peak resident memory. |
 | `gpu` | When true, the scenario pins behavior of the target GPUs. CI runners lack them, so CI skips it by name; run it with `--gpu` on a target device when a change touches the GPU path. |
+
+A `kernel_work` layout supplies `calls` per iteration, `rows` per call, and pairs of `[symbol, columns]` in `kernels`.
+The executable marks the row and column heads, their fall-throughs, and the function end with `_row`, `_col`, `_col_end`, `_row_end`, and `_end` suffixes.
+Optional `callees` entries give the kernel symbol, callee symbol, and calls per cell.
+The final run's generated words price both endpoints of the steady interval.
+The estimate prices resident arrivals from the first taken backedge at each loop head.
+Separate report counters retain helper, interpreter and native exit work.
 
 The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In CI, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
 

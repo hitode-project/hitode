@@ -19,9 +19,11 @@
 //! Flags (A64-FLAG-3): backward liveness tracks recovery observations
 //! separately from guest reads. Merges agree on the flags recovery needs.
 
+use adv_cpu_core::floating::fast::Fast;
 use adv_cpu_core::memory::{Memory, WRITE};
 
 use super::decode::{Decodes, Effects, Fetcher, Helper, Op, Src};
+use super::forms::X87;
 use crate::translate::front::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
@@ -795,7 +797,16 @@ impl Trace {
                 }
                 _ => op,
             };
-            let cost = if matches!(op, Op::X87(_) | Op::Fild64(..))
+            let cost = if matches!(
+                op,
+                Op::X87(X87 {
+                    fast: Fast::LoadControl | Fast::StoreControl,
+                    ..
+                })
+            ) {
+                // A control access carries no stack operand or arithmetic.
+                WIDE_WEIGHT / 2
+            } else if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
                     Op::Simd(crate::translate::front::forms::Simd {
@@ -804,7 +815,8 @@ impl Trace {
                             | crate::translate::front::forms::SimdKind::Approximate(..),
                         ..
                     })
-                ) {
+                )
+            {
                 WIDE_WEIGHT
             } else {
                 1

@@ -1486,6 +1486,10 @@ impl Native {
             lowered.iteration_retired,
             lowered.entry_words + lowered.exit_words,
         )?;
+        let work = (
+            lowered.iteration_words,
+            lowered.entry_words + lowered.exit_words,
+        );
         let gate = self.plans.job(eip).map(JobPlan::gate);
         self.stop_cold_window(eip);
         let recovery = compile::ResidentRecovery {
@@ -1525,6 +1529,7 @@ impl Native {
         ) {
             return Err(Decline::CacheFull);
         }
+        crate::jit_map::optimized(eip, format_args!("work\t{}\t{}", work.0, work.1));
         self.remove_scoped_job(eip, index as u8);
         if self.inline_saved.len() < spill_cells {
             self.inline_saved.resize(spill_cells, 0);

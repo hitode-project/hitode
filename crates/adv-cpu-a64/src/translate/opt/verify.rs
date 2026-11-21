@@ -196,8 +196,13 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::Test { flags, .. } => is(flags, Type::Flags),
         Op::Select { cond, a, b } => is(cond, Type::I32) && func.ty(a) == func.ty(b),
         Op::Fp32(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
-        Op::Fp(_, a, b) | Op::SseFp64(_, a, b) => is(a, Type::F64) && is(b, Type::F64),
-        Op::FpUnary(_, a) | Op::ToInt { value: a, .. } => is(a, Type::F64),
+        Op::Fp(_, a, b) | Op::X87Single(_, a, b) | Op::SseFp64(_, a, b) => {
+            is(a, Type::F64) && is(b, Type::F64)
+        }
+        Op::FpUnary(_, a) | Op::ToInt { value: a, .. } | Op::X87Store { value: a, .. } => {
+            is(a, Type::F64)
+        }
+        Op::X87StoreC1 { value, stored, .. } => is(value, Type::F64) && int(stored),
         Op::Vec(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
         Op::VecUnary(_, a) | Op::VecToInt(_, a) => is(a, Type::V128),
         Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),

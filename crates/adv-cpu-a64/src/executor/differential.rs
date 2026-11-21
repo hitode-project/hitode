@@ -2140,7 +2140,7 @@ fn x87_loops_run_natively() {
 #[cfg(native)]
 #[test]
 fn x87_directed_store_loops_run_natively() {
-    for control in [0x173f, 0x1b3f, 0x1f3f] {
+    for control in [0x133f, 0x173f, 0x1b3f, 0x1f3f] {
         let mut a = CodeAssembler::new(32).unwrap();
         let mut top = a.create_label();
         for (at, value) in [(0x710, 1.0 + f64::EPSILON), (0x718, 1.0 - f64::EPSILON)] {
@@ -2157,9 +2157,9 @@ fn x87_directed_store_loops_run_natively() {
         a.mov(dword_ptr(ebx + 0x700), ecx).unwrap();
         for (negative, at, source) in [
             (false, 0, 0x710),
-            (true, 0x30, 0x710),
-            (false, 0x60, 0x718),
-            (true, 0x90, 0x718),
+            (true, 0x40, 0x710),
+            (false, 0x80, 0x718),
+            (true, 0xc0, 0x718),
         ] {
             a.fild(dword_ptr(ebx + 0x700)).unwrap();
             a.fmul(qword_ptr(ebx + source)).unwrap();
@@ -2177,11 +2177,21 @@ fn x87_directed_store_loops_run_natively() {
             a.fstp(dword_ptr(edi + at + 20)).unwrap();
             a.fnstsw(ax).unwrap();
             a.mov(word_ptr(edi + at + 24), ax).unwrap();
-            a.fstp(qword_ptr(edi + at + 28)).unwrap();
+            a.fist(word_ptr(edi + at + 28)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 30), ax).unwrap();
+            a.fist(dword_ptr(edi + at + 32)).unwrap();
             a.fnstsw(ax).unwrap();
             a.mov(word_ptr(edi + at + 36), ax).unwrap();
+            a.fld(st0).unwrap();
+            a.fistp(qword_ptr(edi + at + 40)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 48), ax).unwrap();
+            a.fstp(qword_ptr(edi + at + 52)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 60), ax).unwrap();
         }
-        a.add(edi, 0xc0).unwrap();
+        a.add(edi, 0x100).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.nop().unwrap();

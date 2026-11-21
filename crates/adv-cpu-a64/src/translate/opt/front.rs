@@ -607,12 +607,13 @@ fn build_trace(
             let opcode = Location::At(func.param(block, Type::I32));
             let c1 = match model.c1 {
                 model::C1::Constant(c) => Some(Location::Constant(u64::from(c))),
-                model::C1::Round(op) => Some(Location::Recipe(Recipe::C1 {
+                model::C1::Round(op, single) => Some(Location::Recipe(Recipe::C1 {
                     op,
+                    single,
                     a: func.param(block, Type::F64),
                     b: func.param(block, Type::F64),
                 })),
-                model::C1::Unknown => None,
+                model::C1::Value => Some(Location::At(func.param(block, Type::I32))),
             };
             let mmx_meta = if !assumed.mmx {
                 unused[0]

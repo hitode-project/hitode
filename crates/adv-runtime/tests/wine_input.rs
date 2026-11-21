@@ -123,13 +123,16 @@ fn run(probe: &str, gpu: bool) {
             assert!(matches!(stop, Stop::Paused), "{stop:?}: {text}");
         }
         session.input(message, wparam, lparam).unwrap();
-        let stop = session.run(Instant::now() + Duration::from_millis(50));
-        read(&mut output, &mut text);
-        assert!(matches!(stop, Stop::Paused), "{stop:?}: {text}");
-        assert!(
-            text.lines().any(|line| line == expected),
-            "missing {expected}: {text}"
-        );
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stop = session.run(Instant::now() + Duration::from_millis(50));
+            read(&mut output, &mut text);
+            assert!(matches!(stop, Stop::Paused), "{stop:?}: {text}");
+            if text.lines().any(|line| line == expected) {
+                break;
+            }
+            assert!(Instant::now() < until, "missing {expected}: {text}");
+        }
     }
     session.input(0x100, 0x7b, 0x00580001).unwrap();
     session.input(0x101, 0x7b, 0xc0580001).unwrap();

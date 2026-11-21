@@ -10,8 +10,8 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum C1 {
     Constant(bool),
-    Round(FpOp),
-    Unknown,
+    Round(FpOp, bool),
+    Value,
 }
 /// The frame sets are shared between the models of consecutive
 /// instructions and copied only where one changes.
@@ -192,10 +192,11 @@ pub(super) fn analyze(
 fn merge_c1(a: C1, b: C1, i: usize) -> Result<C1, Reject> {
     Ok(match (a, b) {
         (a, b) if a == b => a,
-        (C1::Unknown, _) | (_, C1::Unknown) => C1::Unknown,
-        (C1::Round(a), C1::Round(b)) if a != b => return Err(Reject::StaticX87(i)),
-        (C1::Round(op), _) | (_, C1::Round(op)) => C1::Round(op),
-        _ => C1::Round(FpOp::Add),
+        (C1::Value, C1::Constant(_)) | (C1::Constant(_), C1::Value) => C1::Value,
+        (C1::Value, _) | (_, C1::Value) => return Err(Reject::StaticX87(i)),
+        (C1::Round(..), C1::Round(..)) => return Err(Reject::StaticX87(i)),
+        (round @ C1::Round(..), _) | (_, round @ C1::Round(..)) => round,
+        _ => C1::Round(FpOp::Add, false),
     })
 }
 
@@ -295,7 +296,11 @@ impl Model {
                         self.valid |= 1 << top;
                         self.c1 = C1::Constant(false);
                     }
-                    Fast::Store { pop, integer, .. } => {
+                    Fast::Store {
+                        pop,
+                        integer,
+                        width,
+                    } => {
                         need(self.top)?;
                         if pop {
                             self.valid &= !(1 << self.top);
@@ -303,29 +308,24 @@ impl Model {
                         }
                         // Chopping never rounds the magnitude up.
                         let chop = self.control.is_some_and(|c| c & 0x0c00 == 0x0c00);
-                        self.c1 = if integer && !chop {
-                            C1::Unknown
+                        self.c1 = if integer && !chop || !integer && width == 4 {
+                            C1::Value
                         } else {
                             C1::Constant(false)
                         };
-                        if let Some(mem) = x.mem {
-                            let width = if let Fast::Store { width, .. } = x.fast {
-                                width
-                            } else {
-                                unreachable!()
-                            };
-                            if let Some(p) = frame_offset(mem, offsets) {
-                                overwrite(self, p, width);
-                                if self.bytes.range(p..p + i32::from(width)).next().is_some() {
-                                    let bytes = Rc::make_mut(&mut self.bytes);
-                                    for b in 0..i32::from(width) {
-                                        bytes.remove(&(p + b));
-                                    }
+                        if let Some(mem) = x.mem
+                            && let Some(p) = frame_offset(mem, offsets)
+                        {
+                            overwrite(self, p, width);
+                            if self.bytes.range(p..p + i32::from(width)).next().is_some() {
+                                let bytes = Rc::make_mut(&mut self.bytes);
+                                for b in 0..i32::from(width) {
+                                    bytes.remove(&(p + b));
                                 }
-                                if !integer && width == 8 {
-                                    Rc::make_mut(&mut self.floats).insert(p);
-                                    Rc::make_mut(&mut self.stored).insert(p);
-                                }
+                            }
+                            if !integer && width == 8 {
+                                Rc::make_mut(&mut self.floats).insert(p);
+                                Rc::make_mut(&mut self.stored).insert(p);
                             }
                         }
                     }
@@ -349,7 +349,7 @@ impl Model {
                         if let adv_cpu_core::floating::fast::Source::St(s) = source {
                             need(slot(s))?;
                         }
-                        self.c1 = C1::Round(fp(op));
+                        self.c1 = C1::Round(fp(op), self.control.is_some_and(|c| c & 0x300 == 0));
                         if pop {
                             self.valid &= !(1 << self.top);
                             self.top = (self.top + 1) & 7;

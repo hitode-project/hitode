@@ -49,7 +49,7 @@ pub enum Op {
 pub enum Fast {
     Wait,
     Load(Source),
-    /// FST/FSTP to m32/m64 (width 4/8) or FIST/FISTP to m32/m64 (integer).
+    /// FST/FSTP to m32/m64 or FIST/FISTP to m16/m32/m64.
     Store {
         width: u8,
         integer: bool,
@@ -137,7 +137,7 @@ pub fn classify(i: &Instruction) -> Option<Fast> {
         M::Fst | M::Fstp | M::Fist | M::Fistp if memory => {
             let width = i.memory_size().size() as u8;
             let integer = matches!(m, M::Fist | M::Fistp);
-            if !matches!(width, 4 | 8) {
+            if !(matches!(width, 4 | 8) || integer && width == 2) {
                 return None;
             }
             Fast::Store {
