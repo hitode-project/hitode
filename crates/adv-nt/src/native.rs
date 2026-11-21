@@ -94,7 +94,11 @@ mod dib;
 mod fonts;
 pub use fonts::FontFrontend;
 mod input;
-pub use input::UserServices;
+pub use input::{
+    UserServices, WINDOW_SURFACE_ALPHA_MASK, WINDOW_SURFACE_BOUNDS, WINDOW_SURFACE_COLOR_KEY,
+    WINDOW_SURFACE_MUTEX, WINDOW_SURFACE_RECT, WINDOW_SURFACE_SHAPE_BITMAP,
+    WINDOW_SURFACE_SHAPE_REGION, window_surface_dirty,
+};
 mod linked;
 mod mixer;
 mod nls;

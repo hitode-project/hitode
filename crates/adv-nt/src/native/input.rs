@@ -2,6 +2,32 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+/// Wine 11 i386 `struct window_surface` field offsets (DWARF).
+pub const WINDOW_SURFACE_RECT: u32 = 0x14;
+pub const WINDOW_SURFACE_MUTEX: u32 = 0x24;
+pub const WINDOW_SURFACE_BOUNDS: u32 = 0x3c;
+pub const WINDOW_SURFACE_COLOR_KEY: u32 = 0x54;
+pub const WINDOW_SURFACE_ALPHA_MASK: u32 = 0x5c;
+pub const WINDOW_SURFACE_SHAPE_REGION: u32 = 0x60;
+pub const WINDOW_SURFACE_SHAPE_BITMAP: u32 = 0x64;
+
+/// Clamp `window_surface.bounds` against `window_surface.rect` with Wine 11's
+/// 8-pixel horizontal alignment (`window_surface_flush`).
+pub fn window_surface_dirty(rect: [i32; 4], bounds: [i32; 4]) -> Option<[i32; 4]> {
+    let left = (bounds[0] & !7).max(0);
+    let top = bounds[1].max(0);
+    let right = (bounds[2].wrapping_add(7) & !7).min(rect[2].wrapping_sub(rect[0]));
+    let bottom = bounds[3].min(rect[3].wrapping_sub(rect[1]));
+    (left < right && top < bottom).then_some([left, top, right, bottom])
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirtySurface {
+    writer: u32,
+    since: Instant,
+}
 
 /// Driver-owned data that bodies reach only through shared allocations.
 #[derive(Default)]
@@ -10,6 +36,8 @@ pub struct UserServices(pub Rc<UserState>);
 pub struct UserState {
     pending: RefCell<Vec<Rc<Cell<u32>>>>,
     surfaces: RefCell<Vec<u32>>,
+    dirty: RefCell<Vec<(u32, DirtySurface)>>,
+    has_dirty: Cell<bool>,
 }
 impl UserServices {
     pub fn pending(&self, context: u32) -> Rc<Cell<u32>> {
@@ -24,9 +52,60 @@ impl UserServices {
             (Err(index), true) => surfaces.insert(index, address),
             (Ok(index), false) => {
                 surfaces.remove(index);
+                drop(surfaces);
+                self.mark_surface_dirty(address, None);
             }
             _ => {}
         }
+    }
+    /// Return the tracked `window_surface` owning `mutex`, if any.
+    pub fn surface_for_mutex(&self, mutex: u32) -> Option<u32> {
+        let address = mutex.wrapping_sub(WINDOW_SURFACE_MUTEX);
+        self.0
+            .surfaces
+            .borrow()
+            .binary_search(&address)
+            .ok()
+            .map(|_| address)
+    }
+    /// Record or clear unflushed GDI dirt on a tracked `window_surface`.
+    pub fn mark_surface_dirty(&self, address: u32, writer: Option<u32>) {
+        let mut dirty = self.0.dirty.borrow_mut();
+        match writer {
+            Some(writer) => {
+                if let Some((_, entry)) = dirty.iter_mut().find(|(at, _)| *at == address) {
+                    entry.writer = writer;
+                } else {
+                    dirty.push((
+                        address,
+                        DirtySurface {
+                            writer,
+                            since: Instant::now(),
+                        },
+                    ));
+                }
+            }
+            None => dirty.retain(|(at, _)| *at != address),
+        }
+        self.0.has_dirty.set(!dirty.is_empty());
+    }
+    /// Whether any tracked `window_surface` has unflushed GDI dirt.
+    pub fn has_dirty_surfaces(&self) -> bool {
+        self.0.has_dirty.get()
+    }
+    /// Dirty surfaces written by `context` or overdue past `overdue`.
+    pub fn due_surfaces(&self, context: u32, overdue: Duration) -> Vec<u32> {
+        if !self.0.has_dirty.get() {
+            return Vec::new();
+        }
+        self.0
+            .dirty
+            .borrow()
+            .iter()
+            .filter_map(|&(address, entry)| {
+                (entry.writer == context || entry.since.elapsed() >= overdue).then_some(address)
+            })
+            .collect()
     }
 }
 
@@ -77,24 +156,19 @@ mod bodies {
             }))
         };
         for &surface in surfaces.iter() {
-            // Wine 11 i386 window_surface: rect at 20, bounds at 60 (DWARF).
             let rect = [
-                read(surface + 20)?,
-                read(surface + 24)?,
-                read(surface + 28)?,
-                read(surface + 32)?,
+                read(surface + WINDOW_SURFACE_RECT)?,
+                read(surface + WINDOW_SURFACE_RECT + 4)?,
+                read(surface + WINDOW_SURFACE_RECT + 8)?,
+                read(surface + WINDOW_SURFACE_RECT + 12)?,
             ];
             let bounds = [
-                read(surface + 60)?,
-                read(surface + 64)?,
-                read(surface + 68)?,
-                read(surface + 72)?,
+                read(surface + WINDOW_SURFACE_BOUNDS)?,
+                read(surface + WINDOW_SURFACE_BOUNDS + 4)?,
+                read(surface + WINDOW_SURFACE_BOUNDS + 8)?,
+                read(surface + WINDOW_SURFACE_BOUNDS + 12)?,
             ];
-            let left = bounds[0] & !7;
-            let right = bounds[2].wrapping_add(7) & !7;
-            if left.max(0) < right.min(rect[2].wrapping_sub(rect[0]))
-                && bounds[1].max(0) < bounds[3].min(rect[3].wrapping_sub(rect[1]))
-            {
+            if window_surface_dirty(rect, bounds).is_some() {
                 return Err(Stop::Guest); // A surface's guest flush callback must run.
             }
         }

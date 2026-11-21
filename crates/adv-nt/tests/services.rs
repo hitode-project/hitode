@@ -1,6 +1,7 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 //! Compare service bodies with the pinned guest implementations in isolated servers.
 mod common;
+#[allow(dead_code)]
 #[path = "../src/native/input.rs"]
 mod input_body;
 

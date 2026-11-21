@@ -142,10 +142,14 @@ pub fn install<B: Backend>(
 /// drew, as the built-in stack's GDI does. With presentation deferred to a
 /// UI, nothing else publishes it while the guest idles.
 fn flush_on_wait(env: &mut Env<'_>) -> Option<Outcome> {
+    if let Some(outcome) = adv_drv::user::flush_on_wait(env) {
+        return Some(outcome);
+    }
     let memory = guest_memory(env.cpu);
     let store = env.ext.try_get_mut::<adv_device::surface::SurfaceStore>()?;
     match store.flush_context(env.context, &memory, adv_device::surface::FlushReason::Wait) {
         Ok(true) => {
+            env.sys.poll_work();
             let serial = store.stats.presentations;
             frame_completed(env, serial)
         }
