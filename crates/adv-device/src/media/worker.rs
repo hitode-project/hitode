@@ -30,8 +30,8 @@ struct Owned(Native);
 unsafe impl Send for Owned {}
 
 impl Worker {
-    pub fn open(reader: Box<dyn ReadSeek>) -> Result<Self, Error> {
-        let native = Native::open(reader)?;
+    pub fn open(reader: Box<dyn ReadSeek>, device: super::VideoDevice) -> Result<Self, Error> {
+        let native = Native::open(reader, device)?;
         let (info, stats) = (native.info.clone(), native.stats);
         let (requests, inbox) = channel();
         let (outbox, replies) = channel();
@@ -196,7 +196,7 @@ mod tests {
         ];
         let run = |prefetch: bool| -> Vec<String> {
             let reader = Box::new(std::io::Cursor::new(movie.to_vec()));
-            let mut native = Native::open(reader).unwrap();
+            let mut native = Native::open(reader, super::super::VideoDevice::current()).unwrap();
             requests
                 .iter()
                 .map(|&t| {
@@ -209,7 +209,11 @@ mod tests {
                 .collect()
         };
         assert_eq!(run(true), run(false));
-        let mut worker = Worker::open(Box::new(std::io::Cursor::new(movie.to_vec()))).unwrap();
+        let mut worker = Worker::open(
+            Box::new(std::io::Cursor::new(movie.to_vec())),
+            super::super::VideoDevice::current(),
+        )
+        .unwrap();
         let threaded: Vec<String> = requests
             .iter()
             .map(|&t| answer(worker.frame_at(t)))

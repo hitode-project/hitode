@@ -536,10 +536,11 @@ fn guest_close(
 }
 
 fn open(env: &mut Env<'_>, filename: u32, then: adv_dx::dshow::Opened) -> Outcome {
+    let device = adv_device::media::VideoDevice::current();
     read_on_worker(
         env,
         filename,
-        |file| Ok(Decoder::open_reader(file).ok()),
+        move |file| Ok(Decoder::open_reader_on(file, device).ok()),
         then,
     )
 }

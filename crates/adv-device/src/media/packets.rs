@@ -175,7 +175,7 @@ fn codec_id(format: &CodecFormat) -> codec::Id {
 }
 
 impl Decoder {
-    pub fn open(format: &CodecFormat) -> Result<Self, Error> {
+    pub fn open(format: &CodecFormat, device: super::VideoDevice) -> Result<Self, Error> {
         ff::init()?;
         let id = codec_id(format);
         if id == codec::Id::None {
@@ -268,16 +268,13 @@ impl Decoder {
                     .then(super::audio_clock::AudioClock::default),
             },
         };
+        #[cfg(not(feature = "gpu"))]
+        let _ = device;
         Ok(Self {
             kind,
             #[cfg(feature = "gpu")]
             device: if matches!(format, CodecFormat::Video { .. }) {
-                Some(
-                    crate::gpu::Gpu::execution(false)
-                        .map_err(|e| Error::Decode(e.to_string()))?
-                        .device()
-                        .clone(),
-                )
+                Some(device.resolve()?)
             } else {
                 None
             },

@@ -734,4 +734,119 @@ mod packet_tests {
         }
         assert_eq!(count, 10);
     }
+
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn worker_opened_decoders_share_the_execution_video_device() {
+        use crate::frame::{VideoGeometry, VideoPlane, VideoUpdate};
+        struct DropPresenter;
+        impl crate::frame::Presenter for DropPresenter {
+            fn presentable(&self, _: u32, _: u32) -> bool {
+                false
+            }
+            fn present(&mut self, _: &mut adv_gpu::Queue, _: crate::frame::Frame) {}
+            fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
+        }
+        let take = |frame: &crate::media::VideoFrame| {
+            let rect = adv_gpu::Rect {
+                x: 0,
+                y: 0,
+                w: frame.width,
+                h: frame.height,
+            };
+            let plane = VideoPlane {
+                id: 1,
+                picture: frame.picture.clone(),
+                geometry: VideoGeometry {
+                    source: (frame.width, frame.height),
+                    destination: rect,
+                    source_uv: [0.0, 0.0, 1.0, 1.0],
+                    background: None,
+                    clip: rect,
+                    hide_cursor: false,
+                },
+            };
+            let VideoUpdate::Changed(image) = plane.take_picture() else {
+                panic!("expected fresh present image");
+            };
+            image
+        };
+        // Run on a fresh thread so this test owns its thread-local execution.
+        std::thread::spawn(move || {
+            let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+                software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+                label: "video device test",
+                ..Default::default()
+            })
+            .unwrap();
+            let _gpu = crate::gpu::Gpu::request_with_presenter(
+                device.clone(),
+                queue,
+                Box::new(DropPresenter),
+            )
+            .unwrap();
+            let video_device = crate::media::VideoDevice::current();
+            assert!(video_device.device.is_some());
+
+            // Open both Decoder and PacketDecoder on a separate worker thread
+            // with no thread-local execution, mirroring wine/video.rs and wmvcore.rs.
+            let captured = video_device.clone();
+            let (reader_image, packet_image) = std::thread::spawn(move || {
+                assert!(crate::media::VideoDevice::current().device.is_none());
+                let movie = include_bytes!(
+                    "../../../adv-dx/src/dshow/graph/render/fixtures/guest_movie.mpg"
+                )
+                .to_vec();
+                let mut reader = crate::media::Decoder::open_reader_on(
+                    std::io::Cursor::new(movie),
+                    captured.clone(),
+                )
+                .unwrap();
+                let frame = (0..1_000_000)
+                    .step_by(40_000)
+                    .find_map(|t| reader.frame_at(t).unwrap().video)
+                    .expect("decoded reader frame");
+                let reader_image = take(&frame);
+
+                let input = demux(include_bytes!("packets/ramp.wmv").to_vec()).unwrap();
+                let stream = input
+                    .streams
+                    .iter()
+                    .find(|s| matches!(s.format, CodecFormat::Video { .. }))
+                    .unwrap();
+                let mut packet_decoder = PacketDecoder::open_on(&stream.format, captured).unwrap();
+                let mut packet_image = None;
+                for packet in &stream.packets {
+                    for decoded in packet_decoder
+                        .decode(&packet.data, Some(packet.time_100ns))
+                        .unwrap()
+                    {
+                        if let Decoded::Video(frame) = decoded {
+                            packet_image = Some(take(&frame));
+                            break;
+                        }
+                    }
+                    if packet_image.is_some() {
+                        break;
+                    }
+                }
+                (reader_image, packet_image.expect("packet present image"))
+            })
+            .join()
+            .unwrap();
+
+            assert!(
+                reader_image.pool().belongs_to(&device),
+                "worker-opened Decoder video pool must belong to the session device"
+            );
+            assert!(
+                packet_image.pool().belongs_to(&device),
+                "worker-opened PacketDecoder video pool must belong to the session device"
+            );
+            reader_image.released(None);
+            packet_image.released(None);
+        })
+        .join()
+        .unwrap();
+    }
 }

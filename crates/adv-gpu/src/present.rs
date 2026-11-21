@@ -123,6 +123,9 @@ struct Buffer {
 }
 
 impl PresentPool {
+    pub fn belongs_to(&self, device: &Device) -> bool {
+        self.device.inner.ptr_eq(&device.inner)
+    }
     pub(crate) fn new(device: &Device, desc: &PoolDesc) -> Result<Self> {
         let caps = device.caps();
         if !caps.format(desc.format).contains(FormatCaps::PRESENTABLE)
