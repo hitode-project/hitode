@@ -146,19 +146,52 @@ fn lock_mutex(env: &mut Env<'_>, mutex: u32) -> Outcome {
     }
 }
 
+/// Whether `mutex` is currently held by any guest context.
+pub fn mutex_locked(ext: &adv_machine::Ext, mutex: u32) -> bool {
+    ext.try_get::<Locks>()
+        .is_some_and(|locks| locks.mutexes.contains_key(&mutex))
+}
+
 fn mutex_unlock(env: &mut Env<'_>) -> Outcome {
     let (mutex, context) = (env.arg(0), env.context);
-    let mutexes = &mut locks(env).mutexes;
-    match mutexes.get_mut(&mutex) {
-        Some((owner, depth)) if *owner == context => {
-            *depth -= 1;
-            if *depth == 0 {
-                mutexes.remove(&mutex);
+    let released = {
+        let mutexes = &mut locks(env).mutexes;
+        match mutexes.get_mut(&mutex) {
+            Some((owner, depth)) if *owner == context => {
+                *depth -= 1;
+                if *depth == 0 {
+                    mutexes.remove(&mutex);
+                    true
+                } else {
+                    false
+                }
             }
-            Outcome::Return(0)
+            _ => return Outcome::Return(EPERM),
         }
-        _ => Outcome::Return(EPERM),
+    };
+    if released
+        && let Some(surface) = env
+            .ext
+            .try_get::<adv_nt::native::UserServices>()
+            .and_then(|users| users.surface_for_mutex(mutex))
+    {
+        let read_rect = |at: u32| -> Option<[i32; 4]> {
+            Some([
+                env.cpu.read_u32(at).ok()? as i32,
+                env.cpu.read_u32(at + 4).ok()? as i32,
+                env.cpu.read_u32(at + 8).ok()? as i32,
+                env.cpu.read_u32(at + 12).ok()? as i32,
+            ])
+        };
+        let dirty = read_rect(surface + adv_nt::native::WINDOW_SURFACE_RECT)
+            .zip(read_rect(surface + adv_nt::native::WINDOW_SURFACE_BOUNDS))
+            .and_then(|(rect, bounds)| adv_nt::native::window_surface_dirty(rect, bounds))
+            .is_some();
+        env.ext
+            .get::<adv_nt::native::UserServices>()
+            .mark_surface_dirty(surface, dirty.then_some(context));
     }
+    Outcome::Return(0)
 }
 
 fn rwlock_init(env: &mut Env<'_>) -> Outcome {
@@ -299,4 +332,97 @@ fn mutexes_lock_recurse_unlock_and_block_contenders() {
         assert_eq!(locks(&mut env).mutexes.get(&mutex).copied(), held);
         assert_eq!(env.cpu.reg(Reg::Esp), stack);
     }
+}
+
+#[cfg(test)]
+// spec: WINE-GFX-7
+#[test]
+fn unlocking_a_tracked_window_surface_mutex_records_and_clears_dirty_writer() {
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::{Guest, Prot, Reg};
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+    let mut m = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        crate::Platform,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    let (surface, stack) = (0x410000, 0x410800);
+    let mutex = surface + adv_nt::native::WINDOW_SURFACE_MUTEX;
+    m.cpu.map(surface, 4096, Prot::RW).unwrap();
+    m.ext
+        .get_or_default::<adv_nt::native::UserServices>()
+        .surface(surface, true);
+    for (i, v) in [0i32, 0, 64, 32].into_iter().enumerate() {
+        m.cpu
+            .write_u32(
+                surface + adv_nt::native::WINDOW_SURFACE_RECT + 4 * i as u32,
+                v as u32,
+            )
+            .unwrap();
+    }
+    let write_bounds = |cpu: &mut JitCpu, bounds: [i32; 4]| {
+        for (i, v) in bounds.into_iter().enumerate() {
+            cpu.write_u32(
+                surface + adv_nt::native::WINDOW_SURFACE_BOUNDS + 4 * i as u32,
+                v as u32,
+            )
+            .unwrap();
+        }
+    };
+    m.cpu.write_u32(stack + 4, mutex).unwrap();
+    m.cpu.set_reg(Reg::Esp, stack);
+    let call = |m: &mut Machine<JitCpu>, name: &str, context: u32| {
+        let entry = m.resolve_import(crate::LIBC, name).unwrap();
+        let index = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        let binding = m.sys.thunks.get(index).f;
+        let mut env = Env {
+            context,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: index,
+        };
+        (binding.handler)(&mut env)
+    };
+
+    // Dirty bounds on unlock record the unlocking context as the writer.
+    write_bounds(&mut m.cpu, [0, 0, 16, 16]);
+    assert!(matches!(
+        call(&mut m, "pthread_mutex_lock", 7),
+        Outcome::Return(0)
+    ));
+    assert!(mutex_locked(&m.ext, mutex));
+    assert!(matches!(
+        call(&mut m, "pthread_mutex_unlock", 7),
+        Outcome::Return(0)
+    ));
+    assert!(!mutex_locked(&m.ext, mutex));
+    let users = m.ext.get::<adv_nt::native::UserServices>();
+    assert!(users.has_dirty_surfaces());
+    assert_eq!(
+        users.due_surfaces(7, std::time::Duration::from_secs(60)),
+        vec![surface]
+    );
+    assert!(
+        users
+            .due_surfaces(3, std::time::Duration::from_secs(60))
+            .is_empty()
+    );
+
+    // Empty bounds on unlock (as after window_surface_flush) clear dirty state.
+    write_bounds(&mut m.cpu, [i32::MAX, i32::MAX, i32::MIN, i32::MIN]);
+    assert!(matches!(
+        call(&mut m, "pthread_mutex_lock", 0),
+        Outcome::Return(0)
+    ));
+    assert!(matches!(
+        call(&mut m, "pthread_mutex_unlock", 0),
+        Outcome::Return(0)
+    ));
+    assert!(
+        !m.ext
+            .get::<adv_nt::native::UserServices>()
+            .has_dirty_surfaces()
+    );
 }

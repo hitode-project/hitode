@@ -926,6 +926,60 @@ fn dib_layout_matches_dwarf() {
     }
 }
 
+// spec: WINE-GFX-7
+#[test]
+fn window_surface_layout_matches_dwarf() {
+    let Some(debug) = wine::debug_dist() else {
+        return;
+    };
+    let path = debug.join("usr/local/lib/wine/i386-unix/win32u.so");
+    let dump = std::process::Command::new("dwarfdump")
+        .arg("--debug-info")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(dump.status.success());
+    let text = String::from_utf8(dump.stdout).unwrap();
+    let entries: Vec<_> = text.split("\n0x").collect();
+    let start = entries
+        .iter()
+        .position(|e| {
+            e.contains("DW_TAG_structure_type") && e.contains("DW_AT_name\t(\"window_surface\")")
+        })
+        .unwrap();
+    let members: Vec<_> = entries[start + 1..]
+        .iter()
+        .take_while(|e| !e.contains(":     NULL"))
+        .copied()
+        .collect();
+    for (field, expected) in [
+        ("rect", adv_nt::native::WINDOW_SURFACE_RECT),
+        ("mutex", adv_nt::native::WINDOW_SURFACE_MUTEX),
+        ("bounds", adv_nt::native::WINDOW_SURFACE_BOUNDS),
+        ("color_key", adv_nt::native::WINDOW_SURFACE_COLOR_KEY),
+        ("alpha_mask", adv_nt::native::WINDOW_SURFACE_ALPHA_MASK),
+        ("shape_region", adv_nt::native::WINDOW_SURFACE_SHAPE_REGION),
+        ("shape_bitmap", adv_nt::native::WINDOW_SURFACE_SHAPE_BITMAP),
+    ] {
+        let entry = members
+            .iter()
+            .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
+            .unwrap_or_else(|| panic!("missing window_surface::{field}"));
+        let actual = entry
+            .split("DW_AT_data_member_location\t(0x")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap();
+        assert_eq!(
+            expected,
+            u32::from_str_radix(actual, 16).unwrap(),
+            "window_surface::{field}"
+        );
+    }
+}
+
 // spec: NAT-ID-2
 #[test]
 fn elf_tables_include_static_symbols_and_mask_relocations() {

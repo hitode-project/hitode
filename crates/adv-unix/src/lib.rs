@@ -17,6 +17,7 @@ pub mod loader;
 mod ntdll;
 mod pthread;
 mod stdcall;
+pub use pthread::mutex_locked;
 
 use adv_cpu::backend::Backend;
 use adv_machine::{Conv, Env, HostFn, Machine, Outcome, Resolver};

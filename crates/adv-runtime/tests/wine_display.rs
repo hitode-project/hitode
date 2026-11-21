@@ -180,3 +180,84 @@ fn a_waiting_program_publishes_its_frame_to_the_ui() {
     let yellow = pixels.iter().filter(|p| p[..3] == [0, 0xff, 0xff]).count();
     assert!(white > 100 && yellow > 50, "white {white}, yellow {yellow}");
 }
+
+// spec: WINE-GFX-7
+#[test]
+fn worker_thread_gdi_blits_publish_on_wait_without_message_pump() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "gdi_worker_flush_session",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn gdi_worker_flush_session() {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("adv-wine-gdi-worker-flush-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: &probes.join("gdi_worker_flush.exe"),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: None,
+    };
+    let mut ui = Ui::new();
+    let mut session = Session::start(&config, adv_sync::WakeEvent::new().unwrap(), |machine| {
+        ui.attach(machine);
+        Ok(())
+    })
+    .unwrap();
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut final_frame = None;
+    while Instant::now() < deadline {
+        let stop = session.run_ui(Instant::now() + Duration::from_millis(50));
+        assert!(matches!(stop, Stop::Paused), "{stop:?}");
+        if let Some(frame) = ui.frame(&mut session)
+            && frame.width == 64
+            && frame.height == 64
+            && let Some(pixel) = frame.bgra.as_chunks::<4>().0.first()
+        {
+            let rgb = [pixel[2], pixel[1], pixel[0]];
+            if observed.last() != Some(&rgb) {
+                observed.push(rgb);
+            }
+            if rgb == [255, 0, 255] {
+                final_frame = Some(frame);
+                break;
+            }
+        }
+    }
+    drop(session);
+    std::fs::remove_dir_all(root).unwrap();
+    let frame = final_frame.unwrap_or_else(|| {
+        panic!("final worker BitBlt frame never reached the UI; observed {observed:?}")
+    });
+    assert_eq!((frame.width, frame.height), (64, 64));
+    assert!(
+        observed.len() >= 5,
+        "worker frames were coalesced behind win32u's 50 ms gate; observed {observed:?}"
+    );
+}

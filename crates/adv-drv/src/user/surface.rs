@@ -253,6 +253,15 @@ fn surface(
     })
 }
 
+const CLR_INVALID: u32 = u32::MAX;
+const EMPTY_BOUNDS: [u32; 4] = [
+    i32::MAX as u32,
+    i32::MAX as u32,
+    i32::MIN as u32,
+    i32::MIN as u32,
+];
+const OVERDUE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// flush(surface, rect, dirty, color_info, color_bits, shape_changed, shape_info, shape_bits).
 fn flush(env: &mut Env<'_>) -> Outcome {
     let (address, dirty) = (env.arg(0), env.arg(2));
@@ -261,21 +270,128 @@ fn flush(env: &mut Env<'_>) -> Outcome {
     };
     surface.drawn = true;
     let hwnd = surface.hwnd;
+    if let Some(users) = env.ext.try_get::<adv_nt::native::UserServices>() {
+        users.mark_surface_dirty(address, None);
+    }
     if !super::client_geometry(env.ext, hwnd).is_some_and(|(_, visible)| visible) {
         return Outcome::Return(1);
     }
     let dirty = check!(rect(env, dirty));
+    if let Some(outcome) = check!(present_visible(env, address, dirty)) {
+        return outcome;
+    }
+    Outcome::Return(1)
+}
+
+fn present_visible(
+    env: &mut Env<'_>,
+    address: u32,
+    dirty: [i32; 4],
+) -> Result<Option<Outcome>, String> {
     let before = env.ext.get::<SurfaceStore>().stats.presentations;
-    check!(compose(env, Some((address, dirty))));
+    compose(env, Some((address, dirty)))?;
     let presented = env.ext.get::<SurfaceStore>().stats.presentations;
     if presented != before {
         env.sys.poll_work();
         let provider = *env.ext.get::<Provider>();
         if let Some(outcome) = (provider.completed)(env, presented) {
-            return outcome;
+            return Ok(Some(outcome));
         }
     }
-    Outcome::Return(1)
+    Ok(None)
+}
+
+/// Flush dirty Wine window surfaces written by the waiting context (or overdue
+/// past 50 ms) before parking, so GDI drawing from threads that wait without
+/// pumping messages reaches the presenter without waiting for win32u's 50 ms
+/// redraw gate (WINE-GFX-7, DEV-FRAME-8).
+pub fn flush_on_wait(env: &mut Env<'_>) -> Option<Outcome> {
+    let due = {
+        let users = env.ext.try_get::<adv_nt::native::UserServices>()?;
+        if !users.has_dirty_surfaces() {
+            return None;
+        }
+        users.due_surfaces(env.context, OVERDUE)
+    };
+    for address in due {
+        if adv_unix::mutex_locked(env.ext, address + adv_nt::native::WINDOW_SURFACE_MUTEX) {
+            continue;
+        }
+        let Some(hwnd) = env
+            .ext
+            .get_or_default::<Surfaces>()
+            .0
+            .get(&address)
+            .map(|surface| surface.hwnd)
+        else {
+            env.ext
+                .get::<adv_nt::native::UserServices>()
+                .mark_surface_dirty(address, None);
+            continue;
+        };
+        let Ok(rect_sides) = rect(env, address + adv_nt::native::WINDOW_SURFACE_RECT) else {
+            continue;
+        };
+        let Ok(bounds) = rect(env, address + adv_nt::native::WINDOW_SURFACE_BOUNDS) else {
+            continue;
+        };
+        let Some(dirty) = adv_nt::native::window_surface_dirty(rect_sides, bounds) else {
+            env.ext
+                .get::<adv_nt::native::UserServices>()
+                .mark_surface_dirty(address, None);
+            continue;
+        };
+        // Only bypass win32u's window_surface_flush when it would perform no
+        // color-key, alpha-mask or shape-bitmap conversion of its own.
+        let plain = env
+            .cpu
+            .read_u32(address + adv_nt::native::WINDOW_SURFACE_COLOR_KEY)
+            .ok()
+            == Some(CLR_INVALID)
+            && env
+                .cpu
+                .read_u32(address + adv_nt::native::WINDOW_SURFACE_ALPHA_MASK)
+                .ok()
+                == Some(0)
+            && env
+                .cpu
+                .read_u32(address + adv_nt::native::WINDOW_SURFACE_SHAPE_REGION)
+                .ok()
+                == Some(0)
+            && env
+                .cpu
+                .read_u32(address + adv_nt::native::WINDOW_SURFACE_SHAPE_BITMAP)
+                .ok()
+                == Some(0);
+        if !plain {
+            continue;
+        }
+        if let Err(error) = write_words(
+            env,
+            address + adv_nt::native::WINDOW_SURFACE_BOUNDS,
+            &EMPTY_BOUNDS,
+        ) {
+            return Some(Outcome::Fail(format!("{MODULE}: {error}")));
+        }
+        env.ext
+            .get::<adv_nt::native::UserServices>()
+            .mark_surface_dirty(address, None);
+        env.ext
+            .get_mut::<Surfaces>()
+            .0
+            .get_mut(&address)
+            .unwrap()
+            .drawn = true;
+        if !super::client_geometry(env.ext, hwnd).is_some_and(|(_, visible)| visible) {
+            continue;
+        }
+        match present_visible(env, address, dirty) {
+            Ok(Some(outcome)) => return Some(outcome),
+            Ok(None) => {}
+            Err(error) => return Some(Outcome::Fail(format!("{MODULE}: {error}"))),
+        }
+    }
+    None
 }
 
 fn area(rect: [i32; 4]) -> i64 {
@@ -914,5 +1030,162 @@ mod tests {
         assert!(super::needs_compose(&ext, mid));
         assert!(super::needs_compose(&ext, root));
         assert!(!super::needs_compose(&ext, sibling));
+    }
+
+    // spec: WINE-GFX-7
+    #[test]
+    fn flush_on_wait_publishes_plain_dirty_window_surface_for_writer_only() {
+        use adv_abi::Registry;
+        use adv_cpu::{
+            JitCpu,
+            backend::{Guest, GuestExt, Prot},
+        };
+        use adv_device::surface::{MemoryOperations, MemoryView, Snapshot, SurfaceStore};
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        use std::borrow::Cow;
+        fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
+            MemoryView::new(
+                cpu,
+                MemoryOperations {
+                    read: |cpu, at, len| {
+                        let mut bytes = vec![0; len];
+                        cpu.read(at, &mut bytes).map_err(|e| e.to_string())?;
+                        Ok(Cow::Owned(bytes))
+                    },
+                    write: |cpu, at, bytes| cpu.write(at, bytes).map_err(|e| e.to_string()),
+                    writable: |cpu, at, len| {
+                        adv_abi::guest::check_range(cpu, at, len as u32, Prot::WRITE)
+                            .map_err(|e| e.to_string())
+                    },
+                    copy: |cpu, src, dst, len| {
+                        cpu.copy_memory(src, dst, len).map_err(|e| e.to_string())
+                    },
+                },
+            )
+        }
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let (hwnd, pixels, address) = (0x10070, 0x410000, 0x420000);
+        m.cpu.map(pixels, 4096, Prot::RW).unwrap();
+        m.cpu.map(address, 4096, Prot::RW).unwrap();
+        m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
+        let red: Vec<u8> = [0x00, 0x00, 0xff, 0xff].repeat(64 * 4);
+        m.cpu.write(pixels, &red).unwrap();
+        let write_surface =
+            |cpu: &mut JitCpu, bounds: [i32; 4], color_key: u32, alpha_mask: u32| {
+                let rect = [0i32, 0, 64, 4];
+                for (i, v) in rect.into_iter().enumerate() {
+                    cpu.write_u32(
+                        address + adv_nt::native::WINDOW_SURFACE_RECT + 4 * i as u32,
+                        v as u32,
+                    )
+                    .unwrap();
+                }
+                for (i, v) in bounds.into_iter().enumerate() {
+                    cpu.write_u32(
+                        address + adv_nt::native::WINDOW_SURFACE_BOUNDS + 4 * i as u32,
+                        v as u32,
+                    )
+                    .unwrap();
+                }
+                cpu.write_u32(
+                    address + adv_nt::native::WINDOW_SURFACE_COLOR_KEY,
+                    color_key,
+                )
+                .unwrap();
+                cpu.write_u32(
+                    address + adv_nt::native::WINDOW_SURFACE_ALPHA_MASK,
+                    alpha_mask,
+                )
+                .unwrap();
+                cpu.write_u32(address + adv_nt::native::WINDOW_SURFACE_SHAPE_REGION, 0)
+                    .unwrap();
+                cpu.write_u32(address + adv_nt::native::WINDOW_SURFACE_SHAPE_BITMAP, 0)
+                    .unwrap();
+            };
+        m.ext.insert(crate::Provider {
+            memory,
+            completed: |_, _| None,
+        });
+        let store = SurfaceStore::new(64, 4, 0x500000, 65536, Snapshot::default()).unwrap();
+        m.ext.insert(store);
+        m.ext.get_or_default::<super::super::input::Presentation>();
+        m.ext
+            .get_or_default::<adv_nt::native::UserServices>()
+            .surface(address, true);
+        m.ext.get_or_default::<super::super::Windows>().0.insert(
+            hwnd,
+            super::super::Window {
+                visible: true,
+                origin: (0, 0),
+                client: [0, 0, 64, 4],
+                extent: [0, 0, 64, 4],
+                ..Default::default()
+            },
+        );
+        m.ext.get_or_default::<super::Surfaces>().0.insert(
+            address,
+            super::Surface {
+                hwnd,
+                pixels,
+                width: 64,
+                height: 4,
+                view: None,
+                drawn: false,
+                layered: false,
+            },
+        );
+        let writer = m.spawn("writer", pixels, &[], 4096).unwrap();
+        let other = m.spawn("other", pixels, &[], 4096).unwrap();
+        let run_wait = |m: &mut Machine<JitCpu>, context: u32| {
+            m.visit_context(Some(context), super::flush_on_wait)
+                .unwrap()
+        };
+
+        // Non-writer wait must not flush before the 50 ms overdue threshold.
+        write_surface(&mut m.cpu, [2, 1, 10, 3], super::CLR_INVALID, 0);
+        m.ext
+            .get::<adv_nt::native::UserServices>()
+            .mark_surface_dirty(address, Some(writer));
+        assert!(run_wait(&mut m, other).is_none());
+        assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, 0);
+        assert!(
+            m.ext
+                .get::<adv_nt::native::UserServices>()
+                .has_dirty_surfaces()
+        );
+
+        // Color-keyed surfaces are left for Wine's window_surface_flush.
+        write_surface(&mut m.cpu, [2, 1, 10, 3], 0x00ff00, 0);
+        assert!(run_wait(&mut m, writer).is_none());
+        assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, 0);
+        assert_eq!(
+            m.cpu
+                .read_u32(address + adv_nt::native::WINDOW_SURFACE_BOUNDS)
+                .unwrap(),
+            2
+        );
+
+        // Writer wait flushes a plain surface and clears Wine's bounds to empty.
+        write_surface(&mut m.cpu, [2, 1, 10, 3], super::CLR_INVALID, 0);
+        assert!(run_wait(&mut m, writer).is_none());
+        assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, 1);
+        assert!(
+            !m.ext
+                .get::<adv_nt::native::UserServices>()
+                .has_dirty_surfaces()
+        );
+        for (i, expected) in super::EMPTY_BOUNDS.into_iter().enumerate() {
+            assert_eq!(
+                m.cpu
+                    .read_u32(address + adv_nt::native::WINDOW_SURFACE_BOUNDS + 4 * i as u32)
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }
