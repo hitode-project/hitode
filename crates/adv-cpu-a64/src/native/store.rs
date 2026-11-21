@@ -115,6 +115,7 @@ pub(super) struct SlowPaths {
 pub(super) struct ResidentSite<R> {
     pub unit: Option<Arc<Unit>>,
     pub sample: Box<Cell<u32>>,
+    cold_completions: Box<Cell<u32>>,
     pub versions: Vec<ResidentVersion<R>>,
     pub fallback: usize,
     pub suspended: bool,
@@ -179,7 +180,8 @@ pub(super) struct ResidentVersion<R> {
     pub recovery: R,
     pub slot: Box<Slot>,
     pub probation: bool,
-    pub probation_sensors: Vec<usize>,
+    pub probation_sensors: Vec<(usize, u32)>,
+    probation_counter: usize,
     pub iteration_retired: u64,
     pub accounting: Vec<(usize, u32)>,
     split: Option<PlacedSplit>,
@@ -242,7 +244,7 @@ impl<R> ResidentVersion<R> {
             } else {
                 runtime::SENSOR_BYTES + 4
             };
-            for &point in &self.probation_sensors {
+            for &(point, _) in &self.probation_sensors {
                 cache.patch(point, b(skip as i32));
             }
         }
@@ -347,6 +349,7 @@ impl<R> CodeStore<R> {
         self.chains.entry(eip).or_default().resident = Some(Box::new(ResidentSite {
             unit: Some(unit),
             sample: Box::new(sample.into()),
+            cold_completions: Box::default(),
             versions: Vec::new(),
             fallback: 0,
             suspended: false,
@@ -531,10 +534,11 @@ impl<R> CodeStore<R> {
         let probation_sensors = sensors
             .iter()
             .map(|&word| {
+                let active = placed[word];
                 if probation.is_none() {
                     placed[word] = b((runtime::SENSOR_BYTES + 4) as i32);
                 }
-                entry.form + word * 4
+                (entry.form + word * 4, active)
             })
             .collect();
         if self.cache.append(&entry.words).is_none() {
@@ -595,6 +599,7 @@ impl<R> CodeStore<R> {
             slot,
             probation: probation.is_some(),
             probation_sensors,
+            probation_counter: entry.form + *counter * 4,
             accounting,
             iteration_retired: u64::from(iteration_retired),
             split,
@@ -1099,7 +1104,7 @@ impl<R> CodeStore<R> {
         version.plain_sites[fact]
     }
 
-    pub(super) fn measure_cold(&mut self, eip: u32, enabled: bool) {
+    pub(super) fn measure_cold(&mut self, eip: u32, period: Option<u32>) {
         let site = self
             .chains
             .get_mut(&eip)
@@ -1107,6 +1112,11 @@ impl<R> CodeStore<R> {
             .resident
             .as_mut()
             .unwrap();
+        if let Some(period) = period {
+            site.cold_completions.set(period);
+        }
+        let enabled = period.is_some();
+        let counter = site.cold_completions.as_ptr() as u64;
         for version in &mut site.versions {
             if !version.probation {
                 if enabled && version.row_price.is_none() {
@@ -1114,6 +1124,14 @@ impl<R> CodeStore<R> {
                     version.slot.countdown[1].set(0);
                 }
                 version.account(&mut self.cache, enabled);
+                if enabled {
+                    self.cache.patch(version.probation_counter, counter as u32);
+                    self.cache
+                        .patch(version.probation_counter + 4, (counter >> 32) as u32);
+                    for &(point, active) in &version.probation_sensors {
+                        self.cache.patch(point, active);
+                    }
+                }
             }
         }
         self.sync();

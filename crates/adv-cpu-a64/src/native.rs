@@ -2494,7 +2494,7 @@ mod tests {
         assert!(
             sensors
                 .into_iter()
-                .all(|point| native.code.cache.word(point)
+                .all(|(point, _)| native.code.cache.word(point)
                     == crate::encode::b((runtime::SENSOR_BYTES + 4) as i32))
         );
     }
@@ -2651,6 +2651,44 @@ mod tests {
             invoke(&mut native, 0x1f80, 1);
         }
         assert_eq!(native.diagnostics.resident_entries - before, 32);
+    }
+
+    // spec: A64A-PLACE-3 A64-OPT-9
+    #[test]
+    fn clean_resident_completions_close_a_cold_window() {
+        // test ebx,ebx; jz latch; div esi; dec ecx; jne HEAD
+        let (mut memory, mut native, stop) =
+            resident_loop(&[0x85, 0xdb, 0x74, 2, 0xf7, 0xf6, 0x49, 0x75, 0xf7, 0xcc]);
+        native.count_resident_entries = true;
+        assert!(native.force_resident(&mut memory, HEAD));
+        let patches = native.code.resident(HEAD).unwrap().versions[0]
+            .accounting
+            .clone();
+        let count_calls = |native: &Native| {
+            patches
+                .iter()
+                .filter(|&&(point, call)| native.code.cache.word(point) == call)
+                .count()
+        };
+        assert_eq!(count_calls(&native), 0);
+
+        let mut state = resident_cpu(OUTSIDE, 1);
+        state.regs[3] = 1;
+        enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!(native.diagnostics.resident_cold_exits, 1);
+        assert!(native.plans.resident(HEAD).unwrap().cold_window.is_some());
+        assert!(count_calls(&native) > 0);
+
+        for _ in 0..plan::PROBATION {
+            let mut state = resident_cpu(OUTSIDE, 8);
+            let run = enter(&mut native, &mut memory, stop, &mut state);
+            assert_eq!((state.eip, run.retired), (stop, 34));
+        }
+        let version = &native.code.resident(HEAD).unwrap().versions[0];
+        assert_eq!(version.slot.entries.get(), u64::from(plan::PROBATION));
+        assert_eq!(native.diagnostics.resident_cold_exits, 1);
+        assert!(native.plans.resident(HEAD).unwrap().cold_window.is_none());
+        assert_eq!(count_calls(&native), 0);
     }
 
     // spec: A64A-ROLE-8, A64A-PLACE-3

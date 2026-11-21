@@ -631,7 +631,7 @@ impl Native {
             0
         };
         if head.cold_window.is_none() {
-            self.code.measure_cold(eip, true);
+            self.code.measure_cold(eip, Some(PROBATION));
         }
         if head.observe_cold(site, reason, self.code.accounted(eip), cold_iterations) {
             self.stop_cold_window(eip);
@@ -655,7 +655,7 @@ impl Native {
     fn stop_cold_window(&mut self, eip: u32) {
         let head = self.plans.resident_mut(eip).unwrap();
         if head.cold_window.take().is_some() {
-            self.code.measure_cold(eip, false);
+            self.code.measure_cold(eip, None);
         }
     }
 
