@@ -109,6 +109,10 @@ impl Gpu {
     pub(crate) fn execution(fallback: bool) -> Result<Self, Error> {
         Self::start(fallback, None)
     }
+    /// Clone the active execution's GPU device on this thread, if one is running.
+    pub(crate) fn current_device() -> Option<adv_gpu::Device> {
+        EXECUTION.with(|cached| cached.borrow().upgrade().map(|e| e.device.clone()))
+    }
     fn start(
         fallback: bool,
         presenter: Option<(

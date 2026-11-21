@@ -426,7 +426,10 @@ fn convert(
     video.output.as_mut().unwrap().convert(pts_us, decoded)
 }
 
-fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
+fn open_video(
+    stream: &format::stream::Stream<'_>,
+    device: super::VideoDevice,
+) -> Result<Video, Error> {
     let (index, time_base, rate) = (stream.index(), stream.time_base(), stream.avg_frame_rate());
     let mut context = codec::Context::from_parameters(stream.parameters())?;
     configure_video_context(&mut context);
@@ -440,10 +443,9 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         ));
     }
     #[cfg(feature = "gpu")]
-    let device = crate::gpu::Gpu::execution(false)
-        .map_err(|e| Error::Decode(e.to_string()))?
-        .device()
-        .clone();
+    let device = device.resolve()?;
+    #[cfg(not(feature = "gpu"))]
+    let _ = device;
     let frame_duration_us = if rate.numerator() > 0 {
         (1_000_000 * rate.denominator() as u64 / rate.numerator() as u64).max(1)
     } else {
@@ -499,7 +501,7 @@ fn open_audio(stream: &format::stream::Stream<'_>, asf: bool) -> Result<Audio, E
 }
 
 impl Native {
-    pub fn open(reader: Box<dyn ReadSeek>) -> Result<Self, Error> {
+    pub fn open(reader: Box<dyn ReadSeek>, device: super::VideoDevice) -> Result<Self, Error> {
         ff::init()?;
         let mut input = Input::open(reader)?;
         let mut duration_us = input.context.duration().max(0) as u64;
@@ -513,7 +515,7 @@ impl Native {
             .context
             .streams()
             .best(media::Type::Video)
-            .map(|stream| open_video(&stream))
+            .map(|stream| open_video(&stream, device))
             .transpose()?;
         let audio = match input.context.streams().best(media::Type::Audio) {
             // A damaged or unsupported audio track leaves a playable picture.

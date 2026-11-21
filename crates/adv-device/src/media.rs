@@ -229,6 +229,34 @@ pub enum Decoded {
     Audio(AudioFrame),
 }
 
+/// Captures the calling thread's GPU execution device so a media decoder opened
+/// on a worker thread allocates video pools on the session's device.
+#[derive(Clone, Default)]
+pub struct VideoDevice {
+    #[cfg(feature = "gpu")]
+    device: Option<adv_gpu::Device>,
+}
+
+impl VideoDevice {
+    pub fn current() -> Self {
+        Self {
+            #[cfg(feature = "gpu")]
+            device: crate::gpu::Gpu::current_device(),
+        }
+    }
+
+    #[cfg(all(feature = "gpu", feature = "media"))]
+    pub(super) fn resolve(self) -> Result<adv_gpu::Device, Error> {
+        match self.device {
+            Some(device) => Ok(device),
+            None => Ok(crate::gpu::Gpu::execution(false)
+                .map_err(|e| Error::Decode(e.to_string()))?
+                .device()
+                .clone()),
+        }
+    }
+}
+
 /// Decodes the samples of one stream as they arrive, in decode order. Frame
 /// times come from the sample times given to [`PacketDecoder::decode`].
 pub struct PacketDecoder {
@@ -238,15 +266,19 @@ pub struct PacketDecoder {
 
 impl PacketDecoder {
     pub fn open(format: &CodecFormat) -> Result<Self, Error> {
+        Self::open_on(format, VideoDevice::current())
+    }
+
+    pub fn open_on(format: &CodecFormat, device: VideoDevice) -> Result<Self, Error> {
         #[cfg(feature = "media")]
         {
             Ok(Self {
-                inner: packets::Decoder::open(format)?,
+                inner: packets::Decoder::open(format, device)?,
             })
         }
         #[cfg(not(feature = "media"))]
         {
-            let _ = format;
+            let _ = (format, device);
             Err(Error::Unavailable)
         }
     }
@@ -300,15 +332,22 @@ impl Decoder {
     }
 
     pub fn open_reader(reader: impl ReadSeek + 'static) -> Result<Self, Error> {
+        Self::open_reader_on(reader, VideoDevice::current())
+    }
+
+    pub fn open_reader_on(
+        reader: impl ReadSeek + 'static,
+        device: VideoDevice,
+    ) -> Result<Self, Error> {
         #[cfg(feature = "media")]
         {
             Ok(Self {
-                inner: worker::Worker::open(Box::new(reader))?,
+                inner: worker::Worker::open(Box::new(reader), device)?,
             })
         }
         #[cfg(not(feature = "media"))]
         {
-            let _ = reader;
+            let _ = (reader, device);
             Err(Error::Unavailable)
         }
     }

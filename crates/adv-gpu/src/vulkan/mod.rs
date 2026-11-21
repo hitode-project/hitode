@@ -39,6 +39,12 @@ pub(crate) use video::VideoPool;
 #[derive(Clone)]
 pub(crate) struct Device(pub(crate) Arc<Context>);
 
+impl Device {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub(crate) struct Context {
     _entry: ash::Entry,
     instance: ash::Instance,

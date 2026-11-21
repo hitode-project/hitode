@@ -56,6 +56,9 @@ struct DeviceState {
 }
 
 impl Device {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(crate) fn adapter_identity(&self) -> crate::queue::AdapterIdentity {
         let caps = self.caps();
         let vendor = if self.0.raw.supportsFamily(MTLGPUFamily::Apple1) {
