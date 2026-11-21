@@ -1188,6 +1188,12 @@ impl Native {
         }
     }
 
+    fn restore_resident_retry(&mut self, eip: u32) {
+        let period = self.plans.resident(eip).unwrap().retry_period();
+        self.code.publish_resident(eip, period);
+        self.code.sync();
+    }
+
     pub(super) fn sample_resident_link(&mut self, cpu: &CpuState, eip: u32, point: usize) {
         let head = self.plans.resident_mut(eip).unwrap();
         let site = self.code.resident(eip).unwrap();
@@ -1353,6 +1359,12 @@ impl Native {
                                 }
                                 self.publish_scope(eip);
                             }
+                            Err(Decline::Unprofitable)
+                                if done.task == compile::Task::Append
+                                    && self.code.resident(eip).unwrap().row_entry.is_none() =>
+                            {
+                                self.restore_resident_retry(eip);
+                            }
                             Err(reason) => self.decline_resident(eip, reason),
                         }
                     }
@@ -1383,6 +1395,8 @@ impl Native {
                             }
                         } else if done.task != compile::Task::Append {
                             self.decline_resident(eip, Decline::Compile(reject));
+                        } else {
+                            self.restore_resident_retry(eip);
                         }
                     }
                     _ => {}
