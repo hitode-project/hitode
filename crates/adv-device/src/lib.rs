@@ -43,6 +43,7 @@ pub struct DeviceReader {
     pub(crate) device_time: bool,
     pub(crate) device_origin_us: f64,
     pub(crate) native_clock: bool,
+    pub(crate) native_drain_us: f64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceRead {

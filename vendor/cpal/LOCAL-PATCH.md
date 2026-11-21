@@ -20,6 +20,10 @@ Local differences:
 * Device position, frequency, consumed frames and padding are exposed together.
   The OS observations are sequential, not claimed to be an atomic OS snapshot;
   consumer diagnostics should tolerate timestamp/query rounding.
+* Android AAudio output streams prefer `AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE`
+  (falling back to 48 kHz) over 44.1 kHz, request `LowLatency` performance mode,
+  and size low-latency streams to two bursts so devices can use MMAP/FastTrack
+  while allowing Bluetooth/Legacy routes to fall back cleanly.
 
 The clock field/conversion is allocation free. Platform setup and ownership stay
 in the same CPAL backend. This does not add a second audio backend or resampler.

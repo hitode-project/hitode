@@ -23,6 +23,12 @@ use std::{
 };
 
 const SOURCES: usize = 256;
+/// Maximum lag between the mixer write head and the published guest playback
+/// clock when a native backend buffers a deep downstream FIFO (such as Android
+/// Legacy/Bluetooth AudioTrack). Keeping guest refill clocks within 10 ms of
+/// mixer consumption prevents DirectSound cursor/notification starvation,
+/// WASAPI ring wrap collisions, and waveOut lead exhaustion.
+const MAX_NATIVE_CLOCK_LAG_US: f64 = 10_000.0;
 
 /// Callback-owned observation only; refill timestamps are sampled by the producer.
 #[derive(Default)]
@@ -1156,12 +1162,12 @@ impl Engine {
         let mut frames = delta * u64::from(self.rate) / 1_000_000;
         while frames > 0 {
             let count = frames.min(256) as usize;
-            self.render(&mut scratch[..count * 2], 2, shared);
+            self.render(&mut scratch[..count * 2], 2, 0.0, shared);
             frames -= count as u64;
         }
         self.cursor_us = now as f64;
     }
-    fn render(&mut self, out: &mut [f32], channels: u16, shared: &Shared) {
+    fn render(&mut self, out: &mut [f32], channels: u16, extra_drain_us: f64, shared: &Shared) {
         out.fill(0.0);
         if self.suspended {
             return;
@@ -1301,7 +1307,7 @@ impl Engine {
         if active_before && shared.clock.uses_device_time() {
             shared
                 .active_until_us
-                .store(self.cursor_us as u64, Ordering::Release);
+                .store((self.cursor_us + extra_drain_us) as u64, Ordering::Release);
         }
         shared
             .counters
@@ -1390,6 +1396,7 @@ impl crate::AudioStream {
             device_time: false,
             device_origin_us: 0.0,
             native_clock: false,
+            native_drain_us: 0.0,
         })
     }
     pub fn device_reader(&self, rate: u32, channels: u16) -> Result<crate::DeviceReader, String> {
@@ -1456,8 +1463,12 @@ impl crate::DeviceReader {
                     + f64::from(clock.queued_frames) * 1_000_000.0 / f64::from(self.engine.rate);
                 self.native_clock = true;
             }
+            let lag_us = (self.engine.cursor_us - consumed).max(0.0);
+            let extra_lag_us = (lag_us - MAX_NATIVE_CLOCK_LAG_US).max(0.0);
+            self.native_drain_us = extra_lag_us;
             if self.device_time {
-                self.shared.clock.publish_device(consumed as u64, 0);
+                let published = consumed + extra_lag_us;
+                self.shared.clock.publish_device(published as u64, 0);
             }
         }
         self.read(out, delay_us)
@@ -1485,7 +1496,8 @@ impl crate::DeviceReader {
             self.shared.clock.publish_device(first, delay_us);
         }
         self.engine.service(&self.shared);
-        self.engine.render(out, self.channels, &self.shared);
+        self.engine
+            .render(out, self.channels, self.native_drain_us, &self.shared);
         crate::DeviceRead {
             first_pts_us: first,
             lock_miss: false,
@@ -1907,5 +1919,101 @@ mod tests {
         assert_eq!(state.cursors(0, 3), Some((48, 208)));
         reader.read(&mut [0.0; 200], 0);
         assert_eq!(state.cursors(500_000, 3), Some((0, 0)));
+    }
+
+    // spec: DEV-AUDIO-1
+    #[test]
+    fn deep_native_fifo_bounds_guest_clock_lag_and_preserves_drain() {
+        const RATE: u32 = 44_100;
+        const BURST: usize = 1_473; // 33.4 ms Android Legacy/Bluetooth burst
+        const RING_FRAMES: usize = 8_820; // 200 ms streaming DirectSound ring
+        const RING_BYTES: u32 = (RING_FRAMES * 4) as u32;
+        struct RingSamples;
+        impl SharedReadView for RingSamples {
+            fn len(&self) -> usize {
+                RING_BYTES as usize
+            }
+            fn load_u8(&self, _: usize) -> u8 {
+                0
+            }
+        }
+        let control = AudioControl::new(true);
+        let state = control
+            .add_ring(
+                1,
+                RingConfig {
+                    view: Arc::new(RingSamples),
+                    bytes: RING_BYTES,
+                    channels: 2,
+                    bits: 16,
+                    float: false,
+                    frequency: RATE,
+                    output_rate: RATE,
+                    notifications: vec![],
+                },
+            )
+            .unwrap();
+        assert!(control.written(1, 0, RING_BYTES));
+        assert!(control.committed(1, 0, RING_BYTES));
+        assert!(control.play_ring(1, true, 1));
+        let stream = control.stream();
+        let clock = control.playback_clock();
+        let mut reader = stream.device_reader(RATE, 2).unwrap();
+        let mut out = vec![0.0f32; BURST * 2];
+
+        // Simulate Android Legacy AudioTrack pre-filling 3 bursts (100.2 ms)
+        // while frames_read() stays at 0, then steady state with 4419 queued frames.
+        for prefill in 0..3u32 {
+            reader.read_with_clock(
+                &mut out,
+                0,
+                Some(crate::DeviceClock {
+                    consumed_frames: 0,
+                    queued_frames: prefill * BURST as u32,
+                }),
+            );
+        }
+        let mut consumed = 0u64;
+        for _ in 0..10 {
+            reader.read_with_clock(
+                &mut out,
+                0,
+                Some(crate::DeviceClock {
+                    consumed_frames: consumed,
+                    queued_frames: (BURST * 3) as u32,
+                }),
+            );
+            consumed += BURST as u64;
+        }
+
+        // Guest clock trails the mixer frontier by at most 10 ms + one burst
+        // (~43.4 ms) rather than the full 133.6 ms downstream FIFO.
+        let now = clock.now_us(0);
+        let (play, write) = state.cursors(now, 1).expect("live ring cursors");
+        let gap_bytes = (write + RING_BYTES - play) % RING_BYTES;
+        let staged_bytes = (RATE * 30 / 1_000) * 4;
+        assert!(
+            gap_bytes >= staged_bytes,
+            "write lead {gap_bytes} must preserve the 30 ms staged window ({staged_bytes} bytes)"
+        );
+        assert!(
+            gap_bytes < RING_BYTES / 2,
+            "write-play gap {gap_bytes} must stay well below half a 200 ms ring (not 164 ms)"
+        );
+
+        // Stopping must keep AudioStream::active() true for the full downstream FIFO drain.
+        assert!(control.stop_ring_generation(1, 2));
+        reader.read_with_clock(
+            &mut out,
+            0,
+            Some(crate::DeviceClock {
+                consumed_frames: consumed,
+                queued_frames: (BURST * 3) as u32,
+            }),
+        );
+        assert!(
+            stream.active(),
+            "stream must stay active while deep FIFO drains"
+        );
     }
 }
