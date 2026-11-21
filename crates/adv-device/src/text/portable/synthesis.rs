@@ -85,3 +85,16 @@ pub(super) fn transform(command: Command, matrix: Transform) -> Command {
         Command::Close => Command::Close,
     }
 }
+
+/// Rotate an upright glyph +90° CCW into a `@`-font's horizontal baseline cell
+/// using its vertical origin `tx` and typographic baseline shift `ty`.
+pub(super) fn rotate_vertical(command: Command, tx: f32, ty: f32) -> Command {
+    let point = |p: Vector| Vector::new(-p.y + tx, p.x + ty);
+    match command {
+        Command::MoveTo(p) => Command::MoveTo(point(p)),
+        Command::LineTo(p) => Command::LineTo(point(p)),
+        Command::QuadTo(a, p) => Command::QuadTo(point(a), point(p)),
+        Command::CurveTo(a, b, p) => Command::CurveTo(point(a), point(b), point(p)),
+        Command::Close => Command::Close,
+    }
+}
