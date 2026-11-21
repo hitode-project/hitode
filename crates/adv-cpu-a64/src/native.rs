@@ -603,6 +603,8 @@ pub(crate) struct Native {
     classes: Option<Arc<Vec<u8>>>,
     #[cfg(test)]
     classifications: u64,
+    #[cfg(test)]
+    front_units: u64,
     /// Stop addresses seen so far; units end before all of them.
     stops: Vec<u32>,
     /// Budget exits an entry needs before it is promoted; zero translates
@@ -962,6 +964,8 @@ impl Native {
             classified_epoch: None,
             #[cfg(test)]
             classifications: 0,
+            #[cfg(test)]
+            front_units: 0,
             classes: None,
             retired_forms: None,
             stops: Vec::new(),
@@ -1084,6 +1088,10 @@ impl Native {
         summarize: bool,
         observed: Option<&[u32; 8]>,
     ) -> Arc<Unit> {
+        #[cfg(test)]
+        {
+            self.front_units += 1;
+        }
         let transient = self.plans.baseline_only || accessible(memory, eip, 1, WRITE);
         let decodes = if transient {
             &mut self.scratch_decodes
@@ -3109,5 +3117,77 @@ mod tests {
         memory.protect(0x8000, 0x1000, READ).unwrap();
         native.classify(&mut memory);
         assert_eq!(native.classifications, classifications + 1);
+    }
+
+    // spec: A64-TR-3 A64A-ROLE-2
+    #[test]
+    fn budget_exits_in_promoted_callee_do_not_rebuild_traces() {
+        use adv_cpu_core::memory::EXEC;
+
+        let (mut memory, mut native) = native();
+        let outer = OUTSIDE;
+        let inner = HEAD + 0x2000;
+        let stack_base = 0x30_0000u32;
+        let stack = stack_base + 0x1000;
+        memory.map(outer, 0x8000, READ | WRITE).unwrap();
+        memory.map(stack_base, 0x2000, READ | WRITE).unwrap();
+
+        // Outer non-loop caller pushes return address on the shadow stack
+        // while calling a distant inner loop: mov edx, inner; call edx; int3.
+        let mut caller = vec![0xba];
+        caller.extend_from_slice(&inner.to_le_bytes());
+        caller.extend_from_slice(&[0xff, 0xd2, 0xcc]);
+        let stop = outer + caller.len() as u32 - 1;
+        memory.write(outer, &caller).unwrap();
+
+        // Inner loop: add eax, 1; dec ecx; jne inner; ret.
+        let callee = [0x83, 0xc0, 0x01, 0x49, 0x75, 0xfa, 0xc3];
+        memory.write(inner, &callee).unwrap();
+        memory.protect(outer, 0x8000, READ | EXEC).unwrap();
+
+        native.observe_stop(stop);
+        native.first_visits = false;
+        native.promotion = 1;
+        native.set_computation_offer(true, None);
+
+        let trips = 600_000u32;
+        let mut state = cpu(outer, stack, trips);
+
+        let mut budget_exits = 0u32;
+        let mut settled_exits = 0u32;
+        let mut settled = None;
+        while state.eip != stop {
+            let run = native
+                .run(&mut state, &mut memory, stop, SLICE, std::ptr::null_mut())
+                .unwrap()
+                .unwrap();
+            if run.exit == Exit::Dispatch && state.eip != stop {
+                budget_exits += 1;
+                if let Some((units, decodes, promotions)) = settled {
+                    settled_exits += 1;
+                    assert_eq!(native.front_units, units);
+                    assert_eq!(native.translation_decodes(), decodes);
+                    assert_eq!(native.diagnostics.promotions, promotions);
+                }
+            }
+            // Wait until the inner loop is promoted and any resident discovery settles.
+            if settled.is_none() && budget_exits >= 4 && native.plans.promoted(inner) {
+                native.install_optimized(true);
+                settled = Some((
+                    native.front_units,
+                    native.translation_decodes(),
+                    native.diagnostics.promotions,
+                ));
+            }
+            assert!(budget_exits < 200, "inner loop failed to finish");
+        }
+
+        assert!(settled.is_some(), "inner loop settled after promotion");
+        assert!(
+            settled_exits >= 20,
+            "expected >= 20 settled budget exits, got {settled_exits}"
+        );
+        assert_eq!(state.regs[0], 0x5a5a_5a5au32.wrapping_add(trips));
+        assert_eq!(state.regs[1], 0);
     }
 }
