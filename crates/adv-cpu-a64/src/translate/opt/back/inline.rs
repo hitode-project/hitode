@@ -617,7 +617,7 @@ impl Emitter<'_> {
     fn write_x87(&mut self, x87: &X87<Host>) {
         self.asm.emit_all(&[
             add_imm(X, S4, CPU, runtime::X87_REGS, false),
-            ldrh(S5, CPU, runtime::X87_TAG),
+            movz(W, S5, u16::MAX, 0),
         ]);
         for (i, value) in x87.stack.into_iter().enumerate() {
             if x87.valid >> i & 1 != 0

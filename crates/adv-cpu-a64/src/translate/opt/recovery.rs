@@ -180,8 +180,8 @@ impl<L: Copy> FlagGroup<L> {
 pub(crate) struct X87<L> {
     pub top: u8,
     /// Bit `i` set when physical register `i` is valid. The materializer
-    /// derives each valid register's tag from its value; empty registers
-    /// keep their contents and tags from the job's entry state.
+    /// derives each valid register's tag from its value. Empty slots publish
+    /// an empty tag without writing the register contents.
     pub valid: u8,
     pub control: u16,
     /// Physical registers 0–7: valid slots hold binary64 values.
@@ -451,6 +451,7 @@ pub(crate) fn materialize(
 }
 
 fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::CpuState) {
+    cpu.x87.tag = u16::MAX;
     for (i, location) in x87.stack.iter().enumerate() {
         if x87.valid >> i & 1 != 0
             && let Some(location) = location
@@ -458,7 +459,7 @@ fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::
             let value = binary80(values.locate(*location) as u64);
             cpu.x87.regs[i] = value;
             cpu.mmx[i] = value.significand();
-            cpu.x87.tag = cpu.x87.tag & !(3 << (2 * i)) | value.tag() << (2 * i);
+            cpu.x87.set_physical_tag(i, value.tag());
         }
     }
     cpu.x87.control = x87.control;

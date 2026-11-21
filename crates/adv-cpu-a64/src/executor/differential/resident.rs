@@ -169,6 +169,45 @@ fn resident_delivers_pending_x87_exception_at_the_waiting_instruction() {
     }
 }
 
+// spec: A64-OPT-6 A64-OPT-9
+#[test]
+fn resident_x87_exits_empty_popped_slots_without_changing_their_bytes() {
+    let image = Image::loop_body(|a, head, stop| {
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.div(esi).unwrap();
+        a.dec(ecx).unwrap();
+        a.jz(stop).unwrap();
+        a.fld(qword_ptr(edi)).unwrap();
+        a.jmp(head).unwrap();
+    });
+    for cold in [false, true] {
+        let mut state = initial(3);
+        state.regs[6] = u32::from(!cold);
+        state.x87.push(adv_cpu_core::X87Register::default());
+        let raw = adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff);
+        state.x87.push(raw);
+        state.x87.status |= 0x20;
+        let popped = state.x87.top();
+        let mut trial = Trial::new(&image, &state, "x87 stack pop", &[], |_| {});
+        trial.live.native.as_mut().unwrap().count_resident_entries = true;
+        assert!(trial.try_install_at(state));
+
+        let first = trial.run_native(128).unwrap();
+        assert_eq!(first.exit, Exit::Dispatch);
+        assert_eq!(first.retired, if cold { 2 } else { 17 });
+        let retired = u64::from(first.retired);
+        trial.reference.run(trial.stop, retired).unwrap();
+        trial.same_position_and_memory(retired, !cold);
+        trial.same_state();
+        assert_eq!(trial.live.state.x87.physical_tag(popped), 3);
+        assert_eq!(trial.live.state.x87.regs[popped], raw);
+
+        let diag = &trial.live.native.as_ref().unwrap().diagnostics;
+        assert_eq!(diag.resident_entries, 1);
+        assert_eq!(diag.resident_cold_exits, u64::from(cold));
+    }
+}
+
 struct Trial<'a> {
     live: Executor,
     reference: Executor,

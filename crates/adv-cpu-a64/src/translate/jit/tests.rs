@@ -3837,10 +3837,7 @@ pub(in crate::translate) mod opt_back {
                     assert_eq!(got.cpu.x87.tag >> (2 * i) & 3, got.cpu.x87.regs[i].tag());
                 }
             } else {
-                assert_eq!(
-                    got.cpu.x87.tag >> (2 * i) & 3,
-                    initial().x87.tag >> (2 * i) & 3
-                );
+                assert_eq!(got.cpu.x87.physical_tag(i), 3);
             }
         }
         assert_eq!(
