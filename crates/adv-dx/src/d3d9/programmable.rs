@@ -122,18 +122,26 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
                 &hot.fixed,
                 fixed::layout(env, pointer).ok().map(|l| l.transformed),
             ) != 0
-            || !matches!(fixed::second_stage(&hot.fixed), Ok(None))
+            || !matches!(
+                fixed::second_stage(
+                    &hot.fixed,
+                    [hot.texture.is_some(), hot.shaders.textures[1].is_some()],
+                ),
+                Ok(None)
+            )
     })
 }
+const STAGE_ARGUMENTS: u32 = 1 << 3;
+
 fn fixed_features(f: &fixed::Fixed, transformed: Option<bool>) -> u32 {
+    let stage_arguments = [2, 3, 5, 6]
+        .iter()
+        .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2))
+        || fixed::compact_stage_ops(f).is_none();
     u32::from(transformed == Some(false) && f.render[&137] != 0)
         | (u32::from(f.render[&29] != 0) << 1)
         | (u32::from(f.render[&9] == 1) << 2)
-        | (u32::from(
-            [2, 3, 5, 6]
-                .iter()
-                .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2)),
-        ) << 3)
+        | (u32::from(stage_arguments) * STAGE_ARGUMENTS)
         | (u32::from(f.render[&194] != 0) << 4)
         | (u32::from(f.render[&28] != 0) << 5)
         | (u32::from(
@@ -341,6 +349,7 @@ fn prepare_checked(
         device(env, pointer).unwrap().needs_reset,
     );
     let hot = hot_cell.borrow();
+    let has_texture = [hot.texture.is_some(), hot.shaders.textures[1].is_some()];
     if !hot.scene || needs_reset {
         return Err(INVALID);
     }
@@ -431,7 +440,9 @@ fn prepare_checked(
         instanced,
         fixed_layout.is_some(),
     )?;
-    let (target, image, state) = fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+    let (target, image, state) =
+        fixed::prepare_state(env, pointer, kind, features & STAGE_ARGUMENTS != 0)
+            .map_err(|e| e.code)?;
     let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
     env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);
     let mut draw = fixed::Draw {
@@ -451,7 +462,7 @@ fn prepare_checked(
         && ps_id.is_none()
         && features == 0
         && !instanced
-        && fixed::second_stage(&hot.fixed).is_ok_and(|s| s.is_none());
+        && fixed::second_stage(&hot.fixed, has_texture).is_ok_and(|s| s.is_none());
     if simple_fixed && matches!(kind, 2 | 3) {
         fixed::prepare_lines(&mut draw, &streams, output_indices.as_ref(), length)?;
         return Ok(draw);
@@ -528,7 +539,7 @@ fn prepare_checked(
             image: draw.image.clone(),
             sampler: draw.state.sampler,
         });
-        let second = fixed::second_stage(&hot.fixed).map_err(|e| e.code)?;
+        let second = fixed::second_stage(&hot.fixed, has_texture).map_err(|e| e.code)?;
         if second.is_some() {
             slots.push((false, 1));
             bindings.push(texture(env, pointer, 1, &draw.state)?);
@@ -561,7 +572,11 @@ fn prepare_checked(
     parameters[13] = second.unwrap_or_default();
     parameters[36] = fixed::lighting::color(hot.fixed.render[&60]).map(f32::to_bits);
     parameters[37] = [
-        hot.fixed.stage[&1],
+        if fixed::stage_enabled(&hot.fixed.stage, has_texture[0]) {
+            hot.fixed.stage[&1]
+        } else {
+            1
+        },
         hot.fixed.stage[&2] | hot.fixed.stage[&3] << 8,
         hot.fixed.stage[&4],
         hot.fixed.stage[&5] | hot.fixed.stage[&6] << 8,

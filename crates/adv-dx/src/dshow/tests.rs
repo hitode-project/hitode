@@ -1204,10 +1204,15 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
     );
 
     // Guest filters: source (0x500400) and renderer (0x500500), plus upstream
-    // connector pin (0x500600) and IMediaSeeking (0x500700).
-    let (source, renderer, connector, upstream_seek) =
-        (DATA + 0x400, DATA + 0x500, DATA + 0x600, DATA + 0x700);
-    for (i, obj) in [source, renderer, connector, upstream_seek]
+    // connector, IMediaSeeking and the downstream input pin.
+    let (source, renderer, connector, upstream_seek, downstream) = (
+        DATA + 0x400,
+        DATA + 0x500,
+        DATA + 0x600,
+        DATA + 0x700,
+        DATA + 0x800,
+    );
+    for (i, obj) in [source, renderer, connector, upstream_seek, downstream]
         .into_iter()
         .enumerate()
     {
@@ -1475,8 +1480,12 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
     assert_eq!(method(&mut m, "IMemAllocator::Commit", &[in_alloc]), S_OK);
 
     // A running graph pauses its members first, as quartz does. Stop then
-    // invokes upstream source FIRST and downstream renderer LAST, and
-    // ignores any VFW_E_NOT_COMMITTED abort raised while stopping.
+    // flushes the downstream input before waiting for the source, and
+    // ends the flush after both guest filters have stopped.
+    let s = m.ext.get_mut::<State>();
+    let output = s.filters[&dmo_filter].pins[1];
+    s.pins.get_mut(&output).unwrap().peer = downstream;
+    s.pins.get_mut(&output).unwrap().mem = downstream;
     assert_eq!(
         method_calls(
             &mut m,
@@ -1487,10 +1496,12 @@ fn dmo_graph_forwards_seeks_orders_controls_and_ignores_decommit_aborts() {
                 (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0105, &[renderer], S_OK),
                 (0x7100_0005, &[source], S_OK),
+                (0x7100_040f, &[downstream], S_OK),
                 (0x7100_010a, &[renderer, ANY], E_NOTIMPL),
                 (0x7100_000a, &[source, ANY], E_NOTIMPL),
                 (0x7100_0004, &[source], S_OK),
                 (0x7100_0104, &[renderer], S_OK),
+                (0x7100_0410, &[downstream], S_OK),
                 // Stopped, the graph re-seeks its streams to the kept position.
                 (0x7100_0100, &[renderer, ANY, ANY], E_NOINTERFACE),
                 (0x7100_0000, &[source, ANY, ANY], E_NOINTERFACE),

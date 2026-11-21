@@ -1236,12 +1236,18 @@ fn multiply_transform(
         ))
     })
 }
+pub(super) fn stage_enabled(stage: &StateMap, has_texture: bool) -> bool {
+    stage[&1] != 1 && (has_texture || stage[&2] & 0xf != 2)
+}
+
 /// The enabled second stage as `[color op, color arguments, alpha op and
-/// arguments, coordinate set]`, each argument a byte; `None` when the first
-/// or second stage is disabled.
-pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
+/// arguments, coordinate set]`, each argument a byte.
+pub(super) fn second_stage(
+    f: &Fixed,
+    has_texture: [bool; 2],
+) -> Result<Option<[u32; 4]>, Rejected> {
     let s = &f.stage_slots[1];
-    if f.stage[&1] == 1 || s[&1] == 1 {
+    if !stage_enabled(&f.stage, has_texture[0]) || !stage_enabled(s, has_texture[1]) {
         return Ok(None);
     }
     // Diffuse, current, texture and texture factor, including argument modifiers.
@@ -1258,6 +1264,13 @@ pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
         s[&11],
     ]))
 }
+pub(super) fn compact_stage_ops(f: &Fixed) -> Option<(TextureOp, TextureOp)> {
+    Some((
+        combine(f.stage[&1], f.stage[&2], f.stage[&3])?,
+        combine(f.stage[&4], f.stage[&5], f.stage[&6])?,
+    ))
+}
+
 pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
     let arg = |v| match v {
         0 | 1 | 3..=0x3f => Some(TextureOp::Color),
@@ -1370,6 +1383,7 @@ pub(super) fn prepare_state(
     env: &Env<'_>,
     pointer: u32,
     kind: i32,
+    shader_stage_arguments: bool,
 ) -> Result<(Target, Option<Image>, DrawState), Rejected> {
     let d = device(env, pointer).ok_or(INVALID)?;
     let hot = d.hot.borrow();
@@ -1549,10 +1563,8 @@ pub(super) fn prepare_state(
         lod.max(f.sampler[&9])
     };
     state.sampler.first_level = first.min(image.as_ref().map_or(1, Image::mip_levels) - 1);
-    if image.is_some() && hot.shaders.pixel.is_none() {
-        state.texture_op = combine(f.stage[&1], f.stage[&2], f.stage[&3]).ok_or(UNAVAILABLE)?;
-        state.alpha_texture_op =
-            combine(f.stage[&4], f.stage[&5], f.stage[&6]).ok_or(UNAVAILABLE)?;
+    if image.is_some() && !shader_stage_arguments {
+        (state.texture_op, state.alpha_texture_op) = compact_stage_ops(f).ok_or(UNAVAILABLE)?;
     }
     Ok((target, image, state))
 }

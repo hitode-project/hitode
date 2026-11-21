@@ -102,6 +102,7 @@ pub(crate) struct Graph {
     host_expected: u32,
     pub completed: u32,
     complete_sent: bool,
+    transition_generation: u64,
     pending_run: Option<u64>,
     /// Duration reported by a guest source filter feeding a host decoder.
     pub guest_duration: i64,
@@ -285,6 +286,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             host_expected: 0,
             completed: 0,
             complete_sent: false,
+            transition_generation: 0,
             pending_run: None,
             guest_duration: 0,
             video: video::window::WindowState::default(),
@@ -354,12 +356,22 @@ pub(crate) fn release_method(env: &mut Env<'_>, this: u32) -> Outcome {
 }
 
 fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    super::dmo::begin_stop(env, graph);
+    Transition::begin(env, graph);
+    let outputs = super::dmo::begin_stop(env, graph);
     super::vmr::begin_stop(env, graph);
     stop_sessions(env, graph);
     video::detach(env, graph);
     g(env, graph).state = STOPPED;
     g(env, graph).stopping = true;
+    chain(
+        env,
+        outputs.iter().map(|&pin| Call(pin, 15, vec![])).collect(),
+        Vec::new(),
+        Box::new(move |env, _| detach_members(env, graph, outputs, then)),
+    )
+}
+
+fn detach_members(env: &mut Env<'_>, graph: u32, outputs: Vec<u32>, then: Then) -> Outcome {
     let members: Vec<(u32, Option<u32>)> = state(env).graphs[&graph]
         .members
         .iter()
@@ -377,6 +389,7 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             calls.push_back(Call(filter, 4, vec![]));
         }
     }
+    calls.extend(outputs.into_iter().map(|pin| Call(pin, 16, vec![])));
     for &(_, host) in &members {
         if let Some(host) = host {
             calls.extend(filter::disconnect_filter(env, host));
@@ -985,15 +998,7 @@ fn each_guest_filter(
 /// Pause or run every member, downstream first: host filters directly and
 /// guest filters through `slot` with `args`. Guest sources feeding host
 /// stages go last (MEDIA-DMO-4).
-fn transition_members(
-    env: &mut Env<'_>,
-    graph: u32,
-    value: u32,
-    slot: u32,
-    args: Vec<u32>,
-    start: i64,
-    then: Then,
-) -> Outcome {
+fn transition_members(env: &mut Env<'_>, graph: u32, step: Step, then: Then) -> Outcome {
     let feeding = super::dmo::upstream_filters(env, graph);
     order::members(
         env,
@@ -1001,12 +1006,6 @@ fn transition_members(
         Box::new(move |env, nodes| {
             let (sources, mut nodes) = feeding_first(nodes, &feeding);
             nodes.extend(sources);
-            let step = Step {
-                value,
-                slot,
-                args,
-                start,
-            };
             transition_nodes(env, nodes, step, Vec::new(), then)
         }),
     )
@@ -1027,6 +1026,33 @@ struct Step {
     slot: u32,
     args: Vec<u32>,
     start: i64,
+    transition: Option<Transition>,
+}
+
+#[derive(Clone, Copy)]
+struct Transition {
+    graph: u32,
+    generation: u64,
+}
+
+impl Transition {
+    fn begin(env: &mut Env<'_>, graph: u32) -> Self {
+        let state = g(env, graph);
+        state.transition_generation = state.transition_generation.wrapping_add(1);
+        state.pending_run = None;
+        Self {
+            graph,
+            generation: state.transition_generation,
+        }
+    }
+
+    fn current(self, env: &Env<'_>) -> bool {
+        env.ext
+            .get::<State>()
+            .graphs
+            .get(&self.graph)
+            .is_some_and(|g| g.transition_generation == self.generation)
+    }
 }
 
 fn transition_nodes(
@@ -1036,6 +1062,9 @@ fn transition_nodes(
     mut results: Vec<u32>,
     then: Then,
 ) -> Outcome {
+    if step.transition.is_some_and(|request| !request.current(env)) {
+        return then(env, vec![S_FALSE]);
+    }
     let Some(node) = nodes.pop_front() else {
         return then(env, results);
     };
@@ -1051,17 +1080,28 @@ fn transition_nodes(
 }
 
 pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    g(env, graph).pending_run = None;
+    let request = Transition::begin(env, graph);
+    pause_for(env, request, then)
+}
+
+fn pause_for(env: &mut Env<'_>, request: Transition, then: Then) -> Outcome {
+    let graph = request.graph;
     match g(env, graph).state {
         PAUSED => then(env, Vec::new()),
-        STOPPED => {
-            clock::ensure_default(env, graph, Box::new(move |env, _| paused(env, graph, then)))
-        }
-        _ => paused(env, graph, then),
+        STOPPED => clock::ensure_default(
+            env,
+            graph,
+            Box::new(move |env, _| paused(env, request, then)),
+        ),
+        _ => paused(env, request, then),
     }
 }
 
-fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
+fn paused(env: &mut Env<'_>, request: Transition, then: Then) -> Outcome {
+    if !request.current(env) {
+        return then(env, vec![S_FALSE]);
+    }
+    let graph = request.graph;
     let previous = g(env, graph).state;
     if previous == STOPPED {
         let hr = video::auto_show(env, graph);
@@ -1071,23 +1111,33 @@ fn paused(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         return super::vmr::show_windows(
             env,
             graph,
-            Box::new(move |env, _| pause_members(env, graph, previous, then)),
+            Box::new(move |env, _| pause_members(env, request, previous, then)),
         );
     }
-    pause_members(env, graph, previous, then)
+    pause_members(env, request, previous, then)
 }
 
-fn pause_members(env: &mut Env<'_>, graph: u32, previous: u32, then: Then) -> Outcome {
+fn pause_members(env: &mut Env<'_>, request: Transition, previous: u32, then: Then) -> Outcome {
+    if !request.current(env) {
+        return then(env, vec![S_FALSE]);
+    }
+    let graph = request.graph;
     // Downstream first: host decoders fed by a guest source must accept the
     // samples its streaming threads push as soon as it pauses.
     transition_members(
         env,
         graph,
-        PAUSED,
-        5,
-        vec![],
-        0,
+        Step {
+            value: PAUSED,
+            slot: 5,
+            args: vec![],
+            start: 0,
+            transition: Some(request),
+        },
         Box::new(move |env, results| {
+            if !request.current(env) {
+                return then(env, vec![S_FALSE]);
+            }
             let now = env.sys.clock.now_us();
             let graph_state = g(env, graph);
             graph_state.position = graph_state.position(now);
@@ -1113,19 +1163,33 @@ fn pause_members(env: &mut Env<'_>, graph: u32, previous: u32, then: Then) -> Ou
 /// paused, as quartz does.
 pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     let graph_state = g(env, graph);
-    match (graph_state.state, graph_state.pending_run) {
-        (RUNNING, Some(_)) => then(env, vec![S_FALSE]),
-        (RUNNING, None) => then(env, Vec::new()),
-        (PAUSED, _) => {
-            clock::ensure_default(env, graph, Box::new(move |env, _| ran(env, graph, 0, then)))
-        }
-        _ => pause(
+    let previous = graph_state.state;
+    if previous == RUNNING {
+        let results = if graph_state.pending_run.is_some() {
+            vec![S_FALSE]
+        } else {
+            Vec::new()
+        };
+        return then(env, results);
+    }
+    let request = Transition::begin(env, graph);
+    if previous == PAUSED {
+        clock::ensure_default(
             env,
             graph,
+            Box::new(move |env, _| ran(env, request, 0, then)),
+        )
+    } else {
+        pause_for(
+            env,
+            request,
             Box::new(move |env, paused| {
+                if !request.current(env) {
+                    return then(env, vec![S_FALSE]);
+                }
                 let hr = state::combined(&paused);
                 if hr == S_OK {
-                    return ran(env, graph, 0, then);
+                    return ran(env, request, 0, then);
                 }
                 if hr & 0x8000_0000 != 0 {
                     return then(env, vec![hr]);
@@ -1134,18 +1198,31 @@ pub(crate) fn run(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                     env,
                     graph,
                     Box::new(move |env, cued| {
+                        if !request.current(env) {
+                            return then(env, vec![S_FALSE]);
+                        }
                         if !cued {
-                            return ran(env, graph, 0, then);
+                            return ran(env, request, 0, then);
                         }
                         let graph_state = g(env, graph);
                         graph_state.state = RUNNING;
-                        graph_state.pending_run = Some(0);
-                        stream::spawn_async_run(env, graph);
-                        flush_posts(env, Box::new(move |env, _| then(env, vec![hr])))
+                        graph_state.pending_run = Some(request.generation);
+                        stream::spawn_async_run(
+                            env,
+                            graph,
+                            request.generation,
+                            move |env, result| {
+                                if result != S_OK {
+                                    fail_async_run(env, graph, request.generation, result);
+                                }
+                                let result = if result == S_OK { hr } else { result };
+                                flush_posts(env, Box::new(move |env, _| then(env, vec![result])))
+                            },
+                        )
                     }),
                 )
             }),
-        ),
+        )
     }
 }
 
@@ -1156,41 +1233,77 @@ fn run_at(env: &mut Env<'_>, graph: u32, start: u64, then: Then) -> Outcome {
     if graph_state.state == RUNNING && graph_state.pending_run.is_none() {
         return then(env, Vec::new());
     }
+    let request = Transition::begin(env, graph);
     clock::ensure_default(
         env,
         graph,
-        Box::new(move |env, _| ran(env, graph, start, then)),
+        Box::new(move |env, _| ran(env, request, start, then)),
     )
 }
 
 /// The asynchronous half of IMediaControl::Run, on its own thread: wait until
 /// every member has paused, then run them unless the graph changed state.
-pub(crate) fn async_run(env: &mut Env<'_>, graph: u32) -> Outcome {
+pub(crate) fn async_run(env: &mut Env<'_>, graph: u32, generation: u64) -> Outcome {
+    let request = Transition { graph, generation };
+    if !request.current(env) || g(env, graph).pending_run != Some(generation) {
+        return Outcome::Return(0);
+    }
     state::settle(
         env,
         graph,
+        generation,
         Box::new(move |env, hr| {
-            let pending = state(env)
-                .graphs
-                .get_mut(&graph)
-                .and_then(|g| g.pending_run.take());
-            match pending {
-                Some(start) if hr == S_OK => {
-                    ran(env, graph, start, Box::new(|_, _| Outcome::Return(0)))
-                }
-                _ => Outcome::Return(0),
+            if !request.current(env) || g(env, graph).pending_run != Some(generation) {
+                return Outcome::Return(0);
+            }
+            if hr == S_OK {
+                ran(
+                    env,
+                    request,
+                    0,
+                    Box::new(move |env, results| {
+                        if let Some(hr) = results.into_iter().find(|hr| hr & 0x8000_0000 != 0) {
+                            fail_async_run(env, graph, generation, hr);
+                        }
+                        flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
+                    }),
+                )
+            } else {
+                fail_async_run(env, graph, generation, hr);
+                flush_posts(env, Box::new(|_, _| Outcome::Return(0)))
             }
         }),
     )
 }
 
+fn fail_async_run(env: &mut Env<'_>, graph: u32, generation: u64, hr: u32) {
+    let request = Transition { graph, generation };
+    if !request.current(env) {
+        return;
+    }
+    let now = env.sys.clock.now_us();
+    let graph_state = g(env, graph);
+    graph_state.position = graph_state.position(now);
+    graph_state.origin = None;
+    graph_state.pending_run = None;
+    graph_state.state = PAUSED;
+    let finished = graph_state.finished;
+    graph_state.completion = Some(EC_ERRORABORT);
+    env.sys.set_event(finished);
+    notify(env, graph, EC_ERRORABORT, hr, 0);
+    wake_sessions(env, graph);
+}
+
 /// Start the stream as quartz's graph_start: a new run clears completion and
 /// queued EC_COMPLETE, takes the members' stop position, counts renderers,
 /// then runs every member.
-fn ran(env: &mut Env<'_>, graph: u32, start: u64, then: Then) -> Outcome {
+fn ran(env: &mut Env<'_>, request: Transition, start: u64, then: Then) -> Outcome {
+    if !request.current(env) {
+        return then(env, vec![S_FALSE]);
+    }
+    let graph = request.graph;
     let graph_state = g(env, graph);
     let previous = graph_state.state;
-    graph_state.pending_run = None;
     graph_state.completed = 0;
     graph_state.complete_sent = false;
     graph_state.completion = None;
@@ -1206,27 +1319,39 @@ fn ran(env: &mut Env<'_>, graph: u32, start: u64, then: Then) -> Outcome {
     }
     seeking::keep_stop(
         env,
-        graph,
+        request,
         Box::new(move |env| {
+            if !request.current(env) {
+                return then(env, vec![S_FALSE]);
+            }
             count_guest_renderers(
                 env,
-                graph,
+                request,
                 Box::new(move |env| {
+                    if !request.current(env) {
+                        return then(env, vec![S_FALSE]);
+                    }
                     // Without a caller's start, tStart only orders samples; stream time starts at 0.
                     transition_members(
                         env,
                         graph,
-                        RUNNING,
-                        6,
-                        vec![start as u32, (start >> 32) as u32],
-                        start as i64,
+                        Step {
+                            value: RUNNING,
+                            slot: 6,
+                            args: vec![start as u32, (start >> 32) as u32],
+                            start: start as i64,
+                            transition: Some(request),
+                        },
                         Box::new(move |env, results| {
-                            let now = env.sys.clock.now_us();
-                            if let Some(graph_state) = state(env).graphs.get_mut(&graph) {
-                                graph_state.origin = Some(now);
-                                graph_state.state = RUNNING;
-                                wake_sessions(env, graph);
+                            if !request.current(env) {
+                                return then(env, vec![S_FALSE]);
                             }
+                            let now = env.sys.clock.now_us();
+                            let graph_state = g(env, graph);
+                            graph_state.pending_run = None;
+                            graph_state.origin = Some(now);
+                            graph_state.state = RUNNING;
+                            wake_sessions(env, graph);
                             flush_posts(env, Box::new(move |env, _| then(env, results)))
                         }),
                     )
@@ -1248,12 +1373,10 @@ fn can_query_interface(env: &Env<'_>, obj: u32) -> bool {
 
 fn count_guest_renderers(
     env: &mut Env<'_>,
-    graph: u32,
+    request: Transition,
     then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
 ) -> Outcome {
-    if !state(env).graphs.contains_key(&graph) {
-        return then(env);
-    }
+    let graph = request.graph;
     let mut guests: Vec<u32> = g(env, graph)
         .members
         .iter()
@@ -1267,7 +1390,7 @@ fn count_guest_renderers(
     seeking::probe_seekers(
         env,
         graph,
-        Box::new(move |env| count_next_guest_renderer(env, graph, guests.into(), 0, then)),
+        Box::new(move |env| count_next_guest_renderer(env, request, guests.into(), 0, then)),
     )
 }
 
@@ -1297,11 +1420,15 @@ fn check_no_output_pins(
 
 fn count_next_guest_renderer(
     env: &mut Env<'_>,
-    graph: u32,
+    request: Transition,
     mut guests: VecDeque<u32>,
     count: u32,
     then: Box<dyn FnOnce(&mut Env<'_>) -> Outcome>,
 ) -> Outcome {
+    if !request.current(env) {
+        return then(env);
+    }
+    let graph = request.graph;
     let Some(filter) = guests.pop_front() else {
         if let Some(graph_state) = state(env).graphs.get_mut(&graph) {
             graph_state.expected = graph_state.host_expected + count;
@@ -1309,7 +1436,7 @@ fn count_next_guest_renderer(
         return then(env);
     };
     let Some(scratch) = alloc(env, 20) else {
-        return count_next_guest_renderer(env, graph, guests, count, then);
+        return count_next_guest_renderer(env, request, guests, count, then);
     };
     let _ = write_guid(env, scratch, &super::vmr::IID_IAMFILTERMISCFLAGS);
     let _ = env.cpu.write_u32(scratch + 16, 0);
@@ -1325,7 +1452,7 @@ fn count_next_guest_renderer(
                 return guest_call(env, misc, 3, vec![], move |env, flags| {
                     guest_call(env, misc, 2, vec![], move |env, _| {
                         let add = u32::from((flags & 1) != 0);
-                        count_next_guest_renderer(env, graph, guests, count + add, then)
+                        count_next_guest_renderer(env, request, guests, count + add, then)
                     })
                 });
             }
@@ -1336,7 +1463,7 @@ fn count_next_guest_renderer(
                 .is_some_and(|m| m.seeking != 0);
             let check_pins = move |env: &mut Env<'_>, is_seekable: bool| {
                 if !is_seekable {
-                    return count_next_guest_renderer(env, graph, guests, count, then);
+                    return count_next_guest_renderer(env, request, guests, count, then);
                 }
                 autoplug::pins(
                     env,
@@ -1349,7 +1476,7 @@ fn count_next_guest_renderer(
                             Box::new(move |env, no_outputs| {
                                 count_next_guest_renderer(
                                     env,
-                                    graph,
+                                    request,
                                     guests,
                                     count + u32::from(no_outputs),
                                     then,
@@ -1386,7 +1513,8 @@ fn count_next_guest_renderer(
 }
 
 pub(crate) fn stop(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
-    let was_pending = g(env, graph).pending_run.take().is_some();
+    let was_pending = g(env, graph).pending_run.is_some();
+    Transition::begin(env, graph);
     match g(env, graph).state {
         STOPPED => then(env, Vec::new()),
         // Quartz pauses a running graph's members before stopping them.
@@ -1419,10 +1547,19 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
         graph_state.state = STOPPED;
         graph_state.stopping = true;
     }
-    // Wake blocked host stages first, then stop upstream guest sources before
-    // the other members, downstream first (MEDIA-DMO-4).
-    super::dmo::begin_stop(env, graph);
+    // A guest source can wait for a DMO output's downstream Receive to
+    // return. Flush that sink before joining the source (MEDIA-DMO-4).
+    let outputs = super::dmo::begin_stop(env, graph);
     super::vmr::begin_stop(env, graph);
+    chain(
+        env,
+        outputs.iter().map(|&pin| Call(pin, 15, vec![])).collect(),
+        Vec::new(),
+        Box::new(move |env, _| stop_members(env, graph, outputs, then)),
+    )
+}
+
+fn stop_members(env: &mut Env<'_>, graph: u32, outputs: Vec<u32>, then: Then) -> Outcome {
     let mut feeding = super::dmo::upstream_filters(env, graph);
     feeding.extend(super::vmr::upstream_filters(env, graph));
     order::members(
@@ -1445,16 +1582,31 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                     let finish: Then = Box::new(move |env, more| {
                         let mut results = results;
                         results.extend(more);
-                        join(
+                        chain(
                             env,
-                            graph,
+                            outputs
+                                .into_iter()
+                                .map(|pin| Call(pin, 16, vec![]))
+                                .collect(),
+                            Vec::new(),
                             Box::new(move |env, _| {
-                                let Some(graph_state) = state(env).graphs.get_mut(&graph) else {
-                                    return then(env, results);
-                                };
-                                graph_state.stopping = false;
-                                // Quartz re-seeks every stream to the kept position.
-                                seeking::rewind(env, graph, Box::new(move |env| then(env, results)))
+                                join(
+                                    env,
+                                    graph,
+                                    Box::new(move |env, _| {
+                                        let Some(graph_state) = state(env).graphs.get_mut(&graph)
+                                        else {
+                                            return then(env, results);
+                                        };
+                                        graph_state.stopping = false;
+                                        // Quartz re-seeks every stream to the kept position.
+                                        seeking::rewind(
+                                            env,
+                                            graph,
+                                            Box::new(move |env| then(env, results)),
+                                        )
+                                    }),
+                                )
                             }),
                         )
                     });
@@ -1467,6 +1619,7 @@ fn stopped(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                         slot: 4,
                         args: Vec::new(),
                         start: 0,
+                        transition: None,
                     };
                     transition_nodes(env, rest, step, Vec::new(), finish)
                 }),
@@ -1654,7 +1807,18 @@ pub(crate) fn flush_posts(env: &mut Env<'_>, then: Then) -> Outcome {
         let id = state(env).pending_threads.remove(0);
         let thread = env.ext.get::<Host>().thread;
         let outcome = thread(env, id);
-        return after(env, outcome, Box::new(move |env, _| flush_posts(env, then)));
+        return after(
+            env,
+            outcome,
+            Box::new(move |env, results| {
+                if let [hr] = results.as_slice()
+                    && *hr != S_OK
+                {
+                    stream::thread_failed(env, id, *hr);
+                }
+                flush_posts(env, then)
+            }),
+        );
     }
     if state(env).pending_posts.is_empty() {
         return then(env, Vec::new());
@@ -1951,5 +2115,127 @@ fn audio_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> 
             r(S_OK)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{DATA, activate, env, machine};
+    use super::*;
+    use adv_machine::Resume;
+
+    // spec: MEDIA-GRAPH-20
+    #[test]
+    fn failed_async_preroll_cannot_claim_running_on_the_next_run() {
+        let mut m = machine();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let member = DATA + 0x400;
+        let vtable = member + 4;
+        let get_state = 0x7100_0007;
+        m.cpu.write_u32(member, vtable).unwrap();
+        m.cpu.write_u32(vtable + 7 * 4, get_state).unwrap();
+        let mut e = env(&mut m);
+        g(&mut e, graph).members.push(Member {
+            filter: member,
+            host: None,
+            name: Vec::new(),
+            seeking: 0,
+        });
+        let request = Transition::begin(&mut e, graph);
+        g(&mut e, graph).state = RUNNING;
+        g(&mut e, graph).pending_run = Some(request.generation);
+        let Outcome::Call { target, then, .. } = async_run(&mut e, graph, request.generation)
+        else {
+            panic!("expected guest GetState");
+        };
+        assert_eq!(target, get_state);
+        assert!(matches!(
+            then(&mut e, Resume::Returned(E_FAIL)),
+            Outcome::Return(0)
+        ));
+        assert_eq!(g(&mut e, graph).state, PAUSED);
+        assert!(matches!(
+            wait_completion(&mut e, graph, 0, DATA),
+            Outcome::Return(S_OK)
+        ));
+        assert_eq!(e.cpu.read_u32(DATA).unwrap(), EC_ERRORABORT);
+        let retry = run(&mut e, graph, state::reply());
+        assert!(
+            !matches!(retry, Outcome::Return(S_OK)),
+            "preroll failed before the member's Run, but the next Run returned S_OK"
+        );
+    }
+
+    // spec: MEDIA-GRAPH-20
+    #[test]
+    fn finished_stop_is_not_undone_by_the_old_run() {
+        let mut m = machine();
+        let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+        let member = DATA + 0x400;
+        let vtable = member + 4;
+        let guest_code = 0x7100_0000;
+        m.cpu.write_u32(member, vtable).unwrap();
+        for slot in 0..18 {
+            m.cpu
+                .write_u32(vtable + slot * 4, guest_code + slot)
+                .unwrap();
+        }
+        let mut e = env(&mut m);
+        let graph_state = g(&mut e, graph);
+        graph_state.state = RUNNING;
+        graph_state.members.push(Member {
+            filter: member,
+            host: None,
+            name: Vec::new(),
+            seeking: 0,
+        });
+        // An async Run has settled preroll and taken its pending flag.
+        let request = Transition::begin(&mut e, graph);
+        let mut in_flight = ran(&mut e, request, 0, Box::new(|_, _| Outcome::Return(S_OK)));
+        let mut run_resume = None;
+        for _ in 0..40 {
+            let Outcome::Call { target, then, .. } = in_flight else {
+                panic!("expected the guest Run to be in flight")
+            };
+            if target == guest_code + 6 {
+                run_resume = Some(then);
+                break;
+            }
+            in_flight = then(&mut e, Resume::Returned(E_NOINTERFACE));
+        }
+        let run_resume = run_resume.expect("Run calls the guest member");
+        let mut stopped = stop(&mut e, graph, Box::new(|_, _| Outcome::Return(S_OK)));
+        let mut stopped_member = false;
+        for _ in 0..40 {
+            let Outcome::Call { target, then, .. } = stopped else {
+                break;
+            };
+            let hr = match target - guest_code {
+                4 => {
+                    stopped_member = true;
+                    S_OK
+                }
+                5 => S_OK,
+                _ => E_NOINTERFACE,
+            };
+            stopped = then(&mut e, Resume::Returned(hr));
+        }
+        assert!(stopped_member);
+        assert!(matches!(stopped, Outcome::Return(S_OK)));
+        assert_eq!(g(&mut e, graph).state, STOPPED);
+        let _ = run_resume(&mut e, Resume::Returned(S_OK));
+        assert_eq!(
+            g(&mut e, graph).state,
+            STOPPED,
+            "old Run overwrote an already completed Stop"
+        );
+
+        let next = Transition::begin(&mut e, graph);
+        g(&mut e, graph).pending_run = Some(next.generation);
+        assert!(matches!(
+            async_run(&mut e, graph, request.generation),
+            Outcome::Return(0)
+        ));
+        assert_eq!(g(&mut e, graph).pending_run, Some(next.generation));
     }
 }

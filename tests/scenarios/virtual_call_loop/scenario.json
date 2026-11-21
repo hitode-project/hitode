@@ -1,0 +1,10 @@
+{
+  "spec": ["A64-OPT-8", "A64-CTL-10"],
+  "exe": "virtual_call_loop.exe",
+  "seconds": 60,
+  "outputs": ["virtual-call-loop.bin"],
+  "steady": {
+    "iterations": [2000000, 4000000],
+    "counters": ["accesses", "helper_exits", "checked_faults", "faults", "interprets"]
+  }
+}

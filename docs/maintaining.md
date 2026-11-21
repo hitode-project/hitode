@@ -13,7 +13,7 @@ An agent works for a maintainer when `git config --get hitode.maintainer` prints
 
 ## Integrating a branch
 
-Master takes changes only through pull requests, which must pass the checks its branch protection lists.
+Master takes changes only through pull requests, which must pass the checks its branch protection lists. A pull request must be up to date with master before it merges, so the commit its checks tested is the commit master becomes. It runs two macOS jobs; nothing reruns after a merge. When master moves, rebase the branch and push with `--force-with-lease`; `gh pr update-branch` writes a merge commit the privacy scan rejects.
 
 1. Commit in the worktree and bring in the latest master with `git merge origin/master`.
 2. Run `python3 tools/check.py --ci` and test the affected crates.

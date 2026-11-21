@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use adv_machine::{Env, Outcome};
 
 use super::{
-    Graph, RUNNING, TIME_FORMAT_MEDIA_TIME, TIME_FORMAT_NONE, current, duration, filter, g,
-    resolve_position, seek, seek_guests,
+    Graph, RUNNING, TIME_FORMAT_MEDIA_TIME, TIME_FORMAT_NONE, Transition, current, duration,
+    filter, g, resolve_position, seek, seek_guests,
 };
 use crate::dshow::*;
 
@@ -198,16 +198,14 @@ fn host(env: &mut Env<'_>, graph: u32, slot: u32, args: &[u32], then: Done) -> O
 
 /// Keep the stop position the members report as a run starts; completion
 /// leaves the graph's position there.
-pub(super) fn keep_stop(env: &mut Env<'_>, graph: u32, then: Finish) -> Outcome {
+pub(super) fn keep_stop(env: &mut Env<'_>, request: Transition, then: Finish) -> Outcome {
     longest(
         env,
-        graph,
+        request.graph,
         GET_STOP_POSITION,
         Box::new(move |env, hr, stop| {
-            if let Some(graph_state) = state(env).graphs.get_mut(&graph)
-                && !failed(hr)
-            {
-                graph_state.stream_stop = Some(stop);
+            if request.current(env) && !failed(hr) {
+                g(env, request.graph).stream_stop = Some(stop);
             }
             then(env)
         }),

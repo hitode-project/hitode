@@ -2065,7 +2065,11 @@ fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>)
         let hot = d.hot.borrow();
         if hot.shaders.pixel.is_none() {
             (
-                fixed::second_stage(&hot.fixed).err(),
+                fixed::second_stage(
+                    &hot.fixed,
+                    [hot.texture.is_some(), hot.shaders.textures[1].is_some()],
+                )
+                .err(),
                 hot.texture.is_some()
                     && (fixed::combine(
                         hot.fixed.stage[&1],

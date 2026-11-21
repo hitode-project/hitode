@@ -587,6 +587,7 @@ fn with_notices(machine: &Machine<Cpu>, deadline: Option<u64>) -> Option<u64> {
 
 /// Take finished host work; true when guest work may continue.
 fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
+    super::video::pump_reads(machine);
     let now = machine.sys.clock.now_us();
     machine
         .ext

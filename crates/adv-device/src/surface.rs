@@ -1358,6 +1358,8 @@ pub struct Surfaces<P: Presenter> {
     #[cfg(feature = "gpu")]
     native_source: Option<u32>,
     #[cfg(feature = "gpu")]
+    video_base: Option<crate::gpu::Target>,
+    #[cfg(feature = "gpu")]
     windows: Windows,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
@@ -1447,6 +1449,8 @@ impl<P: Presenter> Surfaces<P> {
             native_video: (Arc::from([]), (0, 0), Arc::from([])),
             #[cfg(feature = "gpu")]
             native_source: None,
+            #[cfg(feature = "gpu")]
+            video_base: None,
             #[cfg(feature = "gpu")]
             windows: Windows::default(),
             stats: GraphicsStats::default(),
@@ -1665,6 +1669,17 @@ impl<P: Presenter> Surfaces<P> {
             return Ok(self.stats.presentations);
         }
         self.flush(m, FlushReason::Immediate)?;
+        #[cfg(feature = "gpu")]
+        let video_canvas = layer
+            .as_ref()
+            .or_else(|| {
+                self.video_layers
+                    .iter()
+                    .find(|(id, _)| *id == key)
+                    .map(|(_, layer)| layer)
+            })
+            .unwrap()
+            .canvas;
         let serial = self
             .stats
             .presentations
@@ -1678,7 +1693,7 @@ impl<P: Presenter> Surfaces<P> {
         }
         self.video_layers = Arc::from(video);
         #[cfg(feature = "gpu")]
-        self.present_video(m, serial)?;
+        self.present_video(m, serial, video_canvas)?;
         if self.retained_frame.is_none() {
             let (width, height) = self
                 .video_layers
@@ -2398,6 +2413,7 @@ impl<P: Presenter> Surfaces<P> {
         self.software_video = Some(self.video_layers.clone());
         self.software_source = Some(id);
         self.native_source = None;
+        self.video_base = None;
         self.stats.presentations = serial;
         self.stats.published_frames += 1;
         self.stats.damaged_pixels += damaged;
@@ -2520,6 +2536,7 @@ impl<P: Presenter> Surfaces<P> {
         self.software_pending = None;
         self.software_source = None;
         self.native_source = Some(id);
+        self.video_base = None;
         self.stats.presentations = serial;
         Ok(())
     }
@@ -2538,9 +2555,17 @@ impl<P: Presenter> Surfaces<P> {
     /// Show changed video layers over the unchanged base. A layer that
     /// moved, appeared or went away redraws the base beneath it.
     #[cfg(feature = "gpu")]
-    fn present_video(&mut self, m: &dyn SurfaceMemory, serial: u64) -> Result<(), String> {
-        let Some(extent) = self.base_extent() else {
-            return Ok(());
+    fn present_video(
+        &mut self,
+        m: &dyn SurfaceMemory,
+        serial: u64,
+        video_canvas: (u32, u32),
+    ) -> Result<(), String> {
+        let extent = if let Some(extent) = self.base_extent() {
+            self.video_base = None;
+            extent
+        } else {
+            video_canvas
         };
         let before = self.native_video.2.clone();
         let video = self.native_video(extent);
@@ -2549,7 +2574,42 @@ impl<P: Presenter> Surfaces<P> {
                 .iter()
                 .zip(video.iter())
                 .any(|(a, b)| a.id != b.id || a.geometry != b.geometry);
-        self.republish(m, serial, whole).map(drop)
+        if self.republish(m, serial, whole)? {
+            return Ok(());
+        }
+        let new_base = self
+            .video_base
+            .as_ref()
+            .is_none_or(|base| (base.image.width(), base.image.height()) != extent);
+        if new_base {
+            let base = self
+                .gpu
+                .target(extent.0, extent.1, false)
+                .map_err(|e| e.to_string())?;
+            self.gpu
+                .clear(&base, Some([0.0, 0.0, 0.0, 1.0]), None)
+                .map_err(|e| e.to_string())?;
+            self.video_base = Some(base);
+        }
+        let windows = self.window_layers(extent);
+        let damage = if whole || new_base {
+            Region::whole(extent)
+        } else {
+            Region::empty(extent)
+        };
+        self.gpu
+            .present(
+                &self.video_base.as_ref().unwrap().image,
+                damage,
+                serial,
+                video,
+                windows,
+            )
+            .map_err(|e| e.to_string())?;
+        if self.video_layers.is_empty() {
+            self.video_base = None;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "gpu")]

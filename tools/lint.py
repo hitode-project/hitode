@@ -4,7 +4,7 @@
   python3 tools/lint.py [host|ios|android|all]...   (default: host)
   python3 tools/lint.py --dry-run all               print the commands only
 
-host is the workspace-lint gate CI runs (.github/workflows/core-performance.yml
+host is the workspace Clippy gate CI runs (.github/workflows/core-performance.yml
 calls this script). ios and android lint adv-launcher and every workspace crate
 it reaches, for aarch64-apple-ios and, through cargo-ndk, aarch64-linux-android.
 Each target runs in the environment tools/env.py prepares; the mobile ones build
@@ -24,7 +24,7 @@ import env as toolchain  # noqa: E402
 
 ROOT = toolchain.ROOT
 # The features CI lints the workspace with.
-WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked",
+WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked", "--keep-going",
                   "--features", "adv-shell/gpu,adv-shell/media,adv-device/slow-tests"]
 TARGETS = ("host", "ios", "android")
 

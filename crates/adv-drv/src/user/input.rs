@@ -470,3 +470,45 @@ fn next(env: &mut Env<'_>, mask: u32) -> Outcome {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: HOST-LIFE-1
+    #[test]
+    fn early_close_reaches_the_first_visible_window_before_it_presents() {
+        use crate::user::{Order, Window, Windows, project};
+
+        let mut ext = Ext::default();
+        ext.insert(Presentation::default());
+        assert!(project::close(&mut ext));
+        let (read, write) = std::io::pipe().unwrap();
+        ext.get_or_default::<Queues>().0.insert(
+            1,
+            Queue {
+                read,
+                write,
+                events: VecDeque::new(),
+                processing: false,
+                pending: Rc::new(Cell::new(0)),
+                counts: [0; 4],
+            },
+        );
+        ext.get_or_default::<Windows>().0.insert(
+            2,
+            Window {
+                context: 1,
+                visible: true,
+                ..Default::default()
+            },
+        );
+        ext.insert(Order(vec![2]));
+        project::close_when_ready(&mut ext);
+        project::close_when_ready(&mut ext);
+        assert!(presented_window(&ext).is_none());
+        let events = &ext.get::<Queues>().0[&1].events;
+        assert!(matches!(events.front(), Some(Event::Job(_))));
+        assert_eq!(events.len(), 1);
+    }
+}

@@ -10,6 +10,8 @@ pub type Opened = Box<
         Result<(Option<adv_device::media::Decoder>, Option<u32>), u32>,
     ) -> Outcome,
 >;
+pub type DemuxFile =
+    Box<dyn FnOnce(&mut Env<'_>, Result<adv_device::media::Demuxed, u32>) -> Outcome>;
 pub type ReadFile = Box<dyn FnOnce(&mut Env<'_>, Result<(Vec<u8>, Option<u32>), u32>) -> Outcome>;
 /// Byte ranges of a file: `(offset, length)`.
 pub type Ranges = Vec<(u64, usize)>;
@@ -42,6 +44,7 @@ pub const WINE_QUARTZ: &str = "winequartz.dll";
 pub struct Host {
     pub allocator: crate::interop::GuestAllocator,
     pub open: fn(&mut Env<'_>, u32, Opened) -> Outcome,
+    pub demux: fn(&mut Env<'_>, u32, DemuxFile) -> Outcome,
     pub read: fn(&mut Env<'_>, u32, ReadFile) -> Outcome,
     pub close: fn(&mut Env<'_>, u32),
     pub thread: fn(&mut Env<'_>, u32) -> Outcome,

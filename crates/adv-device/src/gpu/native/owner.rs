@@ -3,7 +3,7 @@
 //! stay with the encoder until its submission completes.
 
 use super::resources::Storage;
-use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource};
+use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource, Waker};
 use super::{Depth, Image, Target, backing, pass};
 use crate::frame::{Base, Frame, Presenter, SwapImage};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
@@ -12,6 +12,20 @@ use adv_gpu::{Encoder, Extent, Queue, Rect, RenderPassDesc, Span, Token};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+fn retirement_wake(wake: Waker) -> Box<dyn FnOnce() + Send> {
+    struct WakeOnDrop(Waker);
+    impl Drop for WakeOnDrop {
+        fn drop(&mut self) {
+            self.0.poke();
+        }
+    }
+
+    // Device loss can cancel the callback. Wake on both paths so the owner
+    // polls the queue and reports the failure to slot waiters.
+    let wake = WakeOnDrop(wake);
+    Box::new(move || drop(wake))
+}
 
 pub(super) struct Owner {
     join: Option<std::thread::JoinHandle<()>>,
@@ -144,7 +158,7 @@ pub(super) fn run(
                         state.submit(None)?;
                     }
                     state.presenter.service(&mut state.queue, Some(&wake));
-                    Ok(())
+                    state.poll(&commands)
                 })?;
                 #[cfg(not(target_vendor = "apple"))]
                 {
@@ -155,6 +169,7 @@ pub(super) fn run(
                         state.submit(None)?;
                     }
                     state.presenter.service(&mut state.queue, Some(&wake));
+                    state.poll(&commands)?;
                 }
             }
             super::stream::Next::Chunk(chunk) => {
@@ -474,7 +489,11 @@ impl State {
                 self.queue.on_complete(token, done);
             }
             Command::Submit => {
-                self.submit(None)?;
+                let token = self.submit(None)?;
+                // A producer waiting for a software slot may have no more
+                // commands to publish until this boundary retires.
+                self.queue
+                    .on_complete(token, retirement_wake(self.wake.clone()));
             }
             Command::PresentSwap {
                 image,
@@ -1314,6 +1333,42 @@ struct Color {rgba:vec4<f32>}
         assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 2);
         producer_thread.join().unwrap();
         owner.join().unwrap().unwrap();
+    }
+
+    // spec: DEV-FRAME-4
+    #[test]
+    fn flush_retires_without_more_commands() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let image = image(&device, 256, 128);
+        let (mut producer, consumer) =
+            super::super::stream::channel(device.ring(128 << 10).unwrap());
+        let gate = producer.gate();
+        let owner = Owner::start(queue, consumer, Box::new(Headless)).unwrap();
+        producer.push(color(&image));
+        producer.push(clear(rect(0, 0, 256, 128), [1., 0., 0., 1.]));
+        producer.push(Command::Submit);
+        let deadline = Instant::now() + TIMEOUT;
+        while gate.completed() == 0 && Instant::now() < deadline {
+            gate.wait_retired();
+        }
+        let completed = gate.completed();
+        drop(producer);
+        drop(owner);
+        assert!(completed > 0);
+    }
+
+    // spec: DEV-FRAME-4
+    #[test]
+    fn canceling_retirement_notification_wakes_the_owner() {
+        let Some((device, _)) = open() else {
+            return;
+        };
+        let (producer, consumer) = super::super::stream::channel(device.ring(128 << 10).unwrap());
+        drop(retirement_wake(consumer.waker()));
+        drop(producer);
+        assert!(matches!(consumer.next(), super::super::stream::Next::Woken));
     }
 
     // spec: GFX-REC-5

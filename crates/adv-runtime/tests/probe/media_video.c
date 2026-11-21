@@ -1,9 +1,23 @@
-/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_video.c -o media_video.exe -lstrmiids -lole32 -luuid */
+/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_video.c -o media_video.exe -lstrmiids -lole32 -luuid
+ * Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 -DGUEST_READS media_video.c -o media_video_read.exe -lstrmiids -lole32 -luuid
+ */
 #define COBJMACROS
 #include <windows.h>
 #include <dshow.h>
 #include <stdio.h>
 static void check(HRESULT hr, const char *where) { if (FAILED(hr)) { printf("FAIL %s %08lx\n", where, hr); ExitProcess(1); } }
+#ifdef GUEST_READS
+static void use_guest_reads(void)
+{
+    BYTE *entry = (BYTE *)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "ReadFile");
+    DWORD protect;
+    /* Vary Wine's unused hot-patch padding while keeping ReadFile itself intact. */
+    if (!entry || entry[-1] != 0xcc || !VirtualProtect(entry - 1, 1, PAGE_EXECUTE_READWRITE, &protect))
+        ExitProcess(4);
+    entry[-1] = 0x90;
+    if (!VirtualProtect(entry - 1, 1, protect, &protect)) ExitProcess(5);
+}
+#endif
 int main(void)
 {
     IGraphBuilder *graph;
@@ -12,6 +26,9 @@ int main(void)
     IVideoWindow *video;
     HWND owner, child;
     long code;
+#ifdef GUEST_READS
+    use_guest_reads();
+#endif
     CoInitialize(NULL);
     owner = CreateWindowW(L"static", L"media", WS_POPUP | WS_VISIBLE, 40, 30, 160, 120, NULL, NULL, NULL, NULL);
     child = CreateWindowW(L"static", L"", WS_CHILD | WS_VISIBLE, 11, 13, 100, 80, owner, NULL, NULL, NULL);

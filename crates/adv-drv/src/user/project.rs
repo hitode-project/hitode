@@ -161,6 +161,7 @@ struct Part {
 #[derive(Default)]
 struct Projection {
     parts: HashMap<CtxId, Part>,
+    close_pending: bool,
     /// The last menu attached to the presented top-level window.
     menu_origin: Option<MenuOrigin>,
     popup: Option<(u32, Arc<AtomicBool>)>,
@@ -896,10 +897,32 @@ pub fn menu_event(ext: &mut Ext, event: MenuEvent) -> bool {
     deliver(ext, window, vec![message])
 }
 
-/// Ask the presented window to close, as its close box would.
+/// Ask the guest window to close, including before its first frame.
 pub fn close(ext: &mut Ext) -> bool {
-    input::presented_window(ext)
-        .is_some_and(|hwnd| deliver(ext, hwnd, vec![Message::Post(hwnd, WM_CLOSE, 0, 0)]))
+    projection(ext).close_pending = true;
+    close_when_ready(ext);
+    true
+}
+
+pub(super) fn close_when_ready(ext: &mut Ext) {
+    if !ext.try_get::<Projection>().is_some_and(|p| p.close_pending) {
+        return;
+    }
+    let target = presented_top(ext).or_else(|| {
+        ext.try_get::<super::Order>()?
+            .0
+            .iter()
+            .copied()
+            .find(|&hwnd| {
+                super::window(ext, hwnd)
+                    .is_some_and(|w| w.visible && w.parent == 0 && w.style & WS_CHILD == 0)
+            })
+    });
+    if let Some(hwnd) = target
+        && deliver(ext, hwnd, vec![Message::Post(hwnd, WM_CLOSE, 0, 0)])
+    {
+        projection(ext).close_pending = false;
+    }
 }
 
 /// The host application gained or lost activation.
