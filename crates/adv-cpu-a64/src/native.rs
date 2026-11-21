@@ -249,7 +249,7 @@ unsafe extern "C" fn plan_observation(
         native.count_plan_event("resident_version_miss");
         let mut at = cpu.clone();
         at.eip = eip;
-        native.retry_resident(&at, point);
+        native.retry_resident(&at);
         return 0;
     }
     if kind == runtime::RESIDENT_LINK_SAMPLE {
@@ -2360,6 +2360,7 @@ mod tests {
         let latch = body.len() - 2;
         body[latch] = (-(latch as i32 + 1)) as u8;
         let (mut memory, mut native, stop) = resident_loop(&body);
+        native.count_resident_entries = true;
         native
             .translate(
                 &mut memory,
@@ -2446,6 +2447,41 @@ mod tests {
                 .all(|point| native.code.cache.word(point)
                     == crate::encode::b((runtime::SENSOR_BYTES + 4) as i32))
         );
+    }
+
+    // spec: A64-OPT-8 A64-OPT-9
+    #[test]
+    fn resident_probation_withdraws_only_the_unprofitable_version() {
+        let (mut memory, mut native, stop) = probation_loop(100);
+        native.promotion = 0;
+        let mut invoke = |native: &mut Native, trips, mxcsr| {
+            let mut state = resident_cpu(OUTSIDE, trips);
+            state.mxcsr = mxcsr;
+            let mut retired = 0;
+            while state.eip != stop {
+                retired += enter(native, &mut memory, stop, &mut state).retired;
+            }
+            assert_eq!(retired, 2 + 10 * trips);
+        };
+        for _ in 0..300 {
+            invoke(&mut native, 100, 0x1f80);
+        }
+        let kept = &native.code.resident(HEAD).unwrap().versions[0];
+        assert!(!kept.probation);
+        let entry = kept.entry;
+        for _ in 0..300 {
+            invoke(&mut native, 2, 0x3f80);
+        }
+        assert!(!native.plans.resident(HEAD).unwrap().declined());
+        let versions = &native.code.resident(HEAD).unwrap().versions;
+        assert_eq!(versions[0].entry, entry);
+        assert!(versions[0].enabled);
+        assert!(!versions[1].enabled);
+        let before = native.diagnostics.resident_entries;
+        for _ in 0..32 {
+            invoke(&mut native, 100, 0x1f80);
+        }
+        assert_eq!(native.diagnostics.resident_entries - before, 32);
     }
 
     // spec: A64A-ROLE-8, A64A-PLACE-3

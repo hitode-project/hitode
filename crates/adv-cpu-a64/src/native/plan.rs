@@ -735,11 +735,8 @@ impl ResidentPlan {
         }
     }
 
-    pub(super) fn retry(&self, version: usize) -> bool {
-        self.rebuilds == 0
-            && self.pending.is_none()
-            && self.probation.len() == version + 1
-            && self.probation.len() < VERSIONS
+    pub(super) fn retry(&self) -> bool {
+        self.rebuilds == 0 && self.pending.is_none() && self.retry_period().is_some()
     }
 
     pub(super) fn sampling(&self) -> bool {

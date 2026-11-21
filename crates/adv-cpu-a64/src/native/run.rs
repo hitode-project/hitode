@@ -1094,7 +1094,10 @@ impl Native {
             match action {
                 RowAction::Keep => {}
                 RowAction::Sample(active) => self.code.measure_rows(eip, index, active),
-                RowAction::Withdraw => self.withdraw_row(eip, index),
+                RowAction::Withdraw => {
+                    self.count_sensor_decision("row_withdrawn");
+                    self.withdraw_resident(eip, index);
+                }
             }
             if self.plans.resident(eip).unwrap().declined() {
                 break;
@@ -1103,8 +1106,7 @@ impl Native {
         self.code.sync();
     }
 
-    fn withdraw_row(&mut self, eip: u32, index: usize) {
-        self.count_sensor_decision("row_withdrawn");
+    fn withdraw_resident(&mut self, eip: u32, index: usize) {
         self.stop_cold_window(eip);
         let site = self.code.resident_mut(eip).unwrap();
         site.versions[index].enabled = false;
@@ -1176,10 +1178,10 @@ impl Native {
         });
     }
 
-    pub(super) fn retry_resident(&mut self, cpu: &CpuState, version: usize) {
+    pub(super) fn retry_resident(&mut self, cpu: &CpuState) {
         let eip = cpu.eip;
         let head = self.plans.resident(eip).unwrap();
-        if head.retry(version) {
+        if head.retry() {
             self.count_sensor_decision("context_retry");
             self.request_resident(eip, compile::Task::Append, cpu.clone());
             self.code.sync();
@@ -1499,7 +1501,7 @@ impl Native {
         } else {
             crate::jit_map::demoted(eip, index, entries, retired / probation.iteration_retired);
             self.count_sensor_decision("probation_declined");
-            self.decline_resident(eip, Decline::Unprofitable);
+            self.withdraw_resident(eip, index);
         }
     }
 
