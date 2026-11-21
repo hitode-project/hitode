@@ -1208,7 +1208,8 @@ impl Native {
         let version = site
             .versions
             .iter()
-            .position(|v| v.enabled && cpu.rep.is_none() && v.key.holds(cpu));
+            .position(|v| v.enabled && v.row_target.is_none())
+            .filter(|&index| cpu.rep.is_none() && site.versions[index].key.holds(cpu));
         let (link, settled) = head.sample_link(point, version);
         if let Some(version) = link {
             self.code.specialize_link(eip, point, version);

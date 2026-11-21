@@ -1867,7 +1867,7 @@ mod tests {
 
     // spec: A64-OPT-8
     #[test]
-    fn resident_context_misses_chain_three_versions_and_stable_edges_link_directly() {
+    fn resident_context_misses_chain_three_versions_and_keep_checked_entry() {
         let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
         enter(
             &mut native,
@@ -1936,7 +1936,7 @@ mod tests {
         let patch = transition + 4;
         assert_eq!(
             native.code.cache.word(patch),
-            store::branch(patch, resident.versions[2].entry)
+            store::branch(patch, resident.versions[0].probe)
         );
     }
 
@@ -2565,6 +2565,42 @@ mod tests {
             events + 1
         );
         assert!(native.plans.resident(head).is_some());
+    }
+
+    // spec: A64A-FALL-2 A64-OPT-8
+    #[test]
+    fn sampled_arrivals_still_check_earlier_resident_versions() {
+        let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+        native.count_resident_entries = true;
+        assert!(native.force_resident(&mut memory, HEAD));
+        let mut invoke = |native: &mut Native, mxcsr, trips| {
+            let mut cpu = resident_cpu(OUTSIDE, trips);
+            cpu.mxcsr = mxcsr;
+            let run = enter(native, &mut memory, stop, &mut cpu);
+            assert_eq!((cpu.eip, run.retired), (stop, 2 + 4 * trips));
+        };
+        for mxcsr in [0x3f80, 0x5f80] {
+            for _ in 0..plan::MISSES {
+                invoke(&mut native, mxcsr, 10);
+            }
+            native.install_optimized(true);
+        }
+        assert_eq!(native.code.resident(HEAD).unwrap().versions.len(), 3);
+        for _ in 0..2 * plan::SAMPLE {
+            invoke(&mut native, 0x5f80, 10);
+        }
+        let site = native.code.resident(HEAD).unwrap();
+        let point = outside_link(&native, HEAD).direct.unwrap() + 4;
+        assert_eq!(
+            native.code.cache.word(point),
+            store::branch(point, site.versions[0].probe)
+        );
+
+        let before = native.diagnostics.resident_entries;
+        for _ in 0..32 {
+            invoke(&mut native, 0x1f80, 1);
+        }
+        assert_eq!(native.diagnostics.resident_entries - before, 32);
     }
 
     // spec: A64A-ROLE-8, A64A-PLACE-3
