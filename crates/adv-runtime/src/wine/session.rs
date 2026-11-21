@@ -902,9 +902,12 @@ impl Session {
                     self.machine.run_slice(Duration::from_millis(10))
                 };
             self.metrics.run_time += started.elapsed();
-            if let Err(error) = serve(&mut self.machine) {
-                return Stop::Failed(error);
-            }
+            // Finished host work can make a guest runnable; it must run now,
+            // not after the next unrelated wake or deadline.
+            let served = match serve(&mut self.machine) {
+                Ok(served) => served,
+                Err(error) => return Stop::Failed(error),
+            };
             let id = self.shared.id.get();
             // A single-process game is already foreground: skip the window view.
             if self.presented_frames() != before
@@ -972,6 +975,9 @@ impl Session {
                 }
                 SliceResult::Complete(RunResult::Failed(error)) => {
                     return Stop::Failed(format!("{error:?}"));
+                }
+                SliceResult::Complete(RunResult::Idle { .. }) if served => {
+                    self.idle.remove(&id);
                 }
                 SliceResult::Complete(RunResult::Idle { next_deadline }) => {
                     let deadline = with_notices(&self.machine, next_deadline);
