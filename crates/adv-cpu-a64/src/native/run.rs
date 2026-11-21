@@ -745,6 +745,9 @@ impl Native {
         self.remove_scoped_jobs(eip);
         let dropped = self.code.invalidate_unit(eip);
         self.plans.invalidate(eip);
+        if self.plans.routing(eip).0 {
+            self.code.restore_internal_counting(eip);
+        }
         self.worker_jobs.remove(&eip);
         self.offload.admission.invalidate((eip, None));
         dropped

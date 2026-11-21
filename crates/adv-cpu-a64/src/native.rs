@@ -2411,7 +2411,7 @@ mod tests {
         let offer = native.code.offer(HEAD).unwrap().0;
         assert_eq!(
             native.code.cache.word(edge.point),
-            store::branch(edge.point, edge.sensor.unwrap())
+            store::branch(edge.point, edge.sensor.unwrap().0)
         );
         assert_eq!(
             native.code.cache.word(edge.link),
@@ -2519,6 +2519,52 @@ mod tests {
         }
         assert_eq!(native.code.resident(HEAD).unwrap().versions.len(), 2);
         assert!(native.diagnostics.resident_entries > before);
+    }
+
+    // spec: A64-OPT-8
+    #[test]
+    fn invalidated_resident_head_rediscoverable_from_a_surviving_backedge() {
+        let mut body = vec![0x90];
+        for value in 0..8 {
+            body.extend_from_slice(&[0xb8, value, 0, 0, 0]);
+        }
+        body.extend_from_slice(STORE_LOOP);
+        let latch = body.len() - 2;
+        body[latch] = (-(latch as i32)) as u8; // jne HEAD + 1
+        let (mut memory, mut native, stop) = resident_loop(&body);
+        let head = HEAD + 1;
+        native.promotion = 0;
+        native.count_resident_entries = true;
+        let mut state = resident_cpu(HEAD, plan::HOT + 1);
+        enter(&mut native, &mut memory, stop, &mut state);
+        assert!(native.code.resident(head).unwrap().entry().is_some());
+
+        // Invalidate a dependency of the resident trace alone.
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        native
+            .code
+            .watch_pages(&mut memory, head, &[(DATA, 1)], &mut native.decodes);
+        let tier1 = native.code.tier1(HEAD).unwrap().unit;
+        memory.write(DATA, &[42]).unwrap();
+        native.invalidate(&mut memory);
+        assert!(native.plans.resident(head).is_none());
+        assert_eq!(native.code.tier1(HEAD).unwrap().unit, tier1);
+
+        let events = native.diagnostics.plan_events["internal_discovery"];
+        let mut state = resident_cpu(HEAD, plan::HOT);
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!((state.eip, run.retired), (stop, 1 + 12 * plan::HOT));
+        assert_eq!(native.plans.counter_at(head).unwrap().get(), 1);
+        assert_eq!(native.diagnostics.plan_events["internal_discovery"], events);
+
+        let mut state = resident_cpu(HEAD, 2);
+        let run = enter(&mut native, &mut memory, stop, &mut state);
+        assert_eq!((state.eip, run.retired), (stop, 25));
+        assert_eq!(
+            native.diagnostics.plan_events["internal_discovery"],
+            events + 1
+        );
+        assert!(native.plans.resident(head).is_some());
     }
 
     // spec: A64A-ROLE-8, A64A-PLACE-3

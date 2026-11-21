@@ -102,7 +102,7 @@ pub(super) struct InternalEdge {
     pub(super) unit: usize,
     pub(super) source_pc: u32,
     pub(super) back: bool,
-    pub(super) sensor: Option<usize>,
+    pub(super) sensor: Option<(usize, [u32; runtime::SENSOR_BYTES / 4])>,
 }
 
 #[derive(Default)]
@@ -998,7 +998,7 @@ impl<R> CodeStore<R> {
             let entry = Self::resident_link_target(site, facts, edge.back, entry);
             cache.patch(edge.link, branch(edge.link, entry));
             edge.transition
-        } else if let Some((sensor, offer)) = edge.sensor.zip(offer) {
+        } else if let Some(((sensor, _), offer)) = edge.sensor.zip(offer) {
             let words = ingress::internal_offer(sensor, edge.transition, edge.target);
             for (i, word) in words.into_iter().enumerate() {
                 cache.patch(sensor + i * 4, word);
@@ -1044,8 +1044,21 @@ impl<R> CodeStore<R> {
             }
         }
         for edge in self.internal_edges.get(&eip).into_iter().flatten() {
-            if let Some(sensor) = edge.sensor {
+            if let Some((sensor, _)) = edge.sensor {
                 self.cache.patch(sensor, branch(sensor, edge.target));
+            }
+        }
+    }
+
+    pub(super) fn restore_internal_counting(&mut self, eip: u32) {
+        for edge in self.internal_edges.get(&eip).into_iter().flatten() {
+            if let Some((sensor, words)) = edge.sensor
+                && self.contains_unit(edge.source, edge.unit)
+            {
+                for (i, word) in words.into_iter().enumerate() {
+                    self.cache.patch(sensor + i * 4, word);
+                }
+                self.cache.patch(edge.point, branch(edge.point, sensor));
             }
         }
     }
@@ -1362,7 +1375,10 @@ impl<R> CodeStore<R> {
                 unit: at,
                 source_pc: link.source_pc,
                 back: link.counter.is_some(),
-                sensor: link.sensor.map(|offset| at + offset),
+                sensor: link.sensor.map(|offset| {
+                    let words = &work.words[offset / 4..];
+                    (at + offset, std::array::from_fn(|i| words[i]))
+                }),
             };
             if proofs.mask() != 0 {
                 self.point_facts.insert(edge.point, proofs);
@@ -1375,7 +1391,7 @@ impl<R> CodeStore<R> {
                 u32::MAX
             };
             if value == u32::MAX
-                && let Some(sensor) = edge.sensor
+                && let Some((sensor, _)) = edge.sensor
             {
                 self.cache.patch(sensor, branch(sensor, edge.target));
             }
