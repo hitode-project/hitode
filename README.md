@@ -27,14 +27,14 @@ How many steps does it take to put an elephant in a fridge? Open the door, put i
 ## Features
 
 **One runtime for the common ARM platforms**
-- macOS (Apple silicon), iOS / iPadOS and Android share one runtime. Its own x86 → ARM64 JIT translates game code straight into ARM64 machine code with no intermediate representation, so one optimization helps all three platforms.
+- macOS (Apple silicon), iOS / iPadOS and Android share one runtime. Its own x86 → ARM64 JIT translates game code straight into ARM64 machine code, and hot loops move up to an optimizing tier built on an SSA IR, so one optimization helps all three platforms.
 - Graphics use each platform's native API, Metal on Apple platforms and Vulkan on Android, with power-saving work such as damage-based drawing.
 
 **Compatible with the original games**
 - The original exe, DLLs and translation patches run directly. No port is needed, and no particular engine is assumed.
 - Hitode does not rebuild all of Windows. It implements the system features visual novels actually use, faithful to how Windows defines them. Fixes go into that shared behavior, so every game adapted helps the next game that needs the same feature.
 - Patch-friendly: translation patches often rewrite import tables, function prologues or COM vtables. Every fast path detects such rewrites and falls back to the general path, so the patch still takes effect.
-- Text encoding is detected per game (Japanese / Simplified Chinese). Bundled videos, disc images (up to four mounted ISOs) and font substitution work as well.
+- Text encoding is detected per game (Japanese / Simplified Chinese), and Traditional Chinese (Big5) can be selected. Bundled videos, disc images (up to four mounted ISOs) and font substitution work as well.
 
 **Player**
 
